@@ -875,6 +875,28 @@ test("introspection without a workspace verifies machines in the session's works
   );
 });
 
+test("introspection refuses a second organization in single tenancy and allows it in multi", async (t) => {
+  const env = await setup(t);
+  const { accessToken } = await env.login(env.alpha);
+  await env.database.query(
+    "INSERT INTO selfhost_organizations (id, name) VALUES ($1, 'Other')",
+    ["00000000-0000-4000-8000-000000000002"],
+  );
+  const single = await env.introspect({ token: accessToken, aud: HISTORY_PUBLIC });
+  assert.deepEqual(single.body, { active: false, reason: "unknown" });
+
+  const multi = new ControlPlaneStore(
+    env.database,
+    { active: { id: "test-key", key: Buffer.alloc(32, 7) } },
+    0,
+    { tenancy: "multi" },
+  );
+  const session = await multi.introspectAccessToken(accessToken);
+  assert.equal(session?.organizationId, env.organizationId);
+  assert.equal(session?.workspaceId, env.alpha);
+  assert.equal(await multi.introspectAccessToken("sh_at_not-a-real-token"), null);
+});
+
 test("introspection reports the live organization role, for add-on admin decisions", async (t) => {
   const env = await setup(t);
   const { accessToken: ownerToken } = await env.login(env.alpha);
