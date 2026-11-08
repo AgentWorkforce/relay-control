@@ -11,7 +11,7 @@ import { createServer } from "node:http";
 import { PGlite } from "@electric-sql/pglite";
 import { createApp } from "../src/app.js";
 import { createAdminModule } from "../src/admin/routes.js";
-import type { SelfhostConfig } from "../src/config.js";
+import { loadDatabaseSchema, type SelfhostConfig } from "../src/config.js";
 import type { Database, SqlExecutor, SqlResult } from "../src/database.js";
 import { defaultFlowsConfig } from "../src/flows/config.js";
 import { FlowsStore } from "../src/flows/store.js";
@@ -21,7 +21,7 @@ import { pathToFileURL } from 'node:url';
 import type { ChiefBackend } from '../src/chief/routes.js';
 
 class PGliteDatabase implements Database {
-  constructor(readonly client: PGlite) {}
+  constructor(readonly client: PGlite, readonly schema: string) {}
   async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<SqlResult<T>> {
     const result = params.length ? await this.client.query<T>(sql, params) : await this.client.query<T>(sql);
     return { rows: result.rows };
@@ -48,11 +48,18 @@ class PGliteDatabase implements Database {
 const port = Number(process.env.PORT ?? "8787");
 const origin = `http://127.0.0.1:${port}`;
 const bootstrapToken = "dev-bootstrap-token-0123456789abcdef";
-const database = new PGliteDatabase(new PGlite(process.env.DEV_PGLITE_DIR));
+// SELFHOST_DATABASE_SCHEMA works as in production: the schema must exist
+// (pre-created in a persisted DEV_PGLITE_DIR, or created below for local use)
+// and the session is pinned to it before migrate.
+const databaseSchema = loadDatabaseSchema();
+const database = new PGliteDatabase(new PGlite(process.env.DEV_PGLITE_DIR), databaseSchema);
+await database.exec(`CREATE SCHEMA IF NOT EXISTS "${databaseSchema}"`);
+await database.exec(`SET search_path TO "${databaseSchema}"`);
 await migrate(database);
 
 const config: SelfhostConfig = {
   databaseUrl: "pglite",
+  databaseSchema,
   publicBaseUrl: process.env.SELFHOST_PUBLIC_URL ?? origin,
   relaycastUrl: "http://127.0.0.1:1",
   relaycastPublicUrl: "https://relaycast.dev-selfhost.company",

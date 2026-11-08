@@ -9,6 +9,7 @@ import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 
 class PGliteDatabase implements Database {
+  readonly schema = "public";
   constructor(readonly client = new PGlite()) {}
 
   async query<T extends Record<string, unknown>>(
@@ -332,6 +333,7 @@ async function setup(
   await migrate(database);
   const bootstrapToken = "bootstrap-token-that-is-at-least-32-bytes";
   const config: SelfhostConfig = {
+    databaseSchema: "public",
     databaseUrl: "unused-in-test",
     publicBaseUrl: "https://control.internal.example",
     relaycastUrl: "http://relaycast.internal",

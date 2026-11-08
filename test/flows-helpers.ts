@@ -11,6 +11,7 @@ import { ControlPlaneStore } from "../src/store.js";
 import type { ChiefBackend } from '../src/chief/routes.js';
 
 export class PGliteDatabase implements Database {
+  readonly schema = "public";
   constructor(readonly client = new PGlite()) {}
 
   async query<T extends Record<string, unknown>>(
@@ -96,6 +97,7 @@ export async function startControlPlane(flowsOverrides: Partial<FlowsConfig> = {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
+    databaseSchema: "public",
     databaseUrl: "unused",
     publicBaseUrl: "https://control.selfhosted.company",
     relaycastUrl: "http://relaycast.relay.svc.cluster.local",

@@ -6,9 +6,13 @@ import test from "node:test";
 import {
   configFingerprint,
   loadConfig,
+  loadAllowedDatabaseSchemas,
+  loadDatabaseSchema,
+  loadDatabaseSchemaCutover,
   loadDatabaseUrl,
   loadMigrationsDatabaseUrl,
   loadRuntimeDatabaseRole,
+  loadServerRuntimeDatabaseRole,
 } from "../src/config.js";
 
 const completeEnv = {
@@ -199,6 +203,116 @@ test("runtime database role is explicit and cannot name the PUBLIC pseudo-role",
     assert.throws(
       () => loadRuntimeDatabaseRole({ SELFHOST_RUNTIME_DATABASE_ROLE: role }),
       /SELFHOST_RUNTIME_DATABASE_ROLE/,
+    );
+  }
+});
+
+test("database schema defaults to public and accepts lower-case identifiers", () => {
+  assert.equal(loadDatabaseSchema({}), "public");
+  assert.equal(loadDatabaseSchema({ SELFHOST_DATABASE_SCHEMA: "  " }), "public");
+  assert.equal(loadConfig(completeEnv).databaseSchema, "public");
+  assert.equal(
+    loadConfig({
+      ...completeEnv,
+      SELFHOST_DATABASE_SCHEMA: "relaycontrol",
+      SELFHOST_RUNTIME_DATABASE_ROLE: "control_api_runtime",
+    }).databaseSchema,
+    "relaycontrol",
+  );
+  assert.equal(loadDatabaseSchema({ SELFHOST_DATABASE_SCHEMA: "_rc_2" }), "_rc_2");
+  assert.equal(loadDatabaseSchema({ SELFHOST_DATABASE_SCHEMA: "a".repeat(63) }), "a".repeat(63));
+});
+
+test("the server requires its runtime role outside public and validates it", () => {
+  // Legacy single-role install in public: unset keeps the old behaviour.
+  assert.equal(loadConfig(completeEnv).runtimeDatabaseRole, null);
+  assert.equal(loadServerRuntimeDatabaseRole({}), null);
+  assert.equal(
+    loadConfig({ ...completeEnv, SELFHOST_RUNTIME_DATABASE_ROLE: " control_api_runtime " })
+      .runtimeDatabaseRole,
+    "control_api_runtime",
+  );
+  assert.equal(
+    loadConfig({
+      ...completeEnv,
+      SELFHOST_DATABASE_SCHEMA: "relaycontrol",
+      SELFHOST_RUNTIME_DATABASE_ROLE: "control_api_runtime",
+    }).runtimeDatabaseRole,
+    "control_api_runtime",
+  );
+  for (const role of [undefined, "", "  "]) {
+    assert.throws(
+      () => loadConfig({
+        ...completeEnv,
+        SELFHOST_DATABASE_SCHEMA: "relaycontrol",
+        SELFHOST_RUNTIME_DATABASE_ROLE: role,
+      }),
+      /^Error: SELFHOST_RUNTIME_DATABASE_ROLE is required when SELFHOST_DATABASE_SCHEMA is "relaycontrol"/,
+    );
+  }
+  for (const role of ["PUBLIC", "runtime-role", "a".repeat(64)]) {
+    for (const schema of ["public", "relaycontrol"]) {
+      assert.throws(
+        () => loadConfig({
+          ...completeEnv,
+          SELFHOST_DATABASE_SCHEMA: schema,
+          SELFHOST_RUNTIME_DATABASE_ROLE: role,
+        }),
+        /SELFHOST_RUNTIME_DATABASE_ROLE must be a valid non-PUBLIC PostgreSQL role name/,
+      );
+    }
+  }
+});
+
+test("database schema rejects system schemas and non-identifiers", () => {
+  for (const value of [
+    "pg_catalog",
+    "information_schema",
+    "pg_foo",
+    "Relaycontrol",
+    "relay-control",
+    "1relay",
+    "relay control",
+    'relay"; DROP SCHEMA public; --',
+    "a".repeat(64),
+  ]) {
+    assert.throws(
+      () => loadDatabaseSchema({ SELFHOST_DATABASE_SCHEMA: value }),
+      /SELFHOST_DATABASE_SCHEMA must/,
+      value,
+    );
+    assert.throws(
+      () => loadConfig({ ...completeEnv, SELFHOST_DATABASE_SCHEMA: value }),
+      /SELFHOST_DATABASE_SCHEMA must/,
+      value,
+    );
+  }
+});
+
+test("allowed extension schemas are a validated, de-duplicated comma list", () => {
+  assert.deepEqual(loadAllowedDatabaseSchemas({}), []);
+  assert.deepEqual(loadAllowedDatabaseSchemas({ SELFHOST_DATABASE_ALLOWED_SCHEMAS: " , " }), []);
+  assert.deepEqual(
+    loadAllowedDatabaseSchemas({ SELFHOST_DATABASE_ALLOWED_SCHEMAS: " extensions, postgis ,extensions," }),
+    ["extensions", "postgis"],
+  );
+  for (const value of ["pg_catalog", "information_schema", "Ext", "ext-1", "ok,pg_toast"]) {
+    assert.throws(
+      () => loadAllowedDatabaseSchemas({ SELFHOST_DATABASE_ALLOWED_SCHEMAS: value }),
+      /SELFHOST_DATABASE_ALLOWED_SCHEMAS entry/,
+      value,
+    );
+  }
+});
+
+test("schema cutover is unset or fresh", () => {
+  assert.equal(loadDatabaseSchemaCutover({}), undefined);
+  assert.equal(loadDatabaseSchemaCutover({ SELFHOST_DATABASE_SCHEMA_CUTOVER: " " }), undefined);
+  assert.equal(loadDatabaseSchemaCutover({ SELFHOST_DATABASE_SCHEMA_CUTOVER: "fresh" }), "fresh");
+  for (const value of ["FRESH", "move", "true"]) {
+    assert.throws(
+      () => loadDatabaseSchemaCutover({ SELFHOST_DATABASE_SCHEMA_CUTOVER: value }),
+      /SELFHOST_DATABASE_SCHEMA_CUTOVER must be unset or "fresh"/,
     );
   }
 });

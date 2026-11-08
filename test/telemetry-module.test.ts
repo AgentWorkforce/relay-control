@@ -15,6 +15,7 @@ import { createTelemetryModule, type TelemetryModule } from "../src/telemetry/mo
 import { INSTALL_HEADER, SIGNATURE_HEADER, verifySignature } from "../src/telemetry/sign.js";
 
 class PGliteDatabase implements Database {
+  readonly schema = "public";
   constructor(readonly client = new PGlite()) {}
   async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<SqlResult<T>> {
     const result = params.length > 0 ? await this.client.query<T>(sql, params) : await this.client.query<T>(sql);
@@ -111,6 +112,7 @@ async function harness(env: Record<string, string>, tenancy: "single" | "multi" 
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
+    databaseSchema: "public",
     databaseUrl: "unused",
     publicBaseUrl: "https://control.internal.example",
     relaycastUrl: `${upstreamUrl}/relaycast`,

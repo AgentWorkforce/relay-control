@@ -28,6 +28,7 @@ async function setup(t: TestContext, providerProbes?: ProviderProbes) {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
+    databaseSchema: "public",
     databaseUrl: "unused-in-test",
     publicBaseUrl: PUBLIC_ORIGIN,
     relaycastUrl: "http://relaycast.internal",

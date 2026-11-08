@@ -4,7 +4,15 @@ import { PGlite } from "@electric-sql/pglite";
 import type { Database, SqlExecutor, SqlResult } from "../../src/database.js";
 
 export class PGliteDatabase implements Database {
-  constructor(readonly client = new PGlite()) {}
+  /**
+   * `schema` mirrors PostgresDatabase's pinned schema. PGlite is a single
+   * session, so call pinSearchPath() once the schema exists.
+   */
+  constructor(readonly client = new PGlite(), readonly schema = "public") {}
+
+  async pinSearchPath(): Promise<void> {
+    await this.client.exec(`SET search_path TO "${this.schema}"`);
+  }
 
   async query<T extends Record<string, unknown>>(
     sql: string,

@@ -298,6 +298,7 @@ export async function startFactoryEnv(t: TestContext, options: {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
+    databaseSchema: "public",
     databaseUrl: "unused",
     publicBaseUrl: PUBLIC_URL,
     relaycastUrl: relay.origin,

@@ -44,6 +44,7 @@ async function healthyApp() {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
+    databaseSchema: "public",
     databaseUrl: "unused-in-test",
     publicBaseUrl: "https://control.internal.example",
     relaycastUrl: "http://relaycast.relay.svc.cluster.local",

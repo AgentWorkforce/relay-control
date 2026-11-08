@@ -9,6 +9,7 @@ import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 
 class PGliteDatabase implements Database {
+  readonly schema = "public";
   constructor(readonly client = new PGlite()) {}
 
   async query<T extends Record<string, unknown>>(
@@ -217,6 +218,7 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
   assert.deepEqual(await migrate(database), [], "migrations are idempotent");
   const bootstrapToken = "bootstrap-token-that-is-at-least-32-bytes";
   const config: SelfhostConfig = {
+    databaseSchema: "public",
     databaseUrl: "unused-in-test",
     publicBaseUrl: "https://control.internal.example",
     relaycastUrl: "http://relaycast.relay.svc.cluster.local",

@@ -23,6 +23,7 @@ const enabled = Boolean(endpoint && installId && installKey);
 const INTERNAL = "e2e-internal-token-".padEnd(48, "x");
 
 class PGliteDatabase implements Database {
+  readonly schema = "public";
   constructor(readonly client = new PGlite()) {}
   async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<SqlResult<T>> {
     const result = params.length > 0 ? await this.client.query<T>(sql, params) : await this.client.query<T>(sql);

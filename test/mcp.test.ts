@@ -14,6 +14,7 @@ import { ControlPlaneStore } from "../src/store.js";
 import { createRelaycastWorld, type RelaycastWorld } from "./support/relaycast-world.js";
 
 class PGliteDatabase implements Database {
+  readonly schema = "public";
   constructor(readonly client = new PGlite()) {}
 
   async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<SqlResult<T>> {
@@ -211,6 +212,7 @@ async function setup(t: TestContext, options: { relayauth?: boolean } = {}) {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
+    databaseSchema: "public",
     databaseUrl: "unused-in-test",
     publicBaseUrl: PUBLIC_ORIGIN,
     relaycastUrl: "http://relaycast.internal",

@@ -71,7 +71,10 @@ is explicit. RelayAuth is optional: see
 | --- | --- |
 | `DATABASE_URL` | Least-privilege runtime Postgres connection; server only |
 | `DATABASE_MIGRATIONS_URL` | Migration-owner Postgres connection; migrate CLI only |
-| `SELFHOST_RUNTIME_DATABASE_ROLE` | Runtime Postgres role granted CRUD on application tables, but not migration metadata or schema creation |
+| `SELFHOST_RUNTIME_DATABASE_ROLE` | Runtime Postgres role granted CRUD on application tables, but not migration metadata or schema creation. Migrate command: required, the role to grant. Server: required whenever `SELFHOST_DATABASE_SCHEMA` is not `public`; when set, startup refuses unless the `DATABASE_URL` login is exactly this role (see below). Unset with `public` keeps the legacy single-role install, which is not managed-profile acceptable |
+| `SELFHOST_DATABASE_SCHEMA` | Optional Postgres schema holding every `selfhost_*` table, default `public`. Lower-case identifier; `pg_*` and `information_schema` are rejected. Read by both the server and the migrate command |
+| `SELFHOST_DATABASE_ALLOWED_SCHEMAS` | Optional comma list of reviewed extension namespaces the runtime role may use besides its own schema. Extension namespaces only, never another service's schema: migrate refuses, before granting anything, a listed schema that is missing, is not the namespace of an installed extension (an existing but empty schema is refused), or holds any table, sequence, view, materialized view, foreign table or function not owned by an installed extension. Migrate command only |
+| `SELFHOST_DATABASE_SCHEMA_CUTOVER` | Optional; `fresh` lets migrate install into a brand-new configured schema in a database that holds no relaycontrol tables anywhere. Migrate refuses `fresh` unless the configured schema is empty: any pre-existing relation of any kind, function or user-defined type (enum, domain, range, composite) that is not a member of an installed extension is refused, `selfhost_*` tables and the ledger included, and the error names the first one; `fresh` never migrates data and does not unlock coexistence with `selfhost_*` tables in another schema. Unset it after the fresh install. Migrate command only |
 | `SELFHOST_PUBLIC_URL` | Public origin of this API |
 | `RELAYCAST_URL` | Internal Relaycast origin for server-to-server traffic |
 | `RELAYCAST_PUBLIC_URL` | Public Relaycast origin returned to clients; bare HTTPS public DNS origin |
@@ -124,6 +127,114 @@ server reads `DATABASE_URL_FILE`; `agent-relay-selfhost-migrate` reads only
 and the server never reads the migration credential.
 The migrate command rejects a runtime role that is the connected migration
 owner, and never grants that role access to `selfhost_schema_migrations`.
+
+To share one application database with other services, set
+`SELFHOST_DATABASE_SCHEMA` on both the server and the migrate command. In the
+managed profile the schema is `relaycontrol`, owned by the migration role
+`control_owner`, and the server connects as `control_api_runtime`. The
+infrastructure bootstrap pre-creates the schema and both roles. Migrate
+refuses a schema that is missing or owned by any role other than the
+connected migration role (legacy `public` is exempt from the owner check),
+and it never creates or adopts a schema. Every connection pins `search_path`
+to that schema alone, and startup fails unless `current_schema()` matches it.
+
+The runtime-role guard in the migrate command is the isolation proof. It
+refuses to grant anything unless the runtime role carries none of
+SUPERUSER, CREATEROLE, CREATEDB, BYPASSRLS or REPLICATION, is not a member of
+the migration role, has no CREATE on the database or on its schema, has no USAGE
+on any other non-system schema (direct, through membership, or through
+PUBLIC), and holds no table or sequence privilege on any object outside its
+schema. USAGE on a foreign schema together with EXECUTE on a function there
+is reported as effective access. EXECUTE on a function in a schema the role
+cannot use that is granted to it, owned by it, or granted to a non-PUBLIC
+role it is (transitively) a member of is reported separately as explicit
+grant drift. PUBLIC's default EXECUTE on functions in schemas the role cannot
+use is not access and never fails the proof. Each failure names the role and
+the offending schema or object. It then grants USAGE on the schema and CRUD
+on its `selfhost_*` tables and sequences only, with no default privileges.
+Migrate reruns this grant after every migration run, which covers tables that
+later migrations add. Last, it revokes and re-checks all access to
+`selfhost_schema_migrations`. The bootstrap must therefore revoke PUBLIC's
+USAGE on schemas the role must not reach, notably `REVOKE USAGE ON SCHEMA
+public FROM PUBLIC`. Reviewed extension namespaces can be exempted with
+`SELFHOST_DATABASE_ALLOWED_SCHEMAS`; migrate refuses a listed schema unless
+it is the namespace (`pg_extension.extnamespace`) of an installed extension
+and every table, sequence, view, materialized view, foreign table and
+function in it belongs to an installed extension. An existing but empty
+schema is refused, so the exemption is never vacuous and another service's
+schema can never be substituted.
+
+The migrate command's checks concern the role it is told to grant; they do
+not prove which role the server actually logs in as. The API server therefore
+binds its own login at startup whenever `SELFHOST_RUNTIME_DATABASE_ROLE` is
+set (required outside `public`). Right after the `current_schema()` check it
+refuses to start unless `session_user` is exactly that role, `current_user`
+equals `session_user` (no role switched through URL options), the login is
+not SUPERUSER, CREATEROLE, CREATEDB, BYPASSRLS or REPLICATION, it neither owns
+the configured schema nor is a (transitive) member of the schema owner, and
+it has no CREATE on the database or on the schema. An owner or admin
+`DATABASE_URL` is refused with a message naming the login role and the failed
+property; the URL is never logged. A legacy install in `public` without the
+variable skips this check and is not managed-profile acceptable.
+
+The PGlite tests prove the grant logic by switching identities with `SET
+ROLE`, and the server's login binding with `SET SESSION AUTHORIZATION` (which
+changes `session_user`) in a single session. TLS and restart proofs against
+the target Postgres remain outside this check and are still required before
+managed-profile acceptance.
+
+### Moving an existing install into a schema
+
+Relaycontrol tables in more than one schema are unsupported. Migrate into a
+non-public schema refuses, before any migration runs and whether or not
+`fresh` is set, while any other schema holds a `selfhost_*` table or
+`selfhost_schema_migrations`: migration 0011 looks up a constraint by table
+name without a schema filter, so a legacy copy elsewhere can break it. The
+migrator moves no data and claims no cutover success.
+An unrelated `selfhost_*` table or ledger in another schema (for example
+another product's or a stale copy) blocks this profile outright. That is a
+compatibility restriction of the migrator, not a general isolation proof; the
+isolation proof is the runtime-role guard and the server login check described
+above.
+
+`SELFHOST_DATABASE_SCHEMA_CUTOVER=fresh` is only for a brand-new, empty
+target in a database that holds no relaycontrol tables anywhere. It never
+migrates data, does not unlock coexistence with a legacy install, and
+migrate refuses it when the configured schema already holds any `selfhost_*`
+table or the ledger. To keep an existing install, move every relation first.
+Nothing moves data automatically. The reviewed manual path:
+
+1. Stop every relaycontrol server.
+2. As the owner of the legacy tables, generate the move statements, review
+   them, and run them. Indexes, constraints and column-owned sequences move
+   with their tables, and the query lists any standalone sequences
+   separately. The ledger moves too.
+
+   ```sql
+   SELECT format('ALTER TABLE public.%I SET SCHEMA relaycontrol;', tablename)
+     FROM pg_tables
+    WHERE schemaname = 'public' AND tablename LIKE 'selfhost\_%'
+   UNION ALL
+   SELECT format('ALTER SEQUENCE public.%I SET SCHEMA relaycontrol;', c.relname)
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind = 'S' AND c.relname LIKE 'selfhost\_%'
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_depend d
+         WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+           AND d.deptype IN ('a', 'i'));
+   ```
+
+   The statements must move every `selfhost_*` relation and the ledger; the
+   next migrate refuses if any remain in another schema. `ALTER TABLE ...
+   SET SCHEMA` moves relations only; it is not proof of a complete data move.
+   Before switching, verify yourself that every `selfhost_*` table's row
+   count in `relaycontrol` matches the legacy counts taken while the servers
+   were stopped, and that `relaycontrol.selfhost_schema_migrations` holds
+   every ledger row.
+3. Make sure `relaycontrol` is owned by the migration role, then rerun the
+   migrate command with `SELFHOST_DATABASE_SCHEMA=relaycontrol`. It should
+   apply nothing and then run the runtime-role grant.
+4. Start the servers with the same `SELFHOST_DATABASE_SCHEMA`.
 
 The two public service origins are intentionally separate from their internal
 counterparts. They must be bare HTTPS origins on multi-label public DNS hosts;
@@ -460,7 +571,13 @@ What the dashboard sees:
   internal run ID, which workers do not report.
 
 Local development without Postgres: `npx tsx scripts/dev-server.ts` runs the
-API on PGlite at `http://127.0.0.1:8787` with fixed development secrets.
+API on PGlite at `http://127.0.0.1:8787` with fixed development secrets. It
+honours `SELFHOST_DATABASE_SCHEMA`, creating the schema in the local PGlite
+database in the operator's place.
+
+Tests run on PGlite (`npm test`). PGlite is a single session with no separate
+LOGIN connections, so the schema-isolation tests in `test/db-schema.test.ts`
+switch between the migration and runtime roles with `SET ROLE`.
 
 ## Security boundaries
 

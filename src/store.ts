@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "./database.js";
+import { currentSchemaMismatch, qualifiedName } from "./db-schema.js";
 import {
   lockIdentity,
   lockOrganization,
@@ -187,44 +188,66 @@ export class ControlPlaneStore {
   /** SELFHOST_TENANCY: the request-time gate that replaced the schema singleton (0014). */
   readonly tenancy: TenancyMode;
 
+  #schemaMismatchLogged = false;
+
   async ready(): Promise<boolean> {
     return (await this.readiness()).ready;
   }
 
   /**
-   * Schema present (0014 applied) and the database answers. Single mode also
-   * fails with tenancy_mismatch when more than one organization exists (an
-   * installation switched back from multi); nothing is ever deleted.
+   * Schema present (0014 applied) in the configured schema, the connection
+   * resolves unqualified names to it, and the database answers. Single mode
+   * also fails with tenancy_mismatch when more than one organization exists
+   * (an installation switched back from multi); nothing is ever deleted. A
+   * search_path mismatch is logged once per store.
    */
   async readiness(): Promise<{ ready: true } | { ready: false; reason: "schema" | "tenancy_mismatch"; message: string }> {
+    const schema = this.database.schema;
+    const name = (relation: string) => qualifiedName(schema, relation);
+    let row: { schema: string | null; present: boolean; organizations: number } | undefined;
     try {
-      const result = await this.database.query<{ present: boolean; organizations: number }>(
+      const result = await this.database.query<{ schema: string | null; present: boolean; organizations: number }>(
         `SELECT
-           to_regclass('public.selfhost_schema_migrations') IS NOT NULL
-           AND to_regclass('public.selfhost_token_sessions') IS NOT NULL
-           AND to_regclass('public.selfhost_workspaces') IS NOT NULL
-           AND to_regclass('public.selfhost_organization_domains') IS NOT NULL
+           current_schema() AS schema,
+           to_regclass($1) IS NOT NULL
+           AND to_regclass($2) IS NOT NULL
+           AND to_regclass($3) IS NOT NULL
+           AND to_regclass($4) IS NOT NULL
            AND EXISTS (
-             SELECT 1 FROM selfhost_schema_migrations
+             SELECT 1 FROM ${name("selfhost_schema_migrations")}
               WHERE name = '0014_multi_tenant.sql'
            ) AS present,
-           (SELECT count(*)::int FROM selfhost_organizations) AS organizations`,
+           (SELECT count(*)::int FROM ${name("selfhost_organizations")}) AS organizations`,
+        [
+          name("selfhost_schema_migrations"),
+          name("selfhost_token_sessions"),
+          name("selfhost_workspaces"),
+          name("selfhost_organization_domains"),
+        ],
       );
-      const row = result.rows[0];
-      if (row?.present !== true) {
-        return { ready: false, reason: "schema", message: "Database migrations are not applied" };
-      }
-      if (this.tenancy === "single" && row.organizations > 1) {
-        return {
-          ready: false,
-          reason: "tenancy_mismatch",
-          message: `SELFHOST_TENANCY=single but ${row.organizations} organisations exist`,
-        };
-      }
-      return { ready: true };
+      row = result.rows[0];
     } catch {
       return { ready: false, reason: "schema", message: "Database is unreachable or not migrated" };
     }
+    if ((row?.schema ?? null) !== schema) {
+      const message = currentSchemaMismatch(row?.schema ?? null, schema);
+      if (!this.#schemaMismatchLogged) {
+        this.#schemaMismatchLogged = true;
+        console.error(`[selfhost-api] readiness: ${message}`);
+      }
+      return { ready: false, reason: "schema", message };
+    }
+    if (row?.present !== true) {
+      return { ready: false, reason: "schema", message: "Database migrations are not applied" };
+    }
+    if (this.tenancy === "single" && row.organizations > 1) {
+      return {
+        ready: false,
+        reason: "tenancy_mismatch",
+        message: `SELFHOST_TENANCY=single but ${row.organizations} organisations exist`,
+      };
+    }
+    return { ready: true };
   }
 
   /** Whether the organization exists (the 404 boundary for org-scoped routes). */

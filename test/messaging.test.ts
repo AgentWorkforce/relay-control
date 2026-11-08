@@ -12,6 +12,7 @@ import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 
 class PGliteDatabase implements Database {
+  readonly schema = "public";
   constructor(readonly client = new PGlite()) {}
 
   async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<SqlResult<T>> {
@@ -401,6 +402,7 @@ async function harness(t: { after: (fn: () => Promise<void>) => void }, options?
   });
   await migrate(database);
   const config: SelfhostConfig = {
+    databaseSchema: "public",
     databaseUrl: "unused-in-test",
     publicBaseUrl: "https://control.internal.example",
     relaycastUrl: relaycastOrigin,

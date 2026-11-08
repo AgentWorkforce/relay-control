@@ -5,7 +5,7 @@ import { createFactoryModule } from "./factory/routes.js";
 import { createAdminModule } from "./admin/routes.js";
 import { recordAudit } from "./admin/audit.js";
 import { configFingerprint, loadConfig, SELFHOST_API_VERSION } from "./config.js";
-import { PostgresDatabase } from "./database.js";
+import { assertRuntimeLogin, PostgresDatabase } from "./database.js";
 import { ControlPlaneStore } from "./store.js";
 import { loadFlowsConfig } from "./flows/config.js";
 import { FlowsStore } from "./flows/store.js";
@@ -25,7 +25,7 @@ import {
 } from "./analytics/lifecycle.js";
 
 const config = loadConfig();
-const database = new PostgresDatabase(config.databaseUrl);
+const database = new PostgresDatabase(config.databaseUrl, { schema: config.databaseSchema });
 
 // bootstrap-signup lane: first-boot org/workspace, OIDC/email sign-in, invites.
 const identityConfig = loadIdentityConfig();
@@ -113,6 +113,11 @@ server.requestTimeout = 0;
 server.headersTimeout = 65_000;
 
 async function start(): Promise<void> {
+  await database.assertSchema();
+  if (config.runtimeDatabaseRole) {
+    // Binds the actual login to the runtime role; refuses owner/admin URLs.
+    await assertRuntimeLogin(database, config.databaseSchema, config.runtimeDatabaseRole);
+  }
   telemetry.start();
   factory.start();
   server.listen(config.port, config.host, () => {

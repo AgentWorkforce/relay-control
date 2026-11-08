@@ -160,6 +160,7 @@ async function setup(t: test.TestContext, extra: Partial<SelfhostConfig> = {}) {
   const control = createServer();
   controlOrigin = await listen(control);
   const config: SelfhostConfig = {
+    databaseSchema: "public",
     databaseUrl: "unused",
     publicBaseUrl: controlOrigin,
     relaycastUrl: "http://relaycast.invalid",

@@ -2,9 +2,20 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 import type { EncryptionKey, EncryptionKeyring } from "./crypto.js";
+import { DEFAULT_DATABASE_SCHEMA, databaseSchemaError } from "./db-schema.js";
 
 export type SelfhostConfig = {
   databaseUrl: string;
+  /** Postgres schema holding every selfhost_* table (SELFHOST_DATABASE_SCHEMA, default public). */
+  databaseSchema: string;
+  /**
+   * SELFHOST_RUNTIME_DATABASE_ROLE as read by the API server: the role its
+   * DATABASE_URL login must be, checked at startup (assertRuntimeLogin).
+   * Required when databaseSchema is not public; null (unset) only for a
+   * legacy single-role install in public. Optional so test fixtures may omit
+   * it (treated as null).
+   */
+  runtimeDatabaseRole?: string | null;
   publicBaseUrl: string;
   relaycastUrl: string;
   relaycastPublicUrl: string;
@@ -249,9 +260,12 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     throw new Error("SELFHOST_BOOTSTRAP_TOKEN must be at least 32 bytes");
   }
 
+  const databaseSchema = loadDatabaseSchema(env);
   const relayhistoryPublicUrl = publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL");
   return {
     databaseUrl: loadDatabaseUrl(env),
+    databaseSchema,
+    runtimeDatabaseRole: loadServerRuntimeDatabaseRole(env, databaseSchema),
     publicBaseUrl: serviceUrl(env, "SELFHOST_PUBLIC_URL"),
     relaycastUrl: serviceUrl(env, "RELAYCAST_URL"),
     relaycastPublicUrl: publicServiceUrl(env, "RELAYCAST_PUBLIC_URL"),
@@ -399,12 +413,92 @@ export function loadDatabaseUrl(env: Env = process.env): string {
   return required(env, "DATABASE_URL", true);
 }
 
+/**
+ * SELFHOST_DATABASE_SCHEMA: the pre-created schema relaycontrol runs in.
+ * Shared by the server and the migrate command; defaults to public.
+ */
+export function loadDatabaseSchema(env: Env = process.env): string {
+  const value = env.SELFHOST_DATABASE_SCHEMA?.trim();
+  if (!value) return DEFAULT_DATABASE_SCHEMA;
+  const error = databaseSchemaError(value);
+  if (error) throw new Error(`SELFHOST_DATABASE_SCHEMA ${error}`);
+  return value;
+}
+
+/**
+ * SELFHOST_DATABASE_ALLOWED_SCHEMAS: reviewed extension namespaces the runtime
+ * role may use besides its own schema. Extension namespaces only, never
+ * another service's schema: the migrate command refuses (before granting
+ * anything) any listed schema that does not exist, that is not the namespace
+ * (pg_extension.extnamespace) of an installed extension (an empty schema is
+ * refused), or that holds a table, sequence, view, materialized view,
+ * foreign table or function not owned by an installed extension.
+ * Comma-separated; read by the migrate command.
+ */
+export function loadAllowedDatabaseSchemas(env: Env = process.env): string[] {
+  const names = (env.SELFHOST_DATABASE_ALLOWED_SCHEMAS ?? "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+  for (const name of names) {
+    const error = databaseSchemaError(name);
+    if (error) throw new Error(`SELFHOST_DATABASE_ALLOWED_SCHEMAS entry "${name}" ${error}`);
+  }
+  return [...new Set(names)];
+}
+
+/**
+ * SELFHOST_DATABASE_SCHEMA_CUTOVER: unset, or `fresh` to install into a
+ * brand-new configured schema in a database holding no relaycontrol tables
+ * anywhere. `fresh` asserts the target is empty: any pre-existing relation
+ * of any kind, function or user-defined type (enum, domain, range,
+ * composite) is refused, the ledger and selfhost_* tables included, unless
+ * it is a member of an installed extension. It never migrates data and does
+ * not unlock coexistence with selfhost_* tables in another schema, which
+ * migrate always refuses for a non-public target. Unset it after the fresh
+ * install.
+ */
+export function loadDatabaseSchemaCutover(env: Env = process.env): "fresh" | undefined {
+  const value = env.SELFHOST_DATABASE_SCHEMA_CUTOVER?.trim();
+  if (!value) return undefined;
+  if (value !== "fresh") {
+    throw new Error('SELFHOST_DATABASE_SCHEMA_CUTOVER must be unset or "fresh"');
+  }
+  return "fresh";
+}
+
 export function loadMigrationsDatabaseUrl(env: Env = process.env): string {
   return required(env, "DATABASE_MIGRATIONS_URL", true);
 }
 
 export function loadRuntimeDatabaseRole(env: Env = process.env): string {
-  const role = required(env, "SELFHOST_RUNTIME_DATABASE_ROLE");
+  return validRuntimeDatabaseRole(required(env, "SELFHOST_RUNTIME_DATABASE_ROLE"));
+}
+
+/**
+ * The API server's reading of SELFHOST_RUNTIME_DATABASE_ROLE: the role its
+ * login must be (checked at startup). Required for any schema other than
+ * public; unset in public keeps the legacy single-role behaviour, which is
+ * not managed-profile acceptable.
+ */
+export function loadServerRuntimeDatabaseRole(
+  env: Env = process.env,
+  databaseSchema = loadDatabaseSchema(env),
+): string | null {
+  if (!env.SELFHOST_RUNTIME_DATABASE_ROLE?.trim()) {
+    if (databaseSchema !== DEFAULT_DATABASE_SCHEMA) {
+      throw new Error(
+        `SELFHOST_RUNTIME_DATABASE_ROLE is required when SELFHOST_DATABASE_SCHEMA is ` +
+          `"${databaseSchema}": the API server binds its database login to the runtime role ` +
+          "at startup",
+      );
+    }
+    return null;
+  }
+  return loadRuntimeDatabaseRole(env);
+}
+
+function validRuntimeDatabaseRole(role: string): string {
   if (
     !/^[A-Za-z_][A-Za-z0-9_$]{0,62}$/.test(role) ||
     role.toLowerCase() === "public"

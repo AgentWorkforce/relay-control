@@ -1,6 +1,7 @@
 // telemetry lane: Postgres persistence (counters, errors, salt, outbox).
 import { randomBytes, randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
+import { qualifiedName } from "../db-schema.js";
 
 export type CounterDelta = { area: string; metric: string; value: number };
 export type ErrorDelta = {
@@ -338,7 +339,7 @@ export class TelemetryStore {
   async tableExists(name: string): Promise<boolean> {
     const result = await this.database.query<{ present: boolean }>(
       "SELECT to_regclass($1) IS NOT NULL AS present",
-      [`public.${name}`],
+      [qualifiedName(this.database.schema, name)],
     );
     return result.rows[0]?.present === true;
   }

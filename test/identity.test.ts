@@ -195,6 +195,7 @@ async function setup(t: test.TestContext, options: {
   const control = createServer();
   const origin = await listen(control);
   const config: SelfhostConfig = {
+    databaseSchema: "public",
     databaseUrl: "unused",
     publicBaseUrl: origin,
     relaycastUrl,
@@ -738,7 +739,7 @@ test("login page without SSO or email shows the operator code openly", async (t)
   });
   const server: Server = createServer(createApp({
     config: {
-      databaseUrl: "unused", publicBaseUrl: ctx.origin, relaycastUrl: "http://relaycast.invalid", relaycastPublicUrl: "https://relaycast.selfhosted.test",
+      databaseUrl: "unused", databaseSchema: "public", publicBaseUrl: ctx.origin, relaycastUrl: "http://relaycast.invalid", relaycastPublicUrl: "https://relaycast.selfhosted.test",
       relayauthUrl: "http://relayauth.invalid", relayhistoryUrl: "http://relayhistory.invalid", relayhistoryPublicUrl: "https://history.selfhosted.test",
       relayauthApiKey: "x", bootstrapToken: BOOTSTRAP, encryptionKeyring: KEYRING, internalServiceToken: null,
       oauthRedirectUrl: `${ctx.origin}/cb`, dashboardUrl: `${ctx.origin}/`, port: 0, host: "127.0.0.1",
