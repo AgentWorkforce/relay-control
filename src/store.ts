@@ -135,6 +135,7 @@ export type IntrospectedToken = {
   email: string;
   organizationId: string;
   workspaceId: string;
+  role: Principal["role"];
   scopes: string[];
   /** SHA-256 of the access token as stored; never returned to callers. */
   accessTokenHash: string;
@@ -883,6 +884,7 @@ export class ControlPlaneStore {
       email: string;
       organization_id: string;
       workspace_id: string;
+      role: Principal["role"];
       scopes: string[];
       access_token_hash: string;
       revoked: boolean;
@@ -890,7 +892,7 @@ export class ControlPlaneStore {
       issued_at: Date | string;
       expires_at: Date | string;
     }>(
-      `SELECT s.user_id, u.email, s.organization_id, s.workspace_id, s.scopes,
+      `SELECT s.user_id, u.email, s.organization_id, s.workspace_id, m.role, s.scopes,
               s.access_token_hash,
               s.revoked_at IS NOT NULL AS revoked,
               s.access_token_expires_at <= now() AS expired,
@@ -917,6 +919,7 @@ export class ControlPlaneStore {
       email: row.email,
       organizationId: row.organization_id,
       workspaceId: row.workspace_id,
+      role: row.role,
       scopes: row.scopes,
       accessTokenHash: row.access_token_hash,
       revoked: row.revoked,

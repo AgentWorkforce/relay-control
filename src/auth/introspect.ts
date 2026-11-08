@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { ApiTokenStore } from "../admin/api-tokens.js";
 import type { SelfhostConfig } from "../config.js";
-import { NODE_ID_PATTERN, type ControlPlaneStore } from "../store.js";
+import { NODE_ID_PATTERN, type ControlPlaneStore, type Principal } from "../store.js";
 
 /**
  * POST /internal/v1/auth/introspect: RelayHistory (and relayfile) verify a
@@ -46,6 +46,10 @@ import { NODE_ID_PATTERN, type ControlPlaneStore } from "../store.js";
  *   except principal_type `service`, agent_name null and scopes
  *   `["acquisition:operate"]`. Minted only by a workspace owner/admin through
  *   the deployment-api-tokens routes.
+ * - User tokens also carry `role`, the live organization role, so optional
+ *   add-on services can make the same admin decisions as this service without
+ *   reading its database. Each add-on is one more origin in
+ *   SELFHOST_INTROSPECT_AUDIENCES; this service never depends on one existing.
  * - No caching here: the token session row is the truth on every call.
  * - The token, its hash, the secret and the body are never logged.
  */
@@ -80,6 +84,7 @@ export type IntrospectionResult =
     machine_id: string | null;
     org: string;
     workspace: string;
+    role: Principal["role"];
     scopes: string[];
     aud: string;
     iat: number;
@@ -312,6 +317,7 @@ export async function introspect(
     machine_id: machineId,
     org: session.organizationId,
     workspace: session.workspaceId,
+    role: session.role,
     scopes: [...session.scopes],
     aud,
     iat: epochSeconds(session.issuedAt),
