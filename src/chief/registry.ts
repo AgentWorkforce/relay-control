@@ -47,18 +47,26 @@ export class ChiefError extends Error {
   }
 }
 
-const setupSchema = z.strictObject({
+/** Accepts the legacy `region` field until relay-webapp sends `placement`. */
+function withPlacement(raw: unknown): unknown {
+  if (raw === null || typeof raw !== "object" || !("region" in raw)) return raw;
+  const { region, ...rest } = raw as Record<string, unknown>;
+  return "placement" in rest ? raw : { ...rest, placement: region };
+}
+
+const setupSchema = z.preprocess(withPlacement, z.strictObject({
   requestId: z.string().uuid(),
   repositoryIds: z
     .array(z.string().regex(/^[0-9]+$/))
     .min(1)
     .max(100)
     .transform((ids) => [...new Set(ids)].sort()),
-  region: z.enum(["us-east-1", "us-west-2", "eu-west-1"]),
+  // Opaque: only infrastructure maps a placement to a cloud location.
+  placement: z.string().regex(/^[a-z0-9][a-z0-9-]{0,39}$/),
   budgetDollars: z.number().min(1).max(10_000),
   maxConcurrentTasks: z.number().int().min(1).max(10),
   allowedActions: z.array(z.enum(["investigate", "coordinate", "unblock"])).min(1).max(3),
-});
+}));
 
 const slotSchema = z.strictObject({ slotId: z.string().regex(/^slot-[a-z0-9]{8,32}$/) });
 
@@ -94,6 +102,7 @@ const identitiesSchema = z
       !workers.some((worker) => worker.agentId === relayCallerId),
   );
 
+// Byte-for-byte the same as canonical() in relay-chief's contracts.ts.
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value && typeof value === "object") {
@@ -102,7 +111,7 @@ function canonical(value: unknown): string {
       .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
     return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`;
   }
-  return JSON.stringify(value);
+  return JSON.stringify(value) ?? "null";
 }
 
 function digestOf(value: unknown): string {
@@ -138,7 +147,7 @@ type ChiefRow = {
   request_id: string;
   digest: string;
   config: ChiefConfig;
-  region: string;
+  placement: string;
   state: "awaiting_capacity" | "awaiting_binding" | "ready";
   created_at: Date | string;
 };
@@ -191,7 +200,7 @@ export class ChiefRegistry implements ChiefBackend {
   async create(context: WorkspaceContext, raw: unknown) {
     const parsed = setupSchema.safeParse(raw);
     if (!parsed.success) {
-      throw new ChiefError(400, "invalid_setup", "Check the project, repository, region and operating policy.");
+      throw new ChiefError(400, "invalid_setup", "Check the project, repository, placement and operating policy.");
     }
     const input = parsed.data;
     const digest = digestOf(input);
@@ -240,7 +249,7 @@ export class ChiefRegistry implements ChiefBackend {
       await tx.query("SELECT pg_advisory_xact_lock($1)", [SLOT_ASSIGNMENT_LOCK]);
       const inserted = await tx.query(
         `INSERT INTO selfhost_chiefs
-           (id, organization_id, workspace_id, name, repository, request_id, digest, config, region)
+           (id, organization_id, workspace_id, name, repository, request_id, digest, config, placement)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
          ON CONFLICT DO NOTHING
          RETURNING id`,
@@ -253,7 +262,7 @@ export class ChiefRegistry implements ChiefBackend {
           input.requestId,
           digest,
           JSON.stringify(config),
-          input.region,
+          input.placement,
         ],
       );
       if (inserted.rows.length === 0) {
@@ -536,7 +545,9 @@ export class ChiefRegistry implements ChiefBackend {
       mode: "slots",
       status: row.state,
       createdAt: new Date(row.created_at).toISOString(),
-      region: row.region,
+      placement: row.placement,
+      // Compatibility alias until relay-webapp reads `placement`.
+      region: row.placement,
       budgetDollars: row.config.policy.budgetMicros / 1_000_000,
       maxConcurrentTasks: row.config.policy.maxConcurrentTasks,
       allowedActions: row.config.policy.allowedActions,

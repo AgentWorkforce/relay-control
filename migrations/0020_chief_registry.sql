@@ -12,7 +12,7 @@ CREATE TABLE selfhost_chiefs (
   request_id uuid NOT NULL,
   digest text NOT NULL,
   config jsonb NOT NULL,
-  region text NOT NULL,
+  placement text NOT NULL,
   state text NOT NULL DEFAULT 'awaiting_capacity'
     CHECK (state IN ('awaiting_capacity', 'awaiting_binding', 'ready')),
   readiness jsonb NOT NULL DEFAULT '[]'::jsonb,

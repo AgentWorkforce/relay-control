@@ -384,3 +384,24 @@ test("operator-bound identities raise the revision and unlock ready", async (t) 
   assert.equal(changed.body.error, "chief_already_ready");
   assert.equal((await h.operator(path, body)).status, 200);
 });
+
+test("placement is opaque, and the legacy region alias replays the same request", async (t) => {
+  const h = await harness(t);
+  await h.operator("chief-slots", { slotId: SLOT });
+  await h.operator("chief-slots", { slotId: SLOT_2 });
+  const { region, ...rest } = setup(["1"]);
+  const created = await h.create({ ...rest, placement: region });
+  assert.equal(created.status, 202);
+  assert.equal(created.body.placement, region);
+  assert.equal(created.body.region, region);
+
+  const alias = await h.create({ ...rest, region });
+  assert.equal(alias.status, 202);
+  assert.equal(alias.body.id, created.body.id);
+  assert.equal(await h.slotCount("assigned"), "1");
+
+  const opaque = await h.create({ ...setup(["2"]), region: undefined, placement: "default" });
+  assert.equal(opaque.status, 202);
+  assert.equal((await h.create({ ...setup(["3"]), region: undefined, placement: "US EAST" })).status, 400);
+  assert.equal((await h.create({ ...setup(["3"]), placement: "default" })).status, 400);
+});
