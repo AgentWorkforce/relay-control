@@ -1,37 +1,14 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
-import { PGlite } from "@electric-sql/pglite";
-import type { Database, SqlExecutor, SqlResult } from "../src/database.js";
 import { grantRuntimeDatabaseRole, migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
-
-class RoleDatabase implements Database {
-  readonly client = new PGlite();
-
-  async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<SqlResult<T>> {
-    const result = await this.client.query<T>(sql, params);
-    return { rows: result.rows };
-  }
-
-  async transaction<T>(run: (transaction: SqlExecutor) => Promise<T>): Promise<T> {
-    return this.client.transaction(async (transaction) => run({
-      query: async <R extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
-        const result = await transaction.query<R>(sql, params);
-        return { rows: result.rows };
-      },
-      exec: async (sql: string) => { await transaction.exec(sql); },
-    }));
-  }
-
-  async close(): Promise<void> { await this.client.close(); }
-  async exec(sql: string): Promise<void> { await this.client.exec(sql); }
-}
+import { PGliteDatabase } from "./support/harness.js";
 
 const keyring = { active: { id: "test-key", key: Buffer.alloc(32, 7) } };
 const role = "readiness_runtime";
 
 async function runtime(t: TestContext, options: { missingColumn?: boolean; organizations?: number } = {}) {
-  const database = new RoleDatabase();
+  const database = new PGliteDatabase();
   t.after(async () => {
     try { await database.exec("RESET ROLE"); } finally { await database.close(); }
   });
