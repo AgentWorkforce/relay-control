@@ -139,7 +139,10 @@ For an installation that is explicitly using the hosted Worker, set
 `RELAYHISTORY_READ_API_URL` to its accepted bare public HTTPS origin. This is an
 optional connection, off when unset. It sends only unsearched `/v1/sessions`
 and `/v1/sessions/:id/turns` reads directly to that origin using the authenticated
-caller's own `sh_at_` access token. The reader must verify that token by
+caller's own `sh_at_` access token. Other admitted credential families keep
+whatever History transport they already support; this does not add OAuth token
+support to History or forward an OAuth token to the Worker. An outstanding
+native cursor cannot move between these transports. The reader must verify that token by
 introspecting it against this control plane. No login exchange, RelayAuth
 assertion, or service bearer is substituted. Workspace membership is checked
 before forwarding; the query always names the caller's authorized workspace;
@@ -169,8 +172,10 @@ Control configuration:
 Worker configuration, owned by the pipeline operator:
 
 - `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`.
-- `RELAYCONTROL_INTROSPECT_URL`: the accepted reachable control introspection
-  endpoint; `RELAYCONTROL_INTROSPECT_SECRET`: the matching credential.
+- `RELAYCONTROL_INTROSPECT_URL`: the accepted reachable **Control base URL**,
+  not the full introspection endpoint. The shared client appends
+  `/internal/v1/auth/introspect`; do not append it yourself.
+  `RELAYCONTROL_INTROSPECT_SECRET`: the matching credential.
 - `READ_API_ORIGIN`: the configured Worker origin above.
 - The directory/owner-buffered allowlists, exact-user G2 parity and runtime
   privacy authority remain authoritative. The control connection grants no G2
@@ -193,4 +198,24 @@ bypass a privacy refusal or silently restart pagination. Worker 503 refusals
 remain retryable HTTP 503; other failures retain the bounded upstream-error
 response without exposing the upstream body. Rollback unsets
 `RELAYHISTORY_READ_API_URL` and redeploys control. Ordinary first pages return
-to History; outstanding `b96…` cursors fail with 503 instead of restarting.
+to History; outstanding `b96…` cursors return `410 cursor_expired` instead of
+restarting or retrying forever. The client must explicitly restart from the
+first page. MCP callers receive the same fixed restart instruction.
+
+
+The direct reader is a trusted service: it receives the full user access token
+on each request. Unlike an audience-bound read-only credential, that token can
+be replayed against Control with its existing scope if a reader leaks it.
+Pin only an accepted operator-controlled HTTPS origin. The Worker and any
+intermediaries must never log Authorization headers, raw user tokens or
+introspection secrets, including in request dumps or analytics. The current
+protocol is not an audience-bound token delegation scheme; adding such a
+credential requires a separately reviewed issuer/verifier contract.
+
+
+Verify the accepted upstream introspection-cache policy as part of the reader
+handoff. Control itself rechecks the token row on each introspection call;
+that does not prove the reader introspects on every read. At upstream source
+`f196f637`, the shared client defaults to a 60-second positive cache and the
+session reader passes no TTL override. This Control change does not alter that
+policy or establish a no-positive-cache revocation guarantee.

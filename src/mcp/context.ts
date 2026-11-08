@@ -1,5 +1,5 @@
 import type { SelfhostConfig } from "../config.js";
-import { UpstreamError } from "../relayhistory.js";
+import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { readWorkspaceHistory } from "../sessions/history.js";
 import type { EncryptionKeyring } from "../crypto.js";
 import type { Database } from "../database.js";
@@ -88,6 +88,7 @@ export function historyReader(
       return result.body;
     } catch (error) {
       if (error instanceof SharedSessionsToolError) throw error;
+      if (error instanceof ReadCursorExpiredError) throw new SharedSessionsToolError(error.message);
       if (error instanceof UpstreamError) {
         if (error.message === "RelayHistory did not attest the workspace") {
           console.error("[selfhost-mcp] History workspace attestation failed");

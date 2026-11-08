@@ -10,6 +10,7 @@ import { recordAudit } from "./admin/audit.js";
 import {
   issueRelayhistorySession,
   UnsupportedModeError,
+  ReadCursorExpiredError,
   UpstreamError,
 } from "./relayhistory.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
@@ -1664,6 +1665,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       const adminError = adminErrorResponse(error);
       if (adminError) {
         json(response, adminError.status, adminError.body, true);
+        return;
+      }
+      if (error instanceof ReadCursorExpiredError) {
+        json(response, 410, { error: "cursor_expired", message: error.message }, true);
         return;
       }
       if (error instanceof UpstreamError) {

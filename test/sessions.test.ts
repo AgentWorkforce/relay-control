@@ -7,6 +7,8 @@ import type { SelfhostConfig } from "../src/config.js";
 import type { Database, SqlExecutor, SqlResult } from "../src/database.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
+import { readWorkspaceHistory } from "../src/sessions/history.js";
+import { historyReader } from "../src/mcp/context.js";
 
 class PGliteDatabase implements Database {
   constructor(readonly client = new PGlite()) {}
@@ -420,6 +422,8 @@ async function setup(
     origin,
     history,
     readApi,
+    config,
+    store,
     disableDirectRead: () => { config.relayhistoryReadApiUrl = null; },
     alpha,
     beta,
@@ -989,7 +993,8 @@ test("direct read Worker: disabling the connection refuses native cursors instea
   env.disableDirectRead();
   for (const path of ["sessions?cursor=b96s1:opaque", "sessions/alpha-1/turns?source=codex&cursor=b96t1:opaque"]) {
     const result = await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/${path}`, { token });
-    assert.equal(result.status, 503);
+    assert.equal(result.status, 410);
+    assert.deepEqual(result.body, { error: "cursor_expired", message: "This session cursor has expired. Restart from the first page." });
     assert.equal(env.history.requests.length, 0);
     assert.equal(env.readApi!.requests.length, 0);
   }
@@ -1003,4 +1008,46 @@ test("direct read Worker: redirects never forward the caller token to History", 
   assert.equal(result.status, 502);
   assert.equal(env.history.requests.length, 0);
   assert.equal(env.readApi!.requests.length, 1);
+});
+
+
+test("direct read Worker: non-sh_at callers keep their existing History transport", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  const read = await readWorkspaceHistory(env.config, {
+    userId: env.ownerId, organizationId: env.organizationId,
+    workspaceId: env.alpha, callerToken: "synthetic-admitted-oauth-token",
+  }, "/v1/sessions", new URLSearchParams());
+  assert.equal(read.status, "ok");
+  if (read.status === "ok") assert.equal((read.body.sessions as any[])[0].sessionId, "alpha-1");
+  assert.equal(env.readApi!.requests.length, 0);
+  assert(env.history.requests.some((r) => r.path === "/v1/cli/login"));
+});
+
+test("direct read Worker: non-sh_at callers cannot restart a native cursor in History", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  await assert.rejects(() => readWorkspaceHistory(env.config, {
+    userId: env.ownerId, organizationId: env.organizationId,
+    workspaceId: env.alpha, callerToken: "synthetic-admitted-oauth-token",
+  }, "/v1/sessions", new URLSearchParams({ cursor: "b96s1:opaque" })),
+  { name: "ReadCursorExpiredError", message: "This session cursor has expired. Restart from the first page." });
+  assert.equal(env.readApi!.requests.length, 0);
+  assert.equal(env.history.requests.length, 0);
+});
+
+
+test("direct read Worker: MCP reports an expired cursor with an explicit restart instruction", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const principal = await env.store.authenticateAccessToken(token);
+  assert(principal);
+  const read = historyReader(env.config, principal, {
+    id: env.alpha, organizationId: env.organizationId, name: "alpha",
+    relaycastWorkspaceId: "synthetic-relay", relaycastApiKey: "synthetic-key", role: principal.role,
+  }, token);
+  env.disableDirectRead();
+  await assert.rejects(() => read("/v1/sessions?cursor=b96s1:opaque"), {
+    name: "SharedSessionsToolError", message: "This session cursor has expired. Restart from the first page.",
+  });
+  assert.equal(env.history.requests.length, 0);
+  assert.equal(env.readApi!.requests.length, 0);
 });

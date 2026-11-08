@@ -13,6 +13,14 @@ export class UpstreamError extends Error {
   }
 }
 
+/** A backend-specific cursor cannot continue after rollback or credential transport changes. */
+export class ReadCursorExpiredError extends Error {
+  constructor() {
+    super("This session cursor has expired. Restart from the first page.");
+    this.name = "ReadCursorExpiredError";
+  }
+}
+
 /**
  * The configured History backend authenticated the caller but does not serve
  * the requested mode (the self-host read API container grants only

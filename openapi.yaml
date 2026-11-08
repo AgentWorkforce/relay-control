@@ -1468,8 +1468,10 @@ paths:
                 $ref: "#/components/schemas/DashboardSessionPage"
         "404":
           description: Workspace is outside the authenticated tenant
+        "410":
+          description: Native read cursor expired after rollback or a credential transport change. Error cursor_expired instructs the client to restart from the first page.
         "503":
-          description: Configured direct read Worker is temporarily unavailable or a native read cursor cannot continue after rollback. No History fallback.
+          description: Configured direct read Worker is temporarily unavailable. No History fallback.
         "502":
           description: RelayAuth or RelayHistory is unavailable
         "501":
@@ -1741,8 +1743,10 @@ paths:
                 $ref: "#/components/schemas/DashboardTurnPage"
         "404":
           description: Workspace is outside the authenticated tenant
+        "410":
+          description: Native read cursor expired after rollback or a credential transport change. Error cursor_expired instructs the client to restart from the first page.
         "503":
-          description: Configured direct read Worker is temporarily unavailable or a native read cursor cannot continue after rollback. No History fallback.
+          description: Configured direct read Worker is temporarily unavailable. No History fallback.
         "502":
           description: RelayAuth or RelayHistory is unavailable or unattested
         "501":

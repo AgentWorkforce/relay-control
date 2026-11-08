@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { SelfhostConfig } from "../config.js";
-import { issueRelayhistorySession, UpstreamError } from "../relayhistory.js";
+import { issueRelayhistorySession, ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 
 /**
  * Workspace-scoped RelayHistory reads for the dashboard sessions views.
@@ -135,11 +135,14 @@ export async function readWorkspaceHistory(
   // Rollout 1: the GET-only Worker serves unsearched lists and turns. Session
   // issuance, uploads, events/search and the other views keep the History path.
   const rolloutPath = path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+\/turns$/.test(path);
-  const direct = Boolean(config.relayhistoryReadApiUrl && rolloutPath && !query.has("q") && !query.has("search"));
+  // Other admitted credential families retain their pre-existing History
+  // transport; this connection never forwards them to a sh_at_-only Worker.
+  const direct = Boolean(config.relayhistoryReadApiUrl && identity.callerToken.startsWith("sh_at_") &&
+    rolloutPath && !query.has("q") && !query.has("search"));
   // A read-API cursor cannot be interpreted by History after configuration
   // rollback. Refuse instead of silently restarting on its first page.
   if (!direct && rolloutPath && /^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
-    throw new UpstreamError("read", 503, undefined, true);
+    throw new ReadCursorExpiredError();
   }
   const origin = direct ? config.relayhistoryReadApiUrl! : config.relayhistoryUrl;
   const url = new URL(`${path}?${query}`, `${origin}/`);
@@ -148,9 +151,6 @@ export async function readWorkspaceHistory(
   }
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    if (direct && !identity.callerToken.startsWith("sh_at_")) {
-      throw new UpstreamError("read", undefined, "Caller is not authenticated with a user access token");
-    }
     const accessToken = direct ? identity.callerToken : await readToken(config, identity);
     let response: Response;
     try {
