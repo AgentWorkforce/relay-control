@@ -58,6 +58,7 @@ export class SharedSessionsToolError extends Error {
   }
 }
 
+const READ_SCOPE_MESSAGE = "This sign-in cannot read shared session history. Sign in again.";
 export const UNAVAILABLE_MESSAGE = "Shared session history is temporarily unavailable. Please try again.";
 const ATTESTATION_MESSAGE =
   "Workspace-scoped shared session history is not available yet. Please try again later.";
@@ -84,6 +85,11 @@ export function historyReader(
   return async (path: string, options: { timeoutMessage?: string } = {}): Promise<unknown> => {
     const url = new URL(path, "https://relayhistory.invalid");
     try {
+      // The read API would issue rth:read for this identity whatever the
+      // caller holds, so require it here. No History fallback for this refusal.
+      if (config.sessionReadMcpReads && !principal.scopes.includes("rth:read")) {
+        throw new SharedSessionsToolError(READ_SCOPE_MESSAGE);
+      }
       const result = await readViaSessionRead(config, identity, url.pathname, url.searchParams)
         ?? await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
       if (result.status !== "ok") throw new SharedSessionsToolError(UNAVAILABLE_MESSAGE);

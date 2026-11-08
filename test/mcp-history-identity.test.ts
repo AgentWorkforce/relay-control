@@ -28,7 +28,7 @@ function config(on = true) {
     sessionReadMcpReads: on,
   } as SelfhostConfig;
 }
-const principal = (userId: string) => ({ userId }) as Principal;
+const principal = (userId: string, scopes = ["cli:auth", "rth:read"]) => ({ userId, scopes }) as Principal;
 const workspace = (id: string, organizationId: string) => ({ id, organizationId }) as never;
 
 function fake(t: TestContext, options: Options = {}) {
@@ -92,6 +92,20 @@ test("the setting off leaves MCP reads on the existing History path", async (t) 
   assert.deepEqual(body, { from: "history" });
   assert.equal(seen.issues.length, 0);
   assert.equal(seen.reads.length, 0);
+});
+
+test("a caller without rth:read is refused before any token is issued, with no History fallback", async (t) => {
+  const seen = fake(t);
+  const cfg = config();
+  t.after(() => forgetSessionReadTokens(cfg));
+
+  await assert.rejects(
+    historyReader(cfg, principal("user-a", ["cli:auth"]), workspace("ws-a", "org-a"), "sh_at_user_a")("/v1/sessions"),
+    { name: "SharedSessionsToolError", publicMessage: "This sign-in cannot read shared session history. Sign in again." },
+  );
+  assert.equal(seen.issues.length, 0);
+  assert.equal(seen.reads.length, 0);
+  assert.equal(seen.history.length, 0);
 });
 
 test("each MCP read carries only the calling user's token, never a shared credential", async (t) => {
