@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "profile": "x7k2q",
+  "channel": "stable",
+  "version": "2026.11.9",
+  "published_at": "2026-11-20T10:04:31Z",
+  "notes": "- Fixes the tray menu on Windows arm64.\n- Quotes \"and\" backslashes \\ survive JCS.\n",
+  "download_hosts": [
+    "storage.googleapis.com"
+  ],
+  "assets": []
+}

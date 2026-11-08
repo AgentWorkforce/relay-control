@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "profile": "y9p3r",
+  "channel": "stable",
+  "version": "2026.11.9",
+  "published_at": "2026-11-20T11:00:00Z",
+  "notes": "- Fixes the tray menu on Windows arm64.\n- Quotes \"and\" backslashes \\ survive JCS.\n",
+  "download_hosts": [
+    "storage.googleapis.com"
+  ],
+  "assets": [
+    {
+      "id": "a_01JD3Q4W41",
+      "name": "Desktop-y9p3r-2026.11.9-macOS15-arm64.dmg",
+      "platform": "macOS",
+      "arch": "arm64",
+      "os_floor": 15,
+      "kind": "image",
+      "size": 187236352,
+      "sha256": "87a7cabd98c9ca8cbd2b5d568d89a81fa29d15c7425239bbb325444e3d1de77d"
+    },
+    {
+      "id": "a_01JD3Q4W42",
+      "name": "Desktop-y9p3r-2026.11.9-macOS-arm64.dmg",
+      "platform": "macOS",
+      "arch": "arm64",
+      "kind": "image",
+      "size": 186000000,
+      "sha256": "595d33d2cb95086bc7c1c4fcbddc440c74d3294062f8379ade3499311218e522"
+    },
+    {
+      "id": "a_01JD3Q4W43",
+      "name": "Desktop-y9p3r-2026.11.9-Linux-x64.tar.gz",
+      "platform": "Linux",
+      "arch": "x64",
+      "kind": "tarball",
+      "size": 64000000,
+      "sha256": "515df047283faf1df93ed904881bf7400d56fa535974a072ff978ffdbe368837"
+    },
+    {
+      "id": "a_01JD3Q4W44",
+      "name": "Desktop-y9p3r-2026.11.9-Linux-x64.deb",
+      "platform": "Linux",
+      "arch": "x64",
+      "kind": "deb",
+      "size": 63000000,
+      "sha256": "1fe606254fd83e36513d18da50dd695694f8d9170a43b5bbd7f58af3329ffed7"
+    },
+    {
+      "id": "a_01JD3Q4W45",
+      "name": "Desktop-y9p3r-2026.11.9-Windows-x64-Setup.exe",
+      "platform": "Windows",
+      "arch": "x64",
+      "kind": "setup",
+      "size": 71000000,
+      "sha256": "f0ec25a6ec30ab91ad8107ef755d1c8f7469697cf1cf70ea89d268927bdde33b"
+    },
+    {
+      "id": "a_01JD3Q4W46",
+      "name": "Desktop-y9p3r-2026.11.9-Windows-arm64.zip",
+      "platform": "Windows",
+      "arch": "arm64",
+      "kind": "zip",
+      "size": 70000000,
+      "sha256": "c7a40b55407d73cb9cb4390eb798a05f662a6e51552e36219e86b1d216a5be29"
+    },
+    {
+      "id": "a_01JD3Q4W47",
+      "name": "Desktop-y9p3r-2026.11.9-Linux-arm64-probe.tar.gz",
+      "platform": "Linux",
+      "arch": "arm64",
+      "kind": "probe",
+      "size": 9000000,
+      "sha256": "6471693bc5d52df2b6e4aa511afbeb66e16df2bb421af7dedf0b19c331a9bb66"
+    },
+    {
+      "id": "a_01JD3Q4W48",
+      "name": "install.sh",
+      "platform": "Linux",
+      "arch": "x64",
+      "kind": "install-script",
+      "size": 21311,
+      "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+    }
+  ]
+}

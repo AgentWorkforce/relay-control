@@ -1,0 +1,90 @@
+{
+  "manifest": {
+    "schema": 1,
+    "profile": "x7k2q",
+    "channel": "stable",
+    "version": "2026.11.9",
+    "published_at": "2026-11-20T10:04:31Z",
+    "notes": "- Fixes the tray menu on Windows arm64.\n- Quotes \"and\" backslashes \\ survive JCS.\n",
+    "download_hosts": [
+      "storage.googleapis.com"
+    ],
+    "assets": [
+      {
+        "id": "a_01JD3Q4W01",
+        "name": "Desktop-x7k2q-2026.11.9-macOS15-arm64.dmg",
+        "platform": "macOS",
+        "arch": "arm64",
+        "os_floor": 15,
+        "kind": "image",
+        "size": 187236352,
+        "sha256": "d15c4f6b877439a86800b411899322aadef40e6aa1257f158cd3df4e1333af59"
+      },
+      {
+        "id": "a_01JD3Q4W02",
+        "name": "Desktop-x7k2q-2026.11.9-macOS-arm64.dmg",
+        "platform": "macOS",
+        "arch": "arm64",
+        "kind": "image",
+        "size": 186000000,
+        "sha256": "21dce99653c1c02250519107d1ceeec78584b55fbf839b8b273e4fcc55e3319d"
+      },
+      {
+        "id": "a_01JD3Q4W03",
+        "name": "Desktop-x7k2q-2026.11.9-Linux-x64.tar.gz",
+        "platform": "Linux",
+        "arch": "x64",
+        "kind": "tarball",
+        "size": 64000000,
+        "sha256": "ec63f670419e2da113418536e4a1dde8b4dc4e924c7cfba20df1d3fe0f8b4cac"
+      },
+      {
+        "id": "a_01JD3Q4W04",
+        "name": "Desktop-x7k2q-2026.11.9-Linux-x64.deb",
+        "platform": "Linux",
+        "arch": "x64",
+        "kind": "deb",
+        "size": 63000000,
+        "sha256": "e9b527b0362498e99292d91a77038530b64eb4d1cb78db6e3c17a33b8844eb47"
+      },
+      {
+        "id": "a_01JD3Q4W05",
+        "name": "Desktop-x7k2q-2026.11.9-Windows-x64-Setup.exe",
+        "platform": "Windows",
+        "arch": "x64",
+        "kind": "setup",
+        "size": 71000000,
+        "sha256": "f2309f924d37108dfd9b3ccff88fa75cafc6bb909ec407908dbb98019a60b88e"
+      },
+      {
+        "id": "a_01JD3Q4W06",
+        "name": "Desktop-x7k2q-2026.11.9-Windows-arm64.zip",
+        "platform": "Windows",
+        "arch": "arm64",
+        "kind": "zip",
+        "size": 70000000,
+        "sha256": "6f309081b72e4134235d654bfc3dd7ef307b01038dd328ce34de158f156e0f9f"
+      },
+      {
+        "id": "a_01JD3Q4W07",
+        "name": "Desktop-x7k2q-2026.11.9-Linux-arm64-probe.tar.gz",
+        "platform": "Linux",
+        "arch": "arm64",
+        "kind": "probe",
+        "size": 9000000,
+        "sha256": "ed7d342b72ed43e42a073289c5e25fd4bf1f67963c134a7a7096065bce4ea53f"
+      },
+      {
+        "id": "a_01JD3Q4W08",
+        "name": "install.sh",
+        "platform": "Linux",
+        "arch": "x64",
+        "kind": "install-script",
+        "size": 21311,
+        "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+      }
+    ]
+  },
+  "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "key_id": "fk-x7k2q-2026a"
+}

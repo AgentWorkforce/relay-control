@@ -1,0 +1,10 @@
+.git
+.github
+.trajectories
+node_modules
+dist
+test
+*.tgz
+*.log
+.env*
+.secrets

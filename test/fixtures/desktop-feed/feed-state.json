@@ -1,0 +1,41 @@
+{
+  "description": "Draft-contract fixture state for test/desktop-feed-contract.test.ts. Opaque profile ids and placeholder workspace ids only; no credentials. Status: proposed.",
+  "site": "relay.example.com",
+  "object_storage": true,
+  "profiles": {
+    "x7k2q": {
+      "workspaces": [
+        "11111111-1111-4111-8111-111111111111"
+      ],
+      "key_id": "fk_x7k2q_2026a",
+      "channels": {
+        "stable": "manifest/valid-stable.json",
+        "beta": "manifest/valid-beta.json"
+      },
+      "asset_prefix": "Desktop-x7k2q"
+    },
+    "y9p3r": {
+      "workspaces": [
+        "22222222-2222-4222-8222-222222222222"
+      ],
+      "key_id": "fk_y9p3r_2026a",
+      "channels": {
+        "stable": "manifest/other-profile-stable.json",
+        "beta": null
+      },
+      "asset_prefix": "Desktop-y9p3r"
+    },
+    "q4m8z": {
+      "workspaces": [
+        "33333333-3333-4333-8333-333333333333"
+      ],
+      "key_id": "fk_q4m8z_2026a",
+      "channels": {
+        "stable": null,
+        "beta": null
+      },
+      "asset_prefix": "Desktop-q4m8z"
+    }
+  },
+  "object_storage_host": "storage.googleapis.com"
+}

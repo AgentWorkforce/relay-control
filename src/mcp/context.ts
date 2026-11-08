@@ -1,0 +1,117 @@
+import type { SelfhostConfig } from "../config.js";
+import { UpstreamError } from "../relayhistory.js";
+import { readWorkspaceHistory } from "../sessions/history.js";
+import type { EncryptionKeyring } from "../crypto.js";
+import type { Database } from "../database.js";
+import type { RelaycastClient, RosterAgent, PresenceRow } from "../messaging/relaycast.js";
+import type { Principal } from "../store.js";
+import type { McpAuthMode, WorkspaceRole } from "./catalog.js";
+import type { DesktopCallContext } from "./desktop-call.js";
+
+export type McpWorkspace = {
+  id: string;
+  organizationId: string;
+  name: string;
+  relaycastWorkspaceId: string;
+  relaycastApiKey: string;
+  role: Principal["role"];
+};
+
+export type McpMember = { userId: string; email: string; name: string | null };
+
+/** Everything one MCP request's tools may use. Built after admission. */
+export type McpContext = {
+  principal: Principal;
+  workspace: McpWorkspace;
+  authMode: McpAuthMode;
+  role: WorkspaceRole;
+  /** Site origin citations link to (the dashboard or public origin the request arrived on). */
+  origin: string;
+  /** The URL this request was served at. */
+  endpointUrl: string;
+  desktopCall: DesktopCallContext;
+  /** GET a workspace-scoped RelayHistory path (with its query); throws SharedSessionsToolError. */
+  readHistory: (path: string, options?: { timeoutMessage?: string }) => Promise<unknown>;
+  members: () => Promise<McpMember[]>;
+  relaycast: {
+    listAgents: (status: "active" | "all") => Promise<RosterAgent[]>;
+    listPresence: () => Promise<PresenceRow[]>;
+  };
+  /** relay_messaging: the participant store, its key envelope, and the Relaycast client. */
+  relay: {
+    database: Database;
+    keyring: EncryptionKeyring;
+    client: RelaycastClient;
+    /** The Mcp-Session-Id header, when the client sent one. */
+    sessionId: string | undefined;
+  };
+};
+
+export class SharedSessionsToolError extends Error {
+  constructor(readonly publicMessage: string) {
+    super(publicMessage);
+    this.name = "SharedSessionsToolError";
+  }
+}
+
+export const UNAVAILABLE_MESSAGE = "Shared session history is temporarily unavailable. Please try again.";
+const ATTESTATION_MESSAGE =
+  "Workspace-scoped shared session history is not available yet. Please try again later.";
+
+/**
+ * RelayHistory reads through the dashboard's workspace-scoped reader: a
+ * `rth:read` session minted for exactly this {user, organization, workspace},
+ * `workspace=` forced on every query, and the response's workspace
+ * attestation header required. Failures become public tool messages only.
+ */
+export function historyReader(
+  config: SelfhostConfig,
+  principal: Principal,
+  workspace: McpWorkspace,
+  callerToken: string,
+) {
+  const identity = {
+    userId: principal.userId,
+    organizationId: workspace.organizationId,
+    workspaceId: workspace.id,
+    callerToken,
+  };
+  return async (path: string, options: { timeoutMessage?: string } = {}): Promise<unknown> => {
+    const url = new URL(path, "https://relayhistory.invalid");
+    try {
+      const result = await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
+      if (result.status !== "ok") throw new SharedSessionsToolError(UNAVAILABLE_MESSAGE);
+      return result.body;
+    } catch (error) {
+      if (error instanceof SharedSessionsToolError) throw error;
+      if (error instanceof UpstreamError) {
+        if (error.message === "RelayHistory did not attest the workspace") {
+          console.error("[selfhost-mcp] History workspace attestation failed");
+          throw new SharedSessionsToolError(ATTESTATION_MESSAGE);
+        }
+        if (options.timeoutMessage && error.status === 504) throw new SharedSessionsToolError(options.timeoutMessage);
+        console.error("[selfhost-mcp] History read failed", { stage: error.stage, upstreamStatus: error.status ?? null });
+      }
+      throw new SharedSessionsToolError(UNAVAILABLE_MESSAGE);
+    }
+  };
+}
+
+export function toolError(error: unknown, options: { correlationId?: string; structured?: boolean } = {}) {
+  const message = error instanceof SharedSessionsToolError ? error.publicMessage : UNAVAILABLE_MESSAGE;
+  return {
+    isError: true,
+    content: [{ type: "text" as const, text: options.correlationId
+      ? `${message}\ncorrelation_id: ${options.correlationId}` : message }],
+    ...(options.structured && options.correlationId ? { structuredContent: {
+      error: message, correlation_id: options.correlationId,
+    } } : {}),
+  };
+}
+
+/** `<origin>/dashboard/sessions/<id>?source=<source>`, the dashboard's session page. */
+export function sessionCitation(origin: string, sessionId: string, source?: string): string {
+  const url = new URL(`/dashboard/sessions/${encodeURIComponent(sessionId)}`, origin);
+  if (source) url.searchParams.set("source", source);
+  return url.toString();
+}

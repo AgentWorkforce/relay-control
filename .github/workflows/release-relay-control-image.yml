@@ -1,0 +1,215 @@
+# Publish only the standalone relay-control image (canonical name), plus the
+# legacy selfhost-api name as a transition alias with the same digest. This
+# workflow does not call any hosted Cloud deployment workflow, deployment
+# script, or cloud provider.
+name: Release relay-control image
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable OCI tag to publish (for example, 0.1.0).
+        required: true
+        type: string
+      source_sha:
+        description: Exact 40-character commit SHA selected for this dispatch.
+        required: true
+        type: string
+      confirmation:
+        description: Type "publish-relay-control" to authorize registry publication.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Every invocation shares the same publication lock. This closes the race
+# between checking that a tag is absent and publishing it from this workflow.
+concurrency:
+  group: release-relay-control-image
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate immutable release request
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    outputs:
+      image: ${{ steps.identity.outputs.image }}
+      legacy_image: ${{ steps.identity.outputs.legacy_image }}
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+      sha_tag: ${{ steps.identity.outputs.sha_tag }}
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+    steps:
+      - name: Validate dispatch identity
+        id: identity
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          DISPATCH_SHA: ${{ github.sha }}
+          DISPATCH_REF: ${{ github.ref }}
+          OWNER: ${{ github.repository_owner }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+
+          [[ "$DISPATCH_REF" == "refs/heads/main" ]] || {
+            echo "::error::Release dispatches must select the main branch."
+            exit 1
+          }
+          [[ "$CONFIRMATION" == "publish-relay-control" ]] || {
+            echo "::error::confirmation must be exactly publish-relay-control"
+            exit 1
+          }
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]] || {
+            echo "::error::source_sha must be exactly 40 lowercase hexadecimal characters."
+            exit 1
+          }
+          [[ "$SOURCE_SHA" == "$DISPATCH_SHA" ]] || {
+            echo "::error::source_sha must equal the commit selected for this dispatch ($DISPATCH_SHA)."
+            exit 1
+          }
+          [[ "$RELEASE_TAG" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]] || {
+            echo "::error::release_tag must be a lowercase OCI tag of at most 128 characters."
+            exit 1
+          }
+          case "$RELEASE_TAG" in
+            latest|main|stable|edge|sha-*)
+              echo "::error::release_tag must be a unique release identifier, not a moving or reserved tag."
+              exit 1
+              ;;
+          esac
+
+          image="ghcr.io/${OWNER,,}/relay-control"
+          legacy_image="ghcr.io/${OWNER,,}/selfhost-api"
+          {
+            echo "image=$image"
+            echo "legacy_image=$legacy_image"
+            echo "release_tag=$RELEASE_TAG"
+            echo "sha_tag=sha-$SOURCE_SHA"
+            echo "source_sha=$SOURCE_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build and publish multi-arch image
+    needs: validate
+    runs-on: ${{ vars.DEPLOY_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    # Configure required reviewers on this environment. Validation is read-only;
+    # registry credentials are not granted until this protected gate is passed.
+    environment: selfhost-api-release
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image: ${{ needs.validate.outputs.image }}
+      legacy_image: ${{ needs.validate.outputs.legacy_image }}
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse existing tags
+        shell: bash
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          LEGACY_IMAGE: ${{ needs.validate.outputs.legacy_image }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          SHA_TAG: ${{ needs.validate.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          for image in "$IMAGE" "$LEGACY_IMAGE"; do
+            for tag in "$RELEASE_TAG" "$SHA_TAG"; do
+              output_file="$RUNNER_TEMP/imagetools-${image//\//_}-$tag.txt"
+              if docker buildx imagetools inspect "$image:$tag" >"$output_file" 2>&1; then
+                echo "::error::$image:$tag already exists; published tags are never overwritten."
+                exit 1
+              fi
+              if ! grep -Eqi 'manifest unknown|name unknown|not found' "$output_file"; then
+                cat "$output_file" >&2
+                echo "::error::Could not prove $image:$tag is absent; failing closed."
+                exit 1
+              fi
+            done
+          done
+
+      - name: Build and publish
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.release_tag }}
+            ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.sha_tag }}
+            ${{ needs.validate.outputs.legacy_image }}:${{ needs.validate.outputs.release_tag }}
+            ${{ needs.validate.outputs.legacy_image }}:${{ needs.validate.outputs.sha_tag }}
+          labels: |
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.release_tag }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify and report immutable digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+          LEGACY_IMAGE: ${{ needs.validate.outputs.legacy_image }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          SHA_TAG: ${{ needs.validate.outputs.sha_tag }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+            echo "::error::Build did not return a valid OCI digest."
+            exit 1
+          }
+
+          for image in "$IMAGE" "$LEGACY_IMAGE"; do
+            for tag in "$RELEASE_TAG" "$SHA_TAG"; do
+              resolved="$(
+                docker buildx imagetools inspect "$image:$tag" \
+                  --format '{{json .Manifest.Digest}}' | tr -d '"'
+              )"
+              [[ "$resolved" == "$DIGEST" ]] || {
+                echo "::error::$image:$tag resolved to $resolved, expected $DIGEST."
+                exit 1
+              }
+            done
+          done
+
+          {
+            echo "### relay-control image released"
+            echo
+            echo "Canonical image: \`$IMAGE@$DIGEST\`"
+            echo "Transition alias: \`$LEGACY_IMAGE@$DIGEST\`"
+            echo "Release tags: \`$IMAGE:$RELEASE_TAG\`, \`$LEGACY_IMAGE:$RELEASE_TAG\`"
+            echo "Source tags: \`$IMAGE:$SHA_TAG\`, \`$LEGACY_IMAGE:$SHA_TAG\`"
+            echo "Source commit: \`$SOURCE_SHA\`"
+            echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo
+            echo "BuildKit OCI SBOM and max-mode provenance attestations were requested."
+            echo "No hosted Cloud deployment was performed."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,201 @@
+{
+  "description": "Transport rules: Range on the stream endpoint, the client's download host rule and the no-redirect rule. Status: proposed.",
+  "range": [
+    {
+      "name": "no range",
+      "range": null,
+      "size": 1000,
+      "expect": {
+        "status": 200,
+        "content_length": 1000
+      }
+    },
+    {
+      "name": "first 100 bytes",
+      "range": "bytes=0-99",
+      "size": 1000,
+      "expect": {
+        "status": 206,
+        "content_range": "bytes 0-99/1000",
+        "content_length": 100
+      }
+    },
+    {
+      "name": "open-ended resume",
+      "range": "bytes=900-",
+      "size": 1000,
+      "expect": {
+        "status": 206,
+        "content_range": "bytes 900-999/1000",
+        "content_length": 100
+      }
+    },
+    {
+      "name": "suffix range",
+      "range": "bytes=-50",
+      "size": 1000,
+      "expect": {
+        "status": 206,
+        "content_range": "bytes 950-999/1000",
+        "content_length": 50
+      }
+    },
+    {
+      "name": "end past size is clamped",
+      "range": "bytes=990-2000",
+      "size": 1000,
+      "expect": {
+        "status": 206,
+        "content_range": "bytes 990-999/1000",
+        "content_length": 10
+      }
+    },
+    {
+      "name": "start at size",
+      "range": "bytes=1000-",
+      "size": 1000,
+      "expect": {
+        "status": 416,
+        "content_range": "bytes */1000"
+      }
+    },
+    {
+      "name": "start after end",
+      "range": "bytes=50-10",
+      "size": 1000,
+      "expect": {
+        "status": 416,
+        "content_range": "bytes */1000"
+      }
+    },
+    {
+      "name": "multiple ranges",
+      "range": "bytes=0-1,5-6",
+      "size": 1000,
+      "expect": {
+        "status": 416,
+        "content_range": "bytes */1000"
+      }
+    },
+    {
+      "name": "empty suffix",
+      "range": "bytes=-0",
+      "size": 1000,
+      "expect": {
+        "status": 416,
+        "content_range": "bytes */1000"
+      }
+    },
+    {
+      "name": "If-Range matches the sha256 ETag",
+      "range": "bytes=0-99",
+      "if_range": "etag",
+      "size": 1000,
+      "expect": {
+        "status": 206,
+        "content_range": "bytes 0-99/1000",
+        "content_length": 100
+      }
+    },
+    {
+      "name": "If-Range is stale: whole body",
+      "range": "bytes=0-99",
+      "if_range": "other",
+      "size": 1000,
+      "expect": {
+        "status": 200,
+        "content_length": 1000
+      }
+    }
+  ],
+  "download_host": [
+    {
+      "name": "signed host",
+      "site": "relay.example.com",
+      "download_hosts": [
+        "storage.googleapis.com"
+      ],
+      "url": "https://storage.googleapis.com/feed/o?X-Goog-Expires=300",
+      "expect": "accept"
+    },
+    {
+      "name": "the site itself (streamed)",
+      "site": "relay.example.com",
+      "download_hosts": [],
+      "url": "https://relay.example.com/api/v1/desktop/feed/assets/a_01JD3Q4W21",
+      "expect": "accept"
+    },
+    {
+      "name": "host not in download_hosts",
+      "site": "relay.example.com",
+      "download_hosts": [
+        "storage.googleapis.com"
+      ],
+      "url": "https://evil.example.net/o",
+      "expect": "refuse"
+    },
+    {
+      "name": "empty download_hosts refuses any object store",
+      "site": "relay.example.com",
+      "download_hosts": [],
+      "url": "https://storage.googleapis.com/feed/o",
+      "expect": "refuse"
+    },
+    {
+      "name": "http is refused",
+      "site": "relay.example.com",
+      "download_hosts": [
+        "storage.googleapis.com"
+      ],
+      "url": "http://storage.googleapis.com/feed/o",
+      "expect": "refuse"
+    },
+    {
+      "name": "explicit port is refused",
+      "site": "relay.example.com",
+      "download_hosts": [
+        "storage.googleapis.com"
+      ],
+      "url": "https://storage.googleapis.com:8443/feed/o",
+      "expect": "refuse"
+    },
+    {
+      "name": "userinfo is refused",
+      "site": "relay.example.com",
+      "download_hosts": [
+        "storage.googleapis.com"
+      ],
+      "url": "https://a@storage.googleapis.com/feed/o",
+      "expect": "refuse"
+    },
+    {
+      "name": "suffix match is not a match",
+      "site": "relay.example.com",
+      "download_hosts": [
+        "storage.googleapis.com"
+      ],
+      "url": "https://storage.googleapis.com.evil.example.net/o",
+      "expect": "refuse"
+    }
+  ],
+  "redirect": [
+    {
+      "name": "stream answers 3xx",
+      "status": 302,
+      "location": "https://storage.googleapis.com/o",
+      "expect": "refuse"
+    },
+    {
+      "name": "signed URL answers 3xx",
+      "status": 307,
+      "location": "https://elsewhere.example.net/o",
+      "expect": "refuse"
+    },
+    {
+      "name": "stream answers 200",
+      "status": 200,
+      "location": null,
+      "expect": "accept"
+    }
+  ]
+}

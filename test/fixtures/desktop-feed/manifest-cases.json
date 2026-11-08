@@ -1,0 +1,42 @@
+{
+  "description": "Expected outcome of each manifest fixture. schema: result of desktop-feed-manifest.schema.json. client: the client's checks after a valid signature (compiled profile x7k2q unless stated, channel as requested). Envelopes are signed at test run time with a throwaway key.",
+  "cases": [
+    { "file": "manifest/valid-stable.json", "schema": "valid", "request": { "profile": "x7k2q", "channel": "stable" }, "client": "accept" },
+    { "file": "manifest/valid-beta.json", "schema": "valid", "request": { "profile": "x7k2q", "channel": "beta" }, "client": "accept" },
+    { "file": "manifest/valid-stable.json", "schema": "valid", "request": { "profile": "x7k2q", "channel": "beta" }, "client": "channel_mismatch" },
+    { "file": "manifest/other-profile-stable.json", "schema": "valid", "request": { "profile": "x7k2q", "channel": "stable" }, "client": "profile_mismatch" },
+    { "file": "manifest/invalid-duplicate-asset-name.json", "schema": "valid", "request": { "profile": "x7k2q", "channel": "stable" }, "client": "duplicate_asset" },
+    { "file": "manifest/invalid-duplicate-asset-id.json", "schema": "valid", "request": { "profile": "x7k2q", "channel": "stable" }, "client": "duplicate_asset" },
+    { "file": "manifest/invalid-unknown-schema.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-beta-version-on-stable.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-stable-version-on-beta.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-sha256-uppercase.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-sha256-short.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-size-negative.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-size-fractional.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-kind-unknown.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-platform-unknown.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-arch-unknown.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-name-other-profile-prefix.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-name-with-slash.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-os-floor-on-linux.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-download-host-ip.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-download-host-port.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-download-host-uppercase.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-published-at-offset.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-extra-field.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-asset-extra-field.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-no-assets.json", "schema": "invalid", "client": "schema_invalid" },
+    { "file": "manifest/invalid-profile-uppercase.json", "schema": "invalid", "client": "schema_invalid" }
+  ],
+  "envelopes": [
+    { "file": "envelope/invalid-signature-padded.json", "schema": "invalid" },
+    { "file": "envelope/invalid-signature-63-bytes.json", "schema": "invalid" },
+    { "file": "envelope/invalid-signature-noncanonical-tail.json", "schema": "invalid" },
+    { "file": "envelope/invalid-signature-standard-base64.json", "schema": "invalid" },
+    { "file": "envelope/invalid-key-id-format.json", "schema": "invalid" },
+    { "file": "envelope/invalid-key-id-missing.json", "schema": "invalid" },
+    { "file": "envelope/invalid-extra-field.json", "schema": "invalid" },
+    { "file": "envelope/invalid-manifest-invalid.json", "schema": "invalid" }
+  ]
+}

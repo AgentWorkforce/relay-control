@@ -1,0 +1,128 @@
+# Self-host sessions backend: the RelayHistory read API container
+
+relaycontrol does not store sessions. The dashboard session views, the
+`relay_messaging`/shared-sessions MCP reads and `POST
+/api/v1/workspaces/{ws}/relayhistory/session` all read through a RelayHistory
+service. In a self-hosted install that service is the containerized
+**RelayHistory read API**, built and owned by the sessions pipeline maintainers in the
+relayhistory-pipeline repo:
+
+- relayhistory-pipeline #317 (head `33f33c4e`): container entry point;
+- relayhistory-pipeline #318 (head `1d416c96`): `/v1/cli/login` (scopes = token scopes ∩ {`rth:read`}; none served is `403 forbidden "missing required scope: rth:read"`) and catalog.
+
+Merge SHAs will be recorded here once both land. relaycontrol only consumes
+the container; it has no code of its own for storing or indexing sessions.
+
+## relaycontrol configuration
+
+No new environment variables. Point the existing ones at the container:
+
+| Variable | Value |
+| --- | --- |
+| `RELAYHISTORY_URL` | The container's in-cluster service URL (for example `http://relayhistory-read-api.<ns>.svc.cluster.local:8080`). All logins and reads go here. |
+| `RELAYHISTORY_PUBLIC_URL` | The container's `READ_API_ORIGIN`. It is the introspection audience the container sends as `aud`, and the `baseUrl` returned to clients. |
+| `RELAYAUTH_URL`, `RELAYAUTH_API_KEY` | Unset. Without them relaycontrol forwards the caller's own `sh_at_` token. |
+| `RELAYCONTROL_INTROSPECT_SECRET` | Set, and shared with the container, which calls `POST /internal/v1/auth/introspect` with it. |
+| `SELFHOST_INTROSPECT_AUDIENCES` | Only if `READ_API_ORIGIN` differs from `RELAYHISTORY_PUBLIC_URL`; must contain it. `GET /readyz` lists the accepted audiences. |
+
+## Container configuration (owned by the pipeline)
+
+| Variable | Meaning |
+| --- | --- |
+| `RELAYHISTORY_SELFHOST_READ_API` | `"true"` serves; anything else is dormant. |
+| `RELAYHISTORY_READ_API_PORT` | Listen port, default `8080`. |
+| `RELAYHISTORY_READ_API_SECRET` | Container secret (pipeline-defined). |
+| `READ_API_ORIGIN`, `READ_API_DIRECTORY_WORKSPACES`, introspection settings | The existing read API settings (relayhistory-pipeline #313): the relaycontrol introspection URL and `RELAYCONTROL_INTROSPECT_SECRET`. |
+
+Health and readiness: `GET /healthz` answers `200 {"ok":true,"enabled":true}`
+when serving and `200 {"ok":true,"enabled":false}` when dormant. While dormant
+every other route answers `503 not_configured`.
+
+## Authentication
+
+There is no separate service credential.
+
+1. relaycontrol checks workspace membership, then POSTs the caller's `sh_at_`
+   access token to `/v1/cli/login` as `agentRelayToken`.
+2. The container introspects it against relaycontrol (`aud` =
+   `READ_API_ORIGIN`) and answers the same token as `accessToken`, expiring at
+   `min(exp, now + 15m)`, with `refreshToken` equal to `accessToken`. Scopes
+   are the token's scopes intersected with what the backend serves
+   (`rth:read`); a token without `rth:read` gets `403 forbidden` ("missing
+   required scope: rth:read"), which relaycontrol reports as `502
+   relayhistory_session_failed` (stage `exchange`, `upstreamStatus` 403).
+3. Every read is a GET with that token as `Bearer` and `workspace=` set to the
+   authorized workspace. Organization and workspace come only from the
+   verified claims; the response must attest the workspace through
+   `X-Relayhistory-Workspace-Id`, as with hosted RelayHistory.
+
+The login step is not strictly required by the container (a GET with a fresh
+`sh_at_` bearer is introspected the same way), but relaycontrol keeps it as
+the client flow so the RelayAuth and RelayAuth-free paths stay one code path.
+
+**Refresh is unsupported, and relaycontrol never refreshes.** Read tokens are
+cached per {user, organization, workspace, caller token} for at most 5
+minutes (and never past the upstream expiry minus 60 s). On a 401 the cached
+token is dropped and relaycontrol logs in again once; a second 401 is an
+upstream error. Clients that receive a session from
+`POST .../relayhistory/session` get `refreshToken == accessToken` and must
+request a new session instead of refreshing.
+
+## Served views
+
+The container serves the RelayHistory recall contract with the same shapes,
+which is exactly what `src/sessions/routes.ts` proxies: `GET /v1/sessions`,
+`/v1/sessions/activity`, `/v1/sessions/:id/events`, `/v1/events?session=&q=`,
+`/v1/sessions/:id/turns`, `/timing`, `/metadata`, `/catalog`,
+`/v1/sessions/titles`, `/v1/delivery/records`.
+
+Not served: `/v1/sessions/output` and `/v1/digest/daily` answer `501
+unsupported_by_backend` with a reason. Any first page the backend cannot
+answer exactly is also a 501, never an approximation.
+
+How relaycontrol answers each upstream outcome on the dashboard session
+routes (`/cloud/api/v1/workspaces/{ws}/sessions...`):
+
+| Upstream | relaycontrol |
+| --- | --- |
+| 200, workspace attested | 200 with the view |
+| 501 (any route) | `501 {"error":"unsupported_by_backend","reason":<upstream reason>,"message":"The configured session backend does not serve this view"}`, `Cache-Control: no-store`. `reason` is the upstream `reason`, else its `error` string, else `unsupported_by_backend`. No attestation is required since no data is returned. The cached token is kept. |
+| 404 on catalog (unknown session) | 200 empty catalog `{catalog:null,parents:[],children:[],commitLinks:[],truncated:false}` |
+| 404 on timing | 200 `{timing:null}` |
+| 404 on output (older hosted builds) | 200 `{output:null,unsupported:true}` |
+| 401 | cached token dropped, one re-login and retry |
+| 503 (dormant container) or other failures | `502 {"error":"relayhistory_session_failed","stage":"read","upstreamStatus":503}`. No retry, and the cached token is kept. |
+
+The MCP shared-sessions tools report any non-200 read, including a 501, as
+their usual "unavailable" tool error.
+
+## Sync sessions
+
+`POST /api/v1/workspaces/{ws}/relayhistory/session` with `mode=sync` (the
+default) forwards the same caller token to `/v1/cli/login`. The read
+container serves reads only, so its login reply grants `rth:read` even when
+the caller's token also carries `rth:sync`. relaycontrol checks the granted
+scopes on the RelayAuth-free path:
+
+- `mode=sync` without `rth:sync` in the reply: `501
+  {"error":"unsupported_by_backend","reason":"sync_not_served","message":"The
+  configured session backend serves reads only; sync sessions are not
+  available"}`. No session is returned or cached.
+- `mode=read`: 200 as before, with `scopes: ["rth:read"]`.
+- A reply without `rth:read` at all: `502 relayhistory_session_failed`
+  (stage `exchange`), as for any invalid session.
+- A reply with no `scopes` field is trusted as before (compatibility with
+  History builds that omit it): the session is returned with `scopes: []`.
+
+The caller must still hold `rth:sync` to ask for sync (403
+`mode_not_authorized` otherwise, before anything is forwarded). Desktop
+session upload is a separate, pipeline-owned edge and does not go through
+this container.
+
+## Open gap (pipeline-owned)
+
+The current container assembly needs ClickHouse for events and search, and
+requires TLS to Postgres. A Postgres-only assembly is an open follow-up that the
+sessions pipeline maintainers are tracking. Until it lands, a self-host
+install that wants transcripts and search must provide ClickHouse and a
+TLS-enabled Postgres to the container.

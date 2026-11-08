@@ -1,0 +1,516 @@
+{
+  "description": "Response bodies checked against the OpenAPI response schemas. $RUNTIME_INSTALL_TOKEN is replaced at test time with a placeholder built in code, so no credential-shaped value is committed. Status: proposed.",
+  "bodies": [
+    {
+      "name": "not_entitled",
+      "op": "manifest",
+      "status": 403,
+      "body": {
+        "error": "not_entitled",
+        "message": "This workspace is not entitled to that profile."
+      },
+      "valid": true
+    },
+    {
+      "name": "no_release",
+      "op": "manifest",
+      "status": 404,
+      "body": {
+        "error": "no_release",
+        "message": "No release on this channel yet."
+      },
+      "valid": true
+    },
+    {
+      "name": "404 never carries not_entitled",
+      "op": "manifest",
+      "status": 404,
+      "body": {
+        "error": "not_entitled"
+      },
+      "valid": false
+    },
+    {
+      "name": "403 never carries no_release",
+      "op": "manifest",
+      "status": 403,
+      "body": {
+        "error": "no_release"
+      },
+      "valid": false
+    },
+    {
+      "name": "mixed_credentials",
+      "op": "manifest",
+      "status": 400,
+      "body": {
+        "error": "mixed_credentials",
+        "message": "Send one credential."
+      },
+      "valid": true
+    },
+    {
+      "name": "profile_header_required",
+      "op": "manifest",
+      "status": 400,
+      "body": {
+        "error": "profile_header_required"
+      },
+      "valid": true
+    },
+    {
+      "name": "expired install token",
+      "op": "manifest",
+      "status": 401,
+      "body": {
+        "error": "token_expired"
+      },
+      "valid": true
+    },
+    {
+      "name": "revoked install token",
+      "op": "manifest",
+      "status": 401,
+      "body": {
+        "error": "token_revoked"
+      },
+      "valid": true
+    },
+    {
+      "name": "publisher token on read",
+      "op": "manifest",
+      "status": 403,
+      "body": {
+        "error": "wrong_credential",
+        "message": "Publisher tokens cannot read the feed."
+      },
+      "valid": true
+    },
+    {
+      "name": "rate_limited",
+      "op": "manifest",
+      "status": 429,
+      "body": {
+        "error": "rate_limited",
+        "retry_after_seconds": 30
+      },
+      "valid": true
+    },
+    {
+      "name": "rate_limited without retry_after_seconds",
+      "op": "manifest",
+      "status": 429,
+      "body": {
+        "error": "rate_limited"
+      },
+      "valid": false
+    },
+    {
+      "name": "error bodies echo nothing extra",
+      "op": "manifest",
+      "status": 403,
+      "body": {
+        "error": "not_entitled",
+        "profile": "y9p3r"
+      },
+      "valid": false
+    },
+    {
+      "name": "unknown error code",
+      "op": "manifest",
+      "status": 403,
+      "body": {
+        "error": "forbidden"
+      },
+      "valid": false
+    },
+    {
+      "name": "install token on publisher",
+      "op": "create_draft",
+      "status": 403,
+      "body": {
+        "error": "wrong_credential",
+        "message": "Only a publisher token may create a draft."
+      },
+      "valid": true
+    },
+    {
+      "name": "quota_exceeded body",
+      "op": "create_draft",
+      "status": 422,
+      "body": {
+        "error": "quota_exceeded",
+        "message": "Quota exceeded.",
+        "quota_bytes": 20000000000,
+        "used_bytes": 19000000000,
+        "required_bytes": 2000000000
+      },
+      "valid": true
+    },
+    {
+      "name": "quota_exceeded without numbers",
+      "op": "create_draft",
+      "status": 422,
+      "body": {
+        "error": "quota_exceeded",
+        "message": "Quota exceeded."
+      },
+      "valid": false
+    },
+    {
+      "name": "507 is not used for quota",
+      "op": "create_draft",
+      "status": 507,
+      "body": {
+        "error": "quota_exceeded",
+        "quota_bytes": 20000000000,
+        "used_bytes": 19000000000,
+        "required_bytes": 2000000000
+      },
+      "valid": false
+    },
+    {
+      "name": "expected_assets_required",
+      "op": "create_draft",
+      "status": 422,
+      "body": {
+        "error": "expected_assets_required"
+      },
+      "valid": true
+    },
+    {
+      "name": "asset_mismatch",
+      "op": "upload",
+      "status": 422,
+      "body": {
+        "error": "asset_mismatch",
+        "message": "Declared size 187236352, received 187236351."
+      },
+      "valid": true
+    },
+    {
+      "name": "asset_conflict",
+      "op": "upload",
+      "status": 409,
+      "body": {
+        "error": "asset_conflict"
+      },
+      "valid": true
+    },
+    {
+      "name": "assets_incomplete",
+      "op": "publish",
+      "status": 422,
+      "body": {
+        "error": "assets_incomplete",
+        "missing": [
+          "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz"
+        ],
+        "mismatched": []
+      },
+      "valid": true
+    },
+    {
+      "name": "assets_incomplete without lists",
+      "op": "publish",
+      "status": 422,
+      "body": {
+        "error": "assets_incomplete"
+      },
+      "valid": false
+    },
+    {
+      "name": "signer_unavailable",
+      "op": "publish",
+      "status": 503,
+      "body": {
+        "error": "signer_unavailable"
+      },
+      "valid": true
+    },
+    {
+      "name": "import signature_invalid",
+      "op": "import",
+      "status": 422,
+      "body": {
+        "error": "signature_invalid"
+      },
+      "valid": true
+    },
+    {
+      "name": "import key_id_unknown",
+      "op": "import",
+      "status": 422,
+      "body": {
+        "error": "key_id_unknown"
+      },
+      "valid": true
+    },
+    {
+      "name": "download url",
+      "op": "download_url",
+      "status": 200,
+      "body": {
+        "url": "https://storage.googleapis.com/feed/profiles/x7k2q/releases/2026.11.9/install.sh?X-Goog-Expires=300",
+        "expires_at": "2026-11-20T10:09:31Z"
+      },
+      "valid": true
+    },
+    {
+      "name": "download url over http",
+      "op": "download_url",
+      "status": 200,
+      "body": {
+        "url": "http://storage.googleapis.com/x",
+        "expires_at": "2026-11-20T10:09:31Z"
+      },
+      "valid": false
+    },
+    {
+      "name": "no_object_storage",
+      "op": "download_url",
+      "status": 501,
+      "body": {
+        "error": "no_object_storage",
+        "message": "Use GET /assets/{assetId}."
+      },
+      "valid": true
+    },
+    {
+      "name": "range_not_satisfiable",
+      "op": "asset",
+      "status": 416,
+      "body": {
+        "error": "range_not_satisfiable"
+      },
+      "valid": true
+    },
+    {
+      "name": "publisher listing with limits",
+      "op": "releases",
+      "status": 200,
+      "body": {
+        "versions": [
+          {
+            "version": "2026.11.11",
+            "channel": "stable",
+            "state": "draft",
+            "origin": "publish",
+            "published_at": null,
+            "current": false
+          },
+          {
+            "version": "2026.11.9",
+            "channel": "stable",
+            "state": "published",
+            "origin": "publish",
+            "published_at": "2026-11-20T10:04:31Z",
+            "current": true
+          }
+        ],
+        "next_page": null,
+        "limits": {
+          "quota_bytes": 20000000000,
+          "used_bytes": 9000000000,
+          "max_canonical_bytes": 4096,
+          "retention": {
+            "stable": "all",
+            "beta_keep": 10
+          }
+        }
+      },
+      "valid": true
+    },
+    {
+      "name": "stable retention is always all",
+      "op": "releases",
+      "status": 200,
+      "body": {
+        "versions": [
+          {
+            "version": "2026.11.11",
+            "channel": "stable",
+            "state": "draft",
+            "origin": "publish",
+            "published_at": null,
+            "current": false
+          },
+          {
+            "version": "2026.11.9",
+            "channel": "stable",
+            "state": "published",
+            "origin": "publish",
+            "published_at": "2026-11-20T10:04:31Z",
+            "current": true
+          }
+        ],
+        "next_page": null,
+        "limits": {
+          "quota_bytes": 20000000000,
+          "used_bytes": 9000000000,
+          "max_canonical_bytes": 4096,
+          "retention": {
+            "stable": 10,
+            "beta_keep": 10
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "publisher listing without limits",
+      "op": "releases",
+      "status": 200,
+      "body": {
+        "versions": [
+          {
+            "version": "2026.11.11",
+            "channel": "stable",
+            "state": "draft",
+            "origin": "publish",
+            "published_at": null,
+            "current": false
+          },
+          {
+            "version": "2026.11.9",
+            "channel": "stable",
+            "state": "published",
+            "origin": "publish",
+            "published_at": "2026-11-20T10:04:31Z",
+            "current": true
+          }
+        ],
+        "next_page": null
+      },
+      "valid": false
+    },
+    {
+      "name": "install token issued",
+      "op": "install_tokens_create",
+      "status": 201,
+      "body": {
+        "id": "44444444-4444-4444-8444-444444444444",
+        "token": "$RUNTIME_INSTALL_TOKEN",
+        "label": "laptop",
+        "profile": "x7k2q",
+        "workspace_id": "11111111-1111-4111-8111-111111111111",
+        "created_at": "2026-11-20T10:00:00Z",
+        "expires_at": "2026-11-20T11:00:00Z",
+        "command": "AGENT_RELAY_INSTALL_TOKEN=<token> bash install.sh"
+      },
+      "valid": true
+    },
+    {
+      "name": "workspace token prefix is not an install token",
+      "op": "install_tokens_create",
+      "status": 201,
+      "body": {
+        "id": "44444444-4444-4444-8444-444444444444",
+        "token": "sh_wk_0000000000000000000000000000000000000000000",
+        "label": "laptop",
+        "profile": "x7k2q",
+        "workspace_id": "11111111-1111-4111-8111-111111111111",
+        "created_at": "2026-11-20T10:00:00Z",
+        "expires_at": "2026-11-20T11:00:00Z",
+        "command": "AGENT_RELAY_INSTALL_TOKEN=<token> bash install.sh"
+      },
+      "valid": false
+    },
+    {
+      "name": "active, expired and revoked summaries",
+      "op": "install_tokens_list",
+      "status": 200,
+      "body": {
+        "tokens": [
+          {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "label": "laptop",
+            "token_prefix": "sh_dfi_0000",
+            "profile": "x7k2q",
+            "workspace_id": "11111111-1111-4111-8111-111111111111",
+            "created_at": "2026-11-20T10:00:00Z",
+            "expires_at": "2026-11-20T11:00:00Z",
+            "revoked_at": null,
+            "last_used_at": null,
+            "status": "active"
+          },
+          {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "label": "laptop",
+            "token_prefix": "sh_dfi_0000",
+            "profile": "x7k2q",
+            "workspace_id": "11111111-1111-4111-8111-111111111111",
+            "created_at": "2026-11-20T10:00:00Z",
+            "expires_at": "2026-11-20T11:00:00Z",
+            "revoked_at": null,
+            "last_used_at": "2026-11-20T10:05:00Z",
+            "status": "expired"
+          },
+          {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "label": "laptop",
+            "token_prefix": "sh_dfi_0000",
+            "profile": "x7k2q",
+            "workspace_id": "11111111-1111-4111-8111-111111111111",
+            "created_at": "2026-11-20T10:00:00Z",
+            "expires_at": "2026-11-20T11:00:00Z",
+            "revoked_at": "2026-11-20T10:30:00Z",
+            "last_used_at": null,
+            "status": "revoked"
+          }
+        ]
+      },
+      "valid": true
+    },
+    {
+      "name": "a listing never returns the token",
+      "op": "install_tokens_list",
+      "status": 200,
+      "body": {
+        "tokens": [
+          {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "label": "laptop",
+            "token_prefix": "sh_dfi_0000",
+            "profile": "x7k2q",
+            "workspace_id": "11111111-1111-4111-8111-111111111111",
+            "created_at": "2026-11-20T10:00:00Z",
+            "expires_at": "2026-11-20T11:00:00Z",
+            "revoked_at": null,
+            "last_used_at": null,
+            "status": "active",
+            "token": "$RUNTIME_INSTALL_TOKEN"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "revoked summary",
+      "op": "install_tokens_revoke",
+      "status": 200,
+      "body": {
+        "id": "44444444-4444-4444-8444-444444444444",
+        "label": "laptop",
+        "token_prefix": "sh_dfi_0000",
+        "profile": "x7k2q",
+        "workspace_id": "11111111-1111-4111-8111-111111111111",
+        "created_at": "2026-11-20T10:00:00Z",
+        "expires_at": "2026-11-20T11:00:00Z",
+        "revoked_at": "2026-11-20T10:30:00Z",
+        "last_used_at": null,
+        "status": "revoked"
+      },
+      "valid": true
+    },
+    {
+      "name": "install_token_not_found",
+      "op": "install_tokens_revoke",
+      "status": 404,
+      "body": {
+        "error": "install_token_not_found"
+      },
+      "valid": true
+    }
+  ]
+}

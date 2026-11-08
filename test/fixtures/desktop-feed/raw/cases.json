@@ -1,0 +1,13 @@
+{
+  "description": "Raw envelope texts, read as TEXT and never parsed before the code under test. Each file is a template: the single \"$SIGNATURE\" placeholder is replaced at run time with a signature over the canonical bytes of manifest/valid-stable.json made with a throwaway key, so no signature is committed. Plain JSON.parse of every file yields that same valid envelope (key_id fk_x7k2q_2026a), because JSON.parse keeps the last duplicate; that is the DF-001 gap. strict: what test/support/strict-json.ts does (ok, or the StrictJsonError kind). client: clientVerify result for compiled profile x7k2q, channel stable. import: import reference result for the request body {\"envelope\": <file text>}, profile x7k2q with fk_x7k2q_2026a registered and nothing published.",
+  "placeholder": "$SIGNATURE",
+  "cases": [
+    { "file": "raw/duplicate-profile.json", "about": "manifest.profile twice: another profile first, the signed one second", "strict": "duplicate_name", "client": "schema_invalid", "import": { "status": 422, "error": "manifest_invalid" } },
+    { "file": "raw/duplicate-profile-escaped.json", "about": "manifest.profile twice, the second spelled pro\\u0066ile; equal after escape decoding", "strict": "duplicate_name", "client": "schema_invalid", "import": { "status": 422, "error": "manifest_invalid" } },
+    { "file": "raw/duplicate-manifest.json", "about": "two outer manifest members, the second the signed one", "strict": "duplicate_name", "client": "schema_invalid", "import": { "status": 422, "error": "manifest_invalid" } },
+    { "file": "raw/duplicate-key-id.json", "about": "two outer key_id members, another key first, the compiled one second", "strict": "duplicate_name", "client": "schema_invalid", "import": { "status": 422, "error": "manifest_invalid" } },
+    { "file": "raw/duplicate-asset-sha256.json", "about": "sha256 twice inside assets[0]: another asset's hash first, the signed one second", "strict": "duplicate_name", "client": "schema_invalid", "import": { "status": 422, "error": "manifest_invalid" } },
+    { "file": "raw/valid-reordered-whitespace.json", "about": "every object's keys reversed; tabs, CRLF and spaces around tokens", "strict": "ok", "client": "accept", "import": { "status": 201 } },
+    { "file": "raw/valid-pretty.json", "about": "two-space pretty print in signing order", "strict": "ok", "client": "accept", "import": { "status": 201 } }
+  ]
+}

@@ -1,0 +1,1928 @@
+{
+  "description": "Publisher decision cases: draft creation, upload, publish order and quota. Status: proposed (quota 20 GB = 20,000,000,000 bytes, beta_keep 10, stables never pruned, 422 quota_exceeded). No credential values.",
+  "profile": "x7k2q",
+  "asset_prefix": "Desktop-x7k2q",
+  "create": [
+    {
+      "name": "valid stable draft",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "valid beta draft",
+      "body": {
+        "version": "2026.11.11-beta.1",
+        "channel": "beta",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-beta.1-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-beta.1-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "identical retry of an open draft",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "existing": "same_draft",
+      "expect": {
+        "status": 200
+      }
+    },
+    {
+      "name": "different body for an open draft",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Changed.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "existing": "same_draft",
+      "expect": {
+        "status": 409,
+        "error": "version_exists"
+      }
+    },
+    {
+      "name": "version already published",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "existing": "published",
+      "expect": {
+        "status": 409,
+        "error": "version_exists"
+      }
+    },
+    {
+      "name": "expected_assets missing",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n"
+      },
+      "expect": {
+        "status": 422,
+        "error": "expected_assets_required"
+      }
+    },
+    {
+      "name": "expected_assets empty",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": []
+      },
+      "expect": {
+        "status": 422,
+        "error": "expected_assets_required"
+      }
+    },
+    {
+      "name": "beta version on stable",
+      "body": {
+        "version": "2026.11.11-beta.1",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_release"
+      }
+    },
+    {
+      "name": "stable version on beta",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "beta",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_release"
+      }
+    },
+    {
+      "name": "version malformed",
+      "body": {
+        "version": "2026.13.1",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_release"
+      }
+    },
+    {
+      "name": "sha256 upper case",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "2D711642B726B04401627CA9FBAC32F5C8530FB1903CC4DB02258717921A4881",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_asset"
+      }
+    },
+    {
+      "name": "sha256 too short",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a488",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_asset"
+      }
+    },
+    {
+      "name": "size negative",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": -1,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_asset"
+      }
+    },
+    {
+      "name": "size zero",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 0,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_asset"
+      }
+    },
+    {
+      "name": "kind unknown",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "msi",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_asset"
+      }
+    },
+    {
+      "name": "os_floor on Linux",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8",
+            "os_floor": 15
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_asset"
+      }
+    },
+    {
+      "name": "client-supplied asset id",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8",
+            "id": "a_01JD3Q4W99"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_asset"
+      }
+    },
+    {
+      "name": "duplicate asset name",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_asset"
+      }
+    },
+    {
+      "name": "another profile's prefix",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-y9p3r-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_asset"
+      }
+    },
+    {
+      "name": "another version in the name",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.9-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_asset"
+      }
+    },
+    {
+      "name": "path in the name",
+      "body": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "notes": "- Draft fixture.\n",
+        "expected_assets": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "platform": "macOS",
+            "arch": "arm64",
+            "kind": "image",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+            "os_floor": 15
+          },
+          {
+            "name": "../y9p3r/Desktop-y9p3r-2026.11.11-Linux-x64.tar.gz",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "tarball",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "platform": "Linux",
+            "arch": "x64",
+            "kind": "install-script",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ]
+      },
+      "expect": {
+        "status": 422,
+        "error": "invalid_asset"
+      }
+    }
+  ],
+  "upload": [
+    {
+      "name": "declared asset, matching bytes",
+      "draft": {
+        "version": "2026.11.11",
+        "state": "draft",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {}
+      },
+      "request": {
+        "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+        "content_length": 187236352,
+        "x_content_sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+        "received": {
+          "size": 187236352,
+          "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+        }
+      },
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "no such draft",
+      "draft": {
+        "version": "2026.11.11",
+        "state": "none"
+      },
+      "request": {
+        "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+        "content_length": 187236352,
+        "x_content_sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+        "received": {
+          "size": 187236352,
+          "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+        }
+      },
+      "expect": {
+        "status": 404,
+        "error": "draft_not_found"
+      }
+    },
+    {
+      "name": "version already published",
+      "draft": {
+        "version": "2026.11.11",
+        "state": "published",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {}
+      },
+      "request": {
+        "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+        "content_length": 187236352,
+        "x_content_sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+        "received": {
+          "size": 187236352,
+          "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+        }
+      },
+      "expect": {
+        "status": 409,
+        "error": "not_a_draft"
+      }
+    },
+    {
+      "name": "name not declared",
+      "draft": {
+        "version": "2026.11.11",
+        "state": "draft",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {}
+      },
+      "request": {
+        "name": "Desktop-x7k2q-2026.11.11-Windows-x64-Setup.exe",
+        "content_length": 187236352,
+        "x_content_sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+        "received": {
+          "size": 187236352,
+          "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+        }
+      },
+      "expect": {
+        "status": 422,
+        "error": "asset_not_declared"
+      }
+    },
+    {
+      "name": "identical re-upload is idempotent",
+      "draft": {
+        "version": "2026.11.11",
+        "state": "draft",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {
+          "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg": {
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          }
+        }
+      },
+      "request": {
+        "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+        "content_length": 187236352,
+        "x_content_sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+        "received": {
+          "size": 187236352,
+          "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+        }
+      },
+      "expect": {
+        "status": 200
+      }
+    },
+    {
+      "name": "different bytes for an uploaded name",
+      "draft": {
+        "version": "2026.11.11",
+        "state": "draft",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {
+          "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg": {
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          }
+        }
+      },
+      "request": {
+        "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+        "content_length": 187236352,
+        "x_content_sha256": "d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa",
+        "received": {
+          "size": 187236352,
+          "sha256": "d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa"
+        }
+      },
+      "expect": {
+        "status": 409,
+        "error": "asset_conflict"
+      }
+    },
+    {
+      "name": "Content-Length differs from declared size",
+      "draft": {
+        "version": "2026.11.11",
+        "state": "draft",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {}
+      },
+      "request": {
+        "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+        "content_length": 187236351,
+        "x_content_sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+        "received": {
+          "size": 187236352,
+          "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+        }
+      },
+      "expect": {
+        "status": 422,
+        "error": "asset_mismatch"
+      }
+    },
+    {
+      "name": "X-Content-SHA256 differs from declared",
+      "draft": {
+        "version": "2026.11.11",
+        "state": "draft",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {}
+      },
+      "request": {
+        "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+        "content_length": 187236352,
+        "x_content_sha256": "d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa",
+        "received": {
+          "size": 187236352,
+          "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+        }
+      },
+      "expect": {
+        "status": 422,
+        "error": "asset_mismatch"
+      }
+    },
+    {
+      "name": "received bytes hash differs (headers lied)",
+      "draft": {
+        "version": "2026.11.11",
+        "state": "draft",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {}
+      },
+      "request": {
+        "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+        "content_length": 187236352,
+        "x_content_sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+        "received": {
+          "size": 187236352,
+          "sha256": "d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa"
+        }
+      },
+      "expect": {
+        "status": 422,
+        "error": "asset_mismatch"
+      }
+    },
+    {
+      "name": "received fewer bytes than declared",
+      "draft": {
+        "version": "2026.11.11",
+        "state": "draft",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {}
+      },
+      "request": {
+        "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+        "content_length": 187236352,
+        "x_content_sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac",
+        "received": {
+          "size": 187236342,
+          "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+        }
+      },
+      "expect": {
+        "status": 422,
+        "error": "asset_mismatch"
+      }
+    }
+  ],
+  "publish": [
+    {
+      "name": "complete draft is signed",
+      "draft": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "state": "draft",
+        "origin": "publish",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {
+          "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg": {
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz": {
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          "install.sh": {
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        }
+      },
+      "signer": "available",
+      "quota": "fits",
+      "expect": {
+        "status": 200,
+        "action": "sign"
+      }
+    },
+    {
+      "name": "complete import draft is stored verbatim, never signed",
+      "draft": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "state": "draft",
+        "origin": "import",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {
+          "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg": {
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz": {
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          "install.sh": {
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        }
+      },
+      "signer": "unavailable",
+      "quota": "fits",
+      "expect": {
+        "status": 200,
+        "action": "store_verbatim"
+      }
+    },
+    {
+      "name": "incomplete publish names what is missing",
+      "draft": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "state": "draft",
+        "origin": "publish",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {
+          "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg": {
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          "install.sh": {
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        }
+      },
+      "signer": "available",
+      "quota": "fits",
+      "expect": {
+        "status": 422,
+        "error": "assets_incomplete",
+        "missing": [
+          "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz"
+        ],
+        "mismatched": []
+      }
+    },
+    {
+      "name": "stored bytes no longer match",
+      "draft": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "state": "draft",
+        "origin": "publish",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {
+          "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg": {
+            "size": 187236352,
+            "sha256": "7ec879c8c860699e23145733661074c562767d6f860ed0de439e5c2724bc4b18"
+          },
+          "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz": {
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          "install.sh": {
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        }
+      },
+      "signer": "available",
+      "quota": "fits",
+      "expect": {
+        "status": 422,
+        "error": "assets_incomplete",
+        "missing": [],
+        "mismatched": [
+          "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg"
+        ]
+      }
+    },
+    {
+      "name": "completeness is checked before quota",
+      "draft": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "state": "draft",
+        "origin": "publish",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {
+          "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg": {
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          "install.sh": {
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        }
+      },
+      "signer": "available",
+      "quota": "exceeded",
+      "expect": {
+        "status": 422,
+        "error": "assets_incomplete",
+        "missing": [
+          "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz"
+        ],
+        "mismatched": []
+      }
+    },
+    {
+      "name": "quota is checked before signing",
+      "draft": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "state": "draft",
+        "origin": "publish",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {
+          "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg": {
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz": {
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          "install.sh": {
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        }
+      },
+      "signer": "unavailable",
+      "quota": "exceeded",
+      "expect": {
+        "status": 422,
+        "error": "quota_exceeded"
+      }
+    },
+    {
+      "name": "signer unavailable",
+      "draft": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "state": "draft",
+        "origin": "publish",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {
+          "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg": {
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz": {
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          "install.sh": {
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        }
+      },
+      "signer": "unavailable",
+      "quota": "fits",
+      "expect": {
+        "status": 503,
+        "error": "signer_unavailable"
+      }
+    },
+    {
+      "name": "no such draft",
+      "draft": {
+        "version": "2026.11.11",
+        "state": "none"
+      },
+      "signer": "available",
+      "quota": "fits",
+      "expect": {
+        "status": 404,
+        "error": "draft_not_found"
+      }
+    },
+    {
+      "name": "already published",
+      "draft": {
+        "version": "2026.11.11",
+        "channel": "stable",
+        "state": "published",
+        "origin": "publish",
+        "expected": [
+          {
+            "name": "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg",
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          {
+            "name": "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz",
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          {
+            "name": "install.sh",
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        ],
+        "uploaded": {
+          "Desktop-x7k2q-2026.11.11-macOS15-arm64.dmg": {
+            "size": 187236352,
+            "sha256": "285f91fe91ab31c979cad100aecba20e048f588c11e22d3a78dbb154c360e3ac"
+          },
+          "Desktop-x7k2q-2026.11.11-Linux-x64.tar.gz": {
+            "size": 64000000,
+            "sha256": "d6a1fab291004f31d58acd6ecb6a52c3fb146f1104be4e7998f0fbcdf696abb8"
+          },
+          "install.sh": {
+            "size": 21311,
+            "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+          }
+        }
+      },
+      "signer": "available",
+      "quota": "fits",
+      "expect": {
+        "status": 409,
+        "error": "not_a_draft"
+      }
+    }
+  ],
+  "quota": [
+    {
+      "name": "stable fits",
+      "state": {
+        "quota_bytes": 20000000000,
+        "beta_keep": 10,
+        "published": [
+          {
+            "version": "2026.9.1",
+            "channel": "stable",
+            "bytes": 5000000000
+          },
+          {
+            "version": "2026.10.1",
+            "channel": "stable",
+            "bytes": 4000000000
+          }
+        ],
+        "drafts": []
+      },
+      "release": {
+        "channel": "stable",
+        "bytes": 2000000000
+      },
+      "expect": {
+        "ok": true,
+        "used_bytes": 9000000000
+      }
+    },
+    {
+      "name": "stable over quota is refused, stables never pruned",
+      "state": {
+        "quota_bytes": 20000000000,
+        "beta_keep": 10,
+        "published": [
+          {
+            "version": "2026.9.1",
+            "channel": "stable",
+            "bytes": 5000000000
+          },
+          {
+            "version": "2026.10.1",
+            "channel": "stable",
+            "bytes": 4000000000
+          },
+          {
+            "version": "2026.10.1-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.2-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.3-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.4-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.5-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.6-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.7-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.8-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.9-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.10-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          }
+        ],
+        "drafts": []
+      },
+      "release": {
+        "channel": "stable",
+        "bytes": 2000000000
+      },
+      "expect": {
+        "ok": false,
+        "used_bytes": 19000000000,
+        "required_bytes": 2000000000
+      }
+    },
+    {
+      "name": "beta fits after pruning the oldest beta",
+      "state": {
+        "quota_bytes": 20000000000,
+        "beta_keep": 10,
+        "published": [
+          {
+            "version": "2026.9.1",
+            "channel": "stable",
+            "bytes": 5000000000
+          },
+          {
+            "version": "2026.10.1",
+            "channel": "stable",
+            "bytes": 4000000000
+          },
+          {
+            "version": "2026.10.1-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.2-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.3-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.4-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.5-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.6-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.7-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.8-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.9-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.10-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          }
+        ],
+        "drafts": []
+      },
+      "release": {
+        "channel": "beta",
+        "bytes": 2000000000
+      },
+      "expect": {
+        "ok": true,
+        "used_bytes": 18000000000,
+        "pruned": [
+          "2026.10.1-beta.1"
+        ]
+      }
+    },
+    {
+      "name": "beta over quota even after pruning",
+      "state": {
+        "quota_bytes": 20000000000,
+        "beta_keep": 10,
+        "published": [
+          {
+            "version": "2026.9.1",
+            "channel": "stable",
+            "bytes": 5000000000
+          },
+          {
+            "version": "2026.10.1",
+            "channel": "stable",
+            "bytes": 4000000000
+          },
+          {
+            "version": "2026.10.1-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.2-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.3-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.4-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.5-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.6-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.7-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.8-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.9-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.10-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          }
+        ],
+        "drafts": []
+      },
+      "release": {
+        "channel": "beta",
+        "bytes": 3000000000
+      },
+      "expect": {
+        "ok": false,
+        "used_bytes": 18000000000,
+        "required_bytes": 3000000000
+      }
+    },
+    {
+      "name": "open drafts reserve their declared bytes",
+      "state": {
+        "quota_bytes": 20000000000,
+        "beta_keep": 10,
+        "published": [
+          {
+            "version": "2026.9.1",
+            "channel": "stable",
+            "bytes": 5000000000
+          },
+          {
+            "version": "2026.10.1",
+            "channel": "stable",
+            "bytes": 4000000000
+          }
+        ],
+        "drafts": [
+          {
+            "version": "2026.11.12",
+            "bytes": 10000000000
+          }
+        ]
+      },
+      "release": {
+        "channel": "stable",
+        "bytes": 2000000000
+      },
+      "expect": {
+        "ok": false,
+        "used_bytes": 19000000000,
+        "required_bytes": 2000000000
+      }
+    },
+    {
+      "name": "exactly at quota is allowed",
+      "state": {
+        "quota_bytes": 20000000000,
+        "beta_keep": 10,
+        "published": [
+          {
+            "version": "2026.9.1",
+            "channel": "stable",
+            "bytes": 5000000000
+          },
+          {
+            "version": "2026.10.1",
+            "channel": "stable",
+            "bytes": 4000000000
+          }
+        ],
+        "drafts": []
+      },
+      "release": {
+        "channel": "stable",
+        "bytes": 11000000000
+      },
+      "expect": {
+        "ok": true,
+        "used_bytes": 9000000000
+      }
+    },
+    {
+      "name": "fewer than beta_keep betas prunes nothing",
+      "state": {
+        "quota_bytes": 20000000000,
+        "beta_keep": 10,
+        "published": [
+          {
+            "version": "2026.9.1",
+            "channel": "stable",
+            "bytes": 5000000000
+          },
+          {
+            "version": "2026.10.1",
+            "channel": "stable",
+            "bytes": 4000000000
+          },
+          {
+            "version": "2026.10.1-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.2-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.3-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.4-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          },
+          {
+            "version": "2026.10.5-beta.1",
+            "channel": "beta",
+            "bytes": 1000000000
+          }
+        ],
+        "drafts": []
+      },
+      "release": {
+        "channel": "beta",
+        "bytes": 1000000000
+      },
+      "expect": {
+        "ok": true,
+        "used_bytes": 14000000000,
+        "pruned": []
+      }
+    }
+  ]
+}

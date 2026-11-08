@@ -1,0 +1,149 @@
+import type { Database } from "./database.js";
+import { recordAudit, type AuditActor } from "./admin/audit.js";
+
+/**
+ * Operator capture policy (docs/capture-policy.md). Only keys present in
+ * `settings` are enforced; an absent key means the member chooses. Nothing is
+ * ever defaulted here.
+ */
+export type CaptureSettings = {
+  sharing_mode?: "all" | "new" | "selected";
+  upload_control?: "operator" | "user";
+  oops_window_seconds?: number;
+  user_retroactive_delete?: boolean;
+};
+
+export type CapturePolicy = { version: 1; revision: number; settings: CaptureSettings };
+
+export const UNSET_CAPTURE_POLICY: CapturePolicy = Object.freeze({
+  version: 1,
+  revision: 1,
+  settings: Object.freeze({}),
+}) as CapturePolicy;
+
+export class CapturePolicyError extends Error {
+  constructor(readonly status: number, readonly code: string, message: string) {
+    super(message);
+  }
+}
+
+const ENUMS: Record<string, readonly string[]> = {
+  sharing_mode: ["all", "new", "selected"],
+  upload_control: ["operator", "user"],
+};
+const MAX_OOPS_WINDOW_SECONDS = 86_400;
+
+function invalid(message: string): CapturePolicyError {
+  return new CapturePolicyError(400, "invalid_policy", message);
+}
+
+/** Validates a full settings object (unknown keys, enums, ranges). */
+export function parseCaptureSettings(value: unknown): CaptureSettings {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw invalid("settings must be a JSON object");
+  }
+  const settings: CaptureSettings = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (key === "sharing_mode" || key === "upload_control") {
+      if (typeof entry !== "string" || !ENUMS[key]!.includes(entry)) {
+        throw invalid(`${key} must be one of ${ENUMS[key]!.join(", ")}`);
+      }
+      (settings as Record<string, unknown>)[key] = entry;
+    } else if (key === "oops_window_seconds") {
+      if (typeof entry !== "number" || !Number.isInteger(entry) || entry < 0 || entry > MAX_OOPS_WINDOW_SECONDS) {
+        throw invalid(`oops_window_seconds must be an integer from 0 to ${MAX_OOPS_WINDOW_SECONDS}`);
+      }
+      settings.oops_window_seconds = entry;
+    } else if (key === "user_retroactive_delete") {
+      if (typeof entry !== "boolean") throw invalid("user_retroactive_delete must be a boolean");
+      settings.user_retroactive_delete = entry;
+    } else {
+      throw invalid(`Unknown capture policy key: ${key.slice(0, 64)}`);
+    }
+  }
+  return settings;
+}
+
+/** `If-Match: 7` or `If-Match: "7"`; undefined when absent. */
+export function parseIfMatch(header: string | string[] | undefined): number | undefined {
+  if (header === undefined) return undefined;
+  const raw = (Array.isArray(header) ? header[0] ?? "" : header).trim();
+  const match = /^"?([1-9][0-9]{0,8})"?$/.exec(raw);
+  if (!match) throw new CapturePolicyError(400, "invalid_request", "If-Match must be a policy revision number");
+  return Number(match[1]);
+}
+
+function project(row: { revision: number; settings: unknown } | undefined): CapturePolicy {
+  if (!row) return { ...UNSET_CAPTURE_POLICY, settings: {} };
+  const settings = row.settings && typeof row.settings === "object" && !Array.isArray(row.settings)
+    ? row.settings as CaptureSettings
+    : {};
+  return { version: 1, revision: Number(row.revision), settings: projectSettings(settings) };
+}
+
+/** Default oops window (15 min) served when the operator mandates upload. */
+export const DEFAULT_OOPS_WINDOW_SECONDS = 900;
+
+/**
+ * Served settings: stored settings plus `oops_window_seconds: 900` when
+ * `upload_control` is `operator` and no window was set. Storage is untouched.
+ */
+export function projectSettings(settings: CaptureSettings): CaptureSettings {
+  if (settings.upload_control === "operator" && settings.oops_window_seconds === undefined) {
+    return { ...settings, oops_window_seconds: DEFAULT_OOPS_WINDOW_SECONDS };
+  }
+  return settings;
+}
+
+export async function readCapturePolicy(database: Database, organizationId: string): Promise<CapturePolicy> {
+  const result = await database.query<{ revision: number; settings: unknown }>(
+    "SELECT revision, settings FROM selfhost_capture_policies WHERE organization_id = $1",
+    [organizationId],
+  );
+  return project(result.rows[0]);
+}
+
+/**
+ * Replaces (or, with `settings` empty and action cleared, resets) the policy
+ * in one transaction. Revision is previous + 1; an absent row counts as the
+ * unset revision 1, so the first write is revision 2.
+ */
+export async function writeCapturePolicy(database: Database, input: {
+  organizationId: string;
+  settings: CaptureSettings;
+  expectedRevision?: number;
+  actor: AuditActor;
+  action: "capture_policy.set" | "capture_policy.cleared";
+}): Promise<CapturePolicy> {
+  return database.transaction(async (tx) => {
+    // Serializes writers per organization, including the first insert.
+    await tx.query("SELECT id FROM selfhost_organizations WHERE id = $1 FOR UPDATE", [input.organizationId]);
+    const current = project((await tx.query<{ revision: number; settings: unknown }>(
+      "SELECT revision, settings FROM selfhost_capture_policies WHERE organization_id = $1",
+      [input.organizationId],
+    )).rows[0]);
+    if (input.expectedRevision !== undefined && input.expectedRevision !== current.revision) {
+      throw new CapturePolicyError(409, "revision_mismatch",
+        `Capture policy is at revision ${current.revision}, not ${input.expectedRevision}`);
+    }
+    const revision = current.revision + 1;
+    const userId = input.actor.kind === "user" ? input.actor.userId : null;
+    await tx.query(
+      `INSERT INTO selfhost_capture_policies (organization_id, revision, settings, set_by_user_id, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, now())
+       ON CONFLICT (organization_id) DO UPDATE
+         SET revision = EXCLUDED.revision, settings = EXCLUDED.settings,
+             set_by_user_id = EXCLUDED.set_by_user_id, updated_at = now()`,
+      [input.organizationId, revision, JSON.stringify(input.settings), userId],
+    );
+    // The audit row names the keys, never their values.
+    const keys = Object.keys(input.settings).sort();
+    await recordAudit(tx, {
+      organizationId: input.organizationId,
+      actor: input.actor,
+      action: input.action,
+      target: `${input.organizationId} revision=${revision}${keys.length ? ` keys=${keys.join(",")}` : ""}`,
+    });
+    return { version: 1, revision, settings: projectSettings(input.settings) };
+  });
+}

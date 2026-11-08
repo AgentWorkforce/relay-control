@@ -1,0 +1,84 @@
+{
+  "schema": 1,
+  "profile": "x7k2q",
+  "channel": "beta",
+  "version": "2026.11.10",
+  "published_at": "2026-11-24T08:00:00Z",
+  "notes": "- Beta: tray menu rework. Unicode survives JCS: é €.\n",
+  "download_hosts": [],
+  "assets": [
+    {
+      "id": "a_01JD3Q4W21",
+      "name": "Desktop-x7k2q-2026.11.10-beta.2-macOS15-arm64.dmg",
+      "platform": "macOS",
+      "arch": "arm64",
+      "os_floor": 15,
+      "kind": "image",
+      "size": 187236352,
+      "sha256": "e56a5adc7ce3ccf406d66da4d83df89b60c566534f4835bc4e94c4324bdeb226"
+    },
+    {
+      "id": "a_01JD3Q4W22",
+      "name": "Desktop-x7k2q-2026.11.10-beta.2-macOS-arm64.dmg",
+      "platform": "macOS",
+      "arch": "arm64",
+      "kind": "image",
+      "size": 186000000,
+      "sha256": "210619a9265af7a1cdb6b1d63cbc38e59da157f1def377e3ebbf928bbb1cf6a4"
+    },
+    {
+      "id": "a_01JD3Q4W23",
+      "name": "Desktop-x7k2q-2026.11.10-beta.2-Linux-x64.tar.gz",
+      "platform": "Linux",
+      "arch": "x64",
+      "kind": "tarball",
+      "size": 64000000,
+      "sha256": "f9c46a81e8c41f938c6cb203e4382659c790cf16b0c6ef36bbf15f4f2cebb183"
+    },
+    {
+      "id": "a_01JD3Q4W24",
+      "name": "Desktop-x7k2q-2026.11.10-beta.2-Linux-x64.deb",
+      "platform": "Linux",
+      "arch": "x64",
+      "kind": "deb",
+      "size": 63000000,
+      "sha256": "1ba0bdc6d0b92bb0215c501fbd92dabf24125f12783090a4da35571ae21dbd45"
+    },
+    {
+      "id": "a_01JD3Q4W25",
+      "name": "Desktop-x7k2q-2026.11.10-beta.2-Windows-x64-Setup.exe",
+      "platform": "Windows",
+      "arch": "x64",
+      "kind": "setup",
+      "size": 71000000,
+      "sha256": "9171342e4581910b611bcef3d059055f8d99e2deaa2d128bc9a0c86ab9422c89"
+    },
+    {
+      "id": "a_01JD3Q4W26",
+      "name": "Desktop-x7k2q-2026.11.10-beta.2-Windows-arm64.zip",
+      "platform": "Windows",
+      "arch": "arm64",
+      "kind": "zip",
+      "size": 70000000,
+      "sha256": "77bf948d1331f7b481cca213d22761fa85086a9d3819b4b7440c6905ff82eae6"
+    },
+    {
+      "id": "a_01JD3Q4W27",
+      "name": "Desktop-x7k2q-2026.11.10-beta.2-Linux-arm64-probe.tar.gz",
+      "platform": "Linux",
+      "arch": "arm64",
+      "kind": "probe",
+      "size": 9000000,
+      "sha256": "1fe7cd8bd01b249c753d4c972be34465d876ba6f5d5826f9180dfd87ce4ffabd"
+    },
+    {
+      "id": "a_01JD3Q4W28",
+      "name": "install.sh",
+      "platform": "Linux",
+      "arch": "x64",
+      "kind": "install-script",
+      "size": 21311,
+      "sha256": "043df5bdbf6639d7a77e1d44c5226fd7371e5259a1e4df3a0dd5d64c30dca44f"
+    }
+  ]
+}
