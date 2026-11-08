@@ -82,16 +82,28 @@ export function historyReader(
     callerToken,
   };
   return async (path: string, options: { timeoutMessage?: string } = {}): Promise<unknown> => {
+    // MCP admission authenticates the person; content reads additionally need
+    // the issue-time read scope. Neither a handoff nor a service credential
+    // may be promoted by the reader's Control handoff.
+    if (!principal.scopes.includes("rth:read") || principal.pendingHandoff || !callerToken.startsWith("sh_at_")) {
+      throw new SharedSessionsToolError("Session reads require an exchanged user session with rth:read.");
+    }
     const url = new URL(path, "https://relayhistory.invalid");
     try {
       const result = await readViaSessionRead(config, identity, url.pathname, url.searchParams)
         ?? await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
+      if (result.status === "unsupported") {
+        throw new SharedSessionsToolError("The selected backend does not support this view (unsupported_by_backend).");
+      }
       if (result.status !== "ok") throw new SharedSessionsToolError(UNAVAILABLE_MESSAGE);
       return result.body;
     } catch (error) {
       if (error instanceof SharedSessionsToolError) throw error;
       if (error instanceof ReadCursorExpiredError) throw new SharedSessionsToolError(error.message);
       if (error instanceof UpstreamError) {
+        if (error.status === 401) {
+          throw new SharedSessionsToolError("Reader credentials were refused. Reauthenticate before reading again.");
+        }
         if (error.message === "RelayHistory did not attest the workspace") {
           console.error("[selfhost-mcp] History workspace attestation failed");
           throw new SharedSessionsToolError(ATTESTATION_MESSAGE);
