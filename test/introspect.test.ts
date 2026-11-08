@@ -251,6 +251,7 @@ test("introspection describes an active access token and rotates token_id on ref
     machine_id: null,
     org: env.organizationId,
     workspace: env.alpha,
+    role: "owner",
     scopes: ["cli:auth", "rth:read", "rth:sync", "rth:acquire"],
     aud: HISTORY_PUBLIC,
     iat: Math.floor(new Date(session.created_at).getTime() / 1_000),
@@ -872,4 +873,27 @@ test("introspection without a workspace verifies machines in the session's works
     (await env.introspect({ ...base, machine: "node-nobody" })).body,
     { active: false, reason: "machine_unclaimed" },
   );
+});
+
+test("introspection reports the live organization role, for add-on admin decisions", async (t) => {
+  const env = await setup(t);
+  const { accessToken: ownerToken } = await env.login(env.alpha);
+  const active = await env.introspect({ token: ownerToken, aud: HISTORY_PUBLIC });
+  assert.equal(active.body.role, "owner");
+
+  const memberId = await env.member("member@example.test");
+  await env.database.query(
+    "UPDATE selfhost_token_sessions SET user_id = $1 WHERE access_token_hash = $2",
+    [memberId, sha256(ownerToken)],
+  );
+  const asMember = await env.introspect({ token: ownerToken, aud: HISTORY_PUBLIC });
+  assert.equal(asMember.body.active, true);
+  assert.equal(asMember.body.role, "member");
+
+  await env.database.query(
+    "UPDATE selfhost_organization_memberships SET role = 'admin' WHERE user_id = $1",
+    [memberId],
+  );
+  const promoted = await env.introspect({ token: ownerToken, aud: HISTORY_PUBLIC });
+  assert.equal(promoted.body.role, "admin");
 });
