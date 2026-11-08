@@ -204,9 +204,18 @@ export class ControlPlaneStore {
            AND to_regclass('public.selfhost_token_sessions') IS NOT NULL
            AND to_regclass('public.selfhost_workspaces') IS NOT NULL
            AND to_regclass('public.selfhost_organization_domains') IS NOT NULL
-           AND EXISTS (
-             SELECT 1 FROM selfhost_schema_migrations
-              WHERE name = '0014_multi_tenant.sql'
+           -- Runtime roles deliberately cannot read the migration ledger.
+           -- Check the minimum multi-tenant schema through visible columns.
+           AND (
+             SELECT count(*) = 5 FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND (
+                  (table_name = 'selfhost_users'
+                   AND column_name IN ('last_organization_id', 'last_workspace_id'))
+                  OR (table_name = 'selfhost_installation_bootstrap'
+                      AND column_name IN ('personal_org_signup_enabled', 'self_serve_organizations_enabled'))
+                  OR (table_name = 'selfhost_telemetry_outbox' AND column_name = 'organization_id')
+                )
            ) AS present,
            (SELECT count(*)::int FROM selfhost_organizations) AS organizations`,
       );
