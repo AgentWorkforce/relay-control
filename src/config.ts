@@ -17,6 +17,8 @@ export type SelfhostConfig = {
   relayhistoryUrl: string;
   /** Optional GET-only pipeline reader for unsearched session lists and turns. */
   relayhistoryReadApiUrl?: string | null;
+  /** Independent read service; owns issuance, rotation and verification of its tokens. */
+  sessionReadApi?: { url: string; publicUrl: string; secret: string } | null;
   relayhistoryPublicUrl: string;
   relayauthApiKey: string | null;
   bootstrapToken: string;
@@ -273,6 +275,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     relayhistoryUrl: serviceUrl(env, "RELAYHISTORY_URL"),
     relayhistoryPublicUrl,
     relayhistoryReadApiUrl,
+    sessionReadApi: loadSessionReadApiConfig(env),
     ...introspection,
     bootstrapToken,
     encryptionKeyring: loadEncryptionKeyring(env),
@@ -280,6 +283,20 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     factory: loadFactoryConfig(env),
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
+  };
+}
+
+function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {
+  const secret = readSecret(env, "SESSION_READ_API_SECRET");
+  const names = ["SESSION_READ_API_URL", "SESSION_READ_API_PUBLIC_URL"] as const;
+  if (!secret && !names.some((name) => env[name]?.trim())) return null;
+  if (!secret || Buffer.byteLength(secret) < 32) {
+    throw new Error("SESSION_READ_API_SECRET (or _FILE) must be at least 32 bytes");
+  }
+  return {
+    url: serviceUrl(env, "SESSION_READ_API_URL"),
+    publicUrl: publicServiceUrl(env, "SESSION_READ_API_PUBLIC_URL"),
+    secret,
   };
 }
 
@@ -442,6 +459,7 @@ export function configFingerprint(config: SelfhostConfig): string {
       config.relayhistoryUrl,
       config.relayhistoryPublicUrl,
       ...(config.relayhistoryReadApiUrl ? [config.relayhistoryReadApiUrl] : []),
+      ...(config.sessionReadApi ? [config.sessionReadApi.url, config.sessionReadApi.publicUrl] : []),
     ].join("\n"))
     .digest("hex")
     .slice(0, 12);

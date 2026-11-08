@@ -14,6 +14,7 @@ import {
   UpstreamError,
 } from "./relayhistory.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
+import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, INTROSPECT_PATH } from "./auth/introspect.js";
 import {
@@ -1546,6 +1547,38 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    const readSession = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/session-read\/(session|refresh)$/);
+    if (readSession && method === "POST") {
+      const browser = !bearer(request);
+      const { principal, workspace } = await workspaceAccess(request, readSession[0]!);
+      if (browser && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      if (browser && readSession[1] === "refresh") {
+        throw new HttpError(403, "forbidden", "Browser clients must request a new read session");
+      }
+      if (principal.pendingHandoff) {
+        throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      }
+      if (!principal.scopes.includes("rth:read")) {
+        throw new HttpError(403, "forbidden", "Read credentials require rth:read");
+      }
+      if (!config.sessionReadApi) throw new HttpError(404, "session_read_not_configured", "Session read API is not configured");
+      const schema = readSession[1] === "refresh" ? readRefreshRequest : readSessionRequest;
+      const parsed = schema.safeParse(await requestObject(request));
+      if (!parsed.success) throw new HttpError(400, "invalid_request", "Invalid session read request");
+      rateLimit(response, `session-read:${principal.userId}:${workspace.id}`,
+        { limit: 30, windowMs: 60_000 }, "rate_limited", "Too many session read credential requests");
+      const session = await requestReadSession(config.sessionReadApi, {
+        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
+      }, parsed.data);
+      // Page scripts get a short-lived access token only. Renew by requesting
+      // a new session through the cookie path, which rechecks live membership.
+      const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
+      json(response, 200, browser ? accessOnly : session, true);
+      return;
+    }
+
     // Read-only: which RelayHistory origin this workspace's sessions are bound
     // to. Nothing is issued and RelayHistory is not called, so Desktop can
     // answer site-push admission and cold-process delete/revoke lookups
@@ -1702,6 +1735,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       if (error instanceof ReadCursorExpiredError) {
         json(response, 410, { error: "cursor_expired", message: error.message }, true);
+        return;
+      }
+      if (error instanceof SessionReadError) {
+        json(response, error.status, { error: error.code, message: error.message }, true);
         return;
       }
       if (error instanceof UpstreamError) {

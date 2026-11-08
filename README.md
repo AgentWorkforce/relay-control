@@ -137,6 +137,48 @@ assertions (when RelayAuth is set) use `RELAYHISTORY_PUBLIC_URL` as
 
 ### RelayAuth and RelayHistory
 
+The independent session read API has its own credential handoff:
+
+- `POST /api/v1/workspaces/{workspace}/session-read/session`, body `{ label? }`.
+- `POST /api/v1/workspaces/{workspace}/session-read/refresh`, body `{ refreshToken }`.
+
+Both also accept the `/cloud` prefix. Enable them with all three settings:
+`SESSION_READ_API_URL` (internal HTTP(S) origin), `SESSION_READ_API_PUBLIC_URL`
+(bare public HTTPS origin), and `SESSION_READ_API_SECRET` or its mutually
+exclusive `_FILE` form (at least 32 bytes). Leave all unset to keep this
+handoff disabled. Use a dedicated Control-to-reader secret; it is never sent
+to clients. These settings do not change the existing History connection.
+
+Control authenticates the user, refuses unexchanged Desktop handoffs, checks
+live workspace membership and `rth:read` on every issue and refresh, and
+requests credentials from the read API. The read API issues, stores, rotates,
+revokes and verifies its own opaque tokens. Control neither creates nor
+persists reader tokens. Caller-supplied tenant, audience, scope and URL fields
+are rejected. The response's identity, audience, read-only scope, token format
+and expiry are validated before credentials are returned with `Cache-Control:
+no-store`. Each user/workspace may request credentials 30 times per minute.
+
+Bearer-authenticated clients receive `{ baseUrl, sessionId, userId, orgId,
+workspaceId, audience, scopes: ["rth:read"], accessToken,
+accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType: "Bearer" }`.
+Refresh requires both a current Control access token and the reader refresh
+token. The reader binds and atomically rotates that token for the authorized
+identity. A rejected refresh requires sign-in again; an unavailable reader
+fails closed without falling back to older History or returning upstream bodies.
+
+Browser cookie clients call `/cloud/.../session` with JSON and the dashboard
+or API `Origin`. They receive only the access credential; both refresh fields
+are omitted. After expiry they request a new session through Control, checking
+membership again. Cookie requests to `/refresh` are refused. No refresh token
+custody or reader token storage is added to Control.
+
+The internal reader contract is `POST /internal/v1/session-read/sessions` or
+`/internal/v1/session-read/sessions/refresh`, authenticated by the dedicated
+secret. Control supplies `{ userId, orgId, workspaceId, audience, scopes:
+["rth:read"], label? }`, with `refreshToken` instead of `label` on refresh.
+The reader returns the bearer response above without `baseUrl`; Control sets
+that from configuration. Keep these internal routes off public ingress.
+
 `POST /api/v1/relayhistory/session` (and the `/cloud` alias) works in two
 modes, chosen by whether `RELAYAUTH_URL`/`RELAYAUTH_API_KEY` are set. Setting
 only one of them fails startup.
