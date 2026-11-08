@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createServer } from "node:http";
-import { createApp } from "./app.js";
+import { browserOriginsFor, createApp } from "./app.js";
+import { createFactoryModule } from "./factory/routes.js";
 import { createAdminModule } from "./admin/routes.js";
 import { recordAudit } from "./admin/audit.js";
 import { configFingerprint, loadConfig, SELFHOST_API_VERSION } from "./config.js";
@@ -15,6 +16,13 @@ import { IdentityStore } from "./identity/store.js";
 import { smtpMailer } from "./identity/mailer.js";
 import { createIdentityModule } from "./identity/routes.js";
 import { relaycastProvisioner, startBootstrap } from "./identity/bootstrap.js";
+import { loadAnalyticsConfig } from "./analytics/config.js";
+import {
+  buildAnalytics,
+  emitConfigLoaded,
+  emitServiceStarted,
+  emitStopping,
+} from "./analytics/lifecycle.js";
 
 const config = loadConfig();
 const database = new PostgresDatabase(config.databaseUrl);
@@ -59,23 +67,46 @@ const admin = createAdminModule({
 });
 // Subscription logins reach runs through a reference in the assignment payload.
 flows.cliCredentials = admin.logins;
+const telemetryConfig = loadTelemetryConfig(process.env, {
+  probes: [
+    { name: "relaycast", url: `${config.relaycastUrl}/health` },
+    // RelayAuth is optional: without it History introspects relaycontrol tokens.
+    ...(config.relayauthUrl ? [{ name: "relayauth", url: `${config.relayauthUrl}/health` }] : []),
+    { name: "relayhistory", url: `${config.relayhistoryUrl}/readyz` },
+  ],
+});
+const relaycontrolVersion = process.env.SELFHOST_IMAGE_VERSION?.trim() || SELFHOST_API_VERSION;
 const telemetry = createTelemetryModule({
-  config: loadTelemetryConfig(process.env, {
-    probes: [
-      { name: "relaycast", url: `${config.relaycastUrl}/health` },
-      // RelayAuth is optional: without it History introspects relaycontrol tokens.
-      ...(config.relayauthUrl ? [{ name: "relayauth", url: `${config.relayauthUrl}/health` }] : []),
-      { name: "relayhistory", url: `${config.relayhistoryUrl}/readyz` },
-    ],
-  }),
+  config: telemetryConfig,
   database,
   keyring: config.encryptionKeyring,
-  relaycontrolVersion: process.env.SELFHOST_IMAGE_VERSION?.trim() || SELFHOST_API_VERSION,
+  relaycontrolVersion,
   relaycastUrl: config.relaycastUrl,
   audit: (event) => recordAudit(database, event),
   tenancy: identityConfig.tenancy.mode,
 });
-const server = createServer(createApp({ config, store, flows, admin, telemetry, identity }));
+// Factory sessions: routes 404 and the worker stays off unless SELFHOST_FACTORY_ENABLED.
+const factory = createFactoryModule({
+  config,
+  database,
+  messaging: { database, keyring: config.encryptionKeyring, relaycastUrl: config.relaycastUrl },
+  browserOrigins: browserOriginsFor(config),
+});
+// Product analytics: a separate, bounded port. Export failures never fail the product.
+const analyticsConfig = loadAnalyticsConfig(process.env);
+const analytics = buildAnalytics(analyticsConfig);
+emitConfigLoaded(analytics, {
+  telemetry: telemetryConfig,
+  signIn: {
+    oidc: identityConfig.oidc !== null,
+    emailLink: identityConfig.emailLogin,
+    smtp: identityConfig.smtp !== null,
+  },
+  // The flows module is always mounted in this binary.
+  flowsEnabled: true,
+  operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
+});
+const server = createServer(createApp({ config, store, flows, admin, telemetry, identity, factory }));
 const bootstrapAbort = new AbortController();
 // Worker queue streams are long-lived SSE responses.
 server.requestTimeout = 0;
@@ -83,6 +114,7 @@ server.headersTimeout = 65_000;
 
 async function start(): Promise<void> {
   telemetry.start();
+  factory.start();
   server.listen(config.port, config.host, () => {
     console.log("[selfhost-api] listening", {
       host: config.host,
@@ -95,6 +127,10 @@ async function start(): Promise<void> {
         smtp: identityConfig.smtp !== null,
         autoJoinDomains: identityConfig.autoJoinDomains.length,
       },
+    });
+    emitServiceStarted(analytics, {
+      componentVersion: relaycontrolVersion,
+      configFingerprint: configFingerprint(config),
     });
   });
   if (identityConfig.bootstrap) {
@@ -111,22 +147,30 @@ async function start(): Promise<void> {
 }
 
 void start().catch(async (error: unknown) => {
+  // Set first: whatever happens below, the process must not exit 0.
+  process.exitCode = 1;
   console.error("[selfhost-api] startup failed", {
     error: error instanceof Error ? error.message : String(error),
   });
+  // The flush deadline timer holds the process open, so this completes or
+  // times out (SHUTDOWN_DEADLINE_MS) before exit.
+  await emitStopping(analytics, "startup_failed", analyticsConfig.shutdownDeadlineMs);
   await database.close();
-  process.exitCode = 1;
 });
 
-async function shutdown(signal: string): Promise<void> {
+async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
+  // One 10 s budget for the whole sequence: telemetry stop, analytics flush
+  // (SHUTDOWN_DEADLINE_MS, at most 8 s), server.close and database.close.
+  setTimeout(() => process.exit(1), 10_000).unref();
   console.log("[selfhost-api] shutting down", { signal });
   bootstrapAbort.abort();
   await telemetry.stop();
+  await factory.stop();
+  await emitStopping(analytics, signal, analyticsConfig.shutdownDeadlineMs);
   server.close(async () => {
     await database.close();
     process.exit(0);
   });
-  setTimeout(() => process.exit(1), 10_000).unref();
 }
 
 process.on("SIGINT", () => void shutdown("SIGINT"));

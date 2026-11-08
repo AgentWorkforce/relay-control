@@ -7,6 +7,7 @@ import { cookieRequestAllowed } from "../auth/device-approval.js";
 import type { SelfhostConfig } from "../config.js";
 import { secureEqual } from "../crypto.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
+import { providerStatuses, type ProviderProbes } from "../providers/registry.js";
 import type { ControlPlaneStore } from "../store.js";
 import { MCP_FACADE, type McpAuthMode } from "./catalog.js";
 import { historyReader, type McpContext, type McpMember } from "./context.js";
@@ -94,6 +95,8 @@ export function createMcpHandler(input: {
   siteBaseUrl: (request: IncomingMessage) => string;
   /** Relaycast fetch; tests inject it, the server uses global fetch. */
   fetchImpl?: typeof fetch;
+  /** Provider runtime probes (src/providers/registry.ts); empty when unset. */
+  providerProbes?: ProviderProbes;
 }) {
   const { config, store } = input;
   const apiTokens = new ApiTokenStore(store.database);
@@ -215,6 +218,7 @@ export function createMcpHandler(input: {
         email: String(row.email),
         name: typeof row.name === "string" && row.name.trim() ? row.name : null,
       })),
+      providers: () => providerStatuses(input.providerProbes),
       relaycast: {
         listAgents: (status) => relaycast.listAgents(workspace.relaycastApiKey, status),
         listPresence: () => relaycast.listPresence(workspace.relaycastApiKey),

@@ -31,6 +31,11 @@ servers:
 security:
   - bearerAuth: []
 tags:
+  - name: factory
+    description: |
+      Factory sessions (docs/factory-sessions.md). Every operation answers
+      404 not_found when SELFHOST_FACTORY_ENABLED is off. Errors are
+      {error, message} with stable codes; secrets are never returned.
   - name: internal
     description: |
       In-cluster service routes under /internal/v1. Never served through the
@@ -87,7 +92,9 @@ paths:
         `list_relay_channels`, `subscribe_relay_channel`,
         `unsubscribe_relay_channel`, `post_relay_channel`, `read_relay_channel`;
         names and arguments match Cloud), and capability discovery
-        (`describe_capabilities`). Relay tools act as a hosted Relaycast
+        (`describe_capabilities`; its report lists `groups` and, next to them,
+        `providers`: the same `ProviderStatus` array as
+        `GET /api/v1/workspaces/{workspaceId}/providers`). Relay tools act as a hosted Relaycast
         participant owned by the caller, bound to the `Mcp-Session-Id` or chosen
         with `as`; replies arrive in `check_relay_inbox`. Launches,
         `as_person` and desktop-linked identity (`join_relay desktop_address`)
@@ -1321,8 +1328,12 @@ paths:
       operationId: resolveWorkspace
       description: |
         Returns the configured public Relaycast HTTPS origin. The internal
-        Relaycast URL is never exposed. Returns 404, not 403, when the bearer
-        belongs to another tenant.
+        Relaycast URL is never exposed. Requires a person credential (bearer,
+        or the session cookie under `/cloud`) carrying the `cli:auth` scope;
+        any workspace role may resolve. Each disclosure writes a
+        `workspace.relaycast_key.resolved` audit event (no secret recorded).
+        Returns 404, not 403, when the bearer belongs to another tenant or
+        is no longer a member.
       responses:
         "200":
           description: Relaycast endpoint and decrypted workspace credential
@@ -1330,6 +1341,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WorkspaceResolution"
+        "401":
+          description: Missing, invalid, revoked, or bootstrap token
+        "403":
+          description: Token lacks `cli:auth`, or is a workspace API token (`sh_wk_`) or the internal service token
         "404":
           description: Workspace does not exist or is outside the bearer tenant
   /api/v1/workspaces/{workspaceId}/runtime:
@@ -1355,6 +1370,47 @@ paths:
       responses:
         "200":
           description: Stored runtime configuration
+  /api/v1/workspaces/{workspaceId}/providers:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listWorkspaceProviders
+      summary: Provider catalog with this build's runtime state.
+      description: |
+        Read-only, for any member of the workspace; also served at
+        `/cloud/api/v1/workspaces/{workspaceId}/providers`. Every known
+        provider (Amp, Factory, GitHub Copilot, Capy, Replicas, Dot, Grok Bot)
+        is listed with its descriptor and three separate runtime states:
+        `implemented` (a provider module is present in this build),
+        `configured` (its configuration resolves) and `enabled` (the module is
+        mounted and switched on). A build without a provider module reports
+        all three as false. `mcpGroupsRegistered` is true only when the
+        provider owns MCP tool groups and every one is served by the
+        shared-sessions MCP endpoint. Other methods answer 405 after
+        authorization.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Provider statuses, in catalog order
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [providers]
+                properties:
+                  providers:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ProviderStatus"
+        "401":
+          description: Missing or invalid credential
+        "404":
+          description: Workspace does not exist or the caller is not a member (`workspace_not_found`)
+        "405":
+          description: Method other than GET (`method_not_allowed`)
   /cloud/api/v1/workspaces/{workspaceId}/sessions:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -1777,6 +1833,73 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UnsupportedByBackend"
+  /api/v1/workspaces/{workspaceId}/relayhistory/origin:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getRelayhistoryOrigin
+      description: |
+        Read-only lookup of the RelayHistory origin this workspace's sessions
+        are bound to (also under the `/cloud/api` alias). Callers are the
+        user sessions the session route accepts (device session, exchanged
+        Desktop handoff and its exchange session, `/cloud` browser session
+        cookie), bound to this workspace, with no extra scope; an unexchanged
+        Desktop sign-in handoff is refused, and service, bootstrap and
+        workspace API tokens are not user tokens. A workspace in the token's
+        own organization that the caller is a member of, but that the token
+        is not bound to, is 403; every workspace outside the token's
+        organization is 404, even one the same person belongs to. Checked in
+        order: authentication, handoff, workspace binding, membership,
+        configuration. Nothing is
+        issued, RelayHistory is not called, and it does not count against
+        anything the session issue/renew path does, so Agent Relay Desktop
+        can use it for site-push admission and cold-process delete/revoke
+        lookups. `origin` and `audience` are both the configured
+        RELAYHISTORY_PUBLIC_URL, the exact string the issuer binds sessions
+        to (assertion `historyOrigin`/`aud`, default introspection audience,
+        returned `baseUrl`); it is installation-wide, not per workspace.
+      responses:
+        "200":
+          description: The workspace's RelayHistory origin and session audience
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-store]
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [workspace, origin, audience]
+                properties:
+                  workspace:
+                    type: string
+                    description: The workspace id from the path
+                  origin:
+                    type: string
+                    format: uri
+                    description: Public RelayHistory origin, scheme://host[:port]
+                  audience:
+                    type: string
+                    description: Audience the issuer binds this workspace's History sessions to
+        "401":
+          description: |
+            `unauthorized`: missing, invalid, revoked or expired user access
+            token, or a service, bootstrap or workspace API (`sh_wk_`) token.
+        "403":
+          description: |
+            `handoff_not_exchanged`: the bearer is a Desktop sign-in handoff
+            whose PKCE exchange (POST /api/v1/auth/desktop/session) has not
+            happened. `forbidden`: the workspace is in the token's
+            organization and the caller is a member, but the token is bound to
+            another workspace.
+        "404":
+          description: |
+            `workspace_not_found`: workspace does not exist, is outside the
+            token's organization (even if the same person is a member there),
+            or the caller is not a member. `relayhistory_not_configured`: RELAYHISTORY_URL
+            or RELAYHISTORY_PUBLIC_URL is unset (checked after authorization).
   /api/v1/workspaces/{workspaceId}/relayhistory/session:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -4416,8 +4539,373 @@ paths:
                   - $ref: "#/components/schemas/DesktopFeedError"
                   - properties: { error: { enum: [install_token_not_found] } }
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
+  /api/v1/workspaces/{workspaceId}/factory/connection:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [factory]
+      operationId: getFactoryConnection
+      description: |
+        Owner/admin with cli:auth; workspace API tokens and the internal token
+        are refused (403 factory_workspace_token). 404 not_found when
+        SELFHOST_FACTORY_ENABLED is off. The key is never returned.
+      responses:
+        "200":
+          description: Summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FactorySummary" }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+    put:
+      tags: [factory]
+      operationId: putFactoryConnection
+      description: |
+        Connect or replace the workspace Factory key. The key is validated by
+        listing computers; only an envelope and a key_hint are stored. Another
+        admin may connect only when no other member has a live binding or a
+        cleanup-pending binding of an active member (409
+        factory_other_member_bindings). The owner's replacement re-verifies up
+        to 8 bound sessions (409 factory_replace_limit above that).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key: { type: string, minLength: 16, maxLength: 2048, writeOnly: true }
+      responses:
+        "200":
+          description: Summary after connect
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FactorySummary" }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+        "409": { $ref: "#/components/responses/FactoryError" }
+        "422": { $ref: "#/components/responses/FactoryError" }
+        "502": { $ref: "#/components/responses/FactoryError" }
+        "503": { $ref: "#/components/responses/FactoryError" }
+    delete:
+      tags: [factory]
+      operationId: deleteFactoryConnection
+      description: |
+        Connection owner only (403 factory_not_owner); no admin
+        force-disconnect. Retires only the owner's bindings, then deletes the
+        connection.
+      responses:
+        "204": { description: Disconnected }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/workspaces/{workspaceId}/factory/computers:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [factory]
+      operationId: listFactoryComputers
+      description: Connection owner only.
+      responses:
+        "200":
+          description: Computers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  computers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        name: { type: string }
+                        status: { type: string }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+        "502": { $ref: "#/components/responses/FactoryError" }
+        "503": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/workspaces/{workspaceId}/factory/computers/{computerId}/sessions:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: computerId, in: path, required: true, schema: { type: string, pattern: "^[A-Za-z0-9_-]{1,256}$" } }
+    get:
+      tags: [factory]
+      operationId: listFactorySessions
+      description: Connection owner only. An unreachable computer yields a warning, not an error.
+      responses:
+        "200":
+          description: Sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        title: { type: string }
+                        computer_id: { type: string }
+                        bound: { enum: [here, elsewhere, null] }
+                  warning: { type: string }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+        "422": { $ref: "#/components/responses/FactoryError" }
+        "503": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/workspaces/{workspaceId}/factory/bindings:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [factory]
+      operationId: listFactoryBindings
+      description: The caller's own bindings in this workspace.
+      responses:
+        "200":
+          description: Bindings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bindings:
+                    type: array
+                    items: { $ref: "#/components/schemas/FactoryBinding" }
+                  history: { const: deferred }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+    post:
+      tags: [factory]
+      operationId: createFactoryBinding
+      description: |
+        Connection owner only. Binds a session pinned to its computer and
+        registers one hosted Relay agent. 409 factory_cleanup_pending while a
+        retired binding of the same session still holds its remote agent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, computer_id]
+              properties:
+                session_id: { type: string }
+                computer_id: { type: string }
+      responses:
+        "201":
+          description: Bound
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  binding_id: { type: string, format: uuid }
+                  session_id: { type: string }
+                  agent:
+                    type: object
+                    properties:
+                      name: { type: string }
+                      id: { type: string }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+        "409": { $ref: "#/components/responses/FactoryError" }
+        "422": { $ref: "#/components/responses/FactoryError" }
+        "503": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/workspaces/{workspaceId}/factory/bindings/{bindingId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/FactoryBindingId"
+    get:
+      tags: [factory]
+      operationId: getFactoryBinding
+      description: Binding owner only; another member's binding is 404.
+      responses:
+        "200":
+          description: Binding
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FactoryBinding" }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+    delete:
+      tags: [factory]
+      operationId: deleteFactoryBinding
+      description: |
+        Binding owner only. Retires the binding, clears its secrets, payload
+        ciphertext and reply hashes, and releases the Relay agent after commit.
+        A missing binding is 204.
+      responses:
+        "204": { description: Unbound }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/workspaces/{workspaceId}/factory/bindings/{bindingId}/deliveries/{messageId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/FactoryBindingId"
+      - { name: messageId, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [factory]
+      operationId: getFactoryDelivery
+      description: Delivery receipt, binding owner only.
+      responses:
+        "200":
+          description: Receipt
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state: { enum: [pending, sending, delivered, rejected, unknown] }
+                  code: { type: string }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/workspaces/{workspaceId}/factory/bindings/{bindingId}/history/schedule:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/FactoryBindingId"
+    post:
+      tags: [factory]
+      operationId: scheduleFactoryHistory
+      description: Dormant. Records an intent only; 202 never means completed.
+      responses:
+        "202":
+          description: Deferred
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queued: { const: 0 }
+                  deferred: { const: true }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+        "409": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/factory-sessions/agents/{bindingId}/messages:
+    parameters:
+      - $ref: "#/components/parameters/FactoryBindingId"
+    post:
+      tags: [factory]
+      operationId: factoryReply
+      security:
+        - factoryReplyBearer: []
+      description: |
+        Droid reply. Bearer factory_reply_ plus 43 URL-safe characters, pinned
+        to one binding, delivery and sender, valid 24h. Replies to the pinned
+        sender only. A repeat with the same body returns the stored result; a
+        different body is 409 reply_already_recorded.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [text]
+              properties:
+                text: { type: string, minLength: 1, maxLength: 20000 }
+      responses:
+        "200":
+          description: Sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { const: true }
+                  message_id: { type: string }
+                  conversation_id: { type: string }
+        "400": { $ref: "#/components/responses/FactoryError" }
+        "401": { $ref: "#/components/responses/FactoryError" }
+        "409": { $ref: "#/components/responses/FactoryError" }
+        "413": { $ref: "#/components/responses/FactoryError" }
+        "503": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/factory-sessions/relay-events/{bindingId}:
+    parameters:
+      - $ref: "#/components/parameters/FactoryBindingId"
+    post:
+      tags: [factory]
+      operationId: factoryRelayEvents
+      security: []
+      description: Registered but always 404 while Relaycast subscriptions are deferred.
+      responses:
+        "404": { $ref: "#/components/responses/FactoryError" }
+  /internal/v1/factory/job:
+    post:
+      tags: [internal, factory]
+      operationId: factoryJob
+      security:
+        - factoryInternalToken: []
+      description: |
+        Manual Factory job kick. Raw path only (404 under /cloud), and 404 when
+        SELFHOST_FACTORY_ENABLED is off or SELFHOST_INTERNAL_TOKEN is unset.
+        inject claims a due pending row through the normal fence, moves an
+        expired sending row to unknown (lease_expired), and never touches
+        unknown, delivered or rejected rows. sweep expires leases and advances
+        dormant history intents. history is deferred.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  additionalProperties: false
+                  required: [v, kind]
+                  properties:
+                    v: { const: 1 }
+                    kind: { const: sweep }
+                    after: { type: string, format: uuid }
+                - type: object
+                  additionalProperties: false
+                  required: [v, kind, bindingId]
+                  properties:
+                    v: { const: 1 }
+                    kind: { const: history }
+                    bindingId: { type: string, format: uuid }
+                    scheduledAt: { type: string, format: date-time }
+                - type: object
+                  additionalProperties: false
+                  required: [v, kind, bindingId, messageId]
+                  properties:
+                    v: { const: 1 }
+                    kind: { const: inject }
+                    bindingId: { type: string, format: uuid }
+                    messageId: { type: string, pattern: "^[A-Za-z0-9_-]{1,128}$" }
+      responses:
+        "200":
+          description: |
+            {ok:true} plus expired/scheduled (sweep), deferred (history), or
+            state, or skipped:true for an absent delivery (inject).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { const: true }
+                  skipped: { const: true }
+                  state: { enum: [pending, sending, delivered, rejected, unknown] }
+                  expired: { type: integer }
+                  scheduled: { type: integer }
+                  deferred: { const: true }
+        "400": { $ref: "#/components/responses/FactoryError" }
+        "401": { $ref: "#/components/responses/FactoryError" }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+        "405": { $ref: "#/components/responses/FactoryError" }
+        "503": { $ref: "#/components/responses/FactoryError" }
 components:
   securitySchemes:
+    factoryReplyBearer:
+      type: http
+      scheme: bearer
+      description: Single-use Factory reply capability `factory_reply_` plus 43 URL-safe characters, shown to the Droid once inside the injected text; only its hash is stored.
+    factoryInternalToken:
+      type: http
+      scheme: bearer
+      description: SELFHOST_INTERNAL_TOKEN only. Workspace tokens and user sessions are 403 forbidden.
     bearerAuth:
       type: http
       scheme: bearer
@@ -4470,6 +4958,11 @@ components:
         part of this contract). Status: proposed, Cloud team decides, not yet
         confirmed.
   parameters:
+    FactoryBindingId:
+      name: bindingId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
     OrganizationId:
       name: organizationId
       in: path
@@ -4586,6 +5079,69 @@ components:
       description: A declared `expected_assets[].name`; one path segment.
       schema: { type: string, maxLength: 255, pattern: "^[A-Za-z0-9][A-Za-z0-9_+-]*(?:\\.[A-Za-z0-9_+-]+)*$" }
   schemas:
+    FactorySummary:
+      type: object
+      properties:
+        connected: { type: boolean }
+        key_hint: { type: [string, "null"] }
+        validated_at: { type: [string, "null"], format: date-time }
+        user_is_owner: { type: boolean }
+        bindings_count: { type: integer }
+        history: { const: deferred }
+    FactoryBinding:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        session_id: { type: string }
+        computer_id: { type: string }
+        state: { enum: [preparing, bound, retired] }
+        agent:
+          type: object
+          properties:
+            name: { type: [string, "null"] }
+            id: { type: [string, "null"] }
+        history: { const: deferred }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        retired_at: { type: [string, "null"], format: date-time }
+    FactoryError:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Stable code, for example factory_not_owner, factory_other_member_bindings, factory_cleanup_pending, invalid_request.
+        message: { type: string }
+
+    ProviderStatus:
+      type: object
+      additionalProperties: false
+      required: [id, product, family, transport, setup, history, outbound, mcpGroups,
+        implemented, configured, enabled, mcpGroupsRegistered]
+      properties:
+        id: { type: string, enum: [amp, factory, copilot, capy, replicas, dot, grok-bot] }
+        product: { type: string }
+        family: { type: string, enum: [remote_coding_agent, assistant_connector, local_app] }
+        transport: { type: string }
+        setup: { type: string, enum: [api_key, oauth_grant, desktop_roundtrip] }
+        history:
+          type: object
+          additionalProperties: false
+          required: [kind, source, coverage]
+          properties:
+            kind: { type: string, enum: [native_transcript_pull, redacted_mcp_activity, desktop_owned, none] }
+            source: { type: [string, "null"] }
+            coverage: { type: string, enum: [event_triggered, continuous, passive_tail, n_a] }
+            notes: { type: string }
+        outbound: { type: string, enum: ["relay:mcp", "relay:events", none] }
+        mcpGroups:
+          type: array
+          description: MCP tool group ids (as reported by describe_capabilities `groups`) this provider owns.
+          items: { type: string }
+        implemented: { type: boolean, description: A provider module is present in this build. }
+        configured: { type: boolean, description: The provider's configuration resolves. }
+        enabled: { type: boolean, description: The provider module is mounted and switched on. }
+        mcpGroupsRegistered: { type: boolean, description: The provider owns MCP groups and every one is served. }
     CaptureSettings:
       type: object
       additionalProperties: false
@@ -6001,6 +6557,11 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
         status: { enum: [active, expired, revoked] }
   responses:
+    FactoryError:
+      description: Factory error with a stable code
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/FactoryError" }
     CodingAgentStored:
       description: Stored credential (201 created, 200 existing or replaced)
       content:

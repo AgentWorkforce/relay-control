@@ -4,6 +4,7 @@ import test from "node:test";
 import { PGlite } from "@electric-sql/pglite";
 import { ApiTokenStore } from "../src/admin/api-tokens.js";
 import { createApp } from "../src/app.js";
+import { hashSecret } from "../src/crypto.js";
 import type { SelfhostConfig } from "../src/config.js";
 import type { Database, SqlExecutor, SqlResult } from "../src/database.js";
 import { SendAbandoned } from "../src/messaging/http.js";
@@ -1085,4 +1086,196 @@ test("register_human admission stays a typed conflict", async (t) => {
   assert.equal(full.status, 409);
   assert.equal(full.body.error, "register_human_admission");
   assert.equal((await fx.database.query("SELECT id FROM selfhost_person_identities")).rows.length, 0);
+});
+
+// ---- GET /resolve: the workspace-wide Relaycast key (Cloud parity) ----------
+
+function resolvePath(workspaceId: string, cloud = false): string {
+  return `${cloud ? "/cloud" : ""}/api/v1/workspaces/${workspaceId}/resolve`;
+}
+
+async function resolveAudits(database: Database) {
+  return (await database.query<Record<string, unknown>>(
+    "SELECT * FROM selfhost_admin_audit_events WHERE action = 'workspace.relaycast_key.resolved' ORDER BY created_at",
+  )).rows;
+}
+
+async function dropCliAuth(database: Database, token: string): Promise<void> {
+  const updated = await database.query(
+    "UPDATE selfhost_token_sessions SET scopes = ARRAY['rth:read']::text[] WHERE access_token_hash = $1 RETURNING id",
+    [hashSecret(token)],
+  );
+  assert.equal(updated.rows.length, 1);
+}
+
+async function addMember(fx: Awaited<ReturnType<typeof harness>>, email: string): Promise<{ userId: string; token: string }> {
+  const membership = await jsonRequest(fx.origin, `/api/v1/organizations/${fx.orgId}/memberships`, {
+    method: "POST",
+    token: fx.config.bootstrapToken,
+    body: { email, name: email, role: "member" },
+  });
+  assert.equal(membership.status, 200);
+  const userId = membership.body.userId as string;
+  return { userId, token: await fx.signIn(userId) };
+}
+
+test("resolve: an owner cli:auth bearer receives the key", async (t) => {
+  const fx = await harness(t);
+  const resolved = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.accessToken });
+  assert.equal(resolved.status, 200);
+  assert.deepEqual(Object.keys(resolved.body).sort(), [
+    "cloudWorkspaceId", "name", "organizationId", "provisioned", "relaycastApiKey",
+    "relaycastWorkspaceId", "urls", "workspaceId",
+  ]);
+  assert.equal(resolved.body.relaycastApiKey, "rk_live_first");
+});
+
+test("resolve: a plain member with cli:auth still receives the key", async (t) => {
+  const fx = await harness(t);
+  const member = await addMember(fx, "member@example.test");
+  const resolved = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: member.token });
+  assert.equal(resolved.status, 200);
+  assert.equal(resolved.body.relaycastApiKey, "rk_live_first");
+});
+
+test("resolve: a cli:auth session cookie on /cloud receives the key", async (t) => {
+  const fx = await harness(t);
+  const resolved = await jsonRequest(fx.origin, resolvePath(fx.workspaceId, true), {
+    cookie: `agent_relay_session=${fx.accessToken}`,
+  });
+  assert.equal(resolved.status, 200);
+  assert.equal(resolved.body.relaycastApiKey, "rk_live_first");
+});
+
+test("resolve: a bearer without cli:auth is 403 with no key", async (t) => {
+  const fx = await harness(t);
+  const control = await fx.signIn(fx.userId);
+  const lowScope = await fx.signIn(fx.userId);
+  await dropCliAuth(fx.database, lowScope);
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: control })).status, 200);
+  const denied = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: lowScope });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.body.error, "forbidden");
+  assert.equal("relaycastApiKey" in denied.body, false);
+});
+
+test("resolve: a low-scope token sent as a same-origin /cloud cookie is 403", async (t) => {
+  const fx = await harness(t);
+  const lowScope = await fx.signIn(fx.userId);
+  await dropCliAuth(fx.database, lowScope);
+  const denied = await jsonRequest(fx.origin, resolvePath(fx.workspaceId, true), {
+    cookie: `agent_relay_session=${lowScope}`,
+    origin: "https://control.internal.example",
+    secFetchSite: "same-origin",
+  });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.body.error, "forbidden");
+  assert.equal("relaycastApiKey" in denied.body, false);
+});
+
+test("resolve: a workspace sh_wk_ token is 403", async (t) => {
+  const fx = await harness(t);
+  const created = await new ApiTokenStore(fx.database).create({
+    workspaceId: fx.workspaceId,
+    organizationId: fx.orgId,
+    label: "agent",
+    purpose: "agent-runtime",
+    expiryDays: 1,
+    neverExpires: undefined,
+    actor: { kind: "user", userId: fx.userId },
+  });
+  assert.ok(created.accessToken.startsWith("sh_wk_"));
+  const denied = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: created.accessToken });
+  assert.equal(denied.status, 403);
+  assert.equal("relaycastApiKey" in denied.body, false);
+});
+
+test("resolve: the internal service token is 403", async (t) => {
+  const fx = await harness(t);
+  const denied = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.config.internalServiceToken! });
+  assert.equal(denied.status, 403);
+  assert.equal("relaycastApiKey" in denied.body, false);
+});
+
+test("resolve: the bootstrap token is not a user and gets no key", async (t) => {
+  const fx = await harness(t);
+  const denied = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.config.bootstrapToken });
+  assert.equal(denied.status, 401);
+  assert.equal("relaycastApiKey" in denied.body, false);
+});
+
+test("resolve: a token bound to workspace A cannot resolve workspace B", async (t) => {
+  const fx = await harness(t);
+  const boundToOther = await fx.signIn(fx.userId, fx.otherWorkspaceId);
+  const own = await jsonRequest(fx.origin, resolvePath(fx.otherWorkspaceId), { token: boundToOther });
+  assert.equal(own.status, 200);
+  assert.equal(own.body.relaycastApiKey, "rk_live_other");
+  const cross = await jsonRequest(fx.origin, resolvePath(fx.otherWorkspaceId), { token: fx.accessToken });
+  assert.equal(cross.status, 404);
+  assert.equal("relaycastApiKey" in cross.body, false);
+});
+
+test("resolve: a revoked token gets no key", async (t) => {
+  const fx = await harness(t);
+  const token = await fx.signIn(fx.userId);
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token })).status, 200);
+  const revoked = await jsonRequest(fx.origin, "/api/v1/auth/token/revoke", { method: "POST", token });
+  assert.equal(revoked.status, 200);
+  const denied = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token });
+  assert.equal(denied.status, 401);
+  assert.equal("relaycastApiKey" in denied.body, false);
+});
+
+test("resolve: a removed member gets no key", async (t) => {
+  const fx = await harness(t);
+  const member = await addMember(fx, "leaver@example.test");
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: member.token })).status, 200);
+  const removed = await jsonRequest(fx.origin, `/api/v1/organizations/${fx.orgId}/memberships/${member.userId}`, {
+    method: "DELETE",
+    token: fx.config.bootstrapToken,
+  });
+  assert.equal(removed.status, 204);
+  const denied = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: member.token });
+  assert.ok(denied.status === 401 || denied.status === 404, String(denied.status));
+  assert.equal("relaycastApiKey" in denied.body, false);
+});
+
+test("resolve: each disclosure writes one secret-free audit row", async (t) => {
+  const fx = await harness(t);
+  assert.equal((await resolveAudits(fx.database)).length, 0);
+  const resolved = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.accessToken });
+  assert.equal(resolved.status, 200);
+  const rows = await resolveAudits(fx.database);
+  assert.equal(rows.length, 1);
+  const row = rows[0]!;
+  assert.equal(row.actor_kind, "user");
+  assert.equal(row.actor_id, fx.userId);
+  assert.equal(row.workspace_id, fx.workspaceId);
+  assert.equal(row.organization_id, fx.orgId);
+  assert.match(String(row.target), /^session:[0-9a-f-]{36}$/);
+  const serialized = JSON.stringify(row);
+  assert.equal(serialized.includes("rk_live_first"), false);
+  assert.equal(serialized.includes(fx.accessToken), false);
+  assert.equal(serialized.includes(hashSecret(fx.accessToken)), false);
+});
+
+test("resolve: a refusal writes no audit row", async (t) => {
+  const fx = await harness(t);
+  const lowScope = await fx.signIn(fx.userId);
+  await dropCliAuth(fx.database, lowScope);
+  const created = await new ApiTokenStore(fx.database).create({
+    workspaceId: fx.workspaceId,
+    organizationId: fx.orgId,
+    label: "agent",
+    purpose: "agent-runtime",
+    expiryDays: 1,
+    neverExpires: undefined,
+    actor: { kind: "user", userId: fx.userId },
+  });
+  for (const token of [lowScope, created.accessToken, fx.config.internalServiceToken!, fx.config.bootstrapToken]) {
+    const denied = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token });
+    assert.notEqual(denied.status, 200);
+  }
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.otherWorkspaceId), { token: fx.accessToken })).status, 404);
+  assert.equal((await resolveAudits(fx.database)).length, 0);
 });

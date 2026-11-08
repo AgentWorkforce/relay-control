@@ -1,4 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ProviderStatus } from "../providers/registry.js";
 
 /**
  * The shared-sessions MCP tool catalog, ported from Cloud's
@@ -131,6 +132,8 @@ export type CapabilityReport = {
   connection: { auth_mode: McpAuthMode; description: string; scopes: string[] };
   workspace: { workspace_id: string; role: Exclude<WorkspaceRole, null> | "unknown"; can_launch: boolean | null };
   groups: CapabilityGroup[];
+  /** The provider catalog with this build's runtime state (src/providers/registry.ts). */
+  providers: ProviderStatus[];
 };
 
 /**
@@ -145,6 +148,7 @@ export function describeCapabilities(input: {
   scopes: readonly string[];
   workspaceId: string;
   role: WorkspaceRole;
+  providers: ProviderStatus[];
 }): CapabilityReport {
   const planned = new Map(planToolGroups().map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
@@ -161,5 +165,6 @@ export function describeCapabilities(input: {
     connection: { auth_mode: input.authMode, description: AUTH_MODE_LABELS[input.authMode], scopes: [...input.scopes] },
     workspace: { workspace_id: input.workspaceId, role: input.role ?? "unknown", can_launch: false },
     groups,
+    providers: input.providers,
   };
 }

@@ -5,6 +5,8 @@ import { dirname, resolve } from "node:path";
 import { SELFHOST_API_VERSION, type SelfhostConfig } from "./config.js";
 import { secureEqual } from "./crypto.js";
 import { adminErrorResponse, type AdminModule } from "./admin/routes.js";
+import { ApiTokenStore } from "./admin/api-tokens.js";
+import { recordAudit } from "./admin/audit.js";
 import {
   issueRelayhistorySession,
   UnsupportedModeError,
@@ -12,7 +14,6 @@ import {
 } from "./relayhistory.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { z } from "zod";
-import { recordAudit } from "./admin/audit.js";
 import { acceptedAudiences, handleIntrospection, INTROSPECT_PATH } from "./auth/introspect.js";
 import {
   ACCOUNT_SCOPE,
@@ -34,8 +35,11 @@ import type { TelemetryModule } from "./telemetry/module.js";
 import { identityErrorResponse, type IdentityModule } from "./identity/routes.js";
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
 import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.js";
+import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./factory/routes.js";
 import { createMcpHandler } from "./mcp/routes.js";
 import { handleChiefRoutes, type ChiefBackend } from "./chief/routes.js";
+import { handleProviderRoutes } from "./providers/routes.js";
+import type { ProviderProbes } from "./providers/registry.js";
 import {
   CapturePolicyError,
   parseCaptureSettings,
@@ -247,6 +251,14 @@ function routeMatch(pathname: string, pattern: RegExp): string[] | null {
   return match ? match.slice(1).map(decodeURIComponent) : null;
 }
 
+/** Origins allowed to send cookie-authenticated writes. */
+export function browserOriginsFor(config: SelfhostConfig): string[] {
+  return [...new Set([
+    new URL(config.publicBaseUrl).origin,
+    new URL(config.dashboardUrl).origin,
+  ])];
+}
+
 export function createApp(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
@@ -256,18 +268,23 @@ export function createApp(input: {
   /** bootstrap-signup lane: OIDC / email sign-in, invites (src/identity). */
   identity?: IdentityModule;
   chief?: ChiefBackend;
+  /**
+   * Runtime probes for the provider modules this build contains. Unset (the
+   * default) means no provider module: each reports implemented, configured
+   * and enabled as false.
+   */
+  providerProbes?: ProviderProbes;
   /** Person messaging. Tests pass fetchImpl; the server uses global fetch. */
   messagingFetch?: typeof fetch;
+  /** Factory sessions (dormant unless SELFHOST_FACTORY_ENABLED). The server passes its module so it can run the worker. */
+  factory?: FactoryModule;
   now?: () => Date;
   /** Test hooks for claim leases and crash injection. Production leaves this unset. */
   messaging?: Pick<MessagingDeps,
     "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck">;
 }): (request: IncomingMessage, response: ServerResponse) => void {
   const { config, store, admin, telemetry, identity } = input;
-  const browserOrigins = [...new Set([
-    new URL(config.publicBaseUrl).origin,
-    new URL(config.dashboardUrl).origin,
-  ])];
+  const browserOrigins = browserOriginsFor(config);
   const messagingDeps: MessagingDeps = {
     database: store.database,
     keyring: config.encryptionKeyring,
@@ -281,6 +298,13 @@ export function createApp(input: {
     relaycastPublicUrl: config.relaycastPublicUrl,
     internalServiceToken: config.internalServiceToken,
     browserOrigins,
+  });
+  const factory = input.factory ?? createFactoryModule({
+    config,
+    database: store.database,
+    messaging: messagingDeps,
+    browserOrigins,
+    relayFetch: input.messagingFetch,
   });
   // desktop-auth lane: hosted Cloud's device-route limits and CSRF origins.
   const limiter = new RateLimiter(() => (input.now?.() ?? new Date()).getTime());
@@ -301,7 +325,10 @@ export function createApp(input: {
     return siteBases.get(host) ?? config.publicBaseUrl.replace(/\/+$/, "");
   }
   // Hosted MCP (shared-sessions facade): reads, team activity, capabilities.
-  const mcp = createMcpHandler({ config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch });
+  const providerProbes: ProviderProbes = input.providerProbes ?? {};
+  const mcp = createMcpHandler({
+    config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
+  });
   function rateLimit(
     response: ServerResponse,
     key: string,
@@ -366,6 +393,20 @@ export function createApp(input: {
     return auth;
   }
 
+  const apiTokens = new ApiTokenStore(store.database);
+
+  /** Workspace agent tokens and the service token are not a person. */
+  async function rejectServiceCredential(request: IncomingMessage): Promise<void> {
+    const token = bearer(request);
+    if (!token) return;
+    if (config.internalServiceToken && secureEqual(token, config.internalServiceToken)) {
+      throw new HttpError(403, "forbidden", "Service credentials cannot resolve the Relaycast key");
+    }
+    if (token.startsWith("sh_wk_") && await apiTokens.authenticate(token)) {
+      throw new HttpError(403, "forbidden", "Agent, CI, and service tokens cannot resolve the Relaycast key");
+    }
+  }
+
   async function workspaceAccess(
     request: IncomingMessage,
     workspaceId: string,
@@ -383,6 +424,8 @@ export function createApp(input: {
     }
     return { principal: auth.principal, workspace, token: auth.token };
   }
+
+  const factoryRoutes = mountFactoryRoutes(factory, { workspaceAccess, requestObject, bearer, json });
 
   /**
    * DG-001 capability routes. The browser account session is the
@@ -520,6 +563,9 @@ export function createApp(input: {
       else json(response, outcome.status, { error: outcome.error, message: outcome.message }, true);
       return;
     }
+
+    // Factory sessions: 404 before auth when the flag is off.
+    if (await factoryRoutes(request, response, path, publicPath, method)) return;
 
     // bootstrap-signup lane: the sign-in page with SSO / email links, OIDC
     // callbacks and the invitation API. The device-code page below remains
@@ -1324,7 +1370,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         await store.memberRole(organizationId, userId) === "owner") {
         throw new HttpError(403, "forbidden", "Only an owner can remove an owner.");
       }
-      const deleted = await store.deleteMembership(organizationId, userId);
+      const deleted = await store.deleteMembership(
+        organizationId,
+        userId,
+        (tx) => factory.purgeMemberInTx(tx, organizationId, userId),
+      );
       if (!deleted) {
         if (!(await store.memberRole(organizationId, userId))) {
           await revokeRemovedMember(messagingDeps, organizationId, userId);
@@ -1333,6 +1383,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       await identity?.auditMembership({ organizationId, auth, action: "membership.remove", target: userId });
       await revokeRemovedMember(messagingDeps, organizationId, userId);
+      await factory.afterMemberRemoved(organizationId, userId);
       response.writeHead(204);
       response.end();
       return;
@@ -1399,7 +1450,21 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       /^\/api\/v1\/workspaces\/([^/]+)\/resolve$/,
     );
     if (resolveWorkspace && method === "GET") {
-      const { workspace } = await workspaceAccess(request, resolveWorkspace[0]!);
+      // Cloud parity: the workspace-wide key goes only to a person holding
+      // cli:auth (every device and browser session carries it), bearer or cookie.
+      await rejectServiceCredential(request);
+      const { principal, workspace } = await workspaceAccess(request, resolveWorkspace[0]!);
+      if (!principal.scopes.includes("cli:auth")) {
+        throw new HttpError(403, "forbidden", "Relaycast key requires a browser session or cli:auth");
+      }
+      // Written before the key leaves; the target is the non-secret session id.
+      await recordAudit(store.database, {
+        organizationId: workspace.organizationId,
+        workspaceId: workspace.id,
+        actor: { kind: "user", userId: principal.userId },
+        action: "workspace.relaycast_key.resolved",
+        target: `session:${principal.sessionId}`,
+      });
       json(response, 200, {
         workspaceId: workspace.id,
         cloudWorkspaceId: workspace.id,
@@ -1447,6 +1512,54 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    // Read-only: which RelayHistory origin this workspace's sessions are bound
+    // to. Nothing is issued and RelayHistory is not called, so Desktop can
+    // answer site-push admission and cold-process delete/revoke lookups
+    // without the session issue/renew path.
+    const historyOrigin = routeMatch(
+      path,
+      /^\/api\/v1\/workspaces\/([^/]+)\/relayhistory\/origin$/,
+    );
+    if (historyOrigin && method === "GET") {
+      const workspaceId = historyOrigin[0]!;
+      // Callers: the user sessions the sibling POST .../relayhistory/session
+      // accepts through workspaceAccess (device, exchanged Desktop handoff,
+      // browser), minus an unexchanged handoff. Service, bootstrap and
+      // workspace API tokens are 401. Order: authenticate, handoff refusal,
+      // workspace binding, membership, configuration.
+      const auth = await authenticate(request);
+      if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      const principal = auth.principal;
+      if (principal.pendingHandoff) {
+        throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff (POST /api/v1/auth/desktop/session) first");
+      }
+      const workspace = await store.workspaceForUser(workspaceId, principal.userId);
+      if (workspaceId !== principal.workspaceId) {
+        // 403 only for a workspace in the token's own organization that the
+        // caller is a member of; anything else, including the same person's
+        // workspaces in other organizations, is 404 (no existence oracle).
+        if (workspace && workspace.organizationId === principal.organizationId) {
+          throw new HttpError(403, "forbidden", "Token is not authorized for this workspace");
+        }
+        throw new HttpError(404, "workspace_not_found", "Workspace not found");
+      }
+      if (!workspace) throw new HttpError(404, "workspace_not_found", "Workspace not found");
+      // The issuer exchanges at relayhistoryUrl and binds sessions to
+      // relayhistoryPublicUrl (assertion historyOrigin/aud, default
+      // introspection audience, returned baseUrl). One installation-wide value.
+      // relayhistoryPublicUrl is already a bare origin (loadConfig keeps only
+      // url.origin), and the issuer compares the audience by exact string.
+      if (!config.relayhistoryUrl || !config.relayhistoryPublicUrl) {
+        throw new HttpError(404, "relayhistory_not_configured", "RelayHistory is not configured");
+      }
+      json(response, 200, {
+        workspace: workspace.id,
+        origin: config.relayhistoryPublicUrl,
+        audience: config.relayhistoryPublicUrl,
+      }, true);
+      return;
+    }
+
     const historySession = routeMatch(
       path,
       /^\/api\/v1\/workspaces\/([^/]+)\/relayhistory\/session$/,
@@ -1488,6 +1601,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     }
 
     if (await mcp(request, response, path, method)) return;
+    if (await handleProviderRoutes(request, response, path, method, {
+      probes: providerProbes, workspaceAccess: (incoming, id) => workspaceAccess(incoming, id), json,
+    })) return;
     if (await handleChiefRoutes(request, response, path, {
       backend: input.chief, workspaceAccess, requestObject, json,
       csrfAllowed: incoming => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),

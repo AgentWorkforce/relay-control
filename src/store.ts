@@ -475,7 +475,15 @@ export class ControlPlaneStore {
     });
   }
 
-  async deleteMembership(organizationId: string, userId: string): Promise<boolean> {
+  /**
+   * `beforeCommit` runs inside the removal transaction once the membership row
+   * is gone, so dependent state (Factory bindings) is purged atomically.
+   */
+  async deleteMembership(
+    organizationId: string,
+    userId: string,
+    beforeCommit?: (tx: SqlExecutor) => Promise<void>,
+  ): Promise<boolean> {
     return this.database.transaction(async (tx) => {
       await this.requireOrganization(tx, organizationId);
       const result = await tx.query<{ user_id: string }>(
@@ -489,7 +497,9 @@ export class ControlPlaneStore {
           RETURNING user_id`,
         [organizationId, userId],
       );
-      return result.rows.length === 1;
+      const deleted = result.rows.length === 1;
+      if (deleted && beforeCommit) await beforeCommit(tx);
+      return deleted;
     });
   }
 

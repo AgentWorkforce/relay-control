@@ -4,6 +4,7 @@ import { readWorkspaceHistory } from "../sessions/history.js";
 import type { EncryptionKeyring } from "../crypto.js";
 import type { Database } from "../database.js";
 import type { RelaycastClient, RosterAgent, PresenceRow } from "../messaging/relaycast.js";
+import type { ProviderStatus } from "../providers/registry.js";
 import type { Principal } from "../store.js";
 import type { McpAuthMode, WorkspaceRole } from "./catalog.js";
 import type { DesktopCallContext } from "./desktop-call.js";
@@ -33,6 +34,8 @@ export type McpContext = {
   /** GET a workspace-scoped RelayHistory path (with its query); throws SharedSessionsToolError. */
   readHistory: (path: string, options?: { timeoutMessage?: string }) => Promise<unknown>;
   members: () => Promise<McpMember[]>;
+  /** The provider catalog with this build's runtime state, for describe_capabilities. */
+  providers: () => Promise<ProviderStatus[]>;
   relaycast: {
     listAgents: (status: "active" | "all") => Promise<RosterAgent[]>;
     listPresence: () => Promise<PresenceRow[]>;

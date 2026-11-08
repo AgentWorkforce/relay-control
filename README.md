@@ -40,6 +40,10 @@ Included:
   capability discovery tool groups. Launches, person-identity sends
   (`as_person`) and desktop-linked identity (`join_relay desktop_address`) are
   not yet available.
+- provider catalog at `GET /api/v1/workspaces/:id/providers` (and in
+  `describe_capabilities`): Amp, Factory, Copilot, Capy, Replicas, Dot and Grok
+  Bot descriptors with separate `implemented`/`configured`/`enabled` runtime
+  states (all false until a build injects `providerProbes` into `createApp`).
 
 Explicitly absent: billing, fleet, and Relayfile.
 
@@ -106,6 +110,9 @@ is explicit. RelayAuth is optional: see
 | `SELFHOST_PERSONAL_ORG_ON_SIGNIN` | Multi mode only, default `true`: a first sign-in with no invite, membership or assigned domain creates a personal organization. The bootstrap bearer can override it at runtime via `PATCH /api/v1/installation/settings` |
 | `SELFHOST_SELF_SERVE_ORGANIZATIONS` | Multi mode only, default `true`: signed-in people may create organizations. Overridable the same way |
 | `SELFHOST_INVITE_TTL_HOURS` | Invite link lifetime, default 168 (7 days), 1-720 |
+| `SELFHOST_FACTORY_ENABLED` | Optional `true`/`false`, default `false`. Factory sessions: when off every Factory route is 404 and the worker does not start. See [docs/factory-sessions.md](docs/factory-sessions.md) |
+| `SELFHOST_FACTORY_API_URL` | Factory API origin, default `https://api.factory.ai`; absolute https only |
+| `SELFHOST_FACTORY_HISTORY_INTERVAL_MS` | Dormant Factory history loop cadence, default 300000, minimum 60000 |
 | `SELFHOST_OPERATOR_CONTROLS` | Operator-control writes (capture policy PUT/DELETE): `always` (default), `licence`, or `off`; an unrecognised value is treated as `off`. Reads are never gated. See [docs/capture-policy.md](docs/capture-policy.md) |
 | `SELFHOST_TELEMETRY_LEVEL` | Telemetry: `off` (default when unset), `errors`, or `full`. See [docs/telemetry.md](docs/telemetry.md) for this and the other `SELFHOST_TELEMETRY_*` settings |
 | `PORT` | Listener port, default `3000` |
@@ -164,6 +171,22 @@ only one of them fails startup.
   RelayAuth assertion and exchanges it at History, as before; the caller's
   token never reaches History.
 
+`GET /api/v1/workspaces/{workspace}/relayhistory/origin` (and the `/cloud`
+alias) answers `{ workspace, origin, audience }` for a caller authorized like
+the session route: `origin` and `audience` are both `RELAYHISTORY_PUBLIC_URL`,
+the value sessions are bound to. It is read-only and throttle-independent:
+nothing is issued, History is not called, and it shares no state with session
+issue/renew, so Agent Relay Desktop uses it for site-push admission and
+cold-process delete/revoke lookups. It accepts the user sessions the session
+route accepts (device session, exchanged Desktop handoff, `/cloud` browser
+cookie) except an unexchanged Desktop sign-in handoff, which answers 403
+`handoff_not_exchanged`; service, bootstrap, workspace API, revoked and
+expired tokens answer 401. A workspace in the token's own organization that
+the caller is a member of, but the token is not bound to, answers 403
+`forbidden`; any workspace outside the token's organization (even one the same
+person belongs to) or unknown answers 404 `workspace_not_found`; an install
+without RelayHistory 404 `relayhistory_not_configured`.
+
 Fixed session reads under `/cloud/api/sessions` cache a History token per
 user, workspace and caller token session, so a refreshed or revoked caller
 token never reuses another session's History token.
@@ -207,6 +230,22 @@ image, and reports the resulting digest in the run summary. Deploy by the canoni
 immutability matters. BuildKit SBOM and max-mode provenance attestations are
 attached where GHCR supports them. The workflow only publishes this standalone
 image; it does not invoke or modify the hosted Cloud deployment.
+
+### Verifying image provenance
+
+Each release also carries a signed Sigstore provenance bundle (GitHub artifact
+attestation) for the published index digest, under both names. Verify it with
+the GitHub CLI, using the digest from the run summary:
+
+```sh
+gh attestation verify oci://ghcr.io/agentworkforce/relay-control@sha256:<digest> --owner AgentWorkforce
+gh attestation verify oci://ghcr.io/agentworkforce/selfhost-api@sha256:<digest> --owner AgentWorkforce
+```
+
+Images published before signed attestations were added, including `0.4.0`
+(`sha256:f57b2da3fae1615790aeffbb01bad0b85fa30ee5c239bd892d9322bf1ff84dce`),
+have no signed attestation; they carry only the unsigned BuildKit SBOM and
+provenance statements, so `gh attestation verify` fails for them.
 
 The image runs as an unprivileged user. In production, run
 `agent-relay-selfhost-migrate` as a one-shot job with only
@@ -308,6 +347,16 @@ key's read of that node, then stored only as the owner record. A node owned by
 someone else, through another workspace, or through a previous relay binding
 is refused (409). `DELETE` with `{workspaceId, nodeId}` releases it (owner or
 organization owner). Revoking a membership drops its node ownerships.
+
+### Resolving a workspace's Relaycast key
+
+`GET /api/v1/workspaces/{workspaceId}/resolve` returns the decrypted
+workspace Relaycast key to a person credential with the `cli:auth` scope
+(device and browser sessions carry it; any workspace role). Tokens without
+`cli:auth`, workspace API tokens (`sh_wk_`), and `SELFHOST_INTERNAL_TOKEN` get
+`403`; the bootstrap token gets `401`; another or departed tenant gets `404`.
+Each disclosure is audited as `workspace.relaycast_key.resolved` with the
+session id, never the key or token.
 
 ### Replacing a workspace's Relaycast key
 

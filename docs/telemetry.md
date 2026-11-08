@@ -9,6 +9,8 @@ errors installs hit, so that we can fix problems, sometimes before you
 report them. You control it with a single setting. You can see exactly what
 would be sent before anything leaves your cluster.
 
+Product analytics is a separate, off-by-default feature; see [analytics.md](analytics.md).
+
 ## What we never collect
 
 Telemetry never leaves your cluster with any of the following:

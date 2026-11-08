@@ -41,11 +41,21 @@ export type SelfhostConfig = {
    * SELFHOST_INTROSPECT_AUDIENCES. Defaults to [relayhistoryPublicUrl].
    */
   introspectAudiences?: string[];
+  /** Factory sessions (src/factory). Unset or enabled=false: routes 404, worker off. */
+  factory?: FactoryConfig;
   port: number;
   host: string;
 };
 
 type Env = Record<string, string | undefined>;
+
+export type FactoryConfig = {
+  enabled: boolean;
+  /** Factory API origin; https only, redirects are never followed. */
+  apiUrl: string;
+  /** Dormant history-intent loop cadence. */
+  historyIntervalMs: number;
+};
 
 export type OperatorOAuthApp = { clientId: string; clientSecret: string; scopes: string[] | null };
 
@@ -76,7 +86,7 @@ export function loadOperatorOAuthApps(env: Env): Record<string, OperatorOAuthApp
 }
 export const SELFHOST_API_VERSION = "0.1.0";
 
-function readSecret(env: Env, name: string): string | undefined {
+export function readSecret(env: Env, name: string): string | undefined {
   const direct = env[name]?.trim();
   const file = env[`${name}_FILE`]?.trim();
   if (direct && file) {
@@ -252,8 +262,41 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     bootstrapToken,
     encryptionKeyring: loadEncryptionKeyring(env),
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
+    factory: loadFactoryConfig(env),
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
+  };
+}
+
+/**
+ * SELFHOST_FACTORY_ENABLED (default false), SELFHOST_FACTORY_API_URL (https,
+ * default https://api.factory.ai) and SELFHOST_FACTORY_HISTORY_INTERVAL_MS
+ * (default 300000, minimum 60000).
+ */
+export function loadFactoryConfig(env: Env): FactoryConfig {
+  const flag = env.SELFHOST_FACTORY_ENABLED?.trim().toLowerCase() ?? "";
+  if (!["", "true", "1", "false", "0"].includes(flag)) {
+    throw new Error("SELFHOST_FACTORY_ENABLED must be true or false");
+  }
+  const rawUrl = env.SELFHOST_FACTORY_API_URL?.trim() || "https://api.factory.ai";
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new Error("SELFHOST_FACTORY_API_URL must be an absolute https URL");
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+    throw new Error("SELFHOST_FACTORY_API_URL must be an absolute https URL");
+  }
+  const rawInterval = env.SELFHOST_FACTORY_HISTORY_INTERVAL_MS?.trim();
+  const historyIntervalMs = rawInterval ? Number(rawInterval) : 300_000;
+  if (!Number.isSafeInteger(historyIntervalMs) || historyIntervalMs < 60_000) {
+    throw new Error("SELFHOST_FACTORY_HISTORY_INTERVAL_MS must be an integer of at least 60000");
+  }
+  return {
+    enabled: flag === "true" || flag === "1",
+    apiUrl: url.toString().replace(/\/+$/, ""),
+    historyIntervalMs,
   };
 }
 

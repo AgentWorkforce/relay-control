@@ -99,6 +99,7 @@ test("the /cloud prefix aliases every versioned Desktop route", () => {
     "/api/v1/workspaces/w/sessions",
     "/api/v1/workspaces/w/sessions/s/events",
     "/api/v1/workspaces/w/relayhistory/session",
+    "/api/v1/workspaces/w/relayhistory/origin",
   ]) {
     assert.equal(normalizeRoutePath(`/cloud${path}`), path);
   }
