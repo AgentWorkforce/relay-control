@@ -1,0 +1,49 @@
+name: Agent Deploy
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - agent/**
+      - .github/workflows/agent-deploy.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s agent/test -v
+  deploy:
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    environment: agent-deploy
+    concurrency:
+      group: layered-control-agent-deploy
+      cancel-in-progress: false
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate deployment source
+        run: python3 -m unittest discover -s agent/test -v
+      - name: Check deploy role configuration
+        env:
+          DEPLOY_ROLE: ${{ vars.LAYERED_CONTROL_AGENT_DEPLOY_ROLE_ARN }}
+        run: test -n "$DEPLOY_ROLE" || { echo 'Configure the scoped Control agent deploy role first.' >&2; exit 1; }
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ vars.LAYERED_CONTROL_AGENT_DEPLOY_ROLE_ARN }}
+          aws-region: us-west-2
+          role-session-name: control-agent-${{ github.run_id }}
+      - name: Deploy to the existing Control host
+        run: python3 agent/deploy.py --revision "$GITHUB_SHA"
