@@ -19,6 +19,8 @@ export type SelfhostConfig = {
   relayhistoryReadApiUrl?: string | null;
   /** Independent read service; owns issuance, rotation and verification of its tokens. */
   sessionReadApi?: { url: string; publicUrl: string; secret: string } | null;
+  /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
+  sessionReadMcpReads?: boolean;
   relayhistoryPublicUrl: string;
   relayauthApiKey: string | null;
   bootstrapToken: string;
@@ -276,6 +278,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     relayhistoryPublicUrl,
     relayhistoryReadApiUrl,
     sessionReadApi: loadSessionReadApiConfig(env),
+    sessionReadMcpReads: loadSessionReadMcpReads(env),
     ...introspection,
     bootstrapToken,
     encryptionKeyring: loadEncryptionKeyring(env),
@@ -284,6 +287,16 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
   };
+}
+
+function loadSessionReadMcpReads(env: Env): boolean {
+  const value = env.SESSION_READ_API_MCP_READS?.trim();
+  if (!value || value === "false") return false;
+  if (value !== "true") throw new Error("SESSION_READ_API_MCP_READS must be true or false");
+  if (!readSecret(env, "SESSION_READ_API_SECRET")) {
+    throw new Error("SESSION_READ_API_MCP_READS requires the session read API to be configured");
+  }
+  return true;
 }
 
 function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {

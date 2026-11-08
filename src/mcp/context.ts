@@ -1,6 +1,7 @@
 import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { readWorkspaceHistory } from "../sessions/history.js";
+import { readViaSessionRead } from "./session-read-reader.js";
 import type { EncryptionKeyring } from "../crypto.js";
 import type { Database } from "../database.js";
 import type { RelaycastClient, RosterAgent, PresenceRow } from "../messaging/relaycast.js";
@@ -83,7 +84,8 @@ export function historyReader(
   return async (path: string, options: { timeoutMessage?: string } = {}): Promise<unknown> => {
     const url = new URL(path, "https://relayhistory.invalid");
     try {
-      const result = await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
+      const result = await readViaSessionRead(config, identity, url.pathname, url.searchParams)
+        ?? await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
       if (result.status !== "ok") throw new SharedSessionsToolError(UNAVAILABLE_MESSAGE);
       return result.body;
     } catch (error) {
