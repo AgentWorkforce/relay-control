@@ -865,8 +865,10 @@ export class ControlPlaneStore {
   /**
    * The token session behind an access token for introspection, including
    * revoked and expired rows so the caller can say why it is inactive. Same
-   * joins as authenticateAccessToken: a session whose membership, workspace or
-   * single-organization invariant no longer holds is not found at all.
+   * joins as authenticateAccessToken: a session whose membership or workspace
+   * no longer holds is not found at all, nor in single tenancy is one on a
+   * database that has gained a second organization. The joins bind the answer
+   * to the session's own organization in either mode.
    */
   async introspectAccessToken(token: string): Promise<IntrospectedToken | null> {
     const result = await this.database.query<{
@@ -894,12 +896,12 @@ export class ControlPlaneStore {
          JOIN selfhost_organization_memberships m
            ON m.organization_id = s.organization_id AND m.user_id = s.user_id
         WHERE s.access_token_hash = $1
-          AND NOT EXISTS (
+          AND ($2::text = 'multi' OR NOT EXISTS (
             SELECT 1
               FROM selfhost_organizations other
              WHERE other.id <> s.organization_id
-          )`,
-      [hashSecret(token)],
+          ))`,
+      [hashSecret(token), this.tenancy],
     );
     const row = result.rows[0];
     if (!row) return null;
