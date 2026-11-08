@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { recordAudit, type AuditActor } from "./admin/audit.js";
 import type { Database, SqlExecutor } from "./database.js";
 import {
   lockIdentity,
@@ -380,6 +381,47 @@ export class ControlPlaneStore {
         relaycastWorkspaceId: row.relaycast_workspace_id,
       };
     });
+  }
+
+  /**
+   * Deletes a workspace of this organization. Foreign keys cascade its
+   * sessions, tokens, credentials, flows and workspace-scoped audit events;
+   * the deletion itself is recorded at organization level so it outlives them.
+   * A Factory connection or binding restricts the delete until it is torn
+   * down. The organization's rows are locked so two concurrent deletes cannot
+   * both pass the last-workspace check. The Relaycast workspace is not touched.
+   */
+  async deleteWorkspace(input: {
+    organizationId: string;
+    workspaceId: string;
+    allowLast: boolean;
+    actor: AuditActor;
+  }): Promise<"deleted" | "not_found" | "last_workspace" | "in_use"> {
+    try {
+      return await this.database.transaction(async (tx) => {
+        const rows = await tx.query<{ id: string; name: string }>(
+          "SELECT id, name FROM selfhost_workspaces WHERE organization_id = $1 ORDER BY id FOR UPDATE",
+          [input.organizationId],
+        );
+        const target = rows.rows.find((row) => row.id === input.workspaceId);
+        if (!target) return "not_found";
+        if (rows.rows.length === 1 && !input.allowLast) return "last_workspace";
+        await tx.query("DELETE FROM selfhost_workspaces WHERE id = $1 AND organization_id = $2", [
+          input.workspaceId,
+          input.organizationId,
+        ]);
+        await recordAudit(tx, {
+          organizationId: input.organizationId,
+          actor: input.actor,
+          action: "workspace.deleted",
+          target: `${input.workspaceId} (${target.name})`,
+        });
+        return "deleted";
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === "23503") return "in_use";
+      throw error;
+    }
   }
 
   async listWorkspaces(organizationId: string): Promise<Array<Record<string, unknown>>> {

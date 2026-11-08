@@ -367,6 +367,17 @@ organization owner/admin) replaces the stored, encrypted key, for a Relaycast
 that was reset and re-minted. The workspace id, and so Desktop sign-ins bound
 to it, stay the same.
 
+### Deleting a workspace
+
+`DELETE /api/v1/organizations/{organizationId}/workspaces/{workspaceId}`
+(bootstrap bearer or an organization owner/admin) answers `204` and removes the
+workspace with its sessions, tokens, credentials, flows and workspace-scoped
+audit events; the deletion is audited at organization level as
+`workspace.deleted`. A workspace outside the organization is `404`. An
+organization's last workspace is `409 last_workspace` unless the bootstrap
+bearer deletes it, and a workspace with a Factory connection or binding is
+`409 workspace_in_use`. The Relaycast workspace behind it is not deleted.
+
 ## Dashboard contract
 
 Every Desktop route under `/api/v1/*` has an identical

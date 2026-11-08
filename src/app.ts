@@ -31,7 +31,7 @@ import {
   type Principal,
 } from "./store.js";
 import { createFlowsHandler } from "./flows/routes.js";
-import type { FlowsStore } from "./flows/store.js";
+import { isUuid, type FlowsStore } from "./flows/store.js";
 import type { TelemetryModule } from "./telemetry/module.js";
 import { identityErrorResponse, type IdentityModule } from "./identity/routes.js";
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
@@ -1314,6 +1314,39 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       });
       if (!updated) throw new HttpError(404, "workspace_not_found", "Workspace not found");
       json(response, 200, updated);
+      return;
+    }
+
+    if (workspaceItem && method === "DELETE") {
+      // Bootstrap bearer or organization owner/admin. An organization's last
+      // workspace is kept for a person, who could not sign in without one;
+      // only the operator's bootstrap bearer can empty an organization.
+      const [organizationId, workspaceId] = workspaceItem as [string, string];
+      const auth = await organizationAccess(request, organizationId, true);
+      if (!bearer(request)) {
+        const origin = request.headers.origin;
+        const allowed = typeof origin === "string" && origin && origin !== "null"
+          ? browserOrigins.includes(origin)
+          : request.headers["sec-fetch-site"] === "same-origin";
+        if (!allowed) throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      const outcome = isUuid(workspaceId)
+        ? await store.deleteWorkspace({
+          organizationId,
+          workspaceId,
+          allowLast: auth.kind === "bootstrap",
+          actor: auth.kind === "bootstrap" ? { kind: "bootstrap" } : { kind: "user", userId: auth.principal.userId },
+        })
+        : "not_found";
+      if (outcome === "not_found") throw new HttpError(404, "workspace_not_found", "Workspace not found");
+      if (outcome === "last_workspace") {
+        throw new HttpError(409, "last_workspace", "An organization must keep at least one workspace");
+      }
+      if (outcome === "in_use") {
+        throw new HttpError(409, "workspace_in_use", "Tear down this workspace's Factory connection first");
+      }
+      response.writeHead(204);
+      response.end();
       return;
     }
 
