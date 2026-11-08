@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InspectExistingControlHost",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances", "ssm:DescribeInstanceInformation", "ssm:GetCommandInvocation"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "UseStandardShellDocument",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ssm:us-west-2::document/AWS-RunShellScript"
+    },
+    {
+      "Sid": "DeployOnlyToExistingControlHost",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ec2:us-west-2:500268966557:instance/i-0564532755193787a",
+      "Condition": {"StringEquals": {"ssm:resourceTag/Name": "relaycast-agent-host-dev-control"}}
+    }
+  ]
+}
