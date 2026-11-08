@@ -135,6 +135,7 @@ export type IntrospectedToken = {
   email: string;
   organizationId: string;
   workspaceId: string;
+  role: Principal["role"];
   scopes: string[];
   /** SHA-256 of the access token as stored; never returned to callers. */
   accessTokenHash: string;
@@ -204,9 +205,18 @@ export class ControlPlaneStore {
            AND to_regclass('public.selfhost_token_sessions') IS NOT NULL
            AND to_regclass('public.selfhost_workspaces') IS NOT NULL
            AND to_regclass('public.selfhost_organization_domains') IS NOT NULL
-           AND EXISTS (
-             SELECT 1 FROM selfhost_schema_migrations
-              WHERE name = '0014_multi_tenant.sql'
+           -- Runtime roles deliberately cannot read the migration ledger.
+           -- Check the minimum multi-tenant schema through visible columns.
+           AND (
+             SELECT count(*) = 5 FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND (
+                  (table_name = 'selfhost_users'
+                   AND column_name IN ('last_organization_id', 'last_workspace_id'))
+                  OR (table_name = 'selfhost_installation_bootstrap'
+                      AND column_name IN ('personal_org_signup_enabled', 'self_serve_organizations_enabled'))
+                  OR (table_name = 'selfhost_telemetry_outbox' AND column_name = 'organization_id')
+                )
            ) AS present,
            (SELECT count(*)::int FROM selfhost_organizations) AS organizations`,
       );
@@ -876,6 +886,7 @@ export class ControlPlaneStore {
       email: string;
       organization_id: string;
       workspace_id: string;
+      role: Principal["role"];
       scopes: string[];
       access_token_hash: string;
       revoked: boolean;
@@ -883,7 +894,7 @@ export class ControlPlaneStore {
       issued_at: Date | string;
       expires_at: Date | string;
     }>(
-      `SELECT s.user_id, u.email, s.organization_id, s.workspace_id, s.scopes,
+      `SELECT s.user_id, u.email, s.organization_id, s.workspace_id, m.role, s.scopes,
               s.access_token_hash,
               s.revoked_at IS NOT NULL AS revoked,
               s.access_token_expires_at <= now() AS expired,
@@ -910,6 +921,7 @@ export class ControlPlaneStore {
       email: row.email,
       organizationId: row.organization_id,
       workspaceId: row.workspace_id,
+      role: row.role,
       scopes: row.scopes,
       accessTokenHash: row.access_token_hash,
       revoked: row.revoked,

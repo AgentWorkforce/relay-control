@@ -10,6 +10,7 @@ import { recordAudit } from "./admin/audit.js";
 import {
   issueRelayhistorySession,
   UnsupportedModeError,
+  ReadCursorExpiredError,
   UpstreamError,
 } from "./relayhistory.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
@@ -1666,13 +1667,17 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         json(response, adminError.status, adminError.body, true);
         return;
       }
+      if (error instanceof ReadCursorExpiredError) {
+        json(response, 410, { error: "cursor_expired", message: error.message }, true);
+        return;
+      }
       if (error instanceof UpstreamError) {
         telemetry?.observeError(error, {
           path: new URL(request.url ?? "/", config.publicBaseUrl).pathname,
           status: error.status ?? 502,
           component: "relayhistory",
         });
-        json(response, 502, {
+        json(response, error.retryable ? 503 : 502, {
           error: "relayhistory_session_failed",
           stage: error.stage,
           upstreamStatus: error.status ?? null,
