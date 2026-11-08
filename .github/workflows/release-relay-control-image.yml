@@ -161,6 +161,9 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            IMAGE_REVISION=${{ needs.validate.outputs.source_sha }}
+            IMAGE_VERSION=${{ needs.validate.outputs.release_tag }}
           tags: |
             ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.release_tag }}
             ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.sha_tag }}
