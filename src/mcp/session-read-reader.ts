@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
-import { isRecord, WORKSPACE_ATTESTATION_HEADER, type HistoryIdentity, type HistoryRead } from "../sessions/history.js";
+import { isRecord, WORKSPACE_ATTESTATION_HEADER, UNSUPPORTED_BY_BACKEND, type HistoryIdentity, type HistoryRead } from "../sessions/history.js";
 
 /** Client configuration deliberately excludes the issuer URL and internal secret. */
 type ReaderConfig = Pick<SelfhostConfig,"publicBaseUrl"|"sessionReadMcpReads"> & {
@@ -97,7 +97,14 @@ async function heldSession(config:ReaderConfig,identity:HistoryIdentity,rejected
   cache.set(key,pending);
   // Keep a refused session refused for this caller cache entry; do not turn a
   // failed refresh into fresh issuance on the next tool invocation.
-  void pending.catch(error=>{if(!refused(error) && cache.get(key)===pending) cache.delete(key);});
+  void pending.catch(error=>{
+    if(!refused(error) && cache.get(key)===pending) {
+      // An unavailable refresh has not authorized new issuance. Retain the
+      // previous pair so the next attempt retries the same refresh lineage.
+      if(previous) cache.set(key,Promise.resolve(previous));
+      else cache.delete(key);
+    }
+  });
   return pending;
 }
 
@@ -126,9 +133,12 @@ export async function readViaSessionRead(config:ReaderConfig,identity:HistoryIde
       rejectedAccess=held.accessToken; // Refresh through Control once, never remint.
       continue;
     }
-    // The contract explicitly permits an unsupported first page to use the
-    // existing History implementation. Never continue its cursor elsewhere.
-    if(response.status===501 && !cursor) { await response.body?.cancel().catch(()=>{});return null; }
+    // Selection is final: every 501 stays unsupported on this backend,
+    // regardless of the response's reason or whether this is the first page.
+    if(response.status===501) {
+      await response.body?.cancel().catch(()=>{});
+      return {status:"unsupported",reason:UNSUPPORTED_BY_BACKEND};
+    }
     if(!response.ok) {
       await response.body?.cancel().catch(()=>{});
       if(response.status===410 && cursor) throw new ReadCursorExpiredError();

@@ -21,6 +21,7 @@ type Options = {
   readStatus?: (url: URL, bearer: string | null) => number;
   attest?: (workspace: string) => string | null;
   readBody?: unknown;
+  errorReason?: string;
   issueStatus?: (path:string) => number;
   reply?: (pair:Record<string,unknown>,path:string)=>Record<string,unknown>;
 };
@@ -81,7 +82,7 @@ function fake(t: TestContext, options: Options = {}) {
     }
     reads.push({ url, bearer });
     const status = options.readStatus?.(url, bearer) ?? 200;
-    if (status !== 200) return new Response("", { status });
+    if (status !== 200) return Response.json({error:{code:"unsupported_by_backend",reason:options.errorReason??"unavailable"}},{status});
     const ws=url.searchParams.get("workspace")??"";
     const attested=options.attest?options.attest(ws):ws;
     return Response.json(options.readBody??{ from:"read-api" },{headers:attested===null?{}:{[WORKSPACE_HEADER]:attested}});
@@ -175,14 +176,14 @@ test("a near-expiry token is refreshed once, sending only the held refresh token
   assert.deepEqual(Object.keys(seen.issues[1]!.body),["refreshToken"]);
 });
 
-test("a first page the read API can't serve falls back to History", async (t) => {
-  const seen = fake(t, { readStatus: () => 501 });
-  const cfg = config();
-  t.after(() => forgetSessionReadTokens(cfg));
-
-  const body = await historyReader(cfg, principal("user-a"), workspace("ws-a", "org-a"), "sh_at_user_a")("/v1/sessions");
-  assert.deepEqual(body, { from: "history" });
-  assert.equal(seen.reads.length, 1);
+test("every selected-reader501 stays unsupported with zero History calls regardless of reason",async t=>{
+  for(const reason of ["unsupported_by_backend","first_page_inexact","privacy_refused","unknown",""]) {
+    for(const suffix of ["","?cursor=b96l1:opaque"]) {
+      const seen=fake(t,{readStatus:()=>501,errorReason:reason}),cfg=config();
+      await assert.rejects(historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")(`/v1/sessions${suffix}`),/unsupported_by_backend/);
+      assert.equal(seen.reads.length,1);assert.equal(seen.history.length,0);
+    }
+  }
 });
 
 test("a read API cursor is never restarted on History", async (t) => {
@@ -246,7 +247,7 @@ test("an access401 refreshes through Control once; a refused refresh is never re
   assert.equal(seen.history.length,0);
   const rejected=fake(t,{readStatus:()=>401,issueStatus:path=>path.endsWith("/refresh")?401:200}),other=config();
   const denied=historyReader(other,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a");
-  await assert.rejects(denied("/v1/sessions"));await assert.rejects(denied("/v1/sessions"));
+  await assert.rejects(denied("/v1/sessions"),/Reauthenticate/);await assert.rejects(denied("/v1/sessions"),/Reauthenticate/);
   assert.deepEqual(rejected.issues.map(row=>row.path.split("/").at(-1)),["session","refresh"]);
   assert.equal(rejected.history.length,0);
 });
@@ -299,4 +300,40 @@ test("Control refresh must preserve the read session and rotate its refresh toke
     await read("/v1/sessions");await assert.rejects(read("/v1/sessions"));
     assert.equal(seen.issues.length,2);assert.equal(seen.history.length,0);
   }
+});
+
+
+test("refresh503 and timeout retain the same token/session for refresh retry without reminting",async t=>{
+  for(const failure of ["503","timeout"]) {
+    let unavailable=true;
+    const sessionIds:string[]=[];
+    const seen=fake(t,{ttlMs:10_000,issueStatus:path=>{
+      if(path.endsWith("/refresh") && unavailable) {
+        unavailable=false;
+        if(failure==="timeout") throw new DOMException("synthetic timeout","TimeoutError");
+        return 503;
+      }
+      return 200;
+    },reply:pair=>{sessionIds.push(String(pair.sessionId));return pair;}}),cfg=config();
+    const read=historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a");
+    await read("/v1/sessions");
+    await assert.rejects(read("/v1/sessions"),/temporarily unavailable/);
+    assert.deepEqual(await read("/v1/sessions"),{from:"read-api"});
+    assert.deepEqual(seen.issues.map(row=>row.path.split("/").at(-1)),["session","refresh","refresh"]);
+    assert.equal(seen.issues[1]!.body.refreshToken,seen.issues[2]!.body.refreshToken);
+    assert.deepEqual(sessionIds,["session-1","session-1"]);
+    assert.equal(seen.history.length,0);
+  }
+});
+
+test("an unavailable selected read retries on the same backend and cursor without new issuance",async t=>{
+  let unavailable=true;
+  const seen=fake(t,{readStatus:()=>unavailable?503:200}),cfg=config();
+  const read=historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a");
+  const path="/v1/sessions?cursor=b96l1:opaque";
+  await assert.rejects(read(path),/temporarily unavailable/);unavailable=false;
+  assert.deepEqual(await read(path),{from:"read-api"});
+  assert.equal(seen.issues.length,1);assert.equal(seen.reads.length,2);
+  assert.equal(seen.reads[0]!.url.toString(),seen.reads[1]!.url.toString());
+  assert.equal(seen.reads[0]!.bearer,seen.reads[1]!.bearer);assert.equal(seen.history.length,0);
 });
