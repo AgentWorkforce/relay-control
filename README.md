@@ -149,7 +149,7 @@ exclusive `_FILE` form (at least 32 bytes). Leave all unset to keep this
 handoff disabled. Use a dedicated Control-to-reader secret; it is never sent
 to clients. These settings do not change the existing History connection.
 
-`SESSION_READ_API_MCP_READS=true` (default false) sends the MCP's session reads to that read API, with a token issued for the calling user, organization and workspace. The service secret never reaches a read. A first page the read API can't serve falls back to the existing History path; a read API cursor doesn't.
+`SESSION_READ_API_MCP_READS=true` (default false) sends MCP session reads to that read API. MCP obtains and refreshes the calling user's pair through Control, validates its user/organization/workspace, audience and `rth:read` scope, and uses the returned reader URL. Only `rth_at_read_` access tokens reach read routes; the MCP reader client has no internal issuer or service credential. Privacy refusals, failed handoffs/refreshes and attestation failures never fall back to History. An unsupported first page (501) may use the existing History implementation; a cursor continuation never switches backends.
 
 Control authenticates the user, refuses unexchanged Desktop handoffs, checks
 live workspace membership and `rth:read` on every issue and refresh, and

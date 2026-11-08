@@ -82,6 +82,12 @@ export function historyReader(
     callerToken,
   };
   return async (path: string, options: { timeoutMessage?: string } = {}): Promise<unknown> => {
+    // MCP admission authenticates the person; content reads additionally need
+    // the issue-time read scope. Neither a handoff nor a service credential
+    // may be promoted by the reader's Control handoff.
+    if (!principal.scopes.includes("rth:read") || principal.pendingHandoff || !callerToken.startsWith("sh_at_")) {
+      throw new SharedSessionsToolError("Session reads require an exchanged user session with rth:read.");
+    }
     const url = new URL(path, "https://relayhistory.invalid");
     try {
       const result = await readViaSessionRead(config, identity, url.pathname, url.searchParams)
