@@ -1,3 +1,4 @@
+import type { AmpDeps } from "../amp/service.js";
 import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { readWorkspaceHistory } from "../sessions/history.js";
@@ -49,6 +50,8 @@ export type McpContext = {
     /** The Mcp-Session-Id header, when the client sent one. */
     sessionId: string | undefined;
   };
+  /** Amp control (SELFHOST_AMP_ENABLED); absent when the feature is off. */
+  amp?: AmpDeps;
 };
 
 export class SharedSessionsToolError extends Error {

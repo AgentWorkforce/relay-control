@@ -93,9 +93,12 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(): ToolPlanEntry[] {
-  return (["shared_session_reads", "team_activity", "relay_messaging", "capability_discovery"] as const)
-    .map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
+export function planToolGroups(options: { amp?: boolean } = {}): ToolPlanEntry[] {
+  const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relay_messaging"];
+  // Amp tools exist only when SELFHOST_AMP_ENABLED is on.
+  if (options.amp) groups.push("amp");
+  groups.push("capability_discovery");
+  return groups.map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
 }
 
 export type ToolPlanRegistrars = { [G in ToolGroupId]?: (entry: ToolPlanEntry) => void };
@@ -148,9 +151,10 @@ export function describeCapabilities(input: {
   scopes: readonly string[];
   workspaceId: string;
   role: WorkspaceRole;
+  amp?: boolean;
   providers: ProviderStatus[];
 }): CapabilityReport {
-  const planned = new Map(planToolGroups().map(item => [item.group, item]));
+  const planned = new Map(planToolGroups({ amp: input.amp }).map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
     const definition = TOOL_GROUPS[id];
     const base = { id, title: definition.title };
