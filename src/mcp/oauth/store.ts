@@ -1,3 +1,4 @@
+import { revokeMcpOAuthGrantRows, revokeOrganizationMcpOAuthGrants } from "./revocations.js";
 /**
  * Cloud 1776499a mcp-oauth-store.ts: SQL/tenant-lock/token-class adaptation.
  * Uses only OAuth session tables; mounts no routes and grants no general
@@ -22,12 +23,8 @@ export type McpOAuthGrant = McpOAuthOwner & { id:string;clientId:string;clientNa
   agentRemoteId:string|null;scopes:string[];resource:string;setupHandoffId:string|null;tokenFamilyId:string;
   createdAt:Date;revokedAt:Date|null;revokedReason:string|null };
 
-export class McpOAuthContinuationError extends Error {}
-export class McpOAuthAgentNameTakenError extends Error {
-  readonly status = 409;
-  readonly code = "agent_name_taken";
-  constructor() { super("That name is already in use. Choose another name."); }
-}
+import { McpOAuthContinuationError, McpOAuthAgentNameTakenError } from "./errors.js";
+export { McpOAuthContinuationError, McpOAuthAgentNameTakenError } from "./errors.js";
 
 type ClientRow = { client_id: string; client_name: string | null; redirect_uris: string[]; created_at: Date | string };
 type ConnectionRow = { id: string; scopes: string[] };
@@ -187,17 +184,7 @@ export class McpOAuthStore {
 
   /** Caller holds user->org locks. Authority and durable teardown commit together. */
   private async revokeRows(tx:SqlExecutor,id:string,reason:string):Promise<boolean> {
-    const grant=await this.grant(tx,id);
-    if(!grant) return false;
-    const now=this.now(),changed=grant.revoked_at===null;
-    await tx.query(`UPDATE selfhost_mcp_oauth_grants SET revoked_at=$2,revoked_reason=$3 WHERE id=$1 AND revoked_at IS NULL`,[id,now,reason]);
-    await this.sessions.revokeFamily(tx,ownerOf(grant),`oauth_grant_${grant.revoked_reason??reason}`);
-    await tx.query(`INSERT INTO selfhost_mcp_oauth_revocations
-      (id,grant_id,token_family_id,user_id,organization_id,workspace_id,client_id,agent_name,agent_remote_id,reason,created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (grant_id) DO NOTHING`,
-    [randomUUID(),id,grant.token_family_id,grant.user_id,grant.organization_id,grant.workspace_id,grant.client_id,
-      grant.agent_name,grant.agent_remote_id,grant.revoked_reason??reason,now]);
-    return changed;
+    return revokeMcpOAuthGrantRows(tx,id,reason,this.now());
   }
 
   /** Port of Cloud code redemption: verify bindings before consume/replay action. */
@@ -330,11 +317,7 @@ export class McpOAuthStore {
 
   /** Organization departure spans every workspace; caller holds user->org locks. */
   async revokeOrganizationMcpOAuthGrants(tx:SqlExecutor,owner:Pick<McpOAuthOwner,"userId"|"organizationId">):Promise<void> {
-    await tx.query(`UPDATE selfhost_mcp_oauth_authorization_codes SET expires_at=$3
-      WHERE user_id=$1 AND organization_id=$2 AND expires_at>$3`,[owner.userId,owner.organizationId,this.now()]);
-    const grants=await tx.query<{ id:string }>(`SELECT id FROM selfhost_mcp_oauth_grants
-      WHERE user_id=$1 AND organization_id=$2 ORDER BY id`,[owner.userId,owner.organizationId]);
-    for(const { id } of grants.rows) await this.revokeRows(tx,id,"organization_left");
+    return revokeOrganizationMcpOAuthGrants(tx,owner,this.now());
   }
 
   async getOAuthGrant(grantId:string,owner:McpOAuthOwner):Promise<McpOAuthGrant|null> {

@@ -28,7 +28,7 @@ const MCP_OAUTH_RESOURCES: Readonly<Record<McpOAuthResourcePath, McpOAuthResourc
   "/api/v1/mcp/shared-sessions": { name: "Agent Relay Sessions", scopes: [MCP_RELAY_SCOPE, MCP_AGENTS_SCOPE] },
   "/api/v1/mcp/relay-events": { name: "Agent Relay events", scopes: [MCP_EVENTS_SCOPE, MCP_RELAY_SCOPE, MCP_AGENTS_SCOPE] },
 };
-const APP_BASE_PATH = "/cloud";
+export const APP_BASE_PATH = "/cloud";
 const toAppPath = (path: string) => `${APP_BASE_PATH}${path}`;
 const stripAppBasePath = (path: string) => path.startsWith(`${APP_BASE_PATH}/`) ? path.slice(APP_BASE_PATH.length) : path;
 const MCP_RESOURCE_AGENT_NAME_PARAM = "agent_name";

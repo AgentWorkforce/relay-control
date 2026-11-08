@@ -476,8 +476,10 @@ export class ControlPlaneStore {
   }
 
   /**
-   * `beforeCommit` runs inside the removal transaction once the membership row
-   * is gone, so dependent state (Factory bindings) is purged atomically.
+   * `beforeCommit` runs in the removal transaction after deletion (or an
+   * already-absent retry), with user->org locks held. A failure rolls back
+   * membership and dependent cleanup together. A remaining last owner never
+   * invokes cleanup.
    */
   async deleteMembership(
     organizationId: string,
@@ -485,6 +487,9 @@ export class ControlPlaneStore {
     beforeCommit?: (tx: SqlExecutor) => Promise<void>,
   ): Promise<boolean> {
     return this.database.transaction(async (tx) => {
+      // Consent/refresh and rejoin use this same order, before any membership row lock.
+      await lockUser(tx, userId);
+      await lockOrganization(tx, organizationId);
       await this.requireOrganization(tx, organizationId);
       const result = await tx.query<{ user_id: string }>(
         `DELETE FROM selfhost_organization_memberships
@@ -497,8 +502,13 @@ export class ControlPlaneStore {
           RETURNING user_id`,
         [organizationId, userId],
       );
-      const deleted = result.rows.length === 1;
-      if (deleted && beforeCommit) await beforeCommit(tx);
+      const deleted=result.rows.length===1;
+      // An idempotent retry can repair credentials from an earlier departure;
+      // never invoke the hook when a remaining last-owner row blocks deletion.
+      if (deleted || !(await tx.query("SELECT user_id FROM selfhost_organization_memberships WHERE organization_id=$1 AND user_id=$2",
+        [organizationId,userId])).rows.length) {
+        await beforeCommit?.(tx);
+      }
       return deleted;
     });
   }

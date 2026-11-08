@@ -1,3 +1,4 @@
+import { revokeOrganizationMcpOAuthGrants } from "./mcp/oauth/revocations.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -1370,11 +1371,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         await store.memberRole(organizationId, userId) === "owner") {
         throw new HttpError(403, "forbidden", "Only an owner can remove an owner.");
       }
-      const deleted = await store.deleteMembership(
-        organizationId,
-        userId,
-        (tx) => factory.purgeMemberInTx(tx, organizationId, userId),
-      );
+      const deleted = await store.deleteMembership(organizationId, userId, async (tx) => {
+        await factory.purgeMemberInTx(tx, organizationId, userId);
+        await revokeOrganizationMcpOAuthGrants(tx, { organizationId, userId }, input.now?.() ?? new Date());
+      });
       if (!deleted) {
         if (!(await store.memberRole(organizationId, userId))) {
           await revokeRemovedMember(messagingDeps, organizationId, userId);
