@@ -62,8 +62,9 @@ const ATTESTATION_MESSAGE =
   "Workspace-scoped shared session history is not available yet. Please try again later.";
 
 /**
- * RelayHistory reads through the dashboard's workspace-scoped reader: a
- * `rth:read` session minted for exactly this {user, organization, workspace},
+ * Reads through the dashboard's workspace-scoped reader: a History
+ * `rth:read` session minted for exactly this {user, organization, workspace}
+ * or the caller token for an explicitly configured direct list/turns reader,
  * `workspace=` forced on every query, and the response's workspace
  * attestation header required. Failures become public tool messages only.
  */

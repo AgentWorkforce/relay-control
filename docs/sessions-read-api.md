@@ -145,8 +145,11 @@ assertion, or service bearer is substituted. Workspace membership is checked
 before forwarding; the query always names the caller's authorized workspace;
 every successful response still needs the matching workspace attestation.
 
-All other views, search, MCP history reads, session issuance and uploads keep
-the existing History connection. This option does not migrate dashboard
+All other views, search, session issuance and uploads keep the existing
+History connection. Selection follows the upstream read path, including calls
+through the shared MCP reader: the timing tool's initial unsearched session
+list uses the direct reader, while its timing requests and the MCP transcript
+and search requests stay on History. This option does not migrate dashboard
 metadata, events or search. Self-hosted installations using the read container
 can keep the original `RELAYHISTORY_URL` path without this option.
 
