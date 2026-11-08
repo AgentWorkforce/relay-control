@@ -138,7 +138,7 @@ class DeployTests(unittest.TestCase):
         condition = trust["Statement"][0]["Condition"]
         self.assertEqual(set(condition), {"StringEquals"})
         subject = condition["StringEquals"]["token.actions.githubusercontent.com:sub"]
-        self.assertEqual(subject, "repo:AgentWorkforce@252050005/relay-control@1450141592:environment:agent-deploy")
+        self.assertEqual(subject, "repo:AgentWorkforce@252050005/relay-control@1450141592:ref:refs/heads/main")
 
 
 if __name__ == "__main__":

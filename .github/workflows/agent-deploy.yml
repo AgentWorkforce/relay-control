@@ -25,7 +25,6 @@ jobs:
       contents: read
       id-token: write
     runs-on: ubuntu-latest
-    environment: agent-deploy
     concurrency:
       group: layered-control-agent-deploy
       cancel-in-progress: false

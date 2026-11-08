@@ -5,9 +5,10 @@ and host guardrails on the existing Control instance in sessions-dev/us-west-2.
 It requires the existing native supervisor and pinned conversation. EC2,
 CloudFormation ownership, application releases and secret values are unchanged.
 
-The workflow is manual and runs only from `main`, through the `agent-deploy`
-Environment. Configure that Environment to permit only the `main` branch.
-The deploy role's exact immutable GitHub subject and policy are in `iam/`.
+The workflow is manual and runs only from `main`. AWS verifies that branch in
+the exact immutable GitHub OIDC subject itself: the repository IDs and
+`ref:refs/heads/main` must match. No GitHub Environment or customized OIDC
+subject is needed. The deploy role's trust and policy are in `iam/`.
 Its sole write capability is root SSM command execution on the existing Control
 instance; it cannot create/reboot/replace instances or change IAM or secrets.
 Set repository variable `LAYERED_CONTROL_AGENT_DEPLOY_ROLE_ARN` to that role.

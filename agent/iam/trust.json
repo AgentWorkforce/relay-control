@@ -6,7 +6,7 @@
     "Action": "sts:AssumeRoleWithWebIdentity",
     "Condition": {"StringEquals": {
       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-      "token.actions.githubusercontent.com:sub": "repo:AgentWorkforce@252050005/relay-control@1450141592:environment:agent-deploy"
+      "token.actions.githubusercontent.com:sub": "repo:AgentWorkforce@252050005/relay-control@1450141592:ref:refs/heads/main"
     }}
   }]
 }
