@@ -376,9 +376,12 @@ audit events; the deletion is audited at organization level as
 `workspace.deleted`. A workspace outside the organization is `404`. An
 organization's last workspace is `409 last_workspace` unless the bootstrap
 bearer deletes it, and a workspace with a Factory connection or binding is
-`409 workspace_in_use`. Neither the Relaycast workspace behind it nor, with
-`SELFHOST_FLOWS_STORAGE=gcs`, its uploaded run objects are deleted: the bucket
-is not cleaned up, so remove them with a bucket lifecycle rule.
+`409 workspace_in_use`.
+
+Stored objects are not cleaned up. The Relaycast workspace behind it stays, as
+do uploaded run objects (`SELFHOST_FLOWS_STORAGE=gcs`) and the encrypted
+subscription-login blobs in Postgres, GCS or S3. Control has no route to them
+once the workspace is gone; use a bucket lifecycle rule for bucket storage.
 
 ## Dashboard contract
 
