@@ -17,6 +17,8 @@ export type SelfhostConfig = {
   relayhistoryUrl: string;
   /** Optional GET-only pipeline reader for unsearched session lists and turns. */
   relayhistoryReadApiUrl?: string | null;
+  /** RELAYHISTORY_READ_API_EVENTS: opt in to native session-event reads. Default off. */
+  relayhistoryReadApiEvents?: boolean;
   /** Independent read service; owns issuance, rotation and verification of its tokens. */
   sessionReadApi?: { url: string; publicUrl: string; secret: string } | null;
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
@@ -259,6 +261,14 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   const introspection = loadIntrospectionConfig(env, relayhistoryPublicUrl);
   const relayhistoryReadApiUrl = env.RELAYHISTORY_READ_API_URL?.trim()
     ? publicServiceUrl(env, "RELAYHISTORY_READ_API_URL") : null;
+  const eventsFlag = env.RELAYHISTORY_READ_API_EVENTS?.trim();
+  if (eventsFlag && eventsFlag !== "true" && eventsFlag !== "false") {
+    throw new Error("RELAYHISTORY_READ_API_EVENTS must be true or false");
+  }
+  const relayhistoryReadApiEvents = eventsFlag === "true";
+  if (relayhistoryReadApiEvents && !relayhistoryReadApiUrl) {
+    throw new Error("RELAYHISTORY_READ_API_EVENTS requires RELAYHISTORY_READ_API_URL");
+  }
   if (relayhistoryReadApiUrl) {
     if (!introspection.introspectSecret) {
       throw new Error("RELAYHISTORY_READ_API_URL requires RELAYCONTROL_INTROSPECT_SECRET");
@@ -277,6 +287,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     relayhistoryUrl: serviceUrl(env, "RELAYHISTORY_URL"),
     relayhistoryPublicUrl,
     relayhistoryReadApiUrl,
+    relayhistoryReadApiEvents,
     sessionReadApi: loadSessionReadApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
     ...introspection,
@@ -472,6 +483,7 @@ export function configFingerprint(config: SelfhostConfig): string {
       config.relayhistoryUrl,
       config.relayhistoryPublicUrl,
       ...(config.relayhistoryReadApiUrl ? [config.relayhistoryReadApiUrl] : []),
+      ...(config.relayhistoryReadApiEvents ? ["native-session-events"] : []),
       ...(config.sessionReadApi ? [config.sessionReadApi.url, config.sessionReadApi.publicUrl] : []),
     ].join("\n"))
     .digest("hex")

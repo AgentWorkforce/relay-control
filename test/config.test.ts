@@ -259,3 +259,18 @@ test("direct read Worker is dormant by default and requires introspection plus i
   }
   assert.notEqual(configFingerprint(configured), configFingerprint(loadConfig(completeEnv)));
 });
+
+test("native session-event reads are default-off and require the direct reader connection", () => {
+  const reader = "https://session-reader.selfhosted.company";
+  const env = { ...completeEnv, RELAYHISTORY_READ_API_URL: reader, RELAYCONTROL_INTROSPECT_SECRET: "i".repeat(32), SELFHOST_INTROSPECT_AUDIENCES: `${completeEnv.RELAYHISTORY_PUBLIC_URL},${reader}` };
+  assert.equal(loadConfig(completeEnv).relayhistoryReadApiEvents, false);
+  assert.equal(loadConfig(env).relayhistoryReadApiEvents, false);
+  assert.equal(loadConfig({ ...env, RELAYHISTORY_READ_API_EVENTS: "false" }).relayhistoryReadApiEvents, false);
+  const enabled = loadConfig({ ...env, RELAYHISTORY_READ_API_EVENTS: "true" });
+  assert.equal(enabled.relayhistoryReadApiEvents, true);
+  assert.notEqual(configFingerprint(enabled), configFingerprint(loadConfig(env)));
+  assert.throws(() => loadConfig({ ...completeEnv, RELAYHISTORY_READ_API_EVENTS: "true" }), /requires RELAYHISTORY_READ_API_URL/);
+  for (const invalid of ["1", "yes", "TRUE"]) {
+    assert.throws(() => loadConfig({ ...env, RELAYHISTORY_READ_API_EVENTS: invalid }), /must be true or false/);
+  }
+});
