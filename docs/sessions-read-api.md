@@ -217,5 +217,9 @@ Verify the accepted upstream introspection-cache policy as part of the reader
 handoff. Control itself rechecks the token row on each introspection call;
 that does not prove the reader introspects on every read. At upstream source
 `f196f637`, the shared client defaults to a 60-second positive cache and the
-session reader passes no TTL override. This Control change does not alter that
-policy or establish a no-positive-cache revocation guarantee.
+session reader passes no TTL override. A revoked or downgraded caller token
+can therefore remain accepted for reads for up to 60 seconds while a positive
+entry is cached. This is the current read-side revocation-lag contract; it is
+separate from the self-host ingest edge, which introspects per request without
+a positive cache. This Control change does not alter either policy or establish immediate
+read revocation.
