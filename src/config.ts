@@ -1,3 +1,4 @@
+import { loadMcpOAuthConfig, type McpOAuthConfig } from "./mcp/oauth/config.js";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
@@ -43,6 +44,8 @@ export type SelfhostConfig = {
   introspectAudiences?: string[];
   /** Factory sessions (src/factory). Unset or enabled=false: routes 404, worker off. */
   factory?: FactoryConfig;
+  /** Hosted MCP module settings; omitted is off. Loading does not mount routes. */
+  mcpOAuth?: McpOAuthConfig;
   port: number;
   host: string;
 };
@@ -263,6 +266,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     encryptionKeyring: loadEncryptionKeyring(env),
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     factory: loadFactoryConfig(env),
+    mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name)),
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
   };
