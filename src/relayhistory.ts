@@ -7,8 +7,17 @@ export class UpstreamError extends Error {
     readonly stage: "assertion" | "exchange" | "read",
     readonly status?: number,
     message = `RelayHistory ${stage} failed`,
+    readonly retryable = false,
   ) {
     super(message);
+  }
+}
+
+/** A backend-specific cursor cannot continue after rollback or credential transport changes. */
+export class ReadCursorExpiredError extends Error {
+  constructor() {
+    super("This session cursor has expired. Restart from the first page.");
+    this.name = "ReadCursorExpiredError";
   }
 }
 

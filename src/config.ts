@@ -16,6 +16,12 @@ export type SelfhostConfig = {
    */
   relayauthUrl: string | null;
   relayhistoryUrl: string;
+  /** Optional GET-only pipeline reader for unsearched session lists and turns. */
+  relayhistoryReadApiUrl?: string | null;
+  /** Independent read service; owns issuance, rotation and verification of its tokens. */
+  sessionReadApi?: { url: string; publicUrl: string; secret: string } | null;
+  /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
+  sessionReadMcpReads?: boolean;
   relayhistoryPublicUrl: string;
   relayauthApiKey: string | null;
   bootstrapToken: string;
@@ -253,6 +259,18 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   }
 
   const relayhistoryPublicUrl = publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL");
+  const introspection = loadIntrospectionConfig(env, relayhistoryPublicUrl);
+  const relayhistoryReadApiUrl = env.RELAYHISTORY_READ_API_URL?.trim()
+    ? publicServiceUrl(env, "RELAYHISTORY_READ_API_URL") : null;
+  if (relayhistoryReadApiUrl) {
+    if (!introspection.introspectSecret) {
+      throw new Error("RELAYHISTORY_READ_API_URL requires RELAYCONTROL_INTROSPECT_SECRET");
+    }
+    const readerOrigin = new URL(relayhistoryReadApiUrl).origin;
+    if (!introspection.introspectAudiences.some((audience) => new URL(audience).origin === readerOrigin)) {
+      throw new Error("SELFHOST_INTROSPECT_AUDIENCES must include RELAYHISTORY_READ_API_URL");
+    }
+  }
   return {
     databaseUrl: loadDatabaseUrl(env),
     publicBaseUrl: serviceUrl(env, "SELFHOST_PUBLIC_URL"),
@@ -261,7 +279,10 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     ...loadRelayauthConfig(env),
     relayhistoryUrl: serviceUrl(env, "RELAYHISTORY_URL"),
     relayhistoryPublicUrl,
-    ...loadIntrospectionConfig(env, relayhistoryPublicUrl),
+    relayhistoryReadApiUrl,
+    sessionReadApi: loadSessionReadApiConfig(env),
+    sessionReadMcpReads: loadSessionReadMcpReads(env),
+    ...introspection,
     bootstrapToken,
     encryptionKeyring: loadEncryptionKeyring(env),
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
@@ -269,6 +290,30 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name)),
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
+  };
+}
+
+function loadSessionReadMcpReads(env: Env): boolean {
+  const value = env.SESSION_READ_API_MCP_READS?.trim();
+  if (!value || value === "false") return false;
+  if (value !== "true") throw new Error("SESSION_READ_API_MCP_READS must be true or false");
+  if (!readSecret(env, "SESSION_READ_API_SECRET")) {
+    throw new Error("SESSION_READ_API_MCP_READS requires the session read API to be configured");
+  }
+  return true;
+}
+
+function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {
+  const secret = readSecret(env, "SESSION_READ_API_SECRET");
+  const names = ["SESSION_READ_API_URL", "SESSION_READ_API_PUBLIC_URL"] as const;
+  if (!secret && !names.some((name) => env[name]?.trim())) return null;
+  if (!secret || Buffer.byteLength(secret) < 32) {
+    throw new Error("SESSION_READ_API_SECRET (or _FILE) must be at least 32 bytes");
+  }
+  return {
+    url: serviceUrl(env, "SESSION_READ_API_URL"),
+    publicUrl: publicServiceUrl(env, "SESSION_READ_API_PUBLIC_URL"),
+    secret,
   };
 }
 
@@ -430,6 +475,8 @@ export function configFingerprint(config: SelfhostConfig): string {
       config.relayauthUrl ?? "",
       config.relayhistoryUrl,
       config.relayhistoryPublicUrl,
+      ...(config.relayhistoryReadApiUrl ? [config.relayhistoryReadApiUrl] : []),
+      ...(config.sessionReadApi ? [config.sessionReadApi.url, config.sessionReadApi.publicUrl] : []),
     ].join("\n"))
     .digest("hex")
     .slice(0, 12);

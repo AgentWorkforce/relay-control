@@ -11,9 +11,11 @@ import { recordAudit } from "./admin/audit.js";
 import {
   issueRelayhistorySession,
   UnsupportedModeError,
+  ReadCursorExpiredError,
   UpstreamError,
 } from "./relayhistory.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
+import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, INTROSPECT_PATH } from "./auth/introspect.js";
 import {
@@ -31,7 +33,7 @@ import {
   type Principal,
 } from "./store.js";
 import { createFlowsHandler } from "./flows/routes.js";
-import type { FlowsStore } from "./flows/store.js";
+import { isUuid, type FlowsStore } from "./flows/store.js";
 import type { TelemetryModule } from "./telemetry/module.js";
 import { identityErrorResponse, type IdentityModule } from "./identity/routes.js";
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
@@ -1317,6 +1319,39 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    if (workspaceItem && method === "DELETE") {
+      // Bootstrap bearer or organization owner/admin. An organization's last
+      // workspace is kept for a person, who could not sign in without one;
+      // only the operator's bootstrap bearer can empty an organization.
+      const [organizationId, workspaceId] = workspaceItem as [string, string];
+      const auth = await organizationAccess(request, organizationId, true);
+      if (!bearer(request)) {
+        const origin = request.headers.origin;
+        const allowed = typeof origin === "string" && origin && origin !== "null"
+          ? browserOrigins.includes(origin)
+          : request.headers["sec-fetch-site"] === "same-origin";
+        if (!allowed) throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      const outcome = isUuid(workspaceId)
+        ? await store.deleteWorkspace({
+          organizationId,
+          workspaceId,
+          allowLast: auth.kind === "bootstrap",
+          actor: auth.kind === "bootstrap" ? { kind: "bootstrap" } : { kind: "user", userId: auth.principal.userId },
+        })
+        : "not_found";
+      if (outcome === "not_found") throw new HttpError(404, "workspace_not_found", "Workspace not found");
+      if (outcome === "last_workspace") {
+        throw new HttpError(409, "last_workspace", "An organization must keep at least one workspace");
+      }
+      if (outcome === "in_use") {
+        throw new HttpError(409, "workspace_in_use", "Tear down this workspace's Factory connection first");
+      }
+      response.writeHead(204);
+      response.end();
+      return;
+    }
+
     const membershipCollection = routeMatch(
       path,
       /^\/api\/v1\/organizations\/([^/]+)\/memberships$/,
@@ -1512,6 +1547,38 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    const readSession = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/session-read\/(session|refresh)$/);
+    if (readSession && method === "POST") {
+      const browser = !bearer(request);
+      const { principal, workspace } = await workspaceAccess(request, readSession[0]!);
+      if (browser && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      if (browser && readSession[1] === "refresh") {
+        throw new HttpError(403, "forbidden", "Browser clients must request a new read session");
+      }
+      if (principal.pendingHandoff) {
+        throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      }
+      if (!principal.scopes.includes("rth:read")) {
+        throw new HttpError(403, "forbidden", "Read credentials require rth:read");
+      }
+      if (!config.sessionReadApi) throw new HttpError(404, "session_read_not_configured", "Session read API is not configured");
+      const schema = readSession[1] === "refresh" ? readRefreshRequest : readSessionRequest;
+      const parsed = schema.safeParse(await requestObject(request));
+      if (!parsed.success) throw new HttpError(400, "invalid_request", "Invalid session read request");
+      rateLimit(response, `session-read:${principal.userId}:${workspace.id}`,
+        { limit: 30, windowMs: 60_000 }, "rate_limited", "Too many session read credential requests");
+      const session = await requestReadSession(config.sessionReadApi, {
+        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
+      }, parsed.data);
+      // Page scripts get a short-lived access token only. Renew by requesting
+      // a new session through the cookie path, which rechecks live membership.
+      const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
+      json(response, 200, browser ? accessOnly : session, true);
+      return;
+    }
+
     // Read-only: which RelayHistory origin this workspace's sessions are bound
     // to. Nothing is issued and RelayHistory is not called, so Desktop can
     // answer site-push admission and cold-process delete/revoke lookups
@@ -1666,13 +1733,21 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         json(response, adminError.status, adminError.body, true);
         return;
       }
+      if (error instanceof ReadCursorExpiredError) {
+        json(response, 410, { error: "cursor_expired", message: error.message }, true);
+        return;
+      }
+      if (error instanceof SessionReadError) {
+        json(response, error.status, { error: error.code, message: error.message }, true);
+        return;
+      }
       if (error instanceof UpstreamError) {
         telemetry?.observeError(error, {
           path: new URL(request.url ?? "/", config.publicBaseUrl).pathname,
           status: error.status ?? 502,
           component: "relayhistory",
         });
-        json(response, 502, {
+        json(response, error.retryable ? 503 : 502, {
           error: "relayhistory_session_failed",
           stage: error.stage,
           upstreamStatus: error.status ?? null,

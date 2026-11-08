@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { SelfhostConfig } from "../config.js";
-import { issueRelayhistorySession, UpstreamError } from "../relayhistory.js";
+import { issueRelayhistorySession, ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 
 /**
  * Workspace-scoped RelayHistory reads for the dashboard sessions views.
@@ -132,13 +132,26 @@ export async function readWorkspaceHistory(
   const query = new URLSearchParams(params);
   query.delete("workspace");
   query.set("workspace", identity.workspaceId);
-  const url = new URL(`${path}?${query}`, `${config.relayhistoryUrl}/`);
-  if (url.origin !== new URL(config.relayhistoryUrl).origin || !url.pathname.startsWith("/v1/")) {
+  // Rollout 1: the GET-only Worker serves unsearched lists and turns. Session
+  // issuance, uploads, events/search and the other views keep the History path.
+  const rolloutPath = path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+\/turns$/.test(path);
+  // Other admitted credential families retain their pre-existing History
+  // transport; this connection never forwards them to a sh_at_-only Worker.
+  const direct = Boolean(config.relayhistoryReadApiUrl && identity.callerToken.startsWith("sh_at_") &&
+    rolloutPath && !query.has("q") && !query.has("search"));
+  // A read-API cursor cannot be interpreted by History after configuration
+  // rollback. Refuse instead of silently restarting on its first page.
+  if (!direct && rolloutPath && /^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
+    throw new ReadCursorExpiredError();
+  }
+  const origin = direct ? config.relayhistoryReadApiUrl! : config.relayhistoryUrl;
+  const url = new URL(`${path}?${query}`, `${origin}/`);
+  if (url.origin !== new URL(origin).origin || !url.pathname.startsWith("/v1/")) {
     throw new UpstreamError("read", undefined, "RelayHistory read origin mismatch");
   }
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const accessToken = await readToken(config, identity);
+    const accessToken = direct ? identity.callerToken : await readToken(config, identity);
     let response: Response;
     try {
       response = await globalThis.fetch(url, {
@@ -153,7 +166,7 @@ export async function readWorkspaceHistory(
     } catch (error) {
       throw new UpstreamError("read", undefined, error instanceof Error ? error.message : undefined);
     }
-    if (response.status === 401 && attempt === 0) {
+    if (!direct && response.status === 401 && attempt === 0) {
       // A revoked or rotated History session: mint a fresh one once.
       await response.body?.cancel().catch(() => {});
       cacheFor(config).delete(cacheKey(identity));
@@ -171,7 +184,7 @@ export async function readWorkspaceHistory(
       // Includes a dormant read-API container (503 not_configured). The
       // cached History token is kept: only a 401 evicts it.
       await response.body?.cancel().catch(() => {});
-      throw new UpstreamError("read", response.status);
+      throw new UpstreamError("read", response.status, undefined, direct && response.status === 503);
     }
     if (response.headers.get(WORKSPACE_ATTESTATION_HEADER) !== identity.workspaceId) {
       await response.body?.cancel().catch(() => {});

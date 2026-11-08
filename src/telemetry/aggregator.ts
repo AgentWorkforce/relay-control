@@ -14,6 +14,7 @@ export function featureArea(path: string): string {
   const aliases: Record<string, string> = {
     auth: "device-login",
     relayhistory: "history",
+    "session-read": "history",
     "deployment-api-tokens": "api-tokens",
     secrets: "env-vars",
   };

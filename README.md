@@ -77,6 +77,7 @@ is explicit. RelayAuth is optional: see
 | `RELAYCAST_PUBLIC_URL` | Public Relaycast origin returned to clients; bare HTTPS public DNS origin |
 | `RELAYAUTH_URL` | Optional, set together with `RELAYAUTH_API_KEY`. Internal RelayAuth origin; when set, History sessions use RelayAuth assertions (transitional). Unset: History sessions exchange the caller's own access token |
 | `RELAYHISTORY_URL` | Internal RelayHistory origin for session exchange and reads; self-host: the read API container's service URL ([docs/sessions-read-api.md](docs/sessions-read-api.md)) |
+| `RELAYHISTORY_READ_API_URL` | Optional bare public HTTPS origin of the GET-only pipeline read Worker for unsearched session lists and turns. Unset keeps existing routing. Requires the introspection secret and an explicit matching `SELFHOST_INTROSPECT_AUDIENCES` entry; see [read backend connection](docs/sessions-read-api.md#connecting-the-get-only-hosted-read-worker). |
 | `RELAYHISTORY_PUBLIC_URL` | Public RelayHistory origin used as assertion and default introspection audience and returned to clients; bare HTTPS public DNS origin |
 | `RELAYAUTH_API_KEY` | Optional, set together with `RELAYAUTH_URL` (`_FILE` supported). Key allowed to mint RelayHistory assertions |
 | `RELAYCONTROL_INTROSPECT_SECRET` | Optional, at least 32 bytes (`_FILE` supported). Bearer for `POST /internal/v1/auth/introspect`, shared only with RelayHistory (and relayfile). Unset: that route answers 404 |
@@ -135,6 +136,50 @@ assertions (when RelayAuth is set) use `RELAYHISTORY_PUBLIC_URL` as
 `historyOrigin`/`aud`, and issued sessions return it as `baseUrl`.
 
 ### RelayAuth and RelayHistory
+
+The independent session read API has its own credential handoff:
+
+- `POST /api/v1/workspaces/{workspace}/session-read/session`, body `{ label? }`.
+- `POST /api/v1/workspaces/{workspace}/session-read/refresh`, body `{ refreshToken }`.
+
+Both also accept the `/cloud` prefix. Enable them with all three settings:
+`SESSION_READ_API_URL` (internal HTTP(S) origin), `SESSION_READ_API_PUBLIC_URL`
+(bare public HTTPS origin), and `SESSION_READ_API_SECRET` or its mutually
+exclusive `_FILE` form (at least 32 bytes). Leave all unset to keep this
+handoff disabled. Use a dedicated Control-to-reader secret; it is never sent
+to clients. These settings do not change the existing History connection.
+
+`SESSION_READ_API_MCP_READS=true` (default false) sends MCP session reads to that read API. MCP obtains and refreshes the calling user's pair through Control, validates its user/organization/workspace, audience and `rth:read` scope, and uses the returned reader URL. Only `rth_at_read_` access tokens reach read routes; the MCP reader client has no internal issuer or service credential. Once the reader is selected, no response or failure switches the request to History, including an unsupported first page (501). Unsupported views remain unavailable on that backend. A refused refresh requires reauthentication; an unavailable refresh retains the pair for a same-reader retry. History is used only when selected before the request, such as an explicitly legacy view or when the feature is off. Cursor continuations never switch backends.
+
+Control authenticates the user, refuses unexchanged Desktop handoffs, checks
+live workspace membership and `rth:read` on every issue and refresh, and
+requests credentials from the read API. The read API issues, stores, rotates,
+revokes and verifies its own opaque tokens. Control neither creates nor
+persists reader tokens. Caller-supplied tenant, audience, scope and URL fields
+are rejected. The response's identity, audience, read-only scope, token format
+and expiry are validated before credentials are returned with `Cache-Control:
+no-store`. Each user/workspace may request credentials 30 times per minute.
+
+Bearer-authenticated clients receive `{ baseUrl, sessionId, userId, orgId,
+workspaceId, audience, scopes: ["rth:read"], accessToken,
+accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType: "Bearer" }`.
+Refresh requires both a current Control access token and the reader refresh
+token. The reader binds and atomically rotates that token for the authorized
+identity. A rejected refresh requires sign-in again; an unavailable reader
+fails closed without falling back to older History or returning upstream bodies.
+
+Browser cookie clients call `/cloud/.../session` with JSON and the dashboard
+or API `Origin`. They receive only the access credential; both refresh fields
+are omitted. After expiry they request a new session through Control, checking
+membership again. Cookie requests to `/refresh` are refused. No refresh token
+custody or reader token storage is added to Control.
+
+The internal reader contract is `POST /internal/v1/session-read/sessions` or
+`/internal/v1/session-read/sessions/refresh`, authenticated by the dedicated
+secret. Control supplies `{ userId, orgId, workspaceId, audience, scopes:
+["rth:read"], label? }`, with `refreshToken` instead of `label` on refresh.
+The reader returns the bearer response above without `baseUrl`; Control sets
+that from configuration. Keep these internal routes off public ingress.
 
 `POST /api/v1/relayhistory/session` (and the `/cloud` alias) works in two
 modes, chosen by whether `RELAYAUTH_URL`/`RELAYAUTH_API_KEY` are set. Setting
@@ -365,6 +410,22 @@ of `relaycastApiKey`, `relaycastWorkspaceId`, `name` (bootstrap bearer or an
 organization owner/admin) replaces the stored, encrypted key, for a Relaycast
 that was reset and re-minted. The workspace id, and so Desktop sign-ins bound
 to it, stay the same.
+
+### Deleting a workspace
+
+`DELETE /api/v1/organizations/{organizationId}/workspaces/{workspaceId}`
+(bootstrap bearer or an organization owner/admin) answers `204` and removes the
+workspace with its sessions, tokens, credentials, flows and workspace-scoped
+audit events; the deletion is audited at organization level as
+`workspace.deleted`. A workspace outside the organization is `404`. An
+organization's last workspace is `409 last_workspace` unless the bootstrap
+bearer deletes it, and a workspace with a Factory connection or binding is
+`409 workspace_in_use`.
+
+Stored objects are not cleaned up. The Relaycast workspace behind it stays, as
+do uploaded run objects (`SELFHOST_FLOWS_STORAGE=gcs`) and the encrypted
+subscription-login blobs in Postgres, GCS or S3. Control has no route to them
+once the workspace is gone; use a bucket lifecycle rule for bucket storage.
 
 ## Dashboard contract
 

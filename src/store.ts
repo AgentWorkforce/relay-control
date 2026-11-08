@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { recordAudit, type AuditActor } from "./admin/audit.js";
 import type { Database, SqlExecutor } from "./database.js";
 import {
   lockIdentity,
@@ -135,6 +136,7 @@ export type IntrospectedToken = {
   email: string;
   organizationId: string;
   workspaceId: string;
+  role: Principal["role"];
   scopes: string[];
   /** SHA-256 of the access token as stored; never returned to callers. */
   accessTokenHash: string;
@@ -204,9 +206,18 @@ export class ControlPlaneStore {
            AND to_regclass('public.selfhost_token_sessions') IS NOT NULL
            AND to_regclass('public.selfhost_workspaces') IS NOT NULL
            AND to_regclass('public.selfhost_organization_domains') IS NOT NULL
-           AND EXISTS (
-             SELECT 1 FROM selfhost_schema_migrations
-              WHERE name = '0014_multi_tenant.sql'
+           -- Runtime roles deliberately cannot read the migration ledger.
+           -- Check the minimum multi-tenant schema through visible columns.
+           AND (
+             SELECT count(*) = 5 FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND (
+                  (table_name = 'selfhost_users'
+                   AND column_name IN ('last_organization_id', 'last_workspace_id'))
+                  OR (table_name = 'selfhost_installation_bootstrap'
+                      AND column_name IN ('personal_org_signup_enabled', 'self_serve_organizations_enabled'))
+                  OR (table_name = 'selfhost_telemetry_outbox' AND column_name = 'organization_id')
+                )
            ) AS present,
            (SELECT count(*)::int FROM selfhost_organizations) AS organizations`,
       );
@@ -370,6 +381,47 @@ export class ControlPlaneStore {
         relaycastWorkspaceId: row.relaycast_workspace_id,
       };
     });
+  }
+
+  /**
+   * Deletes a workspace of this organization. Foreign keys cascade its
+   * sessions, tokens, credentials, flows and workspace-scoped audit events;
+   * the deletion itself is recorded at organization level so it outlives them.
+   * A Factory connection or binding restricts the delete until it is torn
+   * down. The organization's rows are locked so two concurrent deletes cannot
+   * both pass the last-workspace check. The Relaycast workspace is not touched.
+   */
+  async deleteWorkspace(input: {
+    organizationId: string;
+    workspaceId: string;
+    allowLast: boolean;
+    actor: AuditActor;
+  }): Promise<"deleted" | "not_found" | "last_workspace" | "in_use"> {
+    try {
+      return await this.database.transaction(async (tx) => {
+        const rows = await tx.query<{ id: string; name: string }>(
+          "SELECT id, name FROM selfhost_workspaces WHERE organization_id = $1 ORDER BY id FOR UPDATE",
+          [input.organizationId],
+        );
+        const target = rows.rows.find((row) => row.id === input.workspaceId);
+        if (!target) return "not_found";
+        if (rows.rows.length === 1 && !input.allowLast) return "last_workspace";
+        await tx.query("DELETE FROM selfhost_workspaces WHERE id = $1 AND organization_id = $2", [
+          input.workspaceId,
+          input.organizationId,
+        ]);
+        await recordAudit(tx, {
+          organizationId: input.organizationId,
+          actor: input.actor,
+          action: "workspace.deleted",
+          target: `${input.workspaceId} (${target.name})`,
+        });
+        return "deleted";
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === "23503") return "in_use";
+      throw error;
+    }
   }
 
   async listWorkspaces(organizationId: string): Promise<Array<Record<string, unknown>>> {
@@ -875,8 +927,10 @@ export class ControlPlaneStore {
   /**
    * The token session behind an access token for introspection, including
    * revoked and expired rows so the caller can say why it is inactive. Same
-   * joins as authenticateAccessToken: a session whose membership, workspace or
-   * single-organization invariant no longer holds is not found at all.
+   * joins as authenticateAccessToken: a session whose membership or workspace
+   * no longer holds is not found at all, nor in single tenancy is one on a
+   * database that has gained a second organization. The joins bind the answer
+   * to the session's own organization in either mode.
    */
   async introspectAccessToken(token: string): Promise<IntrospectedToken | null> {
     const result = await this.database.query<{
@@ -884,6 +938,7 @@ export class ControlPlaneStore {
       email: string;
       organization_id: string;
       workspace_id: string;
+      role: Principal["role"];
       scopes: string[];
       access_token_hash: string;
       revoked: boolean;
@@ -891,7 +946,7 @@ export class ControlPlaneStore {
       issued_at: Date | string;
       expires_at: Date | string;
     }>(
-      `SELECT s.user_id, u.email, s.organization_id, s.workspace_id, s.scopes,
+      `SELECT s.user_id, u.email, s.organization_id, s.workspace_id, m.role, s.scopes,
               s.access_token_hash,
               s.revoked_at IS NOT NULL AS revoked,
               s.access_token_expires_at <= now() AS expired,
@@ -904,12 +959,12 @@ export class ControlPlaneStore {
          JOIN selfhost_organization_memberships m
            ON m.organization_id = s.organization_id AND m.user_id = s.user_id
         WHERE s.access_token_hash = $1
-          AND NOT EXISTS (
+          AND ($2::text = 'multi' OR NOT EXISTS (
             SELECT 1
               FROM selfhost_organizations other
              WHERE other.id <> s.organization_id
-          )`,
-      [hashSecret(token)],
+          ))`,
+      [hashSecret(token), this.tenancy],
     );
     const row = result.rows[0];
     if (!row) return null;
@@ -918,6 +973,7 @@ export class ControlPlaneStore {
       email: row.email,
       organizationId: row.organization_id,
       workspaceId: row.workspace_id,
+      role: row.role,
       scopes: row.scopes,
       accessTokenHash: row.access_token_hash,
       revoked: row.revoked,

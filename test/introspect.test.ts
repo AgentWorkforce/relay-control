@@ -251,6 +251,7 @@ test("introspection describes an active access token and rotates token_id on ref
     machine_id: null,
     org: env.organizationId,
     workspace: env.alpha,
+    role: "owner",
     scopes: ["cli:auth", "rth:read", "rth:sync", "rth:acquire"],
     aud: HISTORY_PUBLIC,
     iat: Math.floor(new Date(session.created_at).getTime() / 1_000),
@@ -872,4 +873,49 @@ test("introspection without a workspace verifies machines in the session's works
     (await env.introspect({ ...base, machine: "node-nobody" })).body,
     { active: false, reason: "machine_unclaimed" },
   );
+});
+
+test("introspection refuses a second organization in single tenancy and allows it in multi", async (t) => {
+  const env = await setup(t);
+  const { accessToken } = await env.login(env.alpha);
+  await env.database.query(
+    "INSERT INTO selfhost_organizations (id, name) VALUES ($1, 'Other')",
+    ["00000000-0000-4000-8000-000000000002"],
+  );
+  const single = await env.introspect({ token: accessToken, aud: HISTORY_PUBLIC });
+  assert.deepEqual(single.body, { active: false, reason: "unknown" });
+
+  const multi = new ControlPlaneStore(
+    env.database,
+    { active: { id: "test-key", key: Buffer.alloc(32, 7) } },
+    0,
+    { tenancy: "multi" },
+  );
+  const session = await multi.introspectAccessToken(accessToken);
+  assert.equal(session?.organizationId, env.organizationId);
+  assert.equal(session?.workspaceId, env.alpha);
+  assert.equal(await multi.introspectAccessToken("sh_at_not-a-real-token"), null);
+});
+
+test("introspection reports the live organization role, for add-on admin decisions", async (t) => {
+  const env = await setup(t);
+  const { accessToken: ownerToken } = await env.login(env.alpha);
+  const active = await env.introspect({ token: ownerToken, aud: HISTORY_PUBLIC });
+  assert.equal(active.body.role, "owner");
+
+  const memberId = await env.member("member@example.test");
+  await env.database.query(
+    "UPDATE selfhost_token_sessions SET user_id = $1 WHERE access_token_hash = $2",
+    [memberId, sha256(ownerToken)],
+  );
+  const asMember = await env.introspect({ token: ownerToken, aud: HISTORY_PUBLIC });
+  assert.equal(asMember.body.active, true);
+  assert.equal(asMember.body.role, "member");
+
+  await env.database.query(
+    "UPDATE selfhost_organization_memberships SET role = 'admin' WHERE user_id = $1",
+    [memberId],
+  );
+  const promoted = await env.introspect({ token: ownerToken, aud: HISTORY_PUBLIC });
+  assert.equal(promoted.body.role, "admin");
 });
