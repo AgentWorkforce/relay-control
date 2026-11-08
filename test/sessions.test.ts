@@ -103,7 +103,7 @@ type Session = { sessionId: string; source: string; workspaceId: string; summary
  * per workspace, org-wide reads when `workspace` is omitted, 403 when it does
  * not match the token, and `X-Relayhistory-Workspace-Id` attestation.
  */
-async function startHistory(t: TestContext, historyOrigin: string) {
+async function startHistory(t: TestContext, historyOrigin: string, direct = false) {
   const requests: UpstreamRequest[] = [];
   const tokens = new Map<string, string>();
   const sessions: Session[] = [];
@@ -136,6 +136,10 @@ async function startHistory(t: TestContext, historyOrigin: string) {
       response.statusCode = status;
       response.end(JSON.stringify(value));
     };
+    if (direct && request.method !== "GET") {
+      send(405, { error: "method_not_allowed" });
+      return;
+    }
     if (url.pathname === "/v1/tokens/relayhistory-assertion") {
       send(200, {
         accessToken: `relay_ag_${jwt({
@@ -188,7 +192,7 @@ async function startHistory(t: TestContext, historyOrigin: string) {
       });
       return;
     }
-    const tokenWorkspace = token ? tokens.get(token) : undefined;
+    const tokenWorkspace = token ? (direct ? callerTokens : tokens).get(token) : undefined;
     if (!tokenWorkspace) {
       send(401, { error: { code: "unauthorized" } });
       return;
@@ -323,11 +327,12 @@ async function startHistory(t: TestContext, historyOrigin: string) {
 async function setup(
   t: TestContext,
   now = new Date("2026-11-02T20:00:00.000Z"),
-  options: { relayauth?: boolean } = {},
+  options: { relayauth?: boolean; directReadApi?: boolean } = {},
 ) {
   const relayauth = options.relayauth ?? true;
   const historyOrigin = "https://history.selfhosted.test";
   const history = await startHistory(t, historyOrigin);
+  const readApi = options.directReadApi ? await startHistory(t, historyOrigin, true) : undefined;
   const database = new PGliteDatabase();
   await migrate(database);
   const bootstrapToken = "bootstrap-token-that-is-at-least-32-bytes";
@@ -338,6 +343,7 @@ async function setup(
     relaycastPublicUrl: "https://relaycast.selfhosted.test",
     relayauthUrl: relayauth ? history.origin : null,
     relayhistoryUrl: history.origin,
+    ...(readApi ? { relayhistoryReadApiUrl: readApi.origin } : {}),
     relayhistoryPublicUrl: historyOrigin,
     relayauthApiKey: relayauth ? "rak_test" : null,
     bootstrapToken,
@@ -402,15 +408,19 @@ async function setup(
     assert.equal(tokens.status, 200);
     const accessToken = tokens.body.access_token as string;
     history.callerTokens.set(accessToken, workspaceId);
+    readApi?.callerTokens.set(accessToken, workspaceId);
     return accessToken;
   };
   history.sessions.push(
     { sessionId: "alpha-1", source: "codex", workspaceId: alpha, summary: "Alpha work" },
     { sessionId: "beta-1", source: "claude", workspaceId: beta, summary: "Beta secret" },
   );
+  if (readApi) readApi.sessions.push(...history.sessions);
   return {
     origin,
     history,
+    readApi,
+    disableDirectRead: () => { config.relayhistoryReadApiUrl = null; },
     alpha,
     beta,
     ownerId: org.body.owner.id as string,
@@ -908,4 +918,89 @@ test("read API: sync sessions are refused when the backend grants only rth:read"
   const invalid = await call(env.origin, path, { method: "POST", token, body: { mode: "read" } });
   assert.equal(invalid.status, 502);
   assert.equal(invalid.body.stage, "exchange");
+});
+
+
+test("direct read Worker: list and turns use the caller token without login; issuance stays on History", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}`;
+  const list = await call(env.origin, `${base}/sessions`, { token });
+  assert.equal(list.status, 200);
+  assert.deepEqual(list.body.items.map((row: any) => row.sessionId), ["alpha-1"]);
+  const turns = await call(env.origin, `${base}/sessions/alpha-1/turns?source=codex`, { token });
+  assert.equal(turns.status, 200);
+  assert.equal(turns.body.turns[0].content, "Alpha work");
+  assert.deepEqual(env.readApi!.requests.map((r) => r.path), ["/v1/sessions", "/v1/sessions/alpha-1/turns"]);
+  assert(env.readApi!.requests.every((r) => r.token === token && r.workspaceParams.length === 1 && r.query.workspace === env.alpha));
+  assert.equal(env.history.requests.length, 0);
+  const issued = await call(env.origin, `${base}/relayhistory/session`, { method: "POST", token, body: { mode: "read" } });
+  assert.equal(issued.status, 200);
+  assert.equal(issued.body.baseUrl, "https://history.selfhosted.test");
+  assert(env.history.requests.some((r) => r.path === "/v1/cli/login"));
+  assert.equal(env.readApi!.requests.length, 2);
+});
+
+test("direct read Worker: search/events stay on History and foreign requests never reach the reader", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}`;
+  assert.equal((await call(env.origin, `${base}/sessions?q=work`, { token })).status, 200);
+  assert.equal((await call(env.origin, `${base}/sessions/alpha-1/events?source=codex`, { token })).status, 200);
+  assert.equal(env.readApi!.requests.length, 0);
+  assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.beta}/sessions`, { token })).status, 404);
+  assert.equal((await call(env.origin, `${base}/sessions?workspace=${env.beta}`, { token })).status, 400);
+  assert.equal((await call(env.origin, `${base}/sessions`)).status, 401);
+  assert.equal(env.readApi!.requests.length, 0);
+});
+
+test("direct read Worker: downstream refusal never falls back, logs in or retries", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}`;
+  for (const status of [401, 403, 503]) {
+    env.readApi!.overrides.set("/v1/sessions", () => ({ status, body: { error: "buffered_fenced", private: "must-not-echo" } }));
+    const before = env.readApi!.requests.length;
+    const result = await call(env.origin, `${base}/sessions`, { token });
+    assert.equal(result.status, status === 503 ? 503 : 502);
+    assert.equal(result.body.upstreamStatus, status);
+    assert(!JSON.stringify(result.body).includes("must-not-echo"));
+    assert.equal(env.readApi!.requests.length, before + 1);
+    assert.equal(env.history.requests.length, 0);
+  }
+});
+
+test("direct read Worker: missing/wrong workspace attestation discards content without fallback", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  for (const attestation of ["", env.beta]) {
+    env.readApi!.overrides.set("/v1/sessions", () => ({ headers: { "x-relayhistory-workspace-id": attestation }, body: { sessions: [{ sessionId: "private", summary: "must-not-echo" }] } }));
+    const result = await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token });
+    assert.equal(result.status, 502);
+    assert(!JSON.stringify(result.body).includes("must-not-echo"));
+    assert.equal(env.history.requests.length, 0);
+  }
+});
+
+
+test("direct read Worker: disabling the connection refuses native cursors instead of restarting History", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  env.disableDirectRead();
+  for (const path of ["sessions?cursor=b96s1:opaque", "sessions/alpha-1/turns?source=codex&cursor=b96t1:opaque"]) {
+    const result = await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/${path}`, { token });
+    assert.equal(result.status, 503);
+    assert.equal(env.history.requests.length, 0);
+    assert.equal(env.readApi!.requests.length, 0);
+  }
+});
+
+test("direct read Worker: redirects never forward the caller token to History", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  env.readApi!.overrides.set("/v1/sessions", () => ({ status: 302, headers: { location: `${env.history.origin}/v1/sessions` } }));
+  const result = await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token });
+  assert.equal(result.status, 502);
+  assert.equal(env.history.requests.length, 0);
+  assert.equal(env.readApi!.requests.length, 1);
 });

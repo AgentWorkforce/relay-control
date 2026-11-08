@@ -1672,7 +1672,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           status: error.status ?? 502,
           component: "relayhistory",
         });
-        json(response, 502, {
+        json(response, error.retryable ? 503 : 502, {
           error: "relayhistory_session_failed",
           stage: error.stage,
           upstreamStatus: error.status ?? null,

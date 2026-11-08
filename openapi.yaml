@@ -1468,6 +1468,8 @@ paths:
                 $ref: "#/components/schemas/DashboardSessionPage"
         "404":
           description: Workspace is outside the authenticated tenant
+        "503":
+          description: Configured direct read Worker is temporarily unavailable or a native read cursor cannot continue after rollback. No History fallback.
         "502":
           description: RelayAuth or RelayHistory is unavailable
         "501":
@@ -1715,7 +1717,7 @@ paths:
         - bearerAuth: []
       operationId: getDashboardSessionTurns
       description: |
-        Calls only RelayHistory `GET /v1/sessions/{sessionId}/turns` with
+        Calls the configured session backend `GET /v1/sessions/{sessionId}/turns` with
         explicit `workspace={authorized workspace UUID}`; the response must
         attest that workspace in `X-Relayhistory-Workspace-Id`.
       parameters:
@@ -1739,6 +1741,8 @@ paths:
                 $ref: "#/components/schemas/DashboardTurnPage"
         "404":
           description: Workspace is outside the authenticated tenant
+        "503":
+          description: Configured direct read Worker is temporarily unavailable or a native read cursor cannot continue after rollback. No History fallback.
         "502":
           description: RelayAuth or RelayHistory is unavailable or unattested
         "501":

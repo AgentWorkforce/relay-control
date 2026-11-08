@@ -7,6 +7,7 @@ export class UpstreamError extends Error {
     readonly stage: "assertion" | "exchange" | "read",
     readonly status?: number,
     message = `RelayHistory ${stage} failed`,
+    readonly retryable = false,
   ) {
     super(message);
   }

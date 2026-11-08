@@ -15,6 +15,8 @@ export type SelfhostConfig = {
    */
   relayauthUrl: string | null;
   relayhistoryUrl: string;
+  /** Optional GET-only pipeline reader for unsearched session lists and turns. */
+  relayhistoryReadApiUrl?: string | null;
   relayhistoryPublicUrl: string;
   relayauthApiKey: string | null;
   bootstrapToken: string;
@@ -250,6 +252,18 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   }
 
   const relayhistoryPublicUrl = publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL");
+  const introspection = loadIntrospectionConfig(env, relayhistoryPublicUrl);
+  const relayhistoryReadApiUrl = env.RELAYHISTORY_READ_API_URL?.trim()
+    ? publicServiceUrl(env, "RELAYHISTORY_READ_API_URL") : null;
+  if (relayhistoryReadApiUrl) {
+    if (!introspection.introspectSecret) {
+      throw new Error("RELAYHISTORY_READ_API_URL requires RELAYCONTROL_INTROSPECT_SECRET");
+    }
+    const readerOrigin = new URL(relayhistoryReadApiUrl).origin;
+    if (!introspection.introspectAudiences.some((audience) => new URL(audience).origin === readerOrigin)) {
+      throw new Error("SELFHOST_INTROSPECT_AUDIENCES must include RELAYHISTORY_READ_API_URL");
+    }
+  }
   return {
     databaseUrl: loadDatabaseUrl(env),
     publicBaseUrl: serviceUrl(env, "SELFHOST_PUBLIC_URL"),
@@ -258,7 +272,8 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     ...loadRelayauthConfig(env),
     relayhistoryUrl: serviceUrl(env, "RELAYHISTORY_URL"),
     relayhistoryPublicUrl,
-    ...loadIntrospectionConfig(env, relayhistoryPublicUrl),
+    relayhistoryReadApiUrl,
+    ...introspection,
     bootstrapToken,
     encryptionKeyring: loadEncryptionKeyring(env),
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
@@ -426,6 +441,7 @@ export function configFingerprint(config: SelfhostConfig): string {
       config.relayauthUrl ?? "",
       config.relayhistoryUrl,
       config.relayhistoryPublicUrl,
+      ...(config.relayhistoryReadApiUrl ? [config.relayhistoryReadApiUrl] : []),
     ].join("\n"))
     .digest("hex")
     .slice(0, 12);

@@ -126,3 +126,68 @@ requires TLS to Postgres. A Postgres-only assembly is an open follow-up that the
 sessions pipeline maintainers are tracking. Until it lands, a self-host
 install that wants transcripts and search must provide ClickHouse and a
 TLS-enabled Postgres to the container.
+
+
+## Connecting the GET-only hosted read Worker
+
+The hosted pipeline read Worker and the self-hosted read container have different
+login contracts. The Worker accepts GET only; it cannot answer the container's
+`POST /v1/cli/login`. Do not replace `RELAYHISTORY_URL` with the hosted Worker
+origin: that would break session issuance and the existing login-based reads.
+
+For an installation that is explicitly using the hosted Worker, set
+`RELAYHISTORY_READ_API_URL` to its accepted bare public HTTPS origin. This is an
+optional connection, off when unset. It sends only unsearched `/v1/sessions`
+and `/v1/sessions/:id/turns` reads directly to that origin using the authenticated
+caller's own `sh_at_` access token. The reader must verify that token by
+introspecting it against this control plane. No login exchange, RelayAuth
+assertion, or service bearer is substituted. Workspace membership is checked
+before forwarding; the query always names the caller's authorized workspace;
+every successful response still needs the matching workspace attestation.
+
+All other views, search, MCP history reads, session issuance and uploads keep
+the existing History connection. This option does not migrate dashboard
+metadata, events or search. Self-hosted installations using the read container
+can keep the original `RELAYHISTORY_URL` path without this option.
+
+Control configuration:
+
+- `RELAYHISTORY_READ_API_URL`: the accepted Worker origin, without a path.
+- `RELAYCONTROL_INTROSPECT_SECRET` (or `_FILE`): the existing internal
+  introspection credential, also configured on the Worker. No credential is
+  copied into a client response.
+- `SELFHOST_INTROSPECT_AUDIENCES`: include the Worker's exact `READ_API_ORIGIN`
+  (the same origin as `RELAYHISTORY_READ_API_URL`), retaining the audiences
+  required by existing consumers. Startup refuses an absent secret or missing
+  audience rather than starting with a broken connection.
+- Keep `RELAYHISTORY_URL`, `RELAYHISTORY_PUBLIC_URL` and any existing RelayAuth
+  settings for the old session/login paths.
+
+Worker configuration, owned by the pipeline operator:
+
+- `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`.
+- `RELAYCONTROL_INTROSPECT_URL`: the accepted reachable control introspection
+  endpoint; `RELAYCONTROL_INTROSPECT_SECRET`: the matching credential.
+- `READ_API_ORIGIN`: the configured Worker origin above.
+- The directory/owner-buffered allowlists, exact-user G2 parity and runtime
+  privacy authority remain authoritative. The control connection grants no G2
+  or buffered-content authority. Do not widen either allowlist or grant new
+  users through this connection alone.
+
+The introspection route is internal. Establish the approved private connection
+between the Worker and control; do not expose `/internal` at a public ingress
+or remove an existing ingress restriction to make this work.
+
+Before enabling, retain the current configuration for rollback and obtain the
+accepted schema/generation, G2, privacy-binding and read-Worker deployment
+receipts. Then prove an authorized user's list and turns from that backend and
+content denial for a different user/workspace. A passing readiness probe or a
+successful unit test is not that live proof. No deployed URL or accepted image
+is selected by this document.
+
+A direct read failure never falls back to older History, since that could
+bypass a privacy refusal or silently restart pagination. Worker 503 refusals
+remain retryable HTTP 503; other failures retain the bounded upstream-error
+response without exposing the upstream body. Rollback unsets
+`RELAYHISTORY_READ_API_URL` and redeploys control. Ordinary first pages return
+to History; outstanding `b96…` cursors fail with 503 instead of restarting.
