@@ -17,6 +17,7 @@ import { handleSessionRoutes } from "./sessions/routes.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, INTROSPECT_PATH } from "./auth/introspect.js";
+import { handleAcquisitionRoutes } from "./acquisition/routes.js";
 import {
   ACCOUNT_SCOPE,
   DASHBOARD_DEVICE_CLIENT,
@@ -566,6 +567,13 @@ export function createApp(input: {
       return;
     }
 
+    // Dormant acquisition assertion issuer (docs/acquisition-issuer.md): every
+    // /api/v1/acquisition path is 404 until SELFHOST_ACQUISITION_ISSUER_ENABLED.
+    if (await handleAcquisitionRoutes({
+      config, store, apiTokens: admin?.apiTokens, request, response, method, path, now: input.now,
+    })) {
+      return;
+    }
     // Factory sessions: 404 before auth when the flag is off.
     if (await factoryRoutes(request, response, path, publicPath, method)) return;
 

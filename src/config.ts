@@ -1,7 +1,12 @@
 import { readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey, type KeyObject } from "node:crypto";
 import { isIP } from "node:net";
 import type { EncryptionKey, EncryptionKeyring } from "./crypto.js";
+import {
+  isAcquisitionIdentifier,
+  rawEd25519PublicKey,
+  strictRawPublicKey,
+} from "./acquisition/assertion.js";
 
 export type SelfhostConfig = {
   databaseUrl: string;
@@ -47,6 +52,12 @@ export type SelfhostConfig = {
    * SELFHOST_INTROSPECT_AUDIENCES. Defaults to [relayhistoryPublicUrl].
    */
   introspectAudiences?: string[];
+  /**
+   * Dormant cloud-class acquisition assertion issuer
+   * (SELFHOST_ACQUISITION_ISSUER_ENABLED). Unset or null: off, and every
+   * /api/v1/acquisition/* route answers 404.
+   */
+  acquisitionIssuer?: AcquisitionIssuerConfig | null;
   /** Factory sessions (src/factory). Unset or enabled=false: routes 404, worker off. */
   factory?: FactoryConfig;
   port: number;
@@ -54,6 +65,24 @@ export type SelfhostConfig = {
 };
 
 type Env = Record<string, string | undefined>;
+
+export type AcquisitionPublishedKey = {
+  issuerKeyId: string;
+  issuerClass: "cloud";
+  /** Base64 of the raw 32-byte Ed25519 public key (ACQUISITION_PINNED_KEYS shape). */
+  publicKeyBase64: string;
+};
+
+export type AcquisitionIssuerConfig = {
+  /** SELFHOST_ACQUISITION_ORIGIN as a normalized origin (scheme, lowercase host, port). */
+  origin: string;
+  /** SELFHOST_ACQUISITION_ISSUER_KEY_ID: stamped into every issued payload. */
+  keyId: string;
+  /** Ed25519 private key; never logged, never published. */
+  privateKey: KeyObject;
+  /** Active key first, then SELFHOST_ACQUISITION_ISSUER_PREVIOUS_PUBLIC_KEYS (never used to sign). */
+  publishedKeys: AcquisitionPublishedKey[];
+};
 
 export type FactoryConfig = {
   enabled: boolean;
@@ -280,6 +309,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     sessionReadApi: loadSessionReadApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
     ...introspection,
+    acquisitionIssuer: loadAcquisitionIssuerConfig(env, introspection),
     bootstrapToken,
     encryptionKeyring: loadEncryptionKeyring(env),
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
@@ -362,6 +392,31 @@ function loadRelayauthConfig(env: Env): {
   return { relayauthUrl: serviceUrl(env, "RELAYAUTH_URL"), relayauthApiKey: apiKey };
 }
 
+/**
+ * One http(s) origin without credentials, path, query or fragment, trailing
+ * slashes dropped (SELFHOST_INTROSPECT_AUDIENCES entries and
+ * SELFHOST_ACQUISITION_ORIGIN). `label` names the variable in errors; the
+ * value is never echoed.
+ */
+function audienceOrigin(value: string, label: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${label} must be an absolute origin`);
+  }
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username || url.password || url.search || url.hash ||
+    (url.pathname !== "" && url.pathname !== "/") || /[?#]/.test(value)
+  ) {
+    throw new Error(
+      `${label} must be an http(s) origin without credentials, path, query, or fragment`,
+    );
+  }
+  return value.replace(/\/+$/, "");
+}
+
 function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
   introspectSecret: string | null;
   introspectAudiences: string[];
@@ -372,29 +427,108 @@ function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
   }
   const raw = env.SELFHOST_INTROSPECT_AUDIENCES?.trim();
   const introspectAudiences = raw
-    ? raw.split(",").map((value) => value.trim()).filter(Boolean).map((value) => {
-      let url: URL;
-      try {
-        url = new URL(value);
-      } catch {
-        throw new Error("SELFHOST_INTROSPECT_AUDIENCES entries must be absolute origins");
-      }
-      if (
-        (url.protocol !== "http:" && url.protocol !== "https:") ||
-        url.username || url.password || url.search || url.hash ||
-        (url.pathname !== "" && url.pathname !== "/") || /[?#]/.test(value)
-      ) {
-        throw new Error(
-          "SELFHOST_INTROSPECT_AUDIENCES entries must be http(s) origins without credentials, path, query, or fragment",
-        );
-      }
-      return value.replace(/\/+$/, "");
-    })
+    ? raw.split(",").map((value) => value.trim()).filter(Boolean).map((value) =>
+      audienceOrigin(value, "each SELFHOST_INTROSPECT_AUDIENCES entry"))
     : [relayhistoryPublicUrl];
   if (introspectAudiences.length === 0) {
     throw new Error("SELFHOST_INTROSPECT_AUDIENCES must name at least one origin");
   }
   return { introspectSecret, introspectAudiences };
+}
+
+/**
+ * SELFHOST_ACQUISITION_ISSUER_ENABLED (strict `true` / `false` / unset,
+ * default off). Off: null, and no other acquisition variable is read, so no
+ * key is loaded or parsed. On: every variable must be present and valid, and
+ * startup fails naming the variable (never its value) otherwise.
+ *
+ * The acquisition origin must also be an accepted introspection audience with
+ * introspection enabled: acquisition-operator tokens can only be minted for,
+ * and only introspect against, an accepted audience, and the pipeline
+ * verifies its callers through the same introspection.
+ */
+export function loadAcquisitionIssuerConfig(
+  env: Env,
+  introspection: { introspectSecret: string | null; introspectAudiences: string[] },
+): AcquisitionIssuerConfig | null {
+  const flag = env.SELFHOST_ACQUISITION_ISSUER_ENABLED?.trim() ?? "";
+  if (flag !== "" && flag !== "true" && flag !== "false") {
+    throw new Error("SELFHOST_ACQUISITION_ISSUER_ENABLED must be true or false");
+  }
+  if (flag !== "true") return null;
+
+  const originValue = required(env, "SELFHOST_ACQUISITION_ORIGIN");
+  const origin = new URL(audienceOrigin(originValue, "SELFHOST_ACQUISITION_ORIGIN")).origin;
+  if (!introspection.introspectSecret) {
+    throw new Error("RELAYCONTROL_INTROSPECT_SECRET is required when SELFHOST_ACQUISITION_ISSUER_ENABLED=true");
+  }
+  if (!introspection.introspectAudiences.some((audience) => new URL(audience).origin === origin)) {
+    throw new Error("SELFHOST_ACQUISITION_ORIGIN must be listed in SELFHOST_INTROSPECT_AUDIENCES");
+  }
+
+  const keyId = env.SELFHOST_ACQUISITION_ISSUER_KEY_ID;
+  if (keyId === undefined || keyId === "") throw new Error("SELFHOST_ACQUISITION_ISSUER_KEY_ID is required");
+  if (!isAcquisitionIdentifier(keyId)) {
+    throw new Error(
+      "SELFHOST_ACQUISITION_ISSUER_KEY_ID must be at most 512 UTF-8 bytes without control characters",
+    );
+  }
+
+  const pem = readSecret(env, "SELFHOST_ACQUISITION_ISSUER_PRIVATE_KEY");
+  if (!pem) throw new Error("SELFHOST_ACQUISITION_ISSUER_PRIVATE_KEY (or _FILE) is required");
+  let privateKey: KeyObject;
+  try {
+    if (!pem.startsWith("-----BEGIN PRIVATE KEY-----")) throw new Error("not PKCS#8 PEM");
+    privateKey = createPrivateKey({ key: pem, format: "pem" });
+  } catch {
+    throw new Error("SELFHOST_ACQUISITION_ISSUER_PRIVATE_KEY must be an unencrypted PKCS#8 PEM Ed25519 private key");
+  }
+  if (privateKey.type !== "private" || privateKey.asymmetricKeyType !== "ed25519") {
+    throw new Error("SELFHOST_ACQUISITION_ISSUER_PRIVATE_KEY must be an unencrypted PKCS#8 PEM Ed25519 private key");
+  }
+  const active: AcquisitionPublishedKey = {
+    issuerKeyId: keyId,
+    issuerClass: "cloud",
+    publicKeyBase64: rawEd25519PublicKey(privateKey).toString("base64"),
+  };
+  return {
+    origin,
+    keyId,
+    privateKey,
+    publishedKeys: [active, ...loadPreviousAcquisitionKeys(env, active)],
+  };
+}
+
+/** SELFHOST_ACQUISITION_ISSUER_PREVIOUS_PUBLIC_KEYS: JSON [{issuerKeyId, publicKeyBase64}]. */
+function loadPreviousAcquisitionKeys(env: Env, active: AcquisitionPublishedKey): AcquisitionPublishedKey[] {
+  const name = "SELFHOST_ACQUISITION_ISSUER_PREVIOUS_PUBLIC_KEYS";
+  const raw = env[name]?.trim();
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`${name} must be a JSON array`);
+  }
+  if (!Array.isArray(parsed)) throw new Error(`${name} must be a JSON array`);
+  const ids = new Set([active.issuerKeyId]);
+  const keys = new Set([active.publicKeyBase64]);
+  return parsed.map((entry: unknown) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) ||
+        Object.keys(entry).sort().join(",") !== "issuerKeyId,publicKeyBase64") {
+      throw new Error(`${name} entries need exactly issuerKeyId and publicKeyBase64`);
+    }
+    const { issuerKeyId, publicKeyBase64 } = entry as Record<string, unknown>;
+    if (!isAcquisitionIdentifier(issuerKeyId)) throw new Error(`${name} has an invalid issuerKeyId`);
+    if (!strictRawPublicKey(publicKeyBase64)) {
+      throw new Error(`${name} publicKeyBase64 must be base64 of a raw 32-byte Ed25519 public key`);
+    }
+    if (ids.has(issuerKeyId)) throw new Error(`${name} repeats an issuerKeyId (or the active one)`);
+    if (keys.has(publicKeyBase64 as string)) throw new Error(`${name} repeats a public key (or the active one)`);
+    ids.add(issuerKeyId);
+    keys.add(publicKeyBase64 as string);
+    return { issuerKeyId, issuerClass: "cloud" as const, publicKeyBase64: publicKeyBase64 as string };
+  });
 }
 
 function absoluteHttpUrl(env: Env, name: string, fallback: string): string {

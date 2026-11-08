@@ -31,6 +31,11 @@ servers:
 security:
   - bearerAuth: []
 tags:
+  - name: acquisition
+    description: |
+      Dormant cloud-class acquisition assertion issuer (flag
+      SELFHOST_ACQUISITION_ISSUER_ENABLED, default off). See
+      docs/acquisition-issuer.md.
   - name: factory
     description: |
       Factory sessions (docs/factory-sessions.md). Every operation answers
@@ -3646,8 +3651,8 @@ paths:
 
         Agent and service principals: an `sh_wk_` token is looked up only as a
         workspace API token of purpose relayfile-agent or acquisition-operator;
-        any other `sh_wk_` (unknown, another purpose, revoked or not) is
-        `wrong-kind`. Then `revoked`,
+        one with no such token is `unknown`; any other `sh_wk_` (another
+        purpose, revoked or not) is `wrong-kind`. Then `revoked`,
         `expired`, `audience` (`aud` must normalize to the token's stored aud,
         which must still be an accepted audience) and `workspace` as above.
         An agent has no machine: any `machine` is `machine_not_owned`. The
@@ -4623,6 +4628,118 @@ paths:
                   - $ref: "#/components/schemas/DesktopFeedError"
                   - properties: { error: { enum: [install_token_not_found] } }
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
+  /api/v1/acquisition/issuer-keys:
+    get:
+      tags: [acquisition]
+      operationId: listAcquisitionIssuerKeys
+      security: []
+      description: |
+        Dormant: 404 `{error:{code:"not_found"}}` unless
+        SELFHOST_ACQUISITION_ISSUER_ENABLED=true. Unauthenticated. The public
+        keys this install signs acquisition assertions with, in the exact
+        shape of the RelayHistory pipeline's ACQUISITION_PINNED_KEYS: the
+        active key first, then SELFHOST_ACQUISITION_ISSUER_PREVIOUS_PUBLIC_KEYS.
+        Every key is cloud class. `Cache-Control: no-store`. See
+        docs/acquisition-issuer.md.
+      responses:
+        "200":
+          description: Published issuer keys
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { $ref: "#/components/schemas/AcquisitionIssuerKey" }
+        "404": { $ref: "#/components/responses/AcquisitionNotFound" }
+  /api/v1/acquisition/assertions/install:
+    post:
+      tags: [acquisition]
+      operationId: issueAcquisitionInstallAssertion
+      security:
+        - bearerAuth: []
+      description: |
+        Dormant: 404 `not_found` unless SELFHOST_ACQUISITION_ISSUER_ENABLED=true.
+        Signs a cloud-class install assertion that the RelayHistory pipeline
+        verifies with relayhistory-acquisition-assertion-install-v1. Nothing is
+        stored except an audit event (`acquisition.assertion.issued`).
+
+        Callers (verified through the introspection internals with `aud` =
+        SELFHOST_ACQUISITION_ORIGIN): an acquisition-operator workspace API
+        token (`sh_wk_`, scope `acquisition:operate`, stored aud equal to the
+        origin), or a Desktop user session (`sh_at_`) carrying `rth:acquire`
+        whose `ownerUserId` is the caller (handoff sessions are refused). Any
+        other principal, a missing bearer, a body `aud` other than the origin,
+        or an `orgId`/`workspaceId` outside the caller's workspace is 403
+        `not_authorized`.
+
+        The body is the unsigned pipeline payload (every field, strings only,
+        no unknown keys) plus `aud`. `issuerKeyId` is optional and, when
+        given, must be the active key id. `ownerKind` must be `cloud`
+        (`native` is 400: no native receiver exists yet). With
+        `reserveRevoke: true` the response also carries `revokeEnvelope`, a
+        revoke assertion targeting this install (`targetOwnerKind`,
+        `targetBindingUuid`, `targetInstallationId`, org, workspace, source and
+        session copied from the install) with the `reservedRevoke` fields.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AcquisitionInstallRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/AcquisitionIssued" }
+        "400": { $ref: "#/components/responses/AcquisitionInvalidRequest" }
+        "401": { $ref: "#/components/responses/AcquisitionUnauthorized" }
+        "403": { $ref: "#/components/responses/AcquisitionNotAuthorized" }
+        "404": { $ref: "#/components/responses/AcquisitionNotFound" }
+  /api/v1/acquisition/assertions/revoke:
+    post:
+      tags: [acquisition]
+      operationId: issueAcquisitionRevokeAssertion
+      security:
+        - bearerAuth: []
+      description: |
+        As install, for relayhistory-acquisition-assertion-revoke-v1.
+        Acquisition-operator tokens only: a Desktop user session is 403
+        (a revoke names no owner to match the caller against).
+        `targetOwnerKind` must be `cloud`. `reserveRevoke` is not accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AcquisitionRevokeRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/AcquisitionIssued" }
+        "400": { $ref: "#/components/responses/AcquisitionInvalidRequest" }
+        "401": { $ref: "#/components/responses/AcquisitionUnauthorized" }
+        "403": { $ref: "#/components/responses/AcquisitionNotAuthorized" }
+        "404": { $ref: "#/components/responses/AcquisitionNotFound" }
+  /api/v1/acquisition/assertions/rebind:
+    post:
+      tags: [acquisition]
+      operationId: issueAcquisitionRebindAssertion
+      security:
+        - bearerAuth: []
+      description: |
+        Reserved. A rebind moves a session to a native owner; the pipeline
+        has no native receiver class yet (docs/acquisition-issuer.md, "Native
+        receiver contract (tracked gap)"). An authorized caller gets 409
+        `native_receiver_contract_pending`; anyone else 403; disabled 404.
+      responses:
+        "401": { $ref: "#/components/responses/AcquisitionUnauthorized" }
+        "403": { $ref: "#/components/responses/AcquisitionNotAuthorized" }
+        "404": { $ref: "#/components/responses/AcquisitionNotFound" }
+        "409":
+          description: native_receiver_contract_pending
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/AcquisitionError"
+                  - properties: { error: { properties: { code: { enum: [native_receiver_contract_pending] } } } }
   /api/v1/workspaces/{workspaceId}/factory/connection:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -5180,6 +5297,98 @@ components:
         refreshToken: { type: string, pattern: '^rth_rt_read_[A-Za-z0-9_-]{43,}$', maxLength: 4096, description: Bearer clients only. }
         refreshTokenExpiresAt: { type: string, format: date-time, description: Bearer clients only. }
         tokenType: { type: string, enum: [Bearer] }
+    AcquisitionIssuerKey:
+      type: object
+      additionalProperties: false
+      required: [issuerKeyId, issuerClass, publicKeyBase64]
+      properties:
+        issuerKeyId: { type: string, minLength: 1, maxLength: 512 }
+        issuerClass: { type: string, enum: [cloud] }
+        publicKeyBase64: { type: string, description: Standard base64 of the raw 32-byte Ed25519 public key }
+    AcquisitionError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code]
+          properties:
+            code: { type: string }
+            message: { type: string }
+    AcquisitionEnvelope:
+      type: object
+      additionalProperties: false
+      required: [payload, signature]
+      properties:
+        payload:
+          type: object
+          description: The signed payload, every field a string, including issuerKeyId, evidenceSha256 and requestSha256.
+          additionalProperties: { type: string }
+        signature: { type: string, description: base64url Ed25519 signature (86 characters) }
+    AcquisitionIssued:
+      type: object
+      additionalProperties: false
+      required: [kind, issuerKeyId, issuedAt, envelope]
+      properties:
+        kind: { type: string, enum: [install, revoke] }
+        issuerKeyId: { type: string }
+        issuedAt: { type: string, format: date-time }
+        envelope: { $ref: "#/components/schemas/AcquisitionEnvelope" }
+        revokeEnvelope: { $ref: "#/components/schemas/AcquisitionEnvelope" }
+    AcquisitionInstallRequest:
+      type: object
+      additionalProperties: false
+      required: [aud, operationUuid, orgId, workspaceId, source, sessionId, revision, expectedRevision,
+        expectedOwnerEpoch, expectedPredecessorGrantId, ownerKind, ownerUserId, ownerOriginId,
+        bindingUuid, installationId, grantSha256, expiresAt]
+      properties:
+        aud: { type: string, description: Must equal SELFHOST_ACQUISITION_ORIGIN }
+        issuerKeyId: { type: string, description: Optional; must be the active key id }
+        operationUuid: { type: string, format: uuid }
+        orgId: { type: string }
+        workspaceId: { type: string }
+        source: { type: string }
+        sessionId: { type: string }
+        revision: { type: string }
+        expectedRevision: { type: string }
+        expectedOwnerEpoch: { type: string }
+        expectedPredecessorGrantId: { type: string }
+        ownerKind: { type: string, enum: [cloud] }
+        ownerUserId: { type: string }
+        ownerOriginId: { type: string }
+        bindingUuid: { type: string, format: uuid }
+        installationId: { type: string, enum: [""] }
+        grantSha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        expiresAt: { type: string, description: Empty or YYYY-MM-DDTHH:MM:SSZ }
+        reserveRevoke: { type: boolean }
+        reservedRevoke:
+          type: object
+          additionalProperties: false
+          required: [revision, targetGrantId, targetOwnerEpoch]
+          properties:
+            operationUuid: { type: string, format: uuid, description: Default a fresh random UUID; must differ from the install }
+            revision: { type: string }
+            targetGrantId: { type: string }
+            targetOwnerEpoch: { type: string }
+    AcquisitionRevokeRequest:
+      type: object
+      additionalProperties: false
+      required: [aud, operationUuid, orgId, workspaceId, source, sessionId, revision, targetGrantId,
+        targetOwnerEpoch, targetOwnerKind, targetBindingUuid, targetInstallationId]
+      properties:
+        aud: { type: string, description: Must equal SELFHOST_ACQUISITION_ORIGIN }
+        issuerKeyId: { type: string }
+        operationUuid: { type: string, format: uuid }
+        orgId: { type: string }
+        workspaceId: { type: string }
+        source: { type: string }
+        sessionId: { type: string }
+        revision: { type: string }
+        targetGrantId: { type: string }
+        targetOwnerEpoch: { type: string }
+        targetOwnerKind: { type: string, enum: [cloud] }
+        targetBindingUuid: { type: string, format: uuid }
+        targetInstallationId: { type: string, enum: [""] }
     FactorySummary:
       type: object
       properties:
@@ -6658,6 +6867,31 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
         status: { enum: [active, expired, revoked] }
   responses:
+    AcquisitionIssued:
+      description: "Signed envelope (Cache-Control: no-store)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AcquisitionIssued" }
+    AcquisitionInvalidRequest:
+      description: invalid_request (bad, unknown or missing field; non-cloud class; issuerKeyId not active)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AcquisitionError" }
+    AcquisitionUnauthorized:
+      description: unauthorized (missing, unknown, unrecognised-kind or inactive bearer token)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AcquisitionError" }
+    AcquisitionNotAuthorized:
+      description: not_authorized (authenticated caller lacks the scope, has the wrong aud, is a handoff token, is not a workspace member, or targets another org or workspace)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AcquisitionError" }
+    AcquisitionNotFound:
+      description: not_found (issuer disabled, or unknown assertion kind)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AcquisitionError" }
     FactoryError:
       description: Factory error with a stable code
       content:
