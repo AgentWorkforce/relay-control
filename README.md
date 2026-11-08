@@ -149,6 +149,8 @@ exclusive `_FILE` form (at least 32 bytes). Leave all unset to keep this
 handoff disabled. Use a dedicated Control-to-reader secret; it is never sent
 to clients. These settings do not change the existing History connection.
 
+`SESSION_READ_API_MCP_READS=true` (default false) sends the MCP's session reads to that read API, with a token issued for the calling user, organization and workspace. The service secret never reaches a read. A first page the read API can't serve falls back to the existing History path; a read API cursor doesn't.
+
 Control authenticates the user, refuses unexchanged Desktop handoffs, checks
 live workspace membership and `rth:read` on every issue and refresh, and
 requests credentials from the read API. The read API issues, stores, rotates,
