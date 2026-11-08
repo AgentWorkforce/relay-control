@@ -40,6 +40,7 @@ import { createMcpHandler } from "./mcp/routes.js";
 import { handleChiefRoutes, type ChiefBackend } from "./chief/routes.js";
 import { handleProviderRoutes } from "./providers/routes.js";
 import type { ProviderProbes } from "./providers/registry.js";
+import { handleChiefOperations, type ChiefOperations } from "./chief/operations.js";
 import {
   CapturePolicyError,
   parseCaptureSettings,
@@ -274,6 +275,8 @@ export function createApp(input: {
    * and enabled as false.
    */
   providerProbes?: ProviderProbes;
+  /** Operator slot routes and the chief's service routes. Unset leaves them unrouted. */
+  chiefOperations?: ChiefOperations;
   /** Person messaging. Tests pass fetchImpl; the server uses global fetch. */
   messagingFetch?: typeof fetch;
   /** Factory sessions (dormant unless SELFHOST_FACTORY_ENABLED). The server passes its module so it can run the worker. */
@@ -1603,6 +1606,14 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     if (await mcp(request, response, path, method)) return;
     if (await handleProviderRoutes(request, response, path, method, {
       probes: providerProbes, workspaceAccess: (incoming, id) => workspaceAccess(incoming, id), json,
+    })) return;
+    if (await handleChiefOperations(request, response, path, url, {
+      operations: input.chiefOperations, bearer, requestObject, json,
+      // Installation-wide operator bearer only; tenant owners are never operators.
+      operatorAuthorized: incoming => {
+        const token = bearer(incoming);
+        return token !== null && secureEqual(token, config.bootstrapToken);
+      },
     })) return;
     if (await handleChiefRoutes(request, response, path, {
       backend: input.chief, workspaceAccess, requestObject, json,

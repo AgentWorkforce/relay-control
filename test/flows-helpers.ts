@@ -9,6 +9,7 @@ import { FlowsStore } from "../src/flows/store.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import type { ChiefBackend } from '../src/chief/routes.js';
+import type { ChiefOperations } from '../src/chief/operations.js';
 
 export class PGliteDatabase implements Database {
   constructor(readonly client = new PGlite()) {}
@@ -92,7 +93,11 @@ export function apiClient(origin: string): Api {
 
 export const BOOTSTRAP = "bootstrap-token-that-is-at-least-32-bytes";
 
-export async function startControlPlane(flowsOverrides: Partial<FlowsConfig> = {}, chief?: ChiefBackend) {
+export async function startControlPlane(
+  flowsOverrides: Partial<FlowsConfig> = {},
+  chief?: ChiefBackend,
+  chiefOperations?: (database: Database) => ChiefOperations,
+) {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -119,7 +124,16 @@ export async function startControlPlane(flowsOverrides: Partial<FlowsConfig> = {
     defaultFlowsConfig({ queuePollMs: 25, queuePingMs: 200, ...flowsOverrides }),
     config.relaycastPublicUrl,
   );
-  const server = createServer(createApp({ config, store, flows, chief }));
+  const operations = chiefOperations?.(database);
+  const server = createServer(
+    createApp({
+      config,
+      store,
+      flows,
+      chief: chief ?? operations?.registry,
+      chiefOperations: operations,
+    }),
+  );
   const origin = await listen(server);
   const api = apiClient(origin);
   return {
