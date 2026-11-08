@@ -1,5 +1,5 @@
 import type { SelfhostConfig } from "../config.js";
-import { UpstreamError } from "../relayhistory.js";
+import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { readWorkspaceHistory } from "../sessions/history.js";
 import type { EncryptionKeyring } from "../crypto.js";
 import type { Database } from "../database.js";
@@ -62,8 +62,9 @@ const ATTESTATION_MESSAGE =
   "Workspace-scoped shared session history is not available yet. Please try again later.";
 
 /**
- * RelayHistory reads through the dashboard's workspace-scoped reader: a
- * `rth:read` session minted for exactly this {user, organization, workspace},
+ * Reads through the dashboard's workspace-scoped reader: a History
+ * `rth:read` session minted for exactly this {user, organization, workspace}
+ * or the caller token for an explicitly configured direct list/turns reader,
  * `workspace=` forced on every query, and the response's workspace
  * attestation header required. Failures become public tool messages only.
  */
@@ -87,6 +88,7 @@ export function historyReader(
       return result.body;
     } catch (error) {
       if (error instanceof SharedSessionsToolError) throw error;
+      if (error instanceof ReadCursorExpiredError) throw new SharedSessionsToolError(error.message);
       if (error instanceof UpstreamError) {
         if (error.message === "RelayHistory did not attest the workspace") {
           console.error("[selfhost-mcp] History workspace attestation failed");

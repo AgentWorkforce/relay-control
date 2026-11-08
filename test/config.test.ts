@@ -202,3 +202,19 @@ test("runtime database role is explicit and cannot name the PUBLIC pseudo-role",
     );
   }
 });
+
+
+test("direct read Worker is dormant by default and requires introspection plus its explicit audience", () => {
+  assert.equal(loadConfig(completeEnv).relayhistoryReadApiUrl, null);
+  const reader = "https://session-reader.selfhosted.company";
+  const env = { ...completeEnv, RELAYHISTORY_READ_API_URL: reader, RELAYCONTROL_INTROSPECT_SECRET: "i".repeat(32), SELFHOST_INTROSPECT_AUDIENCES: `${completeEnv.RELAYHISTORY_PUBLIC_URL},${reader}` };
+  const configured = loadConfig(env);
+  assert.equal(configured.relayhistoryReadApiUrl, reader);
+  assert.equal(configured.relayhistoryUrl, completeEnv.RELAYHISTORY_URL);
+  assert.throws(() => loadConfig({ ...env, RELAYCONTROL_INTROSPECT_SECRET: "" }), /RELAYHISTORY_READ_API_URL requires RELAYCONTROL_INTROSPECT_SECRET/);
+  assert.throws(() => loadConfig({ ...env, SELFHOST_INTROSPECT_AUDIENCES: completeEnv.RELAYHISTORY_PUBLIC_URL }), /SELFHOST_INTROSPECT_AUDIENCES must include RELAYHISTORY_READ_API_URL/);
+  for (const url of ["http://session-reader.selfhosted.company", "https://localhost", `${reader}/v1`, `${reader}?token=secret`, "https://user:secret@session-reader.selfhosted.company"]) {
+    assert.throws(() => loadConfig({ ...env, RELAYHISTORY_READ_API_URL: url }), /RELAYHISTORY_READ_API_URL must/);
+  }
+  assert.notEqual(configFingerprint(configured), configFingerprint(loadConfig(completeEnv)));
+});
