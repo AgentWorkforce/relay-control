@@ -5,7 +5,7 @@ import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { isRecord, WORKSPACE_ATTESTATION_HEADER, UNSUPPORTED_BY_BACKEND, type HistoryIdentity, type HistoryRead } from "../sessions/history.js";
 
 /** Client configuration deliberately excludes the issuer URL and internal secret. */
-type ReaderConfig = Pick<SelfhostConfig,"publicBaseUrl"|"sessionReadMcpReads"> & {
+type ReaderConfig = Pick<SelfhostConfig,"publicBaseUrl"|"sessionReadMcpReads"|"relayhistoryBackend"> & {
   sessionReadApi?: Pick<NonNullable<SelfhostConfig["sessionReadApi"]>,"publicUrl"> | null;
 };
 
@@ -112,7 +112,8 @@ export async function readViaSessionRead(config:ReaderConfig,identity:HistoryIde
   const cursor=params.get("cursor");
   const selected=Boolean(config.sessionReadMcpReads && config.sessionReadApi && READ_ROUTES.test(path));
   if(!selected) {
-    if(cursor && READ_API_CURSOR.test(cursor)) throw new ReadCursorExpiredError();
+    // Native: every reader is the read API, so its cursors stay valid through history.
+    if(cursor && READ_API_CURSOR.test(cursor) && config.relayhistoryBackend!=="native") throw new ReadCursorExpiredError();
     return null;
   }
   // A foreign/legacy cursor cannot silently switch the selected backend.

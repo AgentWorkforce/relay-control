@@ -194,11 +194,12 @@ export async function readWorkspaceHistory(
   const rolloutPath = path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+\/turns$/.test(path);
   // Other admitted credential families retain their pre-existing History
   // transport; this connection never forwards them to a sh_at_-only Worker.
+  const native = config.relayhistoryBackend === "native";
   const direct = Boolean(config.relayhistoryReadApiUrl && identity.callerToken.startsWith("sh_at_") &&
     rolloutPath && !query.has("q") && !query.has("search"));
   // A read-API cursor cannot be interpreted by History after configuration
   // rollback. Refuse instead of silently restarting on its first page.
-  if (!direct && config.relayhistoryBackend !== "native" && rolloutPath && /^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
+  if (!direct && !native && rolloutPath && /^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
     throw new ReadCursorExpiredError();
   }
   const origin = direct ? config.relayhistoryReadApiUrl! : config.relayhistoryUrl;
@@ -246,7 +247,8 @@ export async function readWorkspaceHistory(
       // Includes a dormant read-API container (503 not_configured). The
       // cached History token is kept: only a 401 evicts it.
       await response.body?.cancel().catch(() => {});
-      throw new UpstreamError("read", response.status, undefined, direct && response.status === 503);
+      if (native && response.status === 410) throw new ReadCursorExpiredError();
+      throw new UpstreamError("read", response.status, undefined, (direct || native) && response.status === 503);
     }
     if (response.headers.get(WORKSPACE_ATTESTATION_HEADER) !== identity.workspaceId) {
       await response.body?.cancel().catch(() => {});
