@@ -86,6 +86,7 @@ is explicit. RelayAuth is optional: see
 | `RELAYHISTORY_PUBLIC_URL` | Public RelayHistory origin used as assertion and default introspection audience and returned to clients; bare HTTPS public DNS origin |
 | `RELAYAUTH_API_KEY` | Optional, set together with `RELAYAUTH_URL` (`_FILE` supported). Key allowed to mint RelayHistory assertions |
 | `RELAYCONTROL_INTROSPECT_SECRET` | Optional, at least 32 bytes (`_FILE` supported). Bearer for `POST /internal/v1/auth/introspect`, shared only with RelayHistory (and relayfile). Unset: that route answers 404 |
+| `RELAYFILE_CONTROL_BROKER_SECRET` | Optional, at least 32 bytes, `_FILE` supported. Enables the internal credential routes under `/internal/v1/flows/credentials/` for relayfile-control's Flows service. Unset, they answer 404. |
 | `SELFHOST_INTROSPECT_AUDIENCES` | Optional comma-separated http(s) origins a token may be introspected for, default `RELAYHISTORY_PUBLIC_URL`. Matched as normalized origins (scheme, lowercase host, port); `GET /readyz` lists them under `introspection.audiences` |
 | `SELFHOST_ACQUISITION_ISSUER_ENABLED` | Optional, default off (`true`/`false`). Turns on the dormant cloud-class acquisition assertion issuer ([docs/acquisition-issuer.md](docs/acquisition-issuer.md)); off, no other issuer variable is read and `/api/v1/acquisition/*` answers 404 |
 | `SELFHOST_ACQUISITION_ORIGIN` | Required when the issuer is enabled. The pipeline's `ACQUISITION_ORIGIN`; must also be listed in `SELFHOST_INTROSPECT_AUDIENCES` |

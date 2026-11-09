@@ -628,6 +628,18 @@ export class ControlPlaneStore {
     }));
   }
 
+  /** A workspace's Relaycast credentials, for the Flows service that assigns its runs. */
+  async relaycastBinding(workspaceId: string): Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null> {
+    const result = await this.database.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
+      "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM selfhost_workspaces WHERE id = $1",
+      [workspaceId],
+    );
+    const row = result.rows[0];
+    return row
+      ? { relaycastWorkspaceId: row.relaycast_workspace_id, relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring) }
+      : null;
+  }
+
   async workspaceForUser(
     workspaceId: string,
     userId: string,

@@ -69,6 +69,17 @@ export type AdminModule = {
   providers: ProviderRegistry;
   codingAgents: CodingAgentStore;
   logins: SubscriptionLoginStore;
+  runtimeEnvironment(
+    workspaceId: string,
+    actor: Parameters<EnvVarStore["readRuntimeEnvironment"]>[1],
+    includeIntegrations: boolean,
+  ): Promise<{
+    workspaceId: string;
+    env: Record<string, string>;
+    secretEnvNames: string[];
+    skipped: unknown[];
+    integrationErrors: Array<{ provider: string; error: string }>;
+  }>;
 };
 
 const RUNTIME_ENV_SCOPE = "runtime:env:read";
@@ -221,6 +232,30 @@ export function createAdminModule(input: {
     return actor;
   }
 
+  async function runtimeEnvironment(
+    workspaceId: string,
+    actor: Parameters<EnvVarStore["readRuntimeEnvironment"]>[1],
+    includeIntegrations: boolean,
+  ) {
+    const environment = await envVars.readRuntimeEnvironment(workspaceId, actor);
+    const agentEnvironment = await codingAgents.readRuntimeEnvironment(workspaceId, actor);
+    const { env: integrationEnv, failed } = includeIntegrations
+      ? await connections.runtimeIntegrationEnv(workspaceId, actor)
+      : { env: {} as Record<string, string>, failed: [] as Array<{ provider: string; error: string }> };
+    // Run-managed values win over workspace variables in the launcher.
+    // Here a selected coding-agent credential (Settings > Connections)
+    // wins over a same-named workspace variable, and integration env wins
+    // over both.
+    const env = { ...environment.env, ...agentEnvironment.env, ...integrationEnv };
+    return {
+      workspaceId,
+      env,
+      secretEnvNames: Object.keys(env).sort(),
+      skipped: [...environment.skipped, ...agentEnvironment.skipped],
+      integrationErrors: failed,
+    };
+  }
+
   function oauthCallbackPage(
     response: ServerResponse,
     status: number,
@@ -303,27 +338,10 @@ export function createAdminModule(input: {
     if (internalEnv && method === "GET") {
       const workspaceId = internalEnv[0]!;
       const actor = await runtimeAccess(request, helpers, workspaceId, RUNTIME_ENV_SCOPE);
-      const environment = await envVars.readRuntimeEnvironment(workspaceId, actor);
-      const agentEnvironment = await codingAgents.readRuntimeEnvironment(workspaceId, actor);
       const includeIntegrations = url.searchParams.get("includeIntegrations");
-      let integrationEnv: Record<string, string> = {};
-      let failed: Array<{ provider: string; error: string }> = [];
-      if (includeIntegrations === "1" || includeIntegrations === "true") {
-        await runtimeAccess(request, helpers, workspaceId, RUNTIME_INTEGRATIONS_SCOPE);
-        ({ env: integrationEnv, failed } = await connections.runtimeIntegrationEnv(workspaceId, actor));
-      }
-      // Run-managed values win over workspace variables in the launcher.
-      // Here a selected coding-agent credential (Settings > Connections)
-      // wins over a same-named workspace variable, and integration env wins
-      // over both.
-      const env = { ...environment.env, ...agentEnvironment.env, ...integrationEnv };
-      json(response, 200, {
-        workspaceId,
-        env,
-        secretEnvNames: Object.keys(env).sort(),
-        skipped: [...environment.skipped, ...agentEnvironment.skipped],
-        integrationErrors: failed,
-      });
+      const integrations = includeIntegrations === "1" || includeIntegrations === "true";
+      if (integrations) await runtimeAccess(request, helpers, workspaceId, RUNTIME_INTEGRATIONS_SCOPE);
+      json(response, 200, await runtimeEnvironment(workspaceId, actor, integrations));
       return true;
     }
 
@@ -727,7 +745,7 @@ export function createAdminModule(input: {
     return false;
   }
 
-  return { handle, envVars, connections, apiTokens, providers, codingAgents, logins };
+  return { handle, envVars, connections, apiTokens, providers, codingAgents, logins, runtimeEnvironment };
 }
 
 /** Maps admin-module errors to HTTP. Returns null for foreign errors. */

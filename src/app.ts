@@ -14,6 +14,7 @@ import {
   ReadCursorExpiredError,
   UpstreamError,
 } from "./relayhistory.js";
+import { handleFlowsBroker } from "./flows-broker.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
@@ -772,6 +773,19 @@ export function createApp(input: {
       const outcome = await handleIntrospection(config, store, request, undefined, admin?.apiTokens);
       if (outcome.status === 200) json(response, 200, outcome.body, true);
       else json(response, outcome.status, { error: outcome.error, message: outcome.message }, true);
+      return;
+    }
+
+    // Internal only, like introspection: never reachable through the /cloud alias.
+    if (await handleFlowsBroker(request, response, method, publicPath, {
+      secret: config.relayfileControlBrokerSecret,
+      admin,
+      relaycastBinding: (id) => store.relaycastBinding(id),
+      requireFlows: () => requireCapability(loadedLicense, "flows", input.now?.() ?? new Date()),
+      bearer,
+      requestObject,
+      json,
+    })) {
       return;
     }
 
