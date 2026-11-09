@@ -3,7 +3,9 @@ import { createServer } from "node:http";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import {
+  clientIp,
   deviceApprovalPageUrl,
+  normalizeForwardedAddress,
   RateLimiter,
   safeNextPath,
   sanitizeDesktopHostName,
@@ -427,4 +429,21 @@ test("device approval helpers", () => {
   assert.equal(blocked.retryAfterSeconds, 1);
   now = 1_001;
   assert(limiter.consume("k", 2, 1_000).allowed, "the window slides");
+});
+
+test("clientIp: forwarded entries are normalised to a bare IP", () => {
+  assert.equal(normalizeForwardedAddress("[2001:db8::1]"), "2001:db8::1");
+  assert.equal(normalizeForwardedAddress("[2001:DB8::1]:443"), "2001:db8::1");
+  assert.equal(normalizeForwardedAddress("203.0.113.9:51234"), "203.0.113.9");
+  assert.equal(normalizeForwardedAddress("::ffff:203.0.113.9"), "203.0.113.9");
+  assert.equal(normalizeForwardedAddress("unknown"), null);
+  assert.equal(normalizeForwardedAddress("_hidden"), null);
+});
+
+test("clientIp: a trusted entry that is not an IP falls back to the socket address", () => {
+  const request = (xff: string) => ({ headers: { "x-forwarded-for": xff }, socket: { remoteAddress: "10.0.0.5" } }) as unknown as Parameters<typeof clientIp>[0];
+  assert.equal(clientIp(request("198.51.100.1, ::ffff:192.0.2.7"), 1), "192.0.2.7");
+  assert.equal(clientIp(request("198.51.100.1, 192.0.2.7:8080"), 1), "192.0.2.7");
+  assert.equal(clientIp(request("198.51.100.1, garbage"), 1), "10.0.0.5");
+  assert.equal(clientIp(request("[2001:db8::2]:80, 192.0.2.7"), 2), "2001:db8::2");
 });

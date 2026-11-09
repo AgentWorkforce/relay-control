@@ -342,7 +342,9 @@ load balancer. The client address is then the Nth entry from the right, the one
 the outermost trusted proxy appended. Entries further left are client-supplied
 and never trusted. Setting the number higher than the real proxy count lets
 clients pick their own address. Setting it lower makes every request share the
-proxy's address.
+proxy's address. The chosen entry is reduced to a bare IP (brackets, a port
+and an IPv4-mapped `::ffff:` prefix are dropped); an entry that is not an IP
+falls back to the TCP peer address.
 
 The same address is used for the device-flow and Desktop limits.
 

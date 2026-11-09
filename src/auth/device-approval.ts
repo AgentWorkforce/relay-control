@@ -1,4 +1,5 @@
 import type { IncomingMessage } from "node:http";
+import { isIP } from "node:net";
 import { normalizeUserCode } from "../crypto.js";
 
 /**
@@ -84,7 +85,26 @@ export function clientIp(request: IncomingMessage, hops = trustedProxyHops()): s
   const entries = (Array.isArray(header) ? header.join(",") : header ?? "")
     .split(",").map((entry) => entry.trim()).filter(Boolean);
   if (entries.length === 0) return socket;
-  return entries[Math.max(0, entries.length - hops)]!;
+  return normalizeForwardedAddress(entries[Math.max(0, entries.length - hops)]!) ?? socket;
+}
+
+/**
+ * One X-Forwarded-For entry as a bare IP, or null when it is not one:
+ * `[v6]` and `[v6]:port` lose the brackets and port, `a.b.c.d:port` loses
+ * the port, and an IPv4-mapped IPv6 address becomes plain IPv4, so one
+ * client never gets two limiter buckets.
+ */
+export function normalizeForwardedAddress(entry: string): string | null {
+  let value = entry.trim();
+  const bracketed = /^\[([^\]]+)\](?::\d{1,5})?$/.exec(value);
+  if (bracketed) value = bracketed[1]!;
+  else {
+    const v4WithPort = /^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/.exec(value);
+    if (v4WithPort) value = v4WithPort[1]!;
+  }
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(value);
+  if (mapped) value = mapped[1]!;
+  return isIP(value) ? value.toLowerCase() : null;
 }
 
 /**
