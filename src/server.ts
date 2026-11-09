@@ -50,11 +50,14 @@ const identityStore = new IdentityStore(database, config.encryptionKeyring, {
   tenancy: identityConfig.tenancy,
   ...(provisioner ? { provisioner } : {}),
   issueSession: (tx, session) => store.issueBrowserSession(tx, session),
+  // SELFHOST_ADMIN_EMAILS; the SELFHOST_BOOTSTRAP_ADMIN_EMAIL alias is the boot-time owner.
+  adminEmails: identityConfig.bootstrap?.adminEmails.filter((email) => email !== identityConfig.bootstrap?.adminEmail) ?? [],
 });
 const identity = createIdentityModule({
   config: identityConfig,
   identityStore,
   controlStore: store,
+  database,
   keyring: config.encryptionKeyring,
   dashboardUrl: config.dashboardUrl,
   mailer: identityConfig.smtp ? smtpMailer(identityConfig.smtp) : null,
@@ -135,6 +138,7 @@ server.headersTimeout = 65_000;
 
 async function start(): Promise<void> {
   telemetry.start();
+  identity.start();
   amp.start();
   factory.start();
   server.listen(config.port, config.host, () => {
@@ -146,6 +150,7 @@ async function start(): Promise<void> {
       signIn: {
         oidc: identityConfig.oidc ? identityConfig.oidc.issuer : null,
         emailLink: identityConfig.emailLogin,
+        password: identityConfig.signinMethods.includes("password"),
         smtp: identityConfig.smtp !== null,
         autoJoinDomains: identityConfig.autoJoinDomains.length,
       },
@@ -194,6 +199,7 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   await telemetry.stop();
   await amp.stop();
   await factory.stop();
+  identity.stop();
   await emitStopping(analytics, signal, analyticsConfig.shutdownDeadlineMs);
   server.close(async () => {
     await database.close();
