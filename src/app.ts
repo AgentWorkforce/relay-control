@@ -17,6 +17,7 @@ import { handleSessionRoutes } from "./sessions/routes.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, INTROSPECT_PATH } from "./auth/introspect.js";
+import { handleAcquisitionRoutes } from "./acquisition/routes.js";
 import { createDesktopFeedHandler, type DesktopFeedLimits } from "./desktop-feed/routes.js";
 import { AwsKmsDesktopFeedSigner, MemoryDesktopFeedSigner, type DesktopFeedSigner } from "./desktop-feed/signer.js";
 import { MemoryDesktopFeedStorage, S3DesktopFeedStorage, type DesktopFeedStorage } from "./desktop-feed/storage.js";
@@ -650,6 +651,13 @@ export function createApp(input: {
       return;
     }
 
+    // Dormant acquisition assertion issuer (docs/acquisition-issuer.md): every
+    // /api/v1/acquisition path is 404 until SELFHOST_ACQUISITION_ISSUER_ENABLED.
+    if (await handleAcquisitionRoutes({
+      config, store, apiTokens: admin?.apiTokens, request, response, method, path, now: input.now,
+    })) {
+      return;
+    }
     // Amp control: gated before any authentication (off answers 404).
     if (isAmpPath(path)) {
       if (!amp) {
