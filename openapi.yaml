@@ -1507,7 +1507,8 @@ paths:
         chosen only after the address is proven. The answer is always 202, for every
         address. Only an eligible address (admin email, member, open invite or auto-join
         domain) receives a single-use verification link to
-        `<dashboard>/login/password/verify#token=` valid for 1 hour. The token is in the
+        `<site>/login/password/verify#token=` valid for 1 hour, where `<site>` is the
+        configured origin (public or dashboard) the request arrived on. The token is in the
         URL fragment, so it never reaches a server log; that page reads it and posts it
         back (see `/login/password/verify`). A newer request does not cancel older links;
         using any link, setting the password, or completing a reset voids all of them. An
@@ -1617,8 +1618,9 @@ paths:
         - per account and client: 5 free failures, then 30 s doubling to a 15-minute cap;
         - per account across all clients: 50 failures in a rolling hour lock password
           sign-in to the account for 15 minutes, and mail the owner (at most once a day);
-        - per client across all accounts: 30 free failures, then the same backoff. Skipped
-          while `X-Forwarded-For` arrives with `SELFHOST_TRUSTED_PROXIES=0`.
+        - per client across all accounts: 30 free failures, then the same backoff. With
+          `SELFHOST_TRUSTED_PROXIES=0` the client is always the socket address;
+          `X-Forwarded-For` is ignored.
 
         Backoff counters reset after 1 hour without failures. A successful password
         sign-in or a completed reset clears the account counters. Attempts refused inside
@@ -1652,7 +1654,7 @@ paths:
       operationId: passwordResetRequest
       description: |
         Always 202, for every address. An address with a password receives a single-use
-        link to `<dashboard>/login/password/reset#token=` (token in the URL fragment, see
+        link to `<site>/login/password/reset#token=` (the origin the request arrived on; token in the URL fragment, see
         `/login/password/reset`) valid for 30 minutes; only its SHA-256 hash is stored. A
         newer request does not cancel older links; completing a reset voids all of them.
         Reset mail is limited to 3 per address and 10 per IP every 10 minutes, separately
@@ -1685,7 +1687,8 @@ paths:
       description: |
         Spends a reset token and sets a new password. In the same transaction every session
         (browser, CLI, Desktop) and MCP OAuth grant of the person is revoked with reason
-        `password_reset`, the person's Desktop relay identity tokens are deleted,
+        `password_reset`, the person's Desktop relay identity tokens are deleted here
+        (not revoked at Relaycast; Desktop syncs them again after sign-in),
         approved but uncollected device authorizations expire, unredeemed MCP
         authorization codes are voided, outstanding reset, registration, set-password and
         email sign-in tokens are cancelled, and the account lockout is cleared. Person

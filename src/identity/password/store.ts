@@ -244,6 +244,25 @@ export class PasswordStore {
     );
   }
 
+  /**
+   * Gives back every attempt one reservation counted, when the attempt was
+   * never checked (every argon2id slot was taken after the reservation).
+   * Backoff subjects use refundAttempt, which also lifts a lock the
+   * reservation started; threshold subjects are only decremented.
+   */
+  async refundAttempts(rules: Array<{ subject: string; rule: LockoutRule }>): Promise<void> {
+    for (const { subject, rule } of rules) {
+      if (rule.kind === "backoff") {
+        await this.refundAttempt(subject, rule);
+      } else {
+        await this.database.query(
+          "UPDATE selfhost_login_attempts SET failures = GREATEST(failures - 1, 0) WHERE subject = $1",
+          [subject],
+        );
+      }
+    }
+  }
+
   async clearSubject(executor: SqlExecutor, subject: string): Promise<void> {
     await executor.query("DELETE FROM selfhost_login_attempts WHERE subject = $1", [subject]);
   }

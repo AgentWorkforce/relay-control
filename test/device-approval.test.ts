@@ -5,7 +5,6 @@ import { createApp } from "../src/app.js";
 import {
   clientIp,
   deviceApprovalPageUrl,
-  forwardedForUntrusted,
   limiterKey,
   normalizeForwardedAddress,
   RateLimiter,
@@ -459,12 +458,4 @@ test("limiterKey: IPv6 is bucketed by /64, IPv4 stays whole", () => {
   assert.equal(limiterKey("198.51.100.7"), "198.51.100.7");
   assert.equal(limiterKey("::ffff:198.51.100.7"), "198.51.100.7", "an IPv4-mapped address is its IPv4 bucket");
   assert.equal(limiterKey("unknown"), "unknown", "a value that is not an IP is kept as is");
-});
-
-test("forwardedForUntrusted: only with no trusted proxy and an X-Forwarded-For header", () => {
-  const withHeader = { headers: { "x-forwarded-for": "203.0.113.9" } } as never;
-  const without = { headers: {} } as never;
-  assert.equal(forwardedForUntrusted(withHeader, 0), true);
-  assert.equal(forwardedForUntrusted(without, 0), false);
-  assert.equal(forwardedForUntrusted(withHeader, 1), false);
 });

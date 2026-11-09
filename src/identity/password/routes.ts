@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import { hashSecret } from "../../crypto.js";
 import type { ControlPlaneStore } from "../../store.js";
-import { clientIp, cookieRequestAllowed, forwardedForUntrusted, limiterKey, RateLimiter } from "../../auth/device-approval.js";
+import { clientIp, cookieRequestAllowed, limiterKey, RateLimiter } from "../../auth/device-approval.js";
 import { emailDomain, normalizeEmailAddress, type PasswordConfig } from "../config.js";
 import {
   accountLockedEmail,
@@ -123,11 +123,8 @@ export type PasswordRoutesInput = {
   identityStore: IdentityStore;
   controlStore: ControlPlaneStore;
   mailer: Mailer;
-  dashboardOrigin: string;
   sessionCookie: (tokens: SignInResult["tokens"]) => string;
   clearSessionCookie: () => string;
-  /** Server pages that the emailed links open (fragment carries the token). */
-  pageOrigin?: string;
   /** Test seam for the Have I Been Pwned range API. */
   hibpFetch?: HibpFetch;
   now?: () => number;
@@ -145,17 +142,19 @@ export type PasswordRoutes = {
   /**
    * The /login page form: the same checks, lockout and audit as the JSON
    * login. Null means refused (the caller shows the generic message).
+   * `site` is helpers.siteBaseUrl(request), as for the other form calls:
+   * the origin emailed links point at.
    */
-  formLogin(request: IncomingMessage, input: { email: string; password: string; invite: string | null }): Promise<SignInResult | null>;
+  formLogin(request: IncomingMessage, input: { email: string; password: string; invite: string | null }, site: string): Promise<SignInResult | null>;
   /**
    * The /login/password/verify page: redeems a verification link (sh_pv_)
    * and sets the first password. Throws PasswordHttpError or IdentityError.
    */
-  formCompleteRegistration(request: IncomingMessage, input: { token: string; password: string }, siteName: string): Promise<SignInResult>;
+  formCompleteRegistration(request: IncomingMessage, input: { token: string; password: string }, site: string): Promise<SignInResult>;
   /** The /login/password/reset page without a token: the same as POST .../reset. */
-  formResetRequest(request: IncomingMessage, email: string, siteName: string): void;
+  formResetRequest(request: IncomingMessage, email: string, site: string): void;
   /** The /login/password/reset page with a token. Throws PasswordHttpError or IdentityError. */
-  formCompleteReset(request: IncomingMessage, input: { token: string; password: string }, siteName: string): Promise<Revoked>;
+  formCompleteReset(request: IncomingMessage, input: { token: string; password: string }, site: string): Promise<Revoked>;
   /** Retention sweep (see PasswordStore.sweep). */
   sweep(): Promise<void>;
   /** Resolves when background mail work (register, reset) has finished. */
@@ -166,8 +165,11 @@ export type Revoked = { sessions: number; mcpGrants: number; desktopRelayIdentit
 
 export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes {
   const { hasher, passwords, identityStore, controlStore, mailer, log } = input;
-  const pageOrigin = input.pageOrigin ?? input.dashboardOrigin;
-  const resetPage = `${pageOrigin}/login/password/reset`;
+  // Emailed links open this server's own pages (/login/password/...), on
+  // the configured origin the request arrived on, as the email-link flow
+  // does (helpers.siteBaseUrl).
+  const resetPage = (site: string) => `${site}/login/password/reset`;
+  const hostOf = (site: string) => new URL(site).host;
   const limiter = new RateLimiter(() => input.now?.() ?? Date.now());
   const background = new Set<Promise<void>>();
   // Compute the dummy hash now so the first unknown-account login is not slower.
@@ -236,7 +238,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
    * refused inside a lock write nothing). An account-wide lock also emails
    * the owner, at most once a day.
    */
-  async function lockEngaged(lock: Lock, email: string | null, ip: string, userId: string | null, siteName: string): Promise<void> {
+  async function lockEngaged(lock: Lock, email: string | null, ip: string, userId: string | null, site: string): Promise<void> {
     const until = lock.until.toISOString();
     if (lock.subject.startsWith("account-key:")) {
       await audit(userId, "login.lockout", `scope=account_key email=${email} ip=${ip} until=${until}`);
@@ -245,7 +247,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       const to = email!;
       later("account lockout notice", async () => {
         if (!await passwords.claimLockoutNotice(to)) return;
-        await mailer.send(accountLockedEmail({ to, url: resetPage, siteName }));
+        await mailer.send(accountLockedEmail({ to, url: resetPage(site), siteName: hostOf(site) }));
       });
     } else {
       await audit(userId, "login.lockout", `scope=ip ip=${ip} until=${until}`);
@@ -254,11 +256,12 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
 
   /**
    * One password attempt. A per-IP in-memory limit comes first (429), and
-   * a 429 when every argon2id slot is busy; then the attempt is reserved
+   * a 429 when every argon2id slot is busy (also when they fill after the
+   * reservation, which is then refunded); then the attempt is reserved
    * against three counters (refused outright, with no audit row, inside a
    * lock): the account and client key, the account across all clients, and
-   * the client key across all accounts (skipped while X-Forwarded-For
-   * cannot be trusted, see clientIp). Then it is checked. An unknown address
+   * the client key across all accounts (with SELFHOST_TRUSTED_PROXIES=0
+   * always the socket address, see clientIp). Then it is checked. An unknown address
    * and a wrong password both cost one argon2id verification, so neither the
    * answer nor its timing separates them. A locked attempt skips argon2id:
    * whether a lock is in force is not an account secret, and skipping it
@@ -269,7 +272,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     rawEmail: string,
     password: string,
     inviteTokenHash: string | null,
-    siteName: string,
+    site: string,
   ): Promise<SignInResult | null> {
     // The full address goes into audit records; limits use its key (IPv6 /64).
     const ip = clientIp(request).slice(0, 64);
@@ -279,12 +282,10 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     }
     if (!hasher.hasCapacity) throw busy();
     const email = normalizeEmailAddress(rawEmail);
-    // Behind an unconfigured proxy every client has the proxy's address, so
-    // an IP lock would lock everyone; it is skipped until the setting is
-    // fixed (the account rules still apply).
-    const ipRule = forwardedForUntrusted(request) ? [] : [{ subject: ipSubject(key), rule: LOCKOUT.ip }];
+    // With SELFHOST_TRUSTED_PROXIES=0 the key is the socket address and
+    // X-Forwarded-For is ignored, so a client cannot choose its own subject.
     const rules = [
-      ...ipRule,
+      { subject: ipSubject(key), rule: LOCKOUT.ip },
       ...(email ? [
         { subject: accountKeySubject(email, key), rule: LOCKOUT.accountKey },
         { subject: accountSubject(email), rule: LOCKOUT.account },
@@ -295,7 +296,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       email ? passwords.credentialByEmail(email) : Promise.resolve(null),
     ]);
     if (!reservation.allowed) return null;
-    for (const lock of reservation.locks) await lockEngaged(lock, email, ip, credential?.userId ?? null, siteName);
+    for (const lock of reservation.locks) await lockEngaged(lock, email, ip, credential?.userId ?? null, site);
     const fail = async (reason: string) => {
       await audit(credential?.userId ?? null, "login.password.failure", `email=${email ?? "invalid"} ip=${ip} reason=${reason}`);
       return null;
@@ -308,7 +309,12 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       }
       outcome = await hasher.verify(password, credential);
     } catch (error) {
-      if (error instanceof HasherBusy) throw busy();
+      if (error instanceof HasherBusy) {
+        // The slots filled after the pre-check: the attempt was counted but
+        // never checked, so give it back before answering 429.
+        await passwords.refundAttempts(rules);
+        throw busy();
+      }
       throw error;
     }
     if (!outcome.ok) return fail("wrong_password");
@@ -324,7 +330,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     }
     await passwords.clearSubject(passwords.executor, accountKeySubject(email!, key));
     await passwords.clearSubject(passwords.executor, accountSubject(email!));
-    if (ipRule.length) await passwords.refundAttempt(ipSubject(key), LOCKOUT.ip);
+    await passwords.refundAttempt(ipSubject(key), LOCKOUT.ip);
     let rehashed = false;
     if (outcome.needsRehash) {
       // Parameters were raised or the pepper rotated: upgrade while the
@@ -340,8 +346,8 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     return result;
   }
 
-  async function login(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof Login>, siteName: string): Promise<void> {
-    const result = await attempt(request, body.email, body.password, null, siteName);
+  async function login(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof Login>, site: string): Promise<void> {
+    const result = await attempt(request, body.email, body.password, null, site);
     if (!result) {
       sendJson(response, 401, { error: "invalid_credentials", message: INVALID_CREDENTIALS });
       return;
@@ -349,7 +355,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     signedIn(response, result);
   }
 
-  async function register(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof Register>, siteName: string): Promise<void> {
+  async function register(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof Register>, site: string): Promise<void> {
     const email = normalizeEmailAddress(body.email);
     if (!email) throw new PasswordHttpError(400, "email_invalid", "That email address is not valid.");
     const invite = body.invite && INVITE_TOKEN.test(body.invite) ? body.invite : null;
@@ -358,15 +364,15 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       later("password registration", async () => {
         if (!await identityStore.passwordRegistrationEligible(email)) return;
         if (await passwords.credentialByEmail(email)) {
-          await mailer.send(passwordAlreadyRegisteredEmail({ to: email, url: resetPage, siteName }));
+          await mailer.send(passwordAlreadyRegisteredEmail({ to: email, url: resetPage(site), siteName: hostOf(site) }));
           return;
         }
         const token = await passwords.createRegistration({ email, inviteTokenHash: invite ? hashSecret(invite) : null });
         await mailer.send(passwordVerifyEmail({
           to: email,
           // In the fragment: never sent to a server, so never in an access log.
-          url: `${pageOrigin}/login/password/verify#token=${encodeURIComponent(token)}`,
-          siteName,
+          url: `${site}/login/password/verify#token=${encodeURIComponent(token)}`,
+          siteName: hostOf(site),
           expiresInMinutes: REGISTRATION_TTL_MS / 60_000,
         }));
       });
@@ -414,7 +420,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     setupToken: string,
     setup: { email: string; inviteTokenHash: string | null },
     stored: StoredPassword,
-    siteName: string,
+    site: string,
   ): Promise<SignInResult> {
     let result: SignInResult;
     try {
@@ -435,21 +441,21 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     await audit(result.userId, "password.registration.completed", `email=${setup.email}`);
     const to = setup.email;
     later("password added notice", async () => {
-      await mailer.send(passwordAddedEmail({ to, url: resetPage, siteName }));
+      await mailer.send(passwordAddedEmail({ to, url: resetPage(site), siteName: hostOf(site) }));
     });
     return result;
   }
 
-  async function setPassword(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof SetPassword>, siteName: string): Promise<void> {
+  async function setPassword(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof SetPassword>, site: string): Promise<void> {
     tokenLimit(request);
     const setup = await passwords.peekSetup(body.token);
     if (!setup) throw new PasswordHttpError(410, "token_invalid", TOKEN_GONE);
     await policyOrThrow(body.password, setup.email);
     const stored = await hashOrBusy(body.password);
-    signedIn(response, await finishRegistration(request, body.token, setup, stored, siteName));
+    signedIn(response, await finishRegistration(request, body.token, setup, stored, site));
   }
 
-  async function completeRegistration(request: IncomingMessage, form: { token: string; password: string }, siteName: string): Promise<SignInResult> {
+  async function completeRegistration(request: IncomingMessage, form: { token: string; password: string }, site: string): Promise<SignInResult> {
     tokenLimit(request);
     // Checked before the link is spent, so a rejected password can be retried.
     const pending = await passwords.peekRegistration(form.token);
@@ -459,10 +465,10 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     const verified = await redeemRegistration(form.token);
     const setup = await passwords.peekSetup(verified.setupToken);
     if (!setup) throw new PasswordHttpError(410, "token_invalid", TOKEN_GONE);
-    return finishRegistration(request, verified.setupToken, setup, stored, siteName);
+    return finishRegistration(request, verified.setupToken, setup, stored, site);
   }
 
-  function requestReset(request: IncomingMessage, rawEmail: string, siteName: string): void {
+  function requestReset(request: IncomingMessage, rawEmail: string, site: string): void {
     const email = normalizeEmailAddress(rawEmail);
     const ip = clientIp(request).slice(0, 64);
     const key = limiterKey(ip);
@@ -473,20 +479,20 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       await passwords.audit({ userId: created.userId, action: "password.reset.requested", target: `email=${email} ip=${ip}` });
       await mailer.send(passwordResetEmail({
         to: email,
-        url: `${resetPage}#token=${encodeURIComponent(created.token)}`,
-        siteName,
+        url: `${resetPage(site)}#token=${encodeURIComponent(created.token)}`,
+        siteName: hostOf(site),
         expiresInMinutes: RESET_TTL_MS / 60_000,
       }));
     });
   }
 
-  async function resetRequest(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof ResetRequest>, siteName: string): Promise<void> {
-    requestReset(request, body.email, siteName);
+  async function resetRequest(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof ResetRequest>, site: string): Promise<void> {
+    requestReset(request, body.email, site);
     // Identical for unknown, malformed, rate-limited and real addresses.
     sendJson(response, 202, { status: "reset_requested" });
   }
 
-  async function finishReset(request: IncomingMessage, form: { token: string; password: string }, siteName: string): Promise<Revoked> {
+  async function finishReset(request: IncomingMessage, form: { token: string; password: string }, site: string): Promise<Revoked> {
     tokenLimit(request);
     const owner = await passwords.peekReset(form.token);
     if (!owner) throw new PasswordHttpError(410, "token_invalid", RESET_GONE);
@@ -509,13 +515,13 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     });
     const to = completed.email;
     later("password changed notice", async () => {
-      await mailer.send(passwordChangedEmail({ to, url: resetPage, siteName }));
+      await mailer.send(passwordChangedEmail({ to, url: resetPage(site), siteName: hostOf(site) }));
     });
     return revoked;
   }
 
-  async function resetComplete(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof ResetComplete>, siteName: string): Promise<void> {
-    const revoked = await finishReset(request, body, siteName);
+  async function resetComplete(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof ResetComplete>, site: string): Promise<void> {
+    const revoked = await finishReset(request, body, site);
     sendJson(response, 200, { status: "password_reset", revoked }, [input.clearSessionCookie()]);
   }
 
@@ -530,27 +536,27 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
         throw new PasswordHttpError(403, "csrf_rejected", "Cross-origin request refused");
       }
       const raw = await helpers.requestObject(request);
-      const siteName = new URL(helpers.siteBaseUrl(request)).host;
-      if (route === "login") await login(request, response, parse(Login, raw), siteName);
-      else if (route === "register") await register(request, response, parse(Register, raw), siteName);
+      const site = helpers.siteBaseUrl(request);
+      if (route === "login") await login(request, response, parse(Login, raw), site);
+      else if (route === "register") await register(request, response, parse(Register, raw), site);
       else if (route === "verify") await verify(request, response, parse(TokenOnly, raw));
-      else if (route === "set") await setPassword(request, response, parse(SetPassword, raw), siteName);
-      else if (route === "reset") await resetRequest(request, response, parse(ResetRequest, raw), siteName);
-      else await resetComplete(request, response, parse(ResetComplete, raw), siteName);
+      else if (route === "set") await setPassword(request, response, parse(SetPassword, raw), site);
+      else if (route === "reset") await resetRequest(request, response, parse(ResetRequest, raw), site);
+      else await resetComplete(request, response, parse(ResetComplete, raw), site);
       return true;
     },
-    async formLogin(request, form) {
+    async formLogin(request, form, site) {
       const invite = form.invite && INVITE_TOKEN.test(form.invite) ? hashSecret(form.invite) : null;
-      return attempt(request, form.email.slice(0, 320), form.password.slice(0, 1_024), invite, new URL(pageOrigin).host);
+      return attempt(request, form.email.slice(0, 320), form.password.slice(0, 1_024), invite, site);
     },
-    async formCompleteRegistration(request, form, siteName) {
-      return completeRegistration(request, { token: form.token.slice(0, 256), password: form.password.slice(0, 1_024) }, siteName);
+    async formCompleteRegistration(request, form, site) {
+      return completeRegistration(request, { token: form.token.slice(0, 256), password: form.password.slice(0, 1_024) }, site);
     },
-    formResetRequest(request, email, siteName) {
-      requestReset(request, email.slice(0, 320), siteName);
+    formResetRequest(request, email, site) {
+      requestReset(request, email.slice(0, 320), site);
     },
-    async formCompleteReset(request, form, siteName) {
-      return finishReset(request, { token: form.token.slice(0, 256), password: form.password.slice(0, 1_024) }, siteName);
+    async formCompleteReset(request, form, site) {
+      return finishReset(request, { token: form.token.slice(0, 256), password: form.password.slice(0, 1_024) }, site);
     },
     async sweep() {
       const swept = await passwords.sweep();

@@ -101,7 +101,7 @@ export async function call(origin: string, path: string, init: {
   return { status: response.status, body: parsed, text, cookies, location: response.headers.get("location") };
 }
 
-export async function setup(t: test.TestContext, options: { env?: Record<string, string>; hibpFetch?: HibpFetch; trustedProxies?: string | null; passwordHasher?: PasswordHasher } = {}) {
+export async function setup(t: test.TestContext, options: { env?: Record<string, string>; hibpFetch?: HibpFetch; trustedProxies?: string | null; passwordHasher?: PasswordHasher; dashboardUrl?: string } = {}) {
   // The tests stand behind one proxy (they send X-Forwarded-For) unless a
   // test asks otherwise; the variable is read per request.
   const previousProxies = process.env.SELFHOST_TRUSTED_PROXIES;
@@ -131,7 +131,7 @@ export async function setup(t: test.TestContext, options: { env?: Record<string,
     encryptionKeyring: KEYRING,
     internalServiceToken: null,
     oauthRedirectUrl: `${origin}/api/v1/integrations/oauth/callback`,
-    dashboardUrl: `${origin}/`,
+    dashboardUrl: options.dashboardUrl ?? `${origin}/`,
     port: 0,
     host: "127.0.0.1",
   };

@@ -185,7 +185,10 @@ three steps: register, verify and set.
    - Mail goes only to an address that may join: a configured admin email, an
      existing member, an open invite, or an auto-join domain. That address
      receives a single-use link to
-     `<public URL>/login/password/verify#token=...`, valid for 1 hour. The
+     `<site>/login/password/verify#token=...`, valid for 1 hour. `<site>` is
+     the configured origin the request arrived on (`SELFHOST_PUBLIC_URL` or
+     the `SELFHOST_DASHBOARD_URL` origin), as for email sign-in links; this
+     server serves the page. The
      token sits in the URL fragment, so it never reaches server logs, proxies
      or a `Referer` header. The page's script reads it, clears it from the
      address bar and posts it same-origin with the chosen password
@@ -234,7 +237,7 @@ three steps: register, verify and set.
 5. **Request a reset.** `POST /api/v1/auth/password/reset {email}`
    - Always `202 {"status":"reset_requested"}`, for every address.
    - An address with a password receives a link to
-     `<public URL>/login/password/reset#token=...`. The link is single-use and
+     `<site>/login/password/reset#token=...` (the same `<site>` as above). The link is single-use and
      valid for 30 minutes. As with registration the token is in the fragment;
      the page posts it same-origin with the new password
      (`POST /login/password/reset`). Without a token the page offers a form
@@ -246,8 +249,11 @@ three steps: register, verify and set.
    - In the same transaction it:
      - revokes every browser, CLI and Desktop session of that person
        (`revoked_reason = password_reset`) and every MCP OAuth grant;
-     - deletes the person's Desktop relay identities, so a Desktop must sign
-       in again before it can relay;
+     - deletes the person's Desktop relay identities (the Relaycast agent
+       tokens Desktop synced), so this server's MCP endpoint stops acting as
+       those agents. The tokens themselves are not revoked at Relaycast: a
+       copy still works against Relaycast directly until Desktop replaces it.
+       Desktop syncs its identities again after the person signs in;
      - expires approved device authorizations that have not been collected yet
        (the polling client then gets `expired_token`);
      - voids unredeemed MCP authorization codes;
@@ -275,7 +281,9 @@ attempts per IP every 5 minutes, and password sign-in 60 per IP per minute
 
 At most 8 argon2id hashes or verifies run at once in each replica. When all 8
 are busy, sign-in, set and reset-complete answer `429 rate_limited` at once
-instead of queueing. A sign-in refused this way is not counted as a failure.
+instead of queueing. A sign-in refused this way is not counted as a failure:
+when the slots fill after the attempt was reserved against the lockout
+counters, the reservation is given back before the `429`.
 
 #### Error codes
 
@@ -381,11 +389,13 @@ per-IP limits and the IP lockout, an IPv6 address is bucketed by its /64
 prefix, because one host usually holds a whole /64. Audit records keep the
 full address.
 
-With `SELFHOST_TRUSTED_PROXIES=0`, a request that carries `X-Forwarded-For`
-most likely came through a proxy, so its peer address is the proxy's. Such a
-request skips the IP lockout (the per-account counters still apply), and the
-server logs one warning per process saying the IP lockout is disabled until
-the variable is set.
+With `SELFHOST_TRUSTED_PROXIES=0` the IP lockout, like every per-IP limit,
+always uses the TCP peer address, whether or not the request carries
+`X-Forwarded-For`; a forged header cannot move a client to another counter.
+When a request does carry the header, the server logs one warning per
+process: the header was seen with 0 trusted hops, per-IP limits use the
+socket address, and `SELFHOST_TRUSTED_PROXIES` should be set if a proxy is in
+front.
 
 **Upgrade note.** Earlier builds took the leftmost `X-Forwarded-For` entry, then
 `X-Real-IP`. Deployments behind a proxy must now set

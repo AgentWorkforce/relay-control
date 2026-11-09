@@ -93,18 +93,17 @@ test("client IP: X-Forwarded-For is ignored unless SELFHOST_TRUSTED_PROXIES says
     assert.ok((await auditActions(ctx)).some((e) => e.action === "login.lockout" && e.target!.includes("scope=ip")));
   }
   for (const proxies of [null, "0"]) {
-    // No trusted proxy but X-Forwarded-For present: the server is behind a
-    // proxy it was not told about, so the socket address is shared by every
-    // client. The header is still not trusted, and the IP lock is skipped
-    // (the account rules still apply), so one client cannot lock out all.
+    // No trusted proxy but X-Forwarded-For present: the header is not
+    // trusted, so the IP lock is keyed by the socket address, whatever the
+    // header says (test/password-lockout.test.ts covers the counts).
     const ctx = await setup(t, { trustedProxies: proxies });
     await registerVerified(ctx, "spoof@acme.test");
     for (let i = 0; i < LOCKOUT.ip.free + 5; i += 1) await login(ctx, `spray${i}@acme.test`, "wrong password here", `203.0.113.${i + 1}`);
-    assert.equal((await login(ctx, "spoof@acme.test", PASSWORD, "198.51.100.200")).status, 200, `proxies=${proxies}`);
-    const ipRows = await ctx.database.query("SELECT subject FROM selfhost_login_attempts WHERE subject LIKE 'ip:%'");
-    assert.equal(ipRows.rows.length, 0, "no IP subject is counted");
+    assert.equal((await login(ctx, "spoof@acme.test", PASSWORD, "198.51.100.200")).status, 401, `proxies=${proxies}: the socket address is locked`);
+    const ipRows = await ctx.database.query<{ subject: string }>("SELECT subject FROM selfhost_login_attempts WHERE subject LIKE 'ip:%'");
+    assert.deepEqual(ipRows.rows.map((r) => r.subject), ["ip:127.0.0.1"], "only the socket address is counted");
     const events = await auditActions(ctx);
-    assert.ok(!events.some((e) => e.action === "login.lockout" && e.target!.includes("scope=ip")), `proxies=${proxies}`);
+    assert.ok(events.some((e) => e.action === "login.lockout" && e.target!.includes("scope=ip ip=127.0.0.1")), `proxies=${proxies}`);
     assert.ok(!events.some((e) => /203\.0\.113\./.test(e.target ?? "")), "the forged header was not used, even in audit");
     // Each sprayed address is still counted per account.
     const accountKeys = await ctx.database.query("SELECT subject FROM selfhost_login_attempts WHERE subject LIKE 'account-key:spray0@%'");

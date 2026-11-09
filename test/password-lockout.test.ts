@@ -110,6 +110,35 @@ test("argon2id slots: when every slot is busy, password routes answer 429 at onc
   assert.equal((await call(ctx.origin, `${API}/reset/complete`, { json: { token: resetToken, password: "a brand new long passphrase" } })).status, 200);
 });
 
+test("argon2id slots: a sign-in that finds the slots full after its reservation gives the attempt back", async (t) => {
+  // The pre-check passed, then a test hash took the only slot before the
+  // verify: the attempt was reserved but never checked.
+  const slots = new HashSlots(1);
+  class RacedHasher extends PasswordHasher {
+    override get hasCapacity(): boolean {
+      return true;
+    }
+  }
+  const ctx = await setup(t, { passwordHasher: new RacedHasher(passwordConfig(), { slots }) });
+  await registerVerified(ctx, "late@acme.test");
+  assert.equal((await login(ctx, "late@acme.test", "a wrong passphrase")).status, 401);
+  const counters = async () => (await ctx.database.query(
+    "SELECT subject, failures, locked_until FROM selfhost_login_attempts ORDER BY subject")).rows;
+  const before = await counters();
+  assert.equal(before.length, 3, "ip, account-key and account subjects");
+  const auditBefore = (await auditActions(ctx)).length;
+
+  const hold = slots.tryAcquire()!;
+  const refused = await login(ctx, "late@acme.test", PASSWORD);
+  assert.equal(refused.status, 429, refused.text);
+  assert.equal(refused.body.error, "rate_limited");
+  assert.deepEqual(await counters(), before, "every reserved subject was refunded");
+  assert.equal((await auditActions(ctx)).length, auditBefore, "and no audit row was written");
+
+  hold();
+  assert.equal((await login(ctx, "late@acme.test", PASSWORD)).status, 200);
+});
+
 test("lockout: 50 failures in an hour from many clients lock the account for 15 minutes and mail the owner once a day", async (t) => {
   const ctx = await setup(t);
   await registerVerified(ctx, "target@acme.test");
@@ -151,6 +180,31 @@ test("lockout: a locked flood of 50 attempts adds at most one audit row", async 
   const before = (await auditActions(ctx)).length;
   for (let i = 0; i < 50; i += 1) assert.equal((await login(ctx, "flood@acme.test", "a wrong passphrase")).status, 401);
   assert.ok((await auditActions(ctx)).length - before <= 1);
+});
+
+test("IP lockout with SELFHOST_TRUSTED_PROXIES=0: a forged X-Forwarded-For on every request still counts against the socket address", async (t) => {
+  const ctx = await setup(t, { trustedProxies: "0" });
+  await registerVerified(ctx, "first@acme.test");
+  await registerVerified(ctx, "second@acme.test");
+  const accounts = ["first@acme.test", "second@acme.test", ...Array.from({ length: 38 }, (_, i) => `spray${i}@acme.test`)];
+  const checked = async () => (await auditActions(ctx)).filter((e) => e.action === "login.password.failure").length;
+  const ipRows = async () => (await ctx.database.query<{ subject: string; failures: number; locked_until: unknown }>(
+    "SELECT subject, failures, locked_until FROM selfhost_login_attempts WHERE subject LIKE 'ip:%'")).rows;
+
+  for (const [i, email] of accounts.entries()) {
+    assert.equal((await login(ctx, email, "a wrong passphrase", `203.0.113.${i + 1}`)).status, 401);
+    if (i + 1 === LOCKOUT.ip.free) assert.equal(await checked(), LOCKOUT.ip.free);
+  }
+  const rows = await ipRows();
+  assert.equal(rows.length, 1, "one client-wide counter, whatever the header said");
+  assert.equal(rows[0]!.subject, "ip:127.0.0.1", "keyed by the socket address");
+  assert.equal(rows[0]!.failures, LOCKOUT.ip.free, "the 31st and later attempts were refused, not counted");
+  assert.ok(rows[0]!.locked_until, "and the client is locked");
+  assert.equal(await checked(), LOCKOUT.ip.free, "only 30 attempts were checked (one audit row each)");
+  const events = await auditActions(ctx);
+  assert.equal(events.filter((e) => e.action === "login.lockout" && e.target!.includes("scope=ip ip=127.0.0.1")).length, 1);
+  assert.ok(!events.some((e) => /203\.0\.113\./.test(e.target ?? "")), "the forged addresses appear nowhere");
+  assert.equal((await login(ctx, "first@acme.test", PASSWORD, "198.51.100.250")).status, 401, "even the right password waits out the IP lock");
 });
 
 test("mail limits: registration and reset mail have separate buckets", async (t) => {
@@ -206,4 +260,22 @@ test("link pages: the fragment token is posted same-origin from /login/password/
   await ctx.identity.idle();
   assert.ok(ctx.mailer.sent.some((m) => m.to === "page@acme.test" && /password was changed/i.test(m.subject)));
   assert.equal((await login(ctx, "page@acme.test", "a brand new long passphrase")).status, 200);
+});
+
+test("link origin: emailed password links use this server's origin when the dashboard is elsewhere", async (t) => {
+  const ctx = await setup(t, { dashboardUrl: "https://dashboard.acme.test/" });
+  const linkOrigin = (text: string) => new URL(/https?:\/\/\S+/.exec(text)![0]).origin;
+  await registerVerified(ctx, "origin@acme.test");
+  await ctx.identity.idle();
+  const verifyMail = ctx.mailer.sent.find((m) => m.to === "origin@acme.test" && /\/login\/password\/verify#/.test(m.text))!;
+  assert.equal(linkOrigin(verifyMail.text), ctx.origin);
+  const added = ctx.mailer.sent.find((m) => m.to === "origin@acme.test" && /password was added/i.test(m.subject))!;
+  assert.equal(linkOrigin(added.text), ctx.origin);
+
+  await call(ctx.origin, `${API}/reset`, { json: { email: "origin@acme.test" } });
+  await ctx.identity.idle();
+  const resetMail = ctx.mailer.sent.at(-1)!;
+  linkToken(resetMail, "/login/password/reset");
+  assert.equal(linkOrigin(resetMail.text), ctx.origin);
+  assert.notEqual(ctx.origin, "https://dashboard.acme.test");
 });

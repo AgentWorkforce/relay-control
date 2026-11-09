@@ -78,7 +78,7 @@ export function clientIp(request: IncomingMessage, hops = trustedProxyHops()): s
     // address for per-IP limits; say so once per process.
     if (header !== undefined && !warnedUntrustedForwardedFor) {
       warnedUntrustedForwardedFor = true;
-      console.warn("[selfhost-api] X-Forwarded-For received but SELFHOST_TRUSTED_PROXIES=0; per-IP limits use the socket address, and password sign-in's IP lockout is disabled until the setting is fixed. Set SELFHOST_TRUSTED_PROXIES to the number of trusted proxy hops.");
+      console.warn("[selfhost-api] X-Forwarded-For received but SELFHOST_TRUSTED_PROXIES=0; per-IP limits and password sign-in's IP lockout use the socket address. Set SELFHOST_TRUSTED_PROXIES to the number of trusted proxy hops.");
     }
     return socket;
   }
@@ -127,17 +127,6 @@ function expandIpv6(value: string): string[] | null {
   const groups = [...head, ...Array<string>(halves.length === 2 ? missing : 0).fill("0"), ...tail];
   if (groups.some((group) => !/^[0-9a-f]{1,4}$/.test(group))) return null;
   return groups.map((group) => Number.parseInt(group, 16).toString(16));
-}
-
-/**
- * True when the request carries X-Forwarded-For but no proxy is trusted
- * (SELFHOST_TRUSTED_PROXIES=0): the server is most likely behind an ingress
- * it was not told about, so the socket address is the proxy's and is shared
- * by every client. Password sign-in then skips its IP-keyed lockout, which
- * would otherwise let one client lock everyone out.
- */
-export function forwardedForUntrusted(request: IncomingMessage, hops = trustedProxyHops()): boolean {
-  return hops <= 0 && request.headers["x-forwarded-for"] !== undefined;
 }
 
 /**

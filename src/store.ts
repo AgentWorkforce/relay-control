@@ -1318,9 +1318,10 @@ export class ControlPlaneStore {
       [userId, reason],
     );
     // Desktop relay identity tokens let the MCP endpoint act as the person's
-    // Desktop agents. They are deleted (the table has no revoked state);
-    // Desktop syncs them again after the person signs in. The tokens
-    // themselves are not revoked at Relaycast.
+    // Desktop agents. They are deleted (the table has no revoked state), so
+    // this server stops using them; Desktop syncs them again after the
+    // person signs in. The Relaycast-issued tokens themselves are not
+    // revoked at Relaycast (no revocation path exists for them here).
     const desktopRelayIdentities = await executor.query<{ id: string }>(
       "DELETE FROM selfhost_desktop_relay_identities WHERE user_id = $1 RETURNING id",
       [userId],

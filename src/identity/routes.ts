@@ -197,7 +197,6 @@ export function createIdentityModule(input: {
       identityStore: store,
       controlStore,
       mailer,
-      dashboardOrigin,
       sessionCookie: (tokens) => sessionCookie(tokens),
       clearSessionCookie: () => clearCookie(SESSION_COOKIE, "/cloud"),
       ...(input.hibpFetch ? { hibpFetch: input.hibpFetch } : {}),
@@ -442,7 +441,7 @@ export function createIdentityModule(input: {
           email: form.get("email") ?? "",
           password: form.get("password") ?? "",
           invite,
-        });
+        }, helpers.siteBaseUrl(request));
         if (!result) {
           redirect(response, 303, `${back}&error=invalid_credentials`);
           return true;
@@ -471,11 +470,11 @@ export function createIdentityModule(input: {
         return true;
       }
       const form = await formBody(request);
-      const siteName = new URL(helpers.siteBaseUrl(request)).host;
+      const site = helpers.siteBaseUrl(request);
       const token = (form.get("token") ?? "").slice(0, 256);
       const password = form.get("password") ?? "";
       if (kind === "reset" && !token) {
-        passwordRoutes.formResetRequest(request, form.get("email") ?? "", siteName);
+        passwordRoutes.formResetRequest(request, form.get("email") ?? "", site);
         sendHtml(response, 200, messagePage({
           title: "Check your email",
           kind: "ok",
@@ -485,10 +484,10 @@ export function createIdentityModule(input: {
       }
       try {
         if (kind === "verify") {
-          const result = await passwordRoutes.formCompleteRegistration(request, { token, password }, siteName);
+          const result = await passwordRoutes.formCompleteRegistration(request, { token, password }, site);
           redirect(response, 303, "/", [sessionCookie(result.tokens)]);
         } else {
-          await passwordRoutes.formCompleteReset(request, { token, password }, siteName);
+          await passwordRoutes.formCompleteReset(request, { token, password }, site);
           sendHtml(response, 200, messagePage({
             title: "Password changed",
             kind: "ok",
