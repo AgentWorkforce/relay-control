@@ -5,6 +5,10 @@ assigned at release.
 
 ## Unreleased
 
+- Added: Factory MCP tools `list_factory_sessions`, `bind_factory_session` and
+  `unbind_factory_session` (owner/admin, person connections only), and
+  `as=<factory agent>` resolution for send and read of the caller's own bound
+  Factory agents, only when `SELFHOST_FACTORY_ENABLED` is on.
 - Added: `SELFHOST_INTROSPECT_OUTAGE_HOLD_MS` (default off) lets
   `POST /internal/v1/auth/introspect` answer a Desktop `sh_at_` token from its
   last active verdict, marked `held: true` with `exp` clamped, while the

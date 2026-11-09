@@ -61,7 +61,7 @@ export const PROVIDERS: readonly Readonly<ProviderDescriptor>[] = Object.freeze(
     setup: "api_key",
     history: { kind: "native_transcript_pull", source: "droid", coverage: "event_triggered" },
     outbound: "relay:mcp",
-    mcpGroups: [],
+    mcpGroups: ["factory"],
   }),
   freeze({
     id: "copilot",

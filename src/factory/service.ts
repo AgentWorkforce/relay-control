@@ -30,6 +30,7 @@ import {
   liveBindings,
   liveSessionOwners,
   managerInTx,
+  memberRole,
   setupBlockingBindings,
   setupIdentity,
   setupSnapshot,
@@ -61,6 +62,7 @@ export const FACTORY_ERRORS = {
   notOwnerBrowse: () => new FactoryHttpError(403, "factory_not_owner", "Only the person who connected Factory can browse its sessions."),
   notOwnerDisconnect: () => new FactoryHttpError(403, "factory_not_owner", "Only the person who connected Factory can disconnect this session."),
   accessRevoked: () => new FactoryHttpError(403, "factory_access_revoked", "Factory access was revoked"),
+  notManager: () => new FactoryHttpError(403, "forbidden", "Only current owners and admins can manage Factory."),
   notConnected: () => new FactoryHttpError(404, "factory_not_connected", "Factory is not connected"),
   bindingNotFound: () => new FactoryHttpError(404, "binding_not_found", "Binding not found"),
   deliveryNotFound: () => new FactoryHttpError(404, "delivery_not_found", "Delivery not found"),
@@ -705,6 +707,27 @@ export function createFactoryService(deps: FactoryServiceDeps) {
 
     /** Cleanup loop body: retries remote release of retired rows. Returns rows still pending. */
     releasePending,
+
+    /** MCP tools: the caller's current role, re-read from Postgres (the MCP context's role is not trusted). */
+    async assertManager(access: FactoryAccess): Promise<void> {
+      const role = await memberRole(database, access.workspace.organizationId, access.principal.userId);
+      if (role !== "owner" && role !== "admin") throw FACTORY_ERRORS.notManager();
+    },
+
+    /**
+     * MCP resolver hook: the hosted identity of `userId`'s own bound Factory
+     * session whose Relay agent is `name` in this workspace, while `userId`
+     * is still a member. Null for anything else (preparing, retired, foreign,
+     * removed member), so callers fall back to their own error.
+     */
+    async agentFor(workspaceId: string, userId: string, name: string): Promise<{ name: string; token: string } | null> {
+      if (!name.startsWith("factory-")) return null;
+      const row = (await bindingsForUser(database, workspaceId, userId)).find((candidate) =>
+        candidate.state === "bound" && candidate.hosted_token_envelope !== null &&
+        candidate.relay_agent_name === name && agentNameFor(candidate.session_id) === name);
+      if (!row?.hosted_token_envelope || !await isMember(database, row.organization_id, userId)) return null;
+      return { name: row.relay_agent_name, token: decryptSecret(row.hosted_token_envelope, keyring) };
+    },
   };
 }
 

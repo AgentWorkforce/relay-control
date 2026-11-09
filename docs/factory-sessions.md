@@ -26,6 +26,17 @@ before authentication, and the worker does not start.
   sweeps.
 - Teardown: unbind, disconnect, member removal and workspace cleanup, with a
   retrying remote release.
+- MCP tools `list_factory_sessions`, `bind_factory_session` and
+  `unbind_factory_session` on the shared-sessions MCP endpoint, registered
+  only when the feature is on. They act as the connection's person, re-read
+  the owner/admin role on every call, and leave browsing and binding to the
+  person who connected Factory. OAuth connections never get them.
+- MCP resolver hook: on a native (non-OAuth) connection, `send_relay_message`,
+  `subscribe_relay_channel` and `read_relay_conversation` accept `as=<agent name>` of
+  the caller's own bound Factory session and act with that binding's hosted
+  token, without creating a participant. Retired bindings and removed members
+  resolve to nothing. `check_relay_inbox`, `leave_relay`, `relay_status` and
+  `join_relay` do not use the hook.
 
 ## Dormant or deferred
 
@@ -35,7 +46,6 @@ before authentication, and the worker does not start.
 | Relay-events webhook and Relaycast subscriptions | Deferred. `POST /api/v1/factory-sessions/relay-events/{bindingId}` is always 404. Delivery uses inbox polling. |
 | Acquisition transport, tokens and install envelope | Not implemented. |
 | Session mapper and export | Not implemented. Unknown sends are never reconciled from session metadata. |
-| MCP tool group and resolver hook | Planned for a later PR. |
 | Admin force-disconnect | Not provided, by design. Only the person who connected Factory manages that connection. |
 
 ## Configuration
