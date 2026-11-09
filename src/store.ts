@@ -557,6 +557,14 @@ export class ControlPlaneStore {
     });
   }
 
+  /** Licence seats in use: organization members, owners included, across the installation. */
+  async countActiveMembers(): Promise<number> {
+    const result = await this.database.query<{ count: string }>(
+      `SELECT count(DISTINCT user_id)::text AS count FROM selfhost_organization_memberships`,
+    );
+    return Number(result.rows[0]?.count ?? 0);
+  }
+
   async memberRole(organizationId: string, userId: string): Promise<Principal["role"] | null> {
     const result = await this.database.query<{ role: Principal["role"] }>(
       `SELECT role FROM selfhost_organization_memberships

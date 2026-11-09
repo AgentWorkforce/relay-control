@@ -845,6 +845,24 @@ paths:
                 $ref: "#/components/schemas/Whoami"
         "401":
           description: Invalid, expired, rotated, or revoked bearer
+  /api/v1/license:
+    get:
+      operationId: getLicense
+      description: |
+        Installation capability read for any signed-in member (bearer or, on
+        the /cloud mount, the session cookie). Entitlement is per installation,
+        so there is no organization or workspace parameter. Carries no secret
+        material. `capabilities` is the only field a client uses to show or
+        hide a feature. Not available to the bootstrap bearer.
+      responses:
+        "200":
+          description: Licence status, selection, entitlement and capabilities
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/License"
+        "401":
+          description: Missing, invalid, or expired user token
   /api/v1/organizations:
     get:
       operationId: listOrganizations
@@ -2124,7 +2142,7 @@ paths:
                     items:
                       $ref: "#/components/schemas/EnrollmentTokenSummary"
         "403":
-          description: Workspace admin role required
+          description: Workspace admin role required (`forbidden`), or Relayflows is not a capability on this installation (`feature_not_enabled` / `feature_not_licensed`, body FeatureRefusal with feature `flows`)
     post:
       tags: [workers]
       operationId: createWorkerEnrollmentToken
@@ -2181,7 +2199,7 @@ paths:
                   startCommand:
                     type: string
         "403":
-          description: Workspace admin role required
+          description: Workspace admin role required (`forbidden`), or Relayflows is not a capability on this installation (`feature_not_enabled` / `feature_not_licensed`, body FeatureRefusal with feature `flows`)
   /api/v1/workers/enrollment-tokens/{tokenId}:
     delete:
       tags: [workers]
@@ -2198,6 +2216,8 @@ paths:
           description: Revoked
         "404":
           description: Unknown, used, or already revoked
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers:
     get:
       tags: [workers]
@@ -2215,6 +2235,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Worker"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2234,6 +2256,8 @@ paths:
                     $ref: "#/components/schemas/Worker"
         "404":
           description: Not in this workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     delete:
       tags: [workers]
       operationId: revokeWorker
@@ -2252,6 +2276,8 @@ paths:
                     format: uuid
                   status:
                     const: revoked
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/register:
     post:
       tags: [worker-protocol]
@@ -2294,6 +2320,8 @@ paths:
           description: Invalid, used, revoked, or expired enrollment token
         "409":
           description: Worker name already exists in the workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/heartbeat:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2317,6 +2345,8 @@ paths:
                     type: integer
         "401":
           description: Invalid or revoked worker token
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/queue:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2338,6 +2368,8 @@ paths:
             text/event-stream:
               schema:
                 type: string
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/ack:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2354,6 +2386,8 @@ paths:
           description: Not assigned to this worker
         "409":
           description: The run was cancelled before acknowledgement
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/status:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2388,6 +2422,8 @@ paths:
           description: Recorded; reports after a terminal state are returned unchanged
         "404":
           description: Not assigned to this worker
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/cli-credentials:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2433,6 +2469,8 @@ paths:
                         reason: { type: string }
         "401": { description: Missing or invalid worker token or reference }
         "404": { description: Not this worker's active assignment }
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/cli-credentials/{credentialId}:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2468,6 +2506,8 @@ paths:
                   updated: { type: boolean }
         "409": { description: Auth file belongs to a different account }
         "422": { description: Not a valid auth file for the provider }
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/storage/{objectKey}:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2484,6 +2524,8 @@ paths:
           description: Object bytes
         "404":
           description: Unknown object or assignment
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     head:
       tags: [worker-protocol]
       operationId: headAssignmentObject
@@ -2494,6 +2536,8 @@ paths:
           description: Exists
         "404":
           description: Missing
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     put:
       tags: [worker-protocol]
       operationId: putAssignmentObject
@@ -2506,6 +2550,8 @@ paths:
       responses:
         "200":
           description: Stored
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/flows:
     get:
       tags: [flows]
@@ -2523,6 +2569,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Flow"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     post:
       tags: [flows]
       operationId: createFlow
@@ -2537,6 +2585,8 @@ paths:
           description: Created
         "409":
           description: Name already used in the workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/flows/{flowId}:
     parameters:
       - $ref: "#/components/parameters/FlowId"
@@ -2546,6 +2596,8 @@ paths:
       responses:
         "200":
           description: Flow with source, declared steps, and its 20 most recent runs
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     patch:
       tags: [flows]
       operationId: updateFlow
@@ -2557,12 +2609,16 @@ paths:
       responses:
         "200":
           description: Updated
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     delete:
       tags: [flows]
       operationId: deleteFlow
       responses:
         "200":
           description: Deleted (existing runs are kept)
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/flows/{flowId}/invoke:
     parameters:
       - $ref: "#/components/parameters/FlowId"
@@ -2577,6 +2633,8 @@ paths:
       responses:
         "201":
           description: Run queued for a worker
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/run:
     post:
       tags: [runs]
@@ -2632,6 +2690,8 @@ paths:
           description: Invalid body, or a runtime other than `worker`
         "404":
           description: Requested worker or flow not found
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs:
     get:
       tags: [runs]
@@ -2678,6 +2738,8 @@ paths:
                     type: integer
                   needsReviewRuns:
                     type: integer
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2693,6 +2755,8 @@ paths:
                 $ref: "#/components/schemas/Run"
         "404":
           description: Not in this workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/workflow:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2702,6 +2766,8 @@ paths:
       responses:
         "200":
           description: The exact definition the run executed
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/cancel:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2717,6 +2783,8 @@ paths:
           description: Cancelled
         "409":
           description: Run already finished
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/resume:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2740,6 +2808,8 @@ paths:
           description: New run queued
         "409":
           description: Run not finished, or a locally mirrored run
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/retry:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2749,6 +2819,8 @@ paths:
       responses:
         "201":
           description: New run queued from the start
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/steps:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2776,6 +2848,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Step"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     post:
       tags: [run-ingestion]
       operationId: reportFinalSteps
@@ -2785,6 +2859,8 @@ paths:
       responses:
         "201":
           description: Stored
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/steps/snapshot:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2798,6 +2874,8 @@ paths:
           description: Accepted
         "409":
           description: Run already finished
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/events:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2821,6 +2899,8 @@ paths:
       responses:
         "200":
           description: Control-plane lifecycle events (run.queued, run.assigned, run.acknowledged, run.running, run.completed|failed|cancelled) plus mirrored runtime events
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     post:
       tags: [run-ingestion]
       operationId: appendRunEvent
@@ -2829,6 +2909,8 @@ paths:
       responses:
         "201":
           description: Appended with the next per-run sequence
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/storage/{objectKey}:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2844,6 +2926,8 @@ paths:
           description: Stored
         "412":
           description: Object exists and If-None-Match was "*"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/logs:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2886,6 +2970,8 @@ paths:
                     type: boolean
                   reset:
                     type: boolean
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/artifacts:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2895,6 +2981,8 @@ paths:
       responses:
         "200":
           description: Stored objects with kind log, code, or artifact
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/artifacts/{objectKey}:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2906,6 +2994,8 @@ paths:
       responses:
         "200":
           description: Object bytes
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/local-run:
     post:
       tags: [run-ingestion]
@@ -2917,6 +3007,8 @@ paths:
       responses:
         "201":
           description: Local run registered
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/callback:
     post:
       tags: [run-ingestion]
@@ -2931,6 +3023,8 @@ paths:
           description: Invalid run or callback token
         "409":
           description: Non-terminal status or already finished differently
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   # --- admin lane: environment variables, provider connections, API tokens ---
   /api/v1/organizations/{organizationId}:
     parameters:
@@ -5647,11 +5741,19 @@ components:
           type: string
     Readiness:
       type: object
-      required: [status, introspection]
+      required: [status, introspection, license, capabilities]
       properties:
         status:
           type: string
           enum: [ready, not_ready]
+        license:
+          type: object
+          required: [status]
+          properties:
+            status:
+              $ref: "#/components/schemas/LicenseStatus"
+        capabilities:
+          $ref: "#/components/schemas/FeatureCapabilities"
         introspection:
           type: object
           required: [enabled, audiences]
@@ -5663,6 +5765,90 @@ components:
               type: array
               description: Normalized origins POST /internal/v1/auth/introspect accepts as `aud`; empty while disabled.
               items: { type: string }
+    LicenseStatus:
+      type: string
+      enum: [absent, valid, expired, invalid]
+      description: |
+        absent: no SELFHOST_LICENSE / SELFHOST_LICENSE_FILE. invalid: bad
+        signature, malformed claims, unreadable file, or no trusted public key
+        (the key ships null in this build). expired: signature verifies but
+        expires_at has passed. A non-valid licence never stops the server; it
+        runs as core.
+    FeatureCapabilities:
+      type: object
+      required: [flows, relayfile, chief]
+      additionalProperties: false
+      description: selected AND entitled for paid features (flows, relayfile); selected alone for chief.
+      properties:
+        flows: { type: boolean }
+        relayfile: { type: boolean }
+        chief: { type: boolean }
+    License:
+      type: object
+      required: [status, license_id, customer, expires_at, seats, features, paid, selected, entitled, capabilities]
+      properties:
+        status:
+          $ref: "#/components/schemas/LicenseStatus"
+        license_id:
+          type: [string, "null"]
+          format: uuid
+        customer:
+          type: [string, "null"]
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+        seats:
+          description: Reported, not enforced. `used` counts organization members, owners included, across the installation. Null unless the licence signature verified (valid or expired).
+          oneOf:
+            - type: "null"
+            - type: object
+              required: [limit, used]
+              properties:
+                limit: { type: integer, minimum: 1 }
+                used: { type: integer, minimum: 0 }
+        features:
+          type: array
+          description: Paid features the licence entitles; empty unless status is valid.
+          items: { type: string, enum: [flows, relayfile] }
+        paid:
+          type: array
+          description: Feature classes that need entitlement.
+          items: { type: string, enum: [flows, relayfile] }
+        selected:
+          type: object
+          required: [flows, relayfile, chief]
+          additionalProperties: false
+          description: Names in SELFHOST_FEATURES (unset or empty selects nothing).
+          properties:
+            flows: { type: boolean }
+            relayfile: { type: boolean }
+            chief: { type: boolean }
+        entitled:
+          type: object
+          required: [flows, relayfile]
+          additionalProperties: false
+          description: status is valid and the licence lists the feature.
+          properties:
+            flows: { type: boolean }
+            relayfile: { type: boolean }
+        capabilities:
+          $ref: "#/components/schemas/FeatureCapabilities"
+    FeatureRefusal:
+      type: object
+      required: [error, message, feature]
+      properties:
+        error:
+          type: string
+          enum: [feature_not_enabled, feature_not_licensed]
+          description: |
+            feature_not_enabled: the operator has not selected the feature in
+            SELFHOST_FEATURES. feature_not_licensed: a paid feature (flows,
+            relayfile) is selected but the licence is absent, invalid, expired
+            or does not list it. Chief never answers feature_not_licensed.
+        message: { type: string }
+        feature:
+          type: string
+          enum: [flows, relayfile, chief]
     DeviceStart:
       type: object
       required:
@@ -7020,6 +7206,14 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
         status: { enum: [active, expired, revoked] }
   responses:
+    FeatureRefused:
+      description: |
+        The feature is not a capability on this installation. Checked after
+        authentication and membership, before any backend call.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/FeatureRefusal"
     FactoryError:
       description: Factory error with a stable code
       content:
