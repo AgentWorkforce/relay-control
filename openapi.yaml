@@ -1537,6 +1537,14 @@ paths:
         in: path
         required: true
         schema: { type: string, maxLength: 512 }
+      - name: workspaceId
+        in: query
+        required: true
+        schema: { type: string }
+      - name: source
+        in: query
+        required: true
+        schema: { type: string, maxLength: 512 }
     delete:
       operationId: hardDeleteSession
       description: |
@@ -1558,10 +1566,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/SessionErasure" }
-        "400": { description: "`invalid_session_id`" }
+        "400": { description: "`invalid_session_id` or `invalid_session_target`" }
         "403": { description: "Owner/admin role required, `operator_controls_not_entitled`, or cross-origin cookie request" }
-        "404": { description: Organization or session not found }
-        "501": { description: "`not_implemented`: the session pipeline erase is not configured" }
+        "404": { description: "Organization not found, or `workspace_not_found`" }
+        "501": { description: "`not_implemented`: the session pipeline erase is not configured or not yet available" }
         "502": { description: "`session_erasure_failed` (carries the receipt as `erasure`) or `invalid_session_erasure_response`" }
         "503": { description: "`session_erasure_unavailable`: retry the request" }
   /api/v1/organizations/{organizationId}/sessions/{sessionId}/erasure:
@@ -1569,6 +1577,14 @@ paths:
       - $ref: "#/components/parameters/OrganizationId"
       - name: sessionId
         in: path
+        required: true
+        schema: { type: string, maxLength: 512 }
+      - name: workspaceId
+        in: query
+        required: true
+        schema: { type: string }
+      - name: source
+        in: query
         required: true
         schema: { type: string, maxLength: 512 }
     get:
@@ -1583,10 +1599,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/SessionErasure" }
-        "400": { description: "`invalid_session_id`" }
+        "400": { description: "`invalid_session_id` or `invalid_session_target`" }
         "403": { description: Owner/admin role required }
-        "404": { description: "Organization not found, or `erasure_not_found`" }
-        "501": { description: "`not_implemented`: the session pipeline erase is not configured" }
+        "404": { description: "Organization not found, `workspace_not_found`, or `erasure_not_found`" }
+        "501": { description: "`not_implemented`: the session pipeline erase is not configured or not yet available" }
         "502": { description: "`invalid_session_erasure_response`" }
         "503": { description: "`session_erasure_unavailable`: retry the request" }
   /api/v1/workspaces/{workspaceId}/resolve:
@@ -6068,9 +6084,11 @@ components:
     SessionErasure:
       type: object
       additionalProperties: false
-      required: [orgId, sessionId, requestId, status, requestedAt, completedAt, artifacts, uploadsFenced, failure, audit]
+      required: [orgId, workspaceId, source, sessionId, requestId, status, requestedAt, completedAt, artifacts, uploadsFenced, unreadable, unreadableAt, bytesErased, bytesErasedAt, legacyScope, failure, audit]
       properties:
         orgId: { type: string }
+        workspaceId: { type: string }
+        source: { type: string }
         sessionId: { type: string }
         requestId: { type: string }
         status: { type: string, enum: [in_progress, completed, failed] }
@@ -6078,15 +6096,28 @@ components:
         completedAt: { type: [string, "null"], format: date-time }
         artifacts:
           type: object
-          description: Erased item count per artifact category; never content.
-          additionalProperties: { type: integer, minimum: 0 }
+          description: Item count and state per artifact category; never content.
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [count, state]
+            properties:
+              count: { type: integer, minimum: 0 }
+              state: { type: string, enum: [done, pending, not_applicable] }
         uploadsFenced: { type: boolean }
+        unreadable: { type: boolean, description: Fenced and hidden in every store. }
+        unreadableAt: { type: [string, "null"], format: date-time }
+        bytesErased: { type: boolean, description: Every store's delete is verified. }
+        bytesErasedAt: { type: [string, "null"], format: date-time }
+        legacyScope: { type: string, description: "`excluded` means data in older storage generations is not covered by this erase." }
         failure:
           type: [object, "null"]
           additionalProperties: false
-          required: [code]
+          required: [step, code, retryable]
           properties:
+            step: { type: string }
             code: { type: string }
+            retryable: { type: boolean }
         audit:
           type: [object, "null"]
           additionalProperties: false
