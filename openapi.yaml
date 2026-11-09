@@ -1696,6 +1696,27 @@ paths:
         "501": { description: "`not_implemented`: the session pipeline erase is not configured or not yet available" }
         "502": { description: "`invalid_session_erasure_response`" }
         "503": { description: "`session_erasure_unavailable`: retry the request" }
+  /api/v1/workspaces/{workspaceId}/session-agent-names:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listSessionAgentNames
+      description: Any workspace member. Agent names for session search `@name` autocomplete, from the workspace roster.
+      responses:
+        "200":
+          description: Sorted, unique names
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [names]
+                properties:
+                  names:
+                    type: array
+                    items: { type: string }
+        "404": { description: Workspace not found }
+        "502": { description: "`agent_roster_unavailable`" }
   /api/v1/workspaces/{workspaceId}/resolve:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -1804,8 +1825,26 @@ paths:
           in: query
           schema:
             const: deferred
+        - name: agent
+          in: query
+          description: |
+            One agent's Relay name, case-insensitive, without a leading `@`; a
+            trailing `*` is a prefix match of at least 3 letters or digits, where
+            the backend reports support. Newest first. Cannot be combined with
+            free text (501 `unsupported_by_backend`, reason `agent_with_text`).
+            Buffered sessions are not included. 501 reason
+            `agent_filter_not_ready` until the backend's agent catalog is ready.
+            On the read API, `project`, `since` and `until` are not available.
+            The response adds `agent`, `ignoredAgents` and `agentMatch`.
+          schema:
+            type: string
+            maxLength: 512
         - name: q
           in: query
+          description: |
+            With SESSION_SEARCH_AGENT_TOKENS on, an `@name` token here acts as
+            `agent`. Only the first agent applies; the rest are returned in
+            `ignoredAgents`.
           schema:
             type: string
             maxLength: 500

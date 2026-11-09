@@ -153,6 +153,15 @@ async function startHistory(t: TestContext, audience: string) {
       });
       return;
     }
+    if (url.pathname === "/v1/sessions") {
+      send(200, {
+        sessions: url.searchParams.get("agent") === "builder"
+          ? [{ sessionId: "sess-1", source: "codex", lastTs: "2026-11-07T10:01:00.000Z" }]
+          : [],
+        nextCursor: null,
+      });
+      return;
+    }
     const detail = /^\/v1\/sessions\/([^/]+)\/events$/.exec(url.pathname);
     if (detail) {
       const sessionId = decodeURIComponent(detail[1]!);
@@ -1085,4 +1094,25 @@ test("acknowledging another agent's delivery or an unknown id is an error", asyn
   }
   assert.deepEqual(env.relay.world.pending("peer-bot").map(row => row.id), [foreign]);
   assert.deepEqual(pending(), [a, b]);
+});
+
+test("search_shared_sessions: an agent lists that agent's sessions; text cannot be combined", async (t) => {
+  const env = await setup(t);
+  const client = await connect(t, `${env.origin}${CLOUD_MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+
+  const listed = structured(await client.callTool({ name: "search_shared_sessions", arguments: { agent: "Builder" } }));
+  assert.deepEqual(listed.matches, []);
+  assert.equal(listed.sessions.length, 1);
+  assert.equal(listed.sessions[0].session_id, "sess-1");
+  assert.equal(listed.sessions[0].citation_url, `${PUBLIC_ORIGIN}/dashboard/sessions/sess-1?source=codex`);
+  const read = env.history.paths.find((path) => path.startsWith("/v1/sessions?"))!;
+  assert.equal(new URL(read, "http://x").searchParams.get("agent"), "builder");
+  assert.equal(new URL(read, "http://x").searchParams.get("workspace"), env.workspaceId);
+
+  const before = env.history.paths.length;
+  for (const args of [{ agent: "builder", query: "deploy" }, { agent: "build*" }, {}]) {
+    const refused = await client.callTool({ name: "search_shared_sessions", arguments: args });
+    assert.equal(refused.isError, true, JSON.stringify(args));
+  }
+  assert.equal(env.history.paths.length, before);
 });

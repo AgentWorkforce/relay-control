@@ -96,9 +96,14 @@ export function forgetHistoryTokens(config: SelfhostConfig): void {
   tokenCaches.delete(config);
 }
 
+/** Which agent matching the backend applied; absent on a backend without prefix support. */
+export const AGENT_MATCH_HEADER = "x-sessions-read-agent-match";
+
 export type HistoryRead =
-  | { status: "ok"; body: Record<string, unknown> }
+  | { status: "ok"; body: Record<string, unknown>; agentMatch?: string | null }
   | { status: "not_found" }
+  /** The backend refused this agent filter (400 with an `agent_*` code). */
+  | { status: "agent_rejected"; code: string }
   /**
    * The backend answered 501: it does not serve this view (or cannot answer
    * this first page exactly). No workspace data is returned, so no
@@ -127,7 +132,7 @@ export async function readWorkspaceHistory(
   identity: HistoryIdentity,
   path: string,
   params: URLSearchParams,
-  options: { allowNotFound?: boolean } = {},
+  options: { allowNotFound?: boolean; agentFilter?: boolean } = {},
 ): Promise<HistoryRead> {
   const query = new URLSearchParams(params);
   query.delete("workspace");
@@ -180,6 +185,11 @@ export async function readWorkspaceHistory(
       // json() consumes the body (or fails, which releases it).
       return { status: "unsupported", reason: await unsupportedReason(response) };
     }
+    if (response.status === 400 && options.agentFilter) {
+      const code = await unsupportedReason(response);
+      if (code.startsWith("agent_")) return { status: "agent_rejected", code };
+      throw new UpstreamError("read", response.status);
+    }
     if (!response.ok) {
       // Includes a dormant read-API container (503 not_configured). The
       // cached History token is kept: only a 401 evicts it.
@@ -194,7 +204,7 @@ export async function readWorkspaceHistory(
     if (!isRecord(body)) {
       throw new UpstreamError("read", response.status, "RelayHistory returned invalid JSON");
     }
-    return { status: "ok", body };
+    return { status: "ok", body, agentMatch: response.headers.get(AGENT_MATCH_HEADER) };
   }
   throw new UpstreamError("read", 401);
 }

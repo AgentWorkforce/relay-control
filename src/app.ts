@@ -67,6 +67,8 @@ import {
   writeCapturePolicy,
 } from "./capture-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
+import { createRelaycastClient, type RosterAgent } from "./messaging/relaycast.js";
+import { isListedRelayAgent } from "./mcp/team-activity.js";
 import {
   erasureTarget,
   eraseSession,
@@ -1674,6 +1676,22 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       await factory.afterMemberRemoved(organizationId, userId);
       response.writeHead(204);
       response.end();
+      return;
+    }
+
+    // Names for the session search `@name` autocomplete: names only, for members.
+    const agentNames = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/session-agent-names$/);
+    if (agentNames && method === "GET") {
+      const { workspace } = await workspaceAccess(request, agentNames[0]!);
+      let roster: RosterAgent[];
+      try {
+        roster = await createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch })
+          .listAgents(workspace.relaycastApiKey, "all");
+      } catch {
+        throw new HttpError(502, "agent_roster_unavailable", "The agent roster is unavailable");
+      }
+      const names = roster.filter(isListedRelayAgent).map((agent) => agent.name).filter(Boolean);
+      json(response, 200, { names: [...new Set(names)].sort() }, true);
       return;
     }
 
