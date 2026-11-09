@@ -412,10 +412,23 @@ address and a reason, never a password, hash or token.
 - `login.lockout`, with scope `account` or `ip`
 - `password.registration.verified`
 - `password.registration.completed`
-- `password.set` (a first password added from a session)
+- `password.set.from_session` (a first password added from a signed-in
+  session; a notice is mailed to the account address)
 - `password.reset.requested`
 - `password.reset.completed`, with revocation counts
 - `password.hibp.unavailable`
+
+#### Limitations
+
+A signed-in person with no password yet may add one from their browser
+session (`POST /api/v1/auth/password/set` without a token). Sessions carry no
+sign-in time, so there is no recency check: someone holding a stolen session
+cookie can turn it into a durable password that outlives the session. The
+server mails a notice to the account address ("A password was added to your
+account. If this was not you, reset your password.") and records
+`password.set.from_session`, and a reset revokes every session and MCP grant,
+but the window between the theft and the owner acting remains. SSO-only
+installations should leave `password` out of `SELFHOST_SIGNIN_METHODS`.
 
 Migration `0029_password_signin.sql` adds the credential, pending
 registration, set-password token, reset token, login attempt and admin email

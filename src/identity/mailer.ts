@@ -106,6 +106,18 @@ export function passwordAlreadyRegisteredEmail(input: { to: string; url: string;
   };
 }
 
+/** Notice to the account address when a first password is added from a signed-in session. */
+export function passwordAddedEmail(input: { to: string; url: string; siteName: string }): OutgoingEmail {
+  const intro = `A password was added to your Agent Relay (${input.siteName}) account. If this was not you, reset your password.`;
+  const footer = "Resetting the password signs you out everywhere. If you added it, you can ignore this email.";
+  return {
+    to: input.to,
+    subject: "A password was added to your Agent Relay account",
+    text: `${intro}\n\nReset your password: ${input.url}\n\n${footer}\n`,
+    html: layout("A password was added", intro, "Reset password", input.url, footer),
+  };
+}
+
 export function passwordResetEmail(input: { to: string; url: string; siteName: string; expiresInMinutes: number }): OutgoingEmail {
   const intro = `Use this link to choose a new Agent Relay (${input.siteName}) password. It works once and expires in ${input.expiresInMinutes} minutes. Resetting signs you out everywhere.`;
   const footer = "If you didn't ask to reset your password, you can ignore this email; your password has not changed.";

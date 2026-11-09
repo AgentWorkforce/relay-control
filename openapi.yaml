@@ -1584,7 +1584,8 @@ paths:
         - `{password}` with a dashboard session (`/cloud/api/v1/auth/password/set`, the
           session cookie is only sent on `/cloud` paths): a signed-in person who has no
           password yet (SSO or email-link sign-in) adds one. CLI, Desktop and handoff
-          sessions are refused with `reauthentication_required`.
+          sessions are refused with `reauthentication_required`. A notice is mailed to the
+          account address and `password.set.from_session` is audited.
 
         An existing password is never replaced here; use reset.
       security: []

@@ -4,7 +4,7 @@ import { hashSecret } from "../../crypto.js";
 import { ACCOUNT_SCOPE, type ControlPlaneStore, type Principal } from "../../store.js";
 import { clientIp, cookieRequestAllowed, RateLimiter } from "../../auth/device-approval.js";
 import { emailDomain, normalizeEmailAddress, type PasswordConfig } from "../config.js";
-import { passwordAlreadyRegisteredEmail, passwordResetEmail, passwordVerifyEmail, type Mailer } from "../mailer.js";
+import { passwordAddedEmail, passwordAlreadyRegisteredEmail, passwordResetEmail, passwordVerifyEmail, type Mailer } from "../mailer.js";
 import { IdentityError, type IdentityStore, type SignInResult } from "../store.js";
 import type { PasswordHasher } from "./hashing.js";
 import { checkPasswordPolicy, hibpCheck, POLICY_MESSAGES, type HibpFetch } from "./policy.js";
@@ -292,7 +292,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     sendJson(response, 200, { status: "verified", email: verified.email, setupToken: verified.setupToken, expiresAt: verified.expiresAt.toISOString() });
   }
 
-  async function setPassword(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof SetPassword>, helpers: PasswordRouteHelpers): Promise<void> {
+  async function setPassword(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof SetPassword>, helpers: PasswordRouteHelpers, siteName: string): Promise<void> {
     tokenLimit(request);
     if (body.token !== undefined) {
       // Registration: the set-password token from verify.
@@ -334,7 +334,15 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     if (!await passwords.insertFirstCredential(passwords.executor, principal.userId, stored)) {
       throw new PasswordHttpError(409, "password_already_set", "You already have a password. Use reset to change it.");
     }
-    await audit(principal.userId, "password.set", `email=${principal.email}`);
+    // No recency check is possible (a session carries no auth time), so the
+    // account address hears about it: a stolen cookie that adds a password
+    // is visible to the owner, who can reset it. See docs/identity.md
+    // "Limitations".
+    await audit(principal.userId, "password.set.from_session", `email=${principal.email}`);
+    const to = principal.email;
+    later("password added notice", async () => {
+      await mailer.send(passwordAddedEmail({ to, url: `${input.dashboardOrigin}/password/reset`, siteName }));
+    });
     sendJson(response, 200, { status: "password_set" });
   }
 
@@ -396,7 +404,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       if (route === "login") await login(request, response, parse(Login, raw));
       else if (route === "register") await register(request, response, parse(Register, raw), siteName);
       else if (route === "verify") await verify(request, response, parse(TokenOnly, raw));
-      else if (route === "set") await setPassword(request, response, parse(SetPassword, raw), helpers);
+      else if (route === "set") await setPassword(request, response, parse(SetPassword, raw), helpers, siteName);
       else if (route === "reset") await resetRequest(request, response, parse(ResetRequest, raw), siteName);
       else await resetComplete(request, response, parse(ResetComplete, raw));
       return true;

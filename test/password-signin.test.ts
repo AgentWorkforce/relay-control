@@ -348,7 +348,12 @@ test("set-password: an existing password is never replaced (409); a signed-in ac
   assert.equal(setLate.status, 409);
   assert.equal(setLate.body.error, "password_already_set");
   assert.equal((await login(ctx, "sso@acme.test", PASSWORD)).status, 200, "unchanged");
-  assert.ok((await auditActions(ctx)).some((e) => e.action === "password.set"));
+  assert.ok((await auditActions(ctx)).some((e) => e.action === "password.set.from_session"));
+  await ctx.identity.idle();
+  const notice = ctx.mailer.sent.filter((mail) => mail.to === "sso@acme.test" && mail.subject === "A password was added to your Agent Relay account");
+  assert.equal(notice.length, 1, "the account address is told a password was added");
+  assert.match(notice[0]!.text, /If this was not you, reset your password\./);
+  assert.match(notice[0]!.text, /\/password\/reset/);
 
   // A CLI or Desktop token is not an account session.
   const started = await ctx.store.startDeviceAuthorization("relay-cli");
