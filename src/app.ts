@@ -1663,6 +1663,26 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    const abandonCleanup = routeMatch(
+      path,
+      /^\/api\/v1\/organizations\/([^/]+)\/workspaces\/([^/]+)\/mcp-oauth\/abandon-cleanup$/,
+    );
+    if (abandonCleanup && method === "POST") {
+      // Operator-only escape hatch for connector cleanup that cannot finish.
+      // It skips the remote release, so organization admins cannot use it.
+      const [organizationId, workspaceId] = abandonCleanup as [string, string];
+      const auth = await organizationAccess(request, organizationId, true);
+      if (auth.kind !== "bootstrap") {
+        throw new HttpError(403, "operator_only", "Only the operator can abandon connector cleanup");
+      }
+      const abandoned = isUuid(workspaceId)
+        ? await store.abandonMcpOAuthCleanup({ organizationId, workspaceId, actor: { kind: "bootstrap" } })
+        : null;
+      if (abandoned === null) throw new HttpError(404, "workspace_not_found", "Workspace not found");
+      json(response, 200, { abandoned });
+      return;
+    }
+
     const membershipCollection = routeMatch(
       path,
       /^\/api\/v1\/organizations\/([^/]+)\/memberships$/,

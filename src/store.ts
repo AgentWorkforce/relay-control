@@ -434,6 +434,39 @@ export class ControlPlaneStore {
     }
   }
 
+  /**
+   * Operator override for connector cleanup that can never finish (for
+   * example a Relaycast workspace that no longer exists). Completes every
+   * pending MCP OAuth teardown row of the workspace without a remote release,
+   * under the workspace row lock that deletion also takes. Live grants are
+   * untouched, so deletion still refuses while a connector is connected.
+   * Returns null for an unknown workspace.
+   */
+  async abandonMcpOAuthCleanup(input: {
+    organizationId: string;
+    workspaceId: string;
+    actor: AuditActor;
+  }): Promise<number | null> {
+    return this.database.transaction(async (tx) => {
+      const workspace = await tx.query(
+        "SELECT id FROM selfhost_workspaces WHERE id = $1 AND organization_id = $2 FOR UPDATE",
+        [input.workspaceId, input.organizationId],
+      );
+      if (!workspace.rows.length) return null;
+      const abandoned = await tx.query(`UPDATE selfhost_mcp_oauth_revocations
+        SET completed_at = now(), outcome = 'operator_abandoned'
+        WHERE organization_id = $1 AND workspace_id = $2 AND completed_at IS NULL RETURNING id`,
+      [input.organizationId, input.workspaceId]);
+      await recordAudit(tx, {
+        organizationId: input.organizationId,
+        actor: input.actor,
+        action: "mcp_oauth.cleanup_abandoned",
+        target: `${input.workspaceId} (${abandoned.rows.length} pending)`,
+      });
+      return abandoned.rows.length;
+    });
+  }
+
   async listWorkspaces(organizationId: string): Promise<Array<Record<string, unknown>>> {
     const result = await this.database.query<{
       id: string;

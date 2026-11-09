@@ -21,7 +21,9 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { close,listen } from "./support/harness.js";
 import { pkceS256 } from "../src/mcp/oauth/protocol.js";
 import { McpOAuthStore } from "../src/mcp/oauth/store.js";
-import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "../src/mcp/oauth/teardown.js";
+import { McpOAuthTeardown,mcpOAuthTeardownBackoffMs,mcpOAuthTeardownFetch } from "../src/mcp/oauth/teardown.js";
+import { lockOrganization,lockUser } from "../src/tenancy.js";
+import type { RelaycastClient } from "../src/messaging/relaycast.js";
 
 const ORIGIN="https://relay.example.test",SHARED="/api/v1/mcp/shared-sessions";
 const RESOURCE=ORIGIN+"/cloud"+SHARED;
@@ -95,9 +97,11 @@ async function relayFixture(t:test.TestContext) {
   };
   const service=relayService(context);
   const oauth=new McpOAuthStore(f.database,{protocol:f.sessions.options.protocol,tenancyMode:"multi",isGrokRoutine:()=>false});
-  const teardown=new McpOAuthTeardown({database:f.database,keyring,client});
+  // Teardown backoff runs on this clock; advance() makes every retry due.
+  const clock={at:Date.now()},advance=(ms=3_600_000)=>{clock.at+=ms;};
+  const teardown=new McpOAuthTeardown({database:f.database,keyring,client,now:()=>new Date(clock.at)});
   t.after(()=>teardown.stop());
-  return {...f,world,keyring,context,service,fetchImpl,oauth,teardown};
+  return {...f,world,keyring,context,service,fetchImpl,oauth,teardown,clock,advance};
 }
 
 test("MCP-only admission checks the audience, own token class and resource permission",async t=>{
@@ -271,6 +275,8 @@ test("durable remote teardown retries failure, serializes workers and follows on
   f.world.failNext("POST","/v1/agents/release-exact",503);
   assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:1});
   assert.ok(f.world.agents.has(original.name));
+  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:0});
+  f.advance();
   const second=new McpOAuthTeardown(f.teardown.deps);
   const results=await Promise.all([f.teardown.drain(),second.drain()]);
   assert.equal(results.reduce((sum,result)=>sum+result.completed,0),1);
@@ -354,6 +360,7 @@ test("a stalled teardown request aborts and releases local locks with durable wo
   const worker=new McpOAuthTeardown({...f.teardown.deps,client});
   assert.deepEqual(await worker.drain(),{completed:0,kept:0,pending:1});
   assert.equal((await f.database.query("SELECT completed_at FROM selfhost_mcp_oauth_revocations")).rows[0]!.completed_at,null);
+  f.advance();
   assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
 });
 
@@ -402,19 +409,23 @@ test("workspace HTTP deletion preserves credentials through live grants and fail
   assert.equal((await response.json()).error,"workspace_in_use");
   assert.equal((await f.database.query("SELECT id FROM selfhost_workspaces WHERE id=$1",[f.owner.workspaceId])).rows.length,1);
   assert.ok(f.world.agents.has("approved-agent"));
+  f.advance();
   assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
   response=await remove();assert.equal(response.status,204);
   assert.equal(f.world.agents.has("approved-agent"),false);
   assert.equal((await f.database.query("SELECT id FROM selfhost_workspaces WHERE id=$1",[f.owner.workspaceId])).rows.length,0);
 });
 
-test("a missing workspace keeps teardown pending instead of substituting another tenant credential",async t=>{
+test("a missing workspace ends teardown as workspace_mismatch instead of substituting another tenant credential",async t=>{
   const f=await relayFixture(t);await f.service.join({});
   await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-workspace-removal");
   await f.database.query("DELETE FROM selfhost_workspaces WHERE id=$1",[f.owner.workspaceId]);
-  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:1});
+  const releases=f.world.bodies.filter(row=>row.path==="/v1/agents/release-exact").length;
+  assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
   assert.ok(f.world.agents.has("approved-agent"));
-  assert.equal((await f.database.query("SELECT completed_at FROM selfhost_mcp_oauth_revocations")).rows[0]!.completed_at,null);
+  assert.equal(f.world.bodies.filter(row=>row.path==="/v1/agents/release-exact").length,releases);
+  const row=(await f.database.query("SELECT completed_at,outcome FROM selfhost_mcp_oauth_revocations")).rows[0]!;
+  assert.ok(row.completed_at);assert.equal(row.outcome,"workspace_mismatch");
 });
 
 test("blocked old teardown records cannot starve later releasable work",async t=>{
@@ -424,10 +435,200 @@ test("blocked old teardown records cannot starve later releasable work",async t=
     (id,grant_id,token_family_id,user_id,organization_id,workspace_id,client_id,agent_name,agent_remote_id,reason,created_at)
     VALUES ($1,$2,$3,$4,$5,$6,$7,'fake-missing','fake-missing-id','fake-old-intent','2020-01-01T00:00:00Z')`,
     [randomUUID(),randomUUID(),randomUUID(),f.owner.userId,f.owner.organizationId,randomUUID(),f.clientId]);
-  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:20});
+  // Their workspace is gone: terminal, so they cannot block a later pass.
+  assert.deepEqual(await f.teardown.drain(),{completed:20,kept:0,pending:0});
+  assert.equal((await f.database.query("SELECT id FROM selfhost_mcp_oauth_revocations WHERE outcome='workspace_mismatch'")).rows.length,20);
   assert.ok(f.world.agents.has("approved-agent"));
   assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
   assert.equal(f.world.agents.has("approved-agent"),false);
+});
+
+/** A teardown client whose `method` waits at a gate the test opens. */
+function gated(f:Awaited<ReturnType<typeof relayFixture>>,method:"authenticatedAgent"|"releaseHosted") {
+  const base=f.teardown.deps.client;
+  let entered!:()=>void,resume!:()=>void;
+  const reached=new Promise<void>(resolve=>{entered=resolve;}),gate=new Promise<void>(resolve=>{resume=resolve;});
+  const wrapped=async(...args:unknown[])=>{entered();await gate;return (base[method] as (...rest:unknown[])=>unknown)(...args);};
+  const client={...base,[method]:wrapped} as RelaycastClient;
+  return {worker:new McpOAuthTeardown({...f.teardown.deps,client}),reached,resume};
+}
+const revocation=async(f:Awaited<ReturnType<typeof relayFixture>>)=>(await f.database.query<{attempts:number;
+  next_attempt_at:Date|null;claimed_at:Date|null;completed_at:Date|null;outcome:string|null}>(
+  "SELECT attempts,next_attempt_at,claimed_at,completed_at,outcome FROM selfhost_mcp_oauth_revocations")).rows[0]!;
+const releaseCount=(f:Awaited<ReturnType<typeof relayFixture>>)=>f.world.bodies.filter(row=>row.path==="/v1/agents/release-exact").length;
+const within=<T,>(promise:Promise<T>,ms=2000)=>Promise.race([promise,
+  new Promise<never>((_resolve,reject)=>setTimeout(()=>reject(new Error("still blocked")),ms))]);
+
+test("teardown commits its claim and holds no lifecycle lock while Relaycast answers",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  const {worker,reached,resume}=gated(f,"authenticatedAgent");
+  const running=worker.drain();
+  await reached;
+  const claimed=await revocation(f);
+  assert.equal(claimed.attempts,1);assert.ok(claimed.claimed_at);assert.equal(claimed.completed_at,null);
+  assert.equal(new Date(claimed.next_attempt_at!).getTime(),f.clock.at+15_000);
+  // A login, membership change or MCP join of the same owner proceeds meanwhile.
+  await within(f.database.transaction(async tx=>{
+    await lockUser(tx,f.owner.userId);await lockOrganization(tx,f.owner.organizationId);
+    await tx.query("SELECT pg_advisory_xact_lock(hashtext($1),hashtext($2))",["selfhost-hosted-mcp",f.owner.workspaceId+":"+f.owner.userId]);
+  }));
+  resume();
+  assert.deepEqual(await running,{completed:1,kept:0,pending:0});
+  assert.equal((await revocation(f)).outcome,"released");
+  assert.equal(f.world.agents.has("approved-agent"),false);
+});
+
+test("a retryable failure backs off exponentially and retries only once due",async t=>{
+  assert.deepEqual([1,2,3,8,9,40].map(mcpOAuthTeardownBackoffMs),[15_000,30_000,60_000,1_920_000,3_600_000,3_600_000]);
+  const f=await relayFixture(t);await f.service.join({});
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  f.world.failNext("POST","/v1/agents/release-exact",503);
+  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:1});
+  let row=await revocation(f);
+  assert.equal(row.attempts,1);assert.equal(new Date(row.next_attempt_at!).getTime(),f.clock.at+15_000);
+  f.advance(14_999);
+  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:0});
+  assert.equal((await revocation(f)).attempts,1);
+  f.advance(1);f.world.failNext("POST","/v1/agents/release-exact",429);
+  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:1});
+  row=await revocation(f);
+  assert.equal(row.attempts,2);assert.equal(new Date(row.next_attempt_at!).getTime(),f.clock.at+30_000);
+  assert.ok(f.world.agents.has("approved-agent"));
+  f.advance(30_000);
+  assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
+  row=await revocation(f);
+  assert.equal(row.attempts,3);assert.equal(row.outcome,"released");
+  assert.equal(f.world.agents.has("approved-agent"),false);
+});
+
+test("a pass stops at its wall-clock budget and an immediate rerun finishes the rest",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  await f.database.query(`INSERT INTO selfhost_mcp_oauth_revocations
+    (id,grant_id,token_family_id,user_id,organization_id,workspace_id,client_id,agent_name,agent_remote_id,reason,created_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,'fake-unused',NULL,'fake-later-intent',now()+interval '1 second')`,
+  [randomUUID(),randomUUID(),randomUUID(),f.owner.userId,f.owner.organizationId,f.owner.workspaceId,f.clientId]);
+  const worker=new McpOAuthTeardown({...f.teardown.deps,passBudgetMs:0});
+  t.after(()=>worker.stop());
+  assert.deepEqual(await worker.drain(),{completed:1,kept:0,pending:0});
+  // drain() now joins the rerun the budget stop scheduled.
+  assert.deepEqual(await worker.drain(),{completed:1,kept:0,pending:0});
+  const outcomes=(await f.database.query<{outcome:string}>("SELECT outcome FROM selfhost_mcp_oauth_revocations ORDER BY created_at")).rows;
+  assert.deepEqual(outcomes.map(row=>row.outcome),["released","no_remote"]);
+});
+
+test("a native bind between claim and release keeps the intent pending without releasing",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  const {worker,reached,resume}=gated(f,"authenticatedAgent");
+  const running=worker.drain();
+  await reached;
+  await f.database.query("UPDATE selfhost_hosted_relay_participants SET session_hash=$1",["f".repeat(64)]);
+  resume();
+  assert.deepEqual(await running,{completed:0,kept:0,pending:1});
+  assert.equal(releaseCount(f),0);
+  assert.ok(f.world.agents.has("approved-agent"));
+  assert.equal((await revocation(f)).completed_at,null);
+  f.advance();
+  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:1,pending:0});
+  assert.equal((await revocation(f)).outcome,"kept");
+  assert.equal((await f.database.query("SELECT id FROM selfhost_hosted_relay_participants")).rows.length,1);
+});
+
+test("a grant re-pinned during the remote release makes the commit inconclusive and keeps the participant",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  const original=f.world.agents.get("approved-agent")!;
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  const {worker,reached,resume}=gated(f,"releaseHosted");
+  const running=worker.drain();
+  await reached;
+  await f.database.query(`INSERT INTO selfhost_mcp_oauth_grants
+    (id,client_id,user_id,organization_id,workspace_id,agent_name,agent_remote_id,scopes,resource,token_family_id)
+    SELECT $2,client_id,user_id,organization_id,workspace_id,agent_name,$3,scopes,resource,$4
+    FROM selfhost_mcp_oauth_grants WHERE id=$1`,[f.owner.grantId,randomUUID(),original.id,randomUUID()]);
+  resume();
+  assert.deepEqual(await running,{completed:0,kept:0,pending:1});
+  assert.equal((await revocation(f)).completed_at,null);
+  assert.equal((await f.database.query("SELECT id FROM selfhost_hosted_relay_participants")).rows.length,1);
+});
+
+test("terminal teardown outcomes complete the row once, log only the outcome and never release a foreign agent",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  const warn=t.mock.method(console,"warn",()=>undefined);
+  f.world.agents.get("approved-agent")!.metadata.owner_hash="fake-other-owner";
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
+  const row=await revocation(f);
+  assert.equal(row.outcome,"metadata_mismatch");assert.ok(row.completed_at);
+  assert.equal(releaseCount(f),0);assert.ok(f.world.agents.has("approved-agent"));
+  f.advance();
+  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:0});
+  assert.equal(warn.mock.callCount(),1);
+  const id=(await f.database.query<{id:string}>("SELECT id FROM selfhost_mcp_oauth_revocations")).rows[0]!.id;
+  assert.deepEqual(warn.mock.calls[0]!.arguments,["[mcp-oauth] teardown abandoned",{outcome:"metadata_mismatch",revocationId:id}]);
+});
+
+test("a workspace key sealed under a retired encryption key ends teardown as decrypt_failed",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  t.mock.method(console,"warn",()=>undefined);
+  const retired={id:"fake-retired-key",key:Buffer.alloc(32,9)};
+  await f.database.query("UPDATE selfhost_workspaces SET relaycast_api_key_ciphertext=$2 WHERE id=$1",
+    [f.owner.workspaceId,encryptSecret("rk_fake",retired)]);
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
+  assert.equal((await revocation(f)).outcome,"decrypt_failed");
+  assert.equal(releaseCount(f),0);assert.ok(f.world.agents.has("approved-agent"));
+});
+
+test("a relocated relay workspace ends teardown as workspace_mismatch and a never-pinned grant as no_remote",async t=>{
+  const f=await relayFixture(t);
+  t.mock.method(console,"warn",()=>undefined);
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-unused-disconnect");
+  assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
+  assert.equal((await revocation(f)).outcome,"no_remote");
+  const g=await relayFixture(t);await g.service.join({});
+  await g.oauth.revokeMcpOAuthGrant(g.owner.grantId,"fake-disconnect");
+  await g.database.query("UPDATE selfhost_workspaces SET relaycast_workspace_id='fake-moved-workspace' WHERE id=$1",[g.owner.workspaceId]);
+  assert.deepEqual(await g.teardown.drain(),{completed:1,kept:0,pending:0});
+  assert.equal((await revocation(g)).outcome,"workspace_mismatch");
+  assert.equal(releaseCount(g),0);assert.ok(g.world.agents.has("approved-agent"));
+});
+
+test("only the operator can abandon pending connector cleanup, which unblocks deletion but not live grants",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  const config=appConfig(),store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
+  const server=createServer(createApp({config,store,messagingFetch:f.fetchImpl,mcpOAuthTeardown:f.teardown}));
+  const base=await listen(server);t.after(()=>close(server));
+  const item=`${base}/api/v1/organizations/${f.owner.organizationId}/workspaces/${f.owner.workspaceId}`;
+  const operator={authorization:`Bearer ${config.bootstrapToken}`};
+  const abandon=(headers:Record<string,string>,workspace=item)=>fetch(workspace+"/mcp-oauth/abandon-cleanup",{method:"POST",headers});
+  const remove=()=>fetch(item,{method:"DELETE",headers:operator});
+  for(const role of ["owner","admin"]) {
+    await f.database.query("UPDATE selfhost_organization_memberships SET role=$3 WHERE organization_id=$1 AND user_id=$2",
+      [f.owner.organizationId,f.owner.userId,role]);
+    const account=await f.database.transaction(tx=>store.issueBrowserSession(tx,{...f.owner,label:"fake-"+role}));
+    const refused=await abandon({authorization:`Bearer ${account.accessToken}`});
+    assert.equal(refused.status,403);assert.equal((await refused.json()).error,"operator_only");
+  }
+  // Nothing pending yet: a live grant still blocks deletion after an override.
+  let response=await abandon(operator);
+  assert.equal(response.status,200);assert.deepEqual(await response.json(),{abandoned:0});
+  response=await remove();assert.equal(response.status,409);assert.equal((await response.json()).error,"workspace_in_use");
+  response=await abandon(operator,`${base}/api/v1/organizations/${f.owner.organizationId}/workspaces/${randomUUID()}`);
+  assert.equal(response.status,404);
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  f.world.failNext("POST","/v1/agents/release-exact",503);
+  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:1});
+  response=await remove();assert.equal(response.status,409);
+  response=await abandon(operator);
+  assert.equal(response.status,200);assert.deepEqual(await response.json(),{abandoned:1});
+  assert.equal((await revocation(f)).outcome,"operator_abandoned");
+  const audit=(await f.database.query<{target:string;actor_kind:string}>(
+    "SELECT target,actor_kind FROM selfhost_admin_audit_events WHERE action='mcp_oauth.cleanup_abandoned' ORDER BY target")).rows;
+  assert.deepEqual(audit.map(row=>row.target),[`${f.owner.workspaceId} (0 pending)`,`${f.owner.workspaceId} (1 pending)`]);
+  assert.ok(audit.every(row=>row.actor_kind==="bootstrap"));
+  response=await remove();assert.equal(response.status,204);
 });
 
 test("registration follows configured proxy trust without sharing an ingress bucket or trusting spoofed hops",async t=>{

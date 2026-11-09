@@ -1630,6 +1630,34 @@ paths:
           description: Nothing to update
         "404":
           description: Workspace not found
+  /api/v1/organizations/{organizationId}/workspaces/{workspaceId}/mcp-oauth/abandon-cleanup:
+    post:
+      security: [{ bearerAuth: [] }]
+      operationId: abandonMcpOAuthCleanup
+      description: >-
+        Operator override for MCP OAuth connector cleanup that can never
+        finish. Completes every pending teardown record of the workspace
+        without releasing its Relaycast agent, so the workspace can then be
+        deleted, and records an audit event. Live connector grants are not
+        touched; workspace deletion still answers 409 while any remains.
+        Bootstrap bearer only.
+      parameters:
+        - { name: organizationId, in: path, required: true, schema: { type: string } }
+        - { name: workspaceId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Number of teardown records abandoned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [abandoned]
+                properties:
+                  abandoned: { type: integer, minimum: 0 }
+        "403":
+          description: Not the operator's bootstrap bearer (operator_only)
+        "404":
+          description: Organization or workspace not found
   /api/v1/fleet/nodes/claim:
     post:
       security: [{ bearerAuth: [] }]
