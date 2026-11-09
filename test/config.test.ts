@@ -280,3 +280,10 @@ test("direct read Worker is dormant by default and requires introspection plus i
   }
   assert.notEqual(configFingerprint(configured), configFingerprint(loadConfig(completeEnv)));
 });
+
+test("the Flows broker secret is optional and must be long enough", () => {
+  assert.equal(loadConfig(completeEnv).relayfileControlBrokerSecret, null);
+  const secret = "s".repeat(32);
+  assert.equal(loadConfig({ ...completeEnv, RELAYFILE_CONTROL_BROKER_SECRET: secret }).relayfileControlBrokerSecret, secret);
+  assert.throws(() => loadConfig({ ...completeEnv, RELAYFILE_CONTROL_BROKER_SECRET: "short" }), /at least 32 bytes/);
+});
