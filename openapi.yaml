@@ -6770,7 +6770,7 @@ components:
         created_at: {type: string, format: date-time}
     LoginConfig:
       type: object
-      required: [methods, oidc, logo_url, allowed_domain_hint, password_policy]
+      required: [methods, oidc, logo_url, org_name, allowed_domain_hint, password_policy]
       properties:
         methods:
           type: array
@@ -6780,6 +6780,7 @@ components:
           properties:
             displayName: { type: string }
         logo_url: { type: [string, "null"], format: uri }
+        org_name: { type: [string, "null"], description: Shown beside the logo. Null when no logo is set. }
         allowed_domain_hint: { type: boolean }
         password_policy:
           type: [object, "null"]
