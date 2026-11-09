@@ -16,6 +16,8 @@ import { IdentityStore } from "./identity/store.js";
 import { smtpMailer } from "./identity/mailer.js";
 import { createIdentityModule } from "./identity/routes.js";
 import { relaycastProvisioner, startBootstrap } from "./identity/bootstrap.js";
+import { loadAmpConfig } from "./amp/config.js";
+import { createAmpModule } from "./amp/module.js";
 import { loadAnalyticsConfig } from "./analytics/config.js";
 import {
   buildAnalytics,
@@ -85,6 +87,8 @@ const telemetry = createTelemetryModule({
   audit: (event) => recordAudit(database, event),
   tenancy: identityConfig.tenancy.mode,
 });
+// Amp control: off unless SELFHOST_AMP_ENABLED=true; off starts no worker.
+const amp = createAmpModule({ amp: loadAmpConfig(process.env), config, database });
 // Factory sessions: routes 404 and the worker stays off unless SELFHOST_FACTORY_ENABLED.
 const factory = createFactoryModule({
   config,
@@ -106,7 +110,7 @@ emitConfigLoaded(analytics, {
   flowsEnabled: true,
   operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
 });
-const server = createServer(createApp({ config, store, flows, admin, telemetry, identity, factory }));
+const server = createServer(createApp({ config, store, flows, admin, telemetry, identity, factory, amp }));
 const bootstrapAbort = new AbortController();
 // Worker queue streams are long-lived SSE responses.
 server.requestTimeout = 0;
@@ -114,6 +118,7 @@ server.headersTimeout = 65_000;
 
 async function start(): Promise<void> {
   telemetry.start();
+  amp.start();
   factory.start();
   server.listen(config.port, config.host, () => {
     console.log("[selfhost-api] listening", {
@@ -126,6 +131,11 @@ async function start(): Promise<void> {
         emailLink: identityConfig.emailLogin,
         smtp: identityConfig.smtp !== null,
         autoJoinDomains: identityConfig.autoJoinDomains.length,
+      },
+      amp: {
+        enabled: amp.config.enabled,
+        transport: amp.config.transport !== null,
+        internalJob: amp.config.internalSecret !== null,
       },
     });
     emitServiceStarted(analytics, {
@@ -165,6 +175,7 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   console.log("[selfhost-api] shutting down", { signal });
   bootstrapAbort.abort();
   await telemetry.stop();
+  await amp.stop();
   await factory.stop();
   await emitStopping(analytics, signal, analyticsConfig.shutdownDeadlineMs);
   server.close(async () => {

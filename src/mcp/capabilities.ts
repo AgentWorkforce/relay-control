@@ -21,6 +21,7 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       scopes: context.principal.scopes,
       workspaceId: context.workspace.id,
       role: context.role,
+      amp: Boolean(context.amp),
       providers: await context.providers(),
     });
     return {
