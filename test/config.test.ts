@@ -16,10 +16,10 @@ const completeEnv = {
   SELFHOST_PUBLIC_URL: "https://control.internal.example",
   RELAYCAST_URL: "http://relaycast.relay.svc.cluster.local",
   RELAYCAST_PUBLIC_URL: "https://relaycast.selfhosted.company",
-  RELAYAUTH_URL: "http://relayauth.auth.svc.cluster.local",
-  RELAYHISTORY_URL: "http://relayhistory.history.svc.cluster.local",
-  RELAYHISTORY_PUBLIC_URL: "https://history.selfhosted.company",
-  RELAYAUTH_API_KEY: "rak_test",
+  SESSION_READ_API_URL: "http://reader.sessions.svc.cluster.local:8080",
+  SESSION_READ_API_PUBLIC_URL: "https://history.selfhosted.company",
+  SESSION_READ_API_SECRET: "reader-control-secret-".repeat(2),
+  RELAYCONTROL_INTROSPECT_SECRET: "i".repeat(32),
   SELFHOST_BOOTSTRAP_TOKEN: "b".repeat(32),
   SELFHOST_ENCRYPTION_KEY_ID: "test-key",
   SELFHOST_ENCRYPTION_KEY: "00".repeat(32),
@@ -46,30 +46,57 @@ test("the session erase API is default off and requires its full configuration",
   assert.throws(() => loadConfig({ ...completeEnv, ...eraser, SESSION_ERASE_API_SECRET: "short" }), /at least 32 bytes/);
 });
 
-test("the independent read API handoff is default off and requires its full configuration", () => {
-  assert.equal(loadConfig(completeEnv).sessionReadApi, null);
+test("the read API handoff is required and must be fully configured", () => {
   const reader = {
     SESSION_READ_API_URL: "http://reader.sessions.svc.cluster.local:8080",
-    SESSION_READ_API_PUBLIC_URL: "https://sessions.selfhosted.company/",
+    SESSION_READ_API_PUBLIC_URL: "https://history.selfhosted.company/",
     SESSION_READ_API_SECRET: "reader-control-secret-".repeat(2),
   };
   const config = loadConfig({ ...completeEnv, ...reader });
   assert.deepEqual(config.sessionReadApi, {
     url: reader.SESSION_READ_API_URL,
-    publicUrl: "https://sessions.selfhosted.company",
+    publicUrl: "https://history.selfhosted.company",
     secret: reader.SESSION_READ_API_SECRET,
   });
+  // History is the read API: its URLs are the History URLs.
+  assert.equal(config.relayhistoryUrl, reader.SESSION_READ_API_URL);
+  assert.equal(config.relayhistoryPublicUrl, "https://history.selfhosted.company");
+  const { SESSION_READ_API_URL: _url, SESSION_READ_API_PUBLIC_URL: _public, SESSION_READ_API_SECRET: _secret, ...withoutReader } = completeEnv;
+  assert.throws(() => loadConfig(withoutReader), {
+    message: "SESSION_READ_API_URL, SESSION_READ_API_PUBLIC_URL and SESSION_READ_API_SECRET are required",
+  });
   for (const key of Object.keys(reader)) {
-    const partial = { ...reader };
+    const partial = { ...withoutReader, ...reader };
     delete partial[key as keyof typeof partial];
-    assert.throws(() => loadConfig({ ...completeEnv, ...partial }), /SESSION_READ_API_/);
+    assert.throws(() => loadConfig(partial), /SESSION_READ_API_/, key);
   }
   assert.throws(() => loadConfig({ ...completeEnv, ...reader, SESSION_READ_API_SECRET: "short" }), /SECRET/);
   assert.throws(() => loadConfig({ ...completeEnv, ...reader, SESSION_READ_API_PUBLIC_URL: "http://reader.internal" }), /PUBLIC_URL/);
-  assert.notEqual(configFingerprint(config), configFingerprint(loadConfig(completeEnv)));
+  assert.notEqual(
+    configFingerprint(config),
+    configFingerprint(loadConfig({ ...completeEnv, SESSION_READ_API_URL: "http://other-reader.sessions.svc.cluster.local:8080" })),
+  );
   assert.equal(configFingerprint(config), configFingerprint({
-    ...config, sessionReadApi: { ...config.sessionReadApi!, secret: "different-secret" },
+    ...config, sessionReadApi: { ...config.sessionReadApi, secret: "different-secret" },
   }), "fingerprint does not include credentials");
+});
+
+test("RELAYHISTORY_URL and RELAYHISTORY_PUBLIC_URL are accepted only as aliases of the read API", () => {
+  const aliased = loadConfig({
+    ...completeEnv,
+    RELAYHISTORY_URL: completeEnv.SESSION_READ_API_URL,
+    RELAYHISTORY_PUBLIC_URL: completeEnv.SESSION_READ_API_PUBLIC_URL,
+  });
+  assert.equal(aliased.relayhistoryUrl, completeEnv.SESSION_READ_API_URL);
+  assert.equal(aliased.relayhistoryPublicUrl, completeEnv.SESSION_READ_API_PUBLIC_URL);
+  assert.throws(
+    () => loadConfig({ ...completeEnv, RELAYHISTORY_URL: "http://relayhistory.history.svc.cluster.local" }),
+    { message: "RELAYHISTORY_URL must equal SESSION_READ_API_URL (or be unset)" },
+  );
+  assert.throws(
+    () => loadConfig({ ...completeEnv, RELAYHISTORY_PUBLIC_URL: "https://other-history.selfhosted.company" }),
+    { message: "RELAYHISTORY_PUBLIC_URL must equal SESSION_READ_API_PUBLIC_URL (or be unset)" },
+  );
 });
 
 test("the read API handoff supports a mounted secret without accepting both secret forms", (t) => {
@@ -77,13 +104,9 @@ test("the read API handoff supports a mounted secret without accepting both secr
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const secretPath = join(directory, "secret");
   writeFileSync(secretPath, "reader-control-secret-".repeat(2), { mode: 0o600 });
-  const env = {
-    ...completeEnv,
-    SESSION_READ_API_URL: "http://reader.sessions.svc.cluster.local:8080",
-    SESSION_READ_API_PUBLIC_URL: "https://sessions.selfhosted.company",
-    SESSION_READ_API_SECRET_FILE: secretPath,
-  };
-  assert.equal(loadConfig(env).sessionReadApi?.secret, "reader-control-secret-".repeat(2));
+  const { SESSION_READ_API_SECRET: _inlineSecret, ...withoutInlineSecret } = completeEnv;
+  const env = { ...withoutInlineSecret, SESSION_READ_API_SECRET_FILE: secretPath };
+  assert.equal(loadConfig(env).sessionReadApi.secret, "reader-control-secret-".repeat(2));
   assert.throws(() => loadConfig({ ...env, SESSION_READ_API_SECRET: "another-secret" }), /mutually exclusive/);
 });
 
@@ -92,8 +115,8 @@ test("configuration has no hosted service defaults", () => {
     "SELFHOST_PUBLIC_URL",
     "RELAYCAST_URL",
     "RELAYCAST_PUBLIC_URL",
-    "RELAYHISTORY_URL",
-    "RELAYHISTORY_PUBLIC_URL",
+    "SESSION_READ_API_URL",
+    "SESSION_READ_API_PUBLIC_URL",
   ]) {
     const env = { ...completeEnv };
     delete env[required as keyof typeof env];
@@ -105,8 +128,8 @@ test("configuration has no hosted service defaults", () => {
   assert.doesNotMatch(serialized, /agentrelay\.com|relaycast\.dev/i);
   assert.equal(config.relaycastUrl, completeEnv.RELAYCAST_URL);
   assert.equal(config.relaycastPublicUrl, completeEnv.RELAYCAST_PUBLIC_URL);
-  assert.equal(config.relayhistoryUrl, completeEnv.RELAYHISTORY_URL);
-  assert.equal(config.relayhistoryPublicUrl, completeEnv.RELAYHISTORY_PUBLIC_URL);
+  assert.equal(config.relayhistoryUrl, completeEnv.SESSION_READ_API_URL);
+  assert.equal(config.relayhistoryPublicUrl, completeEnv.SESSION_READ_API_PUBLIC_URL);
 });
 
 test("public client origins require bare HTTPS public DNS hosts", () => {
@@ -135,11 +158,13 @@ test("public client origins require bare HTTPS public DNS hosts", () => {
     "https://history.selfhosted.company?tenant=one",
     "https://history.selfhosted.company#fragment",
   ]) {
-    assert.throws(
-      () => loadConfig({ ...completeEnv, RELAYHISTORY_PUBLIC_URL: invalid }),
-      /RELAYHISTORY_PUBLIC_URL/,
-      invalid,
-    );
+    for (const name of ["SESSION_READ_API_PUBLIC_URL", "RELAYHISTORY_PUBLIC_URL"]) {
+      assert.throws(
+        () => loadConfig({ ...completeEnv, [name]: invalid }),
+        new RegExp(name),
+        `${name}=${invalid}`,
+      );
+    }
   }
 });
 
@@ -159,36 +184,44 @@ test("configuration fingerprint covers internal and public service origins", () 
   }
 });
 
-test("RelayAuth is optional but both of its variables travel together", () => {
-  const { RELAYAUTH_URL: _url, RELAYAUTH_API_KEY: _key, ...withoutRelayauth } = completeEnv;
-  const config = loadConfig(withoutRelayauth);
-  assert.equal(config.relayauthUrl, null);
-  assert.equal(config.relayauthApiKey, null);
-  assert.match(configFingerprint(config), /^[0-9a-f]{12}$/);
-  assert.notEqual(configFingerprint(config), configFingerprint(loadConfig(completeEnv)));
-
-  const withRelayauth = loadConfig(completeEnv);
-  assert.equal(withRelayauth.relayauthUrl, completeEnv.RELAYAUTH_URL);
-  assert.equal(withRelayauth.relayauthApiKey, completeEnv.RELAYAUTH_API_KEY);
-
-  for (const only of [
-    { ...withoutRelayauth, RELAYAUTH_URL: completeEnv.RELAYAUTH_URL },
-    { ...withoutRelayauth, RELAYAUTH_API_KEY: completeEnv.RELAYAUTH_API_KEY },
-  ]) {
-    assert.throws(() => loadConfig(only), /RELAYAUTH_URL and RELAYAUTH_API_KEY must be set together/);
+test("startup refuses the removed RelayHistory and RelayAuth variables by name", () => {
+  for (const backend of ["legacy", "maybe"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, RELAYHISTORY_BACKEND: backend }), {
+      message: `RELAYHISTORY_BACKEND=${backend} is no longer supported: the standalone RelayHistory service and RelayAuth were removed; unset it or set native`,
+    });
   }
-  assert.throws(
-    () => loadConfig({ ...completeEnv, RELAYAUTH_URL: "http://relayauth.svc/v1" }),
-    /RELAYAUTH_URL must be an origin/,
-  );
+  for (const [name, value] of [
+    ["RELAYAUTH_URL", "http://relayauth.auth.svc.cluster.local"],
+    ["RELAYAUTH_API_KEY", "rak_test"],
+    ["RELAYAUTH_API_KEY_FILE", "/run/secrets/relayauth-api-key"],
+  ] as const) {
+    assert.throws(() => loadConfig({ ...completeEnv, [name]: value }), {
+      message: `${name} is no longer supported: RelayAuth was removed from self-hosted installs; unset it`,
+    }, name);
+  }
+  assert.throws(() => loadConfig({ ...completeEnv, RELAYHISTORY_READ_API_URL: "https://session-reader.selfhosted.company" }), {
+    message: "RELAYHISTORY_READ_API_URL is no longer supported: the read API is configured only through SESSION_READ_API_URL, SESSION_READ_API_PUBLIC_URL and SESSION_READ_API_SECRET; unset it",
+  });
+  // Unset, empty and `native` start; empty removed variables count as unset.
+  for (const backend of [undefined, "", "native"]) {
+    assert.doesNotThrow(() => loadConfig({ ...completeEnv, RELAYHISTORY_BACKEND: backend }));
+  }
+  assert.doesNotThrow(() => loadConfig({ ...completeEnv, RELAYAUTH_URL: "", RELAYAUTH_API_KEY: " ", RELAYHISTORY_READ_API_URL: "" }));
 });
 
-test("token introspection is off by default and validates its secret and audiences", () => {
+test("token introspection is required and validates its secret and audiences", () => {
   const config = loadConfig(completeEnv);
-  assert.equal(config.introspectSecret, null);
-  assert.deepEqual(config.introspectAudiences, [completeEnv.RELAYHISTORY_PUBLIC_URL]);
+  assert.equal(config.introspectSecret, completeEnv.RELAYCONTROL_INTROSPECT_SECRET);
+  assert.deepEqual(config.introspectAudiences, [completeEnv.SESSION_READ_API_PUBLIC_URL]);
+  assert.throws(() => loadConfig({ ...completeEnv, RELAYCONTROL_INTROSPECT_SECRET: "" }), {
+    message: "RELAYCONTROL_INTROSPECT_SECRET is required: the sessions pipeline verifies every History token through introspection",
+  });
+  assert.throws(
+    () => loadConfig({ ...completeEnv, SELFHOST_INTROSPECT_AUDIENCES: "http://relayfile.files.svc:8080" }),
+    { message: "SELFHOST_INTROSPECT_AUDIENCES must include SESSION_READ_API_PUBLIC_URL" },
+  );
 
-  const secret = "i".repeat(32);
+  const secret = "j".repeat(32);
   const enabled = loadConfig({
     ...completeEnv,
     RELAYCONTROL_INTROSPECT_SECRET: secret,
@@ -265,36 +298,6 @@ test("runtime database role is explicit and cannot name the PUBLIC pseudo-role",
   }
 });
 
-
-test("direct read Worker is dormant by default and requires introspection plus its explicit audience", () => {
-  assert.equal(loadConfig(completeEnv).relayhistoryReadApiUrl, null);
-  const reader = "https://session-reader.selfhosted.company";
-  const env = { ...completeEnv, RELAYHISTORY_READ_API_URL: reader, RELAYCONTROL_INTROSPECT_SECRET: "i".repeat(32), SELFHOST_INTROSPECT_AUDIENCES: `${completeEnv.RELAYHISTORY_PUBLIC_URL},${reader}` };
-  const configured = loadConfig(env);
-  assert.equal(configured.relayhistoryReadApiUrl, reader);
-  assert.equal(configured.relayhistoryUrl, completeEnv.RELAYHISTORY_URL);
-  assert.throws(() => loadConfig({ ...env, RELAYCONTROL_INTROSPECT_SECRET: "" }), /RELAYHISTORY_READ_API_URL requires RELAYCONTROL_INTROSPECT_SECRET/);
-  assert.throws(() => loadConfig({ ...env, SELFHOST_INTROSPECT_AUDIENCES: completeEnv.RELAYHISTORY_PUBLIC_URL }), /SELFHOST_INTROSPECT_AUDIENCES must include RELAYHISTORY_READ_API_URL/);
-  for (const url of ["http://session-reader.selfhosted.company", "https://localhost", `${reader}/v1`, `${reader}?token=secret`, "https://user:secret@session-reader.selfhosted.company"]) {
-    assert.throws(() => loadConfig({ ...env, RELAYHISTORY_READ_API_URL: url }), /RELAYHISTORY_READ_API_URL must/);
-  }
-  assert.notEqual(configFingerprint(configured), configFingerprint(loadConfig(completeEnv)));
-});
-
-test("native session-event reads are default-off and require the direct reader connection", () => {
-  const reader = "https://session-reader.selfhosted.company";
-  const env = { ...completeEnv, RELAYHISTORY_READ_API_URL: reader, RELAYCONTROL_INTROSPECT_SECRET: "i".repeat(32), SELFHOST_INTROSPECT_AUDIENCES: `${completeEnv.RELAYHISTORY_PUBLIC_URL},${reader}` };
-  assert.equal(loadConfig(completeEnv).relayhistoryReadApiEvents, false);
-  assert.equal(loadConfig(env).relayhistoryReadApiEvents, false);
-  assert.equal(loadConfig({ ...env, RELAYHISTORY_READ_API_EVENTS: "false" }).relayhistoryReadApiEvents, false);
-  const enabled = loadConfig({ ...env, RELAYHISTORY_READ_API_EVENTS: "true" });
-  assert.equal(enabled.relayhistoryReadApiEvents, true);
-  assert.notEqual(configFingerprint(enabled), configFingerprint(loadConfig(env)));
-  assert.throws(() => loadConfig({ ...completeEnv, RELAYHISTORY_READ_API_EVENTS: "true" }), /requires RELAYHISTORY_READ_API_URL/);
-  for (const invalid of ["1", "yes", "TRUE"]) {
-    assert.throws(() => loadConfig({ ...env, RELAYHISTORY_READ_API_EVENTS: invalid }), /must be true or false/);
-  }
-});
 
 test("the Flows broker secret is optional and must be long enough", () => {
   assert.equal(loadConfig(completeEnv).relayfileControlBrokerSecret, null);

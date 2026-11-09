@@ -16,37 +16,26 @@ export type SelfhostConfig = {
   relaycastUrl: string;
   relaycastPublicUrl: string;
   /**
-   * Transitional: when set (with relayauthApiKey), RelayHistory sessions are
-   * issued from a RelayAuth assertion. When null, relaycontrol forwards the
-   * caller's own access token and RelayHistory introspects it.
+   * The sessions pipeline read API's internal URL (equal to
+   * sessionReadApi.url). History is served only by the sessions pipeline:
+   * relayhistoryUrl and relayhistoryPublicUrl are the read API's, and uploads
+   * go to the pipeline ingest edge at the same public origin.
    */
-  relayauthUrl: string | null;
   relayhistoryUrl: string;
-  /**
-   * RELAYHISTORY_BACKEND=native: no RelayAuth and no standalone RelayHistory.
-   * relayhistoryUrl and relayhistoryPublicUrl are the read API's (see
-   * loadConfig); uploads go to the pipeline ingest edge at the same public
-   * origin. Absent means the legacy RelayHistory exchange.
-   */
-  relayhistoryBackend?: "native" | null;
-  /** Optional GET-only pipeline reader for unsearched session lists and turns. */
-  relayhistoryReadApiUrl?: string | null;
-  /** RELAYHISTORY_READ_API_EVENTS: opt in to native session-event reads. Default off. */
-  relayhistoryReadApiEvents?: boolean;
   /** RELAYFILE_CONTROL_BROKER_SECRET: Flows credential broker routes. Unset: they 404. */
   relayfileControlBrokerSecret?: string | null;
   /** RELAYCHIEF_CONTROL_RELAY_SECRET: chief agent registration route. Unset: it 404s. */
   chiefRelaySecret?: string | null;
-  /** Independent read service; owns issuance, rotation and verification of its tokens. */
-  sessionReadApi?: { url: string; publicUrl: string; secret: string } | null;
+  /** Independent read service; owns issuance, rotation and verification of its tokens. Required. */
+  sessionReadApi: { url: string; publicUrl: string; secret: string };
   /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
   sessionErasureApi?: { url: string; secret: string } | null;
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
   sessionReadMcpReads?: boolean;
   /** SESSION_SEARCH_AGENT_TOKENS: read `@name` tokens in search text as agent filters. Default off. */
   sessionSearchAgentTokens?: boolean;
+  /** The read API's public origin (equal to sessionReadApi.publicUrl). */
   relayhistoryPublicUrl: string;
-  relayauthApiKey: string | null;
   bootstrapToken: string;
   encryptionKeyring: EncryptionKeyring;
   /** admin lane: service bearer for /internal/v1 runtime reads; null disables them. */
@@ -62,8 +51,8 @@ export type SelfhostConfig = {
    */
   operatorOAuthApps?: Record<string, OperatorOAuthApp>;
   /**
-   * Bearer secret for POST /internal/v1/auth/introspect (RelayHistory and
-   * relayfile pods only). Unset or null turns the endpoint off (404).
+   * Bearer secret for POST /internal/v1/auth/introspect (sessions pipeline and
+   * relayfile pods only). loadConfig requires it. Unset or null turns the endpoint off (404).
    */
   introspectSecret?: string | null;
   /**
@@ -327,46 +316,18 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   // Validated at boot; clientIp (src/auth/device-approval.ts) reads it per request.
   trustedProxyHops(env);
 
-  const relayhistoryBackend = loadRelayhistoryBackend(env);
+  refuseRemovedHistoryVariables(env);
+  // One History origin, the read API's. Nothing may name a second one.
   const sessionReadApi = loadSessionReadApiConfig(env);
-  const relayauth = loadRelayauthConfig(env);
-  // Native: one History origin, the read API's. Nothing may name a second one.
-  const nativeReadApi = relayhistoryBackend === "native"
-    ? nativeReadApiConfig(env, sessionReadApi, relayauth)
-    : null;
-  const relayhistoryPublicUrl = nativeReadApi ? nativeReadApi.publicUrl : publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL");
-  const introspection = loadIntrospectionConfig(env, relayhistoryPublicUrl);
-  if (nativeReadApi) assertNativeIntrospection(introspection, nativeReadApi.publicUrl);
-  const relayhistoryReadApiUrl = env.RELAYHISTORY_READ_API_URL?.trim()
-    ? publicServiceUrl(env, "RELAYHISTORY_READ_API_URL") : null;
-  const eventsFlag = env.RELAYHISTORY_READ_API_EVENTS?.trim();
-  if (eventsFlag && eventsFlag !== "true" && eventsFlag !== "false") {
-    throw new Error("RELAYHISTORY_READ_API_EVENTS must be true or false");
-  }
-  const relayhistoryReadApiEvents = eventsFlag === "true";
-  if (relayhistoryReadApiEvents && !relayhistoryReadApiUrl) {
-    throw new Error("RELAYHISTORY_READ_API_EVENTS requires RELAYHISTORY_READ_API_URL");
-  }
-  if (relayhistoryReadApiUrl) {
-    if (!introspection.introspectSecret) {
-      throw new Error("RELAYHISTORY_READ_API_URL requires RELAYCONTROL_INTROSPECT_SECRET");
-    }
-    const readerOrigin = new URL(relayhistoryReadApiUrl).origin;
-    if (!introspection.introspectAudiences.some((audience) => new URL(audience).origin === readerOrigin)) {
-      throw new Error("SELFHOST_INTROSPECT_AUDIENCES must include RELAYHISTORY_READ_API_URL");
-    }
-  }
+  const introspection = loadIntrospectionConfig(env, sessionReadApi.publicUrl);
+  assertHistoryIntrospection(introspection, sessionReadApi.publicUrl);
   return {
     databaseUrl: loadDatabaseUrl(env),
     publicBaseUrl: serviceUrl(env, "SELFHOST_PUBLIC_URL"),
     relaycastUrl: serviceUrl(env, "RELAYCAST_URL"),
     relaycastPublicUrl: publicServiceUrl(env, "RELAYCAST_PUBLIC_URL"),
-    ...relayauth,
-    relayhistoryBackend,
-    relayhistoryUrl: nativeReadApi ? nativeReadApi.url : serviceUrl(env, "RELAYHISTORY_URL"),
-    relayhistoryPublicUrl,
-    relayhistoryReadApiUrl,
-    relayhistoryReadApiEvents,
+    relayhistoryUrl: sessionReadApi.url,
+    relayhistoryPublicUrl: sessionReadApi.publicUrl,
     sessionReadApi,
     relayfileControlBrokerSecret: loadBrokerSecret(env),
     chiefRelaySecret: loadChiefRelaySecret(env),
@@ -428,71 +389,72 @@ function loadBrokerSecret(env: Env): string | null {
   return secret;
 }
 
-/** RELAYHISTORY_BACKEND: unset or `legacy` (default), or `native`; anything else refuses startup. */
-function loadRelayhistoryBackend(env: Env): "native" | null {
-  const raw = env.RELAYHISTORY_BACKEND?.trim() ?? "";
-  if (raw === "" || raw === "legacy") return null;
-  if (raw === "native") return "native";
-  throw new Error("RELAYHISTORY_BACKEND must be legacy or native");
+/**
+ * The standalone RelayHistory service and RelayAuth were removed: History is
+ * served only by the sessions pipeline. Startup refuses their variables by
+ * name rather than silently ignoring an install that still points at them.
+ * RELAYHISTORY_BACKEND may stay unset or `native` (the only backend).
+ */
+function refuseRemovedHistoryVariables(env: Env): void {
+  const backend = env.RELAYHISTORY_BACKEND?.trim() ?? "";
+  if (backend !== "" && backend !== "native") {
+    throw new Error(
+      `RELAYHISTORY_BACKEND=${backend} is no longer supported: the standalone RelayHistory service and RelayAuth were removed; unset it or set native`,
+    );
+  }
+  for (const name of ["RELAYAUTH_URL", "RELAYAUTH_API_KEY", "RELAYAUTH_API_KEY_FILE"]) {
+    if (env[name]?.trim()) {
+      throw new Error(`${name} is no longer supported: RelayAuth was removed from self-hosted installs; unset it`);
+    }
+  }
+  if (env.RELAYHISTORY_READ_API_URL?.trim()) {
+    throw new Error(
+      "RELAYHISTORY_READ_API_URL is no longer supported: the read API is configured only through SESSION_READ_API_URL, SESSION_READ_API_PUBLIC_URL and SESSION_READ_API_SECRET; unset it",
+    );
+  }
 }
 
 /**
- * RELAYHISTORY_BACKEND=native needs the read API handoff, refuses RelayAuth,
- * and permits RELAYHISTORY_URL / _PUBLIC_URL only when they name the read API.
- * Uploads use the same public origin: the ingest edge is routed there, so a
- * caller's token is valid at exactly one audience.
+ * SESSION_READ_API_URL, SESSION_READ_API_PUBLIC_URL (a bare origin) and
+ * SESSION_READ_API_SECRET (or _FILE, at least 32 bytes) are required.
+ * RELAYHISTORY_URL / RELAYHISTORY_PUBLIC_URL are accepted only as aliases
+ * naming the same read API. Uploads use the same public origin: the ingest
+ * edge is routed there, so a caller's token is valid at exactly one audience.
  */
-function nativeReadApiConfig(
-  env: Env,
-  sessionReadApi: SelfhostConfig["sessionReadApi"],
-  relayauth: { relayauthUrl: string | null; relayauthApiKey: string | null },
-): { url: string; publicUrl: string } {
-  if (!sessionReadApi) {
-    throw new Error("RELAYHISTORY_BACKEND=native requires SESSION_READ_API_URL, SESSION_READ_API_PUBLIC_URL and SESSION_READ_API_SECRET");
+function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {
+  const secret = readSecret(env, "SESSION_READ_API_SECRET");
+  const names = ["SESSION_READ_API_URL", "SESSION_READ_API_PUBLIC_URL"] as const;
+  if (!secret && !names.some((name) => env[name]?.trim())) {
+    throw new Error("SESSION_READ_API_URL, SESSION_READ_API_PUBLIC_URL and SESSION_READ_API_SECRET are required");
   }
-  if (relayauth.relayauthUrl || relayauth.relayauthApiKey) {
-    throw new Error("RELAYHISTORY_BACKEND=native refuses RELAYAUTH_URL and RELAYAUTH_API_KEY");
+  if (!secret || Buffer.byteLength(secret) < 32) {
+    throw new Error("SESSION_READ_API_SECRET (or _FILE) must be at least 32 bytes");
   }
-  if (env.RELAYHISTORY_READ_API_URL?.trim()) {
-    throw new Error("RELAYHISTORY_BACKEND=native refuses RELAYHISTORY_READ_API_URL");
+  const url = serviceUrl(env, "SESSION_READ_API_URL");
+  const publicUrl = publicServiceUrl(env, "SESSION_READ_API_PUBLIC_URL");
+  if (new URL(publicUrl).origin !== publicUrl) {
+    throw new Error("SESSION_READ_API_PUBLIC_URL must be a bare origin");
   }
-  if (new URL(sessionReadApi.publicUrl).origin !== sessionReadApi.publicUrl) {
-    throw new Error("SESSION_READ_API_PUBLIC_URL must be a bare origin with RELAYHISTORY_BACKEND=native");
+  if (env.RELAYHISTORY_URL?.trim() && serviceUrl(env, "RELAYHISTORY_URL") !== url) {
+    throw new Error("RELAYHISTORY_URL must equal SESSION_READ_API_URL (or be unset)");
   }
-  if (env.RELAYHISTORY_URL?.trim() && serviceUrl(env, "RELAYHISTORY_URL") !== sessionReadApi.url) {
-    throw new Error("RELAYHISTORY_URL must equal SESSION_READ_API_URL (or be unset) with RELAYHISTORY_BACKEND=native");
+  if (env.RELAYHISTORY_PUBLIC_URL?.trim() && publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL") !== publicUrl) {
+    throw new Error("RELAYHISTORY_PUBLIC_URL must equal SESSION_READ_API_PUBLIC_URL (or be unset)");
   }
-  if (env.RELAYHISTORY_PUBLIC_URL?.trim() && publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL") !== sessionReadApi.publicUrl) {
-    throw new Error("RELAYHISTORY_PUBLIC_URL must equal SESSION_READ_API_PUBLIC_URL (or be unset) with RELAYHISTORY_BACKEND=native");
-  }
-  return { url: sessionReadApi.url, publicUrl: sessionReadApi.publicUrl };
+  return { url, publicUrl, secret };
 }
 
 /** The ingest edge authorizes every upload through introspection of this audience. */
-function assertNativeIntrospection(
+function assertHistoryIntrospection(
   introspection: { introspectSecret: string | null; introspectAudiences: string[] },
   publicUrl: string,
 ): void {
   if (!introspection.introspectSecret) {
-    throw new Error("RELAYHISTORY_BACKEND=native requires RELAYCONTROL_INTROSPECT_SECRET");
+    throw new Error("RELAYCONTROL_INTROSPECT_SECRET is required: the sessions pipeline verifies every History token through introspection");
   }
   if (!introspection.introspectAudiences.includes(publicUrl)) {
-    throw new Error("SELFHOST_INTROSPECT_AUDIENCES must include SESSION_READ_API_PUBLIC_URL with RELAYHISTORY_BACKEND=native");
+    throw new Error("SELFHOST_INTROSPECT_AUDIENCES must include SESSION_READ_API_PUBLIC_URL");
   }
-}
-
-function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {
-  const secret = readSecret(env, "SESSION_READ_API_SECRET");
-  const names = ["SESSION_READ_API_URL", "SESSION_READ_API_PUBLIC_URL"] as const;
-  if (!secret && !names.some((name) => env[name]?.trim())) return null;
-  if (!secret || Buffer.byteLength(secret) < 32) {
-    throw new Error("SESSION_READ_API_SECRET (or _FILE) must be at least 32 bytes");
-  }
-  return {
-    url: serviceUrl(env, "SESSION_READ_API_URL"),
-    publicUrl: publicServiceUrl(env, "SESSION_READ_API_PUBLIC_URL"),
-    secret,
-  };
 }
 
 /**
@@ -525,23 +487,6 @@ export function loadFactoryConfig(env: Env): FactoryConfig {
     apiUrl: url.toString().replace(/\/+$/, ""),
     historyIntervalMs,
   };
-}
-
-/**
- * RELAYAUTH_URL and RELAYAUTH_API_KEY: both (transitional assertion path) or
- * neither (RelayHistory introspects relaycontrol's own access tokens).
- */
-function loadRelayauthConfig(env: Env): {
-  relayauthUrl: string | null;
-  relayauthApiKey: string | null;
-} {
-  const url = env.RELAYAUTH_URL?.trim();
-  const apiKey = readSecret(env, "RELAYAUTH_API_KEY");
-  if (!url && !apiKey) return { relayauthUrl: null, relayauthApiKey: null };
-  if (!url || !apiKey) {
-    throw new Error("RELAYAUTH_URL and RELAYAUTH_API_KEY must be set together or both left unset");
-  }
-  return { relayauthUrl: serviceUrl(env, "RELAYAUTH_URL"), relayauthApiKey: apiKey };
 }
 
 /**
@@ -852,12 +797,10 @@ export function configFingerprint(config: SelfhostConfig): string {
       config.publicBaseUrl,
       config.relaycastUrl,
       config.relaycastPublicUrl,
-      config.relayauthUrl ?? "",
       config.relayhistoryUrl,
       config.relayhistoryPublicUrl,
-      ...(config.relayhistoryReadApiUrl ? [config.relayhistoryReadApiUrl] : []),
-      ...(config.relayhistoryReadApiEvents ? ["native-session-events"] : []),
-      ...(config.sessionReadApi ? [config.sessionReadApi.url, config.sessionReadApi.publicUrl] : []),
+      config.sessionReadApi.url,
+      config.sessionReadApi.publicUrl,
       ...(config.sessionErasureApi ? [config.sessionErasureApi.url] : []),
     ].join("\n"))
     .digest("hex")

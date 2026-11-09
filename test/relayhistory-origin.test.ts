@@ -80,8 +80,8 @@ async function call(
 const historyOrigin = "https://history.selfhosted.test";
 
 /**
- * Without RelayAuth: a RelayHistory double that exchanges the caller's own
- * sh_at_ token and records every request it receives.
+ * A sessions pipeline read API double that answers the Control handoff and
+ * records every request it receives.
  */
 async function startHistory(t: TestContext) {
   const requests: string[] = [];
@@ -91,14 +91,20 @@ async function startHistory(t: TestContext) {
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as Record<string, any>;
     requests.push(new URL(request.url!, "http://history").pathname);
     response.setHeader("content-type", "application/json");
-    if (request.url === "/v1/cli/login" && String(body.agentRelayToken).startsWith("sh_at_")) {
+    if (request.url === "/internal/v1/session-read/sessions") {
+      const serial = String(requests.length).padStart(43, "0");
       response.end(JSON.stringify({
-        accessToken: body.agentRelayToken,
-        accessTokenExpiresAt: "2099-01-01T00:00:00.000Z",
-        refreshToken: body.agentRelayToken,
-        refreshTokenExpiresAt: "2099-01-01T00:00:00.000Z",
-        tokenType: "Bearer",
+        sessionId: `read-${requests.length}`,
+        userId: body.userId,
+        orgId: body.orgId,
+        workspaceId: body.workspaceId,
+        audience: body.audience,
         scopes: ["rth:read"],
+        accessToken: `rth_at_read_${serial}`,
+        accessTokenExpiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+        refreshToken: `rth_rt_read_${serial}`,
+        refreshTokenExpiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+        tokenType: "Bearer",
       }));
       return;
     }
@@ -121,10 +127,9 @@ async function setup(t: TestContext, options: { tenancy?: "single" | "multi" } =
     publicBaseUrl: "https://control.internal.example",
     relaycastUrl: "http://relaycast.internal",
     relaycastPublicUrl: "https://relaycast.selfhosted.test",
-    relayauthUrl: null,
     relayhistoryUrl: history.origin,
     relayhistoryPublicUrl: historyOrigin,
-    relayauthApiKey: null,
+    sessionReadApi: { url: history.origin, publicUrl: historyOrigin, secret: "session-read-secret-".repeat(2) },
     bootstrapToken,
     encryptionKeyring: { active: { id: "test-key", key: Buffer.alloc(32, 7) } },
     port: 3000,
@@ -287,13 +292,13 @@ test("origin lookups do not consume the session issue/renew path", async (t) => 
     assert.equal(lookup.status, 200);
   }
   // Right after the lookups, issue and renew both still succeed, and the only
-  // upstream traffic is their own exchanges.
+  // upstream traffic is their own read API handoffs.
   const second = await issue();
   assert.equal(second.status, 200);
   assert.equal(second.body.baseUrl, historyOrigin);
   const third = await issue();
   assert.equal(third.status, 200);
-  assert.deepEqual(history.requests, ["/v1/cli/login", "/v1/cli/login", "/v1/cli/login"]);
+  assert.deepEqual(history.requests, Array(3).fill("/internal/v1/session-read/sessions"));
 });
 
 const VERIFIER = "desktop-verifier-0123456789abcdefghijklmnopqrstuvwxyz0123456789";

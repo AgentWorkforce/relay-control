@@ -203,10 +203,9 @@ async function setup(t: test.TestContext, options: {
     publicBaseUrl: origin,
     relaycastUrl,
     relaycastPublicUrl: "https://relaycast.selfhosted.test",
-    relayauthUrl: "http://relayauth.invalid",
     relayhistoryUrl: "http://relayhistory.invalid",
     relayhistoryPublicUrl: "https://history.selfhosted.test",
-    relayauthApiKey: "rak_test",
+    sessionReadApi: { url: "http://relayhistory.invalid", publicUrl: "https://history.selfhosted.test", secret: "session-read-secret-".repeat(2) },
     bootstrapToken: BOOTSTRAP,
     encryptionKeyring: KEYRING,
     internalServiceToken: null,
@@ -900,8 +899,9 @@ test("login page without SSO or email shows the operator code openly", async (t)
   const server: Server = createServer(createApp({
     config: {
       databaseUrl: "unused", publicBaseUrl: ctx.origin, relaycastUrl: "http://relaycast.invalid", relaycastPublicUrl: "https://relaycast.selfhosted.test",
-      relayauthUrl: "http://relayauth.invalid", relayhistoryUrl: "http://relayhistory.invalid", relayhistoryPublicUrl: "https://history.selfhosted.test",
-      relayauthApiKey: "x", bootstrapToken: BOOTSTRAP, encryptionKeyring: KEYRING, internalServiceToken: null,
+      relayhistoryUrl: "http://relayhistory.invalid", relayhistoryPublicUrl: "https://history.selfhosted.test",
+      sessionReadApi: { url: "http://relayhistory.invalid", publicUrl: "https://history.selfhosted.test", secret: "session-read-secret-".repeat(2) },
+      bootstrapToken: BOOTSTRAP, encryptionKeyring: KEYRING, internalServiceToken: null,
       oauthRedirectUrl: `${ctx.origin}/cb`, dashboardUrl: `${ctx.origin}/`, port: 0, host: "127.0.0.1",
     },
     store: ctx.store,

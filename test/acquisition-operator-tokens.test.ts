@@ -70,7 +70,7 @@ async function browserSession(origin: string, userId: string, workspaceId: strin
   return session;
 }
 
-async function setup(t: TestContext, extra: Partial<SelfhostConfig> = {}) {
+async function setup(t: TestContext, extra: Partial<Omit<SelfhostConfig, "sessionReadApi">> = {}) {
   const database = new PGliteDatabase();
   await migrate(database);
   const control = createServer();
@@ -80,10 +80,9 @@ async function setup(t: TestContext, extra: Partial<SelfhostConfig> = {}) {
     publicBaseUrl: origin,
     relaycastUrl: "http://relaycast.invalid",
     relaycastPublicUrl: "https://relaycast.selfhosted.test",
-    relayauthUrl: null,
-    relayauthApiKey: null,
     relayhistoryUrl: "http://relayhistory.invalid",
     relayhistoryPublicUrl: HISTORY,
+    sessionReadApi: { url: "http://relayhistory.invalid", publicUrl: HISTORY, secret: "r".repeat(32) },
     introspectSecret: INTROSPECT_SECRET,
     introspectAudiences: [HISTORY, `${FILES}/`],
     bootstrapToken: BOOTSTRAP,

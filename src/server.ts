@@ -89,10 +89,8 @@ if (features.flows) flows();
 const telemetryConfig = loadTelemetryConfig(process.env, {
   probes: [
     { name: "relaycast", url: `${config.relaycastUrl}/health` },
-    // RelayAuth is optional: without it History introspects relaycontrol tokens.
-    ...(config.relayauthUrl ? [{ name: "relayauth", url: `${config.relayauthUrl}/health` }] : []),
-    // The read API has only /healthz; native has no separate History service.
-    { name: "relayhistory", url: `${config.relayhistoryUrl}/${config.relayhistoryBackend === "native" ? "healthz" : "readyz"}` },
+    // History is the sessions pipeline read API, which serves only /healthz.
+    { name: "relayhistory", url: `${config.relayhistoryUrl}/healthz` },
   ],
 });
 const relaycontrolVersion = process.env.SELFHOST_IMAGE_VERSION?.trim() || SELFHOST_API_VERSION;

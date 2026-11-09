@@ -5,6 +5,19 @@ assigned at release.
 
 ## Unreleased
 
+- Removed: the legacy RelayHistory exchange and RelayAuth integration
+  (`RELAYAUTH_URL`, `RELAYAUTH_API_KEY`, `RELAYHISTORY_READ_API_URL`,
+  `RELAYHISTORY_BACKEND=legacy`); self-hosted installs serve history only
+  through the sessions pipeline.
+- **Upgrade note:** `SESSION_READ_API_URL`, `SESSION_READ_API_PUBLIC_URL`,
+  `SESSION_READ_API_SECRET` (or `_FILE`) and `RELAYCONTROL_INTROSPECT_SECRET`
+  are now required, and `SELFHOST_INTROSPECT_AUDIENCES` must include the public
+  read API origin. `RELAYHISTORY_BACKEND` may be unset or `native`;
+  `RELAYHISTORY_URL`/`RELAYHISTORY_PUBLIC_URL` are accepted only as aliases
+  equal to the read API values. Start-up refuses the removed variables by
+  name. `POST .../relayhistory/session` no longer answers 501
+  `sync_not_served`: `mode=sync` returns the caller's own token for the ingest
+  edge. See [docs/sessions-read-api.md](docs/sessions-read-api.md).
 - Added `RELAYCHIEF_CONTROL_RELAY_SECRET` and `POST /internal/v1/chief/workspaces/{id}/relay-agents`, which registers a chief as a Relaycast agent for relaychief-control.
 - Self-host licensing is gone. Control no longer reads `SELFHOST_LICENSE`,
   `SELFHOST_LICENSE_FILE` or a licence key, and never answers

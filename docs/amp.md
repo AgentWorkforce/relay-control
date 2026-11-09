@@ -47,22 +47,19 @@ The upload Cloud sends, and this code sends once a session exists:
   the watermark does not move.
 
 **It is inactive.** The upload needs a workspace-scoped, push-only
-(`rth:sync`) RelayHistory session issued for a background job. Cloud mints it
-with `createRelayhistorySandboxPushSession` (a RelayAuth
-`/v1/tokens/relayhistory-assertion` with scopes `["rth:sync"]` and purpose
-`amp-session-sync`, exchanged at History `POST /v1/cli/login`). This control
-plane cannot:
+(`rth:sync`) History credential issued for a background job. Hosted Cloud
+mints one per job (`createRelayhistorySandboxPushSession`, purpose
+`amp-session-sync`). Self-hosted installs have neither RelayAuth nor a
+standalone RelayHistory, and this control plane cannot:
 
-- `src/relayhistory.ts` `issueRelayhistorySession` only exchanges the
-  caller's own `sh_at_` person token at History `POST /v1/cli/login`. A
-  background job has no caller.
-- History verifies that exchange through `POST /internal/v1/auth/introspect`
-  (`src/auth/introspect.ts`), which answers only `sh_at_` person access tokens
-  and returns `wrong-kind` for every other token. There is no control-issued
-  push credential for it to accept.
-- The optional RelayAuth path (`relayauthAssertion`) asks for read and sync
-  scopes with fixed `relayhistory-login` metadata on behalf of a person. It is
-  not a push-only, binding-scoped job grant and is not wired.
+- `POST .../relayhistory/session` with `mode: "sync"` only hands a person's
+  own `sh_at_` access token back as the ingest edge credential. A background
+  job has no caller.
+- The ingest edge verifies every upload through
+  `POST /internal/v1/auth/introspect` (`src/auth/introspect.ts`), which
+  answers only `sh_at_` person access tokens and returns `wrong-kind` for
+  every other token. There is no control-issued push credential for it to
+  accept.
 
 So `src/amp/module.ts` sets `AmpDeps.pushSession` to `null`, and no mint,
 trust or fallback path exists. While it is null:

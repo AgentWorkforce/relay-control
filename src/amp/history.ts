@@ -15,17 +15,15 @@ import { decrypt, encrypt, withAmpLock, type AmpDeps } from "./service.js";
  * Why the push session is injected and null in production (module.ts):
  * Cloud mints it per job with createRelayhistorySandboxPushSession, a RelayAuth
  * `/v1/tokens/relayhistory-assertion` call with scopes ["rth:sync"] and purpose
- * "amp-session-sync", exchanged at RelayHistory `POST /v1/cli/login`. This
+ * "amp-session-sync", exchanged at RelayHistory `POST /v1/cli/login`. Self-hosted
+ * installs have neither RelayAuth nor a standalone RelayHistory, and this
  * control plane has no equivalent:
- * - src/relayhistory.ts issueRelayhistorySession only exchanges the caller's own
- *   sh_at_ person token (callerAccessToken). A background job has no caller.
- * - RelayHistory verifies that exchange through relaycontrol
+ * - POST .../relayhistory/session in sync mode only hands a caller's own
+ *   sh_at_ person token back for the ingest edge. A background job has no caller.
+ * - The ingest edge verifies every upload through relaycontrol
  *   `POST /internal/v1/auth/introspect` (src/auth/introspect.ts), which answers
  *   only sh_at_ person access tokens and returns wrong-kind for every other
  *   token, so there is no control-issued, workspace-scoped push credential.
- * - The optional relayauthAssertion path requests read+sync scopes with fixed
- *   "relayhistory-login" metadata for a person; it is not a push-only,
- *   binding-scoped job grant and is deliberately not wired here.
  * No mint, trust or fallback path is invented. History stays inactive until a
  * workspace-scoped, push-only (rth:sync) session can be issued without a
  * caller token and supplied as AmpDeps.pushSession.

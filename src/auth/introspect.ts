@@ -5,9 +5,9 @@ import type { SelfhostConfig } from "../config.js";
 import { NODE_ID_PATTERN, type ControlPlaneStore, type Principal } from "../store.js";
 
 /**
- * POST /internal/v1/auth/introspect: RelayHistory (and relayfile) verify a
- * relaycontrol user access token (`sh_at_`) presented to them, instead of a
- * RelayAuth JWT. Contract: internal design note a-no-relayauth-contract (v1, the
+ * POST /internal/v1/auth/introspect: the sessions pipeline (and relayfile)
+ * verify a relaycontrol user access token (`sh_at_`) presented to them.
+ * Contract: internal design note a-no-relayauth-contract (v1, the
  * v1.1 addendum: machine verification, 2026-11-07, and v1.2: optional
  * workspace, 2026-11-07).
  *

@@ -43,8 +43,10 @@ async function fixture(t:test.TestContext) {
     pairs.push({...issued.body,pending});
   }
   const config:SelfhostConfig={databaseUrl:"unused",publicBaseUrl:ORIGIN,relaycastUrl:"http://unused.test",
-    relaycastPublicUrl:"https://relay.example.test",relayauthUrl:null,relayauthApiKey:null,
-    relayhistoryUrl:"http://unused.test",relayhistoryPublicUrl:"https://history.example.test",bootstrapToken:"fake-bootstrap-at-least-thirty-two-bytes",
+    relaycastPublicUrl:"https://relay.example.test",
+    relayhistoryUrl:"http://unused.test",relayhistoryPublicUrl:"https://history.example.test",
+    sessionReadApi:{url:"http://unused.test",publicUrl:"https://history.example.test",secret:"session-read-secret-".repeat(2)},
+    bootstrapToken:"fake-bootstrap-at-least-thirty-two-bytes",
     encryptionKeyring:KEYRING,internalServiceToken:null,oauthRedirectUrl:`${ORIGIN}/unused`,dashboardUrl:ORIGIN,host:"127.0.0.1",port:3000};
   const count=async(table:"sessions"|"revocations")=>(await database.query<{n:number}>(`SELECT count(*)::int AS n FROM mcp_oauth_${table}`)).rows[0]!.n;
   return {database,store,oauth,organizationId,ownerId,userId,client,pairs,config,count};
