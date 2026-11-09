@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { recordAudit, type AuditActor } from "./admin/audit.js";
 import type { Database, SqlExecutor } from "./database.js";
 import { revokeMcpOAuthGrantRows } from "./mcp/oauth/store.js";
+import { DASHBOARD_DEVICE_CLIENT, isDeviceReservedClientName } from "./reserved-client-names.js";
 import {
   lockIdentity,
   lockOrganization,
@@ -45,12 +46,7 @@ const DEVICE_SCOPES = [...BROWSER_SESSION_SCOPES, "rth:acquire"];
  */
 export const ACCOUNT_SCOPE = "account";
 export const DESKTOP_WORKSPACES_SCOPE = "desktop:workspaces";
-/**
- * The client name GET /login starts its device-code sign-in with. Only that
- * flow, redeemed by POST /login/poll as the browser cookie, is a browser
- * sign-in (scope "account"); POST /api/v1/auth/device/start refuses the name.
- */
-export const DASHBOARD_DEVICE_CLIENT = "relay-dashboard";
+export { DASHBOARD_DEVICE_CLIENT };
 /** Browser sign-in sessions: no rth:acquire, plus "account". */
 const ACCOUNT_SCOPES = [...BROWSER_SESSION_SCOPES, ACCOUNT_SCOPE];
 /** Desktop sessions: device scopes (with rth:acquire) plus "desktop:workspaces". */
@@ -758,7 +754,7 @@ export class ControlPlaneStore {
     const deviceCode = opaqueToken("sh_dc_");
     const expiresAt = new Date(Date.now() + DEVICE_CODE_TTL_MS);
     const client = clientName ? cleanName(clientName, "clientName") : null;
-    if (client === DASHBOARD_DEVICE_CLIENT && !options.reserved) {
+    if (client !== null && isDeviceReservedClientName(client) && !options.reserved) {
       throw new ReservedClientNameError("client_name is reserved");
     }
     for (let attempt = 0; attempt < 5; attempt += 1) {

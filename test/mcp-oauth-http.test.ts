@@ -28,8 +28,9 @@ function config(enabled=true,extra:Record<string,string>={}) {
     SELFHOST_ENCRYPTION_KEY_ID:"fake-key",SELFHOST_ENCRYPTION_KEY:Buffer.alloc(32,7).toString("base64"),
     SELFHOST_MCP_OAUTH:enabled?"on":"off",...extra});
 }
-function harness(options:{enabled?:boolean;access?:boolean;session?:McpConsentSession|null;name?:string;fail?:boolean;
-  resources?:Array<typeof SHARED|"/mcp">;oidc?:Record<string,string>}={}) {
+function harness(options:{enabled?:boolean;access?:boolean;session?:McpConsentSession|null;name?:string|null;fail?:boolean;
+  resources?:Array<typeof SHARED|"/mcp">;oidc?:Record<string,string>;redirectUris?:string[];
+  availability?:"available"|"yours"|"taken"|"unknown"}={}) {
   const calls:string[]=[];
   const store={
     async registerMcpOAuthClient(input:{clientName:string|null;redirectUris:string[]}) {
@@ -37,9 +38,11 @@ function harness(options:{enabled?:boolean;access?:boolean;session?:McpConsentSe
     },
     async getMcpOAuthClient(id:string|undefined) {
       if(options.fail) throw new Error("fake secret must not escape");
-      return id===client.clientId?{...client,clientName:options.name??client.clientName}:null;
+      return id===client.clientId?{...client,clientName:options.name===undefined?client.clientName:options.name,
+        redirectUris:options.redirectUris??client.redirectUris}:null;
     },
-    async createMcpOAuthAuthorizationCode() {calls.push("code");return "mcpac_fake";},
+    async createMcpOAuthAuthorizationCode(_request:unknown,_owner:unknown,continuation?:string) {
+      calls.push(continuation?"code:"+continuation:"code");return "mcpac_fake";},
     async listConnectedAgentNames() {return [];},
     async exchangeMcpOAuthAuthorizationCode() {
       calls.push("exchange");return {ok:true as const,body:{access_token:"mcp_at_fake",refresh_token:"mcp_rt_fake",
@@ -55,7 +58,7 @@ function harness(options:{enabled?:boolean;access?:boolean;session?:McpConsentSe
     resolveSession:async()=>options.session===undefined?{transport:"cookie",principal}:options.session,
     workspaceAccess:async()=>options.access!==false,
     workspaceLabel:async()=>"<Fake workspace>",
-    checkAgentNameAvailability:async()=>"available",
+    checkAgentNameAvailability:async()=>{calls.push("name");return options.availability??"available";},
   });
   return {module,calls};
 }
@@ -303,4 +306,64 @@ test("an unavailable module answers every OAuth path with 501 naming only the re
     } finally { await close(server); }
   }
   assert.deepEqual(created,[],"no OAuth store is built while unavailable");
+});
+
+test("consent page names where the code goes, labels the client name as self-reported and suggests no shared name",async()=>{
+  const remote=await (await harness({resources:[SHARED]}).module.handle(web(pagePath)))!.text();
+  assert.match(remote,/<h1>Connect an app calling itself &quot;Fake client&quot;<\/h1>/);
+  assert.match(remote,/Returns to: <strong>client\.example\.test<\/strong>/);
+  assert.match(remote,/id="caution"><strong>Caution:<\/strong> the app chose its own name/);
+  assert.ok(remote.indexOf("Returns to:")<remote.indexOf("This connection may:"));
+  assert.match(remote,/<input id="agent" maxlength="128" required value="">/);
+  assert.ok(!remote.includes("mcp-agent"));
+  assert.match(remote,/<p id="attach-row" hidden><label><input type="checkbox" id="attach"> Attach to my existing agent<\/label><\/p>/);
+  assert.match(remote,/attach_existing:true/);
+  const loopback="http://127.0.0.1:5000/callback";
+  const local=new URL(pagePath,ORIGIN);local.searchParams.set("redirect_uri",loopback);
+  const html=await (await harness({resources:[SHARED],redirectUris:[loopback],name:null}).module.handle(new Request(local)))!.text();
+  assert.match(html,/<h1>Connect an unnamed app<\/h1>/);
+  assert.match(html,/Returns to: <strong>this computer<\/strong>/);
+  assert.ok(!html.includes('id="caution"'));
+});
+
+test("authorization errors redirect only a signed-in account to the registered callback",async()=>{
+  const bad=new URL(pagePath,ORIGIN);bad.searchParams.set("response_type","nope");
+  for(const session of [null,{transport:"bearer",principal},{transport:"cookie",principal:{...principal,pendingHandoff:true}}] as Array<McpConsentSession|null>) {
+    const anonymous=(await harness({resources:[SHARED],session}).module.handle(new Request(bad)))!;
+    assert.equal(anonymous.status,400);
+    assert.equal(anonymous.headers.get("location"),null);
+    assert.equal((await anonymous.json()).error,"unsupported_response_type");
+  }
+  const signedIn=(await harness({resources:[SHARED]}).module.handle(new Request(bad)))!;
+  assert.equal(signedIn.status,302);
+  const location=new URL(signedIn.headers.get("location")!);
+  assert.equal(location.origin+location.pathname,client.redirectUris[0]);
+  assert.equal(location.searchParams.get("error"),"unsupported_response_type");
+});
+
+test("consent attaches a new connection to the user's existing agent only on explicit confirmation",async()=>{
+  const consent={params,decision:"approve",workspace_id:principal.workspaceId,agent_name:"fake-agent"};
+  const yours=harness({resources:[SHARED],availability:"yours"});
+  const unconfirmed=(await yours.module.handle(web(API+"/authorize",consent)))!;
+  assert.equal(unconfirmed.status,409);
+  const refusal=await unconfirmed.json();
+  assert.equal(refusal.error,"agent_name_in_use");
+  assert.match(refusal.error_description,/existing agents\. Confirm/);
+  assert.equal((await yours.module.handle(web(API+"/authorize",{...consent,attach_existing:false})))!.status,409);
+  assert.equal((await yours.module.handle(web(API+"/authorize",{...consent,attach_existing:"yes"})))!.status,400);
+  assert.equal(yours.calls.includes("code"),false);
+  assert.equal((await yours.module.handle(web(API+"/authorize",{...consent,attach_existing:true})))!.status,200);
+  assert.equal(yours.calls.filter(call=>call==="code").length,1);
+  const taken=harness({resources:[SHARED],availability:"taken"});
+  for(const extra of [{},{attach_existing:true}]) {
+    const response=(await taken.module.handle(web(API+"/authorize",{...consent,...extra})))!;
+    assert.equal(response.status,409);
+    assert.equal((await response.json()).error,"agent_name_taken");
+  }
+  const unknown=harness({resources:[SHARED],availability:"unknown"});
+  assert.equal((await unknown.module.handle(web(API+"/authorize",{...consent,attach_existing:true})))!.status,503);
+  assert.equal([...taken.calls,...unknown.calls].some(call=>call.startsWith("code")),false);
+  const continued=harness({resources:[SHARED],availability:"yours"});
+  assert.equal((await continued.module.handle(web(API+"/authorize",{...consent,continue_grant_id:"fake-existing-grant"})))!.status,200);
+  assert.deepEqual(continued.calls,["code:fake-existing-grant"]);
 });

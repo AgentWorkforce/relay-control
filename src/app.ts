@@ -6,6 +6,7 @@ import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
 import { retiringIdentity } from "./mcp/oauth/retirement.js";
+import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -1330,7 +1331,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       );
       const body = await requestObject(request);
       const clientName = stringField(body, "client_name", false);
-      if (clientName?.trim() === DASHBOARD_DEVICE_CLIENT) {
+      if (clientName && isDeviceReservedClientName(clientName.trim())) {
         throw new HttpError(400, "invalid_request", "client_name is reserved");
       }
       const started = await store.startDeviceAuthorization(
