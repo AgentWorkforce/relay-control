@@ -6,9 +6,6 @@ assigned at release.
 ## Unreleased
 
 - Added: `GET /api/v1/workspaces/{id}/sessions/members` returns the organization's member display names (`{ id, name }`, no email) without a History read, so a dashboard that lists sessions straight from the session read API can still name teammates instead of showing "Unknown teammate".
-
-## 0.5.7 (2026-11-09)
-
 - Added: hosted MCP `join_relay desktop_address` links an MCP session to the
   caller's synced Agent Relay Desktop identity (migration 0035,
   `desktop_relay_session_bindings`), ported from Cloud. A linked session sends
@@ -18,6 +15,9 @@ assigned at release.
   Desktop re-sync no longer lists the identity, and identity sync now reports
   `linked_mcp` / `linked_at` for linked identities. OAuth connections cannot
   link.
+
+## 0.5.7 (2026-11-09)
+
 - Fixed: the desktop sign-in workspace picker and consent screens now name
   both browser origins (API and dashboard) in `form-action` beside `'self'`
   and the loopback origin. The form action stays path-only, so the post
