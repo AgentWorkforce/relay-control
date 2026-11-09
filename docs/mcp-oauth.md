@@ -6,6 +6,23 @@ applied. To turn it off, set `SELFHOST_MCP_OAUTH=off` (`false` and `0` are
 accepted too; `on`, `true` and `1` enable it explicitly). Any other spelling
 stops start-up, so a typo never silently changes the setting.
 
+While on, the server exposes to the internet:
+
+- anonymous dynamic client registration: anyone can register a client (with
+  rate limits, see [Disconnect and operating limits](#disconnect-and-operating-limits));
+- the root MCP resource `/mcp` for OAuth bearers, next to the native endpoint;
+- the consent page, token, refresh and revocation endpoints. Access tokens
+  last one hour and refresh tokens 30 days.
+
+Nobody gets a connection without a signed-in account approving it on the
+consent page. When the module becomes active the server logs one line,
+`[selfhost-api] hosted MCP OAuth active`, naming the authorize, token and
+registration paths and the `SELFHOST_MCP_OAUTH=off` switch.
+
+Turning the module `off` hides these routes but does not revoke existing
+connections or drain pending cleanup; both are kept and resume when it is
+turned on again (see [Stuck cleanup](#stuck-cleanup)).
+
 OpenID Connect stays optional (see below). A partial or invalid OIDC key set
 no longer stops the server: the whole OAuth surface answers
 `501 mcp_oauth_unavailable` with reason `oidc_signing_key` until it is fixed
@@ -64,14 +81,15 @@ Public routes keep their CORS headers. Other routes are unaffected.
 
 | Reason | Cause | Fix |
 | --- | --- | --- |
-| `oidc_signing_key` | Some but not all of the OIDC inputs are set, or the key, salt or retained public keys are invalid | Provide all three inputs correctly, or remove them all to run without OIDC |
+| `oidc_signing_key` | Some but not all of the OIDC inputs are set, the key, salt or retained public keys are invalid, or one of their `_FILE` paths cannot be read (the log names the variable, never the path) | Provide all three inputs correctly, or remove them all to run without OIDC |
 | `public_url` | `SELFHOST_PUBLIC_URL` is plain HTTP on a non-loopback host, so it cannot be an OAuth issuer | Serve the public origin over HTTPS |
 
 The server logs `[selfhost-api] hosted MCP OAuth unavailable` once at start-up
 with the reason and a short detail naming the input, never a configured value. Meanwhile `mcp_at_` bearers are
 refused with `401` at the MCP resources, the root `/mcp` resource is not
 mounted and the cleanup worker does not run. When the module is turned off
-explicitly nothing is logged.
+explicitly nothing is logged. A value supplied both directly and through its
+`_FILE` variable is still a configuration error that stops start-up.
 
 ## Consent and credentials
 
@@ -81,6 +99,25 @@ organization and workspace. Switch the account's workspace before connecting
 to a different workspace. Request fields cannot choose another user or
 organization. Consent submission and connection deletion require the exact
 public Origin.
+
+Client names are self-reported by whoever registered the client. The consent
+page heading reads `Connect an app calling itself "<name>"`, and the page
+shows where the authorization code goes: `Returns to: <host>` from the
+registered redirect URI (`this computer` for loopback), with a caution line
+for any other host. Registration refuses names reserved for this product's own
+apps (compared ignoring case, spaces, hyphens and underscores, including any
+name starting with the product brand) and names over 100 characters, with
+`400 invalid_client_metadata`.
+
+The agent name field starts empty unless the client suggested a name; there
+is no shared default. A new connection may not take a name held by another
+member's agent or by an agent still being released after a disconnect
+(`409 agent_name_taken`). A name that belongs to one of the person's own
+agents needs explicit confirmation: the page shows "Attach to my existing
+agent", which sends `attach_existing: true`; without it the submission answers
+`409 agent_name_in_use`. Continuing an existing connection skips this check.
+If the name cannot be checked the submission answers `503` and no code is
+issued.
 
 An omitted scope receives the resource's baseline. A supplied scope that
 contains no resource permission is refused with `invalid_scope`. The shared
@@ -151,6 +188,11 @@ Retryable failures (network errors, timeouts, 5xx, 429, or a 404 while the
 agent is still listed) retry after 60 seconds, doubling per attempt up to one
 hour. A pass handles at most 20 due records and stops after about 30 seconds,
 continuing immediately with the rest. A new disconnect is attempted at once.
+
+A database without migration 0032 makes every pass fail with an undefined
+column. The worker then logs `[mcp-oauth] teardown needs migration 0032; apply
+pending migrations` once and retries every five minutes instead of every 15
+seconds, until a pass succeeds.
 
 Some failures cannot be fixed by retrying: a missing or relocated workspace or
 a remote agent whose identity does not match. These complete the record

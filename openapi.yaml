@@ -265,6 +265,8 @@ paths:
                 decision: {type: string, enum: [approve, deny]}
                 workspace_id: {type: string, format: uuid, description: Must equal the account session's workspace on approval.}
                 agent_name: {type: string, maxLength: 128, description: Required approved name on approval.}
+                continue_grant_id: {type: string, description: Continues one of the account's existing connections instead of creating a new one; skips the name check.}
+                attach_existing: {type: boolean, description: "Confirms attaching a new connection to the account's existing agent of that name; required when the name already belongs to one of the account's agents, except when continuing an existing grant."}
       responses:
         "200":
           description: Validated redirect_to URL containing the current code or denial, state and issuer.
@@ -283,9 +285,21 @@ paths:
           description: Invalid Origin, handoff or account capability
         "404":
           description: Module disabled
+        "409":
+          description: "agent_name_in_use when the name belongs to an existing agent of this account and attach_existing was not true; agent_name_taken when another member's agent or a retiring agent holds the name."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: {type: string, enum: [agent_name_in_use, agent_name_taken]}
+                  error_description: {type: string}
         "413":
           description: Body exceeds 64 KiB
         "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+        "503":
+          description: "temporarily_unavailable: the agent name could not be checked, so no code is issued."
   /cloud/api/oauth/authorize/agent-name:
     get:
       operationId: mcpOAuthAgentName
