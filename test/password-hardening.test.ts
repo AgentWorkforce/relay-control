@@ -202,8 +202,10 @@ test("reset: revokes CLI, Desktop and browser sessions and MCP grants; expires a
     "SELECT user_id, token_family_id, reason FROM selfhost_mcp_oauth_revocations WHERE grant_id = $1", [grantId]);
   assert.equal(tombstone.rows.length, 1, "a revocation tombstone drives Relaycast teardown");
   assert.deepEqual(tombstone.rows[0], { user_id: member.id, token_family_id: familyId, reason: "password_reset" });
-  const code = await ctx.database.query<{ consumed_at: Date | null }>("SELECT consumed_at FROM selfhost_mcp_oauth_authorization_codes");
-  assert.ok(code.rows[0]!.consumed_at, "the unredeemed MCP code is void");
+  const code = await ctx.database.query<{ consumed_at: Date | null; live: boolean }>(
+    "SELECT consumed_at, expires_at > now() AS live FROM selfhost_mcp_oauth_authorization_codes");
+  assert.equal(code.rows[0]!.live, false, "the unredeemed MCP code is void (expired)");
+  assert.equal(code.rows[0]!.consumed_at, null, "and not marked as redeemed");
   const audit = (await auditActions(ctx)).find((e) => e.action === "password.reset.completed");
   assert.match(audit!.target!, /sessions_revoked=3 mcp_grants_revoked=1 device_authorizations_expired=1 mcp_codes_voided=1/);
 });
@@ -236,6 +238,13 @@ test("every password route refuses cross-site and non-JSON requests (403 csrf_re
     assert.equal(form.status, 403, `${route} form`);
     assert.equal(form.body.error, "csrf_rejected");
   }
+});
+
+test("/login page: the invalid_credentials notice only shows when password sign-in is enabled", async (t) => {
+  const ctx = await setup(t, { env: { SELFHOST_SIGNIN_METHODS: "email_link" } });
+  const page = await call(ctx.origin, "/login?error=invalid_credentials");
+  assert.equal(page.status, 200);
+  assert.doesNotMatch(page.text, /Incorrect email or password\./);
 });
 
 test("/login page: password form posts to /login/password and signs in with a cookie", async (t) => {

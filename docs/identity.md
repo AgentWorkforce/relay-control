@@ -330,6 +330,13 @@ file comes from a mounted secret, make sure the mounted file ends up owned by
 the server's user with mode `0400` or `0600`. A root-owned or group-readable
 mount refuses to start.
 
+On Kubernetes a Secret volume is owned by root, with group bits from
+`fsGroup`, so the file check fails when the file is mounted directly. Either
+copy it in an init container into an `emptyDir` with mode `0400`, owned by the
+server's uid, and point `SELFHOST_PASSWORD_PEPPER_FILE` at the copy, or use a
+projected volume whose ownership and `defaultMode` give the server's uid sole
+read access.
+
 #### Client address
 
 Rate limits, lockouts and audit records use one client address. By default

@@ -305,7 +305,8 @@ export function createIdentityModule(input: {
         oidc: oidc ? { displayName: oidc.config.displayName } : null,
         emailLogin,
         password: passwordRoutes !== null,
-        notice: url.searchParams.get("error") === "invalid_credentials"
+        // Only a password form can produce this redirect.
+        notice: passwordRoutes !== null && url.searchParams.get("error") === "invalid_credentials"
           ? { kind: "error", text: "Incorrect email or password." }
           : null,
         userCode: started.userCode,

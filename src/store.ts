@@ -1342,10 +1342,13 @@ export class ControlPlaneStore {
         RETURNING id`,
       [userId],
     );
+    // Expired, not consumed: redeeming a consumed code is treated as a
+    // replay, which is a different path. The MCP store's membership
+    // departure hooks void codes the same way.
     const codes = await executor.query<{ code_hash: string }>(
       `UPDATE selfhost_mcp_oauth_authorization_codes
-          SET consumed_at = now()
-        WHERE user_id = $1 AND consumed_at IS NULL
+          SET expires_at = now()
+        WHERE user_id = $1 AND consumed_at IS NULL AND expires_at > now()
         RETURNING code_hash`,
       [userId],
     );
