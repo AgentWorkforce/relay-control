@@ -3,7 +3,7 @@ import test from "node:test";
 import { createServer, request as nodeRequest } from "node:http";
 import { createPublicKey, generateKeyPairSync, randomUUID, verify } from "node:crypto";
 import { loadConfig } from "../src/config.js";
-import { createMcpOAuthHttpModule } from "../src/mcp/oauth/routes.js";
+import { createMcpOAuthHttpModule, mcpOAuthActiveNotice } from "../src/mcp/oauth/routes.js";
 import { pkceS256 } from "../src/mcp/oauth/protocol.js";
 import type { McpConsentSession } from "../src/mcp/oauth/consent.js";
 import { McpOAuthStore } from "../src/mcp/oauth/store.js";
@@ -385,4 +385,14 @@ test("consent attaches a new connection to the user's existing agent only on exp
   const continued=harness({resources:[SHARED],availability:"yours"});
   assert.equal((await continued.module.handle(web(API+"/authorize",{...consent,continue_grant_id:"fake-existing-grant"})))!.status,200);
   assert.deepEqual(continued.calls,["code:fake-existing-grant"]);
+});
+
+test("the start-up notice names the endpoints default-on exposes and the off switch",async()=>{
+  const {module}=harness({resources:[SHARED]});
+  const notice=mcpOAuthActiveNotice();
+  assert.deepEqual(notice,{authorize:"/cloud/oauth/authorize",token:API+"/token",register:API+"/register",disable:"SELFHOST_MCP_OAUTH=off"});
+  const metadata=await (await module.handle(web("/cloud/.well-known/oauth-authorization-server")))!.json();
+  assert.equal(metadata.authorization_endpoint,ORIGIN+notice.authorize);
+  assert.equal(metadata.token_endpoint,ORIGIN+notice.token);
+  assert.equal(metadata.registration_endpoint,ORIGIN+notice.register);
 });

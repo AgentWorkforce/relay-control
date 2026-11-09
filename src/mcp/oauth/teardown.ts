@@ -38,6 +38,7 @@ export const MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS=8;
 export const MCP_OAUTH_CLIENT_TTL_MS=24*3_600_000;
 const PRUNE_BATCH=500;
 const PRUNE_INTERVAL_MS=15*60_000;
+const MIGRATION_BACKOFF_MS=5*60_000;
 
 /**
  * Deletes up to one batch of dynamically registered clients older than the
@@ -85,6 +86,9 @@ export class McpOAuthTeardown {
   private rerun=false;
   private stopped=false;
   private prunedAt:number|null=null;
+  /** Timer passes pause until then after a schema error; see deferred(). */
+  private pausedUntil=0;
+  private migrationWarned=false;
   constructor(readonly deps:{
     database:Database; keyring:EncryptionKeyring; client:RelaycastClient; now?:()=>Date;
     /** Wall-clock budget of one pass; the remainder follows in an immediate rerun. */
@@ -104,15 +108,28 @@ export class McpOAuthTeardown {
   kick():void {
     if(this.stopped) return;
     if(this.running) {this.rerun=true;return;}
-    void this.drain().catch(error=>{
-      console.error("[mcp-oauth] teardown deferred",{error:error instanceof Error?error.name:"unknown"});
-    });
+    void this.drain().then(()=>{this.pausedUntil=0;this.migrationWarned=false;},error=>this.deferred(error));
+  }
+
+  /**
+   * A database that is missing migration 0032 fails every pass with 42703
+   * (undefined column). Say so once and slow the timer to every 5 minutes
+   * until a pass succeeds, instead of logging an error class every 15 s.
+   */
+  private deferred(error:unknown):void {
+    if((error as {code?:unknown}|null)?.code==="42703") {
+      this.pausedUntil=this.clock().getTime()+MIGRATION_BACKOFF_MS;
+      if(!this.migrationWarned) console.error("[mcp-oauth] teardown needs migration 0032; apply pending migrations");
+      this.migrationWarned=true;
+      return;
+    }
+    console.error("[mcp-oauth] teardown deferred",{error:error instanceof Error?error.name:"unknown"});
   }
 
   start():void {
     if(this.timer) return;
     this.stopped=false;
-    const tick=()=>this.kick();
+    const tick=()=>{if(this.clock().getTime()>=this.pausedUntil) this.kick();};
     this.timer=setInterval(tick,15_000);this.timer.unref();tick();
   }
   async stop():Promise<void> {

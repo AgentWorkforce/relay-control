@@ -10,6 +10,7 @@ import { createMcpOAuthProtocol, pkceS256, type AuthorizationRequest } from "../
 import { McpOAuthStore, McpOAuthAgentNameTakenError, McpOAuthContinuationError } from "../src/mcp/oauth/store.js";
 import { MCP_OAUTH_CLIENT_TTL_MS, McpOAuthTeardown, pruneMcpOAuthClients } from "../src/mcp/oauth/teardown.js";
 import type { RelaycastClient } from "../src/messaging/relaycast.js";
+import type { Database } from "../src/database.js";
 import { PGliteDatabase } from "./support/harness.js";
 
 const ORIGIN = "https://relay.example.test";
@@ -212,4 +213,37 @@ test("0028/0030/0032 apply after the OAuth foundation without changing its check
   const after=(await database.query<{ checksum:string }>("SELECT checksum FROM selfhost_schema_migrations WHERE name='0015_mcp_oauth.sql'")).rows[0]!.checksum;
   assert.equal(after,before);
   assert.deepEqual(await migrate(database),[]);
+});
+
+test("a database missing migration 0032 logs one hint and slows the teardown timer to five minutes until a pass succeeds", async t => {
+  let failing = true, queries = 0;
+  const undefinedColumn = () => Object.assign(new Error("fake undefined column"), { code: "42703" });
+  const database = {
+    async query() { queries++; if (failing) throw undefinedColumn(); return { rows: [] }; },
+    async transaction() { throw new Error("not reached"); },
+  } as unknown as Database;
+  const errors = t.mock.method(console, "error", () => undefined);
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let clock = NOW.getTime();
+  const worker = new McpOAuthTeardown({ database, keyring: { active: { id: "fake-key", key: Buffer.alloc(32, 7) } },
+    client: {} as RelaycastClient, now: () => new Date(clock) });
+  t.after(() => worker.stop());
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  const tick = async (ms = 15_000) => { clock += ms; t.mock.timers.tick(ms); await settle(); await settle(); };
+  const hints = () => errors.mock.calls.filter(call => call.arguments[0] === "[mcp-oauth] teardown needs migration 0032; apply pending migrations").length;
+  worker.start(); await settle(); await settle();
+  assert.equal(hints(), 1);
+  assert.equal(errors.mock.calls.some(call => call.arguments[0] === "[mcp-oauth] teardown deferred"), false);
+  const afterFirst = queries;
+  for (let index = 0; index < 19; index++) await tick();
+  assert.equal(queries, afterFirst, "no pass inside the five-minute back-off");
+  await tick();
+  assert.ok(queries > afterFirst, "the pass runs again after five minutes");
+  assert.equal(hints(), 1, "the hint is logged once");
+  failing = false;
+  for (let index = 0; index < 20; index++) await tick();
+  const recovered = queries;
+  await tick();
+  assert.ok(queries > recovered, "after a successful pass the timer runs every 15 seconds again");
+  assert.equal(hints(), 1);
 });

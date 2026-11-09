@@ -35,6 +35,11 @@ async function bounded(request:Request):Promise<Request> {
   } finally { await reader.cancel().catch(()=>{}); }
 }
 
+/** Start-up notice fields: the public endpoints default-on exposes and the switch that turns them off. */
+export function mcpOAuthActiveNotice():{authorize:string;token:string;register:string;disable:string} {
+  return {authorize:AUTHORIZE,token:`${API}/token`,register:`${API}/register`,disable:"SELFHOST_MCP_OAUTH=off"};
+}
+
 const LOOPBACK_HOSTS=new Set(["localhost","127.0.0.1","[::1]","::1"]);
 /** Where the authorization code goes, as the consent page names it. */
 function redirectDestination(uri:string):{label:string;loopback:boolean} {
