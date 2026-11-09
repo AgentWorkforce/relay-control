@@ -400,7 +400,7 @@ test("readyz lists exactly the audiences introspection accepts, never the secret
   assert.equal(ready.status, 200);
   assert.deepEqual(ready.body, {
     status: "ready",
-    introspection: { enabled: true, audiences: ["https://files.selfhosted.test", "http://history.svc:8080"] },
+    introspection: { enabled: true, audiences: ["https://files.selfhosted.test", "http://history.svc:8080"], outageHoldMs: 0 },
     // No features wired: core only.
     capabilities: { flows: false, relayfile: false, chief: false },
   });
@@ -414,9 +414,9 @@ test("readyz lists exactly the audiences introspection accepts, never the secret
   assert.deepEqual(unlisted.body, { active: false, reason: "audience" });
 
   const defaults = await setup(t);
-  assert.deepEqual((await request(defaults.origin, "/readyz")).body.introspection, { enabled: true, audiences: [HISTORY_PUBLIC] });
+  assert.deepEqual((await request(defaults.origin, "/readyz")).body.introspection, { enabled: true, audiences: [HISTORY_PUBLIC], outageHoldMs: 0 });
   const off = await setup(t, { introspectSecret: null });
-  assert.deepEqual((await request(off.origin, "/readyz")).body.introspection, { enabled: false, audiences: [] });
+  assert.deepEqual((await request(off.origin, "/readyz")).body.introspection, { enabled: false, audiences: [], outageHoldMs: 0 });
 });
 
 test("introspection responses and server logs never contain token material", async (t) => {
