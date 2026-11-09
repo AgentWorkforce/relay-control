@@ -27,7 +27,7 @@ import { handleFlowsBroker } from "./flows-broker.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
-import { acceptedAudiences, handleIntrospection, INTROSPECT_PATH } from "./auth/introspect.js";
+import { acceptedAudiences, handleIntrospection, introspect, INTROSPECT_PATH } from "./auth/introspect.js";
 import { handleAcquisitionRoutes } from "./acquisition/routes.js";
 import { createDesktopFeedHandler, type DesktopFeedLimits } from "./desktop-feed/routes.js";
 import { AwsKmsDesktopFeedSigner, MemoryDesktopFeedSigner, type DesktopFeedSigner } from "./desktop-feed/signer.js";
@@ -134,6 +134,11 @@ const WorkspaceChoice = z.object({ workspaceId: z.string().trim().min(1).max(200
 const CAPABILITY_RATE_LIMIT = { limit: 30, windowMs: 60 * 1_000 };
 /** `token` is the caller's raw access token; it is a credential, never log it. */
 type Auth = { kind: "bootstrap" } | { kind: "user"; principal: Principal; token: string };
+const ACCESS_TOKEN_PREFIX = "sh_at_";
+/** Upper bound on the advisory expiry of a native upload session (ingest re-introspects every call). */
+const NATIVE_UPLOAD_SESSION_MAX_MS = 15 * 60_000;
+/** Not a credential: the native ingest edge never reads it and refuses every refresh with 401. */
+const NATIVE_UPLOAD_NO_REFRESH = "native_ingest_no_refresh";
 const SESSION_COOKIE = "agent_relay_session";
 const DEVICE_COOKIE = "agent_relay_device";
 
@@ -689,6 +694,66 @@ export function createApp(input: {
       httpError: (status, code, message) => new HttpError(status, code, message),
     })
     : null;
+
+  /**
+   * RELAYHISTORY_BACKEND=native POST .../relayhistory/session: no RelayAuth and
+   * no standalone History. `read` is the read API handoff. `sync` hands a bearer
+   * client's own relaycontrol token back as the upload credential for the
+   * ingest edge, which re-introspects it on every request; nothing is minted.
+   * refreshToken is a fixed placeholder: the edge answers every refresh with
+   * 401 refresh_not_supported, and Desktop then renews here with its own
+   * sign-in.
+   */
+  async function nativeHistorySession(
+    request: IncomingMessage,
+    response: ServerResponse,
+    access: Awaited<ReturnType<typeof workspaceAccess>>,
+    mode: "read" | "sync",
+    label: string | undefined,
+  ): Promise<Record<string, unknown>> {
+    const { principal, workspace, token } = access;
+    const browser = !bearer(request);
+    if (browser && !cookieRequestAllowed(request, browserOrigins)) {
+      throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+    }
+    if (principal.pendingHandoff) {
+      throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+    }
+    const api = config.sessionReadApi;
+    if (!api) throw new HttpError(404, "session_read_not_configured", "Session read API is not configured");
+    if (mode === "read") {
+      if (!principal.scopes.includes("rth:read")) {
+        throw new HttpError(403, "mode_not_authorized", "Read mode is not authorized");
+      }
+      const parsed = readSessionRequest.safeParse(label === undefined ? {} : { label });
+      if (!parsed.success) throw new HttpError(400, "invalid_request", "Invalid session read request");
+      rateLimit(response, `session-read:${principal.userId}:${workspace.id}`,
+        { limit: 30, windowMs: 60_000 }, "rate_limited", "Too many session read credential requests");
+      const session = await requestReadSession(api, {
+        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
+      }, parsed.data);
+      const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
+      return browser ? accessOnly : session;
+    }
+    if (browser) throw new HttpError(403, "forbidden", "Browser clients cannot obtain upload credentials");
+    if (!token.startsWith(ACCESS_TOKEN_PREFIX)) throw new HttpError(401, "unauthorized", "User token required");
+    const active = await introspect(config, store, { token, aud: api.publicUrl, workspace: workspace.id });
+    if (!active.active || !active.scopes.includes("rth:sync")) {
+      throw new HttpError(401, "unauthorized", "Token is not valid for uploads");
+    }
+    const expiresAt = new Date(Math.min(active.exp * 1_000, Date.now() + NATIVE_UPLOAD_SESSION_MAX_MS)).toISOString();
+    return {
+      baseUrl: api.publicUrl,
+      accessToken: token,
+      accessTokenExpiresAt: expiresAt,
+      refreshToken: NATIVE_UPLOAD_NO_REFRESH,
+      refreshTokenExpiresAt: expiresAt,
+      tokenType: "Bearer",
+      scopes: ["rth:sync"],
+      orgId: workspace.organizationId,
+      workspaceId: workspace.id,
+    };
+  }
 
   const factoryRoutes = mountFactoryRoutes(factory, { workspaceAccess, requestObject, bearer, json });
 
@@ -2047,6 +2112,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         throw new HttpError(403, "mode_not_authorized", "Sync mode is not authorized");
       }
       const label = stringField(body, "label", false);
+      if (config.relayhistoryBackend === "native") {
+        json(response, 200, await nativeHistorySession(request, response, access, mode, label), true);
+        return;
+      }
       let session: Record<string, unknown>;
       try {
         session = await issueRelayhistorySession(config, {

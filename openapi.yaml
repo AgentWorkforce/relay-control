@@ -3107,7 +3107,13 @@ paths:
         return a session with sync scopes. A sync request whose login reply
         lacks `rth:sync` answers 501 (see docs/sessions-read-api.md).
 
-        In both modes the returned `baseUrl` is the public History origin.
+        With RELAYHISTORY_BACKEND=native (no RelayAuth, no standalone
+        RelayHistory): `mode=read` is the read API handoff; `mode=sync` is
+        bearer-only and returns the caller's own access token for the pipeline
+        ingest edge, which re-introspects it on every upload. See
+        docs/sessions-read-api.md.
+
+        In every mode the returned `baseUrl` is the public History origin.
         Caller-supplied service URLs or tenant IDs are rejected because they
         are not request fields.
       requestBody:

@@ -223,3 +223,33 @@ entry is cached. This is the current read-side revocation-lag contract; it is
 separate from the self-host ingest edge, which introspects per request without
 a positive cache. This Control change does not alter either policy or establish immediate
 read revocation.
+
+## Native backend (`RELAYHISTORY_BACKEND=native`)
+
+The self-host mode without RelayAuth and without a standalone RelayHistory
+(default `legacy`; unset is `legacy`, anything else refuses startup). One public
+origin serves the pipeline read API and the session ingest edge
+(relayhistory-pipeline `SERVICE=session-ingest`).
+
+Set together: `RELAYHISTORY_BACKEND=native`, `SESSION_READ_API_URL`,
+`SESSION_READ_API_PUBLIC_URL` (bare origin, the read API's `READ_API_ORIGIN`
+and the edge's `RELAYHISTORY_INGEST_ORIGIN`), `SESSION_READ_API_SECRET` and
+`RELAYCONTROL_INTROSPECT_SECRET`. `SELFHOST_INTROSPECT_AUDIENCES`, if set, must
+include that origin. Startup refuses `RELAYAUTH_URL`/`RELAYAUTH_API_KEY` and
+`RELAYHISTORY_READ_API_URL`, and any `RELAYHISTORY_URL`/`RELAYHISTORY_PUBLIC_URL`
+that differs from the read API values (leave them unset).
+
+`POST /api/v1/workspaces/{ws}/relayhistory/session` then behaves as:
+
+- `mode: "read"`: the read API handoff (same credentials as
+  `POST .../session-read/session`).
+- `mode: "sync"`: bearer clients only. Returns the caller's own `sh_at_` token
+  as `accessToken`, with `baseUrl` set to the origin above and scope
+  `rth:sync`. The ingest edge re-introspects it (audience = that origin) on
+  every upload; nothing is minted. `refreshToken` is a fixed placeholder and
+  the edge answers `POST /v1/auth/token/refresh` with 401
+  `refresh_not_supported`, so Desktop renews through this route.
+
+Dashboard reads use a read API token per token session (handoff, refreshed on
+its own lineage). Control has no other History dependency in this mode. Hosted
+Cloud does not use this mode.

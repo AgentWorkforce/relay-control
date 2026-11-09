@@ -82,6 +82,7 @@ is explicit. RelayAuth is optional: see
 | `RELAYCAST_PUBLIC_URL` | Public Relaycast origin returned to clients; bare HTTPS public DNS origin |
 | `RELAYAUTH_URL` | Optional, set together with `RELAYAUTH_API_KEY`. Internal RelayAuth origin; when set, History sessions use RelayAuth assertions (transitional). Unset: History sessions exchange the caller's own access token |
 | `RELAYHISTORY_URL` | Internal RelayHistory origin for session exchange and reads; self-host: the read API container's service URL ([docs/sessions-read-api.md](docs/sessions-read-api.md)) |
+| `RELAYHISTORY_BACKEND` | Optional `legacy` (default) or `native`. `native` is the self-host mode without RelayAuth or a standalone RelayHistory: see [sessions-read-api.md](docs/sessions-read-api.md#native-backend-relayhistory_backendnative). |
 | `RELAYHISTORY_READ_API_URL` | Optional bare public HTTPS origin of the GET-only pipeline read Worker for unsearched session lists and turns. Unset keeps existing routing. Requires the introspection secret and an explicit matching `SELFHOST_INTROSPECT_AUDIENCES` entry; see [read backend connection](docs/sessions-read-api.md#connecting-the-get-only-hosted-read-worker). |
 | `RELAYHISTORY_PUBLIC_URL` | Public RelayHistory origin used as assertion and default introspection audience and returned to clients; bare HTTPS public DNS origin |
 | `RELAYAUTH_API_KEY` | Optional, set together with `RELAYAUTH_URL` (`_FILE` supported). Key allowed to mint RelayHistory assertions |

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { SelfhostConfig } from "../config.js";
 import { issueRelayhistorySession, ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
+import { requestReadSession, SessionReadError } from "../session-read.js";
 
 /**
  * Workspace-scoped RelayHistory reads for the dashboard sessions views.
@@ -29,7 +30,7 @@ export type HistoryIdentity = {
   callerToken: string;
 };
 
-type CachedToken = { accessToken: string; expiresAt: number };
+type CachedToken = { accessToken: string; expiresAt: number; refreshToken?: string; refreshExpiresAt?: number };
 
 const TOKEN_CACHE_LIMIT = 1_000;
 const TOKEN_MAX_AGE_MS = 5 * 60_000;
@@ -53,6 +54,53 @@ function cacheKey(identity: HistoryIdentity): string {
 }
 
 /**
+ * RELAYHISTORY_BACKEND=native: the read API issues the token through the
+ * Control handoff. Control has authorized this {user, org, workspace} on this
+ * request; the pair is kept per token session so a reader's token is renewed
+ * on its own refresh lineage instead of creating a new session per page view.
+ */
+async function nativeReadToken(
+  config: SelfhostConfig,
+  identity: HistoryIdentity,
+  cache: Map<string, CachedToken>,
+  key: string,
+  now: number,
+  previous: CachedToken | undefined,
+): Promise<string> {
+  const api = config.sessionReadApi;
+  if (!api) throw new UpstreamError("exchange", undefined, "Session read API is not configured");
+  const readIdentity = { userId: identity.userId, orgId: identity.organizationId, workspaceId: identity.workspaceId };
+  let session;
+  try {
+    session = previous?.refreshToken && (previous.refreshExpiresAt ?? 0) > now + TOKEN_EXPIRY_MARGIN_MS
+      ? await requestReadSession(api, readIdentity, { refreshToken: previous.refreshToken })
+        .catch((error: unknown) => {
+          if (error instanceof SessionReadError && error.status === 401) return null;
+          throw error;
+        })
+      : null;
+    session ??= await requestReadSession(api, readIdentity, { label: "relay-dashboard" });
+  } catch (error) {
+    if (error instanceof SessionReadError) throw new UpstreamError("exchange", error.status, undefined, error.status === 503);
+    throw error;
+  }
+  const expiresAt = Math.min(now + TOKEN_MAX_AGE_MS, Date.parse(session.accessTokenExpiresAt) - TOKEN_EXPIRY_MARGIN_MS);
+  if (expiresAt > now) {
+    if (cache.size >= TOKEN_CACHE_LIMIT) {
+      const oldest = cache.keys().next().value;
+      if (oldest !== undefined) cache.delete(oldest);
+    }
+    cache.set(key, {
+      accessToken: session.accessToken,
+      expiresAt,
+      refreshToken: session.refreshToken,
+      refreshExpiresAt: Date.parse(session.refreshTokenExpiresAt),
+    });
+  }
+  return session.accessToken;
+}
+
+/**
  * A short-lived read token per identity. Membership is re-checked by the
  * caller on every request before this is used, so caching only saves the
  * RelayAuth assertion (or History introspection) and History login round trips (and avoids creating a
@@ -67,7 +115,11 @@ async function readToken(
   const key = cacheKey(identity);
   const cached = cache.get(key);
   if (cached && cached.expiresAt > now) return cached.accessToken;
-  cache.delete(key);
+  // Native keeps the expired pair for its refresh token; the rest is replaced.
+  if (config.relayhistoryBackend !== "native") cache.delete(key);
+  if (config.relayhistoryBackend === "native") {
+    return nativeReadToken(config, identity, cache, key, now, cached);
+  }
   const session = await issueRelayhistorySession(config, {
     ...identity,
     mode: "read",
@@ -142,11 +194,12 @@ export async function readWorkspaceHistory(
   const rolloutPath = path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+\/turns$/.test(path);
   // Other admitted credential families retain their pre-existing History
   // transport; this connection never forwards them to a sh_at_-only Worker.
+  const native = config.relayhistoryBackend === "native";
   const direct = Boolean(config.relayhistoryReadApiUrl && identity.callerToken.startsWith("sh_at_") &&
     rolloutPath && !query.has("q") && !query.has("search"));
   // A read-API cursor cannot be interpreted by History after configuration
   // rollback. Refuse instead of silently restarting on its first page.
-  if (!direct && rolloutPath && /^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
+  if (!direct && !native && rolloutPath && /^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
     throw new ReadCursorExpiredError();
   }
   const origin = direct ? config.relayhistoryReadApiUrl! : config.relayhistoryUrl;
@@ -194,7 +247,8 @@ export async function readWorkspaceHistory(
       // Includes a dormant read-API container (503 not_configured). The
       // cached History token is kept: only a 401 evicts it.
       await response.body?.cancel().catch(() => {});
-      throw new UpstreamError("read", response.status, undefined, direct && response.status === 503);
+      if (native && response.status === 410) throw new ReadCursorExpiredError();
+      throw new UpstreamError("read", response.status, undefined, (direct || native) && response.status === 503);
     }
     if (response.headers.get(WORKSPACE_ATTESTATION_HEADER) !== identity.workspaceId) {
       await response.body?.cancel().catch(() => {});
