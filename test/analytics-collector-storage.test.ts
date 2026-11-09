@@ -158,6 +158,7 @@ test("restart: remount-broadened segment modes become 0600 before listening, wit
   for (const [i, mode] of [0o660, 0o644, 0o600].entries()) await chmod(join(dataDir, "segments", names[i]!), mode);
   const stray = join(dataDir, "segments", "operator-note");
   await writeFile(stray, "leave this alone", { mode: 0o640 });
+  await chmod(stray, 0o640);
 
   const second = await setup(t, { dataDir });
   assert.equal(second.collector.health().segments, 3);
@@ -179,6 +180,7 @@ for (const fault of ["chmod", "sync", "unchanged-mode", "foreign-owner"] as cons
     const path = join(dataDir, "segments", segmentName(Date.now(), 1));
     const bytes = "synthetic retained event\n";
     await writeFile(path, bytes, { mode: 0o660 });
+    await chmod(path, 0o660);
     let closed = false;
     const fsImpl: CollectorFs = {
       ...nodeFs,
@@ -213,6 +215,7 @@ test("recovery ignores existing symlinks and refuses a segment replaced with a s
   await mkdir(join(dataDir, "segments"));
   const outside = join(dataDir, "outside");
   await writeFile(outside, "not a segment", { mode: 0o644 });
+  await chmod(outside, 0o644);
   await symlink(outside, join(dataDir, "segments", segmentName(Date.now(), 1)));
   const first = await setup(t, { dataDir });
   assert.equal(first.collector.health().segments, 0);
