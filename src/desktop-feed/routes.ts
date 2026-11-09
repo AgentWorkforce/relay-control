@@ -8,6 +8,7 @@ import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormatsModule from "ajv-formats";
 import type { SelfhostConfig } from "../config.js";
 import { hashSecret, opaqueToken, secureEqual } from "../crypto.js";
+import type { SqlExecutor } from "../database.js";
 import type { ControlPlaneStore, Principal } from "../store.js";
 import { ApiTokenStore } from "../admin/api-tokens.js";
 import { recordAudit, type AuditActor } from "../admin/audit.js";
@@ -424,7 +425,9 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
     }
     const principal = await controlStore.authenticateAccessToken(token);
     if (!principal) throw unauthorized("unauthenticated", "Unknown or expired session");
-    if (!principal.scopes.includes("cli:auth")) return { kind: "other", rateKey: `s:${principal.sessionId}` };
+    if (!principal.scopes.includes("cli:auth") || principal.pendingHandoff) {
+      return { kind: "other", rateKey: `s:${principal.sessionId}` };
+    }
     return { kind: headerToken ? "workspaceBearer" : "browserSession", principal, rateKey: `s:${principal.sessionId}` };
   }
 
@@ -473,8 +476,14 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
     return null;
   }
 
-  async function quotaCheck(profile: ProfileRow, channel: Channel, required: number, excludeReleaseId: string | null): Promise<void> {
-    const usage = await store.usage(profile.id);
+  async function quotaCheck(
+    profile: ProfileRow,
+    channel: Channel,
+    required: number,
+    excludeReleaseId: string | null,
+    executor: SqlExecutor = store.database,
+  ): Promise<void> {
+    const usage = await store.usage(profile.id, executor);
     const keptBetas = channel === "beta"
       ? usage.betas.slice(Math.max(0, usage.betas.length - (profile.betaKeep - 1)))
       : usage.betas;
@@ -510,8 +519,17 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
     return { kind: "service", subject: "desktop-feed:unknown" };
   }
 
+  /** The write already committed: a failed audit is logged, not reported as a failed write. */
+  async function auditCommitted(entry: Parameters<typeof recordAudit>[1]): Promise<void> {
+    try {
+      await recordAudit(store.database, entry);
+    } catch (error) {
+      log("audit failed after commit", { action: entry.action, ...errorFields(error) });
+    }
+  }
+
   async function mirror(profile: ProfileRow, credential: Credential, action: string, workspaceId: string | null = null): Promise<void> {
-    await recordAudit(store.database, {
+    await auditCommitted({
       organizationId: profile.organizationId,
       workspaceId,
       actor: serviceActor(credential),
@@ -695,8 +713,8 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
       })),
     )).length);
     const required = draft.expected_assets.reduce((total, entry) => total + entry.size, 0);
-    await quotaCheck(ctx.profile, draft.channel, required, null);
     const created = await store.createDraft({
+      reserve: (tx) => quotaCheck(ctx.profile, draft.channel, required, null, tx),
       profileId: ctx.profile.id,
       version: draft.version,
       channel: draft.channel,
@@ -747,8 +765,8 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
     if (await store.release(ctx.profile.id, signed.version)) throw new FeedError(409, "version_exists", "This version already exists");
     if (await store.assetIdsInUse(ctx.profile.id, [...ids])) throw invalid("An asset id is already used in this profile");
     const required = signed.assets.reduce((total, entry) => total + entry.size, 0);
-    await quotaCheck(ctx.profile, signed.channel, required, null);
     const created = await store.createDraft({
+      reserve: (tx) => quotaCheck(ctx.profile, signed.channel, required, null, tx),
       profileId: ctx.profile.id,
       version: signed.version,
       channel: signed.channel,
@@ -961,7 +979,7 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
         assetId: null,
         clientIp: clientIp(ctx.request),
         status: 200,
-      });
+      }).catch((error) => log("audit failed after commit", { action: "desktop_feed.beta_prune", ...errorFields(error) }));
       await mirror(ctx.profile, ctx.credential, "desktop_feed.beta_prune");
     }
     return { status: 200, text };
@@ -1169,8 +1187,13 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
       try {
         await store.audit(auditEvent(denied ? "desktop_feed.denied" : ACTIONS[op], reply.status));
       } catch (error) {
-        if ("release" in reply) reply.release();
-        throw error;
+        if (success && !READ_OPS.has(op)) {
+          // The write committed; a retry would get 409 or lose a one-time token.
+          log("audit failed after commit", { action: ACTIONS[op], ...errorFields(error) });
+        } else {
+          if ("release" in reply) reply.release();
+          throw error;
+        }
       }
     }
 
@@ -1215,7 +1238,11 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
 
     if ("stream" in reply) {
       const body = reply.stream;
-      response.once("close", reply.release);
+      const { release } = reply;
+      response.once("close", () => {
+        release();
+        body.destroy();
+      });
       response.writeHead(reply.status, { ...reply.headers });
       body.once("error", () => response.destroy());
       body.pipe(response);
@@ -1320,6 +1347,7 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
         return { keyId: entry.key_id, publicKey: entry.public_key };
       });
       if (new Set(publicKeys.map((entry) => entry.keyId)).size !== publicKeys.length) throw bad("key_id values repeat");
+      if (publicKeys.some((entry) => entry.keyId === signer.keyId(id))) throw bad("key_id is this site's signing key");
       if (!signer.hasProfile(id)) {
         throw input.httpError(409, "signing_key_not_configured", "No KMS key alias is configured for this profile id");
       }
@@ -1328,7 +1356,7 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
       });
       if ("refused" in result) throw input.httpError(409, "profile_exists", "A profile with this id already exists");
       const created = result.created;
-      await recordAudit(store.database, { organizationId, actor, action: "desktop_feed.profile_create", target: `profile/${id}` });
+      await auditCommitted({ organizationId, actor, action: "desktop_feed.profile_create", target: `profile/${id}` });
       input.json(response, 201, await profileDetail(created), true);
       return true;
     }
@@ -1350,10 +1378,10 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
       }
       if (method === "PUT") {
         await store.bind(profile.id, subId);
-        await recordAudit(store.database, { organizationId, workspaceId: subId, actor, action: "desktop_feed.workspace_bind", target });
+        await auditCommitted({ organizationId, workspaceId: subId, actor, action: "desktop_feed.workspace_bind", target });
       } else {
         await store.unbind(profile.id, subId);
-        await recordAudit(store.database, { organizationId, workspaceId: subId, actor, action: "desktop_feed.workspace_unbind", target });
+        await auditCommitted({ organizationId, workspaceId: subId, actor, action: "desktop_feed.workspace_unbind", target });
       }
       input.json(response, 200, { profile: profile.id, workspaces: await store.bindings(profile.id) }, true);
       return true;
@@ -1373,14 +1401,14 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
         now: now(),
         keep: ACTIVE_PUBLISHER_TOKENS,
       });
-      await recordAudit(store.database, { organizationId, actor, action: "desktop_feed.publisher_token_create", target });
+      await auditCommitted({ organizationId, actor, action: "desktop_feed.publisher_token_create", target });
       input.json(response, 201, { ...publisherTokenSummary(row), profile: profile.id, token }, true);
       return true;
     }
     if (!subId || !UUID_PATTERN.test(subId)) throw input.httpError(404, "publisher_token_not_found", "Publisher token not found");
     const revoked = await store.revokePublisherToken(profile.id, subId, now());
     if (!revoked) throw input.httpError(404, "publisher_token_not_found", "Publisher token not found");
-    await recordAudit(store.database, { organizationId, actor, action: "desktop_feed.publisher_token_revoke", target });
+    await auditCommitted({ organizationId, actor, action: "desktop_feed.publisher_token_revoke", target });
     input.json(response, 200, publisherTokenSummary(revoked), true);
     return true;
   }

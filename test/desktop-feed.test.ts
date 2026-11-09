@@ -1249,3 +1249,72 @@ test("signer cap: the cloud release fits under the KMS limit and the untrimmed o
   const created = await create(cloud);
   assert.equal(created.status, 201, created.text);
 });
+
+/* ---------------------------------------------------- review regressions */
+
+test("credentials: an unexchanged Desktop handoff cannot read the feed", async (t) => {
+  const world = await setup(t);
+  await provision(world, "acme", "Acme", world.w1);
+  const token = await world.session(world.ownerId, world.w1);
+  assert.equal((await world.call(`${FEED}/manifest?channel=stable`, { token, profile: "acme" })).status, 404, "an exchanged session reaches the feed");
+  await world.database.query(`UPDATE selfhost_token_sessions SET desktop_exchange_challenge = 'pending', desktop_exchanged_at = NULL`);
+  const refused = await world.call(`${FEED}/manifest?channel=stable`, { token, profile: "acme" });
+  assert.equal(refused.status, 403, refused.text);
+  assert.equal(refused.json.error, "wrong_credential");
+  assert.equal((await world.call("/api/v1/desktop/profiles", { token })).status, 403);
+});
+
+test("audit: a failed audit after a commit does not fail the write, and reads still fail closed", async (t) => {
+  const world = await setup(t);
+  const { publisher } = await provision(world, "acme", "Acme", world.w1);
+  const token = await world.session(world.ownerId, world.w1);
+  const body = draftBody("Acme", "2026.11.0");
+  await uploaded(world, "acme", publisher, body, BYTES_BY_INDEX);
+  await world.database.query(`DROP TABLE selfhost_admin_audit_events`);
+  await world.database.query(`DROP TABLE selfhost_desktop_feed_audit_events`);
+  world.logs.length = 0;
+  const published = await world.call(`${FEED}/releases/2026.11.0/publish`, { token: publisher, profile: "acme", body: { latest: true } });
+  assert.equal(published.status, 200, published.text);
+  assert.ok(world.logs.some((entry) => entry.message === "audit failed after commit" && entry.fields.action === "desktop_feed.publish"));
+  const read = await world.call(`${FEED}/manifest?channel=stable`, { token, profile: "acme" });
+  assert.equal(read.status, 500);
+});
+
+test("quota: concurrent drafts cannot reserve more than the quota", async (t) => {
+  const world = await setup(t);
+  const total = BYTES_BY_INDEX.reduce((sum, bytes) => sum + bytes.length, 0);
+  const { publisher } = await provision(world, "acme", "Acme", world.w1, { quota_bytes: total + 1 });
+  const results = await Promise.all(["2026.11.0", "2026.11.1"].map((version) =>
+    world.call(`${FEED}/releases`, { token: publisher, profile: "acme", body: draftBody("Acme", version) })));
+  assert.deepEqual(results.map((result) => result.status).sort(), [201, 422]);
+  assert.ok(results.some((result) => result.json.error === "quota_exceeded"));
+});
+
+test("streams: a cancelled download destroys the upstream body", async (t) => {
+  const world = await setup(t);
+  const { publisher } = await provision(world, "acme", "Acme", world.w1);
+  const token = await world.session(world.ownerId, world.w1);
+  await uploaded(world, "acme", publisher, draftBody("Acme", "2026.11.0"), BYTES_BY_INDEX);
+  const published = await world.call(`${FEED}/releases/2026.11.0/publish`, { token: publisher, profile: "acme", body: { latest: true } });
+  const held: PassThrough[] = [];
+  world.storage.held = held;
+  const request = httpGet(`${world.origin}${FEED}/assets/${published.json.manifest.assets[0].id}`, {
+    headers: { authorization: `Bearer ${token}`, "x-agent-relay-profile": "acme" },
+  });
+  request.on("error", () => undefined);
+  await new Promise((resolve) => request.once("response", resolve));
+  request.destroy();
+  for (let attempt = 0; attempt < 200 && !held[0]?.destroyed; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(held[0]?.destroyed, true);
+});
+
+test("profiles: a registered key cannot shadow the site's signing key", async (t) => {
+  const world = await setup(t);
+  const refused = await world.post(`/api/v1/organizations/${world.orgId}/desktop-feed/profiles`, {
+    id: "shadow", asset_prefix: "Shadow", public_keys: [{ key_id: "fk_shadow_dev", public_key: `${"A".repeat(43)}=` }],
+  });
+  assert.equal(refused.status, 400, refused.text);
+  assert.match(refused.json.message, /signing key/);
+});

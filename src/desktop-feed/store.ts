@@ -449,8 +449,12 @@ export class DesktopFeedStore {
     envelope: string | null;
     assets: DeclaredAsset[];
     now: Date;
+    /** Runs under the profile's row lock, so concurrent drafts cannot overrun the quota. */
+    reserve?: (tx: SqlExecutor) => Promise<void>;
   }): Promise<ReleaseRow | null> {
     return this.database.transaction(async (tx) => {
+      await tx.query(`SELECT id FROM selfhost_desktop_feed_profiles WHERE id = $1 FOR UPDATE`, [input.profileId]);
+      await input.reserve?.(tx);
       const declared = input.assets.reduce((total, entry) => total + entry.size, 0);
       const inserted = await tx.query(
         `INSERT INTO selfhost_desktop_feed_releases
@@ -507,12 +511,12 @@ export class DesktopFeedStore {
   }
 
   /** Bytes for the quota: published releases and open drafts of the profile. */
-  async usage(profileId: string): Promise<{
+  async usage(profileId: string, executor: SqlExecutor = this.database): Promise<{
     stableBytes: number;
     betas: Array<{ version: string; bytes: number }>;
     drafts: Array<{ id: string; bytes: number }>;
   }> {
-    const result = await this.database.query<{ id: string; version: string; channel: Channel; state: string; declared_bytes: unknown }>(
+    const result = await executor.query<{ id: string; version: string; channel: Channel; state: string; declared_bytes: unknown }>(
       `SELECT id, version, channel, state, declared_bytes FROM selfhost_desktop_feed_releases
         WHERE profile_id = $1 ORDER BY publish_seq ASC NULLS LAST, created_at ASC`,
       [profileId],
