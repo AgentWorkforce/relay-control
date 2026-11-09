@@ -177,7 +177,7 @@ test("coding agents: store masked, encrypted at rest, admin-only writes", async 
   assert.equal(formPost.status, 415, "cookie writes must be JSON");
 
   const rows = await ctx.database.query<{ secret_ciphertext: string }>(
-    "SELECT * FROM selfhost_coding_agent_credentials",
+    "SELECT * FROM coding_agent_credentials",
   );
   assert.equal(rows.rows.length, 1);
   assert(!JSON.stringify(rows.rows).includes(ANTHROPIC_KEY), "no plaintext in any column");
@@ -404,10 +404,10 @@ test("coding agents: migration 0006 deletes stored Daytona credentials", async (
       );
     }
     assert.equal((await migrate(database))[0], "0006_coding_agents_drop_daytona.sql");
-    const rows = await database.query<{ model_provider: string }>("SELECT model_provider FROM selfhost_coding_agent_credentials");
+    const rows = await database.query<{ model_provider: string }>("SELECT model_provider FROM coding_agent_credentials");
     assert.deepEqual(rows.rows.map((row) => row.model_provider), ["openai"]);
     await assert.rejects(database.query(
-      `INSERT INTO selfhost_coding_agent_credentials
+      `INSERT INTO coding_agent_credentials
          (id, organization_id, workspace_id, model_provider, harness, auth_type, display_name,
           secret_ciphertext, secret_preview, key_fingerprint)
        VALUES ('55555555-5555-4555-8555-555555555555', $1, $2, 'daytona', 'daytona', 'byo_api_key', 'd', $3, '••••', 'f')`,

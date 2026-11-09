@@ -235,7 +235,7 @@ export async function login(ctx: Ctx, email: string, password: string, ip = "198
 
 export async function auditActions(ctx: Ctx): Promise<Array<{ action: string; target: string | null }>> {
   const result = await ctx.database.query<{ action: string; target: string | null }>(
-    "SELECT action, target FROM selfhost_admin_audit_events ORDER BY created_at, id",
+    "SELECT action, target FROM admin_audit_events ORDER BY created_at, id",
   );
   return result.rows;
 }

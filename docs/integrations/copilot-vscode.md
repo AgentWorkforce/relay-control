@@ -20,7 +20,7 @@ Ported from the hosted control plane's Copilot Desktop integration.
 | Area | Cloud source | Status |
 | --- | --- | --- |
 | Provider credential routes (GET/POST collection, PUT/DELETE item) | `app/api/v1/workspaces/[workspaceId]/mcp/shared-sessions-tokens/**`, `lib/auth/desktop-provider-credentials.ts` | Ported for provider credentials. Dashboard-minted personal tokens (no-body POST) not ported |
-| Verified parent sign-in | Cloud desktop session provenance (migrations 0348/0349) | Ported: `desktop_host_name` and `desktop_verified_at` on `selfhost_token_sessions`, set only by an approved browser consent redeemed with S256 |
+| Verified parent sign-in | Cloud desktop session provenance (migrations 0348/0349) | Ported: `desktop_host_name` and `desktop_verified_at` on `token_sessions`, set only by an approved browser consent redeemed with S256 |
 | Child token class `mcp:desktop` + `rth:read`, 15-minute renewable lease | same | Ported. Usable only at the shared-sessions MCP endpoint |
 | Desktop identity sync (GET/PUT `messaging/desktop-identities`) | `app/api/v1/workspaces/[workspaceId]/messaging/desktop-identities/route.ts`, `lib/messaging/desktop-identities.ts` | Ported. `linked_mcp`/`linked_at` are always null; `web_session_id` is accepted and ignored |
 | Attestation key registration (`attestation_key`) | same | Ported |
@@ -131,7 +131,7 @@ On every `tools/call` relaycontrol:
    owner and source, the signature, the exact tool and arguments, user and
    workspace, a lifetime of at most 60 seconds (`exp - iat <= 60`, not yet
    expired, `iat` at most 30 seconds ahead for clock skew), and spends the
-   nonce once (`selfhost_mcp_attestation_tool_uses`).
+   nonce once (`mcp_attestation_tool_uses`).
 3. A proof that fails any check, a proof on a non-Copilot connection, or a
    proof inside a batch is refused with JSON-RPC 400 `-32602`
    "Invalid native chat context.". There is no fallback to an unattested call.
@@ -166,7 +166,7 @@ provider credential routes.
 - Verified parent = an S256-redeemed handoff from an approved consent that
   named the host; everything else is unverified (no relaxation).
 - Child credentials are ordinary token sessions with a binding row
-  (`selfhost_desktop_mcp_credentials`), so revocation, refresh-family
+  (`desktop_mcp_credentials`), so revocation, refresh-family
   revocation and membership cascades apply without new code paths.
 - POST returns 201 also for an idempotent renew.
 - The child lease is capped at the parent's refresh expiry.

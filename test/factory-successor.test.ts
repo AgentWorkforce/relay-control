@@ -102,14 +102,14 @@ for (const absent of ["completed", "404"] as const) {
     // Worst case: A's row still names its (now gone) agent id while the
     // successor is live, e.g. a lost markReleased write.
     await env.database.query(
-      "UPDATE selfhost_factory_bindings SET relay_agent_id = $2, remote_cleanup_code = 'release_failed' WHERE id = $1",
+      "UPDATE factory_bindings SET relay_agent_id = $2, remote_cleanup_code = 'release_failed' WHERE id = $1",
       [old.binding_id, old.agent.id],
     );
     const requestsBefore = env.relay.releaseRequests.length;
     // Both late release drivers: the worker cleanup loop and the service's releasePending.
     assert.equal(await env.module.worker.cleanup(), 0);
     await env.database.query(
-      "UPDATE selfhost_factory_bindings SET relay_agent_id = $2, remote_cleanup_code = 'release_failed' WHERE id = $1",
+      "UPDATE factory_bindings SET relay_agent_id = $2, remote_cleanup_code = 'release_failed' WHERE id = $1",
       [old.binding_id, old.agent.id],
     );
     assert.equal(await env.module.service.releasePending({ sessionId: "sess-a" }), 0);

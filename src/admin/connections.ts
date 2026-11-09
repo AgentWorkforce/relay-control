@@ -235,7 +235,7 @@ export class ConnectionStore {
     }>(
       `SELECT provider, client_id, client_secret_masked, scopes, created_by_user_id,
               updated_by_user_id, created_at, updated_at
-         FROM selfhost_integration_oauth_apps WHERE workspace_id = $1 ORDER BY provider`,
+         FROM integration_oauth_apps WHERE workspace_id = $1 ORDER BY provider`,
       [workspaceId],
     );
     return result.rows.flatMap((row) => {
@@ -274,7 +274,7 @@ export class ConnectionStore {
     await this.database.transaction(async (tx) => {
       if (secret === null) {
         const updated = await tx.query(
-          `UPDATE selfhost_integration_oauth_apps
+          `UPDATE integration_oauth_apps
               SET client_id = $3, scopes = $4, updated_by_user_id = $5, updated_at = now()
             WHERE workspace_id = $1 AND provider = $2 RETURNING provider`,
           [input.workspaceId, provider.id, clientId, scopes, input.actor.userId],
@@ -284,7 +284,7 @@ export class ConnectionStore {
         }
       } else {
         await tx.query(
-          `INSERT INTO selfhost_integration_oauth_apps
+          `INSERT INTO integration_oauth_apps
              (workspace_id, provider, client_id, client_secret_ciphertext, client_secret_masked,
               scopes, created_by_user_id, updated_by_user_id)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
@@ -327,7 +327,7 @@ export class ConnectionStore {
     const provider = this.oauthProvider(input.provider);
     return this.database.transaction(async (tx) => {
       const deleted = await tx.query(
-        `DELETE FROM selfhost_integration_oauth_apps
+        `DELETE FROM integration_oauth_apps
           WHERE workspace_id = $1 AND provider = $2 RETURNING provider`,
         [input.workspaceId, provider.id],
       );
@@ -354,7 +354,7 @@ export class ConnectionStore {
       scopes: string[] | null;
     }>(
       `SELECT client_id, client_secret_ciphertext, scopes
-         FROM selfhost_integration_oauth_apps WHERE workspace_id = $1 AND provider = $2`,
+         FROM integration_oauth_apps WHERE workspace_id = $1 AND provider = $2`,
       [workspaceId, provider.id],
     );
     // The operator's app (chart values backed by a Secret) wins; a
@@ -409,10 +409,10 @@ export class ConnectionStore {
     const pkce = provider.pkce ? pkcePair() : null;
     const expiresAt = new Date(Date.now() + OAUTH_STATE_TTL_MS);
     await this.database.query(
-      "DELETE FROM selfhost_integration_oauth_states WHERE expires_at < now() - interval '1 day'",
+      "DELETE FROM integration_oauth_states WHERE expires_at < now() - interval '1 day'",
     );
     await this.database.query(
-      `INSERT INTO selfhost_integration_oauth_states
+      `INSERT INTO integration_oauth_states
          (state_hash, workspace_id, provider, user_id, code_verifier_ciphertext, redirect_uri, expires_at, return_to)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
@@ -459,9 +459,9 @@ export class ConnectionStore {
       redirect_uri: string;
       organization_id: string;
     }>(
-      `UPDATE selfhost_integration_oauth_states s
+      `UPDATE integration_oauth_states s
           SET consumed_at = now()
-         FROM selfhost_workspaces w
+         FROM workspaces w
         WHERE s.state_hash = $1
           AND s.consumed_at IS NULL
           AND s.expires_at > now()
@@ -599,7 +599,7 @@ export class ConnectionStore {
   }): Promise<ConnectionRecord> {
     return this.database.transaction(async (tx) => {
       const result = await tx.query<ConnectionRow>(
-        `INSERT INTO selfhost_integration_connections
+        `INSERT INTO integration_connections
            (id, workspace_id, provider, auth_mode, status, credentials_ciphertext, token_type,
             scopes, access_token_expires_at, refresh_token_expires_at, account_id,
             account_label, metadata, created_by_user_id, updated_by_user_id)
@@ -753,7 +753,7 @@ export class ConnectionStore {
 
   async list(workspaceId: string): Promise<ConnectionRecord[]> {
     const result = await this.database.query<ConnectionRow>(
-      `SELECT ${CONNECTION_COLUMNS} FROM selfhost_integration_connections
+      `SELECT ${CONNECTION_COLUMNS} FROM integration_connections
         WHERE workspace_id = $1 ORDER BY provider`,
       [workspaceId],
     );
@@ -763,7 +763,7 @@ export class ConnectionStore {
   async get(workspaceId: string, providerId: string): Promise<ConnectionRecord | null> {
     const provider = this.provider(providerId);
     const result = await this.database.query<ConnectionRow>(
-      `SELECT ${CONNECTION_COLUMNS} FROM selfhost_integration_connections
+      `SELECT ${CONNECTION_COLUMNS} FROM integration_connections
         WHERE workspace_id = $1 AND provider = $2`,
       [workspaceId, provider.id],
     );
@@ -779,7 +779,7 @@ export class ConnectionStore {
     const provider = this.provider(input.provider);
     return this.database.transaction(async (tx) => {
       const deleted = await tx.query(
-        `DELETE FROM selfhost_integration_connections
+        `DELETE FROM integration_connections
           WHERE workspace_id = $1 AND provider = $2 RETURNING id`,
         [input.workspaceId, provider.id],
       );
@@ -809,7 +809,7 @@ export class ConnectionStore {
     const provider = this.provider(input.provider);
     const token = await this.database.transaction(async (tx) => {
       const result = await tx.query<ConnectionRow>(
-        `SELECT ${CONNECTION_COLUMNS} FROM selfhost_integration_connections
+        `SELECT ${CONNECTION_COLUMNS} FROM integration_connections
           WHERE workspace_id = $1 AND provider = $2 FOR UPDATE`,
         [input.workspaceId, provider.id],
       );
@@ -878,7 +878,7 @@ export class ConnectionStore {
       };
       const nextExpiry = expiryFromNow(refreshed.expiresIn);
       const updated = await tx.query<ConnectionRow>(
-        `UPDATE selfhost_integration_connections SET
+        `UPDATE integration_connections SET
            status = 'ready',
            credentials_ciphertext = $2,
            token_type = COALESCE($3, token_type),
@@ -944,7 +944,7 @@ export class ConnectionStore {
 
   private async markError(executor: SqlExecutor, id: string, message: string): Promise<void> {
     await executor.query(
-      `UPDATE selfhost_integration_connections
+      `UPDATE integration_connections
           SET status = 'error', last_error = $2, updated_at = now() WHERE id = $1`,
       [id, message.slice(0, 500)],
     );

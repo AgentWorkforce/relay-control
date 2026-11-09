@@ -311,7 +311,7 @@ export function createFactoryService(deps: FactoryServiceDeps) {
         if (setupIdentity(before) !== setupIdentity(await setupSnapshot(tx, workspaceId))) throw FACTORY_ERRORS.setupChanged();
         await requireConnectAllowed(tx, access, current?.user_id ?? null);
         await tx.query(
-          "DELETE FROM selfhost_factory_history_syncs WHERE workspace_id = $1 AND user_id <> $2",
+          "DELETE FROM factory_history_syncs WHERE workspace_id = $1 AND user_id <> $2",
           [workspaceId, userId],
         );
         await deps.afterLock?.("connect");
@@ -343,7 +343,7 @@ export function createFactoryService(deps: FactoryServiceDeps) {
         // rows keep their cleanup locators for the cleanup loop (Cloud a749e46c).
         const retired = await retireBindingsInTx(tx, { workspaceId: access.workspace.id, userId: connection.user_id });
         await tx.query(
-          "DELETE FROM selfhost_factory_history_syncs WHERE workspace_id = $1 AND user_id = $2",
+          "DELETE FROM factory_history_syncs WHERE workspace_id = $1 AND user_id = $2",
           [access.workspace.id, connection.user_id],
         );
         await deleteConnection(tx, access.workspace.id);
@@ -528,7 +528,7 @@ export function createFactoryService(deps: FactoryServiceDeps) {
         } catch {
           if (outcome.exists) {
             await database.query(
-              "UPDATE selfhost_factory_bindings SET relay_agent_id = $2, remote_cleanup_code = 'release_failed' WHERE id = $1 AND state = 'retired'",
+              "UPDATE factory_bindings SET relay_agent_id = $2, remote_cleanup_code = 'release_failed' WHERE id = $1 AND state = 'retired'",
               [prepared.id, agent.id],
             );
           }
@@ -588,7 +588,7 @@ export function createFactoryService(deps: FactoryServiceDeps) {
         const current = await findBinding(tx, row.id, true);
         if (current?.state !== "bound" || current.user_id !== access.principal.userId) throw FACTORY_ERRORS.retired();
         await tx.query(
-          `INSERT INTO selfhost_factory_history_syncs
+          `INSERT INTO factory_history_syncs
              (workspace_id, session_id, organization_id, binding_id, user_id, next_due_at)
            VALUES ($1, $2, $3, $4, $5, now())
            ON CONFLICT (workspace_id, session_id) DO UPDATE
@@ -597,7 +597,7 @@ export function createFactoryService(deps: FactoryServiceDeps) {
           [row.workspace_id, row.session_id, row.organization_id, row.id, row.user_id],
         );
         await tx.query(
-          "UPDATE selfhost_factory_bindings SET history_queued_at = now() WHERE id = $1 AND state = 'bound'",
+          "UPDATE factory_bindings SET history_queued_at = now() WHERE id = $1 AND state = 'bound'",
           [row.id],
         );
       });
@@ -654,8 +654,8 @@ export function createFactoryService(deps: FactoryServiceDeps) {
         `SELECT d.binding_id, d.message_id, b.organization_id, b.user_id, b.state AS binding_state,
                 d.state AS delivery_state, d.reply_expires_at, d.reply_result, d.reply_body_hash,
                 b.hosted_token_envelope
-           FROM selfhost_factory_deliveries d
-           JOIN selfhost_factory_bindings b ON b.id = d.binding_id
+           FROM factory_deliveries d
+           JOIN factory_bindings b ON b.id = d.binding_id
           WHERE d.reply_hash = $1`,
         [hashSecret(bearer)],
       );
@@ -691,7 +691,7 @@ export function createFactoryService(deps: FactoryServiceDeps) {
       }
       const result = { ok: true, message_id: sent.message.id, conversation_id: sent.conversationId };
       const stored = await database.query<{ reply_result: unknown; reply_body_hash: string | null }>(
-        `UPDATE selfhost_factory_deliveries SET reply_result = COALESCE(reply_result, $3::jsonb),
+        `UPDATE factory_deliveries SET reply_result = COALESCE(reply_result, $3::jsonb),
                 reply_body_hash = COALESCE(reply_body_hash, $4), updated_at = now()
           WHERE binding_id = $1 AND message_id = $2
           RETURNING reply_result, reply_body_hash`,

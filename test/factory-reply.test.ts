@@ -101,7 +101,7 @@ test("factory reply on a retired binding is 409 and the bearer hash is gone", as
   assert.equal((await env.api(factoryPath(env.workspaceId, `/bindings/${binding_id}`), { method: "DELETE", token: env.ownerToken })).status, 204);
   const refused = await reply(env, binding_id, bearer, { text: "after unbind" });
   assert.deepEqual(refused.body, { error: "binding_retired", message: "Binding is retired" });
-  const rows = await env.database.query("SELECT 1 FROM selfhost_factory_deliveries WHERE reply_hash = $1", [hash]);
+  const rows = await env.database.query("SELECT 1 FROM factory_deliveries WHERE reply_hash = $1", [hash]);
   assert.equal(rows.rows.length, 0);
   assert.equal(env.relay.replies.length, 0);
 });
@@ -112,7 +112,7 @@ test("factory reply is refused once the binding's member leaves the organization
   const { binding_id } = await connectAndBind(env, { token: env.adminToken });
   const { bearer } = await seedDelivery(env, binding_id);
   // Simulate the bearer outliving membership without the purge (purge clears the hash; tested in teardown).
-  await env.database.query("DELETE FROM selfhost_organization_memberships WHERE user_id = $1", [env.adminId]);
+  await env.database.query("DELETE FROM organization_memberships WHERE user_id = $1", [env.adminId]);
   assert.equal((await reply(env, binding_id, bearer, { text: "ghost" })).status, 401);
   assert.equal(env.relay.replies.length, 0);
 });

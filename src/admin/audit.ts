@@ -32,7 +32,7 @@ export async function recordAudit(
       ? input.actor.subject
       : null;
   await executor.query(
-    `INSERT INTO selfhost_admin_audit_events
+    `INSERT INTO admin_audit_events
        (id, organization_id, workspace_id, actor_kind, actor_id, action, target)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
     [
@@ -61,7 +61,7 @@ export async function listAudit(
     created_at: Date | string;
   }>(
     `SELECT id, actor_kind, actor_id, action, target, created_at
-       FROM selfhost_admin_audit_events
+       FROM admin_audit_events
       WHERE workspace_id = $1
       ORDER BY created_at DESC
       LIMIT $2`,

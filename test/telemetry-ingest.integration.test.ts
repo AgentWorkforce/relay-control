@@ -76,13 +76,13 @@ test("relaycontrol -> hosted ingest: digest, error burst, issue report, and an a
     for (let i = 0; i < 100; i += 1) {
       await telemetry.sendDue();
       const pending = await database.query<{ n: number }>(
-        "SELECT count(*)::int AS n FROM selfhost_telemetry_outbox WHERE status <> 'sent'");
-      const total = await database.query<{ n: number }>("SELECT count(*)::int AS n FROM selfhost_telemetry_outbox");
+        "SELECT count(*)::int AS n FROM telemetry_outbox WHERE status <> 'sent'");
+      const total = await database.query<{ n: number }>("SELECT count(*)::int AS n FROM telemetry_outbox");
       if (pending.rows[0]?.n === 0 && (total.rows[0]?.n ?? 0) >= 2) break;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     const rows = await database.query<{ kind: string; status: string; last_error: string | null }>(
-      "SELECT kind, status, last_error FROM selfhost_telemetry_outbox ORDER BY kind");
+      "SELECT kind, status, last_error FROM telemetry_outbox ORDER BY kind");
     assert.deepEqual(rows.rows.map((row) => [row.kind, row.status]), [["digest", "sent"], ["error_burst", "sent"]]);
 
     // A customer's agent files an issue through the same channel (real route).
@@ -120,7 +120,7 @@ test("relaycontrol -> hosted ingest: digest, error burst, issue report, and an a
     for (let i = 0; i < 100; i += 1) {
       await telemetry.sendDue();
       const pending = await database.query<{ n: number }>(
-        "SELECT count(*)::int AS n FROM selfhost_telemetry_outbox WHERE kind = 'issue_report' AND status = 'sent'");
+        "SELECT count(*)::int AS n FROM telemetry_outbox WHERE kind = 'issue_report' AND status = 'sent'");
       if (pending.rows[0]?.n === 1) break;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }

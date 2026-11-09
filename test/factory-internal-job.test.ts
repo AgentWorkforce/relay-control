@@ -76,7 +76,7 @@ test("factory internal inject job: authorized no-op for an absent delivery, send
   for (const id of ["due", "settled", "leased", "expired"]) queueRelayMessage(env.relay, bound.agent.name, { id, text: `text ${id}` });
   assert.equal(await env.module.worker.pollInbox(), 4);
   const set = (id: string, sql: string) =>
-    env.database.query(`UPDATE selfhost_factory_deliveries SET ${sql} WHERE message_id = $1`, [id]);
+    env.database.query(`UPDATE factory_deliveries SET ${sql} WHERE message_id = $1`, [id]);
   await set("settled", "state = 'unknown', code = 'factory_http_500', payload_envelope = NULL");
   await set("leased", "state = 'sending', lease_owner = gen_random_uuid(), lease_until = now() + interval '5 minutes'");
   await set("expired", "state = 'sending', lease_owner = gen_random_uuid(), lease_until = now() - interval '1 second'");
@@ -104,16 +104,16 @@ test("factory internal sweep and history jobs: sweep expires leases and advances
   queueRelayMessage(env.relay, bound.agent.name, { id: "m-1", text: "hello" });
   await env.module.worker.pollInbox();
   await env.database.query(
-    "UPDATE selfhost_factory_deliveries SET state = 'sending', lease_owner = gen_random_uuid(), lease_until = now() - interval '1 second'",
+    "UPDATE factory_deliveries SET state = 'sending', lease_owner = gen_random_uuid(), lease_until = now() - interval '1 second'",
   );
   const scheduled = await env.api(`/api/v1/workspaces/${env.workspaceId}/factory/bindings/${bound.binding_id}/history/schedule`, { method: "POST", token: env.ownerToken });
   assert.equal(scheduled.status, 202);
-  await env.database.query("UPDATE selfhost_factory_history_syncs SET next_due_at = now() - interval '1 second'");
+  await env.database.query("UPDATE factory_history_syncs SET next_due_at = now() - interval '1 second'");
 
   const sweep = await job(env, { v: 1, kind: "sweep" });
   assert.deepEqual(sweep.body, { ok: true, expired: 1, scheduled: 1 });
   assert.equal((await deliveryRows(env, bound.binding_id))[0]!.state, "unknown");
-  const history = await env.database.query<{ due: boolean }>("SELECT next_due_at > now() AS due FROM selfhost_factory_history_syncs");
+  const history = await env.database.query<{ due: boolean }>("SELECT next_due_at > now() AS due FROM factory_history_syncs");
   assert.deepEqual(history.rows, [{ due: true }]);
   assert.equal(env.factory.posts, 0);
 

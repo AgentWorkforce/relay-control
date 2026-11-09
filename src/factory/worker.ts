@@ -178,12 +178,12 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
       const { bearer, hash } = mintReplyBearer();
       const leaseOwner = randomUUID();
       const updated = await tx.query<Omit<Claim, "bearer">>(
-        `UPDATE selfhost_factory_deliveries d
+        `UPDATE factory_deliveries d
             SET state = 'sending', lease_owner = $3, claim_generation = b.generation,
                 lease_until = now() + ($4::bigint * interval '1 millisecond'), attempts = d.attempts + 1,
                 reply_hash = $5, reply_expires_at = now() + ($6::bigint * interval '1 millisecond'),
                 code = NULL, updated_at = now()
-           FROM selfhost_factory_bindings b
+           FROM factory_bindings b
           WHERE d.binding_id = $1 AND d.message_id = $2 AND d.state = 'pending'
             AND b.id = d.binding_id AND b.state = 'bound' AND b.hosted_token_envelope IS NOT NULL
           RETURNING d.binding_id, d.message_id, d.lease_owner, d.claim_generation::text AS claim_generation,
@@ -200,8 +200,8 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
     return database.transaction(async (tx) => {
       const due = await tx.query<{ binding_id: string; message_id: string }>(
         `SELECT d.binding_id, d.message_id
-           FROM selfhost_factory_deliveries d
-           JOIN selfhost_factory_bindings b ON b.id = d.binding_id
+           FROM factory_deliveries d
+           JOIN factory_bindings b ON b.id = d.binding_id
           WHERE d.state = 'pending' AND d.next_attempt_at <= now()
             AND b.state = 'bound' AND b.hosted_token_envelope IS NOT NULL
             AND ($2::uuid IS NULL OR (d.binding_id = $2 AND d.message_id = $3))
@@ -224,8 +224,8 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
         `SELECT (d.state = 'sending' AND d.lease_owner = $3 AND d.lease_until > now()
                  AND b.state = 'bound' AND b.generation = d.claim_generation
                  AND d.claim_generation = $4::bigint) AS ok
-           FROM selfhost_factory_deliveries d
-           JOIN selfhost_factory_bindings b ON b.id = d.binding_id
+           FROM factory_deliveries d
+           JOIN factory_bindings b ON b.id = d.binding_id
           WHERE d.binding_id = $1 AND d.message_id = $2
           FOR UPDATE OF d, b`,
         [claimRow.binding_id, claimRow.message_id, claimRow.lease_owner, claimRow.claim_generation],
@@ -254,7 +254,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
       }
     }
     const result = await database.query<{ message_id: string }>(
-      `UPDATE selfhost_factory_deliveries
+      `UPDATE factory_deliveries
           SET state = $4, code = $5, factory_message_id = $6, lease_until = NULL,
               next_attempt_at = now() + ($7::bigint * interval '1 millisecond'),
               payload_envelope = CASE WHEN $4 = 'pending' THEN payload_envelope ELSE NULL END,
@@ -262,7 +262,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
               reply_expires_at = CASE WHEN $4 IN ('pending', 'rejected') THEN NULL ELSE reply_expires_at END,
               updated_at = now()
         WHERE binding_id = $1 AND message_id = $2 AND lease_owner = $3
-          AND claim_generation = (SELECT generation FROM selfhost_factory_bindings WHERE id = $1 AND state = 'bound')
+          AND claim_generation = (SELECT generation FROM factory_bindings WHERE id = $1 AND state = 'bound')
           AND (state = 'sending' OR (state = 'unknown' AND code = 'lease_expired' AND $4 = 'delivered'))
         RETURNING message_id`,
       [
@@ -336,7 +336,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
   /** Expired `sending` leases become `unknown/lease_expired`: the write may have happened. Never resent. */
   async function sweepLeases(only?: { bindingId: string; messageId: string }): Promise<number> {
     const expired = await database.query<{ binding_id: string; message_id: string }>(
-      `UPDATE selfhost_factory_deliveries
+      `UPDATE factory_deliveries
           SET state = 'unknown', code = 'lease_expired', lease_until = NULL, payload_envelope = NULL, updated_at = now()
         WHERE state = 'sending' AND lease_until <= now()
           AND ($1::uuid IS NULL OR (binding_id = $1 AND message_id = $2))
@@ -356,7 +356,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
   async function notify(bindingId: string, messageId: string, state: "rejected" | "unknown", code: string): Promise<void> {
     try {
       const found = await database.query<{ hosted_token_envelope: string | null }>(
-        "SELECT hosted_token_envelope FROM selfhost_factory_bindings WHERE id = $1 AND state = 'bound'",
+        "SELECT hosted_token_envelope FROM factory_bindings WHERE id = $1 AND state = 'bound'",
         [bindingId],
       );
       const envelope = found.rows[0]?.hosted_token_envelope;
@@ -380,10 +380,10 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
   /** Dormant (design §9): advances due intents' schedule only. Nothing is exported or published. */
   async function historyTick(after?: string): Promise<{ scheduled: number; deferred: true }> {
     const due = await database.query<{ binding_id: string }>(
-      `UPDATE selfhost_factory_history_syncs s
+      `UPDATE factory_history_syncs s
           SET next_due_at = now() + ($1::bigint * interval '1 millisecond'), updated_at = now()
         WHERE (s.workspace_id, s.session_id) IN (
-          SELECT workspace_id, session_id FROM selfhost_factory_history_syncs
+          SELECT workspace_id, session_id FROM factory_history_syncs
            WHERE next_due_at <= now() AND active_job_id IS NULL AND binding_id IS NOT NULL
              AND ($3::uuid IS NULL OR binding_id > $3)
            ORDER BY binding_id LIMIT $2)
@@ -392,7 +392,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
     );
     if (due.rows.length > 0) {
       await database.query(
-        "UPDATE selfhost_factory_bindings SET history_queued_at = now() WHERE id = ANY($1::uuid[]) AND state = 'bound'",
+        "UPDATE factory_bindings SET history_queued_at = now() WHERE id = ANY($1::uuid[]) AND state = 'bound'",
         [due.rows.map((row) => row.binding_id)],
       );
     }
@@ -406,7 +406,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
   async function kickDelivery(bindingId: string, messageId: string): Promise<{ state: string | null }> {
     const only = { bindingId, messageId };
     const exists = await database.query(
-      "SELECT 1 FROM selfhost_factory_deliveries WHERE binding_id = $1 AND message_id = $2",
+      "SELECT 1 FROM factory_deliveries WHERE binding_id = $1 AND message_id = $2",
       [bindingId, messageId],
     );
     // Absent (or purged) delivery: an acknowledged no-op, no provider or Relay I/O.
@@ -415,7 +415,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
     const claims = await claim(1, only);
     for (const row of claims) await process(row);
     const found = await database.query<{ state: string }>(
-      "SELECT state FROM selfhost_factory_deliveries WHERE binding_id = $1 AND message_id = $2",
+      "SELECT state FROM factory_deliveries WHERE binding_id = $1 AND message_id = $2",
       [bindingId, messageId],
     );
     return { state: found.rows[0]?.state ?? null };

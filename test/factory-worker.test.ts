@@ -25,7 +25,7 @@ async function boundWithPending(env: FactoryEnv, messageId = "m-1", text = "plea
 }
 
 const makeDue = (env: FactoryEnv) =>
-  env.database.query("UPDATE selfhost_factory_deliveries SET next_attempt_at = now() WHERE state = 'pending'");
+  env.database.query("UPDATE factory_deliveries SET next_attempt_at = now() WHERE state = 'pending'");
 
 const notices = (env: FactoryEnv) => env.relay.replies.filter((reply) => reply.idempotencyKey.startsWith("factory-notice-"));
 
@@ -148,7 +148,7 @@ test("factory worker terminal rejection is sticky: no reclaim, no new bearer, ge
   assert.equal(notices(env).length, 1);
 
   env.factory.injectMode = "ok";
-  await env.database.query("UPDATE selfhost_factory_deliveries SET next_attempt_at = now() - interval '1 hour'");
+  await env.database.query("UPDATE factory_deliveries SET next_attempt_at = now() - interval '1 hour'");
   assert.equal(await env.module.worker.injectBatch(), 0);
   assert.deepEqual(await env.module.worker.kickDelivery(bound.binding_id, "m-1"), { state: "rejected" });
   // A later poll of the same Relay message does not mint a replacement row.
@@ -173,7 +173,7 @@ test("factory worker ambiguous 500 becomes unknown and is never resent", async (
   assert.deepEqual([row!.state, row!.code, row!.payload_envelope], ["unknown", "factory_http_500", null]);
   assert.ok(row!.reply_hash, "an unknown delivery keeps its reply bearer: the session may have received it");
   env.factory.injectMode = "ok";
-  await env.database.query("UPDATE selfhost_factory_deliveries SET next_attempt_at = now() - interval '1 hour'");
+  await env.database.query("UPDATE factory_deliveries SET next_attempt_at = now() - interval '1 hour'");
   assert.equal(await env.module.worker.injectBatch(), 0);
   assert.equal(env.factory.posts, 1);
   assert.match(notices(env)[0]!.text, /unconfirmed/);
@@ -200,7 +200,7 @@ test("factory worker expired lease becomes unknown without resend; the same clai
   const hold = holdNextPost(env);
   const first = env.module.worker.injectBatch();
   await hold.arrived;
-  await env.database.query("UPDATE selfhost_factory_deliveries SET lease_until = now() - interval '1 second'");
+  await env.database.query("UPDATE factory_deliveries SET lease_until = now() - interval '1 second'");
   assert.equal(await env.module.worker.sweepLeases(), 1);
   let [row] = await deliveryRows(env, bound.binding_id);
   assert.deepEqual([row!.state, row!.code, row!.payload_envelope], ["unknown", "lease_expired", null]);
@@ -232,7 +232,7 @@ test("factory worker fence: a retire or a lost lease between claim and POST send
   const bound = await boundWithPending(env, "m-1");
   // Lease lost (expired, not yet swept): no POST, the row returns to pending.
   let [claimed] = await env.module.worker.claim(1);
-  await env.database.query("UPDATE selfhost_factory_deliveries SET lease_until = now() - interval '1 second'");
+  await env.database.query("UPDATE factory_deliveries SET lease_until = now() - interval '1 second'");
   await env.module.worker.process(claimed!);
   assert.equal(env.factory.posts, 0);
   let [row] = await deliveryRows(env, bound.binding_id);
@@ -263,7 +263,7 @@ test("factory worker inbox insert is fenced against a membership removal that co
   assert.equal(await env.module.worker.pollInbox(), 0);
   assert.deepEqual(await deliveryRows(env, bound.binding_id), []);
   assert.ok(env.logs.some((entry) => entry.event === "factory.inbox" && entry.code === "binding_not_live"));
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_factory_deliveries")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM factory_deliveries")).rows.length, 0);
   assert.equal(env.factory.posts, 0);
 });
 

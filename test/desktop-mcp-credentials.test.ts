@@ -47,7 +47,7 @@ test("only a verified Desktop parent registers a credential; it is a 15-minute c
 
   // Stored only as a hash.
   const stored = await env.database.query<{ access_token_hash: string }>(
-    "SELECT access_token_hash FROM selfhost_token_sessions WHERE id = $1", [response.body.id]);
+    "SELECT access_token_hash FROM token_sessions WHERE id = $1", [response.body.id]);
   assert.equal(stored.rows[0]!.access_token_hash, hashSecret(secret));
 
   const initialized = await mcp(env.origin, secret);
@@ -143,14 +143,14 @@ test("renew extends the lease; an expired lease is refused until renewed", async
   const id = response.body.id as string;
   // Age the lease to one minute left, then renew.
   await env.database.query(
-    "UPDATE selfhost_token_sessions SET access_token_expires_at = now() + interval '1 minute' WHERE id = $1", [id]);
+    "UPDATE token_sessions SET access_token_expires_at = now() + interval '1 minute' WHERE id = $1", [id]);
   const renewed = await request(env.origin, tokensPath(env.workspaceId, id), { method: "PUT", token: parent.accessToken });
   assert.equal(renewed.status, 200, renewed.raw);
   assert(Date.parse(renewed.body.leaseExpiresAt) - Date.now() > 14 * 60_000);
 
   // Expired: refused at MCP, and in introspection.
   await env.database.query(
-    "UPDATE selfhost_token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE id = $1", [id]);
+    "UPDATE token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE id = $1", [id]);
   const expired = await mcp(env.origin, secret);
   assert.equal(expired.status, 401);
   assert.equal((await request(env.origin, `/cloud${tokensPath(env.workspaceId, id)}`, { method: "PUT", token: parent.accessToken })).status, 200);
@@ -158,7 +158,7 @@ test("renew extends the lease; an expired lease is refused until renewed", async
 
   // The lease never outlives the parent's refresh lifetime.
   await env.database.query(
-    "UPDATE selfhost_token_sessions SET refresh_token_expires_at = now() + interval '2 minutes' WHERE access_token_hash = $1",
+    "UPDATE token_sessions SET refresh_token_expires_at = now() + interval '2 minutes' WHERE access_token_hash = $1",
     [hashSecret(parent.accessToken)]);
   const capped = await request(env.origin, tokensPath(env.workspaceId, id), { method: "PUT", token: parent.accessToken });
   assert(Date.parse(capped.body.leaseExpiresAt) - Date.now() <= 2 * 60_000);

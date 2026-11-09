@@ -243,10 +243,10 @@ test("Codex device login: start, poll, store encrypted, sandbox access, no secre
     body: { transactionId: started.body.transactionId },
   });
   // The first poll happens after the provider interval; force it due.
-  await ctx.database.query("UPDATE selfhost_coding_agent_device_sessions SET next_poll_at = now() - interval '1 second'");
+  await ctx.database.query("UPDATE coding_agent_device_sessions SET next_poll_at = now() - interval '1 second'");
   const pending = await poll();
   assert.equal(pending.body.status, "pending");
-  await ctx.database.query("UPDATE selfhost_coding_agent_device_sessions SET next_poll_at = now() - interval '1 second'");
+  await ctx.database.query("UPDATE coding_agent_device_sessions SET next_poll_at = now() - interval '1 second'");
   const connected = await poll();
   assert.equal(connected.status, 200);
   assert.equal(connected.body.status, "connected");
@@ -265,9 +265,9 @@ test("Codex device login: start, poll, store encrypted, sandbox access, no secre
   for (const response of [started, pending, connected, listed]) {
     assert(!response.text.includes("rt-openai-secret"), "no refresh token in any response");
   }
-  const dump = await ctx.database.query("SELECT * FROM selfhost_coding_agent_credentials");
-  const blobs = await ctx.database.query("SELECT * FROM selfhost_coding_agent_credential_blobs");
-  const sessions = await ctx.database.query("SELECT * FROM selfhost_coding_agent_device_sessions");
+  const dump = await ctx.database.query("SELECT * FROM coding_agent_credentials");
+  const blobs = await ctx.database.query("SELECT * FROM coding_agent_credential_blobs");
+  const sessions = await ctx.database.query("SELECT * FROM coding_agent_device_sessions");
   for (const rows of [dump.rows, blobs.rows, sessions.rows]) {
     assert(!JSON.stringify(rows).includes("rt-openai-secret"), "no plaintext at rest");
     assert(!JSON.stringify(rows).includes("dev-auth-1"), "device state is encrypted");
@@ -288,7 +288,7 @@ test("Codex device login: start, poll, store encrypted, sandbox access, no secre
 test("materialise and refresh: run reference, refresh-if-stale, write-back, revocation", async (t) => {
   const ctx = await setup(t);
   const base = `/api/v1/workspaces/${ctx.tenant.workspaceId}`;
-  const owner = (await ctx.database.query<{ id: string }>("SELECT id FROM selfhost_users WHERE email = 'owner@acme.test'")).rows[0]!.id;
+  const owner = (await ctx.database.query<{ id: string }>("SELECT id FROM users WHERE email = 'owner@acme.test'")).rows[0]!.id;
   // Expires inside the refresh window, so the first read refreshes it.
   const credentialId = await ctx.admin.logins.storeLogin({
     provider: "openai",
@@ -367,9 +367,9 @@ test("materialise and refresh: run reference, refresh-if-stale, write-back, revo
   })).status, 409, "write-back cannot swap the account");
   const after = await ctx.api(path, { token: workerToken, headers: { "x-cli-credential-ref": ref } });
   assert.equal(JSON.parse(after.body.files[0].content).tokens.refresh_token, "rt-openai-secret-3");
-  const versions = await ctx.database.query<{ blob_version: number }>("SELECT blob_version FROM selfhost_coding_agent_credentials WHERE id = $1", [credentialId]);
+  const versions = await ctx.database.query<{ blob_version: number }>("SELECT blob_version FROM coding_agent_credentials WHERE id = $1", [credentialId]);
   assert.equal(versions.rows[0]!.blob_version, 3);
-  const objects = await ctx.database.query("SELECT object_key FROM selfhost_coding_agent_credential_blobs");
+  const objects = await ctx.database.query("SELECT object_key FROM coding_agent_credential_blobs");
   assert.equal(objects.rows.length, 1, "superseded versions are removed");
 
   // Finishing the run revokes the reference.
@@ -379,7 +379,7 @@ test("materialise and refresh: run reference, refresh-if-stale, write-back, revo
     body: { phase: "completed", exitCode: 0 },
   });
   assert.equal((await ctx.api(path, { token: workerToken, headers: { "x-cli-credential-ref": ref } })).status, 404);
-  const refs = await ctx.database.query<{ revoked_at: unknown }>("SELECT revoked_at FROM selfhost_cli_credential_refs");
+  const refs = await ctx.database.query<{ revoked_at: unknown }>("SELECT revoked_at FROM cli_credential_refs");
   assert(refs.rows[0]!.revoked_at, "reference revoked");
   const audit = await ctx.api(`${base}/admin/audit`, { token: ctx.tenant.ownerToken });
   assert(!audit.text.includes("rt-openai-secret"));
@@ -387,12 +387,12 @@ test("materialise and refresh: run reference, refresh-if-stale, write-back, revo
 
   // Delete removes the stored object.
   await ctx.api(`${base}/cloud-agents/${credentialId}`, { method: "DELETE", token: ctx.tenant.ownerToken });
-  assert.equal((await ctx.database.query("SELECT 1 FROM selfhost_coding_agent_credential_blobs")).rows.length, 0);
+  assert.equal((await ctx.database.query("SELECT 1 FROM coding_agent_credential_blobs")).rows.length, 0);
 });
 
 test("refresh failure: an expired login that cannot refresh is skipped and marked", async (t) => {
   const ctx = await setup(t);
-  const owner = (await ctx.database.query<{ id: string }>("SELECT id FROM selfhost_users WHERE email = 'owner@acme.test'")).rows[0]!.id;
+  const owner = (await ctx.database.query<{ id: string }>("SELECT id FROM users WHERE email = 'owner@acme.test'")).rows[0]!.id;
   const credentialId = await ctx.admin.logins.storeLogin({
     provider: "openai",
     workspaceId: ctx.tenant.workspaceId,
@@ -403,7 +403,7 @@ test("refresh failure: an expired login that cannot refresh is skipped and marke
   ctx.mock.setRefreshStatus(400);
   assert.equal(await ctx.admin.logins.freshAuthFile(ctx.tenant.workspaceId, credentialId), null);
   const row = await ctx.database.query<{ status: string; last_error: string }>(
-    "SELECT status, last_error FROM selfhost_coding_agent_credentials WHERE id = $1",
+    "SELECT status, last_error FROM coding_agent_credentials WHERE id = $1",
     [credentialId],
   );
   assert.equal(row.rows[0]!.status, "refresh_failed");

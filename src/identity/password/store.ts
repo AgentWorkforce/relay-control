@@ -125,7 +125,7 @@ export class PasswordStore {
   async credentialByEmail(email: string): Promise<{ userId: string; hash: string; pepperVersion: number | null } | null> {
     const result = await this.database.query<{ user_id: string; password_hash: string; pepper_version: number | null }>(
       `SELECT c.user_id, c.password_hash, c.pepper_version
-         FROM selfhost_password_credentials c JOIN selfhost_users u ON u.id = c.user_id
+         FROM password_credentials c JOIN users u ON u.id = c.user_id
         WHERE u.email = $1`,
       [email],
     );
@@ -135,7 +135,7 @@ export class PasswordStore {
 
   async upsertCredential(executor: SqlExecutor, userId: string, stored: StoredPassword): Promise<void> {
     await executor.query(
-      `INSERT INTO selfhost_password_credentials (user_id, password_hash, pepper_version, params)
+      `INSERT INTO password_credentials (user_id, password_hash, pepper_version, params)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (user_id) DO UPDATE
          SET password_hash = EXCLUDED.password_hash, pepper_version = EXCLUDED.pepper_version,
@@ -147,7 +147,7 @@ export class PasswordStore {
   /** Replaces the hash only if it is still the one that was verified. */
   async rehash(userId: string, previousHash: string, stored: StoredPassword): Promise<boolean> {
     const result = await this.database.query<{ user_id: string }>(
-      `UPDATE selfhost_password_credentials
+      `UPDATE password_credentials
           SET password_hash = $3, pepper_version = $4, params = $5, updated_at = now()
         WHERE user_id = $1 AND password_hash = $2
         RETURNING user_id`,
@@ -176,7 +176,7 @@ export class PasswordStore {
     return this.database.transaction(async (tx) => {
       // Locked existing rows first, without inserting anything.
       const existing = await tx.query<{ locked_until: Date | string | null }>(
-        "SELECT locked_until FROM selfhost_login_attempts WHERE subject = ANY($1::text[]) ORDER BY subject FOR UPDATE",
+        "SELECT locked_until FROM login_attempts WHERE subject = ANY($1::text[]) ORDER BY subject FOR UPDATE",
         [ordered.map((entry) => entry.subject)],
       );
       if (existing.rows.some((row) => row.locked_until && new Date(row.locked_until).getTime() > now.getTime())) {
@@ -185,12 +185,12 @@ export class PasswordStore {
       const rows: Array<{ subject: string; rule: LockoutRule; failures: number; restart: boolean }> = [];
       for (const { subject, rule } of ordered) {
         await tx.query(
-          `INSERT INTO selfhost_login_attempts (subject, failures, first_failure_at, last_failure_at)
+          `INSERT INTO login_attempts (subject, failures, first_failure_at, last_failure_at)
            VALUES ($1, 0, $2, $2) ON CONFLICT (subject) DO NOTHING`,
           [subject, now],
         );
         const row = (await tx.query<{ failures: number; first_failure_at: Date | string; last_failure_at: Date | string; locked_until: Date | string | null }>(
-          "SELECT failures, first_failure_at, last_failure_at, locked_until FROM selfhost_login_attempts WHERE subject = $1 FOR UPDATE",
+          "SELECT failures, first_failure_at, last_failure_at, locked_until FROM login_attempts WHERE subject = $1 FOR UPDATE",
           [subject],
         )).rows[0]!;
         if (row.locked_until && new Date(row.locked_until).getTime() > now.getTime()) return { allowed: false as const };
@@ -218,7 +218,7 @@ export class PasswordStore {
         }
         if (lockedUntil) locks.push({ subject: row.subject, until: lockedUntil });
         await tx.query(
-          `UPDATE selfhost_login_attempts
+          `UPDATE login_attempts
               SET failures = $2, last_failure_at = $3, locked_until = $4,
                   first_failure_at = CASE WHEN $5::boolean THEN $3 ELSE first_failure_at END
             WHERE subject = $1`,
@@ -236,7 +236,7 @@ export class PasswordStore {
    */
   async refundAttempt(subject: string, rule: { free: number }): Promise<void> {
     await this.database.query(
-      `UPDATE selfhost_login_attempts
+      `UPDATE login_attempts
           SET failures = GREATEST(failures - 1, 0),
               locked_until = CASE WHEN GREATEST(failures - 1, 0) < $2 THEN NULL ELSE locked_until END
         WHERE subject = $1`,
@@ -256,7 +256,7 @@ export class PasswordStore {
         await this.refundAttempt(subject, rule);
       } else {
         await this.database.query(
-          "UPDATE selfhost_login_attempts SET failures = GREATEST(failures - 1, 0) WHERE subject = $1",
+          "UPDATE login_attempts SET failures = GREATEST(failures - 1, 0) WHERE subject = $1",
           [subject],
         );
       }
@@ -264,14 +264,14 @@ export class PasswordStore {
   }
 
   async clearSubject(executor: SqlExecutor, subject: string): Promise<void> {
-    await executor.query("DELETE FROM selfhost_login_attempts WHERE subject = $1", [subject]);
+    await executor.query("DELETE FROM login_attempts WHERE subject = $1", [subject]);
   }
 
   /** Clears the account's lockout: its "account:" row and every "account-key:" row. */
   async clearAccount(executor: SqlExecutor, email: string): Promise<void> {
     const prefix = accountKeyPrefix(email);
     await executor.query(
-      "DELETE FROM selfhost_login_attempts WHERE subject = $1 OR left(subject, $3) = $2",
+      "DELETE FROM login_attempts WHERE subject = $1 OR left(subject, $3) = $2",
       [accountSubject(email), prefix, prefix.length],
     );
   }
@@ -284,8 +284,8 @@ export class PasswordStore {
   async claimLockoutNotice(email: string): Promise<string | null> {
     const now = this.now();
     const result = await this.database.query<{ user_id: string }>(
-      `UPDATE selfhost_password_credentials c SET lockout_notice_at = $2
-         FROM selfhost_users u
+      `UPDATE password_credentials c SET lockout_notice_at = $2
+         FROM users u
         WHERE u.id = c.user_id AND u.email = $1
           AND (c.lockout_notice_at IS NULL OR c.lockout_notice_at <= $3)
         RETURNING c.user_id`,
@@ -302,7 +302,7 @@ export class PasswordStore {
    */
   async assertCredentialUnchanged(tx: SqlExecutor, userId: string, verifiedHash: string): Promise<void> {
     const current = await tx.query<{ password_hash: string }>(
-      "SELECT password_hash FROM selfhost_password_credentials WHERE user_id = $1",
+      "SELECT password_hash FROM password_credentials WHERE user_id = $1",
       [userId],
     );
     if (current.rows[0]?.password_hash !== verifiedHash) throw new CredentialChanged();
@@ -319,7 +319,7 @@ export class PasswordStore {
   async createRegistration(input: { email: string; inviteTokenHash: string | null }): Promise<string> {
     const token = opaqueToken("sh_pv_");
     await this.database.query(
-      `INSERT INTO selfhost_password_registrations (id, email, token_hash, invite_token_hash, expires_at)
+      `INSERT INTO password_registrations (id, email, token_hash, invite_token_hash, expires_at)
        VALUES ($1, $2, $3, $4, $5)`,
       [randomUUID(), input.email, hashSecret(token), input.inviteTokenHash, new Date(this.now() + REGISTRATION_TTL_MS)],
     );
@@ -330,7 +330,7 @@ export class PasswordStore {
   async peekRegistration(token: string): Promise<{ email: string } | null> {
     if (!REGISTRATION_TOKEN.test(token)) return null;
     const result = await this.database.query<{ email: string }>(
-      `SELECT email FROM selfhost_password_registrations
+      `SELECT email FROM password_registrations
         WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > $2`,
       [hashSecret(token), new Date(this.now())],
     );
@@ -351,7 +351,7 @@ export class PasswordStore {
     const now = this.now();
     return this.database.transaction(async (tx) => {
       const spent = await tx.query<{ email: string; invite_token_hash: string | null }>(
-        `UPDATE selfhost_password_registrations SET consumed_at = now()
+        `UPDATE password_registrations SET consumed_at = now()
           WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > $2
           RETURNING email, invite_token_hash`,
         [hashSecret(token), new Date(now)],
@@ -359,24 +359,24 @@ export class PasswordStore {
       const row = spent.rows[0];
       if (!row) return null;
       const existing = await tx.query(
-        `SELECT 1 FROM selfhost_password_credentials c JOIN selfhost_users u ON u.id = c.user_id WHERE u.email = $1`,
+        `SELECT 1 FROM password_credentials c JOIN users u ON u.id = c.user_id WHERE u.email = $1`,
         [row.email],
       );
       if (existing.rows.length) return { email: row.email, refused: "password_already_set" as const };
       // A link was used: every other outstanding link and set-password
       // token for the address stops working.
       await tx.query(
-        "UPDATE selfhost_password_registrations SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL",
+        "UPDATE password_registrations SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL",
         [row.email],
       );
       await tx.query(
-        "UPDATE selfhost_password_setup_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL",
+        "UPDATE password_setup_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL",
         [row.email],
       );
       const setupToken = opaqueToken("sh_ps_");
       const expiresAt = new Date(now + SETUP_TTL_MS);
       await tx.query(
-        `INSERT INTO selfhost_password_setup_tokens (id, email, token_hash, invite_token_hash, expires_at)
+        `INSERT INTO password_setup_tokens (id, email, token_hash, invite_token_hash, expires_at)
          VALUES ($1, $2, $3, $4, $5)`,
         [randomUUID(), row.email, hashSecret(setupToken), row.invite_token_hash, expiresAt],
       );
@@ -388,7 +388,7 @@ export class PasswordStore {
   async peekSetup(token: string): Promise<{ email: string; inviteTokenHash: string | null } | null> {
     if (!SETUP_TOKEN.test(token)) return null;
     const result = await this.database.query<{ email: string; invite_token_hash: string | null }>(
-      `SELECT email, invite_token_hash FROM selfhost_password_setup_tokens
+      `SELECT email, invite_token_hash FROM password_setup_tokens
         WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > $2`,
       [hashSecret(token), new Date(this.now())],
     );
@@ -404,7 +404,7 @@ export class PasswordStore {
    */
   async redeemSetup(tx: SqlExecutor, token: string, userId: string, stored: StoredPassword): Promise<void> {
     const spent = await tx.query<{ email: string }>(
-      `UPDATE selfhost_password_setup_tokens SET consumed_at = now()
+      `UPDATE password_setup_tokens SET consumed_at = now()
         WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > $2
         RETURNING email`,
       [hashSecret(token), new Date(this.now())],
@@ -413,14 +413,14 @@ export class PasswordStore {
     if (!email) throw new SetupRefused("token_invalid");
     if (!await this.insertFirstCredential(tx, userId, stored)) throw new SetupRefused("password_already_set");
     // The password is set: no other outstanding link for the address works.
-    await tx.query("UPDATE selfhost_password_registrations SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [email]);
-    await tx.query("UPDATE selfhost_password_setup_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [email]);
+    await tx.query("UPDATE password_registrations SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [email]);
+    await tx.query("UPDATE password_setup_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [email]);
   }
 
   /** Writes a credential only if the person has none. False if one exists. */
   async insertFirstCredential(executor: SqlExecutor, userId: string, stored: StoredPassword): Promise<boolean> {
     const inserted = await executor.query(
-      `INSERT INTO selfhost_password_credentials (user_id, password_hash, pepper_version, params)
+      `INSERT INTO password_credentials (user_id, password_hash, pepper_version, params)
        VALUES ($1, $2, $3, $4) ON CONFLICT (user_id) DO NOTHING RETURNING user_id`,
       [userId, stored.hash, stored.pepperVersion, stored.params],
     );
@@ -437,7 +437,7 @@ export class PasswordStore {
   async createReset(email: string): Promise<{ token: string; userId: string } | null> {
     return this.database.transaction(async (tx) => {
       const found = await tx.query<{ user_id: string }>(
-        `SELECT c.user_id FROM selfhost_password_credentials c JOIN selfhost_users u ON u.id = c.user_id
+        `SELECT c.user_id FROM password_credentials c JOIN users u ON u.id = c.user_id
           WHERE u.email = $1 FOR UPDATE OF c`,
         [email],
       );
@@ -445,7 +445,7 @@ export class PasswordStore {
       if (!userId) return null;
       const token = opaqueToken("sh_pr_");
       await tx.query(
-        "INSERT INTO selfhost_password_reset_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
         [randomUUID(), userId, hashSecret(token), new Date(this.now() + RESET_TTL_MS)],
       );
       return { token, userId };
@@ -456,7 +456,7 @@ export class PasswordStore {
   async peekReset(token: string): Promise<{ userId: string; email: string } | null> {
     if (!RESET_TOKEN.test(token)) return null;
     const result = await this.database.query<{ user_id: string; email: string }>(
-      `SELECT r.user_id, u.email FROM selfhost_password_reset_tokens r JOIN selfhost_users u ON u.id = r.user_id
+      `SELECT r.user_id, u.email FROM password_reset_tokens r JOIN users u ON u.id = r.user_id
         WHERE r.token_hash = $1 AND r.used_at IS NULL AND r.expires_at > $2`,
       [hashSecret(token), new Date(this.now())],
     );
@@ -495,28 +495,28 @@ export class PasswordStore {
     const tokenHash = hashSecret(token);
     return this.database.transaction(async (tx) => {
       const owner = (await tx.query<{ email: string }>(
-        `SELECT u.email FROM selfhost_password_reset_tokens r JOIN selfhost_users u ON u.id = r.user_id
+        `SELECT u.email FROM password_reset_tokens r JOIN users u ON u.id = r.user_id
           WHERE r.token_hash = $1 AND r.used_at IS NULL AND r.expires_at > $2`,
         [tokenHash, new Date(this.now())],
       )).rows[0];
       if (!owner) return null;
       await lockIdentity(tx, owner.email);
       const spent = await tx.query<{ user_id: string }>(
-        `UPDATE selfhost_password_reset_tokens SET used_at = now()
+        `UPDATE password_reset_tokens SET used_at = now()
           WHERE token_hash = $1 AND used_at IS NULL AND expires_at > $2
           RETURNING user_id`,
         [tokenHash, new Date(this.now())],
       );
       const userId = spent.rows[0]?.user_id;
       if (!userId) return null;
-      const user = (await tx.query<{ email: string }>("SELECT email FROM selfhost_users WHERE id = $1", [userId])).rows[0]!;
+      const user = (await tx.query<{ email: string }>("SELECT email FROM users WHERE id = $1", [userId])).rows[0]!;
       await this.upsertCredential(tx, userId, stored);
       await revoke(tx, userId);
       // Every other outstanding link for the person stops working too.
-      await tx.query("UPDATE selfhost_password_reset_tokens SET used_at = now() WHERE user_id = $1 AND used_at IS NULL", [userId]);
-      await tx.query("UPDATE selfhost_password_registrations SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
-      await tx.query("UPDATE selfhost_password_setup_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
-      await tx.query("UPDATE selfhost_email_login_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
+      await tx.query("UPDATE password_reset_tokens SET used_at = now() WHERE user_id = $1 AND used_at IS NULL", [userId]);
+      await tx.query("UPDATE password_registrations SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
+      await tx.query("UPDATE password_setup_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
+      await tx.query("UPDATE email_login_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
       await this.clearAccount(tx, user.email);
       return { userId, email: user.email };
     });
@@ -534,19 +534,19 @@ export class PasswordStore {
     const attemptCutoff = new Date(now - ATTEMPT_RETENTION_MS);
     const tokenCutoff = new Date(now - TOKEN_RETENTION_MS);
     const attempts = await this.database.query(
-      "DELETE FROM selfhost_login_attempts WHERE last_failure_at < $1 AND (locked_until IS NULL OR locked_until < $1) RETURNING subject",
+      "DELETE FROM login_attempts WHERE last_failure_at < $1 AND (locked_until IS NULL OR locked_until < $1) RETURNING subject",
       [attemptCutoff],
     );
     const registrations = await this.database.query(
-      "DELETE FROM selfhost_password_registrations WHERE COALESCE(consumed_at, expires_at) < $1 RETURNING id",
+      "DELETE FROM password_registrations WHERE COALESCE(consumed_at, expires_at) < $1 RETURNING id",
       [tokenCutoff],
     );
     const setups = await this.database.query(
-      "DELETE FROM selfhost_password_setup_tokens WHERE COALESCE(consumed_at, expires_at) < $1 RETURNING id",
+      "DELETE FROM password_setup_tokens WHERE COALESCE(consumed_at, expires_at) < $1 RETURNING id",
       [tokenCutoff],
     );
     const resets = await this.database.query(
-      "DELETE FROM selfhost_password_reset_tokens WHERE COALESCE(used_at, expires_at) < $1 RETURNING id",
+      "DELETE FROM password_reset_tokens WHERE COALESCE(used_at, expires_at) < $1 RETURNING id",
       [tokenCutoff],
     );
     return { attempts: attempts.rows.length, registrations: registrations.rows.length, setups: setups.rows.length, resets: resets.rows.length };
@@ -558,8 +558,8 @@ export class PasswordStore {
   async auditOrganization(userId: string | null): Promise<string | null> {
     const result = await this.database.query<{ organization_id: string | null }>(
       `SELECT COALESCE(
-         (SELECT last_organization_id FROM selfhost_users WHERE id = $1::uuid),
-         (SELECT organization_id FROM selfhost_installation_bootstrap WHERE installation_slot = 1)
+         (SELECT last_organization_id FROM users WHERE id = $1::uuid),
+         (SELECT organization_id FROM installation_bootstrap WHERE installation_slot = 1)
        ) AS organization_id`,
       [userId],
     );

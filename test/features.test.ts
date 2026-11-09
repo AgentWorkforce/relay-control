@@ -219,7 +219,7 @@ test("core denies flow APIs after user authentication, before mutations and main
   const create = await cp.api("/api/v1/flows", { method: "POST", token: cp.tenant.ownerToken, body: {} });
   assert.equal(create.status, 403);
   assert.equal(maintenance, 0);
-  const flows = await cp.database.query<{ n: number }>("SELECT count(*)::int AS n FROM selfhost_flow_definitions");
+  const flows = await cp.database.query<{ n: number }>("SELECT count(*)::int AS n FROM flow_definitions");
   assert.equal(flows.rows[0]!.n, 0);
 });
 
@@ -235,9 +235,9 @@ test("core refuses worker registration without spending a valid enrollment token
     method: "POST", body: { enrollmentToken: enrollment.body.token, name: "unit-worker" },
   });
   assert.equal(register.status, 403);
-  const state = await cp.database.query<{ used_at: string | null }>("SELECT used_at FROM selfhost_worker_enrollment_tokens");
+  const state = await cp.database.query<{ used_at: string | null }>("SELECT used_at FROM worker_enrollment_tokens");
   assert.equal(state.rows[0]!.used_at, null);
-  const workers = await cp.database.query<{ n: number }>("SELECT count(*)::int AS n FROM selfhost_workers");
+  const workers = await cp.database.query<{ n: number }>("SELECT count(*)::int AS n FROM workers");
   assert.equal(workers.rows[0]!.n, 0);
 });
 
@@ -296,8 +296,8 @@ test("authenticated callback refusal leaves the run and events unchanged; mutati
   const core = await restartWith(t, cp, NO_FEATURES);
   const runId = local.body.runId as string;
   const snapshot = async () => ({
-    run: (await cp.database.query("SELECT status, result, completed_at FROM selfhost_workflow_runs WHERE id = $1", [runId])).rows,
-    events: (await cp.database.query("SELECT * FROM selfhost_run_events WHERE run_id = $1 ORDER BY sequence", [runId])).rows,
+    run: (await cp.database.query("SELECT status, result, completed_at FROM workflow_runs WHERE id = $1", [runId])).rows,
+    events: (await cp.database.query("SELECT * FROM run_events WHERE run_id = $1 ORDER BY sequence", [runId])).rows,
   });
   const before = await snapshot();
   const body = { runId, callbackToken: local.body.callbackToken, status: "completed", result: { ok: true } };
@@ -312,7 +312,7 @@ test("authenticated callback refusal leaves the run and events unchanged; mutati
   // A successful preflight is never cached as mutation authority.
   const credentials = { runId, accessToken: local.body.accessToken, callbackToken: local.body.callbackToken };
   await cp.flows.authenticateCallback(credentials);
-  await cp.database.query("UPDATE selfhost_workflow_runs SET callback_token_hash = 'rotated' WHERE id = $1", [runId]);
+  await cp.database.query("UPDATE workflow_runs SET callback_token_hash = 'rotated' WHERE id = $1", [runId]);
   await assert.rejects(cp.flows.callback({ ...credentials, status: "completed" }), { code: "unauthorized" });
   assert.deepEqual(await snapshot(), before);
 });

@@ -72,23 +72,23 @@ test("factory outbox on real PostgreSQL: two workers, SKIP LOCKED claim and leas
   const orgId = randomUUID();
   const userId = randomUUID();
   const workspaceId = randomUUID();
-  await setup.query("INSERT INTO selfhost_users (id, email, name) VALUES ($1, 'owner@race.test', 'Owner')", [userId]);
-  await setup.query("INSERT INTO selfhost_organizations (id, name) VALUES ($1, 'Race')", [orgId]);
-  await setup.query("INSERT INTO selfhost_organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')", [orgId, userId]);
+  await setup.query("INSERT INTO users (id, email, name) VALUES ($1, 'owner@race.test', 'Owner')", [userId]);
+  await setup.query("INSERT INTO organizations (id, name) VALUES ($1, 'Race')", [orgId]);
+  await setup.query("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')", [orgId, userId]);
   await setup.query(
-    `INSERT INTO selfhost_workspaces (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
+    `INSERT INTO workspaces (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
      VALUES ($1, $2, 'race', 'rc-race', $3)`,
     [workspaceId, orgId, encryptSecret("rk_live_race", keyring.active)],
   );
   await setup.query(
-    `INSERT INTO selfhost_factory_connections (workspace_id, organization_id, user_id, key_envelope, key_hint, validated_at)
+    `INSERT INTO factory_connections (workspace_id, organization_id, user_id, key_envelope, key_hint, validated_at)
      VALUES ($1, $2, $3, $4, '…0001', now())`,
     [workspaceId, orgId, userId, encryptSecret(FACTORY_KEY, keyring.active)],
   );
   const bind = async (sessionId: string) => {
     const id = randomUUID();
     await setup.query(
-      `INSERT INTO selfhost_factory_bindings
+      `INSERT INTO factory_bindings
          (id, workspace_id, organization_id, user_id, session_id, computer_id, state, generation,
           relay_agent_name, relay_agent_id, hosted_token_envelope)
        VALUES ($1, $2, $3, $4, $5, 'cmp-1', 'bound', 1, $6, $7, $8)`,
@@ -98,7 +98,7 @@ test("factory outbox on real PostgreSQL: two workers, SKIP LOCKED claim and leas
   };
   const enqueue = async (bindingId: string, messageId: string) => {
     await setup.query(
-      `INSERT INTO selfhost_factory_deliveries
+      `INSERT INTO factory_deliveries
          (binding_id, message_id, workspace_id, organization_id, relay_delivery_id, sender_agent_name, payload_envelope, state)
        VALUES ($1, $2, $3, $4, $5, 'lead', $6, 'pending')`,
       [bindingId, messageId, workspaceId, orgId, `dl-${messageId}`,
@@ -107,11 +107,11 @@ test("factory outbox on real PostgreSQL: two workers, SKIP LOCKED claim and leas
   };
   const row = async (bindingId: string, messageId: string) =>
     (await setup.query<Record<string, any>>(
-      "SELECT state, code, lease_owner, claim_generation::text AS claim_generation, factory_message_id, attempts FROM selfhost_factory_deliveries WHERE binding_id = $1 AND message_id = $2",
+      "SELECT state, code, lease_owner, claim_generation::text AS claim_generation, factory_message_id, attempts FROM factory_deliveries WHERE binding_id = $1 AND message_id = $2",
       [bindingId, messageId],
     )).rows[0]!;
   const expireLease = (bindingId: string, messageId: string) => setup.query(
-    "UPDATE selfhost_factory_deliveries SET lease_until = now() - interval '1 second' WHERE binding_id = $1 AND message_id = $2",
+    "UPDATE factory_deliveries SET lease_until = now() - interval '1 second' WHERE binding_id = $1 AND message_id = $2",
     [bindingId, messageId],
   );
 
@@ -174,7 +174,7 @@ test("factory outbox on real PostgreSQL: two workers, SKIP LOCKED claim and leas
     const owners = new Set([...claimsA, ...claimsB].map((claim) => claim.lease_owner));
     assert.equal(owners.size, N, "one lease owner per claim");
     const states = await setup.query<{ state: string; n: number }>(
-      "SELECT state, count(*)::int AS n FROM selfhost_factory_deliveries WHERE binding_id = $1 GROUP BY state",
+      "SELECT state, count(*)::int AS n FROM factory_deliveries WHERE binding_id = $1 GROUP BY state",
       [bindingId],
     );
     assert.deepEqual(states.rows, [{ state: "sending", n: N }]);
@@ -215,7 +215,7 @@ test("factory outbox on real PostgreSQL: two workers, SKIP LOCKED claim and leas
     await expireLease(retiredId, "m-late");
     assert.equal(await b.worker.sweepLeases(), 1);
     await b.database.transaction((tx) => retireBindingsInTx(tx, { bindingIds: [retiredId] }));
-    const generation = (await setup.query<{ g: string }>("SELECT generation::text AS g FROM selfhost_factory_bindings WHERE id = $1", [retiredId])).rows[0]!.g;
+    const generation = (await setup.query<{ g: string }>("SELECT generation::text AS g FROM factory_bindings WHERE id = $1", [retiredId])).rows[0]!.g;
     assert.notEqual(generation, lateClaim.claim_generation);
     const before = await row(retiredId, "m-late");
     assert.equal(await a.worker.finalize(lateClaim, { state: "delivered", factoryMessageId: "fm-too-late" }), false);
@@ -234,7 +234,7 @@ test("factory outbox on real PostgreSQL: two workers, SKIP LOCKED claim and leas
     await a.worker.process(first);
     assert.deepEqual([(await row(bindingId, "m-re")).state, (await row(bindingId, "m-re")).code], ["pending", "fence_refused"]);
     assert.equal(injected, 0, "nothing was sent under the expired lease");
-    await setup.query("UPDATE selfhost_factory_deliveries SET next_attempt_at = now() WHERE binding_id = $1", [bindingId]);
+    await setup.query("UPDATE factory_deliveries SET next_attempt_at = now() WHERE binding_id = $1", [bindingId]);
 
     const [second] = await b.worker.claim(1);
     assert.ok(second);

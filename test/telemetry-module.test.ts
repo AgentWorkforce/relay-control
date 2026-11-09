@@ -259,12 +259,12 @@ test("full level: preview shows exactly the scrubbed next digest; outbox retries
   assert.ok(id);
   await h.telemetry.sendDue();
   let rows = (await h.database.query<{ status: string; attempts: number; last_error: string }>(
-    "SELECT status, attempts, last_error FROM selfhost_telemetry_outbox WHERE id = $1", [id])).rows;
+    "SELECT status, attempts, last_error FROM telemetry_outbox WHERE id = $1", [id])).rows;
   assert.deepEqual(rows[0], { status: "pending", attempts: 1, last_error: "http_503" });
-  await h.database.query("UPDATE selfhost_telemetry_outbox SET next_attempt_at = now() WHERE id = $1", [id]);
+  await h.database.query("UPDATE telemetry_outbox SET next_attempt_at = now() WHERE id = $1", [id]);
   assert.equal(await h.telemetry.sendDue(), 1);
   rows = (await h.database.query<{ status: string; attempts: number; last_error: string }>(
-    "SELECT status, attempts, last_error FROM selfhost_telemetry_outbox WHERE id = $1", [id])).rows;
+    "SELECT status, attempts, last_error FROM telemetry_outbox WHERE id = $1", [id])).rows;
   assert.deepEqual(rows[0], { status: "sent", attempts: 2, last_error: null });
   assert.deepEqual(h.ingest.statuses, [503, 202]);
   const delivered = JSON.parse(h.ingest.bodies[0]!);
@@ -319,9 +319,9 @@ test("off level collects and sends nothing; issue reports still need explicit ac
   await h.telemetry.flush();
   assert.equal(await h.telemetry.digestNow(), null);
   const counts = await h.database.query<{ n: number }>(
-    `SELECT (SELECT count(*) FROM selfhost_telemetry_counters)::int
-          + (SELECT count(*) FROM selfhost_telemetry_errors)::int
-          + (SELECT count(*) FROM selfhost_telemetry_outbox)::int AS n`);
+    `SELECT (SELECT count(*) FROM telemetry_counters)::int
+          + (SELECT count(*) FROM telemetry_errors)::int
+          + (SELECT count(*) FROM telemetry_outbox)::int AS n`);
   assert.equal(counts.rows[0]?.n, 0);
   const preview = await call(h.baseUrl, `/api/v1/organizations/${h.organizationId}/telemetry/preview`, { token: BOOTSTRAP });
   assert.equal(preview.body.nextDigest, null);
@@ -394,7 +394,7 @@ test("air-gapped: file transport never sends; export is signed and marks rows ex
     assert.equal(verifySignature(INSTALL_KEY, envelope.body, envelope.signature), true);
   }
   assertPrivate(exported.raw, h);
-  const rows = await h.database.query<{ status: string }>("SELECT status FROM selfhost_telemetry_outbox WHERE id = $1", [id]);
+  const rows = await h.database.query<{ status: string }>("SELECT status FROM telemetry_outbox WHERE id = $1", [id]);
   assert.equal(rows.rows[0]?.status, "exported");
   assert.equal(h.ingest.bodies.length, 0);
   assert.equal(h.audits.length, 1);
@@ -468,7 +468,7 @@ test("multi tenancy: an organization admin sees only its own telemetry; installa
   assert.equal(verifySignature(INSTALL_KEY, exported.body.envelopes[0].body, exported.body.envelopes[0].signature), true);
   assert.doesNotMatch(exported.raw, /Theirs is broken/);
   const stillPending = await h.database.query<{ count: string }>(
-    "SELECT count(*)::text AS count FROM selfhost_telemetry_outbox WHERE status = 'pending'",
+    "SELECT count(*)::text AS count FROM telemetry_outbox WHERE status = 'pending'",
   );
   assert.equal(stillPending.rows[0]?.count, "3");
 

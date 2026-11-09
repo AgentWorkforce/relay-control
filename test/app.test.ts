@@ -289,7 +289,7 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
   const singletonSchema = await database.query<{ index: string | null; slot: number }>(
     `SELECT to_regclass('public.selfhost_single_organization_idx')::text AS index,
             (SELECT count(*)::int FROM information_schema.columns
-              WHERE table_name = 'selfhost_organizations'
+              WHERE table_name = 'organizations'
                 AND column_name = 'installation_slot') AS slot`,
   );
   assert.deepEqual(
@@ -318,7 +318,7 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
   });
   assert.equal(started.status, 201);
   const mismatchedDeviceBindingRejected = await database.query(
-    `UPDATE selfhost_device_authorizations
+    `UPDATE device_authorizations
         SET organization_id = $2, workspace_id = $3
       WHERE user_code = $1`,
     [
@@ -410,12 +410,12 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
   assert.equal(readded.status, 200);
   assert.equal(readded.body.userId, added.body.userId);
   const renamed = await database.query<{ name: string }>(
-    "SELECT name FROM selfhost_users WHERE id = $1",
+    "SELECT name FROM users WHERE id = $1",
     [added.body.userId],
   );
   assert.equal(renamed.rows[0]!.name, "Member Renamed");
-  await database.query("DELETE FROM selfhost_organization_memberships WHERE user_id = $1", [added.body.userId]);
-  await database.query("DELETE FROM selfhost_users WHERE id = $1", [added.body.userId]);
+  await database.query("DELETE FROM organization_memberships WHERE user_id = $1", [added.body.userId]);
+  await database.query("DELETE FROM users WHERE id = $1", [added.body.userId]);
 
   const ownResolve = await jsonRequest(
     controlOrigin,
@@ -699,7 +699,7 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
   // readiness with tenancy_mismatch (DG-005); nothing is deleted, and members
   // of the first still see nothing of it.
   await database.query(
-    "INSERT INTO selfhost_organizations (id, name) VALUES ($1, $2)",
+    "INSERT INTO organizations (id, name) VALUES ($1, $2)",
     ["00000000-0000-4000-8000-000000000002", "Direct second tenant"],
   );
   assert.equal(await store.ready(), false);
@@ -707,7 +707,7 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
   assert.equal(notReady.status, 503);
   assert.equal(notReady.body.reason, "tenancy_mismatch");
   assert.equal(notReady.body.message, "SELFHOST_TENANCY=single but 2 organisations exist");
-  assert.equal((await database.query("SELECT count(*)::int AS n FROM selfhost_organizations")).rows[0]!.n, 2);
+  assert.equal((await database.query("SELECT count(*)::int AS n FROM organizations")).rows[0]!.n, 2);
   assert.deepEqual(
     (await store.listOrganizations(firstOrg.body.owner.id)).map((org) => org.id),
     [firstOrg.body.id],

@@ -136,7 +136,7 @@ test("the Relaycast binding and environment are served per workspace", async (t)
 test("a credential reference can name a run this database has never seen", async (t) => {
   const env = await setup(t);
   await env.database.query(
-    `INSERT INTO selfhost_cli_credential_refs (ref_hash, run_id, workspace_id, credential_ids, expires_at)
+    `INSERT INTO cli_credential_refs (ref_hash, run_id, workspace_id, credential_ids, expires_at)
      VALUES ('hash', $1, $2, '{}', now() + interval '1 hour')`,
     [randomUUID(), env.workspace.id],
   );

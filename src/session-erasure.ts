@@ -95,7 +95,7 @@ export async function erasureTarget(
     throw new SessionErasureError(400, "invalid_session_target", "workspaceId and source are required");
   }
   const workspace = await database.query(
-    `SELECT 1 FROM selfhost_workspaces WHERE id::text = $1 AND organization_id = $2`,
+    `SELECT 1 FROM workspaces WHERE id::text = $1 AND organization_id = $2`,
     [workspaceId, organizationId],
   );
   if (workspace.rows.length === 0) {
@@ -242,7 +242,7 @@ async function withAudit(database: Database, target: ErasureTarget, receipt: Era
   const row = await database.transaction(async (tx) => {
     if (receipt.status === "completed") {
       const claimed = await tx.query<ErasureRow>(
-        `UPDATE selfhost_session_erasures SET completed_at = now()
+        `UPDATE session_erasures SET completed_at = now()
           WHERE ${TARGET_WHERE} AND completed_at IS NULL AND request_id::text = $5
           RETURNING request_id, actor_kind, actor_id, completed_at`,
         [...key, receipt.requestId],
@@ -260,7 +260,7 @@ async function withAudit(database: Database, target: ErasureTarget, receipt: Era
       }
     }
     const existing = await tx.query<ErasureRow>(
-      `SELECT request_id, actor_kind, actor_id, completed_at FROM selfhost_session_erasures WHERE ${TARGET_WHERE}`,
+      `SELECT request_id, actor_kind, actor_id, completed_at FROM session_erasures WHERE ${TARGET_WHERE}`,
       key,
     );
     return existing.rows[0] ?? null;
@@ -283,14 +283,14 @@ export async function eraseSession(
   const actorId = actor.kind === "user" ? actor.userId : actor.kind === "service" ? actor.subject : null;
   const requestId = await database.transaction(async (tx) => {
     await tx.query(
-      `INSERT INTO selfhost_session_erasures
+      `INSERT INTO session_erasures
          (organization_id, workspace_id, source, session_id, request_id, actor_kind, actor_id)
        VALUES ($1, $2::uuid, $3, $4, $5, $6, $7)
        ON CONFLICT (organization_id, workspace_id, source, session_id) DO NOTHING`,
       [...key, randomUUID(), actor.kind, actorId],
     );
     const row = await tx.query<{ request_id: string }>(
-      `SELECT request_id FROM selfhost_session_erasures WHERE ${TARGET_WHERE}`,
+      `SELECT request_id FROM session_erasures WHERE ${TARGET_WHERE}`,
       key,
     );
     const id = row.rows[0]!.request_id;

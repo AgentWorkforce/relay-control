@@ -60,7 +60,7 @@ test("desktop identities round-trip and advertise copilot_session_attestation", 
   assert.deepEqual(synced.body, { synced: 1, identities: [{ agent_id: chat.id, linked_mcp: null, linked_at: null }] });
   assert.equal(synced.raw.includes(chat.token), false, "the agent token is never returned");
   const stored = await env.database.query<{ token_ciphertext: string }>(
-    "SELECT token_ciphertext FROM selfhost_desktop_relay_identities WHERE agent_remote_id = $1", [chat.id]);
+    "SELECT token_ciphertext FROM desktop_relay_identities WHERE agent_remote_id = $1", [chat.id]);
   assert.equal(stored.rows[0]!.token_ciphertext.includes(chat.token), false, "encrypted at rest");
 
   for (const prefix of ["", "/cloud"]) {
@@ -109,7 +109,7 @@ test("desktop identities round-trip and advertise copilot_session_attestation", 
     method: "PUT", token: parent.accessToken, body: { source_id: sourceId, identities: [] },
   });
   assert.deepEqual(cleared.body, { synced: 0, identities: [] });
-  const keys = await env.database.query("SELECT 1 FROM selfhost_desktop_attestation_keys");
+  const keys = await env.database.query("SELECT 1 FROM desktop_attestation_keys");
   assert.equal(keys.rows.length, 0);
 });
 
@@ -132,7 +132,7 @@ test("a signed Copilot call joins and sends as the verified desktop identity; th
   assert.deepEqual(dm?.body, { to: "peer", text: "hello from copilot" });
   assert.equal(JSON.stringify(env.world.bodies).includes(PROOF), false);
   // No hosted participant was created for the chat.
-  const hosted = await env.database.query("SELECT 1 FROM selfhost_hosted_relay_participants");
+  const hosted = await env.database.query("SELECT 1 FROM hosted_relay_participants");
   assert.equal(hosted.rows.length, 0);
 
   // Managed calls cannot choose another actor.

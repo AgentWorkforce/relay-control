@@ -89,7 +89,7 @@ test("fake worker: enroll → register → queue → assignment → ack → stat
   assert.match(enrollment.body.token, /^sh_wrk_enr_/);
   assert.match(enrollment.body.registerCommand, /agent-relay cloud worker register --token sh_wrk_enr_\S+ --name w1 --base-url https:\/\/control\.selfhosted\.company/);
   const stored = await cp.database.query<{ token_hash: string }>(
-    "SELECT token_hash FROM selfhost_worker_enrollment_tokens",
+    "SELECT token_hash FROM worker_enrollment_tokens",
   );
   assert.notEqual(stored.rows[0]!.token_hash, enrollment.body.token, "tokens are stored hashed");
   const listed = await api("/api/v1/workers/enrollment-tokens", { token: tenant.ownerToken });
@@ -186,7 +186,7 @@ test("fake worker: enroll → register → queue → assignment → ack → stat
   assert.equal(payload.workflowFileName, "hello-selfhost.yaml");
   assert.deepEqual(payload.envSecrets, { MY_SECRET: "s3cret", RELAY_SECRET_ENV_NAMES: '["MY_SECRET"]' });
   const runRow = await cp.database.query<{ env_secrets_ciphertext: string }>(
-    "SELECT env_secrets_ciphertext FROM selfhost_workflow_runs WHERE id = $1",
+    "SELECT env_secrets_ciphertext FROM workflow_runs WHERE id = $1",
     [runId],
   );
   assert.doesNotMatch(runRow.rows[0]!.env_secrets_ciphertext, /s3cret/, "env secrets are encrypted");

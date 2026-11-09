@@ -47,11 +47,11 @@ const MIGRATION_BACKOFF_MS=5*60_000;
  * key-share lock and is skipped. Returns the number deleted.
  */
 export async function pruneMcpOAuthClients(database:SqlExecutor,before:Date,limit=PRUNE_BATCH):Promise<number> {
-  const deleted=await database.query(`DELETE FROM selfhost_mcp_oauth_clients WHERE client_id IN (
-      SELECT c.client_id FROM selfhost_mcp_oauth_clients c
+  const deleted=await database.query(`DELETE FROM mcp_oauth_clients WHERE client_id IN (
+      SELECT c.client_id FROM mcp_oauth_clients c
        WHERE c.created_at<$1
-         AND NOT EXISTS (SELECT 1 FROM selfhost_mcp_oauth_grants g WHERE g.client_id=c.client_id)
-         AND NOT EXISTS (SELECT 1 FROM selfhost_mcp_oauth_authorization_codes a WHERE a.client_id=c.client_id)
+         AND NOT EXISTS (SELECT 1 FROM mcp_oauth_grants g WHERE g.client_id=c.client_id)
+         AND NOT EXISTS (SELECT 1 FROM mcp_oauth_authorization_codes a WHERE a.client_id=c.client_id)
        ORDER BY c.created_at LIMIT $2 FOR UPDATE SKIP LOCKED)
     RETURNING client_id`,[before,limit]);
   return deleted.rows.length;
@@ -145,7 +145,7 @@ export class McpOAuthTeardown {
     const started=Date.now(),budget=this.deps.passBudgetMs??30_000,now=this.clock();
     // Only due rows: new intents have no next_attempt_at, so kick() reaches them at once.
     const page=()=>this.deps.database.query<Intent&{created_at:Date|string}>(`SELECT id,grant_id,organization_id,workspace_id,user_id,agent_name,agent_remote_id,created_at
-      FROM selfhost_mcp_oauth_revocations WHERE completed_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=$1)
+      FROM mcp_oauth_revocations WHERE completed_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=$1)
       ${this.cursor?"AND (created_at,id)>($2::timestamptz,$3::uuid)":""} ORDER BY created_at,id LIMIT ${PAGE}`,
     this.cursor?[now,this.cursor.createdAt,this.cursor.id]:[now]);
     await this.prune(now);
@@ -206,12 +206,12 @@ export class McpOAuthTeardown {
     return this.locked(candidate,async tx=>{
       const now=this.clock();
       const intent=(await tx.query<Intent&{attempts:number;created_at:Date|string}>(`SELECT id,grant_id,organization_id,workspace_id,user_id,agent_name,agent_remote_id,attempts,created_at
-        FROM selfhost_mcp_oauth_revocations WHERE id=$1 AND user_id=$2 AND organization_id=$3
+        FROM mcp_oauth_revocations WHERE id=$1 AND user_id=$2 AND organization_id=$3
           AND completed_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=$4) FOR UPDATE SKIP LOCKED`,
       [candidate.id,candidate.user_id,candidate.organization_id,now])).rows[0];
       if(!intent) return "skipped";
       const attempts=intent.attempts+1;
-      await tx.query(`UPDATE selfhost_mcp_oauth_revocations SET attempts=$2,next_attempt_at=$3,claimed_at=$4 WHERE id=$1`,
+      await tx.query(`UPDATE mcp_oauth_revocations SET attempts=$2,next_attempt_at=$3,claimed_at=$4 WHERE id=$1`,
         [intent.id,attempts,new Date(now.getTime()+mcpOAuthTeardownBackoffMs(attempts)),now]);
       const remoteId=intent.agent_remote_id;
       if(!remoteId) {await this.complete(tx,intent.id,"no_remote");return "completed";}
@@ -227,19 +227,19 @@ export class McpOAuthTeardown {
 
   private async snapshot(tx:SqlExecutor,intent:Claim["intent"]):Promise<Snapshot> {
     const workspace=(await tx.query<Workspace>(`SELECT relaycast_workspace_id,relaycast_api_key_ciphertext
-      FROM selfhost_workspaces WHERE id=$1 AND organization_id=$2`,[intent.workspace_id,intent.organization_id])).rows[0]??null;
+      FROM workspaces WHERE id=$1 AND organization_id=$2`,[intent.workspace_id,intent.organization_id])).rows[0]??null;
     const row=(await tx.query<Participant>(`SELECT p.id,p.agent_name,p.agent_remote_id,p.relaycast_workspace_id,p.session_hash,p.token_ciphertext
-      FROM selfhost_hosted_relay_participants p
+      FROM hosted_relay_participants p
       WHERE p.workspace_id=$1 AND p.user_id=$2 AND p.agent_remote_id=$3`,
     [intent.workspace_id,intent.user_id,intent.agent_remote_id])).rows[0]??null;
-    const grants=(await tx.query<Grant>(`SELECT id,agent_remote_id,agent_name,created_at FROM selfhost_mcp_oauth_grants
+    const grants=(await tx.query<Grant>(`SELECT id,agent_remote_id,agent_name,created_at FROM mcp_oauth_grants
       WHERE organization_id=$1 AND workspace_id=$2 AND user_id=$3 AND revoked_at IS NULL ORDER BY id`,
     [intent.organization_id,intent.workspace_id,intent.user_id])).rows;
     return {workspace,row,grants};
   }
 
   private async complete(tx:SqlExecutor,id:string,outcome:McpOAuthTeardownOutcome):Promise<void> {
-    const done=await tx.query(`UPDATE selfhost_mcp_oauth_revocations SET completed_at=$2,outcome=$3
+    const done=await tx.query(`UPDATE mcp_oauth_revocations SET completed_at=$2,outcome=$3
       WHERE id=$1 AND completed_at IS NULL RETURNING id`,[id,this.clock(),outcome]);
     // Logged once per row, when it completes. No names, agent ids or tokens.
     if(done.rows.length && TERMINAL.has(outcome)) console.warn("[mcp-oauth] teardown abandoned",{outcome,revocationId:id});
@@ -248,7 +248,7 @@ export class McpOAuthTeardown {
   /** Read-only recheck under the locks that the claim's local state still holds. */
   private unchanged({intent,snapshot}:Claim):Promise<boolean> {
     return this.locked(intent,async tx=>{
-      const pending=await tx.query("SELECT 1 FROM selfhost_mcp_oauth_revocations WHERE id=$1 AND completed_at IS NULL",[intent.id]);
+      const pending=await tx.query("SELECT 1 FROM mcp_oauth_revocations WHERE id=$1 AND completed_at IS NULL",[intent.id]);
       return pending.rows.length>0 && same(await this.snapshot(tx,intent),snapshot);
     });
   }
@@ -321,7 +321,7 @@ export class McpOAuthTeardown {
 
   private commit({intent,snapshot}:Claim,decision:Exclude<Decision,"pending">):Promise<Counted> {
     return this.locked(intent,async tx=>{
-      const current=await tx.query(`SELECT id FROM selfhost_mcp_oauth_revocations
+      const current=await tx.query(`SELECT id FROM mcp_oauth_revocations
         WHERE id=$1 AND completed_at IS NULL FOR UPDATE`,[intent.id]);
       if(!current.rows.length) return "skipped";
       // This re-read replaces the advisory fence that used to span the remote
@@ -330,11 +330,11 @@ export class McpOAuthTeardown {
       // pending (next_attempt_at was set by the claim) instead of applying it.
       if(!same(await this.snapshot(tx,intent),snapshot)) return "pending";
       const remote=decision.transfer;
-      if(remote) await tx.query(`UPDATE selfhost_mcp_oauth_grants SET agent_remote_id=$4
+      if(remote) await tx.query(`UPDATE mcp_oauth_grants SET agent_remote_id=$4
         WHERE organization_id=$1 AND workspace_id=$2 AND user_id=$3 AND revoked_at IS NULL
           AND agent_remote_id IS NULL AND agent_name=$5 AND date_trunc('milliseconds',created_at)<=$6`,
       [intent.organization_id,intent.workspace_id,intent.user_id,remote.id,remote.name,intent.created_at]);
-      if(decision.deleteRow && snapshot.row) await tx.query(`DELETE FROM selfhost_hosted_relay_participants
+      if(decision.deleteRow && snapshot.row) await tx.query(`DELETE FROM hosted_relay_participants
         WHERE id=$1 AND workspace_id=$2 AND user_id=$3 AND agent_remote_id=$4`,
       [snapshot.row.id,intent.workspace_id,intent.user_id,intent.agent_remote_id]);
       await this.complete(tx,intent.id,decision.outcome);

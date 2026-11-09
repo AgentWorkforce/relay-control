@@ -276,7 +276,7 @@ export class SubscriptionLoginStore {
   }): Promise<DeviceStart> {
     // Hosted: 5 starts per 5 minutes per user and workspace.
     const recent = await this.database.query<{ count: number }>(
-      `SELECT count(*)::int AS count FROM selfhost_coding_agent_device_sessions
+      `SELECT count(*)::int AS count FROM coding_agent_device_sessions
         WHERE user_id = $1 AND workspace_id = $2 AND model_provider = $3
           AND created_at > now() - interval '5 minutes'`,
       [input.userId, input.workspaceId, input.provider],
@@ -313,19 +313,19 @@ export class SubscriptionLoginStore {
     const expiresAt = new Date(now.getTime() + lifetimeSeconds * 1000);
     await this.database.transaction(async (tx) => {
       await tx.query(
-        `DELETE FROM selfhost_coding_agent_device_sessions
+        `DELETE FROM coding_agent_device_sessions
           WHERE user_id = $1 AND workspace_id = $2 AND model_provider = $3 AND status <> 'processing'
             AND created_at <= now() - interval '5 minutes'`,
         [input.userId, input.workspaceId, input.provider],
       );
       await tx.query(
-        `UPDATE selfhost_coding_agent_device_sessions
+        `UPDATE coding_agent_device_sessions
             SET status = 'expired', encrypted_device_state = NULL, updated_at = now()
           WHERE user_id = $1 AND workspace_id = $2 AND model_provider = $3 AND status = 'pending'`,
         [input.userId, input.workspaceId, input.provider],
       );
       await tx.query(
-        `INSERT INTO selfhost_coding_agent_device_sessions
+        `INSERT INTO coding_agent_device_sessions
            (id, organization_id, workspace_id, user_id, model_provider, session_fingerprint,
             encrypted_device_state, poll_interval_seconds, next_poll_at, expires_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
@@ -371,7 +371,7 @@ export class SubscriptionLoginStore {
       updated_at: Date | string; provider_credential_id: string | null; poll_interval_seconds: number;
     }>(
       `SELECT id, status, next_poll_at, expires_at, updated_at, provider_credential_id, poll_interval_seconds
-         FROM selfhost_coding_agent_device_sessions
+         FROM coding_agent_device_sessions
         WHERE id = $1 AND user_id = $2 AND workspace_id = $3 AND model_provider = $4 AND session_fingerprint = $5`,
       [input.transactionId, input.userId, input.workspaceId, input.provider, fingerprint],
     );
@@ -400,7 +400,7 @@ export class SubscriptionLoginStore {
     }
     // One poll at a time: claim the row.
     const claimed = await this.database.query<{ encrypted_device_state: string }>(
-      `UPDATE selfhost_coding_agent_device_sessions SET status = 'processing', updated_at = now()
+      `UPDATE coding_agent_device_sessions SET status = 'processing', updated_at = now()
         WHERE id = $1 AND status = 'pending' AND next_poll_at <= $2
         RETURNING encrypted_device_state`,
       [session.id, now],
@@ -410,7 +410,7 @@ export class SubscriptionLoginStore {
     const state = JSON.parse(decryptSecret(stateCiphertext, this.keyring)) as Record<string, string>;
     const backToPending = async (intervalSeconds: number) => {
       await this.database.query(
-        `UPDATE selfhost_coding_agent_device_sessions
+        `UPDATE coding_agent_device_sessions
             SET status = 'pending', poll_interval_seconds = $2, next_poll_at = $3, updated_at = now()
           WHERE id = $1 AND status = 'processing'`,
         [session.id, intervalSeconds, new Date(now.getTime() + intervalSeconds * 1000)],
@@ -462,7 +462,7 @@ export class SubscriptionLoginStore {
       authFile,
     });
     await this.database.query(
-      `UPDATE selfhost_coding_agent_device_sessions
+      `UPDATE coding_agent_device_sessions
           SET status = 'completed', provider_credential_id = $2, encrypted_device_state = NULL,
               completed_at = now(), updated_at = now()
         WHERE id = $1`,
@@ -473,7 +473,7 @@ export class SubscriptionLoginStore {
 
   private async finishSession(id: string, status: "failed" | "expired"): Promise<void> {
     await this.database.query(
-      `UPDATE selfhost_coding_agent_device_sessions
+      `UPDATE coding_agent_device_sessions
           SET status = $2, encrypted_device_state = NULL, updated_at = now()
         WHERE id = $1 AND status IN ('pending', 'processing')`,
       [id, status],
@@ -500,9 +500,9 @@ export class SubscriptionLoginStore {
     const fingerprint = this.keyFingerprint(input.provider, described.refreshToken);
     let previousLocation: string | null = null;
     const id = await this.database.transaction(async (tx) => {
-      await tx.query("SELECT id FROM selfhost_workspaces WHERE id = $1 FOR UPDATE", [input.workspaceId]);
+      await tx.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [input.workspaceId]);
       const existing = await tx.query<{ id: string; blob_version: number; blob_location: string }>(
-        `SELECT id, blob_version, blob_location FROM selfhost_coding_agent_credentials
+        `SELECT id, blob_version, blob_location FROM coding_agent_credentials
           WHERE workspace_id = $1 AND model_provider = $2 AND auth_type = 'provider_oauth'
             AND provider_account_id = $3
           FOR UPDATE`,
@@ -516,7 +516,7 @@ export class SubscriptionLoginStore {
       if (current) {
         previousLocation = current.blob_location;
         await tx.query(
-          `UPDATE selfhost_coding_agent_credentials SET
+          `UPDATE coding_agent_credentials SET
              blob_backend = $2, blob_location = $3, blob_version = $4, key_fingerprint = $5,
              account_email = COALESCE($6, account_email), secret_preview = $7,
              credential_expires_at = $8, status = 'connected', last_error = NULL,
@@ -526,12 +526,12 @@ export class SubscriptionLoginStore {
         );
       } else {
         const sandbox = await tx.query<{ taken: boolean }>(
-          `SELECT coalesce(bool_or(harness_active), false) AS taken FROM selfhost_coding_agent_credentials
+          `SELECT coalesce(bool_or(harness_active), false) AS taken FROM coding_agent_credentials
             WHERE workspace_id = $1 AND model_provider = $2`,
           [input.workspaceId, input.provider],
         );
         await tx.query(
-          `INSERT INTO selfhost_coding_agent_credentials
+          `INSERT INTO coding_agent_credentials
              (id, organization_id, workspace_id, created_by_user_id, model_provider, harness, auth_type,
               display_name, account_email, secret_ciphertext, secret_preview, key_fingerprint,
               is_active, harness_active, last_authenticated_at, blob_backend, blob_location, blob_version,
@@ -579,7 +579,7 @@ export class SubscriptionLoginStore {
    */
   async issueRunReference(workspaceId: string, runId: string): Promise<RunCredentialReference | null> {
     const rows = await this.database.query<{ id: string; model_provider: SubscriptionProvider }>(
-      `SELECT id, model_provider FROM selfhost_coding_agent_credentials
+      `SELECT id, model_provider FROM coding_agent_credentials
         WHERE workspace_id = $1 AND auth_type = 'provider_oauth' AND harness_active
           AND status = 'connected'
         ORDER BY model_provider`,
@@ -589,7 +589,7 @@ export class SubscriptionLoginStore {
     const ref = opaqueToken("sh_clicred_");
     const expiresAt = new Date(this.now().getTime() + RUN_REFERENCE_TTL_MS);
     await this.database.query(
-      `INSERT INTO selfhost_cli_credential_refs (ref_hash, run_id, workspace_id, credential_ids, expires_at)
+      `INSERT INTO cli_credential_refs (ref_hash, run_id, workspace_id, credential_ids, expires_at)
        VALUES ($1, $2, $3, $4::uuid[], $5)`,
       [sha256(ref), runId, workspaceId, rows.rows.map((row) => row.id), expiresAt],
     );
@@ -609,7 +609,7 @@ export class SubscriptionLoginStore {
       throw new CodingAgentError(401, "unauthorized", "Credential reference required");
     }
     const result = await this.database.query<{ workspace_id: string; credential_ids: string[] }>(
-      `SELECT workspace_id, credential_ids FROM selfhost_cli_credential_refs
+      `SELECT workspace_id, credential_ids FROM cli_credential_refs
         WHERE ref_hash = $1 AND run_id = $2 AND revoked_at IS NULL AND expires_at > now()`,
       [sha256(ref), runId],
     );
@@ -621,7 +621,7 @@ export class SubscriptionLoginStore {
   /** Revokes a run's references (called when the run finishes). */
   async revokeRun(runId: string): Promise<void> {
     await this.database.query(
-      "UPDATE selfhost_cli_credential_refs SET revoked_at = now() WHERE run_id = $1 AND revoked_at IS NULL",
+      "UPDATE cli_credential_refs SET revoked_at = now() WHERE run_id = $1 AND revoked_at IS NULL",
       [runId],
     );
   }
@@ -656,7 +656,7 @@ export class SubscriptionLoginStore {
     }
     if (files.length) {
       await this.database.query(
-        "UPDATE selfhost_coding_agent_credentials SET last_used_at = now() WHERE id = ANY($1::uuid[])",
+        "UPDATE coding_agent_credentials SET last_used_at = now() WHERE id = ANY($1::uuid[])",
         [files.map((file) => file.credentialId)],
       );
       await recordAudit(this.database, {
@@ -673,7 +673,7 @@ export class SubscriptionLoginStore {
     const result = await executor.query<CredentialRow>(
       `SELECT id, model_provider, blob_location, blob_version, provider_account_id,
               credential_expires_at, status, refresh_attempts
-         FROM selfhost_coding_agent_credentials
+         FROM coding_agent_credentials
         WHERE workspace_id = $1 AND id = $2 AND auth_type = 'provider_oauth'`,
       [workspaceId, credentialId],
     );
@@ -702,7 +702,7 @@ export class SubscriptionLoginStore {
         const version = row.blob_version + 1;
         const location = await this.blobs.write(workspaceId, row.id, version, refreshed, tx);
         await tx.query(
-          `UPDATE selfhost_coding_agent_credentials SET
+          `UPDATE coding_agent_credentials SET
              blob_location = $2, blob_version = $3, credential_expires_at = $4,
              key_fingerprint = $5, refresh_attempts = 0, last_refreshed_at = now(),
              last_error = NULL, status = 'connected', updated_at = now()
@@ -716,7 +716,7 @@ export class SubscriptionLoginStore {
         const attempts = row.refresh_attempts + 1;
         const expired = expiresAt.getTime() <= now.getTime();
         await tx.query(
-          `UPDATE selfhost_coding_agent_credentials SET
+          `UPDATE coding_agent_credentials SET
              refresh_attempts = $2, last_error = $3,
              status = CASE WHEN $4 THEN 'refresh_failed' ELSE status END, updated_at = now()
            WHERE id = $1`,
@@ -766,7 +766,7 @@ export class SubscriptionLoginStore {
       const version = row.blob_version + 1;
       const location = await this.blobs.write(workspaceId, row.id, version, content, tx);
       await tx.query(
-        `UPDATE selfhost_coding_agent_credentials SET
+        `UPDATE coding_agent_credentials SET
            blob_location = $2, blob_version = $3, credential_expires_at = $4, key_fingerprint = $5,
            refresh_attempts = 0, last_refreshed_at = now(), last_error = NULL, status = 'connected',
            updated_at = now()

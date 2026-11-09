@@ -4,7 +4,7 @@
 //   releases/<version>/<name>   published assets, what downloads read
 //   manifests/<channel>.json    a copy of the channel's current signed envelope
 // There is deliberately no listing operation. Postgres is the source of truth
-// for envelopes (selfhost_desktop_feed_releases.envelope, served byte-for-byte);
+// for envelopes (desktop_feed_releases.envelope, served byte-for-byte);
 // the manifests/ objects are a copy written after each publish commits.
 import { createHash } from "node:crypto";
 import { request as httpRequest, type IncomingMessage } from "node:http";

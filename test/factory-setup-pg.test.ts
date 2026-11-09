@@ -76,13 +76,13 @@ async function raceDatabase(t: TestContext) {
   const ownerId = randomUUID();
   const adminId = randomUUID();
   const workspaceId = randomUUID();
-  await setup.query("INSERT INTO selfhost_organizations (id, name) VALUES ($1, 'Race')", [orgId]);
+  await setup.query("INSERT INTO organizations (id, name) VALUES ($1, 'Race')", [orgId]);
   for (const [id, role] of [[ownerId, "owner"], [adminId, "admin"]] as const) {
-    await setup.query("INSERT INTO selfhost_users (id, email, name) VALUES ($1, $2, $3)", [id, `${role}@race.test`, role]);
-    await setup.query("INSERT INTO selfhost_organization_memberships (organization_id, user_id, role) VALUES ($1, $2, $3)", [orgId, id, role]);
+    await setup.query("INSERT INTO users (id, email, name) VALUES ($1, $2, $3)", [id, `${role}@race.test`, role]);
+    await setup.query("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, $3)", [orgId, id, role]);
   }
   await setup.query(
-    `INSERT INTO selfhost_workspaces (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
+    `INSERT INTO workspaces (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
      VALUES ($1, $2, 'race', 'rc-race', $3)`,
     [workspaceId, orgId, encryptSecret("rk_live_race", keyring.active)],
   );
@@ -145,7 +145,7 @@ test("factory connect on real PostgreSQL: two first connects on an absent row ar
   assert.equal(refused.code, "factory_bindings_changed");
   assert.equal(refused.message, "Factory changed while verification was running. Retry from current Settings.");
   const rows = (await env.setup.query<{ user_id: string; key_envelope: string }>(
-    "SELECT user_id, key_envelope FROM selfhost_factory_connections WHERE workspace_id = $1",
+    "SELECT user_id, key_envelope FROM factory_connections WHERE workspace_id = $1",
     [env.workspaceId],
   )).rows;
   assert.equal(rows.length, 1);
@@ -157,12 +157,12 @@ test("factory lock order on real PostgreSQL: a disconnect racing the member's re
   const env = await raceDatabase(t);
   // The admin owns the connection and a bound session.
   await env.setup.query(
-    `INSERT INTO selfhost_factory_connections (workspace_id, organization_id, user_id, key_envelope, key_hint, validated_at)
+    `INSERT INTO factory_connections (workspace_id, organization_id, user_id, key_envelope, key_hint, validated_at)
      VALUES ($1, $2, $3, $4, '…k001', now())`,
     [env.workspaceId, env.orgId, env.adminId, encryptSecret("fk_live_admin_owned_k001", keyring.active)],
   );
   await env.setup.query(
-    `INSERT INTO selfhost_factory_bindings
+    `INSERT INTO factory_bindings
        (id, workspace_id, organization_id, user_id, session_id, computer_id, state, generation,
         relay_agent_name, relay_agent_id, hosted_token_envelope)
      VALUES ($1, $2, $3, $4, 'sess-a', 'cmp-1', 'bound', 1, 'factory-sess-a', 'ag-sess-a', $5)`,
@@ -192,9 +192,9 @@ test("factory lock order on real PostgreSQL: a disconnect racing the member's re
     assert.equal(outcome, "ok", `${label}: ${(outcome as { code?: string }).code ?? ""} ${String(outcome)}`);
   }
   const left = await env.setup.query<{ n: string }>(
-    "SELECT count(*)::text AS n FROM selfhost_factory_connections WHERE workspace_id = $1", [env.workspaceId]);
+    "SELECT count(*)::text AS n FROM factory_connections WHERE workspace_id = $1", [env.workspaceId]);
   assert.equal(left.rows[0]!.n, "0");
   const live = await env.setup.query<{ n: string }>(
-    "SELECT count(*)::text AS n FROM selfhost_factory_bindings WHERE state <> 'retired'");
+    "SELECT count(*)::text AS n FROM factory_bindings WHERE state <> 'retired'");
   assert.equal(live.rows[0]!.n, "0");
 });

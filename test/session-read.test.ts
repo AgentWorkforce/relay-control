@@ -103,10 +103,10 @@ test("issue and refresh reject unauthenticated, pending, foreign-workspace and r
     assert.equal((await request(env.origin, `/api/v1/workspaces/${foreignWorkspace.id}/session-read/${action}`,
       { method: "POST", token: env.pair.accessToken, body })).status, 404);
   }
-  await env.database.query("UPDATE selfhost_token_sessions SET scopes = ARRAY['cli:auth'] WHERE access_token_hash = $1", [hashSecret(env.pair.accessToken)]);
+  await env.database.query("UPDATE token_sessions SET scopes = ARRAY['cli:auth'] WHERE access_token_hash = $1", [hashSecret(env.pair.accessToken)]);
   assert.equal((await env.post()).status, 403);
   assert.equal((await env.post("refresh", { refreshToken })).status, 403);
-  await env.database.query("DELETE FROM selfhost_organization_memberships WHERE user_id = $1", [env.org.owner.id]);
+  await env.database.query("DELETE FROM organization_memberships WHERE user_id = $1", [env.org.owner.id]);
   assert.equal((await env.post()).status, 401);
   assert.equal((await env.post("refresh", { refreshToken })).status, 401);
   assert.deepEqual(env.calls, []);
@@ -119,10 +119,10 @@ test("disabled handoff, revoked tokens and expired Control sessions never reach 
   assert.equal(disabled.status, 404);
   assert.equal(disabled.body.error, "session_read_not_configured");
   env.config.sessionReadApi = { url: "http://unused.internal", publicUrl, secret };
-  await env.database.query("UPDATE selfhost_token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE access_token_hash = $1", [hashSecret(env.pair.accessToken)]);
+  await env.database.query("UPDATE token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE access_token_hash = $1", [hashSecret(env.pair.accessToken)]);
   assert.equal((await env.post()).status, 401);
   assert.equal((await env.post("refresh", { refreshToken })).status, 401);
-  await env.database.query("UPDATE selfhost_token_sessions SET access_token_expires_at = now() + interval '1 day', revoked_at = now() WHERE access_token_hash = $1", [hashSecret(env.pair.accessToken)]);
+  await env.database.query("UPDATE token_sessions SET access_token_expires_at = now() + interval '1 day', revoked_at = now() WHERE access_token_hash = $1", [hashSecret(env.pair.accessToken)]);
   assert.equal((await env.post()).status, 401);
   assert.equal((await env.post("refresh", { refreshToken })).status, 401);
   assert.deepEqual(env.calls, []);

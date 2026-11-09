@@ -189,7 +189,7 @@ async function post(env: Env, path: string, init: {
 
 async function setScopes(env: Env, accessToken: string, scopes: string[]) {
   await env.database.query(
-    "UPDATE selfhost_token_sessions SET scopes = $2::text[] WHERE access_token_hash = $1",
+    "UPDATE token_sessions SET scopes = $2::text[] WHERE access_token_hash = $1",
     [hashSecret(accessToken), scopes],
   );
 }
@@ -233,7 +233,7 @@ test("DG-001: the account session lists every membership; tokens act only in the
   // Multi mode: bootstrap use leaves an audit row in the organization it touched.
   assert.equal((await request(env.origin, `/api/v1/organizations/${env.b.id}/workspaces`, { token: BOOTSTRAP })).status, 200);
   const audit = await env.database.query<{ actor_kind: string; target: string }>(
-    "SELECT actor_kind, target FROM selfhost_admin_audit_events WHERE action = 'bootstrap.access' AND organization_id = $1",
+    "SELECT actor_kind, target FROM admin_audit_events WHERE action = 'bootstrap.access' AND organization_id = $1",
     [env.b.id],
   );
   assert(audit.rows.some((row) => row.actor_kind === "bootstrap" && row.target === `GET /api/v1/organizations/${env.b.id}/workspaces`));
@@ -274,12 +274,12 @@ test("DG-001: switching workspaces mints a new session, revokes the old access a
   assert.equal((await request(env.origin, "/cloud/api/auth/session", { cookie })).status, 401);
   assert.equal(await env.store.refresh(issued.refreshToken), null);
   const revoked = await env.database.query<{ revoked_reason: string }>(
-    "SELECT revoked_reason FROM selfhost_token_sessions WHERE id = $1",
+    "SELECT revoked_reason FROM token_sessions WHERE id = $1",
     [issued.sessionId],
   );
   assert.equal(revoked.rows[0]!.revoked_reason, "workspace_switch");
   const user = await env.database.query<{ last_organization_id: string; last_workspace_id: string }>(
-    "SELECT last_organization_id, last_workspace_id FROM selfhost_users WHERE id = $1",
+    "SELECT last_organization_id, last_workspace_id FROM users WHERE id = $1",
     [env.alice],
   );
   assert.deepEqual(user.rows[0], { last_organization_id: env.b.id, last_workspace_id: env.b1 });
@@ -487,7 +487,7 @@ test("DG-001: an unexchanged Desktop handoff token is refused until the verifier
   // Whoever holds only that token (never the verifier) still cannot list or
   // switch workspaces, and no session is minted for them.
   const sessions = async () => Number((await env.database.query<{ count: string | number }>(
-    "SELECT count(*) AS count FROM selfhost_token_sessions WHERE user_id = $1", [env.alice],
+    "SELECT count(*) AS count FROM token_sessions WHERE user_id = $1", [env.alice],
   )).rows[0]!.count);
   const before = await sessions();
   const replayList = await request(env.origin, "/cloud/api/v1/auth/desktop/workspaces", { token: pending });
@@ -523,14 +523,14 @@ test("DG-001: org admins add new people directly but must invite someone who alr
   const put = (token: string, email: string, name: string, role = "member") =>
     request(env.origin, `/api/v1/organizations/${env.a.id}/memberships`, { method: "POST", token, body: { email, name, role } });
   const nameOf = async (email: string) =>
-    (await env.database.query<{ name: string }>("SELECT name FROM selfhost_users WHERE email = $1", [email])).rows[0]?.name;
+    (await env.database.query<{ name: string }>("SELECT name FROM users WHERE email = $1", [email])).rows[0]?.name;
 
   const refused = await put(alice.accessToken, "carol@c.test", "Mallory");
   assert.equal(refused.status, 409);
   assert.equal(refused.body.error, "invitation_required");
   assert.equal(await nameOf("carol@c.test"), "Carol");
   const memberships = await env.database.query(
-    "SELECT 1 FROM selfhost_organization_memberships WHERE organization_id = $1 AND user_id = $2",
+    "SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
     [env.a.id, carolOrg.body.owner.id],
   );
   assert.equal(memberships.rows.length, 0);
