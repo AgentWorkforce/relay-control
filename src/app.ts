@@ -51,6 +51,13 @@ import {
 } from "./capture-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
 import {
+  assertSessionId,
+  eraseSession,
+  readSessionErasure,
+  requireErasureApi,
+  SessionErasureError,
+} from "./session-erasure.js";
+import {
   clientIp,
   cookieRequestAllowed,
   DEVICE_RATE_LIMITS,
@@ -259,6 +266,14 @@ export function browserOriginsFor(config: SelfhostConfig): string[] {
     new URL(config.publicBaseUrl).origin,
     new URL(config.dashboardUrl).origin,
   ])];
+}
+
+/** A bodiless cookie DELETE needs an allowed Origin, or same-origin fetch metadata. */
+function cookieDeleteAllowed(request: IncomingMessage, browserOrigins: string[]): boolean {
+  const origin = request.headers.origin;
+  return typeof origin === "string" && origin && origin !== "null"
+    ? browserOrigins.includes(origin)
+    : request.headers["sec-fetch-site"] === "same-origin";
 }
 
 export function createApp(input: {
@@ -1451,11 +1466,8 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // Cookie writes: JSON from an allowed origin; a bodiless DELETE needs
       // an allowed Origin (or same-origin fetch metadata).
       if (!bearer(request)) {
-        const origin = request.headers.origin;
         const allowed = method === "DELETE"
-          ? (typeof origin === "string" && origin && origin !== "null"
-            ? browserOrigins.includes(origin)
-            : request.headers["sec-fetch-site"] === "same-origin")
+          ? cookieDeleteAllowed(request, browserOrigins)
           : cookieRequestAllowed(request, browserOrigins);
         if (!allowed) throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
       }
@@ -1477,6 +1489,37 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         action: method === "PUT" ? "capture_policy.set" : "capture_policy.cleared",
       });
       json(response, 200, policy, true);
+      return;
+    }
+
+    // Operator session hard delete (docs/session-erasure.md). Erases session
+    // data only: organization membership is never touched.
+    const sessionErase = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/sessions\/([^/]+)$/);
+    if (sessionErase && method === "DELETE") {
+      const [organizationId, sessionId] = sessionErase as [string, string];
+      const auth = await organizationAccess(request, organizationId, true);
+      if (!operatorControlsEntitled()) {
+        throw new HttpError(403, "operator_controls_not_entitled", "Operator controls are not enabled for this installation");
+      }
+      if (!bearer(request) && !cookieDeleteAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      assertSessionId(sessionId);
+      const result = await eraseSession(store.database, requireErasureApi(config), {
+        organizationId,
+        sessionId,
+        actor: auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" },
+      });
+      json(response, result.status === "completed" ? 200 : 202, result, true);
+      return;
+    }
+
+    const sessionErasure = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/sessions\/([^/]+)\/erasure$/);
+    if (sessionErasure && method === "GET") {
+      const [organizationId, sessionId] = sessionErasure as [string, string];
+      await organizationAccess(request, organizationId, true);
+      assertSessionId(sessionId);
+      json(response, 200, await readSessionErasure(store.database, requireErasureApi(config), { organizationId, sessionId }), true);
       return;
     }
 
@@ -1721,6 +1764,14 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       if (error instanceof CapturePolicyError) {
         json(response, error.status, { error: error.code, message: error.message }, true);
+        return;
+      }
+      if (error instanceof SessionErasureError) {
+        json(response, error.status, {
+          error: error.code,
+          message: error.message,
+          ...(error.erasure ? { erasure: error.erasure } : {}),
+        }, true);
         return;
       }
       const identityError = identityErrorResponse(error);

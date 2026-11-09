@@ -19,6 +19,8 @@ export type SelfhostConfig = {
   relayhistoryReadApiUrl?: string | null;
   /** Independent read service; owns issuance, rotation and verification of its tokens. */
   sessionReadApi?: { url: string; publicUrl: string; secret: string } | null;
+  /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
+  sessionErasureApi?: { url: string; secret: string } | null;
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
   sessionReadMcpReads?: boolean;
   relayhistoryPublicUrl: string;
@@ -278,6 +280,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     relayhistoryPublicUrl,
     relayhistoryReadApiUrl,
     sessionReadApi: loadSessionReadApiConfig(env),
+    sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
     ...introspection,
     bootstrapToken,
@@ -297,6 +300,15 @@ function loadSessionReadMcpReads(env: Env): boolean {
     throw new Error("SESSION_READ_API_MCP_READS requires the session read API to be configured");
   }
   return true;
+}
+
+function loadSessionErasureApiConfig(env: Env): SelfhostConfig["sessionErasureApi"] {
+  const secret = readSecret(env, "SESSION_ERASE_API_SECRET");
+  if (!secret && !env.SESSION_ERASE_API_URL?.trim()) return null;
+  if (!secret || Buffer.byteLength(secret) < 32) {
+    throw new Error("SESSION_ERASE_API_SECRET (or _FILE) must be at least 32 bytes");
+  }
+  return { url: serviceUrl(env, "SESSION_ERASE_API_URL"), secret };
 }
 
 function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {
@@ -473,6 +485,7 @@ export function configFingerprint(config: SelfhostConfig): string {
       config.relayhistoryPublicUrl,
       ...(config.relayhistoryReadApiUrl ? [config.relayhistoryReadApiUrl] : []),
       ...(config.sessionReadApi ? [config.sessionReadApi.url, config.sessionReadApi.publicUrl] : []),
+      ...(config.sessionErasureApi ? [config.sessionErasureApi.url] : []),
     ].join("\n"))
     .digest("hex")
     .slice(0, 12);

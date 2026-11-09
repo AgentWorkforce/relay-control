@@ -1321,6 +1321,65 @@ paths:
         "403": { description: Owner/admin role required, or cross-origin cookie request }
         "404": { description: Organization not found }
         "409": { description: "`revision_mismatch`" }
+  /api/v1/organizations/{organizationId}/sessions/{sessionId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: sessionId
+        in: path
+        required: true
+        schema: { type: string, maxLength: 256 }
+    delete:
+      operationId: hardDeleteSession
+      description: |
+        Organization owner/admin or bootstrap bearer. Permanently erases one
+        session and its derived server-side artifacts through the session
+        pipeline; membership is untouched. Idempotent: repeating it returns the
+        same receipt. Audited as `session.hard_delete.requested` before any data
+        is touched and `session.hard_deleted` once on completion. Gated by
+        SELFHOST_OPERATOR_CONTROLS. Cookie callers need an allowed Origin or
+        same-origin fetch metadata. See docs/session-erasure.md.
+      responses:
+        "200":
+          description: Erase completed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "202":
+          description: Erase in progress; poll the erasure read
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "400": { description: "`invalid_session_id`" }
+        "403": { description: "Owner/admin role required, `operator_controls_not_entitled`, or cross-origin cookie request" }
+        "404": { description: Organization or session not found }
+        "501": { description: "`not_implemented`: the session pipeline erase is not configured" }
+        "502": { description: "`session_erasure_failed` (carries the receipt as `erasure`) or `invalid_session_erasure_response`" }
+        "503": { description: "`session_erasure_unavailable`: retry the request" }
+  /api/v1/organizations/{organizationId}/sessions/{sessionId}/erasure:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: sessionId
+        in: path
+        required: true
+        schema: { type: string, maxLength: 256 }
+    get:
+      operationId: getSessionErasure
+      description: |
+        Organization owner/admin or bootstrap bearer. The pipeline's erase
+        receipt plus the audit record, for verifying a delete. Never gated by
+        SELFHOST_OPERATOR_CONTROLS.
+      responses:
+        "200":
+          description: Erase receipt in any status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "400": { description: "`invalid_session_id`" }
+        "403": { description: Owner/admin role required }
+        "404": { description: "Organization not found, or `erasure_not_found`" }
+        "501": { description: "`not_implemented`: the session pipeline erase is not configured" }
+        "502": { description: "`invalid_session_erasure_response`" }
+        "503": { description: "`session_erasure_unavailable`: retry the request" }
   /api/v1/workspaces/{workspaceId}/resolve:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -5252,6 +5311,39 @@ components:
         upload_control: { type: string, enum: [operator, user] }
         oops_window_seconds: { type: integer, minimum: 0, maximum: 86400 }
         user_retroactive_delete: { type: boolean }
+    SessionErasure:
+      type: object
+      additionalProperties: false
+      required: [orgId, sessionId, requestId, status, requestedAt, completedAt, artifacts, uploadsFenced, failure, audit]
+      properties:
+        orgId: { type: string }
+        sessionId: { type: string }
+        requestId: { type: string }
+        status: { type: string, enum: [in_progress, completed, failed] }
+        requestedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time, nullable: true }
+        artifacts:
+          type: object
+          description: Erased item count per artifact category; never content.
+          additionalProperties: { type: integer, minimum: 0 }
+        uploadsFenced: { type: boolean }
+        failure:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [code]
+          properties:
+            code: { type: string }
+        audit:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [action, actorKind, actorId, recordedAt]
+          properties:
+            action: { type: string, enum: [session.hard_deleted] }
+            actorKind: { type: string }
+            actorId: { type: string, nullable: true }
+            recordedAt: { type: string, format: date-time }
     CapturePolicy:
       type: object
       additionalProperties: false
