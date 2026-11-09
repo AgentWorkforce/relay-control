@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { SelfhostConfig } from "../config.js";
 import { UpstreamError } from "../relayhistory.js";
+import { recordedSummary } from "./summary.js";
 import type { ControlPlaneStore, Principal } from "../store.js";
 import { AGENT_VALUE, agentPrefixTooShort, MAX_AGENT_LENGTH, selectAgent } from "./agent-query.js";
 import {
@@ -446,10 +447,29 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
     return true;
   }
 
-  // GET .../sessions/:sessionId/{events|turns|timing|catalog}?source=
+  // GET .../sessions/:sessionId/{events|turns|summary|timing|catalog}?source=
   if (segments.length === 2) {
     const sessionId = sessionPathId(ctx, segments[0]!);
     const resource = segments[1];
+    if (resource === "summary") {
+      const input = query(ctx, { source: { max: 512 }, kind: { values: ["short"] } }, ["source"]);
+      const access = await ctx.workspaceAccess(ctx.request, workspaceId);
+      const read = await readWorkspaceHistory(
+        ctx.config,
+        identityOf(access),
+        `/v1/sessions/${encodeURIComponent(sessionId)}/summary`,
+        params({ source: input.source, kind: input.kind ?? "short" }),
+        { allowNotFound: true },
+      );
+      if (read.status === "not_found") {
+        send({ summary: { status: "empty", kind: "short", state: null } });
+        return true;
+      }
+      const summary = recordedSummary(read.body);
+      if (!summary) throw upstreamShape("Session backend returned an invalid recorded summary");
+      send({ summary });
+      return true;
+    }
     if (resource === "events") {
       const input = query(ctx, {
         source: { max: 512 },

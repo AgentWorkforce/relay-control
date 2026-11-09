@@ -477,8 +477,14 @@ The dashboard session endpoints are deliberately not a general proxy:
   to RelayHistory's fixed `/v1/sessions` path.
 - `GET /cloud/api/v1/workspaces/:id/sessions/:sessionId/events` forwards only
   `source` to the fixed session-events path and requests ascending order.
+- `GET /cloud/api/v1/workspaces/:id/sessions/:sessionId/summary` accepts the
+  required `source` and optional `kind=short`. It returns the backend's recorded
+  description, model and generation time; missing provenance is an upstream
+  error, and an absent summary stays `status: empty`. With the direct read API
+  configured, this read uses the caller's workspace-bound token without issuing
+  a History session or falling back to another backend.
 
-Both upstream requests add `workspace=` from the tenant-authorized database
+These upstream requests add `workspace=` from the tenant-authorized database
 record. Caller-supplied origins, paths, workspace IDs, and credentials are
 never forwarded.
 

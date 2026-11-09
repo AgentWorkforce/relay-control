@@ -1265,3 +1265,58 @@ test("native event transport: other admitted credential families retain the lega
   assert.deepEqual(legacy?.query, { source: "codex", includeMessageId: "true", workspace: env.alpha });
   assert.equal(query.get("includeMessageId"), "true");
 });
+
+test("recorded summaries preserve native provenance and workspace isolation without login or fallback", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const upstream = "/v1/sessions/alpha-1/summary";
+  const path = `/api/v1/workspaces/${env.alpha}/sessions/alpha-1/summary?source=codex&kind=short`;
+  const ready = { status: "ready", kind: "short", summary: "Recorded model-written description", model: "recorded-model", builtAt: "2026-11-02T18:00:00Z", state: null };
+  env.readApi!.overrides.set(upstream, () => ({ body: { summary: ready } }));
+  const response = await call(env.origin, path, { token });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, { summary: ready });
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const request = env.readApi!.requests.at(-1)!;
+  assert.equal(request.path, upstream);
+  assert.deepEqual(request.query, { source: "codex", kind: "short", workspace: env.alpha });
+  assert.equal(request.token, token);
+  assert.equal(env.readApi!.mints, 0);
+  assert.equal(env.history.requests.length, 0);
+  const count = env.readApi!.requests.length;
+  assert.equal((await call(env.origin, path)).status, 401);
+  assert.equal((await call(env.origin, `/api/v1/workspaces/${env.beta}/sessions/alpha-1/summary?source=codex&kind=short`, { token })).status, 404);
+  assert.equal((await call(env.origin, path + `&workspace=${env.beta}`, { token })).status, 400);
+  assert.equal((await call(env.origin, path.replace("kind=short", "kind=long"), { token })).status, 400);
+  assert.equal(env.readApi!.requests.length, count);
+});
+
+test("recorded summaries fail closed on missing provenance, tenant attestation and native errors", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const upstream = "/v1/sessions/alpha-1/summary";
+  const path = `/api/v1/workspaces/${env.alpha}/sessions/alpha-1/summary?source=codex`;
+  const ready = { status: "ready", kind: "short", summary: "private-recorded-description", model: "recorded-model", builtAt: "2026-11-02T18:00:00Z", state: null };
+  for (const invalid of [{ ...ready, model: "" }, { ...ready, model: null }, { ...ready, builtAt: "invalid" }, { ...ready, summary: " " }, { ...ready, state: { state: "completed", classifiedAt: ready.builtAt } }]) {
+    env.readApi!.overrides.set(upstream, () => ({ body: { summary: invalid } }));
+    const result = await call(env.origin, path, { token });
+    assert.equal(result.status, 502);
+    assert(!JSON.stringify(result.body).includes("private-recorded-description"));
+  }
+  for (const workspace of ["", env.beta]) {
+    env.readApi!.overrides.set(upstream, () => ({ headers: { "x-relayhistory-workspace-id": workspace }, body: { summary: ready } }));
+    assert.equal((await call(env.origin, path, { token })).status, 502);
+  }
+  env.readApi!.overrides.set(upstream, () => ({ body: { summary: { status: "empty", kind: "short", state: null } } }));
+  assert.deepEqual((await call(env.origin, path, { token })).body, { summary: { status: "empty", kind: "short", state: null } });
+  env.readApi!.overrides.set(upstream, () => ({ status: 404, body: { error: "missing" } }));
+  assert.deepEqual((await call(env.origin, path, { token })).body, { summary: { status: "empty", kind: "short", state: null } });
+  for (const status of [401, 403, 501, 503]) {
+    env.readApi!.overrides.set(upstream, () => ({ status, body: { error: { code: "unsupported_by_backend", reason: "summary_unqualified" } } }));
+    const before = env.readApi!.requests.length;
+    const result = await call(env.origin, path, { token });
+    assert.equal(result.status, status === 501 ? 501 : status === 503 ? 503 : 502);
+    assert.equal(env.readApi!.requests.length, before + 1);
+    assert.equal(env.history.requests.length, 0);
+  }
+});

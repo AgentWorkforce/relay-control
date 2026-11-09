@@ -42,6 +42,7 @@ async function startReadApi(t: TestContext) {
   const reads: string[] = [];
   const unexpected: string[] = [];
   const eventQueries: string[] = [];
+  const summary = { body: { summary: { status: "ready", kind: "short", summary: "Recorded description", model: "recorded-model", builtAt: "2026-11-02T18:00:00Z", state: null } } };
   let n = 0;
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const chunks: Buffer[] = [];
@@ -70,6 +71,13 @@ async function startReadApi(t: TestContext) {
         res.end(JSON.stringify({ events: [{ eventId: "event-1", ts: "2026-11-02T18:00:01.000Z", source: "codex", kind: "text", type: "prompt", content: "test event" }], nextCursor: null }));
         return;
       }
+      if (req.method === "GET" && path === "/v1/sessions/s/summary") {
+        reads.push(`${req.headers.authorization}`);
+        const workspace = new URL(req.url ?? "/", "http://x").searchParams.get("workspace") ?? "";
+        res.writeHead(200, { "content-type": "application/json", "x-relayhistory-workspace-id": workspace });
+        res.end(JSON.stringify(summary.body));
+        return;
+      }
       unexpected.push(`${req.method} ${path}`);
       res.writeHead(500);
       res.end("{}");
@@ -77,7 +85,7 @@ async function startReadApi(t: TestContext) {
   });
   const origin = await listen(server);
   t.after(() => close(server));
-  return { origin, issued, reads, unexpected, eventQueries };
+  return { origin, issued, reads, unexpected, eventQueries, summary };
 }
 
 async function setup(t: TestContext) {
@@ -173,6 +181,25 @@ test("native: dashboard reads use the read API with its own token and cache it",
   assert.equal(env.readApi.issued.length, 1, "the access token is reused within its lifetime");
   assert.equal(env.readApi.issued[0]?.body.label, "relay-dashboard");
   for (const bearer of env.readApi.reads) assert.match(bearer, /^Bearer rth_at_read_/);
+  assert.deepEqual(env.readApi.unexpected, []);
+});
+
+test("native: recorded summary preserves the independent read-token handoff and provenance", async (t) => {
+  const env = await setup(t);
+  const path = `/cloud/api/v1/workspaces/${env.workspace}/sessions/s/summary?source=codex&kind=short`;
+  const result = await request(env.origin, path, { token: env.token });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body, env.readApi.summary.body);
+  assert.equal(env.readApi.issued.length, 1);
+  assert.equal(env.readApi.issued[0]?.body.workspaceId, env.workspace);
+  assert.match(env.readApi.reads[0]!, /^Bearer rth_at_read_/);
+  assert.notEqual(env.readApi.reads[0], `Bearer ${env.token}`);
+  env.readApi.summary.body.summary.model = "";
+  const invalid = await request(env.origin, path, { token: env.token });
+  assert.equal(invalid.status, 502);
+  assert.ok(!invalid.raw.includes("Recorded description"));
+  assert.equal((await request(env.origin, path)).status, 401);
+  assert.equal(env.readApi.issued.length, 1);
   assert.deepEqual(env.readApi.unexpected, []);
 });
 
