@@ -15,6 +15,7 @@ export async function handleChiefRoutes(
   path: string,
   deps: {
     backend?: ChiefBackend;
+    requireFeature(): void;
     workspaceAccess(
       request: IncomingMessage,
       id: string,
@@ -50,6 +51,7 @@ export async function handleChiefRoutes(
     );
     return true;
   }
+  deps.requireFeature();
   if (!deps.backend) {
     deps.json(
       response,

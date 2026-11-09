@@ -455,6 +455,8 @@ test("readyz lists exactly the audiences introspection accepts, never the secret
   assert.deepEqual(ready.body, {
     status: "ready",
     introspection: { enabled: true, audiences: ["https://files.selfhosted.test", "http://history.svc:8080"] },
+    license: { status: "absent" },
+    capabilities: { flows: false, relayfile: false, chief: false },
   });
   assert.equal(JSON.stringify(ready.body).includes(INTROSPECT_SECRET), false);
   const { accessToken } = await env.login(env.alpha);

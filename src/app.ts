@@ -31,6 +31,10 @@ import {
   type ControlPlaneStore,
   type Principal,
 } from "./store.js";
+import {
+  CORE_LICENSE, FeatureRefusedError, requireCapability, resolveLicense,
+  type Feature, type LoadedLicense,
+} from "./license/resolver.js";
 import { createFlowsHandler } from "./flows/routes.js";
 import { isUuid, type FlowsStore } from "./flows/store.js";
 import type { TelemetryModule } from "./telemetry/module.js";
@@ -264,7 +268,9 @@ export function browserOriginsFor(config: SelfhostConfig): string[] {
 export function createApp(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
-  flows?: FlowsStore;
+  flows?: FlowsStore | (() => FlowsStore);
+  /** Unset selects core only. Verified entitlements never replace operator selection. */
+  license?: LoadedLicense;
   admin?: AdminModule;
   telemetry?: TelemetryModule;
   /** bootstrap-signup lane: OIDC / email sign-in, invites (src/identity). */
@@ -286,6 +292,9 @@ export function createApp(input: {
     "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck">;
 }): (request: IncomingMessage, response: ServerResponse) => void {
   const { config, store, admin, telemetry, identity } = input;
+  const loadedLicense = input.license ?? CORE_LICENSE;
+  const license = () => resolveLicense(loadedLicense, input.now?.() ?? new Date());
+  const requireFeature = (feature: Feature) => requireCapability(loadedLicense, feature, input.now?.() ?? new Date());
   const browserOrigins = browserOriginsFor(config);
   const messagingDeps: MessagingDeps = {
     database: store.database,
@@ -509,6 +518,7 @@ export function createApp(input: {
     ? createFlowsHandler({
       store: input.flows,
       publicBaseUrl: config.publicBaseUrl,
+      requireFeature: () => requireFeature("flows"),
       userAccess: async (request, admin = false) => {
         const auth = await authenticate(request);
         if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
@@ -545,15 +555,32 @@ export function createApp(input: {
     }
     if (method === "GET" && path === "/readyz") {
       const readiness = await store.readiness();
+      const current = license();
+      const capabilities = current.capabilities;
       const introspection = { enabled: Boolean(config.introspectSecret), audiences: acceptedAudiences(config) };
       json(response, readiness.ready ? 200 : 503, readiness.ready
-        ? { status: "ready", introspection }
-        : { status: "not_ready", reason: readiness.reason, message: readiness.message, introspection });
+        ? { status: "ready", introspection, license: { status: current.status }, capabilities }
+        : { status: "not_ready", reason: readiness.reason, message: readiness.message, introspection, license: { status: current.status }, capabilities });
       return;
     }
     if (method === "GET" && path === "/openapi.yaml") {
       const location = resolve(dirname(fileURLToPath(import.meta.url)), "../openapi.yaml");
       text(response, 200, await readFile(location, "utf8"), "application/yaml");
+      return;
+    }
+
+    if (method === "GET" && path === "/api/v1/license") {
+      const auth = await authenticate(request);
+      if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      const current = license();
+      // This member-facing endpoint exposes effective feature state only.
+      // Installation customer, licence identifiers and seat usage stay private.
+      json(response, 200, {
+        status: current.status,
+        selected: current.selected,
+        entitled: current.entitled,
+        capabilities: current.capabilities,
+      }, true);
       return;
     }
 
@@ -1673,6 +1700,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     })) return;
     if (await handleChiefRoutes(request, response, path, {
       backend: input.chief, workspaceAccess, requestObject, json,
+      requireFeature: () => requireFeature("chief"),
       csrfAllowed: incoming => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
     })) return;
 
@@ -1713,6 +1741,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     void handle(request, response).catch((error: unknown) => {
       if (response.headersSent) {
         response.end();
+        return;
+      }
+      if (error instanceof FeatureRefusedError) {
+        json(response, error.status, { error: error.code, message: error.message, feature: error.feature }, true);
         return;
       }
       if (error instanceof HttpError || error instanceof MessagingHttpError) {

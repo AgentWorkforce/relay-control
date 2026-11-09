@@ -9,6 +9,9 @@ import { PostgresDatabase } from "./database.js";
 import { ControlPlaneStore } from "./store.js";
 import { loadFlowsConfig } from "./flows/config.js";
 import { FlowsStore } from "./flows/store.js";
+import { lazyFlowsStore } from "./flows/lazy.js";
+import { loadLicense } from "./license/load.js";
+import { gateCredentialVerifier, resolveLicense } from "./license/resolver.js";
 import { loadTelemetryConfig } from "./telemetry/config.js";
 import { createTelemetryModule } from "./telemetry/module.js";
 import { loadIdentityConfig } from "./identity/config.js";
@@ -25,6 +28,7 @@ import {
 } from "./analytics/lifecycle.js";
 
 const config = loadConfig();
+const license = loadLicense();
 const database = new PostgresDatabase(config.databaseUrl);
 
 // bootstrap-signup lane: first-boot org/workspace, OIDC/email sign-in, invites.
@@ -52,21 +56,23 @@ const identity = createIdentityModule({
   dashboardUrl: config.dashboardUrl,
   mailer: identityConfig.smtp ? smtpMailer(identityConfig.smtp) : null,
 });
-const flows = new FlowsStore(
-  database,
-  config.encryptionKeyring,
-  loadFlowsConfig(),
-  config.relaycastPublicUrl,
-);
+const flows = lazyFlowsStore(() => {
+  const instance = new FlowsStore(
+    database,
+    config.encryptionKeyring,
+    loadFlowsConfig(),
+    config.relaycastPublicUrl,
+  );
+  instance.cliCredentials = admin.logins;
+  return instance;
+});
 const admin = createAdminModule({
   config,
   database,
   keyring: config.encryptionKeyring,
   // Flows worker credentials may read their own workspace's runtime environment.
-  runtimeCredentialVerifier: (t) => flows.verifyRuntimeCredential(t),
+  runtimeCredentialVerifier: gateCredentialVerifier((t: string) => flows().verifyRuntimeCredential(t), license, "flows"),
 });
-// Subscription logins reach runs through a reference in the assignment payload.
-flows.cliCredentials = admin.logins;
 const telemetryConfig = loadTelemetryConfig(process.env, {
   probes: [
     { name: "relaycast", url: `${config.relaycastUrl}/health` },
@@ -102,11 +108,11 @@ emitConfigLoaded(analytics, {
     emailLink: identityConfig.emailLogin,
     smtp: identityConfig.smtp !== null,
   },
-  // The flows module is always mounted in this binary.
-  flowsEnabled: true,
+  // Report effective capability, not module presence.
+  flowsEnabled: resolveLicense(license, new Date()).capabilities.flows,
   operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
 });
-const server = createServer(createApp({ config, store, flows, admin, telemetry, identity, factory }));
+const server = createServer(createApp({ config, store, flows, admin, telemetry, identity, factory, license }));
 const bootstrapAbort = new AbortController();
 // Worker queue streams are long-lived SSE responses.
 server.requestTimeout = 0;

@@ -15,6 +15,8 @@ import type { SelfhostConfig } from "../src/config.js";
 import type { Database, SqlExecutor, SqlResult } from "../src/database.js";
 import { defaultFlowsConfig } from "../src/flows/config.js";
 import { FlowsStore } from "../src/flows/store.js";
+import { loadLicense } from "../src/license/load.js";
+import { gateCredentialVerifier } from "../src/license/resolver.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { pathToFileURL } from 'node:url';
@@ -68,13 +70,14 @@ const config: SelfhostConfig = {
   oauthRedirectUrl: `${process.env.SELFHOST_PUBLIC_URL ?? origin}/api/v1/integrations/oauth/callback`,
   dashboardUrl: process.env.SELFHOST_DASHBOARD_URL ?? `${process.env.SELFHOST_PUBLIC_URL ?? origin}/`,
 };
+const license = loadLicense();
 const store = new ControlPlaneStore(database, config.encryptionKeyring, 1);
 const flows = new FlowsStore(database, config.encryptionKeyring, defaultFlowsConfig(), config.relaycastPublicUrl);
 const admin = createAdminModule({
   config,
   database,
   keyring: config.encryptionKeyring,
-  runtimeCredentialVerifier: (t) => flows.verifyRuntimeCredential(t),
+  runtimeCredentialVerifier: gateCredentialVerifier((t: string) => flows.verifyRuntimeCredential(t), license, "flows"),
 });
 // Explicit operator-selected local provider. Never a browser-controlled module or auth bypass.
 const chief: ChiefBackend | undefined = process.env.DEV_CHIEF_MODULE
@@ -82,7 +85,7 @@ const chief: ChiefBackend | undefined = process.env.DEV_CHIEF_MODULE
       dataDir: process.env.DEV_CHIEF_DATA_DIR,
     })
   : undefined;
-const server = createServer(createApp({ config, store, flows, admin, chief }));
+const server = createServer(createApp({ config, store, flows, admin, chief, license }));
 server.requestTimeout = 0;
 
 const existing = await store.listOrganizations();

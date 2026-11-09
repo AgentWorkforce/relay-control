@@ -47,18 +47,56 @@ Included:
 
 Explicitly absent: billing, fleet, and Relayfile.
 
+### Core and optional capabilities
+
+Core sessions, messaging, workspace administration and hosted MCP need no
+licence. With `SELFHOST_FEATURES` unset, the effective `flows`, `relayfile` and
+`chief` capabilities are all false. `GET /api/v1/license` (also `/cloud/api/v1/license`)
+requires a signed-in user, sends `Cache-Control: no-store`, and returns
+`{status, selected, entitled, capabilities}`. Each capability is a boolean.
+The member-facing response contains no licence identifier, customer details,
+seat limit, seat usage or notes. There is no installation licence administration
+endpoint in this build.
+
+`SELFHOST_FEATURES` is a comma-separated operator selection of `flows`,
+`relayfile` and `chief`; unknown names are startup errors. Chief needs selection
+but no paid entitlement. Flows and Relayfile additionally require a valid,
+unexpired signed licence that names the feature. A signed entitlement alone
+does not select a feature. This Control build does not implement the Relayfile
+service or activate its external workloads.
+
+The release currently compiles no licence verification key, so paid capabilities
+remain false even if a document is supplied. `SELFHOST_LICENSE` and
+`SELFHOST_LICENSE_FILE` are mutually exclusive optional document sources.
+Invalid, expired or unreadable documents do not prevent core startup. No runtime
+public-key override is supported, including under `NODE_ENV=test`; changing the
+trusted key requires an explicit source change and a new release. Unit tests
+inject a verifier into a pure loader and do not configure a production key.
+
+Flows routes refuse with 403 `feature_not_enabled` or `feature_not_licensed`
+before mutations, enrollment redemption, callback recording or queue work.
+Existing worker/run credentials are still authenticated before the refusal;
+unknown credentials remain unauthorized. An open worker queue rechecks the
+capability before further work. Core startup and ordinary core requests do not
+initialize optional Flows storage. Requesting its protocol may initialize the
+credential/storage adapter to authenticate existing credentials, but cannot
+start work while the capability is off. Aggregate analytics records the
+effective Flows capability rather than assuming the module is enabled.
+
 ### Relay Chief integration
 
 `createApp` accepts an optional `chief` backend implemented by `relay-chief`.
 Workspace-scoped `/cloud/api/v1/workspaces/:id/chiefs` routes preserve the existing
 cookie/bearer login and workspace membership checks. Setup and scans require an
-owner/admin; cookie mutations require same-origin JSON. Without a backend the
-routes return an explicit unavailable response.
+owner/admin; cookie mutations require same-origin JSON. With Chief selected, a missing backend returns a real 503 `chief_unavailable`
+response. With Chief unselected, authorized requests receive 403
+`feature_not_enabled`; this never provides a stub Chief implementation.
 
 For integrated local validation, `scripts/dev-server.ts` accepts a trusted
 operator-selected `DEV_CHIEF_MODULE` exporting `createChiefBackend({dataDir})`,
 with `DEV_CHIEF_DATA_DIR` pointing to a private state directory. This development
 composition is not enabled by production startup and does not provision EC2.
+Select `SELFHOST_FEATURES=chief` for that optional local composition.
 Set `SELFHOST_DASHBOARD_URL` when the local dashboard origin differs from the API.
 
 ## Configuration
@@ -498,7 +536,8 @@ Workspace environment and integrations reach runs this way:
 - **Just-in-time tokens.** A worker token can also read
   `/internal/v1/workspaces/{id}/integrations/{provider}/token`. To enable
   this, pass `runtimeCredentialVerifier: (token) =>
-  flows.verifyRuntimeCredential(token)` to `createAdminModule`.
+  gateCredentialVerifier((token) => flows.verifyRuntimeCredential(token), license, "flows")`
+  to `createAdminModule`, using the loaded licence and selection.
 - **v1 shell steps.** The v1 runtime passes only an allow-listed environment
   to `deterministic` shell steps. Delivered values reach the runtime and agent
   steps, not arbitrary shell commands.

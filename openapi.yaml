@@ -76,6 +76,40 @@ tags:
         The provider that holds the hosted feed's per-profile Ed25519 private
         keys is unresolved. A private key stored in Postgres is not a fallback.
 paths:
+  /api/v1/license:
+    get:
+      summary: Effective installation capabilities for a signed-in user
+      description: |
+        Core needs no licence. Optional capabilities are off unless selected;
+        paid features additionally require a valid unexpired entitlement.
+        This member-facing response contains no customer or seat metadata.
+        Bootstrap and service credentials are not user credentials.
+      responses:
+        "200":
+          description: Effective feature state. Cache-Control is no-store.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status, selected, entitled, capabilities]
+                properties:
+                  status:
+                    type: string
+                    enum: [absent, invalid, expired, valid]
+                  selected:
+                    $ref: "#/components/schemas/ProductCapabilities"
+                  entitled:
+                    type: object
+                    additionalProperties: false
+                    required: [flows, relayfile]
+                    properties:
+                      flows: {type: boolean}
+                      relayfile: {type: boolean}
+                  capabilities:
+                    $ref: "#/components/schemas/ProductCapabilities"
+        "401":
+          description: A signed-in user is required
   /api/v1/mcp/shared-sessions:
     post:
       operationId: hostedMcpSharedSessions
@@ -5163,6 +5197,14 @@ components:
       description: A declared `expected_assets[].name`; one path segment.
       schema: { type: string, maxLength: 255, pattern: "^[A-Za-z0-9][A-Za-z0-9_+-]*(?:\\.[A-Za-z0-9_+-]+)*$" }
   schemas:
+    ProductCapabilities:
+      type: object
+      additionalProperties: false
+      required: [flows, relayfile, chief]
+      properties:
+        flows: {type: boolean}
+        relayfile: {type: boolean}
+        chief: {type: boolean}
     SessionReadCredentials:
       type: object
       additionalProperties: false

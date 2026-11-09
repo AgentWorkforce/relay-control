@@ -1,3 +1,4 @@
+import { testLicense } from "./support/license.js";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
@@ -122,7 +123,7 @@ async function setup(t: test.TestContext) {
     credentialBackend: new PostgresObjectBackend(database),
   });
   flows.cliCredentials = admin.logins;
-  control.on("request", createApp({ config, store, flows, admin }));
+  control.on("request", createApp({ config, store, flows, admin, license: testLicense() }));
   t.after(async () => {
     await close(control);
     await database.close();
