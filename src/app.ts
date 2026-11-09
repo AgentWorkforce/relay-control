@@ -437,6 +437,7 @@ export function createApp(input: {
   }) : null;
   const mcpOAuth = createMcpOAuthHttpModule({
     config,mountedResources:["/mcp","/api/v1/mcp/shared-sessions"],
+    clientAddress:request=>limiterKey(clientIp(request)),
     createStore:({protocol,issuer})=>new McpOAuthStore(store.database,{
       protocol,tenancyMode:store.tenancy,now:input.now,issueIdToken:issuer?.issueMcpOidcIdToken,
       isGrokRoutine:(request,client)=>request.resourcePath==="/api/v1/mcp/relay-events" &&

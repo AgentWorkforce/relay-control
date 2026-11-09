@@ -87,6 +87,12 @@ test("HTTP module stays disabled by default and discovery advertises only declar
     assert.equal(result!.status,200);
     assert.equal((await result!.json()).resource,declared.protocol!.mcpResourceUrl(path));
     assert.equal(result!.headers.get("access-control-allow-origin"),"*");
+    const standard="/.well-known/oauth-protected-resource"+new URL(declared.protocol!.mcpResourceUrl(path)).pathname;
+    const alias=(await declared.handle(web(standard)))!;
+    assert.equal(alias.status,200);
+    assert.equal((await alias.json()).resource,declared.protocol!.mcpResourceUrl(path));
+    assert.equal(alias.headers.get("access-control-allow-origin"),"*");
+    assert.equal((await declared.handle(web(standard,undefined,{},"OPTIONS")))!.status,204);
   }
   assert.equal(await declared.handle(web("/cloud/api/v1/mcp/relay-events")),null);
 });

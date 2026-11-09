@@ -1,6 +1,6 @@
 /**
  * Register/token/revoke handlers ported from Cloud 1776499a. Storage is
- * injected; routes.ts supplies body bounds, TCP-peer rate limiting and the
+ * injected; routes.ts supplies body bounds, client-address rate limiting and the
  * default-off module gate.
  */
 import { parseClientRegistration, type ClientRegistrationInput, type OAuthErrorBody } from "./protocol.js";

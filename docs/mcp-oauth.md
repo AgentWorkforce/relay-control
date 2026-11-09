@@ -35,6 +35,8 @@ An unauthenticated MCP POST returns a Bearer challenge with the resource's
 metadata URL. Clients should follow that URL rather than construct it.
 The standard issuer-discovery alias
 `/.well-known/oauth-authorization-server/cloud` is also served.
+Shared-resource metadata is also available at
+`/.well-known/oauth-protected-resource/cloud/api/v1/mcp/shared-sessions`.
 Bare `/api/oauth/*` and `/api/v1/oauth/grants*` routes are not mounted.
 
 ## Consent and credentials
@@ -110,9 +112,12 @@ past blocked records. Database row locks coordinate workers. Each cleanup
 request to Relaycast has a 10-second abort deadline.
 
 Issuer requests have a 64 KiB body limit. Public registration allows 20
-requests per TCP peer per hour and 500 per process per hour. Forwarded headers
-do not choose the peer identity. Account and consent endpoints do not enable
-public credentialed CORS.
+requests per client-address bucket per hour and 500 per process per hour.
+Control uses its `SELFHOST_TRUSTED_PROXIES` policy and groups IPv6 addresses
+by /64. The default of zero trusted proxies ignores forwarded headers and
+uses the socket peer. Standalone module callers without an address resolver
+also use the socket peer. Account and consent endpoints do not enable public
+credentialed CORS.
 
 Events and its pump have separate default-off settings:
 `SELFHOST_MCP_EVENTS` and `SELFHOST_MCP_EVENTS_PUMP`; the pump requires Events.

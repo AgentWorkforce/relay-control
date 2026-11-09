@@ -169,7 +169,7 @@ paths:
       operationId: mcpOAuthSharedResourceMetadata
       tags: [MCP OAuth]
       summary: Discover the shared-sessions MCP resource.
-      description: Follow the MCP Bearer challenge's metadata URL; the repeated cloud path component is intentional.
+      description: Also served at /.well-known/oauth-protected-resource/cloud/api/v1/mcp/shared-sessions. The existing Bearer challenge URL is preserved.
       security: []
       responses:
         "200":
@@ -315,7 +315,9 @@ paths:
       description: |
         No client secret. JSON body, 64 KiB maximum. Redirects must be absolute
         HTTPS or loopback HTTP without credentials or fragments. Limited to
-        20 requests per TCP peer per hour and 500 per process per hour.
+        20 requests per trusted client-address bucket per hour (IPv6 /64) and
+        500 per process per hour. SELFHOST_TRUSTED_PROXIES defaults to zero;
+        forwarded headers are then ignored and the socket peer is used.
       security: []
       requestBody:
         required: true

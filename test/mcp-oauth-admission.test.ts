@@ -430,6 +430,31 @@ test("blocked old teardown records cannot starve later releasable work",async t=
   assert.equal(f.world.agents.has("approved-agent"),false);
 });
 
+test("registration follows configured proxy trust without sharing an ingress bucket or trusting spoofed hops",async t=>{
+  const f=await relayFixture(t),config=appConfig();
+  const before=process.env.SELFHOST_TRUSTED_PROXIES;
+  t.after(()=>{
+    if(before===undefined)delete process.env.SELFHOST_TRUSTED_PROXIES;
+    else process.env.SELFHOST_TRUSTED_PROXIES=before;
+  });
+  process.env.SELFHOST_TRUSTED_PROXIES="0";
+  const store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
+  const server=createServer(createApp({config,store,messagingFetch:f.fetchImpl,mcpOAuthTeardown:f.teardown}));
+  const base=await listen(server);t.after(()=>close(server));
+  const register=(forwarded:string)=>fetch(base+"/cloud/api/oauth/register",{method:"POST",
+    headers:{"content-type":"application/json","x-forwarded-for":forwarded},
+    body:JSON.stringify({redirect_uris:["https://client.example.test/cb"]}),
+  });
+  for(let index=0;index<20;index++)assert.equal((await register(`192.0.2.${index+1}`)).status,201);
+  assert.equal((await register("198.51.100.100")).status,429,"untrusted forwarded addresses cannot evade the socket bucket");
+  process.env.SELFHOST_TRUSTED_PROXIES="1";
+  for(let index=0;index<20;index++)assert.equal((await register(`203.0.113.${index+1}, 198.51.100.7`)).status,201);
+  assert.equal((await register("192.0.2.200, 198.51.100.7")).status,429,"spoofed leftmost hops cannot evade the trusted client bucket");
+  assert.equal((await register("198.51.100.8")).status,201,"a different trusted client behind the same socket has its own budget");
+  for(let index=0;index<20;index++)assert.equal((await register(`2001:db8:abcd:1::${index+1}`)).status,201);
+  assert.equal((await register("2001:db8:abcd:1::ffff")).status,429,"IPv6 addresses in one /64 share a budget");
+});
+
 test("disabled module exposes no issuer, root facade or grant API and cannot admit its stored tokens",async t=>{
   const f=await relayFixture(t),config=appConfig(false);
   const store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});

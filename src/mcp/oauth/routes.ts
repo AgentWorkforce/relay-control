@@ -59,6 +59,7 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
   workspaceAccess(principal:TenantOwner):Promise<boolean>;
   workspaceLabel?(principal:McpConsentPrincipal):Promise<string>;
   checkAgentNameAvailability(principal:TenantOwner,name:string):Promise<AgentNameAvailability>;
+  clientAddress?(request:IncomingMessage):string;
   now?:()=>Date;
   afterMutation?():void;
 }) {
@@ -79,14 +80,18 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
   const limiter=new RateLimiter(()=>now().getTime());
   const addresses=new WeakMap<Request,string>();
   const publicHandlers=createMcpOAuthPublicHandlers({store,oidcEnabled,allowRegistration:request=>{
-    // TCP peer identity is supplied by the adapter, never an arbitrary forwarded header.
+    // The adapter supplies a trusted address; forwarded headers alone cannot choose it.
     if(!limiter.consume("registration-global",500,3_600_000).allowed) return false;
     return limiter.consume(`registration:${addresses.get(request)??"unknown"}`,20,3_600_000).allowed;
   }});
   const consent=createMcpOAuthConsentHandlers({protocol,store,resolveSession:deps.resolveSession,
     workspaceAccess:deps.workspaceAccess,checkAgentNameAvailability:deps.checkAgentNameAvailability,
     now:()=>now().getTime()});
-  const metadata=new Map(resources.map(resource=>[new URL(protocol!.protectedResourceMetadataUrl(resource)).pathname,resource]));
+  const metadata=new Map(resources.flatMap(resource=>{
+    const primary=new URL(protocol.protectedResourceMetadataUrl(resource)).pathname;
+    const standard="/.well-known/oauth-protected-resource"+new URL(protocol.mcpResourceUrl(resource)).pathname;
+    return [...new Set([primary,standard])].map(path=>[path,resource] as const);
+  }));
   const discovery=new Set([`${APP_BASE_PATH}/.well-known/oauth-authorization-server`,`${APP_BASE_PATH}/.well-known/openid-configuration`,
     "/.well-known/oauth-authorization-server/cloud","/.well-known/openid-configuration/cloud"]);
   const jwks=`${APP_BASE_PATH}/.well-known/jwks.json`;
@@ -237,7 +242,8 @@ form.addEventListener('submit',event=>{event.preventDefault();decide('approve');
       response.writeHead(error instanceof BodyLimit?413:400,{"content-type":"application/json","cache-control":"no-store",connection:"close"});
       response.end(JSON.stringify({error:error instanceof BodyLimit?"payload_too_large":"invalid_request"}));return true;
     }
-    const result=await handle(new Request(url,{method:request.method??"GET",headers,...(text===undefined?{}:{body:text})}),request.socket.remoteAddress??"unknown");
+    const result=await handle(new Request(url,{method:request.method??"GET",headers,...(text===undefined?{}:{body:text})}),
+      deps.clientAddress?.(request)??request.socket.remoteAddress??"unknown");
     if(!result) return false;
     const responseHeaders:Record<string,string>={};result.headers.forEach((value,key)=>{responseHeaders[key]=value;});
     response.writeHead(result.status,responseHeaders);response.end(Buffer.from(await result.arrayBuffer()));return true;
