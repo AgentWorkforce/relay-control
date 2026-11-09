@@ -35,6 +35,8 @@ export type SelfhostConfig = {
   relayhistoryReadApiEvents?: boolean;
   /** RELAYFILE_CONTROL_BROKER_SECRET: Flows credential broker routes. Unset: they 404. */
   relayfileControlBrokerSecret?: string | null;
+  /** RELAYCHIEF_CONTROL_RELAY_SECRET: chief agent registration route. Unset: it 404s. */
+  chiefRelaySecret?: string | null;
   /** Independent read service; owns issuance, rotation and verification of its tokens. */
   sessionReadApi?: { url: string; publicUrl: string; secret: string } | null;
   /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
@@ -367,6 +369,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     relayhistoryReadApiEvents,
     sessionReadApi,
     relayfileControlBrokerSecret: loadBrokerSecret(env),
+    chiefRelaySecret: loadChiefRelaySecret(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
     sessionSearchAgentTokens: loadSessionSearchAgentTokens(env),
@@ -406,6 +409,16 @@ function loadSessionErasureApiConfig(env: Env): SelfhostConfig["sessionErasureAp
     throw new Error("SESSION_ERASE_API_SECRET (or _FILE) must be at least 32 bytes");
   }
   return { url: serviceUrl(env, "SESSION_ERASE_API_URL"), secret };
+}
+
+function loadChiefRelaySecret(env: Env): string | null {
+  const secret = readSecret(env, "RELAYCHIEF_CONTROL_RELAY_SECRET");
+  if (!secret) return null;
+  if (Buffer.byteLength(secret) < 32) throw new Error("RELAYCHIEF_CONTROL_RELAY_SECRET (or _FILE) must be at least 32 bytes");
+  if (secret === readSecret(env, "RELAYFILE_CONTROL_BROKER_SECRET")) {
+    throw new Error("RELAYCHIEF_CONTROL_RELAY_SECRET must differ from RELAYFILE_CONTROL_BROKER_SECRET");
+  }
+  return secret;
 }
 
 function loadBrokerSecret(env: Env): string | null {
