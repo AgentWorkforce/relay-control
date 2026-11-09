@@ -713,6 +713,35 @@ test("send_relay_message auto-joins, sends, replies, and reads the conversation"
   assert.equal(read.earlier, null);
 });
 
+test("send_relay_message to an exact machine address sends address only and is delivered", async (t) => {
+  const env = await setup(t);
+  const peer = env.relay.world.addAgent("peer-bot");
+  const address = `peer-bot@cloud-${peer.id}`;
+  const client = await relayClient(t, env);
+  const sent = await client.callTool({ name: "send_relay_message", arguments: { to: address, text: "by address" } });
+  assert.notEqual(sent.isError, true, JSON.stringify(sent.content));
+  const data = structured(sent);
+  assert.equal(data.to, "peer-bot");
+  assert.equal(data.to_address, address);
+  const dm = env.relay.world.bodies.filter(call => call.method === "POST" && call.path === "/v1/dm");
+  assert.deepEqual(dm.map(call => call.body), [{ address, text: "by address" }]);
+  assert.deepEqual(env.relay.world.deliveries.filter(row => row.agent === "peer-bot").map(row => row.message.text), ["by address"]);
+
+  // A bare name still sends the name only.
+  structured(await client.callTool({ name: "send_relay_message", arguments: { to: "peer-bot", text: "by name" } }));
+  const byName = env.relay.world.bodies.filter(call => call.method === "POST" && call.path === "/v1/dm");
+  assert.deepEqual(byName.at(-1)!.body, { to: "peer-bot", text: "by name" });
+});
+
+test("an upstream schema refusal on send names invalid_request", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-bot");
+  const client = await relayClient(t, env);
+  env.relay.world.failNext("POST", "/v1/dm", 400, { code: "invalid_request" });
+  assert.match(toolError(await client.callTool({ name: "send_relay_message", arguments: { to: "peer-bot", text: "x" } })),
+    /status=400 code=invalid_request\./);
+});
+
 test("check_relay_inbox enriches and acknowledges deliveries", async (t) => {
   const env = await setup(t);
   env.relay.world.addAgent("peer-bot");
@@ -1090,4 +1119,26 @@ test("search_shared_sessions: an agent lists that agent's sessions; text cannot 
     assert.equal(refused.isError, true, JSON.stringify(args));
   }
   assert.equal(env.history.paths.length, before);
+});
+
+
+test("an addressed MCP send pins one machine and retains its retry receipt", async (t) => {
+  const env = await setup(t);
+  const peer = env.relay.world.addAgent("machine-peer");
+  const address = `machine-peer@cloud-${peer.id}`;
+  const client = await relayClient(t, env);
+  const args = { to: address, text: "one machine-bound message", idempotency_key: "stable-machine-send-key" };
+  const first = structured(await client.callTool({ name: "send_relay_message", arguments: args }));
+  assert.equal(first.to, "machine-peer");
+  assert.equal(first.to_address, address);
+  assert.equal(first.idempotency_key, args.idempotency_key);
+  const requests = env.relay.world.bodies.filter(call => call.path === "/v1/dm");
+  assert.deepEqual(requests[0]?.body, { address, text: args.text });
+  const again = structured(await client.callTool({ name: "send_relay_message", arguments: args }));
+  assert.equal(again.message_id, first.message_id);
+  assert.equal(env.relay.world.deliveries.filter(row => row.agent === "machine-peer").length, 1);
+  const beforeRefusal = env.relay.world.bodies.filter(call => call.path === "/v1/dm").length;
+  const refused = await client.callTool({ name: "send_relay_message", arguments: { ...args, to: "machine-peer@another-machine" } });
+  assert.match(toolError(refused), /Unknown agent name or stale machine address/);
+  assert.equal(env.relay.world.bodies.filter(call => call.path === "/v1/dm").length, beforeRefusal);
 });
