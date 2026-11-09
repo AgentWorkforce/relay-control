@@ -24,6 +24,8 @@ export type SelfhostConfig = {
   relayhistoryReadApiUrl?: string | null;
   /** Independent read service; owns issuance, rotation and verification of its tokens. */
   sessionReadApi?: { url: string; publicUrl: string; secret: string } | null;
+  /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
+  sessionErasureApi?: { url: string; secret: string } | null;
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
   sessionReadMcpReads?: boolean;
   relayhistoryPublicUrl: string;
@@ -60,11 +62,31 @@ export type SelfhostConfig = {
   acquisitionIssuer?: AcquisitionIssuerConfig | null;
   /** Factory sessions (src/factory). Unset or enabled=false: routes 404, worker off. */
   factory?: FactoryConfig;
+  /**
+   * Desktop feed (docs/desktop-feed.md). Null or absent turns the feature off
+   * and every feed route answers 404 like any unknown path.
+   */
+  desktopFeed?: DesktopFeedConfig | null;
   port: number;
   host: string;
 };
 
-type Env = Record<string, string | undefined>;
+export type DesktopFeedSignerConfig =
+  | { kind: "memory"; label: string }
+  | { kind: "awskms"; region: string; label: string; keyAliases: Record<string, string> };
+
+export type DesktopFeedStorageConfig =
+  | { kind: "memory" }
+  | { kind: "s3"; bucket: string; region: string; prefix: string };
+
+export type DesktopFeedConfig = {
+  signer: DesktopFeedSignerConfig;
+  storage: DesktopFeedStorageConfig;
+  /** sha256 hex of each env-configured publisher token, by profile id. */
+  publisherTokenHashes?: Record<string, string[]>;
+};
+
+export type Env = Record<string, string | undefined>;
 
 export type AcquisitionPublishedKey = {
   issuerKeyId: string;
@@ -307,6 +329,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     relayhistoryPublicUrl,
     relayhistoryReadApiUrl,
     sessionReadApi: loadSessionReadApiConfig(env),
+    sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
     ...introspection,
     acquisitionIssuer: loadAcquisitionIssuerConfig(env, introspection),
@@ -327,6 +350,15 @@ function loadSessionReadMcpReads(env: Env): boolean {
     throw new Error("SESSION_READ_API_MCP_READS requires the session read API to be configured");
   }
   return true;
+}
+
+function loadSessionErasureApiConfig(env: Env): SelfhostConfig["sessionErasureApi"] {
+  const secret = readSecret(env, "SESSION_ERASE_API_SECRET");
+  if (!secret && !env.SESSION_ERASE_API_URL?.trim()) return null;
+  if (!secret || Buffer.byteLength(secret) < 32) {
+    throw new Error("SESSION_ERASE_API_SECRET (or _FILE) must be at least 32 bytes");
+  }
+  return { url: serviceUrl(env, "SESSION_ERASE_API_URL"), secret };
 }
 
 function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {
@@ -553,6 +585,7 @@ function loadAdminConfig(env: Env, publicBaseUrl: string): {
   oauthRedirectUrl: string;
   dashboardUrl: string;
   operatorOAuthApps: Record<string, OperatorOAuthApp>;
+  desktopFeed: DesktopFeedConfig | null;
 } {
   const internalServiceToken = readSecret(env, "SELFHOST_INTERNAL_TOKEN") ?? null;
   if (internalServiceToken !== null && Buffer.byteLength(internalServiceToken) < 32) {
@@ -571,9 +604,106 @@ function loadAdminConfig(env: Env, publicBaseUrl: string): {
     oauthRedirectUrl,
     dashboardUrl: absoluteHttpUrl(env, "SELFHOST_DASHBOARD_URL", `${publicBaseUrl}/`),
     operatorOAuthApps: loadOperatorOAuthApps(env),
+    desktopFeed: loadDesktopFeedConfig(env),
   };
 }
 
+const FEED_PROFILE_ID = /^[a-z0-9]{1,32}$/;
+const KMS_ALIAS = /^alias\/(?!aws\/)[A-Za-z0-9/_-]{1,250}$/;
+
+function feedProfileMap(env: Env, name: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(env[name] ?? "");
+  } catch {
+    throw new Error(`${name} must be a JSON object keyed by profile id`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${name} must be a JSON object keyed by profile id`);
+  }
+  for (const profile of Object.keys(parsed)) {
+    if (!FEED_PROFILE_ID.test(profile)) throw new Error(`${name} has a profile id that is not ^[a-z0-9]{1,32}$`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/**
+ * SELFHOST_DESKTOP_FEED_SIGNER (awskms | memory) and
+ * SELFHOST_DESKTOP_FEED_STORAGE (s3 | memory) together turn the feed on;
+ * with neither set it is off. Setting only one is a configuration error, so a
+ * half-configured feed never starts silently disabled.
+ */
+export function loadDesktopFeedConfig(env: Env = process.env): DesktopFeedConfig | null {
+  const signerKind = env.SELFHOST_DESKTOP_FEED_SIGNER?.trim();
+  const storageKind = env.SELFHOST_DESKTOP_FEED_STORAGE?.trim();
+  if (!signerKind && !storageKind) return null;
+  if (!signerKind || !storageKind) {
+    throw new Error("SELFHOST_DESKTOP_FEED_SIGNER and SELFHOST_DESKTOP_FEED_STORAGE must be set together");
+  }
+  // The memory backends lose their key and objects on restart: tests and dev only.
+  if (env.NODE_ENV === "production" && (signerKind === "memory" || storageKind === "memory")) {
+    throw new Error("The memory desktop feed signer and storage are for tests and development, not NODE_ENV=production");
+  }
+  const label = env.SELFHOST_DESKTOP_FEED_KEY_LABEL?.trim() || (signerKind === "awskms" ? "k1" : "dev");
+  if (!/^[a-z0-9]{1,16}$/.test(label)) throw new Error("SELFHOST_DESKTOP_FEED_KEY_LABEL must match ^[a-z0-9]{1,16}$");
+  let signer: DesktopFeedSignerConfig;
+  if (signerKind === "awskms") {
+    const region = env.SELFHOST_DESKTOP_FEED_KMS_REGION?.trim() || env.AWS_REGION?.trim() || "";
+    if (!/^[a-z0-9-]+$/.test(region)) {
+      throw new Error("SELFHOST_DESKTOP_FEED_KMS_REGION (or AWS_REGION) is required for the awskms feed signer");
+    }
+    const aliases = feedProfileMap(env, "SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES");
+    if (Object.keys(aliases).length === 0) {
+      throw new Error("SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES must name at least one profile");
+    }
+    for (const alias of Object.values(aliases)) {
+      if (typeof alias !== "string" || !KMS_ALIAS.test(alias)) {
+        throw new Error("SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES values must look like alias/name");
+      }
+    }
+    signer = { kind: "awskms", region, label, keyAliases: aliases as Record<string, string> };
+  } else if (signerKind === "memory") {
+    signer = { kind: "memory", label };
+  } else {
+    throw new Error("SELFHOST_DESKTOP_FEED_SIGNER must be awskms or memory");
+  }
+  let storage: DesktopFeedStorageConfig;
+  if (storageKind === "s3") {
+    const bucket = required(env, "SELFHOST_DESKTOP_FEED_S3_BUCKET");
+    // Dots would break TLS on the virtual-hosted host signed URLs point at.
+    if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(bucket)) {
+      throw new Error("SELFHOST_DESKTOP_FEED_S3_BUCKET must be a bucket name without dots");
+    }
+    const region = env.SELFHOST_DESKTOP_FEED_S3_REGION?.trim() || env.AWS_REGION?.trim()
+      || (signer.kind === "awskms" ? signer.region : "");
+    if (!region || !/^[a-z0-9-]+$/.test(region)) {
+      throw new Error("SELFHOST_DESKTOP_FEED_S3_REGION (or AWS_REGION) is required for s3 feed storage");
+    }
+    // Unset, empty or only slashes: the default. Segments use only characters
+    // that encodeURIComponent and SigV4 canonical encoding agree on.
+    const prefix = (env.SELFHOST_DESKTOP_FEED_S3_PREFIX ?? "").trim().replace(/^\/+|\/+$/g, "") || "desktop-feed";
+    if (!/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(prefix)
+      || prefix.split("/").some((segment) => segment === "." || segment === "..")) {
+      throw new Error("SELFHOST_DESKTOP_FEED_S3_PREFIX must be [A-Za-z0-9._-] segments separated by /");
+    }
+    storage = { kind: "s3", bucket, region, prefix };
+  } else if (storageKind === "memory") {
+    storage = { kind: "memory" };
+  } else {
+    throw new Error("SELFHOST_DESKTOP_FEED_STORAGE must be s3 or memory");
+  }
+  const publisherTokenHashes: Record<string, string[]> = {};
+  if (env.SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES?.trim()) {
+    const entries = feedProfileMap(env, "SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES");
+    for (const [profile, hashes] of Object.entries(entries)) {
+      if (!Array.isArray(hashes) || !hashes.every((hash) => typeof hash === "string" && /^[0-9a-f]{64}$/.test(hash))) {
+        throw new Error("SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES values must be arrays of sha256 hex");
+      }
+      publisherTokenHashes[profile] = hashes as string[];
+    }
+  }
+  return { signer, storage, publisherTokenHashes };
+}
 export function loadDatabaseUrl(env: Env = process.env): string {
   return required(env, "DATABASE_URL", true);
 }
@@ -607,6 +737,7 @@ export function configFingerprint(config: SelfhostConfig): string {
       config.relayhistoryPublicUrl,
       ...(config.relayhistoryReadApiUrl ? [config.relayhistoryReadApiUrl] : []),
       ...(config.sessionReadApi ? [config.sessionReadApi.url, config.sessionReadApi.publicUrl] : []),
+      ...(config.sessionErasureApi ? [config.sessionErasureApi.url] : []),
     ].join("\n"))
     .digest("hex")
     .slice(0, 12);

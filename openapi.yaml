@@ -14,15 +14,19 @@ info:
     same-origin HttpOnly session cookie issued by `/login`.
     Client-visible Relaycast and RelayHistory URLs are explicit public HTTPS
     origins and are distinct from internal server-to-server upstream URLs.
-    Desktop feed (`/api/v1/desktop/feed/*`, tag "Desktop feed (draft contract)")
-    is a draft contract only (x-status proposed; Cloud team decides, not yet
-    confirmed); this server implements none of it. Signing: the
+    Desktop feed (`/api/v1/desktop/feed/*`, tag "Desktop feed") is
+    implemented and off unless SELFHOST_DESKTOP_FEED_SIGNER and
+    SELFHOST_DESKTOP_FEED_STORAGE are set; operations still marked
+    x-status proposed deviate from this document (docs/desktop-feed.md,
+    "Deviations from the contract"). Signing: the
     hosted feed signs each release at publish with Ed25519 (RFC 8032) over the
     RFC 8785 (JCS) canonical UTF-8 bytes of the envelope's `manifest` object;
     `key_id` selects the key, and a client holds one key and refuses any
     other. Self-hosted and customer deployments import or mirror pre-signed
-    envelopes and verify them against the profile's public key; they hold no
-    private key. The signer provider is unresolved (x-status unresolved).
+    envelopes and verify them against the profile's public key. A
+    relaycontrol site signs each profile with that profile's own AWS KMS
+    Ed25519 key, addressed by alias (x-signer-provider awskms); the private
+    key never leaves KMS.
 servers:
   - url: "{controlPlaneUrl}"
     variables:
@@ -36,6 +40,9 @@ tags:
       Dormant cloud-class acquisition assertion issuer (flag
       SELFHOST_ACQUISITION_ISSUER_ENABLED, default off). See
       docs/acquisition-issuer.md.
+  - name: amp
+    description: |
+      Amp thread control (SELFHOST_AMP_ENABLED, default off). See docs/amp.md.
   - name: factory
     description: |
       Factory sessions (docs/factory-sessions.md). Every operation answers
@@ -45,13 +52,13 @@ tags:
     description: |
       In-cluster service routes under /internal/v1. Never served through the
       /cloud alias; each operation names the service credential it accepts.
-  - name: Desktop feed (draft contract)
-    x-status: proposed
+  - name: Desktop feed
     description: |
       Private, workspace-authenticated release feed for enterprise Desktop
       profiles (relay-desktop docs/enterprise-distribution.md at 21e61026;
-      contract notes in docs/desktop-feed.md). Status: proposed, Cloud team
-      decides, not yet confirmed. Nothing here is implemented.
+      contract notes in docs/desktop-feed.md). Status: implemented; deviations
+      are listed in docs/desktop-feed.md and keep `x-status: proposed` on
+      their operations.
 
       Credentials: workspace bearer (`bearerAuth`, the desktop-core session),
       `installToken`, browser session (`cookieAuth`, `/cloud` mount only) and
@@ -74,12 +81,12 @@ tags:
       Rate limits on every endpoint answer 429 with Retry-After; per-profile
       quota and retention appear in the publisher's version listing
       (`DesktopFeedLimits`).
-    x-proposed-default: "gcpkms hosted, awskms non-production; see docs/desktop-feed.md Proposed defaults"
     x-signer-provider:
-      x-status: unresolved
+      provider: awskms
       description: |
-        The provider that holds the hosted feed's per-profile Ed25519 private
-        keys is unresolved. A private key stored in Postgres is not a fallback.
+        AWS KMS key (ECC_NIST_EDWARDS25519, Sign with MessageType RAW and
+        ED25519_SHA_512, 4096-byte message cap), one key per profile,
+        addressed by alias. A private key stored in Postgres is not a fallback.
 paths:
   /api/v1/mcp/shared-sessions:
     post:
@@ -843,6 +850,24 @@ paths:
                 $ref: "#/components/schemas/Whoami"
         "401":
           description: Invalid, expired, rotated, or revoked bearer
+  /api/v1/license:
+    get:
+      operationId: getLicense
+      description: |
+        Installation capability read for any signed-in member (bearer or, on
+        the /cloud mount, the session cookie). Entitlement is per installation,
+        so there is no organization or workspace parameter. Carries no secret
+        material. `capabilities` is the only field a client uses to show or
+        hide a feature. Not available to the bootstrap bearer.
+      responses:
+        "200":
+          description: Licence status, selection, entitlement and capabilities
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/License"
+        "401":
+          description: Missing, invalid, or expired user token
   /api/v1/organizations:
     get:
       operationId: listOrganizations
@@ -1326,6 +1351,65 @@ paths:
         "403": { description: Owner/admin role required, or cross-origin cookie request }
         "404": { description: Organization not found }
         "409": { description: "`revision_mismatch`" }
+  /api/v1/organizations/{organizationId}/sessions/{sessionId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: sessionId
+        in: path
+        required: true
+        schema: { type: string, maxLength: 512 }
+    delete:
+      operationId: hardDeleteSession
+      description: |
+        Organization owner/admin or bootstrap bearer. Permanently erases one
+        session and its derived server-side artifacts through the session
+        pipeline; membership is untouched. Idempotent: repeating it returns the
+        same receipt. Audited as `session.hard_delete.requested` before any data
+        is touched and `session.hard_deleted` once on completion. Gated by
+        SELFHOST_OPERATOR_CONTROLS. Cookie callers need an allowed Origin or
+        same-origin fetch metadata. See docs/session-erasure.md.
+      responses:
+        "200":
+          description: Erase completed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "202":
+          description: Erase in progress; poll the erasure read
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "400": { description: "`invalid_session_id`" }
+        "403": { description: "Owner/admin role required, `operator_controls_not_entitled`, or cross-origin cookie request" }
+        "404": { description: Organization or session not found }
+        "501": { description: "`not_implemented`: the session pipeline erase is not configured" }
+        "502": { description: "`session_erasure_failed` (carries the receipt as `erasure`) or `invalid_session_erasure_response`" }
+        "503": { description: "`session_erasure_unavailable`: retry the request" }
+  /api/v1/organizations/{organizationId}/sessions/{sessionId}/erasure:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: sessionId
+        in: path
+        required: true
+        schema: { type: string, maxLength: 512 }
+    get:
+      operationId: getSessionErasure
+      description: |
+        Organization owner/admin or bootstrap bearer. The pipeline's erase
+        receipt plus the audit record, for verifying a delete. Never gated by
+        SELFHOST_OPERATOR_CONTROLS.
+      responses:
+        "200":
+          description: Erase receipt in any status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "400": { description: "`invalid_session_id`" }
+        "403": { description: Owner/admin role required }
+        "404": { description: "Organization not found, or `erasure_not_found`" }
+        "501": { description: "`not_implemented`: the session pipeline erase is not configured" }
+        "502": { description: "`invalid_session_erasure_response`" }
+        "503": { description: "`session_erasure_unavailable`: retry the request" }
   /api/v1/workspaces/{workspaceId}/resolve:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -2063,7 +2147,7 @@ paths:
                     items:
                       $ref: "#/components/schemas/EnrollmentTokenSummary"
         "403":
-          description: Workspace admin role required
+          description: Workspace admin role required (`forbidden`), or Relayflows is not a capability on this installation (`feature_not_enabled` / `feature_not_licensed`, body FeatureRefusal with feature `flows`)
     post:
       tags: [workers]
       operationId: createWorkerEnrollmentToken
@@ -2120,7 +2204,7 @@ paths:
                   startCommand:
                     type: string
         "403":
-          description: Workspace admin role required
+          description: Workspace admin role required (`forbidden`), or Relayflows is not a capability on this installation (`feature_not_enabled` / `feature_not_licensed`, body FeatureRefusal with feature `flows`)
   /api/v1/workers/enrollment-tokens/{tokenId}:
     delete:
       tags: [workers]
@@ -2137,6 +2221,8 @@ paths:
           description: Revoked
         "404":
           description: Unknown, used, or already revoked
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers:
     get:
       tags: [workers]
@@ -2154,6 +2240,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Worker"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2173,6 +2261,8 @@ paths:
                     $ref: "#/components/schemas/Worker"
         "404":
           description: Not in this workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     delete:
       tags: [workers]
       operationId: revokeWorker
@@ -2191,6 +2281,8 @@ paths:
                     format: uuid
                   status:
                     const: revoked
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/register:
     post:
       tags: [worker-protocol]
@@ -2233,6 +2325,8 @@ paths:
           description: Invalid, used, revoked, or expired enrollment token
         "409":
           description: Worker name already exists in the workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/heartbeat:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2256,6 +2350,8 @@ paths:
                     type: integer
         "401":
           description: Invalid or revoked worker token
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/queue:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2277,6 +2373,8 @@ paths:
             text/event-stream:
               schema:
                 type: string
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/ack:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2293,6 +2391,8 @@ paths:
           description: Not assigned to this worker
         "409":
           description: The run was cancelled before acknowledgement
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/status:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2327,6 +2427,8 @@ paths:
           description: Recorded; reports after a terminal state are returned unchanged
         "404":
           description: Not assigned to this worker
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/cli-credentials:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2372,6 +2474,8 @@ paths:
                         reason: { type: string }
         "401": { description: Missing or invalid worker token or reference }
         "404": { description: Not this worker's active assignment }
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/cli-credentials/{credentialId}:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2407,6 +2511,8 @@ paths:
                   updated: { type: boolean }
         "409": { description: Auth file belongs to a different account }
         "422": { description: Not a valid auth file for the provider }
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/storage/{objectKey}:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2423,6 +2529,8 @@ paths:
           description: Object bytes
         "404":
           description: Unknown object or assignment
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     head:
       tags: [worker-protocol]
       operationId: headAssignmentObject
@@ -2433,6 +2541,8 @@ paths:
           description: Exists
         "404":
           description: Missing
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     put:
       tags: [worker-protocol]
       operationId: putAssignmentObject
@@ -2445,6 +2555,8 @@ paths:
       responses:
         "200":
           description: Stored
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/flows:
     get:
       tags: [flows]
@@ -2462,6 +2574,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Flow"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     post:
       tags: [flows]
       operationId: createFlow
@@ -2476,6 +2590,8 @@ paths:
           description: Created
         "409":
           description: Name already used in the workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/flows/{flowId}:
     parameters:
       - $ref: "#/components/parameters/FlowId"
@@ -2485,6 +2601,8 @@ paths:
       responses:
         "200":
           description: Flow with source, declared steps, and its 20 most recent runs
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     patch:
       tags: [flows]
       operationId: updateFlow
@@ -2496,12 +2614,16 @@ paths:
       responses:
         "200":
           description: Updated
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     delete:
       tags: [flows]
       operationId: deleteFlow
       responses:
         "200":
           description: Deleted (existing runs are kept)
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/flows/{flowId}/invoke:
     parameters:
       - $ref: "#/components/parameters/FlowId"
@@ -2516,6 +2638,8 @@ paths:
       responses:
         "201":
           description: Run queued for a worker
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/run:
     post:
       tags: [runs]
@@ -2571,6 +2695,8 @@ paths:
           description: Invalid body, or a runtime other than `worker`
         "404":
           description: Requested worker or flow not found
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs:
     get:
       tags: [runs]
@@ -2617,6 +2743,8 @@ paths:
                     type: integer
                   needsReviewRuns:
                     type: integer
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2632,6 +2760,8 @@ paths:
                 $ref: "#/components/schemas/Run"
         "404":
           description: Not in this workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/workflow:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2641,6 +2771,8 @@ paths:
       responses:
         "200":
           description: The exact definition the run executed
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/cancel:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2656,6 +2788,8 @@ paths:
           description: Cancelled
         "409":
           description: Run already finished
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/resume:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2679,6 +2813,8 @@ paths:
           description: New run queued
         "409":
           description: Run not finished, or a locally mirrored run
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/retry:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2688,6 +2824,8 @@ paths:
       responses:
         "201":
           description: New run queued from the start
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/steps:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2715,6 +2853,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Step"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     post:
       tags: [run-ingestion]
       operationId: reportFinalSteps
@@ -2724,6 +2864,8 @@ paths:
       responses:
         "201":
           description: Stored
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/steps/snapshot:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2737,6 +2879,8 @@ paths:
           description: Accepted
         "409":
           description: Run already finished
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/events:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2760,6 +2904,8 @@ paths:
       responses:
         "200":
           description: Control-plane lifecycle events (run.queued, run.assigned, run.acknowledged, run.running, run.completed|failed|cancelled) plus mirrored runtime events
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     post:
       tags: [run-ingestion]
       operationId: appendRunEvent
@@ -2768,6 +2914,8 @@ paths:
       responses:
         "201":
           description: Appended with the next per-run sequence
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/storage/{objectKey}:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2783,6 +2931,8 @@ paths:
           description: Stored
         "412":
           description: Object exists and If-None-Match was "*"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/logs:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2825,6 +2975,8 @@ paths:
                     type: boolean
                   reset:
                     type: boolean
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/artifacts:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2834,6 +2986,8 @@ paths:
       responses:
         "200":
           description: Stored objects with kind log, code, or artifact
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/artifacts/{objectKey}:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2845,6 +2999,8 @@ paths:
       responses:
         "200":
           description: Object bytes
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/local-run:
     post:
       tags: [run-ingestion]
@@ -2856,6 +3012,8 @@ paths:
       responses:
         "201":
           description: Local run registered
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/callback:
     post:
       tags: [run-ingestion]
@@ -2870,6 +3028,8 @@ paths:
           description: Invalid run or callback token
         "409":
           description: Non-terminal status or already finished differently
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   # --- admin lane: environment variables, provider connections, API tokens ---
   /api/v1/organizations/{organizationId}:
     parameters:
@@ -3994,18 +4154,54 @@ paths:
           description: HTML page
           content:
             text/html: {}
-  # --- Desktop feed (draft contract; docs/desktop-feed.md). Status: proposed, Cloud team decides,
-  # not yet confirmed. Nothing below is implemented by this server.
+  # --- Desktop feed (docs/desktop-feed.md). Implemented; x-status proposed marks a deviation.
+  /api/v1/desktop/profiles:
+    get:
+      tags: [Desktop feed]
+      operationId: listDesktopFeedProfiles
+      summary: The Desktop feed profiles the signed-in workspace may read
+      description: |
+        Lets the dashboard downloads page learn the profile id to send in
+        X-Agent-Relay-Profile. Takes no profile header. A workspace without
+        an entitlement gets an empty list.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The workspace's profiles
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [profiles]
+                properties:
+                  profiles:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [id, asset_prefix]
+                      properties:
+                        id: { type: string, pattern: "^[a-z0-9]{1,32}$" }
+                        asset_prefix: { type: string }
+        "401": { $ref: "#/components/responses/DesktopFeedUnauthorized" }
+        "403":
+          description: wrong_credential (a publisher or install token)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DesktopFeedError" }
+        "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/manifest:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: getDesktopFeedManifest
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession]
       summary: Envelope of the current release of the profile's channel.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Accepts a workspace bearer (the desktop-core session), an install token,
         or the browser session cookie (on the `/cloud` mount only). A publisher
         token is refused with 403 `wrong_credential`; two credentials in one
@@ -4034,14 +4230,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: listDesktopFeedReleases
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession, publisherToken]
       summary: Published releases newest first (read), or the version listing with drafts (publisher).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Two callers, two shapes, chosen by the credential and `include_drafts`:
         - Read (workspace bearer, install token, browser session on `/cloud`):
           `include_drafts` must be absent or false. Returns
@@ -4091,14 +4286,15 @@ paths:
         "404": { $ref: "#/components/responses/DesktopFeedNoRelease" }
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: createDesktopFeedDraft
       x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
       summary: Create a draft release that declares its complete asset set.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
         Publisher token only. A workspace bearer, install token or browser
         session is 403 `wrong_credential`; mixed credentials are 400.
         Resolves an omission in the source design: the draft declares every
@@ -4148,11 +4344,13 @@ paths:
             invalid_release (version pattern, channel, or the beta.N rule),
             expected_assets_required (missing or empty), invalid_asset (an
             entry fails the asset rules, or names or platform/arch/kind/os_floor
-            tuples repeat), or quota_exceeded.
+            tuples repeat), quota_exceeded, or manifest_too_large (the signed
+            manifest would exceed the signer's limit; refused before any upload).
           content:
             application/json:
               schema:
                 oneOf:
+                  - $ref: "#/components/schemas/DesktopFeedManifestTooLarge"
                   - allOf:
                       - $ref: "#/components/schemas/DesktopFeedError"
                       - properties: { error: { enum: [invalid_release, expected_assets_required, invalid_asset] } }
@@ -4160,14 +4358,15 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases/import:
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: importDesktopFeedRelease
       x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
       summary: Open an import draft from a pre-signed envelope (on-prem path (a); also the store step of (b) and (c)).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed. The
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7). The
         endpoint itself is decided in the source design (open question 5:
         "verified against the profile's public key before it is stored"); its
         two-step shape here is a proposal, and whether it ships before or after
@@ -4222,14 +4421,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases/{version}/assets/{name}:
     put:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: uploadDesktopFeedAsset
-      x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
       summary: Upload one declared asset's bytes to a draft.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Publisher token only; workspace bearer, install token or browser
         session is 403 `wrong_credential`. Checks, in order:
         1. The release is an open draft (404 `draft_not_found`; 409
@@ -4304,22 +4502,21 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases/{version}/publish:
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: publishDesktopFeedRelease
       x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
-      x-proposed-default: "gcpkms hosted, awskms non-production; see docs/desktop-feed.md Proposed defaults"
       x-signer-provider:
-        x-status: unresolved
+        provider: awskms
         description: |
-          Which provider holds the hosted feed's Ed25519 private keys is not
-          decided (the source design says Cloud's KMS; the Cloud team has not
-          confirmed a provider). A key held by this deployment's Postgres is
-          not a fallback.
+          AWS KMS key (ECC_NIST_EDWARDS25519, Sign with MessageType RAW and
+          ED25519_SHA_512, 4096-byte message cap), one profile per
+          installation. A private key stored in Postgres is not a fallback.
       summary: Verify the declared asset set, then sign (hosted draft) or store verbatim (import draft).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
         Publisher token only. Steps, in order; any failure leaves the release
         a draft, unsigned and invisible to the read API:
         1. Open draft (404 `draft_not_found`, 409 `not_a_draft`).
@@ -4400,14 +4597,13 @@ paths:
                   - properties: { error: { enum: [signer_unavailable] } }
   /api/v1/desktop/feed/assets/{assetId}/download-url:
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: issueDesktopFeedDownloadUrl
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession]
       summary: Short-lived signed GET URL for one published asset.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Accepts a workspace bearer, an install token, or the browser session
         cookie on the `/cloud` mount (cookie requests also pass the existing
         browser-origin check, else 403 `csrf_rejected`). A publisher token is
@@ -4448,15 +4644,14 @@ paths:
                   - properties: { error: { enum: [no_object_storage] } }
   /api/v1/desktop/feed/assets/{assetId}:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: streamDesktopFeedAsset
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession]
       x-desktop-feed-redirects: never
       summary: Stream one published asset from the site itself.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Accepts a workspace bearer, an install token, or the browser session
         cookie on the `/cloud` mount. A publisher token is 403
         `wrong_credential`; mixed credentials are 400.
@@ -4516,14 +4711,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/install-tokens:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: listDesktopFeedInstallTokens
-      x-status: proposed
       x-desktop-feed-role: install-token
       x-desktop-feed-credentials: [browserSession]
       summary: The caller's install tokens for the profile (never the token values).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Browser session cookie on the `/cloud` mount only (the downloads page).
         A workspace bearer, install token or publisher token is 403
         `wrong_credential`; mixed credentials are 400. Lists the caller's own
@@ -4550,14 +4744,15 @@ paths:
         "403": { $ref: "#/components/responses/DesktopFeedReadForbidden" }
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: createDesktopFeedInstallToken
       x-status: proposed
       x-desktop-feed-role: install-token
       x-desktop-feed-credentials: [browserSession]
       summary: Mint a 1-hour install token for headless installs.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
         Browser session cookie on the `/cloud` mount only, with the existing
         browser-origin check (403 `csrf_rejected`). Any bearer, including a
         workspace bearer, is 403 `wrong_credential`; mixed credentials are 400.
@@ -4590,14 +4785,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/install-tokens/{tokenId}:
     delete:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: revokeDesktopFeedInstallToken
-      x-status: proposed
       x-desktop-feed-role: install-token
       x-desktop-feed-credentials: [browserSession]
       summary: Revoke one of the caller's install tokens.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Browser session cookie on the `/cloud` mount only, with the
         browser-origin check. Revocation takes effect on the next request made
         with the token (401 `token_revoked`); a signed URL already issued with
@@ -5097,6 +5291,231 @@ paths:
         "404": { $ref: "#/components/responses/FactoryError" }
         "405": { $ref: "#/components/responses/FactoryError" }
         "503": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/workspaces/{workspaceId}/amp:
+    get:
+      operationId: getAmpWorkspace
+      tags: [amp]
+      summary: Amp connection and binding summary (key hint only; history reported as unavailable with reason push_session_unavailable until a push-only RelayHistory session can be issued). Owner/admin person with cli:auth. 404 {"error":"Not found"} before auth when SELFHOST_AMP_ENABLED is off. Also under /cloud. See docs/amp.md.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{connection, bindings[{..., history: {state: unavailable|idle|queued|running|synced|error, reason?, lastSyncedAt, lastError, queuedAt}}], history: {available, reason?}}; never a secret"
+        "401":
+          description: unauthorized
+        "403":
+          description: forbidden (member, missing cli:auth, sh_wk_ workspace token or SELFHOST_INTERNAL_TOKEN)
+        "404":
+          description: Feature off ({"error":"Not found"}) or unknown workspace
+  /api/v1/workspaces/{workspaceId}/amp/connection:
+    post:
+      operationId: connectAmp
+      tags: [amp]
+      summary: Connect an Amp API key (validated by a read-only discover, stored encrypted). Only the connected key's owner may replace it while threads are bound.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key: { type: string, pattern: "^sgamp_", description: Never returned or logged }
+      responses:
+        "200":
+          description: Summary plus discovered threads
+        "400":
+          description: invalid_key or invalid_request
+        "403":
+          description: forbidden or not_connection_owner
+        "409":
+          description: connection_owner_locked or key_cannot_read_threads
+        "502":
+          description: amp_unavailable
+        "503":
+          description: amp_transport_not_configured
+    delete:
+      operationId: disconnectAmp
+      tags: [amp]
+      summary: Retire every binding, delete the stored key and release Relaycast identities after commit.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{disconnected: true} with cleanup: pending when a Relaycast release must be retried"
+  /api/v1/workspaces/{workspaceId}/amp/threads:
+    get:
+      operationId: discoverAmpThreads
+      tags: [amp]
+      summary: Up to 100 recent threads of the connected key. Connected key owner only.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{threads: [{id, title}]}"
+        "403":
+          description: forbidden or not_connection_owner
+        "409":
+          description: amp_not_connected
+  /api/v1/workspaces/{workspaceId}/amp/bindings:
+    post:
+      operationId: bindAmpThread
+      tags: [amp]
+      summary: Bind one explicitly chosen thread after the stored key exports it. Bind registers the Relaycast agent, mints a whsec_ secret (encrypted at rest, never returned) and creates two Relaycast subscriptions to the binding's relay-events URL (dm.received + thread.reply, and message.created filtered to mentions of the agent), signed with Standard Webhooks.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [threadId]
+              properties:
+                threadId: { type: string, description: "T-<id> or https://ampcode.com/threads/T-<id>" }
+      responses:
+        "201":
+          description: "{binding_id, thread_id, agent}"
+        "400":
+          description: invalid_thread
+        "403":
+          description: forbidden or not_connection_owner
+        "409":
+          description: amp_thread_unreadable, thread_owned or relay_name_taken
+        "502":
+          description: "relay_subscription_failed {error, message}: Relaycast refused or did not answer a subscription create. Subscriptions created by this attempt are deleted; the binding stays preparing and binding the thread again retries."
+  /api/v1/workspaces/{workspaceId}/amp/bindings/{bindingId}:
+    delete:
+      operationId: unbindAmpThread
+      tags: [amp]
+      summary: Retire the binding (generation bump revokes reply capabilities and fences in-flight deliveries), then delete both Relaycast subscriptions (404 counts as deleted) and release the Relaycast identity.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: "{disconnected: true} with cleanup: pending when the release must be retried"
+  /api/v1/workspaces/{workspaceId}/amp/bindings/{bindingId}/deliveries/{messageId}/check:
+    post:
+      operationId: checkAmpDelivery
+      tags: [amp]
+      summary: Read-only reconciliation (Cloud reconcileDelivery) of a delivery. Exports the bound thread and, only when the prompt's own marker is present, settles a pending, rejected or unknown row as delivered; a row under a live lease is left to the worker. Absence changes nothing and nothing is ever resent.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: messageId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: "{confirmed, state}: confirmed is whether the marker was found; state is the delivery state afterwards"
+        "400":
+          description: "{error: invalid_request, message}"
+        "403":
+          description: "{error: forbidden, message}: not a current owner or admin"
+        "404":
+          description: "{error: binding_not_found | delivery_not_found, message}; also when the binding was retired or rebound while the export ran"
+        "409":
+          description: "{error: relay_changed | amp_not_connected | amp_thread_unreadable, message}"
+  /api/v1/amp/agents/{bindingId}/messages:
+    post:
+      operationId: sendAmpReply
+      tags: [amp]
+      summary: Reply from an Amp thread through its scoped capability. Prompt-embedded helper; not proof of native MCP use.
+      security: [{ ampReplyBearer: [] }]
+      parameters:
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, text, message_id, request_id]
+              properties:
+                to: { type: string }
+                text: { type: string }
+                message_id: { type: string }
+                request_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: "{ok, message_id} or {ok, duplicate, message_id} for an identical repeat"
+        "401":
+          description: Wrong binding, unknown, revoked or expired capability, or owner no longer a member
+        "403":
+          description: Recipient, message or request mismatch
+        "409":
+          description: reply_already_sent
+        "413":
+          description: payload_too_large (64 KiB)
+        "502":
+          description: reply_uncertain (retry with the same request_id; the Relaycast idempotency key prevents a double send)
+  /api/v1/amp/relay-events/{bindingId}:
+    post:
+      operationId: receiveAmpRelayEvent
+      tags: [amp]
+      summary: Relaycast webhook for one binding, verified with Standard Webhooks v1 against the stored secret (300 s tolerance, 256 KiB body). Accepting only writes the outbox row.
+      security: []
+      parameters:
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: webhook-id, in: header, required: true, schema: { type: string } }
+        - { name: webhook-timestamp, in: header, required: true, schema: { type: string } }
+        - { name: webhook-signature, in: header, required: true, schema: { type: string, description: "v1,<base64 HMAC-SHA256>; space-separated list during rotation" } }
+      responses:
+        "200":
+          description: "{ok, queued} | {ok, duplicate} | {ok, delivered: false}"
+        "400":
+          description: invalid_request
+        "401":
+          description: Bad signature, stale timestamp or no stored secret
+        "410":
+          description: binding_gone
+        "413":
+          description: payload_too_large
+  /api/v1/internal/amp/job:
+    post:
+      operationId: runAmpJob
+      tags: [amp, internal]
+      summary: Scheduler entry for the Amp outbox. Not served under /cloud. 404 {"error":"Not found"} when the feature is off or SELFHOST_AMP_INTERNAL_SECRET is unset.
+      security: [{ ampInternalSecret: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, required: [v, kind], properties: { v: { const: 1 }, kind: { const: sweep } } }
+                - { type: object, required: [v, kind, bindingId, messageId], properties: { v: { const: 1 }, kind: { const: inject }, bindingId: { type: string }, messageId: { type: string } } }
+                - { type: object, required: [v, kind, bindingId], properties: { v: { const: 1 }, kind: { const: history }, bindingId: { type: string }, scheduledAt: { type: string, format: date-time } } }
+      responses:
+        "200":
+          description: "sweep {queued: 0, due, expired, deferred: true}; inject result or {ok, duplicate, state}; history {ok: true, queued: false, skipped: true} when not bound or already covered"
+        "202":
+          description: "history {ok: true, queued: true}: queued (coalesced) for src/amp/history.ts runHistory, which uploads to RelayHistory POST {baseUrl}/v1/ingest"
+        "501":
+          description: >-
+            history_push_unavailable: history is implemented to the upload
+            boundary (src/amp/history.ts) but inactive. It needs a
+            workspace-scoped push-only (rth:sync) RelayHistory session issued
+            without a caller token; src/relayhistory.ts
+            issueRelayhistorySession only exchanges a caller's sh_at_ token and
+            POST /internal/v1/auth/introspect answers only sh_at_ person tokens.
+            See docs/amp.md.
+        "400":
+          description: invalid_request
+        "401":
+          description: Bearer required
+        "403":
+          description: Wrong credential
+        "413":
+          description: payload_too_large (64 KiB)
 components:
   securitySchemes:
     factoryReplyBearer:
@@ -5125,6 +5544,14 @@ components:
       type: http
       scheme: bearer
       description: SELFHOST_INTERNAL_TOKEN, a workspace API token (sh_wk_) with the runtime scope, or a flows worker credential accepted by the runtime credential verifier. Never a user session.
+    ampReplyBearer:
+      type: http
+      scheme: bearer
+      description: "`amp_reply_<43 base64url>` capability embedded in one Amp prompt; stored only as a SHA-256 hash, bound to one binding, message and request, revoked on unbind, disconnect or member removal, expires after 24 h."
+    ampInternalSecret:
+      type: http
+      scheme: bearer
+      description: SELFHOST_AMP_INTERNAL_SECRET. Not SELFHOST_INTERNAL_TOKEN, a workspace token or a user session.
     introspectAuth:
       type: http
       scheme: bearer
@@ -5140,24 +5567,22 @@ components:
     installToken:
       type: http
       scheme: bearer
-      x-status: proposed
       description: |
         Desktop feed install token (proposed prefix `sh_dfi_`), minted by the
         downloads page from a browser session. Feed read for one profile
         through one workspace, lifetime 1 hour, revocable on the page and
         revoked with the user. Accepted by the four Desktop feed read
-        endpoints only. Status: proposed, Cloud team decides, not yet confirmed.
+        endpoints only. Status: implemented.
     publisherToken:
       type: http
       scheme: bearer
-      x-status: proposed
       description: |
         Desktop feed publisher token (proposed prefix `sh_dfp_`), the
         `DESKTOP_FEED_PUBLISHER_TOKEN` of one profile. Write-only on that
         profile's drafts plus the version listing; reads nothing else; never a
-        workspace user's token; rotatable and revocable by the admin tool (not
-        part of this contract). Status: proposed, Cloud team decides, not yet
-        confirmed.
+        workspace user's token; minted and revoked through
+        `/api/v1/organizations/{org}/desktop-feed/profiles/{id}/publisher-tokens`
+        (docs/desktop-feed.md). Status: implemented.
   parameters:
     FactoryBindingId:
       name: bindingId
@@ -5461,6 +5886,37 @@ components:
         upload_control: { type: string, enum: [operator, user] }
         oops_window_seconds: { type: integer, minimum: 0, maximum: 86400 }
         user_retroactive_delete: { type: boolean }
+    SessionErasure:
+      type: object
+      additionalProperties: false
+      required: [orgId, sessionId, requestId, status, requestedAt, completedAt, artifacts, uploadsFenced, failure, audit]
+      properties:
+        orgId: { type: string }
+        sessionId: { type: string }
+        requestId: { type: string }
+        status: { type: string, enum: [in_progress, completed, failed] }
+        requestedAt: { type: string, format: date-time }
+        completedAt: { type: [string, "null"], format: date-time }
+        artifacts:
+          type: object
+          description: Erased item count per artifact category; never content.
+          additionalProperties: { type: integer, minimum: 0 }
+        uploadsFenced: { type: boolean }
+        failure:
+          type: [object, "null"]
+          additionalProperties: false
+          required: [code]
+          properties:
+            code: { type: string }
+        audit:
+          type: [object, "null"]
+          additionalProperties: false
+          required: [action, actorKind, actorId, recordedAt]
+          properties:
+            action: { type: string, enum: [session.hard_deleted] }
+            actorKind: { type: string }
+            actorId: { type: [string, "null"] }
+            recordedAt: { type: string, format: date-time }
     CapturePolicy:
       type: object
       additionalProperties: false
@@ -5494,11 +5950,19 @@ components:
           type: string
     Readiness:
       type: object
-      required: [status, introspection]
+      required: [status, introspection, license, capabilities]
       properties:
         status:
           type: string
           enum: [ready, not_ready]
+        license:
+          type: object
+          required: [status]
+          properties:
+            status:
+              $ref: "#/components/schemas/LicenseStatus"
+        capabilities:
+          $ref: "#/components/schemas/FeatureCapabilities"
         introspection:
           type: object
           required: [enabled, audiences]
@@ -5510,6 +5974,90 @@ components:
               type: array
               description: Normalized origins POST /internal/v1/auth/introspect accepts as `aud`; empty while disabled.
               items: { type: string }
+    LicenseStatus:
+      type: string
+      enum: [absent, valid, expired, invalid]
+      description: |
+        absent: no SELFHOST_LICENSE / SELFHOST_LICENSE_FILE. invalid: bad
+        signature, malformed claims, unreadable file, or no trusted public key
+        (the key ships null in this build). expired: signature verifies but
+        expires_at has passed. A non-valid licence never stops the server; it
+        runs as core.
+    FeatureCapabilities:
+      type: object
+      required: [flows, relayfile, chief]
+      additionalProperties: false
+      description: selected AND entitled for paid features (flows, relayfile); selected alone for chief.
+      properties:
+        flows: { type: boolean }
+        relayfile: { type: boolean }
+        chief: { type: boolean }
+    License:
+      type: object
+      required: [status, license_id, customer, expires_at, seats, features, paid, selected, entitled, capabilities]
+      properties:
+        status:
+          $ref: "#/components/schemas/LicenseStatus"
+        license_id:
+          type: [string, "null"]
+          format: uuid
+        customer:
+          type: [string, "null"]
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+        seats:
+          description: Reported, not enforced. `used` counts organization members, owners included, across the installation. Null unless the licence signature verified (valid or expired).
+          oneOf:
+            - type: "null"
+            - type: object
+              required: [limit, used]
+              properties:
+                limit: { type: integer, minimum: 1 }
+                used: { type: integer, minimum: 0 }
+        features:
+          type: array
+          description: Paid features the licence entitles; empty unless status is valid.
+          items: { type: string, enum: [flows, relayfile] }
+        paid:
+          type: array
+          description: Feature classes that need entitlement.
+          items: { type: string, enum: [flows, relayfile] }
+        selected:
+          type: object
+          required: [flows, relayfile, chief]
+          additionalProperties: false
+          description: Names in SELFHOST_FEATURES (unset or empty selects nothing).
+          properties:
+            flows: { type: boolean }
+            relayfile: { type: boolean }
+            chief: { type: boolean }
+        entitled:
+          type: object
+          required: [flows, relayfile]
+          additionalProperties: false
+          description: status is valid and the licence lists the feature.
+          properties:
+            flows: { type: boolean }
+            relayfile: { type: boolean }
+        capabilities:
+          $ref: "#/components/schemas/FeatureCapabilities"
+    FeatureRefusal:
+      type: object
+      required: [error, message, feature]
+      properties:
+        error:
+          type: string
+          enum: [feature_not_enabled, feature_not_licensed]
+          description: |
+            feature_not_enabled: the operator has not selected the feature in
+            SELFHOST_FEATURES. feature_not_licensed: a paid feature (flows,
+            relayfile) is selected but the licence is absent, invalid, expired
+            or does not list it. Chief never answers feature_not_licensed.
+        message: { type: string }
+        feature:
+          type: string
+          enum: [flows, relayfile, chief]
     DeviceStart:
       type: object
       required:
@@ -6544,10 +7092,10 @@ components:
           pattern: ^fk_[a-z0-9]{1,32}_[a-z0-9]{1,16}$
       description: Envelope served by the feed; mirrors docs/specs/desktop-feed-envelope.schema.json. A received envelope whose JSON text has a duplicate member name at any depth (compared after escape decoding), a lone surrogate, or anything outside RFC 8259 (including a leading BOM) is rejected before canonicalising or verifying (RFC 8785 section 3.1 requires I-JSON, RFC 7493).
     DesktopFeedErrorCode:
-      x-status: proposed
       description: |
-        Every `error` code a Desktop feed endpoint may return. Status: proposed,
-        Cloud team decides, not yet confirmed. `not_entitled`,
+        Every `error` code a Desktop feed endpoint may return, besides the
+        app-wide 413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
+        Status: implemented. `not_entitled`,
         `no_object_storage` and the 401/403/404/429 split come from the source
         design; the other names are proposals.
       type: string
@@ -6892,6 +7440,14 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/AcquisitionError" }
+    FeatureRefused:
+      description: |
+        The feature is not a capability on this installation. Checked after
+        authentication and membership, before any backend call.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/FeatureRefusal"
     FactoryError:
       description: Factory error with a stable code
       content:

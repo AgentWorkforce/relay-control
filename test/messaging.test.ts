@@ -8,6 +8,7 @@ import { hashSecret } from "../src/crypto.js";
 import type { SelfhostConfig } from "../src/config.js";
 import type { Database, SqlExecutor, SqlResult } from "../src/database.js";
 import { SendAbandoned } from "../src/messaging/http.js";
+import { createRelaycastClient, RelaycastCallError } from "../src/messaging/relaycast.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 
@@ -1086,6 +1087,69 @@ test("register_human admission stays a typed conflict", async (t) => {
   assert.equal(full.status, 409);
   assert.equal(full.body.error, "register_human_admission");
   assert.equal((await fx.database.query("SELECT id FROM selfhost_person_identities")).rows.length, 0);
+});
+
+test("relaycast client creates and deletes outbound subscriptions with the workspace key", async () => {
+  const key = "rk_live_subscription_key";
+  const secret = `whsec_${Buffer.alloc(32, 3).toString("base64")}`;
+  const calls: Array<{ method: string; url: string; authorization: string | null; body: unknown }> = [];
+  let reply: () => Response = () => Response.json({ ok: true, data: { id: "sub_1" } }, { status: 201 });
+  const client = createRelaycastClient({
+    internalOrigin: "http://relaycast.test/",
+    fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({
+        method: init?.method ?? "GET",
+        url: String(input),
+        authorization: new Headers(init?.headers).get("authorization"),
+        body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
+      });
+      return reply();
+    }) as typeof fetch,
+  });
+
+  const id = await client.createSubscription(key, {
+    events: ["message.created"], url: "https://control.test/hook", secret, filter: { mentions: "amp-1" },
+  });
+  assert.equal(id, "sub_1");
+  assert.deepEqual(calls[0], {
+    method: "POST",
+    url: "http://relaycast.test/v1/subscriptions",
+    authorization: `Bearer ${key}`,
+    body: {
+      events: ["message.created"], url: "https://control.test/hook", secret,
+      signature_scheme: "standard-webhooks", filter: { mentions: "amp-1" },
+    },
+  });
+  await client.createSubscription(key, { events: ["dm.received"], url: "https://control.test/hook", secret });
+  assert.equal("filter" in (calls[1]!.body as Record<string, unknown>), false);
+
+  // A response without an id is refused as an unconfirmed outcome.
+  reply = () => Response.json({ ok: true, data: {} }, { status: 201 });
+  await assert.rejects(client.createSubscription(key, { events: ["dm.received"], url: "https://x.test", secret }),
+    (error: unknown) => error instanceof RelaycastCallError && error.outcomeUnknown && error.operation === "create_subscription");
+
+  // An upstream failure (even one echoing the request) never puts the secret or key in the message.
+  reply = () => new Response(JSON.stringify({ error: { code: "bad", detail: `${secret} ${key}` } }), { status: 422 });
+  await assert.rejects(client.createSubscription(key, { events: ["dm.received"], url: "https://x.test", secret }), (error: unknown) => {
+    assert.ok(error instanceof RelaycastCallError);
+    assert.equal(error.status, 422);
+    assert.equal(error.operation, "create_subscription");
+    assert.equal(error.message.includes(secret), false);
+    assert.equal(error.message.includes(key), false);
+    assert.equal(String(error).includes("whsec_"), false);
+    return true;
+  });
+
+  reply = () => Response.json({ ok: true, data: { deleted: true } });
+  await client.deleteSubscription(key, "sub/1");
+  assert.equal(calls.at(-1)!.method, "DELETE");
+  assert.equal(calls.at(-1)!.url, "http://relaycast.test/v1/subscriptions/sub%2F1");
+  assert.equal(calls.at(-1)!.authorization, `Bearer ${key}`);
+  reply = () => Response.json({ ok: false, error: { code: "subscription_not_found" } }, { status: 404 });
+  await client.deleteSubscription(key, "sub_gone");
+  reply = () => Response.json({ ok: false, error: { code: "internal_error" } }, { status: 503 });
+  await assert.rejects(client.deleteSubscription(key, "sub_1"),
+    (error: unknown) => error instanceof RelaycastCallError && error.status === 503 && error.operation === "delete_subscription");
 });
 
 // ---- GET /resolve: the workspace-wide Relaycast key (Cloud parity) ----------
