@@ -16,8 +16,7 @@ import { IdentityStore } from "./identity/store.js";
 import { smtpMailer } from "./identity/mailer.js";
 import { createIdentityModule } from "./identity/routes.js";
 import { relaycastProvisioner, startBootstrap } from "./identity/bootstrap.js";
-import { loadLicense } from "./license/load.js";
-import { gateCredentialVerifier } from "./license/resolver.js";
+import { FEATURES, gateCredentialVerifier, loadSelectedFeatures } from "./features.js";
 import { loadAmpConfig } from "./amp/config.js";
 import { createAmpModule } from "./amp/module.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
@@ -33,9 +32,9 @@ import {
 } from "./analytics/lifecycle.js";
 
 const config = loadConfig();
-// SELFHOST_FEATURES and the add-on licence. Only configuration mistakes throw;
-// a bad or expired licence is logged once and the installation runs as core.
-const license = loadLicense();
+// An unknown SELFHOST_FEATURES name stops startup.
+const features = loadSelectedFeatures();
+console.log("[selfhost-api] features selected", FEATURES.filter((feature) => features[feature]));
 const database = new PostgresDatabase(config.databaseUrl);
 
 // bootstrap-signup lane: first-boot org/workspace, OIDC/email sign-in, invites.
@@ -77,8 +76,8 @@ const admin = createAdminModule({
   database,
   keyring: config.encryptionKeyring,
   // Flows worker credentials may read their own workspace's runtime environment.
-  // Refused with the Flows feature code while Flows is not a capability.
-  runtimeCredentialVerifier: gateCredentialVerifier((t: string) => flows.verifyRuntimeCredential(t), license, "flows"),
+  // Refused with the Flows feature code while Flows is not selected.
+  runtimeCredentialVerifier: gateCredentialVerifier((t: string) => flows.verifyRuntimeCredential(t), features, "flows"),
 });
 // Subscription logins reach runs through a reference in the assignment payload.
 flows.cliCredentials = admin.logins;
@@ -136,7 +135,7 @@ const server = createServer(createApp({
   telemetry,
   identity,
   factory,
-  license,
+  features,
   amp,
   analytics: { port: analytics, config: analyticsConfig },
   mcpOAuthTeardown,
