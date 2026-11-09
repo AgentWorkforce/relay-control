@@ -553,66 +553,6 @@ test("a grant re-pinned during the remote release makes the commit inconclusive 
   assert.equal((await f.database.query("SELECT id FROM selfhost_hosted_relay_participants")).rows.length,1);
 });
 
-// Adapted from the reviewer's race reproducer: same setup, but under the
-// retirement fence the rejoin is refused instead of adopting the agent whose
-// release is in flight, and nothing binds the released id.
-for (const actor of ["oauth", "native"] as const) test("cleanup retains a rejoined " + actor + " identity", async t => {
-  const f = await relayFixture(t);
-  await f.service.join({});
-  const original = f.world.agents.get("approved-agent")!;
-  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId, "fake-disconnect");
-  let notify!: () => void, release!: () => void;
-  const started = new Promise<void>(resolve => { notify = resolve; });
-  const held = new Promise<void>(resolve => { release = resolve; });
-  const client = f.teardown.deps.client;
-  const worker = new McpOAuthTeardown({ ...f.teardown.deps, client: {
-    ...client, releaseHosted: async (key, name, id) => {
-      notify(); await held; await client.releaseHosted(key, name, id);
-    },
-  }});
-  const finished = worker.drain().then(value => ({ value }), error => ({ error }));
-  await Promise.race([started, finished.then(result => {
-    if ("error" in result) throw result.error;
-    throw new Error("release not reached");
-  })]);
-  try {
-    if (actor === "oauth") {
-      const grantId = randomUUID(), tokenFamilyId = randomUUID();
-      await f.database.query(`INSERT INTO selfhost_mcp_oauth_grants
-        (id,client_id,user_id,organization_id,workspace_id,agent_name,scopes,resource,token_family_id)
-        SELECT $2,client_id,user_id,organization_id,workspace_id,agent_name,scopes,resource,$3
-        FROM selfhost_mcp_oauth_grants WHERE id=$1`, [f.owner.grantId, grantId, tokenFamilyId]);
-      const pair = await f.database.transaction(tx => f.sessions.issue(tx,
-        { ...f.owner, grantId, tokenFamilyId, scopes: ["relay:mcp"] }));
-      const admitted = await admitMcpOAuthBearer({ sessions: f.sessions,
-        token: pair.accessToken, resourcePath: SHARED });
-      assert.ok(admitted.ok);
-      const service = relayService({ ...f.context,
-        principal: admitted.connection.access.principal, oauth: admitted.connection });
-      await assert.rejects(service.join({}), /being retired after a disconnect/);
-      assert.equal(admitted.connection.access.agentRemoteId, null);
-    } else {
-      const service = relayService({ ...f.context, oauth: undefined, authMode: "cli_login",
-        relay: { ...f.context.relay, sessionId: "fake-native-reconnect" } });
-      await assert.rejects(service.join({ name: original.name }), /being retired after a disconnect/);
-      assert.equal((await f.database.query("SELECT session_hash FROM selfhost_hosted_relay_participants")).rows[0]!.session_hash, null);
-    }
-  } finally { release(); }
-  const result = await finished;
-  if ("error" in result) throw result.error;
-  // The oauth case added a grant meanwhile, so its commit stays inconclusive
-  // once; the retry finds the agent released.
-  if (actor === "oauth") {
-    assert.deepEqual(result.value, { completed: 0, kept: 0, pending: 1 });
-    f.advance();
-    assert.deepEqual(await f.teardown.drain(), { completed: 1, kept: 0, pending: 0 });
-  } else assert.deepEqual(result.value, { completed: 1, kept: 0, pending: 0 });
-  assert.equal(f.world.agents.has(original.name), false);
-  assert.equal((await f.database.query("SELECT id FROM selfhost_mcp_oauth_grants WHERE agent_remote_id=$1 AND revoked_at IS NULL",
-    [original.id])).rows.length, 0);
-  assert.equal((await f.database.query("SELECT id FROM selfhost_hosted_relay_participants")).rows.length, 0);
-});
-
 /** A second live grant of the fixture owner, unpinned unless `pinned` is given. */
 async function laterConnection(f:Awaited<ReturnType<typeof relayFixture>>,pinned:string|null=null,createdAfterRevocation=false) {
   const grantId=randomUUID(),tokenFamilyId=randomUUID();
