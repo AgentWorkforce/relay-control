@@ -94,6 +94,8 @@ export type IdentityConfig = {
   signinMethods: SigninMethod[];
   /** SELFHOST_LOGIN_LOGO_URL, an https URL shown on the sign-in page. */
   logoUrl: string | null;
+  /** SELFHOST_LOGIN_ORG_NAME, else the bootstrap organization. Shown beside the logo. */
+  loginOrgName: string | null;
   /** Password sign-in settings, or null when "password" is not enabled. */
   password: PasswordConfig | null;
 };
@@ -433,6 +435,7 @@ export function loadIdentityConfig(env: Env = process.env): IdentityConfig {
     tenancy,
     signinMethods,
     logoUrl: loadLogoUrl(env),
+    loginOrgName: cleanLabel(env.SELFHOST_LOGIN_ORG_NAME ?? "") || bootstrap?.organizationName || null,
     password: signinMethods.includes("password") ? loadPassword(env) : null,
   };
 }

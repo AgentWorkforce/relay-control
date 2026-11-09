@@ -96,11 +96,11 @@ function clearCookie(name: string, path: string): string {
   return `${name}=; Path=${path}; Max-Age=0; Secure; HttpOnly; SameSite=Lax`;
 }
 
-function sendHtml(response: ServerResponse, status: number, body: string, cookies: string[] = []): void {
+function sendHtml(response: ServerResponse, status: number, body: string, cookies: string[] = [], csp = PAGE_CSP): void {
   response.writeHead(status, {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
-    "content-security-policy": PAGE_CSP,
+    "content-security-policy": csp,
     "referrer-policy": "no-referrer",
     "x-frame-options": "DENY",
     ...(cookies.length ? { "set-cookie": cookies } : {}),
@@ -186,6 +186,9 @@ export function createIdentityModule(input: {
   const limiter = new RateLimiter(now);
   const oidc = input.oidcClient !== undefined ? input.oidcClient : config.oidc ? new OidcClient(config.oidc) : null;
   const dashboardOrigin = new URL(input.dashboardUrl).origin;
+  // PAGE_CSP loads no images: only /login gets one, from the logo's own origin.
+  const coBrand = config.logoUrl ? { logoUrl: config.logoUrl, orgName: config.loginOrgName } : null;
+  const loginCsp = config.logoUrl ? `${PAGE_CSP}; img-src ${new URL(config.logoUrl).origin}` : PAGE_CSP;
   const emailLogin = config.emailLogin && mailer !== null;
   let passwordRoutes: PasswordRoutes | null = null;
   if (config.signinMethods.includes("password") && config.password && mailer) {
@@ -312,7 +315,8 @@ export function createIdentityModule(input: {
           : null,
         userCode: started.userCode,
         pollIntervalMs: Math.max(1, started.intervalSeconds) * 1_000,
-      }), cookies);
+        coBrand,
+      }), cookies, loginCsp);
       return true;
     }
 
@@ -615,6 +619,8 @@ export function createIdentityModule(input: {
         methods: signinMethods,
         oidc: oidc ? { displayName: oidc.config.displayName } : null,
         logo_url: config.logoUrl,
+        // Shown beside the logo, so it is only public once a logo is set.
+        org_name: config.logoUrl ? config.loginOrgName : null,
         // Whether only some email domains may join (never the list itself).
         allowed_domain_hint: config.autoJoinDomains.length > 0 || (oidc?.config.allowedDomains.length ?? 0) > 0,
         password_policy: passwordRoutes ? { min_length: PASSWORD_MIN_LENGTH, max_length: PASSWORD_MAX_LENGTH } : null,
