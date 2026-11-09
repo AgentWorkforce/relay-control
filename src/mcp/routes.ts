@@ -6,6 +6,7 @@ import { ApiTokenStore } from "../admin/api-tokens.js";
 import { cookieRequestAllowed } from "../auth/device-approval.js";
 import type { SelfhostConfig } from "../config.js";
 import { secureEqual } from "../crypto.js";
+import type { AmpDeps } from "../amp/service.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
 import { providerStatuses, type ProviderProbes } from "../providers/registry.js";
 import type { ControlPlaneStore } from "../store.js";
@@ -95,6 +96,8 @@ export function createMcpHandler(input: {
   siteBaseUrl: (request: IncomingMessage) => string;
   /** Relaycast fetch; tests inject it, the server uses global fetch. */
   fetchImpl?: typeof fetch;
+  /** Amp control dependencies, only when SELFHOST_AMP_ENABLED is on. */
+  amp?: AmpDeps;
   /** Provider runtime probes (src/providers/registry.ts); empty when unset. */
   providerProbes?: ProviderProbes;
 }) {
@@ -229,6 +232,7 @@ export function createMcpHandler(input: {
         client: relaycast,
         sessionId: typeof sessionId === "string" ? sessionId : undefined,
       },
+      ...(input.amp ? { amp: input.amp } : {}),
     };
 
     const server = buildMcpServer(context);

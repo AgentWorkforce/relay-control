@@ -1,6 +1,7 @@
 /**
  * A small stateful Relaycast for the relay_messaging MCP tests: agents and
- * their tokens, 1:1 DMs, deliveries, threaded replies and channels. It answers
+ * their tokens, 1:1 DMs, deliveries, threaded replies, channels and outbound
+ * event subscriptions. It answers
  * only the endpoints the self-host Relaycast client calls, with the response
  * shapes that client parses. Workspace keys start with `rk_`; anything else
  * is an agent token.
@@ -14,6 +15,11 @@ type Message = {
 /** Acknowledged rows are kept, owner-scoped, as Relaycast does; only unacknowledged ones are pending. */
 type Delivery = { id: string; agent: string; message: Message; reason: string; acked: boolean };
 type Channel = { id: string; name: string; topic: string | null; members: Set<string>; archived: boolean };
+/** An outbound webhook subscription, with the workspace key that created it. */
+type Subscription = {
+  id: string; events: string[]; url: string; secret: string; signature_scheme: string;
+  filter: Record<string, unknown> | null; workspaceKey: string;
+};
 
 export type RelaycastWorld = ReturnType<typeof createRelaycastWorld>;
 
@@ -25,6 +31,7 @@ export function createRelaycastWorld(roster: unknown[]) {
   const messages = new Map<string, Message>();
   const deliveries: Delivery[] = [];
   const channels = new Map<string, Channel>();
+  const subscriptions = new Map<string, Subscription>();
   const idempotent = new Map<string, unknown>();
   /** Every request body, for assertions about what was sent upstream. */
   const bodies: Array<{ method: string; path: string; body: Record<string, any> | null }> = [];
@@ -111,6 +118,20 @@ export function createRelaycastWorld(roster: unknown[]) {
       agents.delete(agent.name);
       syncRoster();
       return once(ok({ status: "completed" }));
+    }
+    if (method === "POST" && path === "/v1/subscriptions" && workspace) {
+      const subscription = {
+        id: `sub_${next()}`, events: body!.events, url: body!.url, secret: body!.secret,
+        signature_scheme: body!.signature_scheme, filter: body!.filter ?? null, workspaceKey: bearer,
+      };
+      subscriptions.set(subscription.id, subscription);
+      return ok({ id: subscription.id, events: subscription.events, url: subscription.url }, 201);
+    }
+    if ((match = /^\/v1\/subscriptions\/([^/]+)$/.exec(path)) && method === "DELETE" && workspace) {
+      const id = decodeURIComponent(match[1]!);
+      if (!subscriptions.has(id)) return fail(404, "subscription_not_found");
+      subscriptions.delete(id);
+      return ok({ deleted: true });
     }
     if (method === "POST" && path === "/v1/agents/heartbeat" && caller) return ok({});
     if ((match = /^\/v1\/agents\/([^/]+)\/takeover$/.exec(path)) && method === "POST" && workspace) {
@@ -218,7 +239,7 @@ export function createRelaycastWorld(roster: unknown[]) {
   }
 
   return {
-    agents, conversations, messages, deliveries, channels, bodies, handle, addAgent,
+    agents, conversations, messages, deliveries, channels, subscriptions, bodies, handle, addAgent,
     /** An agent's unacknowledged deliveries. */
     pending(agent: string) {
       return deliveries.filter(row => row.agent === agent && !row.acked);

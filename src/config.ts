@@ -55,7 +55,7 @@ export type SelfhostConfig = {
   host: string;
 };
 
-type Env = Record<string, string | undefined>;
+export type Env = Record<string, string | undefined>;
 
 export type FactoryConfig = {
   enabled: boolean;
