@@ -149,8 +149,22 @@ export function createRelaycastWorld(roster: unknown[]) {
         .filter(channel => channel.members.has(caller.name)).map(channel => ({ id: channel.id, name: channel.name })) });
     }
     if (method === "POST" && path === "/v1/dm" && caller) {
-      if (!agents.has(body!.to)) return fail(404, "agent_not_found");
-      return once(ok(directMessage(caller, body!.to, body!.text), 201));
+      // Relaycast's POST /v1/dm takes exactly one of `to` (agent name) or
+      // `address` (agent@machine) and refuses anything else with 400.
+      if ((body?.to === undefined) === (body?.address === undefined)) {
+        return { status: 400, body: { ok: false, error: { code: "invalid_request",
+          message: 'exactly one of "to" (agent name) or "address" (agent@machine) is required' } } };
+      }
+      let to: string = body!.to;
+      if (body!.address !== undefined) {
+        const address = String(body!.address);
+        const at = address.lastIndexOf("@");
+        const agent = at > 0 ? agents.get(address.slice(0, at)) : undefined;
+        if (!agent || rosterEntry(agent).address !== address) return fail(404, "address_not_found");
+        to = agent.name;
+      }
+      if (!agents.has(to)) return fail(404, "agent_not_found");
+      return once(ok(directMessage(caller, to, body!.text), 201));
     }
     if (method === "GET" && path === "/v1/dm/conversations" && caller) {
       return ok(conversations.filter(item => item.participants.includes(caller.name)).map(item => ({

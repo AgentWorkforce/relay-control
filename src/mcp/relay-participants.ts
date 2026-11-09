@@ -156,6 +156,7 @@ const SAFE_DIAGNOSTIC_CODES: ReadonlySet<string> = new Set([
   "idempotency_key_reused", "dm_conversation_id_collision", "internal_error", "database_overloaded",
   "idempotency_unavailable", "handler_unavailable", "node_dispatch_unavailable", "mailbox_full",
   "event_delivery_retryable_failure", "rate_limit_exceeded", "plan_limit_exceeded",
+  "invalid_request", "invalid_json",
 ]);
 
 export type RelayToolOperation = "send" | "join" | "leave";
