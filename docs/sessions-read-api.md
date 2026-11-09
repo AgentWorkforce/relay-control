@@ -122,7 +122,8 @@ routes (`/cloud/api/v1/workspaces/{ws}/sessions...`):
 | Upstream | relaycontrol |
 | --- | --- |
 | 200, workspace attested | 200 with the view |
-| 501 (any route) | `501 {"error":"unsupported_by_backend","reason":<upstream reason>,"message":"The configured session backend does not serve this view"}`, `Cache-Control: no-store`. `reason` is the upstream `reason`, else its `error` string, else `unsupported_by_backend`. The cached token is kept. |
+| 501 (any route) | `501 {"error":"unsupported_by_backend","reason":<upstream reason>,"message":"The configured session backend does not serve this view"}`, `Cache-Control: no-store`. `reason` is the upstream top-level `reason`, nested `error.reason`, nested `error.code`, or legacy `error` string, in that order; otherwise `unsupported_by_backend`. Upstream messages are not forwarded. The cached token is kept. |
+| 400 on an agent-filter read | A nested `error.code` beginning with `agent_` is preserved as a 400 refusal; its explanatory reason and message are not forwarded. Other 400s remain upstream failures. |
 | 404 on catalog (unknown session) | 200 empty catalog `{catalog:null,parents:[],children:[],commitLinks:[],truncated:false}` |
 | 404 on timing | 200 `{timing:null}` |
 | 401 | cached token dropped, one new handoff and retry |

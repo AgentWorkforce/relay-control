@@ -143,7 +143,12 @@ async function unsupportedReason(response: Response): Promise<string> {
   if (isRecord(body)) {
     if (nonEmptyString(body.reason)) return body.reason;
     // The native read API uses { error: { code, reason, message } }.
-    if (isRecord(body.error) && nonEmptyString(body.error.reason)) return body.error.reason;
+    if (isRecord(body.error)) {
+      // Agent-filter 400s are classified by code, not by explanatory reason.
+      if (response.status === 400 && nonEmptyString(body.error.code)) return body.error.code;
+      if (nonEmptyString(body.error.reason)) return body.error.reason;
+      if (nonEmptyString(body.error.code)) return body.error.code;
+    }
     if (nonEmptyString(body.error)) return body.error;
   }
   return UNSUPPORTED_BY_BACKEND;

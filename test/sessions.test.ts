@@ -843,6 +843,8 @@ test("read API: nested reader refusal reasons survive without forwarding upstrea
       [{ reason: "flat_reason", error: { reason: "nested_reason" } }, "flat_reason"],
       [{ error: { reason: "", message: "private upstream detail" } }, "unsupported_by_backend"],
       [{ error: { reason: { unexpected: true }, message: "private upstream detail" } }, "unsupported_by_backend"],
+      [{ error: { code: "native_refusal", message: "private upstream detail" } }, "native_refusal"],
+      [{ error: { code: {}, reason: [] } }, "unsupported_by_backend"],
     ] as const) {
       env.history.overrides.set(upstream, () => ({ status: 501, body }));
       const response = await call(env.origin, path, { token });
@@ -968,6 +970,16 @@ test("agent filter: passes one agent to the read API and reports what it applied
   assert.equal(broad.status, 400);
   assert.equal(broad.body.error, "agent_prefix_too_broad");
   assert(!JSON.stringify(broad.body).includes("must-not-echo"));
+  reply = { status: 400, body: { error: { code: "agent_prefix_too_broad", reason: "private explanatory reason", message: "must-not-echo" } } };
+  const nativeBroad = await call(env.origin, `${base}?agent=example*`, { token });
+  assert.equal(nativeBroad.status, 400);
+  assert.equal(nativeBroad.body.error, "agent_prefix_too_broad");
+  assert(!JSON.stringify(nativeBroad.body).includes("private explanatory reason"));
+  assert(!JSON.stringify(nativeBroad.body).includes("must-not-echo"));
+  reply = { status: 400, body: { error: { code: "bad_request", message: "must-not-echo" } } };
+  const unrelated = await call(env.origin, `${base}?agent=example*`, { token });
+  assert.equal(unrelated.status, 502);
+  assert(!JSON.stringify(unrelated.body).includes("must-not-echo"));
 });
 
 test("agent filter: with parsing on, @tokens select the agent and the first wins", async (t) => {
