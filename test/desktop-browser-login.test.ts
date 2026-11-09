@@ -244,6 +244,13 @@ test("a sign-in naming its host needs the person's approval on a same-origin con
   // post (Fetch: Origin header follows the referrer policy), which the consent
   // check would refuse; the page must keep its origin on the same-origin post.
   assert.equal(page.headers.get("referrer-policy"), "same-origin");
+  // Chromium applies form-action to the redirect that answers the form post,
+  // so the loopback origin the approve 303 goes to must be allowed, or the
+  // page stays put after Approve.
+  assert.equal(
+    page.headers.get("content-security-policy"),
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' http://127.0.0.1:5123; base-uri 'none'; frame-ancestors 'none'",
+  );
   const html = await page.text();
   assert.match(html, /Agent Relay Desktop on <strong>sf-mini<\/strong>/);
   assert.match(html, /<strong>Primary<\/strong>/);

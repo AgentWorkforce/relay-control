@@ -1154,12 +1154,17 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         // no-referrer it would send "Origin: null", which the same-origin
         // check below refuses. same-origin keeps the real origin on the
         // form post and still withholds the URL from any other destination.
+        // The approve post is answered with a 303 to this computer's loopback
+        // listener, and Chromium applies form-action to that redirect too, so
+        // the validated loopback origin (isLoopbackRedirectUri) is allowed
+        // beside 'self'; with 'self' alone the page just stayed put.
+        const loopbackOrigin = new URL(login.redirectUri).origin;
         response.writeHead(200, {
           "content-type": "text/html; charset=utf-8",
           "cache-control": "no-store",
           "referrer-policy": "same-origin",
           "content-security-policy":
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${loopbackOrigin}; base-uri 'none'; frame-ancestors 'none'`,
         });
         response.end(desktopConsentPage({
           action: publicPath,
