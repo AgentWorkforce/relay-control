@@ -418,6 +418,39 @@ export function createRelaycastClient(input: {
       throw pending;
     },
 
+    /**
+     * A workspace outbound event subscription signed with Standard Webhooks
+     * (ported from Cloud's createSubscription). Relaycast POSTs matching events
+     * to `url`; the `whsec_` secret is sent upstream and never echoed in errors.
+     */
+    async createSubscription(workspaceKey: string, input: {
+      events: string[];
+      url: string;
+      secret: string;
+      filter?: { mentions?: string; channel?: string };
+    }): Promise<string> {
+      const data = record(await labeled("create_subscription", () => call("POST", "/v1/subscriptions", workspaceKey, {
+        events: input.events,
+        url: input.url,
+        secret: input.secret,
+        signature_scheme: "standard-webhooks",
+        ...(input.filter ? { filter: input.filter } : {}),
+      })));
+      const id = text(data?.id);
+      if (!id) {
+        const invalid = new RelaycastCallError(502, "", true);
+        invalid.operation = "create_subscription";
+        throw invalid;
+      }
+      return id;
+    },
+
+    /** Deletes an outbound subscription; an already-deleted one (404) is fine. */
+    async deleteSubscription(workspaceKey: string, id: string): Promise<void> {
+      await labeled("delete_subscription", () =>
+        call("DELETE", `/v1/subscriptions/${encodeURIComponent(id)}`, workspaceKey, undefined, undefined, true));
+    },
+
     /** The agent a token controls, with its channel memberships. */
     async authenticatedAgent(token: string): Promise<RosterAgent & { channels: Array<{ id: string; name: string }> }> {
       const data = await labeled("authenticated_agent", () => call("GET", "/v1/agent", token));

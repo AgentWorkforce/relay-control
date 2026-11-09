@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { agentNameError } from "./agent-name.js";
 import { connectorKind } from "./connector-kind.js";
-import { MCP_EVENTS_SCOPE, type AuthorizationRequest, type createMcpOAuthProtocol } from "./protocol.js";
+import { APP_BASE_PATH, MCP_EVENTS_SCOPE, type AuthorizationRequest, type createMcpOAuthProtocol } from "./protocol.js";
 
 export type McpConsentPrincipal = {
   userId: string; organizationId: string; workspaceId: string;
@@ -14,7 +14,8 @@ export type McpConsentPrincipal = {
 };
 export type McpConsentSession = { transport: "cookie" | "bearer"; principal: McpConsentPrincipal };
 type ConsentClient = { clientId: string; clientName: string | null; redirectUris: string[] };
-export class McpOAuthContinuationError extends Error {}
+import { McpOAuthContinuationError, McpOAuthAgentNameTakenError } from "./errors.js";
+export { McpOAuthContinuationError } from "./errors.js";
 export type AgentNameAvailability = "available" | "yours" | "taken" | "unknown";
 type TenantOwner = Pick<McpConsentPrincipal, "userId" | "organizationId" | "workspaceId">;
 
@@ -53,6 +54,18 @@ export function mcpOAuthSetupHandoff(code: string): string {
   return `mcpos_${createHash("sha256").update(code).digest("hex")}`;
 }
 
+/** Shared account admission for the consent API and its server-rendered page. */
+export async function resolveMcpConsentAccount(request:Request,
+  resolveSession:(request:Request)=>Promise<McpConsentSession|null>):Promise<McpConsentPrincipal|Response> {
+  const session=await resolveSession(request);
+  if(!session || session.transport!=="cookie") return oauthJson({error:"unauthorized"},401);
+  if(!session.principal.scopes.includes("account") || session.principal.pendingHandoff || session.principal.handoff) {
+    return oauthJson({error:"reauthentication_required"},403);
+  }
+  if(!new URL(request.url).pathname.startsWith(`${APP_BASE_PATH}/`)) return oauthJson({error:"unauthorized"},401);
+  return session.principal;
+}
+
 export function createMcpOAuthConsentHandlers(deps: {
   protocol: ReturnType<typeof createMcpOAuthProtocol>;
   store: McpOAuthConsentStore;
@@ -69,16 +82,7 @@ export function createMcpOAuthConsentHandlers(deps: {
   const grokSetupEnabled = deps.grokSetupEnabled === true;
   const now = deps.now ?? Date.now;
 
-  async function accountSession(request: Request): Promise<McpConsentPrincipal | Response> {
-    const session = await deps.resolveSession(request);
-    if (!session || session.transport !== "cookie") return oauthJson({ error: "unauthorized" }, 401);
-    if (!session.principal.scopes.includes("account") || session.principal.pendingHandoff || session.principal.handoff) {
-      return oauthJson({ error: "reauthentication_required" }, 403);
-    }
-    // Match the app's cookie path boundary even in isolated handler tests.
-    if (!new URL(request.url).pathname.startsWith("/cloud/")) return oauthJson({ error: "unauthorized" }, 401);
-    return session.principal;
-  }
+  const accountSession = (request:Request) => resolveMcpConsentAccount(request,deps.resolveSession);
 
   async function authorize(request: Request): Promise<Response> {
     const principal = await accountSession(request);
@@ -106,7 +110,7 @@ export function createMcpOAuthConsentHandlers(deps: {
       const response = oauthJson(payload);
       const hint = readNameHint(request, now());
       if (grok && hint && hint.id === body.name_handoff_id) {
-        response.headers.append("set-cookie", `${GROK_NAME_COOKIE}=; Max-Age=0; Path=/cloud; HttpOnly; SameSite=Lax${origin.startsWith("https:") ? "; Secure" : ""}`);
+        response.headers.append("set-cookie", `${GROK_NAME_COOKIE}=; Max-Age=0; Path=${APP_BASE_PATH}; HttpOnly; SameSite=Lax${origin.startsWith("https:") ? "; Secure" : ""}`);
       }
       return response;
     }
@@ -121,6 +125,25 @@ export function createMcpOAuthConsentHandlers(deps: {
     if (body.continue_grant_id !== undefined && typeof body.continue_grant_id !== "string") {
       return oauthJson({ error: "invalid_request", error_description: "Select an existing connection." }, 400);
     }
+    if (body.attach_existing !== undefined && typeof body.attach_existing !== "boolean") {
+      return oauthJson({ error: "invalid_request", error_description: "attach_existing must be a boolean." }, 400);
+    }
+    if (!body.continue_grant_id) {
+      // A new connection never lands on an existing agent by accident: another
+      // member's (or a retiring) agent is refused, and this user's own agent
+      // needs an explicit confirmation, since attaching shares its identity and inbox.
+      const availability = await deps.checkAgentNameAvailability(principal, agentName).catch((): AgentNameAvailability => "unknown");
+      if (availability === "unknown") {
+        return oauthJson({ error: "temporarily_unavailable", error_description: "The agent name could not be checked. Try again." }, 503);
+      }
+      if (availability === "taken") {
+        return oauthJson({ error: "agent_name_taken", error_description: "That name is already in use. Choose another name." }, 409);
+      }
+      if (availability === "yours" && body.attach_existing !== true) {
+        return oauthJson({ error: "agent_name_in_use", error_description:
+          "That name belongs to one of your existing agents. Confirm that this app should attach to it, or choose another name." }, 409);
+      }
+    }
     if (grok && !body.continue_grant_id) {
       const connected = await deps.store.listConnectedAgentNames(principal);
       if (connected.some(agent => agent.workspaceId === principal.workspaceId && agent.agentName === agentName)) {
@@ -133,10 +156,11 @@ export function createMcpOAuthConsentHandlers(deps: {
         userId: principal.userId, organizationId: principal.organizationId, workspaceId: principal.workspaceId, agentName,
       }, body.continue_grant_id ? body.continue_grant_id as string : undefined);
     } catch (error) {
+      if (error instanceof McpOAuthAgentNameTakenError) return oauthJson({ error: error.code, error_description: error.message }, error.status);
       if (error instanceof McpOAuthContinuationError) return oauthJson({ error: "invalid_request", error_description: error.message }, 400);
       throw error;
     }
-    const setupUrl = grok && grokSetupEnabled ? `/cloud/connect/grok/webhook?${new URLSearchParams({
+    const setupUrl = grok && grokSetupEnabled ? `${APP_BASE_PATH}/connect/grok/webhook?${new URLSearchParams({
       workspace: principal.workspaceId, handoff: mcpOAuthSetupHandoff(code),
     })}` : undefined;
     return finish({ redirect_to: deps.protocol.authorizationResponseUrl(authorization.redirectUri, { code, state: authorization.state }),

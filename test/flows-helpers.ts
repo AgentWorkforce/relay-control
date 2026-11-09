@@ -8,9 +8,9 @@ import { defaultFlowsConfig, type FlowsConfig } from "../src/flows/config.js";
 import { FlowsStore } from "../src/flows/store.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
-import { testLicense } from "./support/license.js";
-import type { LoadedLicense } from "../src/license/resolver.js";
 import type { ChiefBackend } from '../src/chief/routes.js';
+import type { SelectedFeatures } from "../src/features.js";
+import { testFeatures } from "./support/features.js";
 
 export class PGliteDatabase implements Database {
   constructor(readonly client = new PGlite()) {}
@@ -94,7 +94,13 @@ export function apiClient(origin: string): Api {
 
 export const BOOTSTRAP = "bootstrap-token-that-is-at-least-32-bytes";
 
-export async function startControlPlane(flowsOverrides: Partial<FlowsConfig> = {}, chief?: ChiefBackend, license: LoadedLicense = testLicense()) {
+/** `features` defaults to every optional feature selected. */
+export async function startControlPlane(
+  flowsOverrides: Partial<FlowsConfig> = {},
+  chief?: ChiefBackend,
+  configOverrides: Partial<SelfhostConfig> = {},
+  features: SelectedFeatures = testFeatures(),
+) {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -113,6 +119,7 @@ export async function startControlPlane(flowsOverrides: Partial<FlowsConfig> = {
     internalServiceToken: null,
     oauthRedirectUrl: `https://control.selfhosted.company/api/v1/integrations/oauth/callback`,
     dashboardUrl: `https://control.selfhosted.company/`,
+    ...configOverrides,
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
   const flows = new FlowsStore(
@@ -121,13 +128,13 @@ export async function startControlPlane(flowsOverrides: Partial<FlowsConfig> = {
     defaultFlowsConfig({ queuePollMs: 25, queuePingMs: 200, ...flowsOverrides }),
     config.relaycastPublicUrl,
   );
-  const server = createServer(createApp({ config, store, flows, chief, license }));
+  const server = createServer(createApp({ config, store, flows, chief, features }));
   const origin = await listen(server);
   const api = apiClient(origin);
   return {
-    database,
     config,
     store,
+    database,
     flows,
     origin,
     api,

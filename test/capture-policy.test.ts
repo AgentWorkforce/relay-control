@@ -71,7 +71,7 @@ test("capture policy: member read, owner/admin write, revisions, audit and CSRF"
     `${tenant.organizationId} revision=2 keys=oops_window_seconds,sharing_mode,upload_control,user_retroactive_delete`,
   );
   assert.ok(audit.rows[0]!.actor_id);
-  assert.doesNotMatch(audit.rows.map((row) => row.target).join(" "), /operator|900|selected/);
+  assert.doesNotMatch(audit.rows.map((row) => row.target!.replaceAll(tenant.organizationId, "")).join(" "), /operator|900|selected/);
 
   // Invalid input is refused with the key named; nothing changes.
   for (const [body, pattern] of [
@@ -191,7 +191,7 @@ test("capture policy: SELFHOST_OPERATOR_CONTROLS gates writes only", async (t) =
   const { operatorControlsEntitled } = await import("../src/admin/operator-controls.js");
   assert.equal(operatorControlsEntitled({}), true);
   assert.equal(operatorControlsEntitled({ SELFHOST_OPERATOR_CONTROLS: "always" }), true);
-  assert.equal(operatorControlsEntitled({ SELFHOST_OPERATOR_CONTROLS: "licence" }), false);
+  assert.equal(operatorControlsEntitled({ SELFHOST_OPERATOR_CONTROLS: "bogus" }), false);
   assert.equal(operatorControlsEntitled({ SELFHOST_OPERATOR_CONTROLS: "off" }), false);
 
   const app = await startControlPlane();
@@ -206,7 +206,7 @@ test("capture policy: SELFHOST_OPERATOR_CONTROLS gates writes only", async (t) =
   });
   assert.equal(entitled.status, 200);
 
-  for (const mode of ["off", "licence"]) {
+  for (const mode of ["off", "bogus"]) {
     process.env.SELFHOST_OPERATOR_CONTROLS = mode;
     const put = await app.api(policyPath, {
       method: "PUT", token: tenant.ownerToken, body: { settings: { sharing_mode: "all" } },

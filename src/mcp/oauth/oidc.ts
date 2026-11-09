@@ -36,7 +36,7 @@ export function mcpOidcKeyId(jwk: JsonWebKey): string {
 }
 
 function validateKeyId(kid: string): void {
-  if (!kid || kid.length > 128 || !/^[\x21-\x7e]+$/.test(kid)) {
+  if (typeof kid !== "string" || !kid || kid.length > 128 || !/^[\x21-\x7e]+$/.test(kid)) {
     throw new Error("MCP OIDC key id must be bounded printable ASCII");
   }
 }
@@ -99,11 +99,15 @@ export function createMcpOidcIssuer(configuration: McpOidcConfiguration) {
   // Retain the source's bounded key ring; expired keys still undergo validation.
   if (!Array.isArray(previousInput) || previousInput.length > 2) throw new Error("MCP OIDC allows at most two previous keys");
   const ids = new Set([configuration.keyId]);
+  const materials = new Set([mcpOidcKeyId(signer.publicJwk)]);
   const previous = previousInput.map(entry => {
     if (!entry || typeof entry !== "object") throw new Error("MCP OIDC previous key is invalid");
     const key = normalizePublicJwk(entry.publicJwk, entry.kid);
     if (ids.has(key.kid)) throw new Error("MCP OIDC key ids must be unique");
     ids.add(key.kid);
+    const material=mcpOidcKeyId(key);
+    if(materials.has(material)) throw new Error("MCP OIDC key material must be unique across key ids");
+    materials.add(material);
     const expiresAt = Date.parse(entry.expiresAt);
     if (!Number.isFinite(expiresAt)) throw new Error("MCP OIDC previous key expiry is invalid");
     return { key, expiresAt };

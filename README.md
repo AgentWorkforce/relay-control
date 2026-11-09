@@ -44,59 +44,26 @@ Included:
   `describe_capabilities`): Amp, Factory, Copilot, Capy, Replicas, Dot and Grok
   Bot descriptors with separate `implemented`/`configured`/`enabled` runtime
   states (all false until a build injects `providerProbes` into `createApp`).
+- Copilot in VS Code through Agent Relay Desktop: provider MCP credentials
+  (`/api/v1/workspaces/{ws}/mcp/shared-sessions-tokens`), Desktop identity
+  sync (`.../messaging/desktop-identities`) and Ed25519-attested Copilot tool
+  calls that act as the chat's own Desktop identity. No environment variables;
+  see [docs/integrations/copilot-vscode.md](docs/integrations/copilot-vscode.md)
 
 Explicitly absent: billing, fleet, and Relayfile.
-
-### Core and optional capabilities
-
-Core sessions, messaging, workspace administration and hosted MCP need no
-licence. With `SELFHOST_FEATURES` unset, the effective `flows`, `relayfile` and
-`chief` capabilities are all false. `GET /api/v1/license` (also `/cloud/api/v1/license`)
-requires a signed-in user, sends `Cache-Control: no-store`, and returns
-`{status, selected, entitled, capabilities}`. Each capability is a boolean.
-The member-facing response contains no licence identifier, customer details,
-seat limit, seat usage or notes. There is no installation licence administration
-endpoint in this build.
-
-`SELFHOST_FEATURES` is a comma-separated operator selection of `flows`,
-`relayfile` and `chief`; unknown names are startup errors. Chief needs selection
-but no paid entitlement. Flows and Relayfile additionally require a valid,
-unexpired signed licence that names the feature. A signed entitlement alone
-does not select a feature. This Control build does not implement the Relayfile
-service or activate its external workloads.
-
-The release currently compiles no licence verification key, so paid capabilities
-remain false even if a document is supplied. `SELFHOST_LICENSE` and
-`SELFHOST_LICENSE_FILE` are mutually exclusive optional document sources.
-Invalid, expired or unreadable documents do not prevent core startup. No runtime
-public-key override is supported, including under `NODE_ENV=test`; changing the
-trusted key requires an explicit source change and a new release. Unit tests
-inject a verifier into a pure loader and do not configure a production key.
-
-Flows routes refuse with 403 `feature_not_enabled` or `feature_not_licensed`
-before mutations, enrollment redemption, callback recording or queue work.
-Existing worker/run credentials are still authenticated before the refusal;
-unknown credentials remain unauthorized. An open worker queue rechecks the
-capability before further work. Core startup and ordinary core requests do not
-initialize optional Flows storage. Requesting its protocol may initialize the
-credential/storage adapter to authenticate existing credentials, but cannot
-start work while the capability is off. Aggregate analytics records the
-effective Flows capability rather than assuming the module is enabled.
 
 ### Relay Chief integration
 
 `createApp` accepts an optional `chief` backend implemented by `relay-chief`.
 Workspace-scoped `/cloud/api/v1/workspaces/:id/chiefs` routes preserve the existing
 cookie/bearer login and workspace membership checks. Setup and scans require an
-owner/admin; cookie mutations require same-origin JSON. With Chief selected, a missing backend returns a real 503 `chief_unavailable`
-response. With Chief unselected, authorized requests receive 403
-`feature_not_enabled`; this never provides a stub Chief implementation.
+owner/admin; cookie mutations require same-origin JSON. Without a backend the
+routes return an explicit unavailable response.
 
 For integrated local validation, `scripts/dev-server.ts` accepts a trusted
 operator-selected `DEV_CHIEF_MODULE` exporting `createChiefBackend({dataDir})`,
 with `DEV_CHIEF_DATA_DIR` pointing to a private state directory. This development
 composition is not enabled by production startup and does not provision EC2.
-Select `SELFHOST_FEATURES=chief` for that optional local composition.
 Set `SELFHOST_DASHBOARD_URL` when the local dashboard origin differs from the API.
 
 ## Configuration
@@ -115,12 +82,19 @@ is explicit. RelayAuth is optional: see
 | `RELAYCAST_PUBLIC_URL` | Public Relaycast origin returned to clients; bare HTTPS public DNS origin |
 | `RELAYAUTH_URL` | Optional, set together with `RELAYAUTH_API_KEY`. Internal RelayAuth origin; when set, History sessions use RelayAuth assertions (transitional). Unset: History sessions exchange the caller's own access token |
 | `RELAYHISTORY_URL` | Internal RelayHistory origin for session exchange and reads; self-host: the read API container's service URL ([docs/sessions-read-api.md](docs/sessions-read-api.md)) |
+| `RELAYHISTORY_BACKEND` | Optional `legacy` (default) or `native`. `native` is the self-host mode without RelayAuth or a standalone RelayHistory: see [sessions-read-api.md](docs/sessions-read-api.md#native-backend-relayhistory_backendnative). |
 | `RELAYHISTORY_READ_API_URL` | Optional bare public HTTPS origin of the GET-only pipeline read Worker for unsearched session lists and turns. Unset keeps existing routing. Requires the introspection secret and an explicit matching `SELFHOST_INTROSPECT_AUDIENCES` entry; see [read backend connection](docs/sessions-read-api.md#connecting-the-get-only-hosted-read-worker). |
 | `RELAYHISTORY_READ_API_EVENTS` | Optional strict `true`/`false`, default `false`. With `true` and `RELAYHISTORY_READ_API_URL`, session-event reads by `sh_at_` callers also use the native reader. The legacy-only `includeMessageId` expansion option is omitted only on that direct connection; native event IDs are preserved. Search and other views retain their existing routing. |
 | `RELAYHISTORY_PUBLIC_URL` | Public RelayHistory origin used as assertion and default introspection audience and returned to clients; bare HTTPS public DNS origin |
 | `RELAYAUTH_API_KEY` | Optional, set together with `RELAYAUTH_URL` (`_FILE` supported). Key allowed to mint RelayHistory assertions |
 | `RELAYCONTROL_INTROSPECT_SECRET` | Optional, at least 32 bytes (`_FILE` supported). Bearer for `POST /internal/v1/auth/introspect`, shared only with RelayHistory (and relayfile). Unset: that route answers 404 |
+| `RELAYFILE_CONTROL_BROKER_SECRET` | Optional, at least 32 bytes, `_FILE` supported. Enables the internal credential routes under `/internal/v1/flows/credentials/` for relayfile-control's Flows service. Unset, they answer 404. |
 | `SELFHOST_INTROSPECT_AUDIENCES` | Optional comma-separated http(s) origins a token may be introspected for, default `RELAYHISTORY_PUBLIC_URL`. Matched as normalized origins (scheme, lowercase host, port); `GET /readyz` lists them under `introspection.audiences` |
+| `SELFHOST_ACQUISITION_ISSUER_ENABLED` | Optional, default off (`true`/`false`). Turns on the dormant cloud-class acquisition assertion issuer ([docs/acquisition-issuer.md](docs/acquisition-issuer.md)); off, no other issuer variable is read and `/api/v1/acquisition/*` answers 404 |
+| `SELFHOST_ACQUISITION_ORIGIN` | Required when the issuer is enabled. The pipeline's `ACQUISITION_ORIGIN`; must also be listed in `SELFHOST_INTROSPECT_AUDIENCES` |
+| `SELFHOST_ACQUISITION_ISSUER_KEY_ID` | Required when the issuer is enabled. The `issuerKeyId` published and stamped into every assertion |
+| `SELFHOST_ACQUISITION_ISSUER_PRIVATE_KEY` | Required when the issuer is enabled (`_FILE` supported). Unencrypted PKCS#8 PEM Ed25519 key |
+| `SELFHOST_ACQUISITION_ISSUER_PREVIOUS_PUBLIC_KEYS` | Optional. JSON array of `{issuerKeyId, publicKeyBase64}` still published during a key rotation |
 | `SELFHOST_BOOTSTRAP_TOKEN` | At least 32 bytes; initial management bearer |
 | `SELFHOST_ENCRYPTION_KEY_ID` | 1-64 URL-safe characters; stamped into each new ciphertext |
 | `SELFHOST_ENCRYPTION_KEY` | Exactly 32 bytes encoded as 64 hex chars or base64 |
@@ -138,25 +112,47 @@ is explicit. RelayAuth is optional: see
 | `SELFHOST_FLOWS_RUNTIME_ENV_URL` | Origin serving that internal route, default `http://127.0.0.1:$PORT` (this process) |
 | `SELFHOST_OAUTH_REDIRECT_URL` | Optional. OAuth redirect URI registered in each provider OAuth app. Default `$SELFHOST_PUBLIC_URL/api/v1/integrations/oauth/callback` |
 | `SELFHOST_DASHBOARD_URL` | Optional dashboard origin. Link shown on the OAuth result page (default `$SELFHOST_PUBLIC_URL/`) and, when https, `runUrl` on mirrored flow runs |
-| `SELFHOST_BOOTSTRAP_ORG_NAME` / `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` | Optional, set together. First-boot bootstrap: creates the organization with this admin as owner and a default workspace bound to a new Relaycast workspace. Idempotent. See [docs/identity.md](docs/identity.md) |
+| `SELFHOST_BOOTSTRAP_ORG_NAME` / `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` | Optional, set together (or the org name with `SELFHOST_ADMIN_EMAILS`). First-boot bootstrap: creates the organization with this admin as owner and a default workspace bound to a new Relaycast workspace. Idempotent. See [docs/identity.md](docs/identity.md) |
 | `SELFHOST_BOOTSTRAP_ADMIN_NAME` / `SELFHOST_BOOTSTRAP_WORKSPACE_NAME` | Optional display name for the admin (default: the email's local part) and the workspace name (default `Default`) |
 | `RELAYCAST_INTERNAL_SECRET` | Optional (`_FILE` supported), at least 32 bytes, equal to Relaycast's own internal secret. Lets the bootstrap create the default workspace through Relaycast's `POST /internal/workspaces` |
 | `SELFHOST_OIDC_ISSUER` / `SELFHOST_OIDC_CLIENT_ID` / `SELFHOST_OIDC_CLIENT_SECRET[_FILE]` | Optional OpenID Connect sign-in (Google Workspace, Okta, Entra ID, Keycloak...). Authorization code + PKCE. See [docs/identity.md](docs/identity.md) |
 | `SELFHOST_OIDC_ALLOWED_DOMAINS` / `SELFHOST_OIDC_DISPLAY_NAME` / `SELFHOST_OIDC_SCOPES` / `SELFHOST_OIDC_REDIRECT_URL` | Optional OIDC refinements: email domains allowed to sign in, button label, scopes (default `openid email profile`), and a fixed redirect URI (default `<site>/login/oidc/callback`) |
 | `SELFHOST_SMTP_HOST` / `_PORT` / `_SECURITY` / `_USERNAME` / `_PASSWORD[_FILE]`, `SELFHOST_EMAIL_FROM` | Optional SMTP for invite emails and sign-in links |
 | `SELFHOST_EMAIL_LOGIN` | Optional `true`: email sign-in links (requires SMTP) |
+| `SELFHOST_SIGNIN_METHODS` | Optional comma list of `email_link` and `password` (both require SMTP). Default: `email_link` when `SELFHOST_EMAIL_LOGIN=true`. Unlisted methods answer 404 `signin_method_disabled`. Failed password sign-ins lock per account and client (5 free, then 30 s doubling to 15 min) and per account across all clients (50 in an hour locks it for 15 min and mails the owner, at most once a day). See [docs/identity.md](docs/identity.md#email-and-password-optional) and [Lockout](docs/identity.md#lockout) |
+| `SELFHOST_PASSWORD_PEPPER_FILE` / `SELFHOST_PASSWORD_HIBP` / `SELFHOST_PASSWORD_ARGON2_MEMORY_KIB` / `_TIME_COST` / `_PARALLELISM` | Optional password sign-in settings: a versioned HMAC pepper file (`v<n>:<secret>` lines, owned by the server's user, mode `0600` or `0400`), the Have I Been Pwned check (default `off`), and argon2id parameters, which can only be raised above m=19456 KiB, t=2, p=1 |
+| `SELFHOST_TRUSTED_PROXIES` | Number of reverse proxies that append to `X-Forwarded-For` (default `0`: use the TCP peer address and ignore the header). Use `1` only behind a single HTTP proxy that appends to `X-Forwarded-For` (for example the Helm chart's ingress) and only when direct access to the pod or Service that bypasses that proxy is restricted; any other proxy chain needs its actual hop count. Used by every per-IP limit and the password lockout; IPv6 is bucketed by /64. **Required when `SELFHOST_SIGNIN_METHODS` includes `password`: set it explicitly, even to `0`** (unset or empty refuses to start). Use `0` when clients connect directly. See [docs/identity.md](docs/identity.md#client-address) |
+| `SELFHOST_LOGIN_LOGO_URL` | Optional https logo URL, published by `GET /api/v1/auth/login-config` |
+| `SELFHOST_LOGIN_ORG_NAME` | Optional name shown beside the logo (default `SELFHOST_BOOTSTRAP_ORG_NAME`); published only while a logo is set |
+| `SELFHOST_ADMIN_EMAILS` | Optional comma list of admin addresses: the first to sign in with a verified email becomes owner, the rest admins. `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` is an alias that is made owner at first boot |
 | `SELFHOST_AUTO_JOIN_DOMAINS` | Optional, single mode only (multi mode refuses to start with it). Email domains whose verified users join as `member` on first sign-in, without an invite. The only authority for auto-join in single mode: absent or empty means none |
 | `SELFHOST_TENANCY` | `single` (default): one organization. `multi`: many organizations on one installation; requires `SELFHOST_BOOTSTRAP_ORG_NAME` / `SELFHOST_BOOTSTRAP_ADMIN_EMAIL`. See [docs/identity.md](docs/identity.md#tenancy) |
 | `SELFHOST_PERSONAL_ORG_ON_SIGNIN` | Multi mode only, default `true`: a first sign-in with no invite, membership or assigned domain creates a personal organization. The bootstrap bearer can override it at runtime via `PATCH /api/v1/installation/settings` |
 | `SELFHOST_SELF_SERVE_ORGANIZATIONS` | Multi mode only, default `true`: signed-in people may create organizations. Overridable the same way |
 | `SELFHOST_INVITE_TTL_HOURS` | Invite link lifetime, default 168 (7 days), 1-720 |
+| `SELFHOST_FEATURES` | Comma list of optional components to serve: `flows`, `relayfile`, `chief`. Unset selects nothing; those routes answer 403 `feature_not_enabled`. See [docs/features.md](docs/features.md) |
 | `SELFHOST_FACTORY_ENABLED` | Optional `true`/`false`, default `false`. Factory sessions: when off every Factory route is 404 and the worker does not start. See [docs/factory-sessions.md](docs/factory-sessions.md) |
 | `SELFHOST_FACTORY_API_URL` | Factory API origin, default `https://api.factory.ai`; absolute https only |
 | `SELFHOST_FACTORY_HISTORY_INTERVAL_MS` | Dormant Factory history loop cadence, default 300000, minimum 60000 |
-| `SELFHOST_OPERATOR_CONTROLS` | Operator-control writes (capture policy PUT/DELETE): `always` (default), `licence`, or `off`; an unrecognised value is treated as `off`. Reads are never gated. See [docs/capture-policy.md](docs/capture-policy.md) |
+| `SELFHOST_OPERATOR_CONTROLS` | Operator-control writes (capture policy PUT/DELETE, session hard delete): `always` (default) or `off`; an unrecognised value is treated as `off`. Reads are never gated. See [docs/capture-policy.md](docs/capture-policy.md) and [docs/session-erasure.md](docs/session-erasure.md) |
+| `SESSION_ERASE_API_URL`, `SESSION_ERASE_API_SECRET` (or `_FILE`) | Internal origin and dedicated secret (at least 32 bytes) of the session pipeline's per-session erase. Unset, the session hard-delete routes answer 501. See [docs/session-erasure.md](docs/session-erasure.md) |
+| `SELFHOST_DESKTOP_FEED_SIGNER` / `SELFHOST_DESKTOP_FEED_STORAGE` | Optional, set together: turn on the signed Desktop release feed (`/api/v1/desktop/feed/*`). Signer `awskms` (or `memory`, tests and development only), storage `s3` (or `memory`). Unset: the feed routes answer 404. See [docs/desktop-feed.md](docs/desktop-feed.md) |
+| `SELFHOST_DESKTOP_FEED_KMS_REGION` / `SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES` | `awskms`: region (default `AWS_REGION`) and a JSON object of profile id to KMS alias, one Ed25519 key per profile. Credentials: the instance role via IMDSv2, or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` |
+| `SELFHOST_DESKTOP_FEED_KEY_LABEL` | The `key_id` label, default `k1` for `awskms` |
+| `SELFHOST_DESKTOP_FEED_S3_BUCKET` / `_S3_REGION` / `_S3_PREFIX` | `s3`: private bucket without dots, its region (default `AWS_REGION`, then the KMS region) and key prefix (default `desktop-feed`) |
+| `SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES` | Optional JSON object of profile id to token sha256 hex digests, for publisher tokens (`sh_dfp_...`) provisioned through env; tokens can also be minted through the admin routes |
 | `SELFHOST_TELEMETRY_LEVEL` | Telemetry: `off` (default when unset), `errors`, or `full`. See [docs/telemetry.md](docs/telemetry.md) for this and the other `SELFHOST_TELEMETRY_*` settings |
 | `PORT` | Listener port, default `3000` |
+| `SELFHOST_AMP_ENABLED` | Optional `true` turns on Amp control (default `false`). Off: every Amp route answers 404 `{"error":"Not found"}` before authentication and no outbox worker runs. See [docs/amp.md](docs/amp.md) |
+| `SELFHOST_MCP_OAUTH` | Optional, default on. Hosted MCP OAuth connectors; `off`, `false` or `0` disables them (`on`/`true`/`1` enables; other spellings fail start-up). A missing or partial signing-key set, invalid key material or an unreadable MCP OIDC `_FILE` leaves the server running (routes answer 501 `mcp_oauth_unavailable`); a value supplied both directly and via `_FILE` still fails start-up. See [docs/mcp-oauth.md](docs/mcp-oauth.md) |
+| `SELFHOST_MCP_EVENTS` | Optional, default off (`on`/`true`/`1` or `off`/`false`/`0`). Setting for the separate MCP Events module, which this server does not mount. See [docs/mcp-oauth.md](docs/mcp-oauth.md) |
+| `SELFHOST_MCP_EVENTS_PUMP` | Optional, default off, same spellings. Events pump setting; `on` requires `SELFHOST_MCP_EVENTS=on` or start-up fails |
+| `AMP_TRANSPORT_ORIGIN` / `AMP_TRANSPORT_TOKEN[_FILE]` | Optional, set together. Bare https origin of the persistent Amp process service and its bearer (at least 32 bytes); calls go to `POST /v1/internal/amp/operation`. Unset: every Amp operation answers 503 `amp_transport_not_configured` |
+| `SELFHOST_AMP_INTERNAL_SECRET` | Optional (`_FILE` supported), at least 32 bytes. Bearer for `POST /api/v1/internal/amp/job` (scheduler sweeps and inject jobs). Unset: that route answers 404 |
+| `SELFHOST_AMP_WORKER_INTERVAL_MS` / `SELFHOST_AMP_LEASE_MS` | Outbox drain interval, default 5000 (250-600000), and delivery lease, default 120000 (1000-3600000). An expired lease becomes `unknown` and is never resent |
 | `HOST` | Listener address, default `0.0.0.0` |
+
+**Upgrade note (client address).** Per-IP limits and the password lockout now use the TCP peer address unless `SELFHOST_TRUSTED_PROXIES` is set. Deployments behind a proxy must set `SELFHOST_TRUSTED_PROXIES` to the number of proxy hops that append to `X-Forwarded-For` (`1` only for a single such proxy, such as the Helm chart's ingress, with direct pod or Service access restricted); otherwise every client shares the proxy's bucket, and the server logs one warning when it sees `X-Forwarded-For` with `0` trusted hops (per-IP limits, including the password IP lockout, use the socket address). With password sign-in enabled the variable must now be set explicitly, even to `0`, or the server refuses to start; `1` is correct for a Helm install only when the chart's ingress is the single proxy and direct access to the pod or Service that bypasses it is restricted. `X-Real-IP` is no longer read.
 
 Sensitive variables also accept a mutually exclusive `_FILE` form. The API
 server reads `DATABASE_URL_FILE`; `agent-relay-selfhost-migrate` reads only
@@ -188,7 +184,9 @@ exclusive `_FILE` form (at least 32 bytes). Leave all unset to keep this
 handoff disabled. Use a dedicated Control-to-reader secret; it is never sent
 to clients. These settings do not change the existing History connection.
 
-`SESSION_READ_API_MCP_READS=true` (default false) sends the MCP's session reads to that read API, with a token issued for the calling user, organization and workspace. The service secret never reaches a read. A first page the read API can't serve falls back to the existing History path; a read API cursor doesn't.
+`SESSION_SEARCH_AGENT_TOKENS=true` (default false) reads `@name` tokens in API and MCP search text as agent filters. Enable it once the session backend's agent catalog is ready; until then those tokens stay ordinary search text. The explicit `agent` parameter does not need this setting and answers 501 `agent_filter_not_ready` until the backend is ready.
+
+`SESSION_READ_API_MCP_READS=true` (default false) sends MCP session reads to that read API. MCP obtains and refreshes the calling user's pair through Control, validates its user/organization/workspace, audience and `rth:read` scope, and uses the returned reader URL. Only `rth_at_read_` access tokens reach read routes; the MCP reader client has no internal issuer or service credential. Once the reader is selected, no response or failure switches the request to History, including an unsupported first page (501). Unsupported views remain unavailable on that backend. A refused refresh requires reauthentication; an unavailable refresh retains the pair for a same-reader retry. History is used only when selected before the request, such as an explicitly legacy view or when the feature is off. Cursor continuations never switch backends.
 
 Control authenticates the user, refuses unexchanged Desktop handoffs, checks
 live workspace membership and `rth:read` on every issue and refresh, and
@@ -307,10 +305,10 @@ unique lowercase release tag, the exact selected commit SHA, and the
 configure its required reviewers before the first release.
 
 The workflow publishes `linux/amd64` and `linux/arm64` manifests to
-`ghcr.io/<repository-owner>/relay-control` (canonical) and, as a transition
-alias with the same digest, `ghcr.io/<repository-owner>/selfhost-api`. It
-refuses to overwrite the release tag or its `sha-<commit>` tag on either
-image, and reports the resulting digest in the run summary. Deploy by the canonical `image@sha256:...` reference when
+`ghcr.io/<repository-owner>/relay-control`. It refuses to overwrite the release
+tag or its `sha-<commit>` tag, and reports the resulting digest in the run
+summary. The legacy `selfhost-api` image name is deprecated and receives no new
+releases. Deploy by the `image@sha256:...` reference when
 immutability matters. BuildKit SBOM and max-mode provenance attestations are
 attached where GHCR supports them. The workflow only publishes this standalone
 image; it does not invoke or modify the hosted Cloud deployment.
@@ -318,12 +316,11 @@ image; it does not invoke or modify the hosted Cloud deployment.
 ### Verifying image provenance
 
 Each release also carries a signed Sigstore provenance bundle (GitHub artifact
-attestation) for the published index digest, under both names. Verify it with
+attestation) for the published index digest. Verify it with
 the GitHub CLI, using the digest from the run summary:
 
 ```sh
 gh attestation verify oci://ghcr.io/agentworkforce/relay-control@sha256:<digest> --owner AgentWorkforce
-gh attestation verify oci://ghcr.io/agentworkforce/selfhost-api@sha256:<digest> --owner AgentWorkforce
 ```
 
 Images published before signed attestations were added, including `0.4.0`
@@ -394,8 +391,8 @@ signs in. The same rule applies to `verification_uri`, the browser handoff's
 `api_url` and the desktop session's `apiUrl`.
 
 Rate limits match hosted Cloud and are per process: device start 10 per 5 minutes
-and token polling 120 per minute per client address (first `X-Forwarded-For`
-hop), and approval 30 per 5 minutes per signed-in user. Desktop's PKCE proof
+and token polling 120 per minute per client address (the TCP peer, or the
+`X-Forwarded-For` entry chosen by `SELFHOST_TRUSTED_PROXIES`), and approval 30 per 5 minutes per signed-in user. Desktop's PKCE proof
 fields are accepted but not enforced (self-host has no Desktop-authority grant).
 
 See `openapi.yaml` (also served at `/openapi.yaml`) for the exact contract.
@@ -536,8 +533,7 @@ Workspace environment and integrations reach runs this way:
 - **Just-in-time tokens.** A worker token can also read
   `/internal/v1/workspaces/{id}/integrations/{provider}/token`. To enable
   this, pass `runtimeCredentialVerifier: (token) =>
-  gateCredentialVerifier((token) => flows.verifyRuntimeCredential(token), license, "flows")`
-  to `createAdminModule`, using the loaded licence and selection.
+  flows.verifyRuntimeCredential(token)` to `createAdminModule`.
 - **v1 shell steps.** The v1 runtime passes only an allow-listed environment
   to `deterministic` shell steps. Delivered values reach the runtime and agent
   steps, not arbitrary shell commands.
