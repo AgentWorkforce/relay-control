@@ -387,8 +387,8 @@ export class ControlPlaneStore {
    * Deletes a workspace of this organization. Foreign keys cascade its
    * sessions, tokens, credentials, flows and workspace-scoped audit events;
    * the deletion itself is recorded at organization level so it outlives them.
-   * A Factory connection or binding restricts the delete until it is torn
-   * down. The organization's rows are locked so two concurrent deletes cannot
+   * Factory connections/bindings and live MCP OAuth grants or pending cleanup
+   * restrict deletion until teardown finishes. The organization's rows are locked so two concurrent deletes cannot
    * both pass the last-workspace check. The Relaycast workspace is not touched.
    */
   async deleteWorkspace(input: {
@@ -406,6 +406,15 @@ export class ControlPlaneStore {
         const target = rows.rows.find((row) => row.id === input.workspaceId);
         if (!target) return "not_found";
         if (rows.rows.length === 1 && !input.allowLast) return "last_workspace";
+        // Keep the workspace key/location until connector cleanup commits.
+        // The workspace row lock also fences a new grant's FK insertion;
+        // revocation alone must not let CASCADE discard pending remote work.
+        const oauth = await tx.query(`SELECT 1 FROM selfhost_mcp_oauth_grants
+          WHERE organization_id=$1 AND workspace_id=$2 AND revoked_at IS NULL
+          UNION ALL SELECT 1 FROM selfhost_mcp_oauth_revocations
+          WHERE organization_id=$1 AND workspace_id=$2 AND completed_at IS NULL
+          LIMIT 1`, [input.organizationId,input.workspaceId]);
+        if (oauth.rows.length) return "in_use";
         await tx.query("DELETE FROM selfhost_workspaces WHERE id = $1 AND organization_id = $2", [
           input.workspaceId,
           input.organizationId,

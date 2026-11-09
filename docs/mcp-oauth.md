@@ -99,6 +99,12 @@ immutable IDs and preserves identities still used by another live connection
 or a bound native MCP session. Missing workspace credentials leave cleanup
 pending.
 
+Workspace deletion returns `409 workspace_in_use` while live connections or
+pending cleanup exist. Disconnect them and let cleanup finish before deleting
+the workspace or disabling the module. This preserves the workspace credential
+needed to retry a failed remote release; teardown does not copy that secret
+into the cleanup record.
+
 Issuer requests have a 64 KiB body limit. Public registration allows 20
 requests per TCP peer per hour and 500 per process per hour. Forwarded headers
 do not choose the peer identity. Account and consent endpoints do not enable

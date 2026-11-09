@@ -1637,7 +1637,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         throw new HttpError(409, "last_workspace", "An organization must keep at least one workspace");
       }
       if (outcome === "in_use") {
-        throw new HttpError(409, "workspace_in_use", "Tear down this workspace's Factory connection first");
+        throw new HttpError(409, "workspace_in_use", "Disconnect workspace integrations and finish their cleanup first");
       }
       response.writeHead(204);
       response.end();

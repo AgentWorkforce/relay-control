@@ -298,6 +298,30 @@ test("teardown intent survives deletion of the user and participant rows",async 
   assert.equal(f.world.agents.has("approved-agent"),false);
 });
 
+test("workspace HTTP deletion preserves credentials through live grants and failed remote cleanup",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  const config=appConfig(),store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
+  const server=createServer(createApp({config,store,messagingFetch:f.fetchImpl,mcpOAuthTeardown:f.teardown}));
+  const base=await listen(server);t.after(()=>close(server));
+  const remove=()=>fetch(`${base}/api/v1/organizations/${f.owner.organizationId}/workspaces/${f.owner.workspaceId}`,{
+    method:"DELETE",headers:{authorization:`Bearer ${config.bootstrapToken}`},
+  });
+  let response=await remove();assert.equal(response.status,409);
+  assert.equal((await response.json()).error,"workspace_in_use");
+  assert.ok(await f.sessions.resolveAccessToken(f.pair.accessToken,RESOURCE));
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  f.world.failNext("POST","/v1/agents/release-exact",503);
+  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:1});
+  response=await remove();assert.equal(response.status,409);
+  assert.equal((await response.json()).error,"workspace_in_use");
+  assert.equal((await f.database.query("SELECT id FROM selfhost_workspaces WHERE id=$1",[f.owner.workspaceId])).rows.length,1);
+  assert.ok(f.world.agents.has("approved-agent"));
+  assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
+  response=await remove();assert.equal(response.status,204);
+  assert.equal(f.world.agents.has("approved-agent"),false);
+  assert.equal((await f.database.query("SELECT id FROM selfhost_workspaces WHERE id=$1",[f.owner.workspaceId])).rows.length,0);
+});
+
 test("a missing workspace keeps teardown pending instead of substituting another tenant credential",async t=>{
   const f=await relayFixture(t);await f.service.join({});
   await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-workspace-removal");
