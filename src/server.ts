@@ -149,7 +149,7 @@ async function start(): Promise<void> {
   identity.start();
   amp.start();
   if(mcpOAuthActive(config)) mcpOAuthTeardown.start();
-  else if(config.mcpOAuth?.unavailable) console.warn("[selfhost-api] hosted MCP OAuth unavailable", { reason: config.mcpOAuth.unavailable.reason });
+  else if(config.mcpOAuth?.unavailable) console.warn("[selfhost-api] hosted MCP OAuth unavailable", { reason: config.mcpOAuth.unavailable.reason, detail: config.mcpOAuth.unavailable.detail });
   factory.start();
   server.listen(config.port, config.host, () => {
     console.log("[selfhost-api] listening", {

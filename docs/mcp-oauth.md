@@ -68,7 +68,7 @@ Public routes keep their CORS headers. Other routes are unaffected.
 | `public_url` | `SELFHOST_PUBLIC_URL` is plain HTTP on a non-loopback host, so it cannot be an OAuth issuer | Serve the public origin over HTTPS |
 
 The server logs `[selfhost-api] hosted MCP OAuth unavailable` once at start-up
-with the reason only, never a configured value. Meanwhile `mcp_at_` bearers are
+with the reason and a short detail naming the input, never a configured value. Meanwhile `mcp_at_` bearers are
 refused with `401` at the MCP resources, the root `/mcp` resource is not
 mounted and the cleanup worker does not run. When the module is turned off
 explicitly nothing is logged.
@@ -148,7 +148,7 @@ decided on is unchanged; otherwise the record stays pending for its next
 attempt. Each request to Relaycast has a 10-second abort deadline.
 
 Retryable failures (network errors, timeouts, 5xx, 429, or a 404 while the
-agent is still listed) retry after 15 seconds, doubling per attempt up to one
+agent is still listed) retry after 60 seconds, doubling per attempt up to one
 hour. A pass handles at most 20 due records and stops after about 30 seconds,
 continuing immediately with the rest. A new disconnect is attempted at once.
 

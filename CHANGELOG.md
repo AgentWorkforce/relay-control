@@ -18,7 +18,7 @@ assigned at release.
   `oidc_signing_key`, `public_url`), `mcp_at_` bearers are refused with `401`,
   no cleanup worker starts and the reason is logged once at start-up.
 - Connector cleanup no longer holds tenant locks across Relaycast calls,
-  retries with exponential backoff (15 s doubling, capped at one hour), and
+  retries with exponential backoff (60 s doubling, capped at one hour), and
   completes records that retrying cannot fix. Migration 0032 adds the retry
   columns. The operator-only
   `POST /api/v1/organizations/{organizationId}/workspaces/{workspaceId}/mcp-oauth/abandon-cleanup`

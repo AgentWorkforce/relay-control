@@ -50,7 +50,9 @@ test("OIDC is absent without signing inputs; partial or invalid inputs make the 
     {SELFHOST_MCP_OIDC_SUBJECT_SALT:"fake-salt"},{SELFHOST_MCP_OIDC_PREVIOUS_PUBLIC_KEYS:"[]"},invalid]) {
     const config=load(env);
     assert.equal(config.enabled,true);
-    assert.deepEqual(config.unavailable,{reason:"oidc_signing_key"});
+    assert.equal(config.unavailable?.reason,"oidc_signing_key");
+    if(env!==invalid) assert.match(config.unavailable!.detail,/SELFHOST_MCP_OIDC/);
+    assert.doesNotMatch(config.unavailable!.detail,/BEGIN|fake-|PRIVATE|MII/);
     assert.equal(config.oidc,null);
     assert.equal(mcpOAuthActive({mcpOAuth:config}),false);
     // Explicitly off: nothing to report.
@@ -65,7 +67,7 @@ test("OIDC is absent without signing inputs; partial or invalid inputs make the 
 
 test("a public origin the OAuth issuer cannot use makes the flow unavailable",()=>{
   for(const origin of ["http://relay.example.test","https://relay.example.test/base"]) {
-    assert.deepEqual(loadMcpOAuthConfig({},()=>undefined,origin).unavailable,{reason:"public_url"},origin);
+    assert.equal(loadMcpOAuthConfig({},()=>undefined,origin).unavailable?.reason,"public_url",origin);
   }
   for(const origin of ["https://relay.example.test","http://localhost:3000","http://127.0.0.1"]) {
     assert.equal(loadMcpOAuthConfig({},()=>undefined,origin).unavailable,null,origin);
@@ -91,10 +93,10 @@ test("retained OIDC keys must be bounded, public, distinct and correctly typed e
     [{...entry,publicJwk:previous.privateKey.export({format:"jwk"})}],
     [{...entry,kid:inputs.SELFHOST_MCP_OIDC_SIGNING_KEY_ID}],
     [{...entry,publicJwk:pair.publicKey.export({format:"jwk"})}]]) {
-    assert.deepEqual(load({...inputs,SELFHOST_MCP_OIDC_PREVIOUS_PUBLIC_KEYS:JSON.stringify(value)}).unavailable,{reason:"oidc_signing_key"});
+    assert.equal(load({...inputs,SELFHOST_MCP_OIDC_PREVIOUS_PUBLIC_KEYS:JSON.stringify(value)}).unavailable?.reason,"oidc_signing_key");
   }
-  assert.deepEqual(load({...inputs,SELFHOST_MCP_OIDC_PREVIOUS_PUBLIC_KEYS:"not-json"}).unavailable,{reason:"oidc_signing_key"});
-  assert.deepEqual(load({...inputs,SELFHOST_MCP_OIDC_SIGNING_KEY:"fake-invalid-key"}).unavailable,{reason:"oidc_signing_key"});
+  assert.equal(load({...inputs,SELFHOST_MCP_OIDC_PREVIOUS_PUBLIC_KEYS:"not-json"}).unavailable?.reason,"oidc_signing_key");
+  assert.equal(load({...inputs,SELFHOST_MCP_OIDC_SIGNING_KEY:"fake-invalid-key"}).unavailable?.reason,"oidc_signing_key");
 });
 
 test("application config includes default-on MCP settings without retaining secret values in diagnostics",()=>{
@@ -104,9 +106,9 @@ test("application config includes default-on MCP settings without retaining secr
     RELAYHISTORY_PUBLIC_URL:"https://history.selfhosted.company",SELFHOST_ENCRYPTION_KEY_ID:"fake-key",SELFHOST_ENCRYPTION_KEY:Buffer.alloc(32,7).toString("base64")};
   assert.deepEqual(loadConfig(env).mcpOAuth,{enabled:true,unavailable:null,eventsEnabled:false,pumpEnabled:false,oidc:null});
   assert.deepEqual(loadConfig({...env,SELFHOST_MCP_OAUTH:"off"}).mcpOAuth,{enabled:false,unavailable:null,eventsEnabled:false,pumpEnabled:false,oidc:null});
-  assert.deepEqual(loadConfig({...env,SELFHOST_PUBLIC_URL:"http://relay.example.test"}).mcpOAuth!.unavailable,{reason:"public_url"});
+  assert.equal(loadConfig({...env,SELFHOST_PUBLIC_URL:"http://relay.example.test"}).mcpOAuth!.unavailable?.reason,"public_url");
   const invalid="fake-secret-value-never-echo";
   const degraded=loadConfig({...env,...inputs,SELFHOST_MCP_OIDC_SIGNING_KEY:invalid}).mcpOAuth!;
-  assert.deepEqual(degraded.unavailable,{reason:"oidc_signing_key"});
+  assert.equal(degraded.unavailable?.reason,"oidc_signing_key");
   assert.ok(!JSON.stringify(degraded).includes(invalid));
 });

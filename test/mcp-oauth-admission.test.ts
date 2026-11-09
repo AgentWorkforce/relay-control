@@ -28,7 +28,7 @@ import type { RelaycastClient } from "../src/messaging/relaycast.js";
 const ORIGIN="https://relay.example.test",SHARED="/api/v1/mcp/shared-sessions";
 const RESOURCE=ORIGIN+"/cloud"+SHARED;
 const KEYRING={active:{id:"fake-key",key:Buffer.alloc(32,7)}};
-function appConfig(enabled=true,unavailable:{reason:"public_url"|"oidc_signing_key"}|null=null):SelfhostConfig {
+function appConfig(enabled=true,unavailable:{reason:"public_url"|"oidc_signing_key";detail:string}|null=null):SelfhostConfig {
   return {
     databaseUrl:"unused",publicBaseUrl:ORIGIN,dashboardUrl:ORIGIN,
     relaycastUrl:"http://fake-relay.test",relaycastPublicUrl:"https://cast.example.test",
@@ -467,7 +467,7 @@ test("teardown commits its claim and holds no lifecycle lock while Relaycast ans
   await reached;
   const claimed=await revocation(f);
   assert.equal(claimed.attempts,1);assert.ok(claimed.claimed_at);assert.equal(claimed.completed_at,null);
-  assert.equal(new Date(claimed.next_attempt_at!).getTime(),f.clock.at+15_000);
+  assert.equal(new Date(claimed.next_attempt_at!).getTime(),f.clock.at+60_000);
   // A login, membership change or MCP join of the same owner proceeds meanwhile.
   await within(f.database.transaction(async tx=>{
     await lockUser(tx,f.owner.userId);await lockOrganization(tx,f.owner.organizationId);
@@ -480,22 +480,22 @@ test("teardown commits its claim and holds no lifecycle lock while Relaycast ans
 });
 
 test("a retryable failure backs off exponentially and retries only once due",async t=>{
-  assert.deepEqual([1,2,3,8,9,40].map(mcpOAuthTeardownBackoffMs),[15_000,30_000,60_000,1_920_000,3_600_000,3_600_000]);
+  assert.deepEqual([1,2,3,6,7,40].map(mcpOAuthTeardownBackoffMs),[60_000,120_000,240_000,1_920_000,3_600_000,3_600_000]);
   const f=await relayFixture(t);await f.service.join({});
   await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
   f.world.failNext("POST","/v1/agents/release-exact",503);
   assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:1});
   let row=await revocation(f);
-  assert.equal(row.attempts,1);assert.equal(new Date(row.next_attempt_at!).getTime(),f.clock.at+15_000);
-  f.advance(14_999);
+  assert.equal(row.attempts,1);assert.equal(new Date(row.next_attempt_at!).getTime(),f.clock.at+60_000);
+  f.advance(59_999);
   assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:0});
   assert.equal((await revocation(f)).attempts,1);
   f.advance(1);f.world.failNext("POST","/v1/agents/release-exact",429);
   assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:1});
   row=await revocation(f);
-  assert.equal(row.attempts,2);assert.equal(new Date(row.next_attempt_at!).getTime(),f.clock.at+30_000);
+  assert.equal(row.attempts,2);assert.equal(new Date(row.next_attempt_at!).getTime(),f.clock.at+120_000);
   assert.ok(f.world.agents.has("approved-agent"));
-  f.advance(30_000);
+  f.advance(120_000);
   assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
   row=await revocation(f);
   assert.equal(row.attempts,3);assert.equal(row.outcome,"released");
@@ -674,7 +674,7 @@ test("disabled module exposes no issuer, root facade or grant API and cannot adm
 });
 
 test("unavailable module answers 501 on OAuth paths, starts no worker and refuses stored bearers with 401",async t=>{
-  for(const [reason,config] of [["oidc_signing_key",appConfig(true,{reason:"oidc_signing_key"})],
+  for(const [reason,config] of [["oidc_signing_key",appConfig(true,{reason:"oidc_signing_key",detail:"fake detail"})],
     ["public_url",{...appConfig(),publicBaseUrl:"http://relay.example.test"}]] as const) {
     const f=await relayFixture(t);
     const store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});

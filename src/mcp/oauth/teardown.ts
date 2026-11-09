@@ -28,9 +28,10 @@ export type McpOAuthTeardownResult = {completed:number;kept:number;pending:numbe
 const TERMINAL=new Set<McpOAuthTeardownOutcome>(["workspace_mismatch","decrypt_failed","metadata_mismatch"]);
 const PAGE=20;
 
-/** Exponential retry delay after the given attempt count: 15 s doubling, capped at one hour. */
+/** Exponential retry delay after the given attempt count: 60 s doubling, capped at one hour. */
 export function mcpOAuthTeardownBackoffMs(attempts:number):number {
-  return Math.min(15_000*2**Math.max(0,attempts-1),3_600_000);
+  // The remote phase makes up to four Relaycast calls with a 10 s deadline each, so the first retry must be later than that worst case or a second pass could claim the same row.
+  return Math.min(60_000*2**Math.max(0,attempts-1),3_600_000);
 }
 
 /** Bound each remote teardown call. */

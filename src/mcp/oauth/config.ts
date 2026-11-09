@@ -7,7 +7,7 @@ export type McpOAuthUnavailableReason = "public_url" | "oidc_signing_key";
 export type McpOAuthConfig = {
   enabled: boolean;
   /** Non-null only when enabled: the OAuth surface answers 501 and no worker starts. */
-  unavailable: null | {reason: McpOAuthUnavailableReason};
+  unavailable: null | {reason: McpOAuthUnavailableReason; detail: string};
   eventsEnabled: boolean;
   pumpEnabled: boolean;
   /** Null means OAuth without OpenID Connect; callers derive OIDC availability from this one value. */
@@ -41,13 +41,13 @@ export function loadMcpOAuthConfig(env: Env, readSecret: (name:string)=>string|u
   const pumpEnabled=flag(env,"SELFHOST_MCP_EVENTS_PUMP",false);
   if(pumpEnabled && !eventsEnabled) throw new Error("SELFHOST_MCP_EVENTS_PUMP requires SELFHOST_MCP_EVENTS=on");
   let oidc:McpOidcConfiguration|null=null;
-  let reason:McpOAuthUnavailableReason|null=null;
+  let reason:McpOAuthUnavailableReason|null=null,detail="";
   try { oidc=loadOidc(env,readSecret); } catch(error) {
     if(!(error instanceof OidcUnavailable)) throw error;
-    reason="oidc_signing_key";
+    reason="oidc_signing_key";detail=error.message;
   }
-  if(publicBaseUrl!==undefined && !mcpOAuthPublicOriginAllowed(publicBaseUrl)) reason="public_url";
-  return {enabled,unavailable:enabled && reason?{reason}:null,eventsEnabled,pumpEnabled,oidc:reason?null:oidc};
+  if(publicBaseUrl!==undefined && !mcpOAuthPublicOriginAllowed(publicBaseUrl)) reason="public_url",detail="SELFHOST_PUBLIC_URL must be an HTTPS origin (or loopback HTTP) to serve OAuth";
+  return {enabled,unavailable:enabled && reason?{reason,detail}:null,eventsEnabled,pumpEnabled,oidc:reason?null:oidc};
 }
 
 function loadOidc(env: Env, readSecret: (name:string)=>string|undefined): McpOidcConfiguration|null {
