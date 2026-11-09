@@ -4,7 +4,19 @@
 // collector interface (infra docs/analytics-collector-interface.md, infra #84
 // @62599fb as amended by infra #85 @ca91118 (merged 91c9b79)).
 
-export type AnalyticsEventKind = "config_loaded" | "service_started" | "service_stopping";
+export type AnalyticsEventKind =
+  // Server lifecycle (installation scope, emitted by the control server itself).
+  | "config_loaded"
+  | "service_started"
+  | "service_stopping"
+  // Client kinds, accepted only through the authenticated client gateway.
+  | "dashboard.page_viewed"
+  | "dashboard.session_opened"
+  | "desktop.app_started"
+  | "desktop.sign_in_completed";
+
+/** A client that may send registered kinds through the gateway. */
+export type AnalyticsClient = "dashboard" | "desktop";
 
 /**
  * Registry scope of an event kind; fixes which attribution fields it carries.
@@ -34,6 +46,11 @@ export type CaptureInput = {
   /** Only where the kind's registered scope requires it, after application authorization. */
   tenantId?: string;
   workspaceId?: string;
+  /**
+   * Epoch ms the event happened; defaults to the capture time. Set by the
+   * client gateway after bounding the client's clock. Exported as UTC ISO-8601.
+   */
+  occurredAt?: number;
 };
 
 export type FlushResult = { sent: number; dropped: number };
@@ -50,6 +67,32 @@ export type AnalyticsFailureReason =
   | "protocol"
   | "rejected"
   | "oversize";
+
+/** Why the client gateway refused a request (one counter per request). */
+export type AnalyticsGatewayRejection =
+  | "auth"
+  | "csrf"
+  | "client_mismatch"
+  | "body"
+  | "invalid"
+  | "reserved_field"
+  | "rate_limited";
+
+export type AnalyticsGatewayCounter =
+  | "requests"
+  | "accepted"
+  | "clock_adjusted"
+  | `rejected.${AnalyticsGatewayRejection}`;
+
+export type AnalyticsGatewayStats = {
+  /** Requests that reached the gateway route. */
+  requests: number;
+  /** Events accepted (202) and handed to capture; a later drop is counted under `dropped`. */
+  accepted: number;
+  rejected: Record<AnalyticsGatewayRejection, number>;
+  /** Accepted events whose supplied `occurred_at` was not a valid time within the skew window and was replaced by server time. */
+  clock_adjusted: number;
+};
 
 export type AnalyticsStats = {
   captured: number;
@@ -83,6 +126,8 @@ export type AnalyticsStats = {
   queueBytes: number;
   lastFailureReason: AnalyticsFailureReason | null;
   lastSuccessAt: string | null;
+  /** Client gateway counters (`gateway.*`); zero when the gateway is not mounted. */
+  gateway: AnalyticsGatewayStats;
 };
 
 export interface AnalyticsPort {
@@ -91,6 +136,11 @@ export interface AnalyticsPort {
   /** `deadline` is epoch ms on the port's clock. Resolves by the deadline; never rejects. */
   flush(deadline: number): Promise<FlushResult>;
   stats(): AnalyticsStats;
+  /**
+   * Increments a `gateway.*` counter (default by 1). Optional so ports
+   * without a gateway need not implement it; never throws.
+   */
+  recordGateway?(counter: AnalyticsGatewayCounter, amount?: number): void;
 }
 
 export type AnalyticsEnvelope = {

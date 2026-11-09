@@ -1,7 +1,14 @@
+import { loadMcpOAuthConfig, type McpOAuthConfig } from "./mcp/oauth/config.js";
 import { readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey, type KeyObject } from "node:crypto";
 import { isIP } from "node:net";
 import type { EncryptionKey, EncryptionKeyring } from "./crypto.js";
+import { trustedProxyHops } from "./auth/device-approval.js";
+import {
+  isAcquisitionIdentifier,
+  rawEd25519PublicKey,
+  strictRawPublicKey,
+} from "./acquisition/assertion.js";
 
 export type SelfhostConfig = {
   databaseUrl: string;
@@ -15,14 +22,27 @@ export type SelfhostConfig = {
    */
   relayauthUrl: string | null;
   relayhistoryUrl: string;
+  /**
+   * RELAYHISTORY_BACKEND=native: no RelayAuth and no standalone RelayHistory.
+   * relayhistoryUrl and relayhistoryPublicUrl are the read API's (see
+   * loadConfig); uploads go to the pipeline ingest edge at the same public
+   * origin. Absent means the legacy RelayHistory exchange.
+   */
+  relayhistoryBackend?: "native" | null;
   /** Optional GET-only pipeline reader for unsearched session lists and turns. */
   relayhistoryReadApiUrl?: string | null;
   /** RELAYHISTORY_READ_API_EVENTS: opt in to native session-event reads. Default off. */
   relayhistoryReadApiEvents?: boolean;
+  /** RELAYFILE_CONTROL_BROKER_SECRET: Flows credential broker routes. Unset: they 404. */
+  relayfileControlBrokerSecret?: string | null;
   /** Independent read service; owns issuance, rotation and verification of its tokens. */
   sessionReadApi?: { url: string; publicUrl: string; secret: string } | null;
+  /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
+  sessionErasureApi?: { url: string; secret: string } | null;
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
   sessionReadMcpReads?: boolean;
+  /** SESSION_SEARCH_AGENT_TOKENS: read `@name` tokens in search text as agent filters. Default off. */
+  sessionSearchAgentTokens?: boolean;
   relayhistoryPublicUrl: string;
   relayauthApiKey: string | null;
   bootstrapToken: string;
@@ -49,13 +69,59 @@ export type SelfhostConfig = {
    * SELFHOST_INTROSPECT_AUDIENCES. Defaults to [relayhistoryPublicUrl].
    */
   introspectAudiences?: string[];
+  /**
+   * Dormant cloud-class acquisition assertion issuer
+   * (SELFHOST_ACQUISITION_ISSUER_ENABLED). Unset or null: off, and every
+   * /api/v1/acquisition/* route answers 404.
+   */
+  acquisitionIssuer?: AcquisitionIssuerConfig | null;
   /** Factory sessions (src/factory). Unset or enabled=false: routes 404, worker off. */
   factory?: FactoryConfig;
+  /** Hosted MCP module settings; omitted is off. Loading does not mount routes. */
+  mcpOAuth?: McpOAuthConfig;
+  /**
+   * Desktop feed (docs/desktop-feed.md). Null or absent turns the feature off
+   * and every feed route answers 404 like any unknown path.
+   */
+  desktopFeed?: DesktopFeedConfig | null;
   port: number;
   host: string;
 };
 
-type Env = Record<string, string | undefined>;
+export type DesktopFeedSignerConfig =
+  | { kind: "memory"; label: string }
+  | { kind: "awskms"; region: string; label: string; keyAliases: Record<string, string> };
+
+export type DesktopFeedStorageConfig =
+  | { kind: "memory" }
+  | { kind: "s3"; bucket: string; region: string; prefix: string };
+
+export type DesktopFeedConfig = {
+  signer: DesktopFeedSignerConfig;
+  storage: DesktopFeedStorageConfig;
+  /** sha256 hex of each env-configured publisher token, by profile id. */
+  publisherTokenHashes?: Record<string, string[]>;
+};
+
+export type Env = Record<string, string | undefined>;
+
+export type AcquisitionPublishedKey = {
+  issuerKeyId: string;
+  issuerClass: "cloud";
+  /** Base64 of the raw 32-byte Ed25519 public key (ACQUISITION_PINNED_KEYS shape). */
+  publicKeyBase64: string;
+};
+
+export type AcquisitionIssuerConfig = {
+  /** SELFHOST_ACQUISITION_ORIGIN as a normalized origin (scheme, lowercase host, port). */
+  origin: string;
+  /** SELFHOST_ACQUISITION_ISSUER_KEY_ID: stamped into every issued payload. */
+  keyId: string;
+  /** Ed25519 private key; never logged, never published. */
+  privateKey: KeyObject;
+  /** Active key first, then SELFHOST_ACQUISITION_ISSUER_PREVIOUS_PUBLIC_KEYS (never used to sign). */
+  publishedKeys: AcquisitionPublishedKey[];
+};
 
 export type FactoryConfig = {
   enabled: boolean;
@@ -256,9 +322,19 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   if (Buffer.byteLength(bootstrapToken) < 32) {
     throw new Error("SELFHOST_BOOTSTRAP_TOKEN must be at least 32 bytes");
   }
+  // Validated at boot; clientIp (src/auth/device-approval.ts) reads it per request.
+  trustedProxyHops(env);
 
-  const relayhistoryPublicUrl = publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL");
+  const relayhistoryBackend = loadRelayhistoryBackend(env);
+  const sessionReadApi = loadSessionReadApiConfig(env);
+  const relayauth = loadRelayauthConfig(env);
+  // Native: one History origin, the read API's. Nothing may name a second one.
+  const nativeReadApi = relayhistoryBackend === "native"
+    ? nativeReadApiConfig(env, sessionReadApi, relayauth)
+    : null;
+  const relayhistoryPublicUrl = nativeReadApi ? nativeReadApi.publicUrl : publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL");
   const introspection = loadIntrospectionConfig(env, relayhistoryPublicUrl);
+  if (nativeReadApi) assertNativeIntrospection(introspection, nativeReadApi.publicUrl);
   const relayhistoryReadApiUrl = env.RELAYHISTORY_READ_API_URL?.trim()
     ? publicServiceUrl(env, "RELAYHISTORY_READ_API_URL") : null;
   const eventsFlag = env.RELAYHISTORY_READ_API_EVENTS?.trim();
@@ -283,21 +359,34 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     publicBaseUrl: serviceUrl(env, "SELFHOST_PUBLIC_URL"),
     relaycastUrl: serviceUrl(env, "RELAYCAST_URL"),
     relaycastPublicUrl: publicServiceUrl(env, "RELAYCAST_PUBLIC_URL"),
-    ...loadRelayauthConfig(env),
-    relayhistoryUrl: serviceUrl(env, "RELAYHISTORY_URL"),
+    ...relayauth,
+    relayhistoryBackend,
+    relayhistoryUrl: nativeReadApi ? nativeReadApi.url : serviceUrl(env, "RELAYHISTORY_URL"),
     relayhistoryPublicUrl,
     relayhistoryReadApiUrl,
     relayhistoryReadApiEvents,
-    sessionReadApi: loadSessionReadApiConfig(env),
+    sessionReadApi,
+    relayfileControlBrokerSecret: loadBrokerSecret(env),
+    sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
+    sessionSearchAgentTokens: loadSessionSearchAgentTokens(env),
     ...introspection,
+    acquisitionIssuer: loadAcquisitionIssuerConfig(env, introspection),
     bootstrapToken,
     encryptionKeyring: loadEncryptionKeyring(env),
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     factory: loadFactoryConfig(env),
+    mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name), serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
   };
+}
+
+function loadSessionSearchAgentTokens(env: Env): boolean {
+  const value = env.SESSION_SEARCH_AGENT_TOKENS?.trim();
+  if (!value || value === "false") return false;
+  if (value !== "true") throw new Error("SESSION_SEARCH_AGENT_TOKENS must be true or false");
+  return true;
 }
 
 function loadSessionReadMcpReads(env: Env): boolean {
@@ -308,6 +397,75 @@ function loadSessionReadMcpReads(env: Env): boolean {
     throw new Error("SESSION_READ_API_MCP_READS requires the session read API to be configured");
   }
   return true;
+}
+
+function loadSessionErasureApiConfig(env: Env): SelfhostConfig["sessionErasureApi"] {
+  const secret = readSecret(env, "SESSION_ERASE_API_SECRET");
+  if (!secret && !env.SESSION_ERASE_API_URL?.trim()) return null;
+  if (!secret || Buffer.byteLength(secret) < 32) {
+    throw new Error("SESSION_ERASE_API_SECRET (or _FILE) must be at least 32 bytes");
+  }
+  return { url: serviceUrl(env, "SESSION_ERASE_API_URL"), secret };
+}
+
+function loadBrokerSecret(env: Env): string | null {
+  const secret = readSecret(env, "RELAYFILE_CONTROL_BROKER_SECRET");
+  if (!secret) return null;
+  if (Buffer.byteLength(secret) < 32) throw new Error("RELAYFILE_CONTROL_BROKER_SECRET (or _FILE) must be at least 32 bytes");
+  return secret;
+}
+
+/** RELAYHISTORY_BACKEND: unset or `legacy` (default), or `native`; anything else refuses startup. */
+function loadRelayhistoryBackend(env: Env): "native" | null {
+  const raw = env.RELAYHISTORY_BACKEND?.trim() ?? "";
+  if (raw === "" || raw === "legacy") return null;
+  if (raw === "native") return "native";
+  throw new Error("RELAYHISTORY_BACKEND must be legacy or native");
+}
+
+/**
+ * RELAYHISTORY_BACKEND=native needs the read API handoff, refuses RelayAuth,
+ * and permits RELAYHISTORY_URL / _PUBLIC_URL only when they name the read API.
+ * Uploads use the same public origin: the ingest edge is routed there, so a
+ * caller's token is valid at exactly one audience.
+ */
+function nativeReadApiConfig(
+  env: Env,
+  sessionReadApi: SelfhostConfig["sessionReadApi"],
+  relayauth: { relayauthUrl: string | null; relayauthApiKey: string | null },
+): { url: string; publicUrl: string } {
+  if (!sessionReadApi) {
+    throw new Error("RELAYHISTORY_BACKEND=native requires SESSION_READ_API_URL, SESSION_READ_API_PUBLIC_URL and SESSION_READ_API_SECRET");
+  }
+  if (relayauth.relayauthUrl || relayauth.relayauthApiKey) {
+    throw new Error("RELAYHISTORY_BACKEND=native refuses RELAYAUTH_URL and RELAYAUTH_API_KEY");
+  }
+  if (env.RELAYHISTORY_READ_API_URL?.trim()) {
+    throw new Error("RELAYHISTORY_BACKEND=native refuses RELAYHISTORY_READ_API_URL");
+  }
+  if (new URL(sessionReadApi.publicUrl).origin !== sessionReadApi.publicUrl) {
+    throw new Error("SESSION_READ_API_PUBLIC_URL must be a bare origin with RELAYHISTORY_BACKEND=native");
+  }
+  if (env.RELAYHISTORY_URL?.trim() && serviceUrl(env, "RELAYHISTORY_URL") !== sessionReadApi.url) {
+    throw new Error("RELAYHISTORY_URL must equal SESSION_READ_API_URL (or be unset) with RELAYHISTORY_BACKEND=native");
+  }
+  if (env.RELAYHISTORY_PUBLIC_URL?.trim() && publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL") !== sessionReadApi.publicUrl) {
+    throw new Error("RELAYHISTORY_PUBLIC_URL must equal SESSION_READ_API_PUBLIC_URL (or be unset) with RELAYHISTORY_BACKEND=native");
+  }
+  return { url: sessionReadApi.url, publicUrl: sessionReadApi.publicUrl };
+}
+
+/** The ingest edge authorizes every upload through introspection of this audience. */
+function assertNativeIntrospection(
+  introspection: { introspectSecret: string | null; introspectAudiences: string[] },
+  publicUrl: string,
+): void {
+  if (!introspection.introspectSecret) {
+    throw new Error("RELAYHISTORY_BACKEND=native requires RELAYCONTROL_INTROSPECT_SECRET");
+  }
+  if (!introspection.introspectAudiences.includes(publicUrl)) {
+    throw new Error("SELFHOST_INTROSPECT_AUDIENCES must include SESSION_READ_API_PUBLIC_URL with RELAYHISTORY_BACKEND=native");
+  }
 }
 
 function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {
@@ -373,6 +531,31 @@ function loadRelayauthConfig(env: Env): {
   return { relayauthUrl: serviceUrl(env, "RELAYAUTH_URL"), relayauthApiKey: apiKey };
 }
 
+/**
+ * One http(s) origin without credentials, path, query or fragment, trailing
+ * slashes dropped (SELFHOST_INTROSPECT_AUDIENCES entries and
+ * SELFHOST_ACQUISITION_ORIGIN). `label` names the variable in errors; the
+ * value is never echoed.
+ */
+function audienceOrigin(value: string, label: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${label} must be an absolute origin`);
+  }
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username || url.password || url.search || url.hash ||
+    (url.pathname !== "" && url.pathname !== "/") || /[?#]/.test(value)
+  ) {
+    throw new Error(
+      `${label} must be an http(s) origin without credentials, path, query, or fragment`,
+    );
+  }
+  return value.replace(/\/+$/, "");
+}
+
 function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
   introspectSecret: string | null;
   introspectAudiences: string[];
@@ -383,29 +566,108 @@ function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
   }
   const raw = env.SELFHOST_INTROSPECT_AUDIENCES?.trim();
   const introspectAudiences = raw
-    ? raw.split(",").map((value) => value.trim()).filter(Boolean).map((value) => {
-      let url: URL;
-      try {
-        url = new URL(value);
-      } catch {
-        throw new Error("SELFHOST_INTROSPECT_AUDIENCES entries must be absolute origins");
-      }
-      if (
-        (url.protocol !== "http:" && url.protocol !== "https:") ||
-        url.username || url.password || url.search || url.hash ||
-        (url.pathname !== "" && url.pathname !== "/") || /[?#]/.test(value)
-      ) {
-        throw new Error(
-          "SELFHOST_INTROSPECT_AUDIENCES entries must be http(s) origins without credentials, path, query, or fragment",
-        );
-      }
-      return value.replace(/\/+$/, "");
-    })
+    ? raw.split(",").map((value) => value.trim()).filter(Boolean).map((value) =>
+      audienceOrigin(value, "each SELFHOST_INTROSPECT_AUDIENCES entry"))
     : [relayhistoryPublicUrl];
   if (introspectAudiences.length === 0) {
     throw new Error("SELFHOST_INTROSPECT_AUDIENCES must name at least one origin");
   }
   return { introspectSecret, introspectAudiences };
+}
+
+/**
+ * SELFHOST_ACQUISITION_ISSUER_ENABLED (strict `true` / `false` / unset,
+ * default off). Off: null, and no other acquisition variable is read, so no
+ * key is loaded or parsed. On: every variable must be present and valid, and
+ * startup fails naming the variable (never its value) otherwise.
+ *
+ * The acquisition origin must also be an accepted introspection audience with
+ * introspection enabled: acquisition-operator tokens can only be minted for,
+ * and only introspect against, an accepted audience, and the pipeline
+ * verifies its callers through the same introspection.
+ */
+export function loadAcquisitionIssuerConfig(
+  env: Env,
+  introspection: { introspectSecret: string | null; introspectAudiences: string[] },
+): AcquisitionIssuerConfig | null {
+  const flag = env.SELFHOST_ACQUISITION_ISSUER_ENABLED?.trim() ?? "";
+  if (flag !== "" && flag !== "true" && flag !== "false") {
+    throw new Error("SELFHOST_ACQUISITION_ISSUER_ENABLED must be true or false");
+  }
+  if (flag !== "true") return null;
+
+  const originValue = required(env, "SELFHOST_ACQUISITION_ORIGIN");
+  const origin = new URL(audienceOrigin(originValue, "SELFHOST_ACQUISITION_ORIGIN")).origin;
+  if (!introspection.introspectSecret) {
+    throw new Error("RELAYCONTROL_INTROSPECT_SECRET is required when SELFHOST_ACQUISITION_ISSUER_ENABLED=true");
+  }
+  if (!introspection.introspectAudiences.some((audience) => new URL(audience).origin === origin)) {
+    throw new Error("SELFHOST_ACQUISITION_ORIGIN must be listed in SELFHOST_INTROSPECT_AUDIENCES");
+  }
+
+  const keyId = env.SELFHOST_ACQUISITION_ISSUER_KEY_ID;
+  if (keyId === undefined || keyId === "") throw new Error("SELFHOST_ACQUISITION_ISSUER_KEY_ID is required");
+  if (!isAcquisitionIdentifier(keyId)) {
+    throw new Error(
+      "SELFHOST_ACQUISITION_ISSUER_KEY_ID must be at most 512 UTF-8 bytes without control characters",
+    );
+  }
+
+  const pem = readSecret(env, "SELFHOST_ACQUISITION_ISSUER_PRIVATE_KEY");
+  if (!pem) throw new Error("SELFHOST_ACQUISITION_ISSUER_PRIVATE_KEY (or _FILE) is required");
+  let privateKey: KeyObject;
+  try {
+    if (!pem.startsWith("-----BEGIN PRIVATE KEY-----")) throw new Error("not PKCS#8 PEM");
+    privateKey = createPrivateKey({ key: pem, format: "pem" });
+  } catch {
+    throw new Error("SELFHOST_ACQUISITION_ISSUER_PRIVATE_KEY must be an unencrypted PKCS#8 PEM Ed25519 private key");
+  }
+  if (privateKey.type !== "private" || privateKey.asymmetricKeyType !== "ed25519") {
+    throw new Error("SELFHOST_ACQUISITION_ISSUER_PRIVATE_KEY must be an unencrypted PKCS#8 PEM Ed25519 private key");
+  }
+  const active: AcquisitionPublishedKey = {
+    issuerKeyId: keyId,
+    issuerClass: "cloud",
+    publicKeyBase64: rawEd25519PublicKey(privateKey).toString("base64"),
+  };
+  return {
+    origin,
+    keyId,
+    privateKey,
+    publishedKeys: [active, ...loadPreviousAcquisitionKeys(env, active)],
+  };
+}
+
+/** SELFHOST_ACQUISITION_ISSUER_PREVIOUS_PUBLIC_KEYS: JSON [{issuerKeyId, publicKeyBase64}]. */
+function loadPreviousAcquisitionKeys(env: Env, active: AcquisitionPublishedKey): AcquisitionPublishedKey[] {
+  const name = "SELFHOST_ACQUISITION_ISSUER_PREVIOUS_PUBLIC_KEYS";
+  const raw = env[name]?.trim();
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`${name} must be a JSON array`);
+  }
+  if (!Array.isArray(parsed)) throw new Error(`${name} must be a JSON array`);
+  const ids = new Set([active.issuerKeyId]);
+  const keys = new Set([active.publicKeyBase64]);
+  return parsed.map((entry: unknown) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) ||
+        Object.keys(entry).sort().join(",") !== "issuerKeyId,publicKeyBase64") {
+      throw new Error(`${name} entries need exactly issuerKeyId and publicKeyBase64`);
+    }
+    const { issuerKeyId, publicKeyBase64 } = entry as Record<string, unknown>;
+    if (!isAcquisitionIdentifier(issuerKeyId)) throw new Error(`${name} has an invalid issuerKeyId`);
+    if (!strictRawPublicKey(publicKeyBase64)) {
+      throw new Error(`${name} publicKeyBase64 must be base64 of a raw 32-byte Ed25519 public key`);
+    }
+    if (ids.has(issuerKeyId)) throw new Error(`${name} repeats an issuerKeyId (or the active one)`);
+    if (keys.has(publicKeyBase64 as string)) throw new Error(`${name} repeats a public key (or the active one)`);
+    ids.add(issuerKeyId);
+    keys.add(publicKeyBase64 as string);
+    return { issuerKeyId, issuerClass: "cloud" as const, publicKeyBase64: publicKeyBase64 as string };
+  });
 }
 
 function absoluteHttpUrl(env: Env, name: string, fallback: string): string {
@@ -430,6 +692,7 @@ function loadAdminConfig(env: Env, publicBaseUrl: string): {
   oauthRedirectUrl: string;
   dashboardUrl: string;
   operatorOAuthApps: Record<string, OperatorOAuthApp>;
+  desktopFeed: DesktopFeedConfig | null;
 } {
   const internalServiceToken = readSecret(env, "SELFHOST_INTERNAL_TOKEN") ?? null;
   if (internalServiceToken !== null && Buffer.byteLength(internalServiceToken) < 32) {
@@ -448,9 +711,106 @@ function loadAdminConfig(env: Env, publicBaseUrl: string): {
     oauthRedirectUrl,
     dashboardUrl: absoluteHttpUrl(env, "SELFHOST_DASHBOARD_URL", `${publicBaseUrl}/`),
     operatorOAuthApps: loadOperatorOAuthApps(env),
+    desktopFeed: loadDesktopFeedConfig(env),
   };
 }
 
+const FEED_PROFILE_ID = /^[a-z0-9]{1,32}$/;
+const KMS_ALIAS = /^alias\/(?!aws\/)[A-Za-z0-9/_-]{1,250}$/;
+
+function feedProfileMap(env: Env, name: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(env[name] ?? "");
+  } catch {
+    throw new Error(`${name} must be a JSON object keyed by profile id`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${name} must be a JSON object keyed by profile id`);
+  }
+  for (const profile of Object.keys(parsed)) {
+    if (!FEED_PROFILE_ID.test(profile)) throw new Error(`${name} has a profile id that is not ^[a-z0-9]{1,32}$`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/**
+ * SELFHOST_DESKTOP_FEED_SIGNER (awskms | memory) and
+ * SELFHOST_DESKTOP_FEED_STORAGE (s3 | memory) together turn the feed on;
+ * with neither set it is off. Setting only one is a configuration error, so a
+ * half-configured feed never starts silently disabled.
+ */
+export function loadDesktopFeedConfig(env: Env = process.env): DesktopFeedConfig | null {
+  const signerKind = env.SELFHOST_DESKTOP_FEED_SIGNER?.trim();
+  const storageKind = env.SELFHOST_DESKTOP_FEED_STORAGE?.trim();
+  if (!signerKind && !storageKind) return null;
+  if (!signerKind || !storageKind) {
+    throw new Error("SELFHOST_DESKTOP_FEED_SIGNER and SELFHOST_DESKTOP_FEED_STORAGE must be set together");
+  }
+  // The memory backends lose their key and objects on restart: tests and dev only.
+  if (env.NODE_ENV === "production" && (signerKind === "memory" || storageKind === "memory")) {
+    throw new Error("The memory desktop feed signer and storage are for tests and development, not NODE_ENV=production");
+  }
+  const label = env.SELFHOST_DESKTOP_FEED_KEY_LABEL?.trim() || (signerKind === "awskms" ? "k1" : "dev");
+  if (!/^[a-z0-9]{1,16}$/.test(label)) throw new Error("SELFHOST_DESKTOP_FEED_KEY_LABEL must match ^[a-z0-9]{1,16}$");
+  let signer: DesktopFeedSignerConfig;
+  if (signerKind === "awskms") {
+    const region = env.SELFHOST_DESKTOP_FEED_KMS_REGION?.trim() || env.AWS_REGION?.trim() || "";
+    if (!/^[a-z0-9-]+$/.test(region)) {
+      throw new Error("SELFHOST_DESKTOP_FEED_KMS_REGION (or AWS_REGION) is required for the awskms feed signer");
+    }
+    const aliases = feedProfileMap(env, "SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES");
+    if (Object.keys(aliases).length === 0) {
+      throw new Error("SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES must name at least one profile");
+    }
+    for (const alias of Object.values(aliases)) {
+      if (typeof alias !== "string" || !KMS_ALIAS.test(alias)) {
+        throw new Error("SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES values must look like alias/name");
+      }
+    }
+    signer = { kind: "awskms", region, label, keyAliases: aliases as Record<string, string> };
+  } else if (signerKind === "memory") {
+    signer = { kind: "memory", label };
+  } else {
+    throw new Error("SELFHOST_DESKTOP_FEED_SIGNER must be awskms or memory");
+  }
+  let storage: DesktopFeedStorageConfig;
+  if (storageKind === "s3") {
+    const bucket = required(env, "SELFHOST_DESKTOP_FEED_S3_BUCKET");
+    // Dots would break TLS on the virtual-hosted host signed URLs point at.
+    if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(bucket)) {
+      throw new Error("SELFHOST_DESKTOP_FEED_S3_BUCKET must be a bucket name without dots");
+    }
+    const region = env.SELFHOST_DESKTOP_FEED_S3_REGION?.trim() || env.AWS_REGION?.trim()
+      || (signer.kind === "awskms" ? signer.region : "");
+    if (!region || !/^[a-z0-9-]+$/.test(region)) {
+      throw new Error("SELFHOST_DESKTOP_FEED_S3_REGION (or AWS_REGION) is required for s3 feed storage");
+    }
+    // Unset, empty or only slashes: the default. Segments use only characters
+    // that encodeURIComponent and SigV4 canonical encoding agree on.
+    const prefix = (env.SELFHOST_DESKTOP_FEED_S3_PREFIX ?? "").trim().replace(/^\/+|\/+$/g, "") || "desktop-feed";
+    if (!/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(prefix)
+      || prefix.split("/").some((segment) => segment === "." || segment === "..")) {
+      throw new Error("SELFHOST_DESKTOP_FEED_S3_PREFIX must be [A-Za-z0-9._-] segments separated by /");
+    }
+    storage = { kind: "s3", bucket, region, prefix };
+  } else if (storageKind === "memory") {
+    storage = { kind: "memory" };
+  } else {
+    throw new Error("SELFHOST_DESKTOP_FEED_STORAGE must be s3 or memory");
+  }
+  const publisherTokenHashes: Record<string, string[]> = {};
+  if (env.SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES?.trim()) {
+    const entries = feedProfileMap(env, "SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES");
+    for (const [profile, hashes] of Object.entries(entries)) {
+      if (!Array.isArray(hashes) || !hashes.every((hash) => typeof hash === "string" && /^[0-9a-f]{64}$/.test(hash))) {
+        throw new Error("SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES values must be arrays of sha256 hex");
+      }
+      publisherTokenHashes[profile] = hashes as string[];
+    }
+  }
+  return { signer, storage, publisherTokenHashes };
+}
 export function loadDatabaseUrl(env: Env = process.env): string {
   return required(env, "DATABASE_URL", true);
 }
@@ -485,6 +845,7 @@ export function configFingerprint(config: SelfhostConfig): string {
       ...(config.relayhistoryReadApiUrl ? [config.relayhistoryReadApiUrl] : []),
       ...(config.relayhistoryReadApiEvents ? ["native-session-events"] : []),
       ...(config.sessionReadApi ? [config.sessionReadApi.url, config.sessionReadApi.publicUrl] : []),
+      ...(config.sessionErasureApi ? [config.sessionErasureApi.url] : []),
     ].join("\n"))
     .digest("hex")
     .slice(0, 12);

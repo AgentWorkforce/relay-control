@@ -163,7 +163,7 @@ function createInitializedFlowsHandler(deps: {
   publicBaseUrl: string;
   userAccess: FlowsUserAccess;
   /**
-   * Throws the feature refusal (403) unless Flows is a capability. Every
+   * Throws the feature refusal (403) unless Flows is selected. Every
    * route calls it after its own authentication (membership, worker, run,
    * enrollment or callback credential) and before mutations or queue work.
    */

@@ -7,7 +7,8 @@
   "description": "Minimal self-hosted Agent Relay sessions control plane",
   "bin": {
     "agent-relay-selfhost-api": "./dist/server.js",
-    "agent-relay-selfhost-migrate": "./dist/migrate-cli.js"
+    "agent-relay-selfhost-migrate": "./dist/migrate-cli.js",
+    "agent-relay-analytics-collector": "./dist/collector-cli.js"
   },
   "files": [
     "dist",
@@ -26,6 +27,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@node-rs/argon2": "^2.2.2",
     "nodemailer": "^8.0.11",
     "pg": "^8.16.3",
     "yaml": "^2.9.1",

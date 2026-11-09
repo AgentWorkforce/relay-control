@@ -3,6 +3,7 @@ import type { SelfhostConfig } from "../config.js";
 import { UpstreamError } from "../relayhistory.js";
 import { recordedSummary } from "./summary.js";
 import type { ControlPlaneStore, Principal } from "../store.js";
+import { AGENT_VALUE, agentPrefixTooShort, MAX_AGENT_LENGTH, selectAgent } from "./agent-query.js";
 import {
   isRecord,
   nonEmptyString,
@@ -144,10 +145,18 @@ class UnsupportedView extends Error {
   }
 }
 
+/** The backend refused an agent filter, such as a prefix that is too broad. */
+class AgentFilterRejected extends Error {
+  constructor(readonly code: string) {
+    super("This agent filter was refused; try a more specific name");
+  }
+}
+
 /** `readWorkspaceHistory`, with an upstream 501 turned into `UnsupportedView`. */
 async function readWorkspaceHistory(...args: Parameters<typeof readHistory>) {
   const read = await readHistory(...args);
   if (read.status === "unsupported") throw new UnsupportedView(read.reason);
+  if (read.status === "agent_rejected") throw new AgentFilterRejected(read.code);
   return read;
 }
 
@@ -228,12 +237,17 @@ const LIST_RULES: Record<string, Rule> = {
   until: { max: 64, pattern: ISO_TIME },
   ranking: { values: ["hybrid"] },
   limit: { pattern: /^\d{1,2}$/ },
+  agent: { max: MAX_AGENT_LENGTH, pattern: AGENT_VALUE },
 };
 
 export async function handleSessionRoutes(ctx: SessionRouteContext): Promise<boolean> {
   try {
     return await routeSessions(ctx);
   } catch (error) {
+    if (error instanceof AgentFilterRejected) {
+      ctx.json(ctx.response, 400, { error: error.code, message: error.message }, true);
+      return true;
+    }
     if (!(error instanceof UnsupportedView)) throw error;
     ctx.json(ctx.response, 501, {
       error: UNSUPPORTED_BY_BACKEND,
@@ -274,16 +288,30 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
     const since = instant(ctx, input.since, "since");
     const until = instant(ctx, input.until, "until");
     const access = await ctx.workspaceAccess(ctx.request, workspaceId);
+    const { agent, ignored, text } = selectAgent(input.agent, input.q, Boolean(ctx.config.sessionSearchAgentTokens));
+    if (agent && agent.length > MAX_AGENT_LENGTH) {
+      throw ctx.httpError(400, "invalid_request", "Invalid session parameter: agent");
+    }
+    if (agent && agentPrefixTooShort(agent)) {
+      throw ctx.httpError(400, "agent_prefix_too_short", "An agent prefix needs at least 3 letters or digits");
+    }
+    // The backend cannot combine these, and narrowing a page here would hide matches.
+    if (agent && (text || input.ranking)) throw new UnsupportedView("agent_with_text");
     const read = await readWorkspaceHistory(ctx.config, identityOf(access), "/v1/sessions", params({
       limit: String(limit ?? 50),
-      q: input.q,
+      q: agent ? undefined : input.q,
+      agent,
       cursor: input.cursor,
       source: input.source,
       project: input.project,
       since,
       until,
       ...(input.ranking ? { search: "hybrid" } : {}),
-    }));
+    }), { agentFilter: Boolean(agent) });
+    // An older backend matches `foo*` literally, so its page is not a prefix result.
+    if (read.status === "ok" && agent?.endsWith("*") && read.agentMatch !== "prefix") {
+      throw new UnsupportedView("agent_prefix_not_supported");
+    }
     if (read.status !== "ok" || !Array.isArray(read.body.sessions)) {
       throw upstreamShape("RelayHistory returned an invalid session page");
     }
@@ -296,6 +324,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
       error: false,
       now: now.toISOString(),
       ...(input.ranking ? { ranking: "hybrid" } : {}),
+      ...(agent ? { agent, ignoredAgents: ignored, agentMatch: read.agentMatch } : {}),
     });
     return true;
   }
@@ -379,6 +408,10 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
       cursor: { max: 4_096 },
       limit: { pattern: /^\d{1,2}$/ },
     }, ["q"]);
+    // Transcript search has no agent filter; refuse rather than search for "@name".
+    if (selectAgent(undefined, input.q, Boolean(ctx.config.sessionSearchAgentTokens)).agent) {
+      throw new UnsupportedView("agent_filter_not_on_search");
+    }
     const limit = input.limit === undefined ? 25 : Number(input.limit);
     if (limit < 1 || limit > 50) {
       throw ctx.httpError(400, "invalid_request", "limit must be between 1 and 50");

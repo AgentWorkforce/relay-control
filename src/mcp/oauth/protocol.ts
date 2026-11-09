@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isReservedClientName } from "../../reserved-client-names.js";
 
 /**
  * Pure OAuth wire contract ported from Cloud 1776499a's lib/auth/mcp-oauth.ts.
@@ -28,7 +29,7 @@ const MCP_OAUTH_RESOURCES: Readonly<Record<McpOAuthResourcePath, McpOAuthResourc
   "/api/v1/mcp/shared-sessions": { name: "Agent Relay Sessions", scopes: [MCP_RELAY_SCOPE, MCP_AGENTS_SCOPE] },
   "/api/v1/mcp/relay-events": { name: "Agent Relay events", scopes: [MCP_EVENTS_SCOPE, MCP_RELAY_SCOPE, MCP_AGENTS_SCOPE] },
 };
-const APP_BASE_PATH = "/cloud";
+export const APP_BASE_PATH = "/cloud";
 const toAppPath = (path: string) => `${APP_BASE_PATH}${path}`;
 const stripAppBasePath = (path: string) => path.startsWith(`${APP_BASE_PATH}/`) ? path.slice(APP_BASE_PATH.length) : path;
 const MCP_RESOURCE_AGENT_NAME_PARAM = "agent_name";
@@ -44,6 +45,7 @@ const CODE_CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const CODE_VERIFIER_PATTERN = /^[A-Za-z0-9._~-]{43,128}$/u;
 const MAX_REDIRECT_URIS = 10;
 const MAX_URL_LENGTH = 2048;
+const MAX_CLIENT_NAME_LENGTH = 100;
 const MAX_STATE_LENGTH = 1024;
 const MAX_NONCE_LENGTH = 1024;
 // WHATWG URL keeps IPv6 brackets in `hostname`; the bare form is accepted defensively.
@@ -155,21 +157,33 @@ export function parseClientRegistration(body: unknown):
       error: { error: "invalid_client_metadata", error_description: "Only RS256 ID tokens are supported." },
     };
   }
-  return {
-    ok: true,
-    value: { clientName: sanitizeClientName(input.client_name), redirectUris: [...new Set(redirectUris)] },
-  };
+  const clientName = sanitizeClientName(input.client_name);
+  if (clientName !== null && clientName.length > MAX_CLIENT_NAME_LENGTH) {
+    return {
+      ok: false,
+      error: { error: "invalid_client_metadata", error_description: `client_name must be at most ${MAX_CLIENT_NAME_LENGTH} characters.` },
+    };
+  }
+  // The name is self-reported and shown on the consent page, so it may not
+  // pose as one of this product's own apps.
+  if (clientName !== null && isReservedClientName(clientName)) {
+    return { ok: false, error: { error: "invalid_client_metadata", error_description: "client_name is reserved." } };
+  }
+  return { ok: true, value: { clientName, redirectUris: [...new Set(redirectUris)] } };
 }
 
+/** Strips control characters and padding; length is checked by the caller, never truncated. */
 export function sanitizeClientName(value: unknown): string | null {
   if (typeof value !== "string") return null;
-  const cleaned = value.replace(/[\u0000-\u001f\u007f]/gu, "").trim().slice(0, 100);
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]/gu, "").trim();
   return cleaned || null;
 }
 
 export type AuthorizationRequest = {
   clientId: string;
   redirectUri: string;
+  /** Server-derived authorization parameter presence; legacy callers default to required. */
+  redirectUriRequired?: boolean;
   codeChallenge: string;
   state: string | null;
   scopes: McpAuthorizationScope[];
@@ -193,12 +207,17 @@ export type McpOAuthProtocolConfig = {
   oidcEnabled?: boolean;
 };
 
+/** Whether a configured public origin can host the OAuth issuer (the same gate the protocol applies). */
+export function mcpOAuthPublicOriginAllowed(publicOrigin: string): boolean {
+  const url = parseSafeOAuthUrl(publicOrigin);
+  return url !== null && (url.pathname === "/" || url.pathname === "") && !/[?#]/u.test(publicOrigin);
+}
+
 export function createMcpOAuthProtocol(config: McpOAuthProtocolConfig) {
-  const url = parseSafeOAuthUrl(config.publicOrigin);
-  if (!url || (url.pathname !== "/" && url.pathname !== "") ||
-      /[?#]/u.test(config.publicOrigin)) {
+  if (!mcpOAuthPublicOriginAllowed(config.publicOrigin)) {
     throw new Error("publicOrigin must be an HTTPS origin (or loopback HTTP), without path, credentials, query or fragment");
   }
+  const url = parseSafeOAuthUrl(config.publicOrigin)!;
   const origin = url.origin;
   const enabled = new Set(config.enabledResources ?? []);
   for (const path of enabled) {
@@ -518,6 +537,7 @@ export function createMcpOAuthProtocol(config: McpOAuthProtocolConfig) {
       value: {
         clientId: client.clientId,
         redirectUri,
+        redirectUriRequired: requestedRedirect !== undefined,
         codeChallenge: params.code_challenge,
         state,
         scopes,
@@ -544,7 +564,7 @@ export function createMcpOAuthProtocol(config: McpOAuthProtocolConfig) {
   }
 
   return {
-    mcpOAuthOrigin, mcpOAuthIssuer, mcpResourcePathFor, mcpResourceUrl,
+    mcpOAuthOrigin, mcpOAuthIssuer, mcpOAuthResourceAvailable, mcpResourcePathFor, mcpResourceUrl,
     parseMcpResourceRequest, parseMcpResource, canonicalMcpResourceParam,
     requestAgentNameHint, protectedResourceMetadataUrl, protectedResourceMetadata,
     authorizationServerMetadata, mcpOAuthChallenge, mcpOAuthUnauthorized,

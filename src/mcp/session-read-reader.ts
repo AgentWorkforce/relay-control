@@ -1,159 +1,157 @@
 import { createHash } from "node:crypto";
+import { z } from "zod";
 import type { SelfhostConfig } from "../config.js";
-import { UpstreamError } from "../relayhistory.js";
-import { requestReadSession } from "../session-read.js";
-import {
-  isRecord,
-  WORKSPACE_ATTESTATION_HEADER,
-  type HistoryIdentity,
-  type HistoryRead,
-} from "../sessions/history.js";
+import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
+import { isRecord, WORKSPACE_ATTESTATION_HEADER, UNSUPPORTED_BY_BACKEND, type HistoryIdentity, type HistoryRead } from "../sessions/history.js";
 
-/**
- * The MCP's session reads through the session read API
- * (SESSION_READ_API_MCP_READS=true, default false). Every read uses an access
- * token the read API issued for exactly this {user, organization, workspace};
- * the service secret only ever reaches the issue and refresh calls. Refresh
- * tokens stay in this process's memory.
- *
- * Returns null when the existing History path should answer: the setting is
- * off, the route is outside the read contract, or a first page failed. A
- * read API cursor never falls back, because History would restart at page one.
- */
+/** Client configuration deliberately excludes the issuer URL and internal secret. */
+type ReaderConfig = Pick<SelfhostConfig,"publicBaseUrl"|"sessionReadMcpReads"|"relayhistoryBackend"> & {
+  sessionReadApi?: Pick<NonNullable<SelfhostConfig["sessionReadApi"]>,"publicUrl"> | null;
+};
+
+/** Per-user reader client. Only Control sees the reader's internal issuer secret. */
 const READ_ROUTES = /^\/v1\/(?:events|sessions(?:\/activity|\/[^/]+\/(?:turns|metadata|events))?)$/;
 const READ_API_CURSOR = /^b96[a-z][0-9]+:/;
 const EXPIRY_MARGIN_MS = 30_000;
 const CACHE_LIMIT = 1_000;
+const HANDOFF_MAX_BYTES = 16_384;
+const opaque = (prefix:string) => z.string().max(4096).regex(new RegExp(`^${prefix}[A-Za-z0-9_-]{43,}$`));
+const pairSchema = z.object({
+  baseUrl:z.string(), sessionId:z.string().min(1).max(256), userId:z.string(), orgId:z.string(), workspaceId:z.string(),
+  audience:z.string(), scopes:z.tuple([z.literal("rth:read")]), tokenType:z.literal("Bearer"),
+  accessToken:opaque("rth_at_read_"), refreshToken:opaque("rth_rt_read_"),
+  accessTokenExpiresAt:z.iso.datetime({offset:true}), refreshTokenExpiresAt:z.iso.datetime({offset:true}),
+});
+type Held = { sessionId:string; baseUrl:string; accessToken:string; accessExpiresAt:number; refreshToken:string; refreshExpiresAt:number };
+const caches = new WeakMap<ReaderConfig,Map<string,Promise<Held>>>();
 
-type Held = {
-  accessToken: string;
-  accessExpiresAt: number;
-  refreshToken: string;
-  refreshExpiresAt: number;
-};
-
-const caches = new WeakMap<SelfhostConfig, Map<string, Promise<Held>>>();
-
-function cacheFor(config: SelfhostConfig): Map<string, Promise<Held>> {
-  let cache = caches.get(config);
-  if (!cache) {
-    cache = new Map();
-    caches.set(config, cache);
-  }
+function cacheFor(config:ReaderConfig) {
+  let cache=caches.get(config);
+  if(!cache) { cache=new Map(); caches.set(config,cache); }
   return cache;
 }
-
-function cacheKey(identity: HistoryIdentity): string {
-  // Bound to the caller's token too: a rotated or revoked sign-in never reuses a held session.
-  const tokenHash = createHash("sha256").update(identity.callerToken).digest("hex");
-  return JSON.stringify([identity.userId, identity.organizationId, identity.workspaceId, tokenHash]);
+function cacheKey(identity:HistoryIdentity) {
+  const hash=createHash("sha256").update(identity.callerToken).digest("hex");
+  return JSON.stringify([identity.userId,identity.organizationId,identity.workspaceId,hash]);
+}
+export function forgetSessionReadTokens(config:ReaderConfig):void { caches.delete(config); }
+function refused(error:unknown):boolean {
+  return error instanceof UpstreamError && [401,403,404].includes(error.status??0);
 }
 
-export function forgetSessionReadTokens(config: SelfhostConfig): void {
-  caches.delete(config);
+async function handoffJson(response:Response):Promise<unknown> {
+  const reader=response.body?.getReader();
+  if(!reader) throw new UpstreamError("exchange");
+  const chunks:Uint8Array[]=[];let size=0;
+  try {
+    for(;;) {
+      const part=await reader.read();if(part.done) break;
+      size+=part.value.byteLength;
+      if(size>HANDOFF_MAX_BYTES) throw new UpstreamError("exchange");
+      chunks.push(part.value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } finally { await reader.cancel().catch(()=>{}); }
 }
 
-async function issue(
-  api: NonNullable<SelfhostConfig["sessionReadApi"]>,
-  identity: HistoryIdentity,
-  previous: Held | null,
-): Promise<Held> {
-  const ids = { userId: identity.userId, orgId: identity.organizationId, workspaceId: identity.workspaceId };
-  const session = previous
-    ? await requestReadSession(api, ids, { refreshToken: previous.refreshToken })
-      .catch(() => requestReadSession(api, ids, { label: "mcp" }))
-    : await requestReadSession(api, ids, { label: "mcp" });
-  return {
-    accessToken: session.accessToken,
-    accessExpiresAt: Date.parse(session.accessTokenExpiresAt),
-    refreshToken: session.refreshToken,
-    refreshExpiresAt: Date.parse(session.refreshTokenExpiresAt),
-  };
-}
-
-async function heldSession(
-  config: SelfhostConfig,
-  api: NonNullable<SelfhostConfig["sessionReadApi"]>,
-  identity: HistoryIdentity,
-): Promise<Held> {
-  const cache = cacheFor(config);
-  const key = cacheKey(identity);
-  const existing = cache.get(key);
-  const current = existing ? await existing.catch(() => null) : null;
-  if (current && current.accessExpiresAt - EXPIRY_MARGIN_MS > Date.now()) return current;
-  // Concurrent callers share one issue or refresh: refresh tokens rotate on use.
-  const latest = cache.get(key);
-  if (latest && latest !== existing) return latest;
-  const usable = current && current.refreshExpiresAt - EXPIRY_MARGIN_MS > Date.now() ? current : null;
-  const pending = issue(api, identity, usable);
-  if (!cache.has(key) && cache.size >= CACHE_LIMIT) {
-    const oldest = cache.keys().next().value;
-    if (oldest !== undefined) cache.delete(oldest);
+async function issue(config:ReaderConfig,identity:HistoryIdentity,previous:Held|null):Promise<Held> {
+  const api=config.sessionReadApi!;
+  // Caller authority goes only to the configured Control origin. The read
+  // client never sends user/org/scopes overrides or an internal/service secret.
+  const path=`/api/v1/workspaces/${encodeURIComponent(identity.workspaceId)}/session-read/${previous?"refresh":"session"}`;
+  let response:Response;
+  try {
+    response=await globalThis.fetch(new URL(path,config.publicBaseUrl),{
+      method:"POST",redirect:"error",signal:AbortSignal.timeout(10_000),
+      headers:{accept:"application/json","content-type":"application/json",authorization:`Bearer ${identity.callerToken}`},
+      body:JSON.stringify(previous?{refreshToken:previous.refreshToken}:{label:"mcp"}),
+    });
+  } catch { throw new UpstreamError("exchange"); }
+  if(!response.ok) {
+    await response.body?.cancel().catch(()=>{});
+    throw new UpstreamError("exchange",response.status);
   }
-  cache.set(key, pending);
-  pending.catch(() => {
-    if (cache.get(key) === pending) cache.delete(key);
+  let value:unknown;
+  try { value=await handoffJson(response); } catch { throw new UpstreamError("exchange"); }
+  const result=pairSchema.safeParse(value);
+  if(!result.success) throw new UpstreamError("exchange");
+  const pair=result.data,now=Date.now();
+  const accessExpiresAt=Date.parse(pair.accessTokenExpiresAt),refreshExpiresAt=Date.parse(pair.refreshTokenExpiresAt);
+  if(pair.userId!==identity.userId || pair.orgId!==identity.organizationId || pair.workspaceId!==identity.workspaceId ||
+    pair.baseUrl!==api.publicUrl || pair.audience!==api.publicUrl || accessExpiresAt<=now || accessExpiresAt>now+3_600_000 ||
+    refreshExpiresAt<accessExpiresAt || (previous && (pair.refreshToken===previous.refreshToken || pair.sessionId!==previous.sessionId))) {
+    throw new UpstreamError("exchange");
+  }
+  return {sessionId:pair.sessionId,baseUrl:pair.baseUrl,accessToken:pair.accessToken,accessExpiresAt,refreshToken:pair.refreshToken,refreshExpiresAt};
+}
+
+async function heldSession(config:ReaderConfig,identity:HistoryIdentity,rejectedAccess?:string):Promise<Held> {
+  const cache=cacheFor(config),key=cacheKey(identity),existing=cache.get(key);
+  const current=existing?await existing.catch(error=>{if(refused(error)) throw error;return null;}):null;
+  if(current && current.accessToken!==rejectedAccess && current.accessExpiresAt-EXPIRY_MARGIN_MS>Date.now()) return current;
+  const latest=cache.get(key);
+  if(latest && latest!==existing) return latest;
+  const previous=current && current.refreshExpiresAt-EXPIRY_MARGIN_MS>Date.now()?current:null;
+  const pending=issue(config,identity,previous);
+  if(!cache.has(key) && cache.size>=CACHE_LIMIT) cache.delete(cache.keys().next().value!);
+  cache.set(key,pending);
+  // Keep a refused session refused for this caller cache entry; do not turn a
+  // failed refresh into fresh issuance on the next tool invocation.
+  void pending.catch(error=>{
+    if(!refused(error) && cache.get(key)===pending) {
+      // An unavailable refresh has not authorized new issuance. Retain the
+      // previous pair so the next attempt retries the same refresh lineage.
+      if(previous) cache.set(key,Promise.resolve(previous));
+      else cache.delete(key);
+    }
   });
   return pending;
 }
 
-export async function readViaSessionRead(
-  config: SelfhostConfig,
-  identity: HistoryIdentity,
-  path: string,
-  params: URLSearchParams,
-): Promise<HistoryRead | null> {
-  const api = config.sessionReadApi;
-  if (!config.sessionReadMcpReads || !api || !READ_ROUTES.test(path)) return null;
-  const cursor = params.get("cursor");
-  // A History cursor can only continue at History.
-  if (cursor && !READ_API_CURSOR.test(cursor)) return null;
-  const orFallback = (stage: "exchange" | "read", status?: number): null => {
-    if (cursor) throw new UpstreamError(stage, status);
+export async function readViaSessionRead(config:ReaderConfig,identity:HistoryIdentity,path:string,params:URLSearchParams):Promise<HistoryRead|null> {
+  const cursor=params.get("cursor");
+  const selected=Boolean(config.sessionReadMcpReads && config.sessionReadApi && READ_ROUTES.test(path));
+  if(!selected) {
+    // Native: every reader is the read API, so its cursors stay valid through history.
+    if(cursor && READ_API_CURSOR.test(cursor) && config.relayhistoryBackend!=="native") throw new ReadCursorExpiredError();
     return null;
-  };
-
-  const query = new URLSearchParams(params);
-  query.delete("workspace");
-  query.set("workspace", identity.workspaceId);
-  const url = new URL(`${path}?${query}`, `${api.url}/`);
-  if (url.origin !== new URL(api.url).origin) throw new UpstreamError("read", undefined, "RelayHistory read origin mismatch");
-
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    let held: Held;
+  }
+  // A foreign/legacy cursor cannot silently switch the selected backend.
+  if(cursor && !READ_API_CURSOR.test(cursor)) throw new ReadCursorExpiredError();
+  const query=new URLSearchParams(params);query.delete("workspace");query.set("workspace",identity.workspaceId);
+  let rejectedAccess:string|undefined;
+  for(let attempt=0;attempt<2;attempt++) {
+    const held=await heldSession(config,identity,rejectedAccess);
+    const url=new URL(`${path}?${query}`,held.baseUrl);
+    if(url.origin!==new URL(held.baseUrl).origin) throw new UpstreamError("read");
+    let response:Response;
     try {
-      held = await heldSession(config, api, identity);
-    } catch {
-      return orFallback("exchange");
-    }
-    let response: Response;
-    try {
-      response = await globalThis.fetch(url, {
-        method: "GET",
-        redirect: "error",
-        signal: AbortSignal.timeout(15_000),
-        headers: { accept: "application/json", authorization: `Bearer ${held.accessToken}` },
-      });
-    } catch {
-      return orFallback("read");
-    }
-    if (response.status === 401 && attempt === 0) {
-      await response.body?.cancel().catch(() => {});
-      cacheFor(config).delete(cacheKey(identity));
+      response=await globalThis.fetch(url,{method:"GET",redirect:"error",signal:AbortSignal.timeout(15_000),
+        headers:{accept:"application/json",authorization:`Bearer ${held.accessToken}`}});
+    } catch { throw new UpstreamError("read"); }
+    if(response.status===401 && attempt===0) {
+      await response.body?.cancel().catch(()=>{});
+      rejectedAccess=held.accessToken; // Refresh through Control once, never remint.
       continue;
     }
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
-      return orFallback("read", response.status);
+    // Selection is final: every 501 stays unsupported on this backend,
+    // regardless of the response's reason or whether this is the first page.
+    if(response.status===501) {
+      await response.body?.cancel().catch(()=>{});
+      return {status:"unsupported",reason:UNSUPPORTED_BY_BACKEND};
     }
-    // Never a fallback: a response naming another workspace is a tenancy failure.
-    if (response.headers.get(WORKSPACE_ATTESTATION_HEADER) !== identity.workspaceId) {
-      await response.body?.cancel().catch(() => {});
-      throw new UpstreamError("read", response.status, "RelayHistory did not attest the workspace");
+    if(!response.ok) {
+      await response.body?.cancel().catch(()=>{});
+      if(response.status===410 && cursor) throw new ReadCursorExpiredError();
+      throw new UpstreamError("read",response.status);
     }
-    const body: unknown = await response.json().catch(() => null);
-    if (!isRecord(body)) return orFallback("read", response.status);
-    return { status: "ok", body };
+    if(response.headers.get(WORKSPACE_ATTESTATION_HEADER)!==identity.workspaceId) {
+      await response.body?.cancel().catch(()=>{});
+      throw new UpstreamError("read",response.status,"RelayHistory did not attest the workspace");
+    }
+    const body:unknown=await response.json().catch(()=>null);
+    if(!isRecord(body)) throw new UpstreamError("read",response.status);
+    return {status:"ok",body};
   }
-  return orFallback("read", 401);
+  throw new UpstreamError("read",401);
 }

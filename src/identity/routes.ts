@@ -2,12 +2,18 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import { decryptSecret, encryptSecret, hashSecret, secureEqual, type EncryptionKeyring } from "../crypto.js";
 import { ACCOUNT_SCOPE, DASHBOARD_DEVICE_CLIENT, type ControlPlaneStore, type Principal } from "../store.js";
-import { clientIp, cookieRequestAllowed, RateLimiter, safeNextPath } from "../auth/device-approval.js";
+import { clientIp, cookieRequestAllowed, limiterKey, RateLimiter, safeNextPath } from "../auth/device-approval.js";
 import { emailDomain, type IdentityConfig } from "./config.js";
 import { inviteEmail, signInEmail, type Mailer } from "./mailer.js";
 import { OidcClient, OidcError, pkcePair, randomState } from "./oidc.js";
-import { confirmEmailPage, loginPage, messagePage, PAGE_CSP, type InviteBanner } from "./pages.js";
+import { cloudPathForNext } from "../auth/desktop-login.js";
+import { confirmEmailPage, loginPage, messagePage, PAGE_CSP, passwordLinkPage, type InviteBanner } from "./pages.js";
 import { IdentityError, IdentityStore, type Role } from "./store.js";
+import type { Database } from "../database.js";
+import { PasswordHasher } from "./password/hashing.js";
+import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, type HibpFetch } from "./password/policy.js";
+import { createPasswordRoutes, disabledMethod, PASSWORD_PATH_PREFIX, PasswordHttpError, type PasswordRoutes } from "./password/routes.js";
+import { PasswordStore } from "./password/store.js";
 
 type JsonObject = Record<string, unknown>;
 type Auth = { kind: "bootstrap" } | { kind: "user"; principal: Principal };
@@ -16,6 +22,8 @@ const SESSION_COOKIE = "agent_relay_session";
 const DEVICE_COOKIE = "agent_relay_device";
 const OIDC_COOKIE = "agent_relay_oidc";
 const OIDC_ATTEMPT_TTL_MS = 10 * 60 * 1_000;
+/** Password sign-in retention sweep (login attempts, spent tokens). */
+const SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
 const RATE = {
   oidcStart: { limit: 30, windowMs: 5 * 60 * 1_000 },
   callback: { limit: 30, windowMs: 5 * 60 * 1_000 },
@@ -89,11 +97,11 @@ function clearCookie(name: string, path: string): string {
   return `${name}=; Path=${path}; Max-Age=0; Secure; HttpOnly; SameSite=Lax`;
 }
 
-function sendHtml(response: ServerResponse, status: number, body: string, cookies: string[] = []): void {
+function sendHtml(response: ServerResponse, status: number, body: string, cookies: string[] = [], csp = PAGE_CSP): void {
   response.writeHead(status, {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
-    "content-security-policy": PAGE_CSP,
+    "content-security-policy": csp,
     "referrer-policy": "no-referrer",
     "x-frame-options": "DENY",
     ...(cookies.length ? { "set-cookie": cookies } : {}),
@@ -147,6 +155,13 @@ export type IdentityModule = {
   ): Promise<boolean>;
   /** Owner-guarded membership change audit (called by the memberships routes). */
   auditMembership(input: { organizationId: string; auth: Auth; action: string; target: string }): Promise<void>;
+  /** Resolves once background sign-in mail work has finished (tests, shutdown). */
+  idle(): Promise<void>;
+  /** Starts the hourly retention sweep (password sign-in state); stop() ends it. */
+  start(): void;
+  stop(): void;
+  /** One retention sweep now (tests). */
+  sweep(): Promise<void>;
 };
 
 export function createIdentityModule(input: {
@@ -157,6 +172,12 @@ export function createIdentityModule(input: {
   dashboardUrl: string;
   mailer: Mailer | null;
   oidcClient?: OidcClient | null;
+  /** Needed when password sign-in is enabled (its Postgres state). */
+  database?: Database;
+  /** Test seam: the Have I Been Pwned range fetch (SELFHOST_PASSWORD_HIBP=on). */
+  hibpFetch?: HibpFetch;
+  /** Test seam: the argon2id hasher (default: one per module, sharing the process-wide slots). */
+  passwordHasher?: PasswordHasher;
   now?: () => number;
   log?: (message: string, fields?: Record<string, unknown>) => void;
 }): IdentityModule {
@@ -166,7 +187,44 @@ export function createIdentityModule(input: {
   const limiter = new RateLimiter(now);
   const oidc = input.oidcClient !== undefined ? input.oidcClient : config.oidc ? new OidcClient(config.oidc) : null;
   const dashboardOrigin = new URL(input.dashboardUrl).origin;
+  // PAGE_CSP loads no images: only /login gets one, from the logo's own origin.
+  const coBrand = config.logoUrl ? { logoUrl: config.logoUrl, orgName: config.loginOrgName } : null;
+  const loginCsp = config.logoUrl ? `${PAGE_CSP}; img-src ${new URL(config.logoUrl).origin}` : PAGE_CSP;
+  /**
+   * The dashboard's forgot-password and register pages, keeping where the
+   * person was going. A `next` under /api/v1 moves to /cloud/api/v1, the only
+   * mount a separate dashboard host routes to this service.
+   */
+  function passwordPageLinks(next: string, invite: string | null): { forgot: string; register: string } {
+    const query = new URLSearchParams({ next: cloudPathForNext(next) });
+    if (invite) query.set("invite", invite);
+    const dashboard = new URL(input.dashboardUrl);
+    const base = `${dashboard.origin}${dashboard.pathname.replace(/\/+$/, "")}`;
+    return { forgot: `${base}/#/forgot-password?${query}`, register: `${base}/#/register?${query}` };
+  }
   const emailLogin = config.emailLogin && mailer !== null;
+  let passwordRoutes: PasswordRoutes | null = null;
+  if (config.signinMethods.includes("password") && config.password && mailer) {
+    if (!input.database) throw new Error("password sign-in needs the database");
+    passwordRoutes = createPasswordRoutes({
+      config: config.password,
+      hasher: input.passwordHasher ?? new PasswordHasher(config.password),
+      passwords: new PasswordStore(input.database, input.now ? { now: input.now } : {}),
+      identityStore: store,
+      controlStore,
+      mailer,
+      sessionCookie: (tokens) => sessionCookie(tokens),
+      clearSessionCookie: () => clearCookie(SESSION_COOKIE, "/cloud"),
+      ...(input.hibpFetch ? { hibpFetch: input.hibpFetch } : {}),
+      ...(input.now ? { now: input.now } : {}),
+      log,
+    });
+  }
+  let sweepTimer: NodeJS.Timeout | null = null;
+  const signinMethods = [
+    ...(emailLogin ? ["email_link" as const] : []),
+    ...(passwordRoutes ? ["password" as const] : []),
+  ];
 
   function limited(key: string, rule: { limit: number; windowMs: number }): boolean {
     return !limiter.consume(key, rule.limit, rule.windowMs).allowed;
@@ -263,9 +321,16 @@ export function createIdentityModule(input: {
         banner: await banner(invite ?? (url.searchParams.has("invite") ? "invalid" : null)),
         oidc: oidc ? { displayName: oidc.config.displayName } : null,
         emailLogin,
+        password: passwordRoutes !== null,
+        passwordLinks: passwordRoutes ? passwordPageLinks(next, invite) : null,
+        // Only a password form can produce this redirect.
+        notice: passwordRoutes !== null && url.searchParams.get("error") === "invalid_credentials"
+          ? { kind: "error", text: "Incorrect email or password." }
+          : null,
         userCode: started.userCode,
         pollIntervalMs: Math.max(1, started.intervalSeconds) * 1_000,
-      }), cookies);
+        coBrand,
+      }), cookies, loginCsp);
       return true;
     }
 
@@ -275,7 +340,7 @@ export function createIdentityModule(input: {
         sendHtml(response, 404, messagePage({ title: "Single sign-on is not configured", message: "Ask your administrator to configure an OIDC identity provider." }));
         return true;
       }
-      if (limited(`oidc-start:${clientIp(request)}`, RATE.oidcStart)) {
+      if (limited(`oidc-start:${limiterKey(clientIp(request))}`, RATE.oidcStart)) {
         sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
         return true;
       }
@@ -315,7 +380,7 @@ export function createIdentityModule(input: {
 
     if (method === "GET" && publicPath === "/login/oidc/callback") {
       if (!oidc) return false;
-      if (limited(`oidc-callback:${clientIp(request)}`, RATE.callback)) {
+      if (limited(`oidc-callback:${limiterKey(clientIp(request))}`, RATE.callback)) {
         sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
         return true;
       }
@@ -360,7 +425,7 @@ export function createIdentityModule(input: {
           method: "oidc",
           emailVerified: identity.emailVerified,
           beforePersonalOrganization: () => {
-            if (limited(`personal-org-addr:${identity.email.toLowerCase()}`, RATE.personalOrgPerAddress) || limited(`personal-org-ip:${clientIp(request)}`, RATE.personalOrgPerIp)) {
+            if (limited(`personal-org-addr:${identity.email.toLowerCase()}`, RATE.personalOrgPerAddress) || limited(`personal-org-ip:${limiterKey(clientIp(request))}`, RATE.personalOrgPerIp)) {
               throw new IdentityError(429, "rate_limited", "Too many new organizations were created. Try again later.");
             }
           },
@@ -373,9 +438,104 @@ export function createIdentityModule(input: {
       return true;
     }
 
+    // ---- password form (the /login page) ---------------------------------------
+    // Lets CLI login (/cloud/api/v1/cli/login) and Desktop browser login,
+    // which both land on /login, work with SELFHOST_SIGNIN_METHODS=password.
+    if (method === "POST" && publicPath === "/login/password") {
+      if (!passwordRoutes) {
+        disabledMethod(response, "password");
+        return true;
+      }
+      if (!sameOriginForm(request, helpers)) {
+        sendHtml(response, 403, messagePage({ title: "Unable to sign in", message: "Cross-origin request refused." }));
+        return true;
+      }
+      const form = await formBody(request);
+      const next = safeNextPath(form.get("next"));
+      const invite = inviteParam(form.get("invite"));
+      const back = `/login?next=${encodeURIComponent(next)}${invite ? `&invite=${encodeURIComponent(invite)}` : ""}`;
+      try {
+        const result = await passwordRoutes.formLogin(request, {
+          email: form.get("email") ?? "",
+          password: form.get("password") ?? "",
+          invite,
+        }, helpers.siteBaseUrl(request));
+        if (!result) {
+          redirect(response, 303, `${back}&error=invalid_credentials`);
+          return true;
+        }
+        redirect(response, 303, next, [sessionCookie(result.tokens)]);
+      } catch (error) {
+        signInErrorPage(response, error, back);
+      }
+      return true;
+    }
+
+    // ---- emailed password links (token in the URL fragment) ----------------------
+    if (publicPath === "/login/password/verify" || publicPath === "/login/password/reset") {
+      const kind = publicPath === "/login/password/verify" ? "verify" as const : "reset" as const;
+      if (method !== "GET" && method !== "POST") return false;
+      if (!passwordRoutes) {
+        disabledMethod(response, "password");
+        return true;
+      }
+      if (method === "GET") {
+        sendHtml(response, 200, passwordLinkPage({ kind, minLength: PASSWORD_MIN_LENGTH }));
+        return true;
+      }
+      if (!sameOriginForm(request, helpers)) {
+        sendHtml(response, 403, messagePage({ title: "Unable to continue", message: "Cross-origin request refused." }));
+        return true;
+      }
+      const form = await formBody(request);
+      const site = helpers.siteBaseUrl(request);
+      const token = (form.get("token") ?? "").slice(0, 256);
+      const password = form.get("password") ?? "";
+      if (kind === "reset" && !token) {
+        passwordRoutes.formResetRequest(request, form.get("email") ?? "", site);
+        sendHtml(response, 200, messagePage({
+          title: "Check your email",
+          kind: "ok",
+          message: "If that address has a password here, we've sent it a reset link. It works once and expires in 30 minutes.",
+        }));
+        return true;
+      }
+      try {
+        if (kind === "verify") {
+          const result = await passwordRoutes.formCompleteRegistration(request, { token, password }, site);
+          redirect(response, 303, "/", [sessionCookie(result.tokens)]);
+        } else {
+          await passwordRoutes.formCompleteReset(request, { token, password }, site);
+          sendHtml(response, 200, messagePage({
+            title: "Password changed",
+            kind: "ok",
+            message: "Your password was changed and every session was signed out. Sign in with the new password.",
+          }), [clearCookie(SESSION_COOKIE, "/cloud")]);
+        }
+      } catch (error) {
+        const known = identityErrorResponse(error);
+        if (!known) throw error;
+        // A rejected password (policy, breach list) keeps the link usable:
+        // render the form again with the token in it.
+        if (known.status === 400) {
+          sendHtml(response, 400, passwordLinkPage({ kind, token, minLength: PASSWORD_MIN_LENGTH, notice: { kind: "error", text: known.body.message } }));
+        } else {
+          sendHtml(response, known.status, messagePage({
+            title: known.status === 410 ? "Link expired" : "Unable to continue",
+            message: known.body.message,
+            back: kind === "reset" ? "/login/password/reset" : "/login",
+          }));
+        }
+      }
+      return true;
+    }
+
     // ---- email sign-in links ---------------------------------------------------
     if (method === "POST" && publicPath === "/login/email") {
-      if (!emailLogin) return false;
+      if (!emailLogin) {
+        disabledMethod(response, "email_link");
+        return true;
+      }
       if (!sameOriginForm(request, helpers)) {
         sendHtml(response, 403, messagePage({ title: "Unable to sign in", message: "Cross-origin request refused." }));
         return true;
@@ -385,7 +545,7 @@ export function createIdentityModule(input: {
       const invite = inviteParam(form.get("invite"));
       const email = (form.get("email") ?? "").trim().toLowerCase().slice(0, 320);
       const back = `/login?next=${encodeURIComponent(next)}${invite ? `&invite=${encodeURIComponent(invite)}` : ""}`;
-      if (limited(`email-ip:${clientIp(request)}`, RATE.emailPerIp) || limited(`email-addr:${email}`, RATE.emailPerAddress)) {
+      if (limited(`email-ip:${limiterKey(clientIp(request))}`, RATE.emailPerIp) || limited(`email-addr:${email}`, RATE.emailPerAddress)) {
         sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in emails were requested. Try again in a few minutes.", back }));
         return true;
       }
@@ -412,7 +572,10 @@ export function createIdentityModule(input: {
     }
 
     if (method === "GET" && publicPath === "/login/email/verify") {
-      if (!emailLogin) return false;
+      if (!emailLogin) {
+        disabledMethod(response, "email_link");
+        return true;
+      }
       const token = url.searchParams.get("token") ?? "";
       const email = await store.peekEmailLogin(token);
       if (!email) {
@@ -425,12 +588,15 @@ export function createIdentityModule(input: {
     }
 
     if (method === "POST" && publicPath === "/login/email/verify") {
-      if (!emailLogin) return false;
+      if (!emailLogin) {
+        disabledMethod(response, "email_link");
+        return true;
+      }
       if (!sameOriginForm(request, helpers)) {
         sendHtml(response, 403, messagePage({ title: "Unable to sign in", message: "Cross-origin request refused." }));
         return true;
       }
-      if (limited(`email-verify:${clientIp(request)}`, RATE.verify)) {
+      if (limited(`email-verify:${limiterKey(clientIp(request))}`, RATE.verify)) {
         sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
         return true;
       }
@@ -448,7 +614,7 @@ export function createIdentityModule(input: {
           method: "email",
           emailVerified: true,
           beforePersonalOrganization: () => {
-            if (limited(`personal-org-addr:${consumed.email}`, RATE.personalOrgPerAddress) || limited(`personal-org-ip:${clientIp(request)}`, RATE.personalOrgPerIp)) {
+            if (limited(`personal-org-addr:${consumed.email}`, RATE.personalOrgPerAddress) || limited(`personal-org-ip:${limiterKey(clientIp(request))}`, RATE.personalOrgPerIp)) {
               throw new IdentityError(429, "rate_limited", "Too many new organizations were created. Try again later.");
             }
           },
@@ -461,6 +627,30 @@ export function createIdentityModule(input: {
       return true;
     }
 
+    // ---- API: public login configuration (no auth, no secrets) -----------------
+    if (method === "GET" && path === "/api/v1/auth/login-config") {
+      sendJson(response, 200, {
+        methods: signinMethods,
+        oidc: oidc ? { displayName: oidc.config.displayName } : null,
+        logo_url: config.logoUrl,
+        // Shown beside the logo, so it is only public once a logo is set.
+        org_name: config.logoUrl ? config.loginOrgName : null,
+        // Whether only some email domains may join (never the list itself).
+        allowed_domain_hint: config.autoJoinDomains.length > 0 || (oidc?.config.allowedDomains.length ?? 0) > 0,
+        password_policy: passwordRoutes ? { min_length: PASSWORD_MIN_LENGTH, max_length: PASSWORD_MAX_LENGTH } : null,
+      });
+      return true;
+    }
+
+    // ---- API: email + password sign-in --------------------------------------------
+    if (path.startsWith(PASSWORD_PATH_PREFIX)) {
+      if (!passwordRoutes) {
+        disabledMethod(response, "password");
+        return true;
+      }
+      if (await passwordRoutes.handle(request, response, path, helpers)) return true;
+    }
+
     // ---- API: sign-in methods (for the dashboard) ------------------------------
     if (method === "GET" && path === "/api/v1/auth/methods") {
       const auth = await helpers.authenticate(request);
@@ -468,6 +658,7 @@ export function createIdentityModule(input: {
       sendJson(response, 200, {
         oidc: oidc ? { displayName: oidc.config.displayName, allowedDomains: oidc.config.allowedDomains } : null,
         emailLink: emailLogin,
+        password: passwordRoutes !== null,
         inviteEmail: mailer !== null,
         autoJoinDomains: config.autoJoinDomains,
         inviteTtlHours: Math.round(config.inviteTtlMs / 3_600_000),
@@ -491,7 +682,7 @@ export function createIdentityModule(input: {
         throw new IdentityHttpError(403, "reauthentication_required", "Sign in to the dashboard to create an organization");
       }
       const body = parseBody(OrganizationCreate, await helpers.requestObject(request));
-      if (limited(`organization-user:${auth.principal.userId}`, RATE.organizationPerUser) || limited(`organization-ip:${clientIp(request)}`, RATE.organizationPerIp)) {
+      if (limited(`organization-user:${auth.principal.userId}`, RATE.organizationPerUser) || limited(`organization-ip:${limiterKey(clientIp(request))}`, RATE.organizationPerIp)) {
         throw new IdentityHttpError(429, "rate_limited", "Too many new organizations were created. Try again later.");
       }
       const created = await store.createOrganizationForUser({
@@ -628,11 +819,32 @@ export function createIdentityModule(input: {
         target,
       });
     },
+    async idle() {
+      await passwordRoutes?.idle();
+    },
+    start() {
+      if (!passwordRoutes || sweepTimer) return;
+      const sweep = () => {
+        void passwordRoutes!.sweep().catch((error: unknown) => {
+          log("password retention sweep failed", { error: error instanceof Error ? error.message : String(error) });
+        });
+      };
+      sweep();
+      sweepTimer = setInterval(sweep, SWEEP_INTERVAL_MS);
+      sweepTimer.unref();
+    },
+    stop() {
+      if (sweepTimer) clearInterval(sweepTimer);
+      sweepTimer = null;
+    },
+    async sweep() {
+      await passwordRoutes?.sweep();
+    },
   };
 }
 
 export function identityErrorResponse(error: unknown): { status: number; body: { error: string; message: string } } | null {
-  if (error instanceof IdentityHttpError || error instanceof IdentityError) {
+  if (error instanceof IdentityHttpError || error instanceof IdentityError || error instanceof PasswordHttpError) {
     return { status: error.status, body: { error: error.code, message: error.message } };
   }
   return null;

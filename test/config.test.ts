@@ -25,6 +25,27 @@ const completeEnv = {
   SELFHOST_ENCRYPTION_KEY: "00".repeat(32),
 };
 
+test("session search @name parsing is default off and strictly boolean", () => {
+  assert.equal(loadConfig(completeEnv).sessionSearchAgentTokens, false);
+  assert.equal(loadConfig({ ...completeEnv, SESSION_SEARCH_AGENT_TOKENS: "true" }).sessionSearchAgentTokens, true);
+  assert.throws(() => loadConfig({ ...completeEnv, SESSION_SEARCH_AGENT_TOKENS: "1" }), /SESSION_SEARCH_AGENT_TOKENS/);
+});
+
+test("the session erase API is default off and requires its full configuration", () => {
+  assert.equal(loadConfig(completeEnv).sessionErasureApi, null);
+  const eraser = {
+    SESSION_ERASE_API_URL: "http://eraser.sessions.svc.cluster.local:8080",
+    SESSION_ERASE_API_SECRET: "control-eraser-secret-".repeat(2),
+  };
+  assert.deepEqual(loadConfig({ ...completeEnv, ...eraser }).sessionErasureApi, {
+    url: eraser.SESSION_ERASE_API_URL,
+    secret: eraser.SESSION_ERASE_API_SECRET,
+  });
+  assert.throws(() => loadConfig({ ...completeEnv, SESSION_ERASE_API_URL: eraser.SESSION_ERASE_API_URL }), /SESSION_ERASE_API_SECRET/);
+  assert.throws(() => loadConfig({ ...completeEnv, SESSION_ERASE_API_SECRET: eraser.SESSION_ERASE_API_SECRET }), /SESSION_ERASE_API_URL/);
+  assert.throws(() => loadConfig({ ...completeEnv, ...eraser, SESSION_ERASE_API_SECRET: "short" }), /at least 32 bytes/);
+});
+
 test("the independent read API handoff is default off and requires its full configuration", () => {
   assert.equal(loadConfig(completeEnv).sessionReadApi, null);
   const reader = {
@@ -273,4 +294,11 @@ test("native session-event reads are default-off and require the direct reader c
   for (const invalid of ["1", "yes", "TRUE"]) {
     assert.throws(() => loadConfig({ ...env, RELAYHISTORY_READ_API_EVENTS: invalid }), /must be true or false/);
   }
+});
+
+test("the Flows broker secret is optional and must be long enough", () => {
+  assert.equal(loadConfig(completeEnv).relayfileControlBrokerSecret, null);
+  const secret = "s".repeat(32);
+  assert.equal(loadConfig({ ...completeEnv, RELAYFILE_CONTROL_BROKER_SECRET: secret }).relayfileControlBrokerSecret, secret);
+  assert.throws(() => loadConfig({ ...completeEnv, RELAYFILE_CONTROL_BROKER_SECRET: "short" }), /at least 32 bytes/);
 });

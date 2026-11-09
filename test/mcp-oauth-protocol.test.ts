@@ -268,3 +268,20 @@ test("OAuth responses replace stale callback fields and preserve unrelated query
   assert.deepEqual(denied.searchParams.getAll("state"), [""]);
   assert.equal(denied.searchParams.get("app"), "keep");
 });
+
+test("registration refuses product names ignoring case, spaces and hyphens, and over-long names instead of truncating", () => {
+  for (const name of ["Agent Relay Desktop", "agent-relay-desktop", " AGENTRELAY desktop ", "Agent Relay", "agent_relay for macOS",
+    "relay-dashboard", "Relay Dashboard", "RELAY-control", "Ａｇｅｎｔ Ｒｅｌａｙ"]) {
+    assert.deepEqual(parseClientRegistration({ client_name: name, redirect_uris: [REDIRECT] }),
+      { ok: false, error: { error: "invalid_client_metadata", error_description: "client_name is reserved." } }, name);
+  }
+  for (const name of ["Fake relay helper", "my agent relay", "Desktop"]) {
+    assert.equal(parseClientRegistration({ client_name: name, redirect_uris: [REDIRECT] }).ok, true, name);
+  }
+  assert.deepEqual(parseClientRegistration({ client_name: "x".repeat(101), redirect_uris: [REDIRECT] }),
+    { ok: false, error: { error: "invalid_client_metadata", error_description: "client_name must be at most 100 characters." } });
+  assert.deepEqual(parseClientRegistration({ client_name: " " + "x".repeat(100) + "\u0000 ", redirect_uris: [REDIRECT] }),
+    { ok: true, value: { clientName: "x".repeat(100), redirectUris: [REDIRECT] } });
+  assert.equal(parseClientRegistration({ redirect_uris: Array.from({ length: 10 }, (_, index) => `${REDIRECT}/${index}`) }).ok, true);
+  assert.equal(parseClientRegistration({ redirect_uris: Array.from({ length: 11 }, (_, index) => `${REDIRECT}/${index}`) }).ok, false);
+});

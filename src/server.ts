@@ -10,8 +10,6 @@ import { ControlPlaneStore } from "./store.js";
 import { loadFlowsConfig } from "./flows/config.js";
 import { FlowsStore } from "./flows/store.js";
 import { lazyFlowsStore } from "./flows/lazy.js";
-import { loadLicense } from "./license/load.js";
-import { gateCredentialVerifier, resolveLicense } from "./license/resolver.js";
 import { loadTelemetryConfig } from "./telemetry/config.js";
 import { createTelemetryModule } from "./telemetry/module.js";
 import { loadIdentityConfig } from "./identity/config.js";
@@ -19,6 +17,13 @@ import { IdentityStore } from "./identity/store.js";
 import { smtpMailer } from "./identity/mailer.js";
 import { createIdentityModule } from "./identity/routes.js";
 import { relaycastProvisioner, startBootstrap } from "./identity/bootstrap.js";
+import { FEATURES, gateCredentialVerifier, loadSelectedFeatures } from "./features.js";
+import { loadAmpConfig } from "./amp/config.js";
+import { createAmpModule } from "./amp/module.js";
+import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
+import { mcpOAuthActive } from "./mcp/oauth/config.js";
+import { mcpOAuthActiveNotice } from "./mcp/oauth/routes.js";
+import { createRelaycastClient } from "./messaging/relaycast.js";
 import { loadAnalyticsConfig } from "./analytics/config.js";
 import {
   buildAnalytics,
@@ -28,7 +33,9 @@ import {
 } from "./analytics/lifecycle.js";
 
 const config = loadConfig();
-const license = loadLicense();
+// An unknown SELFHOST_FEATURES name stops startup.
+const features = loadSelectedFeatures();
+console.log("[selfhost-api] features selected", FEATURES.filter((feature) => features[feature]));
 const database = new PostgresDatabase(config.databaseUrl);
 
 // bootstrap-signup lane: first-boot org/workspace, OIDC/email sign-in, invites.
@@ -47,11 +54,14 @@ const identityStore = new IdentityStore(database, config.encryptionKeyring, {
   tenancy: identityConfig.tenancy,
   ...(provisioner ? { provisioner } : {}),
   issueSession: (tx, session) => store.issueBrowserSession(tx, session),
+  // SELFHOST_ADMIN_EMAILS; the SELFHOST_BOOTSTRAP_ADMIN_EMAIL alias is the boot-time owner.
+  adminEmails: identityConfig.bootstrap?.adminEmails.filter((email) => email !== identityConfig.bootstrap?.adminEmail) ?? [],
 });
 const identity = createIdentityModule({
   config: identityConfig,
   identityStore,
   controlStore: store,
+  database,
   keyring: config.encryptionKeyring,
   dashboardUrl: config.dashboardUrl,
   mailer: identityConfig.smtp ? smtpMailer(identityConfig.smtp) : null,
@@ -71,14 +81,18 @@ const admin = createAdminModule({
   database,
   keyring: config.encryptionKeyring,
   // Flows worker credentials may read their own workspace's runtime environment.
-  runtimeCredentialVerifier: gateCredentialVerifier((t: string) => flows().verifyRuntimeCredential(t), license, "flows"),
+  // Refused with the Flows feature code while Flows is not selected.
+  runtimeCredentialVerifier: gateCredentialVerifier((t: string) => flows().verifyRuntimeCredential(t), features, "flows"),
 });
+// Selected Flows retains startup validation; core does not parse optional config.
+if (features.flows) flows();
 const telemetryConfig = loadTelemetryConfig(process.env, {
   probes: [
     { name: "relaycast", url: `${config.relaycastUrl}/health` },
     // RelayAuth is optional: without it History introspects relaycontrol tokens.
     ...(config.relayauthUrl ? [{ name: "relayauth", url: `${config.relayauthUrl}/health` }] : []),
-    { name: "relayhistory", url: `${config.relayhistoryUrl}/readyz` },
+    // The read API has only /healthz; native has no separate History service.
+    { name: "relayhistory", url: `${config.relayhistoryUrl}/${config.relayhistoryBackend === "native" ? "healthz" : "readyz"}` },
   ],
 });
 const relaycontrolVersion = process.env.SELFHOST_IMAGE_VERSION?.trim() || SELFHOST_API_VERSION;
@@ -90,6 +104,12 @@ const telemetry = createTelemetryModule({
   relaycastUrl: config.relaycastUrl,
   audit: (event) => recordAudit(database, event),
   tenancy: identityConfig.tenancy.mode,
+});
+// Amp control: off unless SELFHOST_AMP_ENABLED=true; off starts no worker.
+const amp = createAmpModule({ amp: loadAmpConfig(process.env), config, database });
+const mcpOAuthTeardown = new McpOAuthTeardown({
+  database,keyring:config.encryptionKeyring,
+  client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch()}),
 });
 // Factory sessions: routes 404 and the worker stays off unless SELFHOST_FACTORY_ENABLED.
 const factory = createFactoryModule({
@@ -108,11 +128,23 @@ emitConfigLoaded(analytics, {
     emailLink: identityConfig.emailLogin,
     smtp: identityConfig.smtp !== null,
   },
-  // Report effective capability, not module presence.
-  flowsEnabled: resolveLicense(license, new Date()).capabilities.flows,
+  // Report whether optional Flows is actually selected.
+  flowsEnabled: features.flows,
   operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
 });
-const server = createServer(createApp({ config, store, flows, admin, telemetry, identity, factory, license }));
+const server = createServer(createApp({
+  config,
+  store,
+  flows,
+  admin,
+  telemetry,
+  identity,
+  factory,
+  features,
+  amp,
+  analytics: { port: analytics, config: analyticsConfig },
+  mcpOAuthTeardown,
+}));
 const bootstrapAbort = new AbortController();
 // Worker queue streams are long-lived SSE responses.
 server.requestTimeout = 0;
@@ -120,6 +152,13 @@ server.headersTimeout = 65_000;
 
 async function start(): Promise<void> {
   telemetry.start();
+  identity.start();
+  amp.start();
+  if(mcpOAuthActive(config)) {
+    console.log("[selfhost-api] hosted MCP OAuth active", mcpOAuthActiveNotice());
+    mcpOAuthTeardown.start();
+  }
+  else if(config.mcpOAuth?.unavailable) console.warn("[selfhost-api] hosted MCP OAuth unavailable", { reason: config.mcpOAuth.unavailable.reason, detail: config.mcpOAuth.unavailable.detail });
   factory.start();
   server.listen(config.port, config.host, () => {
     console.log("[selfhost-api] listening", {
@@ -130,8 +169,14 @@ async function start(): Promise<void> {
       signIn: {
         oidc: identityConfig.oidc ? identityConfig.oidc.issuer : null,
         emailLink: identityConfig.emailLogin,
+        password: identityConfig.signinMethods.includes("password"),
         smtp: identityConfig.smtp !== null,
         autoJoinDomains: identityConfig.autoJoinDomains.length,
+      },
+      amp: {
+        enabled: amp.config.enabled,
+        transport: amp.config.transport !== null,
+        internalJob: amp.config.internalSecret !== null,
       },
     });
     emitServiceStarted(analytics, {
@@ -171,7 +216,10 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   console.log("[selfhost-api] shutting down", { signal });
   bootstrapAbort.abort();
   await telemetry.stop();
+  await amp.stop();
+  await mcpOAuthTeardown.stop();
   await factory.stop();
+  identity.stop();
   await emitStopping(analytics, signal, analyticsConfig.shutdownDeadlineMs);
   server.close(async () => {
     await database.close();

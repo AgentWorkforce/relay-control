@@ -7,6 +7,7 @@ import type { SelfhostConfig } from "../src/config.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { loadIdentityConfig, type IdentityConfig } from "../src/identity/config.js";
+import { OidcClient, type OidcError } from "../src/identity/oidc.js";
 import { IdentityStore } from "../src/identity/store.js";
 import { createIdentityModule } from "../src/identity/routes.js";
 import { bootstrapOnce, relaycastProvisioner, startBootstrap, type RelaycastProvisioner } from "../src/identity/bootstrap.js";
@@ -20,7 +21,7 @@ const CLIENT_SECRET = "relay-test-client-secret";
 
 // ---- fakes -------------------------------------------------------------------
 
-type IdpCode = { email: string; name?: string; nonce: string; challenge: string; redirectUri: string; emailVerified?: boolean | null; aud?: string };
+type IdpCode = { email: string; name?: string; nonce: string; challenge: string; redirectUri: string; emailVerified?: boolean | null; aud?: string; noEmail?: boolean; claims?: Record<string, unknown> };
 
 /** A standards-shaped OIDC provider: discovery, JWKS, token endpoint (RS256). */
 function fakeIdp() {
@@ -63,7 +64,8 @@ function fakeIdp() {
         iss: state.issuer,
         aud: code.aud ?? CLIENT_ID,
         sub: `sub-${code.email}`,
-        email: code.email,
+        ...(code.noEmail ? {} : { email: code.email }),
+        ...code.claims,
         // null: the provider sends no email_verified claim at all.
         ...(code.emailVerified === null ? {} : { email_verified: code.emailVerified ?? true }),
         name: code.name ?? "Test Person",
@@ -184,6 +186,8 @@ async function setup(t: test.TestContext, options: {
   bootstrap?: boolean;
   /** SELFHOST_TENANCY=multi: the stores get the tenancy and the Relaycast provisioner. */
   multi?: boolean;
+  /** Name the fake provider's issuer in SELFHOST_OIDC_TRUST_MISSING_EMAIL_VERIFIED_ISSUER. */
+  trustMissingEmailVerified?: boolean;
 } = {}) {
   const database = new PGliteDatabase();
   await migrate(database);
@@ -221,6 +225,7 @@ async function setup(t: test.TestContext, options: {
     SELFHOST_BOOTSTRAP_ADMIN_EMAIL: "Admin@Acme.test",
     RELAYCAST_INTERNAL_SECRET: relaycast.state.secret,
     ...(options.multi ? { SELFHOST_TENANCY: "multi" } : {}),
+    ...(options.trustMissingEmailVerified ? { SELFHOST_OIDC_TRUST_MISSING_EMAIL_VERIFIED_ISSUER: idpUrl } : {}),
     ...(options.mailer ? { SELFHOST_SMTP_HOST: "smtp.acme.test", SELFHOST_EMAIL_FROM: "Relay <relay@acme.test>", SELFHOST_EMAIL_LOGIN: "true" } : {}),
     ...options.env,
   });
@@ -286,7 +291,7 @@ test("identity config: pairs, https issuer, smtp and domain validation", () => {
   assert.throws(() => loadIdentityConfig({ SELFHOST_BOOTSTRAP_ORG_NAME: "Acme" }), /set together/);
   assert.throws(() => loadIdentityConfig({ SELFHOST_BOOTSTRAP_ORG_NAME: "Acme", SELFHOST_BOOTSTRAP_ADMIN_EMAIL: "nope" }), /email address/);
   const boot = loadIdentityConfig({ SELFHOST_BOOTSTRAP_ORG_NAME: " Acme ", SELFHOST_BOOTSTRAP_ADMIN_EMAIL: "Ops@Acme.com" }).bootstrap!;
-  assert.deepEqual(boot, { organizationName: "Acme", adminEmail: "ops@acme.com", adminName: "ops", workspaceName: "Default" });
+  assert.deepEqual(boot, { organizationName: "Acme", adminEmail: "ops@acme.com", adminEmails: ["ops@acme.com"], adminName: "ops", workspaceName: "Default" });
   assert.throws(() => loadIdentityConfig({ SELFHOST_OIDC_ISSUER: "http://idp.acme.com", SELFHOST_OIDC_CLIENT_ID: "a", SELFHOST_OIDC_CLIENT_SECRET: "b" }), /https/);
   assert.throws(() => loadIdentityConfig({ SELFHOST_OIDC_ISSUER: "https://idp.acme.com", SELFHOST_OIDC_CLIENT_ID: "a" }), /CLIENT_SECRET/);
   const oidc = loadIdentityConfig({
@@ -476,6 +481,162 @@ test("oidc: refuses strangers, other domains, unverified email, forged state and
     cookie: `agent_relay_oidc=${encodeURIComponent(start.cookies.agent_relay_oidc!)}`,
   });
   assert.match(cancelled.text, /cancelled/);
+});
+
+// ---- Microsoft Entra ID: an id_token without email_verified ----------------------
+
+/** A v2.0 Entra id_token: no email_verified, plus the directory claims Entra adds. */
+function entra(email: string, extra: Partial<IdpCode> = {}): Partial<IdpCode> & { email: string } {
+  return {
+    email,
+    emailVerified: null,
+    claims: {
+      preferred_username: email,
+      upn: email,
+      oid: "00000000-0000-0000-0000-00000000e17a",
+      tid: "11111111-2222-3333-4444-555555555555",
+      ver: "2.0",
+    },
+    ...extra,
+  };
+}
+
+const ENTRA_TRUST_ISSUER = "SELFHOST_OIDC_TRUST_MISSING_EMAIL_VERIFIED_ISSUER";
+
+async function inviteFor(ctx: Awaited<ReturnType<typeof setup>>, email: string, role: "admin" | "member" = "admin") {
+  const organizationId = await orgId(ctx);
+  const created = await call(ctx.origin, `/api/v1/organizations/${organizationId}/invitations`, {
+    method: "POST",
+    token: BOOTSTRAP,
+    json: { email, role },
+  });
+  assert.equal(created.status, 201, created.text);
+  return { organizationId, token: created.body.token as string };
+}
+
+test("oidc entra, single mode: every path accepts a token without email_verified", async (t) => {
+  const ctx = await setup(t, { env: { SELFHOST_AUTO_JOIN_DOMAINS: "acme.test", SELFHOST_OIDC_ALLOWED_DOMAINS: "acme.test" } });
+
+  // Bootstrap owner.
+  const owner = await oidcSignIn(ctx, entra("admin@acme.test"));
+  assert.equal(owner.callback.status, 303, owner.callback.text);
+  assert.equal((await whoami(ctx.origin, owner.cookie!)).body.currentOrganization.role, "owner");
+
+  // Domain auto-join.
+  const joined = await oidcSignIn(ctx, entra("new.person@acme.test"));
+  assert.equal(joined.callback.status, 303, joined.callback.text);
+  assert.equal((await whoami(ctx.origin, joined.cookie!)).body.currentOrganization.role, "member");
+
+  // Existing member, again.
+  const again = await oidcSignIn(ctx, entra("new.person@acme.test"));
+  assert.equal(again.callback.status, 303, again.callback.text);
+
+  // Invite keeps the invited role.
+  const { token } = await inviteFor(ctx, "invited@acme.test");
+  const invited = await oidcSignIn(ctx, entra("invited@acme.test"), `?invite=${encodeURIComponent(token)}`);
+  assert.equal(invited.callback.status, 303, invited.callback.text);
+  assert.equal((await whoami(ctx.origin, invited.cookie!)).body.currentOrganization.role, "admin");
+
+  // The allow-list still applies.
+  const other = await oidcSignIn(ctx, entra("admin@evil.test"));
+  assert.equal(other.callback.status, 403);
+  assert.equal(other.cookie, null);
+});
+
+test("oidc entra, single mode: without auto-join a stranger at the domain is refused", async (t) => {
+  const ctx = await setup(t);
+  const result = await oidcSignIn(ctx, entra("stranger@acme.test"));
+  assert.equal(result.callback.status, 403);
+  assert.match(result.callback.text, /doesn&#39;t have access to Acme/);
+});
+
+test("oidc entra: preferred_username and upn never stand in for a missing email claim", async (t) => {
+  const ctx = await setup(t);
+  const result = await oidcSignIn(ctx, entra("admin@acme.test", { noEmail: true }));
+  assert.equal(result.callback.status, 502);
+  assert.match(result.callback.text, /did not share an email address/);
+  assert.equal(result.cookie, null);
+});
+
+test("oidc entra, multi mode: a token without email_verified skips domain auto-join only", async (t) => {
+  const ctx = await setup(t, { multi: true });
+  const organizationId = await orgId(ctx);
+  assert.equal((await call(ctx.origin, `/api/v1/organizations/${organizationId}/domains/acme.test`, { method: "PUT", token: BOOTSTRAP })).status, 201);
+
+  const owner = await oidcSignIn(ctx, entra("admin@acme.test"));
+  assert.equal(owner.callback.status, 303, owner.callback.text);
+  assert.equal((await whoami(ctx.origin, owner.cookie!)).body.currentOrganization.role, "owner");
+
+  const { token } = await inviteFor(ctx, "invited@acme.test", "member");
+  const invited = await oidcSignIn(ctx, entra("invited@acme.test"), `?invite=${encodeURIComponent(token)}`);
+  assert.equal(invited.callback.status, 303, invited.callback.text);
+  assert.equal((await whoami(ctx.origin, invited.cookie!)).body.currentOrganization.id, organizationId);
+
+  // At the assigned domain, but not auto-joined: a personal organization instead.
+  const domainUser = await oidcSignIn(ctx, entra("new.person@acme.test"));
+  assert.equal(domainUser.callback.status, 303, domainUser.callback.text);
+  const me = await whoami(ctx.origin, domainUser.cookie!);
+  assert.notEqual(me.body.currentOrganization.id, organizationId);
+  assert.equal(me.body.currentOrganization.role, "owner");
+});
+
+test("oidc entra, multi mode: naming the issuer auto-joins the domain; false stays refused", async (t) => {
+  const ctx = await setup(t, { multi: true, trustMissingEmailVerified: true });
+  const organizationId = await orgId(ctx);
+  assert.equal((await call(ctx.origin, `/api/v1/organizations/${organizationId}/domains/acme.test`, { method: "PUT", token: BOOTSTRAP })).status, 201);
+
+  const joined = await oidcSignIn(ctx, entra("new.person@acme.test"));
+  assert.equal(joined.callback.status, 303, joined.callback.text);
+  const me = await whoami(ctx.origin, joined.cookie!);
+  assert.equal(me.body.currentOrganization.id, organizationId);
+  assert.equal(me.body.currentOrganization.role, "member");
+
+  const refused = await oidcSignIn(ctx, entra("other@acme.test", { emailVerified: false }));
+  assert.equal(refused.callback.status, 502);
+  assert.match(refused.callback.text, /not verified/);
+});
+
+test("oidc entra: the trust setting names one exact, single-directory issuer", () => {
+  const tenant = "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0";
+  const load = (issuer: string, named?: string) => loadIdentityConfig({
+    SELFHOST_OIDC_ISSUER: issuer,
+    SELFHOST_OIDC_CLIENT_ID: "a",
+    SELFHOST_OIDC_CLIENT_SECRET: "b",
+    ...(named === undefined ? {} : { [ENTRA_TRUST_ISSUER]: named }),
+  }).oidc!;
+  assert.equal(load(tenant).trustMissingEmailVerified, false);
+  assert.equal(load(tenant, `${tenant}/`).trustMissingEmailVerified, true);
+  assert.throws(() => load(tenant, "https://login.microsoftonline.com/99999999-2222-3333-4444-555555555555/v2.0"), /must equal SELFHOST_OIDC_ISSUER/);
+  for (const shared of [
+    "https://login.microsoftonline.com/common/v2.0",
+    "https://login.microsoftonline.com/Organizations/v2.0",
+    "https://login.microsoftonline.com/consumers/v2.0",
+    "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0",
+    "https://login.microsoftonline.com/{tenantid}/v2.0",
+    "https://login.microsoftonline.us/common/v2.0",
+    "https://login.partner.microsoftonline.cn/organizations/v2.0",
+  ]) {
+    assert.throws(() => load(shared, shared), /must name one tenant/, shared);
+  }
+  // A realm that happens to be called "common" on another provider is fine.
+  assert.equal(load("https://idp.acme.test/common", "https://idp.acme.test/common").trustMissingEmailVerified, true);
+});
+
+test("oidc entra: a shared 'common' or 'organizations' issuer fails discovery", async () => {
+  for (const tenant of ["common", "organizations"]) {
+    const issuer = `https://login.microsoftonline.com/${tenant}/v2.0`;
+    const client = new OidcClient(
+      loadIdentityConfig({ SELFHOST_OIDC_ISSUER: issuer, SELFHOST_OIDC_CLIENT_ID: "a", SELFHOST_OIDC_CLIENT_SECRET: "b" }).oidc!,
+      // Microsoft's published document for both: a template, never the tenant-less URL.
+      async () => new Response(JSON.stringify({
+        issuer: "https://login.microsoftonline.com/{tenantid}/v2.0",
+        authorization_endpoint: `${issuer.replace("/v2.0", "")}/oauth2/v2.0/authorize`,
+        token_endpoint: `${issuer.replace("/v2.0", "")}/oauth2/v2.0/token`,
+        jwks_uri: `${issuer.replace("/v2.0", "")}/discovery/v2.0/keys`,
+      }), { status: 200 }),
+    );
+    await assert.rejects(client.discovery(), (error: OidcError) => error.code === "discovery_invalid");
+  }
 });
 
 test("oidc: before the workspace exists, sign-in says the installation is still setting up", async (t) => {
@@ -1281,3 +1442,244 @@ function lossyIdentityStore(ctx: Awaited<ReturnType<typeof setup>>, database: Aw
   });
   return { provisioned, store };
 }
+
+// ---- a real provider: Keycloak, shaped like Okta and like Entra ID ------------------
+//
+// Skipped unless OIDC_E2E_KEYCLOAK_URL is set:
+//   docker run -d --name oidc-e2e -p 127.0.0.1:8180:8080 \
+//     -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+//     quay.io/keycloak/keycloak:26.4 start-dev
+//   OIDC_E2E_KEYCLOAK_URL=http://127.0.0.1:8180 node --import tsx --test \
+//     --test-name-pattern='oidc e2e' test/identity.test.ts
+
+const KEYCLOAK = process.env.OIDC_E2E_KEYCLOAK_URL?.replace(/\/+$/, "");
+const E2E_PASSWORD = "e2e-password";
+const E2E_SECRET = "e2e-client-secret";
+const E2E_VERIFIER = "e2e-verifier-0123456789abcdefghijklmnopqrstuvwxyz0123456789abc";
+
+async function keycloakAdminToken(): Promise<string> {
+  const response = await fetch(`${KEYCLOAK}/realms/master/protocol/openid-connect/token`, {
+    method: "POST",
+    body: new URLSearchParams({ grant_type: "password", client_id: "admin-cli", username: "admin", password: process.env.OIDC_E2E_KEYCLOAK_ADMIN_PASSWORD ?? "admin" }),
+  });
+  assert.equal(response.status, 200, "Keycloak admin sign-in");
+  return (await response.json() as { access_token: string }).access_token;
+}
+
+/** A throwaway realm. `entra` removes email_verified and adds a upn claim. */
+async function keycloakRealm(t: test.TestContext, shape: "okta" | "entra", emails: string[]) {
+  const realm = `${shape}-${randomUUID().slice(0, 8)}`;
+  const token = await keycloakAdminToken();
+  const admin = async (method: string, path: string, json?: unknown) => {
+    const response = await fetch(`${KEYCLOAK}/admin/realms${path}`, {
+      method,
+      headers: { authorization: `Bearer ${token}`, ...(json === undefined ? {} : { "content-type": "application/json" }) },
+      body: json === undefined ? undefined : JSON.stringify(json),
+    });
+    assert(response.ok, `${method} ${path}: ${response.status}`);
+    return response.status === 200 ? response.json() as Promise<any> : null;
+  };
+  await admin("POST", "", { realm, enabled: true });
+  t.after(() => admin("DELETE", `/${realm}`));
+  await admin("POST", `/${realm}/clients`, {
+    clientId: CLIENT_ID,
+    secret: E2E_SECRET,
+    publicClient: false,
+    standardFlowEnabled: true,
+    directAccessGrantsEnabled: true,
+    redirectUris: ["*"],
+    protocol: "openid-connect",
+  });
+  for (const email of emails) {
+    await admin("POST", `/${realm}/users`, {
+      username: email,
+      email,
+      emailVerified: true,
+      firstName: "Test",
+      lastName: "Person",
+      enabled: true,
+      credentials: [{ type: "password", value: E2E_PASSWORD, temporary: false }],
+    });
+  }
+  if (shape === "entra") {
+    const scopes = await admin("GET", `/${realm}/client-scopes`) as { id: string; name: string }[];
+    const scope = scopes.find((item) => item.name === "email")!;
+    const mappers = await admin("GET", `/${realm}/client-scopes/${scope.id}/protocol-mappers/models`) as { id: string; name: string }[];
+    const verified = mappers.find((item) => item.name === "email verified")!;
+    await admin("DELETE", `/${realm}/client-scopes/${scope.id}/protocol-mappers/models/${verified.id}`);
+    await admin("POST", `/${realm}/client-scopes/${scope.id}/protocol-mappers/models`, {
+      name: "upn",
+      protocol: "openid-connect",
+      protocolMapper: "oidc-usermodel-property-mapper",
+      config: { "user.attribute": "email", "claim.name": "upn", "jsonType.label": "String", "id.token.claim": "true" },
+    });
+  }
+  const issuer = `${KEYCLOAK}/realms/${realm}`;
+  // The claims Keycloak really issues, read straight from its token endpoint.
+  const direct = await fetch(`${issuer}/protocol/openid-connect/token`, {
+    method: "POST",
+    body: new URLSearchParams({ grant_type: "password", client_id: CLIENT_ID, client_secret: E2E_SECRET, username: emails[0]!, password: E2E_PASSWORD, scope: "openid email profile" }),
+  });
+  assert.equal(direct.status, 200, "direct grant");
+  const idToken = (await direct.json() as { id_token: string }).id_token;
+  const claims = JSON.parse(Buffer.from(idToken.split(".")[1]!, "base64url").toString()) as Record<string, unknown>;
+  assert.equal(claims.email, emails[0]);
+  if (shape === "entra") {
+    assert.equal("email_verified" in claims, false, "the Entra-shaped realm omits email_verified");
+    assert.equal(claims.upn, emails[0]);
+    assert.equal(claims.preferred_username, emails[0]);
+  } else {
+    assert.equal(claims.email_verified, true);
+  }
+  return {
+    issuer,
+    env: {
+      SELFHOST_OIDC_ISSUER: issuer,
+      SELFHOST_OIDC_CLIENT_ID: CLIENT_ID,
+      SELFHOST_OIDC_CLIENT_SECRET: E2E_SECRET,
+      SELFHOST_OIDC_ALLOW_HTTP_ISSUER: "true",
+    },
+  };
+}
+
+/** A browser's cookies, one jar across Control and the provider. Secure is ignored over loopback http. */
+class Browser {
+  #cookies = new Map<string, { value: string; origin: string; path: string }>();
+
+  header(url: URL): string {
+    return [...this.#cookies.entries()]
+      .filter(([, cookie]) => cookie.origin === url.origin && url.pathname.startsWith(cookie.path))
+      .map(([name, cookie]) => `${name}=${cookie.value}`)
+      .join("; ");
+  }
+
+  async fetch(target: string, init: { method?: string; form?: Record<string, string> } = {}) {
+    const url = new URL(target);
+    const cookie = this.header(url);
+    const response = await fetch(url, {
+      method: init.method ?? "GET",
+      redirect: "manual",
+      headers: {
+        ...(cookie ? { cookie } : {}),
+        ...(init.form ? { "content-type": "application/x-www-form-urlencoded" } : {}),
+      },
+      body: init.form ? new URLSearchParams(init.form).toString() : undefined,
+    });
+    for (const line of response.headers.getSetCookie()) {
+      const [pair, ...attributes] = line.split(";");
+      const index = pair!.indexOf("=");
+      const name = pair!.slice(0, index);
+      const path = attributes.map((part) => /^\s*path=(.*)$/i.exec(part)?.[1]).find(Boolean) ?? "/";
+      if (/max-age=0(;|$)/i.test(line) || pair!.slice(index + 1) === "") this.#cookies.delete(name);
+      else this.#cookies.set(name, { value: pair!.slice(index + 1), origin: url.origin, path });
+    }
+    return { url, response, text: await response.text() };
+  }
+
+  /** Follows redirects until `stop` matches or a page renders. */
+  async follow(target: string, stop: (url: URL) => boolean = () => false) {
+    let current = await this.fetch(target);
+    for (let hop = 0; hop < 12 && current.response.status >= 300 && current.response.status < 400; hop += 1) {
+      const next = new URL(current.response.headers.get("location")!, current.url);
+      if (stop(next)) return { stopped: next, current };
+      current = await this.fetch(next.toString());
+    }
+    return { stopped: null, current };
+  }
+}
+
+/** Signs in at the real provider's own login form, from Control's /login page. */
+async function keycloakSignIn(browser: Browser, origin: string, email: string, next: string, stop?: (url: URL) => boolean) {
+  const login = await browser.fetch(`${origin}/login?next=${encodeURIComponent(next)}`);
+  assert.equal(login.response.status, 200);
+  assert.match(login.text, /Continue with Acme SSO/);
+  const href = /href="(\/login\/oidc\/start[^"]*)"/.exec(login.text)?.[1]?.replaceAll("&amp;", "&");
+  assert(href, "the /login page links to the provider");
+  const form = await browser.follow(`${origin}${href}`);
+  assert.equal(form.current.response.status, 200, form.current.text.slice(0, 300));
+  const action = /action="([^"]+)"/.exec(form.current.text)?.[1]?.replaceAll("&amp;", "&");
+  assert(action, "the provider's login form");
+  let current = await browser.fetch(action, { method: "POST", form: { username: email, password: E2E_PASSWORD, credentialId: "" } });
+  for (let hop = 0; hop < 12 && current.response.status >= 300 && current.response.status < 400; hop += 1) {
+    const location = new URL(current.response.headers.get("location")!, current.url);
+    if (stop?.(location)) return { stopped: location, current };
+    current = await browser.fetch(location.toString());
+  }
+  return { stopped: null, current };
+}
+
+async function e2eWhoami(browser: Browser, origin: string) {
+  const url = new URL("/cloud/api/v1/auth/whoami", origin);
+  const response = await fetch(url, { headers: { cookie: browser.header(url) } });
+  assert.equal(response.status, 200);
+  return await response.json() as any;
+}
+
+for (const shape of ["okta", "entra"] as const) {
+  test(`oidc e2e (${shape}-shaped Keycloak), single mode: owner, auto-join, invite, repeat and desktop login`, { skip: !KEYCLOAK }, async (t) => {
+    const realm = await keycloakRealm(t, shape, ["admin@acme.test", "person@acme.test", "invited@acme.test", "desktop@acme.test"]);
+    const ctx = await setup(t, { env: { ...realm.env, SELFHOST_AUTO_JOIN_DOMAINS: "acme.test", SELFHOST_OIDC_ALLOWED_DOMAINS: "acme.test" } });
+
+    const owner = new Browser();
+    await keycloakSignIn(owner, ctx.origin, "admin@acme.test", "/");
+    const ownerInfo = await e2eWhoami(owner, ctx.origin);
+    assert.equal(ownerInfo.currentOrganization.role, "owner");
+    assert.equal(ownerInfo.user.name, "Test Person");
+
+    const person = new Browser();
+    await keycloakSignIn(person, ctx.origin, "person@acme.test", "/");
+    assert.equal((await e2eWhoami(person, ctx.origin)).currentOrganization.role, "member");
+    const repeat = new Browser();
+    await keycloakSignIn(repeat, ctx.origin, "person@acme.test", "/");
+    assert.equal((await e2eWhoami(repeat, ctx.origin)).user.email, "person@acme.test");
+
+    await inviteFor(ctx, "invited@acme.test");
+    const invited = new Browser();
+    await keycloakSignIn(invited, ctx.origin, "invited@acme.test", "/");
+    assert.equal((await e2eWhoami(invited, ctx.origin)).currentOrganization.role, "admin");
+
+    // The Desktop app's browser login, as desktop-core browser_login.rs opens it.
+    const challenge = createHash("sha256").update(E2E_VERIFIER).digest("base64url");
+    const params = new URLSearchParams({
+      redirect_uri: "http://127.0.0.1:5123/callback/STATE1",
+      state: "STATE1",
+      client: "desktop",
+      workspace_selection: "desktop",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+    const desktopPath = `/cloud/api/v1/cli/login?${params}`;
+    const desktop = new Browser();
+    const signedOut = await desktop.fetch(`${ctx.origin}${desktopPath}`);
+    assert.equal(signedOut.response.status, 302);
+    const toLogin = new URL(signedOut.response.headers.get("location")!, ctx.origin);
+    assert.equal(toLogin.pathname, "/login");
+    const handoff = await keycloakSignIn(desktop, ctx.origin, "desktop@acme.test", toLogin.searchParams.get("next")!, (url) => url.port === "5123");
+    assert(handoff.stopped, "reached the desktop loopback listener");
+    assert.equal(handoff.stopped.searchParams.get("state"), "STATE1");
+    const accessToken = handoff.stopped.searchParams.get("access_token");
+    assert.match(accessToken ?? "", /^sh_at_/);
+    const exchanged = await call(ctx.origin, "/cloud/api/v1/auth/desktop/session", { method: "POST", token: accessToken!, json: { codeVerifier: E2E_VERIFIER } });
+    assert.equal(exchanged.status, 200, exchanged.text);
+    assert.equal((await call(ctx.origin, "/cloud/api/v1/auth/whoami", { token: exchanged.body.accessToken })).body.user.email, "desktop@acme.test");
+  });
+}
+
+test("oidc e2e (entra-shaped Keycloak), multi mode: domain auto-join needs the named issuer", { skip: !KEYCLOAK }, async (t) => {
+  for (const trusted of [false, true]) {
+    await t.test(`issuer named: ${trusted}`, async (st) => {
+      const realm = await keycloakRealm(st, "entra", ["person@acme.test"]);
+      const ctx = await setup(st, {
+        multi: true,
+        env: { ...realm.env, ...(trusted ? { [ENTRA_TRUST_ISSUER]: realm.issuer } : {}) },
+      });
+      const organizationId = await orgId(ctx);
+      assert.equal((await call(ctx.origin, `/api/v1/organizations/${organizationId}/domains/acme.test`, { method: "PUT", token: BOOTSTRAP })).status, 201);
+      const browser = new Browser();
+      await keycloakSignIn(browser, ctx.origin, "person@acme.test", "/");
+      const info = await e2eWhoami(browser, ctx.origin);
+      assert.equal(info.currentOrganization.id === organizationId, trusted);
+      assert.equal(info.currentOrganization.role, trusted ? "member" : "owner");
+    });
+  }
+});

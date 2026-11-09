@@ -25,6 +25,14 @@ export type AnalyticsLimits = {
 
 export type AnalyticsProfile = "production" | "development";
 
+/** Bounds of the client gateway (`POST /api/v1/analytics/events`). */
+export type AnalyticsGatewayLimits = {
+  /** Request body limit, enforced on the streamed bytes. */
+  maxBodyBytes: number;
+  /** Events per request. */
+  maxEvents: number;
+};
+
 export type AnalyticsConfig = AnalyticsLimits & {
   destination: AnalyticsDestination;
   profile: AnalyticsProfile;
@@ -46,6 +54,7 @@ export type AnalyticsConfig = AnalyticsLimits & {
     /** Never logged or described. */
     projectKey: string;
   } | null;
+  gateway: AnalyticsGatewayLimits;
 };
 
 const PREFIX = "SELFHOST_ANALYTICS_";
@@ -289,10 +298,16 @@ export function loadAnalyticsConfig(env: Env = process.env): AnalyticsConfig {
     throw new Error(`${PREFIX}DELIVERY_DEADLINE_MS must be at least ${PREFIX}REQUEST_TIMEOUT_MS`);
   }
 
+  const gateway: AnalyticsGatewayLimits = {
+    maxBodyBytes: boundedInt(env, `${PREFIX}GATEWAY_MAX_BODY_BYTES`, 32_768, 1024, 262_144),
+    maxEvents: boundedInt(env, `${PREFIX}GATEWAY_MAX_EVENTS`, 20, 1, 100),
+  };
+
   return {
     destination,
     profile,
     deploymentId: deploymentIdRaw,
+    gateway,
     collector: destination === "collector" ? collectorConfig(env, profile) : null,
     posthog: destination === "posthog" ? posthogConfig(env) : null,
     ...limits,
@@ -320,5 +335,7 @@ export function describeAnalyticsConfig(config: AnalyticsConfig): Record<string,
     maxAttempts: config.maxAttempts,
     flushIntervalMs: config.flushIntervalMs,
     shutdownDeadlineMs: config.shutdownDeadlineMs,
+    gatewayMaxBodyBytes: config.gateway.maxBodyBytes,
+    gatewayMaxEvents: config.gateway.maxEvents,
   };
 }

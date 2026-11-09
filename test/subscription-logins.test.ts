@@ -1,4 +1,3 @@
-import { testLicense } from "./support/license.js";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
@@ -19,6 +18,7 @@ import { XAI_DEVICE_CREDENTIAL_SCOPE } from "../src/admin/xai-device-auth.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { defaultFlowsConfig } from "../src/flows/config.js";
 import { FlowsStore } from "../src/flows/store.js";
+import { testFeatures } from "./support/features.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { apiClient, BOOTSTRAP, openQueue, seedTenant } from "./flows-helpers.js";
@@ -123,7 +123,7 @@ async function setup(t: test.TestContext) {
     credentialBackend: new PostgresObjectBackend(database),
   });
   flows.cliCredentials = admin.logins;
-  control.on("request", createApp({ config, store, flows, admin, license: testLicense() }));
+  control.on("request", createApp({ config, store, flows, admin, features: testFeatures("flows") }));
   t.after(async () => {
     await close(control);
     await database.close();

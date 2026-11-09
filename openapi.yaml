@@ -12,17 +12,24 @@ info:
     identical methods, bodies, and responses. Bearer authentication remains
     available on both mounts; the `/cloud` mount additionally accepts the
     same-origin HttpOnly session cookie issued by `/login`.
+    The MCP OAuth issuer (on by default) and grant-management APIs use explicit
+    /cloud/api/oauth/* and /cloud/api/v1/oauth/grants* prefixes; their bare
+    equivalents are not mounted.
     Client-visible Relaycast and RelayHistory URLs are explicit public HTTPS
     origins and are distinct from internal server-to-server upstream URLs.
-    Desktop feed (`/api/v1/desktop/feed/*`, tag "Desktop feed (draft contract)")
-    is a draft contract only (x-status proposed; Cloud team decides, not yet
-    confirmed); this server implements none of it. Signing: the
+    Desktop feed (`/api/v1/desktop/feed/*`, tag "Desktop feed") is
+    implemented and off unless SELFHOST_DESKTOP_FEED_SIGNER and
+    SELFHOST_DESKTOP_FEED_STORAGE are set; operations still marked
+    x-status proposed deviate from this document (docs/desktop-feed.md,
+    "Deviations from the contract"). Signing: the
     hosted feed signs each release at publish with Ed25519 (RFC 8032) over the
     RFC 8785 (JCS) canonical UTF-8 bytes of the envelope's `manifest` object;
     `key_id` selects the key, and a client holds one key and refuses any
     other. Self-hosted and customer deployments import or mirror pre-signed
-    envelopes and verify them against the profile's public key; they hold no
-    private key. The signer provider is unresolved (x-status unresolved).
+    envelopes and verify them against the profile's public key. A
+    relaycontrol site signs each profile with that profile's own AWS KMS
+    Ed25519 key, addressed by alias (x-signer-provider awskms); the private
+    key never leaves KMS.
 servers:
   - url: "{controlPlaneUrl}"
     variables:
@@ -31,6 +38,16 @@ servers:
 security:
   - bearerAuth: []
 tags:
+  - name: MCP OAuth
+    description: MCP connector issuer, on by default (SELFHOST_MCP_OAUTH=off disables it; missing inputs answer 501 mcp_oauth_unavailable); see docs/mcp-oauth.md.
+  - name: acquisition
+    description: |
+      Dormant cloud-class acquisition assertion issuer (flag
+      SELFHOST_ACQUISITION_ISSUER_ENABLED, default off). See
+      docs/acquisition-issuer.md.
+  - name: amp
+    description: |
+      Amp thread control (SELFHOST_AMP_ENABLED, default off). See docs/amp.md.
   - name: factory
     description: |
       Factory sessions (docs/factory-sessions.md). Every operation answers
@@ -40,13 +57,13 @@ tags:
     description: |
       In-cluster service routes under /internal/v1. Never served through the
       /cloud alias; each operation names the service credential it accepts.
-  - name: Desktop feed (draft contract)
-    x-status: proposed
+  - name: Desktop feed
     description: |
       Private, workspace-authenticated release feed for enterprise Desktop
       profiles (relay-desktop docs/enterprise-distribution.md at 21e61026;
-      contract notes in docs/desktop-feed.md). Status: proposed, Cloud team
-      decides, not yet confirmed. Nothing here is implemented.
+      contract notes in docs/desktop-feed.md). Status: implemented; deviations
+      are listed in docs/desktop-feed.md and keep `x-status: proposed` on
+      their operations.
 
       Credentials: workspace bearer (`bearerAuth`, the desktop-core session),
       `installToken`, browser session (`cookieAuth`, `/cloud` mount only) and
@@ -69,47 +86,409 @@ tags:
       Rate limits on every endpoint answer 429 with Retry-After; per-profile
       quota and retention appear in the publisher's version listing
       (`DesktopFeedLimits`).
-    x-proposed-default: "gcpkms hosted, awskms non-production; see docs/desktop-feed.md Proposed defaults"
     x-signer-provider:
-      x-status: unresolved
+      provider: awskms
       description: |
-        The provider that holds the hosted feed's per-profile Ed25519 private
-        keys is unresolved. A private key stored in Postgres is not a fallback.
+        AWS KMS key (ECC_NIST_EDWARDS25519, Sign with MessageType RAW and
+        ED25519_SHA_512, 4096-byte message cap), one key per profile,
+        addressed by alias. A private key stored in Postgres is not a fallback.
 paths:
-  /api/v1/license:
-    get:
-      summary: Effective installation capabilities for a signed-in user
+  /mcp:
+    post:
+      operationId: mcpOAuthRoot
+      tags: [MCP OAuth]
+      summary: MCP root resource, mounted while MCP OAuth is active (SELFHOST_MCP_OAUTH, on by default).
       description: |
-        Core needs no licence. Optional capabilities are off unless selected;
-        paid features additionally require a valid unexpired entitlement.
-        This member-facing response contains no customer or seat metadata.
-        Bootstrap and service credentials are not user credentials.
+        Stateless JSON-RPC endpoint; /cloud/mcp is an RPC alias. OAuth tokens
+        must target the canonical public /mcp resource, including on the alias.
+        The approved agent is pinned by immutable ID across chats. Native
+        personal cli:auth bearers are also accepted. Cookies are accepted only
+        on the /cloud alias behind the native origin guard. OAuth connections
+        do not acquire native API, Desktop or transcript-history authority.
+        Disabled or unavailable module returns 404 (an mcp_at_ bearer is refused
+        with 401). All responses disable caching.
+      security:
+        - oauthMcpBearer: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: JSON-RPC 2.0 request, notification or batch, at most 64 KiB.
       responses:
         "200":
-          description: Effective feature state. Cache-Control is no-store.
+          description: JSON-RPC response
+        "202":
+          description: Notification accepted
+        "400":
+          description: Invalid JSON-RPC or MCP session metadata
+        "401":
+          description: Invalid credential or resource audience; Bearer challenge includes resource_metadata.
+        "403":
+          description: Insufficient issued scope, handoff artifact or cross-origin native request
+        "404":
+          description: Module disabled or workspace unavailable
+        "413":
+          description: Body exceeds 64 KiB
+  /cloud/.well-known/oauth-authorization-server:
+    get:
+      operationId: mcpOAuthAuthorizationServerMetadata
+      tags: [MCP OAuth]
+      summary: Discover the enabled OAuth issuer.
+      description: |
+        Also served at /.well-known/oauth-authorization-server/cloud and the
+        /cloud/.well-known/openid-configuration and
+        /.well-known/openid-configuration/cloud aliases. Only mounted
+        endpoints and enabled OIDC features are advertised. Public CORS;
+        no credentials required. Disabled module returns 404.
+      security: []
+      responses:
+        "200":
+          description: Authorization-server metadata; issuer is the configured public origin plus /cloud.
+          content:
+            application/json:
+              schema: {type: object}
+        "404":
+          description: Module disabled
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+  /.well-known/oauth-protected-resource/mcp:
+    get:
+      operationId: mcpOAuthRootResourceMetadata
+      tags: [MCP OAuth]
+      summary: Discover the canonical root MCP resource.
+      security: []
+      responses:
+        "200":
+          description: Protected-resource metadata with canonical /mcp resource and mounted authorization server.
+          content:
+            application/json:
+              schema: {type: object}
+        "404":
+          description: Module disabled
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+  /cloud/.well-known/oauth-protected-resource/cloud/api/v1/mcp/shared-sessions:
+    get:
+      operationId: mcpOAuthSharedResourceMetadata
+      tags: [MCP OAuth]
+      summary: Discover the shared-sessions MCP resource.
+      description: Also served at /.well-known/oauth-protected-resource/cloud/api/v1/mcp/shared-sessions. The existing Bearer challenge URL is preserved.
+      security: []
+      responses:
+        "200":
+          description: Metadata for the canonical /cloud/api/v1/mcp/shared-sessions audience.
+          content:
+            application/json:
+              schema: {type: object}
+        "404":
+          description: Module disabled
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+  /cloud/.well-known/jwks.json:
+    get:
+      operationId: mcpOAuthJwks
+      tags: [MCP OAuth]
+      summary: Active and unexpired retained OIDC public keys.
+      security: []
+      responses:
+        "200":
+          description: Public JWK set; private key material is never returned.
           content:
             application/json:
               schema:
                 type: object
-                additionalProperties: false
-                required: [status, selected, entitled, capabilities]
+                required: [keys]
                 properties:
-                  status:
-                    type: string
-                    enum: [absent, invalid, expired, valid]
-                  selected:
-                    $ref: "#/components/schemas/ProductCapabilities"
-                  entitled:
-                    type: object
-                    additionalProperties: false
-                    required: [flows, relayfile]
-                    properties:
-                      flows: {type: boolean}
-                      relayfile: {type: boolean}
-                  capabilities:
-                    $ref: "#/components/schemas/ProductCapabilities"
+                  keys:
+                    type: array
+                    items: {type: object}
+        "404":
+          description: OAuth or OIDC disabled
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+  /cloud/oauth/authorize:
+    get:
+      operationId: mcpOAuthConsentPage
+      tags: [MCP OAuth]
+      summary: Show the account's workspace-bound consent page.
+      description: |
+        Requires an account-capable native browser session; Authorization
+        headers are not accepted as browser authority. The account's issued
+        workspace is the only consent target. PKCE S256 and a registered
+        redirect URI are mandatory. Malformed requests never choose a redirect
+        before registration has been verified. Duplicate query keys are refused.
+      security:
+        - cookieAuth: []
+      parameters:
+        - {name: client_id, in: query, required: true, schema: {type: string}}
+        - {name: redirect_uri, in: query, schema: {type: string, format: uri}, description: Required when registration has multiple redirects.}
+        - {name: response_type, in: query, required: true, schema: {type: string, const: code}}
+        - {name: code_challenge, in: query, required: true, schema: {type: string, minLength: 43, maxLength: 43}}
+        - {name: code_challenge_method, in: query, required: true, schema: {type: string, const: S256}}
+        - {name: resource, in: query, required: true, schema: {type: string, format: uri}, description: Canonical root or shared-sessions resource URL.}
+        - {name: scope, in: query, schema: {type: string}, description: Space-separated scopes; omission chooses the resource baseline.}
+        - {name: state, in: query, schema: {type: string, maxLength: 1024}}
+        - {name: nonce, in: query, schema: {type: string, minLength: 1, maxLength: 1024}, description: Validated only for an enabled openid grant.}
+      responses:
+        "200":
+          description: Escaped HTML consent page with nonce-based Content-Security-Policy.
+          content:
+            text/html:
+              schema: {type: string}
+        "302":
+          description: Sign-in redirect or registered-client OAuth error redirect with state and issuer.
+        "400":
+          description: Invalid authorization request without a verified redirect
+        "403":
+          description: Account capability or handoff admission refused
+        "404":
+          description: Module disabled or workspace no longer accessible
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+  /cloud/api/oauth/authorize:
+    post:
+      operationId: mcpOAuthConsent
+      tags: [MCP OAuth]
+      summary: Approve or deny a workspace-bound connection.
+      description: Native account cookie and exact configured public Origin required; no bearer authority or tenant selection.
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [params, decision]
+              properties:
+                params:
+                  type: object
+                  description: Original authorization parameters, revalidated against registration and PKCE.
+                  additionalProperties: {type: string}
+                decision: {type: string, enum: [approve, deny]}
+                workspace_id: {type: string, format: uuid, description: Must equal the account session's workspace on approval.}
+                agent_name: {type: string, maxLength: 128, description: Required approved name on approval.}
+                continue_grant_id: {type: string, description: Continues one of the account's existing connections instead of creating a new one; skips the name check.}
+                attach_existing: {type: boolean, description: "Confirms attaching a new connection to the account's existing agent of that name; required when the name already belongs to one of the account's agents, except when continuing an existing grant."}
+      responses:
+        "200":
+          description: Validated redirect_to URL containing the current code or denial, state and issuer.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [redirect_to]
+                properties:
+                  redirect_to: {type: string, format: uri}
+        "400":
+          description: Invalid request, agent name or workspace
         "401":
-          description: A signed-in user is required
+          description: Browser account sign-in required
+        "403":
+          description: Invalid Origin, handoff or account capability
+        "404":
+          description: Module disabled
+        "409":
+          description: "agent_name_in_use when the name belongs to an existing agent of this account and attach_existing was not true; agent_name_taken when another member's agent or a retiring agent holds the name."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: {type: string, enum: [agent_name_in_use, agent_name_taken]}
+                  error_description: {type: string}
+        "413":
+          description: Body exceeds 64 KiB
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+        "503":
+          description: "temporarily_unavailable: the agent name could not be checked, so no code is issued."
+  /cloud/api/oauth/authorize/agent-name:
+    get:
+      operationId: mcpOAuthAgentName
+      tags: [MCP OAuth]
+      summary: Check an agent name in the signed-in account's workspace.
+      security:
+        - cookieAuth: []
+      parameters:
+        - {name: workspace_id, in: query, required: true, schema: {type: string, format: uuid}}
+        - {name: name, in: query, required: true, schema: {type: string, maxLength: 128}}
+      responses:
+        "200":
+          description: Name and availability status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  status: {type: string, enum: [available, yours, taken, unknown]}
+        "400":
+          description: Invalid agent name or workspace
+        "401":
+          description: Browser sign-in required
+        "403":
+          description: Account capability or handoff refused
+        "404":
+          description: Module disabled
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+  /cloud/api/oauth/register:
+    post:
+      operationId: mcpOAuthRegister
+      tags: [MCP OAuth]
+      summary: Register a public OAuth client.
+      description: |
+        No client secret. JSON body, 64 KiB maximum. Redirects must be absolute
+        HTTPS or loopback HTTP without credentials or fragments. Limited to
+        20 requests per trusted client-address bucket per hour (IPv6 /64) and
+        500 per process per hour. SELFHOST_TRUSTED_PROXIES defaults to zero;
+        forwarded headers are then ignored and the socket peer is used.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [redirect_uris]
+              properties:
+                client_name: {type: string, maxLength: 100}
+                redirect_uris:
+                  type: array
+                  minItems: 1
+                  maxItems: 10
+                  items: {type: string, format: uri}
+                token_endpoint_auth_method: {type: string, const: none}
+                grant_types:
+                  type: array
+                  items: {type: string, enum: [authorization_code, refresh_token]}
+                response_types:
+                  type: array
+                  items: {type: string, const: code}
+      responses:
+        "201":
+          description: Registered client_id and validated redirect_uris; OIDC algorithm advertised only when enabled.
+          content:
+            application/json:
+              schema: {type: object}
+        "400":
+          description: invalid_client_metadata
+        "404":
+          description: Module disabled
+        "413":
+          description: Body exceeds 64 KiB
+        "429":
+          description: Registration rate limit (slow_down)
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+  /cloud/api/oauth/token:
+    post:
+      operationId: mcpOAuthToken
+      tags: [MCP OAuth]
+      summary: Exchange a PKCE code or rotate an OAuth refresh token.
+      description: |
+        Public client_id is required. Code exchange verifies the bound client,
+        redirect, resource and PKCE before consuming the code. Refresh rotates
+        the pair without widening its issued scopes. Only this issuer's
+        mcp_rt_ credentials are accepted; no native session is minted.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/McpOAuthTokenRequest"}
+          application/x-www-form-urlencoded:
+            schema: {$ref: "#/components/schemas/McpOAuthTokenRequest"}
+      responses:
+        "200":
+          description: New access and refresh pair
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, token_type, expires_in, refresh_token, scope]
+                properties:
+                  access_token: {type: string, pattern: "^mcp_at_"}
+                  token_type: {type: string, const: Bearer}
+                  expires_in: {type: integer}
+                  refresh_token: {type: string, pattern: "^mcp_rt_"}
+                  scope: {type: string}
+                  id_token: {type: string, description: Present only for an enabled openid grant.}
+        "400":
+          description: invalid_request, invalid_grant, invalid_target or unsupported_grant_type
+        "401":
+          description: invalid_client
+        "404":
+          description: Module disabled
+        "413":
+          description: Body exceeds 64 KiB
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+  /cloud/api/oauth/revoke:
+    post:
+      operationId: mcpOAuthRevoke
+      tags: [MCP OAuth]
+      summary: Revoke an OAuth token family.
+      description: RFC 7009; unknown tokens return the same empty success response. Local revocation queues durable remote cleanup.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/McpOAuthRevokeRequest"}
+          application/x-www-form-urlencoded:
+            schema: {$ref: "#/components/schemas/McpOAuthRevokeRequest"}
+      responses:
+        "200":
+          description: Empty response, including for unknown tokens
+        "400":
+          description: Missing token or malformed body
+        "404":
+          description: Module disabled
+        "413":
+          description: Body exceeds 64 KiB
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+  /cloud/api/v1/oauth/grants:
+    get:
+      operationId: mcpOAuthListGrants
+      tags: [MCP OAuth]
+      summary: List the account's connections in its issued workspace.
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Non-secret metadata for live owned connections; query parameters cannot widen the tenant.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grants]
+                properties:
+                  grants:
+                    type: array
+                    items: {$ref: "#/components/schemas/McpOAuthGrant"}
+        "401":
+          description: Browser account sign-in required
+        "403":
+          description: Account capability or handoff refused
+        "404":
+          description: Module disabled or workspace inaccessible
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+  /cloud/api/v1/oauth/grants/{grantId}:
+    delete:
+      operationId: mcpOAuthDisconnect
+      tags: [MCP OAuth]
+      summary: Revoke an owned connection and queue its remote cleanup.
+      description: Exact configured public Origin and workspace-bound browser account required.
+      security:
+        - cookieAuth: []
+      parameters:
+        - {name: grantId, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "204":
+          description: Local grant family revoked; remote cleanup retries independently.
+        "401":
+          description: Browser account sign-in required
+        "403":
+          description: Invalid Origin, account capability or handoff
+        "404":
+          description: Module disabled, workspace inaccessible or no owned grant
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /api/v1/mcp/shared-sessions:
     post:
       operationId: hostedMcpSharedSessions
@@ -132,11 +511,33 @@ paths:
         participant owned by the caller, bound to the `Mcp-Session-Id` or chosen
         with `as`; replies arrive in `check_relay_inbox`. Launches,
         `as_person` and desktop-linked identity (`join_relay desktop_address`)
-        are not yet available. Initialize advertises the experimental capability
-        `com.agentrelay/native-session-identity` version 1 and returns an
-        `Mcp-Session-Id` header.
+        are not yet available. Initialize advertises the experimental
+        capabilities `com.agentrelay/native-session-identity`,
+        `com.agentrelay/copilot-session-attestation` and
+        `com.agentrelay/desktop-provider-credentials` (version 1 each) and
+        returns an `Mcp-Session-Id` header.
 
-        Requires a personal credential with `cli:auth`: a device bearer token,
+        A Desktop provider credential (`mcp:desktop` child token, see
+        `/api/v1/workspaces/{workspaceId}/mcp/shared-sessions-tokens`) is also
+        accepted here, as a header bearer only, while its verified parent and
+        the membership are live. On a `copilot` credential, relay tools act as
+        the synced Desktop identity of the chat named by a verified
+        `_agent_relay_attestation` argument (Ed25519 JWS over the tool, exact
+        arguments, user, workspace, source, native session id and a single-use
+        nonce, at most 60 seconds). The argument is removed from every call
+        before dispatch. A proof that does not verify, a proof on any other
+        connection, or a proof in a batch is refused with 400 (-32602); a
+        Copilot call without one gets a tool error and no relay action. See
+        docs/integrations/copilot-vscode.md.
+
+        With MCP OAuth active (the default), an OAuth header bearer granted for
+        the canonical /cloud/api/v1/mcp/shared-sessions resource is accepted.
+        It acts only as its approved immutable relay-agent identity. The
+        cookie account and native API authority are not granted by OAuth;
+        transcript-history reads remain restricted on that connection.
+        Initialize omits desktop credential/attestation capabilities for OAuth.
+
+        Native access requires a personal credential with `cli:auth`: a device bearer token,
         or on the `/cloud` mount the session cookie behind the origin guard.
         Workspace API tokens (`sh_wk_`) and the internal service token are
         refused. Every tool is pinned to the credential's workspace. The
@@ -148,12 +549,13 @@ paths:
       security:
         - bearerAuth: []
         - cookieAuth: []
+        - oauthMcpBearer: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              description: A JSON-RPC 2.0 message or batch, at most 64 KiB.
+              description: A JSON-RPC 2.0 message or batch, at most 64 KiB (128 KiB on a copilot provider credential).
       responses:
         "200":
           description: JSON-RPC response
@@ -168,9 +570,173 @@ paths:
         "405":
           description: "Any method other than POST (-32000), with `Allow: POST`"
         "413":
-          description: Body larger than 64 KiB (-32600)
+          description: Body larger than 64 KiB, or 128 KiB on a copilot provider credential (-32600)
         "500":
           description: Internal server error (-32603)
+  /api/v1/workspaces/{workspaceId}/mcp/shared-sessions-tokens:
+    get:
+      operationId: listDesktopMcpCredentials
+      summary: The calling verified Desktop sign-in's live provider credentials. No secret is returned.
+      description: |
+        Header bearer only; the bearer must be a verified Desktop parent: a
+        live `cli:auth` session redeemed with its S256 verifier from an
+        approved browser consent that named the Desktop host. Device-flow,
+        cookie, handoff and provider child tokens are refused. Also served at
+        `/cloud/api/v1/...`; the session cookie is never accepted here.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: Provider credentials minted by this parent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tokens]
+                properties:
+                  tokens:
+                    type: array
+                    items: { $ref: "#/components/schemas/DesktopMcpCredential" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "405": { $ref: "#/components/responses/DesktopMcpError" }
+        "429": { $ref: "#/components/responses/DesktopMcpError" }
+    post:
+      operationId: registerDesktopMcpCredential
+      summary: Register a provider secret Desktop generated as a child MCP credential (scopes rth:read and mcp:desktop, 15-minute lease).
+      description: |
+        Idempotent: the same parent, installation, provider and secret renew
+        the lease and return the same id. The same installation and provider
+        with another secret, or a secret registered elsewhere, is 409
+        credential_conflict; when the conflict is with this parent's own
+        existing credential the 409 body also carries `credential_id` (the id
+        to DELETE before re-registering). Only the secret's hash is stored and the response
+        never echoes it. The lease never outlives the parent's refresh expiry.
+        Also served at `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DesktopMcpCredentialCreate" }
+      responses:
+        "201":
+          description: Registered or renewed (metadata only)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DesktopMcpCredential" }
+        "400": { $ref: "#/components/responses/DesktopMcpError" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "409": { $ref: "#/components/responses/DesktopMcpError" }
+        "429": { $ref: "#/components/responses/DesktopMcpError" }
+  /api/v1/workspaces/{workspaceId}/mcp/shared-sessions-tokens/{tokenId}:
+    put:
+      operationId: renewDesktopMcpCredential
+      summary: Renew one of this parent's provider credentials for another 15 minutes (capped at the parent's refresh expiry).
+      description: Same caller rules as the collection. Also served at `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: tokenId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Renewed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DesktopMcpCredential" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "429": { $ref: "#/components/responses/DesktopMcpError" }
+    delete:
+      operationId: revokeDesktopMcpCredential
+      summary: Revoke one of this parent's provider credentials. It stops working at MCP immediately.
+      description: Same caller rules as the collection. Also served at `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: tokenId, in: path, required: true, schema: { type: string } }
+      responses:
+        "204":
+          description: Revoked
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "429": { $ref: "#/components/responses/DesktopMcpError" }
+  /api/v1/workspaces/{workspaceId}/messaging/desktop-identities:
+    get:
+      operationId: listDesktopIdentities
+      summary: The caller's synced Desktop identities for one Desktop source, and the sync capabilities this server verifies.
+      description: |
+        Requires `cli:auth` (a Desktop bearer, or the session cookie on the
+        `/cloud` mount). Provider child tokens are refused. No token is
+        returned. Also served at `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: source_id, in: query, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Identities and capabilities
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [identities, capabilities]
+                properties:
+                  identities:
+                    type: array
+                    items: { $ref: "#/components/schemas/DesktopIdentityLink" }
+                  capabilities: { $ref: "#/components/schemas/DesktopIdentityCapabilities" }
+        "400": { $ref: "#/components/responses/DesktopMcpError" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "502": { $ref: "#/components/responses/DesktopMcpError" }
+    put:
+      operationId: syncDesktopIdentities
+      summary: Replace this Desktop source's identities and attestation key.
+      description: |
+        Each identity is kept only after Relaycast confirms its token controls
+        exactly that agent and the agent's metadata says source
+        `relay-desktop` with `owner_hash` = hex sha256 of the caller's user id;
+        others are returned in `skipped`. Identities not listed are removed and
+        the attestation key is replaced (or removed when absent). Agent tokens
+        are encrypted at rest and never returned. Cookie requests must pass
+        the origin check. Also served at `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DesktopIdentitySync" }
+      responses:
+        "200":
+          description: Sync result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DesktopIdentitySyncResult" }
+        "400": { $ref: "#/components/responses/DesktopMcpError" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "502": { $ref: "#/components/responses/DesktopMcpError" }
   /api/v1/workspaces/{workspaceId}/messaging/people:
     get:
       operationId: listMessagingPeople
@@ -872,6 +1438,118 @@ paths:
                 $ref: "#/components/schemas/Whoami"
         "401":
           description: Invalid, expired, rotated, or revoked bearer
+  /api/v1/capabilities:
+    get:
+      operationId: getCapabilities
+      description: |
+        Optional features this installation serves, for any signed-in member
+        (bearer or, on the /cloud mount, the session cookie). Selection is per
+        installation, so there is no organization or workspace parameter. Not
+        available to the bootstrap bearer.
+      responses:
+        "200":
+          description: Selected optional features
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [capabilities]
+                properties:
+                  capabilities:
+                    $ref: "#/components/schemas/FeatureCapabilities"
+        "401":
+          description: Missing, invalid, or expired user token
+  /api/v1/analytics/events:
+    post:
+      operationId: captureClientAnalyticsEvents
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      description: |
+        Client analytics gateway (see `docs/analytics.md`, "Client gateway").
+        Mounted only when `SELFHOST_ANALYTICS_DESTINATION` is not `none`;
+        otherwise this path is `404 not_found`.
+
+        A user bearer (Desktop, `client: desktop`) or the dashboard session
+        cookie under `/cloud` (`client: dashboard`) with scope `cli:auth`.
+        Bootstrap, internal and workspace API tokens are `401`. Cookie requests
+        must be `application/json` with an allowed `Origin` (or
+        `Sec-Fetch-Site: same-origin`), else `403 forbidden`, checked before
+        the body is read. Limited to 60 requests per minute per session and
+        300 per minute per client IP.
+
+        The whole body is validated before anything is captured. Tenant and
+        workspace attribution comes from the credential, never the body, and
+        no user identity is exported. `202` means accepted for best-effort
+        export, not durably stored; `queued: false` means the in-memory queue
+        dropped at least one event of this request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [schema, client, events]
+              properties:
+                schema:
+                  enum: [agent-relay.analytics.client-batch/v1]
+                client:
+                  enum: [dashboard, desktop]
+                  description: Must match the credential (cookie = dashboard, bearer = desktop).
+                events:
+                  type: array
+                  minItems: 1
+                  maxItems: 20
+                  description: At most `SELFHOST_ANALYTICS_GATEWAY_MAX_EVENTS` (default 20).
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [event]
+                    properties:
+                      event:
+                        enum:
+                          - dashboard.page_viewed
+                          - dashboard.session_opened
+                          - desktop.app_started
+                          - desktop.sign_in_completed
+                      occurred_at:
+                        type: string
+                        format: date-time
+                        description: Kept within 5 minutes of server time, otherwise replaced by server time.
+                      client_event_id:
+                        type: string
+                        format: uuid
+                      properties:
+                        type: object
+                        description: Only the properties registered for the event kind.
+      responses:
+        "202":
+          description: Accepted for best-effort export
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accepted, queued]
+                properties:
+                  accepted:
+                    type: integer
+                  queued:
+                    type: boolean
+        "400":
+          description: |
+            `invalid_request`, `client_mismatch`, `too_many_events`,
+            `invalid_event` (message names `events[i]`) or `reserved_field`
+        "401":
+          description: Missing or unknown credential, or a bootstrap, internal or workspace API token
+        "403":
+          description: Scope `cli:auth` missing, or a cookie request failed the CSRF check
+        "404":
+          description: Gateway not mounted (`not_found`), or the session's membership is gone (`workspace_not_found`)
+        "413":
+          description: Body over `SELFHOST_ANALYTICS_GATEWAY_MAX_BODY_BYTES` (default 32768), `payload_too_large`
+        "429":
+          description: Rate limit reached (`rate_limited`); see Retry-After
   /api/v1/organizations:
     get:
       operationId: listOrganizations
@@ -982,6 +1660,49 @@ paths:
           description: Nothing to update
         "404":
           description: Workspace not found
+  /api/v1/organizations/{organizationId}/workspaces/{workspaceId}/mcp-oauth/abandon-cleanup:
+    post:
+      security: [{ bearerAuth: [] }]
+      operationId: abandonMcpOAuthCleanup
+      description: >-
+        Operator override for MCP OAuth connector cleanup that can never
+        finish. Completes every pending teardown record of the workspace
+        without releasing its Relaycast agent, so the workspace can then be
+        deleted, and records an audit event. Live connector grants are not
+        touched unless revoke_live=true; without it workspace deletion still
+        answers 409 while any remains. Works while the module is off or
+        unavailable. Bootstrap bearer only.
+      parameters:
+        - { name: organizationId, in: path, required: true, schema: { type: string } }
+        - { name: workspaceId, in: path, required: true, schema: { type: string } }
+        - name: revoke_live
+          in: query
+          required: false
+          description: >-
+            When true, first revokes every live connector grant of the
+            workspace (reason operator_abandoned, ending its sessions and
+            expiring unredeemed codes) in the same transaction, then completes
+            all pending records including the new ones.
+          schema: { type: string, enum: ["true", "false"], default: "false" }
+      responses:
+        "200":
+          description: >-
+            Number of teardown records abandoned; with revoke_live=true also
+            the number of live grants revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [abandoned]
+                properties:
+                  abandoned: { type: integer, minimum: 0 }
+                  revoked: { type: integer, minimum: 0 }
+        "400":
+          description: revoke_live is not true or false (invalid_request)
+        "403":
+          description: Not the operator's bootstrap bearer (operator_only)
+        "404":
+          description: Organization or workspace not found
   /api/v1/fleet/nodes/claim:
     post:
       security: [{ bearerAuth: [] }]
@@ -1217,7 +1938,252 @@ paths:
       description: Any signed-in member. Which sign-in methods and invite delivery are configured.
       responses:
         "200":
-          description: "{ oidc: {displayName, allowedDomains}|null, emailLink, inviteEmail, autoJoinDomains, inviteTtlHours }"
+          description: "{ oidc: {displayName, allowedDomains}|null, emailLink, password, inviteEmail, autoJoinDomains, inviteTtlHours }"
+  /api/v1/auth/login-config:
+    get:
+      operationId: loginConfig
+      description: |
+        Public (also served at `/cloud/api/v1/auth/login-config`). What a sign-in page
+        needs: the enabled methods, the OIDC button label, the logo, whether auto-join
+        or OIDC domains are configured (a boolean, never the domains) and the password
+        length bounds. Contains no secrets.
+      security: []
+      responses:
+        "200":
+          description: Login configuration
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LoginConfig" }
+  /api/v1/auth/password/register:
+    post:
+      operationId: passwordRegister
+      description: |
+        Starts a password registration. The body carries no password: the password is
+        chosen only after the address is proven. The answer is always 202, for every
+        address. Only an eligible address (admin email, member, open invite or auto-join
+        domain) receives a single-use verification link to
+        `<site>/login/password/verify#token=` valid for 1 hour, where `<site>` is the
+        configured origin (public or dashboard) the request arrived on. The token is in the
+        URL fragment, so it never reaches a server log; that page reads it and posts it
+        back (see `/login/password/verify`). A newer request does not cancel older links;
+        using any link, setting the password, or completing a reset voids all of them. An
+        address that already has a password receives a pointer to reset instead.
+        Registration mail is limited to 3 per address and 10 per IP (IPv6 by /64) every
+        10 minutes, separately from reset mail (silently; the answer does not change).
+        Requires a JSON body and a same-site `Origin`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email]
+              properties:
+                email: { type: string, maxLength: 320 }
+                invite: { type: string, maxLength: 256, description: Invite token from an invite link; carried into the verification link. }
+      responses:
+        "202":
+          description: Always, for a well-formed request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [verification_sent] }
+        "400": { description: "`invalid_request` or `email_invalid`" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+  /api/v1/auth/password/verify:
+    post:
+      operationId: passwordVerify
+      description: |
+        Spends a registration link token and returns a short-lived set-password token
+        (`sh_ps_`, single use, valid for 15 minutes) for `POST /api/v1/auth/password/set`.
+        No account or credential is written here and no session is issued.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token]
+              properties:
+                token: { type: string, maxLength: 256 }
+      responses:
+        "200":
+          description: Address verified; choose a password next
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, email, setupToken, expiresAt]
+                properties:
+                  status: { type: string, enum: [verified] }
+                  email: { type: string }
+                  setupToken: { type: string, description: "`sh_ps_` set-password token; send it to /password/set" }
+                  expiresAt: { type: string, format: date-time }
+        "400": { description: "`invalid_request`" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "409": { description: "`password_already_set`: the address got a password meanwhile; use reset" }
+        "410": { description: "`token_invalid`: used, expired or unknown" }
+        "429": { description: "`rate_limited`: more than 30 attempts per IP in 5 minutes" }
+  /api/v1/auth/password/set:
+    post:
+      operationId: passwordSet
+      description: |
+        Sets a first password. `token` is the set-password token from verify (a session
+        alone never sets a password). Spending the token, creating or joining the account
+        and writing the credential commit in one transaction; the person is signed in with
+        the session cookie, every other pending registration link and set-password token
+        of the address is voided, and the address is mailed a "password was added" notice.
+        An existing password is never replaced here; use reset.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token, password]
+              properties:
+                token: { type: string, maxLength: 256 }
+                password: { type: string, maxLength: 1024 }
+      responses:
+        "200": { $ref: "#/components/responses/PasswordSignedIn" }
+        "400": { $ref: "#/components/responses/PasswordPolicyError" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "409": { description: "`password_already_set`: the person already has a password; use reset" }
+        "410": { description: "`token_invalid`: used, expired or unknown" }
+        "429": { description: "`rate_limited`: more than 30 attempts per IP in 5 minutes, or every password-hashing slot is busy (answered at once)" }
+  /api/v1/auth/password/login:
+    post:
+      operationId: passwordLogin
+      description: |
+        Email and password sign-in. Every failure (unknown address, wrong password, locked
+        account or IP, malformed address) is the same 401 with comparable timing. Three
+        lockout counters apply (IPv6 clients are keyed by /64):
+
+        - per account and client: 5 free failures, then 30 s doubling to a 15-minute cap;
+        - per account across all clients: 50 failures in a rolling hour lock password
+          sign-in to the account for 15 minutes, and mail the owner (at most once a day);
+        - per client across all accounts: 30 free failures, then the same backoff. With
+          `SELFHOST_TRUSTED_PROXIES=0` the client is always the socket address;
+          `X-Forwarded-For` is ignored.
+
+        Backoff counters reset after 1 hour without failures. A successful password
+        sign-in or a completed reset clears the account counters. Attempts refused inside
+        a lock are not counted and write no audit event; one `login.lockout` event is
+        written when a lock starts or grows.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email, password]
+              properties:
+                email: { type: string, maxLength: 320 }
+                password: { type: string, maxLength: 1024 }
+      responses:
+        "200": { $ref: "#/components/responses/PasswordSignedIn" }
+        "400": { description: "`invalid_request`" }
+        "401":
+          description: "`invalid_credentials`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PasswordError" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "429": { description: "`rate_limited`: more than 60 attempts per IP in a minute, or every password-hashing slot is busy (answered at once, nothing is hashed)" }
+  /api/v1/auth/password/reset:
+    post:
+      operationId: passwordResetRequest
+      description: |
+        Always 202, for every address. An address with a password receives a single-use
+        link to `<site>/login/password/reset#token=` (the origin the request arrived on; token in the URL fragment, see
+        `/login/password/reset`) valid for 30 minutes; only its SHA-256 hash is stored. A
+        newer request does not cancel older links; completing a reset voids all of them.
+        Reset mail is limited to 3 per address and 10 per IP every 10 minutes, separately
+        from registration mail.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email]
+              properties:
+                email: { type: string, maxLength: 320 }
+      responses:
+        "202":
+          description: Always
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [reset_requested] }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+  /api/v1/auth/password/reset/complete:
+    post:
+      operationId: passwordResetComplete
+      description: |
+        Spends a reset token and sets a new password. In the same transaction every session
+        (browser, CLI, Desktop) and MCP OAuth grant of the person is revoked with reason
+        `password_reset`, the person's Desktop relay identity tokens are deleted here
+        (not revoked at Relaycast; Desktop syncs them again after sign-in),
+        approved but uncollected device authorizations expire, unredeemed MCP
+        authorization codes are voided, outstanding reset, registration, set-password and
+        email sign-in tokens are cancelled, and the account lockout is cleared. Person
+        messaging identities (the person's human agent per workspace) and workspace API
+        keys are not touched. The
+        address is mailed a "password was changed" notice. Clears the session cookie.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token, password]
+              properties:
+                token: { type: string, maxLength: 256 }
+                password: { type: string, maxLength: 1024 }
+      responses:
+        "200":
+          description: Password changed; every session and pending grant revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [password_reset] }
+                  revoked:
+                    type: object
+                    properties:
+                      sessions: { type: integer }
+                      mcpGrants: { type: integer }
+                      desktopRelayIdentities: { type: integer, description: Desktop relay identity tokens deleted }
+                      deviceAuthorizations: { type: integer }
+                      mcpCodes: { type: integer }
+        "400": { $ref: "#/components/responses/PasswordPolicyError" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "410": { description: "`token_invalid`: used, expired or unknown" }
+        "429": { description: "`rate_limited`: more than 30 attempts per IP in 5 minutes, or every password-hashing slot is busy (answered at once)" }
   /login/oidc/start:
     get:
       operationId: oidcStart
@@ -1234,6 +2200,70 @@ paths:
           description: To `next` with the session cookie
         "403":
           description: Not invited, wrong domain, or invite email mismatch (HTML)
+  /login/password:
+    post:
+      operationId: passwordFormLogin
+      description: |
+        Form post from the `/login` page (same origin; `email`, `password`, `next`,
+        `invite`). Same lockout and answers as `POST /api/v1/auth/password/login`, so CLI
+        and Desktop browser login work when only password sign-in is enabled.
+      security: []
+      responses:
+        "303":
+          description: To `next` (a safe local path; anything else becomes `/`) with the session cookie, or back to `/login?error=invalid_credentials`
+        "403":
+          description: Cross-origin form (HTML)
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+  /login/password/verify:
+    get:
+      operationId: passwordVerifyPage
+      description: |
+        The page an emailed verification link opens. The token travels in the URL
+        fragment (`#token=`), which browsers never send to a server; the page's inline
+        script copies it into a form and removes it from the address bar.
+      security: []
+      responses:
+        "200": { description: Set-password page (HTML) }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+    post:
+      operationId: passwordVerifyForm
+      description: |
+        Form post (same origin; `token`, `password`). Spends the verification link and
+        sets the first password, as verify then set do.
+      security: []
+      responses:
+        "303": { description: To `/` with the session cookie }
+        "400": { description: Password refused by the policy; the form again, link still usable (HTML) }
+        "403": { description: Cross-origin form (HTML) }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "409": { description: The address already has a password (HTML) }
+        "410": { description: Link used, expired or unknown (HTML) }
+        "429": { description: Too many attempts, or the server is busy (HTML) }
+  /login/password/reset:
+    get:
+      operationId: passwordResetPage
+      description: |
+        The page an emailed reset link opens (token in the URL fragment, as for
+        `/login/password/verify`). Without a token it offers the reset-request form.
+      security: []
+      responses:
+        "200": { description: New-password or request page (HTML) }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+    post:
+      operationId: passwordResetForm
+      description: |
+        Form post (same origin). With `token` and `password`: as
+        `POST /api/v1/auth/password/reset/complete`, and clears the session cookie. With
+        `email` only: as `POST /api/v1/auth/password/reset`, the same page for every
+        address.
+      security: []
+      responses:
+        "200": { description: Password-changed or check-your-email page (HTML) }
+        "400": { description: Password refused by the policy; the form again, link still usable (HTML) }
+        "403": { description: Cross-origin form (HTML) }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "410": { description: Link used, expired or unknown (HTML) }
+        "429": { description: Too many attempts, or the server is busy (HTML) }
   /login/email:
     post:
       operationId: emailLinkRequest
@@ -1241,12 +2271,14 @@ paths:
       responses:
         "200":
           description: Check-your-email page
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
   /login/email/verify:
     get:
       operationId: emailLinkConfirm
       responses:
         "200":
           description: Confirmation page (does not spend the link)
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
     post:
       operationId: emailLinkVerify
       responses:
@@ -1254,6 +2286,7 @@ paths:
           description: To `next` with the session cookie
         "410":
           description: Expired or used
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
   /api/v1/workspaces/{workspaceId}/access/me:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -1355,6 +2388,104 @@ paths:
         "403": { description: Owner/admin role required, or cross-origin cookie request }
         "404": { description: Organization not found }
         "409": { description: "`revision_mismatch`" }
+  /api/v1/organizations/{organizationId}/sessions/{sessionId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: sessionId
+        in: path
+        required: true
+        schema: { type: string, maxLength: 512 }
+      - name: workspaceId
+        in: query
+        required: true
+        schema: { type: string }
+      - name: source
+        in: query
+        required: true
+        schema: { type: string, maxLength: 512 }
+    delete:
+      operationId: hardDeleteSession
+      description: |
+        Organization owner/admin or bootstrap bearer. Permanently erases one
+        session and its derived server-side artifacts through the session
+        pipeline; membership is untouched. Idempotent: repeating it returns the
+        same receipt. Audited as `session.hard_delete.requested` before any data
+        is touched and `session.hard_deleted` once on completion. Gated by
+        SELFHOST_OPERATOR_CONTROLS. Cookie callers need an allowed Origin or
+        same-origin fetch metadata. See docs/session-erasure.md.
+      responses:
+        "200":
+          description: Erase completed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "202":
+          description: Erase in progress; poll the erasure read
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "400": { description: "`invalid_session_id` or `invalid_session_target`" }
+        "403": { description: "Owner/admin role required, `operator_controls_not_entitled`, or cross-origin cookie request" }
+        "404": { description: "Organization not found, or `workspace_not_found`" }
+        "501": { description: "`not_implemented`: the session pipeline erase is not configured or not yet available" }
+        "502": { description: "`session_erasure_failed` (carries the receipt as `erasure`) or `invalid_session_erasure_response`" }
+        "503": { description: "`session_erasure_unavailable`: retry the request" }
+  /api/v1/organizations/{organizationId}/sessions/{sessionId}/erasure:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: sessionId
+        in: path
+        required: true
+        schema: { type: string, maxLength: 512 }
+      - name: workspaceId
+        in: query
+        required: true
+        schema: { type: string }
+      - name: source
+        in: query
+        required: true
+        schema: { type: string, maxLength: 512 }
+    get:
+      operationId: getSessionErasure
+      description: |
+        Organization owner/admin or bootstrap bearer. The pipeline's erase
+        receipt plus the audit record, for verifying a delete. Never gated by
+        SELFHOST_OPERATOR_CONTROLS.
+      responses:
+        "200":
+          description: Erase receipt in any status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "400": { description: "`invalid_session_id` or `invalid_session_target`" }
+        "403": { description: Owner/admin role required }
+        "404": { description: "Organization not found, `workspace_not_found`, or `erasure_not_found`" }
+        "501": { description: "`not_implemented`: the session pipeline erase is not configured or not yet available" }
+        "502": { description: "`invalid_session_erasure_response`" }
+        "503": { description: "`session_erasure_unavailable`: retry the request" }
+  /api/v1/workspaces/{workspaceId}/session-agent-names:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listSessionAgentNames
+      description: Any workspace member. Agent names for session search `@name` autocomplete, from the workspace roster.
+      responses:
+        "200":
+          description: Sorted, unique names
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [names]
+                properties:
+                  names:
+                    type: array
+                    items: { type: string }
+        "403": { description: "`handoff_not_exchanged`" }
+        "404": { description: Workspace not found }
+        "429": { description: "`rate_limited`" }
+        "502": { description: "`agent_roster_unavailable`" }
   /api/v1/workspaces/{workspaceId}/resolve:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -1463,8 +2594,26 @@ paths:
           in: query
           schema:
             const: deferred
+        - name: agent
+          in: query
+          description: |
+            One agent's Relay name, case-insensitive, without a leading `@`; a
+            trailing `*` is a prefix match of at least 3 letters or digits, where
+            the backend reports support. Newest first. Cannot be combined with
+            free text (501 `unsupported_by_backend`, reason `agent_with_text`).
+            Buffered sessions are not included. 501 reason
+            `agent_filter_not_ready` until the backend's agent catalog is ready.
+            On the read API, `project`, `since` and `until` are not available.
+            The response adds `agent`, `ignoredAgents` and `agentMatch`.
+          schema:
+            type: string
+            maxLength: 200
         - name: q
           in: query
+          description: |
+            With SESSION_SEARCH_AGENT_TOKENS on, an `@name` token here acts as
+            `agent`. Only the first agent applies; the rest are returned in
+            `ignoredAgents`.
           schema:
             type: string
             maxLength: 500
@@ -1532,9 +2681,15 @@ paths:
         - bearerAuth: []
       operationId: getDashboardSessionEvents
       description: |
-        Calls only RelayHistory `GET /v1/sessions/{sessionId}/events`, with
-        explicit `workspace={authorized workspace UUID}`, `source`, and
-        `order=asc` (default) or `order=desc`, `includeMessageId=true`.
+        Calls `GET /v1/sessions/{sessionId}/events` with explicit
+        `workspace={authorized workspace UUID}`, `source`, and `order=asc`
+        (default) or `order=desc`. With `RELAYHISTORY_READ_API_EVENTS=true`, an
+        eligible device-session bearer uses `RELAYHISTORY_READ_API_URL`; the
+        default and other credential families retain the RelayHistory transport.
+        Only legacy requests include `includeMessageId=true`. Native requests
+        preserve the backend's authoritative event IDs without synthesizing
+        message IDs; enable this option only after downstream message-identity
+        behavior is qualified. Backend cursors cannot cross a transport change.
         Returned events are validated and each page is ordered oldest-first.
       parameters:
         - name: source
@@ -2029,7 +3184,13 @@ paths:
         return a session with sync scopes. A sync request whose login reply
         lacks `rth:sync` answers 501 (see docs/sessions-read-api.md).
 
-        In both modes the returned `baseUrl` is the public History origin.
+        With RELAYHISTORY_BACKEND=native (no RelayAuth, no standalone
+        RelayHistory): `mode=read` is the read API handoff; `mode=sync` is
+        bearer-only and returns the caller's own access token for the pipeline
+        ingest edge, which re-introspects it on every upload. See
+        docs/sessions-read-api.md.
+
+        In every mode the returned `baseUrl` is the public History origin.
         Caller-supplied service URLs or tenant IDs are rejected because they
         are not request fields.
       requestBody:
@@ -2160,7 +3321,7 @@ paths:
                     items:
                       $ref: "#/components/schemas/EnrollmentTokenSummary"
         "403":
-          description: Workspace admin role required
+          description: Workspace admin role required (`forbidden`), or Relayflows is not enabled on this installation (`feature_not_enabled`, body FeatureRefusal with feature `flows`)
     post:
       tags: [workers]
       operationId: createWorkerEnrollmentToken
@@ -2217,7 +3378,7 @@ paths:
                   startCommand:
                     type: string
         "403":
-          description: Workspace admin role required
+          description: Workspace admin role required (`forbidden`), or Relayflows is not enabled on this installation (`feature_not_enabled`, body FeatureRefusal with feature `flows`)
   /api/v1/workers/enrollment-tokens/{tokenId}:
     delete:
       tags: [workers]
@@ -2234,6 +3395,8 @@ paths:
           description: Revoked
         "404":
           description: Unknown, used, or already revoked
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers:
     get:
       tags: [workers]
@@ -2251,6 +3414,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Worker"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2270,6 +3435,8 @@ paths:
                     $ref: "#/components/schemas/Worker"
         "404":
           description: Not in this workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     delete:
       tags: [workers]
       operationId: revokeWorker
@@ -2288,6 +3455,8 @@ paths:
                     format: uuid
                   status:
                     const: revoked
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/register:
     post:
       tags: [worker-protocol]
@@ -2330,6 +3499,8 @@ paths:
           description: Invalid, used, revoked, or expired enrollment token
         "409":
           description: Worker name already exists in the workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/heartbeat:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2353,6 +3524,8 @@ paths:
                     type: integer
         "401":
           description: Invalid or revoked worker token
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/queue:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2374,6 +3547,8 @@ paths:
             text/event-stream:
               schema:
                 type: string
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/ack:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2390,6 +3565,8 @@ paths:
           description: Not assigned to this worker
         "409":
           description: The run was cancelled before acknowledgement
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/status:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2424,6 +3601,8 @@ paths:
           description: Recorded; reports after a terminal state are returned unchanged
         "404":
           description: Not assigned to this worker
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/cli-credentials:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2469,6 +3648,8 @@ paths:
                         reason: { type: string }
         "401": { description: Missing or invalid worker token or reference }
         "404": { description: Not this worker's active assignment }
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/cli-credentials/{credentialId}:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2504,6 +3685,8 @@ paths:
                   updated: { type: boolean }
         "409": { description: Auth file belongs to a different account }
         "422": { description: Not a valid auth file for the provider }
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workers/{workerId}/assignments/{runId}/storage/{objectKey}:
     parameters:
       - $ref: "#/components/parameters/WorkerId"
@@ -2520,6 +3703,8 @@ paths:
           description: Object bytes
         "404":
           description: Unknown object or assignment
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     head:
       tags: [worker-protocol]
       operationId: headAssignmentObject
@@ -2530,6 +3715,8 @@ paths:
           description: Exists
         "404":
           description: Missing
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     put:
       tags: [worker-protocol]
       operationId: putAssignmentObject
@@ -2542,6 +3729,8 @@ paths:
       responses:
         "200":
           description: Stored
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/flows:
     get:
       tags: [flows]
@@ -2559,6 +3748,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Flow"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     post:
       tags: [flows]
       operationId: createFlow
@@ -2573,6 +3764,8 @@ paths:
           description: Created
         "409":
           description: Name already used in the workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/flows/{flowId}:
     parameters:
       - $ref: "#/components/parameters/FlowId"
@@ -2582,6 +3775,8 @@ paths:
       responses:
         "200":
           description: Flow with source, declared steps, and its 20 most recent runs
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     patch:
       tags: [flows]
       operationId: updateFlow
@@ -2593,12 +3788,16 @@ paths:
       responses:
         "200":
           description: Updated
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     delete:
       tags: [flows]
       operationId: deleteFlow
       responses:
         "200":
           description: Deleted (existing runs are kept)
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/flows/{flowId}/invoke:
     parameters:
       - $ref: "#/components/parameters/FlowId"
@@ -2613,6 +3812,8 @@ paths:
       responses:
         "201":
           description: Run queued for a worker
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/run:
     post:
       tags: [runs]
@@ -2668,6 +3869,8 @@ paths:
           description: Invalid body, or a runtime other than `worker`
         "404":
           description: Requested worker or flow not found
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs:
     get:
       tags: [runs]
@@ -2714,6 +3917,8 @@ paths:
                     type: integer
                   needsReviewRuns:
                     type: integer
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2729,6 +3934,8 @@ paths:
                 $ref: "#/components/schemas/Run"
         "404":
           description: Not in this workspace
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/workflow:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2738,6 +3945,8 @@ paths:
       responses:
         "200":
           description: The exact definition the run executed
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/cancel:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2753,6 +3962,8 @@ paths:
           description: Cancelled
         "409":
           description: Run already finished
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/resume:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2776,6 +3987,8 @@ paths:
           description: New run queued
         "409":
           description: Run not finished, or a locally mirrored run
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/retry:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2785,6 +3998,8 @@ paths:
       responses:
         "201":
           description: New run queued from the start
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/steps:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2812,6 +4027,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Step"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     post:
       tags: [run-ingestion]
       operationId: reportFinalSteps
@@ -2821,6 +4038,8 @@ paths:
       responses:
         "201":
           description: Stored
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/steps/snapshot:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2834,6 +4053,8 @@ paths:
           description: Accepted
         "409":
           description: Run already finished
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/events:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2857,6 +4078,8 @@ paths:
       responses:
         "200":
           description: Control-plane lifecycle events (run.queued, run.assigned, run.acknowledged, run.running, run.completed|failed|cancelled) plus mirrored runtime events
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
     post:
       tags: [run-ingestion]
       operationId: appendRunEvent
@@ -2865,6 +4088,8 @@ paths:
       responses:
         "201":
           description: Appended with the next per-run sequence
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/storage/{objectKey}:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2880,6 +4105,8 @@ paths:
           description: Stored
         "412":
           description: Object exists and If-None-Match was "*"
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/logs:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2922,6 +4149,8 @@ paths:
                     type: boolean
                   reset:
                     type: boolean
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/artifacts:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2931,6 +4160,8 @@ paths:
       responses:
         "200":
           description: Stored objects with kind log, code, or artifact
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/runs/{runId}/artifacts/{objectKey}:
     parameters:
       - $ref: "#/components/parameters/RunId"
@@ -2942,6 +4173,8 @@ paths:
       responses:
         "200":
           description: Object bytes
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/local-run:
     post:
       tags: [run-ingestion]
@@ -2953,6 +4186,8 @@ paths:
       responses:
         "201":
           description: Local run registered
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   /api/v1/workflows/callback:
     post:
       tags: [run-ingestion]
@@ -2967,6 +4202,8 @@ paths:
           description: Invalid run or callback token
         "409":
           description: Non-terminal status or already finished differently
+        "403":
+          $ref: "#/components/responses/FeatureRefused"
   # --- admin lane: environment variables, provider connections, API tokens ---
   /api/v1/organizations/{organizationId}:
     parameters:
@@ -3748,8 +4985,8 @@ paths:
 
         Agent and service principals: an `sh_wk_` token is looked up only as a
         workspace API token of purpose relayfile-agent or acquisition-operator;
-        any other `sh_wk_` (unknown, another purpose, revoked or not) is
-        `wrong-kind`. Then `revoked`,
+        one with no such token is `unknown`; any other `sh_wk_` (another
+        purpose, revoked or not) is `wrong-kind`. Then `revoked`,
         `expired`, `audience` (`aud` must normalize to the token's stored aud,
         which must still be an accepted audience) and `workspace` as above.
         An agent has no machine: any `machine` is `machine_not_owned`. The
@@ -4091,18 +5328,54 @@ paths:
           description: HTML page
           content:
             text/html: {}
-  # --- Desktop feed (draft contract; docs/desktop-feed.md). Status: proposed, Cloud team decides,
-  # not yet confirmed. Nothing below is implemented by this server.
+  # --- Desktop feed (docs/desktop-feed.md). Implemented; x-status proposed marks a deviation.
+  /api/v1/desktop/profiles:
+    get:
+      tags: [Desktop feed]
+      operationId: listDesktopFeedProfiles
+      summary: The Desktop feed profiles the signed-in workspace may read
+      description: |
+        Lets the dashboard downloads page learn the profile id to send in
+        X-Agent-Relay-Profile. Takes no profile header. A workspace without
+        an entitlement gets an empty list.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The workspace's profiles
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [profiles]
+                properties:
+                  profiles:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [id, asset_prefix]
+                      properties:
+                        id: { type: string, pattern: "^[a-z0-9]{1,32}$" }
+                        asset_prefix: { type: string }
+        "401": { $ref: "#/components/responses/DesktopFeedUnauthorized" }
+        "403":
+          description: wrong_credential (a publisher or install token)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DesktopFeedError" }
+        "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/manifest:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: getDesktopFeedManifest
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession]
       summary: Envelope of the current release of the profile's channel.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Accepts a workspace bearer (the desktop-core session), an install token,
         or the browser session cookie (on the `/cloud` mount only). A publisher
         token is refused with 403 `wrong_credential`; two credentials in one
@@ -4131,14 +5404,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: listDesktopFeedReleases
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession, publisherToken]
       summary: Published releases newest first (read), or the version listing with drafts (publisher).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Two callers, two shapes, chosen by the credential and `include_drafts`:
         - Read (workspace bearer, install token, browser session on `/cloud`):
           `include_drafts` must be absent or false. Returns
@@ -4188,14 +5460,15 @@ paths:
         "404": { $ref: "#/components/responses/DesktopFeedNoRelease" }
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: createDesktopFeedDraft
       x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
       summary: Create a draft release that declares its complete asset set.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
         Publisher token only. A workspace bearer, install token or browser
         session is 403 `wrong_credential`; mixed credentials are 400.
         Resolves an omission in the source design: the draft declares every
@@ -4245,11 +5518,13 @@ paths:
             invalid_release (version pattern, channel, or the beta.N rule),
             expected_assets_required (missing or empty), invalid_asset (an
             entry fails the asset rules, or names or platform/arch/kind/os_floor
-            tuples repeat), or quota_exceeded.
+            tuples repeat), quota_exceeded, or manifest_too_large (the signed
+            manifest would exceed the signer's limit; refused before any upload).
           content:
             application/json:
               schema:
                 oneOf:
+                  - $ref: "#/components/schemas/DesktopFeedManifestTooLarge"
                   - allOf:
                       - $ref: "#/components/schemas/DesktopFeedError"
                       - properties: { error: { enum: [invalid_release, expected_assets_required, invalid_asset] } }
@@ -4257,14 +5532,15 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases/import:
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: importDesktopFeedRelease
       x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
       summary: Open an import draft from a pre-signed envelope (on-prem path (a); also the store step of (b) and (c)).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed. The
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7). The
         endpoint itself is decided in the source design (open question 5:
         "verified against the profile's public key before it is stored"); its
         two-step shape here is a proposal, and whether it ships before or after
@@ -4319,14 +5595,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases/{version}/assets/{name}:
     put:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: uploadDesktopFeedAsset
-      x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
       summary: Upload one declared asset's bytes to a draft.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Publisher token only; workspace bearer, install token or browser
         session is 403 `wrong_credential`. Checks, in order:
         1. The release is an open draft (404 `draft_not_found`; 409
@@ -4401,22 +5676,21 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases/{version}/publish:
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: publishDesktopFeedRelease
       x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
-      x-proposed-default: "gcpkms hosted, awskms non-production; see docs/desktop-feed.md Proposed defaults"
       x-signer-provider:
-        x-status: unresolved
+        provider: awskms
         description: |
-          Which provider holds the hosted feed's Ed25519 private keys is not
-          decided (the source design says Cloud's KMS; the Cloud team has not
-          confirmed a provider). A key held by this deployment's Postgres is
-          not a fallback.
+          AWS KMS key (ECC_NIST_EDWARDS25519, Sign with MessageType RAW and
+          ED25519_SHA_512, 4096-byte message cap), one profile per
+          installation. A private key stored in Postgres is not a fallback.
       summary: Verify the declared asset set, then sign (hosted draft) or store verbatim (import draft).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
         Publisher token only. Steps, in order; any failure leaves the release
         a draft, unsigned and invisible to the read API:
         1. Open draft (404 `draft_not_found`, 409 `not_a_draft`).
@@ -4497,14 +5771,13 @@ paths:
                   - properties: { error: { enum: [signer_unavailable] } }
   /api/v1/desktop/feed/assets/{assetId}/download-url:
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: issueDesktopFeedDownloadUrl
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession]
       summary: Short-lived signed GET URL for one published asset.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Accepts a workspace bearer, an install token, or the browser session
         cookie on the `/cloud` mount (cookie requests also pass the existing
         browser-origin check, else 403 `csrf_rejected`). A publisher token is
@@ -4545,15 +5818,14 @@ paths:
                   - properties: { error: { enum: [no_object_storage] } }
   /api/v1/desktop/feed/assets/{assetId}:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: streamDesktopFeedAsset
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession]
       x-desktop-feed-redirects: never
       summary: Stream one published asset from the site itself.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Accepts a workspace bearer, an install token, or the browser session
         cookie on the `/cloud` mount. A publisher token is 403
         `wrong_credential`; mixed credentials are 400.
@@ -4613,14 +5885,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/install-tokens:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: listDesktopFeedInstallTokens
-      x-status: proposed
       x-desktop-feed-role: install-token
       x-desktop-feed-credentials: [browserSession]
       summary: The caller's install tokens for the profile (never the token values).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Browser session cookie on the `/cloud` mount only (the downloads page).
         A workspace bearer, install token or publisher token is 403
         `wrong_credential`; mixed credentials are 400. Lists the caller's own
@@ -4647,14 +5918,15 @@ paths:
         "403": { $ref: "#/components/responses/DesktopFeedReadForbidden" }
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: createDesktopFeedInstallToken
       x-status: proposed
       x-desktop-feed-role: install-token
       x-desktop-feed-credentials: [browserSession]
       summary: Mint a 1-hour install token for headless installs.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
         Browser session cookie on the `/cloud` mount only, with the existing
         browser-origin check (403 `csrf_rejected`). Any bearer, including a
         workspace bearer, is 403 `wrong_credential`; mixed credentials are 400.
@@ -4687,14 +5959,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/install-tokens/{tokenId}:
     delete:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: revokeDesktopFeedInstallToken
-      x-status: proposed
       x-desktop-feed-role: install-token
       x-desktop-feed-credentials: [browserSession]
       summary: Revoke one of the caller's install tokens.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Browser session cookie on the `/cloud` mount only, with the
         browser-origin check. Revocation takes effect on the next request made
         with the token (401 `token_revoked`); a signed URL already issued with
@@ -4725,6 +5996,118 @@ paths:
                   - $ref: "#/components/schemas/DesktopFeedError"
                   - properties: { error: { enum: [install_token_not_found] } }
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
+  /api/v1/acquisition/issuer-keys:
+    get:
+      tags: [acquisition]
+      operationId: listAcquisitionIssuerKeys
+      security: []
+      description: |
+        Dormant: 404 `{error:{code:"not_found"}}` unless
+        SELFHOST_ACQUISITION_ISSUER_ENABLED=true. Unauthenticated. The public
+        keys this install signs acquisition assertions with, in the exact
+        shape of the RelayHistory pipeline's ACQUISITION_PINNED_KEYS: the
+        active key first, then SELFHOST_ACQUISITION_ISSUER_PREVIOUS_PUBLIC_KEYS.
+        Every key is cloud class. `Cache-Control: no-store`. See
+        docs/acquisition-issuer.md.
+      responses:
+        "200":
+          description: Published issuer keys
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { $ref: "#/components/schemas/AcquisitionIssuerKey" }
+        "404": { $ref: "#/components/responses/AcquisitionNotFound" }
+  /api/v1/acquisition/assertions/install:
+    post:
+      tags: [acquisition]
+      operationId: issueAcquisitionInstallAssertion
+      security:
+        - bearerAuth: []
+      description: |
+        Dormant: 404 `not_found` unless SELFHOST_ACQUISITION_ISSUER_ENABLED=true.
+        Signs a cloud-class install assertion that the RelayHistory pipeline
+        verifies with relayhistory-acquisition-assertion-install-v1. Nothing is
+        stored except an audit event (`acquisition.assertion.issued`).
+
+        Callers (verified through the introspection internals with `aud` =
+        SELFHOST_ACQUISITION_ORIGIN): an acquisition-operator workspace API
+        token (`sh_wk_`, scope `acquisition:operate`, stored aud equal to the
+        origin), or a Desktop user session (`sh_at_`) carrying `rth:acquire`
+        whose `ownerUserId` is the caller (handoff sessions are refused). Any
+        other principal, a missing bearer, a body `aud` other than the origin,
+        or an `orgId`/`workspaceId` outside the caller's workspace is 403
+        `not_authorized`.
+
+        The body is the unsigned pipeline payload (every field, strings only,
+        no unknown keys) plus `aud`. `issuerKeyId` is optional and, when
+        given, must be the active key id. `ownerKind` must be `cloud`
+        (`native` is 400: no native receiver exists yet). With
+        `reserveRevoke: true` the response also carries `revokeEnvelope`, a
+        revoke assertion targeting this install (`targetOwnerKind`,
+        `targetBindingUuid`, `targetInstallationId`, org, workspace, source and
+        session copied from the install) with the `reservedRevoke` fields.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AcquisitionInstallRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/AcquisitionIssued" }
+        "400": { $ref: "#/components/responses/AcquisitionInvalidRequest" }
+        "401": { $ref: "#/components/responses/AcquisitionUnauthorized" }
+        "403": { $ref: "#/components/responses/AcquisitionNotAuthorized" }
+        "404": { $ref: "#/components/responses/AcquisitionNotFound" }
+  /api/v1/acquisition/assertions/revoke:
+    post:
+      tags: [acquisition]
+      operationId: issueAcquisitionRevokeAssertion
+      security:
+        - bearerAuth: []
+      description: |
+        As install, for relayhistory-acquisition-assertion-revoke-v1.
+        Acquisition-operator tokens only: a Desktop user session is 403
+        (a revoke names no owner to match the caller against).
+        `targetOwnerKind` must be `cloud`. `reserveRevoke` is not accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AcquisitionRevokeRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/AcquisitionIssued" }
+        "400": { $ref: "#/components/responses/AcquisitionInvalidRequest" }
+        "401": { $ref: "#/components/responses/AcquisitionUnauthorized" }
+        "403": { $ref: "#/components/responses/AcquisitionNotAuthorized" }
+        "404": { $ref: "#/components/responses/AcquisitionNotFound" }
+  /api/v1/acquisition/assertions/rebind:
+    post:
+      tags: [acquisition]
+      operationId: issueAcquisitionRebindAssertion
+      security:
+        - bearerAuth: []
+      description: |
+        Reserved. A rebind moves a session to a native owner; the pipeline
+        has no native receiver class yet (docs/acquisition-issuer.md, "Native
+        receiver contract (tracked gap)"). An authorized caller gets 409
+        `native_receiver_contract_pending`; anyone else 403; disabled 404.
+      responses:
+        "401": { $ref: "#/components/responses/AcquisitionUnauthorized" }
+        "403": { $ref: "#/components/responses/AcquisitionNotAuthorized" }
+        "404": { $ref: "#/components/responses/AcquisitionNotFound" }
+        "409":
+          description: native_receiver_contract_pending
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/AcquisitionError"
+                  - properties: { error: { properties: { code: { enum: [native_receiver_contract_pending] } } } }
   /api/v1/workspaces/{workspaceId}/factory/connection:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -5082,8 +6465,237 @@ paths:
         "404": { $ref: "#/components/responses/FactoryError" }
         "405": { $ref: "#/components/responses/FactoryError" }
         "503": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/workspaces/{workspaceId}/amp:
+    get:
+      operationId: getAmpWorkspace
+      tags: [amp]
+      summary: Amp connection and binding summary (key hint only; history reported as unavailable with reason push_session_unavailable until a push-only RelayHistory session can be issued). Owner/admin person with cli:auth. 404 {"error":"Not found"} before auth when SELFHOST_AMP_ENABLED is off. Also under /cloud. See docs/amp.md.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{connection, bindings[{..., history: {state: unavailable|idle|queued|running|synced|error, reason?, lastSyncedAt, lastError, queuedAt}}], history: {available, reason?}}; never a secret"
+        "401":
+          description: unauthorized
+        "403":
+          description: forbidden (member, missing cli:auth, sh_wk_ workspace token or SELFHOST_INTERNAL_TOKEN)
+        "404":
+          description: Feature off ({"error":"Not found"}) or unknown workspace
+  /api/v1/workspaces/{workspaceId}/amp/connection:
+    post:
+      operationId: connectAmp
+      tags: [amp]
+      summary: Connect an Amp API key (validated by a read-only discover, stored encrypted). Only the connected key's owner may replace it while threads are bound.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key: { type: string, pattern: "^sgamp_", description: Never returned or logged }
+      responses:
+        "200":
+          description: Summary plus discovered threads
+        "400":
+          description: invalid_key or invalid_request
+        "403":
+          description: forbidden or not_connection_owner
+        "409":
+          description: connection_owner_locked or key_cannot_read_threads
+        "502":
+          description: amp_unavailable
+        "503":
+          description: amp_transport_not_configured
+    delete:
+      operationId: disconnectAmp
+      tags: [amp]
+      summary: Retire every binding, delete the stored key and release Relaycast identities after commit.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{disconnected: true} with cleanup: pending when a Relaycast release must be retried"
+  /api/v1/workspaces/{workspaceId}/amp/threads:
+    get:
+      operationId: discoverAmpThreads
+      tags: [amp]
+      summary: Up to 100 recent threads of the connected key. Connected key owner only.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{threads: [{id, title}]}"
+        "403":
+          description: forbidden or not_connection_owner
+        "409":
+          description: amp_not_connected
+  /api/v1/workspaces/{workspaceId}/amp/bindings:
+    post:
+      operationId: bindAmpThread
+      tags: [amp]
+      summary: Bind one explicitly chosen thread after the stored key exports it. Bind registers the Relaycast agent, mints a whsec_ secret (encrypted at rest, never returned) and creates two Relaycast subscriptions to the binding's relay-events URL (dm.received + thread.reply, and message.created filtered to mentions of the agent), signed with Standard Webhooks.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [threadId]
+              properties:
+                threadId: { type: string, description: "T-<id> or https://ampcode.com/threads/T-<id>" }
+      responses:
+        "201":
+          description: "{binding_id, thread_id, agent}"
+        "400":
+          description: invalid_thread
+        "403":
+          description: forbidden or not_connection_owner
+        "409":
+          description: amp_thread_unreadable, thread_owned or relay_name_taken
+        "502":
+          description: "relay_subscription_failed {error, message}: Relaycast refused or did not answer a subscription create. Subscriptions created by this attempt are deleted; the binding stays preparing and binding the thread again retries."
+  /api/v1/workspaces/{workspaceId}/amp/bindings/{bindingId}:
+    delete:
+      operationId: unbindAmpThread
+      tags: [amp]
+      summary: Retire the binding (generation bump revokes reply capabilities and fences in-flight deliveries), then delete both Relaycast subscriptions (404 counts as deleted) and release the Relaycast identity.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: "{disconnected: true} with cleanup: pending when the release must be retried"
+  /api/v1/workspaces/{workspaceId}/amp/bindings/{bindingId}/deliveries/{messageId}/check:
+    post:
+      operationId: checkAmpDelivery
+      tags: [amp]
+      summary: Read-only reconciliation (Cloud reconcileDelivery) of a delivery. Exports the bound thread and, only when the prompt's own marker is present, settles a pending, rejected or unknown row as delivered; a row under a live lease is left to the worker. Absence changes nothing and nothing is ever resent.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: messageId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: "{confirmed, state}: confirmed is whether the marker was found; state is the delivery state afterwards"
+        "400":
+          description: "{error: invalid_request, message}"
+        "403":
+          description: "{error: forbidden, message}: not a current owner or admin"
+        "404":
+          description: "{error: binding_not_found | delivery_not_found, message}; also when the binding was retired or rebound while the export ran"
+        "409":
+          description: "{error: relay_changed | amp_not_connected | amp_thread_unreadable, message}"
+  /api/v1/amp/agents/{bindingId}/messages:
+    post:
+      operationId: sendAmpReply
+      tags: [amp]
+      summary: Reply from an Amp thread through its scoped capability. Prompt-embedded helper; not proof of native MCP use.
+      security: [{ ampReplyBearer: [] }]
+      parameters:
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, text, message_id, request_id]
+              properties:
+                to: { type: string }
+                text: { type: string }
+                message_id: { type: string }
+                request_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: "{ok, message_id} or {ok, duplicate, message_id} for an identical repeat"
+        "401":
+          description: Wrong binding, unknown, revoked or expired capability, or owner no longer a member
+        "403":
+          description: Recipient, message or request mismatch
+        "409":
+          description: reply_already_sent
+        "413":
+          description: payload_too_large (64 KiB)
+        "502":
+          description: reply_uncertain (retry with the same request_id; the Relaycast idempotency key prevents a double send)
+  /api/v1/amp/relay-events/{bindingId}:
+    post:
+      operationId: receiveAmpRelayEvent
+      tags: [amp]
+      summary: Relaycast webhook for one binding, verified with Standard Webhooks v1 against the stored secret (300 s tolerance, 256 KiB body). Accepting only writes the outbox row.
+      security: []
+      parameters:
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: webhook-id, in: header, required: true, schema: { type: string } }
+        - { name: webhook-timestamp, in: header, required: true, schema: { type: string } }
+        - { name: webhook-signature, in: header, required: true, schema: { type: string, description: "v1,<base64 HMAC-SHA256>; space-separated list during rotation" } }
+      responses:
+        "200":
+          description: "{ok, queued} | {ok, duplicate} | {ok, delivered: false}"
+        "400":
+          description: invalid_request
+        "401":
+          description: Bad signature, stale timestamp or no stored secret
+        "410":
+          description: binding_gone
+        "413":
+          description: payload_too_large
+  /api/v1/internal/amp/job:
+    post:
+      operationId: runAmpJob
+      tags: [amp, internal]
+      summary: Scheduler entry for the Amp outbox. Not served under /cloud. 404 {"error":"Not found"} when the feature is off or SELFHOST_AMP_INTERNAL_SECRET is unset.
+      security: [{ ampInternalSecret: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, required: [v, kind], properties: { v: { const: 1 }, kind: { const: sweep } } }
+                - { type: object, required: [v, kind, bindingId, messageId], properties: { v: { const: 1 }, kind: { const: inject }, bindingId: { type: string }, messageId: { type: string } } }
+                - { type: object, required: [v, kind, bindingId], properties: { v: { const: 1 }, kind: { const: history }, bindingId: { type: string }, scheduledAt: { type: string, format: date-time } } }
+      responses:
+        "200":
+          description: "sweep {queued: 0, due, expired, deferred: true}; inject result or {ok, duplicate, state}; history {ok: true, queued: false, skipped: true} when not bound or already covered"
+        "202":
+          description: "history {ok: true, queued: true}: queued (coalesced) for src/amp/history.ts runHistory, which uploads to RelayHistory POST {baseUrl}/v1/ingest"
+        "501":
+          description: >-
+            history_push_unavailable: history is implemented to the upload
+            boundary (src/amp/history.ts) but inactive. It needs a
+            workspace-scoped push-only (rth:sync) RelayHistory session issued
+            without a caller token; src/relayhistory.ts
+            issueRelayhistorySession only exchanges a caller's sh_at_ token and
+            POST /internal/v1/auth/introspect answers only sh_at_ person tokens.
+            See docs/amp.md.
+        "400":
+          description: invalid_request
+        "401":
+          description: Bearer required
+        "403":
+          description: Wrong credential
+        "413":
+          description: payload_too_large (64 KiB)
 components:
   securitySchemes:
+    oauthMcpBearer:
+      type: http
+      scheme: bearer
+      description: Opaque mcp_at_ token, restricted to its granted MCP resource. Never accepted by general API auth, native refresh or introspection.
     factoryReplyBearer:
       type: http
       scheme: bearer
@@ -5110,6 +6722,14 @@ components:
       type: http
       scheme: bearer
       description: SELFHOST_INTERNAL_TOKEN, a workspace API token (sh_wk_) with the runtime scope, or a flows worker credential accepted by the runtime credential verifier. Never a user session.
+    ampReplyBearer:
+      type: http
+      scheme: bearer
+      description: "`amp_reply_<43 base64url>` capability embedded in one Amp prompt; stored only as a SHA-256 hash, bound to one binding, message and request, revoked on unbind, disconnect or member removal, expires after 24 h."
+    ampInternalSecret:
+      type: http
+      scheme: bearer
+      description: SELFHOST_AMP_INTERNAL_SECRET. Not SELFHOST_INTERNAL_TOKEN, a workspace token or a user session.
     introspectAuth:
       type: http
       scheme: bearer
@@ -5125,24 +6745,22 @@ components:
     installToken:
       type: http
       scheme: bearer
-      x-status: proposed
       description: |
         Desktop feed install token (proposed prefix `sh_dfi_`), minted by the
         downloads page from a browser session. Feed read for one profile
         through one workspace, lifetime 1 hour, revocable on the page and
         revoked with the user. Accepted by the four Desktop feed read
-        endpoints only. Status: proposed, Cloud team decides, not yet confirmed.
+        endpoints only. Status: implemented.
     publisherToken:
       type: http
       scheme: bearer
-      x-status: proposed
       description: |
         Desktop feed publisher token (proposed prefix `sh_dfp_`), the
         `DESKTOP_FEED_PUBLISHER_TOKEN` of one profile. Write-only on that
         profile's drafts plus the version listing; reads nothing else; never a
-        workspace user's token; rotatable and revocable by the admin tool (not
-        part of this contract). Status: proposed, Cloud team decides, not yet
-        confirmed.
+        workspace user's token; minted and revoked through
+        `/api/v1/organizations/{org}/desktop-feed/profiles/{id}/publisher-tokens`
+        (docs/desktop-feed.md). Status: implemented.
   parameters:
     FactoryBindingId:
       name: bindingId
@@ -5272,14 +6890,91 @@ components:
       properties:
         state: { type: string, enum: [active, done, abandoned, unknown] }
         classifiedAt: { type: string, format: date-time }
-    ProductCapabilities:
+    McpOAuthTokenRequest:
       type: object
-      additionalProperties: false
-      required: [flows, relayfile, chief]
+      required: [grant_type, client_id]
       properties:
-        flows: {type: boolean}
-        relayfile: {type: boolean}
-        chief: {type: boolean}
+        grant_type: {type: string, enum: [authorization_code, refresh_token]}
+        client_id: {type: string}
+        code: {type: string, description: Required for authorization_code.}
+        code_verifier: {type: string, minLength: 43, maxLength: 128, description: Required for authorization_code.}
+        redirect_uri: {type: string, format: uri, description: Required if supplied during authorization.}
+        refresh_token: {type: string, description: Required for refresh_token.}
+        resource: {type: string, format: uri, description: Optional exact bound resource; cannot change the audience.}
+    McpOAuthRevokeRequest:
+      type: object
+      required: [token]
+      properties:
+        token: {type: string}
+        client_id: {type: string}
+    McpOAuthGrant:
+      type: object
+      required: [id, client_id, client_name, organization_id, workspace_id, agent_name, scopes, resource, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        client_id: {type: string}
+        client_name: {type: [string, "null"]}
+        organization_id: {type: string, format: uuid}
+        workspace_id: {type: string, format: uuid}
+        agent_name: {type: string}
+        scopes:
+          type: array
+          items: {type: string}
+        resource: {type: string, format: uri}
+        created_at: {type: string, format: date-time}
+    LoginConfig:
+      type: object
+      required: [methods, oidc, logo_url, org_name, allowed_domain_hint, password_policy]
+      properties:
+        methods:
+          type: array
+          items: { type: string, enum: [email_link, password] }
+        oidc:
+          type: [object, "null"]
+          properties:
+            displayName: { type: string }
+        logo_url: { type: [string, "null"], format: uri }
+        org_name: { type: [string, "null"], description: Shown beside the logo. Null when no logo is set. }
+        allowed_domain_hint: { type: boolean }
+        password_policy:
+          type: [object, "null"]
+          properties:
+            min_length: { type: integer, example: 12 }
+            max_length: { type: integer, example: 128 }
+    PasswordError:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum:
+            - invalid_request
+            - email_invalid
+            - password_too_short
+            - password_too_long
+            - password_common
+            - password_contains_email
+            - password_breached
+            - invalid_credentials
+            - token_invalid
+            - password_already_set
+            - reauthentication_required
+            - rate_limited
+            - csrf_rejected
+            - signin_method_disabled
+            - method_not_allowed
+            - password_already_set
+            - token_invalid
+            - rate_limited
+        message: { type: string }
+    PasswordSignIn:
+      type: object
+      required: [userId, email, organizationId]
+      properties:
+        userId: { type: string, format: uuid }
+        email: { type: string }
+        organizationId: { type: string, format: uuid }
+        workspaceId: { type: [string, "null"], format: uuid }
     SessionReadCredentials:
       type: object
       additionalProperties: false
@@ -5297,6 +6992,98 @@ components:
         refreshToken: { type: string, pattern: '^rth_rt_read_[A-Za-z0-9_-]{43,}$', maxLength: 4096, description: Bearer clients only. }
         refreshTokenExpiresAt: { type: string, format: date-time, description: Bearer clients only. }
         tokenType: { type: string, enum: [Bearer] }
+    AcquisitionIssuerKey:
+      type: object
+      additionalProperties: false
+      required: [issuerKeyId, issuerClass, publicKeyBase64]
+      properties:
+        issuerKeyId: { type: string, minLength: 1, maxLength: 512 }
+        issuerClass: { type: string, enum: [cloud] }
+        publicKeyBase64: { type: string, description: Standard base64 of the raw 32-byte Ed25519 public key }
+    AcquisitionError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code]
+          properties:
+            code: { type: string }
+            message: { type: string }
+    AcquisitionEnvelope:
+      type: object
+      additionalProperties: false
+      required: [payload, signature]
+      properties:
+        payload:
+          type: object
+          description: The signed payload, every field a string, including issuerKeyId, evidenceSha256 and requestSha256.
+          additionalProperties: { type: string }
+        signature: { type: string, description: base64url Ed25519 signature (86 characters) }
+    AcquisitionIssued:
+      type: object
+      additionalProperties: false
+      required: [kind, issuerKeyId, issuedAt, envelope]
+      properties:
+        kind: { type: string, enum: [install, revoke] }
+        issuerKeyId: { type: string }
+        issuedAt: { type: string, format: date-time }
+        envelope: { $ref: "#/components/schemas/AcquisitionEnvelope" }
+        revokeEnvelope: { $ref: "#/components/schemas/AcquisitionEnvelope" }
+    AcquisitionInstallRequest:
+      type: object
+      additionalProperties: false
+      required: [aud, operationUuid, orgId, workspaceId, source, sessionId, revision, expectedRevision,
+        expectedOwnerEpoch, expectedPredecessorGrantId, ownerKind, ownerUserId, ownerOriginId,
+        bindingUuid, installationId, grantSha256, expiresAt]
+      properties:
+        aud: { type: string, description: Must equal SELFHOST_ACQUISITION_ORIGIN }
+        issuerKeyId: { type: string, description: Optional; must be the active key id }
+        operationUuid: { type: string, format: uuid }
+        orgId: { type: string }
+        workspaceId: { type: string }
+        source: { type: string }
+        sessionId: { type: string }
+        revision: { type: string }
+        expectedRevision: { type: string }
+        expectedOwnerEpoch: { type: string }
+        expectedPredecessorGrantId: { type: string }
+        ownerKind: { type: string, enum: [cloud] }
+        ownerUserId: { type: string }
+        ownerOriginId: { type: string }
+        bindingUuid: { type: string, format: uuid }
+        installationId: { type: string, enum: [""] }
+        grantSha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        expiresAt: { type: string, description: Empty or YYYY-MM-DDTHH:MM:SSZ }
+        reserveRevoke: { type: boolean }
+        reservedRevoke:
+          type: object
+          additionalProperties: false
+          required: [revision, targetGrantId, targetOwnerEpoch]
+          properties:
+            operationUuid: { type: string, format: uuid, description: Default a fresh random UUID; must differ from the install }
+            revision: { type: string }
+            targetGrantId: { type: string }
+            targetOwnerEpoch: { type: string }
+    AcquisitionRevokeRequest:
+      type: object
+      additionalProperties: false
+      required: [aud, operationUuid, orgId, workspaceId, source, sessionId, revision, targetGrantId,
+        targetOwnerEpoch, targetOwnerKind, targetBindingUuid, targetInstallationId]
+      properties:
+        aud: { type: string, description: Must equal SELFHOST_ACQUISITION_ORIGIN }
+        issuerKeyId: { type: string }
+        operationUuid: { type: string, format: uuid }
+        orgId: { type: string }
+        workspaceId: { type: string }
+        source: { type: string }
+        sessionId: { type: string }
+        revision: { type: string }
+        targetGrantId: { type: string }
+        targetOwnerEpoch: { type: string }
+        targetOwnerKind: { type: string, enum: [cloud] }
+        targetBindingUuid: { type: string, format: uuid }
+        targetInstallationId: { type: string, enum: [""] }
     FactorySummary:
       type: object
       properties:
@@ -5369,6 +7156,52 @@ components:
         upload_control: { type: string, enum: [operator, user] }
         oops_window_seconds: { type: integer, minimum: 0, maximum: 86400 }
         user_retroactive_delete: { type: boolean }
+    SessionErasure:
+      type: object
+      additionalProperties: false
+      required: [orgId, workspaceId, source, sessionId, requestId, status, requestedAt, completedAt, artifacts, uploadsFenced, unreadable, unreadableAt, bytesErased, bytesErasedAt, legacyScope, failure, audit]
+      properties:
+        orgId: { type: string }
+        workspaceId: { type: string }
+        source: { type: string }
+        sessionId: { type: string }
+        requestId: { type: string }
+        status: { type: string, enum: [in_progress, completed, failed] }
+        requestedAt: { type: string, format: date-time }
+        completedAt: { type: [string, "null"], format: date-time }
+        artifacts:
+          type: object
+          description: Item count and state per artifact category; never content.
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [count, state]
+            properties:
+              count: { type: integer, minimum: 0 }
+              state: { type: string, enum: [done, pending, not_applicable] }
+        uploadsFenced: { type: boolean }
+        unreadable: { type: boolean, description: Fenced and hidden in every store. }
+        unreadableAt: { type: [string, "null"], format: date-time }
+        bytesErased: { type: boolean, description: Every store's delete is verified. }
+        bytesErasedAt: { type: [string, "null"], format: date-time }
+        legacyScope: { type: string, description: "`excluded` means data in older storage generations is not covered by this erase." }
+        failure:
+          type: [object, "null"]
+          additionalProperties: false
+          required: [step, code, retryable]
+          properties:
+            step: { type: string }
+            code: { type: string }
+            retryable: { type: boolean }
+        audit:
+          type: [object, "null"]
+          additionalProperties: false
+          required: [action, actorKind, actorId, recordedAt]
+          properties:
+            action: { type: string, enum: [session.hard_deleted] }
+            actorKind: { type: string }
+            actorId: { type: [string, "null"] }
+            recordedAt: { type: string, format: date-time }
     CapturePolicy:
       type: object
       additionalProperties: false
@@ -5402,11 +7235,13 @@ components:
           type: string
     Readiness:
       type: object
-      required: [status, introspection]
+      required: [status, introspection, capabilities]
       properties:
         status:
           type: string
           enum: [ready, not_ready]
+        capabilities:
+          $ref: "#/components/schemas/FeatureCapabilities"
         introspection:
           type: object
           required: [enabled, audiences]
@@ -5418,6 +7253,27 @@ components:
               type: array
               description: Normalized origins POST /internal/v1/auth/introspect accepts as `aud`; empty while disabled.
               items: { type: string }
+    FeatureCapabilities:
+      type: object
+      required: [flows, relayfile, chief]
+      additionalProperties: false
+      description: Names in SELFHOST_FEATURES (unset or empty selects nothing).
+      properties:
+        flows: { type: boolean }
+        relayfile: { type: boolean }
+        chief: { type: boolean }
+    FeatureRefusal:
+      type: object
+      required: [error, message, feature]
+      properties:
+        error:
+          type: string
+          enum: [feature_not_enabled]
+          description: The operator has not selected the feature in SELFHOST_FEATURES.
+        message: { type: string }
+        feature:
+          type: string
+          enum: [flows, relayfile, chief]
     DeviceStart:
       type: object
       required:
@@ -6297,6 +8153,94 @@ components:
             name: { type: [string, "null"] }
             email: { type: [string, "null"] }
             avatarUrl: { type: "null" }
+    DesktopMcpCredentialCreate:
+      type: object
+      additionalProperties: false
+      required: [provider, installationId, accessToken]
+      properties:
+        provider: { type: string, pattern: "^[a-z][a-z0-9-]{0,63}$", examples: [copilot] }
+        installationId: { type: string, format: uuid }
+        accessToken:
+          type: string
+          pattern: "^sh_at_[A-Za-z0-9_-]{43}$"
+          description: Secret Desktop generated and saved before this call. Stored only as a hash.
+    DesktopMcpCredential:
+      type: object
+      required: [id, workspaceId, provider, installationId, accessTokenExpiresAt, leaseExpiresAt, createdAt, scopes]
+      properties:
+        id: { type: string }
+        workspaceId: { type: string }
+        provider: { type: string }
+        installationId: { type: string, format: uuid }
+        accessTokenExpiresAt: { type: string, format: date-time }
+        leaseExpiresAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        scopes:
+          type: array
+          items: { type: string, enum: ["rth:read", "mcp:desktop"] }
+    DesktopIdentityLink:
+      type: object
+      required: [agent_id, linked_mcp, linked_at]
+      properties:
+        agent_id: { type: string }
+        linked_mcp: { type: "null", description: Always null on self-host. }
+        linked_at: { type: "null", description: Always null on self-host. }
+    DesktopIdentityCapabilities:
+      type: object
+      required: [native_session_identity, copilot_session_attestation]
+      properties:
+        native_session_identity: { type: integer, const: 1 }
+        copilot_session_attestation: { type: integer, const: 1 }
+    DesktopIdentitySync:
+      type: object
+      additionalProperties: false
+      required: [source_id, identities]
+      properties:
+        source_id: { type: string, format: uuid }
+        identities:
+          type: array
+          maxItems: 200
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, address, agent_id, token]
+            properties:
+              name: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" }
+              address: { type: string, description: Must start with `name@`. }
+              agent_id: { type: string }
+              token: { type: string, minLength: 12, maxLength: 512, description: The agent's Relaycast token. Encrypted at rest, never returned. }
+              web_session_id: { type: string, description: Accepted for Cloud compatibility and ignored. }
+              native_session:
+                type: object
+                additionalProperties: false
+                required: [kind, id]
+                properties:
+                  kind: { type: string, enum: [codex, grok, pi, claude, copilot, opencode] }
+                  id: { type: string, description: A UUID, or `ses_...` for opencode. }
+        attestation_key:
+          type: object
+          additionalProperties: false
+          required: [kid, alg, public_key]
+          properties:
+            kid: { type: string, pattern: "^[A-Za-z0-9_-]{22}$", description: base64url of the first 16 bytes of SHA-256 of the raw public key. }
+            alg: { type: string, const: Ed25519 }
+            public_key: { type: string, description: base64url raw 32-byte Ed25519 public key. }
+    DesktopIdentitySyncResult:
+      type: object
+      required: [synced, identities]
+      properties:
+        synced: { type: integer }
+        skipped:
+          type: array
+          items:
+            type: object
+            required: [agent_id, reason]
+            properties:
+              agent_id: { type: string }
+              reason: { type: string, enum: [unverified, not_owned] }
+        identities:
+          type: array
+          items: { $ref: "#/components/schemas/DesktopIdentityLink" }
     DesktopFeedManifest:
       x-status: proposed
       type: object
@@ -6452,10 +8396,10 @@ components:
           pattern: ^fk_[a-z0-9]{1,32}_[a-z0-9]{1,16}$
       description: Envelope served by the feed; mirrors docs/specs/desktop-feed-envelope.schema.json. A received envelope whose JSON text has a duplicate member name at any depth (compared after escape decoding), a lone surrogate, or anything outside RFC 8259 (including a leading BOM) is rejected before canonicalising or verifying (RFC 8785 section 3.1 requires I-JSON, RFC 7493).
     DesktopFeedErrorCode:
-      x-status: proposed
       description: |
-        Every `error` code a Desktop feed endpoint may return. Status: proposed,
-        Cloud team decides, not yet confirmed. `not_entitled`,
+        Every `error` code a Desktop feed endpoint may return, besides the
+        app-wide 413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
+        Status: implemented. `not_entitled`,
         `no_object_storage` and the 401/403/404/429 split come from the source
         design; the other names are proposals.
       type: string
@@ -6775,11 +8719,96 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
         status: { enum: [active, expired, revoked] }
   responses:
+    McpOAuthUnavailable:
+      description: >-
+        MCP OAuth is enabled but cannot run because an input is missing or
+        invalid; every OAuth route answers this until the operator fixes it.
+        Public routes keep their CORS headers. Cache-Control is no-store.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, reason]
+            properties:
+              error: {type: string, const: mcp_oauth_unavailable}
+              reason: {type: string, enum: [public_url, oidc_signing_key]}
+    PasswordSignedIn:
+      description: Signed in; sets the `agent_relay_session` cookie (Path=/cloud). The token is never in the body.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/PasswordSignIn" }
+    PasswordPolicyError:
+      description: "`invalid_request`, `email_invalid`, `password_too_short`, `password_too_long`, `password_common`, `password_contains_email` or `password_breached`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/PasswordError" }
+    PasswordCsrfRejected:
+      description: "`csrf_rejected`: not a JSON content type, or an `Origin` other than the public or dashboard origin"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/PasswordError" }
+    SignInMethodDisabled:
+      description: "`signin_method_disabled`: the method is not in SELFHOST_SIGNIN_METHODS"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/PasswordError" }
+    AcquisitionIssued:
+      description: "Signed envelope (Cache-Control: no-store)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AcquisitionIssued" }
+    AcquisitionInvalidRequest:
+      description: invalid_request (bad, unknown or missing field; non-cloud class; issuerKeyId not active)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AcquisitionError" }
+    AcquisitionUnauthorized:
+      description: unauthorized (missing, unknown, unrecognised-kind or inactive bearer token)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AcquisitionError" }
+    AcquisitionNotAuthorized:
+      description: not_authorized (authenticated caller lacks the scope, has the wrong aud, is a handoff token, is not a workspace member, or targets another org or workspace)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AcquisitionError" }
+    AcquisitionNotFound:
+      description: not_found (issuer disabled, or unknown assertion kind)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AcquisitionError" }
+    FeatureRefused:
+      description: |
+        The feature is not a capability on this installation. Checked after
+        authentication and membership, before any backend call.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/FeatureRefusal"
     FactoryError:
       description: Factory error with a stable code
       content:
         application/json:
           schema: { $ref: "#/components/schemas/FactoryError" }
+    DesktopMcpError:
+      description: |
+        `{error, message}` with a stable code: invalid_request (400),
+        unauthorized (401), desktop_login_required, workspace_access_changed,
+        forbidden or csrf_rejected (403), workspace_not_found or
+        token_not_found (404), method_not_allowed (405, with Allow),
+        credential_conflict or too_many_credentials (409), rate_limited (429),
+        upstream_unavailable (502).
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, message]
+            properties:
+              error: { type: string }
+              message: { type: string }
+              credential_id:
+                type: string
+                description: Only on credential_conflict (409) for this parent's own surviving credential; the id to DELETE.
     CodingAgentStored:
       description: Stored credential (201 created, 200 existing or replaced)
       content:

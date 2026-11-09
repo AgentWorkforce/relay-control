@@ -1,8 +1,8 @@
 /**
- * Draft contract tests for the Desktop feed (docs/desktop-feed.md).
- * Status: proposed, Cloud team decides, not yet confirmed.
+ * Contract tests for the Desktop feed (docs/desktop-feed.md).
+ * Status: implemented; test/desktop-feed.test.ts exercises the server.
  *
- * Nothing here exercises a server: there is no implementation. The tests pin
+ * Nothing here exercises a server. The tests pin
  * the contract instead: the JSON schemas, the OpenAPI operations and
  * responses, the canonicalisation and signature rule, and reference decision
  * functions for the credential, upload, publish, quota and transport rules,
@@ -204,7 +204,7 @@ test("JCS: refuses what the manifest never contains", () => {
 test("schemas: strict, self-contained, envelope copies the manifest definition", () => {
   for (const schema of [manifestSchema, envelopeSchema]) {
     assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");
-    assert.match(schema.$comment, /proposed/i);
+    assert.match(schema.$comment, /Status: implemented/);
     const refs = JSON.stringify(schema).match(/"\$ref":"([^"]+)"/g) ?? [];
     for (const ref of refs) assert.match(ref, /"#\/\$defs\//, `self-contained: ${ref}`);
   }
@@ -814,7 +814,7 @@ test("publish: signer byte limit refuses before signing", () => {
   assert.ok(validate(body), JSON.stringify(validate.errors));
   assert.ok(component("DesktopFeedManifestTooLarge")(withMessage));
 
-  // Documented on publish 422 only; import never signs.
+  // Documented on create (refused before any upload) and publish; import never signs.
   assert.ok(spec.components.schemas.DesktopFeedErrorCode.enum.includes("manifest_too_large"));
   const where: string[] = [];
   for (const [name, [method, path]] of Object.entries<Json>(requestCases.operations)) {
@@ -822,7 +822,7 @@ test("publish: signer byte limit refuses before signing", () => {
       if (documentedErrors(name, Number(status)).has("manifest_too_large")) where.push(`${name} ${status}`);
     }
   }
-  assert.deepEqual(where, ["publish 422"]);
+  assert.deepEqual(where, ["create_draft 422", "publish 422"]);
   for (const status of Object.keys(spec.paths[`${FEED_PREFIX}/releases/import`].post.responses)) {
     assert.ok(!documentedErrors("import", Number(status)).has("manifest_too_large"), `import ${status}`);
   }
@@ -959,7 +959,7 @@ test("response bodies: valid bodies match, invalid ones do not", () => {
 
 /* ------------------------------------------------------- OpenAPI coverage */
 
-test("coverage: every feed operation requires X-Agent-Relay-Profile and is marked proposed", () => {
+test("coverage: every feed operation requires X-Agent-Relay-Profile; only deviating operations stay proposed", () => {
   const operations = feedOperations();
   assert.equal(operations.length, 11);
   const profileParam = spec.components.parameters.DesktopFeedProfile;
@@ -970,9 +970,12 @@ test("coverage: every feed operation requires X-Agent-Relay-Profile and is marke
     const label = `${method} ${path}`;
     const params = (op.parameters ?? []).map((p: Json) => (p.$ref ? spec.components.parameters[p.$ref.split("/").pop()] : p));
     assert.ok(params.some((p: Json) => p.name === "X-Agent-Relay-Profile" && p.in === "header" && p.required === true), `${label}: profile header`);
-    assert.equal(op["x-status"], "proposed", label);
-    assert.ok(op.tags.includes("Desktop feed (draft contract)"), label);
-    assert.match(op.description, /Status: proposed, Cloud team decides, not yet confirmed/, label);
+    // A JSON body over 1 MiB answers the app-wide 413 on these (docs/desktop-feed.md, deviation 7).
+    const deviates = ["createDesktopFeedDraft", "importDesktopFeedRelease", "publishDesktopFeedRelease", "createDesktopFeedInstallToken"]
+      .includes(op.operationId);
+    assert.equal(op["x-status"], deviates ? "proposed" : undefined, label);
+    assert.ok(op.tags.includes("Desktop feed"), label);
+    assert.match(op.description, deviates ? /Status: implemented with a deviation/ : /Status: implemented\./, label);
     assert.ok(op.responses["429"], `${label}: 429`);
     const rateLimited = resolveResponse(op.responses["429"]);
     assert.equal(rateLimited.headers["Retry-After"].required, true, `${label}: Retry-After`);
@@ -1035,12 +1038,12 @@ test("coverage: credentials, security schemes and the error-code enum agree", ()
   for (const code of enumCodes) assert.ok(used.has(code), `${code} is used`);
 });
 
-test("coverage: the signer is unresolved and there is no stored-key fallback", () => {
-  const tag = spec.tags.find((t: Json) => t.name === "Desktop feed (draft contract)");
-  assert.equal(tag["x-status"], "proposed");
-  assert.equal(tag["x-signer-provider"]["x-status"], "unresolved");
+test("coverage: the signer is AWS KMS and there is no stored-key fallback", () => {
+  const tag = spec.tags.find((t: Json) => t.name === "Desktop feed");
+  assert.equal(tag["x-status"], undefined);
+  assert.equal(tag["x-signer-provider"].provider, "awskms");
   const publish = spec.paths[`${FEED_PREFIX}/releases/{version}/publish`].post;
-  assert.equal(publish["x-signer-provider"]["x-status"], "unresolved");
+  assert.equal(publish["x-signer-provider"].provider, "awskms");
   assert.match(spec.info.description, /Ed25519/);
   assert.match(spec.info.description, /RFC 8785/);
   const feedText = JSON.stringify([tag, ...feedOperations().map(({ op }) => op)]);

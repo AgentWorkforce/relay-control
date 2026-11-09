@@ -302,10 +302,12 @@ test("introspection names exactly one inactive reason, in contract order", async
   };
 
   // Never looked up as user tokens, even if well-formed for their own kind.
-  for (const token of [alpha.refreshToken, "sh_wk_workspace-token", BOOTSTRAP, INTERNAL, INTROSPECT_SECRET, "sh_dc_x", "nt_live_abcdefgh"]) {
+  for (const token of [alpha.refreshToken, BOOTSTRAP, INTERNAL, INTROSPECT_SECRET, "sh_dc_x", "nt_live_abcdefgh"]) {
     await inactive(token, "wrong-kind");
   }
   await inactive("sh_at_does-not-exist", "unknown");
+  // A workspace API token with no such record is unknown, not another kind.
+  await inactive("sh_wk_workspace-token", "unknown");
   // wrong-kind wins over everything else.
   await inactive(alpha.refreshToken, "wrong-kind", "https://elsewhere.test", env.beta);
 
@@ -455,7 +457,7 @@ test("readyz lists exactly the audiences introspection accepts, never the secret
   assert.deepEqual(ready.body, {
     status: "ready",
     introspection: { enabled: true, audiences: ["https://files.selfhosted.test", "http://history.svc:8080"] },
-    license: { status: "absent" },
+    // No features wired: core only.
     capabilities: { flows: false, relayfile: false, chief: false },
   });
   assert.equal(JSON.stringify(ready.body).includes(INTROSPECT_SECRET), false);
@@ -920,4 +922,23 @@ test("introspection reports the live organization role, for add-on admin decisio
   );
   const promoted = await env.introspect({ token: ownerToken, aud: HISTORY_PUBLIC });
   assert.equal(promoted.body.role, "admin");
+});
+
+test("an unexchanged desktop handoff is not introspectable, and its exchanged pair is", async (t) => {
+  const env = await setup(t);
+  const pending = await env.store.issueDesktopHandoff({
+    userId: env.ownerId,
+    organizationId: env.organizationId,
+    workspaceId: env.alpha,
+    codeChallenge: "a".repeat(43),
+  });
+  const refused = await env.introspect({ token: pending.accessToken, aud: HISTORY_PUBLIC });
+  assert.equal(refused.status, 200);
+  assert.deepEqual(refused.body, { active: false, reason: "unknown" });
+
+  const issued = await env.store.exchangeDesktopHandoff(pending.accessToken, () => true);
+  assert(issued);
+  const active = await env.introspect({ token: issued.accessToken, aud: HISTORY_PUBLIC });
+  assert.equal(active.body.active, true);
+  assert.equal(active.body.role, "owner");
 });

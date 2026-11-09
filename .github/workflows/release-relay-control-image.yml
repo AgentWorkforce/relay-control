@@ -1,5 +1,4 @@
-# Publish only the standalone relay-control image (canonical name), plus the
-# legacy selfhost-api name as a transition alias with the same digest. This
+# Publish only the standalone relay-control image. This
 # workflow does not call any hosted Cloud deployment workflow, deployment
 # script, or cloud provider.
 name: Release relay-control image
@@ -36,7 +35,6 @@ jobs:
     timeout-minutes: 5
     outputs:
       image: ${{ steps.identity.outputs.image }}
-      legacy_image: ${{ steps.identity.outputs.legacy_image }}
       release_tag: ${{ steps.identity.outputs.release_tag }}
       sha_tag: ${{ steps.identity.outputs.sha_tag }}
       source_sha: ${{ steps.identity.outputs.source_sha }}
@@ -82,10 +80,8 @@ jobs:
           esac
 
           image="ghcr.io/${OWNER,,}/relay-control"
-          legacy_image="ghcr.io/${OWNER,,}/selfhost-api"
           {
             echo "image=$image"
-            echo "legacy_image=$legacy_image"
             echo "release_tag=$RELEASE_TAG"
             echo "sha_tag=sha-$SOURCE_SHA"
             echo "source_sha=$SOURCE_SHA"
@@ -108,7 +104,6 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       image: ${{ needs.validate.outputs.image }}
-      legacy_image: ${{ needs.validate.outputs.legacy_image }}
     steps:
       - name: Checkout exact source commit
         uses: actions/checkout@v4
@@ -133,12 +128,11 @@ jobs:
         shell: bash
         env:
           IMAGE: ${{ needs.validate.outputs.image }}
-          LEGACY_IMAGE: ${{ needs.validate.outputs.legacy_image }}
           RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
           SHA_TAG: ${{ needs.validate.outputs.sha_tag }}
         run: |
           set -euo pipefail
-          for image in "$IMAGE" "$LEGACY_IMAGE"; do
+          for image in "$IMAGE"; do
             for tag in "$RELEASE_TAG" "$SHA_TAG"; do
               output_file="$RUNNER_TEMP/imagetools-${image//\//_}-$tag.txt"
               if docker buildx imagetools inspect "$image:$tag" >"$output_file" 2>&1; then
@@ -167,8 +161,6 @@ jobs:
           tags: |
             ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.release_tag }}
             ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.sha_tag }}
-            ${{ needs.validate.outputs.legacy_image }}:${{ needs.validate.outputs.release_tag }}
-            ${{ needs.validate.outputs.legacy_image }}:${{ needs.validate.outputs.sha_tag }}
           labels: |
             org.opencontainers.image.licenses=Apache-2.0
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -177,19 +169,11 @@ jobs:
           provenance: mode=max
           sbom: true
 
-      # Both names publish the same index digest, so each gets a signed
-      # Sigstore provenance bundle stored in GitHub and pushed to the registry.
-      - name: Attest provenance (relay-control)
+      # A signed Sigstore provenance bundle, stored in GitHub and pushed to the registry.
+      - name: Attest provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ghcr.io/agentworkforce/relay-control
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
-
-      - name: Attest provenance (selfhost-api alias)
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ghcr.io/agentworkforce/selfhost-api
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
@@ -198,7 +182,6 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
           IMAGE: ${{ needs.validate.outputs.image }}
-          LEGACY_IMAGE: ${{ needs.validate.outputs.legacy_image }}
           RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
           SHA_TAG: ${{ needs.validate.outputs.sha_tag }}
           SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
@@ -209,7 +192,7 @@ jobs:
             exit 1
           }
 
-          for image in "$IMAGE" "$LEGACY_IMAGE"; do
+          for image in "$IMAGE"; do
             for tag in "$RELEASE_TAG" "$SHA_TAG"; do
               resolved="$(
                 docker buildx imagetools inspect "$image:$tag" \
@@ -225,14 +208,13 @@ jobs:
           {
             echo "### relay-control image released"
             echo
-            echo "Canonical image: \`$IMAGE@$DIGEST\`"
-            echo "Transition alias: \`$LEGACY_IMAGE@$DIGEST\`"
-            echo "Release tags: \`$IMAGE:$RELEASE_TAG\`, \`$LEGACY_IMAGE:$RELEASE_TAG\`"
-            echo "Source tags: \`$IMAGE:$SHA_TAG\`, \`$LEGACY_IMAGE:$SHA_TAG\`"
+            echo "Image: \`$IMAGE@$DIGEST\`"
+            echo "Release tag: \`$IMAGE:$RELEASE_TAG\`"
+            echo "Source tag: \`$IMAGE:$SHA_TAG\`"
             echo "Source commit: \`$SOURCE_SHA\`"
             echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
             echo
             echo "BuildKit OCI SBOM and max-mode provenance attestations were requested."
-            echo "Signed GitHub artifact attestations (SLSA provenance) were pushed for both names."
+            echo "A signed GitHub artifact attestation (SLSA provenance) was pushed."
             echo "No hosted Cloud deployment was performed."
           } >> "$GITHUB_STEP_SUMMARY"

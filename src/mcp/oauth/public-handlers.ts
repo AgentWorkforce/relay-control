@@ -1,8 +1,7 @@
 /**
- * Unmounted Cloud 1776499a register/token/revoke handlers. Storage is injected
- * so this port can be exercised while the tenant SQL integration is pending.
- * App-level body bounds, trusted client IP/rate limiting and the module flag
- * remain the mounting adapter's responsibility.
+ * Register/token/revoke handlers ported from Cloud 1776499a. Storage is
+ * injected; routes.ts supplies body bounds, client-address rate limiting and the
+ * default-on module gate with its unavailable mode.
  */
 import { parseClientRegistration, type ClientRegistrationInput, type OAuthErrorBody } from "./protocol.js";
 
