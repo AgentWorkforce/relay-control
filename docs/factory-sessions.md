@@ -31,12 +31,13 @@ before authentication, and the worker does not start.
   only when the feature is on. They act as the connection's person, re-read
   the owner/admin role on every call, and leave browsing and binding to the
   person who connected Factory. OAuth connections never get them.
-- MCP resolver hook: on a native (non-OAuth) connection, `send_relay_message`,
-  `subscribe_relay_channel` and `read_relay_conversation` accept `as=<agent name>` of
+- MCP resolver hook: on a native (non-OAuth) connection, `send_relay_message` and
+  `read_relay_conversation` accept `as=<agent name>` of
   the caller's own bound Factory session and act with that binding's hosted
   token, without creating a participant. Retired bindings and removed members
-  resolve to nothing. `check_relay_inbox`, `leave_relay`, `relay_status` and
-  `join_relay` do not use the hook.
+  resolve to nothing. `check_relay_inbox`, `leave_relay`, `relay_status`,
+  `join_relay` and the channel tools do not use the hook. Replies to a Factory
+  agent land in its Droid session, not in `check_relay_inbox`.
 
 ## Dormant or deferred
 

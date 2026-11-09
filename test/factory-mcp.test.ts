@@ -5,7 +5,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerFactoryTools } from "../src/factory/mcp-tools.js";
 import { planToolGroups } from "../src/mcp/catalog.js";
 import type { McpContext } from "../src/mcp/context.js";
-import { relayService } from "../src/mcp/relay-participants.js";
+import { FACTORY_REPLY_GUIDANCE, relayService } from "../src/mcp/relay-participants.js";
 import { buildMcpServer } from "../src/mcp/server.js";
 import { assertNoSecrets, bindingRow, connectAndBind, removeMember, startFactoryEnv, type FactoryEnv } from "./factory-helpers.js";
 
@@ -160,7 +160,7 @@ test("agentFor returns null after the binding owner is removed through the API",
   assert.equal(await env.module.mcp.agentFor(env.workspaceId, env.adminId, binding.agent.name), null);
 });
 
-test("send and read accept as=<own bound factory agent>; inbox and leave do not", async (t) => {
+test("send and read accept as=<own bound factory agent>; inbox, leave and channel subscribe do not", async (t) => {
   const env = await startFactoryEnv(t);
   const binding = await connectAndBind(env);
   const name = binding.agent.name;
@@ -185,6 +185,8 @@ test("send and read accept as=<own bound factory agent>; inbox and leave do not"
 
   const result = await relayService(context()).send({ to: "peer-agent", text: "hello", as: name });
   assert.equal(result.from, name);
+  assert.equal(result.reply_guidance, FACTORY_REPLY_GUIDANCE);
+  assert.ok(!("desktop_relay_guidance" in result));
   assert.deepEqual(sent, [{ token, to: "peer-agent", text: "hello" }]);
   const conversation = await relayService(context()).read({ agent: "peer-agent", as: name, limit: 10 });
   assert.equal(conversation.you, name);
@@ -192,6 +194,7 @@ test("send and read accept as=<own bound factory agent>; inbox and leave do not"
 
   await assert.rejects(relayService(context()).inbox(name, []), { message: NO_PARTICIPANT });
   await assert.rejects(relayService(context()).leave(name), { message: NO_PARTICIPANT });
+  await assert.rejects(relayService(context()).subscribeChannel({ channel: "ops", as: name }), { message: NO_PARTICIPANT });
   // Another user and a disabled module get the original error.
   await assert.rejects(relayService(mcpContext(env, env.memberId, { relay: context().relay } as Partial<McpContext>))
     .send({ to: "peer-agent", text: "x", as: name }), { message: NO_PARTICIPANT });
