@@ -87,14 +87,12 @@ import {
   SessionErasureError,
 } from "./session-erasure.js";
 import {
-  CORE_LICENSE,
   FeatureRefusedError,
-  PAID_FEATURES,
-  requireCapability,
-  resolveLicense,
+  NO_FEATURES,
+  requireSelected,
   type Feature,
-  type LoadedLicense,
-} from "./license/resolver.js";
+  type SelectedFeatures,
+} from "./features.js";
 import type { AnalyticsConfig } from "./analytics/config.js";
 import {
   clientAttribution,
@@ -348,8 +346,8 @@ export function createApp(input: {
   /** bootstrap-signup lane: OIDC / email sign-in, invites (src/identity). */
   identity?: IdentityModule;
   chief?: ChiefBackend;
-  /** Startup licence and SELFHOST_FEATURES selection (src/license). Unset = core only. */
-  license?: LoadedLicense;
+  /** SELFHOST_FEATURES selection (src/features.ts). Unset = core only. */
+  features?: SelectedFeatures;
   /** Amp control (src/amp). Absent or disabled: every Amp route answers 404 before auth. */
   amp?: AmpModule;
   /** Server-owned worker; absent tests use the same on-demand cleanup without a timer. */
@@ -388,12 +386,10 @@ export function createApp(input: {
     "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck">;
 }): (request: IncomingMessage, response: ServerResponse) => void {
   const { config, store, admin, telemetry, identity } = input;
-  const loadedLicense = input.license ?? CORE_LICENSE;
-  // Expiry is judged per request, so a licence that lapses while running stops granting.
-  const license = () => resolveLicense(loadedLicense, input.now?.() ?? new Date());
-  /** Throws the 403 refusal unless `feature` is a capability. Call after membership, before backends. */
+  const features = input.features ?? NO_FEATURES;
+  /** Throws the 403 refusal unless `feature` is selected. Call after membership, before backends. */
   function requireFeature(feature: Feature): void {
-    requireCapability(loadedLicense, feature, input.now?.() ?? new Date());
+    requireSelected(features, feature);
   }
   const browserOrigins = browserOriginsFor(config);
   const messagingDeps: MessagingDeps = {
@@ -875,11 +871,9 @@ export function createApp(input: {
     if (method === "GET" && path === "/readyz") {
       const readiness = await store.readiness();
       const introspection = { enabled: Boolean(config.introspectSecret), audiences: acceptedAudiences(config) };
-      const current = license();
-      const licenseFields = { license: { status: current.status }, capabilities: current.capabilities };
       json(response, readiness.ready ? 200 : 503, readiness.ready
-        ? { status: "ready", introspection, ...licenseFields }
-        : { status: "not_ready", reason: readiness.reason, message: readiness.message, introspection, ...licenseFields });
+        ? { status: "ready", introspection, capabilities: features }
+        : { status: "not_ready", reason: readiness.reason, message: readiness.message, introspection, capabilities: features });
       return;
     }
     if (method === "GET" && path === "/openapi.yaml") {
@@ -902,7 +896,7 @@ export function createApp(input: {
       secret: config.relayfileControlBrokerSecret,
       admin,
       relaycastBinding: (id) => store.relaycastBinding(id),
-      requireFlows: () => requireCapability(loadedLicense, "flows", input.now?.() ?? new Date()),
+      requireFlows: () => requireFeature("flows"),
       bearer,
       requestObject,
       json,
@@ -1605,24 +1599,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
-    // Installation entitlement for any signed-in member; never secret material.
-    if (method === "GET" && path === "/api/v1/license") {
+    // Which optional features this installation serves, for any signed-in member.
+    if (method === "GET" && path === "/api/v1/capabilities") {
       const auth = await authenticate(request);
       if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
-      const current = license();
-      const claims = current.claims;
-      json(response, 200, {
-        status: current.status,
-        license_id: claims?.licenseId ?? null,
-        customer: claims?.customer ?? null,
-        expires_at: claims?.expiresAt ?? null,
-        seats: claims ? { limit: claims.seats, used: await store.countActiveMembers() } : null,
-        features: PAID_FEATURES.filter((feature) => current.entitled[feature]),
-        paid: [...PAID_FEATURES],
-        selected: current.selected,
-        entitled: current.entitled,
-        capabilities: current.capabilities,
-      }, true);
+      json(response, 200, { capabilities: features }, true);
       return;
     }
 

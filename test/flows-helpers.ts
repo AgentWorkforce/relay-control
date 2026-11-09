@@ -9,8 +9,8 @@ import { FlowsStore } from "../src/flows/store.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import type { ChiefBackend } from '../src/chief/routes.js';
-import type { LoadedLicense } from "../src/license/resolver.js";
-import { testLicense } from "./support/license.js";
+import type { SelectedFeatures } from "../src/features.js";
+import { testFeatures } from "./support/features.js";
 
 export class PGliteDatabase implements Database {
   constructor(readonly client = new PGlite()) {}
@@ -94,12 +94,12 @@ export function apiClient(origin: string): Api {
 
 export const BOOTSTRAP = "bootstrap-token-that-is-at-least-32-bytes";
 
-/** `license` defaults to a valid licence with every feature selected and licensed. */
+/** `features` defaults to every optional feature selected. */
 export async function startControlPlane(
   flowsOverrides: Partial<FlowsConfig> = {},
   chief?: ChiefBackend,
   configOverrides: Partial<SelfhostConfig> = {},
-  license: LoadedLicense = testLicense(),
+  features: SelectedFeatures = testFeatures(),
 ) {
   const database = new PGliteDatabase();
   await migrate(database);
@@ -128,7 +128,7 @@ export async function startControlPlane(
     defaultFlowsConfig({ queuePollMs: 25, queuePingMs: 200, ...flowsOverrides }),
     config.relaycastPublicUrl,
   );
-  const server = createServer(createApp({ config, store, flows, chief, license }));
+  const server = createServer(createApp({ config, store, flows, chief, features }));
   const origin = await listen(server);
   const api = apiClient(origin);
   return {
