@@ -1,5 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { recordAudit, type AuditActor } from "./admin/audit.js";
+import { consentAttemptKey, type ConsentAttempt } from "./auth/desktop-login.js";
 import type { Database, SqlExecutor } from "./database.js";
 import { revokeMcpOAuthGrantRows } from "./mcp/oauth/store.js";
 import { DASHBOARD_DEVICE_CLIENT, isDeviceReservedClientName } from "./reserved-client-names.js";
@@ -18,6 +19,7 @@ import {
   hashSecret,
   normalizeUserCode,
   opaqueToken,
+  secureEqual,
   type EncryptionKeyring,
 } from "./crypto.js";
 
@@ -53,6 +55,8 @@ const ACCOUNT_SCOPES = [...BROWSER_SESSION_SCOPES, ACCOUNT_SCOPE];
 const DESKTOP_SCOPES = [...DEVICE_SCOPES, DESKTOP_WORKSPACES_SCOPE];
 /** desktop-auth lane, browser flow: hosted Cloud's 15-minute loopback handoff. */
 const DESKTOP_HANDOFF_TTL_MS = 15 * 60 * 1_000;
+/** The Desktop consent screen's single-use token lives as long as the screen. */
+const DESKTOP_CONSENT_TOKEN_TTL_MS = 10 * 60 * 1_000;
 const DESKTOP_SESSION_LABEL = "Agent Relay Desktop";
 
 export type Principal = {
@@ -1152,6 +1156,42 @@ export class ControlPlaneStore {
         scopes: DESKTOP_SCOPES,
         desktopHostName: input.consentedHostName,
       }));
+  }
+
+  /**
+   * A single-use consent token for the "approve Agent Relay Desktop on <host>"
+   * screen, bound to one person and one sign-in attempt. It is a shared row
+   * (only its hash is stored), so any replica may receive the form post.
+   * Expired rows are swept on the way in.
+   */
+  async issueDesktopConsentToken(attempt: ConsentAttempt): Promise<string> {
+    const token = randomBytes(32).toString("base64url");
+    await this.database.transaction(async (tx) => {
+      await tx.query(`DELETE FROM desktop_consent_tokens WHERE expires_at <= now()`);
+      await tx.query(
+        `INSERT INTO desktop_consent_tokens (id, token_hash, attempt_key, user_id, expires_at)
+         VALUES ($1, $2, $3, $4, now() + ($5::int * interval '1 millisecond'))`,
+        [randomUUID(), hashSecret(token), consentAttemptKey(attempt), attempt.userId, DESKTOP_CONSENT_TOKEN_TTL_MS],
+      );
+    });
+    return token;
+  }
+
+  /**
+   * True once, for the matching attempt; the token is consumed either way.
+   * One DELETE claims the row, so across replicas exactly one post wins.
+   */
+  async consumeDesktopConsentToken(token: unknown, attempt: ConsentAttempt): Promise<boolean> {
+    if (typeof token !== "string" || !token) return false;
+    const claimed = await this.database.query<{ attempt_key: string; live: boolean }>(
+      `DELETE FROM desktop_consent_tokens
+        WHERE token_hash = $1
+        RETURNING attempt_key, expires_at > now() AS live`,
+      [hashSecret(token)],
+    );
+    const row = claimed.rows[0];
+    if (!row || !row.live) return false;
+    return secureEqual(row.attempt_key, consentAttemptKey(attempt));
   }
 
   /**

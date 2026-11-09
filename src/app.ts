@@ -112,7 +112,6 @@ import {
 import {
   challengeMatches,
   cloudPathForNext,
-  ConsentTokens,
   DESKTOP_CONSENT_FIELDS,
   DESKTOP_LOGIN_RATE_LIMITS,
   desktopConsentDeniedPage,
@@ -411,7 +410,6 @@ export function createApp(input: {
   });
   // desktop-auth lane: hosted Cloud's device-route limits and CSRF origins.
   const limiter = new RateLimiter(() => (input.now?.() ?? new Date()).getTime());
-  const consentTokens = new ConsentTokens(() => (input.now?.() ?? new Date()).getTime());
   const NODE_TOKEN = /^nt_live_[A-Za-z0-9_-]{8,256}$/;
   const NODE_ID = NODE_ID_PATTERN;
   // The site a client signed in through: the public API origin or the
@@ -1168,7 +1166,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           params: consentParams,
           hostName: login.desktopHostName,
           workspaceName: target.workspaceName,
-          consentToken: consentTokens.issue(attempt),
+          consentToken: await store.issueDesktopConsentToken(attempt),
         }));
         return;
       }
@@ -1185,7 +1183,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (!login.desktopHostName) {
         throw new HttpError(400, "invalid_request", "Desktop consent needs client=desktop, an S256 code_challenge and desktop_host_name");
       }
-      if (!consentTokens.consume(params.get("consent_token"), attempt)) {
+      if (!(await store.consumeDesktopConsentToken(params.get("consent_token"), attempt))) {
         throw new HttpError(403, "forbidden", "Consent token is missing, used, or for another sign-in");
       }
       if (params.get("decision") !== "approve") {

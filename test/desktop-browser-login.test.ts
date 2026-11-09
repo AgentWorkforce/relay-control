@@ -1,11 +1,10 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import {
   cloudPathForNext,
-  ConsentTokens,
   isLoopbackRedirectUri,
   validateDesktopLogin,
 } from "../src/auth/desktop-login.js";
@@ -92,6 +91,8 @@ async function setup(t: test.TestContext) {
   assert.equal(workspace.status, 201);
   return {
     origin,
+    database,
+    store,
     relaycastState,
     orgId: org.body.id as string,
     ownerId: org.body.owner.id as string,
@@ -328,11 +329,49 @@ test("bad login requests are refused before any session work", async (t) => {
     redirect_uri: "http://127.0.0.1:1/cb", client: "desktop",
   }));
   assert("codeChallenge" in login && login.codeChallenge === null);
-  const tokens = new ConsentTokens(() => 0, 1_000);
-  const attempt = { userId: "u", codeChallenge: "c", hostName: "h", workspaceId: "w", redirectUri: "r" };
-  const issued = tokens.issue(attempt);
-  assert.equal(tokens.consume(issued, { ...attempt, userId: "other" }), false);
-  assert.equal(tokens.consume(issued, attempt), false, "consumed by the first attempt");
+});
+
+test("a consent token is a shared single-use row: once per attempt, burnt by a wrong attempt, refused when expired", async (t) => {
+  const { database, store, ownerId, workspaceId } = await setup(t);
+  const attempt = { userId: ownerId, codeChallenge: "c", hostName: "h", workspaceId, redirectUri: "r" };
+  const rows = async () =>
+    (await database.query<{ n: number }>("SELECT count(*)::int AS n FROM desktop_consent_tokens")).rows[0]!.n;
+
+  const issued = await store.issueDesktopConsentToken(attempt);
+  assert.equal(await store.consumeDesktopConsentToken(issued, attempt), true);
+  assert.equal(await store.consumeDesktopConsentToken(issued, attempt), false, "single use");
+  assert.equal(await store.consumeDesktopConsentToken("", attempt), false);
+  assert.equal(await store.consumeDesktopConsentToken(undefined, attempt), false);
+
+  const burnt = await store.issueDesktopConsentToken(attempt);
+  assert.equal(await store.consumeDesktopConsentToken(burnt, { ...attempt, userId: randomUUID() }), false);
+  assert.equal(await rows(), 0, "a wrong attempt still consumes the token");
+  assert.equal(await store.consumeDesktopConsentToken(burnt, attempt), false, "consumed by the wrong attempt");
+  const otherHost = await store.issueDesktopConsentToken(attempt);
+  assert.equal(await store.consumeDesktopConsentToken(otherHost, { ...attempt, hostName: "elsewhere" }), false);
+
+  const expired = await store.issueDesktopConsentToken(attempt);
+  await database.query("UPDATE desktop_consent_tokens SET expires_at = now() - interval '1 second'");
+  assert.equal(await store.consumeDesktopConsentToken(expired, attempt), false, "expired");
+  assert.equal(await rows(), 0);
+
+  // Only the hash is stored, and issuing sweeps expired rows.
+  const stale = await store.issueDesktopConsentToken(attempt);
+  const stored = await database.query<{ token_hash: string }>("SELECT token_hash FROM desktop_consent_tokens");
+  assert.equal(stored.rows.length, 1);
+  assert.notEqual(stored.rows[0]!.token_hash, stale);
+  await database.query("UPDATE desktop_consent_tokens SET expires_at = now() - interval '1 second'");
+  await store.issueDesktopConsentToken(attempt);
+  assert.equal(await rows(), 1, "the expired row was swept");
+});
+
+test("a consent token issued by one Control replica is consumed by another", async (t) => {
+  const { database, store, ownerId, workspaceId } = await setup(t);
+  const replica = new ControlPlaneStore(database, KEYRING, 0);
+  const attempt = { userId: ownerId, codeChallenge: "c", hostName: "h", workspaceId, redirectUri: "r" };
+  const issued = await store.issueDesktopConsentToken(attempt);
+  assert.equal(await replica.consumeDesktopConsentToken(issued, attempt), true);
+  assert.equal(await store.consumeDesktopConsentToken(issued, attempt), false, "claimed once across replicas");
 });
 
 test("the Desktop claims its spawn node with a proven node token, idempotently, and can release it", async (t) => {

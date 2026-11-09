@@ -167,6 +167,15 @@ async function databaseAtPriorSchema(): Promise<PGliteDatabase> {
   return database;
 }
 
+/** The migrations shipped after the rename, in the order the runner applies them. */
+async function migrationsAfterRename(): Promise<Array<{ name: string; sql: string }>> {
+  const directory = defaultMigrationsDirectory();
+  const names = (await readdir(directory))
+    .filter((name) => /^\d+.*\.sql$/.test(name) && name > RENAME_MIGRATION)
+    .sort();
+  return Promise.all(names.map(async (name) => ({ name, sql: await readFile(join(directory, name), "utf8") })));
+}
+
 /** Inserts one type-derived row per table, skipping tables whose CHECKs reject it. */
 async function seedPriorSchema(database: PGliteDatabase): Promise<number> {
   await database.exec("SET session_replication_role = replica");
@@ -229,16 +238,26 @@ test("an install at the previous schema upgrades in place with row counts unchan
   const before = await schemaObjects(database);
   const beforeCounts = await rowCounts(database, before.tables);
 
-  assert.deepEqual(await migrate(database), [RENAME_MIGRATION]);
+  // The rename runs first; later migrations apply after it in the same pass.
+  const later = await migrationsAfterRename();
+  assert.deepEqual(await migrate(database), [RENAME_MIGRATION, ...later.map((migration) => migration.name)]);
   assert.deepEqual(await migrate(database), []);
 
   const after = await schemaObjects(database);
-  assert.deepEqual(after.tables, before.tables.map(renamedTable).sort());
+  const renamed = before.tables.map(renamedTable).sort();
+  assert.deepEqual(after.tables.filter((table) => renamed.includes(table)), renamed);
+  // Any other table is one a migration after the rename creates.
+  for (const table of after.tables.filter((name) => !renamed.includes(name))) {
+    assert.ok(
+      later.some((migration) => new RegExp(`CREATE TABLE (IF NOT EXISTS )?${table}\\b`).test(migration.sql)),
+      `${table} appeared without a later migration creating it`,
+    );
+  }
   assert.deepEqual([...after.tables, ...after.other].filter((name) => name.startsWith("selfhost_")), []);
   const afterCounts = await rowCounts(database, after.tables);
   for (const [table, count] of beforeCounts) {
-    // The ledger gains exactly the row that records this migration.
-    const expected = table === PRIOR_LEDGER ? count + 1 : count;
+    // The ledger gains exactly the rows that record the migrations just applied.
+    const expected = table === PRIOR_LEDGER ? count + 1 + later.length : count;
     assert.equal(afterCounts.get(renamedTable(table)), expected, `row count changed for ${table}`);
   }
   const sequence = await database.query<{ value: string }>("SELECT nextval('desktop_feed_publish_seq')::text AS value");
