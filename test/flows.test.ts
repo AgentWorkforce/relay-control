@@ -179,7 +179,15 @@ test("fake worker: enroll → register → queue → assignment → ack → stat
   assert.equal(payload.relaycastApiKey, "rk_live_primary");
   assert.equal(payload.relaycastBaseUrl, "https://relaycast.selfhosted.company");
   assert.equal(typeof payload.relayfileUrl, "string");
-  assert.equal(typeof payload.relayfileToken, "string");
+  // No worker Relayfile credential is configured here: the field is absent
+  // (never an empty token) and the run records why.
+  assert.equal("relayfileToken" in payload, false);
+  const unavailable = await cp.database.query<{ payload: { error: string } }>(
+    "SELECT payload FROM run_events WHERE run_id = $1 AND event_type = 'run.relayfile_credential_unavailable'",
+    [runId],
+  );
+  assert.equal(unavailable.rows.length, 1);
+  assert.equal(unavailable.rows[0]!.payload.error, "relayfile_not_configured");
   assert.equal(payload.workflow, DETERMINISTIC_FLOW);
   assert.equal(payload.fileType, "yaml");
   assert.equal(payload.sourceFileType, "yaml");
@@ -245,6 +253,7 @@ test("fake worker: enroll → register → queue → assignment → ack → stat
   assert.deepEqual(events.body.events.map((event: { eventType: string }) => event.eventType), [
     "run.queued",
     "run.assigned",
+    "run.relayfile_credential_unavailable",
     "run.acknowledged",
     "run.running",
     "run.completed",

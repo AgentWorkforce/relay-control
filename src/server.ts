@@ -10,6 +10,8 @@ import { ControlPlaneStore } from "./store.js";
 import { loadFlowsConfig } from "./flows/config.js";
 import { FlowsStore } from "./flows/store.js";
 import { lazyFlowsStore } from "./flows/lazy.js";
+import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
+import { acceptedAudiences } from "./auth/introspect.js";
 import { loadTelemetryConfig } from "./telemetry/config.js";
 import { createTelemetryModule } from "./telemetry/module.js";
 import { loadIdentityConfig } from "./identity/config.js";
@@ -67,13 +69,19 @@ const identity = createIdentityModule({
   mailer: identityConfig.smtp ? smtpMailer(identityConfig.smtp) : null,
 });
 const flows = lazyFlowsStore(() => {
+  const flowsConfig = loadFlowsConfig();
   const instance = new FlowsStore(
     database,
     config.encryptionKeyring,
-    loadFlowsConfig(),
+    flowsConfig,
     config.relaycastPublicUrl,
   );
   instance.cliCredentials = admin.logins;
+  instance.relayfileCredentials = new FlowRunRelayfileCredentials(database, () => new Date(), {
+    ttlMs: flowsConfig.relayfileCredentialTtlMs,
+    workerRelayfileUrl: flowsConfig.workerRelayfileUrl,
+    audiences: () => acceptedAudiences(config),
+  });
   return instance;
 });
 const admin = createAdminModule({

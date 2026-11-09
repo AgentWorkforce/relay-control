@@ -5,6 +5,17 @@ assigned at release.
 
 ## Unreleased
 
+- Added: per-run, path-scoped Relayfile credentials for Flows workers
+  (migration 0036, `flow_run_relayfile_credentials`). The broker's new
+  `POST /internal/v1/flows/credentials/relayfile` action mints an opaque
+  `sh_fr_` token scoped to the run's mount paths, with one active credential
+  per run, a lifetime set by `SELFHOST_FLOWS_RELAYFILE_CREDENTIAL_TTL_MS`
+  (default 12 h) and revocation by the existing run-end `revoke` action.
+  Relayfile verifies it through `POST /internal/v1/auth/introspect`. Worker
+  assignment payloads no longer carry an empty `relayfileToken`: without a
+  credential the field is omitted and the run records a
+  `run.relayfile_credential_unavailable` event. See
+  [docs/flows-relayfile-credential.md](docs/flows-relayfile-credential.md).
 - Added: `GET /api/v1/workspaces/{id}/sessions/members` returns the organization's member display names (`{ id, name }`, no email) without a History read, so a dashboard that lists sessions straight from the session read API can still name teammates instead of showing "Unknown teammate".
 - Added: hosted MCP `join_relay desktop_address` links an MCP session to the
   caller's synced Agent Relay Desktop identity (migration 0035,

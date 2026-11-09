@@ -2,14 +2,15 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { ApiTokenStore } from "../admin/api-tokens.js";
 import type { SelfhostConfig } from "../config.js";
+import type { FlowRunRelayfileCredentials } from "../flows/relayfile-credentials.js";
 import { NODE_ID_PATTERN, type ControlPlaneStore, type Principal } from "../store.js";
 
 /**
  * POST /internal/v1/auth/introspect: the sessions pipeline (and relayfile)
  * verify a relaycontrol user access token (`sh_at_`) presented to them.
  * Contract: internal design note a-no-relayauth-contract (v1, the
- * v1.1 addendum: machine verification, 2026-11-07, and v1.2: optional
- * workspace, 2026-11-07).
+ * v1.1 addendum: machine verification, 2026-11-07, v1.2: optional
+ * workspace, 2026-11-07, and v1.4: Flows run credentials, 2026-11-09).
  *
  * - Request `{token, aud, workspace?, machine?}`. `workspace` may be absent
  *   or null (the Desktop-upload edge has only the bearer): a token session is
@@ -47,6 +48,13 @@ import { NODE_ID_PATTERN, type ControlPlaneStore, type Principal } from "../stor
  *   except principal_type `service`, agent_name null and scopes
  *   `["acquisition:operate"]`. Minted only by a workspace owner/admin through
  *   the deployment-api-tokens routes.
+ * - Flows run Relayfile credentials (v1.4, docs/flows-relayfile-credential.md):
+ *   an `sh_fr_` token minted by the Flows credential broker for one run.
+ *   Inactive reasons `unknown`, `revoked`, `expired`, `audience`, `workspace`
+ *   and, for any `machine`, `machine_not_owned`, checked like an agent token.
+ *   Active answers have principal_type `agent`, agent_name
+ *   `flows-run-<runId>`, sub = token_id = the credential id, the stored
+ *   path scopes, iat = minted and exp = the credential's expiry.
  * - User tokens also carry `role`, the live organization role, so optional
  *   add-on services can make the same admin decisions as this service without
  *   reading its database. Each add-on is one more origin in
@@ -58,6 +66,7 @@ export const INTROSPECT_PATH = "/internal/v1/auth/introspect";
 export const INTROSPECT_BODY_LIMIT = 16 * 1024;
 const USER_ACCESS_TOKEN_PREFIX = "sh_at_";
 export const WORKSPACE_API_TOKEN_PREFIX = "sh_wk_";
+export const FLOW_RUN_CREDENTIAL_PREFIX = "sh_fr_";
 /** `exp` horizon for an agent token without an expiry, from each call. */
 export const AGENT_TOKEN_EXP_WINDOW_SECONDS = 3_600;
 
@@ -272,14 +281,55 @@ async function introspectWorkspaceApiToken(
   };
 }
 
+/** Flows run Relayfile credentials (`sh_fr_`, principal `agent`). */
+async function introspectFlowRunCredential(
+  config: SelfhostConfig,
+  credentials: FlowRunRelayfileCredentials | undefined,
+  request: IntrospectionRequest,
+): Promise<IntrospectionResult> {
+  const credential = credentials ? await credentials.introspect(request.token) : null;
+  if (!credential) return { active: false, reason: "unknown" };
+  if (credential.revoked) return { active: false, reason: "revoked" };
+  if (credential.expired) return { active: false, reason: "expired" };
+  if (
+    normalizedOrigin(request.aud) !== credential.aud ||
+    !acceptedAudiences(config).includes(credential.aud)
+  ) {
+    return { active: false, reason: "audience" };
+  }
+  if (request.workspace !== undefined && credential.workspaceId !== request.workspace) {
+    return { active: false, reason: "workspace" };
+  }
+  if (request.machine !== undefined) return { active: false, reason: "machine_not_owned" };
+  return {
+    active: true,
+    sub: credential.credentialId,
+    email: null,
+    principal_type: "agent",
+    agent_name: `flows-run-${credential.runId}`,
+    machine_id: null,
+    org: credential.organizationId,
+    workspace: credential.workspaceId,
+    scopes: [...credential.scopes],
+    aud: credential.aud,
+    iat: epochSeconds(credential.createdAt),
+    exp: epochSeconds(credential.expiresAt),
+    token_id: credential.credentialId,
+  };
+}
+
 export async function introspect(
   config: SelfhostConfig,
   store: ControlPlaneStore,
   request: IntrospectionRequest,
   apiTokens?: ApiTokenStore,
+  flowRunCredentials?: FlowRunRelayfileCredentials,
 ): Promise<IntrospectionResult> {
   if (request.token.startsWith(WORKSPACE_API_TOKEN_PREFIX)) {
     return introspectWorkspaceApiToken(config, apiTokens, request);
+  }
+  if (request.token.startsWith(FLOW_RUN_CREDENTIAL_PREFIX)) {
+    return introspectFlowRunCredential(config, flowRunCredentials, request);
   }
   // Refresh, internal, bootstrap, worker, run and enrollment tokens are
   // never looked up as user tokens.
@@ -335,6 +385,7 @@ export async function handleIntrospection(
   log: (message: string, fields: Record<string, unknown>) => void = (message, fields) =>
     console.warn(message, fields),
   apiTokens?: ApiTokenStore,
+  flowRunCredentials?: FlowRunRelayfileCredentials,
 ): Promise<IntrospectionOutcome> {
   const secret = config.introspectSecret;
   if (!secret) {
@@ -358,5 +409,5 @@ export async function handleIntrospection(
       message: "Body must be a JSON object with string token and aud, optionally a non-empty string (or null) workspace, and optionally a node-id string machine (at most 16 KiB)",
     };
   }
-  return { status: 200, body: await introspect(config, store, body, apiTokens) };
+  return { status: 200, body: await introspect(config, store, body, apiTokens, flowRunCredentials) };
 }

@@ -6,6 +6,7 @@ import { createApp } from "../src/app.js";
 import { CodingAgentError } from "../src/admin/coding-agents.js";
 import type { AdminModule } from "../src/admin/routes.js";
 import type { SelfhostConfig } from "../src/config.js";
+import { FlowRunRelayfileCredentials } from "../src/flows/relayfile-credentials.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { close, listen, PGliteDatabase, request } from "./support/harness.js";
@@ -14,7 +15,15 @@ import { testFeatures } from "./support/features.js";
 const secret = "broker-secret-that-is-at-least-32-bytes";
 const PREFIX = "/internal/v1/flows/credentials";
 
-async function setup(t: TestContext, options: { secret?: string | null; flows?: boolean } = {}) {
+const FILES = "https://files.selfhosted.company";
+const TTL_MS = 2 * 60 * 60 * 1_000;
+
+async function setup(t: TestContext, options: {
+  secret?: string | null;
+  flows?: boolean;
+  workerRelayfileUrl?: string;
+  audiences?: string[];
+} = {}) {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -49,14 +58,26 @@ async function setup(t: TestContext, options: { secret?: string | null; flows?: 
     },
     runtimeEnvironment: record("environment", { workspaceId: workspace.id, env: { A: "1" }, secretEnvNames: ["A"], skipped: [], integrationErrors: [] }),
   } as unknown as AdminModule;
-  const app = createApp({ config, store, admin, ...(options.flows === false ? {} : { features: testFeatures() }) });
+  let clock = new Date("2026-11-09T12:00:00.000Z");
+  const relayfile = new FlowRunRelayfileCredentials(database, () => clock, {
+    ttlMs: TTL_MS,
+    workerRelayfileUrl: options.workerRelayfileUrl ?? `${FILES}/`,
+    audiences: () => options.audiences ?? [FILES, "https://history.selfhosted.company"],
+  });
+  const app = createApp({
+    config, store, admin, flowRelayfileCredentials: relayfile,
+    ...(options.flows === false ? {} : { features: testFeatures() }),
+  });
   const server = createServer(app);
   const origin = await listen(server);
   t.after(async () => { await close(server); await database.close(); });
   const post = (action: string, body: unknown, token: string | undefined = secret) =>
     request(origin, `${PREFIX}/${action}`, { method: "POST", ...(token ? { token } : {}), body });
   const get = (action: string, token = secret) => request(origin, `${PREFIX}/${action}`, { token });
-  return { database, workspace, calls, origin, post, get, setIssued: (v: unknown) => { issued = v; }, setFailure: (e: Error | null) => { failure = e; } };
+  return {
+    database, workspace, calls, origin, post, get, relayfile,
+    now: () => clock, advance: (ms: number) => { clock = new Date(clock.getTime() + ms); },
+    setIssued: (v: unknown) => { issued = v; }, setFailure: (e: Error | null) => { failure = e; } };
 }
 
 test("the broker routes do not exist without their secret", async (t) => {
@@ -141,4 +162,145 @@ test("a credential reference can name a run this database has never seen", async
      VALUES ('hash', $1, $2, '{}', now() + interval '1 hour')`,
     [randomUUID(), env.workspace.id],
   );
+});
+
+test("relayfile issues a run-scoped sh_fr_ credential with exact scopes", async (t) => {
+  const env = await setup(t);
+  const runId = randomUUID();
+  const mountPaths = [`/workflows/runs/${runId}`, "/github/acme/repo"];
+  const answer = await env.post("relayfile", { workspaceId: env.workspace.id, runId, mountPaths });
+  assert.equal(answer.status, 200);
+  assert.equal(answer.headers.get("cache-control"), "no-store");
+  assert.match(answer.body.relayfileToken, /^sh_fr_[A-Za-z0-9_-]{43}$/);
+  assert.deepEqual(answer.body.relayfileMountPaths, mountPaths);
+  assert.equal(answer.body.aud, FILES);
+  assert.equal(Date.parse(answer.body.relayfileTokenExpiresAt), env.now().getTime() + TTL_MS);
+  assert.deepEqual(answer.body.scopes, [
+    `relayfile:fs:read:/workflows/runs/${runId}`,
+    `relayfile:fs:read:/workflows/runs/${runId}/*`,
+    `relayfile:fs:write:/workflows/runs/${runId}`,
+    `relayfile:fs:write:/workflows/runs/${runId}/*`,
+    "relayfile:fs:read:/github/acme/repo",
+    "relayfile:fs:read:/github/acme/repo/*",
+    "relayfile:fs:write:/github/acme/repo",
+    "relayfile:fs:write:/github/acme/repo/*",
+  ]);
+  const looked = await env.relayfile.introspect(answer.body.relayfileToken);
+  assert.equal(looked?.credentialId, answer.body.credentialId);
+  assert.equal(looked?.runId, runId);
+  const readOnly = await env.post("relayfile", {
+    workspaceId: env.workspace.id, runId: randomUUID(), mountPaths: ["/workflows/schedules/nightly.sync"], readOnly: true,
+  });
+  assert.equal(readOnly.status, 200);
+  assert.deepEqual(readOnly.body.scopes, [
+    "relayfile:fs:read:/workflows/schedules/nightly.sync",
+    "relayfile:fs:read:/workflows/schedules/nightly.sync/*",
+  ]);
+  // The audit trail names the credential and run, never the token.
+  const audit = await env.database.query<{ action: string; target: string; actor_id: string }>(
+    "SELECT action, target, actor_id FROM admin_audit_events WHERE action = 'flows.relayfile_credential.issue'",
+  );
+  assert.equal(audit.rows.length, 2);
+  const row = audit.rows.find((entry) => entry.target.includes(runId))!;
+  assert.ok(row.target.includes(answer.body.credentialId));
+  assert.ok(row.target.includes(answer.body.relayfileTokenExpiresAt));
+  assert.equal(row.actor_id, "relayfile-control");
+  const everything = JSON.stringify((await env.database.query("SELECT * FROM admin_audit_events")).rows);
+  assert.equal(everything.includes(answer.body.relayfileToken), false);
+  assert.equal(everything.includes(readOnly.body.relayfileToken), false);
+  assert.equal(everything.includes("sh_fr_"), false);
+});
+
+test("relayfile refuses mount paths outside the rules", async (t) => {
+  const env = await setup(t);
+  const runId = randomUUID();
+  const root = `/workflows/runs/${runId}`;
+  const refused = async (mountPaths: unknown) => {
+    const answer = await env.post("relayfile", { workspaceId: env.workspace.id, runId, mountPaths });
+    assert.equal(answer.status, 400, JSON.stringify(mountPaths));
+    assert.equal(answer.body.error, "invalid_mount_paths", JSON.stringify(mountPaths));
+  };
+  await refused([`workflows/runs/${runId}`]);
+  await refused([root, "/github/../secrets"]);
+  await refused([`${root}/`]);
+  await refused([root, "/github/*"]);
+  await refused([root, "/github/./repo"]);
+  await refused([root, "/github//repo"]);
+  await refused([root, "/github/a b"]);
+  await refused([root, `/${"a".repeat(512)}`]);
+  await refused([`/workflows/runs/${randomUUID()}`]);
+  await refused(["/github/acme/repo", root]);
+  await refused(["/workflows/schedules/.hidden"]);
+  await refused([root, ...Array.from({ length: 16 }, (_, index) => `/p/${index}`)]);
+  await refused([]);
+  const malformed = await env.post("relayfile", { workspaceId: env.workspace.id, runId, mountPaths: [root], extra: 1 });
+  assert.equal(malformed.status, 400);
+  assert.equal(malformed.body.error, "invalid_request");
+  const sixteen = await env.post("relayfile", {
+    workspaceId: env.workspace.id, runId, mountPaths: [root, ...Array.from({ length: 15 }, (_, index) => `/p/${index}`)],
+  });
+  assert.equal(sixteen.status, 200);
+});
+
+test("relayfile is not configured without a worker Relayfile URL or introspection", async (t) => {
+  for (const options of [{ workerRelayfileUrl: "" }, { audiences: [] }]) {
+    const env = await setup(t, options);
+    const runId = randomUUID();
+    const answer = await env.post("relayfile", { workspaceId: env.workspace.id, runId, mountPaths: [`/workflows/runs/${runId}`] });
+    assert.equal(answer.status, 404);
+    assert.equal(answer.body.error, "relayfile_not_configured");
+  }
+});
+
+test("relayfile refuses an audience introspection would not accept, or a mismatched requested aud", async (t) => {
+  const env = await setup(t, { audiences: ["https://history.selfhosted.company"] });
+  const runId = randomUUID();
+  const body = { workspaceId: env.workspace.id, runId, mountPaths: [`/workflows/runs/${runId}`] };
+  const answer = await env.post("relayfile", body);
+  assert.equal(answer.status, 409);
+  assert.equal(answer.body.error, "relayfile_audience_not_accepted");
+  assert.match(answer.body.message, /SELFHOST_FLOWS_WORKER_RELAYFILE_URL/);
+  assert.match(answer.body.message, /SELFHOST_INTROSPECT_AUDIENCES/);
+
+  const accepted = await setup(t);
+  const ok = { workspaceId: accepted.workspace.id, runId, mountPaths: [`/workflows/runs/${runId}`] };
+  const matching = await accepted.post("relayfile", { ...ok, aud: "HTTPS://files.selfhosted.company:443/any/path" });
+  assert.equal(matching.status, 200);
+  assert.equal(matching.body.aud, FILES);
+  const mismatched = await accepted.post("relayfile", { ...ok, aud: "https://elsewhere.selfhosted.company" });
+  assert.equal(mismatched.status, 409);
+  assert.equal(mismatched.body.error, "relayfile_audience_not_accepted");
+  assert.match(mismatched.body.message, /does not match/);
+  assert.doesNotMatch(mismatched.body.message, /SELFHOST_INTROSPECT_AUDIENCES/);
+  assert.equal((await accepted.post("relayfile", { ...ok, aud: "" })).status, 400);
+});
+
+test("relayfile answers 404 for an unknown workspace", async (t) => {
+  const env = await setup(t);
+  const runId = randomUUID();
+  const answer = await env.post("relayfile", { workspaceId: randomUUID(), runId, mountPaths: [`/workflows/runs/${runId}`] });
+  assert.equal(answer.status, 404);
+  assert.equal(answer.body.error, "workspace_not_found");
+});
+
+test("re-issue revokes the earlier credential and run-end revoke ends the current one", async (t) => {
+  const env = await setup(t);
+  const runId = randomUUID();
+  const body = { workspaceId: env.workspace.id, runId, mountPaths: [`/workflows/runs/${runId}`] };
+  const first = await env.post("relayfile", body);
+  const second = await env.post("relayfile", body);
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.notEqual(first.body.relayfileToken, second.body.relayfileToken);
+  assert.equal((await env.relayfile.introspect(first.body.relayfileToken))?.revoked, true);
+  assert.equal((await env.relayfile.introspect(second.body.relayfileToken))?.revoked, false);
+  const revoke = await env.post("revoke", { runId });
+  assert.equal(revoke.status, 200);
+  assert.deepEqual(revoke.body, { revoked: true });
+  assert.equal((await env.relayfile.introspect(second.body.relayfileToken))?.revoked, true);
+  // Idempotent, and fine for a run that never had a Relayfile credential.
+  assert.deepEqual((await env.post("revoke", { runId })).body, { revoked: true });
+  const never = await env.post("revoke", { runId: randomUUID() });
+  assert.equal(never.status, 200);
+  assert.deepEqual(never.body, { revoked: true });
 });

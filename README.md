@@ -94,7 +94,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `RELAYHISTORY_BACKEND` | Optional; unset or `native` (the only backend). Any other value refuses startup |
 | `RELAYCONTROL_INTROSPECT_SECRET` | At least 32 bytes (`_FILE` supported). Bearer for `POST /internal/v1/auth/introspect`, shared only with the sessions pipeline ingest edge (and relayfile) |
 | `RELAYCHIEF_CONTROL_RELAY_SECRET` | Optional, at least 32 bytes, `_FILE` supported, must differ from the broker secret. Enables `POST /internal/v1/chief/workspaces/{id}/relay-agents`, which registers a chief as a Relaycast agent for relaychief-control. A repeat call rotates that chief's live token. Requires the `chief` feature. Unset, it answers 404. |
-| `RELAYFILE_CONTROL_BROKER_SECRET` | Optional, at least 32 bytes, `_FILE` supported. Enables the internal credential routes under `/internal/v1/flows/credentials/` for relayfile-control's Flows service. Unset, they answer 404. |
+| `RELAYFILE_CONTROL_BROKER_SECRET` | Optional, at least 32 bytes, `_FILE` supported. Enables the internal credential routes under `/internal/v1/flows/credentials/` for relayfile-control's Flows service. Unset, they answer 404. Its `relayfile` action mints the per-run path-scoped `sh_fr_` Relayfile credential a Flows worker uses; see [docs/flows-relayfile-credential.md](docs/flows-relayfile-credential.md). |
 | `SELFHOST_INTROSPECT_AUDIENCES` | Optional comma-separated http(s) origins a token may be introspected for, default `SESSION_READ_API_PUBLIC_URL`; must include it. Matched as normalized origins (scheme, lowercase host, port); `GET /readyz` lists them under `introspection.audiences` |
 | `SELFHOST_ACQUISITION_ISSUER_ENABLED` | Optional, default off (`true`/`false`). Turns on the dormant cloud-class acquisition assertion issuer ([docs/acquisition-issuer.md](docs/acquisition-issuer.md)); off, no other issuer variable is read and `/api/v1/acquisition/*` answers 404 |
 | `SELFHOST_ACQUISITION_ORIGIN` | Required when the issuer is enabled. The pipeline's `ACQUISITION_ORIGIN`; must also be listed in `SELFHOST_INTROSPECT_AUDIENCES` |
@@ -111,6 +111,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_FLOWS_GCS_PREFIX` | Optional object prefix in the bucket, default `relayflows` |
 | `SELFHOST_FLOWS_WORKER_RELAYCAST_URL` | Optional Relaycast origin handed to workers; default `RELAYCAST_PUBLIC_URL` |
 | `SELFHOST_FLOWS_WORKER_RELAYFILE_URL` | Optional Relayfile origin handed to workers; default empty |
+| `SELFHOST_FLOWS_RELAYFILE_CREDENTIAL_TTL_MS` | Optional lifetime of a per-run `sh_fr_` Relayfile credential, default `43200000` (12 h), minimum 5 minutes, maximum 24 hours. Credentials are minted only when `SELFHOST_FLOWS_WORKER_RELAYFILE_URL` is set and its origin is in `SELFHOST_INTROSPECT_AUDIENCES`; see [docs/flows-relayfile-credential.md](docs/flows-relayfile-credential.md) |
 | `SELFHOST_FLOWS_QUEUE_WAIT_MS` | How long queued work waits for a worker before failing, default 600000 |
 | `SELFHOST_FLOWS_ENROLLMENT_TTL_MS` | Default enrollment token lifetime, default 3600000 (max 7 days) |
 | `SELFHOST_FLOWS_QUEUE_PING_MS` | SSE keepalive cadence, default 20000; keep it below proxy idle timeouts |

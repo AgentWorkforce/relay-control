@@ -20,6 +20,7 @@ import { recordAudit } from "./admin/audit.js";
 import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
 import { handleChiefRelay } from "./chief-relay.js";
 import { handleFlowsBroker } from "./flows-broker.js";
+import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
@@ -336,6 +337,11 @@ export function createApp(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
   flows?: FlowsStore | (() => FlowsStore);
+  /**
+   * Per-run Relayfile credentials (docs/flows-relayfile-credential.md). Unset:
+   * built from the Flows settings, read only when a credential is issued.
+   */
+  flowRelayfileCredentials?: FlowRunRelayfileCredentials;
   admin?: AdminModule;
   telemetry?: TelemetryModule;
   /** bootstrap-signup lane: OIDC / email sign-in, invites (src/identity). */
@@ -629,6 +635,20 @@ export function createApp(input: {
   }
 
   const apiTokens = new ApiTokenStore(store.database);
+  const flowRelayfileCredentials = input.flowRelayfileCredentials ?? new FlowRunRelayfileCredentials(
+    store.database,
+    () => input.now?.() ?? new Date(),
+    () => {
+      const flowsStore = typeof input.flows === "function" ? input.flows() : input.flows;
+      return flowsStore
+        ? {
+            ttlMs: flowsStore.config.relayfileCredentialTtlMs,
+            workerRelayfileUrl: flowsStore.config.workerRelayfileUrl,
+            audiences: () => acceptedAudiences(config),
+          }
+        : null;
+    },
+  );
 
   /** Workspace agent tokens and the service token are not a person. */
   async function rejectServiceCredential(request: IncomingMessage): Promise<void> {
@@ -883,7 +903,9 @@ export function createApp(input: {
     // The sessions pipeline and relayfile verify relaycontrol access tokens here.
     // Internal only: never reachable through the /cloud alias.
     if (method === "POST" && publicPath === INTROSPECT_PATH) {
-      const outcome = await handleIntrospection(config, store, request, undefined, admin?.apiTokens);
+      const outcome = await handleIntrospection(
+        config, store, request, undefined, admin?.apiTokens, flowRelayfileCredentials,
+      );
       if (outcome.status === 200) json(response, 200, outcome.body, true);
       else json(response, outcome.status, { error: outcome.error, message: outcome.message }, true);
       return;
@@ -893,6 +915,7 @@ export function createApp(input: {
     if (await handleFlowsBroker(request, response, method, publicPath, {
       secret: config.relayfileControlBrokerSecret,
       admin,
+      relayfileCredentials: () => flowRelayfileCredentials,
       relaycastBinding: (id) => store.relaycastBinding(id),
       requireFlows: () => requireFeature("flows"),
       bearer,
