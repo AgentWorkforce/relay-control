@@ -8,9 +8,41 @@ import { loadTenancyConfig, type TenancyConfig } from "../tenancy.js";
  */
 export type BootstrapConfig = {
   organizationName: string;
-  adminEmail: string;
+  /**
+   * SELFHOST_BOOTSTRAP_ADMIN_EMAIL: made owner at first boot, before any
+   * sign-in (the original behaviour). Null when only SELFHOST_ADMIN_EMAILS
+   * is set.
+   */
+  adminEmail: string | null;
+  /**
+   * Every admin email (SELFHOST_BOOTSTRAP_ADMIN_EMAIL first, then
+   * SELFHOST_ADMIN_EMAILS), normalized and de-duplicated. On a verified
+   * sign-in the first of them to arrive becomes owner when the bootstrap
+   * organization has none; the rest become admin, once each.
+   */
+  adminEmails: string[];
   adminName: string;
   workspaceName: string;
+};
+
+export type SigninMethod = "email_link" | "password";
+export const SIGNIN_METHODS: readonly SigninMethod[] = ["email_link", "password"];
+
+/** OWASP Password Storage Cheat Sheet argon2id baseline; env may only raise it. */
+export const ARGON2_BASELINE = { memoryCost: 19_456, timeCost: 2, parallelism: 1 } as const;
+
+export type Argon2Params = { memoryCost: number; timeCost: number; parallelism: number };
+
+export type PasswordPepper = { version: number; secret: Buffer };
+
+export type PasswordConfig = {
+  argon2: Argon2Params;
+  /** Every pepper in SELFHOST_PASSWORD_PEPPER_FILE, highest version first. */
+  peppers: PasswordPepper[];
+  /** The version new hashes use (the highest), or null without a pepper file. */
+  currentPepperVersion: number | null;
+  /** SELFHOST_PASSWORD_HIBP=on: k-anonymity range check (fails open). */
+  hibp: boolean;
 };
 
 export type OidcConfig = {
@@ -51,6 +83,12 @@ export type IdentityConfig = {
   inviteTtlMs: number;
   /** SELFHOST_TENANCY and its multi-mode flags (src/tenancy.ts). */
   tenancy: TenancyConfig;
+  /** SELFHOST_SIGNIN_METHODS (OIDC is configured separately). */
+  signinMethods: SigninMethod[];
+  /** SELFHOST_LOGIN_LOGO_URL, an https URL shown on the sign-in page. */
+  logoUrl: string | null;
+  /** Password sign-in settings, or null when "password" is not enabled. */
+  password: PasswordConfig | null;
 };
 
 type Env = Record<string, string | undefined>;
@@ -112,18 +150,113 @@ function cleanLabel(value: string): string {
   return value.replace(/[\p{C}]/gu, " ").trim().slice(0, 120);
 }
 
+function adminEmailList(env: Env): string[] {
+  const raw = env.SELFHOST_ADMIN_EMAILS?.trim();
+  if (!raw) return [];
+  return [...new Set(raw.split(/[\s,]+/).filter(Boolean).map((item) => {
+    const email = normalizeEmailAddress(item);
+    if (!email) throw new Error(`SELFHOST_ADMIN_EMAILS must list email addresses, got ${JSON.stringify(item)}`);
+    return email;
+  }))];
+}
+
 function loadBootstrap(env: Env): BootstrapConfig | null {
   const organizationName = cleanLabel(env.SELFHOST_BOOTSTRAP_ORG_NAME ?? "");
   const rawEmail = env.SELFHOST_BOOTSTRAP_ADMIN_EMAIL?.trim() ?? "";
-  if (!organizationName && !rawEmail) return null;
-  if (!organizationName || !rawEmail) {
-    throw new Error("SELFHOST_BOOTSTRAP_ORG_NAME and SELFHOST_BOOTSTRAP_ADMIN_EMAIL must be set together");
+  const listed = adminEmailList(env);
+  if (!organizationName && !rawEmail && listed.length === 0) return null;
+  if (!organizationName || (!rawEmail && listed.length === 0)) {
+    throw new Error(
+      "SELFHOST_BOOTSTRAP_ORG_NAME must be set together with SELFHOST_BOOTSTRAP_ADMIN_EMAIL or SELFHOST_ADMIN_EMAILS",
+    );
   }
-  const adminEmail = normalizeEmailAddress(rawEmail);
-  if (!adminEmail) throw new Error("SELFHOST_BOOTSTRAP_ADMIN_EMAIL must be an email address");
-  const adminName = cleanLabel(env.SELFHOST_BOOTSTRAP_ADMIN_NAME ?? "") || adminEmail.slice(0, adminEmail.indexOf("@"));
+  const adminEmail = rawEmail ? normalizeEmailAddress(rawEmail) : null;
+  if (rawEmail && !adminEmail) throw new Error("SELFHOST_BOOTSTRAP_ADMIN_EMAIL must be an email address");
+  const adminEmails = [...new Set([...(adminEmail ? [adminEmail] : []), ...listed])];
+  const first = adminEmails[0]!;
+  const adminName = cleanLabel(env.SELFHOST_BOOTSTRAP_ADMIN_NAME ?? "") || first.slice(0, first.indexOf("@"));
   const workspaceName = cleanLabel(env.SELFHOST_BOOTSTRAP_WORKSPACE_NAME ?? "") || "Default";
-  return { organizationName, adminEmail, adminName, workspaceName };
+  return { organizationName, adminEmail, adminEmails, adminName, workspaceName };
+}
+
+function loadSigninMethods(env: Env, emailLoginFlag: boolean): SigninMethod[] {
+  const raw = env.SELFHOST_SIGNIN_METHODS?.trim();
+  if (!raw) return emailLoginFlag ? ["email_link"] : [];
+  const methods = [...new Set(raw.split(/[\s,]+/).filter(Boolean).map((item) => item.toLowerCase()))];
+  for (const method of methods) {
+    if (!(SIGNIN_METHODS as readonly string[]).includes(method)) {
+      throw new Error(`SELFHOST_SIGNIN_METHODS must list ${SIGNIN_METHODS.join(" and/or ")}, got ${JSON.stringify(method)}`);
+    }
+  }
+  if (emailLoginFlag && !methods.includes("email_link")) {
+    throw new Error("SELFHOST_EMAIL_LOGIN=true conflicts with SELFHOST_SIGNIN_METHODS without email_link");
+  }
+  return methods as SigninMethod[];
+}
+
+function loadLogoUrl(env: Env): string | null {
+  const raw = env.SELFHOST_LOGIN_LOGO_URL?.trim();
+  if (!raw) return null;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("SELFHOST_LOGIN_LOGO_URL must be an absolute https URL");
+  }
+  if (url.protocol !== "https:") throw new Error("SELFHOST_LOGIN_LOGO_URL must use https");
+  if (url.username || url.password) throw new Error("SELFHOST_LOGIN_LOGO_URL must not contain credentials");
+  if (raw.length > 2_048 || /[\p{C}\s"'<>\\]/u.test(raw)) {
+    throw new Error("SELFHOST_LOGIN_LOGO_URL must be at most 2048 characters without spaces, quotes or angle brackets");
+  }
+  return url.toString();
+}
+
+function raisedInteger(env: Env, name: string, baseline: number, max: number): number {
+  const raw = env[name]?.trim();
+  if (!raw) return baseline;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < baseline || value > max) {
+    throw new Error(`${name} must be an integer from ${baseline} (the OWASP baseline; it can only be raised) to ${max}`);
+  }
+  return value;
+}
+
+/**
+ * SELFHOST_PASSWORD_PEPPER_FILE: one pepper per line as `<version>:<secret>`
+ * (a single line without a version is version 1). The highest version hashes
+ * new passwords; older lines stay so existing hashes still verify and are
+ * re-hashed on the next sign-in. Blank lines and `#` comments are ignored.
+ */
+export function parsePepperFile(text: string): PasswordPepper[] {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+  if (lines.length === 0) throw new Error("SELFHOST_PASSWORD_PEPPER_FILE is empty");
+  const peppers = new Map<number, Buffer>();
+  for (const line of lines) {
+    const match = /^v?(\d{1,6}):(.*)$/.exec(line);
+    if (!match && lines.length > 1) {
+      throw new Error("SELFHOST_PASSWORD_PEPPER_FILE lines must be <version>:<secret> when it holds more than one pepper");
+    }
+    const version = match ? Number(match[1]) : 1;
+    const secret = Buffer.from(match ? match[2]!.trim() : line, "utf8");
+    if (version < 1) throw new Error("SELFHOST_PASSWORD_PEPPER_FILE versions start at 1");
+    if (secret.length < 32) throw new Error("SELFHOST_PASSWORD_PEPPER_FILE secrets must be at least 32 bytes");
+    if (peppers.has(version)) throw new Error(`SELFHOST_PASSWORD_PEPPER_FILE repeats version ${version}`);
+    peppers.set(version, secret);
+  }
+  return [...peppers].sort((a, b) => b[0] - a[0]).map(([version, secret]) => ({ version, secret }));
+}
+
+function loadPassword(env: Env): PasswordConfig {
+  const argon2 = {
+    memoryCost: raisedInteger(env, "SELFHOST_PASSWORD_ARGON2_MEMORY_KIB", ARGON2_BASELINE.memoryCost, 1_048_576),
+    timeCost: raisedInteger(env, "SELFHOST_PASSWORD_ARGON2_TIME_COST", ARGON2_BASELINE.timeCost, 10),
+    parallelism: raisedInteger(env, "SELFHOST_PASSWORD_ARGON2_PARALLELISM", ARGON2_BASELINE.parallelism, 16),
+  };
+  const pepperFile = env.SELFHOST_PASSWORD_PEPPER_FILE?.trim();
+  const peppers = pepperFile ? parsePepperFile(readFileSync(pepperFile, "utf8")) : [];
+  const hibpRaw = env.SELFHOST_PASSWORD_HIBP?.trim().toLowerCase() || "off";
+  if (hibpRaw !== "on" && hibpRaw !== "off") throw new Error("SELFHOST_PASSWORD_HIBP must be on or off");
+  return { argon2, peppers, currentPepperVersion: peppers[0]?.version ?? null, hibp: hibpRaw === "on" };
 }
 
 function loadOidc(env: Env): OidcConfig | null {
@@ -198,8 +331,13 @@ function loadSmtp(env: Env): SmtpConfig | null {
 
 export function loadIdentityConfig(env: Env = process.env): IdentityConfig {
   const smtp = loadSmtp(env);
-  const emailLogin = flag(env, "SELFHOST_EMAIL_LOGIN");
-  if (emailLogin && !smtp) throw new Error("SELFHOST_EMAIL_LOGIN=true requires SELFHOST_SMTP_HOST");
+  const emailLoginFlag = flag(env, "SELFHOST_EMAIL_LOGIN");
+  if (emailLoginFlag && !smtp) throw new Error("SELFHOST_EMAIL_LOGIN=true requires SELFHOST_SMTP_HOST");
+  const signinMethods = loadSigninMethods(env, emailLoginFlag);
+  if (signinMethods.length > 0 && !smtp) {
+    throw new Error("SELFHOST_SIGNIN_METHODS (email_link and password both send email) requires SELFHOST_SMTP_HOST");
+  }
+  const emailLogin = signinMethods.includes("email_link");
   const ttlHours = Number(env.SELFHOST_INVITE_TTL_HOURS?.trim() || "168");
   if (!Number.isInteger(ttlHours) || ttlHours < 1 || ttlHours > 720) {
     throw new Error("SELFHOST_INVITE_TTL_HOURS must be an integer from 1 to 720");
@@ -233,5 +371,8 @@ export function loadIdentityConfig(env: Env = process.env): IdentityConfig {
     autoJoinDomains,
     inviteTtlMs: ttlHours * 60 * 60 * 1_000,
     tenancy,
+    signinMethods,
+    logoUrl: loadLogoUrl(env),
+    password: signinMethods.includes("password") ? loadPassword(env) : null,
   };
 }
