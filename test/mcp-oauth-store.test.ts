@@ -151,14 +151,31 @@ test("tenant composite foreign keys and scope constraints reject malformed store
   assert.equal(await f.codeCount(), 0);
 });
 
-test("reserved0015 applies after a database already ran0018/0019 and is idempotent", async t => {
+test("OAuth migrations upgrade an existing database idempotently", async t => {
   const directory = await mkdtemp(join(tmpdir(),"mcp-oauth-upgrade-"));
   t.after(() => rm(directory,{ recursive: true, force: true }));
   const database = new PGliteDatabase();
   t.after(() => database.close());
   const source = defaultMigrationsDirectory();
-  for (const name of await readdir(source)) if (name.endsWith(".sql") && name !== "0015_mcp_oauth.sql") await copyFile(join(source,name),join(directory,name));
+  const oauthMigrations=new Set(["0015_mcp_oauth.sql","0028_mcp_oauth_sessions.sql","0030_mcp_oauth_revocations.sql"]);
+  for (const name of await readdir(source)) if (name.endsWith(".sql") && !oauthMigrations.has(name)) await copyFile(join(source,name),join(directory,name));
   await migrate(database,directory);
-  assert.deepEqual(await migrate(database),["0015_mcp_oauth.sql"]);
+  assert.deepEqual(await migrate(database),["0015_mcp_oauth.sql","0028_mcp_oauth_sessions.sql","0030_mcp_oauth_revocations.sql"]);
+  assert.deepEqual(await migrate(database),[]);
+});
+
+test("0028/0030 apply after the OAuth foundation without changing its checksum",async t=>{
+  const directory=await mkdtemp(join(tmpdir(),"mcp-oauth-foundation-upgrade-"));
+  t.after(()=>rm(directory,{ recursive:true,force:true }));
+  const database=new PGliteDatabase(); t.after(()=>database.close());
+  const source=defaultMigrationsDirectory();
+  for(const name of await readdir(source)) if(name.endsWith(".sql") && name!=="0028_mcp_oauth_sessions.sql" && name!=="0030_mcp_oauth_revocations.sql") {
+    await copyFile(join(source,name),join(directory,name));
+  }
+  await migrate(database,directory);
+  const before=(await database.query<{ checksum:string }>("SELECT checksum FROM selfhost_schema_migrations WHERE name='0015_mcp_oauth.sql'")).rows[0]!.checksum;
+  assert.deepEqual(await migrate(database),["0028_mcp_oauth_sessions.sql","0030_mcp_oauth_revocations.sql"]);
+  const after=(await database.query<{ checksum:string }>("SELECT checksum FROM selfhost_schema_migrations WHERE name='0015_mcp_oauth.sql'")).rows[0]!.checksum;
+  assert.equal(after,before);
   assert.deepEqual(await migrate(database),[]);
 });

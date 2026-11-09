@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { recordAudit, type AuditActor } from "./admin/audit.js";
 import type { Database, SqlExecutor } from "./database.js";
+import { revokeMcpOAuthGrantRows } from "./mcp/oauth/store.js";
 import {
   lockIdentity,
   lockOrganization,
@@ -387,8 +388,8 @@ export class ControlPlaneStore {
    * Deletes a workspace of this organization. Foreign keys cascade its
    * sessions, tokens, credentials, flows and workspace-scoped audit events;
    * the deletion itself is recorded at organization level so it outlives them.
-   * A Factory connection or binding restricts the delete until it is torn
-   * down. The organization's rows are locked so two concurrent deletes cannot
+   * Factory connections/bindings and live MCP OAuth grants or pending cleanup
+   * restrict deletion until teardown finishes. The organization's rows are locked so two concurrent deletes cannot
    * both pass the last-workspace check. The Relaycast workspace is not touched.
    */
   async deleteWorkspace(input: {
@@ -406,6 +407,15 @@ export class ControlPlaneStore {
         const target = rows.rows.find((row) => row.id === input.workspaceId);
         if (!target) return "not_found";
         if (rows.rows.length === 1 && !input.allowLast) return "last_workspace";
+        // Keep the workspace key/location until connector cleanup commits.
+        // The workspace row lock also fences a new grant's FK insertion;
+        // revocation alone must not let CASCADE discard pending remote work.
+        const oauth = await tx.query(`SELECT 1 FROM selfhost_mcp_oauth_grants
+          WHERE organization_id=$1 AND workspace_id=$2 AND revoked_at IS NULL
+          UNION ALL SELECT 1 FROM selfhost_mcp_oauth_revocations
+          WHERE organization_id=$1 AND workspace_id=$2 AND completed_at IS NULL
+          LIMIT 1`, [input.organizationId,input.workspaceId]);
+        if (oauth.rows.length) return "in_use";
         await tx.query("DELETE FROM selfhost_workspaces WHERE id = $1 AND organization_id = $2", [
           input.workspaceId,
           input.organizationId,
@@ -528,15 +538,20 @@ export class ControlPlaneStore {
   }
 
   /**
-   * `beforeCommit` runs inside the removal transaction once the membership row
-   * is gone, so dependent state (Factory bindings) is purged atomically.
+   * `beforeCommit` runs in the removal transaction after deletion (or an
+   * already-absent retry), with user->org locks held. A failure rolls back
+   * membership and dependent cleanup together. A remaining last owner never
+   * invokes cleanup.
    */
   async deleteMembership(
     organizationId: string,
     userId: string,
-    beforeCommit?: (tx: SqlExecutor) => Promise<void>,
+    beforeCommit?: (tx: SqlExecutor, member: { organizationId: string; userId: string }) => Promise<void>,
   ): Promise<boolean> {
     return this.database.transaction(async (tx) => {
+      // Consent/refresh and rejoin use this same order, before any membership row lock.
+      await lockUser(tx, userId);
+      await lockOrganization(tx, organizationId);
       await this.requireOrganization(tx, organizationId);
       const result = await tx.query<{ user_id: string }>(
         `DELETE FROM selfhost_organization_memberships
@@ -549,10 +564,23 @@ export class ControlPlaneStore {
           RETURNING user_id`,
         [organizationId, userId],
       );
-      const deleted = result.rows.length === 1;
-      if (deleted && beforeCommit) await beforeCommit(tx);
+      const deleted=result.rows.length===1;
+      // An idempotent retry can repair credentials from an earlier departure;
+      // never invoke the hook when a remaining last-owner row blocks deletion.
+      if (deleted || !(await tx.query("SELECT user_id FROM selfhost_organization_memberships WHERE organization_id=$1 AND user_id=$2",
+        [organizationId,userId])).rows.length) {
+        await beforeCommit?.(tx, { organizationId, userId });
+      }
       return deleted;
     });
+  }
+
+  /** Licence seats in use: organization members, owners included, across the installation. */
+  async countActiveMembers(): Promise<number> {
+    const result = await this.database.query<{ count: string }>(
+      `SELECT count(DISTINCT user_id)::text AS count FROM selfhost_organization_memberships`,
+    );
+    return Number(result.rows[0]?.count ?? 0);
   }
 
   async memberRole(organizationId: string, userId: string): Promise<Principal["role"] | null> {
@@ -616,6 +644,18 @@ export class ControlPlaneStore {
       organizationName: row.organization_name,
       role: row.role,
     }));
+  }
+
+  /** A workspace's Relaycast credentials, for the Flows service that assigns its runs. */
+  async relaycastBinding(workspaceId: string): Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null> {
+    const result = await this.database.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
+      "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM selfhost_workspaces WHERE id = $1",
+      [workspaceId],
+    );
+    const row = result.rows[0];
+    return row
+      ? { relaycastWorkspaceId: row.relaycast_workspace_id, relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring) }
+      : null;
   }
 
   async workspaceForUser(
@@ -892,7 +932,10 @@ export class ControlPlaneStore {
          JOIN selfhost_organization_memberships m
            ON m.organization_id = s.organization_id AND m.user_id = s.user_id
         WHERE s.access_token_hash = $1
-          AND s.revoked_at IS NULL AND s.access_token_expires_at > now()`,
+          AND s.revoked_at IS NULL AND s.access_token_expires_at > now()
+          -- Desktop-provider MCP credentials authenticate only at the MCP
+          -- endpoint (DesktopMcpCredentials.resolve), never at app routes.
+          AND NOT ('mcp:desktop' = ANY(s.scopes))`,
       [hashSecret(token)],
     );
     const row = result.rows[0];
@@ -920,7 +963,9 @@ export class ControlPlaneStore {
    * joins as authenticateAccessToken: a session whose membership or workspace
    * no longer holds is not found at all, nor in single tenancy is one on a
    * database that has gained a second organization. The joins bind the answer
-   * to the session's own organization in either mode.
+   * to the session's own organization in either mode. A Desktop handoff whose
+   * PKCE exchange has not happened is not found either: until then, whoever
+   * holds it may only have intercepted the redirect.
    */
   async introspectAccessToken(token: string): Promise<IntrospectedToken | null> {
     const result = await this.database.query<{
@@ -938,7 +983,15 @@ export class ControlPlaneStore {
     }>(
       `SELECT s.user_id, u.email, s.organization_id, s.workspace_id, m.role, s.scopes,
               s.access_token_hash,
-              s.revoked_at IS NOT NULL AS revoked,
+              (s.revoked_at IS NOT NULL OR (
+                'mcp:desktop' = ANY(s.scopes) AND NOT EXISTS (
+                  SELECT 1
+                    FROM selfhost_desktop_mcp_credentials c
+                    JOIN selfhost_token_sessions p ON p.id = c.parent_session_id
+                   WHERE c.token_session_id = s.id
+                     AND p.revoked_at IS NULL AND p.refresh_token_expires_at > now()
+                     AND p.desktop_verified_at IS NOT NULL
+                ))) AS revoked,
               s.access_token_expires_at <= now() AS expired,
               COALESCE(s.last_refreshed_at, s.created_at) AS issued_at,
               s.access_token_expires_at AS expires_at
@@ -949,6 +1002,7 @@ export class ControlPlaneStore {
          JOIN selfhost_organization_memberships m
            ON m.organization_id = s.organization_id AND m.user_id = s.user_id
         WHERE s.access_token_hash = $1
+          AND NOT (s.desktop_exchange_challenge IS NOT NULL AND s.desktop_exchanged_at IS NULL)
           AND ($2::text = 'multi' OR NOT EXISTS (
             SELECT 1
               FROM selfhost_organizations other
@@ -1014,12 +1068,16 @@ export class ControlPlaneStore {
    * bound to the app's S256 code_challenge. It authenticates like any access
    * token until it expires; the verifier redeems it once for a renewable pair
    * (exchangeDesktopHandoff). Its refresh token is never handed out.
+   * `consentedHostName` is set only when the person approved "Agent Relay
+   * Desktop on <host>" on the consent screen; it is what makes the redeemed
+   * session a verified Desktop sign-in (desktop MCP provider credentials).
    */
   async issueDesktopHandoff(input: {
     userId: string;
     organizationId: string;
     workspaceId: string;
     codeChallenge: string;
+    consentedHostName?: string;
   }): Promise<IssuedTokens> {
     return this.database.transaction((tx) =>
       this.issueTokens(tx, {
@@ -1032,6 +1090,7 @@ export class ControlPlaneStore {
         refreshTtlMs: DESKTOP_HANDOFF_TTL_MS,
         desktopExchangeChallenge: input.codeChallenge,
         scopes: DESKTOP_SCOPES,
+        desktopHostName: input.consentedHostName,
       }));
   }
 
@@ -1053,9 +1112,10 @@ export class ControlPlaneStore {
         token_family_id: string;
         desktop_exchange_challenge: string | null;
         scopes: string[];
+        desktop_host_name: string | null;
       }>(
         `SELECT id, user_id, organization_id, workspace_id, token_family_id,
-                desktop_exchange_challenge, scopes
+                desktop_exchange_challenge, scopes, desktop_host_name
            FROM selfhost_token_sessions
           WHERE access_token_hash = $1 AND revoked_at IS NULL
             AND desktop_exchanged_at IS NULL AND desktop_exchange_challenge IS NOT NULL
@@ -1080,9 +1140,14 @@ export class ControlPlaneStore {
         organizationId: row.organization_id,
         workspaceId: row.workspace_id,
         label: DESKTOP_SESSION_LABEL,
+      }, {
+        tokenFamilyId: row.token_family_id,
         // The handoff's own scopes: a handoff minted before desktop:workspaces
         // existed never gains it.
-      }, { tokenFamilyId: row.token_family_id, scopes: row.scopes });
+        scopes: row.scopes,
+        // Proven: consented host on the handoff plus the S256 verifier now.
+        ...(row.desktop_host_name ? { desktopHostName: row.desktop_host_name, desktopVerified: true } : {}),
+      });
     });
   }
 
@@ -1259,6 +1324,89 @@ export class ControlPlaneStore {
     return result.rows.length === 1;
   }
 
+  /**
+   * Revokes every live session of a person (browser, CLI and Desktop token
+   * sessions, and MCP OAuth grants) and deletes the Desktop relay identity
+   * tokens they synced, e.g. after a password reset. Workspace API keys
+   * belong to the workspace, and person messaging identities
+   * (selfhost_person_identities, the person's human agent per workspace)
+   * are not sessions, so neither is touched.
+   */
+  async revokeAllForUser(
+    executor: SqlExecutor,
+    userId: string,
+    reason: string,
+  ): Promise<{ sessions: number; mcpGrants: number; desktopRelayIdentities: number }> {
+    // The user lock comes first, before any row is changed: it is the lock
+    // order (identity, user, organizations in id order) every writer of
+    // this person's sessions and grants follows, so nothing for this person
+    // commits between the session UPDATE and the grant revocation below.
+    await lockUser(executor, userId);
+    const sessions = await executor.query<{ id: string }>(
+      `UPDATE selfhost_token_sessions
+          SET revoked_at = now(), revoked_reason = $2, updated_at = now()
+        WHERE user_id = $1 AND revoked_at IS NULL
+        RETURNING id`,
+      [userId, reason],
+    );
+    // Desktop relay identity tokens let the MCP endpoint act as the person's
+    // Desktop agents. They are deleted (the table has no revoked state), so
+    // this server stops using them; Desktop syncs them again after the
+    // person signs in. The Relaycast-issued tokens themselves are not
+    // revoked at Relaycast (no revocation path exists for them here).
+    const desktopRelayIdentities = await executor.query<{ id: string }>(
+      "DELETE FROM selfhost_desktop_relay_identities WHERE user_id = $1 RETURNING id",
+      [userId],
+    );
+    // MCP OAuth grants go through the MCP store's revoker so each grant's
+    // session family ends and a revocation tombstone (Relaycast teardown)
+    // commits with it. That revoker needs user->org locks, taken in the
+    // tenancy lock order (user above, then organizations in id order).
+    const organizations = await executor.query<{ organization_id: string }>(
+      `SELECT DISTINCT organization_id FROM selfhost_mcp_oauth_grants
+        WHERE user_id = $1 AND revoked_at IS NULL ORDER BY organization_id`,
+      [userId],
+    );
+    for (const { organization_id } of organizations.rows) await lockOrganization(executor, organization_id);
+    const grants = await executor.query<{ id: string }>(
+      `SELECT id FROM selfhost_mcp_oauth_grants WHERE user_id = $1 AND revoked_at IS NULL ORDER BY id`,
+      [userId],
+    );
+    const now = new Date();
+    let mcpGrants = 0;
+    for (const { id } of grants.rows) {
+      if (await revokeMcpOAuthGrantRows(executor, id, reason, now)) mcpGrants += 1;
+    }
+    return { sessions: sessions.rows.length, mcpGrants, desktopRelayIdentities: desktopRelayIdentities.rows.length };
+  }
+
+  /**
+   * Ends what a person approved but nobody has collected yet: device and
+   * browser authorizations approved by them (CLI, Desktop, dashboard) become
+   * expired, and unredeemed MCP OAuth authorization codes are voided. Run
+   * with revokeAllForUser so a credential change leaves no way back in.
+   */
+  async voidPendingAuthorizationsForUser(executor: SqlExecutor, userId: string): Promise<{ deviceAuthorizations: number; mcpCodes: number }> {
+    const devices = await executor.query<{ id: string }>(
+      `UPDATE selfhost_device_authorizations
+          SET status = 'expired', updated_at = now()
+        WHERE approved_by_user_id = $1 AND status = 'approved'
+        RETURNING id`,
+      [userId],
+    );
+    // Expired, not consumed: redeeming a consumed code is treated as a
+    // replay, which is a different path. The MCP store's membership
+    // departure hooks void codes the same way.
+    const codes = await executor.query<{ code_hash: string }>(
+      `UPDATE selfhost_mcp_oauth_authorization_codes
+          SET expires_at = now()
+        WHERE user_id = $1 AND consumed_at IS NULL AND expires_at > now()
+        RETURNING code_hash`,
+      [userId],
+    );
+    return { deviceAuthorizations: devices.rows.length, mcpCodes: codes.rows.length };
+  }
+
   private async upsertUser(
     tx: SqlExecutor,
     emailInput: string,
@@ -1322,6 +1470,8 @@ export class ControlPlaneStore {
       refreshTtlMs?: number;
       tokenFamilyId?: string;
       desktopExchangeChallenge?: string;
+      desktopHostName?: string;
+      desktopVerified?: boolean;
     },
   ): Promise<IssuedTokens> {
     const context = await tx.query<{ valid: boolean }>(
@@ -1348,8 +1498,9 @@ export class ControlPlaneStore {
       `INSERT INTO selfhost_token_sessions
         (id, token_family_id, user_id, organization_id, workspace_id, label, scopes,
          access_token_hash, refresh_token_hash, access_token_expires_at, refresh_token_expires_at,
-         desktop_exchange_challenge)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+         desktop_exchange_challenge, desktop_host_name, desktop_verified_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+               CASE WHEN $14::boolean THEN now() ELSE NULL END)`,
       [
         sessionId,
         options.tokenFamilyId ?? randomUUID(),
@@ -1363,6 +1514,8 @@ export class ControlPlaneStore {
         accessExpires,
         refreshExpires,
         options.desktopExchangeChallenge ?? null,
+        options.desktopHostName ?? null,
+        options.desktopVerified === true,
       ],
     );
     return {

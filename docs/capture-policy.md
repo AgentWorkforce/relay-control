@@ -33,8 +33,8 @@ cookie `DELETE` needs an allowed Origin or `Sec-Fetch-Site: same-origin`):
 (403 `operator_controls_not_entitled`); reads are never gated. `licence` needs the licence feature
 `operator_controls` (feature switch, PR #37) and is not entitled until that lands.
 
-**Erasure**: user-scope erasure never removes membership; erase and offboard are separate operator actions
-(deletion-gate branch, not this one).
+**Erasure**: erasure never removes membership; erase and offboard are separate operator actions. See
+[session-erasure.md](session-erasure.md) for the per-session hard delete, which shares this entitlement.
 
 **Desktop semantics**: a key present in `settings` locks that choice; Desktop hides the matching user control
 (hidden, not disabled). An absent key means the user chooses. Desktop reads the policy at sign-in, token refresh

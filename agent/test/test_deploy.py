@@ -94,9 +94,11 @@ class DeployTests(unittest.TestCase):
             prompt = "Literal `reboot` and $(reboot)\nCONTROL_AGENT_DEPLOY\n"
             (root / "lead-prompt.md").write_text(prompt)
             (root / "apply.py").write_text((ROOT / "apply.py").read_text())
+            (root / "node_test_guard.py").write_text((ROOT / "node_test_guard.py").read_text())
             script = deploy.command(SHA, root)
             encoded = script.split("'", 2)[1]
             self.assertEqual(json.loads(base64.b64decode(encoded))["lead_prompt"], prompt)
+            self.assertEqual(json.loads(base64.b64decode(encoded))["node_test_guard"], (ROOT / "node_test_guard.py").read_text())
             self.assertNotIn("$(reboot)", script)
 
     def test_privilege_check_precedes_all_host_mutation(self):
@@ -117,9 +119,31 @@ class DeployTests(unittest.TestCase):
                  patch.object(apply, "checked_file") as write, \
                  patch.object(apply.subprocess, "run") as run:
                 with self.assertRaisesRegex(RuntimeError, "drain it"):
-                    apply.main({"revision": SHA, "lead_prompt": "test"})
+                    apply.main({"revision": SHA, "lead_prompt": "test", "node_test_guard": (ROOT / "node_test_guard.py").read_text()})
                 write.assert_not_called()
                 run.assert_not_called()
+
+    def test_lead_cannot_be_rethrottled_by_deployment(self):
+        self.assertEqual(apply.budget_properties("agent-host-lead.service", 1001), ["MemoryHigh=infinity", "MemoryMax=8G"])
+        self.assertEqual(apply.budget_properties("user-1001.slice", 1001), ["MemoryHigh=6G", "MemoryMax=8G"])
+        self.assertIn("MemoryHigh=infinity", apply.LEAD_DROPIN)
+
+    def test_unrelated_node_binary_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "node"
+            path.write_bytes(b"\x7fELF\xff")
+            with self.assertRaisesRegex(RuntimeError, "existing Node binary"):
+                apply.validate_node_target(path)
+            path.write_text("#!/bin/sh\nexec something-else\n")
+            with self.assertRaisesRegex(RuntimeError, "unrelated Node"):
+                apply.validate_node_target(path)
+
+    def test_existing_reviewed_guard_can_be_updated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "node"
+            apply.validate_node_target(path)
+            path.write_text((ROOT / "node_test_guard.py").read_text())
+            apply.validate_node_target(path)
 
     def test_role_has_no_broad_or_additional_write_capability(self):
         policy = json.loads((ROOT / "iam/deploy-policy.json").read_text())

@@ -4,6 +4,7 @@ import { z } from "zod";
 import { SHARED_SESSION_READ_TOOLS } from "./catalog.js";
 import { type McpContext, SharedSessionsToolError, sessionCitation, toolError } from "./context.js";
 import { registerSessionTimings } from "./session-timings.js";
+import { agentPrefixTooShort, AGENT_VALUE, MAX_AGENT_LENGTH, selectAgent } from "../sessions/agent-query.js";
 
 /**
  * Shared-session transcript reads, ported from Cloud's
@@ -127,8 +128,25 @@ const ToolEventSchema = z.object({
 const SearchOutputSchema = z.object({
   workspace_id: z.string(),
   matches: z.array(ToolEventSchema),
+  /** Present for an agent search, which lists sessions rather than transcript excerpts. */
+  sessions: z.array(z.object({
+    session_id: z.string(),
+    source: z.string().nullable(),
+    last_activity_at: z.string().nullable(),
+    citation_url: z.string().url(),
+  })).optional(),
+  ignored_agents: z.array(z.string()).optional(),
   next_cursor: z.string().nullable(),
   correlation_id: z.string(),
+});
+
+const AgentSessionsPageSchema = z.object({
+  sessions: z.array(z.object({
+    sessionId: z.string().min(1),
+    source: z.string().nullish(),
+    lastTs: z.string().nullish(),
+  })),
+  nextCursor: z.string().nullish(),
 });
 
 const SessionOutputSchema = z.object({
@@ -305,9 +323,10 @@ export function registerSharedSessionReads(server: McpServer, context: McpContex
   server.registerTool("search_shared_sessions", {
     title: "Search shared session transcripts",
     description:
-      "Search the actual transcript event content shared in an authorized workspace. Returns bounded matching excerpts and source-session citation links, not merely session metadata.",
+      "Search the actual transcript event content shared in an authorized workspace. Returns bounded matching excerpts and source-session citation links, not merely session metadata. Set agent to instead list one agent's sessions, newest first, returned in sessions.",
     inputSchema: {
-      query: z.string().trim().min(1).max(500).describe("Case-insensitive transcript text to find."),
+      query: z.string().trim().min(1).max(500).optional().describe("Case-insensitive transcript text to find. Required unless agent is set."),
+      agent: z.string().trim().min(1).max(MAX_AGENT_LENGTH).regex(AGENT_VALUE).optional().describe("One agent's Relay name, without a leading @, to list that agent's sessions. Exact and case-insensitive. Cannot be combined with query text."),
       workspace_id: WorkspaceIdSchema,
       source: SourceSchema,
       project: z.string().trim().min(1).max(512).optional(),
@@ -323,6 +342,34 @@ export function registerSharedSessionReads(server: McpServer, context: McpContex
     const correlationId = randomUUID();
     try {
       const workspaceId = resolveWorkspace(input.workspace_id, context);
+      const { agent, ignored, text } = selectAgent(input.agent, input.query, Boolean(context.agentTokens));
+      if (agent) {
+        if (agent.length > MAX_AGENT_LENGTH) throw new SharedSessionsToolError(`An agent name can be at most ${MAX_AGENT_LENGTH} characters.`);
+        if (text) throw new SharedSessionsToolError("An agent search cannot be combined with transcript text yet. Search by agent or by text.");
+        if (agent.endsWith("*") || agentPrefixTooShort(agent)) throw new SharedSessionsToolError("Agent prefix search is not available through this tool yet. Use the exact agent name.");
+        const list = new URLSearchParams({ agent, limit: String(input.limit) });
+        if (input.source) list.set("source", input.source);
+        if (input.project) list.set("project", input.project);
+        if (input.since) list.set("since", input.since);
+        if (input.until) list.set("until", input.until);
+        if (input.cursor) list.set("cursor", input.cursor);
+        const sessions = parsePage(AgentSessionsPageSchema,
+          await context.readHistory(`/v1/sessions?${list.toString()}`, { timeoutMessage: SEARCH_TIMEOUT_MESSAGE }));
+        return toolSuccess({
+          workspace_id: workspaceId,
+          matches: [],
+          sessions: sessions.sessions.map((row) => ({
+            session_id: row.sessionId,
+            source: row.source ?? null,
+            last_activity_at: row.lastTs ?? null,
+            citation_url: sessionCitation(origin, row.sessionId, row.source ?? undefined),
+          })),
+          ignored_agents: ignored,
+          next_cursor: sessions.nextCursor ?? null,
+          correlation_id: correlationId,
+        });
+      }
+      if (!input.query) throw new SharedSessionsToolError("Provide query text or an agent.");
       const params = new URLSearchParams({ q: input.query, limit: String(input.limit), order: "desc", maxContent: String(input.max_content) });
       if (input.source) params.set("source", input.source);
       if (input.project) params.set("project", input.project);
@@ -339,7 +386,9 @@ export function registerSharedSessionReads(server: McpServer, context: McpContex
       });
     } catch (error) {
       console.error("[selfhost-mcp] Search failed", { correlationId });
-      return toolError(error, { correlationId, structured: true });
+      // Error content is not a successful SearchOutputSchema value. SDK
+      // clients validate any structuredContent even when isError is true.
+      return toolError(error, { correlationId });
     }
   });
 

@@ -2,8 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { decryptSecret, encryptSecret } from "../crypto.js";
 import type { SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RosterAgent } from "../messaging/relaycast.js";
+import { DesktopIdentityUnavailable, DESKTOP_IDENTITY_MESSAGES, linkedDesktopIdentity } from "../messaging/desktop-identities.js";
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
+import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
 
 /**
  * Hosted relay participants and the Relaycast operations behind the
@@ -14,10 +16,16 @@ import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
  * (`as`). The server keeps no state between requests: every call looks the
  * participant up again, verifies that the remote agent still carries this
  * owner's metadata, and serializes join/leave per owner with a Postgres
- * advisory lock. A desktop chat's native session context is not an identity
- * here: Cloud would act as the linked Desktop identity, which self-host
- * cannot link yet, so every caller acts as a hosted participant. Desktop-linked identities, person sends (`as_person`), OAuth
- * grants, events inboxes, launches and Capy are not part of self-host.
+ * advisory lock.
+ *
+ * Managed (Desktop provider) calls: a request admitted with a `mcp:desktop`
+ * provider credential acts only as the Desktop identity synced for its
+ * verified native chat (a Copilot chat named by a verified attestation). No
+ * verified chat, or no matching synced identity, means the actor tools are
+ * unavailable; they never fall back to a hosted participant.
+ * Other callers act as hosted participants; their native session context is
+ * not an identity here. Person sends (`as_person`), OAuth grants, events
+ * inboxes, launches and Capy are not part of self-host.
  */
 
 export class RelayToolError extends Error {
@@ -37,6 +45,9 @@ const AS_PERSON_UNAVAILABLE =
 
 export const RELAY_COORDINATION_GUIDANCE = "DM a specific agent by default. Use channels only to coordinate a larger swarm or broadcast to many agents, and subscribe only to channels you need. Reply to a channel post in that channel with post_relay_channel (thread_id for its thread), not by DM, unless the reply is private. At task start, check list_relay_agents and DM peers whose work your task affects, without waiting to be asked.";
 export const HOSTED_REPLY_GUIDANCE = "replies arrive in check_relay_inbox; poll it";
+export const DESKTOP_REPLY_GUIDANCE = "replies will be injected into your session by Agent Relay Desktop";
+export const MANAGED_AS_REFUSED = "This managed chat can only act as its verified desktop identity.";
+export const MANAGED_JOIN_REFUSED = "This chat can only use its verified desktop identity.";
 /** Cloud's DESKTOP_RELAY_GUIDANCE, adapted: self-host cannot link a desktop identity yet. */
 export const DESKTOP_RELAY_GUIDANCE = "This self-hosted site does not link Agent Relay Desktop identities yet: this MCP session messages as its hosted participant, and replies arrive in check_relay_inbox.";
 /** Cloud's UNLINKED_CHANNEL_GUIDANCE without the desktop link, which self-host does not offer. */
@@ -57,6 +68,7 @@ export function normalizeChannelName(channel: string): string {
 }
 const channelReplyHint = (channel: string, threadId: string) => `post_relay_channel channel=${channel} thread_id=${threadId}`;
 const hostedChannelDelivery = (channel: string) => `Posts in #${channel} will arrive in check_relay_inbox; poll it.`;
+const desktopChannelDelivery = (channel: string) => `Posts in #${channel} will be injected into this session by Agent Relay Desktop.`;
 
 function automaticParticipantName(user: { name: string; email: string }, sessionHash: string): string {
   const label = user.name.trim() || user.email.split("@")[0] || "agent";
@@ -79,9 +91,9 @@ export type ParticipantRow = {
   tokenCiphertext: string;
 };
 
-type Selector = { name: string } | { sessionHash: string };
+type Selector = { name: string } | { sessionHash: string } | { agentRemoteId: string };
 
-const COLUMNS = `id, workspace_id, user_id, relaycast_workspace_id, session_hash, agent_name, agent_remote_id, token_ciphertext`;
+const COLUMNS = `p.id, p.workspace_id, p.user_id, p.relaycast_workspace_id, p.session_hash, p.agent_name, p.agent_remote_id, p.token_ciphertext`;
 
 function rowFrom(row: Record<string, unknown>): ParticipantRow {
   return {
@@ -97,12 +109,14 @@ function rowFrom(row: Record<string, unknown>): ParticipantRow {
 }
 
 /** Only the owner's own rows are ever visible: workspace and user are always in the predicate. */
-async function findParticipant(executor: SqlExecutor, workspaceId: string, userId: string, selector: Selector) {
-  const [column, value] = "name" in selector ? ["agent_name", selector.name] : ["session_hash", selector.sessionHash];
+async function findParticipant(executor: SqlExecutor, workspaceId: string, userId: string, organizationId: string, selector: Selector) {
+  const [column, value] = "name" in selector ? ["agent_name", selector.name]
+    : "agentRemoteId" in selector ? ["agent_remote_id", selector.agentRemoteId] : ["session_hash", selector.sessionHash];
   const result = await executor.query(
-    `SELECT ${COLUMNS} FROM selfhost_hosted_relay_participants
-      WHERE workspace_id = $1 AND user_id = $2 AND ${column} = $3`,
-    [workspaceId, userId, value],
+    `SELECT ${COLUMNS} FROM selfhost_hosted_relay_participants p
+      JOIN selfhost_workspaces w ON w.id=p.workspace_id
+      WHERE p.workspace_id = $1 AND p.user_id = $2 AND w.organization_id=$3 AND p.${column} = $4`,
+    [workspaceId, userId, organizationId, value],
   );
   return result.rows[0] ? rowFrom(result.rows[0]) : null;
 }
@@ -204,18 +218,53 @@ const rejectedToken = (name: string) => new RelayToolError(
   `The relay token for participant ${name} was rejected by Relaycast. Call join_relay with name=${name} to recover it, or leave_relay to remove it.`);
 type ChannelInput = { as?: string; as_person?: boolean; hosted?: boolean };
 
-export function relayService(context: McpContext) {
+function createRelayService(context: McpContext) {
   const { database, keyring, client, sessionId } = context.relay;
   const workspaceId = context.workspace.id;
+  const organizationId = context.workspace.organizationId;
+  const executor = database;
+  const oauth = context.oauth;
   const userId = context.principal.userId;
   const key = context.workspace.relaycastApiKey;
   const relayWorkspaceId = context.workspace.relaycastWorkspaceId;
-  const sessionHash = sessionId ? ownerHash(sessionId) : null;
+  const sessionHash = !oauth && sessionId ? ownerHash(sessionId) : null;
   const owner = ownerHash(userId);
+  const desktopCall = context.desktopCall;
+  /** A Desktop-provider credential: only the verified native chat's identity may act. */
+  const managed = desktopCall.provider !== undefined;
+  const linkedKind = managed ? "desktop" as const : "hosted" as const;
+  const channelDelivery = managed ? desktopChannelDelivery : hostedChannelDelivery;
+  let linked: Promise<{ name: string; address: string; token: string }> | undefined;
+
+  /** The synced Desktop identity of this call's verified native chat; throws when there is none. */
+  function desktop() {
+    linked ??= (async () => {
+      if (!desktopCall.nativeSession) throw new RelayToolError(DESKTOP_IDENTITY_MESSAGES.unverified);
+      try {
+        return await linkedDesktopIdentity({
+          database, keyring, client, workspaceId, userId, relaycastWorkspaceId: relayWorkspaceId,
+          nativeSession: desktopCall.nativeSession, sourceId: desktopCall.nativeSourceId,
+        });
+      } catch (error) {
+        if (error instanceof DesktopIdentityUnavailable) throw new RelayToolError(error.message);
+        throw error;
+      }
+    })();
+    return linked;
+  }
+
+  /** Managed calls cannot choose another actor. */
+  async function managedActorOnly(as?: string, alternate = false) {
+    if (managed && (as || alternate)) {
+      await desktop();
+      throw new RelayToolError(MANAGED_AS_REFUSED);
+    }
+  }
 
   /** Serializes join and leave for this owner in Postgres; every store access inside uses `tx`. */
   function withOwnerLock<T>(run: (tx: SqlExecutor) => Promise<T>): Promise<T> {
     return database.transaction(async (tx) => {
+      if (oauth) await oauth.lock(tx);
       await tx.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
         ["selfhost-hosted-mcp", `${workspaceId}:${userId}`]);
       return run(tx);
@@ -238,7 +287,10 @@ export function relayService(context: McpContext) {
       return { remote: remote.status === "released" ? null : remote, tokenUsable: true };
     } catch (error) {
       if (!(error instanceof RelaycastCallError) || error.status !== 401) throw error;
-      return { remote: await client.getRosterAgent(key, row.agentName), tokenUsable: false };
+      const remote = oauth
+        ? (await client.listAgents(key, "all", { includeStale: true })).find(agent=>agent.id===row.agentRemoteId) ?? null
+        : await client.getRosterAgent(key, row.agentName);
+      return { remote, tokenUsable: false };
     }
   }
 
@@ -248,11 +300,17 @@ export function relayService(context: McpContext) {
    * refuses a rejected token unless `allowRejected`.
    */
   async function participant(as?: string, options: ParticipantOptions = {}): Promise<Hosted | null> {
-    const { allowMissing = false, allowGone = false, allowRejected = false, executor = database } = options;
-    const selector: Selector | null = as ? { name: as } : sessionHash ? { sessionHash } : null;
-    const row = selector ? await findParticipant(executor, workspaceId, userId, selector) : null;
+    if (oauth && !options.executor) return withOwnerLock(tx=>participant(as,{...options,executor:tx}));
+    const { allowMissing = false, allowGone = false, allowRejected = false, executor: query = executor } = options;
+    const requested = as;
+    const approvedId = oauth?.access.agentRemoteId;
+    if (oauth && !approvedId) { oauth.assertActor(as); as = oauth.access.agentName; }
+    const selector: Selector | null = approvedId ? { agentRemoteId: approvedId }
+      : as ? { name: as } : sessionHash ? { sessionHash } : null;
+    const row = selector ? await findParticipant(query, workspaceId, userId, organizationId, selector) : null;
     if (!row) {
-      if (as && !allowMissing) throw new RelayToolError("No hosted participant with that name is owned by you in this workspace.");
+      if (approvedId && !allowGone) throw new RelayToolError("The approved agent is no longer available. Reconnect the app to choose an agent.");
+      if (as && !allowMissing && !(oauth && !requested) && !approvedId) throw new RelayToolError("No hosted participant with that name is owned by you in this workspace.");
       return null;
     }
     if (row.relayWorkspaceId !== relayWorkspaceId) {
@@ -265,8 +323,12 @@ export function relayService(context: McpContext) {
     }
     let name = row.agentName;
     if (remote && remote.name !== row.agentName) {
-      await updateParticipant(executor, row.id, { agentName: remote.name });
+      await updateParticipant(query, row.id, { agentName: remote.name });
       name = remote.name;
+    }
+    if (oauth) {
+      oauth.assertActor(requested, name);
+      if (remote) await oauth.pin(query, { workspaceId, userId, agentName: name, agentRemoteId: row.agentRemoteId });
     }
     if (!tokenUsable && !allowRejected) throw rejectedToken(name);
     return { row: { ...row, agentName: name }, token, name, remotePresent: remote !== null, tokenUsable };
@@ -333,6 +395,7 @@ export function relayService(context: McpContext) {
       ? await client.recoverHosted(key, name, remote.id, userId)
       : await client.registerHosted(key, name, {
         source: HOSTED_SOURCE, cloud_workspace_id: workspaceId, owner_hash: owner, objective,
+        ...(oauth ? { created_by: "mcp-oauth" } : {}),
       });
     try {
       await insertParticipant(tx, {
@@ -340,6 +403,7 @@ export function relayService(context: McpContext) {
         agentName: registered.name, agentRemoteId: registered.id,
         tokenCiphertext: encryptSecret(registered.token, keyring.active),
       });
+      if (oauth) await oauth.pin(tx, { workspaceId, userId, agentName: registered.name, agentRemoteId: registered.id });
     } catch (error) {
       if (!remote) await client.releaseHosted(key, registered.name, registered.id).catch(() => {});
       throw error;
@@ -375,16 +439,26 @@ export function relayService(context: McpContext) {
   }
 
   async function join(input: { name?: string; description?: string; desktop_address?: string }) {
+    if (managed) {
+      const identity = await desktop();
+      if (input.name || input.description || (input.desktop_address && input.desktop_address !== identity.address)) {
+        throw new RelayToolError(MANAGED_JOIN_REFUSED);
+      }
+      return { joined: true, linked: "desktop" as const, name: identity.name, address: identity.address,
+        already_joined: true, reply_guidance: DESKTOP_REPLY_GUIDANCE };
+    }
     if (input.desktop_address) throw new RelayToolError(DESKTOP_ADDRESS_UNAVAILABLE);
-    if (!sessionHash && !input.name) {
+    if (oauth && !oauth.access.agentRemoteId) oauth.assertActor(input.name);
+    if (!sessionHash && !input.name && !oauth) {
       throw new RelayToolError("Initialize MCP to receive Mcp-Session-Id, or pass an explicit name and use as on later calls.");
     }
     const joined = await withOwnerLock(async (tx) => {
       const bound = await participant(undefined, { allowRejected: true, executor: tx });
-      if (bound && input.name && bound.name !== input.name) {
+      if (oauth && bound) oauth.assertActor(input.name, bound.name);
+      if (bound && input.name && bound.name !== input.name && !oauth) {
         throw new RelayToolError("This MCP session is already joined. Leave before choosing another name.");
       }
-      const requestedName = input.name ?? automaticParticipantName(context.principal, sessionHash!);
+      const requestedName = oauth?.access.agentName ?? input.name ?? automaticParticipantName(context.principal, sessionHash!);
       const existing = bound ?? await participant(requestedName, { allowMissing: true, allowRejected: true, executor: tx });
       if (existing) {
         if (sessionHash && existing.row.sessionHash && existing.row.sessionHash !== sessionHash) {
@@ -405,8 +479,12 @@ export function relayService(context: McpContext) {
   }
 
   /** The participant `as` names, else this session's, auto-joining this session when it has none. */
-  async function hostedActor<T>(as: string | undefined, fn: (identity: Hosted) => Promise<T>): Promise<T> {
-    let hosted = await participant(as);
+  async function hostedActor<T>(as: string | undefined, fn: (identity: Identity) => Promise<T>): Promise<T> {
+    if (managed) {
+      await managedActorOnly(as);
+      return fn(await desktop());
+    }
+    let hosted = await participant(as, { allowMissing: Boolean(oauth) });
     if (!hosted) {
       await join({});
       hosted = await participant();
@@ -422,13 +500,17 @@ export function relayService(context: McpContext) {
    * when `create`. Unchosen, `unlinked` decides: "error" throws, "none" acts
    * as nobody.
    */
-  async function channelActor<T>(input: ChannelInput, create: boolean, fn: (identity: Hosted) => Promise<T>,
+  async function channelActor<T>(input: ChannelInput, create: boolean, fn: (identity: Identity) => Promise<T>,
     unlinked: "error" | "none" = "error"): Promise<T | null> {
     if (input.as_person && input.as) throw new RelayToolError("Choose either as_person or as, not both.");
     if (input.hosted && (input.as_person || input.as)) throw new RelayToolError("Choose one of hosted, as or as_person.");
+    if (managed) {
+      await managedActorOnly(input.as, Boolean(input.hosted || input.as_person));
+      return fn(await desktop());
+    }
     if (input.as_person) throw new RelayToolError(AS_PERSON_UNAVAILABLE);
     if (!input.as) {
-      const chosen = input.hosted || (sessionHash && await findParticipant(database, workspaceId, userId, { sessionHash }));
+      const chosen = oauth || input.hosted || (sessionHash && await findParticipant(executor, workspaceId, userId, organizationId, { sessionHash }));
       if (!chosen) {
         if (unlinked === "none") return null;
         throw new RelayToolError(UNLINKED_CHANNEL_GUIDANCE);
@@ -463,10 +545,21 @@ export function relayService(context: McpContext) {
     join,
 
     async leave(as?: string) {
+      if (managed) {
+        await managedActorOnly(as);
+        await desktop();
+        return { joined: false, desktop_agent_unchanged: true, native_chat_identity_retained: true };
+      }
       return withOwnerLock(async (tx) => {
         // Release uses the workspace key, so a rejected token can still leave.
         const hosted = await participant(as, { allowGone: true, allowRejected: true, executor: tx });
         if (!hosted) return { joined: false, already_left: true };
+        if (oauth && hosted.row.sessionHash) {
+          throw new RelayToolError("A native MCP session still uses this agent. Leave from that session instead.");
+        }
+        if (oauth && await oauth.claimedByOther(tx, { agentName: hosted.name, agentRemoteId: hosted.row.agentRemoteId })) {
+          throw new RelayToolError("Another active connection still uses this agent. Disconnect it before leaving.");
+        }
         if (hosted.remotePresent) {
           try {
             await client.releaseHosted(key, hosted.name, hosted.row.agentRemoteId);
@@ -481,6 +574,12 @@ export function relayService(context: McpContext) {
     },
 
     async status(as?: string) {
+      if (managed) {
+        await managedActorOnly(as);
+        const identity = await desktop();
+        return { joined: true, linked: "desktop" as const, name: identity.name, address: identity.address,
+          unread_count: null, guidance: DESKTOP_REPLY_GUIDANCE };
+      }
       const hosted = await participant(as);
       if (!hosted) return { joined: false, name: null, address: null, unread_count: 0,
         guidance: "Send a message with send_relay_message to auto-join this MCP session, or call join_relay first." };
@@ -491,6 +590,13 @@ export function relayService(context: McpContext) {
     },
 
     async inbox(as: string | undefined, acknowledge: string[]) {
+      if (managed) {
+        await managedActorOnly(as);
+        const identity = await desktop();
+        return { linked: "desktop" as const, name: identity.name, address: identity.address, messages: [],
+          polling_needed: false,
+          guidance: "Replies are injected into your session by Agent Relay Desktop; check_relay_inbox is not used for this linked identity." };
+      }
       const hosted = await participant(as);
       if (!hosted) throw new RelayToolError("No hosted participant is bound to this MCP session. Send a message with send_relay_message to auto-join, or call join_relay first.");
       await touchPresence(hosted.token);
@@ -535,6 +641,7 @@ export function relayService(context: McpContext) {
     async send(input: { to: string; text: string; reply_to?: string; as?: string; as_person?: boolean; idempotency_key?: string },
       serverIdempotencyKey: string = randomUUID()) {
       if (input.as_person && input.as) throw new RelayToolError("Choose either as_person or as, not both.");
+      await managedActorOnly(input.as, Boolean(input.as_person));
       if (input.as_person) throw new RelayToolError(AS_PERSON_UNAVAILABLE);
       // The recipient is validated before any identity is joined, so an
       // unknown recipient never leaves a participant behind.
@@ -572,7 +679,8 @@ export function relayService(context: McpContext) {
           message_id: sent.message.id, conversation_id: sent.conversationId, idempotency_key: responseIdempotencyKey,
           delivery: peer.online ? "queued_unconfirmed" : "queued_offline",
           note: "Accepted by Relaycast; delivery and reading are not confirmed.",
-          reply_guidance: HOSTED_REPLY_GUIDANCE, desktop_relay_guidance: DESKTOP_RELAY_GUIDANCE };
+          ...(managed ? { reply_guidance: DESKTOP_REPLY_GUIDANCE }
+            : { reply_guidance: HOSTED_REPLY_GUIDANCE, desktop_relay_guidance: DESKTOP_RELAY_GUIDANCE }) };
       });
     },
 
@@ -580,7 +688,8 @@ export function relayService(context: McpContext) {
       // Names resolve within the actor's own DMs; only a machine address needs a lookup.
       const peerName = input.agent.includes("@") ? (await explicitAgent(input.agent))?.name : input.agent;
       if (!peerName) throw new RelayToolError("Unknown or stale machine address in this workspace.");
-      const hosted = await participant(input.as);
+      await managedActorOnly(input.as);
+      const hosted: Identity | null = managed ? await desktop() : await participant(input.as);
       if (!hosted) return { you: null, conversation_id: null, messages: [], earlier: null };
       await touchPresence(hosted.token);
       const conv = await conversation(hosted.token, hosted.name, peerName);
@@ -604,9 +713,9 @@ export function relayService(context: McpContext) {
         acted = true;
         return { you: identity.name, ids: new Set((await client.authenticatedAgent(identity.token)).channels.map(row => row.id)) };
       }, "none")]);
-      const unlinked = !acted && !input.as && !input.hosted &&
-        !(sessionHash && await findParticipant(database, workspaceId, userId, { sessionHash }));
-      return { you: mine?.you ?? null, linked: mine ? "hosted" as const : null,
+      const unlinked = !managed && !acted && !input.as && !input.hosted &&
+        !(sessionHash && await findParticipant(executor, workspaceId, userId, organizationId, { sessionHash }));
+      return { you: mine?.you ?? null, linked: mine ? linkedKind : null,
         ...(unlinked ? { note: UNLINKED_CHANNEL_GUIDANCE } : {}),
         channels: channels.filter(channel => !channel.archived && !channel.name.startsWith(RESERVED_CHANNEL_PREFIX)).map(channel => ({
           name: channel.name, topic: channel.topic, member_count: channel.memberCount, subscribed: mine?.ids.has(channel.id) ?? false })),
@@ -633,8 +742,8 @@ export function relayService(context: McpContext) {
             alreadySubscribed = (await client.joinChannel(identity.token, channel)).alreadyMember;
           }
         }
-        return { subscribed: true, channel, you: identity.name, linked: "hosted" as const, created,
-          already_subscribed: alreadySubscribed, delivery: hostedChannelDelivery(channel), reply_guidance: CHANNEL_REPLY_GUIDANCE };
+        return { subscribed: true, channel, you: identity.name, linked: linkedKind, created,
+          already_subscribed: alreadySubscribed, delivery: channelDelivery(channel), reply_guidance: CHANNEL_REPLY_GUIDANCE };
       }))!;
     },
 
@@ -668,10 +777,10 @@ export function relayService(context: McpContext) {
         } else {
           messageId = (await client.postChannelMessage({ token: identity.token, channel, text: input.text, idempotencyKey })).id;
         }
-        return { from: identity.name, channel, linked: "hosted" as const, message_id: messageId, thread_id: threadId,
+        return { from: identity.name, channel, linked: linkedKind, message_id: messageId, thread_id: threadId,
           idempotency_key: responseIdempotencyKey,
           note: "Accepted by Relaycast and delivered to the channel's subscribers; reading is not confirmed.",
-          reply_guidance: `${hostedChannelDelivery(channel)} Continue this thread with ${channelReplyHint(channel, threadId ?? messageId)}.` };
+          reply_guidance: `${channelDelivery(channel)} Continue this thread with ${channelReplyHint(channel, threadId ?? messageId)}.` };
       })) ?? notSubscribed(channel);
     },
 
@@ -689,4 +798,29 @@ export function relayService(context: McpContext) {
       })) ?? notSubscribed(channel);
     },
   };
+}
+
+/** Native calls retain their flow; OAuth tools recheck the exact live bearer before acting. */
+export function relayService(context: McpContext) {
+  const service = createRelayService(context);
+  if (!context.oauth) return service;
+  const fenced = {} as typeof service;
+  for (const name of Object.keys(service) as Array<keyof typeof service>) {
+    const call = async (...args: unknown[]) => {
+      try {
+        await context.relay.database.transaction(tx=>context.oauth!.lock(tx));
+        // Join/pin commits before sending. A lost send response therefore
+        // retains the identity for idempotent retry and revocation cleanup.
+        const method = service[name] as (...values: unknown[]) => Promise<unknown>;
+        return await method(...args);
+      } catch (error) {
+        if (error instanceof McpOAuthAccessRefused || error instanceof McpOAuthActorRefused) {
+          throw new RelayToolError(error.message);
+        }
+        throw error;
+      }
+    };
+    Object.defineProperty(fenced,name,{value:call,enumerable:true});
+  }
+  return fenced;
 }

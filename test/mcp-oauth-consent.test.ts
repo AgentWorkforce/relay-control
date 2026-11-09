@@ -4,6 +4,8 @@ import { createMcpOAuthConsentHandlers, McpOAuthContinuationError, mcpOAuthSetup
   type McpConsentSession } from "../src/mcp/oauth/consent.js";
 import { createMcpOAuthProtocol, pkceS256 } from "../src/mcp/oauth/protocol.js";
 
+import { McpOAuthAgentNameTakenError } from "../src/mcp/oauth/store.js";
+
 const ORIGIN = "https://relay.example.test";
 const SHARED = "/api/v1/mcp/shared-sessions";
 const EVENTS = "/api/v1/mcp/relay-events";
@@ -14,7 +16,7 @@ const params = { client_id: client.clientId, response_type: "code", redirect_uri
 const body = { params, decision: "approve", workspace_id: principal.workspaceId, agent_name: "fake-agent" };
 
 function harness(options: { session?: McpConsentSession | null; access?: boolean; grok?: boolean; connected?: boolean;
-  continuationError?: boolean; setup?: boolean } = {}) {
+  continuationError?: boolean; nameTakenError?: boolean; setup?: boolean } = {}) {
   const calls: Array<{ operation: string; input?: unknown }> = [];
   const protocol = createMcpOAuthProtocol({ publicOrigin: ORIGIN, enabledResources: [SHARED, EVENTS] });
   const handlers = createMcpOAuthConsentHandlers({
@@ -27,6 +29,7 @@ function harness(options: { session?: McpConsentSession | null; access?: boolean
         ? { ...client, redirectUris: options.grok ? ["https://www.cursor.com/agents/fake/callback"] : client.redirectUris } : null; },
       async createMcpOAuthAuthorizationCode(request, owner, continuation) {
         calls.push({ operation: "code", input: { request, owner, continuation } });
+        if (options.nameTakenError) throw new McpOAuthAgentNameTakenError();
         if (options.continuationError) throw new McpOAuthContinuationError("The selected connection changed.");
         return "mcpac_fake-code";
       },
@@ -154,4 +157,12 @@ test("agent-name advisory stays session/workspace/live-member scoped", async () 
     assert.equal(response.status, status);
     assert.equal(calls.some(call => call.operation === "name"), status === 200);
   }
+});
+
+
+test("SQL store typed name collision maps to 409 even after advisory preflight passed", async () => {
+  const { handlers }=harness({ nameTakenError:true });
+  const response=await handlers.authorize(request());
+  assert.equal(response.status,409);
+  assert.equal((await response.json()).error,"agent_name_taken");
 });

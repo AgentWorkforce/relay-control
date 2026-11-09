@@ -22,6 +22,8 @@ export async function handleChiefRoutes(
     ): Promise<{ workspace: { id: string; organizationId: string } }>;
     requestObject(request: IncomingMessage): Promise<Record<string, unknown>>;
     csrfAllowed(request: IncomingMessage): boolean;
+    /** Throws the feature refusal (403) unless Chief is selected on this installation. */
+    requireFeature(): void;
     json(
       response: ServerResponse,
       status: number,
@@ -41,6 +43,8 @@ export async function handleChiefRoutes(
     decodeURIComponent(match[1]!),
     method !== "GET",
   );
+  // After membership (non-members keep their 404/403), before any backend call.
+  deps.requireFeature();
   if (method !== "GET" && !deps.csrfAllowed(request)) {
     deps.json(
       response,
