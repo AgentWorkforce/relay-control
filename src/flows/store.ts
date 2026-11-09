@@ -957,13 +957,13 @@ export class FlowsStore {
       result?: unknown;
     } = {},
   ): Promise<boolean> {
-    const updated = await tx.query(
+    const updated = await tx.query<{ id: string; workspace_id: string }>(
       `UPDATE workflow_runs
           SET status = $2, error = COALESCE($3, error), summary = COALESCE($4, summary),
               exit_code = COALESCE($5, exit_code), duration_ms = COALESCE($6, duration_ms),
               result = COALESCE($7::jsonb, result), completed_at = now(), updated_at = now()
         WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
-        RETURNING id`,
+        RETURNING id, workspace_id`,
       [
         runId,
         status,
@@ -979,6 +979,10 @@ export class FlowsStore {
     await tx.query(
       "UPDATE cli_credential_refs SET revoked_at = now() WHERE run_id = $1 AND revoked_at IS NULL",
       [runId],
+    );
+    await tx.query(
+      "UPDATE flow_run_relayfile_credentials SET revoked_at = now() WHERE run_id = $1 AND workspace_id = $2 AND revoked_at IS NULL",
+      [runId, updated.rows[0]!.workspace_id],
     );
     await this.appendEventTx(tx, runId, `run.${status}`, null, {
       ...(detail.error ? { error: detail.error } : {}),
@@ -1145,7 +1149,7 @@ export class FlowsStore {
       if (!this.relayfileCredentials) {
         throw new FlowRelayfileCredentialError(404, "relayfile_not_configured", "Relayfile credentials are not configured");
       }
-      relayfile = await this.relayfileCredentials.issue({
+      relayfile = await this.relayfileCredentials.issueForLocalRun({
         workspaceId: row.workspace_id,
         runId: row.id,
         mountPaths: [`/workflows/runs/${row.id}`],
