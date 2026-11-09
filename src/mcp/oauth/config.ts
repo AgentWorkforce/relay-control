@@ -51,10 +51,20 @@ export function loadMcpOAuthConfig(env: Env, readSecret: (name:string)=>string|u
 }
 
 function loadOidc(env: Env, readSecret: (name:string)=>string|undefined): McpOidcConfiguration|null {
+  // An unreadable _FILE (missing, unmounted, no permission) marks the flow
+  // unavailable instead of stopping start-up. The detail names the variable
+  // only, never the path or the loader's message. A value supplied both
+  // directly and via _FILE is an operator contradiction and still throws.
+  const secret=(name:string)=>{
+    try { return readSecret(name); } catch(error) {
+      if(env[name]?.trim() && env[`${name}_FILE`]?.trim()) throw error;
+      throw new OidcUnavailable(`${name} could not be read; check its _FILE path`);
+    }
+  };
   const keyId=env.SELFHOST_MCP_OIDC_SIGNING_KEY_ID?.trim();
-  const privateKeyPem=readSecret("SELFHOST_MCP_OIDC_SIGNING_KEY");
-  const subjectSalt=readSecret("SELFHOST_MCP_OIDC_SUBJECT_SALT");
-  const previousJson=readSecret("SELFHOST_MCP_OIDC_PREVIOUS_PUBLIC_KEYS");
+  const privateKeyPem=secret("SELFHOST_MCP_OIDC_SIGNING_KEY");
+  const subjectSalt=secret("SELFHOST_MCP_OIDC_SUBJECT_SALT");
+  const previousJson=secret("SELFHOST_MCP_OIDC_PREVIOUS_PUBLIC_KEYS");
   let oidc:McpOidcConfiguration|null=null;
   if(keyId || privateKeyPem || subjectSalt || previousJson) {
     if(!keyId || !privateKeyPem || !subjectSalt) {

@@ -128,3 +128,23 @@ test("review repro: a missing MCP-only signing-key file produces sanitized unava
   assert.ok(!config.unavailable.detail.includes(directory));
   assert.ok(!config.unavailable.detail.includes("fake-salt"));
 });
+
+test("an unreadable MCP-only secret file names only its variable while core secret files stay strict",async t=>{
+  const directory=await mkdtemp(join(tmpdir(),"mcp-config-missing-"));t.after(()=>rm(directory,{recursive:true,force:true}));
+  const missing=join(directory,"absent");
+  for(const name of ["SELFHOST_MCP_OIDC_SIGNING_KEY","SELFHOST_MCP_OIDC_SUBJECT_SALT","SELFHOST_MCP_OIDC_PREVIOUS_PUBLIC_KEYS"]) {
+    const env:Record<string,string>={...inputs};delete env[name];env[name+"_FILE"]=missing;
+    const config=load(env);
+    assert.deepEqual(config.unavailable,{reason:"oidc_signing_key",detail:`${name} could not be read; check its _FILE path`},name);
+    assert.equal(config.oidc,null);assert.equal(mcpOAuthActive({mcpOAuth:config}),false);
+  }
+  const core={DATABASE_URL:"postgres://unused",SELFHOST_PUBLIC_URL:"https://relay.example.test",
+    RELAYCAST_URL:"http://relaycast.test",RELAYCAST_PUBLIC_URL:"https://relaycast.selfhosted.company",
+    RELAYHISTORY_URL:"http://history.test",RELAYHISTORY_PUBLIC_URL:"https://history.selfhosted.company",
+    SELFHOST_ENCRYPTION_KEY_ID:"fake-key",SELFHOST_ENCRYPTION_KEY:Buffer.alloc(32,7).toString("base64")};
+  assert.throws(()=>loadConfig({...core,SELFHOST_BOOTSTRAP_TOKEN_FILE:missing}),/ENOENT/);
+  const active=loadConfig({...core,SELFHOST_BOOTSTRAP_TOKEN:"fake-bootstrap-token-at-least-32-bytes",
+    SELFHOST_MCP_OIDC_SIGNING_KEY_ID:"fake-active",SELFHOST_MCP_OIDC_SIGNING_KEY_FILE:missing,SELFHOST_MCP_OIDC_SUBJECT_SALT:"fake-stable-salt"});
+  assert.equal(active.mcpOAuth?.unavailable?.reason,"oidc_signing_key");
+  assert.ok(!active.mcpOAuth!.unavailable!.detail.includes(directory));
+});
