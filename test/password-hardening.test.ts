@@ -52,6 +52,34 @@ test("lockout: a parallel burst gets no more than the free allowance", async (t)
   assert.equal((await login(ctx, "burst@acme.test", PASSWORD)).status, 200);
 });
 
+test("login: more than 60 attempts a minute from one IP answer 429 rate_limited before the lockout", async (t) => {
+  const ctx = await setup(t);
+  const statuses: number[] = [];
+  for (let i = 0; i < 61; i += 1) statuses.push((await login(ctx, `flood${i}@acme.test`, "wrong password here", "198.51.100.61")).status);
+  assert.ok(statuses.slice(0, 60).every((status) => status === 401));
+  const refused = await login(ctx, "flood-last@acme.test", "wrong password here", "198.51.100.61");
+  assert.equal(refused.status, 429);
+  assert.equal(refused.body.error, "rate_limited");
+  assert.equal((await login(ctx, "flood-other@acme.test", "wrong password here", "198.51.100.62")).status, 401, "other addresses are unaffected");
+  ctx.clock.now += 61_000;
+  assert.equal((await login(ctx, "flood-later@acme.test", "wrong password here", "198.51.100.61")).status, 401, "the window resets");
+});
+
+test("lockout: a locked IP spraying new addresses does not grow selfhost_login_attempts", async (t) => {
+  const ctx = await setup(t);
+  for (let i = 0; i < LOCKOUT.ip.free; i += 1) await login(ctx, `spray${i}@acme.test`, "wrong password here", "198.51.100.90");
+  const count = async () => Number((await ctx.database.query<{ n: string }>("SELECT count(*) AS n FROM selfhost_login_attempts")).rows[0]!.n);
+  const before = await count();
+  const ipRow = async () => (await ctx.database.query<{ failures: number }>(
+    "SELECT failures FROM selfhost_login_attempts WHERE subject LIKE 'ip:%'")).rows[0]!.failures;
+  const failuresBefore = await ipRow();
+  for (let i = 0; i < 10; i += 1) {
+    assert.equal((await login(ctx, `fresh${i}@acme.test`, "wrong password here", "198.51.100.90")).status, 401);
+  }
+  assert.equal(await count(), before, "locked attempts insert no rows");
+  assert.equal(await ipRow(), failuresBefore, "and count nothing");
+});
+
 test("client IP: X-Forwarded-For is ignored unless SELFHOST_TRUSTED_PROXIES says how many proxies to trust", async (t) => {
   for (const proxies of [null, "0"]) {
     const ctx = await setup(t, { trustedProxies: proxies });

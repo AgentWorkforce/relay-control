@@ -121,7 +121,9 @@ export class PasswordStore {
   /**
    * Reserves one attempt for every subject before the password is checked,
    * in one transaction that row-locks them (in a fixed order). If any subject
-   * is inside a lock nothing is counted and the attempt is refused; otherwise
+   * is inside a lock the transaction rolls back, so nothing is counted and no
+   * row is created (a locked flood of new addresses cannot grow the table),
+   * and the attempt is refused; otherwise
    * each counter goes up and may start the next lock. Concurrent attempts
    * serialize on the rows, so a parallel burst gets no more than the free
    * allowance. The row locks are not held across the argon2id check.
@@ -132,6 +134,14 @@ export class PasswordStore {
     const now = new Date(this.now());
     const ordered = [...rules].sort((a, b) => a.subject.localeCompare(b.subject));
     return this.database.transaction(async (tx) => {
+      // Locked existing rows first, without inserting anything.
+      const existing = await tx.query<{ locked_until: Date | string | null }>(
+        "SELECT locked_until FROM selfhost_login_attempts WHERE subject = ANY($1::text[]) ORDER BY subject FOR UPDATE",
+        [ordered.map((entry) => entry.subject)],
+      );
+      if (existing.rows.some((row) => row.locked_until && new Date(row.locked_until).getTime() > now.getTime())) {
+        return { allowed: false as const };
+      }
       const rows: Array<{ subject: string; rule: LockoutRule; failures: number; idle: boolean }> = [];
       for (const { subject, rule } of ordered) {
         await tx.query(

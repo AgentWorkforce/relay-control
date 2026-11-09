@@ -46,6 +46,8 @@ const RATE = {
   mailPerIp: { limit: 10, windowMs: 10 * 60 * 1_000 },
   mailPerAddress: { limit: 3, windowMs: 10 * 60 * 1_000 },
   tokenPerIp: { limit: 30, windowMs: 5 * 60 * 1_000 },
+  /** In-memory, in front of the Postgres lockout: bounds DB and argon2id work per IP. */
+  loginPerIp: { limit: 60, windowMs: 60 * 1_000 },
   personalOrgPerAddress: { limit: 3, windowMs: 60 * 60 * 1_000 },
   personalOrgPerIp: { limit: 10, windowMs: 60 * 60 * 1_000 },
 };
@@ -192,13 +194,19 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
   }
 
   /**
-   * One password attempt. The attempt is reserved against the account and
-   * IP counters first (refused outright inside a lock), then checked. Every
-   * refusal costs one argon2id verification, so neither the answer nor its
-   * timing separates an unknown address, a wrong password and a lock.
+   * One password attempt. A per-IP in-memory limit comes first (429), then
+   * the attempt is reserved against the account and IP counters (refused
+   * outright inside a lock), then checked. An unknown address and a wrong
+   * password both cost one argon2id verification, so neither the answer nor
+   * its timing separates them. A locked attempt skips argon2id: whether a
+   * lock is in force is not an account secret (the lock follows from the
+   * caller's own attempts), and skipping it keeps a locked flood cheap.
    */
   async function attempt(request: IncomingMessage, rawEmail: string, password: string, inviteTokenHash: string | null): Promise<SignInResult | null> {
     const ip = clientIp(request).slice(0, 64);
+    if (limited(`pw-login-ip:${ip}`, RATE.loginPerIp)) {
+      throw new IdentityError(429, "rate_limited", "Too many sign-in attempts. Try again in a minute.");
+    }
     const email = normalizeEmailAddress(rawEmail);
     const rules = [{ subject: ipSubject(ip), rule: LOCKOUT.ip }, ...(email ? [{ subject: accountSubject(email), rule: LOCKOUT.account }] : [])];
     const [reservation, credential] = await Promise.all([
@@ -216,10 +224,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       await audit(credential?.userId ?? null, "login.password.failure", `email=${email ?? "invalid"} ip=${ip} reason=${reason}`);
       return null;
     };
-    if (!reservation.allowed) {
-      await hasher.dummyVerify(password);
-      return fail("locked");
-    }
+    if (!reservation.allowed) return fail("locked");
     if (!credential) {
       await hasher.dummyVerify(password);
       return fail(email ? "unknown_account" : "invalid_email");
