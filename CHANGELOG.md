@@ -3,6 +3,12 @@
 Notable changes to the self-hosted control plane. Dates and versions are
 assigned at release.
 
+## Unreleased
+
+- Added: the analytics collector accepts registered session ingest, reader and
+  consumer producers with closed event vocabularies, scoped attribution and
+  separate producer tokens.
+
 ## 0.5.8 (2026-11-09)
 
 - Added: per-run, path-scoped Relayfile credentials for Flows workers
