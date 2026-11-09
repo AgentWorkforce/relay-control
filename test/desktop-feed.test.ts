@@ -1215,3 +1215,37 @@ for (const file of ["valid-stable", "valid-beta"]) {
     assert.equal(new Set(manifest.assets.map((entry: Json) => entry.id)).size, manifest.assets.length);
   });
 }
+
+test("signer cap: the cloud release fits under the KMS limit and the untrimmed one does not", async (t) => {
+  const world = await setup(t);
+  const { publisher } = await provision(world, "acme", "AgentRelay", world.w1, { quota_bytes: 1_000_000_000_000 });
+  world.signer.max = 4096;
+  world.storage.host = `${"b".repeat(63)}.s3.ap-southeast-3.amazonaws.com`;
+  const version = "2026.12.12";
+  const asset = (name: string, platform: string, arch: string, kind: string, osFloor?: number) => ({
+    name, platform, arch, ...(osFloor ? { os_floor: osFloor } : {}), kind, size: 1_999_999_999, sha256: "a".repeat(64),
+  });
+  const packaged = (rest: string) => `AgentRelay-${version}-${rest}`;
+  const cloud = ["arm64", "x64"].flatMap((arch) => [
+    asset(packaged(`macOS15-${arch}.dmg`), "macOS", arch, "image", 15),
+    asset(packaged(`Linux-${arch}.tar.gz`), "Linux", arch, "tarball"),
+    asset(packaged(`Linux-${arch}.deb`), "Linux", arch, "deb"),
+    asset(packaged(`Linux-${arch}-probe.tar.gz`), "Linux", arch, "probe"),
+    asset(packaged(`Windows-${arch}.zip`), "Windows", arch, "zip"),
+    asset(packaged(`Windows-${arch}-probe.zip`), "Windows", arch, "probe"),
+    asset(packaged(`Windows-${arch}-Setup.exe`), "Windows", arch, "setup"),
+  ]).concat([asset("install.sh", "Linux", "x64", "install-script"), asset("install.ps1", "Windows", "x64", "install-script")]);
+  assert.equal(cloud.length, 16);
+  const untrimmed = cloud.concat(["arm64", "x64"].flatMap((arch) => [
+    asset(packaged(`macOS-${arch}.dmg`), "macOS", arch, "image"),
+    asset(packaged(`macOS-${arch}-probe.tar.gz`), "macOS", arch, "probe"),
+  ]));
+  const create = (expected_assets: typeof cloud) => world.call(`${FEED}/releases`, {
+    token: publisher, profile: "acme", body: { version, channel: "stable", notes: "n".repeat(300), expected_assets },
+  });
+  const refused = await create(untrimmed);
+  assert.equal(refused.status, 422, refused.text);
+  assert.equal(refused.json.error, "manifest_too_large");
+  const created = await create(cloud);
+  assert.equal(created.status, 201, created.text);
+});

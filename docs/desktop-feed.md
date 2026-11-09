@@ -55,9 +55,13 @@ byte for byte.
 KMS caps a `RAW` message at 4096 bytes. `POST /releases` computes the exact
 canonical size and answers 422 `manifest_too_large` with `canonical_bytes` and
 `max_canonical_bytes` before anything is uploaded, and publish checks again.
-A cloud profile's release is trimmed to fit: 12 assets (the floored macOS
-images, the Linux tarballs and debs, the Windows zips and setups, `install.sh`,
-`install.ps1`), with notes capped by the publisher. Asset ids are `a_` plus 8
+A cloud profile's release is trimmed to fit: 16 assets (the floored macOS
+images, the Linux tarballs and debs, the Windows zips and setups, the Linux and
+Windows probe bundles the headless installers use, `install.sh`, `install.ps1`)
+with signed notes of about 300 bytes, a short summary that links to the full
+notes. The publisher enforces the asset set and the notes budget; this server
+enforces only the total, so the set can change without a server release. Asset
+ids are `a_` plus 8
 base62 characters for the same reason; they are not secrets, since every lookup
 is scoped to an entitled profile.
 
