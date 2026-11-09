@@ -346,6 +346,13 @@ proxy's address.
 
 The same address is used for the device-flow and Desktop limits.
 
+**Upgrade note.** Earlier builds took the leftmost `X-Forwarded-For` entry, then
+`X-Real-IP`. Deployments behind an ingress or load balancer must now set
+`SELFHOST_TRUSTED_PROXIES=1` (or the number of proxy hops); with the default
+`0` every client shares the proxy's address for per-IP limits and lockouts,
+and the server logs one warning per process when a request carries
+`X-Forwarded-For`. `X-Real-IP` is no longer read.
+
 #### Lockout
 
 Failed sign-ins are counted in Postgres (`selfhost_login_attempts`), per

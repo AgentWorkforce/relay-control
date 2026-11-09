@@ -67,10 +67,20 @@ export function trustedProxyHops(env: NodeJS.ProcessEnv = process.env): number {
  * last one a trusted proxy appended; entries further left are client
  * supplied. A shorter header than N falls back to its leftmost entry.
  */
+let warnedUntrustedForwardedFor = false;
+
 export function clientIp(request: IncomingMessage, hops = trustedProxyHops()): string {
   const socket = request.socket?.remoteAddress || "unknown";
-  if (hops <= 0) return socket;
   const header = request.headers["x-forwarded-for"];
+  if (hops <= 0) {
+    // Behind an ingress with the default 0 every client shares the proxy's
+    // address for per-IP limits; say so once per process.
+    if (header !== undefined && !warnedUntrustedForwardedFor) {
+      warnedUntrustedForwardedFor = true;
+      console.warn("[selfhost-api] X-Forwarded-For received but SELFHOST_TRUSTED_PROXIES=0; per-IP limits use the socket address. Set SELFHOST_TRUSTED_PROXIES to the number of trusted proxy hops.");
+    }
+    return socket;
+  }
   const entries = (Array.isArray(header) ? header.join(",") : header ?? "")
     .split(",").map((entry) => entry.trim()).filter(Boolean);
   if (entries.length === 0) return socket;

@@ -493,8 +493,8 @@ export function createApp(input: {
       const limited = "Too many analytics requests. Try again shortly.";
       const limits = { ...GATEWAY_RATE_LIMITS, ...gateway.rateLimits };
       rateLimit(response, `analytics:session:${principal.sessionId}`, limits.session, "rate_limited", limited);
-      // Keyed by clientIp(): the first X-Forwarded-For hop, as the auth limiters
-      // are. Only an ingress that overwrites that header makes it client-proof;
+      // Keyed by clientIp(), as the auth limiters are: the socket address, or
+      // with SELFHOST_TRUSTED_PROXIES=N the address the Nth trusted proxy saw;
       // see docs/analytics.md "Rate limits and the forwarded-header boundary".
       rateLimit(response, `analytics:ip:${clientIp(request)}`, limits.ip, "rate_limited", limited);
       // A membership revoked after the token was checked attributes nothing.

@@ -144,6 +144,8 @@ is explicit. RelayAuth is optional: see
 | `SELFHOST_AMP_WORKER_INTERVAL_MS` / `SELFHOST_AMP_LEASE_MS` | Outbox drain interval, default 5000 (250-600000), and delivery lease, default 120000 (1000-3600000). An expired lease becomes `unknown` and is never resent |
 | `HOST` | Listener address, default `0.0.0.0` |
 
+**Upgrade note (client address).** Per-IP limits and the password lockout now use the TCP peer address unless `SELFHOST_TRUSTED_PROXIES` is set. Deployments behind an ingress or load balancer must set `SELFHOST_TRUSTED_PROXIES=1` (or the number of proxy hops that append to `X-Forwarded-For`); otherwise every client shares the proxy's bucket, and the server logs one warning when it sees `X-Forwarded-For`. `X-Real-IP` is no longer read.
+
 Sensitive variables also accept a mutually exclusive `_FILE` form. The API
 server reads `DATABASE_URL_FILE`; `agent-relay-selfhost-migrate` reads only
 `DATABASE_MIGRATIONS_URL_FILE`. It never falls back to the runtime credential,
