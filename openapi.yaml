@@ -2681,9 +2681,15 @@ paths:
         - bearerAuth: []
       operationId: getDashboardSessionEvents
       description: |
-        Calls only RelayHistory `GET /v1/sessions/{sessionId}/events`, with
-        explicit `workspace={authorized workspace UUID}`, `source`, and
-        `order=asc` (default) or `order=desc`, `includeMessageId=true`.
+        Calls `GET /v1/sessions/{sessionId}/events` with explicit
+        `workspace={authorized workspace UUID}`, `source`, and `order=asc`
+        (default) or `order=desc`. With `RELAYHISTORY_READ_API_EVENTS=true`, an
+        eligible device-session bearer uses `RELAYHISTORY_READ_API_URL`; the
+        default and other credential families retain the RelayHistory transport.
+        Only legacy requests include `includeMessageId=true`. Native requests
+        preserve the backend's authoritative event IDs without synthesizing
+        message IDs; enable this option only after downstream message-identity
+        behavior is qualified. Backend cursors cannot cross a transport change.
         Returned events are validated and each page is ordered oldest-first.
       parameters:
         - name: source
