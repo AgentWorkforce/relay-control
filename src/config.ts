@@ -126,6 +126,13 @@ export type FactoryConfig = {
   apiUrl: string;
   /** Dormant history-intent loop cadence. */
   historyIntervalMs: number;
+  /**
+   * SELFHOST_ACQUISITION_ORIGIN, read only when Factory is enabled. Set: a
+   * Factory connect enrols the workspace with the acquisition service by
+   * minting one acquisition-operator token for this audience. Unset: no
+   * enrollment.
+   */
+  acquisitionOrigin?: string;
 };
 
 export type OperatorOAuthApp = { clientId: string; clientSecret: string; scopes: string[] | null };
@@ -345,7 +352,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     bootstrapToken,
     encryptionKeyring: loadEncryptionKeyring(env),
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
-    factory: loadFactoryConfig(env),
+    factory: loadFactoryConfig(env, introspection),
     mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name), serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
@@ -467,8 +474,20 @@ function assertHistoryIntrospection(
  * SELFHOST_FACTORY_ENABLED (default false), SELFHOST_FACTORY_API_URL (https,
  * default https://api.factory.ai) and SELFHOST_FACTORY_HISTORY_INTERVAL_MS
  * (default 300000, minimum 60000).
+ *
+ * Only when enabled, SELFHOST_ACQUISITION_ORIGIN (the variable shared with the
+ * acquisition issuer) turns on acquisition enrollment. It fails closed: the
+ * origin needs RELAYCONTROL_INTROSPECT_SECRET and must be listed in
+ * SELFHOST_INTROSPECT_AUDIENCES, because the minted token is only useful
+ * through introspection against that audience.
  */
-export function loadFactoryConfig(env: Env): FactoryConfig {
+export function loadFactoryConfig(
+  env: Env,
+  introspection: { introspectSecret: string | null; introspectAudiences: string[] } = {
+    introspectSecret: null,
+    introspectAudiences: [],
+  },
+): FactoryConfig {
   const flag = env.SELFHOST_FACTORY_ENABLED?.trim().toLowerCase() ?? "";
   if (!["", "true", "1", "false", "0"].includes(flag)) {
     throw new Error("SELFHOST_FACTORY_ENABLED must be true or false");
@@ -488,11 +507,28 @@ export function loadFactoryConfig(env: Env): FactoryConfig {
   if (!Number.isSafeInteger(historyIntervalMs) || historyIntervalMs < 60_000) {
     throw new Error("SELFHOST_FACTORY_HISTORY_INTERVAL_MS must be an integer of at least 60000");
   }
-  return {
-    enabled: flag === "true" || flag === "1",
+  const enabled = flag === "true" || flag === "1";
+  const config: FactoryConfig = {
+    enabled,
     apiUrl: url.toString().replace(/\/+$/, ""),
     historyIntervalMs,
   };
+  const rawOrigin = enabled ? env.SELFHOST_ACQUISITION_ORIGIN?.trim() : undefined;
+  if (rawOrigin) {
+    const origin = new URL(audienceOrigin(rawOrigin, "SELFHOST_ACQUISITION_ORIGIN")).origin;
+    if (!introspection.introspectSecret) {
+      throw new Error(
+        "RELAYCONTROL_INTROSPECT_SECRET is required when SELFHOST_FACTORY_ENABLED=true and SELFHOST_ACQUISITION_ORIGIN is set",
+      );
+    }
+    if (!introspection.introspectAudiences.some((audience) => new URL(audience).origin === origin)) {
+      throw new Error(
+        "SELFHOST_ACQUISITION_ORIGIN must be listed in SELFHOST_INTROSPECT_AUDIENCES when SELFHOST_FACTORY_ENABLED=true",
+      );
+    }
+    config.acquisitionOrigin = origin;
+  }
+  return config;
 }
 
 /**

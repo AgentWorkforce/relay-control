@@ -33,7 +33,8 @@ before authentication, and the worker does not start.
 |---|---|
 | History capture and export | Dormant. `POST .../history/schedule` records an intent and answers `202 {queued:0, deferred:true}`. Every surface reports history as `deferred`, never completed. The history loop only advances intents. |
 | Relay-events webhook and Relaycast subscriptions | Deferred. `POST /api/v1/factory-sessions/relay-events/{bindingId}` is always 404. Delivery uses inbox polling. |
-| Acquisition transport, tokens and install envelope | Not implemented. |
+| Acquisition enrollment token | Shipped, inert unless `SELFHOST_ACQUISITION_ORIGIN` is set. See [Acquisition enrollment](#acquisition-enrollment). |
+| Acquisition transport and install envelope | Not implemented. Control mints and retires the enrollment token only; it never calls the acquisition service. |
 | Session mapper and export | Not implemented. Unknown sends are never reconciled from session metadata. |
 | MCP tool group and resolver hook | Planned for a later PR. |
 | Admin force-disconnect | Not provided, by design. Only the person who connected Factory manages that connection. |
@@ -45,8 +46,9 @@ before authentication, and the worker does not start.
 | `SELFHOST_FACTORY_ENABLED` | `false` | `true` or `false`, and any other value fails startup. When off, routes are 404 and the worker stays off. |
 | `SELFHOST_FACTORY_API_URL` | `https://api.factory.ai` | Must be an absolute https URL. Redirects are not followed. |
 | `SELFHOST_FACTORY_HISTORY_INTERVAL_MS` | `300000` | Cadence of the dormant history loop, minimum 60000. |
-| `SELFHOST_ENCRYPTION_KEY[_ID]` | required | Encrypts the Factory key and hosted agent tokens. |
+| `SELFHOST_ENCRYPTION_KEY[_ID]` | required | Encrypts the Factory key, hosted agent tokens and the acquisition enrollment token. |
 | `SELFHOST_INTERNAL_TOKEN` | unset | Required for the job route. While it is unset, the job route is 404. |
+| `SELFHOST_ACQUISITION_ORIGIN` | unset | The acquisition service's public origin, shared with the acquisition issuer lane. Read only while Factory is on. When set, startup requires `RELAYCONTROL_INTROSPECT_SECRET` and the origin listed in `SELFHOST_INTROSPECT_AUDIENCES`, and fails naming the variable otherwise. Unset: no enrollment. |
 
 The fixed limits are:
 
@@ -56,7 +58,9 @@ The fixed limits are:
 - Reply text: at most 20,000 characters, in a body of at most 64 KiB.
 - Reply bearers expire after 24 hours.
 - Worker loops: inbox every 5 s (up to 200 bindings per tick), injection every
-  2 s (batch of 10), cleanup every 60 s.
+  2 s (batch of 10), cleanup every 60 s, acquisition reconcile every 60 s
+  (up to 50 draining enrollments per tick).
+- A draining enrollment token is revoked after 24 hours at the latest.
 
 ## Routes
 
@@ -74,9 +78,11 @@ Every response is `no-store`.
 
 | Method and path | Success | Notes |
 |---|---|---|
-| `GET /connection` | 200 summary | `{connected, key_hint, validated_at, user_is_owner, bindings_count, history}` |
+| `GET /connection` | 200 summary | `{connected, key_hint, validated_at, user_is_owner, bindings_count, history, acquisition}`. `acquisition` is `{state:"unconfigured"}` or `{state, token_prefix, created_at}` with `state` one of `enrolled`, `draining`, `revoked`. |
 | `PUT /connection` `{key}` | 200 summary | Connect or replace the key. Replacing it re-verifies up to 8 bound sessions. |
 | `DELETE /connection` | 204 | Connection owner only. Retires that owner's bindings. |
+| `POST /connection/acquisition/rotate` | 200 summary | Owner or admin. Needs a connection. Mints a new enrollment token and drains the previous one. |
+| `POST /connection/acquisition/revoke` | 200 summary | Owner or admin. Revokes every enrolled and draining enrollment token now. |
 | `GET /computers` | 200 `{computers}` | Connection owner only |
 | `GET /computers/{computerId}/sessions` | 200 `{sessions, warning?}` | Each row has `bound`: `here`, `elsewhere` or `null` |
 | `POST /bindings` `{session_id, computer_id}` | 201 `{binding_id, session_id, agent}` | |
@@ -100,11 +106,47 @@ Errors use `{error, message}` with stable codes. The Factory-specific codes:
 |---|---|
 | 403 | `factory_workspace_token`, `factory_not_owner`, `factory_access_revoked` |
 | 404 | `factory_not_connected`, `binding_not_found`, `delivery_not_found` |
-| 409 | `factory_other_member_bindings`, `factory_session_other_workspace`, `factory_session_other_member`, `factory_session_moved`, `binding_retired`, `factory_cleanup_pending`, `factory_replace_limit`, `factory_bindings_changed`, `factory_agent_conflict`, `reply_already_recorded` |
+| 409 | `acquisition_unconfigured`, `factory_other_member_bindings`, `factory_session_other_workspace`, `factory_session_other_member`, `factory_session_moved`, `binding_retired`, `factory_cleanup_pending`, `factory_replace_limit`, `factory_bindings_changed`, `factory_agent_conflict`, `reply_already_recorded` |
 | 422 | `invalid_factory_key`, `invalid_request` |
 | 502 / 503 | `factory_key_rejected`, `factory_unavailable`, `relay_unavailable`, `factory_reply_failed` |
 
 Provider error bodies are never echoed.
+
+## Acquisition enrollment
+
+When `SELFHOST_ACQUISITION_ORIGIN` is set, a successful `PUT /connection` by a
+signed-in owner or admin enrols the workspace with the acquisition service. In
+the same transaction, Control mints one workspace API token with these
+properties:
+
+- prefix `sh_wk_` and purpose `acquisition-operator`
+- scope `acquisition:operate`
+- `aud` equal to the acquisition origin
+- no expiry
+
+Introspection answers this token with `principal_type: "service"`, so the
+acquisition service can verify it through `POST /internal/v1/auth/introspect`.
+Control stores the token encrypted under `SELFHOST_ENCRYPTION_KEY` and never
+returns, logs or audits it; responses and audit rows carry its prefix only.
+Replacing the Factory key keeps the same enrollment. A connect also re-enrols
+when the enrolled token was revoked through the API tokens routes.
+
+Enrollments move from `enrolled` to `draining`, then to `revoked`:
+
+- `DELETE /connection`, `POST /connection/acquisition/rotate`, removing the
+  connection owner and workspace cleanup move the enrolled row to `draining`
+  in the same transaction. The token stays valid while it drains.
+- The worker's acquisition loop revokes a draining token once it has no
+  outstanding acquisition obligations, or after 24 hours. No obligations exist
+  on Control yet, so today the next tick revokes it. A forced revoke records
+  the outstanding count as `stranded_count`.
+- `POST /connection/acquisition/revoke` revokes every enrolled and draining
+  token at once.
+
+Audit actions are `api_token.create`, `factory.acquisition.enrol`,
+`factory.acquisition.rotate`, `api_token.revoke` and
+`factory.acquisition.revoke`. The revoke target carries the reason and the
+stranded count.
 
 ## Ownership, removal and rejoin
 

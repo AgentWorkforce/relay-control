@@ -5,6 +5,15 @@ assigned at release.
 
 ## Unreleased
 
+- Added: Factory acquisition enrollment (default off). With Factory on and
+  `SELFHOST_ACQUISITION_ORIGIN` set, connecting a Factory key mints one
+  encrypted, never-returned `acquisition-operator` workspace token for the
+  acquisition origin. Disconnect, rotate, owner removal and workspace cleanup
+  drain it, and the worker revokes it. Adds
+  `POST .../factory/connection/acquisition/{rotate,revoke}` and an `acquisition`
+  field on the connection summary. Startup fails unless the origin is in
+  `SELFHOST_INTROSPECT_AUDIENCES` and `RELAYCONTROL_INTROSPECT_SECRET` is set.
+  Migration 0037.
 - Added: `SELFHOST_INTROSPECT_OUTAGE_HOLD_MS` (default off) lets
   `POST /internal/v1/auth/introspect` answer a Desktop `sh_at_` token from its
   last active verdict, marked `held: true` with `exp` clamped, while the

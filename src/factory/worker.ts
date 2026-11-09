@@ -52,6 +52,8 @@ export type FactoryWorkerDeps = {
   historyIntervalMs: number;
   /** Remote cleanup of retired rows (the service's release path). */
   releasePending: (limit: number) => Promise<number>;
+  /** Acquisition enrollment reconciler (the service's draining-token revoke path). */
+  reconcileAcquisition?: (limit: number) => Promise<number>;
   leaseMs?: number;
   /** Test seam: runs after the inbox read, before the fenced insert transaction. */
   beforeInboxInsert?: () => Promise<void>;
@@ -464,6 +466,8 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
         await injectBatch();
       });
       every("cleanup", CLEANUP_INTERVAL_MS, () => deps.releasePending(50));
+      const reconcileAcquisition = deps.reconcileAcquisition;
+      if (reconcileAcquisition) every("acquisition", CLEANUP_INTERVAL_MS, () => reconcileAcquisition(50));
       every("history", deps.historyIntervalMs, () => historyTick());
     },
     async stop(): Promise<void> {

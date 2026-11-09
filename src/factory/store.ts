@@ -469,7 +469,11 @@ export async function purgeMemberInTx(
     "DELETE FROM factory_history_syncs WHERE organization_id = $1 AND user_id = $2",
     [organizationId, userId],
   );
-  return { releases, connections: connections.rows.map((row) => row.workspace_id) };
+  const workspaceIds = connections.rows.map((row) => row.workspace_id);
+  // A deleted connection retires its acquisition enrollment in the same
+  // transaction; the token stays active until the reconciler revokes it.
+  await drainAcquisitionOperatorsInTx(tx, workspaceIds, "member_removed");
+  return { releases, connections: workspaceIds };
 }
 
 /**
@@ -495,6 +499,7 @@ export async function cleanupWorkspaceFactory(
   await tx.query("DELETE FROM factory_deliveries WHERE workspace_id = $1", [workspaceId]);
   await tx.query("DELETE FROM factory_bindings WHERE workspace_id = $1", [workspaceId]);
   await tx.query("DELETE FROM factory_connections WHERE workspace_id = $1", [workspaceId]);
+  await drainAcquisitionOperatorsInTx(tx, [workspaceId], "workspace_deleted");
   return { releases: releases.rows };
 }
 
@@ -593,4 +598,127 @@ export async function boundBindings(executor: SqlExecutor, limit: number): Promi
     [limit],
   );
   return result.rows;
+}
+
+export type AcquisitionOperatorState = "enrolled" | "draining" | "revoked";
+
+export type AcquisitionOperatorRow = {
+  id: string;
+  workspace_id: string;
+  organization_id: string;
+  acquisition_origin: string;
+  token_id: string;
+  token_envelope: string;
+  token_prefix: string;
+  control_origin: string;
+  created_by_user_id: string | null;
+  state: AcquisitionOperatorState;
+  reason: string | null;
+  created_at: string | Date;
+  drain_started_at: string | Date | null;
+  revoked_at: string | Date | null;
+  stranded_count: number;
+  /** Joined from workspace_api_tokens: the token was revoked elsewhere. */
+  token_revoked: boolean;
+};
+
+const OPERATOR_SELECT = `SELECT o.id, o.workspace_id, o.organization_id, o.acquisition_origin, o.token_id,
+       o.token_envelope, o.token_prefix, o.control_origin, o.created_by_user_id, o.state, o.reason,
+       o.created_at, o.drain_started_at, o.revoked_at, o.stranded_count,
+       (t.revoked_at IS NOT NULL) AS token_revoked
+  FROM factory_acquisition_operators o
+  JOIN workspace_api_tokens t ON t.id = o.token_id`;
+
+/** The workspace's enrolled row for this origin, locked when `lock` is set. */
+export async function enrolledAcquisitionOperator(
+  executor: SqlExecutor,
+  workspaceId: string,
+  origin: string,
+  lock = false,
+): Promise<AcquisitionOperatorRow | null> {
+  const result = await executor.query<AcquisitionOperatorRow>(
+    `${OPERATOR_SELECT}
+      WHERE o.workspace_id = $1 AND o.acquisition_origin = $2 AND o.state = 'enrolled'
+      ${lock ? "FOR UPDATE OF o" : ""}`,
+    [workspaceId, origin],
+  );
+  return result.rows[0] ?? null;
+}
+
+/** The row the summary reports: the enrolled one, else the most recent. */
+export async function currentAcquisitionOperator(
+  executor: SqlExecutor,
+  workspaceId: string,
+  origin: string,
+): Promise<AcquisitionOperatorRow | null> {
+  const result = await executor.query<AcquisitionOperatorRow>(
+    `${OPERATOR_SELECT}
+      WHERE o.workspace_id = $1 AND o.acquisition_origin = $2
+      ORDER BY (o.state = 'enrolled') DESC, o.created_at DESC, o.id DESC
+      LIMIT 1`,
+    [workspaceId, origin],
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function insertAcquisitionOperator(
+  tx: SqlExecutor,
+  row: {
+    id: string;
+    workspaceId: string;
+    organizationId: string;
+    origin: string;
+    tokenId: string;
+    tokenEnvelope: string;
+    tokenPrefix: string;
+    controlOrigin: string;
+    userId: string;
+  },
+): Promise<void> {
+  await tx.query(
+    `INSERT INTO factory_acquisition_operators
+       (id, workspace_id, organization_id, acquisition_origin, token_id, token_envelope,
+        token_prefix, control_origin, created_by_user_id, state)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'enrolled')`,
+    [row.id, row.workspaceId, row.organizationId, row.origin, row.tokenId, row.tokenEnvelope,
+      row.tokenPrefix, row.controlOrigin, row.userId],
+  );
+}
+
+/**
+ * Moves enrolled rows to draining with their reason. The token is never
+ * revoked here: outstanding acquisition obligations may still need it, and
+ * the reconciler revokes it once they settle.
+ */
+export async function drainAcquisitionOperatorsInTx(
+  tx: SqlExecutor,
+  workspaceIds: string[],
+  reason: string,
+): Promise<number> {
+  let drained = 0;
+  for (const workspaceId of workspaceIds) {
+    const result = await tx.query(
+      `UPDATE factory_acquisition_operators
+          SET state = 'draining', drain_started_at = now(), reason = $2
+        WHERE workspace_id = $1 AND state = 'enrolled'
+        RETURNING id`,
+      [workspaceId, reason],
+    );
+    drained += result.rows.length;
+  }
+  return drained;
+}
+
+export async function markAcquisitionOperatorRevoked(
+  tx: SqlExecutor,
+  id: string,
+  reason: string,
+  strandedCount: number,
+): Promise<void> {
+  await tx.query(
+    `UPDATE factory_acquisition_operators
+        SET state = 'revoked', revoked_at = now(), reason = $2, stranded_count = $3
+      WHERE id = $1 AND state <> 'revoked'`,
+    [id, reason, strandedCount],
+  );
 }

@@ -7,7 +7,8 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import { decryptSecret, encryptSecret, hashSecret, opaqueToken, type EncryptionKeyring } from "../crypto.js";
-import { recordAudit } from "../admin/audit.js";
+import { recordAudit, type AuditActor } from "../admin/audit.js";
+import { ACQUISITION_OPERATOR_PURPOSE, type ApiTokenStore } from "../admin/api-tokens.js";
 import { ownerHash } from "../mcp/relay-participants.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import { replyBodyHash, replyIdempotencyKey } from "./reply-capability.js";
@@ -19,7 +20,12 @@ import {
 } from "./runtime.js";
 import {
   bindingsForUser,
+  currentAcquisitionOperator,
   deleteBinding,
+  drainAcquisitionOperatorsInTx,
+  enrolledAcquisitionOperator,
+  insertAcquisitionOperator,
+  markAcquisitionOperatorRevoked,
   deleteConnection,
   findBinding,
   findConnection,
@@ -41,6 +47,7 @@ import {
   retireBindingsInTx,
   writeConnection,
   lockWorkspaceFactory,
+  type AcquisitionOperatorRow,
   type FactoryBindingRow,
   type FactoryRelease,
 } from "./store.js";
@@ -73,6 +80,7 @@ export const FACTORY_ERRORS = {
   /** Cloud 9f813ff `requireSetupIdentity` (service.ts:303-309); the code is kept from the earlier bound-set check. */
   setupChanged: () => new FactoryHttpError(409, "factory_bindings_changed", "Factory changed while verification was running. Retry from current Settings."),
   cleanupPending: () => new FactoryHttpError(409, "factory_cleanup_pending", "Factory session cleanup is still pending"),
+  acquisitionUnconfigured: () => new FactoryHttpError(409, "acquisition_unconfigured", "Acquisition enrollment is not configured"),
   replyUnauthorized: () => new FactoryHttpError(401, "unauthorized", "Unauthorized"),
   replyRecorded: () => new FactoryHttpError(409, "reply_already_recorded", "Reply already recorded"),
   replyFailed: () => new FactoryHttpError(503, "factory_reply_failed", "Factory reply failed."),
@@ -86,6 +94,26 @@ export const FACTORY_ERRORS = {
 
 /** Re-verification bound when the connection owner replaces the key (Cloud). */
 export const MAX_REVERIFY_BINDINGS = 8;
+/**
+ * A draining acquisition-operator token is revoked once its obligations
+ * settle, and at the latest this long after draining started, even with
+ * obligations outstanding (recorded as `stranded_count`). No env knob.
+ */
+export const ACQUISITION_DRAIN_MAX_MS = 24 * 60 * 60 * 1_000;
+export const ACQUISITION_OPERATOR_LABEL = "Factory acquisition operator";
+const RECONCILER_ACTOR: AuditActor = { kind: "service", subject: "factory-acquisition-reconciler" };
+
+/**
+ * Acquisition obligations still owed through this workspace's draining
+ * acquisition-operator token. Always 0 today: Control carries no acquisition
+ * transport or revoke intents yet, so nothing can be outstanding. The
+ * acquisition owner wires the real count here; the reconciler already honors
+ * it (revoke at 0, or strand after ACQUISITION_DRAIN_MAX_MS).
+ */
+export async function outstandingObligations(_tx: SqlExecutor, _workspaceId: string): Promise<number> {
+  return 0;
+}
+
 /** History is dormant in this release; every surface says so (design §9). */
 export const HISTORY_DEFERRED = { queued: 0, deferred: true } as const;
 
@@ -116,6 +144,17 @@ export type FactoryServiceDeps = {
    * concurrency tests hold a transaction open here).
    */
   afterLock?: (operation: "connect" | "disconnect") => Promise<void>;
+  /**
+   * Acquisition enrollment, inert when unset or when `origin` is unset. The
+   * token store must accept `origin` as an introspection audience.
+   */
+  acquisition?: {
+    apiTokens: ApiTokenStore;
+    /** Normalized SELFHOST_ACQUISITION_ORIGIN. */
+    origin?: string;
+    /** Origin of SELFHOST_PUBLIC_URL, recorded on each enrollment. */
+    controlOrigin: string;
+  };
 };
 
 export function bindingHash(bindingId: string): string {
@@ -176,6 +215,81 @@ export function createFactoryService(deps: FactoryServiceDeps) {
       action,
       target,
     });
+  }
+
+  const acquisitionOrigin = deps.acquisition?.origin;
+
+  function operatorTarget(row: Pick<AcquisitionOperatorRow, "token_id">, detail?: string): string {
+    return detail ? `${row.token_id} (acquisition-operator; ${detail})` : `${row.token_id} (acquisition-operator)`;
+  }
+
+  /**
+   * Mints one acquisition-operator token on `tx` and records the enrolled
+   * row. The plaintext exists only in this scope and in the encrypted
+   * envelope; it is never logged, audited or returned.
+   */
+  async function enrolInTx(tx: SqlExecutor, access: FactoryAccess, action: string): Promise<void> {
+    const acquisition = deps.acquisition!;
+    const origin = acquisitionOrigin!;
+    const created = await acquisition.apiTokens.createIn(tx, {
+      workspaceId: access.workspace.id,
+      organizationId: access.workspace.organizationId,
+      label: ACQUISITION_OPERATOR_LABEL,
+      purpose: ACQUISITION_OPERATOR_PURPOSE,
+      expiryDays: undefined,
+      neverExpires: true,
+      aud: origin,
+      actor: { kind: "user", userId: access.principal.userId },
+    });
+    await insertAcquisitionOperator(tx, {
+      id: randomUUID(),
+      workspaceId: access.workspace.id,
+      organizationId: access.workspace.organizationId,
+      origin,
+      tokenId: created.id,
+      tokenEnvelope: encryptSecret(created.accessToken, keyring.active),
+      tokenPrefix: created.tokenPrefix,
+      controlOrigin: acquisition.controlOrigin,
+      userId: access.principal.userId,
+    });
+    await audit(tx, access, action, operatorTarget({ token_id: created.id }));
+  }
+
+  /** Revokes the row's token (if still active) and marks the row revoked, both on `tx`. */
+  async function revokeOperatorInTx(
+    tx: SqlExecutor,
+    row: AcquisitionOperatorRow,
+    actor: AuditActor,
+    reason: string,
+    stranded: number,
+  ): Promise<void> {
+    await deps.acquisition!.apiTokens.revokeIn(tx, {
+      workspaceId: row.workspace_id,
+      organizationId: row.organization_id,
+      tokenId: row.token_id,
+      actor,
+    });
+    await markAcquisitionOperatorRevoked(tx, row.id, reason, stranded);
+    await recordAudit(tx, {
+      organizationId: row.organization_id,
+      workspaceId: row.workspace_id,
+      actor,
+      action: "factory.acquisition.revoke",
+      target: operatorTarget(row, `reason=${reason}; stranded=${stranded}`),
+    });
+  }
+
+  /** Honest enrollment status for the summary; never claims more than the rows show. */
+  async function acquisitionSummary(workspaceId: string) {
+    if (!acquisitionOrigin) return { state: "unconfigured" as const };
+    const row = await currentAcquisitionOperator(database, workspaceId, acquisitionOrigin);
+    if (!row) return { state: "unconfigured" as const };
+    return {
+      // A token revoked outside this flow (the API tokens routes) is reported as revoked.
+      state: row.state === "enrolled" && row.token_revoked ? "revoked" as const : row.state,
+      token_prefix: row.token_prefix,
+      created_at: iso(row.created_at),
+    };
   }
 
   /** The caller's connection key, or the §3.1 refusal. */
@@ -263,6 +377,7 @@ export function createFactoryService(deps: FactoryServiceDeps) {
       user_is_owner: connection?.user_id === access.principal.userId,
       bindings_count: live.length,
       history: "deferred" as const,
+      acquisition: await acquisitionSummary(access.workspace.id),
     };
   }
 
@@ -324,6 +439,15 @@ export function createFactoryService(deps: FactoryServiceDeps) {
         }, before.connection);
         if (!written) throw FACTORY_ERRORS.setupChanged();
         await audit(tx, access, "factory.connection.put", null);
+        if (acquisitionOrigin) {
+          // One enrollment per workspace and origin: a key replacement keeps it.
+          const enrolled = await enrolledAcquisitionOperator(tx, workspaceId, acquisitionOrigin, true);
+          if (enrolled?.token_revoked) {
+            // Its token was revoked elsewhere; record that and enrol afresh.
+            await revokeOperatorInTx(tx, enrolled, { kind: "user", userId }, "token_revoked", 0);
+          }
+          if (!enrolled || enrolled.token_revoked) await enrolInTx(tx, access, "factory.acquisition.enrol");
+        }
       });
       log({ event: "factory.connect", outcome: "connected" });
       return summary(access);
@@ -348,6 +472,8 @@ export function createFactoryService(deps: FactoryServiceDeps) {
         );
         await deleteConnection(tx, access.workspace.id);
         await audit(tx, access, "factory.connection.delete", null);
+        // Same transaction: the enrollment drains; the reconciler revokes its token later.
+        await drainAcquisitionOperatorsInTx(tx, [access.workspace.id], "disconnect");
         return retired;
       });
       await release(releases, access.workspace.relaycastApiKey);
@@ -701,6 +827,88 @@ export function createFactoryService(deps: FactoryServiceDeps) {
       const winner = stored.rows[0];
       if (winner && winner.reply_body_hash !== bodyHash) throw FACTORY_ERRORS.replyRecorded();
       return winner?.reply_result ?? result;
+    },
+
+    /**
+     * Owner/admin: a new enrolled token for the configured origin; the
+     * previous enrolled row drains (reason `rotate`) and the reconciler
+     * revokes it. Needs a current connection.
+     */
+    async rotateAcquisition(access: FactoryAccess) {
+      if (!acquisitionOrigin) throw FACTORY_ERRORS.acquisitionUnconfigured();
+      await database.transaction(async (tx) => {
+        if (!await managerInTx(tx, access.workspace.organizationId, access.principal.userId)) {
+          throw FACTORY_ERRORS.accessRevoked();
+        }
+        await lockWorkspaceFactory(tx, access.workspace.id);
+        if (!await findConnection(tx, access.workspace.id, true)) throw FACTORY_ERRORS.notConnected();
+        await enrolledAcquisitionOperator(tx, access.workspace.id, acquisitionOrigin, true);
+        await drainAcquisitionOperatorsInTx(tx, [access.workspace.id], "rotate");
+        await enrolInTx(tx, access, "factory.acquisition.rotate");
+      });
+      log({ event: "factory.acquisition", kind: "rotate", outcome: "rotated" });
+      return summary(access);
+    },
+
+    /**
+     * Owner/admin: revokes every enrolled or draining acquisition-operator
+     * token of the workspace now (reason `admin`). Works after a disconnect
+     * too, so draining tokens can be cut without waiting for the reconciler.
+     */
+    async revokeAcquisition(access: FactoryAccess) {
+      if (!acquisitionOrigin) throw FACTORY_ERRORS.acquisitionUnconfigured();
+      const actor: AuditActor = { kind: "user", userId: access.principal.userId };
+      await database.transaction(async (tx) => {
+        if (!await managerInTx(tx, access.workspace.organizationId, access.principal.userId)) {
+          throw FACTORY_ERRORS.accessRevoked();
+        }
+        await lockWorkspaceFactory(tx, access.workspace.id);
+        const connection = await findConnection(tx, access.workspace.id, true);
+        const rows = await tx.query<AcquisitionOperatorRow>(
+          `SELECT o.*, (t.revoked_at IS NOT NULL) AS token_revoked
+             FROM factory_acquisition_operators o
+             JOIN workspace_api_tokens t ON t.id = o.token_id
+            WHERE o.workspace_id = $1 AND o.state IN ('enrolled', 'draining')
+            ORDER BY o.created_at, o.id
+            FOR UPDATE OF o`,
+          [access.workspace.id],
+        );
+        if (!connection && rows.rows.length === 0) throw FACTORY_ERRORS.notConnected();
+        for (const row of rows.rows) await revokeOperatorInTx(tx, row, actor, "admin", 0);
+      });
+      log({ event: "factory.acquisition", kind: "revoke", outcome: "revoked" });
+      return summary(access);
+    },
+
+    /**
+     * Acquisition loop body: revokes draining tokens whose obligations are
+     * settled, or that drained longer than ACQUISITION_DRAIN_MAX_MS (the
+     * outstanding count is kept as `stranded_count`). Returns rows revoked.
+     */
+    async reconcileAcquisition(limit = 50): Promise<number> {
+      if (!deps.acquisition) return 0;
+      return database.transaction(async (tx) => {
+        const rows = await tx.query<AcquisitionOperatorRow & { expired: boolean }>(
+          `SELECT o.*, (t.revoked_at IS NOT NULL) AS token_revoked,
+                  (o.drain_started_at <= now() - ($2::bigint * interval '1 millisecond')) AS expired
+             FROM factory_acquisition_operators o
+             JOIN workspace_api_tokens t ON t.id = o.token_id
+            WHERE o.state = 'draining'
+            ORDER BY o.drain_started_at, o.id
+            LIMIT $1
+            FOR UPDATE OF o SKIP LOCKED`,
+          [limit, ACQUISITION_DRAIN_MAX_MS],
+        );
+        let revoked = 0;
+        for (const row of rows.rows) {
+          const obligations = await outstandingObligations(tx, row.workspace_id);
+          if (obligations !== 0 && !row.expired) continue;
+          await revokeOperatorInTx(tx, row, RECONCILER_ACTOR, row.reason ?? "drained", obligations);
+          revoked++;
+        }
+        if (revoked > 0) log({ event: "factory.acquisition", kind: "reconcile", outcome: "revoked" });
+        return revoked;
+      });
     },
 
     /** Cleanup loop body: retries remote release of retired rows. Returns rows still pending. */

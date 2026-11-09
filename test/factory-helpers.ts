@@ -20,6 +20,7 @@ export const FACTORY_KEY = "fk_live_primary_key_0001";
 export const FACTORY_KEY_2 = "fk_live_replacement_key_02";
 export const INTERNAL = "internal-service-token-that-is-at-least-32-bytes";
 export const PUBLIC_URL = "https://control.selfhosted.company";
+export const INTROSPECT_SECRET = "introspect-secret-that-is-at-least-32-bytes";
 
 async function readBody(request: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
@@ -292,6 +293,11 @@ export async function startFactoryEnv(t: TestContext, options: {
   hooks?: Pick<FactoryServiceDeps, "beforeFinalWrite"> & { beforeInboxInsert?: () => Promise<void> };
   /** Override the internal service token (null: unset). */
   internalToken?: string | null;
+  /**
+   * Turns on acquisition enrollment for this origin, with introspection
+   * enabled and the origin accepted as an audience (what startup requires).
+   */
+  acquisitionOrigin?: string;
 } = {}) {
   const factory = await startFakeFactory(t);
   const relay = await startFakeRelay(t);
@@ -312,7 +318,18 @@ export async function startFactoryEnv(t: TestContext, options: {
     internalServiceToken: options.internalToken === undefined ? INTERNAL : options.internalToken,
     oauthRedirectUrl: `${PUBLIC_URL}/api/v1/integrations/oauth/callback`,
     dashboardUrl: `${PUBLIC_URL}/`,
-    factory: { enabled: options.enabled ?? true, apiUrl: factory.origin, historyIntervalMs: 300_000 },
+    factory: {
+      enabled: options.enabled ?? true,
+      apiUrl: factory.origin,
+      historyIntervalMs: 300_000,
+      ...(options.acquisitionOrigin ? { acquisitionOrigin: options.acquisitionOrigin } : {}),
+    },
+    ...(options.acquisitionOrigin
+      ? {
+        introspectSecret: INTROSPECT_SECRET,
+        introspectAudiences: ["https://history.selfhosted.company", options.acquisitionOrigin],
+      }
+      : {}),
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
   const logs: Array<Record<string, unknown>> = [];
@@ -333,7 +350,7 @@ export async function startFactoryEnv(t: TestContext, options: {
   });
   const api = apiClient(origin);
   const tenant = await seedFactoryTenant(api);
-  return { factory: factory.state, relay: relay.state, database, module, api, origin, logs, config, ...tenant };
+  return { factory: factory.state, relay: relay.state, database, store, module, api, origin, logs, config, ...tenant };
 }
 
 async function seedFactoryTenant(api: Api) {
