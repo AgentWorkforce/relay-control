@@ -387,6 +387,11 @@ export function createApp(input: {
     requireSelected(features, feature);
   }
   const browserOrigins = browserOriginsFor(config);
+  // The desktop sign-in pages post to a path-only action, so the form always
+  // resolves to the page's own origin; both browser origins (API and
+  // dashboard) are still named in form-action so the policy holds however
+  // the page was reached, and the Origin check on the post accepts the same set.
+  const formActionSources = ["'self'", ...browserOrigins];
   const messagingDeps: MessagingDeps = {
     database: store.database,
     keyring: config.encryptionKeyring,
@@ -1098,7 +1103,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
             "cache-control": "no-store",
             "referrer-policy": "no-referrer",
             "content-security-policy":
-              "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+              `default-src 'none'; style-src 'unsafe-inline'; form-action ${formActionSources.join(" ")}; base-uri 'none'; frame-ancestors 'none'`,
           });
           response.end(desktopWorkspacePickerPage({
             action: publicPath,
@@ -1164,7 +1169,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           "cache-control": "no-store",
           "referrer-policy": "same-origin",
           "content-security-policy":
-            `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${loopbackOrigin}; base-uri 'none'; frame-ancestors 'none'`,
+            `default-src 'none'; style-src 'unsafe-inline'; form-action ${[...formActionSources, loopbackOrigin].join(" ")}; base-uri 'none'; frame-ancestors 'none'`,
         });
         response.end(desktopConsentPage({
           action: publicPath,

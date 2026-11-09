@@ -5,6 +5,12 @@ assigned at release.
 
 ## Unreleased
 
+- Fixed: the desktop sign-in workspace picker and consent screens now name
+  both browser origins (API and dashboard) in `form-action` beside `'self'`
+  and the loopback origin. The form action stays path-only, so the post
+  always targets the page's own origin whichever host served it, and the
+  policy no longer depends on which of the two origins the page was reached
+  on.
 - Fixed: after Approve on the desktop sign-in consent screen the page stayed
   put in Chromium browsers. The screen's Content-Security-Policy allowed
   `form-action 'self'` only, and Chromium applies form-action to the 303
