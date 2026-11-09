@@ -142,9 +142,16 @@ export class McpOAuthTeardown {
       // Consent may have selected an existing identity, or a native session
       // may have reused it. Disconnecting the connector must keep it running.
       if(remote.metadata.created_by!=="mcp-oauth" || row?.session_hash) return "kept";
+      // A connection approved after the first pin may still be unused. Before
+      // handing cleanup responsibility to it, persist this verified immutable
+      // id so its eventual revocation can release the same agent.
+      await tx.query(`UPDATE selfhost_mcp_oauth_grants SET agent_remote_id=$4
+        WHERE organization_id=$1 AND workspace_id=$2 AND user_id=$3 AND revoked_at IS NULL
+          AND agent_remote_id IS NULL AND agent_name=$5`,
+      [intent.organization_id,intent.workspace_id,intent.user_id,remote.id,remote.name]);
       const claimed=await tx.query(`SELECT id FROM selfhost_mcp_oauth_grants
         WHERE organization_id=$1 AND workspace_id=$2 AND user_id=$3 AND revoked_at IS NULL
-          AND (agent_remote_id=$4 OR agent_name=$5) LIMIT 1`,
+          AND (agent_remote_id=$4 OR (agent_remote_id IS NULL AND agent_name=$5)) LIMIT 1`,
       [intent.organization_id,intent.workspace_id,intent.user_id,remote.id,remote.name]);
       if(claimed.rows.length) return "kept";
       try {

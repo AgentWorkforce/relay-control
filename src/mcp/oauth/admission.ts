@@ -79,11 +79,13 @@ export class McpOAuthConnection {
         participant.userId !== principal.userId || (agentRemoteId && agentRemoteId !== participant.agentRemoteId)) {
       throw new McpOAuthAccessRefused();
     }
-    // Like Cloud, every live grant already pinned to this same id learns its rename.
+    // Grants that approved this name before first use share its established
+    // immutable identity. Already-pinned grants may learn only their own rename.
     const updated = await tx.query<{ id: string }>(`UPDATE selfhost_mcp_oauth_grants
       SET agent_remote_id=$5,agent_name=$6
       WHERE organization_id=$1 AND workspace_id=$2 AND user_id=$3 AND revoked_at IS NULL
-        AND (id=$4 OR agent_remote_id=$5) AND (agent_remote_id IS NULL OR agent_remote_id=$5)
+        AND (id=$4 OR agent_remote_id=$5 OR (agent_remote_id IS NULL AND agent_name=$6))
+        AND (agent_remote_id IS NULL OR agent_remote_id=$5)
       RETURNING id`,
     [principal.organizationId,principal.workspaceId,principal.userId,grantId,participant.agentRemoteId,participant.agentName]);
     if (!updated.rows.some(row => row.id === grantId)) throw new McpOAuthAccessRefused();
@@ -96,7 +98,7 @@ export class McpOAuthConnection {
     const { principal, grantId } = this.access;
     const result = await tx.query(`SELECT id FROM selfhost_mcp_oauth_grants
       WHERE organization_id=$1 AND workspace_id=$2 AND user_id=$3 AND revoked_at IS NULL AND id<>$4
-        AND (agent_remote_id=$5 OR agent_name=$6) LIMIT 1`,
+        AND (agent_remote_id=$5 OR (agent_remote_id IS NULL AND agent_name=$6)) LIMIT 1`,
     [principal.organizationId,principal.workspaceId,principal.userId,grantId,agent.agentRemoteId,agent.agentName]);
     return result.rows.length > 0;
   }

@@ -150,6 +150,21 @@ test("a pin accepts only its owner's participant and never switches immutable id
   assert.equal(rows.length,2);
   for(const row of rows) assert.deepEqual(row,{agent_name:"renamed-agent",agent_remote_id:"fake-original-id"});
   f.connection.assertActor("renamed-agent");
+  const different=randomUUID();
+  await f.database.query(`INSERT INTO selfhost_mcp_oauth_grants
+    (id,client_id,user_id,organization_id,workspace_id,agent_name,agent_remote_id,scopes,resource,token_family_id)
+    SELECT $2,client_id,user_id,organization_id,workspace_id,agent_name,'fake-different-id',scopes,resource,$3
+    FROM selfhost_mcp_oauth_grants WHERE id=$1`,[f.owner.grantId,different,randomUUID()]);
+  await f.database.transaction(async tx=>{
+    await f.connection.lock(tx);await f.connection.pin(tx,{...agent,agentName:"renamed-again"});
+  });
+  assert.deepEqual((await f.database.query("SELECT agent_name,agent_remote_id FROM selfhost_mcp_oauth_grants WHERE id=$1",[different])).rows[0],
+    {agent_name:"renamed-agent",agent_remote_id:"fake-different-id"});
+  await f.database.query("UPDATE selfhost_mcp_oauth_grants SET revoked_at=now() WHERE id=$1",[secondId]);
+  await f.database.transaction(async tx=>{
+    await f.connection.lock(tx);
+    assert.equal(await f.connection.claimedByOther(tx,{...agent,agentName:"renamed-agent"}),false);
+  });
 });
 
 test("membership departure and grant revocation refuse an admitted connection before a relay action",async t=>{
@@ -266,19 +281,60 @@ test("durable remote teardown retries failure, serializes workers and follows on
   assert.ok(completed.completed_at);
 });
 
-test("disconnect keeps a participant claimed by another grant, and the last disconnect releases it",async t=>{
-  const f=await relayFixture(t);await f.service.join({});
+test("first pin covers an unused same-name grant, whose final disconnect releases the agent before workspace deletion",async t=>{
+  const f=await relayFixture(t);
   const other=randomUUID();
   await f.database.query(`INSERT INTO selfhost_mcp_oauth_grants
     (id,client_id,user_id,organization_id,workspace_id,agent_name,agent_remote_id,scopes,resource,token_family_id)
-    SELECT $2,client_id,user_id,organization_id,workspace_id,agent_name,agent_remote_id,scopes,resource,$3
+    SELECT $2,client_id,user_id,organization_id,workspace_id,agent_name,NULL,scopes,resource,$3
     FROM selfhost_mcp_oauth_grants WHERE id=$1`,[f.owner.grantId,other,randomUUID()]);
+  await f.service.join({});
+  const original=f.world.agents.get("approved-agent")!;
+  assert.equal((await f.database.query("SELECT agent_remote_id FROM selfhost_mcp_oauth_grants WHERE id=$1",[other])).rows[0]!.agent_remote_id,original.id);
   await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
   assert.deepEqual(await f.teardown.drain(),{completed:0,kept:1,pending:0});
   assert.ok(f.world.agents.has("approved-agent"));
+  const store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
+  const remove=()=>store.deleteWorkspace({...f.owner,allowLast:true,actor:{kind:"bootstrap"}});
+  assert.equal(await remove(),"in_use");
   await f.oauth.revokeMcpOAuthGrant(other,"fake-last-disconnect");
+  assert.equal(await remove(),"in_use");
   assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
   assert.equal(f.world.agents.has("approved-agent"),false);
+  assert.equal(await remove(),"deleted");
+});
+
+test("teardown transfers the verified pin to a later unused same-name grant before keeping its agent",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  const original=f.world.agents.get("approved-agent")!,other=randomUUID();
+  await f.database.query(`INSERT INTO selfhost_mcp_oauth_grants
+    (id,client_id,user_id,organization_id,workspace_id,agent_name,scopes,resource,token_family_id)
+    SELECT $2,client_id,user_id,organization_id,workspace_id,agent_name,scopes,resource,$3
+    FROM selfhost_mcp_oauth_grants WHERE id=$1`,[f.owner.grantId,other,randomUUID()]);
+  assert.equal((await f.database.query("SELECT agent_remote_id FROM selfhost_mcp_oauth_grants WHERE id=$1",[other])).rows[0]!.agent_remote_id,null);
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:1,pending:0});
+  assert.equal((await f.database.query("SELECT agent_remote_id FROM selfhost_mcp_oauth_grants WHERE id=$1",[other])).rows[0]!.agent_remote_id,original.id);
+  await f.oauth.revokeMcpOAuthGrant(other,"fake-last-disconnect");
+  assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
+  assert.equal(f.world.agents.has(original.name),false);
+});
+
+test("OAuth leave preserves an approved agent and inbox already bound to a native chat",async t=>{
+  const f=await relayFixture(t);
+  const native=relayService({...f.context,oauth:undefined,authMode:"cli_login",
+    relay:{...f.context.relay,sessionId:"fake-native-chat"}});
+  await native.join({name:"approved-agent"});
+  const original=f.world.agents.get("approved-agent")!;
+  const row=(await f.database.query("SELECT session_hash FROM selfhost_hosted_relay_participants")).rows[0]!;
+  assert.ok(row.session_hash);
+  await f.service.join({});
+  const releases=f.world.bodies.filter(row=>row.path==="/v1/agents/release-exact").length;
+  await assert.rejects(f.service.leave(),/native MCP session still uses/);
+  assert.equal(f.world.bodies.filter(row=>row.path==="/v1/agents/release-exact").length,releases);
+  assert.equal(f.world.agents.get(original.name)!.id,original.id);
+  assert.equal((await f.database.query("SELECT session_hash FROM selfhost_hosted_relay_participants")).rows[0]!.session_hash,row.session_hash);
+  assert.equal((await native.status()).name,original.name);
 });
 
 test("a stalled teardown request aborts and releases local locks with durable work still retryable",async t=>{

@@ -554,6 +554,9 @@ function createRelayService(context: McpContext) {
         // Release uses the workspace key, so a rejected token can still leave.
         const hosted = await participant(as, { allowGone: true, allowRejected: true, executor: tx });
         if (!hosted) return { joined: false, already_left: true };
+        if (oauth && hosted.row.sessionHash) {
+          throw new RelayToolError("A native MCP session still uses this agent. Leave from that session instead.");
+        }
         if (oauth && await oauth.claimedByOther(tx, { agentName: hosted.name, agentRemoteId: hosted.row.agentRemoteId })) {
           throw new RelayToolError("Another active connection still uses this agent. Disconnect it before leaving.");
         }
