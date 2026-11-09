@@ -329,6 +329,15 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
     return true;
   }
 
+  // GET .../sessions/members — member display names without a History read,
+  // for a dashboard that lists sessions straight from the read API.
+  if (segments.length === 1 && segments[0] === "members") {
+    query(ctx, {});
+    const access = await ctx.workspaceAccess(ctx.request, workspaceId);
+    send({ members: await workspaceMembers(ctx, access.workspace.organizationId) });
+    return true;
+  }
+
   // GET .../sessions/activity?first&last[&q]
   if (segments.length === 1 && segments[0] === "activity") {
     const input = query(ctx, { first: {}, last: {}, q: { max: 500 } }, ["first", "last"]);
