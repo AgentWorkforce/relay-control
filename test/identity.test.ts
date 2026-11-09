@@ -286,7 +286,7 @@ test("identity config: pairs, https issuer, smtp and domain validation", () => {
   assert.throws(() => loadIdentityConfig({ SELFHOST_BOOTSTRAP_ORG_NAME: "Acme" }), /set together/);
   assert.throws(() => loadIdentityConfig({ SELFHOST_BOOTSTRAP_ORG_NAME: "Acme", SELFHOST_BOOTSTRAP_ADMIN_EMAIL: "nope" }), /email address/);
   const boot = loadIdentityConfig({ SELFHOST_BOOTSTRAP_ORG_NAME: " Acme ", SELFHOST_BOOTSTRAP_ADMIN_EMAIL: "Ops@Acme.com" }).bootstrap!;
-  assert.deepEqual(boot, { organizationName: "Acme", adminEmail: "ops@acme.com", adminName: "ops", workspaceName: "Default" });
+  assert.deepEqual(boot, { organizationName: "Acme", adminEmail: "ops@acme.com", adminEmails: ["ops@acme.com"], adminName: "ops", workspaceName: "Default" });
   assert.throws(() => loadIdentityConfig({ SELFHOST_OIDC_ISSUER: "http://idp.acme.com", SELFHOST_OIDC_CLIENT_ID: "a", SELFHOST_OIDC_CLIENT_SECRET: "b" }), /https/);
   assert.throws(() => loadIdentityConfig({ SELFHOST_OIDC_ISSUER: "https://idp.acme.com", SELFHOST_OIDC_CLIENT_ID: "a" }), /CLIENT_SECRET/);
   const oidc = loadIdentityConfig({
