@@ -21,7 +21,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { close,listen } from "./support/harness.js";
 import { pkceS256 } from "../src/mcp/oauth/protocol.js";
 import { McpOAuthStore } from "../src/mcp/oauth/store.js";
-import { McpOAuthTeardown } from "../src/mcp/oauth/teardown.js";
+import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "../src/mcp/oauth/teardown.js";
 
 const ORIGIN="https://relay.example.test",SHARED="/api/v1/mcp/shared-sessions";
 const RESOURCE=ORIGIN+"/cloud"+SHARED;
@@ -279,6 +279,26 @@ test("disconnect keeps a participant claimed by another grant, and the last disc
   await f.oauth.revokeMcpOAuthGrant(other,"fake-last-disconnect");
   assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
   assert.equal(f.world.agents.has("approved-agent"),false);
+});
+
+test("a stalled teardown request aborts and releases local locks with durable work still retryable",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  const stalled:typeof fetch=(input,init)=>{
+    if(!String(input).endsWith("/v1/agents/release-exact")) return f.fetchImpl(input,init);
+    return new Promise((_resolve,reject)=>{
+      const signal=init!.signal!;
+      const network=setTimeout(()=>reject(new Error("missing abort")),1000);
+      const aborted=()=>{clearTimeout(network);reject(signal.reason);};
+      if(signal.aborted)aborted();
+      else signal.addEventListener("abort",aborted,{once:true});
+    });
+  };
+  const client=createRelaycastClient({internalOrigin:"http://fake-relay.test",fetchImpl:mcpOAuthTeardownFetch(stalled,10)});
+  const worker=new McpOAuthTeardown({...f.teardown.deps,client});
+  assert.deepEqual(await worker.drain(),{completed:0,kept:0,pending:1});
+  assert.equal((await f.database.query("SELECT completed_at FROM selfhost_mcp_oauth_revocations")).rows[0]!.completed_at,null);
+  assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
 });
 
 test("disconnect preserves an OAuth participant a native MCP session has since bound",async t=>{

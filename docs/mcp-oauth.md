@@ -105,6 +105,10 @@ the workspace or disabling the module. This preserves the workspace credential
 needed to retry a failed remote release; teardown does not copy that secret
 into the cleanup record.
 
+The server retries cleanup every 15 seconds in batches of at most 20, rotating
+past blocked records. Database row locks coordinate workers. Each cleanup
+request to Relaycast has a 10-second abort deadline.
+
 Issuer requests have a 64 KiB body limit. Public registration allows 20
 requests per TCP peer per hour and 500 per process per hour. Forwarded headers
 do not choose the peer identity. Account and consent endpoints do not enable

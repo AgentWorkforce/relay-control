@@ -15,6 +15,15 @@ type Participant = {
 type Outcome = "completed"|"kept"|"pending"|"skipped";
 export type McpOAuthTeardownResult = {completed:number;kept:number;pending:number};
 
+/** Bound the remote work performed while holding lifecycle locks. */
+export function mcpOAuthTeardownFetch(upstream:typeof fetch=fetch,timeoutMs=10_000):typeof fetch {
+  return (input,init)=>{
+    const prior=init?.signal??(input instanceof Request?input.signal:null);
+    const timeout=AbortSignal.timeout(timeoutMs);
+    return upstream(input,{...init,signal:prior?AbortSignal.any([prior,timeout]):timeout});
+  };
+}
+
 /** Durable post-commit cleanup. Row locks fence workers; the actor lock fences reconnects. */
 export class McpOAuthTeardown {
   private running:Promise<McpOAuthTeardownResult>|null=null;

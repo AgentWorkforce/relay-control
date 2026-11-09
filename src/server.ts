@@ -20,7 +20,7 @@ import { loadLicense } from "./license/load.js";
 import { gateCredentialVerifier } from "./license/resolver.js";
 import { loadAmpConfig } from "./amp/config.js";
 import { createAmpModule } from "./amp/module.js";
-import { McpOAuthTeardown } from "./mcp/oauth/teardown.js";
+import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { createRelaycastClient } from "./messaging/relaycast.js";
 import { loadAnalyticsConfig } from "./analytics/config.js";
 import {
@@ -98,7 +98,8 @@ const telemetry = createTelemetryModule({
 // Amp control: off unless SELFHOST_AMP_ENABLED=true; off starts no worker.
 const amp = createAmpModule({ amp: loadAmpConfig(process.env), config, database });
 const mcpOAuthTeardown = new McpOAuthTeardown({
-  database,keyring:config.encryptionKeyring,client:createRelaycastClient({internalOrigin:config.relaycastUrl}),
+  database,keyring:config.encryptionKeyring,
+  client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch()}),
 });
 // Factory sessions: routes 404 and the worker stays off unless SELFHOST_FACTORY_ENABLED.
 const factory = createFactoryModule({
