@@ -329,7 +329,7 @@ async function startHistory(t: TestContext, historyOrigin: string, direct = fals
 async function setup(
   t: TestContext,
   now = new Date("2026-11-02T20:00:00.000Z"),
-  options: { relayauth?: boolean; directReadApi?: boolean } = {},
+  options: { relayauth?: boolean; directReadApi?: boolean; agentTokens?: boolean; relaycastFetch?: typeof fetch } = {},
 ) {
   const relayauth = options.relayauth ?? true;
   const historyOrigin = "https://history.selfhosted.test";
@@ -355,9 +355,10 @@ async function setup(
     internalServiceToken: null,
     oauthRedirectUrl: "https://control.internal.example/api/v1/integrations/oauth/callback",
     dashboardUrl: "https://control.internal.example/",
+    sessionSearchAgentTokens: options.agentTokens,
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
-  const control = createServer(createApp({ config, store, now: () => now }));
+  const control = createServer(createApp({ config, store, now: () => now, messagingFetch: options.relaycastFetch }));
   const origin = await listen(control);
   t.after(async () => {
     await close(control);
@@ -998,6 +999,119 @@ test("direct read Worker: disabling the connection refuses native cursors instea
     assert.equal(env.history.requests.length, 0);
     assert.equal(env.readApi!.requests.length, 0);
   }
+});
+
+test("agent filter: passes one agent to the read API and reports what it applied", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}/sessions`;
+  const seen: URL[] = [];
+  let reply: { status?: number; body?: unknown; headers?: Record<string, string> } = {
+    body: { sessions: [{ sessionId: "alpha-1", source: "codex" }] },
+  };
+  env.readApi!.overrides.set("/v1/sessions", (_request, url) => {
+    seen.push(url);
+    return reply;
+  });
+
+  const exact = await call(env.origin, `${base}?agent=Example-Agent`, { token });
+  assert.equal(exact.status, 200);
+  assert.equal(seen[0]!.searchParams.get("agent"), "example-agent");
+  assert.equal(seen[0]!.searchParams.has("q"), false);
+  assert.deepEqual(
+    { agent: exact.body.agent, ignoredAgents: exact.body.ignoredAgents, agentMatch: exact.body.agentMatch },
+    { agent: "example-agent", ignoredAgents: [], agentMatch: null },
+  );
+
+  // Without parsing enabled, an @token is still ordinary search text.
+  const plain = await call(env.origin, `${base}?q=${encodeURIComponent("@builder")}`, { token });
+  assert.equal(plain.status, 200);
+  assert.equal(plain.body.agent, undefined);
+  assert.equal(env.history.requests.at(-1)!.query.q, "@builder");
+
+  const count = seen.length;
+  for (const [suffix, status, code] of [
+    ["agent=a&agent=b", 400, "invalid_request"],
+    ["agent=has%20space", 400, "invalid_request"],
+    ["agent=ab*", 400, "agent_prefix_too_short"],
+    [`agent=${"a".repeat(201)}`, 400, "invalid_request"],
+  ] as const) {
+    const refused = await call(env.origin, `${base}?${suffix}`, { token });
+    assert.equal(refused.status, status, suffix);
+    assert.equal(refused.body.error, code, suffix);
+  }
+  const combined = await call(env.origin, `${base}?agent=builder&q=deploy`, { token });
+  assert.equal(combined.status, 501);
+  assert.equal(combined.body.reason, "agent_with_text");
+  assert.equal(seen.length, count);
+
+  // An older backend matches `foo*` literally, so its empty page is not a result.
+  reply = { body: { sessions: [] } };
+  const unconfirmed = await call(env.origin, `${base}?agent=example*`, { token });
+  assert.equal(unconfirmed.status, 501);
+  assert.equal(unconfirmed.body.reason, "agent_prefix_not_supported");
+  reply = { headers: { "x-sessions-read-agent-match": "prefix" }, body: { sessions: [] } };
+  const prefix = await call(env.origin, `${base}?agent=example*`, { token });
+  assert.equal(prefix.status, 200);
+  assert.equal(prefix.body.agentMatch, "prefix");
+  assert.equal(seen.at(-1)!.searchParams.get("agent"), "example*");
+
+  reply = { status: 501, body: { error: "agent_filter_not_ready" } };
+  const notReady = await call(env.origin, `${base}?agent=builder`, { token });
+  assert.equal(notReady.status, 501);
+  assert.equal(notReady.body.reason, "agent_filter_not_ready");
+  reply = { status: 400, body: { error: "agent_prefix_too_broad", private: "must-not-echo" } };
+  const broad = await call(env.origin, `${base}?agent=example*`, { token });
+  assert.equal(broad.status, 400);
+  assert.equal(broad.body.error, "agent_prefix_too_broad");
+  assert(!JSON.stringify(broad.body).includes("must-not-echo"));
+});
+
+test("agent filter: with parsing on, @tokens select the agent and the first wins", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true, agentTokens: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}/sessions`;
+  let last: URL | undefined;
+  env.readApi!.overrides.set("/v1/sessions", (_request, url) => {
+    last = url;
+    return { body: { sessions: [] } };
+  });
+  const listed = await call(env.origin, `${base}?q=${encodeURIComponent("@Builder @other")}`, { token });
+  assert.equal(listed.status, 200);
+  assert.equal(last!.searchParams.get("agent"), "builder");
+  assert.equal(last!.searchParams.has("q"), false);
+  assert.deepEqual(listed.body.ignoredAgents, ["other"]);
+
+  const withText = await call(env.origin, `${base}?q=${encodeURIComponent("@builder deploy")}`, { token });
+  assert.equal(withText.status, 501);
+  assert.equal(withText.body.reason, "agent_with_text");
+
+  const search = await call(env.origin, `${base}/search?q=${encodeURIComponent("@builder")}`, { token });
+  assert.equal(search.status, 501);
+  assert.equal(search.body.reason, "agent_filter_not_on_search");
+});
+
+test("agent names for autocomplete: members only, names only, hidden agents left out", async (t) => {
+  const relaycastFetch = (async () => Response.json({ data: [
+    { id: "1", name: "zeta", token: "must-not-echo", metadata: {} },
+    { id: "2", name: "alpha", metadata: {} },
+    { id: "3", name: "alpha", metadata: {} },
+    { id: "4", name: "old-name", metadata: { renamed_to: "new-name" } },
+  ] })) as typeof fetch;
+  const env = await setup(t, undefined, { relaycastFetch });
+  const token = await env.login(env.ownerId, env.alpha);
+  const path = `/cloud/api/v1/workspaces/${env.alpha}/session-agent-names`;
+  const listed = await call(env.origin, path, { token });
+  assert.equal(listed.status, 200);
+  assert.deepEqual(listed.body, { names: ["alpha", "zeta"] });
+  assert.equal((await call(env.origin, path)).status, 401);
+  assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.beta}/session-agent-names`, { token })).status, 404);
+
+  // One already used above; the roster call spends a server-side key.
+  for (let used = 1; used < 60; used += 1) assert.equal((await call(env.origin, path, { token })).status, 200);
+  const limited = await call(env.origin, path, { token });
+  assert.equal(limited.status, 429);
+  assert.equal(limited.body.error, "rate_limited");
 });
 
 test("direct read Worker: redirects never forward the caller token to History", async (t) => {

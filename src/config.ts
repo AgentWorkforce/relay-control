@@ -28,6 +28,8 @@ export type SelfhostConfig = {
   sessionErasureApi?: { url: string; secret: string } | null;
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
   sessionReadMcpReads?: boolean;
+  /** SESSION_SEARCH_AGENT_TOKENS: read `@name` tokens in search text as agent filters. Default off. */
+  sessionSearchAgentTokens?: boolean;
   relayhistoryPublicUrl: string;
   relayauthApiKey: string | null;
   bootstrapToken: string;
@@ -331,6 +333,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     sessionReadApi: loadSessionReadApiConfig(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
+    sessionSearchAgentTokens: loadSessionSearchAgentTokens(env),
     ...introspection,
     acquisitionIssuer: loadAcquisitionIssuerConfig(env, introspection),
     bootstrapToken,
@@ -340,6 +343,13 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
   };
+}
+
+function loadSessionSearchAgentTokens(env: Env): boolean {
+  const value = env.SESSION_SEARCH_AGENT_TOKENS?.trim();
+  if (!value || value === "false") return false;
+  if (value !== "true") throw new Error("SESSION_SEARCH_AGENT_TOKENS must be true or false");
+  return true;
 }
 
 function loadSessionReadMcpReads(env: Env): boolean {

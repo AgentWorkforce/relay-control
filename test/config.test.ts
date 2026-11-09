@@ -25,6 +25,12 @@ const completeEnv = {
   SELFHOST_ENCRYPTION_KEY: "00".repeat(32),
 };
 
+test("session search @name parsing is default off and strictly boolean", () => {
+  assert.equal(loadConfig(completeEnv).sessionSearchAgentTokens, false);
+  assert.equal(loadConfig({ ...completeEnv, SESSION_SEARCH_AGENT_TOKENS: "true" }).sessionSearchAgentTokens, true);
+  assert.throws(() => loadConfig({ ...completeEnv, SESSION_SEARCH_AGENT_TOKENS: "1" }), /SESSION_SEARCH_AGENT_TOKENS/);
+});
+
 test("the session erase API is default off and requires its full configuration", () => {
   assert.equal(loadConfig(completeEnv).sessionErasureApi, null);
   const eraser = {

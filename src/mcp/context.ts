@@ -35,6 +35,8 @@ export type McpContext = {
   desktopCall: DesktopCallContext;
   /** GET a workspace-scoped RelayHistory path (with its query); throws SharedSessionsToolError. */
   readHistory: (path: string, options?: { timeoutMessage?: string }) => Promise<unknown>;
+  /** Read `@name` tokens in search text as agent filters. */
+  agentTokens?: boolean;
   members: () => Promise<McpMember[]>;
   /** The provider catalog with this build's runtime state, for describe_capabilities. */
   providers: () => Promise<ProviderStatus[]>;

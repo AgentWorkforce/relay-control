@@ -242,6 +242,7 @@ export function createMcpHandler(input: {
       endpointUrl: `${site}${rawPath}`,
       desktopCall,
       readHistory: historyReader(config, principal, workspace, token),
+      agentTokens: config.sessionSearchAgentTokens,
       members: async () => (await store.listMemberships(workspace.organizationId)).map((row): McpMember => ({
         userId: String(row.userId),
         email: String(row.email),
