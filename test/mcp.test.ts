@@ -1116,3 +1116,25 @@ test("search_shared_sessions: an agent lists that agent's sessions; text cannot 
   }
   assert.equal(env.history.paths.length, before);
 });
+
+
+test("an addressed MCP send pins one machine and retains its retry receipt", async (t) => {
+  const env = await setup(t);
+  const peer = env.relay.world.addAgent("machine-peer");
+  const address = `machine-peer@cloud-${peer.id}`;
+  const client = await relayClient(t, env);
+  const args = { to: address, text: "one machine-bound message", idempotency_key: "stable-machine-send-key" };
+  const first = structured(await client.callTool({ name: "send_relay_message", arguments: args }));
+  assert.equal(first.to, "machine-peer");
+  assert.equal(first.to_address, address);
+  assert.equal(first.idempotency_key, args.idempotency_key);
+  const requests = env.relay.world.bodies.filter(call => call.path === "/v1/dm");
+  assert.deepEqual(requests[0]?.body, { address, text: args.text });
+  const again = structured(await client.callTool({ name: "send_relay_message", arguments: args }));
+  assert.equal(again.message_id, first.message_id);
+  assert.equal(env.relay.world.deliveries.filter(row => row.agent === "machine-peer").length, 1);
+  const beforeRefusal = env.relay.world.bodies.filter(call => call.path === "/v1/dm").length;
+  const refused = await client.callTool({ name: "send_relay_message", arguments: { ...args, to: "machine-peer@another-machine" } });
+  assert.match(toolError(refused), /Unknown agent name or stale machine address/);
+  assert.equal(env.relay.world.bodies.filter(call => call.path === "/v1/dm").length, beforeRefusal);
+});

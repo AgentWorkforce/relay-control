@@ -149,8 +149,12 @@ export function createRelaycastWorld(roster: unknown[]) {
         .filter(channel => channel.members.has(caller.name)).map(channel => ({ id: channel.id, name: channel.name })) });
     }
     if (method === "POST" && path === "/v1/dm" && caller) {
-      if (!agents.has(body!.to)) return fail(404, "agent_not_found");
-      return once(ok(directMessage(caller, body!.to, body!.text), 201));
+      // Match the engine's exclusive name-or-machine-address request contract.
+      if ((body!.to === undefined) === (body!.address === undefined)) return fail(400, "invalid_request");
+      const to = body!.address === undefined ? body!.to
+        : [...agents.values()].find(agent => rosterEntry(agent).address === body!.address)?.name;
+      if (!to || !agents.has(to)) return fail(404, body!.address === undefined ? "agent_not_found" : "address_not_found");
+      return once(ok(directMessage(caller, to, body!.text), 201));
     }
     if (method === "GET" && path === "/v1/dm/conversations" && caller) {
       return ok(conversations.filter(item => item.participants.includes(caller.name)).map(item => ({

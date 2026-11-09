@@ -267,7 +267,7 @@ export function createRelaycastClient(input: {
     async sendDirectMessage(input: {
       token: string;
       to: string;
-      /** An exact machine address, sent beside the name when the caller addressed one. */
+      /** An exact machine address; when supplied it replaces the name selector. */
       address?: string;
       text: string;
       idempotencyKey: string;
@@ -276,7 +276,10 @@ export function createRelaycastClient(input: {
         "POST",
         "/v1/dm",
         input.token,
-        { to: input.to, ...(input.address ? { address: input.address } : {}), text: input.text },
+        // Relaycast requires one selector; an address also pins the machine.
+        input.address !== undefined
+          ? { address: input.address, text: input.text }
+          : { to: input.to, text: input.text },
         input.idempotencyKey,
       )));
       const message = record(data?.message);
