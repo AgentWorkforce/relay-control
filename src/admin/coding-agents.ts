@@ -170,8 +170,8 @@ const COLUMNS = `c.id, c.model_provider, c.harness, c.auth_type, c.display_name,
   c.account_email, c.secret_preview, c.is_active, c.harness_active, c.status, c.last_error,
   c.last_checked_at, c.last_authenticated_at, c.last_used_at, c.created_at, c.updated_at,
   c.created_by_user_id, u.name AS owner_name, u.email AS owner_email`;
-const FROM = `selfhost_coding_agent_credentials c
-  LEFT JOIN selfhost_users u ON u.id = c.created_by_user_id`;
+const FROM = `coding_agent_credentials c
+  LEFT JOIN users u ON u.id = c.created_by_user_id`;
 
 function maybeIso(value: Date | string | null): string | null {
   return value === null ? null : iso(value);
@@ -395,9 +395,9 @@ export class CodingAgentStore {
     const id = await this.database.transaction(async (tx) => {
       // Serialize credential writers per workspace so the selection
       // invariants (first credential becomes active) hold.
-      await tx.query("SELECT id FROM selfhost_workspaces WHERE id = $1 FOR UPDATE", [input.workspaceId]);
+      await tx.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [input.workspaceId]);
       const duplicate = await tx.query<{ id: string }>(
-        `SELECT id FROM selfhost_coding_agent_credentials
+        `SELECT id FROM coding_agent_credentials
           WHERE workspace_id = $1 AND model_provider = $2 AND auth_type = $3 AND key_fingerprint = $4`,
         [input.workspaceId, input.provider.id, input.authType, fingerprint],
       );
@@ -405,7 +405,7 @@ export class CodingAgentStore {
 
       if (input.authType === "oauth_token" && input.accountEmail) {
         const sameAccount = await tx.query<{ id: string }>(
-          `UPDATE selfhost_coding_agent_credentials SET
+          `UPDATE coding_agent_credentials SET
              secret_ciphertext = $3, secret_preview = $4, key_fingerprint = $5,
              label = COALESCE($6, label), display_name = $7, status = 'connected', last_error = NULL,
              last_authenticated_at = now(), updated_at = now()
@@ -427,12 +427,12 @@ export class CodingAgentStore {
 
       const hasActive = await tx.query<{ llm: boolean; sandbox: boolean }>(
         `SELECT coalesce(bool_or(is_active), false) AS llm, coalesce(bool_or(harness_active), false) AS sandbox
-           FROM selfhost_coding_agent_credentials WHERE workspace_id = $1 AND model_provider = $2`,
+           FROM coding_agent_credentials WHERE workspace_id = $1 AND model_provider = $2`,
         [input.workspaceId, input.provider.id],
       );
       const id = randomUUID();
       await tx.query(
-        `INSERT INTO selfhost_coding_agent_credentials
+        `INSERT INTO coding_agent_credentials
            (id, organization_id, workspace_id, created_by_user_id, model_provider, harness, auth_type,
             display_name, label, account_email, secret_ciphertext, secret_preview, key_fingerprint,
             is_active, harness_active, last_authenticated_at)
@@ -499,12 +499,12 @@ export class CodingAgentStore {
     const column = selection === "model" ? "is_active" : "harness_active";
     await this.database.transaction(async (tx) => {
       await tx.query(
-        `UPDATE selfhost_coding_agent_credentials SET ${column} = false, updated_at = now()
+        `UPDATE coding_agent_credentials SET ${column} = false, updated_at = now()
           WHERE workspace_id = $1 AND model_provider = $2 AND ${column} AND id <> $3`,
         [input.workspaceId, existing.modelProvider, existing.id],
       );
       await tx.query(
-        `UPDATE selfhost_coding_agent_credentials SET ${column} = true, updated_at = now()
+        `UPDATE coding_agent_credentials SET ${column} = true, updated_at = now()
           WHERE workspace_id = $1 AND id = $2`,
         [input.workspaceId, existing.id],
       );
@@ -532,19 +532,19 @@ export class CodingAgentStore {
     const existing = await this.get(input.workspaceId, input.id);
     if (!existing) return null;
     const blob = await this.database.query<{ blob_location: string | null }>(
-      "SELECT blob_location FROM selfhost_coding_agent_credentials WHERE workspace_id = $1 AND id = $2",
+      "SELECT blob_location FROM coding_agent_credentials WHERE workspace_id = $1 AND id = $2",
       [input.workspaceId, existing.id],
     );
     await this.database.transaction(async (tx) => {
-      await tx.query("SELECT id FROM selfhost_workspaces WHERE id = $1 FOR UPDATE", [input.workspaceId]);
+      await tx.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [input.workspaceId]);
       await tx.query(
-        "DELETE FROM selfhost_coding_agent_credentials WHERE workspace_id = $1 AND id = $2",
+        "DELETE FROM coding_agent_credentials WHERE workspace_id = $1 AND id = $2",
         [input.workspaceId, existing.id],
       );
       if (existing.isActive) {
         await tx.query(
-          `UPDATE selfhost_coding_agent_credentials SET is_active = true, updated_at = now()
-            WHERE id = (SELECT id FROM selfhost_coding_agent_credentials
+          `UPDATE coding_agent_credentials SET is_active = true, updated_at = now()
+            WHERE id = (SELECT id FROM coding_agent_credentials
                          WHERE workspace_id = $1 AND model_provider = $2 AND status = 'connected'
                            AND auth_type <> 'provider_oauth'
                          ORDER BY updated_at DESC, created_at DESC, id LIMIT 1)`,
@@ -553,8 +553,8 @@ export class CodingAgentStore {
       }
       if (existing.harnessActive) {
         await tx.query(
-          `UPDATE selfhost_coding_agent_credentials SET harness_active = true, updated_at = now()
-            WHERE id = (SELECT id FROM selfhost_coding_agent_credentials
+          `UPDATE coding_agent_credentials SET harness_active = true, updated_at = now()
+            WHERE id = (SELECT id FROM coding_agent_credentials
                          WHERE workspace_id = $1 AND model_provider = $2 AND status = 'connected'
                            AND auth_type IN ('oauth_token', 'provider_oauth')
                          ORDER BY updated_at DESC, created_at DESC, id LIMIT 1)`,
@@ -576,7 +576,7 @@ export class CodingAgentStore {
 
   private async secret(workspaceId: string, id: string): Promise<string> {
     const result = await this.database.query<{ secret_ciphertext: string }>(
-      "SELECT secret_ciphertext FROM selfhost_coding_agent_credentials WHERE workspace_id = $1 AND id = $2",
+      "SELECT secret_ciphertext FROM coding_agent_credentials WHERE workspace_id = $1 AND id = $2",
       [workspaceId, id],
     );
     const row = result.rows[0];
@@ -636,7 +636,7 @@ export class CodingAgentStore {
     }
     if (result.status !== "unsupported") {
       await this.database.query(
-        `UPDATE selfhost_coding_agent_credentials SET
+        `UPDATE coding_agent_credentials SET
            status = $3, last_error = $4, last_checked_at = $5,
            last_authenticated_at = CASE WHEN $3 = 'connected' THEN $5 ELSE last_authenticated_at END
          WHERE workspace_id = $1 AND id = $2`,
@@ -671,7 +671,7 @@ export class CodingAgentStore {
       secret_ciphertext: string;
     }>(
       `SELECT id, model_provider, auth_type, is_active, harness_active, secret_ciphertext
-         FROM selfhost_coding_agent_credentials
+         FROM coding_agent_credentials
         WHERE workspace_id = $1 AND status = 'connected' AND (is_active OR harness_active)
           AND auth_type <> 'provider_oauth'
         ORDER BY harness_active DESC, model_provider, id`,
@@ -701,7 +701,7 @@ export class CodingAgentStore {
     }
     if (used.length) {
       await this.database.query(
-        "UPDATE selfhost_coding_agent_credentials SET last_used_at = now() WHERE id = ANY($1::uuid[])",
+        "UPDATE coding_agent_credentials SET last_used_at = now() WHERE id = ANY($1::uuid[])",
         [used],
       );
       await recordAudit(this.database, {

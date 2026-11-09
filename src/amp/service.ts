@@ -117,7 +117,7 @@ export function withAmpLock<T>(
   run: (tx: SqlExecutor) => Promise<T>,
 ): Promise<T> {
   return deps.database.transaction(async (tx) => {
-    await tx.query("SELECT id FROM selfhost_organizations WHERE id = $1 FOR SHARE", [scope.organizationId]);
+    await tx.query("SELECT id FROM organizations WHERE id = $1 FOR SHARE", [scope.organizationId]);
     await tx.query("SELECT pg_advisory_xact_lock(hashtext('selfhost-amp'), hashtext($1))", [scope.workspaceId]);
     return run(tx);
   });
@@ -129,8 +129,8 @@ export type WorkspaceRelay = { relaycastWorkspaceId: string; key: string };
 export async function requireAdmin(deps: AmpDeps, tx: SqlExecutor, actor: AmpActor): Promise<WorkspaceRelay> {
   const result = await tx.query<{ role: string; relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
     `SELECT m.role, w.relaycast_workspace_id, w.relaycast_api_key_ciphertext
-       FROM selfhost_workspaces w
-       JOIN selfhost_organization_memberships m
+       FROM workspaces w
+       JOIN organization_memberships m
          ON m.organization_id = w.organization_id AND m.user_id = $3
       WHERE w.id = $1 AND w.organization_id = $2
       FOR SHARE OF m`,
@@ -145,7 +145,7 @@ export async function requireAdmin(deps: AmpDeps, tx: SqlExecutor, actor: AmpAct
 
 export async function workspaceRelay(deps: AmpDeps, executor: SqlExecutor, workspaceId: string): Promise<WorkspaceRelay | null> {
   const result = await executor.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
-    "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM selfhost_workspaces WHERE id = $1",
+    "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM workspaces WHERE id = $1",
     [workspaceId],
   );
   const row = result.rows[0];
@@ -156,7 +156,7 @@ type ConnectionRow = { user_id: string; key_ciphertext: string; key_hint: string
 
 async function connectionFor(tx: SqlExecutor, workspaceId: string): Promise<ConnectionRow | null> {
   const result = await tx.query<ConnectionRow>(
-    "SELECT user_id, key_ciphertext, key_hint, validated_at FROM selfhost_amp_connections WHERE workspace_id = $1",
+    "SELECT user_id, key_ciphertext, key_hint, validated_at FROM amp_connections WHERE workspace_id = $1",
     [workspaceId],
   );
   return result.rows[0] ?? null;
@@ -165,7 +165,7 @@ async function connectionFor(tx: SqlExecutor, workspaceId: string): Promise<Conn
 export async function bindingById(executor: SqlExecutor, id: string, lock = false): Promise<BindingRow | null> {
   if (!UUID.test(id)) return null;
   const result = await executor.query<BindingRow>(
-    `SELECT ${BINDING_COLUMNS} FROM selfhost_amp_bindings WHERE id = $1${lock ? " FOR UPDATE" : ""}`,
+    `SELECT ${BINDING_COLUMNS} FROM amp_bindings WHERE id = $1${lock ? " FOR UPDATE" : ""}`,
     [id],
   );
   return result.rows[0] ?? null;
@@ -230,12 +230,12 @@ export async function summary(deps: AmpDeps, executor: SqlExecutor, workspaceId:
   const connection = await connectionFor(executor, workspaceId);
   const bindings = await executor.query<BindingRow & HistoryRowState>(
     `SELECT ${BINDING_COLUMNS}, history_queued_at, history_lease_owner, history_lease_until, history_error
-       FROM selfhost_amp_bindings WHERE workspace_id = $1 ORDER BY created_at, id`,
+       FROM amp_bindings WHERE workspace_id = $1 ORDER BY created_at, id`,
     [workspaceId],
   );
   const deliveries = await executor.query<{ binding_id: string; message_id: string; state: string }>(
     `SELECT d.binding_id, d.message_id, d.state
-       FROM selfhost_amp_deliveries d JOIN selfhost_amp_bindings b ON b.id = d.binding_id
+       FROM amp_deliveries d JOIN amp_bindings b ON b.id = d.binding_id
       WHERE b.workspace_id = $1 AND d.state <> 'delivered'
       ORDER BY d.created_at`,
     [workspaceId],
@@ -280,7 +280,7 @@ export async function connect(deps: AmpDeps, actor: AmpActor, raw: unknown) {
     await requireAdmin(deps, tx, actor);
     const prior = await connectionFor(tx, actor.workspaceId);
     const bound = await tx.query<{ thread_id: string }>(
-      "SELECT thread_id FROM selfhost_amp_bindings WHERE workspace_id = $1 AND state = 'bound'",
+      "SELECT thread_id FROM amp_bindings WHERE workspace_id = $1 AND state = 'bound'",
       [actor.workspaceId],
     );
     return { prior, bound: bound.rows.map((row) => row.thread_id) };
@@ -306,7 +306,7 @@ export async function connect(deps: AmpDeps, actor: AmpActor, raw: unknown) {
     await requireAdmin(deps, tx, actor);
     const prior = await connectionFor(tx, actor.workspaceId);
     const bound = await tx.query<{ thread_id: string }>(
-      "SELECT thread_id FROM selfhost_amp_bindings WHERE workspace_id = $1 AND state = 'bound'",
+      "SELECT thread_id FROM amp_bindings WHERE workspace_id = $1 AND state = 'bound'",
       [actor.workspaceId],
     );
     if (
@@ -316,7 +316,7 @@ export async function connect(deps: AmpDeps, actor: AmpActor, raw: unknown) {
       throw new AmpError(409, "amp_changed", CHANGED);
     }
     await tx.query(
-      `INSERT INTO selfhost_amp_connections
+      `INSERT INTO amp_connections
          (workspace_id, organization_id, user_id, key_ciphertext, key_hint, validated_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $6)
        ON CONFLICT (workspace_id) DO UPDATE
@@ -348,7 +348,7 @@ export async function discover(deps: AmpDeps, actor: AmpActor) {
 
 async function saveParticipant(deps: AmpDeps, tx: SqlExecutor, row: BindingRow, tokenCiphertext: string) {
   await tx.query(
-    `INSERT INTO selfhost_hosted_relay_participants
+    `INSERT INTO hosted_relay_participants
        (id, workspace_id, user_id, relaycast_workspace_id, session_hash, agent_name, agent_remote_id, token_ciphertext)
      VALUES ($1, $2, $3, $4, NULL, $5, $6, $7)
      ON CONFLICT (workspace_id, user_id, agent_name) DO UPDATE
@@ -374,7 +374,7 @@ export async function bind(deps: AmpDeps, actor: AmpActor, rawThread: unknown) {
       throw new AmpError(409, "amp_changed", CHANGED);
     }
     const existing = await tx.query<BindingRow>(
-      `SELECT ${BINDING_COLUMNS} FROM selfhost_amp_bindings WHERE thread_id = $1 FOR UPDATE`,
+      `SELECT ${BINDING_COLUMNS} FROM amp_bindings WHERE thread_id = $1 FOR UPDATE`,
       [threadId],
     );
     let row = existing.rows[0];
@@ -388,7 +388,7 @@ export async function bind(deps: AmpDeps, actor: AmpActor, rawThread: unknown) {
       // The relay-events secret is minted once, with the row; a retry of this
       // preparing row reuses it (as hosted Cloud does).
       const inserted = await tx.query<BindingRow>(
-        `INSERT INTO selfhost_amp_bindings
+        `INSERT INTO amp_bindings
            (id, workspace_id, organization_id, user_id, thread_id, relaycast_workspace_id, agent_name, hook_ciphertext)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING ${BINDING_COLUMNS}`,
@@ -398,7 +398,7 @@ export async function bind(deps: AmpDeps, actor: AmpActor, rawThread: unknown) {
       row = inserted.rows[0]!;
     } else if (!row.hook_ciphertext) {
       const updated = await tx.query<BindingRow>(
-        `UPDATE selfhost_amp_bindings SET hook_ciphertext = $2, updated_at = now()
+        `UPDATE amp_bindings SET hook_ciphertext = $2, updated_at = now()
           WHERE id = $1 RETURNING ${BINDING_COLUMNS}`,
         [row.id, encrypt(deps, mintHookSecret())],
       );
@@ -433,7 +433,7 @@ export async function bind(deps: AmpDeps, actor: AmpActor, rawThread: unknown) {
           host: "Amp",
         });
       const updated = await tx.query<BindingRow>(
-        `UPDATE selfhost_amp_bindings SET agent_remote_id = $2, token_ciphertext = $3, updated_at = now()
+        `UPDATE amp_bindings SET agent_remote_id = $2, token_ciphertext = $3, updated_at = now()
           WHERE id = $1 RETURNING ${BINDING_COLUMNS}`,
         [row.id, agent.id, encrypt(deps, agent.token)],
       );
@@ -478,14 +478,14 @@ export async function bind(deps: AmpDeps, actor: AmpActor, rawThread: unknown) {
         }
         created.push(id);
         const updated = await tx.query<BindingRow>(
-          `UPDATE selfhost_amp_bindings SET ${subscription.column} = $2, updated_at = now()
+          `UPDATE amp_bindings SET ${subscription.column} = $2, updated_at = now()
             WHERE id = $1 RETURNING ${BINDING_COLUMNS}`,
           [row.id, id],
         );
         row = updated.rows[0]!;
       }
       await tx.query(
-        "UPDATE selfhost_amp_bindings SET state = 'bound', last_error = NULL, updated_at = now() WHERE id = $1",
+        "UPDATE amp_bindings SET state = 'bound', last_error = NULL, updated_at = now() WHERE id = $1",
         [row.id],
       );
       return { binding_id: row.id, thread_id: threadId, agent: row.agent_name };
@@ -506,7 +506,7 @@ export async function bind(deps: AmpDeps, actor: AmpActor, rawThread: unknown) {
  */
 export async function retireLocally(tx: SqlExecutor, where: string, params: unknown[]): Promise<string[]> {
   const retired = await tx.query<{ id: string; workspace_id: string; thread_id: string }>(
-    `UPDATE selfhost_amp_bindings
+    `UPDATE amp_bindings
         SET state = 'retired', generation = generation + 1, token_ciphertext = NULL,
             hook_ciphertext = NULL, history_queued_at = NULL, history_lease_owner = NULL,
             history_lease_until = NULL, updated_at = now()
@@ -516,7 +516,7 @@ export async function retireLocally(tx: SqlExecutor, where: string, params: unkn
   const ids = retired.rows.map((row) => row.id);
   if (!ids.length) return ids;
   await tx.query(
-    `UPDATE selfhost_amp_deliveries
+    `UPDATE amp_deliveries
         SET state = CASE state WHEN 'pending' THEN 'rejected' WHEN 'sending' THEN 'unknown' ELSE state END,
             code = CASE WHEN state IN ('pending', 'sending') THEN 'binding_retired' ELSE code END,
             payload_ciphertext = NULL, reply_hash = NULL, reply_expires_at = NULL,
@@ -526,7 +526,7 @@ export async function retireLocally(tx: SqlExecutor, where: string, params: unkn
   );
   for (const row of retired.rows) {
     await tx.query(
-      `UPDATE selfhost_amp_history_syncs SET pending_ciphertext = NULL, redactions_ciphertext = NULL
+      `UPDATE amp_history_syncs SET pending_ciphertext = NULL, redactions_ciphertext = NULL
         WHERE workspace_id = $1 AND thread_id = $2`,
       [row.workspace_id, row.thread_id],
     );
@@ -555,7 +555,7 @@ export async function releaseRetired(deps: AmpDeps, bindingId: string): Promise<
         if (!id) continue;
         await deps.relaycast.deleteSubscription(relay.key, id);
         await deps.database.query(
-          `UPDATE selfhost_amp_bindings SET ${column} = NULL, updated_at = now() WHERE id = $1 AND ${column} = $2`,
+          `UPDATE amp_bindings SET ${column} = NULL, updated_at = now() WHERE id = $1 AND ${column} = $2`,
           [row.id, id],
         );
       }
@@ -565,7 +565,7 @@ export async function releaseRetired(deps: AmpDeps, bindingId: string): Promise<
         // only the preparatory row. Anything else needs a person to inspect it.
         if (row.agent_remote_id) {
           await deps.database.query(
-            "UPDATE selfhost_amp_bindings SET last_error = $2, updated_at = now() WHERE id = $1",
+            "UPDATE amp_bindings SET last_error = $2, updated_at = now() WHERE id = $1",
             [row.id, "relay_identity_changed: inspect it before cleanup"],
           );
           return false;
@@ -576,16 +576,16 @@ export async function releaseRetired(deps: AmpDeps, bindingId: string): Promise<
     }
     await deps.database.transaction(async (tx) => {
       await tx.query(
-        `DELETE FROM selfhost_hosted_relay_participants
+        `DELETE FROM hosted_relay_participants
           WHERE workspace_id = $1 AND user_id = $2 AND agent_name = $3`,
         [row.workspace_id, row.user_id, row.agent_name],
       );
-      await tx.query("DELETE FROM selfhost_amp_bindings WHERE id = $1 AND state = 'retired'", [row.id]);
+      await tx.query("DELETE FROM amp_bindings WHERE id = $1 AND state = 'retired'", [row.id]);
     });
     return true;
   } catch {
     await deps.database.query(
-      "UPDATE selfhost_amp_bindings SET last_error = $2, updated_at = now() WHERE id = $1",
+      "UPDATE amp_bindings SET last_error = $2, updated_at = now() WHERE id = $1",
       [row.id, "release_pending: Relaycast cleanup will retry"],
     ).catch(() => undefined);
     return false;
@@ -607,7 +607,7 @@ export async function disconnect(deps: AmpDeps, actor: AmpActor) {
   const retired = await withAmpLock(deps, actor, async (tx) => {
     await requireAdmin(deps, tx, actor);
     const ids = await retireLocally(tx, "workspace_id = $1 AND state <> 'retired'", [actor.workspaceId]);
-    await tx.query("DELETE FROM selfhost_amp_connections WHERE workspace_id = $1", [actor.workspaceId]);
+    await tx.query("DELETE FROM amp_connections WHERE workspace_id = $1", [actor.workspaceId]);
     return ids;
   });
   let released = true;
@@ -623,14 +623,14 @@ export async function disconnect(deps: AmpDeps, actor: AmpActor) {
 export async function purgeMemberAmp(tx: SqlExecutor, member: { organizationId: string; userId: string }): Promise<void> {
   await retireLocally(tx, "organization_id = $1 AND user_id = $2 AND state <> 'retired'", [member.organizationId, member.userId]);
   await tx.query(
-    "DELETE FROM selfhost_amp_connections WHERE organization_id = $1 AND user_id = $2",
+    "DELETE FROM amp_connections WHERE organization_id = $1 AND user_id = $2",
     [member.organizationId, member.userId],
   );
 }
 
 export async function releaseMemberAmp(deps: AmpDeps, member: { organizationId: string; userId: string }) {
   const rows = await deps.database.query<{ id: string }>(
-    "SELECT id FROM selfhost_amp_bindings WHERE organization_id = $1 AND user_id = $2 AND state = 'retired'",
+    "SELECT id FROM amp_bindings WHERE organization_id = $1 AND user_id = $2 AND state = 'retired'",
     [member.organizationId, member.userId],
   );
   for (const row of rows.rows) await releaseRetired(deps, row.id);
@@ -642,7 +642,7 @@ export async function releaseMemberAmp(deps: AmpDeps, member: { organizationId: 
  */
 export async function cleanupWorkspaceAmp(deps: AmpDeps, workspaceId: string) {
   const workspace = await deps.database.query<{ organization_id: string }>(
-    "SELECT organization_id FROM selfhost_workspaces WHERE id = $1",
+    "SELECT organization_id FROM workspaces WHERE id = $1",
     [workspaceId],
   );
   const organizationId = workspace.rows[0]?.organization_id;
@@ -650,10 +650,10 @@ export async function cleanupWorkspaceAmp(deps: AmpDeps, workspaceId: string) {
   const retired = await withAmpLock(deps, { workspaceId, organizationId }, async (tx) => {
     const ids = await retireLocally(tx, "workspace_id = $1 AND state <> 'retired'", [workspaceId]);
     const already = await tx.query<{ id: string }>(
-      "SELECT id FROM selfhost_amp_bindings WHERE workspace_id = $1 AND state = 'retired'",
+      "SELECT id FROM amp_bindings WHERE workspace_id = $1 AND state = 'retired'",
       [workspaceId],
     );
-    await tx.query("DELETE FROM selfhost_amp_connections WHERE workspace_id = $1", [workspaceId]);
+    await tx.query("DELETE FROM amp_connections WHERE workspace_id = $1", [workspaceId]);
     return [...new Set([...ids, ...already.rows.map((row) => row.id)])];
   });
   let pending = 0;

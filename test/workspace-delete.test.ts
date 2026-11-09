@@ -98,9 +98,9 @@ test("workspace delete requires authentication, an admin of that organization, a
   assert.equal((await env.remove(acme.id, MISSING, ownerToken)).status, 404);
   assert.equal((await env.remove(acme.id, "not-a-uuid", BOOTSTRAP)).status, 404);
 
-  await env.database.query("UPDATE selfhost_organization_memberships SET role = 'member' WHERE user_id = $1", [acme.ownerId]);
+  await env.database.query("UPDATE organization_memberships SET role = 'member' WHERE user_id = $1", [acme.ownerId]);
   assert.equal((await env.remove(acme.id, doomed, ownerToken)).status, 403);
-  await env.database.query("UPDATE selfhost_organization_memberships SET role = 'admin' WHERE user_id = $1", [acme.ownerId]);
+  await env.database.query("UPDATE organization_memberships SET role = 'admin' WHERE user_id = $1", [acme.ownerId]);
 
   assert.deepEqual(await env.names(acme.id), ["keep", "doomed"]);
   assert.deepEqual(await env.names(other.id), ["foreign", "spare"]);
@@ -109,7 +109,7 @@ test("workspace delete requires authentication, an admin of that organization, a
   assert.deepEqual(await env.names(acme.id), ["keep"]);
   assert.equal((await env.remove(acme.id, doomed, ownerToken)).status, 404);
   const audit = await env.database.query<{ actor_kind: string; workspace_id: string | null; target: string }>(
-    "SELECT actor_kind, workspace_id, target FROM selfhost_admin_audit_events WHERE action = 'workspace.deleted'",
+    "SELECT actor_kind, workspace_id, target FROM admin_audit_events WHERE action = 'workspace.deleted'",
   );
   assert.deepEqual(audit.rows, [{ actor_kind: "user", workspace_id: null, target: `${doomed} (doomed)` }]);
 });
@@ -150,7 +150,7 @@ test("a workspace with a Factory connection is refused and left intact", async (
   await env.workspace(acme.id, "keep");
   const bound = await env.workspace(acme.id, "bound");
   await env.database.query(
-    `INSERT INTO selfhost_factory_connections
+    `INSERT INTO factory_connections
        (workspace_id, organization_id, user_id, key_envelope, key_hint, validated_at)
      VALUES ($1, $2, $3, 'envelope', 'hint', now())`,
     [bound, acme.id, acme.ownerId],
@@ -160,7 +160,7 @@ test("a workspace with a Factory connection is refused and left intact", async (
   assert.equal(refused.status, 409);
   assert.equal(refused.body.error, "workspace_in_use");
   assert.deepEqual(await env.names(acme.id), ["keep", "bound"]);
-  const audit = await env.database.query("SELECT 1 FROM selfhost_admin_audit_events WHERE action = 'workspace.deleted'");
+  const audit = await env.database.query("SELECT 1 FROM admin_audit_events WHERE action = 'workspace.deleted'");
   assert.equal(audit.rows.length, 0);
 });
 

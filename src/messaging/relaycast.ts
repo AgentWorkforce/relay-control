@@ -267,7 +267,11 @@ export function createRelaycastClient(input: {
     async sendDirectMessage(input: {
       token: string;
       to: string;
-      /** An exact machine address; when supplied it replaces the name selector. */
+      /**
+       * An exact machine address. When set it is sent instead of `to`:
+       * Relaycast's POST /v1/dm takes exactly one of `to` (agent name) or
+       * `address` (agent@machine) and refuses a body with both (400).
+       */
       address?: string;
       text: string;
       idempotencyKey: string;
@@ -276,7 +280,7 @@ export function createRelaycastClient(input: {
         "POST",
         "/v1/dm",
         input.token,
-        // Relaycast requires one selector; an address also pins the machine.
+        // Presence selects the exact-address contract, including invalid/empty addresses.
         input.address !== undefined
           ? { address: input.address, text: input.text }
           : { to: input.to, text: input.text },

@@ -273,10 +273,10 @@ test("registration: register takes no password; verify proves the address and mi
   assert.equal(ctx.mailer.sent.length, 1, "only the eligible address gets mail");
   assert.equal(ctx.mailer.sent[0]!.to, "dev@acme.test");
   const token = linkToken(ctx.mailer.sent[0]!, "/login/password/verify");
-  const pending = await ctx.database.query<{ token_hash: string }>("SELECT token_hash FROM selfhost_password_registrations");
+  const pending = await ctx.database.query<{ token_hash: string }>("SELECT token_hash FROM password_registrations");
   assert.notEqual(pending.rows[0]!.token_hash, token, "only the token hash is stored");
   const columns = await ctx.database.query<{ column_name: string }>(
-    "SELECT column_name FROM information_schema.columns WHERE table_name = 'selfhost_password_registrations'",
+    "SELECT column_name FROM information_schema.columns WHERE table_name = 'password_registrations'",
   );
   assert.ok(!columns.rows.some((c) => c.column_name.includes("password")), "a pending registration holds no password");
 
@@ -291,7 +291,7 @@ test("registration: register takes no password; verify proves the address and mi
   assert.ok(Date.parse(verified.body.expiresAt) - ctx.clock.now <= SETUP_TTL_MS + 1_000);
   assert.equal(SETUP_TTL_MS, 15 * 60 * 1_000);
   assert.equal(verified.cookies.agent_relay_session, undefined, "verify alone signs nobody in");
-  assert.equal((await ctx.database.query("SELECT 1 FROM selfhost_users WHERE email = 'dev@acme.test'")).rows.length, 0, "no account yet");
+  assert.equal((await ctx.database.query("SELECT 1 FROM users WHERE email = 'dev@acme.test'")).rows.length, 0, "no account yet");
   const again = await call(ctx.origin, `${API}/verify`, { json: { token } });
   assert.equal(again.status, 410, "single use");
   assert.equal(again.body.error, "token_invalid");
@@ -337,7 +337,7 @@ test("registration: register takes no password; verify proves the address and mi
 
 test("registration: invitees may register (invite carried through verify); policy errors come from set", async (t) => {
   const ctx = await setup(t, { env: { SELFHOST_AUTO_JOIN_DOMAINS: "" } });
-  const organization = (await ctx.database.query<{ id: string }>("SELECT id FROM selfhost_organizations")).rows[0]!.id;
+  const organization = (await ctx.database.query<{ id: string }>("SELECT id FROM organizations")).rows[0]!.id;
   // Not invited and no auto-join domain: no mail.
   await call(ctx.origin, `${API}/register`, { json: { email: "guest@partner.test" } });
   await ctx.identity.idle();
@@ -377,7 +377,7 @@ test("registration: a newer link leaves older ones working until one is used; li
   const late = await call(ctx.origin, `${API}/set`, { json: { token: newerSetup, password: PASSWORD } });
   assert.equal(late.status, 410, "15 minutes at most");
   assert.equal(late.body.error, "token_invalid");
-  assert.equal((await ctx.database.query("SELECT 1 FROM selfhost_users WHERE email = 'ex@acme.test'")).rows.length, 0, "nothing was created");
+  assert.equal((await ctx.database.query("SELECT 1 FROM users WHERE email = 'ex@acme.test'")).rows.length, 0, "nothing was created");
   assert.equal((await call(ctx.origin, `${API}/set`, { json: { token: "sh_ps_" + "x".repeat(300), password: PASSWORD } })).status, 400, "tokens are at most 256 characters");
 });
 
@@ -463,12 +463,12 @@ test("login: unknown, wrong and locked answer the same 401 invalid_credentials",
   assert.equal((await login(ctx, "ghost@acme.test", PASSWORD)).text, locked.text);
 
   // After the backoff the right password works and clears the counter.
-  const lockRow = await ctx.database.query<{ failures: number }>("SELECT failures FROM selfhost_login_attempts WHERE subject = 'account-key:lock@acme.test|198.51.100.7'");
+  const lockRow = await ctx.database.query<{ failures: number }>("SELECT failures FROM login_attempts WHERE subject = 'account-key:lock@acme.test|198.51.100.7'");
   assert.equal(lockRow.rows[0]!.failures, 5, "an attempt refused inside a lock is not counted");
   ctx.clock.now += lockDelayMs(5, LOCKOUT.accountKey.free) + 1_000;
   const after = await login(ctx, "lock@acme.test", PASSWORD);
   assert.equal(after.status, 200, after.text);
-  const rows = await ctx.database.query("SELECT subject FROM selfhost_login_attempts WHERE subject LIKE '%lock@acme.test%'");
+  const rows = await ctx.database.query("SELECT subject FROM login_attempts WHERE subject LIKE '%lock@acme.test%'");
   assert.deepEqual(rows.rows, [], "a successful sign-in clears the account's counters");
 
   const actions = await auditActions(ctx);
@@ -520,13 +520,13 @@ test("login: unknown accounts spend a comparable argon2id verification", async (
 test("login: re-hashes on success when the pepper version changed", async (t) => {
   const ctx = await setup(t, { env: { SELFHOST_PASSWORD_PEPPER_FILE: pepperFile("v3:" + "p".repeat(40)) } });
   await registerVerified(ctx, "re@acme.test");
-  const user = (await ctx.database.query<{ id: string }>("SELECT id FROM selfhost_users WHERE email = 're@acme.test'")).rows[0]!.id;
+  const user = (await ctx.database.query<{ id: string }>("SELECT id FROM users WHERE email = 're@acme.test'")).rows[0]!.id;
   // Simulate a hash made before the pepper existed.
   const legacy = await new PasswordHasher(passwordConfig()).hash(PASSWORD);
-  await ctx.database.query("UPDATE selfhost_password_credentials SET password_hash = $2, pepper_version = NULL WHERE user_id = $1", [user, legacy.hash]);
+  await ctx.database.query("UPDATE password_credentials SET password_hash = $2, pepper_version = NULL WHERE user_id = $1", [user, legacy.hash]);
   assert.equal((await login(ctx, "re@acme.test", PASSWORD)).status, 200);
   const row = (await ctx.database.query<{ password_hash: string; pepper_version: number | null; params: string }>(
-    "SELECT password_hash, pepper_version, params FROM selfhost_password_credentials WHERE user_id = $1", [user],
+    "SELECT password_hash, pepper_version, params FROM password_credentials WHERE user_id = $1", [user],
   )).rows[0]!;
   assert.equal(row.pepper_version, 3);
   assert.notEqual(row.password_hash, legacy.hash);
@@ -555,7 +555,7 @@ test("reset: identical 202s, single-use 30-minute token, revokes every session",
   await ctx.identity.idle();
   assert.equal(ctx.mailer.sent.length, sent + 1, "mail only for an address with a password");
   const token = linkToken(ctx.mailer.sent.at(-1)!, "/login/password/reset");
-  const stored = await ctx.database.query<{ token_hash: string; expires_at: Date; created_at: Date }>("SELECT token_hash, expires_at FROM selfhost_password_reset_tokens");
+  const stored = await ctx.database.query<{ token_hash: string; expires_at: Date; created_at: Date }>("SELECT token_hash, expires_at FROM password_reset_tokens");
   assert.notEqual(stored.rows[0]!.token_hash, token, "stored only as a hash");
   assert.ok(new Date(stored.rows[0]!.expires_at).getTime() - ctx.clock.now <= RESET_TTL_MS + 1_000);
   assert.equal(RESET_TTL_MS, 30 * 60 * 1_000);
@@ -570,7 +570,7 @@ test("reset: identical 202s, single-use 30-minute token, revokes every session",
   assert.ok(done.body.revoked.sessions >= 2);
   assert.equal((await session(ctx, first)).status, 401, "existing sessions are revoked");
   assert.equal((await session(ctx, second)).status, 401);
-  const reasons = await ctx.database.query<{ revoked_reason: string }>("SELECT DISTINCT revoked_reason FROM selfhost_token_sessions WHERE revoked_at IS NOT NULL");
+  const reasons = await ctx.database.query<{ revoked_reason: string }>("SELECT DISTINCT revoked_reason FROM token_sessions WHERE revoked_at IS NOT NULL");
   assert.deepEqual(reasons.rows.map((r) => r.revoked_reason), ["password_reset"]);
   assert.equal((await call(ctx.origin, "/api/v1/auth/password/reset/complete", { json: { token, password: NEW } })).status, 410, "single use");
   assert.equal((await login(ctx, "rs@acme.test", PASSWORD)).status, 401, "the old password no longer works");
@@ -603,13 +603,13 @@ test("admin emails: the first to verify becomes owner, the rest admin", async (t
   const ctx = await setup(t, {
     env: { SELFHOST_BOOTSTRAP_ADMIN_EMAIL: "", SELFHOST_ADMIN_EMAILS: "first@partner.test,second@partner.test", SELFHOST_AUTO_JOIN_DOMAINS: "" },
   });
-  const owners = await ctx.database.query("SELECT 1 FROM selfhost_organization_memberships WHERE role = 'owner'");
+  const owners = await ctx.database.query("SELECT 1 FROM organization_memberships WHERE role = 'owner'");
   assert.equal(owners.rows.length, 0, "no owner until an admin email verifies");
   // The second listed address verifies first and becomes owner.
   const second = await registerVerified(ctx, "second@partner.test");
   const first = await registerVerified(ctx, "first@partner.test");
   const role = async (email: string) => (await ctx.database.query<{ role: string }>(
-    "SELECT m.role FROM selfhost_organization_memberships m JOIN selfhost_users u ON u.id = m.user_id WHERE u.email = $1", [email],
+    "SELECT m.role FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE u.email = $1", [email],
   )).rows[0]?.role;
   assert.equal(await role("second@partner.test"), "owner");
   assert.equal(await role("first@partner.test"), "admin");
@@ -619,7 +619,7 @@ test("admin emails: the first to verify becomes owner, the rest admin", async (t
   assert.ok(actions.includes("membership.admin_email_admin"));
   // A grant is recorded once: a later demotion is not undone by signing in again.
   await ctx.database.query(
-    "UPDATE selfhost_organization_memberships SET role = 'member' WHERE user_id = (SELECT id FROM selfhost_users WHERE email = 'first@partner.test')",
+    "UPDATE organization_memberships SET role = 'member' WHERE user_id = (SELECT id FROM users WHERE email = 'first@partner.test')",
   );
   assert.equal((await login(ctx, "first@partner.test", PASSWORD)).status, 200);
   assert.equal(await role("first@partner.test"), "member");

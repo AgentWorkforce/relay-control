@@ -26,16 +26,16 @@ export type RetiringIdentityQuery = {
  * before any Relaycast call.
  */
 export async function retiringIdentity(tx: SqlExecutor, query: RetiringIdentityQuery): Promise<boolean> {
-  const result = await tx.query(`SELECT 1 FROM selfhost_mcp_oauth_revocations r
+  const result = await tx.query(`SELECT 1 FROM mcp_oauth_revocations r
     WHERE r.organization_id=$1 AND r.workspace_id=$2 AND r.user_id=$3
       AND (($4::text IS NOT NULL AND r.agent_remote_id=$4::text
             AND (r.completed_at IS NULL OR r.outcome='operator_abandoned'))
         OR (r.completed_at IS NULL AND r.agent_remote_id IS NULL AND r.agent_name=$5))
       AND NOT ($4::text IS NOT NULL AND (
-        EXISTS (SELECT 1 FROM selfhost_mcp_oauth_grants g
+        EXISTS (SELECT 1 FROM mcp_oauth_grants g
           WHERE g.organization_id=$1 AND g.workspace_id=$2 AND g.user_id=$3
             AND g.revoked_at IS NULL AND g.agent_remote_id=$4::text)
-        OR EXISTS (SELECT 1 FROM selfhost_hosted_relay_participants p
+        OR EXISTS (SELECT 1 FROM hosted_relay_participants p
           WHERE p.workspace_id=$2 AND p.user_id=$3 AND p.agent_remote_id=$4::text AND p.session_hash IS NOT NULL)))
     LIMIT 1`,
   [query.organizationId, query.workspaceId, query.userId, query.agentRemoteId, query.agentName]);

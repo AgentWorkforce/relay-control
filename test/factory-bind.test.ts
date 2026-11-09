@@ -52,7 +52,7 @@ test("factory bind recovers its own registration after a crash between Relay reg
   const agentName = agentNameFor("sess-a");
   const orphan = env.relay.agents.get(agentName)!;
   assert.ok(orphan);
-  const preparing = await env.database.query<{ id: string; state: string }>("SELECT id, state FROM selfhost_factory_bindings");
+  const preparing = await env.database.query<{ id: string; state: string }>("SELECT id, state FROM factory_bindings");
   assert.deepEqual(preparing.rows.map((row) => row.state), ["preparing"]);
 
   const retried = await bind(env, { session_id: "sess-a", computer_id: "cmp-1" });
@@ -88,7 +88,7 @@ test("factory bind: two attempts sharing one preparing row and recovering the sa
   assert.equal((await bind(env, { session_id: "sess-a", computer_id: "cmp-1" })).status, 500);
   const agentName = agentNameFor("sess-a");
   const agent = env.relay.agents.get(agentName)!;
-  const [row] = (await env.database.query<{ id: string }>("SELECT id FROM selfhost_factory_bindings")).rows;
+  const [row] = (await env.database.query<{ id: string }>("SELECT id FROM factory_bindings")).rows;
 
   const attempt = () => bind(env, { session_id: "sess-a", computer_id: "cmp-1" }).finally(() => firstFinished());
   const results = await Promise.all([attempt(), attempt()]);

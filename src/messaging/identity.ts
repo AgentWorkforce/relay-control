@@ -91,7 +91,7 @@ async function withLock<T>(database: Database, key: string, run: (tx: SqlExecuto
 async function readRow(executor: SqlExecutor, workspaceId: string, userId: string): Promise<IdentityRow | null> {
   const result = await executor.query<IdentityRow>(
     `SELECT agent_name, agent_remote_id, token_ciphertext, relaycast_workspace_id
-       FROM selfhost_person_identities
+       FROM person_identities
       WHERE workspace_id = $1 AND user_id = $2`,
     [workspaceId, userId],
   );
@@ -111,7 +111,7 @@ function usable(row: IdentityRow | null, relaycastWorkspaceId: string, keyring: 
 async function isMember(executor: SqlExecutor, organizationId: string, userId: string): Promise<boolean> {
   const result = await executor.query<{ present: boolean }>(
     `SELECT true AS present
-       FROM selfhost_organization_memberships
+       FROM organization_memberships
       WHERE organization_id = $1 AND user_id = $2`,
     [organizationId, userId],
   );
@@ -123,7 +123,7 @@ async function saveIdentity(
   input: { workspaceId: string; userId: string; relaycastWorkspaceId: string; identity: PersonIdentity; keyring: EncryptionKeyring },
 ): Promise<void> {
   await executor.query(
-    `INSERT INTO selfhost_person_identities
+    `INSERT INTO person_identities
        (id, workspace_id, user_id, agent_name, agent_remote_id, token_ciphertext, relaycast_workspace_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (workspace_id, user_id) DO UPDATE
@@ -312,14 +312,14 @@ type RevocationTarget = {
 
 async function queueRevocation(executor: SqlExecutor, target: RevocationTarget): Promise<void> {
   await executor.query(
-    `INSERT INTO selfhost_person_revocations
+    `INSERT INTO person_revocations
        (id, workspace_id, user_id, relaycast_workspace_id, agent_name, agent_remote_id)
      VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (workspace_id, user_id, agent_remote_id) DO NOTHING`,
     [randomUUID(), target.workspaceId, target.userId, target.relaycastWorkspaceId, target.agentName, target.agentRemoteId],
   );
   await executor.query(
-    `DELETE FROM selfhost_person_identities
+    `DELETE FROM person_identities
       WHERE workspace_id = $1 AND user_id = $2 AND agent_remote_id = $3`,
     [target.workspaceId, target.userId, target.agentRemoteId],
   );
@@ -336,8 +336,8 @@ export async function revokeRemovedMember(deps: MessagingDeps, organizationId: s
   }>(
     `SELECT identity.workspace_id, identity.relaycast_workspace_id, identity.agent_name,
             identity.agent_remote_id, workspace.relaycast_api_key_ciphertext
-       FROM selfhost_person_identities identity
-       JOIN selfhost_workspaces workspace ON workspace.id = identity.workspace_id
+       FROM person_identities identity
+       JOIN workspaces workspace ON workspace.id = identity.workspace_id
       WHERE workspace.organization_id = $1 AND identity.user_id = $2`,
     [organizationId, userId],
   );
@@ -367,8 +367,8 @@ export async function sweepRevocations(deps: MessagingDeps, organizationId?: str
   }>(
     `SELECT revocation.id, revocation.agent_name, revocation.agent_remote_id,
             revocation.user_id, workspace.relaycast_api_key_ciphertext
-       FROM selfhost_person_revocations revocation
-       JOIN selfhost_workspaces workspace ON workspace.id = revocation.workspace_id
+       FROM person_revocations revocation
+       JOIN workspaces workspace ON workspace.id = revocation.workspace_id
       WHERE ($1::uuid IS NULL OR workspace.organization_id = $1)
         AND ($2::uuid IS NULL OR revocation.user_id = $2)`,
     [organizationId ?? null, userId ?? null],
@@ -382,7 +382,7 @@ export async function sweepRevocations(deps: MessagingDeps, organizationId?: str
         row.agent_remote_id,
         `selfhost-user:${row.user_id}`,
       );
-      await deps.database.query("DELETE FROM selfhost_person_revocations WHERE id = $1", [row.id]);
+      await deps.database.query("DELETE FROM person_revocations WHERE id = $1", [row.id]);
     } catch {
       // The queue row remains for the next request.
     }
@@ -450,7 +450,7 @@ async function claimSendOnce(
       const existing = await tx.query<SendClaim & { created_at: Date | string }>(
         `SELECT relay_message_id, conversation_id, body, peer_name, status, terminal_code, fingerprint,
                 EXTRACT(EPOCH FROM (clock_timestamp() - created_at)) * 1000 AS age_ms, created_at
-           FROM selfhost_person_messages
+           FROM person_messages
           WHERE workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3 AND client_message_id = $4
           FOR UPDATE`,
         [input.workspaceId, input.userId, input.relaycastWorkspaceId, input.clientMessageId],
@@ -458,7 +458,7 @@ async function claimSendOnce(
       const row = existing.rows[0];
       if (!row) {
         await tx.query(
-          `INSERT INTO selfhost_person_messages
+          `INSERT INTO person_messages
              (id, workspace_id, user_id, relaycast_workspace_id, peer_name, client_message_id, body, fingerprint, status)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')`,
           [randomUUID(), input.workspaceId, input.userId, input.relaycastWorkspaceId, input.peer, input.clientMessageId, input.text, fingerprint],
@@ -477,7 +477,7 @@ async function claimSendOnce(
       // claims are not sent again.
       if (row.status === "retryable") {
         await tx.query(
-          `UPDATE selfhost_person_messages
+          `UPDATE person_messages
               SET status = 'pending', created_at = clock_timestamp()
             WHERE workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3 AND client_message_id = $4`,
           [input.workspaceId, input.userId, input.relaycastWorkspaceId, input.clientMessageId],
@@ -519,7 +519,7 @@ export async function finishSend(
   },
 ): Promise<void> {
   await deps.database.query(
-    `UPDATE selfhost_person_messages
+    `UPDATE person_messages
         SET status = $5,
             relay_message_id = COALESCE($6, relay_message_id),
             conversation_id = COALESCE($7, conversation_id),
@@ -547,7 +547,7 @@ export async function waitForSend(
     const result = await deps.database.query<SendClaim>(
       `SELECT relay_message_id, conversation_id, body, peer_name, status, terminal_code, fingerprint,
               EXTRACT(EPOCH FROM (clock_timestamp() - created_at)) * 1000 AS age_ms
-         FROM selfhost_person_messages
+         FROM person_messages
         WHERE workspace_id = $1 AND user_id = $2 AND relaycast_workspace_id = $3 AND client_message_id = $4`,
       [input.workspaceId, input.userId, input.relaycastWorkspaceId, input.clientMessageId],
     );

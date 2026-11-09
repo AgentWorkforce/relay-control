@@ -57,7 +57,7 @@ async function freshDatabase(t: test.TestContext) {
 }
 
 async function organizationCount(database: PGliteDatabase): Promise<number> {
-  const result = await database.query<{ count: number }>("SELECT count(*)::int AS count FROM selfhost_organizations");
+  const result = await database.query<{ count: number }>("SELECT count(*)::int AS count FROM organizations");
   return result.rows[0]!.count;
 }
 
@@ -108,7 +108,7 @@ test("single mode: parallel bootstrap passes yield one organization and one work
   assert.deepEqual(passes, ["done", "done"]);
   assert.equal(await organizationCount(database), 1);
   const workspaces = await database.query<{ relaycast_workspace_id: string }>(
-    "SELECT relaycast_workspace_id FROM selfhost_workspaces",
+    "SELECT relaycast_workspace_id FROM workspaces",
   );
   assert.equal(workspaces.rows.length, 1);
   // Any Relaycast workspace the losing pass provisioned is released again.
@@ -180,7 +180,7 @@ test("DG-004: an upgraded single installation keeps its SELFHOST_AUTO_JOIN_DOMAI
   assert.deepEqual(await restart("acme.test"), ["acme.test"]);
   assert.deepEqual(await restart(undefined), [], "removal clears the rows");
   const audit = await database.query<{ target: string }>(
-    "SELECT target FROM selfhost_admin_audit_events WHERE action = 'organization.domains_env_sync'",
+    "SELECT target FROM admin_audit_events WHERE action = 'organization.domains_env_sync'",
   );
   assert.equal(audit.rows.length, 5);
   assert.equal(await control.ready(), true);
@@ -188,7 +188,7 @@ test("DG-004: an upgraded single installation keeps its SELFHOST_AUTO_JOIN_DOMAI
 
 test("DG-005: single tenancy over a multi-organization database fails readiness and deletes nothing", async (t) => {
   const database = await freshDatabase(t);
-  await database.query("INSERT INTO selfhost_organizations (id, name) VALUES (gen_random_uuid(), 'One'), (gen_random_uuid(), 'Two')");
+  await database.query("INSERT INTO organizations (id, name) VALUES (gen_random_uuid(), 'One'), (gen_random_uuid(), 'Two')");
   const single = new ControlPlaneStore(database, KEYRING, 0);
   assert.deepEqual(await single.readiness(), {
     ready: false,
@@ -213,9 +213,9 @@ test("DG-005: single tenancy over a multi-organization database fails readiness 
   assert.equal(await bootstrapOnce({ bootstrap: config.bootstrap!, store: identityStore, provisioner: null, log: (message) => logged.push(message) }), "done");
   assert.match(logged.join("\n"), /bootstrap skipped/);
   const untouched = await database.query<{ users: number; domains: number; memberships: number }>(
-    `SELECT (SELECT count(*)::int FROM selfhost_users) AS users,
-            (SELECT count(*)::int FROM selfhost_organization_domains) AS domains,
-            (SELECT count(*)::int FROM selfhost_organization_memberships) AS memberships`,
+    `SELECT (SELECT count(*)::int FROM users) AS users,
+            (SELECT count(*)::int FROM organization_domains) AS domains,
+            (SELECT count(*)::int FROM organization_memberships) AS memberships`,
   );
   assert.deepEqual(untouched.rows[0], { users: 0, domains: 0, memberships: 0 });
   assert.equal(await organizationCount(database), 2);
@@ -249,12 +249,12 @@ test("DG-005: concurrent first sign-ins of one person create one personal organi
   assert.equal(first.organizationId, second.organizationId);
   assert.equal(first.workspaceId, second.workspaceId);
   assert.equal(await organizationCount(database), 1);
-  const org = await database.query<{ name: string }>("SELECT name FROM selfhost_organizations");
+  const org = await database.query<{ name: string }>("SELECT name FROM organizations");
   assert.equal(org.rows[0]!.name, "Ada's Workspace");
-  const workspaces = await database.query<{ relaycast_workspace_id: string }>("SELECT relaycast_workspace_id FROM selfhost_workspaces");
+  const workspaces = await database.query<{ relaycast_workspace_id: string }>("SELECT relaycast_workspace_id FROM workspaces");
   assert.equal(workspaces.rows.length, 1);
   assert.deepEqual([...removed, workspaces.rows[0]!.relaycast_workspace_id].sort(), [...created].sort());
-  const owners = await database.query<{ role: string }>("SELECT role FROM selfhost_organization_memberships");
+  const owners = await database.query<{ role: string }>("SELECT role FROM organization_memberships");
   assert.deepEqual(owners.rows.map((row) => row.role), ["owner"]);
   assert.equal([first, second].filter((result) => result.joined?.via === "personal").length, 1);
 });

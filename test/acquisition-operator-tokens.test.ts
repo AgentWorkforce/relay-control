@@ -300,7 +300,7 @@ test("introspection answers for an acquisition-operator token as a service princ
   const created = await ctx.mint(operatorBody({ expiryDays: 30 }));
   const token = created.body.accessToken as string;
   const row = (await ctx.database.query<{ created_at: Date }>(
-    "SELECT created_at FROM selfhost_workspace_api_tokens WHERE id = $1",
+    "SELECT created_at FROM workspace_api_tokens WHERE id = $1",
     [created.body.id],
   )).rows[0]!;
 
@@ -337,7 +337,7 @@ test("introspection answers for an acquisition-operator token as a service princ
   assert(rolling.body.exp >= before + 3_590 && rolling.body.exp <= Math.floor(Date.now() / 1_000) + 3_610);
 
   const used = (await ctx.database.query<{ last_used_at: Date | null }>(
-    "SELECT last_used_at FROM selfhost_workspace_api_tokens WHERE id = $1",
+    "SELECT last_used_at FROM workspace_api_tokens WHERE id = $1",
     [created.body.id],
   )).rows[0]!;
   assert.notEqual(used.last_used_at, null);
@@ -359,7 +359,7 @@ test("introspection inactive reasons for acquisition-operator tokens", async (t)
 
   const expiring = (await ctx.mint(operatorBody())).body;
   await ctx.database.query(
-    "UPDATE selfhost_workspace_api_tokens SET expires_at = now() - interval '1 second' WHERE id = $1",
+    "UPDATE workspace_api_tokens SET expires_at = now() - interval '1 second' WHERE id = $1",
     [expiring.id],
   );
   await inactive({ token: expiring.accessToken, aud: HISTORY }, "expired");
@@ -372,7 +372,7 @@ test("Desktop-issued sessions carry rth:acquire; dashboard browser sessions do n
   const ctx = await setup(t);
   const scopesOf = async (accessToken: string) =>
     (await ctx.database.query<{ scopes: string[] }>(
-      "SELECT scopes FROM selfhost_token_sessions WHERE access_token_hash = $1",
+      "SELECT scopes FROM token_sessions WHERE access_token_hash = $1",
       [createHash("sha256").update(accessToken).digest("hex")],
     )).rows[0]?.scopes;
 

@@ -15,9 +15,9 @@ import {
 type Level = "organization" | "workspace" | "connection" | "bindings";
 const RANK: Record<Level, number> = { organization: 0, workspace: 1, connection: 2, bindings: 3 };
 const TABLE: Record<string, Level> = {
-  selfhost_organizations: "organization",
-  selfhost_factory_connections: "connection",
-  selfhost_factory_bindings: "bindings",
+  organizations: "organization",
+  factory_connections: "connection",
+  factory_bindings: "bindings",
 };
 
 /** The lock level a statement takes, if any (row locks and writes only). */

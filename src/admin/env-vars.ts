@@ -73,7 +73,7 @@ export class EnvVarStore {
 
   async list(workspaceId: string): Promise<EnvVarRecord[]> {
     const result = await this.database.query<Row>(
-      `SELECT ${COLUMNS} FROM selfhost_workspace_env_vars
+      `SELECT ${COLUMNS} FROM workspace_env_vars
         WHERE workspace_id = $1 ORDER BY name`,
       [workspaceId],
     );
@@ -82,7 +82,7 @@ export class EnvVarStore {
 
   async get(workspaceId: string, name: string): Promise<EnvVarRecord | null> {
     const result = await this.database.query<Row>(
-      `SELECT ${COLUMNS} FROM selfhost_workspace_env_vars
+      `SELECT ${COLUMNS} FROM workspace_env_vars
         WHERE workspace_id = $1 AND name = $2`,
       [workspaceId, name],
     );
@@ -105,11 +105,11 @@ export class EnvVarStore {
     return this.database.transaction(async (tx) => {
       // Serialize writers per workspace so count/size limits hold.
       await tx.query(
-        "SELECT id FROM selfhost_workspaces WHERE id = $1 FOR UPDATE",
+        "SELECT id FROM workspaces WHERE id = $1 FOR UPDATE",
         [input.workspaceId],
       );
       const totals = await tx.query<{ name: string; value_bytes: number }>(
-        `SELECT name, value_bytes FROM selfhost_workspace_env_vars WHERE workspace_id = $1`,
+        `SELECT name, value_bytes FROM workspace_env_vars WHERE workspace_id = $1`,
         [input.workspaceId],
       );
       const others = totals.rows.filter((row) => row.name !== name);
@@ -128,7 +128,7 @@ export class EnvVarStore {
         );
       }
       const result = await tx.query<Row & { inserted: boolean }>(
-        `INSERT INTO selfhost_workspace_env_vars
+        `INSERT INTO workspace_env_vars
            (workspace_id, name, value_ciphertext, masked_value, value_bytes,
             created_by_user_id, updated_by_user_id)
          VALUES ($1, $2, $3, $4, $5, $6, $6)
@@ -161,7 +161,7 @@ export class EnvVarStore {
   }): Promise<EnvVarRecord | null> {
     return this.database.transaction(async (tx) => {
       const result = await tx.query<Row>(
-        `DELETE FROM selfhost_workspace_env_vars
+        `DELETE FROM workspace_env_vars
           WHERE workspace_id = $1 AND name = $2
           RETURNING ${COLUMNS}`,
         [input.workspaceId, input.name],
@@ -188,7 +188,7 @@ export class EnvVarStore {
     actor: AuditActor,
   ): Promise<RuntimeEnvironment> {
     const result = await this.database.query<{ name: string; value_ciphertext: string }>(
-      `SELECT name, value_ciphertext FROM selfhost_workspace_env_vars
+      `SELECT name, value_ciphertext FROM workspace_env_vars
         WHERE workspace_id = $1 ORDER BY name`,
       [workspaceId],
     );

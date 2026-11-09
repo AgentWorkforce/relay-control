@@ -25,10 +25,10 @@ async function fixture(t:test.TestContext) {
   });
   await migrate(database);
   const owner={ userId:randomUUID(),organizationId:randomUUID(),workspaceId:randomUUID(),agentName:"fake-agent" };
-  await database.query("INSERT INTO selfhost_users(id,email,name) VALUES ($1,$2,'Fake User')",[owner.userId,`fake-${owner.userId}@example.test`]);
-  await database.query("INSERT INTO selfhost_organizations(id,name) VALUES ($1,'Fake Org')",[owner.organizationId]);
-  await database.query("INSERT INTO selfhost_organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'owner')",[owner.organizationId,owner.userId]);
-  await database.query(`INSERT INTO selfhost_workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
+  await database.query("INSERT INTO users(id,email,name) VALUES ($1,$2,'Fake User')",[owner.userId,`fake-${owner.userId}@example.test`]);
+  await database.query("INSERT INTO organizations(id,name) VALUES ($1,'Fake Org')",[owner.organizationId]);
+  await database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'owner')",[owner.organizationId,owner.userId]);
+  await database.query(`INSERT INTO workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
     VALUES ($1,$2,'Fake Workspace',$3,'fake-envelope')`,[owner.workspaceId,owner.organizationId,`fake-${owner.workspaceId}`]);
   const protocol=createMcpOAuthProtocol({ publicOrigin:ORIGIN,enabledResources:[SHARED] });
   const storeOptions={ protocol,tenancyMode:"multi" as const,isGrokRoutine:()=>false };
@@ -50,8 +50,8 @@ test("real Postgres: full refresh flow serializes competing refreshes and preser
   const winners=results.filter(value=>value.ok);
   assert.equal(winners.length,1); assert.ok(winners[0]!.ok);
   assert.ok(await f.store.sessions.resolveAccessToken(winners[0]!.body.access_token,f.request.resource));
-  assert.equal((await f.database.query("SELECT token_hash FROM selfhost_mcp_oauth_retired_refresh_tokens")).rows.length,1);
-  assert.equal((await f.database.query("SELECT id FROM selfhost_mcp_oauth_revocations")).rows.length,0);
+  assert.equal((await f.database.query("SELECT token_hash FROM mcp_oauth_retired_refresh_tokens")).rows.length,1);
+  assert.equal((await f.database.query("SELECT id FROM mcp_oauth_revocations")).rows.length,0);
 });
 
 test("real Postgres: code issuance fences native membership deletion with a row lock",options,async t=>{
@@ -64,7 +64,7 @@ test("real Postgres: code issuance fences native membership deletion with a row 
     transaction:run=>f.database.transaction(tx=>{
       const wrapped:SqlExecutor={ exec:tx.exec.bind(tx),query:async <T extends Record<string,unknown>>(sql:string,params?:unknown[])=>{
         const result=await tx.query<T>(sql,params);
-        if(sql.includes("SELECT w.id FROM selfhost_workspaces w")) { notifyLocked(); await released; }
+        if(sql.includes("SELECT w.id FROM workspaces w")) { notifyLocked(); await released; }
         return result;
       } };
       return run(wrapped);
@@ -78,12 +78,12 @@ test("real Postgres: code issuance fences native membership deletion with a row 
   try {
     await Promise.race([locked,outcome.then(value=>{ if("error" in value) throw value.error; throw new Error("missing membership fence"); })]);
     await deleter.query("BEGIN"); await deleter.query("SET LOCAL lock_timeout='150ms'");
-    await assert.rejects(deleter.query("DELETE FROM selfhost_organization_memberships WHERE organization_id=$1 AND user_id=$2",
+    await assert.rejects(deleter.query("DELETE FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",
       [f.owner.organizationId,f.owner.userId]),(error:unknown)=>typeof error==="object" && error!==null && "code" in error && error.code==="55P03");
     await deleter.query("ROLLBACK");
   } finally { release(); deleter.release(); }
   const result=await outcome; if("error" in result) throw result.error;
-  await f.database.query("DELETE FROM selfhost_organization_memberships WHERE organization_id=$1 AND user_id=$2",[f.owner.organizationId,f.owner.userId]);
+  await f.database.query("DELETE FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",[f.owner.organizationId,f.owner.userId]);
   assert.equal((await f.exchange(result.code)).ok,false);
 });
 

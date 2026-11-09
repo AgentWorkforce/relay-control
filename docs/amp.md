@@ -30,7 +30,7 @@ history schedule up to the RelayHistory upload. It exports the
 thread through `deps.run`, scrubs reply capabilities, parses it with
 `ampExport` from `src/amp/provider.ts` (the RelayHistory parser, copied
 byte-for-byte and pinned by `src/amp/provider-origin.json`), diffs per
-message version against `selfhost_amp_history_syncs.versions`, keeps each
+message version against `amp_history_syncs.versions`, keeps each
 prepared page in an encrypted pending envelope until the receipt matches, and
 advances the binding's `last_synced_at` watermark only after every page was
 fully accepted. Metadata-only `sourceDigest` backfills are persisted without
@@ -248,7 +248,7 @@ credential, `Authorization: Bearer amp_reply_<43 base64url chars>`.
 **Lifecycle**
 
 - Each injected prompt carries a fresh bearer, minted at claim time.
-- Only its SHA-256 is stored, in `selfhost_amp_deliveries.reply_hash`.
+- Only its SHA-256 is stored, in `amp_deliveries.reply_hash`.
 - It expires 24 hours after the claim.
 
 **Binding.** The bearer is bound to one binding, one message ID, the original
@@ -312,7 +312,7 @@ external scheduler that wants to drive it.
 
 ## Outbox semantics
 
-`selfhost_amp_deliveries` is the outbox. The unique key is
+`amp_deliveries` is the outbox. The unique key is
 `(binding_id, message_id)`. The states:
 
 | State | Meaning |

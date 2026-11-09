@@ -4,7 +4,7 @@ import type { Database } from "../database.js";
 /**
  * Run object storage (code archives, runner logs, step logs, artifacts).
  *
- * The object index always lives in Postgres (`selfhost_run_objects`), so
+ * The object index always lives in Postgres (`run_objects`), so
  * listing and authorization never depend on the blob backend. Bytes live
  * either inline in Postgres (default; fine for logs and small artifacts) or in
  * a GCS bucket when `SELFHOST_FLOWS_STORAGE=gcs`.
@@ -128,7 +128,7 @@ export class RunObjectStore {
     const etag = `"${createHash("sha256").update(body).digest("hex").slice(0, 32)}"`;
     const external = await this.backend.put(`${runId}/${key}`, body, contentType);
     const result = await this.database.query<{ updated_at: Date | string }>(
-      `INSERT INTO selfhost_run_objects
+      `INSERT INTO run_objects
          (run_id, object_key, content_type, size_bytes, etag, content, external_location)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (run_id, object_key) DO UPDATE
@@ -156,7 +156,7 @@ export class RunObjectStore {
       updated_at: Date | string;
     }>(
       `SELECT object_key, content_type, size_bytes, etag, updated_at
-         FROM selfhost_run_objects WHERE run_id = $1 AND object_key = $2`,
+         FROM run_objects WHERE run_id = $1 AND object_key = $2`,
       [runId, key],
     );
     const row = result.rows[0];
@@ -174,7 +174,7 @@ export class RunObjectStore {
       external_location: string | null;
     }>(
       `SELECT object_key, content_type, size_bytes, etag, updated_at, content, external_location
-         FROM selfhost_run_objects WHERE run_id = $1 AND object_key = $2`,
+         FROM run_objects WHERE run_id = $1 AND object_key = $2`,
       [runId, key],
     );
     const row = result.rows[0];
@@ -197,7 +197,7 @@ export class RunObjectStore {
       updated_at: Date | string;
     }>(
       `SELECT object_key, content_type, size_bytes, etag, updated_at
-         FROM selfhost_run_objects WHERE run_id = $1 ORDER BY object_key`,
+         FROM run_objects WHERE run_id = $1 ORDER BY object_key`,
       [runId],
     );
     return result.rows.map(toMeta);

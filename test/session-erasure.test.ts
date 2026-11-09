@@ -87,7 +87,7 @@ async function setup(t: TestContext) {
   const erasure = `${base}/erasure${query}`;
   const internal = `/internal/v1/session-erase/organizations/${tenant.organizationId}/workspaces/${tenant.workspaceId}/sources/${SOURCE}/sessions`;
   const audits = async () => (await app.database.query<{ action: string; actor_id: string | null; target: string }>(
-    `SELECT action, actor_id, target FROM selfhost_admin_audit_events
+    `SELECT action, actor_id, target FROM admin_audit_events
       WHERE organization_id = $1 AND action LIKE 'session.hard_%' ORDER BY created_at, action`,
     [tenant.organizationId],
   )).rows;
@@ -104,7 +104,7 @@ test("session hard delete stays 501 until the pipeline erase is configured", asy
     assert.equal(result.status, 501);
     assert.equal(result.body.error, "not_implemented");
   }
-  const rows = await app.database.query(`SELECT 1 FROM selfhost_admin_audit_events WHERE action LIKE 'session.hard_%'`);
+  const rows = await app.database.query(`SELECT 1 FROM admin_audit_events WHERE action LIKE 'session.hard_%'`);
   assert.equal(rows.rows.length, 0);
 });
 
@@ -112,7 +112,7 @@ test("session hard delete: owner erases, audits once, repeat is idempotent, memb
   const { app, tenant, pipeline, path, internal, audits } = await setup(t);
   pipeline.state.reply = () => ({ status: 200, body: receipt(tenant.organizationId) });
   const members = async () => (await app.database.query(
-    `SELECT 1 FROM selfhost_organization_memberships WHERE organization_id = $1`, [tenant.organizationId],
+    `SELECT 1 FROM organization_memberships WHERE organization_id = $1`, [tenant.organizationId],
   )).rows.length;
   const before = await members();
 
@@ -288,7 +288,7 @@ test("the same session id in another source is a separate erasure", async (t) =>
   await app.api(`${base}?workspaceId=${tenant.workspaceId}&source=claude`, { method: "DELETE", token: tenant.ownerToken });
   assert.notEqual(pipeline.calls[0]!.body.requestId, pipeline.calls[1]!.body.requestId);
   const rows = await app.database.query(
-    `SELECT source FROM selfhost_session_erasures WHERE organization_id = $1 ORDER BY source`, [tenant.organizationId],
+    `SELECT source FROM session_erasures WHERE organization_id = $1 ORDER BY source`, [tenant.organizationId],
   );
   assert.deepEqual(rows.rows.map((row) => row.source), ["claude", "codex"]);
 });

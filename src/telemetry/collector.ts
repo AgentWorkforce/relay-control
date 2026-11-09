@@ -117,42 +117,42 @@ async function grouped(store: TelemetryStore, sql: string, params: unknown[] = [
 /** Aggregate gauges from the control-plane database (counts only). */
 export async function collectGauges(store: TelemetryStore, windowStart: string): Promise<Record<string, unknown>> {
   const gauges: Record<string, unknown> = {
-    organizations: await count(store, "SELECT count(*) AS count FROM selfhost_organizations"),
-    workspaces: await count(store, "SELECT count(*) AS count FROM selfhost_workspaces"),
-    members: await count(store, "SELECT count(*) AS count FROM selfhost_users"),
+    organizations: await count(store, "SELECT count(*) AS count FROM organizations"),
+    workspaces: await count(store, "SELECT count(*) AS count FROM workspaces"),
+    members: await count(store, "SELECT count(*) AS count FROM users"),
     activeMembers24h: await count(store,
-      `SELECT count(DISTINCT user_id) AS count FROM selfhost_token_sessions
+      `SELECT count(DISTINCT user_id) AS count FROM token_sessions
         WHERE revoked_at IS NULL AND COALESCE(last_refreshed_at, created_at) > now() - interval '24 hours'`),
     activeMembers7d: await count(store,
-      `SELECT count(DISTINCT user_id) AS count FROM selfhost_token_sessions
+      `SELECT count(DISTINCT user_id) AS count FROM token_sessions
         WHERE revoked_at IS NULL AND COALESCE(last_refreshed_at, created_at) > now() - interval '7 days'`),
     logins: await grouped(store,
       `SELECT CASE WHEN client_name = 'relay-dashboard' THEN 'dashboard' ELSE 'cli' END AS key,
               count(*) AS count
-         FROM selfhost_device_authorizations
+         FROM device_authorizations
         WHERE approved_at >= $1 GROUP BY 1`, [windowStart]),
   };
   // Other lanes' tables: counted only when their migrations are present.
-  if (await store.tableExists("selfhost_workflow_runs")) {
+  if (await store.tableExists("workflow_runs")) {
     gauges.flowRuns = await grouped(store,
-      `SELECT status AS key, count(*) AS count FROM selfhost_workflow_runs
+      `SELECT status AS key, count(*) AS count FROM workflow_runs
         WHERE created_at >= $1 GROUP BY status`, [windowStart]);
   }
-  if (await store.tableExists("selfhost_flow_definitions")) {
-    gauges.flowDefinitions = await count(store, "SELECT count(*) AS count FROM selfhost_flow_definitions");
+  if (await store.tableExists("flow_definitions")) {
+    gauges.flowDefinitions = await count(store, "SELECT count(*) AS count FROM flow_definitions");
   }
-  if (await store.tableExists("selfhost_workers")) {
+  if (await store.tableExists("workers")) {
     gauges.workers = await grouped(store,
-      "SELECT status AS key, count(*) AS count FROM selfhost_workers GROUP BY status");
+      "SELECT status AS key, count(*) AS count FROM workers GROUP BY status");
   }
-  if (await store.tableExists("selfhost_workspace_env_vars")) {
-    gauges.envVars = await count(store, "SELECT count(*) AS count FROM selfhost_workspace_env_vars");
+  if (await store.tableExists("workspace_env_vars")) {
+    gauges.envVars = await count(store, "SELECT count(*) AS count FROM workspace_env_vars");
   }
-  if (await store.tableExists("selfhost_integration_connections")) {
-    gauges.integrationConnections = await count(store, "SELECT count(*) AS count FROM selfhost_integration_connections");
+  if (await store.tableExists("integration_connections")) {
+    gauges.integrationConnections = await count(store, "SELECT count(*) AS count FROM integration_connections");
   }
-  if (await store.tableExists("selfhost_workspace_api_tokens")) {
-    gauges.apiTokens = await count(store, "SELECT count(*) AS count FROM selfhost_workspace_api_tokens");
+  if (await store.tableExists("workspace_api_tokens")) {
+    gauges.apiTokens = await count(store, "SELECT count(*) AS count FROM workspace_api_tokens");
   }
   return gauges;
 }
@@ -166,7 +166,7 @@ export async function collectRelaycastUsage(deps: CollectorDeps, salt: string): 
   let rows: Array<{ id: string; relaycast_api_key_ciphertext: string }>;
   try {
     rows = (await deps.store.database.query<{ id: string; relaycast_api_key_ciphertext: string }>(
-      "SELECT id, relaycast_api_key_ciphertext FROM selfhost_workspaces ORDER BY created_at LIMIT 50",
+      "SELECT id, relaycast_api_key_ciphertext FROM workspaces ORDER BY created_at LIMIT 50",
     )).rows;
   } catch {
     return null;

@@ -495,7 +495,7 @@ the server refuses to start. `X-Real-IP` is no longer read.
 
 #### Lockout
 
-Failed sign-ins are counted in Postgres (`selfhost_login_attempts`) under
+Failed sign-ins are counted in Postgres (`login_attempts`) under
 three subjects. The account is the normalized email, also for addresses with
 no account; the client is the client address (IPv6 by /64).
 
@@ -556,7 +556,7 @@ Credentials and the audit log are not swept.
 
 #### Audit events
 
-All of these are recorded in `selfhost_admin_audit_events`. Targets carry the
+All of these are recorded in `admin_audit_events`. Targets carry the
 address and a reason, never a password, hash or token.
 - `login.password.success`, with `rehashed=true` when the hash was upgraded
 - `login.password.failure`, with reason `wrong_password`, `unknown_account`,
@@ -602,7 +602,7 @@ Keep it in the Secret and use it only when no sign-in method works.
 
 The bootstrap bearer is an installation-wide operator credential in both
 modes: it reaches every organization. With `SELFHOST_TENANCY=multi` every use
-against an organization route is written to `selfhost_admin_audit_events`
+against an organization route is written to `admin_audit_events`
 (action `bootstrap.access`, actor `bootstrap`, target `METHOD path`).
 
 **Rotating it.** The token is read at startup and compared on each request;
@@ -732,7 +732,7 @@ workspace.
 
 `SELFHOST_AUTO_JOIN_DOMAINS` is the only authority for auto-join in single
 mode, including when it is absent or empty. On every bootstrap pass (each
-start) the bootstrap organization's rows in `selfhost_organization_domains`
+start) the bootstrap organization's rows in `organization_domains`
 are made equal to the normalized list (lowercase, IDNA ASCII, a leading `@`
 dropped): missing rows are inserted, extra rows deleted, and all rows are
 cleared when the variable is absent or empty, which means no auto-join, as
@@ -743,7 +743,7 @@ answer `409 domains_managed_by_env` to `PUT` and `DELETE` in single mode.
 1. the invite the person followed, then every other open invite for the
    email (each is accepted; the session lands in the last one accepted);
 2. otherwise an existing membership: the remembered organization
-   (`selfhost_users.last_organization_id`) when still a member, else the
+   (`users.last_organization_id`) when still a member, else the
    newest;
 3. otherwise the organization the operator assigned the email's domain to,
    as `member`, and only for a verified email (see [Domains](#domains));
@@ -818,7 +818,7 @@ Multi mode refuses to start with `SELFHOST_AUTO_JOIN_DOMAINS` set (assign
 domains per organization instead) and requires `SELFHOST_BOOTSTRAP_ORG_NAME`
 and `SELFHOST_BOOTSTRAP_ADMIN_EMAIL`. The bootstrap organization is the
 operator's; the bootstrap pass adopts only the organization recorded in
-`selfhost_installation_bootstrap`, never "the only organization".
+`installation_bootstrap`, never "the only organization".
 
 ### Readiness
 
@@ -985,30 +985,30 @@ enforces that. With the old image stopped, run this as the migration owner:
 BEGIN;
 DO $$
 BEGIN
-  IF (SELECT count(*) FROM selfhost_organizations) <> 1 THEN
+  IF (SELECT count(*) FROM organizations) <> 1 THEN
     RAISE EXCEPTION 'rollback of 0014 requires exactly one organization';
   END IF;
 END
 $$;
 -- telemetry organization column
-DROP INDEX IF EXISTS selfhost_telemetry_outbox_organization_idx;
-ALTER TABLE selfhost_telemetry_outbox DROP COLUMN IF EXISTS organization_id;
+DROP INDEX IF EXISTS telemetry_outbox_organization_idx;
+ALTER TABLE telemetry_outbox DROP COLUMN IF EXISTS organization_id;
 -- domains, selections, kill switches, single-organization constraint
-ALTER TABLE selfhost_installation_bootstrap
+ALTER TABLE installation_bootstrap
   DROP COLUMN IF EXISTS personal_org_signup_enabled,
   DROP COLUMN IF EXISTS self_serve_organizations_enabled;
-DROP TABLE IF EXISTS selfhost_organization_domains;
-ALTER TABLE selfhost_users
+DROP TABLE IF EXISTS organization_domains;
+ALTER TABLE users
   DROP COLUMN IF EXISTS last_organization_id,
   DROP COLUMN IF EXISTS last_workspace_id;
-ALTER TABLE selfhost_organizations
+ALTER TABLE organizations
   ADD COLUMN installation_slot smallint NOT NULL DEFAULT 1,
-  ADD CONSTRAINT selfhost_organizations_single_slot CHECK (installation_slot = 1);
-CREATE UNIQUE INDEX selfhost_organizations_singleton_idx
-  ON selfhost_organizations (installation_slot);
-CREATE UNIQUE INDEX selfhost_single_organization_idx
-  ON selfhost_organizations ((true));
-DELETE FROM selfhost_schema_migrations
+  ADD CONSTRAINT organizations_single_slot CHECK (installation_slot = 1);
+CREATE UNIQUE INDEX organizations_singleton_idx
+  ON organizations (installation_slot);
+CREATE UNIQUE INDEX single_organization_idx
+  ON organizations ((true));
+DELETE FROM control_schema_migrations
  WHERE name = '0014_multi_tenant.sql';
 COMMIT;
 ```

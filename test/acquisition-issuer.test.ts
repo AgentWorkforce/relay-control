@@ -329,7 +329,7 @@ test("service principal: install, revoke and reserved revoke verify with the pip
 
   // Audited without signatures or digests; nothing else is stored.
   const audit = await ctx.database.query<{ action: string; target: string; actor_kind: string }>(
-    "SELECT action, target, actor_kind FROM selfhost_admin_audit_events WHERE action = 'acquisition.assertion.issued'",
+    "SELECT action, target, actor_kind FROM admin_audit_events WHERE action = 'acquisition.assertion.issued'",
   );
   assert.equal(audit.rows.length, 5);
   assert(audit.rows.every((row) => row.actor_kind === "service"));
@@ -369,7 +369,7 @@ test("desktop user with rth:acquire: own install (and its reserved revoke) only"
   await pipelineVerify(ctx, "install", installed.body.envelope);
   await pipelineVerify(ctx, "revoke", installed.body.revokeEnvelope);
   const audit = await ctx.database.query<{ actor_kind: string; actor_id: string }>(
-    "SELECT actor_kind, actor_id FROM selfhost_admin_audit_events WHERE action = 'acquisition.assertion.issued'",
+    "SELECT actor_kind, actor_id FROM admin_audit_events WHERE action = 'acquisition.assertion.issued'",
   );
   assert.deepEqual(audit.rows, [{ actor_kind: "user", actor_id: ctx.ownerId }]);
 
@@ -420,7 +420,7 @@ test("refusals: principals, audience, scope, class and rebind", async (t) => {
   await expect(await ctx.issue("install", installBody(ctx), "garbage"), 401, "unauthorized", "unknown prefix");
   await expect(await ctx.issue("install", installBody(ctx), "sh_wk_unknown"), 401, "unauthorized", "unknown workspace API token");
   const revokedDesktop = await deviceToken(ctx.origin, ctx.ownerId, ctx.workspaceId);
-  await ctx.database.query("UPDATE selfhost_token_sessions SET revoked_at = now() WHERE access_token_hash = $1", [hashSecret(revokedDesktop)]);
+  await ctx.database.query("UPDATE token_sessions SET revoked_at = now() WHERE access_token_hash = $1", [hashSecret(revokedDesktop)]);
   await expect(await ctx.issue("install", installBody(ctx), revokedDesktop), 401, "unauthorized", "revoked desktop token");
   await expect(await ctx.issue("install", installBody(ctx, { aud: HISTORY }), ctx.operator), 403, "not_authorized", "body aud");
   await expect(await ctx.issue("install", installBody(ctx, { aud: HISTORY }), ctx.owner), 403, "not_authorized", "desktop body aud");
@@ -459,7 +459,7 @@ test("refusals: principals, audience, scope, class and rebind", async (t) => {
   await expect(await ctx.issue("rebind", {}, browser), 403, "not_authorized", "rebind unauthenticated");
   await expect(await ctx.issue("other", installBody(ctx), ctx.operator), 404, "not_found", "unknown kind");
 
-  const audit = await ctx.database.query("SELECT 1 FROM selfhost_admin_audit_events WHERE action = 'acquisition.assertion.issued'");
+  const audit = await ctx.database.query("SELECT 1 FROM admin_audit_events WHERE action = 'acquisition.assertion.issued'");
   assert.equal(audit.rows.length, 0, "nothing refused is audited as issued");
 });
 

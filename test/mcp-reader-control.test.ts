@@ -63,7 +63,7 @@ test("MCP obtains and refreshes through real Control HTTP admission, and parent 
     assert.match(call.bearer!,/^Bearer rth_at_read_/);assert.ok(!call.bearer!.includes(secret));
     assert.notEqual(call.bearer,`Bearer ${pair.accessToken}`);
   }
-  await database.query("UPDATE selfhost_token_sessions SET revoked_at=now() WHERE access_token_hash=$1",[hashSecret(pair.accessToken)]);
+  await database.query("UPDATE token_sessions SET revoked_at=now() WHERE access_token_hash=$1",[hashSecret(pair.accessToken)]);
   await assert.rejects(read("/v1/sessions"),/Reauthenticate/);
   assert.equal(calls.length,4,"Control refuses the revoked parent before the reader is contacted");
 });

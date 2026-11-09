@@ -77,7 +77,7 @@ test("factory gates refuse workspace tokens, the internal token, members, missin
   assert.equal(foreign.status, 404);
 
   await env.database.query(
-    "UPDATE selfhost_token_sessions SET scopes = array_remove(scopes, 'cli:auth') WHERE access_token_hash = $1",
+    "UPDATE token_sessions SET scopes = array_remove(scopes, 'cli:auth') WHERE access_token_hash = $1",
     [hashSecret(env.adminToken)],
   );
   const scope = await env.api(path, { token: env.adminToken });
@@ -103,7 +103,7 @@ test("factory gates refuse workspace tokens, the internal token, members, missin
   });
   assert.equal(bareCookie.status, 401);
   // Nothing was written by the refused requests: only the same-site write connected.
-  const rows = await env.database.query("SELECT user_id FROM selfhost_factory_connections");
+  const rows = await env.database.query("SELECT user_id FROM factory_connections");
   assert.equal(rows.rows.length, 1);
 });
 
@@ -118,7 +118,7 @@ test("factory connect validates the key, stores only an envelope and a hint, and
   const rejected = await env.api(path, { method: "PUT", token: env.ownerToken, body: { key: "fk_live_not_a_known_key" } });
   assert.equal(rejected.status, 502);
   assert.equal(rejected.body.error, "factory_key_rejected");
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_factory_connections")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM factory_connections")).rows.length, 0);
 
   const ok = await env.api(path, { method: "PUT", token: env.ownerToken, body: { key: FACTORY_KEY } });
   assert.equal(ok.status, 200);
@@ -126,7 +126,7 @@ test("factory connect validates the key, stores only an envelope and a hint, and
   assert.equal(ok.body.key_hint, `…${FACTORY_KEY.slice(-4)}`);
   assert.equal(ok.body.user_is_owner, true);
   assertNoSecrets(env, ok.body);
-  const stored = await env.database.query<{ key_envelope: string }>("SELECT key_envelope FROM selfhost_factory_connections");
+  const stored = await env.database.query<{ key_envelope: string }>("SELECT key_envelope FROM factory_connections");
   assert.ok(!stored.rows[0]!.key_envelope.includes(FACTORY_KEY));
 
   // Authorized acceptance: a second workspace admin reads the summary (count only, not owner).
@@ -134,7 +134,7 @@ test("factory connect validates the key, stores only an envelope and a hint, and
   assert.equal(admin.status, 200);
   assert.equal(admin.body.connected, true);
   assert.equal(admin.body.user_is_owner, false);
-  const audit = await env.database.query<{ action: string }>("SELECT action FROM selfhost_admin_audit_events WHERE action LIKE 'factory.%'");
+  const audit = await env.database.query<{ action: string }>("SELECT action FROM admin_audit_events WHERE action LIKE 'factory.%'");
   assert.deepEqual(audit.rows.map((row) => row.action), ["factory.connection.put"]);
   assertNoSecrets(env, env.logs);
 });
@@ -243,10 +243,10 @@ test("factory bind, list, get, unbind and disconnect round trip with owner check
   assert.equal(disconnect.status, 204);
   assert.equal((await bindingRow(env, second.body.binding_id)).state, "retired");
   assert.equal(env.relay.agents.size, 0);
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_factory_connections")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM factory_connections")).rows.length, 0);
   assert.equal((await env.api(factoryPath(env.workspaceId, "/connection"), { method: "DELETE", token: env.ownerToken })).status, 204);
   const audit = await env.database.query<{ action: string }>(
-    "SELECT action FROM selfhost_admin_audit_events WHERE action LIKE 'factory.%' ORDER BY created_at, action",
+    "SELECT action FROM admin_audit_events WHERE action LIKE 'factory.%' ORDER BY created_at, action",
   );
   assert.deepEqual(audit.rows.map((r) => r.action).sort(), [
     "factory.binding.create", "factory.binding.create", "factory.binding.delete",
@@ -262,7 +262,7 @@ test("factory history schedule records a dormant intent and reports deferred", a
   assert.equal(scheduled.status, 202);
   assert.deepEqual(scheduled.body, { queued: 0, deferred: true });
   const rows = await env.database.query<{ session_id: string; active_job_id: string | null }>(
-    "SELECT session_id, active_job_id FROM selfhost_factory_history_syncs",
+    "SELECT session_id, active_job_id FROM factory_history_syncs",
   );
   assert.deepEqual(rows.rows, [{ session_id: "sess-a", active_job_id: null }]);
   assert.equal((await env.api(factoryPath(env.workspaceId, "/connection"), { token: env.ownerToken })).body.history, "deferred");

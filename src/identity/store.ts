@@ -87,8 +87,8 @@ function isDefiniteAbort(error: unknown): boolean {
 const INVITATION_SELECT = `SELECT i.id, i.organization_id, i.email, i.role, i.token_hash, i.invited_by_user_id,
        u.name AS inviter_name, u.email AS inviter_email, i.expires_at, i.accepted_at,
        i.accepted_by_user_id, i.revoked_at, i.created_at
-  FROM selfhost_organization_invitations i
-  LEFT JOIN selfhost_users u ON u.id = i.invited_by_user_id`;
+  FROM organization_invitations i
+  LEFT JOIN users u ON u.id = i.invited_by_user_id`;
 
 export type SignInResult = {
   userId: string;
@@ -189,7 +189,7 @@ export class IdentityStore {
     effective: { personalOrgOnSignIn: boolean; selfServeOrganizations: boolean };
   }> {
     const result = await executor.query<{ personal_org_signup_enabled: boolean | null; self_serve_organizations_enabled: boolean | null }>(
-      "SELECT personal_org_signup_enabled, self_serve_organizations_enabled FROM selfhost_installation_bootstrap WHERE installation_slot = 1",
+      "SELECT personal_org_signup_enabled, self_serve_organizations_enabled FROM installation_bootstrap WHERE installation_slot = 1",
     );
     const personal = result.rows[0]?.personal_org_signup_enabled ?? null;
     const selfServe = result.rows[0]?.self_serve_organizations_enabled ?? null;
@@ -213,11 +213,11 @@ export class IdentityStore {
   }): Promise<Awaited<ReturnType<IdentityStore["installationSettings"]>>> {
     return this.database.transaction(async (tx) => {
       await tx.query(
-        `INSERT INTO selfhost_installation_bootstrap (installation_slot) VALUES (1)
+        `INSERT INTO installation_bootstrap (installation_slot) VALUES (1)
          ON CONFLICT (installation_slot) DO NOTHING`,
       );
       await tx.query(
-        `UPDATE selfhost_installation_bootstrap
+        `UPDATE installation_bootstrap
             SET personal_org_signup_enabled = CASE WHEN $1::boolean THEN $2::boolean ELSE personal_org_signup_enabled END,
                 self_serve_organizations_enabled = CASE WHEN $3::boolean THEN $4::boolean ELSE self_serve_organizations_enabled END,
                 updated_at = now()
@@ -277,17 +277,17 @@ export class IdentityStore {
         if (!(await this.installationSettings(tx)).effective.selfServeOrganizations) {
           throw new IdentityError(403, "self_serve_disabled", "Creating organizations is turned off on this installation. Ask the operator.");
         }
-        const user = await tx.query<{ id: string }>("SELECT id FROM selfhost_users WHERE id = $1 AND email = $2", [input.userId, input.email]);
+        const user = await tx.query<{ id: string }>("SELECT id FROM users WHERE id = $1 AND email = $2", [input.userId, input.email]);
         if (!user.rows[0]) throw new IdentityError(401, "unauthorized", "Sign in again.");
         const id = randomUUID();
         const workspaceId = randomUUID();
-        await tx.query("INSERT INTO selfhost_organizations (id, name) VALUES ($1, $2)", [id, name]);
+        await tx.query("INSERT INTO organizations (id, name) VALUES ($1, $2)", [id, name]);
         await tx.query(
-          "INSERT INTO selfhost_organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')",
+          "INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')",
           [id, input.userId],
         );
         await tx.query(
-          `INSERT INTO selfhost_workspaces
+          `INSERT INTO workspaces
              (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
            VALUES ($1, $2, 'Default', $3, $4)`,
           [workspaceId, id, relaycast.id, encryptSecret(relaycast.apiKey, this.keyring.active)],
@@ -345,7 +345,7 @@ export class IdentityStore {
   /** The bootstrap (operator) organization, when the bootstrap has run. */
   async bootstrapOrganizationId(): Promise<string | null> {
     const result = await this.database.query<{ organization_id: string | null }>(
-      "SELECT organization_id FROM selfhost_installation_bootstrap WHERE installation_slot = 1",
+      "SELECT organization_id FROM installation_bootstrap WHERE installation_slot = 1",
     );
     return result.rows[0]?.organization_id ?? null;
   }
@@ -355,7 +355,7 @@ export class IdentityStore {
   /** Domains whose verified addresses auto-join the organization. */
   async listDomains(organizationId: string): Promise<string[]> {
     const result = await this.database.query<{ domain: string }>(
-      "SELECT domain FROM selfhost_organization_domains WHERE organization_id = $1 ORDER BY domain",
+      "SELECT domain FROM organization_domains WHERE organization_id = $1 ORDER BY domain",
       [organizationId],
     );
     return result.rows.map((row) => row.domain);
@@ -369,16 +369,16 @@ export class IdentityStore {
   async assignDomain(input: { organizationId: string; domain: string; actor: AuditActor }): Promise<{ domain: string; created: boolean }> {
     const domain = normalizeDomain(input.domain);
     return this.database.transaction(async (tx) => {
-      const organization = await tx.query("SELECT 1 FROM selfhost_organizations WHERE id = $1", [input.organizationId]);
+      const organization = await tx.query("SELECT 1 FROM organizations WHERE id = $1", [input.organizationId]);
       if (!organization.rows[0]) throw new IdentityError(404, "organization_not_found", "Organization not found");
       const inserted = await tx.query<{ organization_id: string }>(
-        `INSERT INTO selfhost_organization_domains (domain, organization_id) VALUES ($1, $2)
+        `INSERT INTO organization_domains (domain, organization_id) VALUES ($1, $2)
          ON CONFLICT (domain) DO NOTHING RETURNING organization_id`,
         [domain, input.organizationId],
       );
       if (!inserted.rows[0]) {
         const owner = await tx.query<{ organization_id: string }>(
-          "SELECT organization_id FROM selfhost_organization_domains WHERE domain = $1",
+          "SELECT organization_id FROM organization_domains WHERE domain = $1",
           [domain],
         );
         if (owner.rows[0]?.organization_id === input.organizationId) return { domain, created: false };
@@ -398,7 +398,7 @@ export class IdentityStore {
     const domain = normalizeDomain(input.domain);
     return this.database.transaction(async (tx) => {
       const removed = await tx.query(
-        "DELETE FROM selfhost_organization_domains WHERE domain = $1 AND organization_id = $2 RETURNING domain",
+        "DELETE FROM organization_domains WHERE domain = $1 AND organization_id = $2 RETURNING domain",
         [domain, input.organizationId],
       );
       if (!removed.rows[0]) return false;
@@ -441,7 +441,7 @@ export class IdentityStore {
       if (bootstrap.adminEmail) await lockIdentity(tx, bootstrap.adminEmail);
       const findOrganization = async (): Promise<string | undefined | "mismatch"> => {
         if (this.tenancy.mode === "single") {
-          const orgs = await tx.query<{ id: string }>("SELECT id FROM selfhost_organizations ORDER BY created_at LIMIT 2");
+          const orgs = await tx.query<{ id: string }>("SELECT id FROM organizations ORDER BY created_at LIMIT 2");
           if (orgs.rows.length > 1) return "mismatch";
           return orgs.rows[0]?.id;
         }
@@ -450,15 +450,15 @@ export class IdentityStore {
         // its organization). Nothing else is adopted: the only organization
         // of a fresh multi installation may be someone's personal one.
         const state = await tx.query<{ organization_id: string | null }>(
-          "SELECT organization_id FROM selfhost_installation_bootstrap WHERE installation_slot = 1",
+          "SELECT organization_id FROM installation_bootstrap WHERE installation_slot = 1",
         );
         const named = state.rows[0]?.organization_id ?? null;
         if (!named) return undefined;
-        const found = await tx.query<{ id: string }>("SELECT id FROM selfhost_organizations WHERE id = $1", [named]);
+        const found = await tx.query<{ id: string }>("SELECT id FROM organizations WHERE id = $1", [named]);
         return found.rows[0]?.id;
       };
       const mismatch = async () => {
-        const count = await tx.query<{ n: number }>("SELECT count(*)::int AS n FROM selfhost_organizations");
+        const count = await tx.query<{ n: number }>("SELECT count(*)::int AS n FROM organizations");
         return { organizationId: null, skipped: "tenancy_mismatch" as const, organizations: count.rows[0]!.n };
       };
       let found = await findOrganization();
@@ -476,12 +476,12 @@ export class IdentityStore {
         organizationId = found;
       }
       const state = await tx.query<{ admin_email: string | null }>(
-        "SELECT admin_email FROM selfhost_installation_bootstrap WHERE installation_slot = 1",
+        "SELECT admin_email FROM installation_bootstrap WHERE installation_slot = 1",
       );
       let created = false;
       if (!organizationId) {
         organizationId = randomUUID();
-        await tx.query("INSERT INTO selfhost_organizations (id, name) VALUES ($1, $2)", [organizationId, bootstrap.organizationName]);
+        await tx.query("INSERT INTO organizations (id, name) VALUES ($1, $2)", [organizationId, bootstrap.organizationName]);
         created = true;
         await recordAudit(tx, { organizationId, actor: BOOTSTRAP_ACTOR, action: "organization.bootstrap", target: bootstrap.organizationName });
       }
@@ -489,12 +489,12 @@ export class IdentityStore {
       if (bootstrap.adminEmail && (created || state.rows[0]?.admin_email !== bootstrap.adminEmail)) {
         const user = await this.upsertUser(tx, bootstrap.adminEmail, bootstrap.adminName, false);
         const existing = await tx.query<{ role: Role }>(
-          "SELECT role FROM selfhost_organization_memberships WHERE organization_id = $1 AND user_id = $2",
+          "SELECT role FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
           [organizationId, user.id],
         );
         if (existing.rows[0]?.role !== "owner") {
           await tx.query(
-            `INSERT INTO selfhost_organization_memberships (organization_id, user_id, role)
+            `INSERT INTO organization_memberships (organization_id, user_id, role)
              VALUES ($1, $2, 'owner')
              ON CONFLICT (organization_id, user_id) DO UPDATE SET role = 'owner', updated_at = now()`,
             [organizationId, user.id],
@@ -504,12 +504,12 @@ export class IdentityStore {
         }
       }
       await tx.query(
-        `INSERT INTO selfhost_installation_bootstrap (installation_slot, organization_id, admin_email, admin_granted_at)
+        `INSERT INTO installation_bootstrap (installation_slot, organization_id, admin_email, admin_granted_at)
          VALUES (1, $1, $2, CASE WHEN $3::boolean THEN now() ELSE NULL END)
          ON CONFLICT (installation_slot) DO UPDATE
            SET organization_id = EXCLUDED.organization_id,
-               admin_email = COALESCE(EXCLUDED.admin_email, selfhost_installation_bootstrap.admin_email),
-               admin_granted_at = COALESCE(EXCLUDED.admin_granted_at, selfhost_installation_bootstrap.admin_granted_at),
+               admin_email = COALESCE(EXCLUDED.admin_email, installation_bootstrap.admin_email),
+               admin_granted_at = COALESCE(EXCLUDED.admin_granted_at, installation_bootstrap.admin_granted_at),
                updated_at = now()`,
         [organizationId, bootstrap.adminEmail, adminGranted],
       );
@@ -523,14 +523,14 @@ export class IdentityStore {
   private async syncEnvDomains(tx: SqlExecutor, organizationId: string): Promise<void> {
     const domains = [...new Set(this.options.autoJoinDomains.map(normalizeDomain))];
     const removed = await tx.query<{ domain: string }>(
-      "DELETE FROM selfhost_organization_domains WHERE NOT (domain = ANY($1::text[])) RETURNING domain",
+      "DELETE FROM organization_domains WHERE NOT (domain = ANY($1::text[])) RETURNING domain",
       [domains],
     );
     const added = await tx.query<{ domain: string }>(
-      `INSERT INTO selfhost_organization_domains (domain, organization_id)
+      `INSERT INTO organization_domains (domain, organization_id)
        SELECT unnest($2::text[]), $1
        ON CONFLICT (domain) DO UPDATE SET organization_id = EXCLUDED.organization_id
-         WHERE selfhost_organization_domains.organization_id <> EXCLUDED.organization_id
+         WHERE organization_domains.organization_id <> EXCLUDED.organization_id
        RETURNING domain`,
       [organizationId, domains],
     );
@@ -546,7 +546,7 @@ export class IdentityStore {
 
   async workspaceCount(organizationId: string): Promise<number> {
     const result = await this.database.query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM selfhost_workspaces WHERE organization_id = $1",
+      "SELECT count(*)::text AS count FROM workspaces WHERE organization_id = $1",
       [organizationId],
     );
     return Number(result.rows[0]?.count ?? "0");
@@ -565,19 +565,19 @@ export class IdentityStore {
     return this.database.transaction(async (tx) => {
       await lockOrganizationCreate(tx);
       const existing = await tx.query<{ id: string }>(
-        "SELECT id FROM selfhost_workspaces WHERE organization_id = $1 LIMIT 1",
+        "SELECT id FROM workspaces WHERE organization_id = $1 LIMIT 1",
         [input.organizationId],
       );
       if (existing.rows[0]) return null;
       const id = randomUUID();
       await tx.query(
-        `INSERT INTO selfhost_workspaces
+        `INSERT INTO workspaces
            (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
          VALUES ($1, $2, $3, $4, $5)`,
         [id, input.organizationId, input.name, input.relaycastWorkspaceId, encryptSecret(input.relaycastApiKey, this.keyring.active)],
       );
       await tx.query(
-        "UPDATE selfhost_installation_bootstrap SET workspace_id = $1, updated_at = now() WHERE installation_slot = 1",
+        "UPDATE installation_bootstrap SET workspace_id = $1, updated_at = now() WHERE installation_slot = 1",
         [id],
       );
       await recordAudit(tx, {
@@ -642,23 +642,23 @@ export class IdentityStore {
     const expiresAt = new Date(this.now() + this.options.inviteTtlMs);
     const actorUserId = input.actor.kind === "user" ? input.actor.userId : null;
     await this.database.transaction(async (tx) => {
-      await tx.query("SELECT id FROM selfhost_organizations WHERE id = $1 FOR UPDATE", [input.organizationId]);
+      await tx.query("SELECT id FROM organizations WHERE id = $1 FOR UPDATE", [input.organizationId]);
       const member = await tx.query<{ user_id: string }>(
-        `SELECT m.user_id FROM selfhost_organization_memberships m
-           JOIN selfhost_users u ON u.id = m.user_id
+        `SELECT m.user_id FROM organization_memberships m
+           JOIN users u ON u.id = m.user_id
           WHERE m.organization_id = $1 AND u.email = $2`,
         [input.organizationId, email],
       );
       if (member.rows[0]) throw new IdentityError(409, "already_member", "That person is already a member of this organization.");
       const replaced = await tx.query<{ id: string }>(
-        `UPDATE selfhost_organization_invitations
+        `UPDATE organization_invitations
             SET revoked_at = now(), revoked_by_user_id = $3, updated_at = now()
           WHERE organization_id = $1 AND email = $2 AND accepted_at IS NULL AND revoked_at IS NULL
           RETURNING id`,
         [input.organizationId, email, actorUserId],
       );
       await tx.query(
-        `INSERT INTO selfhost_organization_invitations
+        `INSERT INTO organization_invitations
            (id, organization_id, email, role, token_hash, invited_by_user_id, expires_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [id, input.organizationId, email, input.role, hashSecret(token), actorUserId, expiresAt],
@@ -703,7 +703,7 @@ export class IdentityStore {
     await this.database.transaction(async (tx) => {
       const row = await this.openInvitationForUpdate(tx, input.organizationId, input.id, input.actor.kind === "user" ? input.actor.role : null);
       await tx.query(
-        `UPDATE selfhost_organization_invitations
+        `UPDATE organization_invitations
             SET revoked_at = now(), revoked_by_user_id = $2, updated_at = now() WHERE id = $1`,
         [row.id, input.actor.kind === "user" ? input.actor.userId : null],
       );
@@ -725,7 +725,7 @@ export class IdentityStore {
     await this.database.transaction(async (tx) => {
       const row = await this.openInvitationForUpdate(tx, input.organizationId, input.id, input.actor.kind === "user" ? input.actor.role : null);
       await tx.query(
-        `UPDATE selfhost_organization_invitations
+        `UPDATE organization_invitations
             SET token_hash = $2, expires_at = $3, updated_at = now() WHERE id = $1`,
         [row.id, hashSecret(token), new Date(this.now() + this.options.inviteTtlMs)],
       );
@@ -751,9 +751,9 @@ export class IdentityStore {
     if (!/^sh_inv_[A-Za-z0-9_-]{20,}$/.test(token)) return null;
     const result = await this.database.query<InvitationRow & { organization_name: string }>(
       `SELECT i.*, u.name AS inviter_name, u.email AS inviter_email, o.name AS organization_name
-         FROM selfhost_organization_invitations i
-         JOIN selfhost_organizations o ON o.id = i.organization_id
-         LEFT JOIN selfhost_users u ON u.id = i.invited_by_user_id
+         FROM organization_invitations i
+         JOIN organizations o ON o.id = i.organization_id
+         LEFT JOIN users u ON u.id = i.invited_by_user_id
         WHERE i.token_hash = $1`,
       [hashSecret(token)],
     );
@@ -781,7 +781,7 @@ export class IdentityStore {
    *   2. otherwise the invite they followed (email must match), or any open
    *      invite for that email (hosted Cloud's auto-accept), makes them a member;
    *   3. otherwise an auto-join domain (SELFHOST_AUTO_JOIN_DOMAINS or the
-   *      operator-assigned selfhost_organization_domains rows) joins them;
+   *      operator-assigned organization_domains rows) joins them;
    *   4. otherwise sign-in is refused.
    *
    * Multi mode picks the organization (invitation > membership > domain >
@@ -811,7 +811,7 @@ export class IdentityStore {
     if (!email) throw new IdentityError(400, "email_invalid", "That email address is not valid.");
     if (this.tenancy.mode === "single") {
       return this.database.transaction(async (tx) => {
-        const org = await tx.query<{ id: string; name: string }>("SELECT id, name FROM selfhost_organizations ORDER BY created_at LIMIT 2");
+        const org = await tx.query<{ id: string; name: string }>("SELECT id, name FROM organizations ORDER BY created_at LIMIT 2");
         if (org.rows.length !== 1) {
           throw new IdentityError(503, "not_ready", "This Agent Relay installation is not set up yet. Ask your administrator to configure its organization.");
         }
@@ -849,7 +849,7 @@ export class IdentityStore {
     // same per-user lock and create it only if still nothing matched.
     if (!provisioner) throw new Error("unreachable: provisioner checked above");
     input.beforePersonalOrganization?.();
-    const existingName = await this.database.query<{ name: string }>("SELECT name FROM selfhost_users WHERE email = $1", [email]);
+    const existingName = await this.database.query<{ name: string }>("SELECT name FROM users WHERE email = $1", [email]);
     const displayName = cleanName(input.name ?? existingName.rows[0]?.name ?? "") || email.slice(0, email.indexOf("@"));
     const organizationName = `${displayName}'s Workspace`.slice(0, 120);
     const relaycast = await provisioner.create(organizationName).catch((error: unknown) => {
@@ -878,13 +878,13 @@ export class IdentityStore {
         const user = { id: context.userId! };
         const organizationId = randomUUID();
         const workspaceId = randomUUID();
-        await tx.query("INSERT INTO selfhost_organizations (id, name) VALUES ($1, $2)", [organizationId, organizationName]);
+        await tx.query("INSERT INTO organizations (id, name) VALUES ($1, $2)", [organizationId, organizationName]);
         await tx.query(
-          "INSERT INTO selfhost_organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')",
+          "INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')",
           [organizationId, user.id],
         );
         await tx.query(
-          `INSERT INTO selfhost_workspaces
+          `INSERT INTO workspaces
              (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
            VALUES ($1, $2, 'Default', $3, $4)`,
           [workspaceId, organizationId, relaycast.id, encryptSecret(relaycast.apiKey, this.keyring.active)],
@@ -930,7 +930,7 @@ export class IdentityStore {
     const context = await this.signInContext(tx, email, input);
     if (input.inviteTokenHash) {
       const found = await tx.query<{ organization_id: string }>(
-        "SELECT organization_id FROM selfhost_organization_invitations WHERE token_hash = $1",
+        "SELECT organization_id FROM organization_invitations WHERE token_hash = $1",
         [input.inviteTokenHash],
       );
       const organizationId = found.rows[0]?.organization_id;
@@ -940,7 +940,7 @@ export class IdentityStore {
       return { kind: "organization", organizationId, context };
     }
     const open = await tx.query<{ organization_id: string }>(
-      `SELECT DISTINCT organization_id FROM selfhost_organization_invitations
+      `SELECT DISTINCT organization_id FROM organization_invitations
         WHERE email = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > $2
         ORDER BY organization_id`,
       [email, new Date(this.now())],
@@ -958,8 +958,8 @@ export class IdentityStore {
     if (context.lastJoined) return { kind: "organization", organizationId: context.lastJoined, context };
     const memberships = await tx.query<{ organization_id: string }>(
       `SELECT m.organization_id
-         FROM selfhost_organization_memberships m
-         JOIN selfhost_users u ON u.id = m.user_id
+         FROM organization_memberships m
+         JOIN users u ON u.id = m.user_id
         WHERE m.user_id = $1
         ORDER BY (m.organization_id = u.last_organization_id) DESC NULLS LAST, m.created_at DESC, m.organization_id`,
       [user.id],
@@ -980,7 +980,7 @@ export class IdentityStore {
     const domain = asciiDomain(emailDomain(context.email));
     if (!domain) return null;
     const result = await tx.query<{ organization_id: string }>(
-      "SELECT organization_id FROM selfhost_organization_domains WHERE domain = $1",
+      "SELECT organization_id FROM organization_domains WHERE domain = $1",
       [domain],
     );
     return result.rows[0]?.organization_id ?? null;
@@ -991,12 +991,12 @@ export class IdentityStore {
     email: string,
     input: SignInInput,
   ): Promise<SignInContext> {
-    const existingUser = await tx.query<{ id: string }>("SELECT id FROM selfhost_users WHERE email = $1", [email]);
+    const existingUser = await tx.query<{ id: string }>("SELECT id FROM users WHERE email = $1", [email]);
     const userId = existingUser.rows[0]?.id ?? null;
     const roles = new Map<string, Role>();
     if (userId) {
       const memberships = await tx.query<{ organization_id: string; role: Role }>(
-        "SELECT organization_id, role FROM selfhost_organization_memberships WHERE user_id = $1",
+        "SELECT organization_id, role FROM organization_memberships WHERE user_id = $1",
         [userId],
       );
       for (const row of memberships.rows) roles.set(row.organization_id, row.role);
@@ -1027,12 +1027,12 @@ export class IdentityStore {
       context.userId = user.id;
       if (context.role(organizationId) === null) {
         await tx.query(
-          `INSERT INTO selfhost_organization_memberships (organization_id, user_id, role) VALUES ($1, $2, $3)
+          `INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, $3)
            ON CONFLICT (organization_id, user_id) DO NOTHING`,
           [organizationId, user.id, invite.role],
         );
         const role = await tx.query<{ role: Role }>(
-          "SELECT role FROM selfhost_organization_memberships WHERE organization_id = $1 AND user_id = $2",
+          "SELECT role FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
           [organizationId, user.id],
         );
         context.roles.set(organizationId, role.rows[0]!.role);
@@ -1040,7 +1040,7 @@ export class IdentityStore {
         context.lastJoined = organizationId;
       }
       await tx.query(
-        `UPDATE selfhost_organization_invitations
+        `UPDATE organization_invitations
             SET accepted_at = now(), accepted_by_user_id = $2, updated_at = now() WHERE id = $1`,
         [invite.id, user.id],
       );
@@ -1093,10 +1093,10 @@ export class IdentityStore {
   private async grantAdminEmail(tx: SqlExecutor, context: SignInContext, organizationId: string): Promise<void> {
     const { email } = context;
     if (!context.addressVerified || !this.adminEmails.includes(email)) return;
-    const granted = await tx.query("SELECT 1 AS found FROM selfhost_admin_email_grants WHERE email = $1", [email]);
+    const granted = await tx.query("SELECT 1 AS found FROM admin_email_grants WHERE email = $1", [email]);
     if (granted.rows[0]) return;
     const owners = await tx.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM selfhost_organization_memberships WHERE organization_id = $1 AND role = 'owner'",
+      "SELECT count(*)::int AS n FROM organization_memberships WHERE organization_id = $1 AND role = 'owner'",
       [organizationId],
     );
     const role: Role = owners.rows[0]!.n === 0 ? "owner" : "admin";
@@ -1105,7 +1105,7 @@ export class IdentityStore {
     const current = context.role(organizationId);
     if (current === null || ROLE_RANK[current] < ROLE_RANK[role]) {
       await tx.query(
-        `INSERT INTO selfhost_organization_memberships (organization_id, user_id, role) VALUES ($1, $2, $3)
+        `INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, $3)
          ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role, updated_at = now()`,
         [organizationId, user.id, role],
       );
@@ -1122,14 +1122,14 @@ export class IdentityStore {
       });
     }
     await tx.query(
-      "INSERT INTO selfhost_admin_email_grants (email, organization_id, role) VALUES ($1, $2, $3) ON CONFLICT (email) DO NOTHING",
+      "INSERT INTO admin_email_grants (email, organization_id, role) VALUES ($1, $2, $3) ON CONFLICT (email) DO NOTHING",
       [email, organizationId, role],
     );
   }
 
   private async bootstrapOrganizationIdIn(tx: SqlExecutor): Promise<string | null> {
     const state = await tx.query<{ organization_id: string | null }>(
-      "SELECT organization_id FROM selfhost_installation_bootstrap WHERE installation_slot = 1",
+      "SELECT organization_id FROM installation_bootstrap WHERE installation_slot = 1",
     );
     return state.rows[0]?.organization_id ?? null;
   }
@@ -1141,18 +1141,18 @@ export class IdentityStore {
     if (!domain) return;
     let matches = await this.domainOrganization(tx, context) === organizationId;
     // Single mode: SELFHOST_AUTO_JOIN_DOMAINS also applies before the first
-    // bootstrap pass copies it into selfhost_organization_domains.
+    // bootstrap pass copies it into organization_domains.
     if (!matches && this.tenancy.mode === "single") matches = this.options.autoJoinDomains.includes(domain);
     if (!matches) return;
     const user = await this.upsertUser(tx, email, context.name ?? email.slice(0, email.indexOf("@")), context.name !== null);
     context.userId = user.id;
     const inserted = await tx.query<{ role: Role }>(
-      `INSERT INTO selfhost_organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'member')
+      `INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'member')
        ON CONFLICT (organization_id, user_id) DO NOTHING RETURNING role`,
       [organizationId, user.id],
     );
     const role = await tx.query<{ role: Role }>(
-      "SELECT role FROM selfhost_organization_memberships WHERE organization_id = $1 AND user_id = $2",
+      "SELECT role FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
       [organizationId, user.id],
     );
     context.roles.set(organizationId, role.rows[0]!.role);
@@ -1180,11 +1180,11 @@ export class IdentityStore {
       throw new IdentityError(403, "not_invited", `${context.email} doesn't have access to this organization. Ask an owner or admin to invite you.`);
     }
     if (context.name && !context.joined) {
-      await tx.query("UPDATE selfhost_users SET name = $2, updated_at = now() WHERE id = $1 AND name <> $2", [userId, cleanName(context.name) || context.email]);
+      await tx.query("UPDATE users SET name = $2, updated_at = now() WHERE id = $1 AND name <> $2", [userId, cleanName(context.name) || context.email]);
     }
     const workspace = await tx.query<{ id: string }>(
-      `SELECT w.id FROM selfhost_workspaces w
-         LEFT JOIN selfhost_users u ON u.id = $2 AND u.last_workspace_id = w.id
+      `SELECT w.id FROM workspaces w
+         LEFT JOIN users u ON u.id = $2 AND u.last_workspace_id = w.id
         WHERE w.organization_id = $1
         ORDER BY (u.id IS NOT NULL) DESC, w.created_at, w.id LIMIT 1`,
       [organizationId, userId],
@@ -1194,7 +1194,7 @@ export class IdentityStore {
     }
     const workspaceId = workspace.rows[0].id;
     await tx.query(
-      "UPDATE selfhost_users SET last_organization_id = $2, last_workspace_id = $3 WHERE id = $1",
+      "UPDATE users SET last_organization_id = $2, last_workspace_id = $3 WHERE id = $1",
       [userId, organizationId, workspaceId],
     );
     const tokens = await this.options.issueSession(tx, {
@@ -1219,9 +1219,9 @@ export class IdentityStore {
     const inviteTokenHash = input.inviteToken ? hashSecret(input.inviteToken) : null;
     const eligible = await this.database.query<{ ok: boolean }>(
       `SELECT EXISTS (
-         SELECT 1 FROM selfhost_organization_memberships m JOIN selfhost_users u ON u.id = m.user_id WHERE u.email = $1
+         SELECT 1 FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE u.email = $1
        ) OR EXISTS (
-         SELECT 1 FROM selfhost_organization_invitations
+         SELECT 1 FROM organization_invitations
           WHERE email = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > $2
        ) AS ok`,
       [email, new Date(this.now())],
@@ -1232,7 +1232,7 @@ export class IdentityStore {
       !await this.autoJoinEligible(email)) return null;
     const token = opaqueToken("sh_el_");
     await this.database.query(
-      `INSERT INTO selfhost_email_login_tokens (id, email, token_hash, invite_token_hash, next_path, expires_at)
+      `INSERT INTO email_login_tokens (id, email, token_hash, invite_token_hash, next_path, expires_at)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [randomUUID(), email, hashSecret(token), inviteTokenHash, input.next, new Date(this.now() + EMAIL_LOGIN_TTL_MS)],
     );
@@ -1248,9 +1248,9 @@ export class IdentityStore {
     if (this.adminEmails.includes(email)) return true;
     const eligible = await this.database.query<{ ok: boolean }>(
       `SELECT EXISTS (
-         SELECT 1 FROM selfhost_organization_memberships m JOIN selfhost_users u ON u.id = m.user_id WHERE u.email = $1
+         SELECT 1 FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE u.email = $1
        ) OR EXISTS (
-         SELECT 1 FROM selfhost_organization_invitations
+         SELECT 1 FROM organization_invitations
           WHERE email = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > $2
        ) AS ok`,
       [email, new Date(this.now())],
@@ -1264,7 +1264,7 @@ export class IdentityStore {
     if (!domain) return false;
     if (this.options.autoJoinDomains.includes(domain)) return true;
     const result = await this.database.query<{ ok: boolean }>(
-      "SELECT EXISTS (SELECT 1 FROM selfhost_organization_domains WHERE domain = $1) AS ok",
+      "SELECT EXISTS (SELECT 1 FROM organization_domains WHERE domain = $1) AS ok",
       [domain],
     );
     return result.rows[0]?.ok === true;
@@ -1274,7 +1274,7 @@ export class IdentityStore {
   async consumeEmailLogin(token: string): Promise<{ email: string; inviteTokenHash: string | null; next: string } | null> {
     if (!/^sh_el_[A-Za-z0-9_-]{20,}$/.test(token)) return null;
     const result = await this.database.query<{ email: string; invite_token_hash: string | null; next_path: string | null }>(
-      `UPDATE selfhost_email_login_tokens SET consumed_at = now()
+      `UPDATE email_login_tokens SET consumed_at = now()
         WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > $2
         RETURNING email, invite_token_hash, next_path`,
       [hashSecret(token), new Date(this.now())],
@@ -1286,7 +1286,7 @@ export class IdentityStore {
   async peekEmailLogin(token: string): Promise<string | null> {
     if (!/^sh_el_[A-Za-z0-9_-]{20,}$/.test(token)) return null;
     const result = await this.database.query<{ email: string }>(
-      "SELECT email FROM selfhost_email_login_tokens WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > $2",
+      "SELECT email FROM email_login_tokens WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > $2",
       [hashSecret(token), new Date(this.now())],
     );
     return result.rows[0]?.email ?? null;
@@ -1299,21 +1299,21 @@ export class IdentityStore {
   }
 
   async organizationName(organizationId: string): Promise<string | null> {
-    const result = await this.database.query<{ name: string }>("SELECT name FROM selfhost_organizations WHERE id = $1", [organizationId]);
+    const result = await this.database.query<{ name: string }>("SELECT name FROM organizations WHERE id = $1", [organizationId]);
     return result.rows[0]?.name ?? null;
   }
 
   async userSummary(userId: string): Promise<{ name: string; email: string } | null> {
-    const result = await this.database.query<{ name: string; email: string }>("SELECT name, email FROM selfhost_users WHERE id = $1", [userId]);
+    const result = await this.database.query<{ name: string; email: string }>("SELECT name, email FROM users WHERE id = $1", [userId]);
     return result.rows[0] ?? null;
   }
 
   private async upsertUser(tx: SqlExecutor, email: string, name: string, overwriteName: boolean): Promise<{ id: string }> {
     const cleaned = cleanName(name) || email;
     const result = await tx.query<{ id: string }>(
-      `INSERT INTO selfhost_users (id, email, name) VALUES ($1, $2, $3)
+      `INSERT INTO users (id, email, name) VALUES ($1, $2, $3)
        ON CONFLICT (email) DO UPDATE
-         SET name = CASE WHEN $4::boolean THEN EXCLUDED.name ELSE selfhost_users.name END,
+         SET name = CASE WHEN $4::boolean THEN EXCLUDED.name ELSE users.name END,
              updated_at = now()
        RETURNING id`,
       [randomUUID(), email, cleaned, overwriteName],

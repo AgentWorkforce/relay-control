@@ -44,15 +44,15 @@ export class McpOAuthConnection {
       agent_name: string; agent_remote_id: string | null;
       scopes: string[]; grant_scopes: string[]; role: typeof principal.role;
     }>(`SELECT g.agent_name,g.agent_remote_id,s.scopes,g.scopes AS grant_scopes,m.role
-      FROM selfhost_mcp_oauth_grants g
-      JOIN selfhost_mcp_oauth_sessions s ON s.grant_id=g.id AND s.token_family_id=g.token_family_id
+      FROM mcp_oauth_grants g
+      JOIN mcp_oauth_sessions s ON s.grant_id=g.id AND s.token_family_id=g.token_family_id
         AND s.user_id=g.user_id AND s.organization_id=g.organization_id AND s.workspace_id=g.workspace_id
-      JOIN selfhost_organization_memberships m ON m.organization_id=g.organization_id AND m.user_id=g.user_id
-      JOIN selfhost_workspaces w ON w.id=g.workspace_id AND w.organization_id=g.organization_id
+      JOIN organization_memberships m ON m.organization_id=g.organization_id AND m.user_id=g.user_id
+      JOIN workspaces w ON w.id=g.workspace_id AND w.organization_id=g.organization_id
       WHERE g.id=$1 AND g.client_id=$2 AND g.resource=$3 AND g.revoked_at IS NULL
         AND s.id=$4 AND s.access_token_hash=$5 AND s.revoked_at IS NULL AND s.access_token_expires_at>$6
         AND g.user_id=$7 AND g.organization_id=$8 AND g.workspace_id=$9
-        AND ($10::text='multi' OR NOT EXISTS (SELECT 1 FROM selfhost_organizations other WHERE other.id<>g.organization_id))
+        AND ($10::text='multi' OR NOT EXISTS (SELECT 1 FROM organizations other WHERE other.id<>g.organization_id))
       FOR UPDATE OF g FOR KEY SHARE OF s,m,w`,
     [grantId,clientId,resource,principal.sessionId,this.tokenHash,this.options.now?.() ?? new Date(),
       principal.userId,principal.organizationId,principal.workspaceId,this.options.tenancyMode])).rows[0];
@@ -89,7 +89,7 @@ export class McpOAuthConnection {
     }
     // Grants that approved this name before first use share its established
     // immutable identity. Already-pinned grants may learn only their own rename.
-    const updated = await tx.query<{ id: string }>(`UPDATE selfhost_mcp_oauth_grants
+    const updated = await tx.query<{ id: string }>(`UPDATE mcp_oauth_grants
       SET agent_remote_id=$5,agent_name=$6
       WHERE organization_id=$1 AND workspace_id=$2 AND user_id=$3 AND revoked_at IS NULL
         AND (id=$4 OR agent_remote_id=$5 OR (agent_remote_id IS NULL AND agent_name=$6))
@@ -104,7 +104,7 @@ export class McpOAuthConnection {
   /** A successor connection or another live grant must never lose its inbox during cleanup. */
   async claimedByOther(tx: SqlExecutor, agent: McpOAuthAgent): Promise<boolean> {
     const { principal, grantId } = this.access;
-    const result = await tx.query(`SELECT id FROM selfhost_mcp_oauth_grants
+    const result = await tx.query(`SELECT id FROM mcp_oauth_grants
       WHERE organization_id=$1 AND workspace_id=$2 AND user_id=$3 AND revoked_at IS NULL AND id<>$4
         AND (agent_remote_id=$5 OR (agent_remote_id IS NULL AND agent_name=$6)) LIMIT 1`,
     [principal.organizationId,principal.workspaceId,principal.userId,grantId,agent.agentRemoteId,agent.agentName]);

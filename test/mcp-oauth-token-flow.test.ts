@@ -21,10 +21,10 @@ function issued(result:McpOAuthTokenResult) {
 async function fixture(t:test.TestContext) {
   const database=new PGliteDatabase(); t.after(()=>database.close()); await migrate(database);
   const owner={ userId:randomUUID(),organizationId:randomUUID(),workspaceId:randomUUID(),agentName:"fake-agent" };
-  await database.query("INSERT INTO selfhost_users(id,email,name) VALUES ($1,'fake@example.test','Fake User')",[owner.userId]);
-  await database.query("INSERT INTO selfhost_organizations(id,name) VALUES ($1,'Fake Org')",[owner.organizationId]);
-  await database.query("INSERT INTO selfhost_organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'owner')",[owner.organizationId,owner.userId]);
-  await database.query(`INSERT INTO selfhost_workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
+  await database.query("INSERT INTO users(id,email,name) VALUES ($1,'fake@example.test','Fake User')",[owner.userId]);
+  await database.query("INSERT INTO organizations(id,name) VALUES ($1,'Fake Org')",[owner.organizationId]);
+  await database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'owner')",[owner.organizationId,owner.userId]);
+  await database.query(`INSERT INTO workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
     VALUES ($1,$2,'Fake Workspace','fake-relay','fake-envelope')`,[owner.workspaceId,owner.organizationId]);
   let now=new Date(),signerFails=false;
   const signed:Array<Record<string,unknown>>=[];
@@ -45,9 +45,9 @@ async function fixture(t:test.TestContext) {
   const create=(overrides:Record<string,string>={},continuation?:string,agentName=owner.agentName)=>
     store.createMcpOAuthAuthorizationCode(authorization(overrides),{ ...owner,agentName },continuation);
   async function grantId(code:string) {
-    return (await database.query<{ grant_id:string }>("SELECT grant_id FROM selfhost_mcp_oauth_authorization_codes WHERE code_hash=$1",[hashSecret(code)])).rows[0]!.grant_id;
+    return (await database.query<{ grant_id:string }>("SELECT grant_id FROM mcp_oauth_authorization_codes WHERE code_hash=$1",[hashSecret(code)])).rows[0]!.grant_id;
   }
-  const count=(table:"grants"|"sessions"|"revocations")=>database.query<{ n:number }>(`SELECT count(*)::int AS n FROM selfhost_mcp_oauth_${table}`).then(r=>r.rows[0]!.n);
+  const count=(table:"grants"|"sessions"|"revocations")=>database.query<{ n:number }>(`SELECT count(*)::int AS n FROM mcp_oauth_${table}`).then(r=>r.rows[0]!.n);
   return { database,owner,store,client,create,exchange,grantId,count,signed,authorization,
     advance:(ms:number)=>{ now=new Date(now.getTime()+ms); },signerFailure:(value:boolean)=>{ signerFails=value; } };
 }
@@ -58,13 +58,13 @@ test("code exchange creates only an OAuth pair with source TTL/scope and exact c
   assert.equal(body.expires_in,3600); assert.equal(body.scope,"relay:mcp");
   const access=await f.store.sessions.resolveAccessToken(body.access_token,`${ORIGIN}/cloud${SHARED}`);
   assert.ok(access); assert.equal(access.principal.organizationId,f.owner.organizationId);
-  const row=(await f.database.query("SELECT * FROM selfhost_mcp_oauth_authorization_codes")).rows[0]!;
+  const row=(await f.database.query("SELECT * FROM mcp_oauth_authorization_codes")).rows[0]!;
   assert.equal(row.issued_session_id,access.principal.sessionId); assert.ok(row.consumed_at);
   assert.equal(row.grant_id,access.grantId);
   const general=new ControlPlaneStore(f.database,KEYRING,0,{ tenancy:"multi" });
   assert.equal(await general.authenticateAccessToken(body.access_token),null);
   assert.equal(await general.refresh(body.refresh_token),null);
-  assert.equal((await f.database.query("SELECT id FROM selfhost_token_sessions")).rows.length,0);
+  assert.equal((await f.database.query("SELECT id FROM token_sessions")).rows.length,0);
 });
 
 test("client/redirect/resource/PKCE errors cannot burn a code or revoke the legitimate pair",async t=>{
@@ -73,7 +73,7 @@ test("client/redirect/resource/PKCE errors cannot burn a code or revoke the legi
     { resource:`${ORIGIN}/mcp` },{ codeVerifier:"b".repeat(43) },{ codeVerifier:"bad" }];
   for(const override of invalid) {
     const response=await f.exchange(code,override); assert.equal(response.ok,false);
-    assert.equal((await f.database.query("SELECT consumed_at FROM selfhost_mcp_oauth_authorization_codes")).rows[0]!.consumed_at,null);
+    assert.equal((await f.database.query("SELECT consumed_at FROM mcp_oauth_authorization_codes")).rows[0]!.consumed_at,null);
   }
   const body=issued(await f.exchange(code));
   assert.equal((await f.exchange(code,{ codeVerifier:"b".repeat(43) })).ok,false);
@@ -85,7 +85,7 @@ test("verified basic code replay revokes its family and persists one durable tea
   const f=await fixture(t),code=await f.create(),body=issued(await f.exchange(code));
   assert.equal((await f.exchange(code)).ok,false);
   assert.equal(await f.store.sessions.resolveAccessToken(body.access_token,`${ORIGIN}/cloud${SHARED}`),null);
-  const event=(await f.database.query("SELECT * FROM selfhost_mcp_oauth_revocations")).rows[0]!;
+  const event=(await f.database.query("SELECT * FROM mcp_oauth_revocations")).rows[0]!;
   assert.equal(event.reason,"authorization_code_replayed"); assert.equal(event.completed_at,null);
   await f.exchange(code); assert.equal(await f.count("revocations"),1);
 });
@@ -111,11 +111,11 @@ test("legacy continued grant without marker/receipt never revokes unrelated cont
   const f=await fixture(t),request={ resource:`${ORIGIN}/cloud${EVENTS}`,scope:"relay:events" };
   const code=await f.create(request); issued(await f.exchange(code)); const id=await f.grantId(code);
   const nextCode=await f.create(request,id),next=issued(await f.exchange(nextCode));
-  await f.database.query("UPDATE selfhost_mcp_oauth_grants SET continued_at=NULL WHERE id=$1",[id]);
-  await f.database.query("UPDATE selfhost_mcp_oauth_authorization_codes SET issued_session_id=NULL WHERE grant_id=$1",[id]);
+  await f.database.query("UPDATE mcp_oauth_grants SET continued_at=NULL WHERE id=$1",[id]);
+  await f.database.query("UPDATE mcp_oauth_authorization_codes SET issued_session_id=NULL WHERE grant_id=$1",[id]);
   assert.equal((await f.exchange(code)).ok,false);
   assert.ok(await f.store.sessions.resolveAccessToken(next.access_token,request.resource));
-  assert.ok((await f.database.query("SELECT continued_at FROM selfhost_mcp_oauth_grants WHERE id=$1",[id])).rows[0]!.continued_at);
+  assert.ok((await f.database.query("SELECT continued_at FROM mcp_oauth_grants WHERE id=$1",[id])).rows[0]!.continued_at);
   assert.equal(await f.count("revocations"),0);
 });
 
@@ -143,14 +143,14 @@ test("refresh client/resource bindings precede rotation; old-token grace refuses
   assert.equal((await refresh()).ok,false);
   assert.equal(await f.store.sessions.resolveAccessToken(next.access_token,`${ORIGIN}/cloud${SHARED}`),null);
   assert.ok(await f.store.sessions.resolveAccessToken(unrelated.access_token,`${ORIGIN}/cloud${SHARED}`));
-  assert.equal((await f.database.query("SELECT reason FROM selfhost_mcp_oauth_revocations")).rows[0]!.reason,"refresh_token_reused");
+  assert.equal((await f.database.query("SELECT reason FROM mcp_oauth_revocations")).rows[0]!.reason,"refresh_token_reused");
 });
 
 test("OIDC failure rolls back code/grant/session; nonce and signer inputs are source-bound on retry",async t=>{
   const f=await fixture(t),code=await f.create({ scope:"openid relay:mcp",nonce:"fake-nonce" });
   f.signerFailure(true); await assert.rejects(f.exchange(code),/fake signer failure/);
   assert.equal(await f.count("grants"),0); assert.equal(await f.count("sessions"),0);
-  assert.equal((await f.database.query("SELECT consumed_at FROM selfhost_mcp_oauth_authorization_codes")).rows[0]!.consumed_at,null);
+  assert.equal((await f.database.query("SELECT consumed_at FROM mcp_oauth_authorization_codes")).rows[0]!.consumed_at,null);
   f.signerFailure(false); const body=issued(await f.exchange(code)); assert.equal(body.id_token,"fake-id-token");
   assert.equal(f.signed[0]!.nonce,"fake-nonce"); assert.equal(f.signed[0]!.issuer,`${ORIGIN}/cloud`);
   assert.equal(f.signed[0]!.sectorIdentifier,"x.ai"); assert.equal(f.signed[0]!.userId,f.owner.userId);
@@ -166,7 +166,7 @@ test("revocation conceals unknown/mismatched clients, kills its family and queue
   await f.store.revokeMcpOAuthToken({ token:body.access_token,clientId:f.client.clientId });
   assert.equal(await f.store.sessions.resolveAccessToken(body.access_token,`${ORIGIN}/cloud${SHARED}`),null);
   assert.equal(await f.count("revocations"),1);
-  assert.equal((await f.database.query("SELECT reason FROM selfhost_mcp_oauth_revocations")).rows[0]!.reason,"client_revoked");
+  assert.equal((await f.database.query("SELECT reason FROM mcp_oauth_revocations")).rows[0]!.reason,"client_revoked");
 });
 
 test("departure hook expires outstanding codes and revokes families before a later rejoin",async t=>{
@@ -174,9 +174,9 @@ test("departure hook expires outstanding codes and revokes families before a lat
   await f.database.transaction(async tx=>{
     await lockUser(tx,f.owner.userId); await lockOrganization(tx,f.owner.organizationId);
     await f.store.revokeWorkspaceMcpOAuthGrants(tx,f.owner);
-    await tx.query("DELETE FROM selfhost_organization_memberships WHERE organization_id=$1 AND user_id=$2",[f.owner.organizationId,f.owner.userId]);
+    await tx.query("DELETE FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",[f.owner.organizationId,f.owner.userId]);
   });
-  await f.database.query("INSERT INTO selfhost_organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')",[f.owner.organizationId,f.owner.userId]);
+  await f.database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')",[f.owner.organizationId,f.owner.userId]);
   assert.equal((await f.exchange(pending)).ok,false);
   assert.equal(await f.store.sessions.resolveAccessToken(body.access_token,`${ORIGIN}/cloud${SHARED}`),null);
   assert.equal((await f.store.refreshMcpOAuthToken({ refreshToken:body.refresh_token,clientId:f.client.clientId,resource:undefined })).ok,false);
@@ -229,12 +229,12 @@ test("receipt FK accepts only the code's OAuth session, grant and tenant tuple",
   const f=await fixture(t),first=await f.create(); issued(await f.exchange(first));
   const second=await f.create({},undefined,"fake-other-agent"); issued(await f.exchange(second));
   const row=(await f.database.query<{ issued_session_id:string }>(
-    "SELECT issued_session_id FROM selfhost_mcp_oauth_authorization_codes WHERE code_hash=$1",[hashSecret(second)])).rows[0]!;
+    "SELECT issued_session_id FROM mcp_oauth_authorization_codes WHERE code_hash=$1",[hashSecret(second)])).rows[0]!;
   for(const id of [randomUUID(),row.issued_session_id]) {
-    await assert.rejects(f.database.query("UPDATE selfhost_mcp_oauth_authorization_codes SET issued_session_id=$2 WHERE code_hash=$1",
+    await assert.rejects(f.database.query("UPDATE mcp_oauth_authorization_codes SET issued_session_id=$2 WHERE code_hash=$1",
       [hashSecret(first),id]),/foreign key/);
   }
-  await assert.rejects(f.database.query("UPDATE selfhost_mcp_oauth_authorization_codes SET grant_id=NULL WHERE code_hash=$1",[hashSecret(first)]),/check constraint/);
+  await assert.rejects(f.database.query("UPDATE mcp_oauth_authorization_codes SET grant_id=NULL WHERE code_hash=$1",[hashSecret(first)]),/check constraint/);
 });
 
 test("connection filters canonicalize hints and trailing slash but reject foreign origins",async t=>{
@@ -250,23 +250,23 @@ test("connection filters canonicalize hints and trailing slash but reject foreig
 test("organization departure revokes every workspace while preserving session receipts and durable intents",async t=>{
   const f=await fixture(t),first=issued(await f.exchange(await f.create())),pending=await f.create();
   const secondWorkspace=randomUUID();
-  await f.database.query(`INSERT INTO selfhost_workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
+  await f.database.query(`INSERT INTO workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
     VALUES ($1,$2,'Fake Second Workspace','fake-second-relay','fake-envelope')`,[secondWorkspace,f.owner.organizationId]);
   const secondCode=await f.store.createMcpOAuthAuthorizationCode(f.authorization(),{ ...f.owner,workspaceId:secondWorkspace });
   const second=issued(await f.exchange(secondCode));
   const otherOrg=randomUUID(),otherWorkspace=randomUUID();
-  await f.database.query("INSERT INTO selfhost_organizations(id,name) VALUES ($1,'Fake Other Org')",[otherOrg]);
-  await f.database.query("INSERT INTO selfhost_organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'owner')",[otherOrg,f.owner.userId]);
-  await f.database.query(`INSERT INTO selfhost_workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
+  await f.database.query("INSERT INTO organizations(id,name) VALUES ($1,'Fake Other Org')",[otherOrg]);
+  await f.database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'owner')",[otherOrg,f.owner.userId]);
+  await f.database.query(`INSERT INTO workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
     VALUES ($1,$2,'Fake Other Workspace','fake-other-relay','fake-envelope')`,[otherWorkspace,otherOrg]);
   const otherCode=await f.store.createMcpOAuthAuthorizationCode(f.authorization(),{ ...f.owner,organizationId:otherOrg,workspaceId:otherWorkspace });
   const other=issued(await f.exchange(otherCode));
   await f.database.transaction(async tx=>{
     await lockUser(tx,f.owner.userId); await lockOrganization(tx,f.owner.organizationId);
     await f.store.revokeOrganizationMcpOAuthGrants(tx,f.owner);
-    await tx.query("DELETE FROM selfhost_organization_memberships WHERE organization_id=$1 AND user_id=$2",[f.owner.organizationId,f.owner.userId]);
+    await tx.query("DELETE FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",[f.owner.organizationId,f.owner.userId]);
   });
-  await f.database.query("INSERT INTO selfhost_organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')",[f.owner.organizationId,f.owner.userId]);
+  await f.database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')",[f.owner.organizationId,f.owner.userId]);
   assert.equal((await f.exchange(pending)).ok,false);
   assert.equal(await f.store.sessions.resolveAccessToken(first.access_token,`${ORIGIN}/cloud${SHARED}`),null);
   assert.equal(await f.store.sessions.resolveAccessToken(second.access_token,`${ORIGIN}/cloud${SHARED}`),null);

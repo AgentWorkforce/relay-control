@@ -33,7 +33,7 @@ test("lockout: a parallel burst gets no more than the free allowance", async (t)
   const burst = await Promise.all(Array.from({ length: 12 }, (_, i) => login(ctx, "burst@acme.test", `wrong password number ${i}`)));
   assert.ok(burst.every((res) => res.status === 401));
   const row = await ctx.database.query<{ failures: number; locked_until: Date | null }>(
-    "SELECT failures, locked_until FROM selfhost_login_attempts WHERE subject = 'account-key:burst@acme.test|198.51.100.7'",
+    "SELECT failures, locked_until FROM login_attempts WHERE subject = 'account-key:burst@acme.test|198.51.100.7'",
   );
   assert.equal(row.rows[0]!.failures, LOCKOUT.accountKey.free, "attempts are reserved before argon2id, not counted after it");
   assert.ok(row.rows[0]!.locked_until);
@@ -66,13 +66,13 @@ test("login: more than 60 attempts a minute from one IP answer 429 rate_limited 
   assert.equal((await login(ctx, "flood-later@acme.test", "wrong password here", "198.51.100.61")).status, 401, "the window resets");
 });
 
-test("lockout: a locked IP spraying new addresses does not grow selfhost_login_attempts", async (t) => {
+test("lockout: a locked IP spraying new addresses does not grow login_attempts", async (t) => {
   const ctx = await setup(t);
   for (let i = 0; i < LOCKOUT.ip.free; i += 1) await login(ctx, `spray${i}@acme.test`, "wrong password here", "198.51.100.90");
-  const count = async () => Number((await ctx.database.query<{ n: string }>("SELECT count(*) AS n FROM selfhost_login_attempts")).rows[0]!.n);
+  const count = async () => Number((await ctx.database.query<{ n: string }>("SELECT count(*) AS n FROM login_attempts")).rows[0]!.n);
   const before = await count();
   const ipRow = async () => (await ctx.database.query<{ failures: number }>(
-    "SELECT failures FROM selfhost_login_attempts WHERE subject LIKE 'ip:%'")).rows[0]!.failures;
+    "SELECT failures FROM login_attempts WHERE subject LIKE 'ip:%'")).rows[0]!.failures;
   const failuresBefore = await ipRow();
   for (let i = 0; i < 10; i += 1) {
     assert.equal((await login(ctx, `fresh${i}@acme.test`, "wrong password here", "198.51.100.90")).status, 401);
@@ -100,13 +100,13 @@ test("client IP: X-Forwarded-For is ignored unless SELFHOST_TRUSTED_PROXIES says
     await registerVerified(ctx, "spoof@acme.test");
     for (let i = 0; i < LOCKOUT.ip.free + 5; i += 1) await login(ctx, `spray${i}@acme.test`, "wrong password here", `203.0.113.${i + 1}`);
     assert.equal((await login(ctx, "spoof@acme.test", PASSWORD, "198.51.100.200")).status, 401, `proxies=${proxies}: the socket address is locked`);
-    const ipRows = await ctx.database.query<{ subject: string }>("SELECT subject FROM selfhost_login_attempts WHERE subject LIKE 'ip:%'");
+    const ipRows = await ctx.database.query<{ subject: string }>("SELECT subject FROM login_attempts WHERE subject LIKE 'ip:%'");
     assert.deepEqual(ipRows.rows.map((r) => r.subject), ["ip:127.0.0.1"], "only the socket address is counted");
     const events = await auditActions(ctx);
     assert.ok(events.some((e) => e.action === "login.lockout" && e.target!.includes("scope=ip ip=127.0.0.1")), `proxies=${proxies}`);
     assert.ok(!events.some((e) => /203\.0\.113\./.test(e.target ?? "")), "the forged header was not used, even in audit");
     // Each sprayed address is still counted per account.
-    const accountKeys = await ctx.database.query("SELECT subject FROM selfhost_login_attempts WHERE subject LIKE 'account-key:spray0@%'");
+    const accountKeys = await ctx.database.query("SELECT subject FROM login_attempts WHERE subject LIKE 'account-key:spray0@%'");
     assert.equal(accountKeys.rows.length, 1);
   }
   // One trusted proxy: the last X-Forwarded-For entry is the client.
@@ -134,7 +134,7 @@ test("pepper file: refused when group/other may read it; wrong passwords still f
   const ctx = await setup(t, { env: { SELFHOST_PASSWORD_PEPPER_FILE: pepperFile(`v1:${secret}`) } });
   await registerVerified(ctx, "pep@acme.test");
   const stored = await ctx.database.query<{ pepper_version: number }>(
-    "SELECT c.pepper_version FROM selfhost_password_credentials c JOIN selfhost_users u ON u.id = c.user_id WHERE u.email = 'pep@acme.test'",
+    "SELECT c.pepper_version FROM password_credentials c JOIN users u ON u.id = c.user_id WHERE u.email = 'pep@acme.test'",
   );
   assert.equal(stored.rows[0]!.pepper_version, 1);
   const wrong = await login(ctx, "pep@acme.test", "not the right passphrase");
@@ -149,9 +149,9 @@ test("reset: revokes CLI, Desktop and browser sessions and MCP grants; expires a
   const ctx = await setup(t);
   const browser = sessionCookie(await registerVerified(ctx, "all@acme.test"));
   const member = (await ctx.database.query<{ id: string; organization_id: string; workspace_id: string }>(
-    `SELECT u.id, m.organization_id, w.id AS workspace_id FROM selfhost_users u
-       JOIN selfhost_organization_memberships m ON m.user_id = u.id
-       JOIN selfhost_workspaces w ON w.organization_id = m.organization_id
+    `SELECT u.id, m.organization_id, w.id AS workspace_id FROM users u
+       JOIN organization_memberships m ON m.user_id = u.id
+       JOIN workspaces w ON w.organization_id = m.organization_id
       WHERE u.email = 'all@acme.test' LIMIT 1`,
   )).rows[0]!;
   const approve = async () => {
@@ -166,43 +166,43 @@ test("reset: revokes CLI, Desktop and browser sessions and MCP grants; expires a
   const desktop = await ctx.store.issueDesktopSession({ userId: member.id, organizationId: member.organization_id, workspaceId: member.workspace_id, tokenFamilyId: randomUUID() });
   const uncollected = await approve();
   // An MCP OAuth grant and an authorization code not redeemed yet.
-  await ctx.database.query("INSERT INTO selfhost_mcp_oauth_clients (client_id, client_name, redirect_uris) VALUES ('mcp-client', 'Editor', ARRAY['http://127.0.0.1/cb'])");
+  await ctx.database.query("INSERT INTO mcp_oauth_clients (client_id, client_name, redirect_uris) VALUES ('mcp-client', 'Editor', ARRAY['http://127.0.0.1/cb'])");
   const grantId = randomUUID();
   const familyId = randomUUID();
   await ctx.database.query(
-    `INSERT INTO selfhost_mcp_oauth_grants (id, client_id, user_id, organization_id, workspace_id, agent_name, scopes, resource, token_family_id)
+    `INSERT INTO mcp_oauth_grants (id, client_id, user_id, organization_id, workspace_id, agent_name, scopes, resource, token_family_id)
      VALUES ($1, 'mcp-client', $2, $3, $4, 'editor', ARRAY['relay:mcp'], 'https://mcp.example.test', $5)`,
     [grantId, member.id, member.organization_id, member.workspace_id, familyId],
   );
   // A live MCP OAuth session in the grant's token family.
   await ctx.database.query(
-    `INSERT INTO selfhost_mcp_oauth_sessions
+    `INSERT INTO mcp_oauth_sessions
        (id, grant_id, token_family_id, user_id, organization_id, workspace_id, scopes, access_token_hash, refresh_token_hash,
         access_token_expires_at, refresh_token_expires_at, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, ARRAY['relay:mcp'], $7, $8, now() + interval '1 hour', now() + interval '30 days', now(), now())`,
     [randomUUID(), grantId, familyId, member.id, member.organization_id, member.workspace_id, "a".repeat(64), "b".repeat(64)],
   );
   await ctx.database.query(
-    `INSERT INTO selfhost_mcp_oauth_authorization_codes
+    `INSERT INTO mcp_oauth_authorization_codes
        (code_hash, client_id, user_id, organization_id, workspace_id, agent_name, redirect_uri, code_challenge, scopes, resource, expires_at)
      VALUES ($1, 'mcp-client', $2, $3, $4, 'editor', 'http://127.0.0.1/cb', 'challenge', ARRAY['relay:mcp'], 'https://mcp.example.test', now() + interval '5 minutes')`,
     ["c".repeat(64), member.id, member.organization_id, member.workspace_id],
   );
   // A Desktop relay identity (an agent token Relaycast minted for this person).
   await ctx.database.query(
-    `INSERT INTO selfhost_desktop_relay_identities
+    `INSERT INTO desktop_relay_identities
        (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id, agent_name, agent_remote_id, address, token_ciphertext)
      VALUES ($1, $2, $3, $4, 'rc-ws', $5, 'desktop-agent', 'remote-1', 'desktop-agent@host', 'ciphertext')`,
     [randomUUID(), member.workspace_id, member.organization_id, member.id, randomUUID()],
   );
   // A person messaging identity is not a session: kept.
   await ctx.database.query(
-    `INSERT INTO selfhost_person_identities (id, workspace_id, user_id, agent_name, agent_remote_id, token_ciphertext, relaycast_workspace_id)
+    `INSERT INTO person_identities (id, workspace_id, user_id, agent_name, agent_remote_id, token_ciphertext, relaycast_workspace_id)
      VALUES ($1, $2, $3, 'all', 'human-1', 'ciphertext', 'rc-ws')`,
     [randomUUID(), member.workspace_id, member.id],
   );
   const identitiesBefore = Number((await ctx.database.query<{ n: number }>(
-    "SELECT count(*)::int AS n FROM selfhost_person_identities WHERE user_id = $1", [member.id])).rows[0]!.n);
+    "SELECT count(*)::int AS n FROM person_identities WHERE user_id = $1", [member.id])).rows[0]!.n);
   assert.ok(await ctx.store.authenticateAccessToken(cli.accessToken));
   assert.ok(await ctx.store.authenticateAccessToken(desktop.accessToken));
 
@@ -224,26 +224,26 @@ test("reset: revokes CLI, Desktop and browser sessions and MCP grants; expires a
   const late = await ctx.store.pollDeviceAuthorization(uncollected);
   assert.equal(late.kind, "error", "an approval nobody collected cannot be collected after the reset");
   assert.equal((late as { error: string }).error, "expired_token");
-  const grant = await ctx.database.query<{ revoked_reason: string | null }>("SELECT revoked_reason FROM selfhost_mcp_oauth_grants WHERE id = $1", [grantId]);
+  const grant = await ctx.database.query<{ revoked_reason: string | null }>("SELECT revoked_reason FROM mcp_oauth_grants WHERE id = $1", [grantId]);
   assert.equal(grant.rows[0]!.revoked_reason, "password_reset");
   const family = await ctx.database.query<{ revoked_at: Date | null; revoked_reason: string | null }>(
-    "SELECT revoked_at, revoked_reason FROM selfhost_mcp_oauth_sessions WHERE grant_id = $1", [grantId]);
+    "SELECT revoked_at, revoked_reason FROM mcp_oauth_sessions WHERE grant_id = $1", [grantId]);
   assert.ok(family.rows[0]!.revoked_at, "the grant's MCP session family is revoked with it");
   assert.equal(family.rows[0]!.revoked_reason, "oauth_grant_password_reset");
   const tombstone = await ctx.database.query<{ user_id: string; token_family_id: string; reason: string }>(
-    "SELECT user_id, token_family_id, reason FROM selfhost_mcp_oauth_revocations WHERE grant_id = $1", [grantId]);
+    "SELECT user_id, token_family_id, reason FROM mcp_oauth_revocations WHERE grant_id = $1", [grantId]);
   assert.equal(tombstone.rows.length, 1, "a revocation tombstone drives Relaycast teardown");
   assert.deepEqual(tombstone.rows[0], { user_id: member.id, token_family_id: familyId, reason: "password_reset" });
   const code = await ctx.database.query<{ consumed_at: Date | null; live: boolean }>(
-    "SELECT consumed_at, expires_at > now() AS live FROM selfhost_mcp_oauth_authorization_codes");
+    "SELECT consumed_at, expires_at > now() AS live FROM mcp_oauth_authorization_codes");
   assert.equal(code.rows[0]!.live, false, "the unredeemed MCP code is void (expired)");
   assert.equal(code.rows[0]!.consumed_at, null, "and not marked as redeemed");
   const audit = (await auditActions(ctx)).find((e) => e.action === "password.reset.completed");
   assert.match(audit!.target!, /sessions_revoked=3 mcp_grants_revoked=1 desktop_relay_identities_deleted=1 device_authorizations_expired=1 mcp_codes_voided=1/);
-  const relayIdentities = await ctx.database.query("SELECT id FROM selfhost_desktop_relay_identities WHERE user_id = $1", [member.id]);
+  const relayIdentities = await ctx.database.query("SELECT id FROM desktop_relay_identities WHERE user_id = $1", [member.id]);
   assert.equal(relayIdentities.rows.length, 0, "Desktop relay identities are deleted");
   const identitiesAfter = Number((await ctx.database.query<{ n: number }>(
-    "SELECT count(*)::int AS n FROM selfhost_person_identities WHERE user_id = $1", [member.id])).rows[0]!.n);
+    "SELECT count(*)::int AS n FROM person_identities WHERE user_id = $1", [member.id])).rows[0]!.n);
   assert.equal(identitiesBefore, 1);
   assert.equal(identitiesAfter, identitiesBefore, "person messaging identities are not touched");
 });
@@ -350,7 +350,7 @@ test("retention: idle login attempts after 24 hours, spent or expired tokens aft
   await call(ctx.origin, `${API}/reset`, { json: { email: "keep@acme.test" } });
   await ctx.identity.idle();
   const count = async (table: string) => Number((await ctx.database.query<{ n: number }>(`SELECT count(*)::int AS n FROM ${table}`)).rows[0]!.n);
-  const tables = ["selfhost_login_attempts", "selfhost_password_registrations", "selfhost_password_setup_tokens", "selfhost_password_reset_tokens"];
+  const tables = ["login_attempts", "password_registrations", "password_setup_tokens", "password_reset_tokens"];
   const before = await Promise.all(tables.map(count));
   assert.ok(before.every((n) => n > 0), String(before));
 
@@ -358,10 +358,10 @@ test("retention: idle login attempts after 24 hours, spent or expired tokens aft
   assert.deepEqual(await Promise.all(tables.map(count)), before, "nothing recent is deleted");
   ctx.clock.now += 25 * 60 * 60 * 1_000;
   await ctx.identity.sweep();
-  assert.equal(await count("selfhost_login_attempts"), 0, "idle attempt rows go after 24 hours");
-  assert.ok((await count("selfhost_password_registrations")) > 0, "tokens are kept for 7 days");
+  assert.equal(await count("login_attempts"), 0, "idle attempt rows go after 24 hours");
+  assert.ok((await count("password_registrations")) > 0, "tokens are kept for 7 days");
   ctx.clock.now += 7 * 24 * 60 * 60 * 1_000;
   await ctx.identity.sweep();
   assert.deepEqual(await Promise.all(tables.map(count)), [0, 0, 0, 0]);
-  assert.equal(await count("selfhost_password_credentials"), 1, "credentials are never swept");
+  assert.equal(await count("password_credentials"), 1, "credentials are never swept");
 });

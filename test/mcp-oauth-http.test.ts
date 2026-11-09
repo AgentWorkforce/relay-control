@@ -228,10 +228,10 @@ test("native HTTP adapter bounds chunked bodies and uses configured issuer inste
 for(const oidc of [false,true]) test("real store HTTP consent/exchange/refresh/revoke uses only OAuth credentials; OIDC "+oidc,async t=>{
   const database=new PGliteDatabase();t.after(()=>database.close());await migrate(database);
   const owner={userId:randomUUID(),organizationId:randomUUID(),workspaceId:randomUUID()};
-  await database.query("INSERT INTO selfhost_users(id,email,name) VALUES ($1,'fake@example.test','Fake User')",[owner.userId]);
-  await database.query("INSERT INTO selfhost_organizations(id,name) VALUES ($1,'Fake Organization')",[owner.organizationId]);
-  await database.query("INSERT INTO selfhost_organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')",[owner.organizationId,owner.userId]);
-  await database.query("INSERT INTO selfhost_workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext) VALUES ($1,$2,'Fake Workspace','fake-relay','fake-envelope')",
+  await database.query("INSERT INTO users(id,email,name) VALUES ($1,'fake@example.test','Fake User')",[owner.userId]);
+  await database.query("INSERT INTO organizations(id,name) VALUES ($1,'Fake Organization')",[owner.organizationId]);
+  await database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')",[owner.organizationId,owner.userId]);
+  await database.query("INSERT INTO workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext) VALUES ($1,$2,'Fake Workspace','fake-relay','fake-envelope')",
     [owner.workspaceId,owner.organizationId]);
   const signing=oidc?generateKeyPairSync("rsa",{modulusLength:2048}):null;
   const module=createMcpOAuthHttpModule({config:config(true,signing?{
@@ -272,7 +272,7 @@ for(const oidc of [false,true]) test("real store HTTP consent/exchange/refresh/r
     assert.equal(claims.iss,ORIGIN+"/cloud");assert.equal(claims.aud,registered.client_id);
     assert.equal(claims.nonce,"fake-nonce");assert.notEqual(claims.sub,owner.userId);
   } else assert.equal(pair.id_token,undefined);
-  assert.equal((await database.query("SELECT id FROM selfhost_token_sessions")).rows.length,0);
+  assert.equal((await database.query("SELECT id FROM token_sessions")).rows.length,0);
   const refreshed=await call(API+"/token",{grant_type:"refresh_token",client_id:registered.client_id,refresh_token:pair.refresh_token,resource});
   assert.equal(refreshed.status,200);
   const next=await refreshed.json();

@@ -14,11 +14,11 @@ async function runtime(t: TestContext, options: { missingColumn?: boolean; organ
   });
   await migrate(database);
   if (options.missingColumn) {
-    await database.exec("ALTER TABLE selfhost_users DROP COLUMN last_workspace_id");
+    await database.exec("ALTER TABLE users DROP COLUMN last_workspace_id");
   }
   for (let n = 0; n < (options.organizations ?? 0); n += 1) {
     await database.query(
-      "INSERT INTO selfhost_organizations(id,name) VALUES($1,$2)",
+      "INSERT INTO organizations(id,name) VALUES($1,$2)",
       [`00000000-0000-4000-8000-${String(n + 1).padStart(12, "0")}`, `Fixture ${n + 1}`],
     );
   }
@@ -31,7 +31,7 @@ async function runtime(t: TestContext, options: { missingColumn?: boolean; organ
 test("a runtime role is ready without permission to read migration metadata", async (t) => {
   const database = await runtime(t);
   assert.equal((await database.query<{ current_user: string }>("SELECT current_user")).rows[0]?.current_user, role);
-  await assert.rejects(database.query("SELECT name FROM selfhost_schema_migrations"),
+  await assert.rejects(database.query("SELECT name FROM control_schema_migrations"),
     (error: unknown) => error instanceof Error && "code" in error && error.code === "42501");
   assert.deepEqual(await new ControlPlaneStore(database, keyring).readiness(), { ready: true });
 });
