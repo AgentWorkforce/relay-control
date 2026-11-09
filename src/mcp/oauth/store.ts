@@ -381,3 +381,6 @@ export class McpOAuthStore {
     });
   }
 }
+
+// Preserve the exported revocation contract used by account credential resets.
+export { revokeMcpOAuthGrantRows } from "./revocations.js";

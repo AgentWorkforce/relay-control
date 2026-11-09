@@ -86,6 +86,7 @@ is explicit. RelayAuth is optional: see
 | `RELAYHISTORY_PUBLIC_URL` | Public RelayHistory origin used as assertion and default introspection audience and returned to clients; bare HTTPS public DNS origin |
 | `RELAYAUTH_API_KEY` | Optional, set together with `RELAYAUTH_URL` (`_FILE` supported). Key allowed to mint RelayHistory assertions |
 | `RELAYCONTROL_INTROSPECT_SECRET` | Optional, at least 32 bytes (`_FILE` supported). Bearer for `POST /internal/v1/auth/introspect`, shared only with RelayHistory (and relayfile). Unset: that route answers 404 |
+| `RELAYFILE_CONTROL_BROKER_SECRET` | Optional, at least 32 bytes, `_FILE` supported. Enables the internal credential routes under `/internal/v1/flows/credentials/` for relayfile-control's Flows service. Unset, they answer 404. |
 | `SELFHOST_INTROSPECT_AUDIENCES` | Optional comma-separated http(s) origins a token may be introspected for, default `RELAYHISTORY_PUBLIC_URL`. Matched as normalized origins (scheme, lowercase host, port); `GET /readyz` lists them under `introspection.audiences` |
 | `SELFHOST_ACQUISITION_ISSUER_ENABLED` | Optional, default off (`true`/`false`). Turns on the dormant cloud-class acquisition assertion issuer ([docs/acquisition-issuer.md](docs/acquisition-issuer.md)); off, no other issuer variable is read and `/api/v1/acquisition/*` answers 404 |
 | `SELFHOST_ACQUISITION_ORIGIN` | Required when the issuer is enabled. The pipeline's `ACQUISITION_ORIGIN`; must also be listed in `SELFHOST_INTROSPECT_AUDIENCES` |
@@ -109,13 +110,18 @@ is explicit. RelayAuth is optional: see
 | `SELFHOST_FLOWS_RUNTIME_ENV_URL` | Origin serving that internal route, default `http://127.0.0.1:$PORT` (this process) |
 | `SELFHOST_OAUTH_REDIRECT_URL` | Optional. OAuth redirect URI registered in each provider OAuth app. Default `$SELFHOST_PUBLIC_URL/api/v1/integrations/oauth/callback` |
 | `SELFHOST_DASHBOARD_URL` | Optional dashboard origin. Link shown on the OAuth result page (default `$SELFHOST_PUBLIC_URL/`) and, when https, `runUrl` on mirrored flow runs |
-| `SELFHOST_BOOTSTRAP_ORG_NAME` / `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` | Optional, set together. First-boot bootstrap: creates the organization with this admin as owner and a default workspace bound to a new Relaycast workspace. Idempotent. See [docs/identity.md](docs/identity.md) |
+| `SELFHOST_BOOTSTRAP_ORG_NAME` / `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` | Optional, set together (or the org name with `SELFHOST_ADMIN_EMAILS`). First-boot bootstrap: creates the organization with this admin as owner and a default workspace bound to a new Relaycast workspace. Idempotent. See [docs/identity.md](docs/identity.md) |
 | `SELFHOST_BOOTSTRAP_ADMIN_NAME` / `SELFHOST_BOOTSTRAP_WORKSPACE_NAME` | Optional display name for the admin (default: the email's local part) and the workspace name (default `Default`) |
 | `RELAYCAST_INTERNAL_SECRET` | Optional (`_FILE` supported), at least 32 bytes, equal to Relaycast's own internal secret. Lets the bootstrap create the default workspace through Relaycast's `POST /internal/workspaces` |
 | `SELFHOST_OIDC_ISSUER` / `SELFHOST_OIDC_CLIENT_ID` / `SELFHOST_OIDC_CLIENT_SECRET[_FILE]` | Optional OpenID Connect sign-in (Google Workspace, Okta, Entra ID, Keycloak...). Authorization code + PKCE. See [docs/identity.md](docs/identity.md) |
 | `SELFHOST_OIDC_ALLOWED_DOMAINS` / `SELFHOST_OIDC_DISPLAY_NAME` / `SELFHOST_OIDC_SCOPES` / `SELFHOST_OIDC_REDIRECT_URL` | Optional OIDC refinements: email domains allowed to sign in, button label, scopes (default `openid email profile`), and a fixed redirect URI (default `<site>/login/oidc/callback`) |
 | `SELFHOST_SMTP_HOST` / `_PORT` / `_SECURITY` / `_USERNAME` / `_PASSWORD[_FILE]`, `SELFHOST_EMAIL_FROM` | Optional SMTP for invite emails and sign-in links |
 | `SELFHOST_EMAIL_LOGIN` | Optional `true`: email sign-in links (requires SMTP) |
+| `SELFHOST_SIGNIN_METHODS` | Optional comma list of `email_link` and `password` (both require SMTP). Default: `email_link` when `SELFHOST_EMAIL_LOGIN=true`. Unlisted methods answer 404 `signin_method_disabled`. Failed password sign-ins lock per account and client (5 free, then 30 s doubling to 15 min) and per account across all clients (50 in an hour locks it for 15 min and mails the owner, at most once a day). See [docs/identity.md](docs/identity.md#email-and-password-optional) and [Lockout](docs/identity.md#lockout) |
+| `SELFHOST_PASSWORD_PEPPER_FILE` / `SELFHOST_PASSWORD_HIBP` / `SELFHOST_PASSWORD_ARGON2_MEMORY_KIB` / `_TIME_COST` / `_PARALLELISM` | Optional password sign-in settings: a versioned HMAC pepper file (`v<n>:<secret>` lines, owned by the server's user, mode `0600` or `0400`), the Have I Been Pwned check (default `off`), and argon2id parameters, which can only be raised above m=19456 KiB, t=2, p=1 |
+| `SELFHOST_TRUSTED_PROXIES` | Number of reverse proxies that append to `X-Forwarded-For` (default `0`: use the TCP peer address and ignore the header). Use `1` only behind a single HTTP proxy that appends to `X-Forwarded-For` (for example the Helm chart's ingress) and only when direct access to the pod or Service that bypasses that proxy is restricted; any other proxy chain needs its actual hop count. Used by every per-IP limit and the password lockout; IPv6 is bucketed by /64. **Required when `SELFHOST_SIGNIN_METHODS` includes `password`: set it explicitly, even to `0`** (unset or empty refuses to start). Use `0` when clients connect directly. See [docs/identity.md](docs/identity.md#client-address) |
+| `SELFHOST_LOGIN_LOGO_URL` | Optional https logo URL, published by `GET /api/v1/auth/login-config` |
+| `SELFHOST_ADMIN_EMAILS` | Optional comma list of admin addresses: the first to sign in with a verified email becomes owner, the rest admins. `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` is an alias that is made owner at first boot |
 | `SELFHOST_AUTO_JOIN_DOMAINS` | Optional, single mode only (multi mode refuses to start with it). Email domains whose verified users join as `member` on first sign-in, without an invite. The only authority for auto-join in single mode: absent or empty means none |
 | `SELFHOST_TENANCY` | `single` (default): one organization. `multi`: many organizations on one installation; requires `SELFHOST_BOOTSTRAP_ORG_NAME` / `SELFHOST_BOOTSTRAP_ADMIN_EMAIL`. See [docs/identity.md](docs/identity.md#tenancy) |
 | `SELFHOST_PERSONAL_ORG_ON_SIGNIN` | Multi mode only, default `true`: a first sign-in with no invite, membership or assigned domain creates a personal organization. The bootstrap bearer can override it at runtime via `PATCH /api/v1/installation/settings` |
@@ -138,6 +144,8 @@ is explicit. RelayAuth is optional: see
 | `SELFHOST_AMP_INTERNAL_SECRET` | Optional (`_FILE` supported), at least 32 bytes. Bearer for `POST /api/v1/internal/amp/job` (scheduler sweeps and inject jobs). Unset: that route answers 404 |
 | `SELFHOST_AMP_WORKER_INTERVAL_MS` / `SELFHOST_AMP_LEASE_MS` | Outbox drain interval, default 5000 (250-600000), and delivery lease, default 120000 (1000-3600000). An expired lease becomes `unknown` and is never resent |
 | `HOST` | Listener address, default `0.0.0.0` |
+
+**Upgrade note (client address).** Per-IP limits and the password lockout now use the TCP peer address unless `SELFHOST_TRUSTED_PROXIES` is set. Deployments behind a proxy must set `SELFHOST_TRUSTED_PROXIES` to the number of proxy hops that append to `X-Forwarded-For` (`1` only for a single such proxy, such as the Helm chart's ingress, with direct pod or Service access restricted); otherwise every client shares the proxy's bucket, and the server logs one warning when it sees `X-Forwarded-For` with `0` trusted hops (per-IP limits, including the password IP lockout, use the socket address). With password sign-in enabled the variable must now be set explicitly, even to `0`, or the server refuses to start; `1` is correct for a Helm install only when the chart's ingress is the single proxy and direct access to the pod or Service that bypasses it is restricted. `X-Real-IP` is no longer read.
 
 Sensitive variables also accept a mutually exclusive `_FILE` form. The API
 server reads `DATABASE_URL_FILE`; `agent-relay-selfhost-migrate` reads only
@@ -376,8 +384,8 @@ signs in. The same rule applies to `verification_uri`, the browser handoff's
 `api_url` and the desktop session's `apiUrl`.
 
 Rate limits match hosted Cloud and are per process: device start 10 per 5 minutes
-and token polling 120 per minute per client address (first `X-Forwarded-For`
-hop), and approval 30 per 5 minutes per signed-in user. Desktop's PKCE proof
+and token polling 120 per minute per client address (the TCP peer, or the
+`X-Forwarded-For` entry chosen by `SELFHOST_TRUSTED_PROXIES`), and approval 30 per 5 minutes per signed-in user. Desktop's PKCE proof
 fields are accepted but not enforced (self-host has no Desktop-authority grant).
 
 See `openapi.yaml` (also served at `/openapi.yaml`) for the exact contract.

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { createHash, createPrivateKey, type KeyObject } from "node:crypto";
 import { isIP } from "node:net";
 import type { EncryptionKey, EncryptionKeyring } from "./crypto.js";
+import { trustedProxyHops } from "./auth/device-approval.js";
 import {
   isAcquisitionIdentifier,
   rawEd25519PublicKey,
@@ -23,6 +24,8 @@ export type SelfhostConfig = {
   relayhistoryUrl: string;
   /** Optional GET-only pipeline reader for unsearched session lists and turns. */
   relayhistoryReadApiUrl?: string | null;
+  /** RELAYFILE_CONTROL_BROKER_SECRET: Flows credential broker routes. Unset: they 404. */
+  relayfileControlBrokerSecret?: string | null;
   /** Independent read service; owns issuance, rotation and verification of its tokens. */
   sessionReadApi?: { url: string; publicUrl: string; secret: string } | null;
   /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
@@ -310,6 +313,8 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   if (Buffer.byteLength(bootstrapToken) < 32) {
     throw new Error("SELFHOST_BOOTSTRAP_TOKEN must be at least 32 bytes");
   }
+  // Validated at boot; clientIp (src/auth/device-approval.ts) reads it per request.
+  trustedProxyHops(env);
 
   const relayhistoryPublicUrl = publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL");
   const introspection = loadIntrospectionConfig(env, relayhistoryPublicUrl);
@@ -334,6 +339,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     relayhistoryPublicUrl,
     relayhistoryReadApiUrl,
     sessionReadApi: loadSessionReadApiConfig(env),
+    relayfileControlBrokerSecret: loadBrokerSecret(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
     sessionSearchAgentTokens: loadSessionSearchAgentTokens(env),
@@ -373,6 +379,13 @@ function loadSessionErasureApiConfig(env: Env): SelfhostConfig["sessionErasureAp
     throw new Error("SESSION_ERASE_API_SECRET (or _FILE) must be at least 32 bytes");
   }
   return { url: serviceUrl(env, "SESSION_ERASE_API_URL"), secret };
+}
+
+function loadBrokerSecret(env: Env): string | null {
+  const secret = readSecret(env, "RELAYFILE_CONTROL_BROKER_SECRET");
+  if (!secret) return null;
+  if (Buffer.byteLength(secret) < 32) throw new Error("RELAYFILE_CONTROL_BROKER_SECRET (or _FILE) must be at least 32 bytes");
+  return secret;
 }
 
 function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {

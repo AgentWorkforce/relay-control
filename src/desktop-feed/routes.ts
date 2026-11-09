@@ -12,7 +12,7 @@ import type { SqlExecutor } from "../database.js";
 import type { ControlPlaneStore, Principal } from "../store.js";
 import { ApiTokenStore } from "../admin/api-tokens.js";
 import { recordAudit, type AuditActor } from "../admin/audit.js";
-import { clientIp, cookieRequestAllowed, RateLimiter } from "../auth/device-approval.js";
+import { clientIp, cookieRequestAllowed, limiterKey, RateLimiter } from "../auth/device-approval.js";
 import { canonicalBytes, canonicalize } from "./canonical.js";
 import { strictParse } from "./strict-json.js";
 import { DRAFT_CREATE_SCHEMA, ENVELOPE_SCHEMA } from "./schemas.js";
@@ -377,7 +377,7 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
       throw new FeedError(400, "mixed_credentials", "Send exactly one credential");
     }
     const unauthorized = (code: string, message: string): FeedError => {
-      const result = limiter.consume(`df:unauth:${ip}`, limits.unauthenticated.limit, limits.unauthenticated.windowMs);
+      const result = limiter.consume(`df:unauth:${limiterKey(ip)}`, limits.unauthenticated.limit, limits.unauthenticated.windowMs);
       if (!result.allowed) return rateLimited(result.retryAfterSeconds);
       return new FeedError(401, code, message, {}, { "www-authenticate": "Bearer" });
     };

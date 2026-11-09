@@ -603,12 +603,24 @@ test("a desktop_version outside the version grammar is 400 invalid_event and not
   assert.deepEqual(ctx.sink.sent, []);
 });
 
+/** Sets SELFHOST_TRUSTED_PROXIES (read per request by clientIp) and restores it after the test. */
+function trustProxies(t: test.TestContext, hops: string) {
+  const previous = process.env.SELFHOST_TRUSTED_PROXIES;
+  process.env.SELFHOST_TRUSTED_PROXIES = hops;
+  t.after(() => {
+    if (previous === undefined) delete process.env.SELFHOST_TRUSTED_PROXIES;
+    else process.env.SELFHOST_TRUSTED_PROXIES = previous;
+  });
+}
+
 test("sessions sharing one client IP exhaust the per-IP bucket while each session is under its own limit", async (t) => {
   // Production limits are unchanged; the test bucket is small so it stays fast.
   assert.deepEqual(GATEWAY_RATE_LIMITS, {
     session: { limit: 60, windowMs: 60_000 },
     ip: { limit: 300, windowMs: 60_000 },
   });
+  // One trusted proxy, so the forwarded address below is the client IP.
+  trustProxies(t, "1");
   const ctx = await setup(t, { rateLimits: { ip: { limit: 6, windowMs: 60_000 } } });
   const sessions = [await ctx.session(), await ctx.session(), await ctx.session()];
   assert.equal(new Set(sessions.map((session) => session.sessionId)).size, 3);
@@ -635,34 +647,41 @@ test("sessions sharing one client IP exhaust the per-IP bucket while each sessio
   assert.equal(ctx.port.stats().captured, 7);
 });
 
-test("the per-IP key is the first X-Forwarded-For hop, else the socket address, so the header must come from the ingress", async (t) => {
-  const ctx = await setup(t, { rateLimits: { ip: { limit: 2, windowMs: 60_000 } } });
-  const { accessToken } = await ctx.session();
+test("the per-IP key is the socket address unless SELFHOST_TRUSTED_PROXIES trusts the rightmost hops", async (t) => {
   const body = batch("desktop", [{ event: "desktop.sign_in_completed" }]);
-  const send = (forwardedFor?: string) => post(ctx.origin, EVENTS, { token: accessToken, body, forwardedFor });
 
-  // Fill the 203.0.113.1 bucket; the first hop decides, later hops are ignored.
+  // 0 trusted proxies (the default): X-Forwarded-For is ignored, so requests
+  // with different forwarded values share the socket address bucket.
+  trustProxies(t, "0");
+  const direct = await setup(t, { rateLimits: { ip: { limit: 2, windowMs: 60_000 } } });
+  const directToken = (await direct.session()).accessToken;
+  const sendDirect = (forwardedFor?: string) => post(direct.origin, EVENTS, { token: directToken, body, forwardedFor });
+  assert.equal((await sendDirect("203.0.113.1")).status, 202);
+  assert.equal((await sendDirect("203.0.113.2")).status, 202);
+  assert.equal((await sendDirect("198.51.100.1")).status, 429);
+  assert.equal((await sendDirect()).status, 429);
+  assert.equal(direct.port.stats().captured, 2);
+  assert.equal(direct.port.stats().gateway.rejected.rate_limited, 2);
+
+  // 1 trusted proxy: the rightmost entry (the one the proxy appended) is the
+  // key; entries to its left are client-supplied and ignored. clientIp reads
+  // the variable per request; trustProxies above restores it after the test.
+  process.env.SELFHOST_TRUSTED_PROXIES = "1";
+  const proxied = await setup(t, { rateLimits: { ip: { limit: 2, windowMs: 60_000 } } });
+  const proxiedToken = (await proxied.session()).accessToken;
+  const send = (forwardedFor?: string) => post(proxied.origin, EVENTS, { token: proxiedToken, body, forwardedFor });
   assert.equal((await send("203.0.113.1")).status, 202);
-  assert.equal((await send("203.0.113.1, 10.0.0.1")).status, 202);
-  assert.equal((await send("203.0.113.1")).status, 429);
-  assert.equal((await send(" 203.0.113.1 , 10.0.0.2")).status, 429);
-  // Same socket, another first hop: a fresh bucket. A client that can set the
-  // header picks its own key, so behind no overwriting ingress this limit is
-  // not a client-proof control.
-  assert.equal((await send("203.0.113.2")).status, 202);
   assert.equal((await send("10.0.0.1, 203.0.113.1")).status, 202);
-
-  // No forwarded header: the socket address (127.0.0.1) is the key, the same
-  // bucket a forwarded "127.0.0.1" lands in.
+  // Same rightmost address after normalisation (port stripped): same bucket.
+  assert.equal((await send("198.51.100.1, 203.0.113.1:443")).status, 429);
+  // Another rightmost address: a fresh bucket, whatever the left entries say.
+  assert.equal((await send("203.0.113.1, 10.0.0.1")).status, 202);
+  // No header, or a rightmost entry that is not an IP: the socket address.
   assert.equal((await send()).status, 202);
-  assert.equal((await send()).status, 202);
+  assert.equal((await send("not-an-ip")).status, 202);
   assert.equal((await send()).status, 429);
-  assert.equal((await send("127.0.0.1")).status, 429);
-  assert.equal((await send("203.0.113.3")).status, 202);
-
-  const stats = ctx.port.stats();
-  assert.equal(stats.gateway.rejected.rate_limited, 4);
-  assert.equal(stats.captured, 7);
+  assert.equal(proxied.port.stats().captured, 5);
+  assert.equal(proxied.port.stats().gateway.rejected.rate_limited, 2);
 });
 
 test("with destination none (or no analytics port) the route is absent and other routes are unchanged", async (t) => {

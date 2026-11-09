@@ -82,3 +82,73 @@ export function signInEmail(input: { to: string; url: string; siteName: string }
     html: layout("Sign in to Agent Relay", intro, "Sign in", input.url, "If you didn't ask to sign in, you can ignore this email."),
   };
 }
+
+export function passwordVerifyEmail(input: { to: string; url: string; siteName: string; expiresInMinutes: number }): OutgoingEmail {
+  const intro = `Confirm this address to finish setting your Agent Relay (${input.siteName}) password. The link works once and expires in ${input.expiresInMinutes} minutes.`;
+  const footer = "If you didn't ask to set a password, you can ignore this email; no password is set until the link is used.";
+  return {
+    to: input.to,
+    subject: "Confirm your Agent Relay password",
+    text: `${intro}\n\nConfirm: ${input.url}\n\n${footer}\n`,
+    html: layout("Confirm your email", intro, "Confirm and set password", input.url, footer),
+  };
+}
+
+/** Sent instead of a verification link when the address already has a password. */
+export function passwordAlreadyRegisteredEmail(input: { to: string; url: string; siteName: string }): OutgoingEmail {
+  const intro = `Someone asked to set a password for this address on Agent Relay (${input.siteName}), but it already has one. If you forgot it, reset it.`;
+  const footer = "If this wasn't you, you can ignore this email; your password has not changed.";
+  return {
+    to: input.to,
+    subject: "You already have an Agent Relay password",
+    text: `${intro}\n\nReset your password: ${input.url}\n\n${footer}\n`,
+    html: layout("You already have a password", intro, "Reset password", input.url, footer),
+  };
+}
+
+/** Notice to the account address when its first password is set (register, verify, set). */
+export function passwordAddedEmail(input: { to: string; url: string; siteName: string }): OutgoingEmail {
+  const intro = `A password was added to your Agent Relay (${input.siteName}) account. If this was not you, reset your password.`;
+  const footer = "Resetting the password signs you out everywhere. If you added it, you can ignore this email.";
+  return {
+    to: input.to,
+    subject: "A password was added to your Agent Relay account",
+    text: `${intro}\n\nReset your password: ${input.url}\n\n${footer}\n`,
+    html: layout("A password was added", intro, "Reset password", input.url, footer),
+  };
+}
+
+export function passwordResetEmail(input: { to: string; url: string; siteName: string; expiresInMinutes: number }): OutgoingEmail {
+  const intro = `Use this link to choose a new Agent Relay (${input.siteName}) password. It works once and expires in ${input.expiresInMinutes} minutes. Resetting signs you out everywhere.`;
+  const footer = "If you didn't ask to reset your password, you can ignore this email; your password has not changed.";
+  return {
+    to: input.to,
+    subject: "Reset your Agent Relay password",
+    text: `${intro}\n\nReset: ${input.url}\n\n${footer}\n`,
+    html: layout("Reset your password", intro, "Choose a new password", input.url, footer),
+  };
+}
+
+/** Notice to the account address after a password reset completes. */
+export function passwordChangedEmail(input: { to: string; url: string; siteName: string }): OutgoingEmail {
+  const intro = `Your Agent Relay (${input.siteName}) password was changed, and every session was signed out. If this was not you, reset your password now.`;
+  const footer = "If you changed it, you can ignore this email.";
+  return {
+    to: input.to,
+    subject: "Your Agent Relay password was changed",
+    text: `${intro}\n\nReset your password: ${input.url}\n\n${footer}\n`,
+    html: layout("Your password was changed", intro, "Reset password", input.url, footer),
+  };
+}
+
+/** Sent at most once a day when too many failed sign-ins lock the account for a while. */
+export function accountLockedEmail(input: { to: string; url: string; siteName: string }): OutgoingEmail {
+  const intro = `Too many failed sign-ins to your Agent Relay (${input.siteName}) account; password sign-in is paused for 15 minutes. If this was not you, reset your password.`;
+  const footer = "Your password has not changed. If these attempts were yours, wait and try again.";
+  return {
+    to: input.to,
+    subject: "Too many failed sign-ins to your Agent Relay account",
+    text: `${intro}\n\nReset your password: ${input.url}\n\n${footer}\n`,
+    html: layout("Too many failed sign-ins", intro, "Reset password", input.url, footer),
+  };
+}

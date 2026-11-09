@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { recordAudit, type AuditActor } from "./admin/audit.js";
 import type { Database, SqlExecutor } from "./database.js";
+import { revokeMcpOAuthGrantRows } from "./mcp/oauth/store.js";
 import {
   lockIdentity,
   lockOrganization,
@@ -643,6 +644,18 @@ export class ControlPlaneStore {
       organizationName: row.organization_name,
       role: row.role,
     }));
+  }
+
+  /** A workspace's Relaycast credentials, for the Flows service that assigns its runs. */
+  async relaycastBinding(workspaceId: string): Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null> {
+    const result = await this.database.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
+      "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM selfhost_workspaces WHERE id = $1",
+      [workspaceId],
+    );
+    const row = result.rows[0];
+    return row
+      ? { relaycastWorkspaceId: row.relaycast_workspace_id, relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring) }
+      : null;
   }
 
   async workspaceForUser(
@@ -1309,6 +1322,89 @@ export class ControlPlaneStore {
       [hash],
     );
     return result.rows.length === 1;
+  }
+
+  /**
+   * Revokes every live session of a person (browser, CLI and Desktop token
+   * sessions, and MCP OAuth grants) and deletes the Desktop relay identity
+   * tokens they synced, e.g. after a password reset. Workspace API keys
+   * belong to the workspace, and person messaging identities
+   * (selfhost_person_identities, the person's human agent per workspace)
+   * are not sessions, so neither is touched.
+   */
+  async revokeAllForUser(
+    executor: SqlExecutor,
+    userId: string,
+    reason: string,
+  ): Promise<{ sessions: number; mcpGrants: number; desktopRelayIdentities: number }> {
+    // The user lock comes first, before any row is changed: it is the lock
+    // order (identity, user, organizations in id order) every writer of
+    // this person's sessions and grants follows, so nothing for this person
+    // commits between the session UPDATE and the grant revocation below.
+    await lockUser(executor, userId);
+    const sessions = await executor.query<{ id: string }>(
+      `UPDATE selfhost_token_sessions
+          SET revoked_at = now(), revoked_reason = $2, updated_at = now()
+        WHERE user_id = $1 AND revoked_at IS NULL
+        RETURNING id`,
+      [userId, reason],
+    );
+    // Desktop relay identity tokens let the MCP endpoint act as the person's
+    // Desktop agents. They are deleted (the table has no revoked state), so
+    // this server stops using them; Desktop syncs them again after the
+    // person signs in. The Relaycast-issued tokens themselves are not
+    // revoked at Relaycast (no revocation path exists for them here).
+    const desktopRelayIdentities = await executor.query<{ id: string }>(
+      "DELETE FROM selfhost_desktop_relay_identities WHERE user_id = $1 RETURNING id",
+      [userId],
+    );
+    // MCP OAuth grants go through the MCP store's revoker so each grant's
+    // session family ends and a revocation tombstone (Relaycast teardown)
+    // commits with it. That revoker needs user->org locks, taken in the
+    // tenancy lock order (user above, then organizations in id order).
+    const organizations = await executor.query<{ organization_id: string }>(
+      `SELECT DISTINCT organization_id FROM selfhost_mcp_oauth_grants
+        WHERE user_id = $1 AND revoked_at IS NULL ORDER BY organization_id`,
+      [userId],
+    );
+    for (const { organization_id } of organizations.rows) await lockOrganization(executor, organization_id);
+    const grants = await executor.query<{ id: string }>(
+      `SELECT id FROM selfhost_mcp_oauth_grants WHERE user_id = $1 AND revoked_at IS NULL ORDER BY id`,
+      [userId],
+    );
+    const now = new Date();
+    let mcpGrants = 0;
+    for (const { id } of grants.rows) {
+      if (await revokeMcpOAuthGrantRows(executor, id, reason, now)) mcpGrants += 1;
+    }
+    return { sessions: sessions.rows.length, mcpGrants, desktopRelayIdentities: desktopRelayIdentities.rows.length };
+  }
+
+  /**
+   * Ends what a person approved but nobody has collected yet: device and
+   * browser authorizations approved by them (CLI, Desktop, dashboard) become
+   * expired, and unredeemed MCP OAuth authorization codes are voided. Run
+   * with revokeAllForUser so a credential change leaves no way back in.
+   */
+  async voidPendingAuthorizationsForUser(executor: SqlExecutor, userId: string): Promise<{ deviceAuthorizations: number; mcpCodes: number }> {
+    const devices = await executor.query<{ id: string }>(
+      `UPDATE selfhost_device_authorizations
+          SET status = 'expired', updated_at = now()
+        WHERE approved_by_user_id = $1 AND status = 'approved'
+        RETURNING id`,
+      [userId],
+    );
+    // Expired, not consumed: redeeming a consumed code is treated as a
+    // replay, which is a different path. The MCP store's membership
+    // departure hooks void codes the same way.
+    const codes = await executor.query<{ code_hash: string }>(
+      `UPDATE selfhost_mcp_oauth_authorization_codes
+          SET expires_at = now()
+        WHERE user_id = $1 AND consumed_at IS NULL AND expires_at > now()
+        RETURNING code_hash`,
+      [userId],
+    );
+    return { deviceAuthorizations: devices.rows.length, mcpCodes: codes.rows.length };
   }
 
   private async upsertUser(

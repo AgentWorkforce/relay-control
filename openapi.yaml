@@ -1863,7 +1863,252 @@ paths:
       description: Any signed-in member. Which sign-in methods and invite delivery are configured.
       responses:
         "200":
-          description: "{ oidc: {displayName, allowedDomains}|null, emailLink, inviteEmail, autoJoinDomains, inviteTtlHours }"
+          description: "{ oidc: {displayName, allowedDomains}|null, emailLink, password, inviteEmail, autoJoinDomains, inviteTtlHours }"
+  /api/v1/auth/login-config:
+    get:
+      operationId: loginConfig
+      description: |
+        Public (also served at `/cloud/api/v1/auth/login-config`). What a sign-in page
+        needs: the enabled methods, the OIDC button label, the logo, whether auto-join
+        or OIDC domains are configured (a boolean, never the domains) and the password
+        length bounds. Contains no secrets.
+      security: []
+      responses:
+        "200":
+          description: Login configuration
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LoginConfig" }
+  /api/v1/auth/password/register:
+    post:
+      operationId: passwordRegister
+      description: |
+        Starts a password registration. The body carries no password: the password is
+        chosen only after the address is proven. The answer is always 202, for every
+        address. Only an eligible address (admin email, member, open invite or auto-join
+        domain) receives a single-use verification link to
+        `<site>/login/password/verify#token=` valid for 1 hour, where `<site>` is the
+        configured origin (public or dashboard) the request arrived on. The token is in the
+        URL fragment, so it never reaches a server log; that page reads it and posts it
+        back (see `/login/password/verify`). A newer request does not cancel older links;
+        using any link, setting the password, or completing a reset voids all of them. An
+        address that already has a password receives a pointer to reset instead.
+        Registration mail is limited to 3 per address and 10 per IP (IPv6 by /64) every
+        10 minutes, separately from reset mail (silently; the answer does not change).
+        Requires a JSON body and a same-site `Origin`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email]
+              properties:
+                email: { type: string, maxLength: 320 }
+                invite: { type: string, maxLength: 256, description: Invite token from an invite link; carried into the verification link. }
+      responses:
+        "202":
+          description: Always, for a well-formed request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [verification_sent] }
+        "400": { description: "`invalid_request` or `email_invalid`" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+  /api/v1/auth/password/verify:
+    post:
+      operationId: passwordVerify
+      description: |
+        Spends a registration link token and returns a short-lived set-password token
+        (`sh_ps_`, single use, valid for 15 minutes) for `POST /api/v1/auth/password/set`.
+        No account or credential is written here and no session is issued.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token]
+              properties:
+                token: { type: string, maxLength: 256 }
+      responses:
+        "200":
+          description: Address verified; choose a password next
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, email, setupToken, expiresAt]
+                properties:
+                  status: { type: string, enum: [verified] }
+                  email: { type: string }
+                  setupToken: { type: string, description: "`sh_ps_` set-password token; send it to /password/set" }
+                  expiresAt: { type: string, format: date-time }
+        "400": { description: "`invalid_request`" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "409": { description: "`password_already_set`: the address got a password meanwhile; use reset" }
+        "410": { description: "`token_invalid`: used, expired or unknown" }
+        "429": { description: "`rate_limited`: more than 30 attempts per IP in 5 minutes" }
+  /api/v1/auth/password/set:
+    post:
+      operationId: passwordSet
+      description: |
+        Sets a first password. `token` is the set-password token from verify (a session
+        alone never sets a password). Spending the token, creating or joining the account
+        and writing the credential commit in one transaction; the person is signed in with
+        the session cookie, every other pending registration link and set-password token
+        of the address is voided, and the address is mailed a "password was added" notice.
+        An existing password is never replaced here; use reset.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token, password]
+              properties:
+                token: { type: string, maxLength: 256 }
+                password: { type: string, maxLength: 1024 }
+      responses:
+        "200": { $ref: "#/components/responses/PasswordSignedIn" }
+        "400": { $ref: "#/components/responses/PasswordPolicyError" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "409": { description: "`password_already_set`: the person already has a password; use reset" }
+        "410": { description: "`token_invalid`: used, expired or unknown" }
+        "429": { description: "`rate_limited`: more than 30 attempts per IP in 5 minutes, or every password-hashing slot is busy (answered at once)" }
+  /api/v1/auth/password/login:
+    post:
+      operationId: passwordLogin
+      description: |
+        Email and password sign-in. Every failure (unknown address, wrong password, locked
+        account or IP, malformed address) is the same 401 with comparable timing. Three
+        lockout counters apply (IPv6 clients are keyed by /64):
+
+        - per account and client: 5 free failures, then 30 s doubling to a 15-minute cap;
+        - per account across all clients: 50 failures in a rolling hour lock password
+          sign-in to the account for 15 minutes, and mail the owner (at most once a day);
+        - per client across all accounts: 30 free failures, then the same backoff. With
+          `SELFHOST_TRUSTED_PROXIES=0` the client is always the socket address;
+          `X-Forwarded-For` is ignored.
+
+        Backoff counters reset after 1 hour without failures. A successful password
+        sign-in or a completed reset clears the account counters. Attempts refused inside
+        a lock are not counted and write no audit event; one `login.lockout` event is
+        written when a lock starts or grows.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email, password]
+              properties:
+                email: { type: string, maxLength: 320 }
+                password: { type: string, maxLength: 1024 }
+      responses:
+        "200": { $ref: "#/components/responses/PasswordSignedIn" }
+        "400": { description: "`invalid_request`" }
+        "401":
+          description: "`invalid_credentials`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PasswordError" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "429": { description: "`rate_limited`: more than 60 attempts per IP in a minute, or every password-hashing slot is busy (answered at once, nothing is hashed)" }
+  /api/v1/auth/password/reset:
+    post:
+      operationId: passwordResetRequest
+      description: |
+        Always 202, for every address. An address with a password receives a single-use
+        link to `<site>/login/password/reset#token=` (the origin the request arrived on; token in the URL fragment, see
+        `/login/password/reset`) valid for 30 minutes; only its SHA-256 hash is stored. A
+        newer request does not cancel older links; completing a reset voids all of them.
+        Reset mail is limited to 3 per address and 10 per IP every 10 minutes, separately
+        from registration mail.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email]
+              properties:
+                email: { type: string, maxLength: 320 }
+      responses:
+        "202":
+          description: Always
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [reset_requested] }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+  /api/v1/auth/password/reset/complete:
+    post:
+      operationId: passwordResetComplete
+      description: |
+        Spends a reset token and sets a new password. In the same transaction every session
+        (browser, CLI, Desktop) and MCP OAuth grant of the person is revoked with reason
+        `password_reset`, the person's Desktop relay identity tokens are deleted here
+        (not revoked at Relaycast; Desktop syncs them again after sign-in),
+        approved but uncollected device authorizations expire, unredeemed MCP
+        authorization codes are voided, outstanding reset, registration, set-password and
+        email sign-in tokens are cancelled, and the account lockout is cleared. Person
+        messaging identities (the person's human agent per workspace) and workspace API
+        keys are not touched. The
+        address is mailed a "password was changed" notice. Clears the session cookie.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token, password]
+              properties:
+                token: { type: string, maxLength: 256 }
+                password: { type: string, maxLength: 1024 }
+      responses:
+        "200":
+          description: Password changed; every session and pending grant revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [password_reset] }
+                  revoked:
+                    type: object
+                    properties:
+                      sessions: { type: integer }
+                      mcpGrants: { type: integer }
+                      desktopRelayIdentities: { type: integer, description: Desktop relay identity tokens deleted }
+                      deviceAuthorizations: { type: integer }
+                      mcpCodes: { type: integer }
+        "400": { $ref: "#/components/responses/PasswordPolicyError" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "410": { description: "`token_invalid`: used, expired or unknown" }
+        "429": { description: "`rate_limited`: more than 30 attempts per IP in 5 minutes, or every password-hashing slot is busy (answered at once)" }
   /login/oidc/start:
     get:
       operationId: oidcStart
@@ -1880,6 +2125,70 @@ paths:
           description: To `next` with the session cookie
         "403":
           description: Not invited, wrong domain, or invite email mismatch (HTML)
+  /login/password:
+    post:
+      operationId: passwordFormLogin
+      description: |
+        Form post from the `/login` page (same origin; `email`, `password`, `next`,
+        `invite`). Same lockout and answers as `POST /api/v1/auth/password/login`, so CLI
+        and Desktop browser login work when only password sign-in is enabled.
+      security: []
+      responses:
+        "303":
+          description: To `next` (a safe local path; anything else becomes `/`) with the session cookie, or back to `/login?error=invalid_credentials`
+        "403":
+          description: Cross-origin form (HTML)
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+  /login/password/verify:
+    get:
+      operationId: passwordVerifyPage
+      description: |
+        The page an emailed verification link opens. The token travels in the URL
+        fragment (`#token=`), which browsers never send to a server; the page's inline
+        script copies it into a form and removes it from the address bar.
+      security: []
+      responses:
+        "200": { description: Set-password page (HTML) }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+    post:
+      operationId: passwordVerifyForm
+      description: |
+        Form post (same origin; `token`, `password`). Spends the verification link and
+        sets the first password, as verify then set do.
+      security: []
+      responses:
+        "303": { description: To `/` with the session cookie }
+        "400": { description: Password refused by the policy; the form again, link still usable (HTML) }
+        "403": { description: Cross-origin form (HTML) }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "409": { description: The address already has a password (HTML) }
+        "410": { description: Link used, expired or unknown (HTML) }
+        "429": { description: Too many attempts, or the server is busy (HTML) }
+  /login/password/reset:
+    get:
+      operationId: passwordResetPage
+      description: |
+        The page an emailed reset link opens (token in the URL fragment, as for
+        `/login/password/verify`). Without a token it offers the reset-request form.
+      security: []
+      responses:
+        "200": { description: New-password or request page (HTML) }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+    post:
+      operationId: passwordResetForm
+      description: |
+        Form post (same origin). With `token` and `password`: as
+        `POST /api/v1/auth/password/reset/complete`, and clears the session cookie. With
+        `email` only: as `POST /api/v1/auth/password/reset`, the same page for every
+        address.
+      security: []
+      responses:
+        "200": { description: Password-changed or check-your-email page (HTML) }
+        "400": { description: Password refused by the policy; the form again, link still usable (HTML) }
+        "403": { description: Cross-origin form (HTML) }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "410": { description: Link used, expired or unknown (HTML) }
+        "429": { description: Too many attempts, or the server is busy (HTML) }
   /login/email:
     post:
       operationId: emailLinkRequest
@@ -1887,12 +2196,14 @@ paths:
       responses:
         "200":
           description: Check-your-email page
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
   /login/email/verify:
     get:
       operationId: emailLinkConfirm
       responses:
         "200":
           description: Confirmation page (does not spend the link)
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
     post:
       operationId: emailLinkVerify
       responses:
@@ -1900,6 +2211,7 @@ paths:
           description: To `next` with the session cookie
         "410":
           description: Expired or used
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
   /api/v1/workspaces/{workspaceId}/access/me:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -6448,6 +6760,58 @@ components:
           items: {type: string}
         resource: {type: string, format: uri}
         created_at: {type: string, format: date-time}
+    LoginConfig:
+      type: object
+      required: [methods, oidc, logo_url, allowed_domain_hint, password_policy]
+      properties:
+        methods:
+          type: array
+          items: { type: string, enum: [email_link, password] }
+        oidc:
+          type: [object, "null"]
+          properties:
+            displayName: { type: string }
+        logo_url: { type: [string, "null"], format: uri }
+        allowed_domain_hint: { type: boolean }
+        password_policy:
+          type: [object, "null"]
+          properties:
+            min_length: { type: integer, example: 12 }
+            max_length: { type: integer, example: 128 }
+    PasswordError:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum:
+            - invalid_request
+            - email_invalid
+            - password_too_short
+            - password_too_long
+            - password_common
+            - password_contains_email
+            - password_breached
+            - invalid_credentials
+            - token_invalid
+            - password_already_set
+            - reauthentication_required
+            - rate_limited
+            - csrf_rejected
+            - signin_method_disabled
+            - method_not_allowed
+            - password_already_set
+            - token_invalid
+            - rate_limited
+        message: { type: string }
+    PasswordSignIn:
+      type: object
+      required: [userId, email, organizationId]
+      properties:
+        userId: { type: string, format: uuid }
+        email: { type: string }
+        organizationId: { type: string, format: uuid }
+        workspaceId: { type: [string, "null"], format: uuid }
     SessionReadCredentials:
       type: object
       additionalProperties: false
@@ -8261,6 +8625,26 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
         status: { enum: [active, expired, revoked] }
   responses:
+    PasswordSignedIn:
+      description: Signed in; sets the `agent_relay_session` cookie (Path=/cloud). The token is never in the body.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/PasswordSignIn" }
+    PasswordPolicyError:
+      description: "`invalid_request`, `email_invalid`, `password_too_short`, `password_too_long`, `password_common`, `password_contains_email` or `password_breached`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/PasswordError" }
+    PasswordCsrfRejected:
+      description: "`csrf_rejected`: not a JSON content type, or an `Origin` other than the public or dashboard origin"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/PasswordError" }
+    SignInMethodDisabled:
+      description: "`signin_method_disabled`: the method is not in SELFHOST_SIGNIN_METHODS"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/PasswordError" }
     AcquisitionIssued:
       description: "Signed envelope (Cache-Control: no-store)"
       content:

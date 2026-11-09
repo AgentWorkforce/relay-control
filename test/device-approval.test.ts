@@ -3,7 +3,10 @@ import { createServer } from "node:http";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import {
+  clientIp,
   deviceApprovalPageUrl,
+  limiterKey,
+  normalizeForwardedAddress,
   RateLimiter,
   safeNextPath,
   sanitizeDesktopHostName,
@@ -360,6 +363,9 @@ test("/login returns to a safe same-origin next path after sign-in", async (t) =
 });
 
 test("device routes apply hosted Cloud's rate limits", async (t) => {
+  // One trusted proxy: the client address is the rightmost X-Forwarded-For entry.
+  process.env.SELFHOST_TRUSTED_PROXIES = "1";
+  t.after(() => { delete process.env.SELFHOST_TRUSTED_PROXIES; });
   const { origin, ownerId, workspaceId } = await setup(t);
   for (let index = 0; index < 10; index += 1) {
     const started = await request(origin, "/api/v1/auth/device/start", {
@@ -424,4 +430,32 @@ test("device approval helpers", () => {
   assert.equal(blocked.retryAfterSeconds, 1);
   now = 1_001;
   assert(limiter.consume("k", 2, 1_000).allowed, "the window slides");
+});
+
+test("clientIp: forwarded entries are normalised to a bare IP", () => {
+  assert.equal(normalizeForwardedAddress("[2001:db8::1]"), "2001:db8::1");
+  assert.equal(normalizeForwardedAddress("[2001:DB8::1]:443"), "2001:db8::1");
+  assert.equal(normalizeForwardedAddress("203.0.113.9:51234"), "203.0.113.9");
+  assert.equal(normalizeForwardedAddress("::ffff:203.0.113.9"), "203.0.113.9");
+  assert.equal(normalizeForwardedAddress("unknown"), null);
+  assert.equal(normalizeForwardedAddress("_hidden"), null);
+});
+
+test("clientIp: a trusted entry that is not an IP falls back to the socket address", () => {
+  const request = (xff: string) => ({ headers: { "x-forwarded-for": xff }, socket: { remoteAddress: "10.0.0.5" } }) as unknown as Parameters<typeof clientIp>[0];
+  assert.equal(clientIp(request("198.51.100.1, ::ffff:192.0.2.7"), 1), "192.0.2.7");
+  assert.equal(clientIp(request("198.51.100.1, 192.0.2.7:8080"), 1), "192.0.2.7");
+  assert.equal(clientIp(request("198.51.100.1, garbage"), 1), "10.0.0.5");
+  assert.equal(clientIp(request("[2001:db8::2]:80, 192.0.2.7"), 2), "2001:db8::2");
+});
+
+test("limiterKey: IPv6 is bucketed by /64, IPv4 stays whole", () => {
+  assert.equal(limiterKey("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::/64");
+  assert.equal(limiterKey("2001:db8:1:2::ffff"), "2001:db8:1:2::/64", "any host in the /64 shares a bucket");
+  assert.equal(limiterKey("2001:0DB8:0001:0002:aaaa::1"), "2001:db8:1:2::/64", "case and leading zeros do not split it");
+  assert.equal(limiterKey("fe80::1%eth0"), "fe80:0:0:0::/64", "a zone id is dropped");
+  assert.notEqual(limiterKey("2001:db8:1:3::1"), limiterKey("2001:db8:1:2::1"), "the next /64 is another bucket");
+  assert.equal(limiterKey("198.51.100.7"), "198.51.100.7");
+  assert.equal(limiterKey("::ffff:198.51.100.7"), "198.51.100.7", "an IPv4-mapped address is its IPv4 bucket");
+  assert.equal(limiterKey("unknown"), "unknown", "a value that is not an IP is kept as is");
 });

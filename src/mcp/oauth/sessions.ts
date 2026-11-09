@@ -122,9 +122,7 @@ export class McpOAuthSessions {
   }
 
   async revokeFamily(tx: SqlExecutor, owner: McpOAuthSessionOwner, reason: string): Promise<void> {
-    await tx.query(`UPDATE selfhost_mcp_oauth_sessions SET revoked_at=$6,revoked_reason=$7,updated_at=$6
-      WHERE grant_id=$1 AND token_family_id=$2 AND user_id=$3 AND organization_id=$4 AND workspace_id=$5 AND revoked_at IS NULL`,
-    [owner.grantId,owner.tokenFamilyId,owner.userId,owner.organizationId,owner.workspaceId,this.now(),reason]);
+    await revokeMcpOAuthSessionFamily(tx, owner, reason, this.now());
   }
 
   async revokeSession(tx: SqlExecutor, sessionId: string, owner: McpOAuthSessionOwner, reason: string): Promise<void> {
@@ -166,4 +164,11 @@ export class McpOAuthSessions {
       pendingHandoff:false,handoff:false,
     },grantId:row.grant_id,clientId:row.client_id,resource:row.resource,agentName:row.agent_name,agentRemoteId:row.agent_remote_id };
   }
+}
+
+/** Ends every live session of one grant's token family; shared by the class and out-of-store revokers. */
+export async function revokeMcpOAuthSessionFamily(tx: SqlExecutor, owner: McpOAuthSessionOwner, reason: string, now: Date): Promise<void> {
+  await tx.query(`UPDATE selfhost_mcp_oauth_sessions SET revoked_at=$6,revoked_reason=$7,updated_at=$6
+    WHERE grant_id=$1 AND token_family_id=$2 AND user_id=$3 AND organization_id=$4 AND workspace_id=$5 AND revoked_at IS NULL`,
+  [owner.grantId,owner.tokenFamilyId,owner.userId,owner.organizationId,owner.workspaceId,now,reason]);
 }

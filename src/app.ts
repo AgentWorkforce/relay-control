@@ -20,6 +20,7 @@ import {
   ReadCursorExpiredError,
   UpstreamError,
 } from "./relayhistory.js";
+import { handleFlowsBroker } from "./flows-broker.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
@@ -106,6 +107,7 @@ import {
   cookieRequestAllowed,
   DEVICE_RATE_LIMITS,
   deviceApprovalPageUrl,
+  limiterKey,
   RateLimiter,
   safeNextPath,
   sanitizeDesktopHostName,
@@ -544,10 +546,10 @@ export function createApp(input: {
       const limited = "Too many analytics requests. Try again shortly.";
       const limits = { ...GATEWAY_RATE_LIMITS, ...gateway.rateLimits };
       rateLimit(response, `analytics:session:${principal.sessionId}`, limits.session, "rate_limited", limited);
-      // Keyed by clientIp(): the first X-Forwarded-For hop, as the auth limiters
-      // are. Only an ingress that overwrites that header makes it client-proof;
+      // Keyed by limiterKey(clientIp()), as the auth limiters are: the socket address, or
+      // with SELFHOST_TRUSTED_PROXIES=N the address the Nth trusted proxy saw;
       // see docs/analytics.md "Rate limits and the forwarded-header boundary".
-      rateLimit(response, `analytics:ip:${clientIp(request)}`, limits.ip, "rate_limited", limited);
+      rateLimit(response, `analytics:ip:${limiterKey(clientIp(request))}`, limits.ip, "rate_limited", limited);
       // A membership revoked after the token was checked attributes nothing.
       step = "auth";
       const workspace = await store.workspaceForUser(principal.workspaceId, principal.userId);
@@ -823,6 +825,19 @@ export function createApp(input: {
       return;
     }
 
+    // Internal only, like introspection: never reachable through the /cloud alias.
+    if (await handleFlowsBroker(request, response, method, publicPath, {
+      secret: config.relayfileControlBrokerSecret,
+      admin,
+      relaycastBinding: (id) => store.relaycastBinding(id),
+      requireFlows: () => requireCapability(loadedLicense, "flows", input.now?.() ?? new Date()),
+      bearer,
+      requestObject,
+      json,
+    })) {
+      return;
+    }
+
     // Dormant acquisition assertion issuer (docs/acquisition-issuer.md): every
     // /api/v1/acquisition path is 404 until SELFHOST_ACQUISITION_ISSUER_ENABLED.
     if (await handleAcquisitionRoutes({
@@ -948,7 +963,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     if (path === "/api/v1/cli/login" && (method === "GET" || method === "POST")) {
       rateLimit(
         response,
-        `cli-login:${clientIp(request)}`,
+        `cli-login:${limiterKey(clientIp(request))}`,
         DESKTOP_LOGIN_RATE_LIMITS.login,
         "rate_limited",
         "Too many sign-in attempts. Try again shortly.",
@@ -1111,7 +1126,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     if (method === "POST" && path === "/api/v1/auth/desktop/session") {
       rateLimit(
         response,
-        `desktop-session:${clientIp(request)}`,
+        `desktop-session:${limiterKey(clientIp(request))}`,
         DESKTOP_LOGIN_RATE_LIMITS.exchange,
         "rate_limited",
         "Too many exchange attempts. Try again shortly.",
@@ -1302,7 +1317,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     if (method === "POST" && path === "/api/v1/auth/device/start") {
       rateLimit(
         response,
-        `device-start:${clientIp(request)}`,
+        `device-start:${limiterKey(clientIp(request))}`,
         DEVICE_RATE_LIMITS.start,
         "slow_down",
         "Too many device authorization requests",
@@ -1429,7 +1444,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     if (method === "POST" && path === "/api/v1/auth/device/token") {
       rateLimit(
         response,
-        `device-token:${clientIp(request)}`,
+        `device-token:${limiterKey(clientIp(request))}`,
         DEVICE_RATE_LIMITS.token,
         "slow_down",
         "Too many token requests",

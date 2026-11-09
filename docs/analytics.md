@@ -237,20 +237,31 @@ the usual `{"error", "message"}` shape.
 | Limit | Key | Rule |
 |---|---|---|
 | Per session | `analytics:session:<session id>` from the authenticated credential | 60 per minute |
-| Per client IP | `analytics:ip:<clientIp(request)>` | 300 per minute |
+| Per client IP | `analytics:ip:<limiterKey(clientIp(request))>` | 300 per minute |
 
 Both are checked after authentication and before the body is read. A request
 over either is `429 rate_limited` with `Retry-After` and captures nothing.
 
 The IP key comes from `clientIp` in `src/auth/device-approval.ts`, the same
 helper the existing auth limiters use (`cli-login`, `desktop-session`,
-`device-start`, `device-token`). It takes the first `X-Forwarded-For` hop, then
-`X-Real-IP`, then the socket address. Those headers are client-controlled
-unless something in front of the service replaces them: a client that can set
-`X-Forwarded-For` picks its own bucket.
+`device-start`, `device-token`), passed through `limiterKey`: an IPv4
+address is used as is and an IPv6 address is bucketed by its /64. The rule
+depends on
+`SELFHOST_TRUSTED_PROXIES` (the number of reverse proxies in front of the
+service that append to `X-Forwarded-For`, default `0`):
 
-- The deployment's ingress MUST set or overwrite `X-Forwarded-For` and
-  `X-Real-IP` for the control service, so a client cannot supply them.
+- With `0` it is the socket address. `X-Forwarded-For` is ignored and
+  `X-Real-IP` is never read, since any client can send them. Behind an
+  ingress this puts every client in the proxy's bucket; the server logs one
+  warning per process when it sees `X-Forwarded-For` with this setting.
+- With `N` it is the Nth address from the right of `X-Forwarded-For`, the
+  address the outermost trusted proxy saw. Entries further left are client
+  supplied and are not used. A header shorter than `N` falls back to its
+  leftmost entry.
+
+- Deployments behind an ingress or load balancer MUST set
+  `SELFHOST_TRUSTED_PROXIES` to the actual number of proxy hops (`1` only for a single proxy, with direct pod or Service access restricted), and
+  each of those proxies must append to `X-Forwarded-For`.
 - The per-IP limit is defence in depth behind the per-session limit. It is not
   a security control on its own. The per-session key comes from the
   credential, so the client cannot choose it.
