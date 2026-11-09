@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 
-LEAD_DROPIN = "[Service]\nMemoryAccounting=yes\nMemoryHigh=6G\nMemoryMax=8G\nRestart=always\nRestartSec=10\n"
+LEAD_DROPIN = "[Service]\nMemoryAccounting=yes\nMemoryHigh=infinity\nMemoryMax=8G\nRestart=always\nRestartSec=10\n"
 USER_DROPIN = "[Slice]\nMemoryAccounting=yes\nMemoryHigh=6G\nMemoryMax=8G\n"
 HEAVY = "#!/bin/bash\nset -euo pipefail\n[ $# -gt 0 ] || { echo 'usage: layered-heavy COMMAND [ARGS...]' >&2; exit 2; }\nexec flock --exclusive --wait 1800 /home/agent/state/heavy.lock \"$@\"\n"
 LIMIT = 8 * 1024**3
@@ -37,6 +37,26 @@ def current_memory(unit):
     return int(value)
 
 
+def budget_properties(unit, agent_uid):
+    if unit == "agent-host-lead.service":
+        return ["MemoryHigh=infinity", "MemoryMax=8G"]
+    if unit == f"user-{agent_uid}.slice":
+        return ["MemoryHigh=6G", "MemoryMax=8G"]
+    raise ValueError("unexpected resource-budget target")
+
+
+def validate_node_target(path):
+    if path.is_symlink():
+        raise RuntimeError("refusing symlink at Node guard target")
+    if path.exists():
+        try:
+            existing = path.read_text()
+        except UnicodeDecodeError as error:
+            raise RuntimeError("refusing to replace an existing Node binary") from error
+        if "[layered-test-guard]" not in existing:
+            raise RuntimeError("refusing to replace an unrelated Node executable")
+
+
 def main(payload):
     if os.geteuid() != 0:
         raise RuntimeError("deployment must run through the scoped root SSM command")
@@ -46,6 +66,10 @@ def main(payload):
     lead = payload["lead_prompt"]
     if not isinstance(lead, str) or not 1 <= len(lead.encode()) <= 16_384:
         raise ValueError("invalid lead prompt")
+    guard = payload["node_test_guard"]
+    if not isinstance(guard, str) or not 1 <= len(guard.encode()) <= 16_384:
+        raise ValueError("invalid Node guard")
+    compile(guard, "node-test-guard.py", "exec")
     agent = pwd.getpwnam("agent")
     state = Path(agent.pw_dir) / "state/lead"
     session = state / "session.json"
@@ -57,13 +81,17 @@ def main(payload):
     for unit in units:
         if current_memory(unit) >= LIMIT:
             raise RuntimeError(f"{unit} already exceeds the proposed limit; drain it before deployment")
+    if not Path("/usr/bin/node").is_file() or not Path("/usr/bin/systemd-run").is_file():
+        raise RuntimeError("existing Node runtime and systemd-run are required")
+    validate_node_target(Path("/usr/local/bin/node"))
     checked_file(Path("/opt/agent-host/lead-prompt.md"), lead)
     checked_file(Path("/etc/systemd/system/agent-host-lead.service.d/40-memory-budget.conf"), LEAD_DROPIN)
     checked_file(Path(f"/etc/systemd/system/user-{agent.pw_uid}.slice.d/40-agent-memory-budget.conf"), USER_DROPIN)
     checked_file(Path("/usr/local/bin/layered-heavy"), HEAVY, 0o755)
+    checked_file(Path("/usr/local/bin/node"), guard, 0o755)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     for unit in units:
-        subprocess.run(["systemctl", "set-property", unit, "MemoryHigh=6G", "MemoryMax=8G"], check=True)
+        subprocess.run(["systemctl", "set-property", unit, *budget_properties(unit, agent.pw_uid)], check=True)
     subprocess.run(
         ["sudo", "-H", "-u", "agent", "/usr/local/bin/layered-task", "submit",
          "--id", f"public-lane-{revision}", "--sender", "agent-deploy"],
@@ -77,6 +105,8 @@ def main(payload):
         "session_sha256": hashlib.sha256(before).hexdigest(),
         "lead_memory_max_bytes": LIMIT,
         "agent_user_memory_max_bytes": LIMIT,
+        "node_test_guard_sha256": hashlib.sha256(guard.encode()).hexdigest(),
+        "node_test_job_memory_max_bytes": 4 * 1024**3,
         "restart_performed": False,
     }
     checked_file(Path("/var/lib/agent-host/public-lane-deploy.json"), json.dumps(result) + "\n", 0o600)

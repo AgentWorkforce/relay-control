@@ -15,7 +15,9 @@ before deciding what can be retried; do not replay it automatically.
 This host also runs application and database services. Run every build,
 TypeScript check, database test and broad test suite through layered-heavy.
 Keep one Vitest worker and disable file parallelism. Run at most one heavy job
-on the host at a time. Do not disable memory limits or stop shared services to
+on the host at a time. Use `--test-concurrency=1` for Node's test runner. PATH-based
+Node test runs are additionally enforced serially and isolated in a 4 GiB user
+scope; do not bypass that guard with an absolute Node path. Do not disable memory limits or stop shared services to
 make a build pass. A memory-limit failure requires a smaller job or an explicit
 capacity decision, not an unrestricted retry.
 
