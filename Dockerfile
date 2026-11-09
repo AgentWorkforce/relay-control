@@ -24,9 +24,14 @@ LABEL org.opencontainers.image.source="https://github.com/AgentWorkforce/relay-c
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=build /tmp/relay-control-*.tgz /tmp/package.tgz
-RUN npm init -y >/dev/null \
- && npm install --omit=dev --ignore-scripts --no-audit --no-fund /tmp/package.tgz \
- && rm /tmp/package.tgz \
+# Keep the installed application and command paths, but resolve dependencies
+# with the exact source lock instead of a second packed-package npm install.
+RUN mkdir -p node_modules/relay-control \
+ && tar -xzf /tmp/package.tgz -C node_modules/relay-control --strip-components=1 \
+ && rm /tmp/package.tgz
+COPY --from=build /app/package-lock.json node_modules/relay-control/package-lock.json
+RUN cd node_modules/relay-control \
+ && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
  && chown -R node:node /app
 USER node
 EXPOSE 3000
