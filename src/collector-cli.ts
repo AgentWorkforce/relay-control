@@ -3,7 +3,7 @@
 // separate process from the control server: internal POST /v1/events and
 // GET /healthz, atomic NDJSON segments under ANALYTICS_COLLECTOR_DATA_DIR.
 // See docs/analytics-collector.md.
-import { EVENT_REGISTRY } from "./analytics/events.js";
+import { COLLECTOR_REGISTRIES } from "./analytics-collector/registries.js";
 import { createCollector, loadCollectorConfig, loadProducers, type Collector } from "./analytics-collector/index.js";
 
 const log = (message: string, fields: Record<string, unknown> = {}): void => {
@@ -20,7 +20,7 @@ async function start(): Promise<void> {
   collector = await createCollector({
     config,
     producers,
-    registries: { relaycontrol: EVENT_REGISTRY },
+    registries: COLLECTOR_REGISTRIES,
     log,
   });
   const address = await collector.listen();
