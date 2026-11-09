@@ -132,9 +132,12 @@ export function createFactoryModule(input: {
     worker,
     log,
     internalServiceToken: input.config.internalServiceToken,
-    /** The worker runs only when the flag is on. */
+    /**
+     * The full worker runs only when the flag is on; the acquisition reconciler always runs so tokens drained by member removal or workspace cleanup are still revoked.
+     */
     start(): void {
       if (enabled) worker.start();
+      else worker.start({ reconcileOnly: true });
     },
     async stop(): Promise<void> {
       await worker.stop();

@@ -4,7 +4,7 @@ import { ApiTokenStore } from "../src/admin/api-tokens.js";
 import { acceptedAudiences, introspect } from "../src/auth/introspect.js";
 import { loadConfig, loadFactoryConfig } from "../src/config.js";
 import { decryptSecret, hashSecret } from "../src/crypto.js";
-import { cleanupWorkspaceFactory } from "../src/factory/routes.js";
+import { cleanupWorkspaceFactory, createFactoryModule } from "../src/factory/routes.js";
 import { ACQUISITION_DRAIN_MAX_MS } from "../src/factory/service.js";
 import {
   assertNoSecrets,
@@ -416,4 +416,33 @@ test("13: removing the connection owner and workspace cleanup drain the enrollme
   assert.equal((await introspectRow(env, row!)).result.active, true);
   assert.equal(await env.module.service.reconcileAcquisition(50), 2);
   assert.ok((await operators(env)).every((r) => r.state === "revoked"));
+});
+
+test("14: with Factory off the worker only reconciles, and it still revokes a drained token", async (t) => {
+  const env = await startFactoryEnv(t, { acquisitionOrigin: ACQUISITION });
+  await connect(env);
+  assert.equal((await env.api(connectionPath(env), { method: "DELETE", token: env.ownerToken })).status, 204);
+  const [row] = await operators(env);
+  assert.equal(row!.state, "draining");
+
+  const off = createFactoryModule({
+    config: {
+      ...env.config,
+      factory: { enabled: false, apiUrl: env.config.factory!.apiUrl, historyIntervalMs: env.config.factory!.historyIntervalMs },
+    },
+    database: env.database,
+    messaging: { database: env.database, keyring: env.config.encryptionKeyring, relaycastUrl: env.config.relaycastUrl },
+    browserOrigins: [new URL(PUBLIC_URL).origin],
+    log: () => {},
+  });
+  t.after(() => off.stop());
+  assert.equal(off.enabled, false);
+  assert.equal(off.worker.started, false);
+  off.start();
+  assert.equal(off.worker.started, true);
+  assert.equal(env.module.worker.started, false);
+  assert.equal(await off.service.reconcileAcquisition(50), 1);
+  const [revoked] = await operators(env);
+  assert.equal(revoked!.state, "revoked");
+  assert.equal(revoked!.reason, "disconnect");
 });

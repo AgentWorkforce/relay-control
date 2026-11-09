@@ -453,20 +453,25 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
     claim,
     process,
     finalize,
-    /** True while the loop timers are installed. */
+    /** True while the loop timers are installed (all of them, or only the acquisition one after a reconcile-only start). */
     get started(): boolean {
       return timers.length > 0;
     },
-    start(): void {
+    /** `reconcileOnly` installs just the acquisition reconciler, for a module whose Factory flag is off. */
+    start(options: { reconcileOnly?: boolean } = {}): void {
       if (timers.length > 0) return;
       stopped = false;
+      const reconcileAcquisition = deps.reconcileAcquisition;
+      if (options.reconcileOnly) {
+        if (reconcileAcquisition) every("acquisition", CLEANUP_INTERVAL_MS, () => reconcileAcquisition(50));
+        return;
+      }
       every("inbox", INBOX_INTERVAL_MS, () => pollInbox());
       every("inject", INJECT_INTERVAL_MS, async () => {
         await sweepLeases();
         await injectBatch();
       });
       every("cleanup", CLEANUP_INTERVAL_MS, () => deps.releasePending(50));
-      const reconcileAcquisition = deps.reconcileAcquisition;
       if (reconcileAcquisition) every("acquisition", CLEANUP_INTERVAL_MS, () => reconcileAcquisition(50));
       every("history", deps.historyIntervalMs, () => historyTick());
     },

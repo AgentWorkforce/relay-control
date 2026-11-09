@@ -140,6 +140,8 @@ Enrollments move from `enrolled` to `draining`, then to `revoked`:
   outstanding acquisition obligations, or after 24 hours. No obligations exist
   on Control yet, so today the next tick revokes it. A forced revoke records
   the outstanding count as `stranded_count`.
+  The reconciler runs even while `SELFHOST_FACTORY_ENABLED` is off, so a token
+  drained by member removal or workspace cleanup is still revoked.
 - `POST /connection/acquisition/revoke` revokes every enrolled and draining
   token at once.
 
