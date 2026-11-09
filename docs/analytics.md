@@ -109,6 +109,9 @@ registered classification, never a raw exception name, message or context.
 
 ## Collector destination
 
+The receiving side (the collector runtime, its storage and limits) is documented in
+[analytics-collector.md](analytics-collector.md).
+
 `POST {COLLECTOR_URL}` (the URL as configured, already ending in `/v1/events`) with body
 `{"schema":"agent-relay.analytics.batch/v1","events":[...]}` and exactly one
 `Authorization: Bearer <token>` header. One request is in flight at a time.
@@ -296,5 +299,6 @@ hard exit. A startup failure exits non-zero after the same bounded flush.
 - Server-side request-path events; tenant and workspace kinds come only from
   the client gateway.
 - The dashboard and Desktop senders themselves.
-- The collector itself, its storage and its Helm wiring.
+- The collector's image, Helm wiring and CI (the runtime entrypoint is a draft;
+  see [analytics-collector.md](analytics-collector.md)).
 - Persistent spooling across restarts.

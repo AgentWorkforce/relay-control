@@ -74,6 +74,8 @@ import {
   writeCapturePolicy,
 } from "./capture-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
+import { createRelaycastClient, type RosterAgent } from "./messaging/relaycast.js";
+import { isListedRelayAgent } from "./mcp/team-activity.js";
 import {
   erasureTarget,
   eraseSession,
@@ -472,6 +474,7 @@ export function createApp(input: {
   });
   const desktopMcpCredentials = new DesktopMcpCredentials(store.database);
   const DESKTOP_MCP_RATE = { limit: 30, windowMs: 60_000 };
+  const AGENT_NAMES_RATE = { limit: 60, windowMs: 60_000 };
   function rateLimit(
     response: ServerResponse,
     key: string,
@@ -1722,6 +1725,27 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       oauthTeardown?.kick();
       response.writeHead(204);
       response.end();
+      return;
+    }
+
+    // Names for the session search `@name` autocomplete: names only, for members.
+    const agentNames = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/session-agent-names$/);
+    if (agentNames && method === "GET") {
+      const { principal, workspace } = await workspaceAccess(request, agentNames[0]!);
+      if (principal.pendingHandoff) {
+        throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      }
+      // Each call spends the workspace's server-side Relaycast key.
+      rateLimit(response, `session-agent-names:${principal.userId}`, AGENT_NAMES_RATE, "rate_limited", "Too many requests. Try again shortly.");
+      let roster: RosterAgent[];
+      try {
+        roster = await createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch })
+          .listAgents(workspace.relaycastApiKey, "all");
+      } catch {
+        throw new HttpError(502, "agent_roster_unavailable", "The agent roster is unavailable");
+      }
+      const names = roster.filter(isListedRelayAgent).map((agent) => agent.name).filter(Boolean);
+      json(response, 200, { names: [...new Set(names)].sort() }, true);
       return;
     }
 

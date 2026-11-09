@@ -169,6 +169,8 @@ exclusive `_FILE` form (at least 32 bytes). Leave all unset to keep this
 handoff disabled. Use a dedicated Control-to-reader secret; it is never sent
 to clients. These settings do not change the existing History connection.
 
+`SESSION_SEARCH_AGENT_TOKENS=true` (default false) reads `@name` tokens in API and MCP search text as agent filters. Enable it once the session backend's agent catalog is ready; until then those tokens stay ordinary search text. The explicit `agent` parameter does not need this setting and answers 501 `agent_filter_not_ready` until the backend is ready.
+
 `SESSION_READ_API_MCP_READS=true` (default false) sends MCP session reads to that read API. MCP obtains and refreshes the calling user's pair through Control, validates its user/organization/workspace, audience and `rth:read` scope, and uses the returned reader URL. Only `rth_at_read_` access tokens reach read routes; the MCP reader client has no internal issuer or service credential. Once the reader is selected, no response or failure switches the request to History, including an unsupported first page (501). Unsupported views remain unavailable on that backend. A refused refresh requires reauthentication; an unavailable refresh retains the pair for a same-reader retry. History is used only when selected before the request, such as an explicitly legacy view or when the feature is off. Cursor continuations never switch backends.
 
 Control authenticates the user, refuses unexchanged Desktop handoffs, checks

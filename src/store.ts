@@ -950,7 +950,9 @@ export class ControlPlaneStore {
    * joins as authenticateAccessToken: a session whose membership or workspace
    * no longer holds is not found at all, nor in single tenancy is one on a
    * database that has gained a second organization. The joins bind the answer
-   * to the session's own organization in either mode.
+   * to the session's own organization in either mode. A Desktop handoff whose
+   * PKCE exchange has not happened is not found either: until then, whoever
+   * holds it may only have intercepted the redirect.
    */
   async introspectAccessToken(token: string): Promise<IntrospectedToken | null> {
     const result = await this.database.query<{
@@ -987,6 +989,7 @@ export class ControlPlaneStore {
          JOIN selfhost_organization_memberships m
            ON m.organization_id = s.organization_id AND m.user_id = s.user_id
         WHERE s.access_token_hash = $1
+          AND NOT (s.desktop_exchange_challenge IS NOT NULL AND s.desktop_exchanged_at IS NULL)
           AND ($2::text = 'multi' OR NOT EXISTS (
             SELECT 1
               FROM selfhost_organizations other

@@ -165,8 +165,10 @@ export const RESERVED_FIELDS: ReadonlySet<string> = new Set([
   "schema",
 ]);
 
-const OPAQUE_ID = /^[A-Za-z0-9_-]{1,128}$/;
-const TRACE_ID = /^[A-Za-z0-9_-]{8,128}$/;
+/** Grammar of tenant_id, workspace_id (and the collector's deployment_id check). */
+export const OPAQUE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+/** Grammar of trace_id. */
+export const TRACE_ID = /^[A-Za-z0-9_-]{8,128}$/;
 const TOKEN_VALUE = /^[A-Za-z0-9][A-Za-z0-9_.+:@-]*$/;
 /** Longest accepted `version` property value. */
 export const VERSION_MAX_LENGTH = 32;
@@ -174,7 +176,8 @@ const VERSION_IDENTIFIERS = "[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*";
 const VERSION_VALUE = new RegExp(
   `^\\d{1,5}\\.\\d{1,5}\\.\\d{1,5}(?:-${VERSION_IDENTIFIERS})?(?:\\+${VERSION_IDENTIFIERS})?$`,
 );
-const UUID_VALUE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A UUID in canonical 8-4-4-4-12 hex form (either case). */
+export const UUID_VALUE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class AnalyticsProjectionError extends Error {
   override name = "AnalyticsProjectionError";
