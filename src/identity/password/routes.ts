@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import { hashSecret } from "../../crypto.js";
-import type { ControlPlaneStore } from "../../store.js";
+import { ACCOUNT_SCOPE, type ControlPlaneStore, type Principal } from "../../store.js";
 import { clientIp, cookieRequestAllowed, RateLimiter } from "../../auth/device-approval.js";
 import { emailDomain, normalizeEmailAddress, type PasswordConfig } from "../config.js";
 import { passwordAlreadyRegisteredEmail, passwordResetEmail, passwordVerifyEmail, type Mailer } from "../mailer.js";
@@ -14,17 +14,20 @@ import {
   LOCKOUT,
   REGISTRATION_TTL_MS,
   RESET_TTL_MS,
+  SetupRefused,
   type PasswordStore,
 } from "./store.js";
 
 /**
  * Email + password sign-in API (docs/identity.md, "Password sign-in"):
  *
- *   POST /api/v1/auth/password/register        202, always (verification email)
- *   POST /api/v1/auth/password/verify          200 + session cookie
+ *   POST /api/v1/auth/password/register        {email, invite?} -> 202, always (verification email)
+ *   POST /api/v1/auth/password/verify          {token} -> 200 {setupToken} (sh_ps_, 15 minutes)
+ *   POST /api/v1/auth/password/set             {token, password} -> 200 + session cookie
+ *                                              {password} + account session -> 200 (first password)
  *   POST /api/v1/auth/password/login           200 + session cookie | 401 invalid_credentials
  *   POST /api/v1/auth/password/reset           202, always
- *   POST /api/v1/auth/password/reset/complete  200 (every session revoked)
+ *   POST /api/v1/auth/password/reset/complete  200 (every session and pending grant revoked)
  *
  * With password sign-in disabled each answers 404 signin_method_disabled.
  * Nothing here logs a password, a pepper or a token.
@@ -51,10 +54,15 @@ const RATE = {
 // passwords at 128 code points, so a longer one is simply never valid.
 const Secret = z.string().max(1_024);
 const Login = z.object({ email: z.string().max(320), password: Secret }).strict();
-const Register = z.object({ email: z.string().max(320), password: Secret, invite: z.string().max(256).optional() }).strict();
-const TokenOnly = z.object({ token: z.string().max(256) }).strict();
+const Token = z.string().max(256);
+const Register = z.object({ email: z.string().max(320), invite: Token.optional() }).strict();
+const TokenOnly = z.object({ token: Token }).strict();
+const SetPassword = z.object({ token: Token.optional(), password: Secret }).strict();
 const ResetRequest = z.object({ email: z.string().max(320) }).strict();
-const ResetComplete = z.object({ token: z.string().max(256), password: Secret }).strict();
+const ResetComplete = z.object({ token: Token, password: Secret }).strict();
+const INVITE_TOKEN = /^sh_inv_[A-Za-z0-9_-]{20,200}$/;
+const TOKEN_GONE = "This link has expired or was already used. Register again.";
+const ALREADY_SET = "This address already has a password. Sign in, or reset the password instead.";
 
 function parse<T>(schema: z.ZodType<T>, body: unknown): T {
   const parsed = schema.safeParse(body);
@@ -97,12 +105,23 @@ export type PasswordRoutesInput = {
   log: (message: string, fields?: Record<string, unknown>) => void;
 };
 
+export type PasswordRouteHelpers = {
+  requestObject: (request: IncomingMessage) => Promise<Record<string, unknown>>;
+  siteBaseUrl: (request: IncomingMessage) => string;
+  browserOrigins: readonly string[];
+  /** Resolves the bearer or session cookie; throws 401 without one. */
+  authenticate: (request: IncomingMessage) => Promise<{ kind: "bootstrap" } | { kind: "user"; principal: Principal }>;
+};
+
 export type PasswordRoutes = {
-  handle(request: IncomingMessage, response: ServerResponse, path: string, helpers: {
-    requestObject: (request: IncomingMessage) => Promise<Record<string, unknown>>;
-    siteBaseUrl: (request: IncomingMessage) => string;
-    browserOrigins: readonly string[];
-  }): Promise<boolean>;
+  handle(request: IncomingMessage, response: ServerResponse, path: string, helpers: PasswordRouteHelpers): Promise<boolean>;
+  /**
+   * The /login page form: the same checks, lockout and audit as the JSON
+   * login. Null means refused (the caller shows the generic message).
+   */
+  formLogin(request: IncomingMessage, input: { email: string; password: string; invite: string | null }): Promise<SignInResult | null>;
+  /** Retention sweep (see PasswordStore.sweep). */
+  sweep(): Promise<void>;
   /** Resolves when background mail work (register, reset) has finished. */
   idle(): Promise<void>;
 };
@@ -138,11 +157,17 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     }
   }
 
-  async function signInFor(request: IncomingMessage, email: string, inviteTokenHash: string | null): Promise<SignInResult> {
+  async function signInFor(
+    request: IncomingMessage,
+    email: string,
+    inviteTokenHash: string | null,
+    onSignedIn?: (tx: Parameters<PasswordStore["redeemSetup"]>[0], userId: string) => Promise<void>,
+  ): Promise<SignInResult> {
     return identityStore.signIn({
       email,
       name: null,
       inviteTokenHash,
+      ...(onSignedIn ? { onSignedIn } : {}),
       method: "password",
       emailVerified: true,
       beforePersonalOrganization: () => {
@@ -162,68 +187,70 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     }, [input.sessionCookie(result.tokens)]);
   }
 
-  async function countFailure(email: string | null, ip: string, reason: string, userId: string | null): Promise<void> {
-    const subjects: Array<[string, { free: number }, "account" | "ip"]> = [[ipSubject(ip), LOCKOUT.ip, "ip"]];
-    if (email) subjects.unshift([accountSubject(email), LOCKOUT.account, "account"]);
-    for (const [subject, rule, kind] of subjects) {
-      const lockedUntil = await passwords.recordFailure(subject, rule);
-      if (lockedUntil) {
-        await passwords.audit({
-          userId,
-          action: "login.lockout",
-          target: `scope=${kind} ${kind === "account" ? `email=${email}` : `ip=${ip}`} until=${lockedUntil.toISOString()}`,
-        });
-      }
-    }
-    await passwords.audit({ userId, action: "login.password.failure", target: `email=${email ?? "invalid"} ip=${ip} reason=${reason}` });
+  async function audit(userId: string | null, action: string, target: string): Promise<void> {
+    await passwords.audit({ userId, action, target });
   }
 
-  async function login(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof Login>): Promise<void> {
+  /**
+   * One password attempt. The attempt is reserved against the account and
+   * IP counters first (refused outright inside a lock), then checked. Every
+   * refusal costs one argon2id verification, so neither the answer nor its
+   * timing separates an unknown address, a wrong password and a lock.
+   */
+  async function attempt(request: IncomingMessage, rawEmail: string, password: string, inviteTokenHash: string | null): Promise<SignInResult | null> {
     const ip = clientIp(request).slice(0, 64);
-    const email = normalizeEmailAddress(body.email);
-    const subjects = [ipSubject(ip), ...(email ? [accountSubject(email)] : [])];
-    const [locked, credential] = await Promise.all([
-      passwords.locked(subjects),
+    const email = normalizeEmailAddress(rawEmail);
+    const rules = [{ subject: ipSubject(ip), rule: LOCKOUT.ip }, ...(email ? [{ subject: accountSubject(email), rule: LOCKOUT.account }] : [])];
+    const [reservation, credential] = await Promise.all([
+      passwords.reserveAttempt(rules),
       email ? passwords.credentialByEmail(email) : Promise.resolve(null),
     ]);
-    // Unknown address, wrong password and a lock all answer the same 401
-    // after one argon2id verification, so neither the answer nor its timing
-    // tells them apart.
-    const refuse = () => sendJson(response, 401, { error: "invalid_credentials", message: INVALID_CREDENTIALS });
-    if (locked) {
-      await hasher.dummyVerify(body.password);
-      await passwords.audit({ userId: credential?.userId ?? null, action: "login.password.failure", target: `email=${email ?? "invalid"} ip=${ip} reason=locked` });
-      refuse();
-      return;
+    const fail = async (reason: string) => {
+      if (reservation.allowed) {
+        for (const lock of reservation.locks) {
+          const kind = lock.subject.startsWith("account:") ? "account" : "ip";
+          await audit(credential?.userId ?? null, "login.lockout",
+            `scope=${kind} ${kind === "account" ? `email=${email}` : `ip=${ip}`} until=${lock.until.toISOString()}`);
+        }
+      }
+      await audit(credential?.userId ?? null, "login.password.failure", `email=${email ?? "invalid"} ip=${ip} reason=${reason}`);
+      return null;
+    };
+    if (!reservation.allowed) {
+      await hasher.dummyVerify(password);
+      return fail("locked");
     }
     if (!credential) {
-      await hasher.dummyVerify(body.password);
-      await countFailure(email, ip, email ? "unknown_account" : "invalid_email", null);
-      refuse();
-      return;
+      await hasher.dummyVerify(password);
+      return fail(email ? "unknown_account" : "invalid_email");
     }
-    const outcome = await hasher.verify(body.password, credential);
-    if (!outcome.ok) {
-      await countFailure(email, ip, "wrong_password", credential.userId);
-      refuse();
-      return;
-    }
-    const result = await signInFor(request, email!, null);
+    const outcome = await hasher.verify(password, credential);
+    if (!outcome.ok) return fail("wrong_password");
+    const result = await signInFor(request, email!, inviteTokenHash);
     await passwords.clearSubject(passwords.executor, accountSubject(email!));
+    await passwords.refundAttempt(ipSubject(ip), LOCKOUT.ip);
     if (outcome.needsRehash) {
       // Parameters were raised or the pepper rotated: upgrade while the
       // plaintext is at hand. A concurrent change wins (compare-and-set).
-      await passwords.rehash(credential.userId, credential.hash, await hasher.hash(body.password));
+      await passwords.rehash(credential.userId, credential.hash, await hasher.hash(password));
     }
-    await passwords.audit({ userId: result.userId, action: "login.password.success", target: `email=${email} ip=${ip}${outcome.needsRehash ? " rehashed=true" : ""}` });
+    await audit(result.userId, "login.password.success", `email=${email} ip=${ip}${outcome.needsRehash ? " rehashed=true" : ""}`);
+    return result;
+  }
+
+  async function login(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof Login>): Promise<void> {
+    const result = await attempt(request, body.email, body.password, null);
+    if (!result) {
+      sendJson(response, 401, { error: "invalid_credentials", message: INVALID_CREDENTIALS });
+      return;
+    }
     signedIn(response, result);
   }
 
   async function register(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof Register>, siteName: string): Promise<void> {
     const email = normalizeEmailAddress(body.email);
     if (!email) throw new PasswordHttpError(400, "email_invalid", "That email address is not valid.");
-    await policyOrThrow(body.password, email);
-    const invite = body.invite && /^sh_inv_[A-Za-z0-9_-]{20,200}$/.test(body.invite) ? body.invite : null;
+    const invite = body.invite && INVITE_TOKEN.test(body.invite) ? body.invite : null;
     const ip = clientIp(request);
     if (!limited(`pw-mail-ip:${ip}`, RATE.mailPerIp) && !limited(`pw-mail-addr:${email}`, RATE.mailPerAddress)) {
       later("password registration", async () => {
@@ -232,11 +259,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
           await mailer.send(passwordAlreadyRegisteredEmail({ to: email, url: `${input.dashboardOrigin}/password/reset`, siteName }));
           return;
         }
-        const token = await passwords.createRegistration({
-          email,
-          stored: await hasher.hash(body.password),
-          inviteTokenHash: invite ? hashSecret(invite) : null,
-        });
+        const token = await passwords.createRegistration({ email, inviteTokenHash: invite ? hashSecret(invite) : null });
         await mailer.send(passwordVerifyEmail({
           to: email,
           url: `${input.dashboardOrigin}/password/verify?token=${encodeURIComponent(token)}`,
@@ -249,21 +272,65 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     sendJson(response, 202, { status: "verification_sent" });
   }
 
-  async function verify(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof TokenOnly>): Promise<void> {
+  function tokenLimit(request: IncomingMessage): void {
     if (limited(`pw-token-ip:${clientIp(request)}`, RATE.tokenPerIp)) {
       throw new PasswordHttpError(429, "rate_limited", "Too many attempts. Try again in a few minutes.");
     }
-    const consumed = await passwords.consumeRegistration(body.token);
-    if (!consumed) throw new PasswordHttpError(410, "token_invalid", "This link has expired or was already used. Register again.");
-    if (await passwords.credentialByEmail(consumed.email)) {
-      // Setting a password over an existing one is a reset, which also signs out everywhere.
-      throw new PasswordHttpError(409, "password_already_set", "This address already has a password. Reset it instead.");
+  }
+
+  async function verify(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof TokenOnly>): Promise<void> {
+    tokenLimit(request);
+    const verified = await passwords.verifyRegistration(body.token);
+    if (!verified) throw new PasswordHttpError(410, "token_invalid", TOKEN_GONE);
+    if ("refused" in verified) throw new PasswordHttpError(409, "password_already_set", ALREADY_SET);
+    await audit(null, "password.registration.verified", `email=${verified.email}`);
+    sendJson(response, 200, { status: "verified", email: verified.email, setupToken: verified.setupToken, expiresAt: verified.expiresAt.toISOString() });
+  }
+
+  async function setPassword(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof SetPassword>, helpers: PasswordRouteHelpers): Promise<void> {
+    tokenLimit(request);
+    if (body.token !== undefined) {
+      // Registration: the set-password token from verify.
+      const setup = await passwords.peekSetup(body.token);
+      if (!setup) throw new PasswordHttpError(410, "token_invalid", TOKEN_GONE);
+      await policyOrThrow(body.password, setup.email);
+      const stored = await hasher.hash(body.password);
+      const token = body.token;
+      let result: SignInResult;
+      try {
+        // Spending the token, creating the account and writing the credential
+        // commit together or not at all.
+        result = await signInFor(request, setup.email, setup.inviteTokenHash, async (tx, userId) => {
+          await passwords.redeemSetup(tx, token, userId, stored);
+          await passwords.clearSubject(tx, accountSubject(setup.email));
+        });
+      } catch (error) {
+        if (error instanceof SetupRefused) {
+          throw error.reason === "token_invalid"
+            ? new PasswordHttpError(410, "token_invalid", TOKEN_GONE)
+            : new PasswordHttpError(409, "password_already_set", ALREADY_SET);
+        }
+        throw error;
+      }
+      await audit(result.userId, "password.registration.completed", `email=${setup.email}`);
+      signedIn(response, result);
+      return;
     }
-    const result = await signInFor(request, consumed.email, consumed.inviteTokenHash);
-    await passwords.upsertCredential(passwords.executor, result.userId, consumed.stored);
-    await passwords.clearSubject(passwords.executor, accountSubject(consumed.email));
-    await passwords.audit({ userId: result.userId, action: "password.registration.completed", target: `email=${consumed.email}` });
-    signedIn(response, result);
+    // A signed-in person who has no password yet (they signed in with SSO or
+    // an email link). Replacing an existing password is a reset.
+    const auth = await helpers.authenticate(request);
+    if (auth.kind !== "user") throw new PasswordHttpError(403, "reauthentication_required", "Sign in to the dashboard to set a password.");
+    const principal = auth.principal;
+    if (!principal.scopes.includes(ACCOUNT_SCOPE) || principal.pendingHandoff || principal.handoff) {
+      throw new PasswordHttpError(403, "reauthentication_required", "Sign in to the dashboard to set a password.");
+    }
+    await policyOrThrow(body.password, principal.email);
+    const stored = await hasher.hash(body.password);
+    if (!await passwords.insertFirstCredential(passwords.executor, principal.userId, stored)) {
+      throw new PasswordHttpError(409, "password_already_set", "You already have a password. Use reset to change it.");
+    }
+    await audit(principal.userId, "password.set", `email=${principal.email}`);
+    sendJson(response, 200, { status: "password_set" });
   }
 
   async function resetRequest(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof ResetRequest>, siteName: string): Promise<void> {
@@ -287,31 +354,33 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
   }
 
   async function resetComplete(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof ResetComplete>): Promise<void> {
-    if (limited(`pw-token-ip:${clientIp(request)}`, RATE.tokenPerIp)) {
-      throw new PasswordHttpError(429, "rate_limited", "Too many attempts. Try again in a few minutes.");
-    }
+    tokenLimit(request);
     const owner = await passwords.peekReset(body.token);
     if (!owner) throw new PasswordHttpError(410, "token_invalid", "This reset link has expired or was already used. Request a new one.");
     await policyOrThrow(body.password, owner.email);
     const stored = await hasher.hash(body.password);
-    let revoked = { sessions: 0, mcpGrants: 0 };
+    let revoked = { sessions: 0, mcpGrants: 0, deviceAuthorizations: 0, mcpCodes: 0 };
     const completed = await passwords.completeReset(body.token, stored, async (tx, userId) => {
-      revoked = await controlStore.revokeAllForUser(tx, userId, "password_reset");
+      // One transaction: every session and MCP grant ends, and nothing the
+      // person approved but nobody collected yet can still be redeemed.
+      const sessions = await controlStore.revokeAllForUser(tx, userId, "password_reset");
+      const pending = await controlStore.voidPendingAuthorizationsForUser(tx, userId);
+      revoked = { ...sessions, ...pending };
     });
     if (!completed) throw new PasswordHttpError(410, "token_invalid", "This reset link has expired or was already used. Request a new one.");
     await passwords.audit({
       userId: completed.userId,
       action: "password.reset.completed",
-      target: `email=${completed.email} sessions_revoked=${revoked.sessions} mcp_grants_revoked=${revoked.mcpGrants}`,
+      target: `email=${completed.email} sessions_revoked=${revoked.sessions} mcp_grants_revoked=${revoked.mcpGrants} device_authorizations_expired=${revoked.deviceAuthorizations} mcp_codes_voided=${revoked.mcpCodes}`,
     });
-    sendJson(response, 200, { status: "password_reset", sessionsRevoked: revoked.sessions + revoked.mcpGrants }, [input.clearSessionCookie()]);
+    sendJson(response, 200, { status: "password_reset", revoked }, [input.clearSessionCookie()]);
   }
 
   return {
     async handle(request, response, path, helpers) {
       if (!path.startsWith(PASSWORD_PATH_PREFIX)) return false;
       const route = path.slice(PASSWORD_PATH_PREFIX.length);
-      if (!["login", "register", "verify", "reset", "reset/complete"].includes(route)) return false;
+      if (!["login", "register", "verify", "set", "reset", "reset/complete"].includes(route)) return false;
       if (request.method !== "POST") throw new PasswordHttpError(405, "method_not_allowed", "Use POST");
       // Browser-only JSON: an allowed Origin (or same-origin fetch) and a JSON body.
       if (!cookieRequestAllowed(request, helpers.browserOrigins)) {
@@ -322,9 +391,18 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       if (route === "login") await login(request, response, parse(Login, raw));
       else if (route === "register") await register(request, response, parse(Register, raw), siteName);
       else if (route === "verify") await verify(request, response, parse(TokenOnly, raw));
+      else if (route === "set") await setPassword(request, response, parse(SetPassword, raw), helpers);
       else if (route === "reset") await resetRequest(request, response, parse(ResetRequest, raw), siteName);
       else await resetComplete(request, response, parse(ResetComplete, raw));
       return true;
+    },
+    async formLogin(request, form) {
+      const invite = form.invite && INVITE_TOKEN.test(form.invite) ? hashSecret(form.invite) : null;
+      return attempt(request, form.email.slice(0, 320), form.password.slice(0, 1_024), invite);
+    },
+    async sweep() {
+      const swept = await passwords.sweep();
+      if (swept.attempts + swept.registrations + swept.setups + swept.resets > 0) log("password retention sweep", swept);
     },
     async idle() {
       while (background.size) await Promise.allSettled([...background]);

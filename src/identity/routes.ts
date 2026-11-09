@@ -21,6 +21,8 @@ const SESSION_COOKIE = "agent_relay_session";
 const DEVICE_COOKIE = "agent_relay_device";
 const OIDC_COOKIE = "agent_relay_oidc";
 const OIDC_ATTEMPT_TTL_MS = 10 * 60 * 1_000;
+/** Password sign-in retention sweep (login attempts, spent tokens). */
+const SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
 const RATE = {
   oidcStart: { limit: 30, windowMs: 5 * 60 * 1_000 },
   callback: { limit: 30, windowMs: 5 * 60 * 1_000 },
@@ -154,6 +156,11 @@ export type IdentityModule = {
   auditMembership(input: { organizationId: string; auth: Auth; action: string; target: string }): Promise<void>;
   /** Resolves once background sign-in mail work has finished (tests, shutdown). */
   idle(): Promise<void>;
+  /** Starts the hourly retention sweep (password sign-in state); stop() ends it. */
+  start(): void;
+  stop(): void;
+  /** One retention sweep now (tests). */
+  sweep(): Promise<void>;
 };
 
 export function createIdentityModule(input: {
@@ -196,6 +203,7 @@ export function createIdentityModule(input: {
       log,
     });
   }
+  let sweepTimer: NodeJS.Timeout | null = null;
   const signinMethods = [
     ...(emailLogin ? ["email_link" as const] : []),
     ...(passwordRoutes ? ["password" as const] : []),
@@ -296,6 +304,10 @@ export function createIdentityModule(input: {
         banner: await banner(invite ?? (url.searchParams.has("invite") ? "invalid" : null)),
         oidc: oidc ? { displayName: oidc.config.displayName } : null,
         emailLogin,
+        password: passwordRoutes !== null,
+        notice: url.searchParams.get("error") === "invalid_credentials"
+          ? { kind: "error", text: "Incorrect email or password." }
+          : null,
         userCode: started.userCode,
         pollIntervalMs: Math.max(1, started.intervalSeconds) * 1_000,
       }), cookies);
@@ -400,6 +412,39 @@ export function createIdentityModule(input: {
         });
         if (result.joined) log("member joined", { via: result.joined.via, role: result.joined.role, domain: emailDomain(result.email) });
         redirect(response, 303, attempt.next, [sessionCookie(result.tokens), clearCookie(OIDC_COOKIE, "/login/oidc")]);
+      } catch (error) {
+        signInErrorPage(response, error, back);
+      }
+      return true;
+    }
+
+    // ---- password form (the /login page) ---------------------------------------
+    // Lets CLI login (/cloud/api/v1/cli/login) and Desktop browser login,
+    // which both land on /login, work with SELFHOST_SIGNIN_METHODS=password.
+    if (method === "POST" && publicPath === "/login/password") {
+      if (!passwordRoutes) {
+        disabledMethod(response, "password");
+        return true;
+      }
+      if (!sameOriginForm(request, helpers)) {
+        sendHtml(response, 403, messagePage({ title: "Unable to sign in", message: "Cross-origin request refused." }));
+        return true;
+      }
+      const form = await formBody(request);
+      const next = safeNextPath(form.get("next"));
+      const invite = inviteParam(form.get("invite"));
+      const back = `/login?next=${encodeURIComponent(next)}${invite ? `&invite=${encodeURIComponent(invite)}` : ""}`;
+      try {
+        const result = await passwordRoutes.formLogin(request, {
+          email: form.get("email") ?? "",
+          password: form.get("password") ?? "",
+          invite,
+        });
+        if (!result) {
+          redirect(response, 303, `${back}&error=invalid_credentials`);
+          return true;
+        }
+        redirect(response, 303, next, [sessionCookie(result.tokens)]);
       } catch (error) {
         signInErrorPage(response, error, back);
       }
@@ -695,6 +740,24 @@ export function createIdentityModule(input: {
     },
     async idle() {
       await passwordRoutes?.idle();
+    },
+    start() {
+      if (!passwordRoutes || sweepTimer) return;
+      const sweep = () => {
+        void passwordRoutes!.sweep().catch((error: unknown) => {
+          log("password retention sweep failed", { error: error instanceof Error ? error.message : String(error) });
+        });
+      };
+      sweep();
+      sweepTimer = setInterval(sweep, SWEEP_INTERVAL_MS);
+      sweepTimer.unref();
+    },
+    stop() {
+      if (sweepTimer) clearInterval(sweepTimer);
+      sweepTimer = null;
+    },
+    async sweep() {
+      await passwordRoutes?.sweep();
     },
   };
 }

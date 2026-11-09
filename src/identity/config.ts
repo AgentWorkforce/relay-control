@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { domainToASCII } from "node:url";
 import { loadTenancyConfig, type TenancyConfig } from "../tenancy.js";
 
@@ -232,18 +232,35 @@ export function parsePepperFile(text: string): PasswordPepper[] {
   if (lines.length === 0) throw new Error("SELFHOST_PASSWORD_PEPPER_FILE is empty");
   const peppers = new Map<number, Buffer>();
   for (const line of lines) {
-    const match = /^v?(\d{1,6}):(.*)$/.exec(line);
-    if (!match && lines.length > 1) {
-      throw new Error("SELFHOST_PASSWORD_PEPPER_FILE lines must be <version>:<secret> when it holds more than one pepper");
-    }
-    const version = match ? Number(match[1]) : 1;
-    const secret = Buffer.from(match ? match[2]!.trim() : line, "utf8");
+    // Every line names its version, so a secret that happens to start with
+    // digits and a colon is never misread as a versioned one.
+    const match = /^v(\d{1,6}):(.+)$/.exec(line);
+    if (!match) throw new Error("SELFHOST_PASSWORD_PEPPER_FILE lines must be v<version>:<secret>");
+    const version = Number(match[1]);
+    const secret = Buffer.from(match[2]!.trim(), "utf8");
     if (version < 1) throw new Error("SELFHOST_PASSWORD_PEPPER_FILE versions start at 1");
     if (secret.length < 32) throw new Error("SELFHOST_PASSWORD_PEPPER_FILE secrets must be at least 32 bytes");
     if (peppers.has(version)) throw new Error(`SELFHOST_PASSWORD_PEPPER_FILE repeats version ${version}`);
     peppers.set(version, secret);
   }
   return [...peppers].sort((a, b) => b[0] - a[0]).map(([version, secret]) => ({ version, secret }));
+}
+
+/**
+ * Reads the pepper file only if no other user can: owned by this process's
+ * uid and no group or world permission bits (mode & 0o077 === 0).
+ */
+export function readPepperFile(path: string): string {
+  const stats = statSync(path);
+  if (!stats.isFile()) throw new Error("SELFHOST_PASSWORD_PEPPER_FILE must be a regular file");
+  if ((stats.mode & 0o077) !== 0) {
+    throw new Error(`SELFHOST_PASSWORD_PEPPER_FILE must not be readable by group or others (mode ${(stats.mode & 0o777).toString(8)}; use chmod 600)`);
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid !== null && stats.uid !== uid) {
+    throw new Error("SELFHOST_PASSWORD_PEPPER_FILE must be owned by the user the server runs as");
+  }
+  return readFileSync(path, "utf8");
 }
 
 function loadPassword(env: Env): PasswordConfig {
@@ -253,7 +270,7 @@ function loadPassword(env: Env): PasswordConfig {
     parallelism: raisedInteger(env, "SELFHOST_PASSWORD_ARGON2_PARALLELISM", ARGON2_BASELINE.parallelism, 16),
   };
   const pepperFile = env.SELFHOST_PASSWORD_PEPPER_FILE?.trim();
-  const peppers = pepperFile ? parsePepperFile(readFileSync(pepperFile, "utf8")) : [];
+  const peppers = pepperFile ? parsePepperFile(readPepperFile(pepperFile)) : [];
   const hibpRaw = env.SELFHOST_PASSWORD_HIBP?.trim().toLowerCase() || "off";
   if (hibpRaw !== "on" && hibpRaw !== "off") throw new Error("SELFHOST_PASSWORD_HIBP must be on or off");
   return { argon2, peppers, currentPepperVersion: peppers[0]?.version ?? null, hibp: hibpRaw === "on" };

@@ -102,6 +102,12 @@ export type SignInResult = {
 export type SignInMethod = "oidc" | "email" | "password";
 
 type SignInInput = {
+  /**
+   * Runs inside the transaction that issues the session, after the user row
+   * exists; throwing rolls the whole sign-in back (password set-up uses it
+   * to spend its token and write the credential atomically).
+   */
+  onSignedIn?: (tx: SqlExecutor, userId: string) => Promise<void>;
   name: string | null;
   inviteTokenHash: string | null;
   method: SignInMethod;
@@ -819,14 +825,14 @@ export class IdentityStore {
         if (context.role(organization.id) === null) {
           throw new IdentityError(403, "not_invited", `${email} doesn't have access to ${organization.name}. Ask an owner or admin to invite you.`);
         }
-        return this.finishSignIn(tx, context, organization.id, input.method);
+        return this.finishSignIn(tx, context, organization.id, input.method, input.onSignedIn);
       });
     }
 
     const provisioner = this.options.provisioner;
     const selected = await this.database.transaction(async (tx) => {
       const resolved = await this.selectOrganization(tx, email, input);
-      if (resolved.kind === "organization") return this.finishSignIn(tx, resolved.context, resolved.organizationId, input.method);
+      if (resolved.kind === "organization") return this.finishSignIn(tx, resolved.context, resolved.organizationId, input.method, input.onSignedIn);
       // Refusals roll back, so a refused address leaves no user row.
       if (!await this.personalOrgOnSignInEnabled(tx)) {
         throw new IdentityError(403, "no_organization", `${email} isn't a member of any organization here. Ask an owner or admin to invite you.`);
@@ -861,7 +867,7 @@ export class IdentityStore {
         bodyCompleted = false;
         const resolved = await this.selectOrganization(tx, email, input);
         if (resolved.kind === "organization") {
-          const result = await this.finishSignIn(tx, resolved.context, resolved.organizationId, input.method);
+          const result = await this.finishSignIn(tx, resolved.context, resolved.organizationId, input.method, input.onSignedIn);
           bodyCompleted = true;
           return result;
         }
@@ -893,7 +899,7 @@ export class IdentityStore {
           action: "organization.personal_create",
           target: `${organizationName} via=${input.method}`,
         });
-        const result = await this.finishSignIn(tx, context, organizationId, input.method);
+        const result = await this.finishSignIn(tx, context, organizationId, input.method, input.onSignedIn);
         bodyCompleted = true;
         return result;
       });
@@ -1162,7 +1168,13 @@ export class IdentityStore {
   }
 
   /** Picks the workspace, remembers the selection and issues the session. */
-  private async finishSignIn(tx: SqlExecutor, context: SignInContext, organizationId: string, method: SignInMethod): Promise<SignInResult> {
+  private async finishSignIn(
+    tx: SqlExecutor,
+    context: SignInContext,
+    organizationId: string,
+    method: SignInMethod,
+    onSignedIn?: (tx: SqlExecutor, userId: string) => Promise<void>,
+  ): Promise<SignInResult> {
     const userId = context.userId;
     if (userId === null || context.role(organizationId) === null) {
       throw new IdentityError(403, "not_invited", `${context.email} doesn't have access to this organization. Ask an owner or admin to invite you.`);
@@ -1191,6 +1203,7 @@ export class IdentityStore {
       workspaceId,
       label: method === "oidc" ? "Browser sign-in (SSO)" : method === "password" ? "Browser sign-in (password)" : "Browser sign-in (email link)",
     });
+    if (onSignedIn) await onSignedIn(tx, userId);
     const joined = context.lastJoined === organizationId ? context.joined : null;
     return { userId, email: context.email, organizationId, workspaceId, joined, tokens };
   }

@@ -1,19 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
-import { createApp } from "../src/app.js";
-import type { SelfhostConfig } from "../src/config.js";
-import { migrate } from "../src/migrations.js";
-import { ControlPlaneStore } from "../src/store.js";
-import { ARGON2_BASELINE, loadIdentityConfig, parsePepperFile, type PasswordConfig } from "../src/identity/config.js";
-import { IdentityStore } from "../src/identity/store.js";
-import { createIdentityModule } from "../src/identity/routes.js";
-import { bootstrapOnce, relaycastProvisioner } from "../src/identity/bootstrap.js";
-import type { Mailer, OutgoingEmail } from "../src/identity/mailer.js";
+import { parse as parseYaml } from "yaml";
+import { ARGON2_BASELINE, loadIdentityConfig, parsePepperFile } from "../src/identity/config.js";
 import { PasswordHasher, parsePhcParams } from "../src/identity/password/hashing.js";
 import {
   checkPasswordPolicy,
@@ -22,186 +11,28 @@ import {
   isCommonPassword,
   type HibpFetch,
 } from "../src/identity/password/policy.js";
-import { lockDelayMs, LOCKOUT, RESET_TTL_MS } from "../src/identity/password/store.js";
-import { close, listen, PGliteDatabase } from "./support/harness.js";
+import { lockDelayMs, LOCKOUT, REGISTRATION_TTL_MS, RESET_TTL_MS, SETUP_TTL_MS } from "../src/identity/password/store.js";
+import {
+  API,
+  auditActions,
+  call,
+  linkToken,
+  login,
+  passwordConfig,
+  PASSWORD,
+  pepperFile,
+  registerVerified,
+  session,
+  sessionCookie,
+  setup,
+  setupToken,
+  SMTP,
+  verifyLink,
+} from "./support/password.js";
 
-const BOOTSTRAP = "bootstrap-token-that-is-at-least-32-bytes";
-const KEYRING = { active: { id: "test-key", key: Buffer.alloc(32, 7) } };
-const RELAYCAST_SECRET = "relaycast-internal-secret-0123456789abcdef";
-const PASSWORD = "correct horse battery staple";
-const SMTP = { SELFHOST_SMTP_HOST: "smtp.acme.test", SELFHOST_EMAIL_FROM: "Relay <relay@acme.test>" };
-
-// ---- fakes and harness -------------------------------------------------------------
-
-function fakeRelaycast() {
-  let creates = 0;
-  return createServer((req, res) => {
-    res.writeHead(req.headers.authorization === `Bearer ${RELAYCAST_SECRET}` ? 201 : 401, { "content-type": "application/json" });
-    creates += 1;
-    res.end(JSON.stringify({ ok: true, data: { workspace_id: `9900${creates}`, api_key: `ar_ws_test_key_${creates}`, name: "Default" } }));
-  });
-}
-
-function fakeMailer(): Mailer & { sent: OutgoingEmail[] } {
-  const mailer = {
-    sent: [] as OutgoingEmail[],
-    async send(message: OutgoingEmail) {
-      mailer.sent.push(message);
-    },
-  };
-  return mailer;
-}
-
-function passwordConfig(overrides: Partial<PasswordConfig> = {}): PasswordConfig {
-  return { argon2: { ...ARGON2_BASELINE }, peppers: [], currentPepperVersion: null, hibp: false, ...overrides };
-}
-
-type Res = { status: number; body: any; text: string; cookies: Record<string, string> };
-
-async function call(origin: string, path: string, init: {
-  method?: string;
-  cookie?: string;
-  json?: unknown;
-  ip?: string;
-  originHeader?: string | null;
-} = {}): Promise<Res> {
-  const headers: Record<string, string> = {};
-  if (init.cookie) headers.cookie = init.cookie;
-  if (init.ip) headers["x-forwarded-for"] = init.ip;
-  let body: string | undefined;
-  if (init.json !== undefined) {
-    headers["content-type"] = "application/json";
-    body = JSON.stringify(init.json);
-  }
-  const method = init.method ?? (init.json !== undefined ? "POST" : "GET");
-  if (init.originHeader !== null && method !== "GET") headers.origin = init.originHeader ?? origin;
-  const response = await fetch(`${origin}${path}`, { method, headers, body, redirect: "manual" });
-  const text = await response.text();
-  let parsed: any = null;
-  try {
-    parsed = text ? JSON.parse(text) : null;
-  } catch {
-    parsed = null;
-  }
-  const cookies: Record<string, string> = {};
-  for (const line of response.headers.getSetCookie()) {
-    const [pair] = line.split(";");
-    const index = pair!.indexOf("=");
-    cookies[pair!.slice(0, index)] = decodeURIComponent(pair!.slice(index + 1));
-  }
-  return { status: response.status, body: parsed, text, cookies };
-}
-
-async function setup(t: test.TestContext, options: { env?: Record<string, string>; hibpFetch?: HibpFetch } = {}) {
-  const database = new PGliteDatabase();
-  await migrate(database);
-  const relaycast = fakeRelaycast();
-  const relaycastUrl = await listen(relaycast);
-  const control = createServer();
-  const origin = await listen(control);
-  const config: SelfhostConfig = {
-    databaseUrl: "unused",
-    publicBaseUrl: origin,
-    relaycastUrl,
-    relaycastPublicUrl: "https://relaycast.selfhosted.test",
-    relayauthUrl: "http://relayauth.invalid",
-    relayhistoryUrl: "http://relayhistory.invalid",
-    relayhistoryPublicUrl: "https://history.selfhosted.test",
-    relayauthApiKey: "rak_test",
-    bootstrapToken: BOOTSTRAP,
-    encryptionKeyring: KEYRING,
-    internalServiceToken: null,
-    oauthRedirectUrl: `${origin}/api/v1/integrations/oauth/callback`,
-    dashboardUrl: `${origin}/`,
-    port: 0,
-    host: "127.0.0.1",
-  };
-  const identityConfig = loadIdentityConfig({
-    SELFHOST_BOOTSTRAP_ORG_NAME: "Acme",
-    SELFHOST_BOOTSTRAP_ADMIN_EMAIL: "admin@acme.test",
-    SELFHOST_AUTO_JOIN_DOMAINS: "acme.test",
-    SELFHOST_SIGNIN_METHODS: "email_link,password",
-    RELAYCAST_INTERNAL_SECRET: RELAYCAST_SECRET,
-    ...SMTP,
-    ...options.env,
-  });
-  const clock = { now: Date.now() };
-  const mailer = fakeMailer();
-  const store = new ControlPlaneStore(database, KEYRING, 0, { tenancy: identityConfig.tenancy.mode });
-  const bootstrap = identityConfig.bootstrap!;
-  const identityStore = new IdentityStore(database, KEYRING, {
-    inviteTtlMs: identityConfig.inviteTtlMs,
-    autoJoinDomains: identityConfig.autoJoinDomains,
-    issueSession: (tx, session) => store.issueBrowserSession(tx, session),
-    adminEmails: bootstrap.adminEmails.filter((email) => email !== bootstrap.adminEmail),
-  });
-  const identity = createIdentityModule({
-    config: identityConfig,
-    identityStore,
-    controlStore: store,
-    database,
-    keyring: KEYRING,
-    dashboardUrl: config.dashboardUrl,
-    mailer,
-    now: () => clock.now,
-    log: () => undefined,
-    ...(options.hibpFetch ? { hibpFetch: options.hibpFetch } : {}),
-  });
-  control.on("request", createApp({ config, store, identity }));
-  t.after(async () => {
-    await close(control);
-    await close(relaycast);
-    await database.close();
-  });
-  assert.equal(await bootstrapOnce({
-    bootstrap,
-    store: identityStore,
-    provisioner: relaycastProvisioner(relaycastUrl, RELAYCAST_SECRET),
-    log: () => undefined,
-  }), "done");
-  return { database, origin, mailer, identity, identityStore, store, clock };
-}
-
-type Ctx = Awaited<ReturnType<typeof setup>>;
-
-function linkToken(message: OutgoingEmail, path: string): string {
-  const url = new URL(/https?:\/\/\S+/.exec(message.text)![0]);
-  assert.equal(url.pathname, path);
-  return url.searchParams.get("token")!;
-}
-
-function sessionCookie(res: Res): string {
-  assert.ok(res.cookies.agent_relay_session, res.text);
-  return `agent_relay_session=${encodeURIComponent(res.cookies.agent_relay_session!)}`;
-}
-
-async function session(ctx: Ctx, cookie: string): Promise<Res> {
-  return call(ctx.origin, "/cloud/api/auth/session", { cookie });
-}
-
-/** Registers and verifies a password; returns the signed-in response. */
-async function registerVerified(ctx: Ctx, email: string, password = PASSWORD): Promise<Res> {
-  const before = ctx.mailer.sent.length;
-  const asked = await call(ctx.origin, "/api/v1/auth/password/register", { json: { email, password } });
-  assert.equal(asked.status, 202, asked.text);
-  await ctx.identity.idle();
-  assert.equal(ctx.mailer.sent.length, before + 1);
-  const token = linkToken(ctx.mailer.sent.at(-1)!, "/password/verify");
-  const verified = await call(ctx.origin, "/api/v1/auth/password/verify", { json: { token } });
-  assert.equal(verified.status, 200, verified.text);
-  return verified;
-}
-
-async function login(ctx: Ctx, email: string, password: string, ip = "198.51.100.7"): Promise<Res> {
-  return call(ctx.origin, "/api/v1/auth/password/login", { json: { email, password }, ip });
-}
-
-async function auditActions(ctx: Ctx): Promise<Array<{ action: string; target: string | null }>> {
-  const result = await ctx.database.query<{ action: string; target: string | null }>(
-    "SELECT action, target FROM selfhost_admin_audit_events ORDER BY created_at, id",
-  );
-  return result.rows;
-}
+// Registration, login, lockout and reset. Hardening (concurrency, proxies,
+// pepper file permissions, revocation, rate limits, the /login form and
+// retention) is in password-hardening.test.ts.
 
 // ---- hashing ---------------------------------------------------------------------
 
@@ -247,21 +78,23 @@ test("hashing: raised parameters mark an older hash for re-hash", async () => {
 test("pepper: versioned file, HMAC before hashing, rotation re-hashes, a dropped pepper cannot verify", async () => {
   const v1 = "a".repeat(32);
   const v2 = "b".repeat(40);
-  assert.deepEqual(parsePepperFile(`${v1}\n`).map((p) => p.version), [1]);
-  assert.deepEqual(parsePepperFile(`# rotated\n1:${v1}\nv2:${v2}\n`).map((p) => p.version), [2, 1]);
-  assert.throws(() => parsePepperFile("1:short"), /at least 32 bytes/);
-  assert.throws(() => parsePepperFile(`1:${v1}\n1:${v2}`), /repeats version 1/);
-  assert.throws(() => parsePepperFile(`${v1}\n${v2}`), /<version>:<secret>/);
+  assert.deepEqual(parsePepperFile(`v1:${v1}\n`).map((p) => p.version), [1]);
+  assert.deepEqual(parsePepperFile(`# rotated\nv1:${v1}\nv2:${v2}\n`).map((p) => p.version), [2, 1]);
+  assert.throws(() => parsePepperFile("v1:short"), /at least 32 bytes/);
+  assert.throws(() => parsePepperFile(`v1:${v1}\nv1:${v2}`), /repeats version 1/);
+  // Every line needs the v<n>: prefix: a bare secret (or one that happens to
+  // contain a colon) is never read as a version.
+  assert.throws(() => parsePepperFile(v1), /v<version>:<secret>/);
+  assert.throws(() => parsePepperFile(`1:${v1}`), /v<version>:<secret>/);
+  assert.throws(() => parsePepperFile(`v1:${v1}\n${v2}`), /v<version>:<secret>/);
   assert.throws(() => parsePepperFile("\n# nothing\n"), /empty/);
 
-  const dir = mkdtempSync(join(tmpdir(), "pepper-"));
-  const file = join(dir, "pepper");
-  writeFileSync(file, `1:${v1}\n2:${v2}\n`);
+  const file = pepperFile(`v1:${v1}\nv2:${v2}\n`);
   const loaded = loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "password", SELFHOST_PASSWORD_PEPPER_FILE: file }).password!;
   assert.equal(loaded.currentPepperVersion, 2);
 
   const unpeppered = await new PasswordHasher(passwordConfig()).hash(PASSWORD);
-  const onlyV1 = new PasswordHasher(passwordConfig({ peppers: parsePepperFile(`1:${v1}`), currentPepperVersion: 1 }));
+  const onlyV1 = new PasswordHasher(passwordConfig({ peppers: parsePepperFile(`v1:${v1}`), currentPepperVersion: 1 }));
   const peppered = await onlyV1.hash(PASSWORD);
   assert.equal(peppered.pepperVersion, 1);
   // The stored hash is of HMAC(pepper, password): without the pepper it does not verify.
@@ -273,7 +106,7 @@ test("pepper: versioned file, HMAC before hashing, rotation re-hashes, a dropped
   assert.deepEqual(await rotated.verify(PASSWORD, peppered), { ok: true, needsRehash: true });
   assert.equal((await rotated.hash(PASSWORD)).pepperVersion, 2);
   // Once v1 is removed from the file its hashes no longer verify.
-  const v2only = new PasswordHasher(passwordConfig({ peppers: parsePepperFile(`2:${v2}`), currentPepperVersion: 2 }));
+  const v2only = new PasswordHasher(passwordConfig({ peppers: parsePepperFile(`v2:${v2}`), currentPepperVersion: 2 }));
   assert.deepEqual(await v2only.verify(PASSWORD, peppered), { ok: false, needsRehash: false });
 });
 
@@ -343,9 +176,7 @@ test("config: SELFHOST_SIGNIN_METHODS, logo URL and admin email lists", () => {
 });
 
 test("login-config: public, lists methods, logo and domain hint, never secrets", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "pepper-"));
-  writeFileSync(join(dir, "pepper"), "1:" + "s".repeat(40));
-  const ctx = await setup(t, { env: { SELFHOST_LOGIN_LOGO_URL: "https://cdn.example.test/logo.svg", SELFHOST_PASSWORD_PEPPER_FILE: join(dir, "pepper") } });
+  const ctx = await setup(t, { env: { SELFHOST_LOGIN_LOGO_URL: "https://cdn.example.test/logo.svg", SELFHOST_PASSWORD_PEPPER_FILE: pepperFile("v1:" + "s".repeat(40)) } });
   const res = await call(ctx.origin, "/api/v1/auth/login-config");
   assert.equal(res.status, 200);
   assert.deepEqual(res.body, {
@@ -362,7 +193,7 @@ test("login-config: public, lists methods, logo and domain hint, never secrets",
 
 test("disabled methods answer 404 signin_method_disabled", async (t) => {
   const linkOnly = await setup(t, { env: { SELFHOST_SIGNIN_METHODS: "email_link", SELFHOST_AUTO_JOIN_DOMAINS: "" } });
-  for (const route of ["login", "register", "verify", "reset", "reset/complete"]) {
+  for (const route of ["login", "register", "verify", "set", "reset", "reset/complete"]) {
     const res = await call(linkOnly.origin, `/api/v1/auth/password/${route}`, { json: {} });
     assert.equal(res.status, 404, route);
     assert.equal(res.body.error, "signin_method_disabled");
@@ -384,81 +215,158 @@ test("disabled methods answer 404 signin_method_disabled", async (t) => {
 
 // ---- registration and verification --------------------------------------------------
 
-test("registration: verified email first, eligible addresses only, identical 202s", async (t) => {
+test("registration: register takes no password; verify proves the address and mints a 15-minute set-password token", async (t) => {
   const ctx = await setup(t);
-  const asked = await call(ctx.origin, "/api/v1/auth/password/register", { json: { email: "Dev@Acme.test", password: PASSWORD } });
+  const asked = await call(ctx.origin, `${API}/register`, { json: { email: "Dev@Acme.test" } });
   assert.equal(asked.status, 202);
-  const stranger = await call(ctx.origin, "/api/v1/auth/password/register", { json: { email: "dev@elsewhere.test", password: PASSWORD } });
+  const stranger = await call(ctx.origin, `${API}/register`, { json: { email: "dev@elsewhere.test" } });
   assert.equal(stranger.status, 202);
   assert.equal(stranger.text, asked.text, "the same answer for an address that may not register");
+  const withPassword = await call(ctx.origin, `${API}/register`, { json: { email: "dev@acme.test", password: PASSWORD } });
+  assert.equal(withPassword.status, 400, "a password is never accepted before the address is proven");
   await ctx.identity.idle();
   assert.equal(ctx.mailer.sent.length, 1, "only the eligible address gets mail");
   assert.equal(ctx.mailer.sent[0]!.to, "dev@acme.test");
-  assert.ok(!ctx.mailer.sent[0]!.text.includes(PASSWORD));
   const token = linkToken(ctx.mailer.sent[0]!, "/password/verify");
-
-  // The password does nothing until the address is verified.
-  assert.equal((await login(ctx, "dev@acme.test", PASSWORD)).status, 401);
-  const pending = await ctx.database.query<{ password_hash: string; token_hash: string }>("SELECT password_hash, token_hash FROM selfhost_password_registrations");
-  assert.match(pending.rows[0]!.password_hash, /^\$argon2id\$/);
+  const pending = await ctx.database.query<{ token_hash: string }>("SELECT token_hash FROM selfhost_password_registrations");
   assert.notEqual(pending.rows[0]!.token_hash, token, "only the token hash is stored");
+  const columns = await ctx.database.query<{ column_name: string }>(
+    "SELECT column_name FROM information_schema.columns WHERE table_name = 'selfhost_password_registrations'",
+  );
+  assert.ok(!columns.rows.some((c) => c.column_name.includes("password")), "a pending registration holds no password");
 
-  const crossSite = await call(ctx.origin, "/api/v1/auth/password/verify", { json: { token }, originHeader: "https://evil.example" });
+  const crossSite = await call(ctx.origin, `${API}/verify`, { json: { token }, originHeader: "https://evil.example" });
   assert.equal(crossSite.status, 403);
-  const verified = await call(ctx.origin, "/api/v1/auth/password/verify", { json: { token } });
+  assert.equal(crossSite.body.error, "csrf_rejected");
+  const verified = await call(ctx.origin, `${API}/verify`, { json: { token } });
   assert.equal(verified.status, 200, verified.text);
+  assert.equal(verified.body.status, "verified");
   assert.equal(verified.body.email, "dev@acme.test");
-  assert.equal(verified.body.accessToken, undefined, "the token travels only in the HttpOnly cookie");
-  assert.equal((await session(ctx, sessionCookie(verified))).status, 200);
-  assert.equal((await call(ctx.origin, "/api/v1/auth/password/verify", { json: { token } })).body.error, "token_invalid", "single use");
+  assert.match(verified.body.setupToken, /^sh_ps_/);
+  assert.ok(Date.parse(verified.body.expiresAt) - ctx.clock.now <= SETUP_TTL_MS + 1_000);
+  assert.equal(SETUP_TTL_MS, 15 * 60 * 1_000);
+  assert.equal(verified.cookies.agent_relay_session, undefined, "verify alone signs nobody in");
+  assert.equal((await ctx.database.query("SELECT 1 FROM selfhost_users WHERE email = 'dev@acme.test'")).rows.length, 0, "no account yet");
+  const again = await call(ctx.origin, `${API}/verify`, { json: { token } });
+  assert.equal(again.status, 410, "single use");
+  assert.equal(again.body.error, "token_invalid");
+  assert.equal((await login(ctx, "dev@acme.test", PASSWORD)).status, 401);
+
+  const setup_ = verified.body.setupToken as string;
+  const weak = await call(ctx.origin, `${API}/set`, { json: { token: setup_, password: "Unbelievable" } });
+  assert.equal(weak.status, 400);
+  assert.equal(weak.body.error, "password_common");
+  const set = await call(ctx.origin, `${API}/set`, { json: { token: setup_, password: PASSWORD } });
+  assert.equal(set.status, 200, set.text);
+  assert.equal(set.body.email, "dev@acme.test");
+  assert.equal(set.body.accessToken, undefined, "the token travels only in the HttpOnly cookie");
+  assert.equal((await session(ctx, sessionCookie(set))).status, 200);
+  const reused = await call(ctx.origin, `${API}/set`, { json: { token: setup_, password: "another long passphrase" } });
+  assert.equal(reused.status, 410, "the set-password token is single use");
+  assert.equal(reused.body.error, "token_invalid");
 
   const signedIn = await login(ctx, "DEV@acme.test", PASSWORD);
   assert.equal(signedIn.status, 200, signedIn.text);
   assert.equal((await session(ctx, sessionCookie(signedIn))).status, 200);
 
   // Registering again mails a reset pointer instead of a link.
-  await call(ctx.origin, "/api/v1/auth/password/register", { json: { email: "dev@acme.test", password: "another long passphrase" } });
+  await call(ctx.origin, `${API}/register`, { json: { email: "dev@acme.test" } });
   await ctx.identity.idle();
   assert.equal(ctx.mailer.sent.length, 2);
   assert.match(ctx.mailer.sent[1]!.text, /already has one/);
   assert.doesNotMatch(ctx.mailer.sent[1]!.text, /token=/);
   assert.equal((await login(ctx, "dev@acme.test", PASSWORD)).status, 200, "the password did not change");
+  const actions = (await auditActions(ctx)).map((e) => e.action);
+  assert.ok(actions.includes("password.registration.verified"));
+  assert.ok(actions.includes("password.registration.completed"));
 });
 
-test("registration: invitees may register; policy errors are reported before any mail", async (t) => {
+test("registration: invitees may register (invite carried through verify); policy errors come from set", async (t) => {
   const ctx = await setup(t, { env: { SELFHOST_AUTO_JOIN_DOMAINS: "" } });
-  const orgs = await call(ctx.origin, "/api/v1/organizations", { method: "GET" });
-  void orgs;
   const organization = (await ctx.database.query<{ id: string }>("SELECT id FROM selfhost_organizations")).rows[0]!.id;
   // Not invited and no auto-join domain: no mail.
-  await call(ctx.origin, "/api/v1/auth/password/register", { json: { email: "guest@partner.test", password: PASSWORD } });
+  await call(ctx.origin, `${API}/register`, { json: { email: "guest@partner.test" } });
   await ctx.identity.idle();
   assert.equal(ctx.mailer.sent.length, 0);
   await ctx.identityStore.createInvitation({ organizationId: organization, email: "guest@partner.test", role: "member", actor: { kind: "bootstrap" } });
-  const invited = await registerVerified(ctx, "guest@partner.test");
-  assert.equal(invited.body.organizationId, organization);
-
+  const token = await setupToken(ctx, "guest@partner.test");
   for (const [password, code] of [["short", "password_too_short"], ["Unbelievable", "password_common"], ["guest-partner password!", "password_contains_email"]] as const) {
-    const res = await call(ctx.origin, "/api/v1/auth/password/register", { json: { email: "guest@partner.test", password } });
+    const res = await call(ctx.origin, `${API}/set`, { json: { token, password } });
     assert.equal(res.status, 400, password);
     assert.equal(res.body.error, code);
   }
+  const invited = await call(ctx.origin, `${API}/set`, { json: { token, password: PASSWORD } });
+  assert.equal(invited.status, 200, invited.text);
+  assert.equal(invited.body.organizationId, organization);
 });
 
-test("registration: pending links expire and only the newest works", async (t) => {
+test("registration: only the newest verification link works and links expire; so do set-password tokens", async (t) => {
   const ctx = await setup(t);
-  await call(ctx.origin, "/api/v1/auth/password/register", { json: { email: "ex@acme.test", password: PASSWORD } });
-  await call(ctx.origin, "/api/v1/auth/password/register", { json: { email: "ex@acme.test", password: PASSWORD } });
-  await ctx.identity.idle();
-  const [first, second] = ctx.mailer.sent.map((m) => linkToken(m, "/password/verify"));
-  assert.equal((await call(ctx.origin, "/api/v1/auth/password/verify", { json: { token: first } })).status, 410);
-  ctx.clock.now += 61 * 60 * 1_000;
-  const expired = await call(ctx.origin, "/api/v1/auth/password/verify", { json: { token: second } });
+  const first = await verifyLink(ctx, "ex@acme.test");
+  const second = await verifyLink(ctx, "ex@acme.test");
+  assert.equal((await call(ctx.origin, `${API}/verify`, { json: { token: first } })).status, 410);
+  ctx.clock.now += REGISTRATION_TTL_MS + 60_000;
+  const expired = await call(ctx.origin, `${API}/verify`, { json: { token: second } });
   assert.equal(expired.status, 410);
   assert.equal(expired.body.error, "token_invalid");
+
+  // A second verification retires the first set-password token.
+  const olderSetup = await setupToken(ctx, "ex@acme.test");
+  const newerSetup = await setupToken(ctx, "ex@acme.test");
+  assert.equal((await call(ctx.origin, `${API}/set`, { json: { token: olderSetup, password: PASSWORD } })).status, 410);
+  ctx.clock.now += SETUP_TTL_MS + 1_000;
+  const late = await call(ctx.origin, `${API}/set`, { json: { token: newerSetup, password: PASSWORD } });
+  assert.equal(late.status, 410, "15 minutes at most");
+  assert.equal(late.body.error, "token_invalid");
+  assert.equal((await ctx.database.query("SELECT 1 FROM selfhost_users WHERE email = 'ex@acme.test'")).rows.length, 0, "nothing was created");
+  assert.equal((await call(ctx.origin, `${API}/set`, { json: { token: "sh_ps_" + "x".repeat(300), password: PASSWORD } })).status, 400, "tokens are at most 256 characters");
 });
 
-test("HIBP on: breached passwords refused; unreachable fails open with an audit event; off never calls out", async (t) => {
+test("set-password: an existing password is never replaced (409); a signed-in account without one may set it", async (t) => {
+  const ctx = await setup(t);
+  // Signed in another way (an email link): an account with no password.
+  const linked = await ctx.identityStore.signIn({ email: "sso@acme.test", name: null, inviteTokenHash: null, method: "email", emailVerified: true });
+  const cookie = `agent_relay_session=${encodeURIComponent(linked.tokens.accessToken)}`;
+  // A registration started before the password exists.
+  const setup_ = await setupToken(ctx, "sso@acme.test");
+  const laterLink = await verifyLink(ctx, "sso@acme.test");
+
+  const anonymous = await call(ctx.origin, `/cloud${API}/set`, { json: { password: PASSWORD } });
+  assert.equal(anonymous.status, 401, "without a token the caller must be signed in");
+  const viaSession = await call(ctx.origin, `/cloud${API}/set`, { json: { password: PASSWORD }, cookie });
+  assert.equal(viaSession.status, 200, viaSession.text);
+  assert.deepEqual(viaSession.body, { status: "password_set" });
+  assert.equal((await login(ctx, "sso@acme.test", PASSWORD)).status, 200);
+
+  const replace = await call(ctx.origin, `/cloud${API}/set`, { json: { password: "a different passphrase" }, cookie });
+  assert.equal(replace.status, 409, "changing a password is a reset");
+  assert.equal(replace.body.error, "password_already_set");
+  const verifyLate = await call(ctx.origin, `${API}/verify`, { json: { token: laterLink } });
+  assert.equal(verifyLate.status, 409);
+  assert.equal(verifyLate.body.error, "password_already_set");
+  const setLate = await call(ctx.origin, `${API}/set`, { json: { token: setup_, password: "a different passphrase" } });
+  assert.equal(setLate.status, 409);
+  assert.equal(setLate.body.error, "password_already_set");
+  assert.equal((await login(ctx, "sso@acme.test", PASSWORD)).status, 200, "unchanged");
+  assert.ok((await auditActions(ctx)).some((e) => e.action === "password.set"));
+
+  // A CLI or Desktop token is not an account session.
+  const started = await ctx.store.startDeviceAuthorization("relay-cli");
+  const member = await ctx.database.query<{ id: string; workspace_id: string }>(
+    `SELECT u.id, w.id AS workspace_id FROM selfhost_users u
+       JOIN selfhost_organization_memberships m ON m.user_id = u.id
+       JOIN selfhost_workspaces w ON w.organization_id = m.organization_id
+      WHERE u.email = 'sso@acme.test' LIMIT 1`,
+  );
+  assert.equal(await ctx.store.decideDeviceAuthorization({ userCode: started.userCode, approve: true, userId: member.rows[0]!.id, workspaceId: member.rows[0]!.workspace_id }), "approved");
+  const polled = await ctx.store.pollDeviceAuthorization(started.deviceCode);
+  assert.equal(polled.kind, "issued");
+  const cli = await call(ctx.origin, `${API}/set`, { json: { password: "a different passphrase" }, bearer: (polled as { tokens: { accessToken: string } }).tokens.accessToken });
+  assert.equal(cli.status, 403);
+  assert.equal(cli.body.error, "reauthentication_required");
+});
+
+test("HIBP on: breached passwords refused at set; unreachable fails open with an audit event; off never calls out", async (t) => {
   const digest = createHash("sha1").update(PASSWORD).digest("hex").toUpperCase();
   let mode: "breached" | "down" = "breached";
   let calls = 0;
@@ -468,17 +376,19 @@ test("HIBP on: breached passwords refused; unreachable fails open with an audit 
     return { ok: true, status: 200, text: async () => `${digest.slice(5)}:7` };
   };
   const on = await setup(t, { env: { SELFHOST_PASSWORD_HIBP: "on" }, hibpFetch });
-  const breached = await call(on.origin, "/api/v1/auth/password/register", { json: { email: "h@acme.test", password: PASSWORD } });
+  const token = await setupToken(on, "h@acme.test");
+  assert.equal(calls, 0, "register and verify never call out");
+  const breached = await call(on.origin, `${API}/set`, { json: { token, password: PASSWORD } });
   assert.equal(breached.status, 400);
   assert.equal(breached.body.error, "password_breached");
   mode = "down";
-  const open = await call(on.origin, "/api/v1/auth/password/register", { json: { email: "h@acme.test", password: PASSWORD } });
-  assert.equal(open.status, 202);
+  const open = await call(on.origin, `${API}/set`, { json: { token, password: PASSWORD } });
+  assert.equal(open.status, 200, open.text);
   assert.ok((await auditActions(on)).some((e) => e.action === "password.hibp.unavailable"));
   assert.equal(calls, 2);
 
   const off = await setup(t, { hibpFetch });
-  assert.equal((await call(off.origin, "/api/v1/auth/password/register", { json: { email: "h@acme.test", password: PASSWORD } })).status, 202);
+  await registerVerified(off, "h@acme.test");
   assert.equal(calls, 2, "HIBP is off by default");
 });
 
@@ -494,19 +404,20 @@ test("login: unknown, wrong and locked answer the same 401 invalid_credentials",
     assert.equal(res.status, 401);
     assert.deepEqual(res.body, { error: "invalid_credentials", message: "Incorrect email or password." });
   }
-  // Four more failures reach the free allowance (5); the sixth locks.
+  // Four more failures use up the free allowance (5); the fifth starts a lock.
   for (let i = 0; i < 4; i += 1) assert.equal((await login(ctx, "lock@acme.test", `wrong password ${i}!`)).status, 401);
-  assert.equal((await login(ctx, "lock@acme.test", "wrong password again")).status, 401);
   const locked = await login(ctx, "lock@acme.test", PASSWORD);
   assert.equal(locked.status, 401, "the right password is refused while locked");
   assert.deepEqual(locked.body, wrong.body);
   assert.equal(locked.text, wrong.text);
   // A lock on an unknown address looks the same.
-  for (let i = 0; i < 6; i += 1) await login(ctx, "ghost@acme.test", PASSWORD);
+  for (let i = 0; i < 5; i += 1) await login(ctx, "ghost@acme.test", PASSWORD);
   assert.equal((await login(ctx, "ghost@acme.test", PASSWORD)).text, locked.text);
 
   // After the backoff the right password works and clears the counter.
-  ctx.clock.now += lockDelayMs(6, LOCKOUT.account.free) + 1_000;
+  const lockRow = await ctx.database.query<{ failures: number }>("SELECT failures FROM selfhost_login_attempts WHERE subject = 'account:lock@acme.test'");
+  assert.equal(lockRow.rows[0]!.failures, 5, "an attempt refused inside a lock is not counted");
+  ctx.clock.now += lockDelayMs(5, LOCKOUT.account.free) + 1_000;
   const after = await login(ctx, "lock@acme.test", PASSWORD);
   assert.equal(after.status, 200, after.text);
   const rows = await ctx.database.query("SELECT 1 FROM selfhost_login_attempts WHERE subject = 'account:lock@acme.test'");
@@ -521,16 +432,16 @@ test("login: unknown, wrong and locked answer the same 401 invalid_credentials",
 });
 
 test("lockout: exponential backoff with a cap, per IP as well as per account", async (t) => {
-  assert.equal(lockDelayMs(5, 5), 0);
-  assert.equal(lockDelayMs(6, 5), 30_000);
-  assert.equal(lockDelayMs(7, 5), 60_000);
-  assert.equal(lockDelayMs(8, 5), 120_000);
+  assert.equal(lockDelayMs(4, 5), 0);
+  assert.equal(lockDelayMs(5, 5), 30_000, "the attempt that uses the last free slot starts the lock");
+  assert.equal(lockDelayMs(6, 5), 60_000);
+  assert.equal(lockDelayMs(7, 5), 120_000);
   assert.equal(lockDelayMs(50, 5), 15 * 60_000, "capped");
 
   const ctx = await setup(t);
   await registerVerified(ctx, "ip@acme.test");
   // Spraying many addresses from one IP locks that IP, not the accounts.
-  for (let i = 0; i <= LOCKOUT.ip.free; i += 1) await login(ctx, `spray${i}@acme.test`, PASSWORD, "203.0.113.9");
+  for (let i = 0; i < LOCKOUT.ip.free; i += 1) await login(ctx, `spray${i}@acme.test`, PASSWORD, "203.0.113.9");
   assert.equal((await login(ctx, "ip@acme.test", PASSWORD, "203.0.113.9")).status, 401);
   assert.equal((await login(ctx, "ip@acme.test", PASSWORD, "203.0.113.10")).status, 200, "another IP is unaffected");
   assert.ok((await auditActions(ctx)).some((e) => e.action === "login.lockout" && e.target!.includes("scope=ip")));
@@ -559,9 +470,7 @@ test("login: unknown accounts spend a comparable argon2id verification", async (
 });
 
 test("login: re-hashes on success when the pepper version changed", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "pepper-"));
-  writeFileSync(join(dir, "pepper"), "3:" + "p".repeat(40));
-  const ctx = await setup(t, { env: { SELFHOST_PASSWORD_PEPPER_FILE: join(dir, "pepper") } });
+  const ctx = await setup(t, { env: { SELFHOST_PASSWORD_PEPPER_FILE: pepperFile("v3:" + "p".repeat(40)) } });
   await registerVerified(ctx, "re@acme.test");
   const user = (await ctx.database.query<{ id: string }>("SELECT id FROM selfhost_users WHERE email = 're@acme.test'")).rows[0]!.id;
   // Simulate a hash made before the pepper existed.
@@ -609,7 +518,7 @@ test("reset: identical 202s, single-use 30-minute token, revokes every session",
   const done = await call(ctx.origin, "/api/v1/auth/password/reset/complete", { json: { token, password: NEW } });
   assert.equal(done.status, 200, done.text);
   assert.equal(done.body.status, "password_reset");
-  assert.ok(done.body.sessionsRevoked >= 2);
+  assert.ok(done.body.revoked.sessions >= 2);
   assert.equal((await session(ctx, first)).status, 401, "existing sessions are revoked");
   assert.equal((await session(ctx, second)).status, 401);
   const reasons = await ctx.database.query<{ revoked_reason: string }>("SELECT DISTINCT revoked_reason FROM selfhost_token_sessions WHERE revoked_at IS NOT NULL");
@@ -662,11 +571,26 @@ test("admin emails: the first to verify becomes owner, the rest admin", async (t
 
 test("openapi.yaml documents login-config and every password route", async () => {
   const { readFile } = await import("node:fs/promises");
-  const spec = await readFile(new URL("../openapi.yaml", import.meta.url), "utf8");
-  for (const path of ["login-config", "password/register", "password/verify", "password/login", "password/reset", "password/reset/complete"]) {
-    assert.ok(spec.includes(`\n  /api/v1/auth/${path}:\n`), path);
+  const spec = parseYaml(await readFile(new URL("../openapi.yaml", import.meta.url), "utf8"));
+  for (const path of ["login-config", "password/register", "password/verify", "password/set", "password/login", "password/reset", "password/reset/complete"]) {
+    assert.ok(spec.paths[`/api/v1/auth/${path}`], path);
   }
-  for (const code of ["invalid_credentials", "signin_method_disabled", "password_common", "token_invalid", "password_already_set"]) {
-    assert.ok(spec.includes(code), code);
+  const body = (path: string) => spec.paths[`/api/v1/auth/password/${path}`].post.requestBody.content["application/json"].schema;
+  const register = body("register");
+  assert.deepEqual(Object.keys(register.properties).sort(), ["email", "invite"], "register takes no password");
+  assert.equal(register.additionalProperties, false);
+  assert.equal(register.properties.invite.maxLength, 256);
+  assert.equal(body("verify").properties.token.maxLength, 256);
+  assert.equal(body("reset/complete").properties.token.maxLength, 256);
+  assert.deepEqual(body("set").required, ["password"]);
+  assert.equal(body("set").properties.token.maxLength, 256);
+  const verified = spec.paths["/api/v1/auth/password/verify"].post.responses["200"].content["application/json"].schema;
+  assert.ok(verified.required.includes("setupToken"));
+  for (const status of ["200", "403", "409", "410", "429"]) assert.ok(spec.paths["/api/v1/auth/password/set"].post.responses[status], `set ${status}`);
+  const reset = spec.paths["/api/v1/auth/password/reset/complete"].post.responses["200"].content["application/json"].schema;
+  assert.deepEqual(Object.keys(reset.properties.revoked.properties).sort(), ["deviceAuthorizations", "mcpCodes", "mcpGrants", "sessions"]);
+  const text = await readFile(new URL("../openapi.yaml", import.meta.url), "utf8");
+  for (const code of ["invalid_credentials", "signin_method_disabled", "password_common", "token_invalid", "password_already_set", "csrf_rejected", "rate_limited"]) {
+    assert.ok(text.includes(code), code);
   }
 });

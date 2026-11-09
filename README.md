@@ -107,7 +107,8 @@ is explicit. RelayAuth is optional: see
 | `SELFHOST_SMTP_HOST` / `_PORT` / `_SECURITY` / `_USERNAME` / `_PASSWORD[_FILE]`, `SELFHOST_EMAIL_FROM` | Optional SMTP for invite emails and sign-in links |
 | `SELFHOST_EMAIL_LOGIN` | Optional `true`: email sign-in links (requires SMTP) |
 | `SELFHOST_SIGNIN_METHODS` | Optional comma list of `email_link` and `password` (both require SMTP). Default: `email_link` when `SELFHOST_EMAIL_LOGIN=true`. Unlisted methods answer 404 `signin_method_disabled`. See [docs/identity.md](docs/identity.md#email-and-password-optional) |
-| `SELFHOST_PASSWORD_PEPPER_FILE` / `SELFHOST_PASSWORD_HIBP` / `SELFHOST_PASSWORD_ARGON2_MEMORY_KIB` / `_TIME_COST` / `_PARALLELISM` | Optional password sign-in settings: a versioned HMAC pepper file, the Have I Been Pwned check (default `off`), and argon2id parameters, which can only be raised above m=19456 KiB, t=2, p=1 |
+| `SELFHOST_PASSWORD_PEPPER_FILE` / `SELFHOST_PASSWORD_HIBP` / `SELFHOST_PASSWORD_ARGON2_MEMORY_KIB` / `_TIME_COST` / `_PARALLELISM` | Optional password sign-in settings: a versioned HMAC pepper file (`v<n>:<secret>` lines, owned by the server's user, mode `0600` or `0400`), the Have I Been Pwned check (default `off`), and argon2id parameters, which can only be raised above m=19456 KiB, t=2, p=1 |
+| `SELFHOST_TRUSTED_PROXIES` | Number of reverse proxies that append to `X-Forwarded-For` (default `0`: use the TCP peer address and ignore the header). Set it to `1` behind a single ingress or load balancer. Used by every per-IP limit and the password lockout. See [docs/identity.md](docs/identity.md#client-address) |
 | `SELFHOST_LOGIN_LOGO_URL` | Optional https logo URL, published by `GET /api/v1/auth/login-config` |
 | `SELFHOST_ADMIN_EMAILS` | Optional comma list of admin addresses: the first to sign in with a verified email becomes owner, the rest admins. `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` is an alias that is made owner at first boot |
 | `SELFHOST_AUTO_JOIN_DOMAINS` | Optional, single mode only (multi mode refuses to start with it). Email domains whose verified users join as `member` on first sign-in, without an invite. The only authority for auto-join in single mode: absent or empty means none |
@@ -368,8 +369,8 @@ signs in. The same rule applies to `verification_uri`, the browser handoff's
 `api_url` and the desktop session's `apiUrl`.
 
 Rate limits match hosted Cloud and are per process: device start 10 per 5 minutes
-and token polling 120 per minute per client address (first `X-Forwarded-For`
-hop), and approval 30 per 5 minutes per signed-in user. Desktop's PKCE proof
+and token polling 120 per minute per client address (the TCP peer, or the
+`X-Forwarded-For` entry chosen by `SELFHOST_TRUSTED_PROXIES`), and approval 30 per 5 minutes per signed-in user. Desktop's PKCE proof
 fields are accepted but not enforced (self-host has no Desktop-authority grant).
 
 See `openapi.yaml` (also served at `/openapi.yaml`) for the exact contract.

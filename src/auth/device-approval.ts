@@ -47,12 +47,34 @@ export class RateLimiter {
   }
 }
 
-export function clientIp(request: IncomingMessage): string {
-  const forwarded = request.headers["x-forwarded-for"];
-  const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(",")[0]?.trim();
-  const realIp = request.headers["x-real-ip"];
-  return first || (typeof realIp === "string" ? realIp.trim() : "") ||
-    request.socket.remoteAddress || "unknown";
+/**
+ * How many reverse proxies in front of the server append to X-Forwarded-For
+ * (SELFHOST_TRUSTED_PROXIES, a non-negative integer, default 0). Read per
+ * call so tests and operators see one source of truth.
+ */
+export function trustedProxyHops(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.SELFHOST_TRUSTED_PROXIES?.trim();
+  if (!raw) return 0;
+  if (!/^\d{1,2}$/.test(raw)) throw new Error("SELFHOST_TRUSTED_PROXIES must be an integer from 0 to 99");
+  return Number(raw);
+}
+
+/**
+ * The client address for rate limits, lockouts and audit. With 0 trusted
+ * proxies (the default) it is the socket peer and X-Forwarded-For /
+ * X-Real-IP are ignored, since any client can send them. With N trusted
+ * proxies it is the Nth address from the right of X-Forwarded-For, the
+ * last one a trusted proxy appended; entries further left are client
+ * supplied. A shorter header than N falls back to its leftmost entry.
+ */
+export function clientIp(request: IncomingMessage, hops = trustedProxyHops()): string {
+  const socket = request.socket?.remoteAddress || "unknown";
+  if (hops <= 0) return socket;
+  const header = request.headers["x-forwarded-for"];
+  const entries = (Array.isArray(header) ? header.join(",") : header ?? "")
+    .split(",").map((entry) => entry.trim()).filter(Boolean);
+  if (entries.length === 0) return socket;
+  return entries[Math.max(0, entries.length - hops)]!;
 }
 
 /**

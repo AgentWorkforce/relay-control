@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 import type { EncryptionKey, EncryptionKeyring } from "./crypto.js";
+import { trustedProxyHops } from "./auth/device-approval.js";
 
 export type SelfhostConfig = {
   databaseUrl: string;
@@ -276,6 +277,8 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   if (Buffer.byteLength(bootstrapToken) < 32) {
     throw new Error("SELFHOST_BOOTSTRAP_TOKEN must be at least 32 bytes");
   }
+  // Validated at boot; clientIp (src/auth/device-approval.ts) reads it per request.
+  trustedProxyHops(env);
 
   const relayhistoryPublicUrl = publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL");
   const introspection = loadIntrospectionConfig(env, relayhistoryPublicUrl);

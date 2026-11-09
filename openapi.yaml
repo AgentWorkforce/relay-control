@@ -1210,13 +1210,14 @@ paths:
     post:
       operationId: passwordRegister
       description: |
-        Starts a password registration. Policy errors are returned at once; otherwise the
-        answer is always 202, for every address. Only an eligible address (admin email,
-        member, open invite or auto-join domain) receives a single-use verification link
-        to `<dashboard>/password/verify?token=` valid for 1 hour. An address that already
-        has a password receives a pointer to reset instead. Mail is limited to 3 per
-        address and 10 per IP every 10 minutes (silently; the answer does not change).
-        Requires a JSON body and a same-site `Origin`.
+        Starts a password registration. The body carries no password: the password is
+        chosen only after the address is proven. The answer is always 202, for every
+        address. Only an eligible address (admin email, member, open invite or auto-join
+        domain) receives a single-use verification link to
+        `<dashboard>/password/verify?token=` valid for 1 hour; a newer link cancels older
+        ones. An address that already has a password receives a pointer to reset instead.
+        Mail is limited to 3 per address and 10 per IP every 10 minutes (silently; the
+        answer does not change). Requires a JSON body and a same-site `Origin`.
       security: []
       requestBody:
         required: true
@@ -1225,28 +1226,29 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [email, password]
+              required: [email]
               properties:
                 email: { type: string, maxLength: 320 }
-                password: { type: string, maxLength: 1024 }
+                invite: { type: string, maxLength: 256, description: Invite token from an invite link; carried into the verification link. }
       responses:
         "202":
-          description: Always, once the policy passes
+          description: Always, for a well-formed request
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   status: { type: string, enum: [verification_sent] }
-        "400": { $ref: "#/components/responses/PasswordPolicyError" }
+        "400": { description: "`invalid_request` or `email_invalid`" }
         "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
         "404": { $ref: "#/components/responses/SignInMethodDisabled" }
   /api/v1/auth/password/verify:
     post:
       operationId: passwordVerify
       description: |
-        Spends a registration token: creates the password and signs the person in with the
-        session cookie. Membership follows the usual rules for a verified address.
+        Spends a registration link token and returns a short-lived set-password token
+        (`sh_ps_`, single use, valid for 15 minutes) for `POST /api/v1/auth/password/set`.
+        No account or credential is written here and no session is issued.
       security: []
       requestBody:
         required: true
@@ -1257,13 +1259,69 @@ paths:
               additionalProperties: false
               required: [token]
               properties:
-                token: { type: string, maxLength: 1024 }
+                token: { type: string, maxLength: 256 }
       responses:
-        "200": { $ref: "#/components/responses/PasswordSignedIn" }
+        "200":
+          description: Address verified; choose a password next
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, email, setupToken, expiresAt]
+                properties:
+                  status: { type: string, enum: [verified] }
+                  email: { type: string }
+                  setupToken: { type: string, description: "`sh_ps_` set-password token; send it to /password/set" }
+                  expiresAt: { type: string, format: date-time }
         "400": { description: "`invalid_request`" }
         "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
         "404": { $ref: "#/components/responses/SignInMethodDisabled" }
         "409": { description: "`password_already_set`: the address got a password meanwhile; use reset" }
+        "410": { description: "`token_invalid`: used, expired or unknown" }
+        "429": { description: "`rate_limited`: more than 30 attempts per IP in 5 minutes" }
+  /api/v1/auth/password/set:
+    post:
+      operationId: passwordSet
+      description: |
+        Sets a first password, in one of two ways:
+
+        - `{token, password}`: `token` is the set-password token from verify. Spending the
+          token, creating or joining the account and writing the credential commit in one
+          transaction; the person is signed in with the session cookie.
+        - `{password}` with a dashboard session (`/cloud/api/v1/auth/password/set`, the
+          session cookie is only sent on `/cloud` paths): a signed-in person who has no
+          password yet (SSO or email-link sign-in) adds one. CLI, Desktop and handoff
+          sessions are refused with `reauthentication_required`.
+
+        An existing password is never replaced here; use reset.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [password]
+              properties:
+                token: { type: string, maxLength: 256 }
+                password: { type: string, maxLength: 1024 }
+      responses:
+        "200":
+          description: "With `token`: signed in (PasswordSignIn body, session cookie). With a session: `{status: password_set}`."
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/PasswordSignIn" }
+                  - type: object
+                    properties:
+                      status: { type: string, enum: [password_set] }
+        "400": { $ref: "#/components/responses/PasswordPolicyError" }
+        "401": { description: "No token and no session" }
+        "403": { description: "`csrf_rejected`, or `reauthentication_required`: the session is not a dashboard account session" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "409": { description: "`password_already_set`: the person already has a password; use reset" }
         "410": { description: "`token_invalid`: used, expired or unknown" }
         "429": { description: "`rate_limited`: more than 30 attempts per IP in 5 minutes" }
   /api/v1/auth/password/login:
@@ -1331,9 +1389,10 @@ paths:
       description: |
         Spends a reset token and sets a new password. In the same transaction every session
         (browser, CLI, Desktop) and MCP OAuth grant of the person is revoked with reason
-        `password_reset`, outstanding reset, registration and email sign-in tokens are
-        cancelled, and the account lockout is cleared. Workspace API keys are workspace-owned
-        and are not revoked. Clears the session cookie.
+        `password_reset`, approved but uncollected device authorizations expire, unredeemed
+        MCP authorization codes are voided, outstanding reset, registration, set-password
+        and email sign-in tokens are cancelled, and the account lockout is cleared.
+        Workspace API keys are workspace-owned and are not revoked. Clears the session cookie.
       security: []
       requestBody:
         required: true
@@ -1344,18 +1403,24 @@ paths:
               additionalProperties: false
               required: [token, password]
               properties:
-                token: { type: string, maxLength: 1024 }
+                token: { type: string, maxLength: 256 }
                 password: { type: string, maxLength: 1024 }
       responses:
         "200":
-          description: Password changed; every session revoked
+          description: Password changed; every session and pending grant revoked
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   status: { type: string, enum: [password_reset] }
-                  sessionsRevoked: { type: integer }
+                  revoked:
+                    type: object
+                    properties:
+                      sessions: { type: integer }
+                      mcpGrants: { type: integer }
+                      deviceAuthorizations: { type: integer }
+                      mcpCodes: { type: integer }
         "400": { $ref: "#/components/responses/PasswordPolicyError" }
         "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
         "404": { $ref: "#/components/responses/SignInMethodDisabled" }
@@ -1377,6 +1442,20 @@ paths:
           description: To `next` with the session cookie
         "403":
           description: Not invited, wrong domain, or invite email mismatch (HTML)
+  /login/password:
+    post:
+      operationId: passwordFormLogin
+      description: |
+        Form post from the `/login` page (same origin; `email`, `password`, `next`,
+        `invite`). Same lockout and answers as `POST /api/v1/auth/password/login`, so CLI
+        and Desktop browser login work when only password sign-in is enabled.
+      security: []
+      responses:
+        "303":
+          description: To `next` (a safe local path; anything else becomes `/`) with the session cookie, or back to `/login?error=invalid_credentials`
+        "403":
+          description: Cross-origin form (HTML)
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
   /login/email:
     post:
       operationId: emailLinkRequest
@@ -5700,6 +5779,10 @@ components:
             - password_contains_email
             - password_breached
             - invalid_credentials
+            - token_invalid
+            - password_already_set
+            - reauthentication_required
+            - rate_limited
             - csrf_rejected
             - signin_method_disabled
             - method_not_allowed

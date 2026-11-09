@@ -1,0 +1,251 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { trustedProxyHops } from "../src/auth/device-approval.js";
+import { loadIdentityConfig } from "../src/identity/config.js";
+import { lockDelayMs, LOCKOUT } from "../src/identity/password/store.js";
+import {
+  API,
+  auditActions,
+  call,
+  linkToken,
+  login,
+  PASSWORD,
+  pepperFile,
+  registerVerified,
+  session,
+  sessionCookie,
+  setup,
+  SMTP,
+  verifyLink,
+} from "./support/password.js";
+
+const loadConfigProxies = (value: string | undefined) => trustedProxyHops(value === undefined ? {} : { SELFHOST_TRUSTED_PROXIES: value });
+
+// ---- concurrency, proxies and pepper ----------------------------------------------------
+
+test("lockout: a parallel burst gets no more than the free allowance", async (t) => {
+  const ctx = await setup(t);
+  await registerVerified(ctx, "burst@acme.test");
+  const burst = await Promise.all(Array.from({ length: 12 }, (_, i) => login(ctx, "burst@acme.test", `wrong password number ${i}`)));
+  assert.ok(burst.every((res) => res.status === 401));
+  const row = await ctx.database.query<{ failures: number; locked_until: Date | null }>(
+    "SELECT failures, locked_until FROM selfhost_login_attempts WHERE subject = 'account:burst@acme.test'",
+  );
+  assert.equal(row.rows[0]!.failures, LOCKOUT.account.free, "attempts are reserved before argon2id, not counted after it");
+  assert.ok(row.rows[0]!.locked_until);
+  const reasons = (await auditActions(ctx))
+    .filter((e) => e.action === "login.password.failure" && e.target!.includes("burst@acme.test"))
+    .map((e) => /reason=(\w+)/.exec(e.target!)![1]);
+  assert.equal(reasons.filter((r) => r === "wrong_password").length, LOCKOUT.account.free, "only five passwords were checked");
+  assert.equal(reasons.filter((r) => r === "locked").length, 12 - LOCKOUT.account.free);
+  assert.equal((await login(ctx, "burst@acme.test", PASSWORD)).status, 401, "still locked");
+
+  // Past the free allowance each lock admits one attempt, even a parallel
+  // one; the success clears the account counter for what follows.
+  ctx.clock.now += lockDelayMs(LOCKOUT.account.free, LOCKOUT.account.free) + 1_000;
+  const after = await Promise.all(Array.from({ length: 3 }, () => login(ctx, "burst@acme.test", PASSWORD)));
+  assert.deepEqual(after.map((res) => res.status).sort(), [200, 401, 401]);
+  assert.equal((await login(ctx, "burst@acme.test", PASSWORD)).status, 200);
+});
+
+test("client IP: X-Forwarded-For is ignored unless SELFHOST_TRUSTED_PROXIES says how many proxies to trust", async (t) => {
+  for (const proxies of [null, "0"]) {
+    const ctx = await setup(t, { trustedProxies: proxies });
+    await registerVerified(ctx, "spoof@acme.test");
+    // A different forged address on every attempt does not escape the IP lock:
+    // with no trusted proxy the socket address is the client.
+    for (let i = 0; i < LOCKOUT.ip.free; i += 1) await login(ctx, `spray${i}@acme.test`, PASSWORD, `203.0.113.${i + 1}`);
+    const blocked = await login(ctx, "spoof@acme.test", PASSWORD, "198.51.100.200");
+    assert.equal(blocked.status, 401, `proxies=${proxies}`);
+    const lockout = (await auditActions(ctx)).find((e) => e.action === "login.lockout" && e.target!.includes("scope=ip"));
+    assert.ok(lockout, `proxies=${proxies}`);
+    assert.doesNotMatch(lockout.target!, /203\.0\.113\./, "the forged header was not used");
+  }
+  // One trusted proxy: the last X-Forwarded-For entry is the client.
+  const behind = await setup(t, { trustedProxies: "1" });
+  await registerVerified(behind, "proxied@acme.test");
+  for (let i = 0; i < LOCKOUT.ip.free; i += 1) {
+    await call(behind.origin, `${API}/login`, { json: { email: `spray${i}@acme.test`, password: PASSWORD }, ip: `203.0.113.${i + 1}, 192.0.2.50` });
+  }
+  assert.equal((await login(behind, "proxied@acme.test", PASSWORD, "192.0.2.50")).status, 401);
+  assert.equal((await login(behind, "proxied@acme.test", PASSWORD, "192.0.2.51")).status, 200);
+  assert.throws(() => loadConfigProxies("-1"), /SELFHOST_TRUSTED_PROXIES/);
+  assert.throws(() => loadConfigProxies("two"), /SELFHOST_TRUSTED_PROXIES/);
+  assert.equal(loadConfigProxies(undefined), 0, "default 0: the socket address");
+});
+
+test("pepper file: refused when group/other may read it; wrong passwords still fail with a pepper", async (t) => {
+  const secret = "q".repeat(40);
+  const base = { ...SMTP, SELFHOST_SIGNIN_METHODS: "password" };
+  for (const mode of [0o644, 0o640, 0o604]) {
+    assert.throws(() => loadIdentityConfig({ ...base, SELFHOST_PASSWORD_PEPPER_FILE: pepperFile(`v1:${secret}`, mode) }), /group or others.*chmod 600/, mode.toString(8));
+  }
+  assert.equal(loadIdentityConfig({ ...base, SELFHOST_PASSWORD_PEPPER_FILE: pepperFile(`v1:${secret}`, 0o400) }).password!.currentPepperVersion, 1);
+  assert.throws(() => loadIdentityConfig({ ...base, SELFHOST_PASSWORD_PEPPER_FILE: mkdtempSync(join(tmpdir(), "pepper-dir-")) }), /regular file/);
+
+  const ctx = await setup(t, { env: { SELFHOST_PASSWORD_PEPPER_FILE: pepperFile(`v1:${secret}`) } });
+  await registerVerified(ctx, "pep@acme.test");
+  const stored = await ctx.database.query<{ pepper_version: number }>(
+    "SELECT c.pepper_version FROM selfhost_password_credentials c JOIN selfhost_users u ON u.id = c.user_id WHERE u.email = 'pep@acme.test'",
+  );
+  assert.equal(stored.rows[0]!.pepper_version, 1);
+  const wrong = await login(ctx, "pep@acme.test", "not the right passphrase");
+  assert.equal(wrong.status, 401);
+  assert.equal(wrong.body.error, "invalid_credentials");
+  assert.equal((await login(ctx, "pep@acme.test", PASSWORD)).status, 200);
+});
+
+// ---- reset revokes everything ---------------------------------------------------------
+
+test("reset: revokes CLI, Desktop and browser sessions and MCP grants; expires approved device codes; voids MCP codes", async (t) => {
+  const ctx = await setup(t);
+  const browser = sessionCookie(await registerVerified(ctx, "all@acme.test"));
+  const member = (await ctx.database.query<{ id: string; organization_id: string; workspace_id: string }>(
+    `SELECT u.id, m.organization_id, w.id AS workspace_id FROM selfhost_users u
+       JOIN selfhost_organization_memberships m ON m.user_id = u.id
+       JOIN selfhost_workspaces w ON w.organization_id = m.organization_id
+      WHERE u.email = 'all@acme.test' LIMIT 1`,
+  )).rows[0]!;
+  const approve = async () => {
+    const started = await ctx.store.startDeviceAuthorization("relay-cli");
+    assert.equal(await ctx.store.decideDeviceAuthorization({ userCode: started.userCode, approve: true, userId: member.id, workspaceId: member.workspace_id }), "approved");
+    return started.deviceCode;
+  };
+  // A CLI session (collected), a Desktop session, and an approval nobody collected yet.
+  const cliPoll = await ctx.store.pollDeviceAuthorization(await approve());
+  assert.equal(cliPoll.kind, "issued");
+  const cli = (cliPoll as { tokens: { accessToken: string; refreshToken: string } }).tokens;
+  const desktop = await ctx.store.issueDesktopSession({ userId: member.id, organizationId: member.organization_id, workspaceId: member.workspace_id, tokenFamilyId: randomUUID() });
+  const uncollected = await approve();
+  // An MCP OAuth grant and an authorization code not redeemed yet.
+  await ctx.database.query("INSERT INTO selfhost_mcp_oauth_clients (client_id, client_name, redirect_uris) VALUES ('mcp-client', 'Editor', ARRAY['http://127.0.0.1/cb'])");
+  const grantId = randomUUID();
+  await ctx.database.query(
+    `INSERT INTO selfhost_mcp_oauth_grants (id, client_id, user_id, organization_id, workspace_id, agent_name, scopes, resource, token_family_id)
+     VALUES ($1, 'mcp-client', $2, $3, $4, 'editor', ARRAY['relay:mcp'], 'https://mcp.example.test', $5)`,
+    [grantId, member.id, member.organization_id, member.workspace_id, randomUUID()],
+  );
+  await ctx.database.query(
+    `INSERT INTO selfhost_mcp_oauth_authorization_codes
+       (code_hash, client_id, user_id, organization_id, workspace_id, agent_name, redirect_uri, code_challenge, scopes, resource, expires_at)
+     VALUES ($1, 'mcp-client', $2, $3, $4, 'editor', 'http://127.0.0.1/cb', 'challenge', ARRAY['relay:mcp'], 'https://mcp.example.test', now() + interval '5 minutes')`,
+    ["c".repeat(64), member.id, member.organization_id, member.workspace_id],
+  );
+  assert.ok(await ctx.store.authenticateAccessToken(cli.accessToken));
+  assert.ok(await ctx.store.authenticateAccessToken(desktop.accessToken));
+
+  await call(ctx.origin, `${API}/reset`, { json: { email: "all@acme.test" } });
+  await ctx.identity.idle();
+  const token = linkToken(ctx.mailer.sent.at(-1)!, "/password/reset");
+  const done = await call(ctx.origin, `${API}/reset/complete`, { json: { token, password: "a brand new long passphrase" } });
+  assert.equal(done.status, 200, done.text);
+  assert.equal(done.body.revoked.sessions, 3, "browser, CLI and Desktop");
+  assert.equal(done.body.revoked.mcpGrants, 1);
+  assert.equal(done.body.revoked.deviceAuthorizations, 1);
+  assert.equal(done.body.revoked.mcpCodes, 1);
+
+  assert.equal((await session(ctx, browser)).status, 401);
+  assert.equal(await ctx.store.authenticateAccessToken(cli.accessToken), null, "CLI session revoked");
+  assert.equal(await ctx.store.authenticateAccessToken(desktop.accessToken), null, "Desktop session revoked");
+  assert.equal(await ctx.store.refresh(cli.refreshToken), null, "and cannot be refreshed");
+  const late = await ctx.store.pollDeviceAuthorization(uncollected);
+  assert.equal(late.kind, "error", "an approval nobody collected cannot be collected after the reset");
+  assert.equal((late as { error: string }).error, "expired_token");
+  const grant = await ctx.database.query<{ revoked_reason: string | null }>("SELECT revoked_reason FROM selfhost_mcp_oauth_grants WHERE id = $1", [grantId]);
+  assert.equal(grant.rows[0]!.revoked_reason, "password_reset");
+  const code = await ctx.database.query<{ consumed_at: Date | null }>("SELECT consumed_at FROM selfhost_mcp_oauth_authorization_codes");
+  assert.ok(code.rows[0]!.consumed_at, "the unredeemed MCP code is void");
+  const audit = (await auditActions(ctx)).find((e) => e.action === "password.reset.completed");
+  assert.match(audit!.target!, /sessions_revoked=3 mcp_grants_revoked=1 device_authorizations_expired=1 mcp_codes_voided=1/);
+});
+
+// ---- rate limits and the /login page ------------------------------------------------------
+
+test("token routes are rate limited per IP (429 rate_limited)", async (t) => {
+  const ctx = await setup(t);
+  const statuses: number[] = [];
+  for (let i = 0; i < 31; i += 1) {
+    statuses.push((await call(ctx.origin, `${API}/verify`, { json: { token: `sh_pv_${"x".repeat(30)}` }, ip: "203.0.113.77" })).status);
+  }
+  assert.deepEqual([...new Set(statuses.slice(0, 30))], [410]);
+  const limited = await call(ctx.origin, `${API}/set`, { json: { token: `sh_ps_${"x".repeat(30)}`, password: PASSWORD }, ip: "203.0.113.77" });
+  assert.equal(statuses[30], 429);
+  assert.equal(limited.status, 429);
+  assert.equal(limited.body.error, "rate_limited");
+  const reset = await call(ctx.origin, `${API}/reset/complete`, { json: { token: `sh_pr_${"x".repeat(30)}`, password: PASSWORD }, ip: "203.0.113.77" });
+  assert.equal(reset.status, 429);
+  assert.equal((await call(ctx.origin, `${API}/verify`, { json: { token: `sh_pv_${"x".repeat(30)}` }, ip: "203.0.113.78" })).status, 410, "another IP is unaffected");
+});
+
+test("every password route refuses cross-site and non-JSON requests (403 csrf_rejected)", async (t) => {
+  const ctx = await setup(t);
+  for (const route of ["login", "register", "verify", "set", "reset", "reset/complete"]) {
+    const crossSite = await call(ctx.origin, `${API}/${route}`, { json: { email: "x@acme.test" }, originHeader: "https://evil.example" });
+    assert.equal(crossSite.status, 403, route);
+    assert.equal(crossSite.body.error, "csrf_rejected", route);
+    const form = await call(ctx.origin, `${API}/${route}`, { form: { email: "x@acme.test" } });
+    assert.equal(form.status, 403, `${route} form`);
+    assert.equal(form.body.error, "csrf_rejected");
+  }
+});
+
+test("/login page: password form posts to /login/password and signs in with a cookie", async (t) => {
+  const ctx = await setup(t);
+  await registerVerified(ctx, "form@acme.test");
+  const page = await call(ctx.origin, "/login?next=%2Fcloud%2Fsettings");
+  assert.equal(page.status, 200);
+  assert.match(page.text, /<form method="post" action="\/login\/password">/);
+  assert.match(page.text, /type="password" name="password"[^>]*autocomplete="current-password"/);
+  assert.match(page.text, /name="next" value="\/cloud\/settings"/);
+
+  const wrong = await call(ctx.origin, "/login/password", { form: { email: "form@acme.test", password: "not the password", next: "/cloud/settings" } });
+  assert.equal(wrong.status, 303);
+  assert.equal(wrong.location, "/login?next=%2Fcloud%2Fsettings&error=invalid_credentials");
+  assert.equal(wrong.cookies.agent_relay_session, undefined);
+  assert.match((await call(ctx.origin, wrong.location!)).text, /Incorrect email or password\./);
+
+  const crossSite = await call(ctx.origin, "/login/password", { form: { email: "form@acme.test", password: PASSWORD }, originHeader: "https://evil.example" });
+  assert.equal(crossSite.status, 403);
+  const ok = await call(ctx.origin, "/login/password", { form: { email: "form@acme.test", password: PASSWORD, next: "/cloud/settings" } });
+  assert.equal(ok.status, 303);
+  assert.equal(ok.location, "/cloud/settings");
+  assert.equal((await session(ctx, sessionCookie(ok))).status, 200);
+  const offsite = await call(ctx.origin, "/login/password", { form: { email: "form@acme.test", password: PASSWORD, next: "//evil.example/" } });
+  assert.equal(offsite.location, "/", "next stays on this site");
+  // The form shares the JSON route's lockout and audit.
+  assert.ok((await auditActions(ctx)).some((e) => e.action === "login.password.failure" && e.target!.includes("email=form@acme.test")));
+
+  const linkOnly = await setup(t, { env: { SELFHOST_SIGNIN_METHODS: "email_link" } });
+  assert.doesNotMatch((await call(linkOnly.origin, "/login")).text, /action="\/login\/password"/);
+  assert.equal((await call(linkOnly.origin, "/login/password", { form: { email: "a@acme.test", password: PASSWORD } })).status, 404);
+});
+
+// ---- retention -----------------------------------------------------------------------------
+
+test("retention: idle login attempts after 24 hours, spent or expired tokens after 7 days", async (t) => {
+  const ctx = await setup(t);
+  await registerVerified(ctx, "keep@acme.test");
+  await login(ctx, "keep@acme.test", "a wrong passphrase");
+  await verifyLink(ctx, "pending@acme.test");
+  await call(ctx.origin, `${API}/reset`, { json: { email: "keep@acme.test" } });
+  await ctx.identity.idle();
+  const count = async (table: string) => Number((await ctx.database.query<{ n: number }>(`SELECT count(*)::int AS n FROM ${table}`)).rows[0]!.n);
+  const tables = ["selfhost_login_attempts", "selfhost_password_registrations", "selfhost_password_setup_tokens", "selfhost_password_reset_tokens"];
+  const before = await Promise.all(tables.map(count));
+  assert.ok(before.every((n) => n > 0), String(before));
+
+  await ctx.identity.sweep();
+  assert.deepEqual(await Promise.all(tables.map(count)), before, "nothing recent is deleted");
+  ctx.clock.now += 25 * 60 * 60 * 1_000;
+  await ctx.identity.sweep();
+  assert.equal(await count("selfhost_login_attempts"), 0, "idle attempt rows go after 24 hours");
+  assert.ok((await count("selfhost_password_registrations")) > 0, "tokens are kept for 7 days");
+  ctx.clock.now += 7 * 24 * 60 * 60 * 1_000;
+  await ctx.identity.sweep();
+  assert.deepEqual(await Promise.all(tables.map(count)), [0, 0, 0, 0]);
+  assert.equal(await count("selfhost_password_credentials"), 1, "credentials are never swept");
+});

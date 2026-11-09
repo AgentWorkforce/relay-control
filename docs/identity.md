@@ -132,16 +132,17 @@ Turn it on with `SELFHOST_SIGNIN_METHODS`, a comma list of `email_link` and
 `SELFHOST_EMAIL_LOGIN=true` means `email_link` alone. Password sign-in needs
 SMTP, because every password starts from a verified email address. A method
 that is not listed answers `404 {"error":"signin_method_disabled"}` on all of
-its routes. That covers `/api/v1/auth/password/*` for `password`, and
-`/login/email` and `/login/email/verify` for `email_link`.
+its routes. That covers `/api/v1/auth/password/*` and `/login/password` for
+`password`, and `/login/email` and `/login/email/verify` for `email_link`.
 
 | Variable | Meaning |
 |---|---|
 | `SELFHOST_SIGNIN_METHODS` | `email_link`, `password`, or both. The default is `email_link` when `SELFHOST_EMAIL_LOGIN=true`, otherwise none |
 | `SELFHOST_LOGIN_LOGO_URL` | Optional logo for the sign-in page. Must be an absolute `https` URL without credentials |
-| `SELFHOST_PASSWORD_PEPPER_FILE` | Optional file of versioned peppers, one `<version>:<secret>` per line (a single bare line is version 1). Each secret is at least 32 bytes. The highest version hashes new passwords |
+| `SELFHOST_PASSWORD_PEPPER_FILE` | Optional file of versioned peppers, one `v<version>:<secret>` per line (for example `v1:...`, `v2:...`). Each secret is at least 32 bytes. The highest version hashes new passwords. See [Pepper file](#pepper-file) for the required permissions |
 | `SELFHOST_PASSWORD_ARGON2_MEMORY_KIB` / `_TIME_COST` / `_PARALLELISM` | Optional. These can only raise argon2id above the baseline of 19456 KiB, 2 passes and 1 lane. A lower value refuses to start |
 | `SELFHOST_PASSWORD_HIBP` | `off` (the default) or `on`: also refuse passwords found in Have I Been Pwned |
+| `SELFHOST_TRUSTED_PROXIES` | Number of reverse proxies in front of the server that append to `X-Forwarded-For`, `0` to `99`. Default `0`. See [Client address](#client-address) |
 
 #### Login config
 
@@ -164,57 +165,100 @@ secrets, peppers or SMTP settings.
 
 #### Flows
 
-Every route is `POST` with a JSON body. Browsers must send a JSON content type
+Every route is `POST` with a JSON body. Requests must send a JSON content type
 and an `Origin` that matches `SELFHOST_PUBLIC_URL` or the dashboard origin.
 Anything else answers `403 csrf_rejected`. Unknown body fields are refused.
+Native clients (Desktop, CLI or scripts) that call these routes directly must
+also send an `Origin` header equal to one of those two origins. Without
+`Origin`, only a request with `Sec-Fetch-Site: same-origin` is accepted.
+Browsers send that header themselves. Any other request without `Origin` is
+refused.
 
-1. **Register.** `POST /api/v1/auth/password/register {email, password}`
-   - The password policy (below) is checked first and reported as a `400`.
-   - Otherwise the answer is always `202 {"status":"verification_sent"}`.
+A password is never chosen before the address is proven. Registration takes
+three steps: register, verify and set.
+
+1. **Register.** `POST /api/v1/auth/password/register {email, invite?}`
+   - There is no password in the body. `invite` is the token from an invite
+     link (at most 256 characters). It is carried into the verification link.
+   - The answer is always `202 {"status":"verification_sent"}` for a
+     well-formed request, whatever the address.
    - Mail goes only to an address that may join: a configured admin email, an
      existing member, an open invite, or an auto-join domain. That address
      receives a single-use link to `<dashboard>/password/verify?token=...`,
      valid for 1 hour.
-   - The password is hashed at once and held with the pending registration.
-     It does nothing until the link is used.
-   - A newer registration cancels older pending ones.
+   - A newer registration cancels older pending ones, so only the newest link
+     works.
    - An address that already has a password receives a pointer to the reset
      page instead.
 2. **Verify.** `POST /api/v1/auth/password/verify {token}`
-   - Creates the password and signs the person in: `200` with the session
-     cookie and `{userId, email, organizationId, workspaceId}`.
-   - Membership follows the usual sign-in rules for a verified address
-     (invites, auto-join, admin emails).
-   - A used, expired or unknown token answers `410 token_invalid`.
-   - If a password was set meanwhile, the answer is `409 password_already_set`.
+   - Spends the link and answers
+     `200 {"status":"verified","email":...,"setupToken":"sh_ps_...","expiresAt":...}`.
+   - The set-password token is single-use and valid for 15 minutes. Only its
+     SHA-256 hash is stored. Nothing else is written at this step: no account,
+     no credential and no session.
+   - A used, expired or unknown link answers `410 token_invalid`. If the
+     address got a password meanwhile, the answer is `409 password_already_set`.
+3. **Set the password.** `POST /api/v1/auth/password/set {token, password}`
+   - Checks the password policy (below) against the verified address.
+   - Spends the set-password token, creates or joins the account and writes
+     the credential in one transaction. Either all of it happens or none of it.
+   - Answers `200` with the session cookie and
+     `{userId, email, organizationId, workspaceId}`. Membership follows the
+     usual sign-in rules for a verified address (invites, auto-join, admin
+     emails).
+   - A used, expired or unknown token answers `410 token_invalid`. An address
+     that already has a password answers `409 password_already_set`.
+4. **Add a password to an existing account.**
+   `POST /cloud/api/v1/auth/password/set {password}` with the dashboard session
+   cookie. The cookie is scoped to `/cloud`, so this form uses the `/cloud`
+   path.
+   - This is for someone who signed in with OIDC or an email link and has no
+     password yet. It answers `200 {"status":"password_set"}`.
+   - Only a full dashboard account session qualifies. A CLI, Desktop or
+     browser-handoff session answers `403 reauthentication_required`, and no
+     session at all answers `401`.
+   - An account that already has a password answers `409 password_already_set`.
      Changing a password always goes through reset.
-3. **Sign in.** `POST /api/v1/auth/password/login {email, password}`
-   - `200` with the session cookie and the same body as verify.
-   - Every failure is `401 {"error":"invalid_credentials","message":"Incorrect email or password."}`:
-     an unknown address, a wrong password, a locked account or IP, and a
+5. **Sign in.** `POST /api/v1/auth/password/login {email, password}`
+   - Answers `200` with the session cookie and the same body as set.
+   - Every failure is `401 {"error":"invalid_credentials","message":"Incorrect email or password."}`.
+     An unknown address, a wrong password, a locked account or IP, and a
      malformed address all look the same.
-4. **Request a reset.** `POST /api/v1/auth/password/reset {email}`
+   - The `/login` page has a matching email and password form, which posts to
+     `POST /login/password` (same-origin form; `email`, `password`, `next`,
+     `invite`). On success it redirects with `303` to `next` (a local path;
+     anything else becomes `/`). On failure it redirects back to
+     `/login?error=invalid_credentials`. This form is what lets CLI login and
+     Desktop browser login, which both land on `/login`, work when `password`
+     is the only method.
+6. **Request a reset.** `POST /api/v1/auth/password/reset {email}`
    - Always `202 {"status":"reset_requested"}`, for every address.
    - An address with a password receives a link to
      `<dashboard>/password/reset?token=...`. The link is single-use and valid
      for 30 minutes.
    - The token is stored only as a SHA-256 hash, and a newer request cancels
      older tokens.
-5. **Complete a reset.** `POST /api/v1/auth/password/reset/complete {token, password}`
+7. **Complete a reset.** `POST /api/v1/auth/password/reset/complete {token, password}`
    - Checks the policy against the account's email, then sets the new password.
-   - In the same transaction it revokes every browser, CLI and Desktop session
-     of that person (`revoked_reason = password_reset`) and every MCP OAuth
-     grant. It also cancels outstanding reset, registration and email sign-in
-     tokens, and clears the account's lockout.
-   - Answers `200 {"status":"password_reset","sessionsRevoked":n}` and clears
-     the session cookie. The person then signs in again.
+   - In the same transaction it:
+     - revokes every browser, CLI and Desktop session of that person
+       (`revoked_reason = password_reset`) and every MCP OAuth grant;
+     - expires approved device authorizations that have not been collected yet
+       (the polling client then gets `expired_token`);
+     - voids unredeemed MCP authorization codes;
+     - cancels outstanding reset, registration, set-password and email sign-in
+       tokens;
+     - clears the account's lockout.
+   - Answers
+     `200 {"status":"password_reset","revoked":{"sessions":n,"mcpGrants":n,"deviceAuthorizations":n,"mcpCodes":n}}`
+     and clears the session cookie. The person then signs in again.
    - Workspace API keys belong to the workspace rather than to the person, so
      a reset does not revoke them. Rotate them separately if needed.
 
 Registration and reset mail are limited to 3 messages per address and
 10 per IP every 10 minutes. Above the limit the answer stays the same `202`
-and no mail is sent. Verify and reset-complete accept 30 attempts per IP every
-5 minutes (`429 rate_limited`).
+and no mail is sent. Verify, set and reset-complete accept 30 attempts per IP
+every 5 minutes (`429 rate_limited`).
 
 #### Error codes
 
@@ -227,12 +271,14 @@ and no mail is sent. Verify and reset-complete accept 30 attempts per IP every
 | 400 | `password_contains_email` | Contains the address's local part |
 | 400 | `password_breached` | Found by the HIBP check (only when `SELFHOST_PASSWORD_HIBP=on`) |
 | 401 | `invalid_credentials` | Any failed sign-in |
-| 403 | `csrf_rejected` | Wrong content type or a foreign `Origin` |
+| 401 | (the standard authentication error) | Set without a token and without a session |
+| 403 | `csrf_rejected` | Wrong content type, or a missing or foreign `Origin` |
+| 403 | `reauthentication_required` | Set with a session that is not a dashboard account session |
 | 404 | `signin_method_disabled` | The method is not in `SELFHOST_SIGNIN_METHODS` |
 | 405 | `method_not_allowed` | Not `POST` |
-| 409 | `password_already_set` | Verify for an address that already has a password |
-| 410 | `token_invalid` | A used, expired or unknown verify or reset token |
-| 429 | `rate_limited` | Too many verify or reset-complete attempts from one IP |
+| 409 | `password_already_set` | Verify or set for an address that already has a password |
+| 410 | `token_invalid` | A used, expired or unknown verify, set-password or reset token |
+| 429 | `rate_limited` | Too many verify, set or reset-complete attempts from one IP |
 
 #### Password policy
 
@@ -267,21 +313,87 @@ and no mail is sent. Verify and reset-complete accept 30 attempts per IP every
 - An unknown or locked account still spends one argon2id verify against a
   dummy hash, so its response time matches a wrong password.
 
+#### Pepper file
+
+The pepper file is a secret, so the server refuses to start unless only its
+own user can read it:
+
+- It must be a regular file (not a directory or device).
+- It must be owned by the user the server runs as.
+- It must have no group or other permission bits. Use `chmod 600` (or `400`).
+  A mode such as `644`, `640` or `604` refuses to start.
+
+Every line is `v<version>:<secret>`, and each secret is at least 32 bytes.
+Blank lines and `#` comments are ignored. To rotate, add a higher version and
+keep the old line until its hashes have been re-hashed on sign-in. When the
+file comes from a mounted secret, make sure the mounted file ends up owned by
+the server's user with mode `0400` or `0600`. A root-owned or group-readable
+mount refuses to start.
+
+#### Client address
+
+Rate limits, lockouts and audit records use one client address. By default
+(`SELFHOST_TRUSTED_PROXIES=0`) it is the TCP peer address, and
+`X-Forwarded-For` and `X-Real-IP` are ignored, because any client can send them.
+
+Behind reverse proxies, set `SELFHOST_TRUSTED_PROXIES` to the number of proxies
+that append to `X-Forwarded-For`. For example, use `1` for a single ingress or
+load balancer. The client address is then the Nth entry from the right, the one
+the outermost trusted proxy appended. Entries further left are client-supplied
+and never trusted. Setting the number higher than the real proxy count lets
+clients pick their own address. Setting it lower makes every request share the
+proxy's address.
+
+The same address is used for the device-flow and Desktop limits.
+
 #### Lockout
 
 Failed sign-ins are counted in Postgres (`selfhost_login_attempts`), per
-account and per client IP. The client IP is the first `X-Forwarded-For` hop.
+account and per client IP.
 
 | Subject | Free failures | Then |
 |---|---|---|
 | Account (normalized email, also for addresses with no account) | 5 | Locked for 30 s, doubling with each further failure, capped at 15 minutes |
 | IP | 30 | Same backoff |
 
+- An attempt is reserved in Postgres before any argon2id work starts, in a
+  single row-locked update. Parallel requests cannot all slip in before the
+  first failure is recorded. Once the free failures are used, each lock window
+  admits exactly one attempt, however many requests arrive at once.
 - A counter starts over after 1 hour without failures.
 - While a lock lasts, even the right password gets the same `401`. Attempts
-  made during a lock do not extend it.
-- The first successful sign-in after the lock clears the account counter. A
-  successful reset clears it too.
+  refused during a lock are not counted and do not extend it.
+- A successful sign-in clears the account counter and gives back the IP
+  attempt it reserved. A successful reset clears the account counter too.
+
+**Limiter and lockout.** There are two layers, and they do different jobs:
+
+- The lockout above is shared by every replica, because it lives in Postgres.
+  It is the guessing defence.
+- The `429 rate_limited` limits on verify, set and reset-complete, and the mail
+  limits on register and reset, are in-memory and per replica. With N replicas
+  a client can get up to N times those numbers. They protect the server from
+  load, not the account.
+
+**Lock trade-off.** The reservation holds a row lock on the subject's counter
+only for the short update, not during the argon2id work. The argon2id hash runs
+after the reservation commits. This keeps a slow hash from blocking other
+sign-ins on the same account or IP. The cost is that a reserved attempt counts
+even if the request later fails for another reason, such as a client
+disconnect or a server error. Holding the lock through the hash would avoid
+that, but it would serialise every sign-in from one IP (a shared NAT or proxy)
+behind argon2id.
+
+#### Retention
+
+An hourly sweep in each replica deletes:
+
+- login attempt counters with no activity for 24 hours (well past the 1-hour
+  reset);
+- registration links, set-password tokens and reset tokens that were spent
+  or expired more than 7 days ago.
+
+Credentials and the audit log are not swept.
 
 #### Audit events
 
@@ -291,13 +403,16 @@ address and a reason, never a password, hash or token.
 - `login.password.failure`, with reason `wrong_password`, `unknown_account`,
   `invalid_email` or `locked`
 - `login.lockout`, with scope `account` or `ip`
+- `password.registration.verified`
 - `password.registration.completed`
+- `password.set` (a first password added from a session)
 - `password.reset.requested`
 - `password.reset.completed`, with revocation counts
 - `password.hibp.unavailable`
 
 Migration `0029_password_signin.sql` adds the credential, pending
-registration, reset token, login attempt and admin email grant tables.
+registration, set-password token, reset token, login attempt and admin email
+grant tables.
 
 ### Break-glass: the bootstrap bearer
 

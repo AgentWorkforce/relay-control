@@ -360,6 +360,9 @@ test("/login returns to a safe same-origin next path after sign-in", async (t) =
 });
 
 test("device routes apply hosted Cloud's rate limits", async (t) => {
+  // One trusted proxy: the client address is the rightmost X-Forwarded-For entry.
+  process.env.SELFHOST_TRUSTED_PROXIES = "1";
+  t.after(() => { delete process.env.SELFHOST_TRUSTED_PROXIES; });
   const { origin, ownerId, workspaceId } = await setup(t);
   for (let index = 0; index < 10; index += 1) {
     const started = await request(origin, "/api/v1/auth/device/start", {

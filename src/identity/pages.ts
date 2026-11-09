@@ -16,7 +16,7 @@ main{max-width:26rem;margin:10vh auto;padding:0 16px}.card{background:var(--card
 h1{font-size:1.35rem;margin:0 0 6px}p{margin:0 0 14px}.muted{color:var(--muted);font-size:.9rem}
 .btn{display:block;width:100%;text-align:center;padding:10px 16px;border-radius:999px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);font:inherit;font-weight:600;text-decoration:none;cursor:pointer}
 .btn.secondary{background:transparent;color:var(--fg);border-color:var(--border)}
-input[type=email]{width:100%;padding:9px 14px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--fg);font:inherit;margin:0 0 10px}
+input[type=email],input[type=password]{width:100%;padding:9px 14px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--fg);font:inherit;margin:0 0 10px}
 .or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:.8rem;margin:18px 0}.or:before,.or:after{content:"";flex:1;border-top:1px solid var(--border)}
 .notice{border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin:0 0 16px;font-size:.92rem}.notice.error{border-color:var(--danger);background:var(--danger-soft);color:var(--danger)}.notice.ok{background:var(--ok-soft)}
 dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0 0 16px;font-size:.92rem}dt{color:var(--muted)}dd{margin:0;word-break:break-all}
@@ -46,6 +46,8 @@ export function loginPage(input: {
   banner: InviteBanner | null;
   oidc: { displayName: string } | null;
   emailLogin: boolean;
+  /** SELFHOST_SIGNIN_METHODS includes password: a same-origin form to POST /login/password. */
+  password?: boolean;
   userCode: string;
   pollIntervalMs: number;
   notice?: { kind: "error" | "ok"; text: string } | null;
@@ -68,16 +70,25 @@ export function loginPage(input: {
   if (input.oidc) {
     methods.push(`<a class="btn" href="/login/oidc/start?${escapeHtml(query.toString())}">Continue with ${escapeHtml(input.oidc.displayName)}</a>`);
   }
+  const invitedEmail = input.banner?.kind === "valid" ? ` value="${escapeHtml(input.banner.email)}"` : "";
+  const hidden = `<input type="hidden" name="next" value="${escapeHtml(input.next)}">${input.invite ? `<input type="hidden" name="invite" value="${escapeHtml(input.invite)}">` : ""}`;
+  if (input.password) {
+    methods.push(`<form method="post" action="/login/password">
+${hidden}
+<input type="email" name="email" required autocomplete="username" placeholder="you@company.com" aria-label="Email address"${invitedEmail}>
+<input type="password" name="password" required autocomplete="current-password" placeholder="Password" aria-label="Password" maxlength="1024">
+<button class="btn${input.oidc ? " secondary" : ""}" type="submit">Sign in with password</button></form>`);
+  }
   if (input.emailLogin) {
     methods.push(`<form method="post" action="/login/email">
 <input type="hidden" name="next" value="${escapeHtml(input.next)}">${input.invite ? `<input type="hidden" name="invite" value="${escapeHtml(input.invite)}">` : ""}
 <input type="email" name="email" required autocomplete="email" placeholder="you@company.com" aria-label="Email address"${input.banner?.kind === "valid" ? ` value="${escapeHtml(input.banner.email)}"` : ""}>
-<button class="btn${input.oidc ? " secondary" : ""}" type="submit">Email me a sign-in link</button></form>`);
+<button class="btn${input.oidc || input.password ? " secondary" : ""}" type="submit">Email me a sign-in link</button></form>`);
   }
   parts.push(methods.join(`<div class="or">or</div>`));
   const hasMethod = methods.length > 0;
   if (!hasMethod) {
-    parts.push(`<p class="muted">No sign-in method is configured for this installation yet. Ask your administrator to set up single sign-on (OIDC) or email sign-in.</p>`);
+    parts.push(`<p class="muted">No sign-in method is configured for this installation yet. Ask your administrator to set up single sign-on (OIDC), email links or passwords.</p>`);
   }
   parts.push(`<details${hasMethod ? "" : " open"}><summary>Operator sign-in</summary>
 <p class="muted">An administrator or a signed-in Agent Relay client can approve this code:</p>

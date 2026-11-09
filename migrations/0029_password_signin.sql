@@ -14,16 +14,13 @@ CREATE TABLE IF NOT EXISTS selfhost_password_credentials (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
--- A registration waiting for its email to be verified. The chosen password
--- is already hashed; it becomes the credential only when the single-use
--- verification token is redeemed before expires_at.
+-- A registration waiting for its email to be verified. It holds no
+-- password: the address is proven first, then the single-use verification
+-- token is exchanged for a short-lived set-password token (below).
 CREATE TABLE IF NOT EXISTS selfhost_password_registrations (
   id uuid PRIMARY KEY,
   email text NOT NULL,
   token_hash text NOT NULL UNIQUE,
-  password_hash text NOT NULL CHECK (password_hash LIKE '$argon2id$%'),
-  pepper_version integer CHECK (pepper_version IS NULL OR pepper_version >= 1),
-  params text NOT NULL,
   invite_token_hash text,
   expires_at timestamptz NOT NULL,
   consumed_at timestamptz,
@@ -33,6 +30,24 @@ CREATE TABLE IF NOT EXISTS selfhost_password_registrations (
 
 CREATE INDEX IF NOT EXISTS selfhost_password_registrations_email_idx
   ON selfhost_password_registrations (email)
+  WHERE consumed_at IS NULL;
+
+-- A single-use set-password token (sh_ps_, at most 15 minutes) minted when a
+-- verification link is redeemed. Spending it, creating the account and
+-- writing the credential happen in one transaction.
+CREATE TABLE IF NOT EXISTS selfhost_password_setup_tokens (
+  id uuid PRIMARY KEY,
+  email text NOT NULL,
+  token_hash text NOT NULL UNIQUE,
+  invite_token_hash text,
+  expires_at timestamptz NOT NULL,
+  consumed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT selfhost_password_setup_tokens_email_normalized CHECK (email = lower(email))
+);
+
+CREATE INDEX IF NOT EXISTS selfhost_password_setup_tokens_email_idx
+  ON selfhost_password_setup_tokens (email)
   WHERE consumed_at IS NULL;
 
 -- A single-use password reset token (at most 30 minutes).
@@ -49,10 +64,11 @@ CREATE INDEX IF NOT EXISTS selfhost_password_reset_tokens_user_idx
   ON selfhost_password_reset_tokens (user_id)
   WHERE used_at IS NULL;
 
--- Failed password sign-ins per subject ("account:<email>" or "ip:<address>"),
--- shared by every replica. After a free allowance each further failure doubles
--- locked_until (capped); a success clears the account row. Rows idle for a
--- whole window start over.
+-- Password sign-in attempts per subject ("account:<email>" or "ip:<address>"),
+-- shared by every replica. Each attempt is reserved (counted) before the
+-- password is checked; once the free allowance is used each further attempt
+-- doubles locked_until (capped). A success clears the account row and refunds
+-- the IP reservation. Rows idle for a whole window start over.
 CREATE TABLE IF NOT EXISTS selfhost_login_attempts (
   subject text PRIMARY KEY,
   failures integer NOT NULL DEFAULT 0 CHECK (failures >= 0),

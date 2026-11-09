@@ -1284,6 +1284,30 @@ export class ControlPlaneStore {
     return { sessions: sessions.rows.length, mcpGrants: grants.rows.length };
   }
 
+  /**
+   * Ends what a person approved but nobody has collected yet: device and
+   * browser authorizations approved by them (CLI, Desktop, dashboard) become
+   * expired, and unredeemed MCP OAuth authorization codes are voided. Run
+   * with revokeAllForUser so a credential change leaves no way back in.
+   */
+  async voidPendingAuthorizationsForUser(executor: SqlExecutor, userId: string): Promise<{ deviceAuthorizations: number; mcpCodes: number }> {
+    const devices = await executor.query<{ id: string }>(
+      `UPDATE selfhost_device_authorizations
+          SET status = 'expired', updated_at = now()
+        WHERE approved_by_user_id = $1 AND status = 'approved'
+        RETURNING id`,
+      [userId],
+    );
+    const codes = await executor.query<{ code_hash: string }>(
+      `UPDATE selfhost_mcp_oauth_authorization_codes
+          SET consumed_at = now()
+        WHERE user_id = $1 AND consumed_at IS NULL
+        RETURNING code_hash`,
+      [userId],
+    );
+    return { deviceAuthorizations: devices.rows.length, mcpCodes: codes.rows.length };
+  }
+
   private async upsertUser(
     tx: SqlExecutor,
     emailInput: string,

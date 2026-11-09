@@ -121,6 +121,7 @@ server.headersTimeout = 65_000;
 
 async function start(): Promise<void> {
   telemetry.start();
+  identity.start();
   amp.start();
   factory.start();
   server.listen(config.port, config.host, () => {
@@ -181,6 +182,7 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   await telemetry.stop();
   await amp.stop();
   await factory.stop();
+  identity.stop();
   await emitStopping(analytics, signal, analyticsConfig.shutdownDeadlineMs);
   server.close(async () => {
     await database.close();
