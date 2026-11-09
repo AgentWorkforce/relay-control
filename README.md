@@ -486,6 +486,9 @@ The dashboard session endpoints are deliberately not a general proxy:
 
 - `GET /cloud/api/v1/workspaces/:id/sessions` forwards only `q` and `cursor`
   to RelayHistory's fixed `/v1/sessions` path.
+- `GET /api/v1/workspaces/:id/sessions/members` returns `{ members: [{ id, name }] }`
+  (organization members, display names only, no email) and never reads History;
+  it is meant for a dashboard that reads sessions directly from the read API.
 - `GET /cloud/api/v1/workspaces/:id/sessions/:sessionId/events` forwards only
   `source` to the fixed session-events path and requests ascending order.
 - `GET /cloud/api/v1/workspaces/:id/sessions/:sessionId/summary` accepts the

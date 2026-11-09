@@ -3,6 +3,10 @@
 Notable changes to the self-hosted control plane. Dates and versions are
 assigned at release.
 
+## Unreleased
+
+- Added: `GET /api/v1/workspaces/{id}/sessions/members` returns the organization's member display names (`{ id, name }`, no email) without a History read, so a dashboard that lists sessions straight from the session read API can still name teammates instead of showing "Unknown teammate".
+
 ## 0.5.7 (2026-11-09)
 
 - Fixed: the desktop sign-in workspace picker and consent screens now name

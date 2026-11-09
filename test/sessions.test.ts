@@ -417,6 +417,7 @@ test("session reads stay inside the caller's workspace", async (t) => {
   for (const path of [
     `/sessions`,
     `/sessions?q=secret`,
+    `/sessions/members`,
     `/sessions/activity?first=2026-11-01&last=2026-11-02`,
     `/sessions/output?first=2026-11-01&last=2026-11-02`,
     `/sessions/search?q=secret`,
@@ -513,6 +514,26 @@ test("an unattested or mis-attested History response is never returned", async (
   );
   assert.equal(unattested.status, 502);
   assert(!JSON.stringify(unattested.body).includes("Beta secret"));
+});
+
+test("members: names for the dashboard without a History read", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}`;
+
+  const before = env.history.requests.length;
+  const members = await call(env.origin, `${base}/sessions/members`, { token });
+  assert.equal(members.status, 200);
+  assert.deepEqual(members.body.members.map((member: any) => member.name).sort(), ["Member", "Owner"]);
+  assert(members.body.members.every((member: any) => !("email" in member) && typeof member.id === "string"));
+  assert.equal(env.history.requests.length, before);
+
+  const extra = await call(env.origin, `${base}/sessions/members?limit=1`, { token });
+  assert.equal(extra.status, 400);
+  assert.equal(extra.body.error, "invalid_request");
+
+  const anonymous = await call(env.origin, `${base}/sessions/members`);
+  assert.equal(anonymous.status, 401);
 });
 
 test("list, search, transcript, timing, and subagent catalog for the dashboard", async (t) => {
