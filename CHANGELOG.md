@@ -3,7 +3,7 @@
 Notable changes to the self-hosted control plane. Dates and versions are
 assigned at release.
 
-## Unreleased
+## 0.5.5 (2026-11-09)
 
 - Removed: the legacy RelayHistory exchange and RelayAuth integration
   (`RELAYAUTH_URL`, `RELAYAUTH_API_KEY`, `RELAYHISTORY_READ_API_URL`,
