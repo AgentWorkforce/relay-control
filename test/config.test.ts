@@ -302,3 +302,19 @@ test("the Flows broker secret is optional and must be long enough", () => {
   assert.equal(loadConfig({ ...completeEnv, RELAYFILE_CONTROL_BROKER_SECRET: secret }).relayfileControlBrokerSecret, secret);
   assert.throws(() => loadConfig({ ...completeEnv, RELAYFILE_CONTROL_BROKER_SECRET: "short" }), /at least 32 bytes/);
 });
+
+
+test("native event search is a separate default-off connection with a strict switch", () => {
+  const reader = "https://session-reader.selfhosted.company";
+  const env = { ...completeEnv, RELAYHISTORY_READ_API_URL: reader, RELAYCONTROL_INTROSPECT_SECRET: "i".repeat(32), SELFHOST_INTROSPECT_AUDIENCES: `${completeEnv.RELAYHISTORY_PUBLIC_URL},${reader}` };
+  assert.equal(loadConfig(completeEnv).relayhistoryReadApiSearch, false);
+  assert.equal(loadConfig(env).relayhistoryReadApiSearch, false);
+  assert.equal(loadConfig({ ...env, RELAYHISTORY_READ_API_EVENTS: "true" }).relayhistoryReadApiSearch, false);
+  assert.equal(loadConfig({ ...env, RELAYHISTORY_READ_API_SEARCH: "false" }).relayhistoryReadApiSearch, false);
+  const enabled = loadConfig({ ...env, RELAYHISTORY_READ_API_SEARCH: "true" });
+  assert.equal(enabled.relayhistoryReadApiSearch, true);
+  assert.equal(enabled.relayhistoryReadApiEvents, false);
+  assert.notEqual(configFingerprint(enabled), configFingerprint(loadConfig(env)));
+  assert.throws(() => loadConfig({ ...completeEnv, RELAYHISTORY_READ_API_SEARCH: "true" }), /requires RELAYHISTORY_READ_API_URL/);
+  for (const invalid of ["1", "yes", "TRUE"]) assert.throws(() => loadConfig({ ...env, RELAYHISTORY_READ_API_SEARCH: invalid }), /must be true or false/);
+});

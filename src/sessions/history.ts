@@ -196,11 +196,20 @@ export async function readWorkspaceHistory(
   // Other admitted credential families retain their pre-existing History
   // transport; this connection never forwards them to a sh_at_-only Worker.
   const native = config.relayhistoryBackend === "native";
+  // Search has a separate opt-in: enabling per-session events never broadens
+  // the connection to global search or anchored context-window queries.
+  const searchPath = path === "/v1/events";
+  const directSearch = Boolean(searchPath && config.relayhistoryReadApiSearch &&
+    (query.get("q") ?? "").trim() && !query.has("search"));
   const direct = Boolean(config.relayhistoryReadApiUrl && identity.callerToken.startsWith("sh_at_") &&
-    (rolloutPath || (eventPath && config.relayhistoryReadApiEvents)) && !query.has("q") && !query.has("search"));
+    (directSearch || ((rolloutPath || (eventPath && config.relayhistoryReadApiEvents)) && !query.has("q") && !query.has("search"))));
   // A read-API cursor cannot be interpreted by History after configuration
   // rollback. Refuse instead of silently restarting on its first page.
-  if (!direct && !native && (rolloutPath || eventPath) && /^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
+  if (!direct && !native && (rolloutPath || eventPath || searchPath) && /^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
+    throw new ReadCursorExpiredError();
+  }
+  if (direct && directSearch && query.has("cursor") && !/^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
+    // Never reinterpret a cursor issued by the legacy backend on this reader.
     throw new ReadCursorExpiredError();
   }
   if (direct && eventPath) {
@@ -254,7 +263,7 @@ export async function readWorkspaceHistory(
       // Includes a dormant read-API container (503 not_configured). The
       // cached History token is kept: only a 401 evicts it.
       await response.body?.cancel().catch(() => {});
-      if (native && response.status === 410) throw new ReadCursorExpiredError();
+      if ((native || (direct && directSearch)) && response.status === 410) throw new ReadCursorExpiredError();
       throw new UpstreamError("read", response.status, undefined, (direct || native) && response.status === 503);
     }
     if (response.headers.get(WORKSPACE_ATTESTATION_HEADER) !== identity.workspaceId) {

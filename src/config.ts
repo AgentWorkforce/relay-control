@@ -33,6 +33,8 @@ export type SelfhostConfig = {
   relayhistoryReadApiUrl?: string | null;
   /** RELAYHISTORY_READ_API_EVENTS: opt in to native session-event reads. Default off. */
   relayhistoryReadApiEvents?: boolean;
+  /** Opt in to native global event text search with the caller's Control token. */
+  relayhistoryReadApiSearch?: boolean;
   /** RELAYFILE_CONTROL_BROKER_SECRET: Flows credential broker routes. Unset: they 404. */
   relayfileControlBrokerSecret?: string | null;
   /** Independent read service; owns issuance, rotation and verification of its tokens. */
@@ -345,6 +347,14 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   if (relayhistoryReadApiEvents && !relayhistoryReadApiUrl) {
     throw new Error("RELAYHISTORY_READ_API_EVENTS requires RELAYHISTORY_READ_API_URL");
   }
+  const searchFlag = env.RELAYHISTORY_READ_API_SEARCH?.trim();
+  if (searchFlag && searchFlag !== "true" && searchFlag !== "false") {
+    throw new Error("RELAYHISTORY_READ_API_SEARCH must be true or false");
+  }
+  const relayhistoryReadApiSearch = searchFlag === "true";
+  if (relayhistoryReadApiSearch && !relayhistoryReadApiUrl) {
+    throw new Error("RELAYHISTORY_READ_API_SEARCH requires RELAYHISTORY_READ_API_URL");
+  }
   if (relayhistoryReadApiUrl) {
     if (!introspection.introspectSecret) {
       throw new Error("RELAYHISTORY_READ_API_URL requires RELAYCONTROL_INTROSPECT_SECRET");
@@ -365,6 +375,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     relayhistoryPublicUrl,
     relayhistoryReadApiUrl,
     relayhistoryReadApiEvents,
+    relayhistoryReadApiSearch,
     sessionReadApi,
     relayfileControlBrokerSecret: loadBrokerSecret(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
@@ -844,6 +855,7 @@ export function configFingerprint(config: SelfhostConfig): string {
       config.relayhistoryPublicUrl,
       ...(config.relayhistoryReadApiUrl ? [config.relayhistoryReadApiUrl] : []),
       ...(config.relayhistoryReadApiEvents ? ["native-session-events"] : []),
+      ...(config.relayhistoryReadApiSearch ? ["native-event-search"] : []),
       ...(config.sessionReadApi ? [config.sessionReadApi.url, config.sessionReadApi.publicUrl] : []),
       ...(config.sessionErasureApi ? [config.sessionErasureApi.url] : []),
     ].join("\n"))

@@ -72,7 +72,7 @@ type HistoryEvent = {
  * Without RelayAuth, /v1/cli/login receives the caller's own `sh_at_` token;
  * `callerWorkspaces` stands in for History's introspection of it.
  */
-async function startHistory(t: TestContext, audience: string) {
+async function startHistory(t: TestContext, audience: string, direct = false) {
   const paths: string[] = [];
   const logins: string[] = [];
   const callerWorkspaces = new Map<string, string>();
@@ -131,7 +131,7 @@ async function startHistory(t: TestContext, audience: string) {
       return;
     }
     const token = /^Bearer (.+)$/.exec(request.headers.authorization ?? "")?.[1];
-    const tokenWorkspace = token ? tokens.get(token) : undefined;
+    const tokenWorkspace = token ? (direct ? callerWorkspaces : tokens).get(token) : undefined;
     if (!tokenWorkspace) {
       send(401, { error: { code: "unauthorized" } });
       return;
@@ -211,10 +211,11 @@ function fakeRelaycast(state: {
 
 const PUBLIC_ORIGIN = "https://control.internal.example";
 
-async function setup(t: TestContext, options: { relayauth?: boolean } = {}) {
+async function setup(t: TestContext, options: { relayauth?: boolean; nativeSearch?: boolean } = {}) {
   const relayauth = options.relayauth ?? true;
   const historyAudience = "https://history.selfhosted.test";
   const history = await startHistory(t, historyAudience);
+  const readApi = options.nativeSearch ? await startHistory(t, historyAudience, true) : undefined;
   const agents: unknown[] = [];
   const relay = { agents, presence: [] as unknown[] | "fail", calls: [] as RelaycastCall[], world: createRelaycastWorld(agents) };
   const database = new PGliteDatabase();
@@ -226,6 +227,8 @@ async function setup(t: TestContext, options: { relayauth?: boolean } = {}) {
     relaycastPublicUrl: "https://cast.selfhosted.example",
     relayauthUrl: relayauth ? history.origin : null,
     relayhistoryUrl: history.origin,
+    relayhistoryReadApiUrl: readApi?.origin,
+    relayhistoryReadApiSearch: options.nativeSearch,
     relayhistoryPublicUrl: historyAudience,
     relayauthApiKey: relayauth ? "rak_test" : null,
     bootstrapToken: "bootstrap-token-that-is-at-least-32-bytes",
@@ -275,8 +278,9 @@ async function setup(t: TestContext, options: { relayauth?: boolean } = {}) {
     return tokens.body.access_token as string;
   };
   const accessToken = await login();
+  readApi?.callerWorkspaces.set(accessToken, workspace.body.id);
   return {
-    origin, config, database, history, relay, login,
+    origin, config, database, history, readApi, relay, login,
     orgId: org.body.id as string,
     workspaceId: workspace.body.id as string,
     otherWorkspaceId: other.body.id as string,
@@ -1166,4 +1170,25 @@ test("an addressed MCP send pins one machine and retains its retry receipt", asy
   const refused = await client.callTool({ name: "send_relay_message", arguments: { ...args, to: "machine-peer@another-machine" } });
   assert.match(toolError(refused), /Unknown agent name or stale machine address/);
   assert.equal(env.relay.world.bodies.filter(call => call.path === "/v1/dm").length, beforeRefusal);
+});
+
+
+test("native event search through MCP uses the direct reader and refuses a foreign workspace", async (t) => {
+  const env = await setup(t, { nativeSearch: true });
+  env.readApi!.events.push(
+    { eventId: "native-event", sessionId: "native-session", source: "codex", kind: "prompt", type: "user_message", ts: "2026-11-07T10:00:00.000Z", content: "a searchable native needle", workspaceId: env.workspaceId },
+    { eventId: "foreign-event", sessionId: "foreign-session", source: "codex", kind: "prompt", type: "user_message", ts: "2026-11-07T10:00:00.000Z", content: "a private native needle", workspaceId: env.otherWorkspaceId },
+  );
+  const client = await connect(t, `${env.origin}${CLOUD_MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  const data = structured(await client.callTool({ name: "search_shared_sessions", arguments: { query: "needle", since: "2026-11-07T00:00:00Z" } }));
+  assert.deepEqual(data.matches.map((x: any) => x.event_id), ["native-event"]);
+  assert.equal(data.matches[0].citation_url, `${PUBLIC_ORIGIN}/dashboard/sessions/native-session?source=codex`);
+  assert.equal(data.workspace_id, env.workspaceId);
+  assert.equal(env.history.paths.length, 0);
+  assert.equal(env.readApi!.logins.length, 0);
+  const before = env.readApi!.paths.length;
+  const refused = await client.callTool({ name: "search_shared_sessions", arguments: { query: "needle", workspace_id: env.otherWorkspaceId } });
+  assert.equal(refused.isError, true);
+  assert.equal(env.readApi!.paths.length, before);
+  assert.equal(env.history.paths.length, 0);
 });

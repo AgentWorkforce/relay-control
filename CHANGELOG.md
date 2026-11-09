@@ -5,6 +5,11 @@ assigned at release.
 
 ## Unreleased
 
+- Add the default-off `RELAYHISTORY_READ_API_SEARCH` connection for authenticated
+  native transcript text search, including MCP search. Workspace attestation,
+  caller credentials and cursor boundaries are preserved; incomplete coverage
+  and other refusals do not fall back to legacy History.
+
 - Self-host licensing is gone. Control no longer reads `SELFHOST_LICENSE`,
   `SELFHOST_LICENSE_FILE` or a licence key, and never answers
   `feature_not_licensed`. `SELFHOST_FEATURES` alone turns Flows, Relayfile and

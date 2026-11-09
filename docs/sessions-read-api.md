@@ -162,14 +162,26 @@ workspace. A refusal, malformed event, missing attestation or wrong workspace
 never falls back to History. Disabling the opt-in restores legacy event
 requests; outstanding native event cursors are refused rather than restarted.
 
-All other views, search, session issuance and uploads keep the existing
-History connection. Selection follows the upstream read path, including calls
-through the shared MCP reader: the timing tool's initial unsearched session
-list uses the direct reader, while its timing requests and the MCP transcript
-and search requests stay on History. This option does not migrate dashboard
-metadata or search. Events require the separate opt-in above. Self-hosted
-installations using the read container can keep the original
-`RELAYHISTORY_URL` path without this option.
+Text search can be enabled independently with
+`RELAYHISTORY_READ_API_SEARCH=true` (default `false`), using the same URL,
+introspection secret and audience requirements. Only `GET /v1/events` with a
+nonempty `q` uses this connection, including MCP `search_shared_sessions` text
+queries. Control forwards the original caller token, forces exactly one
+authorized `workspace` and checks the response's workspace attestation. Source,
+project, time range, page size and content limits are preserved. No login,
+service token or legacy fallback is attempted on a refusal. Reader completeness
+and history-floor refusals remain refusals: callers must request a supported
+range, and operators must qualify index coverage before enabling this option.
+A legacy cursor cannot enter native search; disabling the option or its URL
+refuses outstanding native search cursors with the explicit restart error.
+
+The events switch does not enable search, and the search switch does not enable
+per-session events. Search on `/v1/sessions`, anchored context windows using
+`/v1/events?session=...` without `q`, timing, session issuance and uploads retain
+their existing connections. The independent issuer-backed
+`RELAYHISTORY_BACKEND=native` transport is unchanged. Self-hosted installations
+using the login-based read container can retain `RELAYHISTORY_URL` without either
+optional direct-read switch.
 
 Control configuration:
 

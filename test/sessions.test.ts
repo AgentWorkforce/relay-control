@@ -329,7 +329,7 @@ async function startHistory(t: TestContext, historyOrigin: string, direct = fals
 async function setup(
   t: TestContext,
   now = new Date("2026-11-02T20:00:00.000Z"),
-  options: { relayauth?: boolean; directReadApi?: boolean; nativeEvents?: boolean; agentTokens?: boolean; relaycastFetch?: typeof fetch } = {},
+  options: { relayauth?: boolean; directReadApi?: boolean; nativeEvents?: boolean; nativeSearch?: boolean; agentTokens?: boolean; relaycastFetch?: typeof fetch } = {},
 ) {
   const relayauth = options.relayauth ?? true;
   const historyOrigin = "https://history.selfhosted.test";
@@ -347,6 +347,7 @@ async function setup(
     relayhistoryUrl: history.origin,
     ...(readApi ? { relayhistoryReadApiUrl: readApi.origin } : {}),
     relayhistoryReadApiEvents: options.nativeEvents ?? false,
+    relayhistoryReadApiSearch: options.nativeSearch ?? false,
     relayhistoryPublicUrl: historyOrigin,
     relayauthApiKey: relayauth ? "rak_test" : null,
     bootstrapToken,
@@ -1319,4 +1320,76 @@ test("recorded summaries fail closed on missing provenance, tenant attestation a
     assert.equal(env.readApi!.requests.length, before + 1);
     assert.equal(env.history.requests.length, 0);
   }
+});
+
+
+test("native event search forwards the original caller, workspace and pagination without login", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true, nativeSearch: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const identity = { userId: env.ownerId, organizationId: env.organizationId, workspaceId: env.alpha, callerToken: token };
+  const params = new URLSearchParams({ q: "needle", workspace: env.beta, source: "codex", project: "project", since: "2026-11-02T00:00:00Z", until: "2026-11-03T00:00:00Z", order: "desc", limit: "5", maxContent: "1200", cursor: "b96e1:opaque" });
+  const read = await readWorkspaceHistory(env.config, identity, "/v1/events", params);
+  assert.equal(read.status, "ok");
+  const request = env.readApi!.requests.at(-1)!;
+  assert.equal(request.path, "/v1/events");
+  assert.equal(request.token, token);
+  assert.deepEqual(request.workspaceParams, [env.alpha]);
+  assert.deepEqual(request.query, { ...Object.fromEntries(params), workspace: env.alpha });
+  assert.equal(params.get("workspace"), env.beta);
+  assert.equal(env.readApi!.mints, 0);
+  assert.equal(env.history.requests.length, 0);
+});
+
+test("native event search refusals never mint credentials or fall back", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true, nativeSearch: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const identity = { userId: env.ownerId, organizationId: env.organizationId, workspaceId: env.alpha, callerToken: token };
+  for (const status of [401, 403, 404, 500, 503]) {
+    const before = env.readApi!.requests.length;
+    env.readApi!.overrides.set("/v1/events", () => ({ status, body: { error: "private-refusal" } }));
+    await assert.rejects(readWorkspaceHistory(env.config, identity, "/v1/events", new URLSearchParams({ q: "needle" })));
+    assert.equal(env.readApi!.requests.length, before + 1);
+  }
+  env.readApi!.overrides.set("/v1/events", () => ({ status: 501, body: { reason: "session_partial" } }));
+  assert.deepEqual(await readWorkspaceHistory(env.config, identity, "/v1/events", new URLSearchParams({ q: "needle" })), { status: "unsupported", reason: "session_partial" });
+  for (const workspace of ["", env.beta]) {
+    env.readApi!.overrides.set("/v1/events", () => ({ headers: { "x-relayhistory-workspace-id": workspace }, body: { events: [{ content: "private-content" }], nextCursor: null } }));
+    await assert.rejects(readWorkspaceHistory(env.config, identity, "/v1/events", new URLSearchParams({ q: "needle" })), /did not attest/);
+  }
+  env.readApi!.overrides.set("/v1/events", () => ({ status: 302, headers: { location: `${env.history.origin}/v1/events` } }));
+  await assert.rejects(readWorkspaceHistory(env.config, identity, "/v1/events", new URLSearchParams({ q: "needle" })));
+  env.readApi!.overrides.set("/v1/events", () => ({ body: [] }));
+  await assert.rejects(readWorkspaceHistory(env.config, identity, "/v1/events", new URLSearchParams({ q: "needle" })), /invalid JSON/);
+  assert.equal(env.history.requests.length, 0);
+  assert.equal(env.readApi!.mints, 0);
+});
+
+test("native event search fences cursors on opt-in, rollback and backend expiry", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true, nativeSearch: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const identity = { userId: env.ownerId, organizationId: env.organizationId, workspaceId: env.alpha, callerToken: token };
+  await assert.rejects(readWorkspaceHistory(env.config, identity, "/v1/events", new URLSearchParams({ q: "needle", cursor: "legacy-cursor" })), { name: "ReadCursorExpiredError" });
+  assert.equal(env.readApi!.requests.length, 0);
+  env.readApi!.overrides.set("/v1/events", () => ({ status: 410 }));
+  await assert.rejects(readWorkspaceHistory(env.config, identity, "/v1/events", new URLSearchParams({ q: "needle", cursor: "b96e1:opaque" })), { name: "ReadCursorExpiredError" });
+  const before = env.readApi!.requests.length;
+  for (const undo of [() => { env.config.relayhistoryReadApiSearch = false; }, () => { env.config.relayhistoryReadApiSearch = true; env.disableDirectRead(); }, () => { env.config.relayhistoryReadApiUrl = env.readApi!.origin; identity.callerToken = "admitted-other-family"; }]) {
+    undo();
+    await assert.rejects(readWorkspaceHistory(env.config, identity, "/v1/events", new URLSearchParams({ q: "needle", cursor: "b96e1:opaque" })), { name: "ReadCursorExpiredError" });
+  }
+  assert.equal(env.readApi!.requests.length, before);
+  assert.equal(env.history.requests.length, 0);
+});
+
+test("native event search default-off preserves legacy search and does not broaden events or context", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true, nativeEvents: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const identity = { userId: env.ownerId, organizationId: env.organizationId, workspaceId: env.alpha, callerToken: token };
+  assert.equal((await readWorkspaceHistory(env.config, identity, "/v1/events", new URLSearchParams({ q: "needle" }))).status, "ok");
+  env.config.relayhistoryReadApiSearch = true;
+  for (const [path, query] of [["/v1/sessions", { q: "needle" }], ["/v1/events", { session: "alpha-1", since: "2026-11-02T00:00:00Z" }]] as const) {
+    assert.equal((await readWorkspaceHistory(env.config, identity, path, new URLSearchParams(query))).status, "ok");
+  }
+  assert.equal(env.readApi!.requests.length, 0);
+  assert(env.history.requests.some(r => r.path === "/v1/cli/login"));
 });
