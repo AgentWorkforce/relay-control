@@ -198,7 +198,8 @@ export function createIdentityModule(input: {
   function passwordPageLinks(next: string, invite: string | null): { forgot: string; register: string } {
     const query = new URLSearchParams({ next: cloudPathForNext(next) });
     if (invite) query.set("invite", invite);
-    const base = input.dashboardUrl.replace(/\/+$/, "");
+    const dashboard = new URL(input.dashboardUrl);
+    const base = `${dashboard.origin}${dashboard.pathname.replace(/\/+$/, "")}`;
     return { forgot: `${base}/#/forgot-password?${query}`, register: `${base}/#/register?${query}` };
   }
   const emailLogin = config.emailLogin && mailer !== null;
