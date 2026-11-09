@@ -16,7 +16,9 @@ async function readBody(incoming: IncomingMessage): Promise<Record<string, unkno
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
 
-async function setup(t: TestContext, options: { secret?: string | null; chief?: boolean; existing?: unknown; fail?: boolean } = {}) {
+const RELAY_WORKSPACE = "245411583121604608";
+
+async function setup(t: TestContext, options: { secret?: string | null; chief?: boolean; existing?: unknown; fail?: boolean; self?: unknown } = {}) {
   const calls: unknown[][] = [];
   const server = createServer((incoming, response) => {
     void handleChiefRelay(incoming, response, incoming.method ?? "GET", new URL(incoming.url!, "http://x").pathname, {
@@ -29,8 +31,12 @@ async function setup(t: TestContext, options: { secret?: string | null; chief?: 
         },
         registerHosted: async (...args) => { calls.push(["register", ...args]); return { id: "agent-new", name: chiefId, token: "token-new" }; },
         recoverHosted: async (...args) => { calls.push(["recover", ...args]); return { id: "agent-old", name: chiefId, token: "token-rotated" }; },
+        authenticatedAgent: async (token) => {
+          calls.push(["self", token]);
+          return (options.self ?? { id: token === "token-new" ? "agent-new" : "agent-old", workspaceId: RELAY_WORKSPACE }) as never;
+        },
       },
-      relaycastBinding: async (id) => (id === workspaceId ? { relaycastWorkspaceId: "relay-ws", relaycastApiKey: "workspace-key" } : null),
+      relaycastBinding: async (id) => (id === workspaceId ? { relaycastWorkspaceId: workspaceId, relaycastApiKey: "workspace-key" } : null),
       requireChief: () => { if (options.chief === false) throw Object.assign(new Error("off"), { off: true }); },
       bearer: (r) => /^Bearer (.+)$/.exec(r.headers.authorization ?? "")?.[1] ?? null,
       requestObject: readBody,
@@ -65,7 +71,7 @@ test("a new chief is registered and never receives the workspace key", async (t)
   const env = await setup(t);
   const answer = await env.post();
   assert.equal(answer.status, 200, answer.raw);
-  assert.deepEqual(answer.body, { agentId: "agent-new", agentName: chiefId, token: "token-new", relayWorkspaceId: "relay-ws" });
+  assert.deepEqual(answer.body, { agentId: "agent-new", agentName: chiefId, token: "token-new", relayWorkspaceId: RELAY_WORKSPACE });
   assert.equal(answer.raw.includes("workspace-key"), false);
   assert.equal((env.calls[1]![3] as { chief_id: string }).chief_id, chiefId);
 });
@@ -75,6 +81,15 @@ test("a repeat call reissues the token of the chief's own agent", async (t) => {
   const answer = await env.post();
   assert.equal(answer.body.token, "token-rotated");
   assert.deepEqual(env.calls[1], ["recover", "workspace-key", chiefId, "agent-old", `chief:${chiefId}`]);
+});
+
+test("a Relay answer that cannot prove the workspace gives no credential", async (t) => {
+  for (const self of [{ id: "agent-new", workspaceId: null }, { id: "someone-else", workspaceId: RELAY_WORKSPACE }]) {
+    const env = await setup(t, { self });
+    const answer = await env.post();
+    assert.equal(answer.status, 502);
+    assert.equal(answer.raw.includes("token-new"), false);
+  }
 });
 
 test("an agent registered for anything else is refused, not taken over", async (t) => {

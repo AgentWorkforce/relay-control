@@ -8,7 +8,7 @@ const bodySchema = z.strictObject({ chiefId: z.string().regex(/^chief-[a-f0-9]{2
 
 export type ChiefRelayDeps = {
   secret: string | null | undefined;
-  relaycast: Pick<RelaycastClient, "getAgent" | "registerHosted" | "recoverHosted">;
+  relaycast: Pick<RelaycastClient, "getAgent" | "registerHosted" | "recoverHosted" | "authenticatedAgent">;
   relaycastBinding(workspaceId: string): Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null>;
   requireChief(): void;
   bearer(request: IncomingMessage): string | null;
@@ -69,7 +69,10 @@ export async function handleChiefRelay(
           chief_id: chiefId,
           cloud_workspace_id: workspaceId.data,
         });
-    send(200, { agentId: agent.id, agentName: agent.name, token: agent.token, relayWorkspaceId: binding.relaycastWorkspaceId });
+    // Relay's own answer: the stored relaycast_workspace_id can be Control's UUID, and a chief refuses to run on a mismatch.
+    const self = await deps.relaycast.authenticatedAgent(agent.token);
+    if (self.id !== agent.id || !self.workspaceId) throw new Error("relay_identity_unresolved");
+    send(200, { agentId: agent.id, agentName: agent.name, token: agent.token, relayWorkspaceId: self.workspaceId });
   } catch {
     // Relaycast diagnostics stay here.
     send(502, { error: "relaycast_unavailable", message: "Relaycast could not register the agent" });
