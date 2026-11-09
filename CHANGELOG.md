@@ -3,6 +3,14 @@
 Notable changes to the self-hosted control plane. Dates and versions are
 assigned at release.
 
+## Unreleased
+
+- Fixed: the desktop browser sign-in consent screen was sent with
+  `referrer-policy: no-referrer`, so browsers posted the person's decision with
+  `Origin: null` and Control refused it with 403 "Cross-origin consent
+  refused" on every install. The page now uses `referrer-policy: same-origin`;
+  the handoff redirect still carries `no-referrer`.
+
 ## 0.5.5 (2026-11-09)
 
 - Removed: the legacy RelayHistory exchange and RelayAuth integration
