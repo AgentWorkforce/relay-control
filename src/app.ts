@@ -58,6 +58,15 @@ import {
   SessionErasureError,
 } from "./session-erasure.js";
 import {
+  CORE_LICENSE,
+  FeatureRefusedError,
+  PAID_FEATURES,
+  requireCapability,
+  resolveLicense,
+  type Feature,
+  type LoadedLicense,
+} from "./license/resolver.js";
+import {
   clientIp,
   cookieRequestAllowed,
   DEVICE_RATE_LIMITS,
@@ -285,6 +294,8 @@ export function createApp(input: {
   /** bootstrap-signup lane: OIDC / email sign-in, invites (src/identity). */
   identity?: IdentityModule;
   chief?: ChiefBackend;
+  /** Startup licence and SELFHOST_FEATURES selection (src/license). Unset = core only. */
+  license?: LoadedLicense;
   /**
    * Runtime probes for the provider modules this build contains. Unset (the
    * default) means no provider module: each reports implemented, configured
@@ -301,6 +312,13 @@ export function createApp(input: {
     "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck">;
 }): (request: IncomingMessage, response: ServerResponse) => void {
   const { config, store, admin, telemetry, identity } = input;
+  const loadedLicense = input.license ?? CORE_LICENSE;
+  // Expiry is judged per request, so a licence that lapses while running stops granting.
+  const license = () => resolveLicense(loadedLicense, input.now?.() ?? new Date());
+  /** Throws the 403 refusal unless `feature` is a capability. Call after membership, before backends. */
+  function requireFeature(feature: Feature): void {
+    requireCapability(loadedLicense, feature, input.now?.() ?? new Date());
+  }
   const browserOrigins = browserOriginsFor(config);
   const messagingDeps: MessagingDeps = {
     database: store.database,
@@ -524,6 +542,7 @@ export function createApp(input: {
     ? createFlowsHandler({
       store: input.flows,
       publicBaseUrl: config.publicBaseUrl,
+      requireFeature: () => requireFeature("flows"),
       userAccess: async (request, admin = false) => {
         const auth = await authenticate(request);
         if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
@@ -561,9 +580,11 @@ export function createApp(input: {
     if (method === "GET" && path === "/readyz") {
       const readiness = await store.readiness();
       const introspection = { enabled: Boolean(config.introspectSecret), audiences: acceptedAudiences(config) };
+      const current = license();
+      const licenseFields = { license: { status: current.status }, capabilities: current.capabilities };
       json(response, readiness.ready ? 200 : 503, readiness.ready
-        ? { status: "ready", introspection }
-        : { status: "not_ready", reason: readiness.reason, message: readiness.message, introspection });
+        ? { status: "ready", introspection, ...licenseFields }
+        : { status: "not_ready", reason: readiness.reason, message: readiness.message, introspection, ...licenseFields });
       return;
     }
     if (method === "GET" && path === "/openapi.yaml") {
@@ -1258,6 +1279,27 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    // Installation entitlement for any signed-in member; never secret material.
+    if (method === "GET" && path === "/api/v1/license") {
+      const auth = await authenticate(request);
+      if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      const current = license();
+      const claims = current.claims;
+      json(response, 200, {
+        status: current.status,
+        license_id: claims?.licenseId ?? null,
+        customer: claims?.customer ?? null,
+        expires_at: claims?.expiresAt ?? null,
+        seats: claims ? { limit: claims.seats, used: await store.countActiveMembers() } : null,
+        features: PAID_FEATURES.filter((feature) => current.entitled[feature]),
+        paid: [...PAID_FEATURES],
+        selected: current.selected,
+        entitled: current.entitled,
+        capabilities: current.capabilities,
+      }, true);
+      return;
+    }
+
     if (path === "/api/v1/organizations" && method === "GET") {
       const auth = await authenticate(request, true);
       json(response, 200, {
@@ -1716,6 +1758,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     })) return;
     if (await handleChiefRoutes(request, response, path, {
       backend: input.chief, workspaceAccess, requestObject, json,
+      requireFeature: () => requireFeature("chief"),
       csrfAllowed: incoming => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
     })) return;
 
@@ -1756,6 +1799,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     void handle(request, response).catch((error: unknown) => {
       if (response.headersSent) {
         response.end();
+        return;
+      }
+      if (error instanceof FeatureRefusedError) {
+        json(response, error.status, { error: error.code, message: error.message, feature: error.feature }, true);
         return;
       }
       if (error instanceof HttpError || error instanceof MessagingHttpError) {

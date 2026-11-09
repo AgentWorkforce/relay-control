@@ -16,6 +16,8 @@ import { IdentityStore } from "./identity/store.js";
 import { smtpMailer } from "./identity/mailer.js";
 import { createIdentityModule } from "./identity/routes.js";
 import { relaycastProvisioner, startBootstrap } from "./identity/bootstrap.js";
+import { loadLicense } from "./license/load.js";
+import { gateCredentialVerifier } from "./license/resolver.js";
 import { loadAnalyticsConfig } from "./analytics/config.js";
 import {
   buildAnalytics,
@@ -25,6 +27,9 @@ import {
 } from "./analytics/lifecycle.js";
 
 const config = loadConfig();
+// SELFHOST_FEATURES and the add-on licence. Only configuration mistakes throw;
+// a bad or expired licence is logged once and the installation runs as core.
+const license = loadLicense();
 const database = new PostgresDatabase(config.databaseUrl);
 
 // bootstrap-signup lane: first-boot org/workspace, OIDC/email sign-in, invites.
@@ -63,7 +68,8 @@ const admin = createAdminModule({
   database,
   keyring: config.encryptionKeyring,
   // Flows worker credentials may read their own workspace's runtime environment.
-  runtimeCredentialVerifier: (t) => flows.verifyRuntimeCredential(t),
+  // Refused with the Flows feature code while Flows is not a capability.
+  runtimeCredentialVerifier: gateCredentialVerifier((t: string) => flows.verifyRuntimeCredential(t), license, "flows"),
 });
 // Subscription logins reach runs through a reference in the assignment payload.
 flows.cliCredentials = admin.logins;
@@ -106,7 +112,7 @@ emitConfigLoaded(analytics, {
   flowsEnabled: true,
   operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
 });
-const server = createServer(createApp({ config, store, flows, admin, telemetry, identity, factory }));
+const server = createServer(createApp({ config, store, flows, admin, telemetry, identity, factory, license }));
 const bootstrapAbort = new AbortController();
 // Worker queue streams are long-lived SSE responses.
 server.requestTimeout = 0;
