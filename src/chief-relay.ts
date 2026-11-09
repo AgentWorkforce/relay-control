@@ -41,7 +41,13 @@ export async function handleChiefRelay(
     send(405, { error: "method_not_allowed" });
     return true;
   }
-  const workspaceId = z.uuid().safeParse(decodeURIComponent(match[1]!));
+  let segment = "";
+  try {
+    segment = decodeURIComponent(match[1]!);
+  } catch {
+    // Malformed percent-encoding fails the uuid check below.
+  }
+  const workspaceId = z.uuid().safeParse(segment);
   const body = bodySchema.safeParse(await deps.requestObject(request));
   if (!workspaceId.success || !body.success) {
     send(400, { error: "invalid_request", message: "Invalid chief registration" });

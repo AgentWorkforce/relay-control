@@ -16,7 +16,7 @@ async function readBody(incoming: IncomingMessage): Promise<Record<string, unkno
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
 
-const RELAY_WORKSPACE = "245411583121604608";
+const RELAY_WORKSPACE = "100000000000000001";
 
 async function setup(t: TestContext, options: { secret?: string | null; chief?: boolean; existing?: unknown; fail?: boolean; self?: unknown } = {}) {
   const calls: unknown[][] = [];
@@ -105,6 +105,7 @@ test("malformed requests and unknown workspaces stop before Relaycast", async (t
   assert.equal((await env.post({ chiefId: "not-a-chief" })).status, 400);
   assert.equal((await env.post({ chiefId, name: "override" })).status, 400);
   assert.equal((await env.post({ chiefId }, secret, "not-a-uuid")).status, 400);
+  assert.equal((await env.post({ chiefId }, secret, "%E0%A4%A")).status, 400);
   assert.equal((await env.post({ chiefId }, secret, randomUUID())).status, 404);
   assert.deepEqual(env.calls, []);
 });
