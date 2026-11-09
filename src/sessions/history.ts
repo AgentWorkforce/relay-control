@@ -142,6 +142,8 @@ async function unsupportedReason(response: Response): Promise<string> {
   const body: unknown = await response.json().catch(() => null);
   if (isRecord(body)) {
     if (nonEmptyString(body.reason)) return body.reason;
+    // The native read API uses { error: { code, reason, message } }.
+    if (isRecord(body.error) && nonEmptyString(body.error.reason)) return body.error.reason;
     if (nonEmptyString(body.error)) return body.error;
   }
   return UNSUPPORTED_BY_BACKEND;

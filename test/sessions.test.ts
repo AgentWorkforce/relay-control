@@ -830,6 +830,33 @@ test("read API: an upstream 501 is answered as 501 unsupported_by_backend", asyn
   assert.equal(env.history.mints, 1);
 });
 
+test("read API: nested reader refusal reasons survive without forwarding upstream messages", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}/sessions`;
+  for (const [upstream, path] of [
+    ["/v1/sessions", `${base}?q=needle`],
+    ["/v1/sessions/activity", `${base}/activity?first=2026-11-02&last=2026-11-02&q=needle`],
+  ] as const) {
+    for (const [body, reason] of [
+      [{ error: { code: "unsupported_by_backend", reason: "param_q", message: "private upstream detail" } }, "param_q"],
+      [{ reason: "flat_reason", error: { reason: "nested_reason" } }, "flat_reason"],
+      [{ error: { reason: "", message: "private upstream detail" } }, "unsupported_by_backend"],
+      [{ error: { reason: { unexpected: true }, message: "private upstream detail" } }, "unsupported_by_backend"],
+    ] as const) {
+      env.history.overrides.set(upstream, () => ({ status: 501, body }));
+      const response = await call(env.origin, path, { token });
+      assert.equal(response.status, 501);
+      assert.deepEqual(response.body, {
+        error: "unsupported_by_backend", reason, message: READ_API_UNSUPPORTED_MESSAGE,
+      });
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert(!JSON.stringify(response.body).includes("private upstream detail"));
+    }
+  }
+  assert.equal(env.history.mints, 1);
+});
+
 test("read API: a dormant read API (503) is a retryable upstream failure and keeps the cached token", async (t) => {
   const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);
