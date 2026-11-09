@@ -200,7 +200,14 @@ still has connections while the module is off, use `revoke_live=true` as
 above.
 
 Issuer requests have a 64 KiB body limit. Public registration allows 20
-requests per client-address bucket per hour and 500 per process per hour.
+requests per client-address bucket per hour and 500 per process per hour;
+token, refresh and revocation requests of registered clients never count
+against it. A registration holds at most 10 redirect URIs of up to 2048
+characters each and a `client_name` of up to 100 characters. While the module
+is active, the cleanup worker deletes registered clients older than 24 hours
+that have no connection and no pending authorization code, up to 500 per pass
+and at most every 15 minutes. A client that registered but never connected
+within a day registers again.
 Control uses its `SELFHOST_TRUSTED_PROXIES` policy and groups IPv6 addresses
 by /64. The default of zero trusted proxies ignores forwarded headers and
 uses the socket peer. Standalone module callers without an address resolver

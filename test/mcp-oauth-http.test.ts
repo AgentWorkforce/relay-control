@@ -186,6 +186,25 @@ test("bounded public requests, CSRF and per-peer registration limits apply befor
   assert.equal(redirect.searchParams.get("state"),"");
 });
 
+test("token, refresh and revocation for known clients never consume the registration limit",async()=>{
+  const {module,calls}=harness({resources:[SHARED]});
+  for(let index=0;index<500;index++) {
+    const response=await module.handle(web(API+"/register",registration),"fake-peer-"+index);
+    assert.equal(response!.status,201);
+  }
+  assert.equal((await module.handle(web(API+"/register",registration),"fake-peer-new"))!.status,429);
+  const before=calls.length;
+  const token=await module.handle(web(API+"/token",{grant_type:"authorization_code",client_id:client.clientId,code:"mcpac_fake",
+    code_verifier:verifier,redirect_uri:client.redirectUris[0],resource}),"fake-peer-new");
+  assert.equal(token!.status,200);
+  const refresh=await module.handle(web(API+"/token",{grant_type:"refresh_token",client_id:client.clientId,
+    refresh_token:"mcp_rt_fake",resource}),"fake-peer-new");
+  assert.equal(refresh!.status,400);assert.equal((await refresh!.json()).error,"invalid_grant");
+  const revoke=await module.handle(web(API+"/revoke",{token:"mcp_rt_fake",client_id:client.clientId}),"fake-peer-new");
+  assert.equal(revoke!.status,200);
+  assert.deepEqual(calls.slice(before),["exchange","refresh","revoke"]);
+});
+
 test("native HTTP adapter bounds chunked bodies and uses configured issuer instead of Host",async t=>{
   const {module,calls}=harness();
   const server=createServer((req,res)=>{void module.handleNode(req,res).then(handled=>{

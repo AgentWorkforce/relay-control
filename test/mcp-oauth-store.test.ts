@@ -8,6 +8,8 @@ import { hashSecret } from "../src/crypto.js";
 import { defaultMigrationsDirectory, migrate } from "../src/migrations.js";
 import { createMcpOAuthProtocol, pkceS256, type AuthorizationRequest } from "../src/mcp/oauth/protocol.js";
 import { McpOAuthStore, McpOAuthAgentNameTakenError, McpOAuthContinuationError } from "../src/mcp/oauth/store.js";
+import { MCP_OAUTH_CLIENT_TTL_MS, McpOAuthTeardown, pruneMcpOAuthClients } from "../src/mcp/oauth/teardown.js";
+import type { RelaycastClient } from "../src/messaging/relaycast.js";
 import { PGliteDatabase } from "./support/harness.js";
 
 const ORIGIN = "https://relay.example.test";
@@ -78,6 +80,37 @@ test("OAuth clients/codes retain source IDs, exact redirect arrays, one-way code
   assert.equal(row.code_challenge, request.codeChallenge);
   assert.deepEqual(row.scopes, ["relay:mcp"]);
   assert.equal((await f.database.query("SELECT id FROM selfhost_token_sessions")).rows.length, 0);
+});
+
+test("unused registered clients are pruned after a day while clients with a grant or code are kept", async t => {
+  const f = await fixture(t);
+  const register = async (name: string, at: Date) => {
+    const client = await f.store.registerMcpOAuthClient({ clientName: name, redirectUris: ["https://client.example.test/cb"] });
+    await f.database.query("UPDATE selfhost_mcp_oauth_clients SET created_at=$2 WHERE client_id=$1", [client.clientId, at]);
+    return client.clientId;
+  };
+  const old = new Date(NOW.getTime() - MCP_OAUTH_CLIENT_TTL_MS - 1000), recent = new Date(NOW.getTime() - 60_000);
+  const unused = await register("fake-unused", old), fresh = await register("fake-fresh", recent);
+  const granted = await register("fake-granted", old), coded = await register("fake-coded", old);
+  await f.grant({ ...f.authorization(), clientId: granted });
+  await f.store.createMcpOAuthAuthorizationCode({ ...f.authorization(), clientId: coded }, f.owner);
+  const extra = await Promise.all(Array.from({ length: 3 }, (_, index) => register("fake-extra-" + index, old)));
+  const cutoff = new Date(NOW.getTime() - MCP_OAUTH_CLIENT_TTL_MS);
+  assert.equal(await pruneMcpOAuthClients(f.database, cutoff, 2), 2);
+  assert.equal(await pruneMcpOAuthClients(f.database, cutoff), 2);
+  assert.equal(await pruneMcpOAuthClients(f.database, cutoff), 0);
+  const left = (await f.database.query<{ client_id: string }>("SELECT client_id FROM selfhost_mcp_oauth_clients")).rows.map(row => row.client_id);
+  for (const id of [unused, ...extra]) assert.equal(left.includes(id), false);
+  for (const id of [fresh, granted, coded]) assert.equal(left.includes(id), true);
+  // The teardown pass runs the prune on its own clock.
+  const doomed = await register("fake-doomed", old);
+  const relaycast = {} as RelaycastClient;
+  const worker = new McpOAuthTeardown({ database: f.database, keyring: { active: { id: "fake-key", key: Buffer.alloc(32, 7) } },
+    client: relaycast, now: () => new Date(NOW) });
+  t.after(() => worker.stop());
+  assert.deepEqual(await worker.drain(), { completed: 0, kept: 0, pending: 0 });
+  assert.equal((await f.database.query("SELECT 1 FROM selfhost_mcp_oauth_clients WHERE client_id=$1", [doomed])).rows.length, 0);
+  assert.equal((await f.database.query("SELECT 1 FROM selfhost_mcp_oauth_clients WHERE client_id=$1", [fresh])).rows.length, 1);
 });
 
 test("one user in two organizations gets explicitly bound codes; mismatched workspace/org is refused", async t => {

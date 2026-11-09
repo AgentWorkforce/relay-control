@@ -34,6 +34,28 @@ const PAGE=20;
  */
 export const MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS=8;
 
+/** Registered clients with no grant or code are deleted after this age. */
+export const MCP_OAUTH_CLIENT_TTL_MS=24*3_600_000;
+const PRUNE_BATCH=500;
+const PRUNE_INTERVAL_MS=15*60_000;
+
+/**
+ * Deletes up to one batch of dynamically registered clients older than the
+ * cutoff that no grant or authorization code references (the only tables
+ * with a foreign key to them). A client being referenced right now holds a
+ * key-share lock and is skipped. Returns the number deleted.
+ */
+export async function pruneMcpOAuthClients(database:SqlExecutor,before:Date,limit=PRUNE_BATCH):Promise<number> {
+  const deleted=await database.query(`DELETE FROM selfhost_mcp_oauth_clients WHERE client_id IN (
+      SELECT c.client_id FROM selfhost_mcp_oauth_clients c
+       WHERE c.created_at<$1
+         AND NOT EXISTS (SELECT 1 FROM selfhost_mcp_oauth_grants g WHERE g.client_id=c.client_id)
+         AND NOT EXISTS (SELECT 1 FROM selfhost_mcp_oauth_authorization_codes a WHERE a.client_id=c.client_id)
+       ORDER BY c.created_at LIMIT $2 FOR UPDATE SKIP LOCKED)
+    RETURNING client_id`,[before,limit]);
+  return deleted.rows.length;
+}
+
 /** Exponential retry delay after the given attempt count: 60 s doubling, capped at one hour. */
 export function mcpOAuthTeardownBackoffMs(attempts:number):number {
   // The remote phase makes up to four Relaycast calls with a 10 s deadline each, so the first retry must be later than that worst case or a second pass could claim the same row.
@@ -62,6 +84,7 @@ export class McpOAuthTeardown {
   private cursor:{createdAt:Date|string;id:string}|null=null;
   private rerun=false;
   private stopped=false;
+  private prunedAt:number|null=null;
   constructor(readonly deps:{
     database:Database; keyring:EncryptionKeyring; client:RelaycastClient; now?:()=>Date;
     /** Wall-clock budget of one pass; the remainder follows in an immediate rerun. */
@@ -108,6 +131,7 @@ export class McpOAuthTeardown {
       FROM selfhost_mcp_oauth_revocations WHERE completed_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=$1)
       ${this.cursor?"AND (created_at,id)>($2::timestamptz,$3::uuid)":""} ORDER BY created_at,id LIMIT ${PAGE}`,
     this.cursor?[now,this.cursor.createdAt,this.cursor.id]:[now]);
+    await this.prune(now);
     let candidates=await page();
     if(!candidates.rows.length && this.cursor) {this.cursor=null;candidates=await page();}
     const counts:McpOAuthTeardownResult={completed:0,kept:0,pending:0};
@@ -127,6 +151,17 @@ export class McpOAuthTeardown {
       }
     }
     return counts;
+  }
+
+  /** Anonymous registration must not grow the client table without bound. */
+  private async prune(now:Date):Promise<void> {
+    if(this.prunedAt!==null && now.getTime()-this.prunedAt<PRUNE_INTERVAL_MS) return;
+    this.prunedAt=now.getTime();
+    try {
+      await pruneMcpOAuthClients(this.deps.database,new Date(now.getTime()-MCP_OAUTH_CLIENT_TTL_MS));
+    } catch(error) {
+      console.error("[mcp-oauth] client prune deferred",{error:error instanceof Error?error.name:"unknown"});
+    }
   }
 
   private async attempt(candidate:Intent):Promise<Counted> {
