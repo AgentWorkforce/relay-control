@@ -268,10 +268,10 @@ unique lowercase release tag, the exact selected commit SHA, and the
 configure its required reviewers before the first release.
 
 The workflow publishes `linux/amd64` and `linux/arm64` manifests to
-`ghcr.io/<repository-owner>/relay-control` (canonical) and, as a transition
-alias with the same digest, `ghcr.io/<repository-owner>/selfhost-api`. It
-refuses to overwrite the release tag or its `sha-<commit>` tag on either
-image, and reports the resulting digest in the run summary. Deploy by the canonical `image@sha256:...` reference when
+`ghcr.io/<repository-owner>/relay-control`. It refuses to overwrite the release
+tag or its `sha-<commit>` tag, and reports the resulting digest in the run
+summary. The legacy `selfhost-api` image name is deprecated and receives no new
+releases. Deploy by the `image@sha256:...` reference when
 immutability matters. BuildKit SBOM and max-mode provenance attestations are
 attached where GHCR supports them. The workflow only publishes this standalone
 image; it does not invoke or modify the hosted Cloud deployment.
@@ -279,12 +279,11 @@ image; it does not invoke or modify the hosted Cloud deployment.
 ### Verifying image provenance
 
 Each release also carries a signed Sigstore provenance bundle (GitHub artifact
-attestation) for the published index digest, under both names. Verify it with
+attestation) for the published index digest. Verify it with
 the GitHub CLI, using the digest from the run summary:
 
 ```sh
 gh attestation verify oci://ghcr.io/agentworkforce/relay-control@sha256:<digest> --owner AgentWorkforce
-gh attestation verify oci://ghcr.io/agentworkforce/selfhost-api@sha256:<digest> --owner AgentWorkforce
 ```
 
 Images published before signed attestations were added, including `0.4.0`
