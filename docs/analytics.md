@@ -237,14 +237,16 @@ the usual `{"error", "message"}` shape.
 | Limit | Key | Rule |
 |---|---|---|
 | Per session | `analytics:session:<session id>` from the authenticated credential | 60 per minute |
-| Per client IP | `analytics:ip:<clientIp(request)>` | 300 per minute |
+| Per client IP | `analytics:ip:<limiterKey(clientIp(request))>` | 300 per minute |
 
 Both are checked after authentication and before the body is read. A request
 over either is `429 rate_limited` with `Retry-After` and captures nothing.
 
 The IP key comes from `clientIp` in `src/auth/device-approval.ts`, the same
 helper the existing auth limiters use (`cli-login`, `desktop-session`,
-`device-start`, `device-token`). The rule depends on
+`device-start`, `device-token`), passed through `limiterKey`: an IPv4
+address is used as is and an IPv6 address is bucketed by its /64. The rule
+depends on
 `SELFHOST_TRUSTED_PROXIES` (the number of reverse proxies in front of the
 service that append to `X-Forwarded-For`, default `0`):
 

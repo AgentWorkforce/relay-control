@@ -5,6 +5,8 @@ import { createApp } from "../src/app.js";
 import {
   clientIp,
   deviceApprovalPageUrl,
+  forwardedForUntrusted,
+  limiterKey,
   normalizeForwardedAddress,
   RateLimiter,
   safeNextPath,
@@ -446,4 +448,23 @@ test("clientIp: a trusted entry that is not an IP falls back to the socket addre
   assert.equal(clientIp(request("198.51.100.1, 192.0.2.7:8080"), 1), "192.0.2.7");
   assert.equal(clientIp(request("198.51.100.1, garbage"), 1), "10.0.0.5");
   assert.equal(clientIp(request("[2001:db8::2]:80, 192.0.2.7"), 2), "2001:db8::2");
+});
+
+test("limiterKey: IPv6 is bucketed by /64, IPv4 stays whole", () => {
+  assert.equal(limiterKey("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::/64");
+  assert.equal(limiterKey("2001:db8:1:2::ffff"), "2001:db8:1:2::/64", "any host in the /64 shares a bucket");
+  assert.equal(limiterKey("2001:0DB8:0001:0002:aaaa::1"), "2001:db8:1:2::/64", "case and leading zeros do not split it");
+  assert.equal(limiterKey("fe80::1%eth0"), "fe80:0:0:0::/64", "a zone id is dropped");
+  assert.notEqual(limiterKey("2001:db8:1:3::1"), limiterKey("2001:db8:1:2::1"), "the next /64 is another bucket");
+  assert.equal(limiterKey("198.51.100.7"), "198.51.100.7");
+  assert.equal(limiterKey("::ffff:198.51.100.7"), "198.51.100.7", "an IPv4-mapped address is its IPv4 bucket");
+  assert.equal(limiterKey("unknown"), "unknown", "a value that is not an IP is kept as is");
+});
+
+test("forwardedForUntrusted: only with no trusted proxy and an X-Forwarded-For header", () => {
+  const withHeader = { headers: { "x-forwarded-for": "203.0.113.9" } } as never;
+  const without = { headers: {} } as never;
+  assert.equal(forwardedForUntrusted(withHeader, 0), true);
+  assert.equal(forwardedForUntrusted(without, 0), false);
+  assert.equal(forwardedForUntrusted(withHeader, 1), false);
 });

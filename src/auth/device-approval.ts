@@ -78,7 +78,7 @@ export function clientIp(request: IncomingMessage, hops = trustedProxyHops()): s
     // address for per-IP limits; say so once per process.
     if (header !== undefined && !warnedUntrustedForwardedFor) {
       warnedUntrustedForwardedFor = true;
-      console.warn("[selfhost-api] X-Forwarded-For received but SELFHOST_TRUSTED_PROXIES=0; per-IP limits use the socket address. Set SELFHOST_TRUSTED_PROXIES to the number of trusted proxy hops.");
+      console.warn("[selfhost-api] X-Forwarded-For received but SELFHOST_TRUSTED_PROXIES=0; per-IP limits use the socket address, and password sign-in's IP lockout is disabled until the setting is fixed. Set SELFHOST_TRUSTED_PROXIES to the number of trusted proxy hops.");
     }
     return socket;
   }
@@ -86,6 +86,58 @@ export function clientIp(request: IncomingMessage, hops = trustedProxyHops()): s
     .split(",").map((entry) => entry.trim()).filter(Boolean);
   if (entries.length === 0) return socket;
   return normalizeForwardedAddress(entries[Math.max(0, entries.length - hops)]!) ?? socket;
+}
+
+/**
+ * The per-client key for rate limits and lockouts. IPv4 addresses are used
+ * as they are; an IPv6 address is bucketed by its /64, because one client
+ * (a home router, a cloud VM) usually holds a whole /64 and could otherwise
+ * take a fresh bucket per address. IPv4-mapped IPv6 becomes plain IPv4.
+ * Anything that is not an IP (e.g. "unknown") is kept, truncated. Audit
+ * records keep the full clientIp() address; only limiter keys use this.
+ */
+export function limiterKey(ip: string): string {
+  let value = ip.trim();
+  const zone = value.indexOf("%");
+  if (zone !== -1) value = value.slice(0, zone);
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(value);
+  if (mapped) value = mapped[1]!;
+  const family = isIP(value);
+  if (family === 4) return value;
+  if (family !== 6) return ip.slice(0, 64);
+  const hextets = expandIpv6(value);
+  return hextets ? `${hextets.slice(0, 4).join(":")}::/64` : ip.slice(0, 64);
+}
+
+/** The eight hextets of a valid IPv6 address (lower case, no leading zeros), or null. */
+function expandIpv6(value: string): string[] | null {
+  let text = value.toLowerCase();
+  // A trailing dotted IPv4 part stands for the last two hextets.
+  const v4 = /(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text);
+  if (v4) {
+    const [a, b, c, d] = v4.slice(1).map(Number) as [number, number, number, number];
+    text = `${text.slice(0, v4.index)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
+  const groups = [...head, ...Array<string>(halves.length === 2 ? missing : 0).fill("0"), ...tail];
+  if (groups.some((group) => !/^[0-9a-f]{1,4}$/.test(group))) return null;
+  return groups.map((group) => Number.parseInt(group, 16).toString(16));
+}
+
+/**
+ * True when the request carries X-Forwarded-For but no proxy is trusted
+ * (SELFHOST_TRUSTED_PROXIES=0): the server is most likely behind an ingress
+ * it was not told about, so the socket address is the proxy's and is shared
+ * by every client. Password sign-in then skips its IP-keyed lockout, which
+ * would otherwise let one client lock everyone out.
+ */
+export function forwardedForUntrusted(request: IncomingMessage, hops = trustedProxyHops()): boolean {
+  return hops <= 0 && request.headers["x-forwarded-for"] !== undefined;
 }
 
 /**

@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { domainToASCII } from "node:url";
 import { loadTenancyConfig, type TenancyConfig } from "../tenancy.js";
+import { trustedProxyHops } from "../auth/device-approval.js";
 
 /**
  * bootstrap-signup lane: first-boot bootstrap, sign-in methods and invites,
@@ -222,8 +223,9 @@ function raisedInteger(env: Env, name: string, baseline: number, max: number): n
 }
 
 /**
- * SELFHOST_PASSWORD_PEPPER_FILE: one pepper per line as `<version>:<secret>`
- * (a single line without a version is version 1). The highest version hashes
+ * SELFHOST_PASSWORD_PEPPER_FILE: one pepper per line as `v<version>:<secret>`
+ * (versions start at 1). A line without the `v<n>:` prefix is refused; there
+ * is no implicit version 1. The highest version hashes
  * new passwords; older lines stay so existing hashes still verify and are
  * re-hashed on the next sign-in. Blank lines and `#` comments are ignored.
  */
@@ -353,6 +355,19 @@ export function loadIdentityConfig(env: Env = process.env): IdentityConfig {
   const signinMethods = loadSigninMethods(env, emailLoginFlag);
   if (signinMethods.length > 0 && !smtp) {
     throw new Error("SELFHOST_SIGNIN_METHODS (email_link and password both send email) requires SELFHOST_SMTP_HOST");
+  }
+  if (signinMethods.includes("password")) {
+    // Password sign-in locks out by client address, so the server must know
+    // which X-Forwarded-For entry is the client's. Unset and empty both count
+    // as not set; "0" is an explicit answer (no proxy). A bad value fails
+    // with trustedProxyHops' own message.
+    if (!env.SELFHOST_TRUSTED_PROXIES?.trim()) {
+      throw new Error(
+        "SELFHOST_SIGNIN_METHODS includes password, so SELFHOST_TRUSTED_PROXIES must be set explicitly, even to 0: "
+        + "the number of reverse proxies in front of the server that append to X-Forwarded-For (0-99; 1 behind the Helm chart's ingress)",
+      );
+    }
+    trustedProxyHops(env);
   }
   const emailLogin = signinMethods.includes("email_link");
   const ttlHours = Number(env.SELFHOST_INVITE_TTL_HOURS?.trim() || "168");
