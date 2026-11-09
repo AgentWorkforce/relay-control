@@ -39,6 +39,23 @@ before authentication, and the worker does not start.
   `join_relay` and the channel tools do not use the hook. Replies to a Factory
   agent land in its Droid session, not in `check_relay_inbox`.
 
+### How a Droid speaks on Relay
+
+- **HTTP capability reply** is the supported outbound path from a Droid
+  session. Every delivery the worker injects carries the reply URL and a
+  single-use `factory_reply_` bearer; the Droid answers with
+  `POST /api/v1/factory-sessions/agents/{bindingId}/messages`, and the reply
+  reaches that delivery's pinned sender only. No user credential is involved.
+  This is an HTTP capability, not MCP.
+- **Managed Desktop provider chats** (a Droid installed from the Desktop
+  catalog, authenticating with a Desktop-issued provider credential) act only
+  as their verified desktop identity. `as=` is refused for them and the
+  Factory resolver hook never applies.
+- **Native MCP `as=<factory agent>`** is a person-side path: it works only on
+  an unmanaged, non-OAuth connection the person opened with their own Control
+  sign-in. Copying a person's sign-in token into a Droid's MCP configuration
+  is not a supported path.
+
 ## Dormant or deferred
 
 | Item | State |
