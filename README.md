@@ -114,9 +114,14 @@ is explicit. RelayAuth is optional: see
 | `SELFHOST_FACTORY_ENABLED` | Optional `true`/`false`, default `false`. Factory sessions: when off every Factory route is 404 and the worker does not start. See [docs/factory-sessions.md](docs/factory-sessions.md) |
 | `SELFHOST_FACTORY_API_URL` | Factory API origin, default `https://api.factory.ai`; absolute https only |
 | `SELFHOST_FACTORY_HISTORY_INTERVAL_MS` | Dormant Factory history loop cadence, default 300000, minimum 60000 |
-| `SELFHOST_OPERATOR_CONTROLS` | Operator-control writes (capture policy PUT/DELETE): `always` (default), `licence`, or `off`; an unrecognised value is treated as `off`. Reads are never gated. See [docs/capture-policy.md](docs/capture-policy.md) |
+| `SELFHOST_OPERATOR_CONTROLS` | Operator-control writes (capture policy PUT/DELETE, session hard delete): `always` (default), `licence`, or `off`; an unrecognised value is treated as `off`. Reads are never gated. See [docs/capture-policy.md](docs/capture-policy.md) and [docs/session-erasure.md](docs/session-erasure.md) |
+| `SESSION_ERASE_API_URL`, `SESSION_ERASE_API_SECRET` (or `_FILE`) | Internal origin and dedicated secret (at least 32 bytes) of the session pipeline's per-session erase. Unset, the session hard-delete routes answer 501. See [docs/session-erasure.md](docs/session-erasure.md) |
 | `SELFHOST_TELEMETRY_LEVEL` | Telemetry: `off` (default when unset), `errors`, or `full`. See [docs/telemetry.md](docs/telemetry.md) for this and the other `SELFHOST_TELEMETRY_*` settings |
 | `PORT` | Listener port, default `3000` |
+| `SELFHOST_AMP_ENABLED` | Optional `true` turns on Amp control (default `false`). Off: every Amp route answers 404 `{"error":"Not found"}` before authentication and no outbox worker runs. See [docs/amp.md](docs/amp.md) |
+| `AMP_TRANSPORT_ORIGIN` / `AMP_TRANSPORT_TOKEN[_FILE]` | Optional, set together. Bare https origin of the persistent Amp process service and its bearer (at least 32 bytes); calls go to `POST /v1/internal/amp/operation`. Unset: every Amp operation answers 503 `amp_transport_not_configured` |
+| `SELFHOST_AMP_INTERNAL_SECRET` | Optional (`_FILE` supported), at least 32 bytes. Bearer for `POST /api/v1/internal/amp/job` (scheduler sweeps and inject jobs). Unset: that route answers 404 |
+| `SELFHOST_AMP_WORKER_INTERVAL_MS` / `SELFHOST_AMP_LEASE_MS` | Outbox drain interval, default 5000 (250-600000), and delivery lease, default 120000 (1000-3600000). An expired lease becomes `unknown` and is never resent |
 | `HOST` | Listener address, default `0.0.0.0` |
 
 Sensitive variables also accept a mutually exclusive `_FILE` form. The API
