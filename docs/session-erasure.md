@@ -13,7 +13,7 @@ Set both on relay-control:
 | `SESSION_ERASE_API_URL` | Internal origin of the session pipeline's erase endpoint |
 | `SESSION_ERASE_API_SECRET` (or `_FILE`) | Dedicated Control-to-pipeline secret, at least 32 bytes. Do not reuse `SESSION_READ_API_SECRET` |
 
-While unset, both routes answer 501 `not_implemented`. `SELFHOST_OPERATOR_CONTROLS` (`always`, `licence`, `off`) gates
+While unset, both routes answer 501 `not_implemented`. `SELFHOST_OPERATOR_CONTROLS` (`always`, `off`) gates
 `DELETE` exactly as it gates capture-policy writes (403 `operator_controls_not_entitled`); the read is never gated.
 
 ## Delete a session

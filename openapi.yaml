@@ -1438,22 +1438,25 @@ paths:
                 $ref: "#/components/schemas/Whoami"
         "401":
           description: Invalid, expired, rotated, or revoked bearer
-  /api/v1/license:
+  /api/v1/capabilities:
     get:
-      operationId: getLicense
+      operationId: getCapabilities
       description: |
-        Installation capability read for any signed-in member (bearer or, on
-        the /cloud mount, the session cookie). Entitlement is per installation,
-        so there is no organization or workspace parameter. Carries no secret
-        material. `capabilities` is the only field a client uses to show or
-        hide a feature. Not available to the bootstrap bearer.
+        Optional features this installation serves, for any signed-in member
+        (bearer or, on the /cloud mount, the session cookie). Selection is per
+        installation, so there is no organization or workspace parameter. Not
+        available to the bootstrap bearer.
       responses:
         "200":
-          description: Licence status, selection, entitlement and capabilities
+          description: Selected optional features
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/License"
+                type: object
+                required: [capabilities]
+                properties:
+                  capabilities:
+                    $ref: "#/components/schemas/FeatureCapabilities"
         "401":
           description: Missing, invalid, or expired user token
   /api/v1/analytics/events:
@@ -2678,10 +2681,11 @@ paths:
         - bearerAuth: []
       operationId: getDashboardSessionEvents
       description: |
-        Calls only RelayHistory `GET /v1/sessions/{sessionId}/events`, with
-        explicit `workspace={authorized workspace UUID}`, `source`, and
-        `order=asc` (default) or `order=desc`, `includeMessageId=true`.
-        Returned events are validated and each page is ordered oldest-first.
+        Calls `GET /v1/sessions/{sessionId}/events` with explicit
+        `workspace={authorized workspace UUID}`, `source`, and `order=asc`
+        (default) or `order=desc` on the sessions read API with a read token
+        issued for the caller. Returned events are validated and each page is
+        ordered oldest-first.
       parameters:
         - name: source
           in: query
@@ -3254,7 +3258,7 @@ paths:
                     items:
                       $ref: "#/components/schemas/EnrollmentTokenSummary"
         "403":
-          description: Workspace admin role required (`forbidden`), or Relayflows is not a capability on this installation (`feature_not_enabled` / `feature_not_licensed`, body FeatureRefusal with feature `flows`)
+          description: Workspace admin role required (`forbidden`), or Relayflows is not enabled on this installation (`feature_not_enabled`, body FeatureRefusal with feature `flows`)
     post:
       tags: [workers]
       operationId: createWorkerEnrollmentToken
@@ -3311,7 +3315,7 @@ paths:
                   startCommand:
                     type: string
         "403":
-          description: Workspace admin role required (`forbidden`), or Relayflows is not a capability on this installation (`feature_not_enabled` / `feature_not_licensed`, body FeatureRefusal with feature `flows`)
+          description: Workspace admin role required (`forbidden`), or Relayflows is not enabled on this installation (`feature_not_enabled`, body FeatureRefusal with feature `flows`)
   /api/v1/workers/enrollment-tokens/{tokenId}:
     delete:
       tags: [workers]
@@ -7181,17 +7185,11 @@ components:
           type: string
     Readiness:
       type: object
-      required: [status, introspection, license, capabilities]
+      required: [status, introspection, capabilities]
       properties:
         status:
           type: string
           enum: [ready, not_ready]
-        license:
-          type: object
-          required: [status]
-          properties:
-            status:
-              $ref: "#/components/schemas/LicenseStatus"
         capabilities:
           $ref: "#/components/schemas/FeatureCapabilities"
         introspection:
@@ -7205,86 +7203,23 @@ components:
               type: array
               description: Normalized origins POST /internal/v1/auth/introspect accepts as `aud`; empty while disabled.
               items: { type: string }
-    LicenseStatus:
-      type: string
-      enum: [absent, valid, expired, invalid]
-      description: |
-        absent: no SELFHOST_LICENSE / SELFHOST_LICENSE_FILE. invalid: bad
-        signature, malformed claims, unreadable file, or no trusted public key
-        (the key ships null in this build). expired: signature verifies but
-        expires_at has passed. A non-valid licence never stops the server; it
-        runs as core.
     FeatureCapabilities:
       type: object
       required: [flows, relayfile, chief]
       additionalProperties: false
-      description: selected AND entitled for paid features (flows, relayfile); selected alone for chief.
+      description: Names in SELFHOST_FEATURES (unset or empty selects nothing).
       properties:
         flows: { type: boolean }
         relayfile: { type: boolean }
         chief: { type: boolean }
-    License:
-      type: object
-      required: [status, license_id, customer, expires_at, seats, features, paid, selected, entitled, capabilities]
-      properties:
-        status:
-          $ref: "#/components/schemas/LicenseStatus"
-        license_id:
-          type: [string, "null"]
-          format: uuid
-        customer:
-          type: [string, "null"]
-        expires_at:
-          type: [string, "null"]
-          format: date-time
-        seats:
-          description: Reported, not enforced. `used` counts organization members, owners included, across the installation. Null unless the licence signature verified (valid or expired).
-          oneOf:
-            - type: "null"
-            - type: object
-              required: [limit, used]
-              properties:
-                limit: { type: integer, minimum: 1 }
-                used: { type: integer, minimum: 0 }
-        features:
-          type: array
-          description: Paid features the licence entitles; empty unless status is valid.
-          items: { type: string, enum: [flows, relayfile] }
-        paid:
-          type: array
-          description: Feature classes that need entitlement.
-          items: { type: string, enum: [flows, relayfile] }
-        selected:
-          type: object
-          required: [flows, relayfile, chief]
-          additionalProperties: false
-          description: Names in SELFHOST_FEATURES (unset or empty selects nothing).
-          properties:
-            flows: { type: boolean }
-            relayfile: { type: boolean }
-            chief: { type: boolean }
-        entitled:
-          type: object
-          required: [flows, relayfile]
-          additionalProperties: false
-          description: status is valid and the licence lists the feature.
-          properties:
-            flows: { type: boolean }
-            relayfile: { type: boolean }
-        capabilities:
-          $ref: "#/components/schemas/FeatureCapabilities"
     FeatureRefusal:
       type: object
       required: [error, message, feature]
       properties:
         error:
           type: string
-          enum: [feature_not_enabled, feature_not_licensed]
-          description: |
-            feature_not_enabled: the operator has not selected the feature in
-            SELFHOST_FEATURES. feature_not_licensed: a paid feature (flows,
-            relayfile) is selected but the licence is absent, invalid, expired
-            or does not list it. Chief never answers feature_not_licensed.
+          enum: [feature_not_enabled]
+          description: The operator has not selected the feature in SELFHOST_FEATURES.
         message: { type: string }
         feature:
           type: string

@@ -9,6 +9,7 @@ import { PostgresDatabase } from "./database.js";
 import { ControlPlaneStore } from "./store.js";
 import { loadFlowsConfig } from "./flows/config.js";
 import { FlowsStore } from "./flows/store.js";
+import { lazyFlowsStore } from "./flows/lazy.js";
 import { loadTelemetryConfig } from "./telemetry/config.js";
 import { createTelemetryModule } from "./telemetry/module.js";
 import { loadIdentityConfig } from "./identity/config.js";
@@ -16,8 +17,7 @@ import { IdentityStore } from "./identity/store.js";
 import { smtpMailer } from "./identity/mailer.js";
 import { createIdentityModule } from "./identity/routes.js";
 import { relaycastProvisioner, startBootstrap } from "./identity/bootstrap.js";
-import { loadLicense } from "./license/load.js";
-import { gateCredentialVerifier } from "./license/resolver.js";
+import { FEATURES, gateCredentialVerifier, loadSelectedFeatures } from "./features.js";
 import { loadAmpConfig } from "./amp/config.js";
 import { createAmpModule } from "./amp/module.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
@@ -33,9 +33,9 @@ import {
 } from "./analytics/lifecycle.js";
 
 const config = loadConfig();
-// SELFHOST_FEATURES and the add-on licence. Only configuration mistakes throw;
-// a bad or expired licence is logged once and the installation runs as core.
-const license = loadLicense();
+// An unknown SELFHOST_FEATURES name stops startup.
+const features = loadSelectedFeatures();
+console.log("[selfhost-api] features selected", FEATURES.filter((feature) => features[feature]));
 const database = new PostgresDatabase(config.databaseUrl);
 
 // bootstrap-signup lane: first-boot org/workspace, OIDC/email sign-in, invites.
@@ -66,22 +66,26 @@ const identity = createIdentityModule({
   dashboardUrl: config.dashboardUrl,
   mailer: identityConfig.smtp ? smtpMailer(identityConfig.smtp) : null,
 });
-const flows = new FlowsStore(
-  database,
-  config.encryptionKeyring,
-  loadFlowsConfig(),
-  config.relaycastPublicUrl,
-);
+const flows = lazyFlowsStore(() => {
+  const instance = new FlowsStore(
+    database,
+    config.encryptionKeyring,
+    loadFlowsConfig(),
+    config.relaycastPublicUrl,
+  );
+  instance.cliCredentials = admin.logins;
+  return instance;
+});
 const admin = createAdminModule({
   config,
   database,
   keyring: config.encryptionKeyring,
   // Flows worker credentials may read their own workspace's runtime environment.
-  // Refused with the Flows feature code while Flows is not a capability.
-  runtimeCredentialVerifier: gateCredentialVerifier((t: string) => flows.verifyRuntimeCredential(t), license, "flows"),
+  // Refused with the Flows feature code while Flows is not selected.
+  runtimeCredentialVerifier: gateCredentialVerifier((t: string) => flows().verifyRuntimeCredential(t), features, "flows"),
 });
-// Subscription logins reach runs through a reference in the assignment payload.
-flows.cliCredentials = admin.logins;
+// Selected Flows retains startup validation; core does not parse optional config.
+if (features.flows) flows();
 const telemetryConfig = loadTelemetryConfig(process.env, {
   probes: [
     { name: "relaycast", url: `${config.relaycastUrl}/health` },
@@ -122,8 +126,8 @@ emitConfigLoaded(analytics, {
     emailLink: identityConfig.emailLogin,
     smtp: identityConfig.smtp !== null,
   },
-  // The flows module is always mounted in this binary.
-  flowsEnabled: true,
+  // Report whether optional Flows is actually selected.
+  flowsEnabled: features.flows,
   operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
 });
 const server = createServer(createApp({
@@ -134,7 +138,7 @@ const server = createServer(createApp({
   telemetry,
   identity,
   factory,
-  license,
+  features,
   amp,
   analytics: { port: analytics, config: analyticsConfig },
   mcpOAuthTeardown,

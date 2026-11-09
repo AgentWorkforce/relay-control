@@ -18,6 +18,14 @@ assigned at release.
   name. `POST .../relayhistory/session` no longer answers 501
   `sync_not_served`: `mode=sync` returns the caller's own token for the ingest
   edge. See [docs/sessions-read-api.md](docs/sessions-read-api.md).
+- Self-host licensing is gone. Control no longer reads `SELFHOST_LICENSE`,
+  `SELFHOST_LICENSE_FILE` or a licence key, and never answers
+  `feature_not_licensed`. `SELFHOST_FEATURES` alone turns Flows, Relayfile and
+  Chief on; a feature that is not selected answers 403 `feature_not_enabled`.
+  `GET /api/v1/license` is replaced by `GET /api/v1/capabilities`, `/readyz`
+  drops its `license` field, and `SELFHOST_OPERATOR_CONTROLS` drops the
+  `licence` mode (which already behaved as `off`, and still does as an
+  unrecognised value). See [docs/features.md](docs/features.md).
 - Hosted MCP OAuth connectors are now **on by default**. Set
   `SELFHOST_MCP_OAUTH=off` (or `false`/`0`) to disable them; `on`/`true`/`1`
   enable them explicitly, and any other spelling stops start-up.
