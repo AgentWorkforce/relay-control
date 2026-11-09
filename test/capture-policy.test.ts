@@ -71,7 +71,7 @@ test("capture policy: member read, owner/admin write, revisions, audit and CSRF"
     `${tenant.organizationId} revision=2 keys=oops_window_seconds,sharing_mode,upload_control,user_retroactive_delete`,
   );
   assert.ok(audit.rows[0]!.actor_id);
-  assert.doesNotMatch(audit.rows.map((row) => row.target).join(" "), /operator|900|selected/);
+  assert.doesNotMatch(audit.rows.map((row) => row.target!.replaceAll(tenant.organizationId, "")).join(" "), /operator|900|selected/);
 
   // Invalid input is refused with the key named; nothing changes.
   for (const [body, pattern] of [
