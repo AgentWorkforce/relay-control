@@ -5,6 +5,12 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `SELFHOST_INTROSPECT_OUTAGE_HOLD_MS` (default off) lets
+  `POST /internal/v1/auth/introspect` answer a Desktop `sh_at_` token from its
+  last active verdict, marked `held: true` with `exp` clamped, while the
+  database is unreachable, so uploads survive short outages. Connection errors
+  only; machine claims are never held. `GET /readyz` reports
+  `introspection.outageHoldMs`.
 - Fixed: analytics collector startup restores private committed-segment
   permissions after volume remounts, and refuses to listen if recovery fails.
 - Added: the analytics collector accepts registered session ingest, reader and

@@ -247,6 +247,25 @@ test("token introspection is required and validates its secret and audiences", (
   }
 });
 
+test("the introspection outage hold is default off and strictly bounded", () => {
+  assert.equal(loadConfig(completeEnv).introspectOutageHoldMs, 0);
+  const hold = (value: string) => loadConfig({ ...completeEnv, SELFHOST_INTROSPECT_OUTAGE_HOLD_MS: value });
+  assert.equal(hold("").introspectOutageHoldMs, 0);
+  assert.equal(hold("0").introspectOutageHoldMs, 0);
+  assert.equal(hold("1000").introspectOutageHoldMs, 1_000);
+  assert.equal(hold("60000").introspectOutageHoldMs, 60_000);
+  assert.equal(hold("3600000").introspectOutageHoldMs, 3_600_000);
+  for (const invalid of ["500", "999", "abc", "3600001", "-1", "1e4", "60000.5", "0x10", "60 000"]) {
+    assert.throws(
+      () => hold(invalid),
+      (error: unknown) => error instanceof Error &&
+        error.message.includes("SELFHOST_INTROSPECT_OUTAGE_HOLD_MS") &&
+        !error.message.includes(invalid),
+      invalid,
+    );
+  }
+});
+
 test("secret files and direct values cannot be combined", () => {
   assert.throws(
     () => loadConfig({

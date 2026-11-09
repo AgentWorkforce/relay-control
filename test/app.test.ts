@@ -228,7 +228,7 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
   assert.equal(health.status, 200);
   const readyz = await jsonRequest(controlOrigin, "/readyz");
   assert.equal(readyz.status, 200);
-  assert.deepEqual(readyz.body.introspection, { enabled: false, audiences: [] });
+  assert.deepEqual(readyz.body.introspection, { enabled: false, audiences: [], outageHoldMs: 0 });
   const cloudHealth = await jsonRequest(controlOrigin, "/cloud/api/health");
   assert.equal(cloudHealth.status, 200);
   assert.equal(cloudHealth.body.status, "ok");

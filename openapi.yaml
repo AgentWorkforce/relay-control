@@ -5055,6 +5055,9 @@ paths:
                       iat: { type: integer }
                       exp: { type: integer }
                       token_id: { type: string, pattern: "^[0-9a-f]{32}$" }
+                      held:
+                        const: true
+                        description: Present and true only when the answer was served from Control's last authoritative verification during a database outage; `exp` is then clamped to the end of the hold.
                   - type: object
                     additionalProperties: false
                     required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, scopes, aud, iat, exp, token_id]
@@ -7278,6 +7281,10 @@ components:
               type: array
               description: Normalized origins POST /internal/v1/auth/introspect accepts as `aud`; empty while disabled.
               items: { type: string }
+            outageHoldMs:
+              type: integer
+              minimum: 0
+              description: SELFHOST_INTROSPECT_OUTAGE_HOLD_MS in effect (0 = off); how long a Desktop token's last active verdict may answer during a database outage.
     FeatureCapabilities:
       type: object
       required: [flows, relayfile, chief]

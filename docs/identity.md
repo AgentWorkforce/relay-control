@@ -660,6 +660,47 @@ effect on the next check. Without `machine` the answer carries
 `machine_id: null` and History treats the caller as read-only. History takes
 the machine id only from this answer, never from its own caller.
 
+#### Database outage hold
+
+The ingest edge has no positive cache, so without help every Desktop upload
+stops the moment Control's database stops answering, even for tokens Control
+verified seconds earlier. `SELFHOST_INTROSPECT_OUTAGE_HOLD_MS` closes that gap
+for Desktop user tokens. It is off by default (unset or `0`); otherwise it is
+an integer from 1000 to 3600000 milliseconds, and any other value refuses
+startup. `GET /readyz` shows the value in effect as
+`introspection.outageHoldMs`.
+
+While the database answers nothing changes: every introspection runs the
+query, and the hold is never consulted. Each active answer for an `sh_at_`
+token is remembered in memory, keyed by the token hash (never the token),
+with the time of the check; an `unknown`, `revoked` or `expired` answer
+removes it. At most 10000 tokens are remembered per process, least recently
+used first out. When the query then fails with a connection-class database
+error (connection refused, reset or timed out, DNS failure, pool connect
+timeout, connection terminated, SQLSTATE class `08`, `57P01`-`57P03`,
+`53300`), and only then, the remembered answer for that token is served if it
+is at most the hold old and the token has not expired. Held answers stop one
+second before the hold or the token would run out, so a verifier never reads
+a held `exp` as already passed. Any other error, a
+token with no remembered answer, or a stale one still fails with 500 as
+before, so the edge keeps answering 503. The hold is per process: each
+replica remembers only the tokens it verified itself.
+
+The verifier sees the normal active answer plus `held: true`, with `exp`
+clamped to the earlier of the token's expiry and the end of the hold. The
+audience and `workspace` checks still run against the request. A request that
+sends `machine` is never held: machine ownership needs the node-claims query,
+so it still fails with 500. `sh_wk_` and `sh_fr_` tokens are never held.
+
+The bound this accepts: a revocation, membership removal or workspace removal
+that happened after the token's last successful introspection and before the
+outage is not visible until the hold runs out or the database returns. The
+Desktop uploads, and so introspects, continuously, so for an active Desktop
+that window is the gap since its last upload. Each held answer is logged as
+`[selfhost-api] token introspection held` with `token_id`, `aud`,
+`workspace`, `age_ms` (time since the last successful check) and `cause` (the
+error's errno or SQLSTATE); the token is never logged.
+
 #### Relayfile agent tokens
 
 An agent that talks to relayfile presents a workspace API token of purpose

@@ -61,6 +61,12 @@ export type SelfhostConfig = {
    */
   introspectAudiences?: string[];
   /**
+   * SELFHOST_INTROSPECT_OUTAGE_HOLD_MS: how long an `sh_at_` token's last
+   * ACTIVE introspection verdict may answer while the database is unreachable
+   * (docs/identity.md, "Database outage hold"). Unset or 0: off.
+   */
+  introspectOutageHoldMs?: number;
+  /**
    * Dormant cloud-class acquisition assertion issuer
    * (SELFHOST_ACQUISITION_ISSUER_ENABLED). Unset or null: off, and every
    * /api/v1/acquisition/* route answers 404.
@@ -514,9 +520,34 @@ function audienceOrigin(value: string, label: string): string {
   return value.replace(/\/+$/, "");
 }
 
+export const INTROSPECT_OUTAGE_HOLD_MIN_MS = 1_000;
+export const INTROSPECT_OUTAGE_HOLD_MAX_MS = 3_600_000;
+
+/**
+ * SELFHOST_INTROSPECT_OUTAGE_HOLD_MS: unset or `0` is off, otherwise an
+ * integer from 1000 to 3600000. Startup fails naming the variable, never
+ * its value.
+ */
+export function loadIntrospectOutageHoldMs(env: Env): number {
+  const raw = env.SELFHOST_INTROSPECT_OUTAGE_HOLD_MS?.trim();
+  if (!raw) return 0;
+  const value = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+  if (value === 0) return 0;
+  if (
+    !Number.isSafeInteger(value) ||
+    value < INTROSPECT_OUTAGE_HOLD_MIN_MS || value > INTROSPECT_OUTAGE_HOLD_MAX_MS
+  ) {
+    throw new Error(
+      "SELFHOST_INTROSPECT_OUTAGE_HOLD_MS must be 0 (off) or an integer from 1000 to 3600000",
+    );
+  }
+  return value;
+}
+
 function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
   introspectSecret: string | null;
   introspectAudiences: string[];
+  introspectOutageHoldMs: number;
 } {
   const introspectSecret = readSecret(env, "RELAYCONTROL_INTROSPECT_SECRET") ?? null;
   if (introspectSecret !== null && Buffer.byteLength(introspectSecret) < 32) {
@@ -530,7 +561,7 @@ function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
   if (introspectAudiences.length === 0) {
     throw new Error("SELFHOST_INTROSPECT_AUDIENCES must name at least one origin");
   }
-  return { introspectSecret, introspectAudiences };
+  return { introspectSecret, introspectAudiences, introspectOutageHoldMs: loadIntrospectOutageHoldMs(env) };
 }
 
 /**
