@@ -37,9 +37,15 @@ Included:
   and presence plus RelayHistory; no running flows), relay messaging (DMs,
   inbox and channels as a hosted Relaycast participant per MCP session or
   `join_relay` name, kept in `hosted_relay_participants`), and
-  capability discovery tool groups. Launches, person-identity sends
-  (`as_person`) and desktop-linked identity (`join_relay desktop_address`) are
-  not yet available.
+  capability discovery tool groups. `join_relay desktop_address` (the address
+  from `GET /whoami` on the local relay socket, or an injected `[reply: ...]`
+  hint) links the MCP session to a synced Agent Relay Desktop identity, kept in
+  `desktop_relay_session_bindings`: DMs, channel posts, `relay_status` and
+  `check_relay_inbox` then act as that identity and replies are injected by
+  Desktop, while the hosted participant stays the fallback inbox. Hosted
+  `join_relay name` or `leave_relay` removes the link, and a Desktop re-sync
+  that drops the identity removes it too. Launches and person-identity sends
+  (`as_person`) are not yet available.
 - provider catalog at `GET /api/v1/workspaces/:id/providers` (and in
   `describe_capabilities`): Amp, Factory, Copilot, Capy, Replicas, Dot and Grok
   Bot descriptors with separate `implemented`/`configured`/`enabled` runtime

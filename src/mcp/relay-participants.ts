@@ -2,7 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { decryptSecret, encryptSecret } from "../crypto.js";
 import type { SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RosterAgent } from "../messaging/relaycast.js";
-import { DesktopIdentityUnavailable, DESKTOP_IDENTITY_MESSAGES, linkedDesktopIdentity } from "../messaging/desktop-identities.js";
+import {
+  bindDesktopSession, DesktopIdentityUnavailable, DESKTOP_IDENTITY_MESSAGES, findDesktopIdentityByAddress,
+  findDesktopIdentityBySession, linkedDesktopIdentity, unbindDesktopSession, verifyDesktopIdentity,
+  type DesktopIdentityRow, type LinkedDesktopIdentity,
+} from "../messaging/desktop-identities.js";
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
@@ -24,9 +28,14 @@ import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } f
  * verified native chat (a Copilot chat named by a verified attestation). No
  * verified chat, or no matching synced identity, means the actor tools are
  * unavailable; they never fall back to a hosted participant.
- * Other callers act as hosted participants; their native session context is
- * not an identity here. Person sends (`as_person`), OAuth grants, events
- * inboxes, launches and Capy are not part of self-host.
+ * Other native MCP sessions may link to one of the owner's synced Desktop
+ * identities with join_relay desktop_address (a row in
+ * desktop_relay_session_bindings keyed by the session hash). A linked
+ * session acts as that identity unless `as` names a hosted participant, so
+ * DMs and channel posts reach the Desktop natively; an unlinked session acts
+ * as its hosted participant. OAuth grants act only as their approved agent
+ * and never link. Person sends (`as_person`), events inboxes, launches and
+ * Capy are not part of self-host.
  */
 
 export class RelayToolError extends Error {
@@ -39,8 +48,6 @@ export class RelayToolError extends Error {
 export const ownerHash = (id: string) => createHash("sha256").update(id).digest("hex");
 
 export const HOSTED_SOURCE = "cloud-hosted-mcp";
-export const DESKTOP_ADDRESS_UNAVAILABLE =
-  "Desktop-linked identity is not yet available on this self-hosted site; call join_relay with name instead.";
 const AS_PERSON_UNAVAILABLE =
   "as_person is not available on this self-hosted site. Omit it to act as this MCP session's hosted participant.";
 
@@ -49,10 +56,14 @@ export const HOSTED_REPLY_GUIDANCE = "replies arrive in check_relay_inbox; poll 
 export const DESKTOP_REPLY_GUIDANCE = "replies will be injected into your session by Agent Relay Desktop";
 export const MANAGED_AS_REFUSED = "This managed chat can only act as its verified desktop identity.";
 export const MANAGED_JOIN_REFUSED = "This chat can only use its verified desktop identity.";
-/** Cloud's DESKTOP_RELAY_GUIDANCE, adapted: self-host cannot link a desktop identity yet. */
-export const DESKTOP_RELAY_GUIDANCE = "This self-hosted site does not link Agent Relay Desktop identities yet: this MCP session messages as its hosted participant, and replies arrive in check_relay_inbox.";
-/** Cloud's UNLINKED_CHANNEL_GUIDANCE without the desktop link, which self-host does not offer. */
-export const UNLINKED_CHANNEL_GUIDANCE = "This MCP session has not joined Agent Relay, so it has no identity for channels. To use this MCP session's hosted inbox (posts arrive in check_relay_inbox; poll it), pass hosted: true, or call join_relay first.";
+/** Cloud's DESKTOP_RELAY_GUIDANCE without the web-session sentence: self-host has no web sessions. */
+export const DESKTOP_RELAY_GUIDANCE = "If this session receives Agent Relay messages with a `[reply: curl --unix-socket …]` hint or has a desktop address from GET /whoami, call join_relay with desktop_address first; DMs and subscribed channel posts are then injected.";
+export const UNLINKED_CHANNEL_GUIDANCE = "This MCP session is not linked to Agent Relay Desktop, so channel posts would not reach your local session. Call join_relay with desktop_address (from GET /whoami on the relay socket, or an injected Agent Relay message), then retry. To use this MCP session's hosted inbox instead (posts arrive in check_relay_inbox; poll it), pass hosted: true.";
+export const DESKTOP_NOT_SYNCED = "That desktop identity is not synced to your account in this workspace. Is Agent Relay Desktop running and signed in?";
+const DESKTOP_LINK_FIELDS = "desktop_address cannot be combined with name or description.";
+const DESKTOP_LINK_NEEDS_SESSION = "Initialize MCP to receive Mcp-Session-Id before linking a desktop identity.";
+const DESKTOP_LINK_OAUTH = "This connection acts only as the agent approved for it and cannot link a desktop identity. Use a native MCP session (one that keeps Mcp-Session-Id) to call join_relay with desktop_address.";
+const DESKTOP_INBOX_GUIDANCE = "Replies are injected into your session by Agent Relay Desktop; check_relay_inbox is not used for this linked identity.";
 const CHANNEL_REPLY_GUIDANCE = "Reply to a post in this channel with post_relay_channel channel=<name> thread_id=<message_id>. Use send_relay_message only when the reply is private.";
 const RESERVED_CHANNEL_PREFIX = "agent-events-";
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,79}$/;
@@ -200,7 +211,9 @@ export function relayFailure(error: unknown, operation?: RelayToolOperation) {
 // ---------------------------------------------------------------------------
 // The per-request relay service.
 
-type Identity = { name: string; token: string };
+/** `desktop` marks a synced Agent Relay Desktop identity; its deliveries are injected, not polled. */
+type Identity = { name: string; token: string; desktop?: boolean };
+type DesktopActor = LinkedDesktopIdentity & { desktop: true };
 /**
  * `remotePresent` and the ownership checks come from the token or, when
  * Relaycast rejects it, from the workspace-key roster; `tokenUsable` says
@@ -236,25 +249,48 @@ function createRelayService(context: McpContext) {
   const desktopCall = context.desktopCall;
   /** A Desktop-provider credential: only the verified native chat's identity may act. */
   const managed = desktopCall.provider !== undefined;
-  const linkedKind = managed ? "desktop" as const : "hosted" as const;
-  const channelDelivery = managed ? desktopChannelDelivery : hostedChannelDelivery;
-  let linked: Promise<{ name: string; address: string; token: string }> | undefined;
+  const linkedKind = (identity: Identity) => identity.desktop ? "desktop" as const : "hosted" as const;
+  const channelDelivery = (identity: Identity, channel: string) =>
+    identity.desktop ? desktopChannelDelivery(channel) : hostedChannelDelivery(channel);
+  let linked: Promise<DesktopActor> | undefined;
 
   /** The synced Desktop identity of this call's verified native chat; throws when there is none. */
   function desktop() {
     linked ??= (async () => {
       if (!desktopCall.nativeSession) throw new RelayToolError(DESKTOP_IDENTITY_MESSAGES.unverified);
       try {
-        return await linkedDesktopIdentity({
+        return { ...await linkedDesktopIdentity({
           database, keyring, client, workspaceId, userId, relaycastWorkspaceId: relayWorkspaceId,
           nativeSession: desktopCall.nativeSession, sourceId: desktopCall.nativeSourceId,
-        });
+        }), desktop: true as const };
       } catch (error) {
         if (error instanceof DesktopIdentityUnavailable) throw new RelayToolError(error.message);
         throw error;
       }
     })();
     return linked;
+  }
+
+  /** Re-checks a stored identity with Relaycast; failures become tool errors. */
+  async function verifiedDesktop(row: DesktopIdentityRow): Promise<DesktopActor> {
+    try {
+      return { ...await verifyDesktopIdentity({ keyring, client, userId, relaycastWorkspaceId: relayWorkspaceId, row }),
+        desktop: true as const };
+    } catch (error) {
+      if (error instanceof DesktopIdentityUnavailable) throw new RelayToolError(error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * The Desktop identity this native MCP session linked with join_relay
+   * desktop_address, verified again on every call; null when it has none.
+   * Managed and OAuth calls never use a session link.
+   */
+  async function linkedDesktop(query: SqlExecutor = executor): Promise<DesktopActor | null> {
+    if (managed || oauth || !sessionHash) return null;
+    const row = await findDesktopIdentityBySession(query, workspaceId, userId, sessionHash);
+    return row ? verifiedDesktop(row) : null;
   }
 
   /** Managed calls cannot choose another actor. */
@@ -465,7 +501,7 @@ function createRelayService(context: McpContext) {
       return { joined: true, linked: "desktop" as const, name: identity.name, address: identity.address,
         already_joined: true, reply_guidance: DESKTOP_REPLY_GUIDANCE };
     }
-    if (input.desktop_address) throw new RelayToolError(DESKTOP_ADDRESS_UNAVAILABLE);
+    if (input.desktop_address) return joinDesktop(input.desktop_address.trim(), input);
     if (oauth && !oauth.access.agentRemoteId) oauth.assertActor(input.name);
     if (!sessionHash && !input.name && !oauth) {
       throw new RelayToolError("Initialize MCP to receive Mcp-Session-Id, or pass an explicit name and use as on later calls.");
@@ -485,11 +521,14 @@ function createRelayService(context: McpContext) {
         }
         const token = existing.tokenUsable ? existing.token : await recoverToken(tx, existing);
         if (sessionHash && !existing.row.sessionHash) await updateParticipant(tx, existing.row.id, { sessionHash });
+        await unlinkDesktop(tx);
         return { name: existing.name, token, alreadyJoined: true, recovered: !existing.tokenUsable };
       }
       const ownerLabel = context.principal.name.trim() || context.principal.email || userId;
       const registered = await registerParticipant(tx, requestedName, sessionHash,
         input.description ?? `Hosted MCP inbox participant acting for ${ownerLabel}`);
+      // Joining a hosted participant replaces this session's desktop link.
+      await unlinkDesktop(tx);
       return { name: registered.name, token: registered.token, alreadyJoined: false, recovered: false };
     });
     await touchPresence(joined.token);
@@ -497,11 +536,75 @@ function createRelayService(context: McpContext) {
       already_joined: joined.alreadyJoined, recovered: joined.recovered, reply_guidance: HOSTED_REPLY_GUIDANCE, desktop_relay_guidance: DESKTOP_RELAY_GUIDANCE };
   }
 
-  /** The participant `as` names, else this session's, auto-joining this session when it has none. */
+  /** Callers hold the owner lock. */
+  async function unlinkDesktop(tx: SqlExecutor): Promise<void> {
+    if (sessionHash && !oauth) await unbindDesktopSession(tx, { workspaceId, userId, sessionHash });
+  }
+
+  /**
+   * join_relay desktop_address: link this native MCP session to one of the
+   * owner's synced Desktop identities, ported from Cloud's joinUncached. The
+   * session's hosted participant, if any, is released once the link is
+   * written; a failed release removes the link again.
+   */
+  async function joinDesktop(address: string, input: { name?: string; description?: string }) {
+    if (input.name || input.description) throw new RelayToolError(DESKTOP_LINK_FIELDS);
+    if (oauth) throw new RelayToolError(DESKTOP_LINK_OAUTH);
+    if (!sessionHash) throw new RelayToolError(DESKTOP_LINK_NEEDS_SESSION);
+    const linkedSession = sessionHash;
+    const owned = { workspaceId, userId, sessionHash: linkedSession };
+    const joined = await withOwnerLock(async (tx) => {
+      const row = await findDesktopIdentityByAddress(tx, workspaceId, userId, address);
+      if (!row) throw new RelayToolError(DESKTOP_NOT_SYNCED);
+      const identity = await verifiedDesktop(row);
+      const current = await findDesktopIdentityBySession(tx, workspaceId, userId, linkedSession);
+      const bind = async () => {
+        try {
+          await bindDesktopSession(tx, { ...owned, identityId: row.id });
+        } catch (error) {
+          if (error instanceof DesktopIdentityUnavailable) throw new RelayToolError(error.message);
+          throw error;
+        }
+      };
+      if (current?.id === row.id) {
+        // A repeat join is fresh proof the tools are loaded: re-binding moves
+        // linked_at past a desktop re-registration of this agent.
+        await bind();
+        return { identity, alreadyJoined: true };
+      }
+      const hosted = await participant(undefined, { allowGone: true, allowRejected: true, executor: tx });
+      await bind();
+      try {
+        if (hosted) {
+          if (hosted.remotePresent) {
+            try {
+              await client.releaseHosted(key, hosted.name, hosted.row.agentRemoteId);
+            } catch (error) {
+              // A concurrent remote deletion also completes the release.
+              if (!(error instanceof RelaycastCallError) || error.status !== 404 || await client.getAgent(key, hosted.name)) throw error;
+            }
+          }
+          await removeParticipant(tx, hosted.row.id);
+        }
+      } catch (error) {
+        await unbindDesktopSession(tx, owned);
+        throw error;
+      }
+      return { identity, alreadyJoined: false };
+    });
+    return { joined: true, linked: "desktop" as const, name: joined.identity.name, address: joined.identity.address,
+      already_joined: joined.alreadyJoined, reply_guidance: DESKTOP_REPLY_GUIDANCE };
+  }
+
+  /** The linked Desktop identity, else the participant `as` names or this session's, auto-joining this session when it has none. */
   async function hostedActor<T>(as: string | undefined, fn: (identity: Identity) => Promise<T>): Promise<T> {
     if (managed) {
       await managedActorOnly(as);
       return fn(await desktop());
+    }
+    if (!as) {
+      const linkedIdentity = await linkedDesktop();
+      if (linkedIdentity) return fn(linkedIdentity);
     }
     let hosted = await participant(as, { allowMissing: Boolean(oauth) });
     if (!hosted) {
@@ -514,10 +617,11 @@ function createRelayService(context: McpContext) {
   }
 
   /**
-   * The identity channel tools act as: a hosted participant chosen by `as`,
-   * `hosted: true`, or the one this session already joined; auto-joined only
-   * when `create`. Unchosen, `unlinked` decides: "error" throws, "none" acts
-   * as nobody.
+   * The identity channel tools act as: the linked Desktop identity unless
+   * `as` names a hosted participant, else a hosted participant chosen by
+   * `as`, `hosted: true`, or the one this session already joined; auto-joined
+   * only when `create`. Unchosen, `unlinked` decides: "error" throws, "none"
+   * acts as nobody.
    */
   async function channelActor<T>(input: ChannelInput, create: boolean, fn: (identity: Identity) => Promise<T>,
     unlinked: "error" | "none" = "error"): Promise<T | null> {
@@ -529,6 +633,9 @@ function createRelayService(context: McpContext) {
     }
     if (input.as_person) throw new RelayToolError(AS_PERSON_UNAVAILABLE);
     if (!input.as) {
+      // As in Cloud, a link wins over hosted: true; linking released this session's hosted participant.
+      const linkedIdentity = await linkedDesktop();
+      if (linkedIdentity) return fn(linkedIdentity);
       const chosen = oauth || input.hosted || (sessionHash && await findParticipant(executor, workspaceId, userId, organizationId, { sessionHash }));
       if (!chosen) {
         if (unlinked === "none") return null;
@@ -570,6 +677,11 @@ function createRelayService(context: McpContext) {
         return { joined: false, desktop_agent_unchanged: true, native_chat_identity_retained: true };
       }
       return withOwnerLock(async (tx) => {
+        if (!as && sessionHash && !oauth && await findDesktopIdentityBySession(tx, workspaceId, userId, sessionHash)) {
+          // Unlinking leaves the Desktop's own agent running.
+          await unlinkDesktop(tx);
+          return { joined: false, linked: null, already_left: false, desktop_agent_unchanged: true };
+        }
         // Release uses the workspace key, so a rejected token can still leave.
         const hosted = await participant(as, { allowGone: true, allowRejected: true, executor: tx });
         if (!hosted) return { joined: false, already_left: true };
@@ -599,6 +711,11 @@ function createRelayService(context: McpContext) {
         return { joined: true, linked: "desktop" as const, name: identity.name, address: identity.address,
           unread_count: null, guidance: DESKTOP_REPLY_GUIDANCE };
       }
+      const linkedIdentity = as ? null : await linkedDesktop();
+      if (linkedIdentity) {
+        return { joined: true, linked: "desktop" as const, name: linkedIdentity.name, address: linkedIdentity.address,
+          unread_count: null, guidance: DESKTOP_REPLY_GUIDANCE };
+      }
       const hosted = await participant(as);
       if (!hosted) return { joined: false, name: null, address: null, unread_count: 0,
         guidance: "Send a message with send_relay_message to auto-join this MCP session, or call join_relay first." };
@@ -613,8 +730,12 @@ function createRelayService(context: McpContext) {
         await managedActorOnly(as);
         const identity = await desktop();
         return { linked: "desktop" as const, name: identity.name, address: identity.address, messages: [],
-          polling_needed: false,
-          guidance: "Replies are injected into your session by Agent Relay Desktop; check_relay_inbox is not used for this linked identity." };
+          polling_needed: false, guidance: DESKTOP_INBOX_GUIDANCE };
+      }
+      const linkedIdentity = as ? null : await linkedDesktop();
+      if (linkedIdentity) {
+        return { linked: "desktop" as const, name: linkedIdentity.name, address: linkedIdentity.address, messages: [],
+          polling_needed: false, guidance: DESKTOP_INBOX_GUIDANCE };
       }
       const hosted = await participant(as);
       if (!hosted) throw new RelayToolError("No hosted participant is bound to this MCP session. Send a message with send_relay_message to auto-join, or call join_relay first.");
@@ -698,7 +819,7 @@ function createRelayService(context: McpContext) {
           message_id: sent.message.id, conversation_id: sent.conversationId, idempotency_key: responseIdempotencyKey,
           delivery: peer.online ? "queued_unconfirmed" : "queued_offline",
           note: "Accepted by Relaycast; delivery and reading are not confirmed.",
-          ...(managed ? { reply_guidance: DESKTOP_REPLY_GUIDANCE }
+          ...(identity.desktop ? { reply_guidance: DESKTOP_REPLY_GUIDANCE }
             : { reply_guidance: HOSTED_REPLY_GUIDANCE, desktop_relay_guidance: DESKTOP_RELAY_GUIDANCE }) };
       });
     },
@@ -708,7 +829,8 @@ function createRelayService(context: McpContext) {
       const peerName = input.agent.includes("@") ? (await explicitAgent(input.agent))?.name : input.agent;
       if (!peerName) throw new RelayToolError("Unknown or stale machine address in this workspace.");
       await managedActorOnly(input.as);
-      const hosted: Identity | null = managed ? await desktop() : await participant(input.as);
+      const hosted: Identity | null = managed ? await desktop()
+        : (input.as ? null : await linkedDesktop()) ?? await participant(input.as);
       if (!hosted) return { you: null, conversation_id: null, messages: [], earlier: null };
       await touchPresence(hosted.token);
       const conv = await conversation(hosted.token, hosted.name, peerName);
@@ -730,11 +852,12 @@ function createRelayService(context: McpContext) {
       let acted = false;
       const [channels, mine] = await Promise.all([client.listChannels(key), channelActor(input, false, async (identity) => {
         acted = true;
-        return { you: identity.name, ids: new Set((await client.authenticatedAgent(identity.token)).channels.map(row => row.id)) };
+        return { you: identity.name, linked: linkedKind(identity),
+          ids: new Set((await client.authenticatedAgent(identity.token)).channels.map(row => row.id)) };
       }, "none")]);
       const unlinked = !managed && !acted && !input.as && !input.hosted &&
         !(sessionHash && await findParticipant(executor, workspaceId, userId, organizationId, { sessionHash }));
-      return { you: mine?.you ?? null, linked: mine ? linkedKind : null,
+      return { you: mine?.you ?? null, linked: mine?.linked ?? null,
         ...(unlinked ? { note: UNLINKED_CHANNEL_GUIDANCE } : {}),
         channels: channels.filter(channel => !channel.archived && !channel.name.startsWith(RESERVED_CHANNEL_PREFIX)).map(channel => ({
           name: channel.name, topic: channel.topic, member_count: channel.memberCount, subscribed: mine?.ids.has(channel.id) ?? false })),
@@ -761,8 +884,8 @@ function createRelayService(context: McpContext) {
             alreadySubscribed = (await client.joinChannel(identity.token, channel)).alreadyMember;
           }
         }
-        return { subscribed: true, channel, you: identity.name, linked: linkedKind, created,
-          already_subscribed: alreadySubscribed, delivery: channelDelivery(channel), reply_guidance: CHANNEL_REPLY_GUIDANCE };
+        return { subscribed: true, channel, you: identity.name, linked: linkedKind(identity), created,
+          already_subscribed: alreadySubscribed, delivery: channelDelivery(identity, channel), reply_guidance: CHANNEL_REPLY_GUIDANCE };
       }))!;
     },
 
@@ -796,10 +919,10 @@ function createRelayService(context: McpContext) {
         } else {
           messageId = (await client.postChannelMessage({ token: identity.token, channel, text: input.text, idempotencyKey })).id;
         }
-        return { from: identity.name, channel, linked: linkedKind, message_id: messageId, thread_id: threadId,
+        return { from: identity.name, channel, linked: linkedKind(identity), message_id: messageId, thread_id: threadId,
           idempotency_key: responseIdempotencyKey,
           note: "Accepted by Relaycast and delivered to the channel's subscribers; reading is not confirmed.",
-          reply_guidance: `${channelDelivery(channel)} Continue this thread with ${channelReplyHint(channel, threadId ?? messageId)}.` };
+          reply_guidance: `${channelDelivery(identity, channel)} Continue this thread with ${channelReplyHint(channel, threadId ?? messageId)}.` };
       })) ?? notSubscribed(channel);
     },
 

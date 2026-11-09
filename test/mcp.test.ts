@@ -661,11 +661,11 @@ test("join_relay is idempotent, defaults its name, and refuses a foreign owner's
   assert.match(toolError(await client.callTool({ name: "relay_status", arguments: {} })), /no longer available/);
 });
 
-test("join_relay refuses desktop_address, and as_person is refused", async (t) => {
+test("join_relay refuses an unsynced desktop_address, and as_person is refused", async (t) => {
   const env = await setup(t);
   const client = await relayClient(t, env);
   assert.equal(toolError(await client.callTool({ name: "join_relay", arguments: { desktop_address: "me@laptop-1" } })),
-    "Desktop-linked identity is not yet available on this self-hosted site; call join_relay with name instead.");
+    "That desktop identity is not synced to your account in this workspace. Is Agent Relay Desktop running and signed in?");
   env.relay.world.addAgent("peer-bot");
   assert.match(toolError(await client.callTool({ name: "send_relay_message", arguments: { to: "peer-bot", text: "hi", as_person: true } })),
     /as_person is not available on this self-hosted site/);
@@ -775,10 +775,10 @@ test("channels: list, subscribe, post, thread, read, inbox, and unsubscribe", as
   // Unjoined sessions see channels but act as nobody until they choose an identity.
   const unlinked = structured(await client.callTool({ name: "list_relay_channels", arguments: {} }));
   assert.equal(unlinked.you, null);
-  assert.match(unlinked.note, /pass hosted: true, or call join_relay first/);
+  assert.match(unlinked.note, /not linked to Agent Relay Desktop.*Call join_relay with desktop_address.*pass hosted: true\./);
   assert.deepEqual(unlinked.channels.map((channel: any) => [channel.name, channel.subscribed]), [["general", false]]);
   assert.match(toolError(await client.callTool({ name: "subscribe_relay_channel", arguments: { channel: "ops" } })),
-    /has not joined Agent Relay/);
+    /not linked to Agent Relay Desktop/);
   assert.match(toolError(await client.callTool({ name: "subscribe_relay_channel", arguments: { channel: "ops", hosted: true } })),
     /No channel #ops exists/);
 
