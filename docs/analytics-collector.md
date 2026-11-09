@@ -220,7 +220,13 @@ DATA_DIR/
   5. Every file in `tmp/` is deleted, so incomplete batches are never exposed.
      `tmp/` is not fsynced after this: a deleted part file that comes back
      after a crash is deleted again on the next start.
-  6. `segments/` is indexed (count and bytes). The next sequence number
+  6. Matching regular files in `segments/` are opened without following
+     symlinks. Each must belong to the collector's user on Unix; modes
+     broadened by a volume remount (for example Kubernetes `fsGroup`) are
+     restored to 0600 through the file handle, fsynced and checked before
+     the listener starts. Contents are unchanged. A failure stops startup.
+     Existing symlinks and non-matching names are left alone and not counted.
+     Recovered files are indexed (count and bytes); the next sequence number
      follows the highest seen.
   7. The age policy is applied.
 

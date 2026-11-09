@@ -10,6 +10,7 @@
 // indexes segments/; files that do not match the segment name are left alone
 // and not counted.
 import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import * as nodeFs from "node:fs/promises";
 import { join } from "node:path";
 import type { RetentionPolicy } from "./config.js";
@@ -137,7 +138,7 @@ export class SegmentStore {
         ignored += 1;
         continue;
       }
-      const { size } = await this.fs.stat(join(this.segmentsDir, entry.name));
+      const size = await this.recoverSegment(entry.name);
       this.index.push({ name: entry.name, epochMs: Number(match[1]), seq: Number(match[2]), bytes: size });
       this.diskBytes += size;
     }
@@ -151,6 +152,26 @@ export class SegmentStore {
       ignored_files: ignored,
       retention_removed: aged,
     });
+  }
+
+  /** Volume remounts can broaden modes (for example Kubernetes fsGroup).
+   * Harden the opened inode before indexing it or starting the listener. */
+  private async recoverSegment(name: string): Promise<number> {
+    const handle = await this.fs.open(join(this.segmentsDir, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const info = await handle.stat();
+      if (!info.isFile() || (process.getuid && info.uid !== process.getuid())) {
+        throw new Error("invalid committed segment");
+      }
+      if ((info.mode & 0o7777) !== 0o600) {
+        await handle.chmod(0o600);
+        await handle.sync();
+        if (((await handle.stat()).mode & 0o7777) !== 0o600) throw new Error("committed segment permissions not private");
+      }
+      return info.size;
+    } finally {
+      await handle.close();
+    }
   }
 
   stats(): StorageStats {

@@ -5,6 +5,8 @@ assigned at release.
 
 ## Unreleased
 
+- Fixed: analytics collector startup restores private committed-segment
+  permissions after volume remounts, and refuses to listen if recovery fails.
 - Added: the analytics collector accepts registered session ingest, reader and
   consumer producers with closed event vocabularies, scoped attribution and
   separate producer tokens.
