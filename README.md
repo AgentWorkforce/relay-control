@@ -419,8 +419,9 @@ token bound to the challenge and redirects to the loopback `redirect_uri`
 with `state`, `access_token`, `access_token_expires_at` and
 `api_url=<site>/cloud` (see above); no refresh token is placed in the URL.
 When the sign-in names its host, a same-origin consent page asks the person
-to approve "Agent Relay Desktop on <host>" first (single-use consent token,
-Origin and Fetch Metadata checked). Desktop then redeems the handoff once at
+to approve "Agent Relay Desktop on <host>" first (single-use consent token
+stored as a shared database row, so any replica may receive the post; Origin
+and Fetch Metadata checked). Desktop then redeems the handoff once at
 `POST /cloud/api/v1/auth/desktop/session` with `codeVerifier`, receiving a
 renewable access/refresh pair in the same token family. Rate limits match
 hosted: 30 per minute per client address on both routes.

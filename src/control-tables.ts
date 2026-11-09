@@ -14,6 +14,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "coding_agent_credentials",
   "coding_agent_device_sessions",
   "desktop_attestation_keys",
+  "desktop_consent_tokens",
   "desktop_feed_assets",
   "desktop_feed_audit_events",
   "desktop_feed_current",

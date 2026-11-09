@@ -3,6 +3,15 @@
 Notable changes to the self-hosted control plane. Dates and versions are
 assigned at release.
 
+## Unreleased
+
+- Fixed: the desktop sign-in consent token is now a shared single-use database
+  record, so the approve/deny post may reach any Control replica and survives
+  a rolling restart; before, it lived in one process's memory and failed with
+  403 "Consent token is missing, used, or for another sign-in" when another
+  replica answered. Adds migration `0034_desktop_consent_tokens` (table
+  `desktop_consent_tokens`, only the token's sha256 is stored).
+
 ## 0.5.6 (2026-11-09)
 
 - Fixed: the desktop browser sign-in consent screen was sent with

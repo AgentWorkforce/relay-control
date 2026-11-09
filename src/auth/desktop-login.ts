@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { safeNextPath } from "./device-approval.js";
 
 /**
@@ -135,48 +135,19 @@ export type ConsentAttempt = {
 };
 
 /**
- * Single-use consent tokens for the "approve Agent Relay Desktop on <host>"
- * screen. Per process (the API runs one replica): a token is bound to one
- * person and one sign-in attempt and expires with the screen.
+ * The sign-in attempt a consent token is bound to: one person, one code
+ * challenge, host, workspace and loopback redirect. The token itself is a
+ * shared single-use database row (ControlPlaneStore.issueDesktopConsentToken),
+ * so any Control replica may receive the approve/deny form post.
  */
-export class ConsentTokens {
-  private readonly entries = new Map<string, { attempt: string; expiresAt: number }>();
-
-  constructor(
-    private readonly clock: () => number = Date.now,
-    private readonly ttlMs = 10 * 60_000,
-  ) {}
-
-  private key(attempt: ConsentAttempt): string {
-    return JSON.stringify([
-      attempt.userId,
-      attempt.codeChallenge,
-      attempt.hostName,
-      attempt.workspaceId,
-      attempt.redirectUri,
-    ]);
-  }
-
-  issue(attempt: ConsentAttempt): string {
-    const now = this.clock();
-    for (const [token, entry] of this.entries) {
-      if (entry.expiresAt <= now) this.entries.delete(token);
-    }
-    const token = base64Url(randomBytes(32));
-    this.entries.set(token, { attempt: this.key(attempt), expiresAt: now + this.ttlMs });
-    return token;
-  }
-
-  /** True once, for the matching attempt; the token is consumed either way. */
-  consume(token: unknown, attempt: ConsentAttempt): boolean {
-    if (typeof token !== "string" || !token) return false;
-    const entry = this.entries.get(token);
-    this.entries.delete(token);
-    if (!entry || entry.expiresAt <= this.clock()) return false;
-    const expected = Buffer.from(entry.attempt);
-    const actual = Buffer.from(this.key(attempt));
-    return expected.length === actual.length && timingSafeEqual(expected, actual);
-  }
+export function consentAttemptKey(attempt: ConsentAttempt): string {
+  return JSON.stringify([
+    attempt.userId,
+    attempt.codeChallenge,
+    attempt.hostName,
+    attempt.workspaceId,
+    attempt.redirectUri,
+  ]);
 }
 
 function escape(value: string): string {
