@@ -309,6 +309,16 @@ test("disconnect preserves an OAuth participant a native MCP session has since b
   assert.ok(f.world.agents.has("approved-agent"));
 });
 
+test("a rejected token and an already-released roster entry complete cleanup without another release",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  f.world.rotateToken("approved-agent");f.world.agents.get("approved-agent")!.status="released";
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  const requests=f.world.bodies.filter(row=>row.path==="/v1/agents/release-exact").length;
+  assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
+  assert.equal(f.world.bodies.filter(row=>row.path==="/v1/agents/release-exact").length,requests);
+  assert.equal((await f.database.query("SELECT id FROM selfhost_hosted_relay_participants")).rows.length,0);
+});
+
 test("teardown intent survives deletion of the user and participant rows",async t=>{
   const f=await relayFixture(t);await f.service.join({});
   await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-user-removal");

@@ -119,7 +119,7 @@ export class McpOAuthTeardown {
     if(row && workspace.relaycast_workspace_id!==row.relaycast_workspace_id) return "pending";
     const key=decryptSecret(workspace.relaycast_api_key_ciphertext,this.deps.keyring);
     const byId=async()=>(await this.deps.client.listAgents(key,"all",{includeStale:true}))
-      .find(agent=>agent.id===intent.agent_remote_id)??null;
+      .find(agent=>agent.id===intent.agent_remote_id && agent.status!=="released")??null;
     let remote:RosterAgent|null;
     if(row) {
       try {
