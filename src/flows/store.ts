@@ -265,10 +265,10 @@ export class FlowsStore {
   private readonly flowSelect = `
     SELECT f.*, lr.id AS last_run_id, lr.status AS last_run_status,
            lr.created_at AS last_run_created_at,
-           (SELECT count(*) FROM selfhost_workflow_runs c WHERE c.flow_id = f.id)::int AS run_count
-      FROM selfhost_flow_definitions f
+           (SELECT count(*) FROM workflow_runs c WHERE c.flow_id = f.id)::int AS run_count
+      FROM flow_definitions f
       LEFT JOIN LATERAL (
-        SELECT id, status, created_at FROM selfhost_workflow_runs r
+        SELECT id, status, created_at FROM workflow_runs r
          WHERE r.flow_id = f.id ORDER BY r.created_at DESC, r.id DESC LIMIT 1
       ) lr ON true`;
 
@@ -309,7 +309,7 @@ export class FlowsStore {
     const name = cleanName(input.name, "name", 100);
     try {
       await this.database.query(
-        `INSERT INTO selfhost_flow_definitions
+        `INSERT INTO flow_definitions
            (id, workspace_id, name, description, file_type, source, created_by)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [
@@ -345,7 +345,7 @@ export class FlowsStore {
     const name = input.name !== undefined ? cleanName(input.name, "name", 100) : existing.name;
     try {
       await this.database.query(
-        `UPDATE selfhost_flow_definitions
+        `UPDATE flow_definitions
             SET name = $3, description = $4, file_type = $5, source = $6, updated_at = now()
           WHERE workspace_id = $1 AND id = $2`,
         [
@@ -371,7 +371,7 @@ export class FlowsStore {
   async deleteFlow(workspaceId: string, flowId: string): Promise<boolean> {
     if (!isUuid(flowId)) return false;
     const result = await this.database.query(
-      "DELETE FROM selfhost_flow_definitions WHERE workspace_id = $1 AND id = $2 RETURNING id",
+      "DELETE FROM flow_definitions WHERE workspace_id = $1 AND id = $2 RETURNING id",
       [workspaceId, flowId],
     );
     return result.rows.length === 1;
@@ -394,7 +394,7 @@ export class FlowsStore {
     );
     const expiresAt = new Date(Date.now() + ttl);
     const result = await this.database.query<{ created_at: Date | string }>(
-      `INSERT INTO selfhost_worker_enrollment_tokens
+      `INSERT INTO worker_enrollment_tokens
          (id, workspace_id, token_hash, token_last4, name, tags, created_by, expires_at)
        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
        RETURNING created_at`,
@@ -421,8 +421,8 @@ export class FlowsStore {
     const result = await this.database.query(
       `SELECT t.id, t.name, t.tags, t.token_last4, t.expires_at, t.used_at, t.revoked_at,
               t.created_at, t.used_by_worker_id, u.email AS created_by_email
-         FROM selfhost_worker_enrollment_tokens t
-         LEFT JOIN selfhost_users u ON u.id = t.created_by
+         FROM worker_enrollment_tokens t
+         LEFT JOIN users u ON u.id = t.created_by
         WHERE t.workspace_id = $1
         ORDER BY t.created_at DESC LIMIT 100`,
       [workspaceId],
@@ -455,7 +455,7 @@ export class FlowsStore {
   async revokeEnrollmentToken(workspaceId: string, tokenId: string): Promise<boolean> {
     if (!isUuid(tokenId)) return false;
     const result = await this.database.query(
-      `UPDATE selfhost_worker_enrollment_tokens SET revoked_at = now()
+      `UPDATE worker_enrollment_tokens SET revoked_at = now()
         WHERE workspace_id = $1 AND id = $2 AND revoked_at IS NULL AND used_at IS NULL
         RETURNING id`,
       [workspaceId, tokenId],
@@ -488,7 +488,7 @@ export class FlowsStore {
         created_by: string | null;
         tags: unknown;
       }>(
-        `SELECT id, workspace_id, created_by, tags FROM selfhost_worker_enrollment_tokens
+        `SELECT id, workspace_id, created_by, tags FROM worker_enrollment_tokens
           WHERE token_hash = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > now()
           FOR UPDATE`,
         [hashSecret(token)],
@@ -498,7 +498,7 @@ export class FlowsStore {
         throw new FlowsError(401, "invalid_enrollment_token", "Invalid enrollment token");
       }
       const existing = await tx.query(
-        "SELECT id FROM selfhost_workers WHERE workspace_id = $1 AND name = $2",
+        "SELECT id FROM workers WHERE workspace_id = $1 AND name = $2",
         [enrollment.workspace_id, name],
       );
       if (existing.rows.length) {
@@ -507,7 +507,7 @@ export class FlowsStore {
       const hostTags = Array.isArray(hostInfo.tags) ? cleanTags(hostInfo.tags) : [];
       const tags = [...new Set([...jsonValue<string[]>(enrollment.tags, []), ...hostTags])];
       await tx.query(
-        `INSERT INTO selfhost_workers
+        `INSERT INTO workers
            (id, workspace_id, name, display_name, host_info, tags, token_hash, status, registered_by)
          VALUES ($1, $2, $3, $3, $4::jsonb, $5::jsonb, $6, 'pending', $7)`,
         [
@@ -521,7 +521,7 @@ export class FlowsStore {
         ],
       );
       await tx.query(
-        `UPDATE selfhost_worker_enrollment_tokens SET used_at = now(), used_by_worker_id = $2
+        `UPDATE worker_enrollment_tokens SET used_at = now(), used_by_worker_id = $2
           WHERE id = $1`,
         [enrollment.id, workerId],
       );
@@ -546,7 +546,7 @@ export class FlowsStore {
       tags: unknown;
       token_hash: string;
     }>(
-      `SELECT id, workspace_id, name, tags, token_hash FROM selfhost_workers
+      `SELECT id, workspace_id, name, tags, token_hash FROM workers
         WHERE id = $1 AND revoked_at IS NULL`,
       [workerId],
     );
@@ -562,7 +562,7 @@ export class FlowsStore {
 
   async touchWorker(workerId: string): Promise<void> {
     await this.database.query(
-      `UPDATE selfhost_workers SET status = 'online', last_seen = now()
+      `UPDATE workers SET status = 'online', last_seen = now()
         WHERE id = $1 AND revoked_at IS NULL`,
       [workerId],
     );
@@ -570,7 +570,7 @@ export class FlowsStore {
 
   async isWorkerRevoked(workerId: string): Promise<boolean> {
     const result = await this.database.query(
-      "SELECT 1 FROM selfhost_workers WHERE id = $1 AND revoked_at IS NULL",
+      "SELECT 1 FROM workers WHERE id = $1 AND revoked_at IS NULL",
       [workerId],
     );
     return result.rows.length === 0;
@@ -599,11 +599,11 @@ export class FlowsStore {
 
   private readonly workerSelect = `
     SELECT w.*, u.email AS registered_by_email,
-           (SELECT a.run_id FROM selfhost_work_assignments a
+           (SELECT a.run_id FROM work_assignments a
              WHERE a.worker_id = w.id AND a.status IN ('assigned', 'running')
              ORDER BY a.assigned_at DESC NULLS LAST LIMIT 1) AS current_run_id
-      FROM selfhost_workers w
-      LEFT JOIN selfhost_users u ON u.id = w.registered_by`;
+      FROM workers w
+      LEFT JOIN users u ON u.id = w.registered_by`;
 
   async listWorkers(workspaceId: string): Promise<WorkerRecord[]> {
     const result = await this.database.query(
@@ -627,7 +627,7 @@ export class FlowsStore {
     if (!isUuid(workerId)) return null;
     const revoked = await this.database.transaction(async (tx) => {
       const result = await tx.query(
-        `UPDATE selfhost_workers
+        `UPDATE workers
             SET status = 'revoked', revoked_at = COALESCE(revoked_at, now()), token_hash = $3
           WHERE workspace_id = $1 AND id = $2 RETURNING id`,
         [workspaceId, workerId, hashSecret(opaqueToken("revoked_"))],
@@ -635,7 +635,7 @@ export class FlowsStore {
       if (!result.rows.length) return false;
       this.notifyWork();
       const active = await tx.query<{ run_id: string }>(
-        `UPDATE selfhost_work_assignments
+        `UPDATE work_assignments
             SET status = 'failed', error = 'worker-revoked', completed_at = now()
           WHERE worker_id = $1 AND status IN ('queued', 'assigned', 'running')
           RETURNING run_id`,
@@ -692,8 +692,8 @@ export class FlowsStore {
     if (input.workerId || input.workerName) {
       const worker = await this.database.query<{ id: string }>(
         input.workerId
-          ? "SELECT id FROM selfhost_workers WHERE workspace_id = $1 AND id = $2 AND revoked_at IS NULL"
-          : "SELECT id FROM selfhost_workers WHERE workspace_id = $1 AND name = $2 AND revoked_at IS NULL",
+          ? "SELECT id FROM workers WHERE workspace_id = $1 AND id = $2 AND revoked_at IS NULL"
+          : "SELECT id FROM workers WHERE workspace_id = $1 AND name = $2 AND revoked_at IS NULL",
         [input.workspaceId, input.workerId && !isUuid(input.workerId) ? "00000000-0000-0000-0000-000000000000" : (input.workerId ?? input.workerName)],
       );
       if (!worker.rows[0]) throw new FlowsError(404, "worker_not_found", "Worker not found");
@@ -704,7 +704,7 @@ export class FlowsStore {
     }
     await this.database.transaction(async (tx) => {
       await tx.query(
-        `INSERT INTO selfhost_workflow_runs
+        `INSERT INTO workflow_runs
            (id, workspace_id, flow_id, workflow_name, workflow, file_type, workflow_file_name,
             dispatch_type, status, trigger, inputs, env_secrets_ciphertext, code_object_key,
             requested_worker_id, requested_tags, resumed_from_run_id, resume_run_id, start_from,
@@ -741,7 +741,7 @@ export class FlowsStore {
       );
       if (dispatchType === "worker") {
         await tx.query(
-          `INSERT INTO selfhost_work_assignments
+          `INSERT INTO work_assignments
              (id, workspace_id, worker_id, run_id, status, queue_deadline)
            VALUES ($1, $2, $3, $4, 'queued', $5)`,
           [
@@ -810,10 +810,10 @@ export class FlowsStore {
   private readonly runSelect = `
     SELECT r.*, a.worker_id, a.status AS assignment_status, a.queue_deadline,
            w.name AS worker_name, u.email AS created_by_email
-      FROM selfhost_workflow_runs r
-      LEFT JOIN selfhost_work_assignments a ON a.run_id = r.id
-      LEFT JOIN selfhost_workers w ON w.id = a.worker_id
-      LEFT JOIN selfhost_users u ON u.id = r.created_by`;
+      FROM workflow_runs r
+      LEFT JOIN work_assignments a ON a.run_id = r.id
+      LEFT JOIN workers w ON w.id = a.worker_id
+      LEFT JOIN users u ON u.id = r.created_by`;
 
   async getRun(workspaceId: string, runId: string): Promise<RunRecord | null> {
     if (!isUuid(runId)) return null;
@@ -824,7 +824,7 @@ export class FlowsStore {
     const row = result.rows[0];
     if (!row) return null;
     const children = await this.database.query(
-      `SELECT id, status, created_at FROM selfhost_workflow_runs
+      `SELECT id, status, created_at FROM workflow_runs
         WHERE resumed_from_run_id = $1 ORDER BY created_at`,
       [runId],
     );
@@ -838,7 +838,7 @@ export class FlowsStore {
   async getRunSource(workspaceId: string, runId: string): Promise<string | null> {
     if (!isUuid(runId)) return null;
     const result = await this.database.query<{ workflow: string }>(
-      "SELECT workflow FROM selfhost_workflow_runs WHERE workspace_id = $1 AND id = $2",
+      "SELECT workflow FROM workflow_runs WHERE workspace_id = $1 AND id = $2",
       [workspaceId, runId],
     );
     return result.rows[0]?.workflow ?? null;
@@ -904,7 +904,7 @@ export class FlowsStore {
       `SELECT count(*)::int AS total,
               count(*) FILTER (WHERE r.status IN ('pending', 'running'))::int AS active,
               count(*) FILTER (WHERE r.status = 'failed')::int AS failed
-         FROM selfhost_workflow_runs r WHERE ${filterWhere}`,
+         FROM workflow_runs r WHERE ${filterWhere}`,
       params,
     );
     return {
@@ -936,7 +936,7 @@ export class FlowsStore {
     } = {},
   ): Promise<boolean> {
     const updated = await tx.query(
-      `UPDATE selfhost_workflow_runs
+      `UPDATE workflow_runs
           SET status = $2, error = COALESCE($3, error), summary = COALESCE($4, summary),
               exit_code = COALESCE($5, exit_code), duration_ms = COALESCE($6, duration_ms),
               result = COALESCE($7::jsonb, result), completed_at = now(), updated_at = now()
@@ -955,7 +955,7 @@ export class FlowsStore {
     if (!updated.rows.length) return false;
     // The run's CLI-credential references stop working with the run.
     await tx.query(
-      "UPDATE selfhost_cli_credential_refs SET revoked_at = now() WHERE run_id = $1 AND revoked_at IS NULL",
+      "UPDATE cli_credential_refs SET revoked_at = now() WHERE run_id = $1 AND revoked_at IS NULL",
       [runId],
     );
     await this.appendEventTx(tx, runId, `run.${status}`, null, {
@@ -975,14 +975,14 @@ export class FlowsStore {
     }
     await this.database.transaction(async (tx) => {
       await tx.query(
-        "UPDATE selfhost_workflow_runs SET cancel_requested_at = now() WHERE id = $1",
+        "UPDATE workflow_runs SET cancel_requested_at = now() WHERE id = $1",
         [runId],
       );
       // Work that a worker has not picked up yet is withdrawn. Work already on a
       // worker cannot be interrupted over the v1 assignment protocol; its later
       // status report is recorded on the assignment but the run stays cancelled.
       await tx.query(
-        `UPDATE selfhost_work_assignments
+        `UPDATE work_assignments
             SET status = 'failed', error = 'cancelled', completed_at = now()
           WHERE run_id = $1 AND status = 'queued'`,
         [runId],
@@ -1011,7 +1011,7 @@ export class FlowsStore {
       throw new FlowsError(409, "run_not_resumable", "Locally mirrored runs are resumed from the CLI");
     }
     const row = await this.database.query<{ workflow: string; env_secrets_ciphertext: string | null; requested_tags: unknown }>(
-      "SELECT workflow, env_secrets_ciphertext, requested_tags FROM selfhost_workflow_runs WHERE id = $1",
+      "SELECT workflow, env_secrets_ciphertext, requested_tags FROM workflow_runs WHERE id = $1",
       [input.runId],
     );
     const source = row.rows[0]!;
@@ -1085,7 +1085,7 @@ export class FlowsStore {
       `SELECT r.id, r.workspace_id, r.workflow, r.file_type, r.workflow_file_name, r.flow_id,
               r.env_secrets_ciphertext, r.code_object_key, r.resume_run_id, r.start_from,
               r.previous_run_id, w.relaycast_workspace_id, w.relaycast_api_key_ciphertext
-         FROM selfhost_workflow_runs r JOIN selfhost_workspaces w ON w.id = r.workspace_id
+         FROM workflow_runs r JOIN workspaces w ON w.id = r.workspace_id
         WHERE r.id = $1`,
       [runId],
     );
@@ -1153,8 +1153,8 @@ export class FlowsStore {
   /** Assigned but never acknowledged work for this worker (redelivered on reconnect). */
   async unackedAssignments(workerId: string): Promise<WorkAssignmentRecord[]> {
     const result = await this.database.query(
-      `SELECT a.* FROM selfhost_work_assignments a
-         JOIN selfhost_workflow_runs r ON r.id = a.run_id
+      `SELECT a.* FROM work_assignments a
+         JOIN workflow_runs r ON r.id = a.run_id
         WHERE a.worker_id = $1 AND a.status = 'assigned' AND a.acked_at IS NULL
           AND r.status = 'pending'
         ORDER BY a.assigned_at`,
@@ -1181,14 +1181,14 @@ export class FlowsStore {
   async claimNext(worker: { id: string; workspaceId: string; tags: string[] }): Promise<WorkAssignmentRecord | null> {
     const claimed = await this.database.transaction(async (tx) => {
       const busy = await tx.query(
-        `SELECT 1 FROM selfhost_work_assignments
+        `SELECT 1 FROM work_assignments
           WHERE worker_id = $1 AND status IN ('assigned', 'running') LIMIT 1`,
         [worker.id],
       );
       if (busy.rows.length) return null;
       const candidate = await tx.query<{ id: string }>(
-        `SELECT a.id FROM selfhost_work_assignments a
-           JOIN selfhost_workflow_runs r ON r.id = a.run_id
+        `SELECT a.id FROM work_assignments a
+           JOIN workflow_runs r ON r.id = a.run_id
           WHERE a.workspace_id = $1 AND a.status = 'queued' AND a.queue_deadline > now()
             AND (a.worker_id IS NULL OR a.worker_id = $2)
             AND r.status = 'pending'
@@ -1201,9 +1201,9 @@ export class FlowsStore {
       const id = candidate.rows[0]?.id;
       if (!id) return null;
       const updated = await tx.query(
-        `UPDATE selfhost_work_assignments a
+        `UPDATE work_assignments a
             SET status = 'assigned', worker_id = $2, assigned_at = now()
-           FROM selfhost_workflow_runs r
+           FROM workflow_runs r
           WHERE a.id = $1 AND a.status = 'queued' AND r.id = a.run_id
           RETURNING a.*, r.requested_worker_id`,
         [id, worker.id],
@@ -1221,7 +1221,7 @@ export class FlowsStore {
     } catch (error) {
       // Release the claim so the run is retried rather than stranded.
       await this.database.query(
-        `UPDATE selfhost_work_assignments
+        `UPDATE work_assignments
             SET status = 'queued', worker_id = $2, assigned_at = NULL
           WHERE id = $1 AND status = 'assigned' AND acked_at IS NULL`,
         [claimed.id, claimed.requested_worker_id ?? null],
@@ -1241,7 +1241,7 @@ export class FlowsStore {
   } | null> {
     if (!token.startsWith(WORKER_TOKEN_PREFIX) || token.startsWith(ENROLLMENT_TOKEN_PREFIX)) return null;
     const result = await this.database.query<{ id: string; workspace_id: string }>(
-      "SELECT id, workspace_id FROM selfhost_workers WHERE token_hash = $1 AND revoked_at IS NULL",
+      "SELECT id, workspace_id FROM workers WHERE token_hash = $1 AND revoked_at IS NULL",
       [hashSecret(token)],
     );
     const row = result.rows[0];
@@ -1256,8 +1256,8 @@ export class FlowsStore {
   private async workerAssignment(tx: SqlExecutor, workerId: string, runId: string): Promise<Row | null> {
     if (!isUuid(runId)) return null;
     const result = await tx.query(
-      `SELECT a.*, r.status AS run_status FROM selfhost_work_assignments a
-         JOIN selfhost_workflow_runs r ON r.id = a.run_id
+      `SELECT a.*, r.status AS run_status FROM work_assignments a
+         JOIN workflow_runs r ON r.id = a.run_id
         WHERE a.worker_id = $1 AND a.run_id = $2 FOR UPDATE OF a`,
       [workerId, runId],
     );
@@ -1273,7 +1273,7 @@ export class FlowsStore {
       }
       if (row.status === "queued" || row.status === "assigned") {
         const updated = await tx.query(
-          `UPDATE selfhost_work_assignments
+          `UPDATE work_assignments
               SET status = 'assigned', assigned_at = COALESCE(assigned_at, now()),
                   acked_at = COALESCE(acked_at, now())
             WHERE id = $1 RETURNING status, assigned_at`,
@@ -1309,14 +1309,14 @@ export class FlowsStore {
       }
       if (detail.phase === "running") {
         await tx.query(
-          `UPDATE selfhost_work_assignments
+          `UPDATE work_assignments
               SET status = 'running', started_at = COALESCE(started_at, now()),
                   assigned_at = COALESCE(assigned_at, now()), acked_at = COALESCE(acked_at, now())
             WHERE id = $1`,
           [row.id],
         );
         const run = await tx.query(
-          `UPDATE selfhost_workflow_runs
+          `UPDATE workflow_runs
               SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now()
             WHERE id = $1 AND status = 'pending' RETURNING id`,
           [runId],
@@ -1332,7 +1332,7 @@ export class FlowsStore {
         ...(detail.summary ? { summary: detail.summary } : {}),
       };
       await tx.query(
-        `UPDATE selfhost_work_assignments
+        `UPDATE work_assignments
             SET status = $2, completed_at = now(), result = $3::jsonb, error = $4
           WHERE id = $1`,
         [row.id, detail.phase, JSON.stringify(assignmentResult), detail.error ?? null],
@@ -1358,7 +1358,7 @@ export class FlowsStore {
   async workerCanAccessRun(workerId: string, runId: string): Promise<boolean> {
     if (!isUuid(runId)) return false;
     const result = await this.database.query(
-      `SELECT 1 FROM selfhost_work_assignments
+      `SELECT 1 FROM work_assignments
         WHERE worker_id = $1 AND run_id = $2 AND status IN ('assigned', 'running')`,
       [workerId, runId],
     );
@@ -1370,7 +1370,7 @@ export class FlowsStore {
     const timedOut: WorkAssignmentRecord[] = [];
     await this.database.transaction(async (tx) => {
       const expired = await tx.query(
-        `UPDATE selfhost_work_assignments
+        `UPDATE work_assignments
             SET status = 'timeout', error = 'queue-timeout', completed_at = now()
           WHERE status = 'queued' AND queue_deadline <= now()
           RETURNING *`,
@@ -1380,9 +1380,9 @@ export class FlowsStore {
         timedOut.push(this.assignmentFromRow(row, "{}"));
       }
       const orphaned = await tx.query(
-        `UPDATE selfhost_work_assignments a
+        `UPDATE work_assignments a
             SET status = 'failed', error = 'worker-disconnected', completed_at = now()
-           FROM selfhost_workers w
+           FROM workers w
           WHERE w.id = a.worker_id AND a.status IN ('assigned', 'running')
             AND (w.last_seen IS NULL OR w.last_seen <= now() - ($1::text || ' milliseconds')::interval)
           RETURNING a.run_id`,
@@ -1404,14 +1404,14 @@ export class FlowsStore {
     stepName: string | null,
     payload: Record<string, unknown>,
   ): Promise<number> {
-    await tx.query("SELECT id FROM selfhost_workflow_runs WHERE id = $1 FOR UPDATE", [runId]);
+    await tx.query("SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE", [runId]);
     const next = await tx.query<{ sequence: number }>(
-      "SELECT COALESCE(max(sequence), 0)::int + 1 AS sequence FROM selfhost_run_events WHERE run_id = $1",
+      "SELECT COALESCE(max(sequence), 0)::int + 1 AS sequence FROM run_events WHERE run_id = $1",
       [runId],
     );
     const sequence = Number(next.rows[0]!.sequence);
     await tx.query(
-      `INSERT INTO selfhost_run_events (id, run_id, sequence, event_type, step_name, payload)
+      `INSERT INTO run_events (id, run_id, sequence, event_type, step_name, payload)
        VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
       [randomUUID(), runId, sequence, eventType, stepName, JSON.stringify(payload)],
     );
@@ -1431,7 +1431,7 @@ export class FlowsStore {
     const limit = Math.min(Math.max(options.limit ?? 100, 1), 1_000);
     const sort = options.sort === "desc" ? "DESC" : "ASC";
     const result = await this.database.query(
-      `SELECT * FROM selfhost_run_events
+      `SELECT * FROM run_events
         WHERE run_id = $1 AND sequence > $2
         ORDER BY sequence ${sort} LIMIT $3`,
       [runId, options.after ?? 0, limit],
@@ -1462,7 +1462,7 @@ export class FlowsStore {
       let position = 0;
       for (const step of steps) {
         await tx.query(
-          `INSERT INTO selfhost_run_steps
+          `INSERT INTO run_steps
              (run_id, step_name, position, source, label, step_type, status, attempt, elapsed_ms,
               completion_reason, depends_on, detail)
            VALUES ($1, $2, $3, 'snapshot', $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)
@@ -1472,7 +1472,7 @@ export class FlowsStore {
                  attempt = EXCLUDED.attempt, elapsed_ms = EXCLUDED.elapsed_ms,
                  completion_reason = EXCLUDED.completion_reason,
                  depends_on = EXCLUDED.depends_on, detail = EXCLUDED.detail, updated_at = now()
-             WHERE selfhost_run_steps.source = 'snapshot'`,
+             WHERE run_steps.source = 'snapshot'`,
           [
             runId,
             step.stepName,
@@ -1494,7 +1494,7 @@ export class FlowsStore {
 
   async replaceFinalSteps(runId: string, steps: Array<Record<string, unknown>>): Promise<number> {
     await this.database.transaction(async (tx) => {
-      await tx.query("DELETE FROM selfhost_run_steps WHERE run_id = $1", [runId]);
+      await tx.query("DELETE FROM run_steps WHERE run_id = $1", [runId]);
       let position = 0;
       for (const step of steps) {
         const exitCode = typeof step.exitCode === "number" ? step.exitCode : null;
@@ -1502,7 +1502,7 @@ export class FlowsStore {
           ? step.status
           : step.error || (exitCode !== null && exitCode !== 0) ? "failed" : "completed";
         await tx.query(
-          `INSERT INTO selfhost_run_steps
+          `INSERT INTO run_steps
              (run_id, step_name, position, source, label, step_type, agent, cli, status,
               started_at, ended_at, elapsed_ms, exit_code, output_summary, error,
               completion_reason, retry_count, depends_on, detail)
@@ -1546,7 +1546,7 @@ export class FlowsStore {
     const run = await this.getRun(workspaceId, runId);
     if (!run) return null;
     const result = await this.database.query(
-      "SELECT * FROM selfhost_run_steps WHERE run_id = $1 ORDER BY position, step_name",
+      "SELECT * FROM run_steps WHERE run_id = $1 ORDER BY position, step_name",
       [runId],
     );
     if (result.rows.length) {
@@ -1614,7 +1614,7 @@ export class FlowsStore {
   async authenticateRunToken(runId: string, token: string | null): Promise<{ workspaceId: string; status: RunStatus } | null> {
     if (!token || !token.startsWith(RUN_TOKEN_PREFIX) || !isUuid(runId)) return null;
     const result = await this.database.query<{ workspace_id: string; status: RunStatus; access_token_hash: string | null }>(
-      "SELECT workspace_id, status, access_token_hash FROM selfhost_workflow_runs WHERE id = $1",
+      "SELECT workspace_id, status, access_token_hash FROM workflow_runs WHERE id = $1",
       [runId],
     );
     const row = result.rows[0];
@@ -1633,7 +1633,7 @@ export class FlowsStore {
     const run = await this.authenticateRunToken(input.runId, input.accessToken);
     if (!run) throw new FlowsError(401, "unauthorized", "Invalid run token");
     const stored = await this.database.query<{ callback_token_hash: string | null }>(
-      "SELECT callback_token_hash FROM selfhost_workflow_runs WHERE id = $1",
+      "SELECT callback_token_hash FROM workflow_runs WHERE id = $1",
       [input.runId],
     );
     const hash = stored.rows[0]?.callback_token_hash;

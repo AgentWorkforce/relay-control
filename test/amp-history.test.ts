@@ -48,11 +48,11 @@ async function historyHarness(t: TestContext) {
     last_synced_at: Date | null; history_queued_at: Date | null; history_error: string | null;
     history_lease_owner: string | null;
   }>(
-    "SELECT last_synced_at, history_queued_at, history_error, history_lease_owner FROM selfhost_amp_bindings WHERE id = $1",
+    "SELECT last_synced_at, history_queued_at, history_error, history_lease_owner FROM amp_bindings WHERE id = $1",
     [binding.binding_id],
   )).rows[0]!;
   const ledger = async () => (await h.database.query<{ versions: Record<string, any>; pending_ciphertext: string | null }>(
-    "SELECT versions, pending_ciphertext FROM selfhost_amp_history_syncs WHERE thread_id = $1",
+    "SELECT versions, pending_ciphertext FROM amp_history_syncs WHERE thread_id = $1",
     [THREAD],
   )).rows[0];
   const advance = (ms: number) => {
@@ -182,7 +182,7 @@ test("amp history: a metadata-only backfill is persisted without an upload", asy
   const [record] = ampExport(THREAD, { id: THREAD, createdAt: "2026-11-08T00:00:00.000Z", messages: x.thread.messages });
   const key = record!.eventId;
   await x.h.database.query(
-    "INSERT INTO selfhost_amp_history_syncs (workspace_id, thread_id, versions) VALUES ($1, $2, $3::jsonb)",
+    "INSERT INTO amp_history_syncs (workspace_id, thread_id, versions) VALUES ($1, $2, $3::jsonb)",
     [x.h.workspaceId, THREAD, JSON.stringify({ [key]: { version: 1, digest: hash(stableJson(record)) } })],
   );
   await historyPass(x.deps);
@@ -281,7 +281,7 @@ test("amp history: without a push session nothing is exported or polled, only th
   }
   assert.equal(h.transport.calls.filter((call) => call.operation.kind === "export").length, before);
   const row = (await h.database.query<{ history_error: string; history_queued_at: Date | null; last_synced_at: Date | null }>(
-    "SELECT history_error, history_queued_at, last_synced_at FROM selfhost_amp_bindings WHERE id = $1",
+    "SELECT history_error, history_queued_at, last_synced_at FROM amp_bindings WHERE id = $1",
     [binding.binding_id],
   )).rows[0]!;
   assert.equal(row.history_error, "push_session_unavailable");
@@ -293,5 +293,5 @@ test("amp history: without a push session nothing is exported or polled, only th
   const job = await internalJob(h, { v: 1, kind: "history", bindingId: binding.binding_id });
   assert.equal(job.status, 501);
   assert.equal(job.body.error, "history_push_unavailable");
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_history_syncs")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_history_syncs")).rows.length, 0);
 });

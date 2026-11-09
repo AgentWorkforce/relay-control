@@ -337,11 +337,11 @@ test("bootstrap: creates org, owner and Relaycast-bound workspace once (idempote
   assert.equal(ctx.relaycast.state.creates, 1);
   const again = await call(ctx.origin, `/api/v1/organizations/${id}/workspaces`, { token: BOOTSTRAP });
   assert.equal(again.body.workspaces.length, 1);
-  const audit = await ctx.database.query<{ action: string }>("SELECT action FROM selfhost_admin_audit_events ORDER BY created_at");
+  const audit = await ctx.database.query<{ action: string }>("SELECT action FROM admin_audit_events ORDER BY created_at");
   assert.deepEqual(audit.rows.map((r) => r.action), ["organization.bootstrap", "membership.bootstrap_owner", "workspace.bootstrap"]);
 
   // The key is stored encrypted and handed to members through resolve.
-  const raw = await ctx.database.query<{ relaycast_api_key_ciphertext: string }>("SELECT relaycast_api_key_ciphertext FROM selfhost_workspaces");
+  const raw = await ctx.database.query<{ relaycast_api_key_ciphertext: string }>("SELECT relaycast_api_key_ciphertext FROM workspaces");
   assert.match(raw.rows[0]!.relaycast_api_key_ciphertext, /^v2\./);
   const signedIn = await oidcSignIn(ctx, { email: "admin@acme.test", name: "Ada Admin" });
   const me = await whoami(ctx.origin, signedIn.cookie!);
@@ -672,7 +672,7 @@ test("invites: owner invites, email + copyable link, invitee joins through SSO, 
   assert.match(ctx.mailer.sent[0]!.text, /Ada Admin invited you to join "Acme" on Agent Relay as a member/);
   assert(ctx.mailer.sent[0]!.text.includes(created.body.inviteUrl));
   // Only the hash is stored.
-  const stored = await ctx.database.query<{ token_hash: string }>("SELECT token_hash FROM selfhost_organization_invitations");
+  const stored = await ctx.database.query<{ token_hash: string }>("SELECT token_hash FROM organization_invitations");
   assert.equal(stored.rows[0]!.token_hash, createHash("sha256").update(token).digest("hex"));
 
   const list = await call(ctx.origin, `/cloud/api/v1/organizations/${id}/invitations`, { cookie: owner });
@@ -704,7 +704,7 @@ test("invites: owner invites, email + copyable link, invitee joins through SSO, 
   assert.equal((await call(ctx.origin, `/cloud/api/v1/organizations/${id}/invitations`, { cookie: owner })).body.invitations.length, 0);
 
   const audit = await ctx.database.query<{ action: string; actor_kind: string }>(
-    "SELECT action, actor_kind FROM selfhost_admin_audit_events WHERE action LIKE 'invitation.%' ORDER BY created_at",
+    "SELECT action, actor_kind FROM admin_audit_events WHERE action LIKE 'invitation.%' ORDER BY created_at",
   );
   assert.deepEqual(audit.rows.map((r) => [r.action, r.actor_kind]), [["invitation.create", "user"], ["invitation.accept", "user"]]);
 });
@@ -800,7 +800,7 @@ test("auto-join: a verified email in an allowed domain joins as member", async (
   assert.equal(joined.callback.status, 303);
   assert.equal((await whoami(ctx.origin, joined.cookie!)).body.currentOrganization.role, "member");
   assert.equal((await oidcSignIn(ctx, { email: "x@other.test" })).callback.status, 403);
-  const audit = await ctx.database.query<{ action: string }>("SELECT action FROM selfhost_admin_audit_events WHERE action = 'membership.auto_join'");
+  const audit = await ctx.database.query<{ action: string }>("SELECT action FROM admin_audit_events WHERE action = 'membership.auto_join'");
   assert.equal(audit.rows.length, 1);
 });
 
@@ -881,7 +881,7 @@ test("memberships: admins cannot grant, change or remove owners; changes are aud
   const ownerRow = (await call(ctx.origin, `/cloud/api/v1/organizations/${id}/memberships`, { cookie: owner })).body.memberships.find((m: any) => m.email === "admin@acme.test");
   assert.equal((await call(ctx.origin, `/cloud/api/v1/organizations/${id}/memberships/${ownerRow.userId}`, { method: "DELETE", cookie: admin })).status, 403);
   assert.equal((await put(owner, "ad@acme.test", "owner")).status, 200);
-  const audit = await ctx.database.query<{ action: string }>("SELECT action FROM selfhost_admin_audit_events WHERE action LIKE 'membership.update' ");
+  const audit = await ctx.database.query<{ action: string }>("SELECT action FROM admin_audit_events WHERE action LIKE 'membership.update' ");
   assert.equal(audit.rows.length, 2);
 });
 
@@ -957,7 +957,7 @@ test("multi: personalOrgSignupEnabled kill switch overrides the env default; nul
   assert.equal(refused.callback.status, 403, refused.callback.text);
   assert.equal(refused.cookie, null);
   assert.match(refused.callback.text, /isn(&#39;|')t a member of any organization/);
-  const leftover = await ctx.database.query("SELECT 1 FROM selfhost_users WHERE email = 'second@elsewhere.test'");
+  const leftover = await ctx.database.query("SELECT 1 FROM users WHERE email = 'second@elsewhere.test'");
   assert.equal(leftover.rows.length, 0, "a refused sign-in leaves no user row");
   // An existing member still signs in.
   assert((await oidcSignIn(ctx, { email: "first@elsewhere.test" })).cookie);
@@ -968,7 +968,7 @@ test("multi: personalOrgSignupEnabled kill switch overrides the env default; nul
   const again = await oidcSignIn(ctx, { email: "second@elsewhere.test", name: "Second Person" });
   assert(again.cookie, again.callback.text);
   const audit = await ctx.database.query<{ target: string }>(
-    "SELECT target FROM selfhost_admin_audit_events WHERE action = 'installation.settings' ORDER BY created_at",
+    "SELECT target FROM admin_audit_events WHERE action = 'installation.settings' ORDER BY created_at",
   );
   assert.equal(audit.rows.length, 2);
 });
@@ -986,7 +986,7 @@ test("multi: selfServeOrganizationsEnabled kill switch overrides the env default
   assert.equal(created.body.name, "Side Project");
   assert.equal(created.body.workspace.name, "Default");
   const owners = await ctx.database.query<{ role: string }>(
-    "SELECT role FROM selfhost_organization_memberships WHERE organization_id = $1", [created.body.id],
+    "SELECT role FROM organization_memberships WHERE organization_id = $1", [created.body.id],
   );
   assert.deepEqual(owners.rows.map((row) => row.role), ["owner"]);
   // A cross-site cookie request is refused before anything is created.
@@ -1005,7 +1005,7 @@ test("multi: selfServeOrganizationsEnabled kill switch overrides the env default
   const restored = await settings(ctx.origin, { selfServeOrganizationsEnabled: null });
   assert.equal(restored.effective.selfServeOrganizations, true);
   assert.equal((await create("Second Project")).status, 201);
-  const names = await ctx.database.query<{ name: string }>("SELECT name FROM selfhost_organizations ORDER BY created_at");
+  const names = await ctx.database.query<{ name: string }>("SELECT name FROM organizations ORDER BY created_at");
   assert(!names.rows.some((row) => row.name === "Refused" || row.name === "Forged"));
 });
 
@@ -1072,7 +1072,7 @@ test("multi DG-002: operator-assigned domains, verified emails only, invites and
   assert.equal(await currentOrganization(ctx.origin, viaMembership.cookie), otherId);
 
   const acmeMembers = await ctx.database.query<{ email: string }>(
-    `SELECT u.email FROM selfhost_organization_memberships m JOIN selfhost_users u ON u.id = m.user_id
+    `SELECT u.email FROM organization_memberships m JOIN users u ON u.id = m.user_id
       WHERE m.organization_id = $1 ORDER BY u.email`, [acme],
   );
   assert.deepEqual(acmeMembers.rows.map((row) => row.email), ["admin@acme.test", "dev@acme.test"]);
@@ -1140,7 +1140,7 @@ test("multi: a Relaycast workspace is released when COMMIT reports a definite ab
     let insertedWorkspace = false;
     const watched = Object.create(tx) as typeof tx;
     watched.query = (sql: string, params?: unknown[]) => {
-      if (/INSERT INTO selfhost_workspaces/.test(sql)) insertedWorkspace = true;
+      if (/INSERT INTO workspaces/.test(sql)) insertedWorkspace = true;
       return tx.query(sql, params);
     };
     const result = await run(watched);
@@ -1164,7 +1164,7 @@ test("multi: a Relaycast workspace is released when COMMIT reports a definite ab
   );
   assert.deepEqual(provisioned.created, ["rw_1", "rw_2"]);
   assert.deepEqual(provisioned.removed, ["rw_1", "rw_2"]);
-  const leftover = await ctx.database.query("SELECT 1 FROM selfhost_workspaces WHERE relaycast_workspace_id LIKE 'rw\\_%'");
+  const leftover = await ctx.database.query("SELECT 1 FROM workspaces WHERE relaycast_workspace_id LIKE 'rw\\_%'");
   assert.equal(leftover.rows.length, 0);
 });
 
@@ -1182,7 +1182,7 @@ test("multi: a Relaycast workspace is retained when a rolled-back COMMIT reports
     let insertedWorkspace = false;
     const watched = Object.create(tx) as typeof tx;
     watched.query = (sql: string, params?: unknown[]) => {
-      if (/INSERT INTO selfhost_workspaces/.test(sql)) insertedWorkspace = true;
+      if (/INSERT INTO workspaces/.test(sql)) insertedWorkspace = true;
       return tx.query(sql, params);
     };
     const result = await run(watched);
@@ -1209,10 +1209,10 @@ test("multi: a Relaycast workspace is released without verification when the bod
   assert(person.cookie);
   const me = (await whoami(ctx.origin, person.cookie)).body;
 
-  // The body throws on the first query after INSERT INTO selfhost_workspaces,
+  // The body throws on the first query after INSERT INTO workspaces,
   // before the callback returns: the transaction rolls back before COMMIT.
   let verifications = 0;
-  const VERIFY = /SELECT 1 FROM selfhost_workspaces WHERE relaycast_workspace_id/;
+  const VERIFY = /SELECT 1 FROM workspaces WHERE relaycast_workspace_id/;
   const failing: typeof ctx.database = Object.create(ctx.database);
   failing.query = ((sql: string, params?: unknown[]) => {
     if (VERIFY.test(sql)) verifications += 1;
@@ -1224,7 +1224,7 @@ test("multi: a Relaycast workspace is released without verification when the bod
     watched.query = (sql: string, params?: unknown[]) => {
       if (VERIFY.test(sql)) verifications += 1;
       if (insertedWorkspace) return Promise.reject(new Error("body failed after binding"));
-      if (/INSERT INTO selfhost_workspaces/.test(sql)) insertedWorkspace = true;
+      if (/INSERT INTO workspaces/.test(sql)) insertedWorkspace = true;
       return tx.query(sql, params);
     };
     return run(watched);
@@ -1248,7 +1248,7 @@ test("multi: a Relaycast workspace is released without verification when the bod
     issueSession: (tx, session) => ctx.store.issueBrowserSession(tx, session),
   });
   const bound = async (id: string) =>
-    (await ctx.database.query("SELECT 1 FROM selfhost_workspaces WHERE relaycast_workspace_id = $1", [id])).rows.length;
+    (await ctx.database.query("SELECT 1 FROM workspaces WHERE relaycast_workspace_id = $1", [id])).rows.length;
 
   // Self-serve organization.
   await assert.rejects(
@@ -1280,7 +1280,7 @@ test("multi: a Relaycast workspace is retained when COMMIT landed but its acknow
   let reads = 0;
   const lossy: typeof ctx.database = Object.create(ctx.database);
   lossy.query = ((sql: string, params?: unknown[]) => {
-    if (/selfhost_workspaces/.test(sql)) reads += 1;
+    if (/workspaces/.test(sql)) reads += 1;
     return ctx.database.query(sql, params);
   }) as never;
   lossy.transaction = (async (run: Parameters<typeof ctx.database.transaction>[0]) => {
@@ -1288,7 +1288,7 @@ test("multi: a Relaycast workspace is retained when COMMIT landed but its acknow
     const runWithWatchedQuery = (tx: Parameters<typeof run>[0]) => {
       const watched = Object.create(tx) as typeof tx;
       watched.query = (sql: string, params?: unknown[]) => {
-        if (/INSERT INTO selfhost_workspaces/.test(sql)) insertedWorkspace = true;
+        if (/INSERT INTO workspaces/.test(sql)) insertedWorkspace = true;
         return tx.query(sql, params);
       };
       return run(watched);
@@ -1299,7 +1299,7 @@ test("multi: a Relaycast workspace is retained when COMMIT landed but its acknow
   }) as never;
   const { provisioned, store } = lossyIdentityStore(ctx, lossy);
   const bound = async (id: string) =>
-    (await ctx.database.query("SELECT 1 FROM selfhost_workspaces WHERE relaycast_workspace_id = $1", [id])).rows.length;
+    (await ctx.database.query("SELECT 1 FROM workspaces WHERE relaycast_workspace_id = $1", [id])).rows.length;
   const retained = (id: string) => (error: any) => {
     assert.match(error.message, new RegExp(`\\(connection lost during COMMIT\\); Relaycast workspace ${id} was retained for operator reconciliation`));
     assert.equal(error.cause?.message, "connection lost during COMMIT");
@@ -1352,7 +1352,7 @@ test("multi: a Relaycast workspace is never released while its COMMIT is still p
     const real = ctx.database.transaction(async (tx) => {
       const watched = Object.create(tx) as typeof tx;
       watched.query = (sql: string, params?: unknown[]) => {
-        if (/INSERT INTO selfhost_workspaces/.test(sql)) insertedWorkspace = true;
+        if (/INSERT INTO workspaces/.test(sql)) insertedWorkspace = true;
         return tx.query(sql, params);
       };
       const result = await run(watched);
@@ -1371,7 +1371,7 @@ test("multi: a Relaycast workspace is never released while its COMMIT is still p
   }) as never;
   const { provisioned, store } = lossyIdentityStore(ctx, lossy);
   const bound = async (id: string) =>
-    (await ctx.database.query("SELECT 1 FROM selfhost_workspaces WHERE relaycast_workspace_id = $1", [id])).rows.length;
+    (await ctx.database.query("SELECT 1 FROM workspaces WHERE relaycast_workspace_id = $1", [id])).rows.length;
   const landPendingCommit = async () => {
     window = false;
     const held = pending.shift();

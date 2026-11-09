@@ -369,7 +369,7 @@ test("bootstrap, unknown and missing credentials are 401; a session without cli:
     assert.equal(response.body.error, "unauthorized");
   }
   const { accessToken, sessionId } = await ctx.session();
-  await ctx.database.query("UPDATE selfhost_token_sessions SET scopes = $1 WHERE id = $2", [["rth:read"], sessionId]);
+  await ctx.database.query("UPDATE token_sessions SET scopes = $1 WHERE id = $2", [["rth:read"], sessionId]);
   const scoped = await post(ctx.origin, EVENTS, { token: accessToken, body });
   assert.equal(scoped.status, 403);
   assert.equal(scoped.body.error, "forbidden");
@@ -508,7 +508,7 @@ test("a membership revoked after the token check is 404 workspace_not_found and 
     const principal = await authenticate(token);
     if (principal) {
       await ctx.database.query(
-        "DELETE FROM selfhost_organization_memberships WHERE organization_id = $1 AND user_id = $2",
+        "DELETE FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
         [principal.organizationId, principal.userId],
       );
     }

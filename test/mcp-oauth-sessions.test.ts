@@ -21,13 +21,13 @@ async function seed(database: Database) {
   await migrate(database);
   const userId=randomUUID(), organizationId=randomUUID(), workspaceId=randomUUID(), grantId=randomUUID(), tokenFamilyId=randomUUID();
   const clientId=`mcpc_fake_${randomUUID()}`;
-  await database.query("INSERT INTO selfhost_users(id,email,name) VALUES ($1,$2,'Fake User')",[userId,`fake-${userId}@example.test`]);
-  await database.query("INSERT INTO selfhost_organizations(id,name) VALUES ($1,'Fake Org')",[organizationId]);
-  await database.query("INSERT INTO selfhost_organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'owner')",[organizationId,userId]);
-  await database.query(`INSERT INTO selfhost_workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
+  await database.query("INSERT INTO users(id,email,name) VALUES ($1,$2,'Fake User')",[userId,`fake-${userId}@example.test`]);
+  await database.query("INSERT INTO organizations(id,name) VALUES ($1,'Fake Org')",[organizationId]);
+  await database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'owner')",[organizationId,userId]);
+  await database.query(`INSERT INTO workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
     VALUES ($1,$2,'Fake Workspace',$3,'fake-envelope')`,[workspaceId,organizationId,`fake-relay-${workspaceId}`]);
-  await database.query("INSERT INTO selfhost_mcp_oauth_clients(client_id,redirect_uris) VALUES ($1,$2)",[clientId,["https://client.example.test/cb"]]);
-  await database.query(`INSERT INTO selfhost_mcp_oauth_grants
+  await database.query("INSERT INTO mcp_oauth_clients(client_id,redirect_uris) VALUES ($1,$2)",[clientId,["https://client.example.test/cb"]]);
+  await database.query(`INSERT INTO mcp_oauth_grants
     (id,client_id,user_id,organization_id,workspace_id,agent_name,agent_remote_id,scopes,resource,token_family_id)
     VALUES ($1,$2,$3,$4,$5,'fake-agent','fake-immutable-id',$6,$7,$8)`,
   [grantId,clientId,userId,organizationId,workspaceId,["relay:mcp"],RESOURCE,tokenFamilyId]);
@@ -49,7 +49,7 @@ test("OAuth tokens have own prefixes/hash-only table and never pass general sess
   const f=await fixture(t), pair=await f.issue();
   assert.match(pair.accessToken,/^mcp_at_[A-Za-z0-9_-]{43}$/);
   assert.match(pair.refreshToken,/^mcp_rt_[A-Za-z0-9_-]{43}$/);
-  const row=(await f.database.query("SELECT * FROM selfhost_mcp_oauth_sessions")).rows[0]!;
+  const row=(await f.database.query("SELECT * FROM mcp_oauth_sessions")).rows[0]!;
   assert.equal(row.access_token_hash,hashSecret(pair.accessToken));
   assert.equal(row.refresh_token_hash,hashSecret(pair.refreshToken));
   assert.ok(!JSON.stringify(row).includes(pair.accessToken));
@@ -59,7 +59,7 @@ test("OAuth tokens have own prefixes/hash-only table and never pass general sess
   assert.equal(await general.authenticateAccessToken(pair.accessToken),null);
   assert.equal(await general.refresh(pair.refreshToken),null);
   assert.equal(await general.introspectAccessToken(pair.accessToken),null);
-  assert.equal((await f.database.query("SELECT id FROM selfhost_token_sessions")).rows.length,0);
+  assert.equal((await f.database.query("SELECT id FROM token_sessions")).rows.length,0);
 });
 
 test("MCP resolver binds resource/origin/tenant and returns only approved participant plus issued scopes", async t=>{
@@ -84,15 +84,15 @@ test("MCP resolver binds resource/origin/tenant and returns only approved partic
 
 test("grant expansion never widens older sessions; resolver intersects current grant and reads live role", async t=>{
   const f=await fixture(t), pair=await f.issue();
-  await f.database.query("UPDATE selfhost_mcp_oauth_grants SET scopes=$2 WHERE id=$1",[f.owner.grantId,["relay:mcp","relay:agents"]]);
-  await f.database.query("UPDATE selfhost_organization_memberships SET role='member' WHERE user_id=$1 AND organization_id=$2",
+  await f.database.query("UPDATE mcp_oauth_grants SET scopes=$2 WHERE id=$1",[f.owner.grantId,["relay:mcp","relay:agents"]]);
+  await f.database.query("UPDATE organization_memberships SET role='member' WHERE user_id=$1 AND organization_id=$2",
     [f.owner.userId,f.owner.organizationId]);
   const access=await f.sessions.resolveAccessToken(pair.accessToken,RESOURCE);
   assert.deepEqual(access!.principal.scopes,["relay:mcp"]);
   assert.equal(access!.principal.role,"member");
   const rotated=await f.database.transaction(tx=>f.sessions.rotate(tx,pair.refreshToken,f.owner));
   assert.deepEqual(rotated!.scopes,["relay:mcp"]);
-  await f.database.query("UPDATE selfhost_mcp_oauth_grants SET scopes=$2 WHERE id=$1",[f.owner.grantId,["openid"]]);
+  await f.database.query("UPDATE mcp_oauth_grants SET scopes=$2 WHERE id=$1",[f.owner.grantId,["openid"]]);
   assert.equal(await f.sessions.resolveAccessToken(rotated!.accessToken,RESOURCE),null);
 });
 
@@ -106,7 +106,7 @@ test("refresh CAS has one winner, persists retired hash atomically, and preserve
   assert.equal(next.tokenFamilyId,pair.tokenFamilyId);
   assert.equal(await f.sessions.resolveAccessToken(pair.accessToken,RESOURCE),null);
   assert.ok(await f.sessions.resolveAccessToken(next.accessToken,RESOURCE));
-  const receipt=(await f.database.query("SELECT * FROM selfhost_mcp_oauth_retired_refresh_tokens")).rows[0]!;
+  const receipt=(await f.database.query("SELECT * FROM mcp_oauth_retired_refresh_tokens")).rows[0]!;
   assert.equal(receipt.token_hash,hashSecret(pair.refreshToken));
   assert.equal(receipt.grant_id,f.owner.grantId);
   assert.equal(receipt.organization_id,f.owner.organizationId);
@@ -119,21 +119,21 @@ test("rotation rollback keeps the old pair and no retired receipt", async t=>{
     throw new Error("fake transaction failure");
   }),/fake transaction failure/);
   assert.ok(await f.sessions.resolveAccessToken(pair.accessToken,RESOURCE));
-  assert.equal((await f.database.query("SELECT token_hash FROM selfhost_mcp_oauth_retired_refresh_tokens")).rows.length,0);
+  assert.equal((await f.database.query("SELECT token_hash FROM mcp_oauth_retired_refresh_tokens")).rows.length,0);
 });
 
 test("revoked grant, expired pair and missing membership cannot resolve/rotate; deletion retains receipts", async t=>{
   const f=await fixture(t), pair=await f.issue();
-  await f.database.query("UPDATE selfhost_mcp_oauth_grants SET revoked_at=now() WHERE id=$1",[f.owner.grantId]);
+  await f.database.query("UPDATE mcp_oauth_grants SET revoked_at=now() WHERE id=$1",[f.owner.grantId]);
   assert.equal(await f.sessions.resolveAccessToken(pair.accessToken,RESOURCE),null);
   assert.equal(await f.database.transaction(tx=>f.sessions.rotate(tx,pair.refreshToken,f.owner)),null);
-  await f.database.query("UPDATE selfhost_mcp_oauth_grants SET revoked_at=NULL WHERE id=$1",[f.owner.grantId]);
+  await f.database.query("UPDATE mcp_oauth_grants SET revoked_at=NULL WHERE id=$1",[f.owner.grantId]);
   f.advance(31*24*60*60*1000);
   assert.equal(await f.sessions.resolveAccessToken(pair.accessToken,RESOURCE),null);
   assert.equal(await f.database.transaction(tx=>f.sessions.rotate(tx,pair.refreshToken,f.owner)),null);
   f.advance(-31*24*60*60*1000);
-  await f.database.query("DELETE FROM selfhost_organization_memberships WHERE user_id=$1 AND organization_id=$2",[f.owner.userId,f.owner.organizationId]);
-  assert.equal((await f.database.query("SELECT id FROM selfhost_mcp_oauth_sessions WHERE id=$1",[pair.sessionId])).rows.length,1);
+  await f.database.query("DELETE FROM organization_memberships WHERE user_id=$1 AND organization_id=$2",[f.owner.userId,f.owner.organizationId]);
+  assert.equal((await f.database.query("SELECT id FROM mcp_oauth_sessions WHERE id=$1",[pair.sessionId])).rows.length,1);
   assert.equal(await f.sessions.resolveAccessToken(pair.accessToken,RESOURCE),null);
   assert.equal(await f.database.transaction(tx=>f.sessions.rotate(tx,pair.refreshToken,f.owner)),null);
 });
@@ -142,13 +142,13 @@ test("session receipt revocation is exact, family revocation covers continued pa
   const f=await fixture(t), first=await f.issue(), second=await f.issue();
   await assert.rejects(f.database.transaction(tx=>f.sessions.issue(tx,{ ...f.owner,tokenFamilyId:randomUUID(),scopes:["relay:mcp"] })),/consented grant/);
   await assert.rejects(f.issue(["account"]),/consented grant/);
-  await assert.rejects(f.database.query("UPDATE selfhost_mcp_oauth_sessions SET scopes=$2 WHERE id=$1",[first.sessionId,["rth:acquire"]]),/check constraint/);
+  await assert.rejects(f.database.query("UPDATE mcp_oauth_sessions SET scopes=$2 WHERE id=$1",[first.sessionId,["rth:acquire"]]),/check constraint/);
   const otherGrant=randomUUID(),otherFamily=randomUUID();
-  await f.database.query(`INSERT INTO selfhost_mcp_oauth_grants
+  await f.database.query(`INSERT INTO mcp_oauth_grants
     (id,client_id,user_id,organization_id,workspace_id,agent_name,scopes,resource,token_family_id)
     SELECT $2,client_id,user_id,organization_id,workspace_id,'fake-other-agent',scopes,resource,$3
-    FROM selfhost_mcp_oauth_grants WHERE id=$1`,[f.owner.grantId,otherGrant,otherFamily]);
-  await assert.rejects(f.database.query("UPDATE selfhost_mcp_oauth_sessions SET grant_id=$2 WHERE id=$1",[first.sessionId,otherGrant]),/foreign key/);
+    FROM mcp_oauth_grants WHERE id=$1`,[f.owner.grantId,otherGrant,otherFamily]);
+  await assert.rejects(f.database.query("UPDATE mcp_oauth_sessions SET grant_id=$2 WHERE id=$1",[first.sessionId,otherGrant]),/foreign key/);
   assert.equal(await f.database.transaction(tx=>f.sessions.rotate(tx,second.refreshToken,{ ...f.owner,workspaceId:randomUUID() })),null);
   await f.database.transaction(tx=>f.sessions.revokeSession(tx,first.sessionId,f.owner,"fake-code-replay"));
   assert.equal(await f.sessions.resolveAccessToken(first.accessToken,RESOURCE),null);
@@ -160,7 +160,7 @@ test("session receipt revocation is exact, family revocation covers continued pa
 
 test("single-mode gate over multi-org state and disabled resources fail closed", async t=>{
   const f=await fixture(t), pair=await f.issue();
-  await f.database.query("INSERT INTO selfhost_organizations(id,name) VALUES ($1,'Fake Other Org')",[randomUUID()]);
+  await f.database.query("INSERT INTO organizations(id,name) VALUES ($1,'Fake Other Org')",[randomUUID()]);
   const single=new McpOAuthSessions(f.database,{ protocol:f.protocol,tenancyMode:"single" });
   assert.equal(await single.resolveAccessToken(pair.accessToken,RESOURCE),null);
   assert.equal(await f.database.transaction(tx=>single.rotate(tx,pair.refreshToken,f.owner)),null);
@@ -191,5 +191,5 @@ test("real Postgres: concurrent OAuth refresh has one winner across independent 
   const winners=results.filter(value=>value!==null);
   assert.equal(winners.length,1);
   assert.ok(await sessions.resolveAccessToken(winners[0]!.accessToken,RESOURCE));
-  assert.equal((await database.query("SELECT token_hash FROM selfhost_mcp_oauth_retired_refresh_tokens")).rows.length,1);
+  assert.equal((await database.query("SELECT token_hash FROM mcp_oauth_retired_refresh_tokens")).rows.length,1);
 });

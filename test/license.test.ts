@@ -109,7 +109,7 @@ test("GET /api/v1/license: exact shape, any member, cookie alias, 401 without a 
     capabilities: { flows: true, relayfile: false, chief: true },
   });
   const owners = await cp.database.query<{ count: string }>(
-    "SELECT count(*)::text AS count FROM selfhost_organization_memberships WHERE role = 'owner'",
+    "SELECT count(*)::text AS count FROM organization_memberships WHERE role = 'owner'",
   );
   assert.equal(owners.rows[0]!.count, "1");
   assert.equal(JSON.stringify(read.body).includes("."), false, "no licence document or signature");

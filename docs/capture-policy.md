@@ -1,7 +1,7 @@
 # Capture policy
 
 An organization owner/admin can mandate how members' Desktop sessions are captured and uploaded.
-Storage: `selfhost_capture_policies` (migration 0019), one row per organization.
+Storage: `capture_policies` (migration 0019), one row per organization.
 
 **Policy object** (`version` 1): `{ "version": 1, "revision": 7, "settings": { ... } }`
 

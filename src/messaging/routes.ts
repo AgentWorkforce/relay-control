@@ -268,9 +268,9 @@ export function createMessagingHandler(input: MessagingDeps & {
         agent_name: string;
       }>(
         `SELECT u.id AS user_id, u.name AS display_name, u.email, i.agent_name
-           FROM selfhost_person_identities i
-           JOIN selfhost_users u ON u.id = i.user_id
-           JOIN selfhost_organization_memberships m
+           FROM person_identities i
+           JOIN users u ON u.id = i.user_id
+           JOIN organization_memberships m
              ON m.organization_id = $2 AND m.user_id = i.user_id
           WHERE i.workspace_id = $1 AND i.relaycast_workspace_id = $3
           ORDER BY u.name`,

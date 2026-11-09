@@ -104,7 +104,7 @@ async function queueDelivery(
     if (!relay || relay.relaycastWorkspaceId !== row.relaycast_workspace_id) return "stale";
     const payload = encrypt(deps, JSON.stringify({ sender: message.sender, text: message.text } satisfies Payload));
     const inserted = await tx.query(
-      `INSERT INTO selfhost_amp_deliveries (id, binding_id, message_id, state, payload_ciphertext)
+      `INSERT INTO amp_deliveries (id, binding_id, message_id, state, payload_ciphertext)
        VALUES ($1, $2, $3, 'pending', $4)
        ON CONFLICT (binding_id, message_id) DO NOTHING RETURNING id`,
       [randomUUID(), row.id, message.messageId, payload],
@@ -113,7 +113,7 @@ async function queueDelivery(
     // A definite rejection (Amp refused before submission) may be retried by a
     // redelivered message. Sending, unknown and delivered are never re-queued.
     const retried = await tx.query(
-      `UPDATE selfhost_amp_deliveries
+      `UPDATE amp_deliveries
           SET state = 'pending', code = NULL, payload_ciphertext = $3, updated_at = now()
         WHERE binding_id = $1 AND message_id = $2 AND state = 'rejected'
           AND code IS DISTINCT FROM 'binding_retired' RETURNING id`,
@@ -217,7 +217,7 @@ export async function recoverInbox(
   limits: { bindings: number; messages: number } = { bindings: INBOX_BINDINGS_PER_TICK, messages: INBOX_MESSAGES_PER_TICK },
 ): Promise<{ polled: number; queued: number; failed: number }> {
   const pick = (after: string | null, limit: number) => deps.database.query<{ id: string }>(
-    `SELECT id FROM selfhost_amp_bindings
+    `SELECT id FROM amp_bindings
       WHERE state = 'bound' AND token_ciphertext IS NOT NULL ${after ? "AND id > $2" : ""}
       ORDER BY id LIMIT $1`,
     after ? [limit, after] : [limit],
@@ -261,7 +261,7 @@ export async function recoverInbox(
       }
       if (!stale && binding.last_error === INBOX_POLL_FAILED) {
         await deps.database.query(
-          `UPDATE selfhost_amp_bindings SET last_error = NULL, updated_at = now()
+          `UPDATE amp_bindings SET last_error = NULL, updated_at = now()
             WHERE id = $1 AND generation = $2 AND last_error = $3`,
           [id, binding.generation, INBOX_POLL_FAILED],
         );
@@ -272,7 +272,7 @@ export async function recoverInbox(
       if (binding) {
         // Never overwrites a send outcome an operator still has to settle.
         await deps.database.query(
-          `UPDATE selfhost_amp_bindings SET last_error = $3, updated_at = now()
+          `UPDATE amp_bindings SET last_error = $3, updated_at = now()
             WHERE id = $1 AND generation = $2 AND state = 'bound' AND last_error IS NULL`,
           [id, binding.generation, INBOX_POLL_FAILED],
         ).catch(() => undefined);
@@ -304,11 +304,11 @@ export async function claimNext(deps: AmpDeps, only?: { bindingId: string; messa
     const filter = only ? "AND d.binding_id = $2 AND d.message_id = $3" : "";
     const picked = await tx.query<{ id: string; binding_id: string; message_id: string; generation: number }>(
       `SELECT d.id, d.binding_id, d.message_id, b.generation
-         FROM selfhost_amp_deliveries d
-         JOIN selfhost_amp_bindings b ON b.id = d.binding_id
+         FROM amp_deliveries d
+         JOIN amp_bindings b ON b.id = d.binding_id
         WHERE d.state = 'pending' AND b.state = 'bound'
           AND NOT EXISTS (
-            SELECT 1 FROM selfhost_amp_deliveries s
+            SELECT 1 FROM amp_deliveries s
              WHERE s.binding_id = d.binding_id AND s.state = 'sending' AND s.lease_until > $1)
           ${filter}
         ORDER BY d.created_at, d.id
@@ -329,7 +329,7 @@ export async function claimNext(deps: AmpDeps, only?: { bindingId: string; messa
       replyExpiresAt: new Date(now.getTime() + REPLY_LIFETIME_MS),
     };
     await tx.query(
-      `UPDATE selfhost_amp_deliveries
+      `UPDATE amp_deliveries
           SET state = 'sending', lease_owner = $2, lease_until = $3, attempts = attempts + 1,
               claim_generation = $4, reply_hash = $5, reply_expires_at = $6, reply_request_id = $7,
               reply_body_hash = NULL, reply_message_id = NULL, updated_at = $8
@@ -351,10 +351,10 @@ async function fence(deps: AmpDeps, tx: SqlExecutor, claim: Claim): Promise<Fenc
   }>(
     `SELECT b.*, d.state AS d_state, d.lease_owner, d.lease_until, d.claim_generation, d.payload_ciphertext,
             c.key_ciphertext
-       FROM selfhost_amp_deliveries d
-       JOIN selfhost_amp_bindings b ON b.id = d.binding_id
-       LEFT JOIN selfhost_amp_connections c ON c.workspace_id = b.workspace_id AND c.user_id = b.user_id
-       JOIN selfhost_organization_memberships m ON m.organization_id = b.organization_id AND m.user_id = b.user_id
+       FROM amp_deliveries d
+       JOIN amp_bindings b ON b.id = d.binding_id
+       LEFT JOIN amp_connections c ON c.workspace_id = b.workspace_id AND c.user_id = b.user_id
+       JOIN organization_memberships m ON m.organization_id = b.organization_id AND m.user_id = b.user_id
       WHERE d.id = $1
       FOR UPDATE OF d`,
     [claim.deliveryId],
@@ -393,17 +393,17 @@ export async function finalize(
 ): Promise<boolean> {
   return deps.database.transaction(async (tx) => {
     const current = await tx.query<{ payload_ciphertext: string | null }>(
-      "SELECT payload_ciphertext FROM selfhost_amp_deliveries WHERE id = $1 FOR UPDATE",
+      "SELECT payload_ciphertext FROM amp_deliveries WHERE id = $1 FOR UPDATE",
       [claim.deliveryId],
     );
     const reduced = senderOnly(deps, current.rows[0]?.payload_ciphertext ?? null);
     const updated = await tx.query(
-      `UPDATE selfhost_amp_deliveries d
+      `UPDATE amp_deliveries d
           SET state = $4, code = $5, lease_owner = NULL, lease_until = NULL,
               payload_ciphertext = CASE WHEN $4 = 'rejected' THEN d.payload_ciphertext ELSE $6 END,
               reply_hash = CASE WHEN $4 = 'rejected' THEN NULL ELSE d.reply_hash END,
               updated_at = $7
-         FROM selfhost_amp_bindings b
+         FROM amp_bindings b
         WHERE d.id = $1 AND b.id = d.binding_id AND d.state = 'sending'
           AND d.lease_owner = $2 AND d.claim_generation = $3 AND b.generation = $3 AND b.state = 'bound'
         RETURNING d.id`,
@@ -414,7 +414,7 @@ export async function finalize(
       return false;
     }
     await tx.query(
-      "UPDATE selfhost_amp_bindings SET last_error = $2, updated_at = now() WHERE id = $1",
+      "UPDATE amp_bindings SET last_error = $2, updated_at = now() WHERE id = $1",
       [claim.bindingId, outcome === "delivered" ? null : outcome === "unknown" ? SEND_UNKNOWN : "amp_send_rejected"],
     );
     return true;
@@ -424,7 +424,7 @@ export async function finalize(
 /** Releases a claim that never reached Amp back to pending (fenced on the lease). */
 async function unclaim(deps: AmpDeps, claim: Claim, state: "pending" | "rejected", code: string | null) {
   await deps.database.query(
-    `UPDATE selfhost_amp_deliveries
+    `UPDATE amp_deliveries
         SET state = $3, code = $4, lease_owner = NULL, lease_until = NULL, reply_hash = NULL, updated_at = now()
       WHERE id = $1 AND state = 'sending' AND lease_owner = $2`,
     [claim.deliveryId, claim.leaseOwner, state, code],
@@ -469,7 +469,7 @@ export async function injectJob(deps: AmpDeps, bindingId: string, messageId: str
   const claim = await claimNext(deps, { bindingId, messageId });
   if (!claim) {
     const existing = await deps.database.query<{ state: string }>(
-      "SELECT state FROM selfhost_amp_deliveries WHERE binding_id = $1 AND message_id = $2",
+      "SELECT state FROM amp_deliveries WHERE binding_id = $1 AND message_id = $2",
       [bindingId, messageId],
     );
     const state = existing.rows[0]?.state;
@@ -486,7 +486,7 @@ export async function sweep(deps: AmpDeps) {
   return deps.database.transaction(async (tx) => {
     const now = deps.now();
     const expired = await tx.query<{ id: string; binding_id: string; payload_ciphertext: string | null }>(
-      `SELECT id, binding_id, payload_ciphertext FROM selfhost_amp_deliveries
+      `SELECT id, binding_id, payload_ciphertext FROM amp_deliveries
         WHERE state = 'sending' AND lease_until <= $1
         FOR UPDATE SKIP LOCKED`,
       [now],
@@ -494,7 +494,7 @@ export async function sweep(deps: AmpDeps) {
     for (const row of expired.rows) {
       const reduced = senderOnly(deps, row.payload_ciphertext);
       await tx.query(
-        `UPDATE selfhost_amp_deliveries
+        `UPDATE amp_deliveries
             SET state = 'unknown', code = 'lease_expired', lease_owner = NULL, lease_until = NULL,
                 payload_ciphertext = $2, updated_at = $3
           WHERE id = $1`,
@@ -502,11 +502,11 @@ export async function sweep(deps: AmpDeps) {
       );
     }
     for (const bindingId of new Set(expired.rows.map((row) => row.binding_id))) {
-      await tx.query("UPDATE selfhost_amp_bindings SET last_error = $2, updated_at = now() WHERE id = $1",
+      await tx.query("UPDATE amp_bindings SET last_error = $2, updated_at = now() WHERE id = $1",
         [bindingId, SEND_UNKNOWN]);
     }
     const due = await tx.query<{ count: number }>(
-      "SELECT count(*)::int AS count FROM selfhost_amp_deliveries WHERE state = 'pending'",
+      "SELECT count(*)::int AS count FROM amp_deliveries WHERE state = 'pending'",
     );
     return { queued: 0, due: due.rows[0]?.count ?? 0, expired: expired.rows.length, deferred: true };
   });
@@ -530,8 +530,8 @@ export async function replySend(deps: AmpDeps, bindingId: string, bearer: string
   if (!REPLY_BEARER.test(bearer) || !UUID.test(bindingId)) throw REVOKED();
   const replyHash = hashSecret(bearer);
   const located = await deps.database.query<{ workspace_id: string; organization_id: string }>(
-    `SELECT b.workspace_id, b.organization_id FROM selfhost_amp_deliveries d
-       JOIN selfhost_amp_bindings b ON b.id = d.binding_id
+    `SELECT b.workspace_id, b.organization_id FROM amp_deliveries d
+       JOIN amp_bindings b ON b.id = d.binding_id
       WHERE d.reply_hash = $1 AND d.binding_id = $2`,
     [replyHash, bindingId],
   );
@@ -549,9 +549,9 @@ export async function replySend(deps: AmpDeps, bindingId: string, bearer: string
     }>(
       `SELECT d.id, d.message_id, d.state, d.payload_ciphertext, d.reply_expires_at, d.reply_request_id,
               d.reply_body_hash, d.reply_message_id,
-              EXISTS (SELECT 1 FROM selfhost_organization_memberships m
+              EXISTS (SELECT 1 FROM organization_memberships m
                        WHERE m.organization_id = b.organization_id AND m.user_id = b.user_id) AS member
-         FROM selfhost_amp_deliveries d JOIN selfhost_amp_bindings b ON b.id = d.binding_id
+         FROM amp_deliveries d JOIN amp_bindings b ON b.id = d.binding_id
         WHERE d.reply_hash = $1 AND d.binding_id = $2 AND b.state = 'bound'
         FOR UPDATE OF d`,
       [replyHash, bindingId],
@@ -587,7 +587,7 @@ export async function replySend(deps: AmpDeps, bindingId: string, bearer: string
         idempotencyKey: `amp-${hashSecret(`${bindingId}:${input.data.request_id}`)}`,
       });
       await tx.query(
-        "UPDATE selfhost_amp_deliveries SET reply_body_hash = $2, reply_message_id = $3, updated_at = now() WHERE id = $1",
+        "UPDATE amp_deliveries SET reply_body_hash = $2, reply_message_id = $3, updated_at = now() WHERE id = $1",
         [delivery.id, bodyHash, sent.message.id],
       );
       return { ok: true, message_id: sent.message.id, conversation_id: sent.conversationId };
@@ -622,12 +622,12 @@ export async function reconcileDelivery(deps: AmpDeps, actor: AmpActor, bindingI
       throw new AmpError(409, "relay_changed", "The bound relay is unavailable.");
     }
     const delivery = await tx.query<{ id: string }>(
-      "SELECT id FROM selfhost_amp_deliveries WHERE binding_id = $1 AND message_id = $2",
+      "SELECT id FROM amp_deliveries WHERE binding_id = $1 AND message_id = $2",
       [bindingId, messageId],
     );
     if (!delivery.rows[0]) throw new AmpError(404, "delivery_not_found", "Delivery not found.");
     const connection = await tx.query<{ key_ciphertext: string }>(
-      "SELECT key_ciphertext FROM selfhost_amp_connections WHERE workspace_id = $1 AND user_id = $2",
+      "SELECT key_ciphertext FROM amp_connections WHERE workspace_id = $1 AND user_id = $2",
       [actor.workspaceId, row.user_id],
     );
     if (!connection.rows[0]) throw new AmpError(409, "amp_not_connected", "Connect Amp in Settings first.");
@@ -652,7 +652,7 @@ export async function reconcileDelivery(deps: AmpDeps, actor: AmpActor, bindingI
       throw new AmpError(404, "binding_not_found", "Binding not found.");
     }
     const current = await tx.query<{ state: string; payload_ciphertext: string | null }>(
-      "SELECT state, payload_ciphertext FROM selfhost_amp_deliveries WHERE binding_id = $1 AND message_id = $2 FOR UPDATE",
+      "SELECT state, payload_ciphertext FROM amp_deliveries WHERE binding_id = $1 AND message_id = $2 FOR UPDATE",
       [bindingId, messageId],
     );
     const delivery = current.rows[0];
@@ -660,7 +660,7 @@ export async function reconcileDelivery(deps: AmpDeps, actor: AmpActor, bindingI
     // A live lease is never overridden: the worker's own finalize settles it.
     if (confirmed && delivery.state !== "sending" && delivery.state !== "delivered") {
       await tx.query(
-        `UPDATE selfhost_amp_deliveries
+        `UPDATE amp_deliveries
             SET state = 'delivered', code = NULL, lease_owner = NULL, lease_until = NULL,
                 payload_ciphertext = $3, updated_at = now()
           WHERE binding_id = $1 AND message_id = $2`,
@@ -669,7 +669,7 @@ export async function reconcileDelivery(deps: AmpDeps, actor: AmpActor, bindingI
       delivery.state = "delivered";
     }
     if (confirmed) {
-      await tx.query("UPDATE selfhost_amp_bindings SET last_error = NULL, updated_at = now() WHERE id = $1", [bindingId]);
+      await tx.query("UPDATE amp_bindings SET last_error = NULL, updated_at = now() WHERE id = $1", [bindingId]);
     }
     return { confirmed, state: delivery.state };
   });

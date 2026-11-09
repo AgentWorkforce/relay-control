@@ -199,24 +199,24 @@ export class ControlPlaneStore {
     try {
       const result = await this.database.query<{ present: boolean; organizations: number }>(
         `SELECT
-           to_regclass('public.selfhost_schema_migrations') IS NOT NULL
-           AND to_regclass('public.selfhost_token_sessions') IS NOT NULL
-           AND to_regclass('public.selfhost_workspaces') IS NOT NULL
-           AND to_regclass('public.selfhost_organization_domains') IS NOT NULL
+           to_regclass('public.control_schema_migrations') IS NOT NULL
+           AND to_regclass('public.token_sessions') IS NOT NULL
+           AND to_regclass('public.workspaces') IS NOT NULL
+           AND to_regclass('public.organization_domains') IS NOT NULL
            -- Runtime roles deliberately cannot read the migration ledger.
            -- Check the minimum multi-tenant schema through visible columns.
            AND (
              SELECT count(*) = 5 FROM information_schema.columns
               WHERE table_schema = 'public'
                 AND (
-                  (table_name = 'selfhost_users'
+                  (table_name = 'users'
                    AND column_name IN ('last_organization_id', 'last_workspace_id'))
-                  OR (table_name = 'selfhost_installation_bootstrap'
+                  OR (table_name = 'installation_bootstrap'
                       AND column_name IN ('personal_org_signup_enabled', 'self_serve_organizations_enabled'))
-                  OR (table_name = 'selfhost_telemetry_outbox' AND column_name = 'organization_id')
+                  OR (table_name = 'telemetry_outbox' AND column_name = 'organization_id')
                 )
            ) AS present,
-           (SELECT count(*)::int FROM selfhost_organizations) AS organizations`,
+           (SELECT count(*)::int FROM organizations) AS organizations`,
       );
       const row = result.rows[0];
       if (row?.present !== true) {
@@ -238,7 +238,7 @@ export class ControlPlaneStore {
   /** Whether the organization exists (the 404 boundary for org-scoped routes). */
   async organizationExists(organizationId: string): Promise<boolean> {
     const result = await this.database.query<{ id: string }>(
-      "SELECT id FROM selfhost_organizations WHERE id = $1",
+      "SELECT id FROM organizations WHERE id = $1",
       [organizationId],
     );
     return result.rows.length === 1;
@@ -263,7 +263,7 @@ export class ControlPlaneStore {
         // check is the singleton (0014 dropped the schema constraint).
         await lockOrganizationCreate(tx);
         const existing = await tx.query<{ id: string }>(
-          "SELECT id FROM selfhost_organizations LIMIT 1",
+          "SELECT id FROM organizations LIMIT 1",
         );
         if (existing.rows.length > 0) {
           throw new OrganizationConflictError(
@@ -272,11 +272,11 @@ export class ControlPlaneStore {
         }
       }
       await tx.query(
-        "INSERT INTO selfhost_organizations (id, name) VALUES ($1, $2)",
+        "INSERT INTO organizations (id, name) VALUES ($1, $2)",
         [id, name],
       );
       await tx.query(
-        `INSERT INTO selfhost_organization_memberships
+        `INSERT INTO organization_memberships
           (organization_id, user_id, role) VALUES ($1, $2, 'owner')`,
         [id, owner.id],
       );
@@ -291,8 +291,8 @@ export class ControlPlaneStore {
       role: Principal["role"] | null;
     }>(
       `SELECT o.id, o.name, m.role
-         FROM selfhost_organizations o
-         LEFT JOIN selfhost_organization_memberships m
+         FROM organizations o
+         LEFT JOIN organization_memberships m
            ON m.organization_id = o.id AND m.user_id = $1
         WHERE $1::uuid IS NULL OR m.user_id IS NOT NULL
         ORDER BY o.created_at, o.id`,
@@ -319,7 +319,7 @@ export class ControlPlaneStore {
     await this.database.transaction(async (tx) => {
       await this.requireOrganization(tx, input.organizationId);
       await tx.query(
-        `INSERT INTO selfhost_workspaces
+        `INSERT INTO workspaces
           (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
          VALUES ($1, $2, $3, $4, $5)`,
         [
@@ -354,7 +354,7 @@ export class ControlPlaneStore {
     return this.database.transaction(async (tx) => {
       await this.requireOrganization(tx, input.organizationId);
       const result = await tx.query<{ id: string; name: string; relaycast_workspace_id: string }>(
-        `UPDATE selfhost_workspaces
+        `UPDATE workspaces
             SET name = COALESCE($3, name),
                 relaycast_workspace_id = COALESCE($4, relaycast_workspace_id),
                 relaycast_api_key_ciphertext = COALESCE($5, relaycast_api_key_ciphertext),
@@ -397,7 +397,7 @@ export class ControlPlaneStore {
     try {
       return await this.database.transaction(async (tx) => {
         const rows = await tx.query<{ id: string; name: string }>(
-          "SELECT id, name FROM selfhost_workspaces WHERE organization_id = $1 ORDER BY id FOR UPDATE",
+          "SELECT id, name FROM workspaces WHERE organization_id = $1 ORDER BY id FOR UPDATE",
           [input.organizationId],
         );
         const target = rows.rows.find((row) => row.id === input.workspaceId);
@@ -406,13 +406,13 @@ export class ControlPlaneStore {
         // Keep the workspace key/location until connector cleanup commits.
         // The workspace row lock also fences a new grant's FK insertion;
         // revocation alone must not let CASCADE discard pending remote work.
-        const oauth = await tx.query(`SELECT 1 FROM selfhost_mcp_oauth_grants
+        const oauth = await tx.query(`SELECT 1 FROM mcp_oauth_grants
           WHERE organization_id=$1 AND workspace_id=$2 AND revoked_at IS NULL
-          UNION ALL SELECT 1 FROM selfhost_mcp_oauth_revocations
+          UNION ALL SELECT 1 FROM mcp_oauth_revocations
           WHERE organization_id=$1 AND workspace_id=$2 AND completed_at IS NULL
           LIMIT 1`, [input.organizationId,input.workspaceId]);
         if (oauth.rows.length) return "in_use";
-        await tx.query("DELETE FROM selfhost_workspaces WHERE id = $1 AND organization_id = $2", [
+        await tx.query("DELETE FROM workspaces WHERE id = $1 AND organization_id = $2", [
           input.workspaceId,
           input.organizationId,
         ]);
@@ -453,21 +453,21 @@ export class ControlPlaneStore {
         // Revocation needs the tenancy lock order: grant owners (user id
         // order), then the organization, then the workspace row.
         const owners = input.revokeLive ? (await tx.query<{ user_id: string }>(
-          `SELECT DISTINCT user_id FROM selfhost_mcp_oauth_grants
+          `SELECT DISTINCT user_id FROM mcp_oauth_grants
             WHERE organization_id = $1 AND workspace_id = $2 AND revoked_at IS NULL ORDER BY user_id`,
           [input.organizationId, input.workspaceId],
         )).rows.map((row) => row.user_id) : [];
         for (const userId of owners) await lockUser(tx, userId);
         if (input.revokeLive) await lockOrganization(tx, input.organizationId);
         const workspace = await tx.query(
-          "SELECT id FROM selfhost_workspaces WHERE id = $1 AND organization_id = $2 FOR UPDATE",
+          "SELECT id FROM workspaces WHERE id = $1 AND organization_id = $2 FOR UPDATE",
           [input.workspaceId, input.organizationId],
         );
         if (!workspace.rows.length) return null;
         let revoked = 0;
         if (input.revokeLive) {
           const live = await tx.query<{ id: string; user_id: string }>(
-            `SELECT id, user_id FROM selfhost_mcp_oauth_grants
+            `SELECT id, user_id FROM mcp_oauth_grants
               WHERE organization_id = $1 AND workspace_id = $2 AND revoked_at IS NULL ORDER BY id`,
             [input.organizationId, input.workspaceId],
           );
@@ -476,14 +476,14 @@ export class ControlPlaneStore {
           if (live.rows.some((row) => !owners.includes(row.user_id))) return "retry" as const;
           const now = new Date();
           // Unredeemed codes would otherwise mint a fresh grant once the module is on.
-          await tx.query(`UPDATE selfhost_mcp_oauth_authorization_codes SET expires_at = $3
+          await tx.query(`UPDATE mcp_oauth_authorization_codes SET expires_at = $3
             WHERE organization_id = $1 AND workspace_id = $2 AND expires_at > $3`,
           [input.organizationId, input.workspaceId, now]);
           for (const { id } of live.rows) {
             if (await revokeMcpOAuthGrantRows(tx, id, "operator_abandoned", now)) revoked += 1;
           }
         }
-        const abandoned = await tx.query(`UPDATE selfhost_mcp_oauth_revocations
+        const abandoned = await tx.query(`UPDATE mcp_oauth_revocations
           SET completed_at = now(), outcome = 'operator_abandoned'
           WHERE organization_id = $1 AND workspace_id = $2 AND completed_at IS NULL RETURNING id`,
         [input.organizationId, input.workspaceId]);
@@ -511,7 +511,7 @@ export class ControlPlaneStore {
       runtime_config: unknown;
     }>(
       `SELECT id, organization_id, name, relaycast_workspace_id, runtime_config
-         FROM selfhost_workspaces WHERE organization_id = $1 ORDER BY created_at, id`,
+         FROM workspaces WHERE organization_id = $1 ORDER BY created_at, id`,
       [organizationId],
     );
     return result.rows.map((row) => ({
@@ -532,8 +532,8 @@ export class ControlPlaneStore {
       created_at: Date | string;
     }>(
       `SELECT u.id AS user_id, u.email, u.name, m.role, m.created_at
-         FROM selfhost_organization_memberships m
-         JOIN selfhost_users u ON u.id = m.user_id
+         FROM organization_memberships m
+         JOIN users u ON u.id = m.user_id
         WHERE m.organization_id = $1 ORDER BY u.email`,
       [organizationId],
     );
@@ -568,10 +568,10 @@ export class ControlPlaneStore {
         // them) without their consent. They accept an invitation instead.
         const found = await tx.query<{ member: boolean }>(
           `SELECT EXISTS (
-                    SELECT 1 FROM selfhost_organization_memberships m
+                    SELECT 1 FROM organization_memberships m
                      WHERE m.organization_id = $2 AND m.user_id = u.id
                   ) AS member
-             FROM selfhost_users u WHERE u.email = $1`,
+             FROM users u WHERE u.email = $1`,
           [email, input.organizationId],
         );
         if (found.rows[0] && found.rows[0].member !== true) {
@@ -580,13 +580,13 @@ export class ControlPlaneStore {
       }
       const user = await this.upsertUser(tx, email, input.name);
       const existing = await tx.query<{ role: Principal["role"] }>(
-        `SELECT role FROM selfhost_organization_memberships
+        `SELECT role FROM organization_memberships
           WHERE organization_id = $1 AND user_id = $2`,
         [input.organizationId, user.id],
       );
       if (existing.rows[0]?.role === "owner" && input.role !== "owner") {
         const owners = await tx.query<{ count: string }>(
-          `SELECT count(*)::text AS count FROM selfhost_organization_memberships
+          `SELECT count(*)::text AS count FROM organization_memberships
             WHERE organization_id = $1 AND role = 'owner'`,
           [input.organizationId],
         );
@@ -595,7 +595,7 @@ export class ControlPlaneStore {
         }
       }
       await tx.query(
-        `INSERT INTO selfhost_organization_memberships (organization_id, user_id, role)
+        `INSERT INTO organization_memberships (organization_id, user_id, role)
          VALUES ($1, $2, $3)
          ON CONFLICT (organization_id, user_id) DO UPDATE
            SET role = EXCLUDED.role, updated_at = now()`,
@@ -622,11 +622,11 @@ export class ControlPlaneStore {
       await lockOrganization(tx, organizationId);
       await this.requireOrganization(tx, organizationId);
       const result = await tx.query<{ user_id: string }>(
-        `DELETE FROM selfhost_organization_memberships
+        `DELETE FROM organization_memberships
           WHERE organization_id = $1 AND user_id = $2
             AND (
               role <> 'owner' OR
-              (SELECT count(*) FROM selfhost_organization_memberships
+              (SELECT count(*) FROM organization_memberships
                 WHERE organization_id = $1 AND role = 'owner') > 1
             )
           RETURNING user_id`,
@@ -635,7 +635,7 @@ export class ControlPlaneStore {
       const deleted=result.rows.length===1;
       // An idempotent retry can repair credentials from an earlier departure;
       // never invoke the hook when a remaining last-owner row blocks deletion.
-      if (deleted || !(await tx.query("SELECT user_id FROM selfhost_organization_memberships WHERE organization_id=$1 AND user_id=$2",
+      if (deleted || !(await tx.query("SELECT user_id FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",
         [organizationId,userId])).rows.length) {
         await beforeCommit?.(tx, { organizationId, userId });
       }
@@ -646,14 +646,14 @@ export class ControlPlaneStore {
   /** Licence seats in use: organization members, owners included, across the installation. */
   async countActiveMembers(): Promise<number> {
     const result = await this.database.query<{ count: string }>(
-      `SELECT count(DISTINCT user_id)::text AS count FROM selfhost_organization_memberships`,
+      `SELECT count(DISTINCT user_id)::text AS count FROM organization_memberships`,
     );
     return Number(result.rows[0]?.count ?? 0);
   }
 
   async memberRole(organizationId: string, userId: string): Promise<Principal["role"] | null> {
     const result = await this.database.query<{ role: Principal["role"] }>(
-      `SELECT role FROM selfhost_organization_memberships
+      `SELECT role FROM organization_memberships
         WHERE organization_id = $1 AND user_id = $2`,
       [organizationId, userId],
     );
@@ -662,8 +662,8 @@ export class ControlPlaneStore {
 
   async memberRoleByEmail(organizationId: string, email: string): Promise<Principal["role"] | null> {
     const result = await this.database.query<{ role: Principal["role"] }>(
-      `SELECT m.role FROM selfhost_organization_memberships m
-         JOIN selfhost_users u ON u.id = m.user_id
+      `SELECT m.role FROM organization_memberships m
+         JOIN users u ON u.id = m.user_id
         WHERE m.organization_id = $1 AND u.email = $2`,
       [organizationId, email.trim().toLowerCase()],
     );
@@ -674,8 +674,8 @@ export class ControlPlaneStore {
   async memberWorkspaceCount(userId: string): Promise<number> {
     const result = await this.database.query<{ n: number }>(
       `SELECT count(*)::int AS n
-         FROM selfhost_organization_memberships m
-         JOIN selfhost_workspaces w ON w.organization_id = m.organization_id
+         FROM organization_memberships m
+         JOIN workspaces w ON w.organization_id = m.organization_id
         WHERE m.user_id = $1`,
       [userId],
     );
@@ -698,9 +698,9 @@ export class ControlPlaneStore {
       role: Principal["role"];
     }>(
       `SELECT w.id, w.name, w.organization_id, o.name AS organization_name, m.role
-         FROM selfhost_organization_memberships m
-         JOIN selfhost_organizations o ON o.id = m.organization_id
-         JOIN selfhost_workspaces w ON w.organization_id = m.organization_id
+         FROM organization_memberships m
+         JOIN organizations o ON o.id = m.organization_id
+         JOIN workspaces w ON w.organization_id = m.organization_id
         WHERE m.user_id = $1
         ORDER BY o.created_at, o.id, w.created_at, w.id`,
       [userId],
@@ -717,7 +717,7 @@ export class ControlPlaneStore {
   /** A workspace's Relaycast credentials, for the Flows service that assigns its runs. */
   async relaycastBinding(workspaceId: string): Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null> {
     const result = await this.database.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
-      "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM selfhost_workspaces WHERE id = $1",
+      "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM workspaces WHERE id = $1",
       [workspaceId],
     );
     const row = result.rows[0];
@@ -749,8 +749,8 @@ export class ControlPlaneStore {
     }>(
       `SELECT w.id, w.organization_id, w.name, w.relaycast_workspace_id,
               w.relaycast_api_key_ciphertext, w.runtime_config, m.role
-         FROM selfhost_workspaces w
-         JOIN selfhost_organization_memberships m
+         FROM workspaces w
+         JOIN organization_memberships m
            ON m.organization_id = w.organization_id AND m.user_id = $2
         WHERE w.id = $1`,
       [workspaceId, userId],
@@ -770,7 +770,7 @@ export class ControlPlaneStore {
 
   async setRuntime(workspaceId: string, runtime: unknown): Promise<boolean> {
     const result = await this.database.query<{ id: string }>(
-      `UPDATE selfhost_workspaces SET runtime_config = $2::jsonb, updated_at = now()
+      `UPDATE workspaces SET runtime_config = $2::jsonb, updated_at = now()
         WHERE id = $1
         RETURNING id`,
       [workspaceId, JSON.stringify(runtime)],
@@ -800,7 +800,7 @@ export class ControlPlaneStore {
       const userCode = generateUserCode();
       try {
         await this.database.query(
-          `INSERT INTO selfhost_device_authorizations
+          `INSERT INTO device_authorizations
             (id, device_code_hash, user_code, client_name, interval_seconds, expires_at,
              desktop_host_name)
            VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -849,7 +849,7 @@ export class ControlPlaneStore {
       expires_at: Date | string;
     }>(
       `SELECT user_code, client_name, desktop_host_name, status, expires_at
-         FROM selfhost_device_authorizations WHERE user_code = $1`,
+         FROM device_authorizations WHERE user_code = $1`,
       [userCode],
     );
     const row = found.rows[0];
@@ -875,7 +875,7 @@ export class ControlPlaneStore {
     const userCode = normalizeUserCode(input.userCode);
     if (!userCode) return "not_found";
     const found = await this.database.query<{ status: string; expires_at: Date | string }>(
-      "SELECT status, expires_at FROM selfhost_device_authorizations WHERE user_code = $1",
+      "SELECT status, expires_at FROM device_authorizations WHERE user_code = $1",
       [userCode],
     );
     const current = found.rows[0];
@@ -886,7 +886,7 @@ export class ControlPlaneStore {
     const workspace = await this.workspaceForUser(input.workspaceId, input.userId);
     if (!workspace) return "not_member";
     const result = await this.database.query<{ id: string }>(
-      `UPDATE selfhost_device_authorizations
+      `UPDATE device_authorizations
           SET status = $2, approved_at = now(), approved_by_user_id = $3,
               organization_id = $4, workspace_id = $5, updated_at = now()
         WHERE user_code = $1 AND status = 'pending' AND expires_at > now()
@@ -927,7 +927,7 @@ export class ControlPlaneStore {
       }>(
         `SELECT id, status, client_name, interval_seconds, last_polled_at, expires_at,
                 approved_by_user_id, organization_id, workspace_id
-           FROM selfhost_device_authorizations
+           FROM device_authorizations
           WHERE device_code_hash = $1 FOR UPDATE`,
         [hashSecret(deviceCode)],
       );
@@ -939,7 +939,7 @@ export class ControlPlaneStore {
       if (row.status === "denied") return fail("access_denied");
       if (row.status === "expired" || new Date(row.expires_at).getTime() <= Date.now()) {
         await tx.query(
-          "UPDATE selfhost_device_authorizations SET status = 'expired', updated_at = now() WHERE id = $1",
+          "UPDATE device_authorizations SET status = 'expired', updated_at = now() WHERE id = $1",
           [row.id],
         );
         return fail("expired_token");
@@ -950,7 +950,7 @@ export class ControlPlaneStore {
       ) {
         const interval = Math.min(60, row.interval_seconds + 5);
         await tx.query(
-          `UPDATE selfhost_device_authorizations
+          `UPDATE device_authorizations
               SET interval_seconds = $2, last_polled_at = now(), updated_at = now()
             WHERE id = $1`,
           [row.id, interval],
@@ -958,7 +958,7 @@ export class ControlPlaneStore {
         return fail("slow_down", interval);
       }
       await tx.query(
-        "UPDATE selfhost_device_authorizations SET last_polled_at = now(), updated_at = now() WHERE id = $1",
+        "UPDATE device_authorizations SET last_polled_at = now(), updated_at = now() WHERE id = $1",
         [row.id],
       );
       if (row.status !== "approved") return fail("authorization_pending");
@@ -976,7 +976,7 @@ export class ControlPlaneStore {
           : DEVICE_SCOPES,
       });
       await tx.query(
-        `UPDATE selfhost_device_authorizations
+        `UPDATE device_authorizations
             SET status = 'consumed', api_token_session_id = $2, updated_at = now()
           WHERE id = $1 AND status = 'approved'`,
         [row.id, tokens.sessionId],
@@ -992,12 +992,12 @@ export class ControlPlaneStore {
               s.workspace_id, w.name AS workspace_name, m.role, s.scopes,
               (s.desktop_exchange_challenge IS NOT NULL AND s.desktop_exchanged_at IS NULL) AS pending_handoff,
               (s.desktop_exchange_challenge IS NOT NULL) AS handoff
-         FROM selfhost_token_sessions s
-         JOIN selfhost_users u ON u.id = s.user_id
-         JOIN selfhost_organizations o ON o.id = s.organization_id
-         JOIN selfhost_workspaces w
+         FROM token_sessions s
+         JOIN users u ON u.id = s.user_id
+         JOIN organizations o ON o.id = s.organization_id
+         JOIN workspaces w
            ON w.id = s.workspace_id AND w.organization_id = s.organization_id
-         JOIN selfhost_organization_memberships m
+         JOIN organization_memberships m
            ON m.organization_id = s.organization_id AND m.user_id = s.user_id
         WHERE s.access_token_hash = $1
           AND s.revoked_at IS NULL AND s.access_token_expires_at > now()
@@ -1054,8 +1054,8 @@ export class ControlPlaneStore {
               (s.revoked_at IS NOT NULL OR (
                 'mcp:desktop' = ANY(s.scopes) AND NOT EXISTS (
                   SELECT 1
-                    FROM selfhost_desktop_mcp_credentials c
-                    JOIN selfhost_token_sessions p ON p.id = c.parent_session_id
+                    FROM desktop_mcp_credentials c
+                    JOIN token_sessions p ON p.id = c.parent_session_id
                    WHERE c.token_session_id = s.id
                      AND p.revoked_at IS NULL AND p.refresh_token_expires_at > now()
                      AND p.desktop_verified_at IS NOT NULL
@@ -1063,17 +1063,17 @@ export class ControlPlaneStore {
               s.access_token_expires_at <= now() AS expired,
               COALESCE(s.last_refreshed_at, s.created_at) AS issued_at,
               s.access_token_expires_at AS expires_at
-         FROM selfhost_token_sessions s
-         JOIN selfhost_users u ON u.id = s.user_id
-         JOIN selfhost_workspaces w
+         FROM token_sessions s
+         JOIN users u ON u.id = s.user_id
+         JOIN workspaces w
            ON w.id = s.workspace_id AND w.organization_id = s.organization_id
-         JOIN selfhost_organization_memberships m
+         JOIN organization_memberships m
            ON m.organization_id = s.organization_id AND m.user_id = s.user_id
         WHERE s.access_token_hash = $1
           AND NOT (s.desktop_exchange_challenge IS NOT NULL AND s.desktop_exchanged_at IS NULL)
           AND ($2::text = 'multi' OR NOT EXISTS (
             SELECT 1
-              FROM selfhost_organizations other
+              FROM organizations other
              WHERE other.id <> s.organization_id
           ))`,
       [hashSecret(token), this.tenancy],
@@ -1104,7 +1104,7 @@ export class ControlPlaneStore {
       id: string;
       scopes: string[];
     }>(
-      `UPDATE selfhost_token_sessions AS s
+      `UPDATE token_sessions AS s
           SET access_token_hash = $2, refresh_token_hash = $3,
               access_token_expires_at = $4, refresh_token_expires_at = $5,
               last_refreshed_at = now(), updated_at = now()
@@ -1184,7 +1184,7 @@ export class ControlPlaneStore {
       }>(
         `SELECT id, user_id, organization_id, workspace_id, token_family_id,
                 desktop_exchange_challenge, scopes, desktop_host_name
-           FROM selfhost_token_sessions
+           FROM token_sessions
           WHERE access_token_hash = $1 AND revoked_at IS NULL
             AND desktop_exchanged_at IS NULL AND desktop_exchange_challenge IS NOT NULL
             AND access_token_expires_at > now()
@@ -1196,7 +1196,7 @@ export class ControlPlaneStore {
         return null;
       }
       const claimed = await tx.query<{ id: string }>(
-        `UPDATE selfhost_token_sessions
+        `UPDATE token_sessions
             SET desktop_exchanged_at = now(), updated_at = now()
           WHERE id = $1 AND desktop_exchanged_at IS NULL AND revoked_at IS NULL
           RETURNING id`,
@@ -1251,7 +1251,7 @@ export class ControlPlaneStore {
   }): Promise<IssuedTokens | null> {
     return this.database.transaction(async (tx) => {
       const current = await tx.query<{ label: string | null; token_family_id: string }>(
-        `SELECT label, token_family_id FROM selfhost_token_sessions
+        `SELECT label, token_family_id FROM token_sessions
           WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL AND $3 = ANY(scopes)
           FOR UPDATE`,
         [input.sessionId, input.userId, ACCOUNT_SCOPE],
@@ -1260,8 +1260,8 @@ export class ControlPlaneStore {
       if (!session) return null;
       const target = await tx.query<{ organization_id: string }>(
         `SELECT w.organization_id
-           FROM selfhost_workspaces w
-           JOIN selfhost_organization_memberships m
+           FROM workspaces w
+           JOIN organization_memberships m
              ON m.organization_id = w.organization_id AND m.user_id = $2
           WHERE w.id = $1
           FOR SHARE OF m`,
@@ -1276,13 +1276,13 @@ export class ControlPlaneStore {
         label: session.label,
       }, { scopes: ACCOUNT_SCOPES });
       await tx.query(
-        `UPDATE selfhost_token_sessions
+        `UPDATE token_sessions
             SET revoked_at = now(), revoked_reason = 'workspace_switch', updated_at = now()
           WHERE id = $1`,
         [input.sessionId],
       );
       await tx.query(
-        "UPDATE selfhost_users SET last_organization_id = $2, last_workspace_id = $3, updated_at = now() WHERE id = $1",
+        "UPDATE users SET last_organization_id = $2, last_workspace_id = $3, updated_at = now() WHERE id = $1",
         [input.userId, organizationId, input.workspaceId],
       );
       return tokens;
@@ -1304,7 +1304,7 @@ export class ControlPlaneStore {
   }): Promise<{ nodeId: string; claimed: boolean }> {
     return this.database.transaction(async (tx) => {
       const member = await tx.query<{ role: string }>(
-        `SELECT role FROM selfhost_organization_memberships
+        `SELECT role FROM organization_memberships
           WHERE organization_id = $1 AND user_id = $2 FOR SHARE`,
         [input.organizationId, input.userId],
       );
@@ -1312,7 +1312,7 @@ export class ControlPlaneStore {
         throw new NodeClaimError(403, "Only an active member of this workspace's organization can claim its nodes.");
       }
       const existing = await tx.query<{ workspace_id: string; user_id: string; relaycast_workspace_id: string }>(
-        `SELECT workspace_id, user_id, relaycast_workspace_id FROM selfhost_fleet_node_owners
+        `SELECT workspace_id, user_id, relaycast_workspace_id FROM fleet_node_owners
           WHERE (relaycast_workspace_id = $1 AND node_id = $2) OR (workspace_id = $3 AND node_id = $2)
           FOR UPDATE`,
         [input.relaycastWorkspaceId, input.nodeId, input.workspaceId],
@@ -1328,7 +1328,7 @@ export class ControlPlaneStore {
         throw new NodeClaimError(409, "Another person owns this node. They, or a workspace owner, must release it first.");
       }
       await tx.query(
-        `INSERT INTO selfhost_fleet_node_owners
+        `INSERT INTO fleet_node_owners
           (id, workspace_id, organization_id, relaycast_workspace_id, node_id, node_name, user_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [randomUUID(), input.workspaceId, input.organizationId, input.relaycastWorkspaceId,
@@ -1345,7 +1345,7 @@ export class ControlPlaneStore {
    */
   async nodeClaimsFor(nodeId: string): Promise<Array<{ workspaceId: string; userId: string }>> {
     const result = await this.database.query<{ workspace_id: string; user_id: string }>(
-      `SELECT workspace_id, user_id FROM selfhost_fleet_node_owners WHERE node_id = $1`,
+      `SELECT workspace_id, user_id FROM fleet_node_owners WHERE node_id = $1`,
       [nodeId],
     );
     return result.rows.map((row) => ({ workspaceId: row.workspace_id, userId: row.user_id }));
@@ -1360,13 +1360,13 @@ export class ControlPlaneStore {
   }): Promise<{ released: true }> {
     return this.database.transaction(async (tx) => {
       const member = await tx.query<{ role: string }>(
-        `SELECT role FROM selfhost_organization_memberships
+        `SELECT role FROM organization_memberships
           WHERE organization_id = $1 AND user_id = $2 FOR SHARE`,
         [input.organizationId, input.actorUserId],
       );
       const role = member.rows[0]?.role;
       const existing = await tx.query<{ id: string; user_id: string }>(
-        `SELECT id, user_id FROM selfhost_fleet_node_owners
+        `SELECT id, user_id FROM fleet_node_owners
           WHERE workspace_id = $1 AND node_id = $2 FOR UPDATE`,
         [input.workspaceId, input.nodeId],
       );
@@ -1375,7 +1375,7 @@ export class ControlPlaneStore {
       if (role !== "owner" && !(role && owner.user_id === input.actorUserId)) {
         throw new NodeClaimError(403, "Only the node's owner or a workspace owner can release it.");
       }
-      await tx.query("DELETE FROM selfhost_fleet_node_owners WHERE id = $1", [owner.id]);
+      await tx.query("DELETE FROM fleet_node_owners WHERE id = $1", [owner.id]);
       return { released: true as const };
     });
   }
@@ -1383,7 +1383,7 @@ export class ControlPlaneStore {
   async revoke(token: string): Promise<boolean> {
     const hash = hashSecret(token);
     const result = await this.database.query<{ id: string }>(
-      `UPDATE selfhost_token_sessions AS s
+      `UPDATE token_sessions AS s
           SET revoked_at = now(), revoked_reason = 'user_requested', updated_at = now()
         WHERE (access_token_hash = $1 OR refresh_token_hash = $1) AND revoked_at IS NULL
         RETURNING id`,
@@ -1397,7 +1397,7 @@ export class ControlPlaneStore {
    * sessions, and MCP OAuth grants) and deletes the Desktop relay identity
    * tokens they synced, e.g. after a password reset. Workspace API keys
    * belong to the workspace, and person messaging identities
-   * (selfhost_person_identities, the person's human agent per workspace)
+   * (person_identities, the person's human agent per workspace)
    * are not sessions, so neither is touched.
    */
   async revokeAllForUser(
@@ -1411,7 +1411,7 @@ export class ControlPlaneStore {
     // commits between the session UPDATE and the grant revocation below.
     await lockUser(executor, userId);
     const sessions = await executor.query<{ id: string }>(
-      `UPDATE selfhost_token_sessions
+      `UPDATE token_sessions
           SET revoked_at = now(), revoked_reason = $2, updated_at = now()
         WHERE user_id = $1 AND revoked_at IS NULL
         RETURNING id`,
@@ -1423,7 +1423,7 @@ export class ControlPlaneStore {
     // person signs in. The Relaycast-issued tokens themselves are not
     // revoked at Relaycast (no revocation path exists for them here).
     const desktopRelayIdentities = await executor.query<{ id: string }>(
-      "DELETE FROM selfhost_desktop_relay_identities WHERE user_id = $1 RETURNING id",
+      "DELETE FROM desktop_relay_identities WHERE user_id = $1 RETURNING id",
       [userId],
     );
     // MCP OAuth grants go through the MCP store's revoker so each grant's
@@ -1431,13 +1431,13 @@ export class ControlPlaneStore {
     // commits with it. That revoker needs user->org locks, taken in the
     // tenancy lock order (user above, then organizations in id order).
     const organizations = await executor.query<{ organization_id: string }>(
-      `SELECT DISTINCT organization_id FROM selfhost_mcp_oauth_grants
+      `SELECT DISTINCT organization_id FROM mcp_oauth_grants
         WHERE user_id = $1 AND revoked_at IS NULL ORDER BY organization_id`,
       [userId],
     );
     for (const { organization_id } of organizations.rows) await lockOrganization(executor, organization_id);
     const grants = await executor.query<{ id: string }>(
-      `SELECT id FROM selfhost_mcp_oauth_grants WHERE user_id = $1 AND revoked_at IS NULL ORDER BY id`,
+      `SELECT id FROM mcp_oauth_grants WHERE user_id = $1 AND revoked_at IS NULL ORDER BY id`,
       [userId],
     );
     const now = new Date();
@@ -1456,7 +1456,7 @@ export class ControlPlaneStore {
    */
   async voidPendingAuthorizationsForUser(executor: SqlExecutor, userId: string): Promise<{ deviceAuthorizations: number; mcpCodes: number }> {
     const devices = await executor.query<{ id: string }>(
-      `UPDATE selfhost_device_authorizations
+      `UPDATE device_authorizations
           SET status = 'expired', updated_at = now()
         WHERE approved_by_user_id = $1 AND status = 'approved'
         RETURNING id`,
@@ -1466,7 +1466,7 @@ export class ControlPlaneStore {
     // replay, which is a different path. The MCP store's membership
     // departure hooks void codes the same way.
     const codes = await executor.query<{ code_hash: string }>(
-      `UPDATE selfhost_mcp_oauth_authorization_codes
+      `UPDATE mcp_oauth_authorization_codes
           SET expires_at = now()
         WHERE user_id = $1 AND consumed_at IS NULL AND expires_at > now()
         RETURNING code_hash`,
@@ -1486,10 +1486,10 @@ export class ControlPlaneStore {
     // insert sets it; an existing row keeps the name its owner chose.
     const result = await tx.query<{ id: string; email: string; name: string }>(
       this.tenancy === "multi"
-        ? `INSERT INTO selfhost_users (id, email, name) VALUES ($1, $2, $3)
-           ON CONFLICT (email) DO UPDATE SET email = selfhost_users.email
+        ? `INSERT INTO users (id, email, name) VALUES ($1, $2, $3)
+           ON CONFLICT (email) DO UPDATE SET email = users.email
            RETURNING id, email, name`
-        : `INSERT INTO selfhost_users (id, email, name) VALUES ($1, $2, $3)
+        : `INSERT INTO users (id, email, name) VALUES ($1, $2, $3)
            ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, updated_at = now()
            RETURNING id, email, name`,
       [randomUUID(), email, name],
@@ -1503,7 +1503,7 @@ export class ControlPlaneStore {
   ): Promise<void> {
     const result = await executor.query<{ id: string }>(
       `SELECT id
-         FROM selfhost_organizations
+         FROM organizations
         WHERE id = $1
         FOR UPDATE`,
       [organizationId],
@@ -1544,10 +1544,10 @@ export class ControlPlaneStore {
   ): Promise<IssuedTokens> {
     const context = await tx.query<{ valid: boolean }>(
       `SELECT true AS valid
-         FROM selfhost_organizations o
-         JOIN selfhost_organization_memberships m
+         FROM organizations o
+         JOIN organization_memberships m
            ON m.organization_id = o.id AND m.user_id = $2
-         JOIN selfhost_workspaces w
+         JOIN workspaces w
            ON w.organization_id = o.id AND w.id = $3
         WHERE o.id = $1`,
       [input.organizationId, input.userId, input.workspaceId],
@@ -1563,7 +1563,7 @@ export class ControlPlaneStore {
     const accessExpires = new Date(Date.now() + (options.accessTtlMs ?? ACCESS_TOKEN_TTL_MS));
     const refreshExpires = new Date(Date.now() + (options.refreshTtlMs ?? REFRESH_TOKEN_TTL_MS));
     await tx.query(
-      `INSERT INTO selfhost_token_sessions
+      `INSERT INTO token_sessions
         (id, token_family_id, user_id, organization_id, workspace_id, label, scopes,
          access_token_hash, refresh_token_hash, access_token_expires_at, refresh_token_expires_at,
          desktop_exchange_challenge, desktop_host_name, desktop_verified_at)

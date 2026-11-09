@@ -34,15 +34,15 @@ test("lock order: one identity racing first sign-in, create-organization and boo
   });
   await migrate(first);
   const foreign = await first.query<{ n: number }>(
-    "SELECT count(*)::int AS n FROM selfhost_organizations WHERE name <> ALL($1::text[])",
+    "SELECT count(*)::int AS n FROM organizations WHERE name <> ALL($1::text[])",
     [FIXTURE_ORGS],
   );
   assert.equal(foreign.rows[0]!.n, 0, "TEST_DATABASE_URL must be an empty throwaway database");
   // A previous run (this test and the single-mode one) may have left its
   // fixtures behind: start from a first sign-in again.
-  await first.query("DELETE FROM selfhost_organizations WHERE name = ANY($1::text[])", [FIXTURE_ORGS]);
-  await first.query("DELETE FROM selfhost_installation_bootstrap");
-  await first.query("DELETE FROM selfhost_users WHERE email = $1", [EMAIL]);
+  await first.query("DELETE FROM organizations WHERE name = ANY($1::text[])", [FIXTURE_ORGS]);
+  await first.query("DELETE FROM installation_bootstrap");
+  await first.query("DELETE FROM users WHERE email = $1", [EMAIL]);
 
   const tenancy = loadTenancyConfig({ SELFHOST_TENANCY: "multi" });
   const provisioner: RelaycastProvisioner = {
@@ -95,15 +95,15 @@ test("lock order: one identity racing first sign-in, create-organization and boo
   }
   const again = await a.store.signIn(signInInput);
   const member = await first.query<{ n: number }>(
-    `SELECT count(*)::int AS n FROM selfhost_organization_memberships m
-       JOIN selfhost_users u ON u.id = m.user_id
+    `SELECT count(*)::int AS n FROM organization_memberships m
+       JOIN users u ON u.id = m.user_id
       WHERE u.email = $1 AND m.organization_id = $2`,
     [EMAIL, again.organizationId],
   );
   assert.equal(member.rows[0]!.n, 1, "the session's organization is one the user belongs to");
-  const users = await first.query<{ n: number }>("SELECT count(*)::int AS n FROM selfhost_users WHERE email = $1", [EMAIL]);
+  const users = await first.query<{ n: number }>("SELECT count(*)::int AS n FROM users WHERE email = $1", [EMAIL]);
   assert.equal(users.rows[0]!.n, 1);
-  const bootstrapOrgs = await first.query<{ n: number }>("SELECT count(*)::int AS n FROM selfhost_organizations WHERE name = 'Race'");
+  const bootstrapOrgs = await first.query<{ n: number }>("SELECT count(*)::int AS n FROM organizations WHERE name = 'Race'");
   assert.equal(bootstrapOrgs.rows[0]!.n, 1);
 });
 
@@ -116,8 +116,8 @@ test("lock order: single-mode bootstrap and create-organization race to one orga
   });
   await migrate(first);
   // Runs after the multi test in the same throwaway database: start clean.
-  await first.query("DELETE FROM selfhost_organizations");
-  await first.query("DELETE FROM selfhost_installation_bootstrap");
+  await first.query("DELETE FROM organizations");
+  await first.query("DELETE FROM installation_bootstrap");
   const control = new ControlPlaneStore(second, KEYRING, 0);
   const store = new IdentityStore(first, KEYRING, {
     inviteTtlMs: 60_000,
@@ -131,6 +131,6 @@ test("lock order: single-mode bootstrap and create-organization race to one orga
   ]);
   assert.equal(bootstrap.status, "fulfilled", String((bootstrap as PromiseRejectedResult).reason ?? ""));
   if (created.status === "rejected") assert(created.reason instanceof OrganizationConflictError, String(created.reason));
-  const orgs = await first.query<{ n: number }>("SELECT count(*)::int AS n FROM selfhost_organizations");
+  const orgs = await first.query<{ n: number }>("SELECT count(*)::int AS n FROM organizations");
   assert.equal(orgs.rows[0]!.n, 1);
 });

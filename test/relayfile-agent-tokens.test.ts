@@ -208,7 +208,7 @@ test("introspection answers for a relayfile-agent token as an agent principal", 
   const created = await ctx.mint(agentBody());
   const token = created.body.accessToken as string;
   const row = (await ctx.database.query<{ created_at: Date }>(
-    "SELECT created_at FROM selfhost_workspace_api_tokens WHERE id = $1",
+    "SELECT created_at FROM workspace_api_tokens WHERE id = $1",
     [created.body.id],
   )).rows[0]!;
 
@@ -275,7 +275,7 @@ test("introspection inactive reasons for workspace API tokens", async (t) => {
 
   const expiring = (await ctx.mint(agentBody("builder-2"))).body;
   await ctx.database.query(
-    "UPDATE selfhost_workspace_api_tokens SET expires_at = now() - interval '1 second' WHERE id = $1",
+    "UPDATE workspace_api_tokens SET expires_at = now() - interval '1 second' WHERE id = $1",
     [expiring.id],
   );
   await inactive({ token: expiring.accessToken, aud: FILES }, "expired");

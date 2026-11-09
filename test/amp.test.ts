@@ -61,19 +61,19 @@ test("amp refuses non-admins, missing cli:auth, service and cross-workspace call
   assert.equal((await h.api(ampPath(h))).status, 401);
 
   // The owner's own session, stripped of cli:auth, is refused; restored, accepted.
-  await h.database.query("UPDATE selfhost_token_sessions SET scopes = ARRAY['rth:read']::text[] WHERE user_id = $1", [h.ownerId]);
+  await h.database.query("UPDATE token_sessions SET scopes = ARRAY['rth:read']::text[] WHERE user_id = $1", [h.ownerId]);
   const scoped = await connect(h.ownerToken);
   assert.equal(scoped.status, 403);
   assert.match(scoped.body.message, /cli:auth/);
   assert.equal(h.transport.calls.length, 0, "no refused caller reaches the Amp transport");
-  await h.database.query("UPDATE selfhost_token_sessions SET scopes = ARRAY['rth:read','cli:auth']::text[] WHERE user_id = $1", [h.ownerId]);
+  await h.database.query("UPDATE token_sessions SET scopes = ARRAY['rth:read','cli:auth']::text[] WHERE user_id = $1", [h.ownerId]);
   const ok = await connect(h.ownerToken);
   assert.equal(ok.status, 200, ok.text);
   assert.equal(ok.body.connection.keyHint, `sgamp_…${AMP_KEY.slice(-4)}`);
   assert.doesNotMatch(ok.text, new RegExp(AMP_KEY));
 
   // Demoted to member mid-session: the role is re-read from Postgres.
-  await h.database.query("UPDATE selfhost_organization_memberships SET role = 'member' WHERE user_id = $1", [h.adminId]);
+  await h.database.query("UPDATE organization_memberships SET role = 'member' WHERE user_id = $1", [h.adminId]);
   assert.equal((await h.api(ampPath(h), { token: h.adminToken })).status, 403);
   assert.equal((await h.api(ampPath(h), { token: h.ownerToken })).status, 200);
 });
@@ -92,7 +92,7 @@ test("amp connect, discover, bind, unbind and disconnect keep the key-owner and 
   assert.equal(connected.status, 200);
   assert.deepEqual(connected.body.threads, [{ id: THREAD, title: `Thread ${THREAD}` }]);
   assert.deepEqual(connected.body.history, { available: false, reason: "push_session_unavailable" });
-  const stored = await h.database.query<{ key_ciphertext: string }>("SELECT key_ciphertext FROM selfhost_amp_connections");
+  const stored = await h.database.query<{ key_ciphertext: string }>("SELECT key_ciphertext FROM amp_connections");
   assert.equal(stored.rows.length, 1);
   assert.doesNotMatch(stored.rows[0]!.key_ciphertext, /sgamp_/, "the key is encrypted at rest");
 
@@ -112,7 +112,7 @@ test("amp connect, discover, bind, unbind and disconnect keep the key-owner and 
   const unreadable = await h.api(ampPath(h, "/bindings"), { method: "POST", token: h.ownerToken, body: { threadId: THREAD_2 } });
   assert.equal(unreadable.status, 409);
   assert.equal(unreadable.body.error, "amp_thread_unreadable");
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_bindings")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_bindings")).rows.length, 0);
 
   const bound = await h.api(ampPath(h, "/bindings"), {
     method: "POST", token: h.ownerToken, body: { thread_id: `https://ampcode.com/threads/${THREAD}` },
@@ -141,12 +141,12 @@ test("amp connect, discover, bind, unbind and disconnect keep the key-owner and 
   assert.deepEqual(unbound.body, { disconnected: true });
   assert.equal(h.world.agents.has(bound.body.agent), false, "the Relaycast identity is released");
   assert.equal(h.world.subscriptions.size, 0, "its Relaycast subscriptions are deleted");
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_bindings")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_bindings")).rows.length, 0);
 
   await connectAndBind(h, h.ownerToken, THREAD);
   const gone = await h.api(`/cloud${ampPath(h, "/connection")}`, { method: "DELETE", token: h.ownerToken });
   assert.deepEqual(gone.body, { disconnected: true });
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_connections")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_connections")).rows.length, 0);
   assert.equal([...h.world.agents.keys()].some((name) => name.startsWith("amp-")), false);
   assert.equal(h.world.subscriptions.size, 0);
   for (const call of h.transport.calls) assert.notEqual(call.operation.kind, "inject", "no lifecycle step prompts Amp");
@@ -158,12 +158,12 @@ test("amp relay-events verify the stored secret, timestamp and body bound (req 3
   const body = dmEvent(binding.agent, "m-1");
 
   // No secret stored: nothing is accepted.
-  const [stored] = (await h.database.query<{ hook_ciphertext: string }>("SELECT hook_ciphertext FROM selfhost_amp_bindings")).rows;
-  await h.database.query("UPDATE selfhost_amp_bindings SET hook_ciphertext = NULL");
+  const [stored] = (await h.database.query<{ hook_ciphertext: string }>("SELECT hook_ciphertext FROM amp_bindings")).rows;
+  await h.database.query("UPDATE amp_bindings SET hook_ciphertext = NULL");
   const unset = await postEvent(h, binding.binding_id, body);
   assert.equal(unset.status, 401);
   assert.equal(unset.body.error, "unauthorized");
-  await h.database.query("UPDATE selfhost_amp_bindings SET hook_ciphertext = $1", [stored!.hook_ciphertext]);
+  await h.database.query("UPDATE amp_bindings SET hook_ciphertext = $1", [stored!.hook_ciphertext]);
   assert.doesNotMatch(stored!.hook_ciphertext, /whsec_/, "the minted secret is encrypted at rest");
 
   const badSignature = await postEvent(h, binding.binding_id, body, { secret: `whsec_${Buffer.alloc(32, 1).toString("base64")}` });
@@ -175,7 +175,7 @@ test("amp relay-events verify the stored secret, timestamp and body bound (req 3
   const tooLarge = await postEvent(h, binding.binding_id, oversized);
   assert.equal(tooLarge.status, 413);
   assert.equal(tooLarge.body.error, "payload_too_large");
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_deliveries")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_deliveries")).rows.length, 0);
 
   // Control: the identical body, correctly signed and fresh, queues one delivery.
   const accepted = await postEvent(h, binding.binding_id, body, { timestamp: nowSeconds - 299 });
@@ -189,7 +189,7 @@ test("amp relay-events verify the stored secret, timestamp and body bound (req 3
   const unknown = await postEvent(h, "00000000-0000-4000-8000-000000000000", body, { secret: hookSecret(h, binding.binding_id) });
   assert.equal(unknown.status, 410);
   const rows = await h.database.query<{ message_id: string; state: string; payload_ciphertext: string }>(
-    "SELECT message_id, state, payload_ciphertext FROM selfhost_amp_deliveries");
+    "SELECT message_id, state, payload_ciphertext FROM amp_deliveries");
   assert.deepEqual(rows.rows.map((row) => [row.message_id, row.state]), [["m-1", "pending"]]);
   assert.doesNotMatch(rows.rows[0]!.payload_ciphertext, /please review/, "the queued payload is encrypted");
   assert.equal(h.transport.injects().length, 0, "the event route only writes the outbox");
@@ -251,7 +251,7 @@ test("amp reply bearer: one idempotent reply, refused for wrong binding, revoked
   await internalJob(h, { v: 1, kind: "inject", bindingId: binding.binding_id, messageId: "m-1" });
   const capability = lastReplyCapability(h.transport);
   assert.equal(capability.url, `https://control.selfhosted.company/api/v1/amp/agents/${binding.binding_id}/messages`);
-  const stored = await h.database.query<{ reply_hash: string }>("SELECT reply_hash FROM selfhost_amp_deliveries");
+  const stored = await h.database.query<{ reply_hash: string }>("SELECT reply_hash FROM amp_deliveries");
   assert.notEqual(stored.rows[0]!.reply_hash, capability.bearer, "only the bearer hash is stored");
   const path = `/api/v1/amp/agents/${binding.binding_id}/messages`;
   const reply = (body: unknown, bearer = capability.bearer, to = path) =>
@@ -270,11 +270,11 @@ test("amp reply bearer: one idempotent reply, refused for wrong binding, revoked
 
   // Membership is checked on every use: removed (directly, bypassing the
   // purge hook) the bearer is refused; restored, it works again.
-  await h.database.exec(`CREATE TEMP TABLE saved_membership AS SELECT * FROM selfhost_organization_memberships WHERE user_id = '${h.adminId}'`);
-  await h.database.query("DELETE FROM selfhost_organization_memberships WHERE user_id = $1", [h.adminId]);
+  await h.database.exec(`CREATE TEMP TABLE saved_membership AS SELECT * FROM organization_memberships WHERE user_id = '${h.adminId}'`);
+  await h.database.query("DELETE FROM organization_memberships WHERE user_id = $1", [h.adminId]);
   const nonMember = await reply(body);
   assert.equal(nonMember.status, 401);
-  await h.database.exec("INSERT INTO selfhost_organization_memberships SELECT * FROM saved_membership");
+  await h.database.exec("INSERT INTO organization_memberships SELECT * FROM saved_membership");
   const sent = await reply(body);
   assert.equal(sent.status, 200, sent.text);
   assert.equal(sent.body.ok, true);
@@ -328,7 +328,7 @@ test("amp check_delivery settles unknown only from the thread's own marker (req 
 
   // A queued message with no marker in the thread stays unconfirmed.
   await postEvent(h, binding.binding_id, dmEvent(binding.agent, "m-2"));
-  await h.database.query("UPDATE selfhost_amp_deliveries SET state = 'unknown' WHERE message_id = 'm-2'");
+  await h.database.query("UPDATE amp_deliveries SET state = 'unknown' WHERE message_id = 'm-2'");
   assert.deepEqual((await check("m-2")).body, { confirmed: false, state: "unknown" });
   const confirmed = await check("m-1");
   assert.deepEqual(confirmed.body, { confirmed: true, state: "delivered" });
@@ -343,9 +343,9 @@ test("amp reconcileDelivery settles every outcome from the marker alone and neve
     h.api(ampPath(h, `/bindings/${binding.binding_id}/deliveries/${messageId}/check`), { method: "POST", token: h.ownerToken });
   const row = async (messageId: string) => (await h.database.query<{
     state: string; code: string | null; lease_owner: string | null; payload_ciphertext: string | null;
-  }>("SELECT state, code, lease_owner, payload_ciphertext FROM selfhost_amp_deliveries WHERE message_id = $1", [messageId])).rows[0]!;
+  }>("SELECT state, code, lease_owner, payload_ciphertext FROM amp_deliveries WHERE message_id = $1", [messageId])).rows[0]!;
   const setState = (messageId: string, state: string, extra = "") => h.database.query(
-    `UPDATE selfhost_amp_deliveries SET state = $2, code = 'test'${extra} WHERE message_id = $1`, [messageId, state]);
+    `UPDATE amp_deliveries SET state = $2, code = 'test'${extra} WHERE message_id = $1`, [messageId, state]);
 
   // m-1 reaches the thread (its marker is in the export); m-2 is queued but never sent.
   await postEvent(h, binding.binding_id, dmEvent(binding.agent, "m-1", "secret body"));
@@ -383,7 +383,7 @@ test("amp reconcileDelivery settles every outcome from the marker alone and neve
   // The binding retired or rebound while the export ran: nothing is written.
   await setState("m-1", "unknown");
   h.transport.hooks.export = async () => {
-    await h.database.query("UPDATE selfhost_amp_bindings SET generation = generation + 1 WHERE id = $1", [binding.binding_id]);
+    await h.database.query("UPDATE amp_bindings SET generation = generation + 1 WHERE id = $1", [binding.binding_id]);
   };
   const raced = await check("m-1");
   assert.equal(raced.status, 404);
@@ -393,7 +393,7 @@ test("amp reconcileDelivery settles every outcome from the marker alone and neve
 
   // A workspace whose relay moved refuses before any export.
   const exports = h.transport.calls.filter((call) => call.operation.kind === "export").length;
-  await h.database.query("UPDATE selfhost_workspaces SET relaycast_workspace_id = 'rc-moved' WHERE id = $1", [h.workspaceId]);
+  await h.database.query("UPDATE workspaces SET relaycast_workspace_id = 'rc-moved' WHERE id = $1", [h.workspaceId]);
   const moved = await check("m-1");
   assert.equal(moved.status, 409);
   assert.deepEqual(moved.body, { error: "relay_changed", message: "The bound relay is unavailable." });
@@ -475,7 +475,7 @@ test("amp bind creates both Relaycast subscriptions with the workspace key and s
   assert.equal(Buffer.from(secret.slice("whsec_".length), "base64").byteLength, 32);
 
   const row = (await h.database.query<{ subscription_id: string; mention_subscription_id: string; hook_ciphertext: string; state: string }>(
-    "SELECT subscription_id, mention_subscription_id, hook_ciphertext, state FROM selfhost_amp_bindings")).rows[0]!;
+    "SELECT subscription_id, mention_subscription_id, hook_ciphertext, state FROM amp_bindings")).rows[0]!;
   assert.deepEqual([row.subscription_id, row.mention_subscription_id, row.state], [direct!.id, mention!.id, "bound"]);
   assert.doesNotMatch(row.hook_ciphertext, /whsec_/, "the minted secret is encrypted at rest");
 
@@ -509,7 +509,7 @@ test("amp bind: a failed subscription create fails the bind, deletes what it cre
   const bind = () => h.api(ampPath(h, "/bindings"), { method: "POST", token: h.ownerToken, body: { threadId: THREAD } });
   const row = async () => (await h.database.query<{
     id: string; state: string; token_ciphertext: string | null; subscription_id: string | null; mention_subscription_id: string | null;
-  }>("SELECT id, state, token_ciphertext, subscription_id, mention_subscription_id FROM selfhost_amp_bindings")).rows[0]!;
+  }>("SELECT id, state, token_ciphertext, subscription_id, mention_subscription_id FROM amp_bindings")).rows[0]!;
   const creates = () => h.world.bodies.filter((call) => call.method === "POST" && call.path === "/v1/subscriptions");
   const registrations = () => h.world.bodies.filter((call) => call.method === "POST" && call.path === "/v1/agents");
   const assertFailed = (response: Awaited<ReturnType<typeof bind>>) => {
@@ -572,7 +572,7 @@ test("amp bind: a failed update after creating subscriptions deletes them and th
       IF NEW.mention_subscription_id IS NOT NULL THEN RAISE EXCEPTION 'refused'; END IF;
       RETURN NEW;
     END $$;
-    CREATE TRIGGER amp_test_refuse_mention BEFORE UPDATE ON selfhost_amp_bindings
+    CREATE TRIGGER amp_test_refuse_mention BEFORE UPDATE ON amp_bindings
       FOR EACH ROW EXECUTE FUNCTION amp_test_refuse_mention();`);
   const bind = () => h.api(ampPath(h, "/bindings"), { method: "POST", token: h.ownerToken, body: { threadId: THREAD } });
   const failed = await bind();
@@ -581,10 +581,10 @@ test("amp bind: a failed update after creating subscriptions deletes them and th
   assert.equal(h.world.bodies.filter((call) => call.method === "POST" && call.path === "/v1/subscriptions").length, 2);
   assert.equal(h.world.subscriptions.size, 0, "both created subscriptions were deleted");
   const row = (await h.database.query<{ state: string; subscription_id: string | null }>(
-    "SELECT state, subscription_id FROM selfhost_amp_bindings")).rows[0]!;
+    "SELECT state, subscription_id FROM amp_bindings")).rows[0]!;
   assert.deepEqual(row, { state: "preparing", subscription_id: null });
 
-  await h.database.exec("DROP TRIGGER amp_test_refuse_mention ON selfhost_amp_bindings");
+  await h.database.exec("DROP TRIGGER amp_test_refuse_mention ON amp_bindings");
   assert.equal((await bind()).status, 201);
   assert.equal(h.world.subscriptions.size, 2);
 });
@@ -600,7 +600,7 @@ test("amp unbind deletes both subscriptions before releasing the agent; a failed
   const row = (await h.database.query<{
     state: string; agent_remote_id: string | null; subscription_id: string | null; mention_subscription_id: string | null;
     hook_ciphertext: string | null; last_error: string | null;
-  }>("SELECT state, agent_remote_id, subscription_id, mention_subscription_id, hook_ciphertext, last_error FROM selfhost_amp_bindings")).rows[0]!;
+  }>("SELECT state, agent_remote_id, subscription_id, mention_subscription_id, hook_ciphertext, last_error FROM amp_bindings")).rows[0]!;
   assert.equal(row.state, "retired");
   assert.equal(row.subscription_id, null, "the deleted subscription's id is cleared");
   assert.equal(row.mention_subscription_id, mention!.id, "the undeleted subscription's id is kept for the retry");
@@ -617,7 +617,7 @@ test("amp unbind deletes both subscriptions before releasing the agent; a failed
   await worker.tick();
   assert.equal(h.world.subscriptions.size, 0);
   assert.equal(h.world.agents.has(binding.agent), false);
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_bindings")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_bindings")).rows.length, 0);
   const calls = h.world.bodies.slice(from).map((call) => `${call.method} ${call.path}`);
   const release = calls.indexOf("POST /v1/agents/release-exact");
   assert.ok(release > 0);
@@ -634,5 +634,5 @@ test("amp unbind deletes both subscriptions before releasing the agent; a failed
   const tolerated = await h.api(ampPath(h, `/bindings/${second.binding_id}`), { method: "DELETE", token: h.ownerToken });
   assert.deepEqual(tolerated.body, { disconnected: true });
   assert.equal(h.world.agents.has(second.agent), false);
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_bindings")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_bindings")).rows.length, 0);
 });

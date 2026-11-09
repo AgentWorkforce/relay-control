@@ -79,7 +79,7 @@ one.
 | `src/desktop-feed/storage.ts` | `S3DesktopFeedStorage` (streamed PUT, ranged GET, presigned GET), `MemoryDesktopFeedStorage` |
 | `src/desktop-feed/schemas.ts` | The manifest, envelope and draft-create schemas, kept equal to `docs/specs/` and `openapi.yaml` by `test/desktop-feed.test.ts` |
 | `src/desktop-feed/canonical.ts`, `strict-json.ts` | RFC 8785 and strict I-JSON |
-| `migrations/0013_desktop_feed.sql` | `selfhost_desktop_feed_*` tables |
+| `migrations/0013_desktop_feed.sql` | `desktop_feed_*` tables |
 
 ### Profile administration
 
@@ -648,7 +648,7 @@ action names:
 
 `recordAudit` today cannot record all of the doc's fields:
 
-- **Missing columns.** `selfhost_admin_audit_events` has `organization_id`,
+- **Missing columns.** `admin_audit_events` has `organization_id`,
   `workspace_id`, `actor_kind`, `actor_id`, `action` and `target`. It has no
   column for the profile, the asset or the client address.
 - **Missing actor kinds.** `AuditActor` allows only `user`, `service` and
@@ -708,8 +708,8 @@ concrete starting point. The signer below is decided; everything else here is
 
 ### Audit
 
-- **A feed-specific table, `selfhost_desktop_feed_audit_events`,** rather than
-  widening `selfhost_admin_audit_events`. Columns: `id`, `occurred_at`,
+- **A feed-specific table, `desktop_feed_audit_events`,** rather than
+  widening `admin_audit_events`. Columns: `id`, `occurred_at`,
   `organization_id`, `workspace_id` (nullable for publisher actions),
   `actor_kind` (`user`, `install_token`, `publisher_token`, `service`),
   `actor_id`, `action` (the `desktop_feed.*` names above), `profile`,

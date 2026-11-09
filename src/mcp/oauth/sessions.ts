@@ -58,12 +58,12 @@ export class McpOAuthSessions {
 
   /** Caller owns the consent/redemption transaction and its user->org locks. */
   async issue(tx: SqlExecutor, input: McpOAuthSessionOwner & { scopes: readonly string[] }): Promise<McpOAuthIssuedPair> {
-    const context = await tx.query<{ scopes: string[] }>(`SELECT g.scopes FROM selfhost_mcp_oauth_grants g
-      JOIN selfhost_organization_memberships m ON m.organization_id=g.organization_id AND m.user_id=g.user_id
-      JOIN selfhost_workspaces w ON w.id=g.workspace_id AND w.organization_id=g.organization_id
+    const context = await tx.query<{ scopes: string[] }>(`SELECT g.scopes FROM mcp_oauth_grants g
+      JOIN organization_memberships m ON m.organization_id=g.organization_id AND m.user_id=g.user_id
+      JOIN workspaces w ON w.id=g.workspace_id AND w.organization_id=g.organization_id
       WHERE g.id=$1 AND g.token_family_id=$2 AND g.user_id=$3 AND g.organization_id=$4 AND g.workspace_id=$5
         AND g.revoked_at IS NULL AND ($6::text='multi' OR NOT EXISTS
-          (SELECT 1 FROM selfhost_organizations other WHERE other.id<>g.organization_id))`,
+          (SELECT 1 FROM organizations other WHERE other.id<>g.organization_id))`,
     [input.grantId,input.tokenFamilyId,input.userId,input.organizationId,input.workspaceId,this.options.tenancyMode]);
     const scopes = [...new Set(input.scopes)];
     if (!context.rows[0] || !scopes.length || !scopes.every(scope => context.rows[0]!.scopes.includes(scope))) {
@@ -73,7 +73,7 @@ export class McpOAuthSessions {
     const sessionId = randomUUID();
     const accessToken = opaqueToken(MCP_OAUTH_ACCESS_PREFIX), refreshToken = opaqueToken(MCP_OAUTH_REFRESH_PREFIX);
     const accessExpires = new Date(createdAt.getTime()+ACCESS_TTL_MS), refreshExpires = new Date(createdAt.getTime()+REFRESH_TTL_MS);
-    await tx.query(`INSERT INTO selfhost_mcp_oauth_sessions
+    await tx.query(`INSERT INTO mcp_oauth_sessions
       (id,grant_id,token_family_id,user_id,organization_id,workspace_id,scopes,access_token_hash,refresh_token_hash,
        access_token_expires_at,refresh_token_expires_at,created_at,updated_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)`,
@@ -88,7 +88,7 @@ export class McpOAuthSessions {
     if (!(kind === "access" ? ACCESS_PATTERN : REFRESH_PATTERN).test(token)) return null;
     const column = kind === "access" ? "access_token_hash" : "refresh_token_hash";
     const result = await tx.query<SessionRow>(`SELECT s.*,g.scopes AS grant_scopes,g.resource,g.client_id,g.revoked_at AS grant_revoked_at
-      FROM selfhost_mcp_oauth_sessions s JOIN selfhost_mcp_oauth_grants g ON g.id=s.grant_id
+      FROM mcp_oauth_sessions s JOIN mcp_oauth_grants g ON g.id=s.grant_id
       WHERE s.${column}=$1`,[hashSecret(token)]);
     return result.rows[0] ? record(result.rows[0]) : null;
   }
@@ -99,21 +99,21 @@ export class McpOAuthSessions {
     const now = this.now();
     const accessToken = opaqueToken(MCP_OAUTH_ACCESS_PREFIX), nextRefresh = opaqueToken(MCP_OAUTH_REFRESH_PREFIX);
     const accessExpires = new Date(now.getTime()+ACCESS_TTL_MS), refreshExpires = new Date(now.getTime()+REFRESH_TTL_MS);
-    const result = await tx.query<{ id: string; scopes: string[] }>(`UPDATE selfhost_mcp_oauth_sessions s
+    const result = await tx.query<{ id: string; scopes: string[] }>(`UPDATE mcp_oauth_sessions s
       SET access_token_hash=$2,refresh_token_hash=$3,access_token_expires_at=$4,refresh_token_expires_at=$5,
           last_refreshed_at=$6,updated_at=$6
-      FROM selfhost_mcp_oauth_grants g,selfhost_organization_memberships m,selfhost_workspaces w
+      FROM mcp_oauth_grants g,organization_memberships m,workspaces w
       WHERE s.refresh_token_hash=$1 AND s.revoked_at IS NULL AND s.refresh_token_expires_at>$6
         AND s.grant_id=$7 AND s.token_family_id=$8 AND s.user_id=$9 AND s.organization_id=$10 AND s.workspace_id=$11
         AND g.id=s.grant_id AND g.revoked_at IS NULL
         AND m.organization_id=s.organization_id AND m.user_id=s.user_id
         AND w.id=s.workspace_id AND w.organization_id=s.organization_id
-        AND ($12::text='multi' OR NOT EXISTS (SELECT 1 FROM selfhost_organizations other WHERE other.id<>s.organization_id))
+        AND ($12::text='multi' OR NOT EXISTS (SELECT 1 FROM organizations other WHERE other.id<>s.organization_id))
       RETURNING s.id,s.scopes`,[hashSecret(refreshToken),hashSecret(accessToken),hashSecret(nextRefresh),accessExpires,refreshExpires,now,
       expected.grantId,expected.tokenFamilyId,expected.userId,expected.organizationId,expected.workspaceId,this.options.tenancyMode]);
     const row = result.rows[0];
     if (!row) return null;
-    await tx.query(`INSERT INTO selfhost_mcp_oauth_retired_refresh_tokens
+    await tx.query(`INSERT INTO mcp_oauth_retired_refresh_tokens
       (token_hash,grant_id,user_id,organization_id,workspace_id,retired_at) VALUES ($1,$2,$3,$4,$5,$6)
       ON CONFLICT (token_hash) DO NOTHING`,[hashSecret(refreshToken),expected.grantId,expected.userId,
       expected.organizationId,expected.workspaceId,now]);
@@ -126,7 +126,7 @@ export class McpOAuthSessions {
   }
 
   async revokeSession(tx: SqlExecutor, sessionId: string, owner: McpOAuthSessionOwner, reason: string): Promise<void> {
-    await tx.query(`UPDATE selfhost_mcp_oauth_sessions SET revoked_at=$7,revoked_reason=$8,updated_at=$7
+    await tx.query(`UPDATE mcp_oauth_sessions SET revoked_at=$7,revoked_reason=$8,updated_at=$7
       WHERE id=$1 AND grant_id=$2 AND token_family_id=$3 AND user_id=$4 AND organization_id=$5 AND workspace_id=$6 AND revoked_at IS NULL`,
     [sessionId,owner.grantId,owner.tokenFamilyId,owner.userId,owner.organizationId,owner.workspaceId,this.now(),reason]);
   }
@@ -145,13 +145,13 @@ export class McpOAuthSessions {
       agent_name: string; agent_remote_id: string | null;
     }>(`SELECT s.*,g.scopes AS grant_scopes,g.resource,g.client_id,g.revoked_at AS grant_revoked_at,
         g.agent_name,g.agent_remote_id,u.email,u.name AS user_name,o.name AS organization_name,w.name AS workspace_name,m.role
-      FROM selfhost_mcp_oauth_sessions s JOIN selfhost_mcp_oauth_grants g ON g.id=s.grant_id
-      JOIN selfhost_users u ON u.id=s.user_id JOIN selfhost_organizations o ON o.id=s.organization_id
-      JOIN selfhost_workspaces w ON w.id=s.workspace_id AND w.organization_id=s.organization_id
-      JOIN selfhost_organization_memberships m ON m.organization_id=s.organization_id AND m.user_id=s.user_id
+      FROM mcp_oauth_sessions s JOIN mcp_oauth_grants g ON g.id=s.grant_id
+      JOIN users u ON u.id=s.user_id JOIN organizations o ON o.id=s.organization_id
+      JOIN workspaces w ON w.id=s.workspace_id AND w.organization_id=s.organization_id
+      JOIN organization_memberships m ON m.organization_id=s.organization_id AND m.user_id=s.user_id
       WHERE s.access_token_hash=$1 AND s.revoked_at IS NULL AND s.access_token_expires_at>$2
         AND g.revoked_at IS NULL AND g.resource=$3
-        AND ($4::text='multi' OR NOT EXISTS (SELECT 1 FROM selfhost_organizations other WHERE other.id<>s.organization_id))`,
+        AND ($4::text='multi' OR NOT EXISTS (SELECT 1 FROM organizations other WHERE other.id<>s.organization_id))`,
     [hashSecret(token),this.now(),resource,this.options.tenancyMode]);
     const row = result.rows[0];
     if (!row) return null;
@@ -168,7 +168,7 @@ export class McpOAuthSessions {
 
 /** Ends every live session of one grant's token family; shared by the class and out-of-store revokers. */
 export async function revokeMcpOAuthSessionFamily(tx: SqlExecutor, owner: McpOAuthSessionOwner, reason: string, now: Date): Promise<void> {
-  await tx.query(`UPDATE selfhost_mcp_oauth_sessions SET revoked_at=$6,revoked_reason=$7,updated_at=$6
+  await tx.query(`UPDATE mcp_oauth_sessions SET revoked_at=$6,revoked_reason=$7,updated_at=$6
     WHERE grant_id=$1 AND token_family_id=$2 AND user_id=$3 AND organization_id=$4 AND workspace_id=$5 AND revoked_at IS NULL`,
   [owner.grantId,owner.tokenFamilyId,owner.userId,owner.organizationId,owner.workspaceId,now,reason]);
 }

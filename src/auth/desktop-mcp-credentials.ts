@@ -109,7 +109,7 @@ export class DesktopMcpCredentials {
     const parent = await tx.query<ParentRow>(
       `SELECT p.id, p.user_id, p.organization_id, p.workspace_id, p.token_family_id,
               p.refresh_token_expires_at
-         FROM selfhost_token_sessions p
+         FROM token_sessions p
         WHERE p.access_token_hash = $1 AND p.workspace_id = $2
           AND p.revoked_at IS NULL
           AND p.access_token_expires_at > now() AND p.refresh_token_expires_at > now()
@@ -123,11 +123,11 @@ export class DesktopMcpCredentials {
     if (!row) throw PARENT_REQUIRED();
     const member = await tx.query<{ role: string }>(
       `SELECT m.role
-         FROM selfhost_organization_memberships m
-         JOIN selfhost_workspaces w ON w.organization_id = m.organization_id AND w.id = $3
+         FROM organization_memberships m
+         JOIN workspaces w ON w.organization_id = m.organization_id AND w.id = $3
         WHERE m.organization_id = $1 AND m.user_id = $2
           AND NOT EXISTS (
-            SELECT 1 FROM selfhost_organizations other WHERE other.id <> m.organization_id
+            SELECT 1 FROM organizations other WHERE other.id <> m.organization_id
           )
         FOR UPDATE OF m`,
       [row.organization_id, row.user_id, workspaceId],
@@ -140,7 +140,7 @@ export class DesktopMcpCredentials {
 
   private async renewChild(tx: SqlExecutor, parent: ParentRow, childId: string): Promise<CredentialRow | null> {
     const renewed = await tx.query<{ id: string }>(
-      `UPDATE selfhost_token_sessions
+      `UPDATE token_sessions
           SET access_token_expires_at = LEAST(now() + make_interval(secs => $2), $3::timestamptz),
               refresh_token_expires_at = LEAST(now() + make_interval(secs => $2), $3::timestamptz),
               last_refreshed_at = now(), updated_at = now()
@@ -155,8 +155,8 @@ export class DesktopMcpCredentials {
   private async read(tx: SqlExecutor, parentId: string, childId: string): Promise<CredentialRow | null> {
     const found = await tx.query<CredentialRow>(
       `SELECT ${CREDENTIAL_COLUMNS}
-         FROM selfhost_desktop_mcp_credentials c
-         JOIN selfhost_token_sessions s ON s.id = c.token_session_id
+         FROM desktop_mcp_credentials c
+         JOIN token_sessions s ON s.id = c.token_session_id
         WHERE c.parent_session_id = $1 AND c.token_session_id = $2`,
       [parentId, childId],
     );
@@ -181,8 +181,8 @@ export class DesktopMcpCredentials {
         const parent = await this.lockParent(tx, input.parentToken, input.workspaceId);
         const existing = await tx.query<{ id: string; access_token_hash: string; revoked: boolean }>(
           `SELECT s.id, s.access_token_hash, s.revoked_at IS NOT NULL AS revoked
-             FROM selfhost_desktop_mcp_credentials c
-             JOIN selfhost_token_sessions s ON s.id = c.token_session_id
+             FROM desktop_mcp_credentials c
+             JOIN token_sessions s ON s.id = c.token_session_id
             WHERE c.parent_session_id = $1 AND c.installation_id = $2 AND c.provider = $3
             FOR UPDATE OF s`,
           [parent.id, installationId, input.provider],
@@ -195,7 +195,7 @@ export class DesktopMcpCredentials {
           return credential(renewed);
         }
         const count = await tx.query<{ count: number | string }>(
-          `SELECT count(*) AS count FROM selfhost_desktop_mcp_credentials WHERE parent_session_id = $1`,
+          `SELECT count(*) AS count FROM desktop_mcp_credentials WHERE parent_session_id = $1`,
           [parent.id],
         );
         if (Number(count.rows[0]?.count ?? 0) >= MAX_CREDENTIALS_PER_PARENT) {
@@ -203,7 +203,7 @@ export class DesktopMcpCredentials {
         }
         const childId = randomUUID();
         await tx.query(
-          `INSERT INTO selfhost_token_sessions
+          `INSERT INTO token_sessions
             (id, token_family_id, user_id, organization_id, workspace_id, label, scopes,
              access_token_hash, refresh_token_hash, access_token_expires_at, refresh_token_expires_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
@@ -225,7 +225,7 @@ export class DesktopMcpCredentials {
           ],
         );
         await tx.query(
-          `INSERT INTO selfhost_desktop_mcp_credentials
+          `INSERT INTO desktop_mcp_credentials
              (token_session_id, parent_session_id, installation_id, provider)
            VALUES ($1, $2, $3, $4)`,
           [childId, parent.id, installationId, input.provider],
@@ -247,8 +247,8 @@ export class DesktopMcpCredentials {
       const parent = await this.lockParent(tx, parentToken, workspaceId);
       const rows = await tx.query<CredentialRow>(
         `SELECT ${CREDENTIAL_COLUMNS}
-           FROM selfhost_desktop_mcp_credentials c
-           JOIN selfhost_token_sessions s ON s.id = c.token_session_id
+           FROM desktop_mcp_credentials c
+           JOIN token_sessions s ON s.id = c.token_session_id
           WHERE c.parent_session_id = $1 AND s.revoked_at IS NULL
           ORDER BY c.created_at, s.id`,
         [parent.id],
@@ -276,14 +276,14 @@ export class DesktopMcpCredentials {
     await this.database.transaction(async (tx) => {
       const parent = await this.lockParent(tx, parentToken, workspaceId);
       const removed = await tx.query<{ token_session_id: string }>(
-        `DELETE FROM selfhost_desktop_mcp_credentials
+        `DELETE FROM desktop_mcp_credentials
           WHERE parent_session_id = $1 AND token_session_id = $2
           RETURNING token_session_id`,
         [parent.id, tokenId.toLowerCase()],
       );
       if (removed.rows.length !== 1) throw NOT_FOUND();
       await tx.query(
-        `UPDATE selfhost_token_sessions
+        `UPDATE token_sessions
             SET revoked_at = now(), revoked_reason = 'desktop_provider_removed', updated_at = now()
           WHERE id = $1 AND revoked_at IS NULL`,
         [tokenId.toLowerCase()],
@@ -317,14 +317,14 @@ export class DesktopMcpCredentials {
       `SELECT s.id AS session_id, s.token_family_id, s.user_id, u.email,
               u.name AS user_name, s.organization_id, o.name AS organization_name,
               s.workspace_id, w.name AS workspace_name, m.role, s.scopes, c.provider
-         FROM selfhost_token_sessions s
-         JOIN selfhost_desktop_mcp_credentials c ON c.token_session_id = s.id
-         JOIN selfhost_token_sessions p ON p.id = c.parent_session_id
-         JOIN selfhost_users u ON u.id = s.user_id
-         JOIN selfhost_organizations o ON o.id = s.organization_id
-         JOIN selfhost_workspaces w
+         FROM token_sessions s
+         JOIN desktop_mcp_credentials c ON c.token_session_id = s.id
+         JOIN token_sessions p ON p.id = c.parent_session_id
+         JOIN users u ON u.id = s.user_id
+         JOIN organizations o ON o.id = s.organization_id
+         JOIN workspaces w
            ON w.id = s.workspace_id AND w.organization_id = s.organization_id
-         JOIN selfhost_organization_memberships m
+         JOIN organization_memberships m
            ON m.organization_id = s.organization_id AND m.user_id = s.user_id
         WHERE s.access_token_hash = $1
           AND 'mcp:desktop' = ANY(s.scopes)
@@ -334,7 +334,7 @@ export class DesktopMcpCredentials {
           AND p.revoked_at IS NULL AND p.refresh_token_expires_at > now()
           AND p.desktop_host_name IS NOT NULL AND p.desktop_verified_at IS NOT NULL
           AND NOT EXISTS (
-            SELECT 1 FROM selfhost_organizations other WHERE other.id <> s.organization_id
+            SELECT 1 FROM organizations other WHERE other.id <> s.organization_id
           )`,
       [hashSecret(token)],
     );

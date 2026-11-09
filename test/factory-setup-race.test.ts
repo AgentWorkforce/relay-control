@@ -17,7 +17,7 @@ const put = (env: FactoryEnv, key: string, token = env.ownerToken) =>
 
 async function storedKey(env: FactoryEnv): Promise<string | null> {
   const rows = await env.database.query<{ key_envelope: string }>(
-    "SELECT key_envelope FROM selfhost_factory_connections WHERE workspace_id = $1",
+    "SELECT key_envelope FROM factory_connections WHERE workspace_id = $1",
     [env.workspaceId],
   );
   return rows.rows[0] ? decryptSecret(rows.rows[0].key_envelope, env.config.encryptionKeyring) : null;
@@ -91,7 +91,7 @@ test("factory bind: a key rotation during the held session check refuses the bin
   const refused = await stale;
   assert.equal(refused.status, 409, JSON.stringify(refused.body));
   assert.deepEqual(refused.body, CHANGED);
-  const rows = await env.database.query("SELECT id FROM selfhost_factory_bindings");
+  const rows = await env.database.query("SELECT id FROM factory_bindings");
   assert.equal(rows.rows.length, 0, "no binding row is created");
   assert.equal(env.relay.registered, 0, "no Relay agent is registered");
 });
@@ -112,7 +112,7 @@ test("factory bind: a key rotation between the preparing and the final transacti
   const refused = await bind(env);
   assert.equal(refused.status, 409, JSON.stringify(refused.body));
   assert.deepEqual(refused.body, CHANGED);
-  const rows = await env.database.query<{ state: string }>("SELECT state FROM selfhost_factory_bindings");
+  const rows = await env.database.query<{ state: string }>("SELECT state FROM factory_bindings");
   assert.deepEqual(rows.rows.map((row) => row.state), ["retired"], "the preparing row is retired, never bound");
   assert.equal(env.relay.registered, 1);
   assert.equal(env.relay.released.length, 1, "the registered agent is released");

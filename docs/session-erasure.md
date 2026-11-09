@@ -83,7 +83,7 @@ session routes no longer returns it.
 
 ## Audit
 
-Both events are written to `selfhost_admin_audit_events` with the organization and workspace ids and target
+Both events are written to `admin_audit_events` with the organization and workspace ids and target
 `session:<id> source=<source> request=<request id>`. They contain ids only.
 
 - `session.hard_delete.requested`: one per `DELETE` that passes authorization, committed before the pipeline is called.

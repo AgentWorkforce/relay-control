@@ -45,7 +45,7 @@ class GatedHasher extends PasswordHasher {
 }
 
 const liveSessions = async (ctx: Ctx, email: string) => Number((await ctx.database.query<{ n: number }>(
-  `SELECT count(*)::int AS n FROM selfhost_token_sessions s JOIN selfhost_users u ON u.id = s.user_id
+  `SELECT count(*)::int AS n FROM token_sessions s JOIN users u ON u.id = s.user_id
     WHERE u.email = $1 AND s.revoked_at IS NULL`, [email])).rows[0]!.n);
 
 test("reset race: a sign-in whose verify straddles a reset answers 401 and leaves no live session", async (t) => {
@@ -85,7 +85,7 @@ test("argon2id slots: when every slot is busy, password routes answer 429 at onc
   await call(ctx.origin, `${API}/reset`, { json: { email: "busy@acme.test" } });
   await ctx.identity.idle();
   const resetToken = linkToken(ctx.mailer.sent.at(-1)!, "/login/password/reset");
-  const attemptsBefore = await ctx.database.query("SELECT subject FROM selfhost_login_attempts");
+  const attemptsBefore = await ctx.database.query("SELECT subject FROM login_attempts");
   const auditBefore = (await auditActions(ctx)).length;
 
   const hold = slots.tryAcquire()!;
@@ -100,7 +100,7 @@ test("argon2id slots: when every slot is busy, password routes answer 429 at onc
   const reset = await call(ctx.origin, `${API}/reset/complete`, { json: { token: resetToken, password: "a brand new long passphrase" } });
   assert.equal(reset.status, 429, reset.text);
   assert.ok(Date.now() - started < 5_000, "refused at once, not queued");
-  assert.deepEqual((await ctx.database.query("SELECT subject FROM selfhost_login_attempts")).rows, attemptsBefore.rows, "a refused sign-in counts nothing");
+  assert.deepEqual((await ctx.database.query("SELECT subject FROM login_attempts")).rows, attemptsBefore.rows, "a refused sign-in counts nothing");
   assert.equal((await auditActions(ctx)).length, auditBefore, "and writes no audit row");
   await assert.rejects(new PasswordHasher(passwordConfig(), { slots }).hash(PASSWORD), /capacity/);
 
@@ -123,7 +123,7 @@ test("argon2id slots: a sign-in that finds the slots full after its reservation 
   await registerVerified(ctx, "late@acme.test");
   assert.equal((await login(ctx, "late@acme.test", "a wrong passphrase")).status, 401);
   const counters = async () => (await ctx.database.query(
-    "SELECT subject, failures, locked_until FROM selfhost_login_attempts ORDER BY subject")).rows;
+    "SELECT subject, failures, locked_until FROM login_attempts ORDER BY subject")).rows;
   const before = await counters();
   assert.equal(before.length, 3, "ip, account-key and account subjects");
   const auditBefore = (await auditActions(ctx)).length;
@@ -179,7 +179,7 @@ test("lockout: 50 failures in an hour from many clients lock the account for 15 
 
   ctx.clock.now += LOCKOUT.account.lockMs + 1_000;
   assert.equal((await login(ctx, "target@acme.test", PASSWORD, "203.0.113.200")).status, 200, "the lock ends after 15 minutes");
-  const left = (await ctx.database.query<{ subject: string }>("SELECT subject FROM selfhost_login_attempts WHERE subject LIKE '%target@acme.test%'")).rows.map((r) => r.subject);
+  const left = (await ctx.database.query<{ subject: string }>("SELECT subject FROM login_attempts WHERE subject LIKE '%target@acme.test%'")).rows.map((r) => r.subject);
   assert.ok(!left.includes("account:target@acme.test"), "a success clears the account-wide counter");
   assert.ok(!left.includes("account-key:target@acme.test|203.0.113.200"), "and its own client's counter");
   assert.equal(left.length, LOCKOUT.account.limit, "other clients' counters are theirs to wait out");
@@ -209,7 +209,7 @@ test("IP lockout with SELFHOST_TRUSTED_PROXIES=0: a forged X-Forwarded-For on ev
   const accounts = ["first@acme.test", "second@acme.test", ...Array.from({ length: 38 }, (_, i) => `spray${i}@acme.test`)];
   const checked = async () => (await auditActions(ctx)).filter((e) => e.action === "login.password.failure").length;
   const ipRows = async () => (await ctx.database.query<{ subject: string; failures: number; locked_until: unknown }>(
-    "SELECT subject, failures, locked_until FROM selfhost_login_attempts WHERE subject LIKE 'ip:%'")).rows;
+    "SELECT subject, failures, locked_until FROM login_attempts WHERE subject LIKE 'ip:%'")).rows;
 
   for (const [i, email] of accounts.entries()) {
     assert.equal((await login(ctx, email, "a wrong passphrase", `203.0.113.${i + 1}`)).status, 401);

@@ -234,7 +234,7 @@ test("introspection describes an active access token and rotates token_id on ref
   const env = await setup(t);
   const { accessToken, refreshToken } = await env.login(env.alpha);
   const session = (await env.database.query<{ created_at: Date; access_token_expires_at: Date; access_token_hash: string }>(
-    "SELECT created_at, access_token_expires_at, access_token_hash FROM selfhost_token_sessions WHERE access_token_hash = $1",
+    "SELECT created_at, access_token_expires_at, access_token_hash FROM token_sessions WHERE access_token_hash = $1",
     [sha256(accessToken)],
   )).rows[0]!;
 
@@ -267,7 +267,7 @@ test("introspection describes an active access token and rotates token_id on ref
 
   // Refresh: a new token_id and iat from last_refreshed_at; the old token is gone.
   await env.database.query(
-    "UPDATE selfhost_token_sessions SET created_at = created_at - interval '1 hour' WHERE access_token_hash = $1",
+    "UPDATE token_sessions SET created_at = created_at - interval '1 hour' WHERE access_token_hash = $1",
     [sha256(accessToken)],
   );
   const refreshed = await request(env.origin, "/api/v1/auth/token/refresh", {
@@ -277,7 +277,7 @@ test("introspection describes an active access token and rotates token_id on ref
   assert.equal(refreshed.status, 200);
   const next = refreshed.body.accessToken as string;
   const row = (await env.database.query<{ last_refreshed_at: Date; created_at: Date }>(
-    "SELECT last_refreshed_at, created_at FROM selfhost_token_sessions WHERE access_token_hash = $1",
+    "SELECT last_refreshed_at, created_at FROM token_sessions WHERE access_token_hash = $1",
     [sha256(next)],
   )).rows[0]!;
   const rotated = await env.introspect({ token: next, aud: HISTORY_PUBLIC, workspace: env.alpha });
@@ -320,7 +320,7 @@ test("introspection names exactly one inactive reason, in contract order", async
 
   const expiring = await env.login(env.alpha);
   await env.database.query(
-    "UPDATE selfhost_token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE access_token_hash = $1",
+    "UPDATE token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE access_token_hash = $1",
     [sha256(expiring.accessToken)],
   );
   await inactive(expiring.accessToken, "expired");
@@ -333,7 +333,7 @@ test("introspection names exactly one inactive reason, in contract order", async
   await inactive(revoked.accessToken, "revoked");
   // revoked is checked before expired.
   await env.database.query(
-    "UPDATE selfhost_token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE access_token_hash = $1",
+    "UPDATE token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE access_token_hash = $1",
     [sha256(revoked.accessToken)],
   );
   await inactive(revoked.accessToken, "revoked");
@@ -540,7 +540,7 @@ test("without RelayAuth, relayhistory/session forwards the caller's own access t
 
   // Sync still requires rth:sync on the caller; History is never asked.
   await env.database.query(
-    "UPDATE selfhost_token_sessions SET scopes = ARRAY['cli:auth','rth:read'] WHERE access_token_hash = $1",
+    "UPDATE token_sessions SET scopes = ARRAY['cli:auth','rth:read'] WHERE access_token_hash = $1",
     [sha256(accessToken)],
   );
   const before = env.history.logins.length;
@@ -749,7 +749,7 @@ test("an inactive token never reveals machine state: the token reason wins", asy
 
   const expiring = await env.login(env.alpha);
   await env.database.query(
-    "UPDATE selfhost_token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE access_token_hash = $1",
+    "UPDATE token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE access_token_hash = $1",
     [sha256(expiring.accessToken)],
   );
   const revoked = await env.login(env.alpha);
@@ -884,7 +884,7 @@ test("introspection refuses a second organization in single tenancy and allows i
   const env = await setup(t);
   const { accessToken } = await env.login(env.alpha);
   await env.database.query(
-    "INSERT INTO selfhost_organizations (id, name) VALUES ($1, 'Other')",
+    "INSERT INTO organizations (id, name) VALUES ($1, 'Other')",
     ["00000000-0000-4000-8000-000000000002"],
   );
   const single = await env.introspect({ token: accessToken, aud: HISTORY_PUBLIC });
@@ -910,7 +910,7 @@ test("introspection reports the live organization role, for add-on admin decisio
 
   const memberId = await env.member("member@example.test");
   await env.database.query(
-    "UPDATE selfhost_token_sessions SET user_id = $1 WHERE access_token_hash = $2",
+    "UPDATE token_sessions SET user_id = $1 WHERE access_token_hash = $2",
     [memberId, sha256(ownerToken)],
   );
   const asMember = await env.introspect({ token: ownerToken, aud: HISTORY_PUBLIC });
@@ -918,7 +918,7 @@ test("introspection reports the live organization role, for add-on admin decisio
   assert.equal(asMember.body.role, "member");
 
   await env.database.query(
-    "UPDATE selfhost_organization_memberships SET role = 'admin' WHERE user_id = $1",
+    "UPDATE organization_memberships SET role = 'admin' WHERE user_id = $1",
     [memberId],
   );
   const promoted = await env.introspect({ token: ownerToken, aud: HISTORY_PUBLIC });

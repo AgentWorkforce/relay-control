@@ -411,7 +411,7 @@ test("the origin lookup refuses revoked and expired user tokens with 401", async
   const expired = await login(memberId, alpha);
   assert.equal((await call(origin, originPath(alpha), { token: expired })).status, 200);
   await database.query(
-    "UPDATE selfhost_token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE access_token_hash = $1",
+    "UPDATE token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE access_token_hash = $1",
     [hashSecret(expired)],
   );
   const afterExpiry = await call(origin, originPath(alpha), { token: expired });

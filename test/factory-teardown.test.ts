@@ -71,21 +71,21 @@ test("factory member removal purges bindings, key and bearers inside the removal
     throw new Error("abort after purge");
   }), /abort after purge/);
   assert.equal((await bindingRow(env, bound.binding_id)).state, "bound");
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_factory_connections")).rows.length, 1);
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_organization_memberships WHERE user_id = $1", [env.adminId])).rows.length, 1);
+  assert.equal((await env.database.query("SELECT 1 FROM factory_connections")).rows.length, 1);
+  assert.equal((await env.database.query("SELECT 1 FROM organization_memberships WHERE user_id = $1", [env.adminId])).rows.length, 1);
 
   // Authorized acceptance: the org owner removes the admin.
   const removed = await removeMember(env, env.adminId);
   assert.equal(removed.status, 204);
   await assertSecretFree(env, bound.binding_id);
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_factory_connections")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM factory_connections")).rows.length, 0);
   // Removal deletes the departed member's outbox rows outright (Cloud a749e46c).
   assert.deepEqual(await deliveryRows(env, bound.binding_id), []);
   assert.deepEqual(env.relay.released, [bound.agent.id]);
   assert.equal((await bindingRow(env, bound.binding_id)).relay_agent_id, null);
   assert.equal((await env.api(replyPath(bound.binding_id), { method: "POST", token: bearer, body: { text: "x" } })).status, 409);
   const audit = await env.database.query<{ action: string; target: string }>(
-    "SELECT action, target FROM selfhost_admin_audit_events WHERE action = 'factory.member.purge'",
+    "SELECT action, target FROM admin_audit_events WHERE action = 'factory.member.purge'",
   );
   assert.deepEqual(audit.rows, [{ action: "factory.member.purge", target: "bindings:1;connections:1" }]);
 });
@@ -112,7 +112,7 @@ test("factory successor connects and rebinds the same session after the former o
   const third = await connectAndBind(env, { token: admin2Token, sessionId: "sess-a" });
   assert.equal((await bindingRow(env, third.binding_id)).state, "bound");
   const retired = await env.database.query<{ n: number }>(
-    "SELECT count(*)::int AS n FROM selfhost_factory_bindings WHERE session_id = 'sess-a' AND state = 'retired'",
+    "SELECT count(*)::int AS n FROM factory_bindings WHERE session_id = 'sess-a' AND state = 'retired'",
   );
   assert.equal(retired.rows[0]!.n, 2);
 });
@@ -133,7 +133,7 @@ test("factory membership removal racing a final bind write wins and leaves no li
   assert.equal(late.status, 403);
   assert.equal(late.body.error, "factory_access_revoked");
   const rows = await env.database.query<{ id: string; state: string; relay_agent_id: string | null }>(
-    "SELECT id, state, relay_agent_id FROM selfhost_factory_bindings",
+    "SELECT id, state, relay_agent_id FROM factory_bindings",
   );
   assert.deepEqual(rows.rows.map((row) => [row.state, row.relay_agent_id]), [["retired", null]]);
   await assertSecretFree(env, rows.rows[0]!.id);
@@ -153,7 +153,7 @@ test("factory membership removal racing a final connect write wins and stores no
   const late = await env.api(factoryPath(env.workspaceId, "/connection"), { method: "PUT", token: env.adminToken, body: { key: FACTORY_KEY } });
   assert.equal(late.status, 403);
   assert.equal(late.body.error, "factory_access_revoked");
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_factory_connections")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM factory_connections")).rows.length, 0);
 });
 
 test("factory workspace cleanup removes every local row and releases remote agents with the captured key", async (t) => {
@@ -166,11 +166,11 @@ test("factory workspace cleanup removes every local row and releases remote agen
   const { releases } = await env.database.transaction((tx) => cleanupWorkspaceFactory(tx, env.workspaceId));
   assert.deepEqual(releases.map((row) => row.relay_agent_id), [here.agent.id]);
   for (const table of ["connections", "bindings", "deliveries", "history_syncs"]) {
-    const rows = await env.database.query(`SELECT 1 FROM selfhost_factory_${table} WHERE workspace_id = $1`, [env.workspaceId]);
+    const rows = await env.database.query(`SELECT 1 FROM factory_${table} WHERE workspace_id = $1`, [env.workspaceId]);
     assert.equal(rows.rows.length, 0, table);
   }
   // The RESTRICT foreign keys no longer block deleting the workspace.
-  await env.database.query("DELETE FROM selfhost_workspaces WHERE id = $1", [env.workspaceId]);
+  await env.database.query("DELETE FROM workspaces WHERE id = $1", [env.workspaceId]);
   assert.equal(await env.module.afterWorkspaceDeleted("rk_live_primary", releases), 0);
   assert.deepEqual(env.relay.released, [here.agent.id]);
   // The other workspace is untouched.
@@ -181,7 +181,7 @@ test("factory workspace cleanup removes every local row and releases remote agen
 test("factory workspace cleanup is required: Factory rows block a bare workspace delete", async (t) => {
   const env = await startFactoryEnv(t);
   await connectAndBind(env);
-  await assert.rejects(env.database.query("DELETE FROM selfhost_workspaces WHERE id = $1", [env.workspaceId]), /foreign key/);
+  await assert.rejects(env.database.query("DELETE FROM workspaces WHERE id = $1", [env.workspaceId]), /foreign key/);
 });
 
 const addAdmin = async (env: FactoryEnv, email: string, role: "admin" | "member" = "admin") => {
@@ -207,7 +207,7 @@ async function rejoinedFormerOwner(env: FactoryEnv, role: "admin" | "member" = "
 }
 
 const connectionRow = async (env: FactoryEnv) =>
-  (await env.database.query<Record<string, unknown>>("SELECT * FROM selfhost_factory_connections")).rows;
+  (await env.database.query<Record<string, unknown>>("SELECT * FROM factory_connections")).rows;
 
 test("factory current owner manages own connection after a removed member rejoins; rejoined member gains no authority over the old session (Cloud 9f813ff)", async (t) => {
   const env = await startFactoryEnv(t);
@@ -257,7 +257,7 @@ test("factory current owner manages own connection after a removed member rejoin
     ["retired", aliceRow.generation, alice.agent.id, env.adminId],
   );
   assert.ok(env.relay.agents.has(alice.agent.name), "the old remote agent was not released by anyone's manage action");
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_factory_history_syncs")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM factory_history_syncs")).rows.length, 0);
 
   // Verified cleanup then frees the old session id.
   env.relay.failRelease = false;
@@ -271,7 +271,7 @@ for (const state of ["bound", "preparing"] as const) {
   test(`factory foreign ${state} binding still blocks the current connection owner after a rejoin, and a fresh connect without a connection (Cloud 9f813ff)`, async (t) => {
     const env = await startFactoryEnv(t);
     const { alice, bob } = await rejoinedFormerOwner(env);
-    await env.database.query("UPDATE selfhost_factory_bindings SET state = $2 WHERE id = $1", [alice.binding_id, state]);
+    await env.database.query("UPDATE factory_bindings SET state = $2 WHERE id = $1", [alice.binding_id, state]);
     const before = await connectionRow(env);
     const connection = factoryPath(env.workspaceId, "/connection");
     assert.equal((await env.api(connection, { method: "PUT", token: env.ownerToken, body: { key: FACTORY_KEY_2 } })).status, 409);
@@ -283,7 +283,7 @@ for (const state of ["bound", "preparing"] as const) {
     assert.deepEqual([row.state, row.user_id, row.relay_agent_id], [state, env.adminId, alice.agent.id]);
 
     // With no connection at all, the foreign live row alone still refuses a fresh connect.
-    await env.database.query("DELETE FROM selfhost_factory_connections");
+    await env.database.query("DELETE FROM factory_connections");
     const fresh = await env.api(connection, { method: "PUT", token: env.ownerToken, body: { key: FACTORY_KEY_2 } });
     assert.deepEqual([fresh.status, fresh.body.error], [409, "factory_other_member_bindings"]);
     assert.deepEqual(await connectionRow(env), []);
@@ -294,7 +294,7 @@ test("factory current personal connection with zero binding rows still refuses a
   const env = await startFactoryEnv(t);
   const connection = factoryPath(env.workspaceId, "/connection");
   assert.equal((await env.api(connection, { method: "PUT", token: env.ownerToken, body: { key: FACTORY_KEY } })).status, 200);
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_factory_bindings")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM factory_bindings")).rows.length, 0);
   const before = await connectionRow(env);
 
   const takeover = await env.api(connection, { method: "PUT", token: env.adminToken, body: { key: FACTORY_KEY_2 } });
@@ -305,7 +305,7 @@ test("factory current personal connection with zero binding rows still refuses a
   assert.deepEqual([bound.status, bound.body.error], [403, "factory_not_owner"]);
   assert.deepEqual([(await env.api(connection, { method: "DELETE", token: env.adminToken })).body.error], ["factory_not_owner"]);
   assert.deepEqual(await connectionRow(env), before);
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_factory_bindings")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM factory_bindings")).rows.length, 0);
 });
 
 test("factory A removed, B connects, A rejoins as member, B disconnects and reconnects without touching A's cleanup rows (Cloud 9f813ff)", async (t) => {
@@ -388,7 +388,7 @@ test("factory role demotion racing a final bind write is fenced inside the commi
   });
   assert.equal(late.status, 403);
   assert.equal(late.body.error, "factory_access_revoked");
-  const rows = await env.database.query<{ state: string }>("SELECT state FROM selfhost_factory_bindings");
+  const rows = await env.database.query<{ state: string }>("SELECT state FROM factory_bindings");
   assert.deepEqual(rows.rows.map((row) => row.state), ["retired"]);
   assert.equal(env.relay.agents.size, 0, "the late registration is released");
 });
