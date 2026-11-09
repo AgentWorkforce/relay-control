@@ -426,6 +426,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
   // ------------------------------------------------------------- lifecycle
 
   const timers: NodeJS.Timeout[] = [];
+  const loops: string[] = [];
   const running = new Set<string>();
   let stopped = false;
 
@@ -440,6 +441,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
     }, ms);
     timer.unref();
     timers.push(timer);
+    loops.push(name);
   }
 
   return {
@@ -456,6 +458,10 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
     /** True while the loop timers are installed (all of them, or only the acquisition one after a reconcile-only start). */
     get started(): boolean {
       return timers.length > 0;
+    },
+    /** Names of the installed loops: all of them, or only "acquisition" after a reconcile-only start. */
+    get loops(): readonly string[] {
+      return [...loops];
     },
     /** `reconcileOnly` installs just the acquisition reconciler, for a module whose Factory flag is off. */
     start(options: { reconcileOnly?: boolean } = {}): void {
@@ -478,6 +484,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
     async stop(): Promise<void> {
       stopped = true;
       for (const timer of timers.splice(0)) clearInterval(timer);
+      loops.length = 0;
     },
   };
 }
