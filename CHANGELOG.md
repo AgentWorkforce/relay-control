@@ -3,7 +3,7 @@
 Notable changes to the self-hosted control plane. Dates and versions are
 assigned at release.
 
-## Unreleased
+## 0.5.7 (2026-11-09)
 
 - Fixed: the desktop sign-in workspace picker and consent screens now name
   both browser origins (API and dashboard) in `form-action` beside `'self'`
