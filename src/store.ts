@@ -1261,6 +1261,29 @@ export class ControlPlaneStore {
     return result.rows.length === 1;
   }
 
+  /**
+   * Revokes every live session of a person (browser, CLI and Desktop token
+   * sessions, and MCP OAuth grants), e.g. after a password reset. Workspace
+   * API tokens belong to the workspace, not the person, and are kept.
+   */
+  async revokeAllForUser(executor: SqlExecutor, userId: string, reason: string): Promise<{ sessions: number; mcpGrants: number }> {
+    const sessions = await executor.query<{ id: string }>(
+      `UPDATE selfhost_token_sessions
+          SET revoked_at = now(), revoked_reason = $2, updated_at = now()
+        WHERE user_id = $1 AND revoked_at IS NULL
+        RETURNING id`,
+      [userId, reason],
+    );
+    const grants = await executor.query<{ id: string }>(
+      `UPDATE selfhost_mcp_oauth_grants
+          SET revoked_at = now(), revoked_reason = $2
+        WHERE user_id = $1 AND revoked_at IS NULL
+        RETURNING id`,
+      [userId, reason],
+    );
+    return { sessions: sessions.rows.length, mcpGrants: grants.rows.length };
+  }
+
   private async upsertUser(
     tx: SqlExecutor,
     emailInput: string,

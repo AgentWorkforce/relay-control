@@ -8,6 +8,11 @@ import { inviteEmail, signInEmail, type Mailer } from "./mailer.js";
 import { OidcClient, OidcError, pkcePair, randomState } from "./oidc.js";
 import { confirmEmailPage, loginPage, messagePage, PAGE_CSP, type InviteBanner } from "./pages.js";
 import { IdentityError, IdentityStore, type Role } from "./store.js";
+import type { Database } from "../database.js";
+import { PasswordHasher } from "./password/hashing.js";
+import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, type HibpFetch } from "./password/policy.js";
+import { createPasswordRoutes, disabledMethod, PASSWORD_PATH_PREFIX, PasswordHttpError, type PasswordRoutes } from "./password/routes.js";
+import { PasswordStore } from "./password/store.js";
 
 type JsonObject = Record<string, unknown>;
 type Auth = { kind: "bootstrap" } | { kind: "user"; principal: Principal };
@@ -147,6 +152,8 @@ export type IdentityModule = {
   ): Promise<boolean>;
   /** Owner-guarded membership change audit (called by the memberships routes). */
   auditMembership(input: { organizationId: string; auth: Auth; action: string; target: string }): Promise<void>;
+  /** Resolves once background sign-in mail work has finished (tests, shutdown). */
+  idle(): Promise<void>;
 };
 
 export function createIdentityModule(input: {
@@ -157,6 +164,10 @@ export function createIdentityModule(input: {
   dashboardUrl: string;
   mailer: Mailer | null;
   oidcClient?: OidcClient | null;
+  /** Needed when password sign-in is enabled (its Postgres state). */
+  database?: Database;
+  /** Test seam: the Have I Been Pwned range fetch (SELFHOST_PASSWORD_HIBP=on). */
+  hibpFetch?: HibpFetch;
   now?: () => number;
   log?: (message: string, fields?: Record<string, unknown>) => void;
 }): IdentityModule {
@@ -167,6 +178,28 @@ export function createIdentityModule(input: {
   const oidc = input.oidcClient !== undefined ? input.oidcClient : config.oidc ? new OidcClient(config.oidc) : null;
   const dashboardOrigin = new URL(input.dashboardUrl).origin;
   const emailLogin = config.emailLogin && mailer !== null;
+  let passwordRoutes: PasswordRoutes | null = null;
+  if (config.signinMethods.includes("password") && config.password && mailer) {
+    if (!input.database) throw new Error("password sign-in needs the database");
+    passwordRoutes = createPasswordRoutes({
+      config: config.password,
+      hasher: new PasswordHasher(config.password),
+      passwords: new PasswordStore(input.database, input.now ? { now: input.now } : {}),
+      identityStore: store,
+      controlStore,
+      mailer,
+      dashboardOrigin,
+      sessionCookie: (tokens) => sessionCookie(tokens),
+      clearSessionCookie: () => clearCookie(SESSION_COOKIE, "/cloud"),
+      ...(input.hibpFetch ? { hibpFetch: input.hibpFetch } : {}),
+      ...(input.now ? { now: input.now } : {}),
+      log,
+    });
+  }
+  const signinMethods = [
+    ...(emailLogin ? ["email_link" as const] : []),
+    ...(passwordRoutes ? ["password" as const] : []),
+  ];
 
   function limited(key: string, rule: { limit: number; windowMs: number }): boolean {
     return !limiter.consume(key, rule.limit, rule.windowMs).allowed;
@@ -375,7 +408,10 @@ export function createIdentityModule(input: {
 
     // ---- email sign-in links ---------------------------------------------------
     if (method === "POST" && publicPath === "/login/email") {
-      if (!emailLogin) return false;
+      if (!emailLogin) {
+        disabledMethod(response, "email_link");
+        return true;
+      }
       if (!sameOriginForm(request, helpers)) {
         sendHtml(response, 403, messagePage({ title: "Unable to sign in", message: "Cross-origin request refused." }));
         return true;
@@ -412,7 +448,10 @@ export function createIdentityModule(input: {
     }
 
     if (method === "GET" && publicPath === "/login/email/verify") {
-      if (!emailLogin) return false;
+      if (!emailLogin) {
+        disabledMethod(response, "email_link");
+        return true;
+      }
       const token = url.searchParams.get("token") ?? "";
       const email = await store.peekEmailLogin(token);
       if (!email) {
@@ -425,7 +464,10 @@ export function createIdentityModule(input: {
     }
 
     if (method === "POST" && publicPath === "/login/email/verify") {
-      if (!emailLogin) return false;
+      if (!emailLogin) {
+        disabledMethod(response, "email_link");
+        return true;
+      }
       if (!sameOriginForm(request, helpers)) {
         sendHtml(response, 403, messagePage({ title: "Unable to sign in", message: "Cross-origin request refused." }));
         return true;
@@ -461,6 +503,28 @@ export function createIdentityModule(input: {
       return true;
     }
 
+    // ---- API: public login configuration (no auth, no secrets) -----------------
+    if (method === "GET" && path === "/api/v1/auth/login-config") {
+      sendJson(response, 200, {
+        methods: signinMethods,
+        oidc: oidc ? { displayName: oidc.config.displayName } : null,
+        logo_url: config.logoUrl,
+        // Whether only some email domains may join (never the list itself).
+        allowed_domain_hint: config.autoJoinDomains.length > 0 || (oidc?.config.allowedDomains.length ?? 0) > 0,
+        password_policy: passwordRoutes ? { min_length: PASSWORD_MIN_LENGTH, max_length: PASSWORD_MAX_LENGTH } : null,
+      });
+      return true;
+    }
+
+    // ---- API: email + password sign-in --------------------------------------------
+    if (path.startsWith(PASSWORD_PATH_PREFIX)) {
+      if (!passwordRoutes) {
+        disabledMethod(response, "password");
+        return true;
+      }
+      if (await passwordRoutes.handle(request, response, path, helpers)) return true;
+    }
+
     // ---- API: sign-in methods (for the dashboard) ------------------------------
     if (method === "GET" && path === "/api/v1/auth/methods") {
       const auth = await helpers.authenticate(request);
@@ -468,6 +532,7 @@ export function createIdentityModule(input: {
       sendJson(response, 200, {
         oidc: oidc ? { displayName: oidc.config.displayName, allowedDomains: oidc.config.allowedDomains } : null,
         emailLink: emailLogin,
+        password: passwordRoutes !== null,
         inviteEmail: mailer !== null,
         autoJoinDomains: config.autoJoinDomains,
         inviteTtlHours: Math.round(config.inviteTtlMs / 3_600_000),
@@ -628,11 +693,14 @@ export function createIdentityModule(input: {
         target,
       });
     },
+    async idle() {
+      await passwordRoutes?.idle();
+    },
   };
 }
 
 export function identityErrorResponse(error: unknown): { status: number; body: { error: string; message: string } } | null {
-  if (error instanceof IdentityHttpError || error instanceof IdentityError) {
+  if (error instanceof IdentityHttpError || error instanceof IdentityError || error instanceof PasswordHttpError) {
     return { status: error.status, body: { error: error.code, message: error.message } };
   }
   return null;

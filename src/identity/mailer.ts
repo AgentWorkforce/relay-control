@@ -82,3 +82,37 @@ export function signInEmail(input: { to: string; url: string; siteName: string }
     html: layout("Sign in to Agent Relay", intro, "Sign in", input.url, "If you didn't ask to sign in, you can ignore this email."),
   };
 }
+
+export function passwordVerifyEmail(input: { to: string; url: string; siteName: string; expiresInMinutes: number }): OutgoingEmail {
+  const intro = `Confirm this address to finish setting your Agent Relay (${input.siteName}) password. The link works once and expires in ${input.expiresInMinutes} minutes.`;
+  const footer = "If you didn't ask to set a password, you can ignore this email; no password is set until the link is used.";
+  return {
+    to: input.to,
+    subject: "Confirm your Agent Relay password",
+    text: `${intro}\n\nConfirm: ${input.url}\n\n${footer}\n`,
+    html: layout("Confirm your email", intro, "Confirm and set password", input.url, footer),
+  };
+}
+
+/** Sent instead of a verification link when the address already has a password. */
+export function passwordAlreadyRegisteredEmail(input: { to: string; url: string; siteName: string }): OutgoingEmail {
+  const intro = `Someone asked to set a password for this address on Agent Relay (${input.siteName}), but it already has one. If you forgot it, reset it.`;
+  const footer = "If this wasn't you, you can ignore this email; your password has not changed.";
+  return {
+    to: input.to,
+    subject: "You already have an Agent Relay password",
+    text: `${intro}\n\nReset your password: ${input.url}\n\n${footer}\n`,
+    html: layout("You already have a password", intro, "Reset password", input.url, footer),
+  };
+}
+
+export function passwordResetEmail(input: { to: string; url: string; siteName: string; expiresInMinutes: number }): OutgoingEmail {
+  const intro = `Use this link to choose a new Agent Relay (${input.siteName}) password. It works once and expires in ${input.expiresInMinutes} minutes. Resetting signs you out everywhere.`;
+  const footer = "If you didn't ask to reset your password, you can ignore this email; your password has not changed.";
+  return {
+    to: input.to,
+    subject: "Reset your Agent Relay password",
+    text: `${intro}\n\nReset: ${input.url}\n\n${footer}\n`,
+    html: layout("Reset your password", intro, "Choose a new password", input.url, footer),
+  };
+}
