@@ -9,9 +9,9 @@ import { ControlPlaneStore } from "../src/store.js";
 import { close, listen, PGliteDatabase, request } from "./support/harness.js";
 
 /**
- * RelayAuth-free self-host: RelayHistory verifies relaycontrol access tokens
- * through POST /internal/v1/auth/introspect, and relaycontrol forwards the
- * caller's own token to History /v1/cli/login.
+ * The sessions pipeline verifies relaycontrol access tokens through
+ * POST /internal/v1/auth/introspect: its ingest edge accepts the caller's own
+ * `sh_at_` token that the relayhistory/session sync route hands back.
  */
 
 const INTROSPECT_SECRET = "introspect-secret-that-is-at-least-32-bytes";
@@ -32,102 +32,47 @@ function captureLogs(t: TestContext): Logged[] {
   return logged;
 }
 
-type HistoryLogin = { agentRelayToken: string; label?: string };
-
 /**
- * A RelayHistory double for the no-RelayAuth mode: /v1/cli/login accepts an
- * `sh_at_` token and every read re-introspects it at relaycontrol for the
- * requested workspace (fail closed), then attests the workspace.
+ * A sessions pipeline ingest-edge double: every upload re-introspects the
+ * bearer at relaycontrol for the requested workspace (fail closed).
  */
-async function startHistory(t: TestContext, control: () => string) {
-  const logins: HistoryLogin[] = [];
-  const reads: Array<{ path: string; workspace: string | null }> = [];
-  const relayauthCalls: string[] = [];
-  const historyTokens = new Map<string, string>();
-  let mints = 0;
+async function startIngestEdge(t: TestContext, control: () => string) {
+  const uploads: Array<{ workspace: string | null; active: boolean }> = [];
   let origin = "";
   const server = createServer(async (incoming: IncomingMessage, response) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of incoming) chunks.push(Buffer.from(chunk));
-    const raw = Buffer.concat(chunks).toString("utf8");
+    for await (const _chunk of incoming) { /* drain */ }
     const url = new URL(incoming.url!, origin);
     response.setHeader("content-type", "application/json");
     const send = (status: number, body: unknown) => {
       response.statusCode = status;
       response.end(JSON.stringify(body));
     };
-    if (url.pathname.startsWith("/v1/tokens/")) {
-      relayauthCalls.push(url.pathname);
-      send(500, { error: "relayauth is not deployed" });
-      return;
-    }
-    if (url.pathname === "/v1/cli/login") {
-      const body = JSON.parse(raw) as HistoryLogin;
-      logins.push(body);
-      if (!body.agentRelayToken.startsWith("sh_at_")) {
-        send(401, { error: "unauthorized" });
-        return;
-      }
-      mints += 1;
-      const accessToken = `rth_at_${mints}`;
-      historyTokens.set(accessToken, body.agentRelayToken);
-      send(200, {
-        sessionId: `history-session-${mints}`,
-        accessToken,
-        accessTokenExpiresAt: "2099-01-01T00:00:00.000Z",
-        refreshToken: `rth_rt_${mints}`,
-        refreshTokenExpiresAt: "2099-02-01T00:00:00.000Z",
-        tokenType: "Bearer",
-        scopes: ["rth:read"],
-      });
-      return;
-    }
     const bearer = /^Bearer (.+)$/.exec(incoming.headers.authorization ?? "")?.[1];
-    const callerToken = bearer ? historyTokens.get(bearer) : undefined;
     const workspace = url.searchParams.get("workspace");
-    reads.push({ path: url.pathname, workspace });
-    if (!callerToken || !workspace) {
-      send(401, { error: "unauthorized" });
+    if (incoming.method !== "POST" || url.pathname !== "/v1/ingest" || !bearer || !workspace) {
+      send(404, { error: "not_found" });
       return;
     }
     const verdict = await request(control(), "/internal/v1/auth/introspect", {
       method: "POST",
       token: INTROSPECT_SECRET,
-      body: { token: callerToken, aud: HISTORY_PUBLIC, workspace },
+      body: { token: bearer, aud: HISTORY_PUBLIC, workspace },
     });
-    if (verdict.status !== 200 || verdict.body.active !== true) {
-      send(401, { error: "unauthorized" });
-      return;
-    }
-    response.setHeader("x-relayhistory-workspace-id", verdict.body.workspace);
-    if (url.pathname === "/v1/sessions") {
-      send(200, {
-        sessions: [{ sessionId: `${workspace}-1`, source: "codex", summary: "work", lastTs: "2026-11-02T18:00:00.000Z" }],
-        nextCursor: null,
-      });
-      return;
-    }
-    send(404, { error: "not_found" });
+    const active = verdict.status === 200 && verdict.body.active === true;
+    uploads.push({ workspace, active });
+    send(active ? 202 : 401, active ? { accepted: true } : { error: "unauthorized" });
   });
   origin = await listen(server);
   t.after(() => close(server));
-  return {
-    origin,
-    logins,
-    reads,
-    relayauthCalls,
-    get mints() {
-      return mints;
-    },
-  };
+  return { origin, uploads };
 }
 
 async function setup(
   t: TestContext,
-  options: { introspectSecret?: string | null; introspectAudiences?: string[]; relayauth?: boolean } = {},
+  options: { introspectSecret?: string | null; introspectAudiences?: string[] } = {},
 ) {
   let controlOrigin = "";
-  const history = await startHistory(t, () => controlOrigin);
+  const history = await startIngestEdge(t, () => controlOrigin);
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -135,10 +80,9 @@ async function setup(
     publicBaseUrl: "https://control.internal.example",
     relaycastUrl: "http://relaycast.internal",
     relaycastPublicUrl: "https://relaycast.selfhosted.test",
-    relayauthUrl: options.relayauth ? history.origin : null,
-    relayauthApiKey: options.relayauth ? "rak_test" : null,
     relayhistoryUrl: history.origin,
     relayhistoryPublicUrl: HISTORY_PUBLIC,
+    sessionReadApi: { url: history.origin, publicUrl: HISTORY_PUBLIC, secret: "session-read-secret-".repeat(2) },
     introspectSecret: options.introspectSecret === undefined ? INTROSPECT_SECRET : options.introspectSecret,
     ...(options.introspectAudiences ? { introspectAudiences: options.introspectAudiences } : {}),
     bootstrapToken: BOOTSTRAP,
@@ -420,7 +364,7 @@ test("introspection audiences compare normalized origins and echo the configured
     `${HISTORY_PUBLIC}/`,
     "https://HISTORY.SelfHosted.TEST",
     "HTTPS://history.selfhosted.test:443/",
-    `${HISTORY_PUBLIC}/v1/cli/login?x=1`,
+    `${HISTORY_PUBLIC}/v1/ingest?x=1`,
   ]) {
     const result = await defaults.introspect({ token: accessToken, aud, workspace: defaults.alpha });
     assert.equal(result.body.active, true, aud);
@@ -502,149 +446,36 @@ test("introspection responses and server logs never contain token material", asy
   assert(logged.length > 0, "failed authentications were logged");
 });
 
-test("without RelayAuth, relayhistory/session forwards the caller's own access token", async (t) => {
+test("the ingest edge verifies the sync credential through introspection, and revocation cuts it off", async (t) => {
   const logged = captureLogs(t);
   const env = await setup(t);
   const { accessToken } = await env.login(env.alpha);
-
-  const issued = await request(env.origin, `/api/v1/workspaces/${env.alpha}/relayhistory/session`, {
-    method: "POST",
-    token: accessToken,
-    body: { mode: "read", label: "desktop" },
-  });
-  assert.equal(issued.status, 200);
-  assert.deepEqual(env.history.logins.at(-1), { agentRelayToken: accessToken, label: "desktop" });
-  assert.deepEqual(issued.body, {
-    baseUrl: HISTORY_PUBLIC,
-    sessionId: "history-session-1",
-    accessToken: "rth_at_1",
-    accessTokenExpiresAt: "2099-01-01T00:00:00.000Z",
-    refreshToken: "rth_rt_1",
-    refreshTokenExpiresAt: "2099-02-01T00:00:00.000Z",
-    tokenType: "Bearer",
-    scopes: ["rth:read"],
-    orgId: env.organizationId,
-    workspaceId: env.alpha,
-  });
-
-  // The browser session cookie under /cloud is forwarded the same way.
-  const viaCookie = await request(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/relayhistory/session`, {
-    method: "POST",
-    cookie: `agent_relay_session=${encodeURIComponent(accessToken)}`,
-    // This History double grants only rth:read, so the default mode (sync)
-    // would be refused with 501 sync_not_served (see test/sessions.test.ts).
-    body: { mode: "read" },
-  });
-  assert.equal(viaCookie.status, 200);
-  assert.deepEqual(env.history.logins.at(-1), { agentRelayToken: accessToken });
-
-  // Sync still requires rth:sync on the caller; History is never asked.
-  await env.database.query(
-    "UPDATE selfhost_token_sessions SET scopes = ARRAY['cli:auth','rth:read'] WHERE access_token_hash = $1",
-    [sha256(accessToken)],
-  );
-  const before = env.history.logins.length;
   const sync = await request(env.origin, `/api/v1/workspaces/${env.alpha}/relayhistory/session`, {
     method: "POST",
     token: accessToken,
     body: { mode: "sync" },
   });
-  assert.equal(sync.status, 403);
-  assert.equal(sync.body.error, "mode_not_authorized");
-  const read = await request(env.origin, `/api/v1/workspaces/${env.alpha}/relayhistory/session`, {
-    method: "POST",
-    token: accessToken,
-    body: { mode: "read" },
-  });
-  assert.equal(read.status, 200);
-  assert.equal(env.history.logins.length, before + 1);
+  assert.equal(sync.status, 200, sync.raw);
+  assert.equal(sync.body.accessToken, accessToken);
+  assert.equal(sync.body.baseUrl, HISTORY_PUBLIC);
 
-  // Another workspace's session is still a 404 before anything is forwarded.
-  const other = await request(env.origin, `/api/v1/workspaces/${env.beta}/relayhistory/session`, {
+  const upload = (workspace: string) => fetch(`${env.history.origin}/v1/ingest?workspace=${workspace}`, {
     method: "POST",
-    token: accessToken,
-    body: { mode: "read" },
+    headers: { authorization: `Bearer ${sync.body.accessToken}`, "content-type": "application/json" },
+    body: "{}",
   });
-  assert.equal(other.status, 404);
-  assert.equal(env.history.logins.length, before + 1);
-
-  assert.deepEqual(env.history.relayauthCalls, [], "RelayAuth is never called");
+  assert.equal((await upload(env.alpha)).status, 202);
+  // The credential is bound to its workspace.
+  assert.equal((await upload(env.beta)).status, 401);
+  await request(env.origin, "/api/v1/auth/token/revoke", { method: "POST", token: accessToken });
+  assert.equal((await upload(env.alpha)).status, 401);
+  assert.deepEqual(env.history.uploads, [
+    { workspace: env.alpha, active: true },
+    { workspace: env.beta, active: false },
+    { workspace: env.alpha, active: false },
+  ]);
   const output = logged.map((line) => line.text).join("\n");
   assert.equal(output.includes(accessToken), false);
-});
-
-test("without RelayAuth, a History login failure never echoes the caller token", async (t) => {
-  const env = await setup(t);
-  const { accessToken } = await env.login(env.alpha);
-  // History refuses the login (e.g. its introspection said inactive).
-  const original = globalThis.fetch;
-  t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
-    if (String(input).endsWith("/v1/cli/login")) return new Response("{}", { status: 401 });
-    return original(input, init);
-  });
-  const failed = await request(env.origin, `/api/v1/workspaces/${env.alpha}/relayhistory/session`, {
-    method: "POST",
-    token: accessToken,
-    body: { mode: "read" },
-  });
-  t.mock.restoreAll();
-  assert.equal(failed.status, 502);
-  assert.deepEqual(failed.body, {
-    error: "relayhistory_session_failed",
-    stage: "exchange",
-    upstreamStatus: 401,
-  });
-  assert.equal(failed.raw.includes(accessToken), false);
-});
-
-test("without RelayAuth, session reads exchange the caller token and cache per token session", async (t) => {
-  const logged = captureLogs(t);
-  const env = await setup(t);
-  const first = await env.login(env.alpha);
-  const second = await env.login(env.alpha);
-
-  const list = await request(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token: first.accessToken });
-  assert.equal(list.status, 200, list.raw);
-  assert.deepEqual(list.body.items.map((row: any) => row.sessionId), [`${env.alpha}-1`]);
-  assert.equal(env.history.mints, 1);
-  assert.deepEqual(env.history.logins.at(-1), { agentRelayToken: first.accessToken, label: "relay-dashboard" });
-
-  // Same token session: the cached History token is reused.
-  assert.equal((await request(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token: first.accessToken })).status, 200);
-  assert.equal(env.history.mints, 1);
-
-  // Same user and workspace, different token session: never shares the cache.
-  assert.equal((await request(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token: second.accessToken })).status, 200);
-  assert.equal(env.history.mints, 2);
-  assert.deepEqual(env.history.logins.at(-1), { agentRelayToken: second.accessToken, label: "relay-dashboard" });
-
-  // Revoking the first token cuts it off at relaycontrol before History.
-  await request(env.origin, "/api/v1/auth/token/revoke", { method: "POST", token: first.accessToken });
-  const revoked = await request(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token: first.accessToken });
-  assert.equal(revoked.status, 401);
-  assert.equal((await request(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token: second.accessToken })).status, 200);
-
-  // Every History read was introspected for exactly the authorized workspace.
-  for (const read of env.history.reads) assert.equal(read.workspace, env.alpha);
-  assert.deepEqual(env.history.relayauthCalls, []);
-  const output = logged.map((line) => line.text).join("\n");
-  for (const token of [first.accessToken, second.accessToken]) assert.equal(output.includes(token), false);
-});
-
-test("with RelayAuth configured, History still receives an assertion, not the caller token", async (t) => {
-  const env = await setup(t, { relayauth: true });
-  const { accessToken } = await env.login(env.alpha);
-  const issued = await request(env.origin, `/api/v1/workspaces/${env.alpha}/relayhistory/session`, {
-    method: "POST",
-    token: accessToken,
-    body: { mode: "read" },
-  });
-  // The double's RelayAuth endpoint is down, so the assertion stage fails
-  // and the caller token is never sent to History.
-  assert.equal(issued.status, 502);
-  assert.equal(issued.body.stage, "assertion");
-  assert.deepEqual(env.history.relayauthCalls, ["/v1/tokens/relayhistory-assertion"]);
-  assert.deepEqual(env.history.logins, []);
 });
 
 test("introspection verifies a supplied machine against the token user's node claims", async (t) => {

@@ -54,13 +54,7 @@ async function close(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
 
-function jwt(payload: Record<string, unknown>): string {
-  return [
-    Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url"),
-    Buffer.from(JSON.stringify(payload)).toString("base64url"),
-    "test-signature",
-  ].join(".");
-}
+const READ_API_SECRET = "session-read-secret-".repeat(2);
 
 type HistoryEvent = {
   eventId: string; sessionId: string; source: string; kind: string; type: string; ts: string; content: string;
@@ -68,14 +62,12 @@ type HistoryEvent = {
 };
 
 /**
- * RelayAuth + RelayHistory double with workspace attestation, as in sessions.test.ts.
- * Without RelayAuth, /v1/cli/login receives the caller's own `sh_at_` token;
- * `callerWorkspaces` stands in for History's introspection of it.
+ * Sessions pipeline read API double with workspace attestation, as in
+ * sessions.test.ts. `handoffs` records the Control handoff request bodies.
  */
-async function startHistory(t: TestContext, audience: string) {
+async function startHistory(t: TestContext) {
   const paths: string[] = [];
-  const logins: string[] = [];
-  const callerWorkspaces = new Map<string, string>();
+  const handoffs: Array<Record<string, any>> = [];
   const tokens = new Map<string, string>();
   const events: HistoryEvent[] = [];
   let mints = 0;
@@ -92,41 +84,27 @@ async function startHistory(t: TestContext, audience: string) {
       response.statusCode = status;
       response.end(JSON.stringify(value));
     };
-    if (url.pathname === "/v1/tokens/relayhistory-assertion") {
-      send(200, { accessToken: `relay_ag_${jwt({ org: body.orgId, wks: body.workspaceId, sponsorId: body.sponsorId, scopes: body.scopes, aud: audience })}` });
-      return;
-    }
-    if (url.pathname === "/v1/cli/login") {
-      const agentRelayToken = String(body.agentRelayToken);
-      logins.push(agentRelayToken);
-      if (agentRelayToken.startsWith("sh_at_")) {
-        const workspace = callerWorkspaces.get(agentRelayToken);
-        if (!workspace) {
-          send(401, { error: { code: "unauthorized" } });
-          return;
-        }
-        mints += 1;
-        tokens.set(`rth_at_${mints}`, workspace);
-        send(200, {
-          accessToken: `rth_at_${mints}`,
-          accessTokenExpiresAt: "2099-01-01T00:00:00.000Z",
-          refreshToken: `rth_rt_${mints}`,
-          refreshTokenExpiresAt: "2099-02-01T00:00:00.000Z",
-          tokenType: "Bearer",
-          scopes: ["rth:read"],
-        });
+    if (url.pathname === "/internal/v1/session-read/sessions") {
+      if (request.headers.authorization !== `Bearer ${READ_API_SECRET}`) {
+        send(401, { error: "unauthorized" });
         return;
       }
+      handoffs.push(body);
       mints += 1;
-      const claims = JSON.parse(Buffer.from(String(body.agentRelayToken).replace(/^relay_ag_/, "").split(".")[1]!, "base64url").toString("utf8")) as { wks: string };
-      tokens.set(`rth_at_${mints}`, claims.wks);
+      const serial = String(mints).padStart(43, "0");
+      tokens.set(`rth_at_read_${serial}`, String(body.workspaceId));
       send(200, {
-        accessToken: `rth_at_${mints}`,
-        accessTokenExpiresAt: "2099-01-01T00:00:00.000Z",
-        refreshToken: `rth_rt_${mints}`,
-        refreshTokenExpiresAt: "2099-02-01T00:00:00.000Z",
-        tokenType: "Bearer",
+        sessionId: `read-${mints}`,
+        userId: body.userId,
+        orgId: body.orgId,
+        workspaceId: body.workspaceId,
+        audience: body.audience,
         scopes: ["rth:read"],
+        accessToken: `rth_at_read_${serial}`,
+        accessTokenExpiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+        refreshToken: `rth_rt_read_${serial}`,
+        refreshTokenExpiresAt: new Date(Date.now() + 24 * 3_600_000).toISOString(),
+        tokenType: "Bearer",
       });
       return;
     }
@@ -180,7 +158,7 @@ async function startHistory(t: TestContext, audience: string) {
   });
   origin = await listen(server);
   t.after(() => close(server));
-  return { origin, paths, events, logins, callerWorkspaces };
+  return { origin, paths, events, handoffs };
 }
 
 type RelaycastCall = { path: string; authorization: string | null };
@@ -211,10 +189,9 @@ function fakeRelaycast(state: {
 
 const PUBLIC_ORIGIN = "https://control.internal.example";
 
-async function setup(t: TestContext, options: { relayauth?: boolean } = {}) {
-  const relayauth = options.relayauth ?? true;
+async function setup(t: TestContext) {
   const historyAudience = "https://history.selfhosted.test";
-  const history = await startHistory(t, historyAudience);
+  const history = await startHistory(t);
   const agents: unknown[] = [];
   const relay = { agents, presence: [] as unknown[] | "fail", calls: [] as RelaycastCall[], world: createRelaycastWorld(agents) };
   const database = new PGliteDatabase();
@@ -224,10 +201,9 @@ async function setup(t: TestContext, options: { relayauth?: boolean } = {}) {
     publicBaseUrl: PUBLIC_ORIGIN,
     relaycastUrl: "http://relaycast.internal",
     relaycastPublicUrl: "https://cast.selfhosted.example",
-    relayauthUrl: relayauth ? history.origin : null,
     relayhistoryUrl: history.origin,
     relayhistoryPublicUrl: historyAudience,
-    relayauthApiKey: relayauth ? "rak_test" : null,
+    sessionReadApi: { url: history.origin, publicUrl: historyAudience, secret: READ_API_SECRET },
     bootstrapToken: "bootstrap-token-that-is-at-least-32-bytes",
     encryptionKeyring: { active: { id: "test-key", key: Buffer.alloc(32, 7) } },
     internalServiceToken: "service-token-that-is-at-least-32-bytes",
@@ -514,22 +490,19 @@ test("session reads go to RelayHistory for the bound workspace only", async (t) 
   assert(!env.history.paths.some((path) => path.includes(env.otherWorkspaceId)));
 });
 
-test("without RelayAuth, History reads send the caller's own bearer or cookie token to /v1/cli/login", async (t) => {
-  const env = await setup(t, { relayauth: false });
+test("History reads for bearer and cookie callers go through the read API handoff, never with the caller token", async (t) => {
+  const env = await setup(t);
   env.history.events.push(
     { eventId: "e1", sessionId: "sess-1", source: "codex", kind: "prompt", type: "user_message", ts: "2026-11-07T10:00:00.000Z", content: "Fix the deploy pipeline", workspaceId: env.workspaceId },
   );
   const cookieToken = await env.login();
   assert.notEqual(cookieToken, env.accessToken);
-  for (const token of [env.accessToken, cookieToken]) {
-    assert.match(token, /^sh_at_/);
-    env.history.callerWorkspaces.set(token, env.workspaceId);
-  }
+  for (const token of [env.accessToken, cookieToken]) assert.match(token, /^sh_at_/);
 
   const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
   const bearer = await client.callTool({ name: "search_shared_sessions", arguments: { query: "deploy" } });
   assert.deepEqual(structured(bearer).matches.map((match: any) => match.event_id), ["e1"]);
-  assert.deepEqual(env.history.logins, [env.accessToken]);
+  assert.deepEqual(env.history.handoffs.map((handoff) => handoff.workspaceId), [env.workspaceId]);
 
   const cookie = await rpc(env.origin, CLOUD_MCP_PATH, {
     headers: { cookie: `agent_relay_session=${cookieToken}`, origin: PUBLIC_ORIGIN },
@@ -538,9 +511,11 @@ test("without RelayAuth, History reads send the caller's own bearer or cookie to
   assert.equal(cookie.status, 200);
   assert.notEqual(cookie.body.result.isError, true, JSON.stringify(cookie.body));
   assert.deepEqual(cookie.body.result.structuredContent.matches.map((match: any) => match.event_id), ["e1"]);
-  assert.deepEqual(env.history.logins, [env.accessToken, cookieToken]);
-
-  assert(!env.history.paths.some((path) => path.startsWith("/v1/tokens/")));
+  // The read token is kept per caller token session: the cookie session asks again.
+  assert.deepEqual(env.history.handoffs.map((handoff) => handoff.workspaceId), [env.workspaceId, env.workspaceId]);
+  const handoffText = JSON.stringify(env.history.handoffs);
+  assert.equal(handoffText.includes(env.accessToken), false);
+  assert.equal(handoffText.includes(cookieToken), false);
   for (const result of [bearer, cookie.body]) {
     const text = JSON.stringify(result);
     assert.equal(text.includes(env.accessToken), false);

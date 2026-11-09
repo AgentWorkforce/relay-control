@@ -47,7 +47,7 @@ test("MCP obtains and refreshes through real Control HTTP admission, and parent 
   const control=createServer(),controlUrl=await listen(control);
   const config:SelfhostConfig={databaseUrl:"unused",publicBaseUrl:controlUrl,relaycastUrl:"http://unused.test",
     relaycastPublicUrl:"https://relay.selfhosted.company",relayhistoryUrl:"http://unused.test",
-    relayhistoryPublicUrl:"https://history.selfhosted.company",relayauthUrl:null,relayauthApiKey:null,
+    relayhistoryPublicUrl:"https://history.selfhosted.company",
     bootstrapToken:"fake-bootstrap-token-".repeat(3),encryptionKeyring:keyring,internalServiceToken:null,
     oauthRedirectUrl:`${controlUrl}/unused`,dashboardUrl:controlUrl,host:"127.0.0.1",port:3000,
     sessionReadApi:{url:readerUrl,publicUrl:readerUrl,secret},sessionReadMcpReads:true};

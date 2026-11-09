@@ -17,12 +17,7 @@ import { secureEqual } from "./crypto.js";
 import { adminErrorResponse, type AdminModule } from "./admin/routes.js";
 import { ApiTokenStore } from "./admin/api-tokens.js";
 import { recordAudit } from "./admin/audit.js";
-import {
-  issueRelayhistorySession,
-  UnsupportedModeError,
-  ReadCursorExpiredError,
-  UpstreamError,
-} from "./relayhistory.js";
+import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
 import { handleFlowsBroker } from "./flows-broker.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
@@ -696,8 +691,8 @@ export function createApp(input: {
     : null;
 
   /**
-   * RELAYHISTORY_BACKEND=native POST .../relayhistory/session: no RelayAuth and
-   * no standalone History. `read` is the read API handoff. `sync` hands a bearer
+   * POST .../relayhistory/session, served by the sessions pipeline (the only
+   * History backend). `read` is the read API handoff. `sync` hands a bearer
    * client's own relaycontrol token back as the upload credential for the
    * ingest edge, which re-introspects it on every request; nothing is minted.
    * refreshToken is a fixed placeholder: the edge answers every refresh with
@@ -720,7 +715,6 @@ export function createApp(input: {
       throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
     }
     const api = config.sessionReadApi;
-    if (!api) throw new HttpError(404, "session_read_not_configured", "Session read API is not configured");
     if (mode === "read") {
       if (!principal.scopes.includes("rth:read")) {
         throw new HttpError(403, "mode_not_authorized", "Read mode is not authorized");
@@ -888,7 +882,7 @@ export function createApp(input: {
       return;
     }
 
-    // History/relayfile verify relaycontrol access tokens here (no RelayAuth).
+    // The sessions pipeline and relayfile verify relaycontrol access tokens here.
     // Internal only: never reachable through the /cloud alias.
     if (method === "POST" && publicPath === INTROSPECT_PATH) {
       const outcome = await handleIntrospection(config, store, request, undefined, admin?.apiTokens);
@@ -2033,7 +2027,6 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (!principal.scopes.includes("rth:read")) {
         throw new HttpError(403, "forbidden", "Read credentials require rth:read");
       }
-      if (!config.sessionReadApi) throw new HttpError(404, "session_read_not_configured", "Session read API is not configured");
       const schema = readSession[1] === "refresh" ? readRefreshRequest : readSessionRequest;
       const parsed = schema.safeParse(await requestObject(request));
       if (!parsed.success) throw new HttpError(400, "invalid_request", "Invalid session read request");
@@ -2049,8 +2042,8 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
-    // Read-only: which RelayHistory origin this workspace's sessions are bound
-    // to. Nothing is issued and RelayHistory is not called, so Desktop can
+    // Read-only: which History origin this workspace's sessions are bound
+    // to. Nothing is issued and the sessions pipeline is not called, so Desktop can
     // answer site-push admission and cold-process delete/revoke lookups
     // without the session issue/renew path.
     const historyOrigin = routeMatch(
@@ -2081,11 +2074,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         throw new HttpError(404, "workspace_not_found", "Workspace not found");
       }
       if (!workspace) throw new HttpError(404, "workspace_not_found", "Workspace not found");
-      // The issuer exchanges at relayhistoryUrl and binds sessions to
-      // relayhistoryPublicUrl (assertion historyOrigin/aud, default
-      // introspection audience, returned baseUrl). One installation-wide value.
-      // relayhistoryPublicUrl is already a bare origin (loadConfig keeps only
-      // url.origin), and the issuer compares the audience by exact string.
+      // Sessions are bound to relayhistoryPublicUrl, the read API's public
+      // origin (default introspection audience, returned baseUrl, ingest edge
+      // origin). One installation-wide value. loadConfig requires it to be a
+      // bare origin, and introspection compares the audience by exact string.
       if (!config.relayhistoryUrl || !config.relayhistoryPublicUrl) {
         throw new HttpError(404, "relayhistory_not_configured", "RelayHistory is not configured");
       }
@@ -2112,32 +2104,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         throw new HttpError(403, "mode_not_authorized", "Sync mode is not authorized");
       }
       const label = stringField(body, "label", false);
-      if (config.relayhistoryBackend === "native") {
-        json(response, 200, await nativeHistorySession(request, response, access, mode, label), true);
-        return;
-      }
-      let session: Record<string, unknown>;
-      try {
-        session = await issueRelayhistorySession(config, {
-          userId: access.principal.userId,
-          organizationId: access.workspace.organizationId,
-          workspaceId: access.workspace.id,
-          mode,
-          label,
-          callerToken: access.token,
-        });
-      } catch (error) {
-        if (error instanceof UnsupportedModeError) {
-          json(response, 501, {
-            error: "unsupported_by_backend",
-            reason: error.reason,
-            message: error.message,
-          }, true);
-          return;
-        }
-        throw error;
-      }
-      json(response, 200, session, true);
+      json(response, 200, await nativeHistorySession(request, response, access, mode, label), true);
       return;
     }
 

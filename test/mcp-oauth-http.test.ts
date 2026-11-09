@@ -24,7 +24,7 @@ const registration={client_name:"Fake client",redirect_uris:client.redirectUris}
 function config(enabled=true,extra:Record<string,string>={}) {
   return loadConfig({DATABASE_URL:"postgres://unused",SELFHOST_BOOTSTRAP_TOKEN:"fake-bootstrap-token-at-least-32-bytes",
     SELFHOST_PUBLIC_URL:ORIGIN,RELAYCAST_URL:"http://relaycast.test",RELAYCAST_PUBLIC_URL:"https://relaycast.selfhosted.company",
-    RELAYHISTORY_URL:"http://history.test",RELAYHISTORY_PUBLIC_URL:"https://history.selfhosted.company",
+    SESSION_READ_API_URL:"http://history.test",SESSION_READ_API_SECRET:"fake-read-api-secret-at-least-32-bytes",RELAYCONTROL_INTROSPECT_SECRET:"fake-introspect-secret-at-least-32-bytes",SESSION_READ_API_PUBLIC_URL:"https://history.selfhosted.company",
     SELFHOST_ENCRYPTION_KEY_ID:"fake-key",SELFHOST_ENCRYPTION_KEY:Buffer.alloc(32,7).toString("base64"),
     SELFHOST_MCP_OAUTH:enabled?"on":"off",...extra});
 }

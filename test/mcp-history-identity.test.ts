@@ -41,6 +41,7 @@ function fake(t: TestContext, options: Options = {}) {
   const issues: Issue[] = [];
   const reads: Read[] = [];
   const history: Read[] = [];
+  const handoffs: Issue[] = [];
   let serial = 0;
   const families=new Map<string,string>();
   const original = originalFetch;
@@ -67,17 +68,27 @@ function fake(t: TestContext, options: Options = {}) {
         refreshTokenExpiresAt:new Date(Date.now()+86_400_000).toISOString(),tokenType:"Bearer"};
       return Response.json(options.reply?.(pair,url.pathname)??pair);
     }
+    if (url.origin === READ_API && url.pathname.startsWith("/internal/v1/session-read/sessions")) {
+      // The dashboard path's read API handoff (service secret, never the caller token).
+      const body = JSON.parse(String(init.body)) as Record<string, string>;
+      handoffs.push({ body, bearer, path: url.pathname });
+      serial += 1;
+      return Response.json({
+        sessionId: `dashboard-${serial}`,
+        userId: body.userId,
+        orgId: body.orgId,
+        workspaceId: body.workspaceId,
+        accessToken: `rth_at_read_${padded(`dashboard_${serial}`)}`,
+        accessTokenExpiresAt: new Date(Date.now() + 300_000).toISOString(),
+        refreshToken: `rth_rt_read_${padded(`dashboard_${serial}`)}`,
+        refreshTokenExpiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+        tokenType: "Bearer",
+        audience: PUBLIC,
+        scopes: ["rth:read"],
+      });
+    }
     if (url.origin === HISTORY) {
       history.push({ url, bearer });
-      if (url.pathname === "/v1/cli/login") {
-        return Response.json({
-          accessToken: "history-token",
-          accessTokenExpiresAt: new Date(Date.now() + 300_000).toISOString(),
-          refreshToken: "history-refresh",
-          refreshTokenExpiresAt: new Date(Date.now() + 86_400_000).toISOString(),
-          tokenType: "Bearer",
-        });
-      }
       return Response.json({ from: "history" }, { headers: { [WORKSPACE_HEADER]: url.searchParams.get("workspace") ?? "" } });
     }
     reads.push({ url, bearer });
@@ -87,7 +98,7 @@ function fake(t: TestContext, options: Options = {}) {
     const attested=options.attest?options.attest(ws):ws;
     return Response.json(options.readBody??{ from:"read-api" },{headers:attested===null?{}:{[WORKSPACE_HEADER]:attested}});
   }) as typeof fetch;
-  return { issues, reads, history };
+  return { issues, reads, history, handoffs };
 }
 
 test("the setting off leaves MCP reads on the existing History path", async (t) => {
@@ -97,6 +108,10 @@ test("the setting off leaves MCP reads on the existing History path", async (t) 
   assert.deepEqual(body, { from: "history" });
   assert.equal(seen.issues.length, 0);
   assert.equal(seen.reads.length, 0);
+  assert.equal(seen.handoffs.length, 1);
+  assert.equal(seen.handoffs[0]!.bearer, `Bearer ${SECRET}`);
+  assert.ok(!JSON.stringify(seen.handoffs[0]!.body).includes("sh_at_user_a"), "the caller token never reaches the handoff");
+  assert.match(seen.history[0]!.bearer!, /^Bearer rth_at_read_/);
 });
 
 test("each MCP read carries only the calling user's token, never a shared credential", async (t) => {
@@ -257,11 +272,14 @@ test("reader cursors retain their exact bytes and never switch to History",async
   await historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")(`/v1/sessions?cursor=${encodeURIComponent(cursor)}`);
   assert.equal(seen.reads[0]!.url.searchParams.get("cursor"),cursor);
   const before=seen.issues.length;
-  for(const [other,path] of [[config(),"/v1/sessions?cursor=legacy-cursor"],
-    [config(false),"/v1/sessions?cursor=b96l1:old"],[config(),"/v1/sessions/s-1/timing?cursor=b96l1:old"]] as const) {
-    await assert.rejects(historyReader(other,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")(path),/cursor has expired/);
-  }
+  await assert.rejects(historyReader(config(),principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")("/v1/sessions?cursor=legacy-cursor"),/cursor has expired/);
   assert.equal(seen.issues.length,before);assert.equal(seen.history.length,0);
+  // History is the read API too, so its cursors stay valid when a read is not selected.
+  for(const [other,path] of [[config(false),"/v1/sessions?cursor=b96l1:old"],[config(),"/v1/sessions/s-1/timing?cursor=b96l1:old"]] as const) {
+    assert.deepEqual(await historyReader(other,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")(path),{from:"history"});
+  }
+  assert.deepEqual(seen.history.map(row=>row.url.searchParams.get("cursor")),["b96l1:old","b96l1:old"]);
+  assert.equal(seen.issues.length,before);
 });
 
 test("session reads require rth:read and an exchanged Control user credential before any upstream call",async t=>{

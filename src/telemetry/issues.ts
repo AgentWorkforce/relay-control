@@ -175,7 +175,7 @@ export const REPORT_ISSUE_TOOL = {
       category: { type: "string", enum: [...ISSUE_CATEGORIES], default: "bug" },
       component: {
         type: "string",
-        description: "Service name, for example relaycontrol, relaycast, relayhistory, relayauth, relayfile, relayflows, 96bulls",
+        description: "Service name, for example relaycontrol, relaycast, relayhistory, relayfile, relayflows, 96bulls",
       },
       stepsToReproduce: { type: "string", maxLength: 4000 },
       expected: { type: "string", maxLength: 2000 },

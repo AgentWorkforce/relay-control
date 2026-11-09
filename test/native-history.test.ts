@@ -8,10 +8,11 @@ import { ControlPlaneStore } from "../src/store.js";
 import { close, listen, PGliteDatabase, request } from "./support/harness.js";
 
 /**
- * RELAYHISTORY_BACKEND=native: Control talks only to the read API handoff, and
- * hands bearer clients their own sh_at_ token as the ingest-edge credential.
- * The upstream double fails the test if anything calls a RelayAuth or History
- * path.
+ * History is served only by the sessions pipeline: Control talks only to the
+ * read API handoff, and hands bearer clients their own sh_at_ token as the
+ * ingest-edge credential. The upstream double records any other path it is
+ * asked for, so a call to a removed RelayAuth or standalone History path fails
+ * the test.
  */
 
 const BOOTSTRAP = "bootstrap-token-that-is-at-least-32-bytes";
@@ -80,9 +81,6 @@ async function setup(t: TestContext) {
     publicBaseUrl: "https://control.internal.example",
     relaycastUrl: "http://relaycast.internal",
     relaycastPublicUrl: "https://relaycast.selfhosted.test",
-    relayauthUrl: null,
-    relayauthApiKey: null,
-    relayhistoryBackend: "native",
     relayhistoryUrl: readApi.origin,
     relayhistoryPublicUrl: ORIGIN,
     sessionReadApi: { url: readApi.origin, publicUrl: ORIGIN, secret: READ_SECRET },
@@ -199,33 +197,41 @@ const nativeEnv = {
 };
 const noisy = (env: NodeJS.ProcessEnv) => () => loadConfig(env);
 
-test("native config: requires the handoff and introspection, refuses RelayAuth and a second origin", () => {
-  assert.throws(noisy({ ...nativeEnv, RELAYHISTORY_BACKEND: "maybe" }), /RELAYHISTORY_BACKEND must be legacy or native/);
-  assert.throws(noisy({ ...nativeEnv, RELAYCONTROL_INTROSPECT_SECRET: "" }), /requires RELAYCONTROL_INTROSPECT_SECRET/);
-  assert.throws(noisy({ ...nativeEnv, SESSION_READ_API_SECRET: "", SESSION_READ_API_URL: "", SESSION_READ_API_PUBLIC_URL: "" }), /requires SESSION_READ_API_URL/);
-  assert.throws(noisy({ ...nativeEnv, RELAYAUTH_URL: "http://relayauth:8787", RELAYAUTH_API_KEY: "k" }), /refuses RELAYAUTH_URL/);
-  assert.throws(noisy({ ...nativeEnv, RELAYHISTORY_READ_API_URL: "https://reader.selfhosted.company" }), /refuses RELAYHISTORY_READ_API_URL/);
-  assert.throws(noisy({ ...nativeEnv, RELAYHISTORY_PUBLIC_URL: "https://other.selfhosted.company" }), /RELAYHISTORY_PUBLIC_URL must equal/);
-  assert.throws(noisy({ ...nativeEnv, RELAYHISTORY_URL: "http://other:8080" }), /RELAYHISTORY_URL must equal/);
-  assert.throws(noisy({ ...nativeEnv, SELFHOST_INTROSPECT_AUDIENCES: "https://other.selfhosted.company" }), /must include SESSION_READ_API_PUBLIC_URL/);
+test("native config: requires the handoff and introspection and refuses a second origin", () => {
+  assert.throws(noisy({ ...nativeEnv, RELAYCONTROL_INTROSPECT_SECRET: "" }), {
+    message: "RELAYCONTROL_INTROSPECT_SECRET is required: the sessions pipeline verifies every History token through introspection",
+  });
+  assert.throws(noisy({ ...nativeEnv, SESSION_READ_API_SECRET: "", SESSION_READ_API_URL: "", SESSION_READ_API_PUBLIC_URL: "" }), {
+    message: "SESSION_READ_API_URL, SESSION_READ_API_PUBLIC_URL and SESSION_READ_API_SECRET are required",
+  });
+  assert.throws(noisy({ ...nativeEnv, SESSION_READ_API_PUBLIC_URL: `${ORIGIN}/v1` }), /SESSION_READ_API_PUBLIC_URL/);
+  assert.throws(noisy({ ...nativeEnv, RELAYHISTORY_PUBLIC_URL: "https://other.selfhosted.company" }), {
+    message: "RELAYHISTORY_PUBLIC_URL must equal SESSION_READ_API_PUBLIC_URL (or be unset)",
+  });
+  assert.throws(noisy({ ...nativeEnv, RELAYHISTORY_URL: "http://other:8080" }), {
+    message: "RELAYHISTORY_URL must equal SESSION_READ_API_URL (or be unset)",
+  });
+  assert.throws(noisy({ ...nativeEnv, SELFHOST_INTROSPECT_AUDIENCES: "https://other.selfhosted.company" }), {
+    message: "SELFHOST_INTROSPECT_AUDIENCES must include SESSION_READ_API_PUBLIC_URL",
+  });
 });
 
-test("native config: resolves the History origin to the read API", () => {
-  const config = loadConfig(nativeEnv);
-  assert.equal(config.relayhistoryBackend, "native");
-  assert.equal(config.relayhistoryUrl, "http://read-api.svc.cluster.local");
-  assert.equal(config.relayhistoryPublicUrl, ORIGIN);
-  assert.equal(config.relayauthUrl, null);
-  assert.deepEqual(config.introspectAudiences, [ORIGIN]);
+test("native config: resolves the History origin to the read API with the backend unset or native", () => {
+  for (const backend of [undefined, "native", " native "]) {
+    const config = loadConfig({ ...nativeEnv, RELAYHISTORY_BACKEND: backend });
+    assert.equal(config.relayhistoryUrl, "http://read-api.svc.cluster.local");
+    assert.equal(config.relayhistoryPublicUrl, ORIGIN);
+    assert.deepEqual(config.sessionReadApi, { url: "http://read-api.svc.cluster.local", publicUrl: ORIGIN, secret: READ_SECRET });
+    assert.deepEqual(config.introspectAudiences, [ORIGIN]);
+  }
 });
 
-test("legacy config is unaffected", () => {
+test("native config: RELAYHISTORY_URL and RELAYHISTORY_PUBLIC_URL stay accepted as aliases of the read API", () => {
   const config = loadConfig({
     ...nativeEnv,
-    RELAYHISTORY_BACKEND: undefined,
-    RELAYHISTORY_URL: "http://relayhistory:8080",
-    RELAYHISTORY_PUBLIC_URL: "https://h.selfhosted.company",
+    RELAYHISTORY_URL: "http://read-api.svc.cluster.local",
+    RELAYHISTORY_PUBLIC_URL: `${ORIGIN}/`,
   });
-  assert.equal(config.relayhistoryBackend, null);
-  assert.equal(config.relayhistoryUrl, "http://relayhistory:8080");
+  assert.equal(config.relayhistoryUrl, "http://read-api.svc.cluster.local");
+  assert.equal(config.relayhistoryPublicUrl, ORIGIN);
 });

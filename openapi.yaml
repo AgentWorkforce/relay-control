@@ -2649,11 +2649,11 @@ paths:
         "404":
           description: Workspace is outside the authenticated tenant
         "410":
-          description: Native read cursor expired after rollback or a credential transport change. Error cursor_expired instructs the client to restart from the first page.
+          description: The read API cursor expired. Error cursor_expired instructs the client to restart from the first page.
         "503":
-          description: Configured direct read Worker is temporarily unavailable. No History fallback.
+          description: The session read API is temporarily unavailable (retryable).
         "502":
-          description: RelayAuth or RelayHistory is unavailable
+          description: The session read API is unavailable
         "501":
           description: |
             The configured session backend does not serve this view (for
@@ -2715,7 +2715,7 @@ paths:
         "404":
           description: Workspace is outside the authenticated tenant
         "502":
-          description: RelayAuth or RelayHistory is unavailable
+          description: The session read API is unavailable
         "501":
           description: |
             The configured session backend does not serve this view (for
@@ -2768,7 +2768,7 @@ paths:
         "404":
           description: Workspace is outside the authenticated tenant
         "502":
-          description: RelayAuth or RelayHistory is unavailable or unattested
+          description: The session read API is unavailable or did not attest the workspace
         "501":
           description: |
             The configured session backend does not serve this view (for
@@ -2818,7 +2818,7 @@ paths:
         "404":
           description: Workspace is outside the authenticated tenant
         "502":
-          description: RelayAuth or RelayHistory is unavailable or unattested
+          description: The session read API is unavailable or did not attest the workspace
         "501":
           description: |
             The configured session backend does not serve this view (for
@@ -2879,7 +2879,7 @@ paths:
         "404":
           description: Workspace is outside the authenticated tenant
         "502":
-          description: RelayAuth or RelayHistory is unavailable or unattested
+          description: The session read API is unavailable or did not attest the workspace
         "501":
           description: |
             The configured session backend does not serve this view (for
@@ -2924,11 +2924,11 @@ paths:
         "404":
           description: Workspace is outside the authenticated tenant
         "410":
-          description: Native read cursor expired after rollback or a credential transport change. Error cursor_expired instructs the client to restart from the first page.
+          description: The read API cursor expired. Error cursor_expired instructs the client to restart from the first page.
         "503":
-          description: Configured direct read Worker is temporarily unavailable. No History fallback.
+          description: The session read API is temporarily unavailable (retryable).
         "502":
-          description: RelayAuth or RelayHistory is unavailable or unattested
+          description: The session read API is unavailable or did not attest the workspace
         "501":
           description: |
             The configured session backend does not serve this view (for
@@ -2969,7 +2969,7 @@ paths:
         "404":
           description: Workspace is outside the authenticated tenant
         "502":
-          description: RelayAuth or RelayHistory is unavailable or unattested
+          description: The session read API is unavailable or did not attest the workspace
         "501":
           description: |
             The configured session backend does not serve this view (for
@@ -3011,7 +3011,7 @@ paths:
         "404":
           description: Workspace is outside the authenticated tenant
         "502":
-          description: RelayAuth or RelayHistory is unavailable or unattested
+          description: The session read API is unavailable or did not attest the workspace
         "501":
           description: |
             The configured session backend does not serve this view (for
@@ -3043,9 +3043,10 @@ paths:
         anything the session issue/renew path does, so Agent Relay Desktop
         can use it for site-push admission and cold-process delete/revoke
         lookups. `origin` and `audience` are both the configured
-        RELAYHISTORY_PUBLIC_URL, the exact string the issuer binds sessions
-        to (assertion `historyOrigin`/`aud`, default introspection audience,
-        returned `baseUrl`); it is installation-wide, not per workspace.
+        public History origin (SESSION_READ_API_PUBLIC_URL), the exact string
+        sessions are bound to (read token audience, default introspection
+        audience, returned `baseUrl`); it is installation-wide, not per
+        workspace.
       responses:
         "200":
           description: The workspace's RelayHistory origin and session audience
@@ -3086,36 +3087,35 @@ paths:
           description: |
             `workspace_not_found`: workspace does not exist, is outside the
             token's organization (even if the same person is a member there),
-            or the caller is not a member. `relayhistory_not_configured`: RELAYHISTORY_URL
-            or RELAYHISTORY_PUBLIC_URL is unset (checked after authorization).
+            or the caller is not a member. `relayhistory_not_configured`: the History origin is unset (checked
+            after authorization; startup requires it, so a running install
+            does not answer this).
   /api/v1/workspaces/{workspaceId}/relayhistory/session:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
     post:
       operationId: issueRelayhistorySession
       description: |
-        With RELAYAUTH_URL set (transitional): mints an assertion through the
-        internal RelayAuth URL using the public RelayHistory HTTPS origin as
-        `historyOrigin` and `aud`, validates its tenant/scope/audience claims,
-        then exchanges it through the internal RelayHistory URL.
+        History is served only by the sessions pipeline (read API and ingest
+        edge); the standalone RelayHistory service and RelayAuth were removed.
 
-        Without RelayAuth: exchanges the caller's own access token (bearer or
-        `/cloud` session cookie) at the internal RelayHistory URL; History
-        verifies it through `POST /internal/v1/auth/introspect` and decides
-        the granted `scopes` from the token session's scopes, so `mode` is
-        enforced only here (sync requires `rth:sync`) and a read request may
-        return a session with sync scopes. A sync request whose login reply
-        lacks `rth:sync` answers 501 (see docs/sessions-read-api.md).
+        `mode=read`: the read API handoff, identical to
+        POST .../session-read/session. Bearer clients receive the reader's
+        token pair; `/cloud` cookie clients receive no refresh fields.
 
-        With RELAYHISTORY_BACKEND=native (no RelayAuth, no standalone
-        RelayHistory): `mode=read` is the read API handoff; `mode=sync` is
-        bearer-only and returns the caller's own access token for the pipeline
-        ingest edge, which re-introspects it on every upload. See
+        `mode=sync` (default): bearer clients holding `rth:sync` only. The
+        caller's own `sh_at_` access token is introspected for the public
+        History origin and handed back unchanged as the upload credential for
+        the ingest edge, which re-introspects it on every upload. Nothing is
+        minted and no upstream is called. `refreshToken` is the fixed
+        placeholder `native_ingest_no_refresh` (the edge refuses refresh;
+        renew through this route), and both expiries are the token's own
+        expiry capped at 15 minutes.
+
+        In every mode `baseUrl` is the public History origin
+        (SESSION_READ_API_PUBLIC_URL). Caller-supplied service URLs or tenant
+        IDs are rejected because they are not request fields. See
         docs/sessions-read-api.md.
-
-        In every mode the returned `baseUrl` is the public History origin.
-        Caller-supplied service URLs or tenant IDs are rejected because they
-        are not request fields.
       requestBody:
         required: false
         content:
@@ -3131,23 +3131,33 @@ paths:
                   maxLength: 120
       responses:
         "200":
-          description: RelayHistory renewable session with the public History baseUrl
-        "403":
-          description: "mode_not_authorized: sync requested without rth:sync"
-        "404":
-          description: Workspace does not exist or is outside the bearer tenant
-        "502":
-          description: RelayAuth assertion or RelayHistory exchange failed
-        "501":
           description: |
-            `unsupported_by_backend` with reason `sync_not_served`: without
-            RelayAuth, mode=sync was requested but History's login reply does
-            not grant `rth:sync` (the self-host read API container serves
-            reads only). No session is returned.
+            `mode=read`: reader-issued credentials (SessionReadCredentials).
+            `mode=sync`: the ingest edge upload credential (NativeUploadSession).
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/UnsupportedByBackend"
+                oneOf:
+                  - $ref: "#/components/schemas/SessionReadCredentials"
+                  - $ref: "#/components/schemas/NativeUploadSession"
+        "400":
+          description: "`invalid_mode` or an invalid read label"
+        "401":
+          description: Missing, expired or revoked user token, or (sync) a token not valid for uploads
+        "403":
+          description: |
+            `mode_not_authorized`: the token lacks `rth:sync` (sync) or
+            `rth:read` (read). `handoff_not_exchanged`: unexchanged Desktop
+            sign-in handoff. `forbidden`: a browser cookie asked for sync.
+            `csrf_rejected`: cross-origin cookie request.
+        "404":
+          description: Workspace does not exist or is outside the bearer tenant
+        "429":
+          description: More than 30 read credential requests per user/workspace per minute
+        "502":
+          description: The read API handoff failed or its reply failed identity/scope/token validation
+        "503":
+          description: The read API refused because its credential backend is unavailable
   /api/v1/workspaces/{workspaceId}/session-read/session:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -4863,12 +4873,10 @@ paths:
       security:
         - introspectAuth: []
       description: |
-        For RelayHistory (and relayfile) pods only: verifies a relaycontrol
-        user access token (`sh_at_`), or a relayfile-agent or
-        acquisition-operator workspace API token (`sh_wk_`), presented to them, replacing the RelayAuth
-        JWT in a RelayAuth-free install. Enabled only while
-        RELAYCONTROL_INTROSPECT_SECRET is set; otherwise 404 like an unknown
-        route. Nothing is cached here; the token session row is read on every
+        For the sessions pipeline ingest edge (and relayfile) only: verifies a
+        relaycontrol user access token (`sh_at_`), or a relayfile-agent or
+        acquisition-operator workspace API token (`sh_wk_`), presented to
+        them. RELAYCONTROL_INTROSPECT_SECRET is required at startup. Nothing is cached here; the token session row is read on every
         call.
 
         Checks, in order: `wrong-kind` (not an `sh_at_` token: refresh,
@@ -6891,6 +6899,28 @@ components:
         email: { type: string }
         organizationId: { type: string, format: uuid }
         workspaceId: { type: [string, "null"], format: uuid }
+    NativeUploadSession:
+      type: object
+      description: |
+        Upload credential for the sessions pipeline ingest edge, returned by
+        POST .../relayhistory/session with mode=sync. `accessToken` is the
+        caller's own access token; the edge introspects it on every upload.
+      required: [baseUrl, accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType, scopes, orgId, workspaceId]
+      properties:
+        baseUrl: { type: string, format: uri, description: The public History origin (SESSION_READ_API_PUBLIC_URL). }
+        accessToken: { type: string, pattern: '^sh_at_' }
+        accessTokenExpiresAt: { type: string, format: date-time }
+        refreshToken:
+          type: string
+          enum: [native_ingest_no_refresh]
+          description: Fixed placeholder; the ingest edge refuses refresh, renew through this route.
+        refreshTokenExpiresAt: { type: string, format: date-time }
+        tokenType: { type: string, enum: [Bearer] }
+        scopes:
+          type: array
+          items: { type: string, enum: ["rth:sync"] }
+        orgId: { type: string }
+        workspaceId: { type: string }
     SessionReadCredentials:
       type: object
       additionalProperties: false
@@ -7562,9 +7592,8 @@ components:
     UnsupportedByBackend:
       description: |
         The configured session backend (see docs/sessions-read-api.md) does
-        not serve the requested view or mode. `reason` is the backend's own
-        reason (or `sync_not_served` for sync sessions); no session data is
-        returned.
+        not serve the requested view. `reason` is the backend's own reason; no
+        session data is returned.
       type: object
       additionalProperties: false
       required: [error, reason, message]

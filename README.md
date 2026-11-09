@@ -15,8 +15,8 @@ Included:
   operator-assigned auto-join domains, cross-organization workspace switching;
   see [docs/identity.md](docs/identity.md#tenancy))
 - Relaycast workspace URL/key resolution
-- RelayHistory session issuance, with or without RelayAuth, and internal
-  token introspection for History
+- RelayHistory session issuance through the sessions pipeline (read API
+  handoff and ingest edge credentials) and internal token introspection
 - Cloud-compatible `/cloud/api` aliases and fixed RelayHistory session reads
 - Secure HttpOnly same-origin browser device login at `/login`
 - Agent Relay Desktop browser sign-in (`/cli/login` handoff, `/auth/desktop/session`) and fleet node claims
@@ -69,8 +69,8 @@ Set `SELFHOST_DASHBOARD_URL` when the local dashboard origin differs from the AP
 ## Configuration
 
 There are no hosted service defaults. Startup fails until every required value
-is explicit. RelayAuth is optional: see
-[RelayAuth and RelayHistory](#relayauth-and-relayhistory).
+is explicit. History is served only by the sessions pipeline: see
+[RelayHistory (sessions pipeline)](#relayhistory-sessions-pipeline).
 
 | Variable | Meaning |
 | --- | --- |
@@ -80,15 +80,14 @@ is explicit. RelayAuth is optional: see
 | `SELFHOST_PUBLIC_URL` | Public origin of this API |
 | `RELAYCAST_URL` | Internal Relaycast origin for server-to-server traffic |
 | `RELAYCAST_PUBLIC_URL` | Public Relaycast origin returned to clients; bare HTTPS public DNS origin |
-| `RELAYAUTH_URL` | Optional, set together with `RELAYAUTH_API_KEY`. Internal RelayAuth origin; when set, History sessions use RelayAuth assertions (transitional). Unset: History sessions exchange the caller's own access token |
-| `RELAYHISTORY_URL` | Internal RelayHistory origin for session exchange and reads; self-host: the read API container's service URL ([docs/sessions-read-api.md](docs/sessions-read-api.md)) |
-| `RELAYHISTORY_BACKEND` | Optional `legacy` (default) or `native`. `native` is the self-host mode without RelayAuth or a standalone RelayHistory: see [sessions-read-api.md](docs/sessions-read-api.md#native-backend-relayhistory_backendnative). |
-| `RELAYHISTORY_READ_API_URL` | Optional bare public HTTPS origin of the GET-only pipeline read Worker for unsearched session lists and turns. Unset keeps existing routing. Requires the introspection secret and an explicit matching `SELFHOST_INTROSPECT_AUDIENCES` entry; see [read backend connection](docs/sessions-read-api.md#connecting-the-get-only-hosted-read-worker). |
-| `RELAYHISTORY_PUBLIC_URL` | Public RelayHistory origin used as assertion and default introspection audience and returned to clients; bare HTTPS public DNS origin |
-| `RELAYAUTH_API_KEY` | Optional, set together with `RELAYAUTH_URL` (`_FILE` supported). Key allowed to mint RelayHistory assertions |
-| `RELAYCONTROL_INTROSPECT_SECRET` | Optional, at least 32 bytes (`_FILE` supported). Bearer for `POST /internal/v1/auth/introspect`, shared only with RelayHistory (and relayfile). Unset: that route answers 404 |
+| `SESSION_READ_API_URL` | Internal HTTP(S) origin of the sessions pipeline read API; the credential handoff and every History read go here ([docs/sessions-read-api.md](docs/sessions-read-api.md)) |
+| `SESSION_READ_API_PUBLIC_URL` | Public origin of the read API and ingest edge: read token audience, default introspection audience and the `baseUrl` returned to clients; bare HTTPS public DNS origin |
+| `SESSION_READ_API_SECRET` | At least 32 bytes (`_FILE` supported). Dedicated Control-to-reader handoff secret; never sent to clients |
+| `RELAYHISTORY_URL`, `RELAYHISTORY_PUBLIC_URL` | Optional aliases; if set they must equal `SESSION_READ_API_URL` and `SESSION_READ_API_PUBLIC_URL` |
+| `RELAYHISTORY_BACKEND` | Optional; unset or `native` (the only backend). Any other value refuses startup |
+| `RELAYCONTROL_INTROSPECT_SECRET` | At least 32 bytes (`_FILE` supported). Bearer for `POST /internal/v1/auth/introspect`, shared only with the sessions pipeline ingest edge (and relayfile) |
 | `RELAYFILE_CONTROL_BROKER_SECRET` | Optional, at least 32 bytes, `_FILE` supported. Enables the internal credential routes under `/internal/v1/flows/credentials/` for relayfile-control's Flows service. Unset, they answer 404. |
-| `SELFHOST_INTROSPECT_AUDIENCES` | Optional comma-separated http(s) origins a token may be introspected for, default `RELAYHISTORY_PUBLIC_URL`. Matched as normalized origins (scheme, lowercase host, port); `GET /readyz` lists them under `introspection.audiences` |
+| `SELFHOST_INTROSPECT_AUDIENCES` | Optional comma-separated http(s) origins a token may be introspected for, default `SESSION_READ_API_PUBLIC_URL`; must include it. Matched as normalized origins (scheme, lowercase host, port); `GET /readyz` lists them under `introspection.audiences` |
 | `SELFHOST_ACQUISITION_ISSUER_ENABLED` | Optional, default off (`true`/`false`). Turns on the dormant cloud-class acquisition assertion issuer ([docs/acquisition-issuer.md](docs/acquisition-issuer.md)); off, no other issuer variable is read and `/api/v1/acquisition/*` answers 404 |
 | `SELFHOST_ACQUISITION_ORIGIN` | Required when the issuer is enabled. The pipeline's `ACQUISITION_ORIGIN`; must also be listed in `SELFHOST_INTROSPECT_AUDIENCES` |
 | `SELFHOST_ACQUISITION_ISSUER_KEY_ID` | Required when the issuer is enabled. The `issuerKeyId` published and stamped into every assertion |
@@ -163,28 +162,39 @@ The two public service origins are intentionally separate from their internal
 counterparts. They must be bare HTTPS origins on multi-label public DNS hosts;
 IP literals, single-label names, credentials, paths, query strings, fragments,
 and special-use names such as `localhost`, `.local`, `.internal`, and
-`.example` are rejected. RelayAuth and RelayHistory fetches use the internal
-URLs. Workspace resolution returns `RELAYCAST_PUBLIC_URL`; RelayHistory
-assertions (when RelayAuth is set) use `RELAYHISTORY_PUBLIC_URL` as
-`historyOrigin`/`aud`, and issued sessions return it as `baseUrl`.
+`.example` are rejected. Relaycast and History fetches use the internal
+URLs. Workspace resolution returns `RELAYCAST_PUBLIC_URL`; History read tokens
+are bound to `SESSION_READ_API_PUBLIC_URL` as their audience, and issued
+sessions return it as `baseUrl`.
 
-### RelayAuth and RelayHistory
+### RelayHistory (sessions pipeline)
 
-The independent session read API has its own credential handoff:
+History in a self-hosted install is served only by the sessions pipeline: its
+read API and its session ingest edge, on one public origin. The standalone
+RelayHistory service and RelayAuth were removed. Startup refuses
+`RELAYAUTH_URL`, `RELAYAUTH_API_KEY` (and `_FILE`), `RELAYHISTORY_READ_API_URL`
+and any `RELAYHISTORY_BACKEND` other than `native` by name; see
+[docs/sessions-read-api.md](docs/sessions-read-api.md) for the exact messages
+and the pipeline-side configuration.
+
+Required: `SESSION_READ_API_URL` (internal HTTP(S) origin),
+`SESSION_READ_API_PUBLIC_URL` (bare public HTTPS origin), `SESSION_READ_API_SECRET`
+or its mutually exclusive `_FILE` form (at least 32 bytes), and
+`RELAYCONTROL_INTROSPECT_SECRET`. `SELFHOST_INTROSPECT_AUDIENCES` must include
+the public origin (it does by default). Use a dedicated Control-to-reader
+secret; it is never sent to clients. Control's History probe is
+`${SESSION_READ_API_URL}/healthz`.
+
+The session read API credential handoff:
 
 - `POST /api/v1/workspaces/{workspace}/session-read/session`, body `{ label? }`.
 - `POST /api/v1/workspaces/{workspace}/session-read/refresh`, body `{ refreshToken }`.
 
-Both also accept the `/cloud` prefix. Enable them with all three settings:
-`SESSION_READ_API_URL` (internal HTTP(S) origin), `SESSION_READ_API_PUBLIC_URL`
-(bare public HTTPS origin), and `SESSION_READ_API_SECRET` or its mutually
-exclusive `_FILE` form (at least 32 bytes). Leave all unset to keep this
-handoff disabled. Use a dedicated Control-to-reader secret; it is never sent
-to clients. These settings do not change the existing History connection.
+Both also accept the `/cloud` prefix.
 
 `SESSION_SEARCH_AGENT_TOKENS=true` (default false) reads `@name` tokens in API and MCP search text as agent filters. Enable it once the session backend's agent catalog is ready; until then those tokens stay ordinary search text. The explicit `agent` parameter does not need this setting and answers 501 `agent_filter_not_ready` until the backend is ready.
 
-`SESSION_READ_API_MCP_READS=true` (default false) sends MCP session reads to that read API. MCP obtains and refreshes the calling user's pair through Control, validates its user/organization/workspace, audience and `rth:read` scope, and uses the returned reader URL. Only `rth_at_read_` access tokens reach read routes; the MCP reader client has no internal issuer or service credential. Once the reader is selected, no response or failure switches the request to History, including an unsupported first page (501). Unsupported views remain unavailable on that backend. A refused refresh requires reauthentication; an unavailable refresh retains the pair for a same-reader retry. History is used only when selected before the request, such as an explicitly legacy view or when the feature is off. Cursor continuations never switch backends.
+`SESSION_READ_API_MCP_READS=true` (default false) gives MCP session reads their own per-user read pair. MCP obtains and refreshes the calling user's pair through Control, validates its user/organization/workspace, audience and `rth:read` scope, and uses the returned reader URL. Only `rth_at_read_` access tokens reach read routes; the MCP reader client has no internal issuer or service credential. Unsupported views (501) remain unavailable. A refused refresh requires reauthentication; an unavailable refresh retains the pair for a same-reader retry. When the setting is off, MCP reads use the dashboard read path below, which is the same read API, so cursors stay valid either way.
 
 Control authenticates the user, refuses unexchanged Desktop handoffs, checks
 live workspace membership and `rth:read` on every issue and refresh, and
@@ -201,7 +211,7 @@ accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType: "Bearer" }
 Refresh requires both a current Control access token and the reader refresh
 token. The reader binds and atomically rotates that token for the authorized
 identity. A rejected refresh requires sign-in again; an unavailable reader
-fails closed without falling back to older History or returning upstream bodies.
+fails closed without returning upstream bodies.
 
 Browser cookie clients call `/cloud/.../session` with JSON and the dashboard
 or API `Origin`. They receive only the access credential; both refresh fields
@@ -216,66 +226,61 @@ secret. Control supplies `{ userId, orgId, workspaceId, audience, scopes:
 The reader returns the bearer response above without `baseUrl`; Control sets
 that from configuration. Keep these internal routes off public ingress.
 
-`POST /api/v1/relayhistory/session` (and the `/cloud` alias) works in two
-modes, chosen by whether `RELAYAUTH_URL`/`RELAYAUTH_API_KEY` are set. Setting
-only one of them fails startup.
+`POST /api/v1/workspaces/{workspace}/relayhistory/session` (and the `/cloud`
+alias) takes `mode`:
 
-- **Without RelayAuth (recommended).** relaycontrol posts the caller's own
-  `sh_at_` access token (bearer or `/cloud` session cookie) to the internal
-  History `/v1/cli/login`. History verifies it by calling
-  `POST /internal/v1/auth/introspect` with `RELAYCONTROL_INTROSPECT_SECRET`,
-  its own public origin as `aud`, and the workspace. `workspace` is optional:
-  absent or null, the answer's `workspace` (the token session's only
-  workspace) is authoritative; present, it must be a non-empty string equal
-  to the session's workspace (an empty string or another type is a 400).
-  relaycontrol answers
-  from the token session row on every call (no cache): active with the user,
-  organization, workspace, scopes, `iat`/`exp` and a `token_id` that changes
-  on every refresh, or inactive with one reason in this order: `wrong-kind`,
-  `unknown`, `revoked`, `expired`, `audience`, `workspace`. History may also
-  send `machine`, the caller's claimed machine (a Relaycast node id, as
-  claimed through `POST /api/v1/fleet/nodes/claim`; malformed is a 400).
-  Only after the token checks pass, relaycontrol answers active with
-  `machine_id` set to it when the token's user claimed that node in the
-  token's workspace, else inactive with `machine_not_owned` (another user's
-  claim in this workspace), `machine_workspace_mismatch` (claimed only in
-  another workspace) or `machine_unclaimed`. Without `machine`,
-  `machine_id` is null and History refuses writes. History takes the machine
-  id only from this answer. History decides
-  the granted scopes from that answer, so `mode` is enforced only by
-  relaycontrol (sync requires `rth:sync`); a read request may get a session
-  that also carries sync scopes. The response shape is unchanged.
-  Revoking or refreshing the access token makes History's next
-  introspection fail.
-- **With RelayAuth (transitional).** relaycontrol mints an origin-bound
-  RelayAuth assertion and exchanges it at History, as before; the caller's
-  token never reaches History.
+- `read`: the read API handoff above, same response.
+- `sync` (default): bearer clients holding `rth:sync` only. Control
+  introspects the caller's own `sh_at_` token for the public origin and hands
+  it back unchanged as the upload credential for the ingest edge: `{ baseUrl,
+  accessToken, accessTokenExpiresAt, refreshToken: "native_ingest_no_refresh",
+  refreshTokenExpiresAt, tokenType: "Bearer", scopes: ["rth:sync"], orgId,
+  workspaceId }`, expiring with the token (at most 15 minutes). Nothing is
+  minted and no upstream is called. `refreshToken` is a fixed placeholder; the
+  edge refuses refresh, and Desktop renews through this route.
+
+The ingest edge verifies every upload by calling
+`POST /internal/v1/auth/introspect` with `RELAYCONTROL_INTROSPECT_SECRET`,
+the public origin as `aud`, and the workspace. `workspace` is optional:
+absent or null, the answer's `workspace` (the token session's only
+workspace) is authoritative; present, it must be a non-empty string equal
+to the session's workspace (an empty string or another type is a 400).
+relaycontrol answers from the token session row on every call (no cache):
+active with the user, organization, workspace, scopes, `iat`/`exp` and a
+`token_id` that changes on every refresh, or inactive with one reason in this
+order: `wrong-kind`, `unknown`, `revoked`, `expired`, `audience`,
+`workspace`. The edge may also send `machine`, the caller's claimed machine (a
+Relaycast node id, as claimed through `POST /api/v1/fleet/nodes/claim`;
+malformed is a 400). Only after the token checks pass, relaycontrol answers
+active with `machine_id` set to it when the token's user claimed that node in
+the token's workspace, else inactive with `machine_not_owned` (another user's
+claim in this workspace), `machine_workspace_mismatch` (claimed only in
+another workspace) or `machine_unclaimed`. Without `machine`, `machine_id` is
+null and the edge refuses writes. The edge takes the machine id only from
+this answer. Revoking or refreshing the access token makes the next
+introspection fail.
 
 `GET /api/v1/workspaces/{workspace}/relayhistory/origin` (and the `/cloud`
 alias) answers `{ workspace, origin, audience }` for a caller authorized like
-the session route: `origin` and `audience` are both `RELAYHISTORY_PUBLIC_URL`,
-the value sessions are bound to. It is read-only and throttle-independent:
-nothing is issued, History is not called, and it shares no state with session
-issue/renew, so Agent Relay Desktop uses it for site-push admission and
-cold-process delete/revoke lookups. It accepts the user sessions the session
-route accepts (device session, exchanged Desktop handoff, `/cloud` browser
-cookie) except an unexchanged Desktop sign-in handoff, which answers 403
-`handoff_not_exchanged`; service, bootstrap, workspace API, revoked and
-expired tokens answer 401. A workspace in the token's own organization that
-the caller is a member of, but the token is not bound to, answers 403
-`forbidden`; any workspace outside the token's organization (even one the same
-person belongs to) or unknown answers 404 `workspace_not_found`; an install
-without RelayHistory 404 `relayhistory_not_configured`.
+the session route: `origin` and `audience` are both the public History
+origin, the value sessions are bound to. It is read-only and
+throttle-independent: nothing is issued, History is not called, and it shares
+no state with session issue/renew, so Agent Relay Desktop uses it for
+site-push admission and cold-process delete/revoke lookups. It accepts the
+user sessions the session route accepts (device session, exchanged Desktop
+handoff, `/cloud` browser cookie) except an unexchanged Desktop sign-in
+handoff, which answers 403 `handoff_not_exchanged`; service, bootstrap,
+workspace API, revoked and expired tokens answer 401. A workspace in the
+token's own organization that the caller is a member of, but the token is not
+bound to, answers 403 `forbidden`; any workspace outside the token's
+organization (even one the same person belongs to) or unknown answers 404
+`workspace_not_found`.
 
-Fixed session reads under `/cloud/api/sessions` cache a History token per
-user, workspace and caller token session, so a refreshed or revoked caller
-token never reuses another session's History token.
-
-In a self-hosted install `RELAYHISTORY_URL` points at the RelayHistory read
-API container owned by the sessions pipeline (`RELAYHISTORY_PUBLIC_URL` is
-its `READ_API_ORIGIN`). It serves reads only: views it does not serve answer
-501 `unsupported_by_backend`, and sync sessions answer 501 `sync_not_served`.
-See [docs/sessions-read-api.md](docs/sessions-read-api.md).
+Fixed session reads under `/cloud/api/sessions` cache a read API token per
+caller token session, renewed on its own refresh lineage, so a refreshed or
+revoked caller token never reuses another session's read token. Views the
+read API does not serve answer 501 `unsupported_by_backend`; an expired cursor
+answers 410 `cursor_expired`.
 
 ## Run
 
@@ -576,9 +581,9 @@ API on PGlite at `http://127.0.0.1:8787` with fixed development secrets.
 - Worker enrollment tokens, worker tokens, and run ingestion tokens are
   stored only as SHA-256 hashes; each worker token is scoped to one worker
   and can only read or write storage for its own active assignment.
-- RelayHistory assertions (RelayAuth mode) must exactly match user,
-  organization, workspace, scopes, and the configured public History origin
-  before exchange through the internal History URL.
+- History read credentials returned by the read API must exactly match user,
+  organization, workspace, the `rth:read` scope and the configured public
+  History origin before they are returned or used.
 - Token introspection requires its own secret, compared in constant time;
   only `sh_at_` access tokens are looked up, and the token, its hash, the
   secret and the request body are never logged.

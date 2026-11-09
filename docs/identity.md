@@ -615,8 +615,8 @@ the `bootstrap.access` audit rows show use you can't account for.
 
 ### Tokens other services verify
 
-Every sign-in method ends in the same `sh_at_` access token. In a RelayAuth-free
-install RelayHistory (and relayfile) accept that token directly and verify it
+Every sign-in method ends in the same `sh_at_` access token. The sessions
+pipeline ingest edge (and relayfile) accept that token directly and verify it
 through `POST /internal/v1/auth/introspect`, authenticated with
 `RELAYCONTROL_INTROSPECT_SECRET`. The answer comes from the live token
 session, so removing a member, revoking a session or refreshing the token
@@ -624,13 +624,15 @@ takes effect on the service's next check; refresh, bootstrap and worker
 tokens, and every workspace API token other than a relayfile agent or
 acquisition operator token (below), are always reported as `wrong-kind` (an
 `sh_wk_` that matches no token is `unknown`). See
-[RelayAuth and RelayHistory](../README.md#relayauth-and-relayhistory).
+[RelayHistory (sessions pipeline)](../README.md#relayhistory-sessions-pipeline).
 `GET /readyz` lists the accepted audiences (`introspection.audiences`, empty
 while introspection is disabled), so a scheme or port mismatch shows up there
 instead of as a runtime 401.
-The self-hosted sessions backend, the RelayHistory read API container, is
-such a service: it introspects the forwarded `sh_at_` token with
-`READ_API_ORIGIN` as `aud` and grants only `rth:read`. See
+The sessions pipeline ingest edge is such a service: it introspects the
+upload credential (the caller's own `sh_at_` token, handed back by
+`POST .../relayhistory/session` with `mode: "sync"`) with the public History
+origin as `aud` on every upload. History reads do not use it: the read API
+issues its own read tokens through Control's handoff. See
 [docs/sessions-read-api.md](sessions-read-api.md).
 
 The `workspace` in the request is optional. A token session is bound to

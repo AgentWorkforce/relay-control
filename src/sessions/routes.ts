@@ -25,7 +25,7 @@ type WorkspaceAccess = (
 ) => Promise<{
   principal: Principal;
   workspace: { id: string; organizationId: string };
-  /** The caller's raw access token, forwarded to History when RelayAuth is off. */
+  /** The caller's raw access token; a credential, used only to key the read token cache. */
   token: string;
 }>;
 

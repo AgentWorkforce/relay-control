@@ -42,7 +42,7 @@ async function setup(t: TestContext) {
     databaseUrl: "unused", publicBaseUrl: "https://control.selfhosted.company",
     relaycastUrl: "http://relaycast.internal", relaycastPublicUrl: "https://relay.selfhosted.company",
     relayhistoryUrl: "http://history.internal", relayhistoryPublicUrl: "https://history.selfhosted.company",
-    relayauthUrl: null, relayauthApiKey: null, bootstrapToken: "bootstrap-secret-".repeat(3),
+    bootstrapToken: "bootstrap-secret-".repeat(3),
     encryptionKeyring: { active: { id: "test", key: Buffer.alloc(32, 5) } },
     internalServiceToken: "service-secret-".repeat(3), port: 3000, host: "127.0.0.1",
     oauthRedirectUrl: "https://control.selfhosted.company/callback", dashboardUrl: "https://app.selfhosted.company",
@@ -112,12 +112,8 @@ test("issue and refresh reject unauthenticated, pending, foreign-workspace and r
   assert.deepEqual(env.calls, []);
 });
 
-test("disabled handoff, revoked tokens and expired Control sessions never reach the reader", async (t) => {
+test("revoked tokens and expired Control sessions never reach the reader", async (t) => {
   const env = await setup(t);
-  env.config.sessionReadApi = null;
-  const disabled = await env.post();
-  assert.equal(disabled.status, 404);
-  assert.equal(disabled.body.error, "session_read_not_configured");
   env.config.sessionReadApi = { url: "http://unused.internal", publicUrl, secret };
   await env.database.query("UPDATE selfhost_token_sessions SET access_token_expires_at = now() - interval '1 second' WHERE access_token_hash = $1", [hashSecret(env.pair.accessToken)]);
   assert.equal((await env.post()).status, 401);

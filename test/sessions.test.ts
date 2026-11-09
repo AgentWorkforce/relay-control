@@ -76,14 +76,6 @@ async function call(
   return { status: response.status, body, headers: response.headers };
 }
 
-function jwt(payload: Record<string, unknown>): string {
-  return [
-    Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url"),
-    Buffer.from(JSON.stringify(payload)).toString("base64url"),
-    "test-signature",
-  ].join(".");
-}
-
 type UpstreamRequest = {
   path: string;
   query: Record<string, string>;
@@ -100,12 +92,15 @@ function lastRequest(
 
 type Session = { sessionId: string; source: string; workspaceId: string; summary: string };
 
+const READ_API_SECRET = "session-read-secret-".repeat(2);
+
 /**
- * A RelayHistory double with the real tenancy rules: one org, sessions stored
- * per workspace, org-wide reads when `workspace` is omitted, 403 when it does
- * not match the token, and `X-Relayhistory-Workspace-Id` attestation.
+ * A sessions pipeline read API double with the real tenancy rules: the
+ * Control handoff mints one read session per {user, org, workspace}, reads
+ * are org-wide when `workspace` is omitted, 403 when it does not match the
+ * token, and carry `X-Relayhistory-Workspace-Id` attestation.
  */
-async function startHistory(t: TestContext, historyOrigin: string, direct = false) {
+async function startHistory(t: TestContext) {
   const requests: UpstreamRequest[] = [];
   const tokens = new Map<string, string>();
   const sessions: Session[] = [];
@@ -114,10 +109,9 @@ async function startHistory(t: TestContext, historyOrigin: string, direct = fals
     body?: unknown;
     headers?: Record<string, string>;
   } | undefined>();
-  const logins: Array<Record<string, any>> = [];
-  /** Caller-token mode: which workspace each relaycontrol `sh_at_` token is bound to. */
-  const callerTokens = new Map<string, string>();
-  let loginScopes: string[] | undefined = ["rth:read"];
+  /** Handoff request bodies, in order. */
+  const handoffs: Array<Record<string, any>> = [];
+  const refreshTokens = new Map<string, string>();
   let mints = 0;
   let origin = "";
   const server = createServer(async (request, response) => {
@@ -138,63 +132,39 @@ async function startHistory(t: TestContext, historyOrigin: string, direct = fals
       response.statusCode = status;
       response.end(JSON.stringify(value));
     };
-    if (direct && request.method !== "GET") {
-      send(405, { error: "method_not_allowed" });
-      return;
-    }
-    if (url.pathname === "/v1/tokens/relayhistory-assertion") {
-      send(200, {
-        accessToken: `relay_ag_${jwt({
-          org: body.orgId,
-          wks: body.workspaceId,
-          sponsorId: body.sponsorId,
-          scopes: body.scopes,
-          aud: historyOrigin,
-        })}`,
-      });
-      return;
-    }
-    if (url.pathname === "/v1/cli/login" && String(body.agentRelayToken).startsWith("sh_at_")) {
-      // The self-host read API container: introspect the caller's token and
-      // answer the same token back (refresh == access), scopes limited to
-      // what the backend serves.
-      logins.push(body);
-      const workspace = callerTokens.get(String(body.agentRelayToken));
-      if (!workspace) {
+    if (url.pathname.startsWith("/internal/v1/session-read/sessions")) {
+      const refreshing = url.pathname.endsWith("/refresh");
+      if (request.method !== "POST" || token !== READ_API_SECRET) {
         send(401, { error: "unauthorized" });
         return;
       }
+      handoffs.push(body);
+      if (refreshing && refreshTokens.get(String(body.refreshToken)) !== body.workspaceId) {
+        send(401, { error: "invalid_refresh_token" });
+        return;
+      }
       mints += 1;
-      tokens.set(String(body.agentRelayToken), workspace);
+      const serial = String(mints).padStart(43, "0");
+      const accessToken = `rth_at_read_${serial}`;
+      const refreshToken = `rth_rt_read_${serial}`;
+      tokens.set(accessToken, String(body.workspaceId));
+      refreshTokens.set(refreshToken, String(body.workspaceId));
       send(200, {
-        accessToken: body.agentRelayToken,
-        accessTokenExpiresAt: "2099-01-01T00:00:00.000Z",
-        refreshToken: body.agentRelayToken,
-        refreshTokenExpiresAt: "2099-01-01T00:00:00.000Z",
-        tokenType: "Bearer",
-        ...(loginScopes ? { scopes: loginScopes } : {}),
-      });
-      return;
-    }
-    if (url.pathname === "/v1/cli/login") {
-      mints += 1;
-      const claims = JSON.parse(Buffer.from(
-        String(body.agentRelayToken).replace(/^relay_ag_/, "").split(".")[1]!,
-        "base64url",
-      ).toString("utf8")) as { wks: string };
-      const accessToken = `rth_at_${mints}`;
-      tokens.set(accessToken, claims.wks);
-      send(200, {
-        accessToken,
-        accessTokenExpiresAt: "2099-01-01T00:00:00.000Z",
-        refreshToken: `rth_rt_${mints}`,
-        refreshTokenExpiresAt: "2099-02-01T00:00:00.000Z",
-        tokenType: "Bearer",
+        sessionId: `read-${mints}`,
+        userId: body.userId,
+        orgId: body.orgId,
+        workspaceId: body.workspaceId,
+        audience: body.audience,
         scopes: ["rth:read"],
+        accessToken,
+        accessTokenExpiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+        refreshToken,
+        refreshTokenExpiresAt: new Date(Date.now() + 24 * 3_600_000).toISOString(),
+        tokenType: "Bearer",
       });
       return;
     }
-    const tokenWorkspace = token ? (direct ? callerTokens : tokens).get(token) : undefined;
+    const tokenWorkspace = token ? tokens.get(token) : undefined;
     if (!tokenWorkspace) {
       send(401, { error: { code: "unauthorized" } });
       return;
@@ -311,12 +281,7 @@ async function startHistory(t: TestContext, historyOrigin: string, direct = fals
     requests,
     sessions,
     overrides,
-    logins,
-    callerTokens,
-    /** `undefined` omits `scopes` from the login reply. */
-    set loginScopes(value: string[] | undefined) {
-      loginScopes = value;
-    },
+    handoffs,
     get mints() {
       return mints;
     },
@@ -329,12 +294,10 @@ async function startHistory(t: TestContext, historyOrigin: string, direct = fals
 async function setup(
   t: TestContext,
   now = new Date("2026-11-02T20:00:00.000Z"),
-  options: { relayauth?: boolean; directReadApi?: boolean; agentTokens?: boolean; relaycastFetch?: typeof fetch } = {},
+  options: { agentTokens?: boolean; relaycastFetch?: typeof fetch } = {},
 ) {
-  const relayauth = options.relayauth ?? true;
   const historyOrigin = "https://history.selfhosted.test";
-  const history = await startHistory(t, historyOrigin);
-  const readApi = options.directReadApi ? await startHistory(t, historyOrigin, true) : undefined;
+  const history = await startHistory(t);
   const database = new PGliteDatabase();
   await migrate(database);
   const bootstrapToken = "bootstrap-token-that-is-at-least-32-bytes";
@@ -343,11 +306,9 @@ async function setup(
     publicBaseUrl: "https://control.internal.example",
     relaycastUrl: "http://relaycast.internal",
     relaycastPublicUrl: "https://relaycast.selfhosted.test",
-    relayauthUrl: relayauth ? history.origin : null,
     relayhistoryUrl: history.origin,
-    ...(readApi ? { relayhistoryReadApiUrl: readApi.origin } : {}),
     relayhistoryPublicUrl: historyOrigin,
-    relayauthApiKey: relayauth ? "rak_test" : null,
+    sessionReadApi: { url: history.origin, publicUrl: historyOrigin, secret: READ_API_SECRET },
     bootstrapToken,
     encryptionKeyring: { active: { id: "test-key", key: Buffer.alloc(32, 7) } },
     port: 3000,
@@ -409,23 +370,17 @@ async function setup(
       body: { device_code: started.body.device_code },
     });
     assert.equal(tokens.status, 200);
-    const accessToken = tokens.body.access_token as string;
-    history.callerTokens.set(accessToken, workspaceId);
-    readApi?.callerTokens.set(accessToken, workspaceId);
-    return accessToken;
+    return tokens.body.access_token as string;
   };
   history.sessions.push(
     { sessionId: "alpha-1", source: "codex", workspaceId: alpha, summary: "Alpha work" },
     { sessionId: "beta-1", source: "claude", workspaceId: beta, summary: "Beta secret" },
   );
-  if (readApi) readApi.sessions.push(...history.sessions);
   return {
     origin,
     history,
-    readApi,
     config,
     store,
-    disableDirectRead: () => { config.relayhistoryReadApiUrl = null; },
     alpha,
     beta,
     ownerId: org.body.owner.id as string,
@@ -452,8 +407,7 @@ test("session reads stay inside the caller's workspace", async (t) => {
   assert.deepEqual(betaList.body.items.map((row: any) => row.sessionId), ["beta-1"]);
 
   // Every upstream read names exactly the authorized workspace.
-  const reads = env.history.requests.filter((entry) => entry.path.startsWith("/v1/") &&
-    !entry.path.startsWith("/v1/cli/") && !entry.path.startsWith("/v1/tokens/"));
+  const reads = env.history.requests.filter((entry) => entry.path.startsWith("/v1/"));
   assert(reads.length > 0);
   for (const read of reads) assert.equal(read.workspaceParams.length, 1, read.path);
 
@@ -774,24 +728,30 @@ test("History read tokens are cached per user, organization and workspace", asyn
   assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.beta}/sessions`, { token: alphaToken })).status, 404);
 });
 
-/* The self-host read API container (relayhistory-pipeline), reached with the
- * caller's own sh_at_ token because RelayAuth is not configured. See
- * docs/sessions-read-api.md. */
+/* The sessions pipeline read API: Control asks its handoff for a read session
+ * for one authorized identity. See docs/sessions-read-api.md. */
 const READ_API_UNSUPPORTED_MESSAGE = "The configured session backend does not serve this view";
 
-test("read API: login forwards the caller token and reads carry the token it answers", async (t) => {
-  const env = await setup(t, undefined, { relayauth: false });
+test("read API: the handoff names one identity and reads carry the token it answers", async (t) => {
+  const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);
   assert(token.startsWith("sh_at_"));
   const list = await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token });
   assert.equal(list.status, 200);
   assert.deepEqual(list.body.items.map((row: any) => row.sessionId), ["alpha-1"]);
-  assert.deepEqual(env.history.logins, [{ agentRelayToken: token, label: "relay-dashboard" }]);
+  assert.deepEqual(env.history.handoffs, [{
+    userId: env.ownerId,
+    orgId: env.organizationId,
+    workspaceId: env.alpha,
+    audience: "https://history.selfhosted.test",
+    scopes: ["rth:read"],
+    label: "relay-dashboard",
+  }]);
   const read = lastRequest(env.history.requests, (entry) => entry.path === "/v1/sessions");
-  // The container answers the same token as accessToken; reads use it.
-  assert.equal(read?.token, token);
+  // Reads use the read API's own token, never the caller's.
+  assert(read?.token?.startsWith("rth_at_read_"));
+  assert.notEqual(read?.token, token);
   assert.equal(read?.query.workspace, env.alpha);
-  assert.equal(env.history.requests.some((entry) => entry.path.startsWith("/v1/tokens/")), false);
 
   // Catalog 404 (unknown session) stays an empty catalog.
   const missing = await call(
@@ -805,7 +765,7 @@ test("read API: login forwards the caller token and reads carry the token it ans
 });
 
 test("read API: an upstream 501 is answered as 501 unsupported_by_backend", async (t) => {
-  const env = await setup(t, undefined, { relayauth: false });
+  const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);
   const base = `/cloud/api/v1/workspaces/${env.alpha}`;
 
@@ -849,8 +809,8 @@ test("read API: an upstream 501 is answered as 501 unsupported_by_backend", asyn
   assert.equal(env.history.mints, 1);
 });
 
-test("read API: a dormant container (503) is an upstream failure and keeps the cached token", async (t) => {
-  const env = await setup(t, undefined, { relayauth: false });
+test("read API: a dormant read API (503) is a retryable upstream failure and keeps the cached token", async (t) => {
+  const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);
   const path = `/cloud/api/v1/workspaces/${env.alpha}/sessions`;
   assert.equal((await call(env.origin, path, { token })).status, 200);
@@ -859,157 +819,52 @@ test("read API: a dormant container (503) is an upstream failure and keeps the c
   env.history.overrides.set("/v1/sessions", () => ({ status: 503, body: { error: "not_configured" } }));
   const before = env.history.requests.length;
   const dormant = await call(env.origin, path, { token });
-  assert.equal(dormant.status, 502);
+  assert.equal(dormant.status, 503);
   assert.deepEqual(dormant.body, {
     error: "relayhistory_session_failed",
     stage: "read",
     upstreamStatus: 503,
   });
-  // Exactly one upstream read, no retry and no re-login.
+  // Exactly one upstream read, no retry and no new handoff.
   assert.deepEqual(env.history.requests.slice(before).map((entry) => entry.path), ["/v1/sessions"]);
 
   env.history.overrides.delete("/v1/sessions");
   assert.equal((await call(env.origin, path, { token })).status, 200);
   assert.equal(env.history.mints, 1, "the 503 did not evict the cached token");
 
-  // A 401 still evicts it and logs in again once.
+  // A 401 still evicts it and asks the handoff again once.
   env.history.revokeAll();
   assert.equal((await call(env.origin, path, { token })).status, 200);
   assert.equal(env.history.mints, 2);
 });
 
-test("read API: sync sessions are refused when the backend grants only rth:read", async (t) => {
-  const env = await setup(t, undefined, { relayauth: false });
-  const token = await env.login(env.ownerId, env.alpha);
-  const path = `/api/v1/workspaces/${env.alpha}/relayhistory/session`;
-
-  const sync = await call(env.origin, path, { method: "POST", token, body: { mode: "sync" } });
-  assert.equal(sync.status, 501);
-  assert.deepEqual(sync.body, {
-    error: "unsupported_by_backend",
-    reason: "sync_not_served",
-    message: "The configured session backend serves reads only; sync sessions are not available",
-  });
-  assert.equal(sync.headers.get("cache-control"), "no-store");
-  assert(!JSON.stringify(sync.body).includes(token));
-  assert.equal(env.history.logins.at(-1)?.agentRelayToken, token);
-
-  // Nothing from the refused sync login is reused: a read logs in afresh.
-  assert.equal(env.history.mints, 1);
-  assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token })).status, 200);
-  assert.equal(env.history.mints, 2);
-
-  const read = await call(env.origin, path, { method: "POST", token, body: { mode: "read" } });
-  assert.equal(read.status, 200);
-  assert.equal(read.body.accessToken, token);
-  assert.deepEqual(read.body.scopes, ["rth:read"]);
-  assert.equal(read.body.workspaceId, env.alpha);
-
-  // A backend that serves sync (scopes include rth:sync) still issues it.
-  env.history.loginScopes = ["rth:read", "rth:sync"];
-  const served = await call(env.origin, path, { method: "POST", token, body: { mode: "sync" } });
-  assert.equal(served.status, 200);
-  assert.deepEqual(served.body.scopes, ["rth:read", "rth:sync"]);
-
-  // A reply without a scopes field is trusted as before (compatibility).
-  env.history.loginScopes = undefined;
-  const unscoped = await call(env.origin, path, { method: "POST", token, body: { mode: "read" } });
-  assert.equal(unscoped.status, 200);
-  assert.equal(unscoped.body.accessToken, token);
-  assert.deepEqual(unscoped.body.scopes, []);
-
-  // A reply without rth:read is an invalid session.
-  env.history.loginScopes = ["rth:sync"];
-  const invalid = await call(env.origin, path, { method: "POST", token, body: { mode: "read" } });
-  assert.equal(invalid.status, 502);
-  assert.equal(invalid.body.stage, "exchange");
-});
-
-
-test("direct read Worker: list and turns use the caller token without login; issuance stays on History", async (t) => {
-  const env = await setup(t, undefined, { directReadApi: true });
+test("read API: a downstream refusal is never echoed or retried", async (t) => {
+  const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);
   const base = `/cloud/api/v1/workspaces/${env.alpha}`;
-  const list = await call(env.origin, `${base}/sessions`, { token });
-  assert.equal(list.status, 200);
-  assert.deepEqual(list.body.items.map((row: any) => row.sessionId), ["alpha-1"]);
-  const turns = await call(env.origin, `${base}/sessions/alpha-1/turns?source=codex`, { token });
-  assert.equal(turns.status, 200);
-  assert.equal(turns.body.turns[0].content, "Alpha work");
-  assert.deepEqual(env.readApi!.requests.map((r) => r.path), ["/v1/sessions", "/v1/sessions/alpha-1/turns"]);
-  assert(env.readApi!.requests.every((r) => r.token === token && r.workspaceParams.length === 1 && r.query.workspace === env.alpha));
-  assert.equal(env.history.requests.length, 0);
-  const issued = await call(env.origin, `${base}/relayhistory/session`, { method: "POST", token, body: { mode: "read" } });
-  assert.equal(issued.status, 200);
-  assert.equal(issued.body.baseUrl, "https://history.selfhosted.test");
-  assert(env.history.requests.some((r) => r.path === "/v1/cli/login"));
-  assert.equal(env.readApi!.requests.length, 2);
-});
-
-test("direct read Worker: search/events stay on History and foreign requests never reach the reader", async (t) => {
-  const env = await setup(t, undefined, { directReadApi: true });
-  const token = await env.login(env.ownerId, env.alpha);
-  const base = `/cloud/api/v1/workspaces/${env.alpha}`;
-  assert.equal((await call(env.origin, `${base}/sessions?q=work`, { token })).status, 200);
-  assert.equal((await call(env.origin, `${base}/sessions/alpha-1/events?source=codex`, { token })).status, 200);
-  assert.equal(env.readApi!.requests.length, 0);
-  assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.beta}/sessions`, { token })).status, 404);
-  assert.equal((await call(env.origin, `${base}/sessions?workspace=${env.beta}`, { token })).status, 400);
-  assert.equal((await call(env.origin, `${base}/sessions`)).status, 401);
-  assert.equal(env.readApi!.requests.length, 0);
-});
-
-test("direct read Worker: downstream refusal never falls back, logs in or retries", async (t) => {
-  const env = await setup(t, undefined, { directReadApi: true });
-  const token = await env.login(env.ownerId, env.alpha);
-  const base = `/cloud/api/v1/workspaces/${env.alpha}`;
-  for (const status of [401, 403, 503]) {
-    env.readApi!.overrides.set("/v1/sessions", () => ({ status, body: { error: "buffered_fenced", private: "must-not-echo" } }));
-    const before = env.readApi!.requests.length;
+  // Hold a read credential first so each refusal below is one upstream read.
+  assert.equal((await call(env.origin, `${base}/sessions`, { token })).status, 200);
+  for (const status of [403, 503]) {
+    env.history.overrides.set("/v1/sessions", () => ({ status, body: { error: "buffered_fenced", private: "must-not-echo" } }));
+    const before = env.history.requests.length;
     const result = await call(env.origin, `${base}/sessions`, { token });
     assert.equal(result.status, status === 503 ? 503 : 502);
     assert.equal(result.body.upstreamStatus, status);
     assert(!JSON.stringify(result.body).includes("must-not-echo"));
-    assert.equal(env.readApi!.requests.length, before + 1);
-    assert.equal(env.history.requests.length, 0);
+    assert.deepEqual(env.history.requests.slice(before).map((entry) => entry.path), ["/v1/sessions"]);
   }
-});
-
-test("direct read Worker: missing/wrong workspace attestation discards content without fallback", async (t) => {
-  const env = await setup(t, undefined, { directReadApi: true });
-  const token = await env.login(env.ownerId, env.alpha);
-  for (const attestation of ["", env.beta]) {
-    env.readApi!.overrides.set("/v1/sessions", () => ({ headers: { "x-relayhistory-workspace-id": attestation }, body: { sessions: [{ sessionId: "private", summary: "must-not-echo" }] } }));
-    const result = await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token });
-    assert.equal(result.status, 502);
-    assert(!JSON.stringify(result.body).includes("must-not-echo"));
-    assert.equal(env.history.requests.length, 0);
-  }
-});
-
-
-test("direct read Worker: disabling the connection refuses native cursors instead of restarting History", async (t) => {
-  const env = await setup(t, undefined, { directReadApi: true });
-  const token = await env.login(env.ownerId, env.alpha);
-  env.disableDirectRead();
-  for (const path of ["sessions?cursor=b96s1:opaque", "sessions/alpha-1/turns?source=codex&cursor=b96t1:opaque"]) {
-    const result = await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/${path}`, { token });
-    assert.equal(result.status, 410);
-    assert.deepEqual(result.body, { error: "cursor_expired", message: "This session cursor has expired. Restart from the first page." });
-    assert.equal(env.history.requests.length, 0);
-    assert.equal(env.readApi!.requests.length, 0);
-  }
+  assert.equal(env.history.mints, 1, "a refusal never asks for another handoff");
 });
 
 test("agent filter: passes one agent to the read API and reports what it applied", async (t) => {
-  const env = await setup(t, undefined, { directReadApi: true });
+  const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);
   const base = `/cloud/api/v1/workspaces/${env.alpha}/sessions`;
   const seen: URL[] = [];
   let reply: { status?: number; body?: unknown; headers?: Record<string, string> } = {
     body: { sessions: [{ sessionId: "alpha-1", source: "codex" }] },
   };
-  env.readApi!.overrides.set("/v1/sessions", (_request, url) => {
+  env.history.overrides.set("/v1/sessions", (_request, url) => {
     seen.push(url);
     return reply;
   });
@@ -1068,11 +923,11 @@ test("agent filter: passes one agent to the read API and reports what it applied
 });
 
 test("agent filter: with parsing on, @tokens select the agent and the first wins", async (t) => {
-  const env = await setup(t, undefined, { directReadApi: true, agentTokens: true });
+  const env = await setup(t, undefined, { agentTokens: true });
   const token = await env.login(env.ownerId, env.alpha);
   const base = `/cloud/api/v1/workspaces/${env.alpha}/sessions`;
   let last: URL | undefined;
-  env.readApi!.overrides.set("/v1/sessions", (_request, url) => {
+  env.history.overrides.set("/v1/sessions", (_request, url) => {
     last = url;
     return { body: { sessions: [] } };
   });
@@ -1114,43 +969,29 @@ test("agent names for autocomplete: members only, names only, hidden agents left
   assert.equal(limited.body.error, "rate_limited");
 });
 
-test("direct read Worker: redirects never forward the caller token to History", async (t) => {
-  const env = await setup(t, undefined, { directReadApi: true });
+test("read API: redirects are refused and never followed", async (t) => {
+  const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);
-  env.readApi!.overrides.set("/v1/sessions", () => ({ status: 302, headers: { location: `${env.history.origin}/v1/sessions` } }));
+  env.history.overrides.set("/v1/sessions", () => ({ status: 302, headers: { location: `${env.history.origin}/v1/events` } }));
   const result = await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token });
   assert.equal(result.status, 502);
-  assert.equal(env.history.requests.length, 0);
-  assert.equal(env.readApi!.requests.length, 1);
+  assert.deepEqual(env.history.requests.filter((entry) => entry.path.startsWith("/v1/")).map((entry) => entry.path), ["/v1/sessions"]);
 });
 
-
-test("direct read Worker: non-sh_at callers keep their existing History transport", async (t) => {
-  const env = await setup(t, undefined, { directReadApi: true });
+test("read API: callers without an sh_at_ token read through the same handoff", async (t) => {
+  const env = await setup(t);
   const read = await readWorkspaceHistory(env.config, {
     userId: env.ownerId, organizationId: env.organizationId,
     workspaceId: env.alpha, callerToken: "synthetic-admitted-oauth-token",
   }, "/v1/sessions", new URLSearchParams());
   assert.equal(read.status, "ok");
   if (read.status === "ok") assert.equal((read.body.sessions as any[])[0].sessionId, "alpha-1");
-  assert.equal(env.readApi!.requests.length, 0);
-  assert(env.history.requests.some((r) => r.path === "/v1/cli/login"));
+  assert.equal(env.history.handoffs.length, 1);
+  assert.equal(env.history.handoffs[0]!.workspaceId, env.alpha);
 });
 
-test("direct read Worker: non-sh_at callers cannot restart a native cursor in History", async (t) => {
-  const env = await setup(t, undefined, { directReadApi: true });
-  await assert.rejects(() => readWorkspaceHistory(env.config, {
-    userId: env.ownerId, organizationId: env.organizationId,
-    workspaceId: env.alpha, callerToken: "synthetic-admitted-oauth-token",
-  }, "/v1/sessions", new URLSearchParams({ cursor: "b96s1:opaque" })),
-  { name: "ReadCursorExpiredError", message: "This session cursor has expired. Restart from the first page." });
-  assert.equal(env.readApi!.requests.length, 0);
-  assert.equal(env.history.requests.length, 0);
-});
-
-
-test("direct read Worker: MCP reports an expired cursor with an explicit restart instruction", async (t) => {
-  const env = await setup(t, undefined, { directReadApi: true });
+test("read API: MCP reports an expired cursor with an explicit restart instruction", async (t) => {
+  const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);
   const principal = await env.store.authenticateAccessToken(token);
   assert(principal);
@@ -1158,10 +999,11 @@ test("direct read Worker: MCP reports an expired cursor with an explicit restart
     id: env.alpha, organizationId: env.organizationId, name: "alpha",
     relaycastWorkspaceId: "synthetic-relay", relaycastApiKey: "synthetic-key", role: principal.role,
   }, token);
-  env.disableDirectRead();
+  env.history.overrides.set("/v1/sessions", () => ({ status: 410, body: { error: "cursor_expired" } }));
   await assert.rejects(() => read("/v1/sessions?cursor=b96s1:opaque"), {
     name: "SharedSessionsToolError", message: "This session cursor has expired. Restart from the first page.",
   });
-  assert.equal(env.history.requests.length, 0);
-  assert.equal(env.readApi!.requests.length, 0);
+  const dashboard = await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions?cursor=b96s1:opaque`, { token });
+  assert.equal(dashboard.status, 410);
+  assert.deepEqual(dashboard.body, { error: "cursor_expired", message: "This session cursor has expired. Restart from the first page." });
 });

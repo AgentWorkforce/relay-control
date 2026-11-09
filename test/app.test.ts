@@ -105,17 +105,10 @@ test("the /cloud prefix aliases every versioned Desktop route", () => {
   }
 });
 
-function jwt(payload: Record<string, unknown>): string {
-  return [
-    Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url"),
-    Buffer.from(JSON.stringify(payload)).toString("base64url"),
-    "test-signature",
-  ].join(".");
-}
-
 test("device flow, tenant isolation, token rotation, runtime, and History issuance", async (t) => {
   const publicRelaycastOrigin = "https://relaycast.selfhosted.company";
   const publicHistoryOrigin = "https://history.selfhosted.company";
+  const HISTORY_READ_TOKEN = `rth_at_read_${"a".repeat(43)}`;
   const upstreamRequests: Array<{
     method: string;
     path: string;
@@ -138,27 +131,20 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
       authorization: request.headers.authorization,
     });
     response.setHeader("content-type", "application/json");
-    if (url.pathname === "/v1/tokens/relayhistory-assertion") {
-      response.end(JSON.stringify({
-        accessToken: `relay_ag_${jwt({
-          org: body.orgId,
-          wks: body.workspaceId,
-          sponsorId: body.sponsorId,
-          scopes: body.scopes,
-          aud: publicHistoryOrigin,
-        })}`,
-      }));
-      return;
-    }
-    if (url.pathname === "/v1/cli/login") {
+    if (url.pathname === "/internal/v1/session-read/sessions") {
+      // The sessions pipeline read API handoff.
       response.end(JSON.stringify({
         sessionId: "history-session",
-        accessToken: "history-access",
-        accessTokenExpiresAt: "2030-01-01T00:00:00.000Z",
-        refreshToken: "history-refresh",
-        refreshTokenExpiresAt: "2030-02-01T00:00:00.000Z",
+        userId: body.userId,
+        orgId: body.orgId,
+        workspaceId: body.workspaceId,
+        audience: body.audience,
+        scopes: ["rth:read"],
+        accessToken: HISTORY_READ_TOKEN,
+        accessTokenExpiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+        refreshToken: `rth_rt_read_${"r".repeat(43)}`,
+        refreshTokenExpiresAt: new Date(Date.now() + 86_400_000).toISOString(),
         tokenType: "Bearer",
-        scopes: ["rth:read", "rth:sync"],
       }));
       return;
     }
@@ -221,10 +207,9 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
     publicBaseUrl: "https://control.internal.example",
     relaycastUrl: "http://relaycast.relay.svc.cluster.local",
     relaycastPublicUrl: publicRelaycastOrigin,
-    relayauthUrl: upstreamOrigin,
     relayhistoryUrl: upstreamOrigin,
     relayhistoryPublicUrl: publicHistoryOrigin,
-    relayauthApiKey: "rak_test",
+    sessionReadApi: { url: upstreamOrigin, publicUrl: publicHistoryOrigin, secret: "session-read-secret-".repeat(2) },
     bootstrapToken,
     encryptionKeyring: {
       active: { id: "test-key", key: Buffer.alloc(32, 7) },
@@ -489,13 +474,11 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
   );
   assert.equal(history.status, 200);
   assert.equal(history.body.baseUrl, publicHistoryOrigin);
-  assert.equal(history.body.accessToken, "history-access");
-  assert.deepEqual(upstreamRequests.map((entry) => entry.path), [
-    "/v1/tokens/relayhistory-assertion",
-    "/v1/cli/login",
-  ]);
-  assert.equal(upstreamRequests[0]!.body.workspaceId, firstWorkspace.body.id);
-  assert.equal(upstreamRequests[0]!.body.historyOrigin, publicHistoryOrigin);
+  // Sync hands the caller its own token for the ingest edge; nothing upstream is called.
+  assert.equal(history.body.accessToken, accessToken);
+  assert.deepEqual(history.body.scopes, ["rth:sync"]);
+  assert.equal(history.body.workspaceId, firstWorkspace.body.id);
+  assert.equal(upstreamRequests.length, 0);
 
   const login = await fetch(`${controlOrigin}/login`);
   assert.equal(login.status, 200);
@@ -598,7 +581,10 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
     q: "fix login",
     cursor: "older",
   });
-  assert.equal(listRead?.authorization, "Bearer history-access");
+  assert.equal(listRead?.authorization, `Bearer ${HISTORY_READ_TOKEN}`);
+  const handoff = upstreamRequests.find((entry) => entry.path === "/internal/v1/session-read/sessions");
+  assert.equal(handoff?.body.workspaceId, firstWorkspace.body.id);
+  assert.equal(handoff?.body.audience, publicHistoryOrigin);
 
   const eventPage = await jsonRequest(
     controlOrigin,

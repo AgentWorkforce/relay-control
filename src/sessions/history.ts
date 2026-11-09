@@ -1,17 +1,18 @@
 import { createHash } from "node:crypto";
 import type { SelfhostConfig } from "../config.js";
-import { issueRelayhistorySession, ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
+import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { requestReadSession, SessionReadError } from "../session-read.js";
 
 /**
- * Workspace-scoped RelayHistory reads for the dashboard sessions views.
+ * Workspace-scoped History reads for the dashboard sessions views, served by
+ * the sessions pipeline read API.
  *
  * Isolation rules (mirroring Cloud's `rejectHistoryResponse`):
  * - every read uses a `rth:read` session minted for exactly one
  *   {user, organization, workspace} triple, after the caller has passed the
  *   control plane's membership check;
  * - every upstream query carries `workspace=<authorized workspace>`, which
- *   RelayHistory requires to equal the token's workspace (403 otherwise);
+ *   the read API requires to equal the token's workspace (403 otherwise);
  * - every accepted response must attest the same workspace through
  *   `X-Relayhistory-Workspace-Id`. A missing or different header is treated
  *   as an upstream failure, so an org-wide read can never reach the browser.
@@ -23,9 +24,9 @@ export type HistoryIdentity = {
   organizationId: string;
   workspaceId: string;
   /**
-   * The caller's raw relaycontrol access token. Without RelayAuth it is what
-   * History exchanges (and introspects); it is a credential and is only ever
-   * used as a cache key through its SHA-256.
+   * The caller's raw relaycontrol access token. It is a credential and is only
+   * ever used as a cache key through its SHA-256, so a read token is kept per
+   * caller token session.
    */
   callerToken: string;
 };
@@ -54,8 +55,7 @@ function cacheKey(identity: HistoryIdentity): string {
 }
 
 /**
- * RELAYHISTORY_BACKEND=native: the read API issues the token through the
- * Control handoff. Control has authorized this {user, org, workspace} on this
+ * The read API issues the token through the Control handoff. Control has authorized this {user, org, workspace} on this
  * request; the pair is kept per token session so a reader's token is renewed
  * on its own refresh lineage instead of creating a new session per page view.
  */
@@ -68,7 +68,6 @@ async function nativeReadToken(
   previous: CachedToken | undefined,
 ): Promise<string> {
   const api = config.sessionReadApi;
-  if (!api) throw new UpstreamError("exchange", undefined, "Session read API is not configured");
   const readIdentity = { userId: identity.userId, orgId: identity.organizationId, workspaceId: identity.workspaceId };
   let session;
   try {
@@ -102,9 +101,8 @@ async function nativeReadToken(
 
 /**
  * A short-lived read token per identity. Membership is re-checked by the
- * caller on every request before this is used, so caching only saves the
- * RelayAuth assertion (or History introspection) and History login round trips (and avoids creating a
- * History auth session per page view).
+ * caller on every request before this is used, so caching only saves read API
+ * handoff round trips (and avoids creating a read session per page view).
  */
 async function readToken(
   config: SelfhostConfig,
@@ -115,33 +113,8 @@ async function readToken(
   const key = cacheKey(identity);
   const cached = cache.get(key);
   if (cached && cached.expiresAt > now) return cached.accessToken;
-  // Native keeps the expired pair for its refresh token; the rest is replaced.
-  if (config.relayhistoryBackend !== "native") cache.delete(key);
-  if (config.relayhistoryBackend === "native") {
-    return nativeReadToken(config, identity, cache, key, now, cached);
-  }
-  const session = await issueRelayhistorySession(config, {
-    ...identity,
-    mode: "read",
-    label: "relay-dashboard",
-  });
-  const accessToken = session.accessToken;
-  if (typeof accessToken !== "string" || !accessToken) {
-    throw new UpstreamError("exchange", undefined, "RelayHistory returned no access token");
-  }
-  const upstreamExpiry = Date.parse(String(session.accessTokenExpiresAt));
-  const expiresAt = Math.min(
-    now + TOKEN_MAX_AGE_MS,
-    Number.isFinite(upstreamExpiry) ? upstreamExpiry - TOKEN_EXPIRY_MARGIN_MS : now,
-  );
-  if (expiresAt > now) {
-    if (cache.size >= TOKEN_CACHE_LIMIT) {
-      const oldest = cache.keys().next().value;
-      if (oldest !== undefined) cache.delete(oldest);
-    }
-    cache.set(key, { accessToken, expiresAt });
-  }
-  return accessToken;
+  // The expired pair is kept for its refresh token.
+  return nativeReadToken(config, identity, cache, key, now, cached);
 }
 
 export function forgetHistoryTokens(config: SelfhostConfig): void {
@@ -175,7 +148,7 @@ async function unsupportedReason(response: Response): Promise<string> {
 }
 
 /**
- * GET a RelayHistory read path for one authorized workspace. The caller
+ * GET a read API path for one authorized workspace. The caller
  * supplies only the path and non-tenant parameters; `workspace` is always
  * set here and cannot be overridden.
  */
@@ -189,27 +162,14 @@ export async function readWorkspaceHistory(
   const query = new URLSearchParams(params);
   query.delete("workspace");
   query.set("workspace", identity.workspaceId);
-  // Rollout 1: the GET-only Worker serves unsearched lists and turns. Session
-  // issuance, uploads, events/search and the other views keep the History path.
-  const rolloutPath = path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+\/turns$/.test(path);
-  // Other admitted credential families retain their pre-existing History
-  // transport; this connection never forwards them to a sh_at_-only Worker.
-  const native = config.relayhistoryBackend === "native";
-  const direct = Boolean(config.relayhistoryReadApiUrl && identity.callerToken.startsWith("sh_at_") &&
-    rolloutPath && !query.has("q") && !query.has("search"));
-  // A read-API cursor cannot be interpreted by History after configuration
-  // rollback. Refuse instead of silently restarting on its first page.
-  if (!direct && !native && rolloutPath && /^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
-    throw new ReadCursorExpiredError();
-  }
-  const origin = direct ? config.relayhistoryReadApiUrl! : config.relayhistoryUrl;
+  const origin = config.relayhistoryUrl;
   const url = new URL(`${path}?${query}`, `${origin}/`);
   if (url.origin !== new URL(origin).origin || !url.pathname.startsWith("/v1/")) {
     throw new UpstreamError("read", undefined, "RelayHistory read origin mismatch");
   }
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const accessToken = direct ? identity.callerToken : await readToken(config, identity);
+    const accessToken = await readToken(config, identity);
     let response: Response;
     try {
       response = await globalThis.fetch(url, {
@@ -224,8 +184,8 @@ export async function readWorkspaceHistory(
     } catch (error) {
       throw new UpstreamError("read", undefined, error instanceof Error ? error.message : undefined);
     }
-    if (!direct && response.status === 401 && attempt === 0) {
-      // A revoked or rotated History session: mint a fresh one once.
+    if (response.status === 401 && attempt === 0) {
+      // A revoked or rotated read session: mint a fresh one once.
       await response.body?.cancel().catch(() => {});
       cacheFor(config).delete(cacheKey(identity));
       continue;
@@ -245,10 +205,10 @@ export async function readWorkspaceHistory(
     }
     if (!response.ok) {
       // Includes a dormant read-API container (503 not_configured). The
-      // cached History token is kept: only a 401 evicts it.
+      // cached read token is kept: only a 401 evicts it.
       await response.body?.cancel().catch(() => {});
-      if (native && response.status === 410) throw new ReadCursorExpiredError();
-      throw new UpstreamError("read", response.status, undefined, (direct || native) && response.status === 503);
+      if (response.status === 410) throw new ReadCursorExpiredError();
+      throw new UpstreamError("read", response.status, undefined, response.status === 503);
     }
     if (response.headers.get(WORKSPACE_ATTESTATION_HEADER) !== identity.workspaceId) {
       await response.body?.cancel().catch(() => {});
