@@ -142,7 +142,7 @@ its routes. That covers `/api/v1/auth/password/*` and `/login/password` for
 | `SELFHOST_PASSWORD_PEPPER_FILE` | Optional file of versioned peppers, one `v<version>:<secret>` per line (for example `v1:...`, `v2:...`). Each secret is at least 32 bytes. The highest version hashes new passwords. See [Pepper file](#pepper-file) for the required permissions |
 | `SELFHOST_PASSWORD_ARGON2_MEMORY_KIB` / `_TIME_COST` / `_PARALLELISM` | Optional. These can only raise argon2id above the baseline of 19456 KiB, 2 passes and 1 lane. A lower value refuses to start |
 | `SELFHOST_PASSWORD_HIBP` | `off` (the default) or `on`: also refuse passwords found in Have I Been Pwned |
-| `SELFHOST_TRUSTED_PROXIES` | Number of reverse proxies in front of the server that append to `X-Forwarded-For`, `0` to `99`. **Required when `password` is enabled: set it explicitly, even to `0`.** Unset or empty refuses to start. Use `1` behind the Helm chart's ingress. See [Client address](#client-address) |
+| `SELFHOST_TRUSTED_PROXIES` | Number of reverse proxies in front of the server that append to `X-Forwarded-For`, `0` to `99`. **Required when `password` is enabled: set it explicitly, even to `0`.** Unset or empty refuses to start. Use `1` only behind a single proxy that appends to `X-Forwarded-For` (such as the Helm chart's ingress) with direct pod or Service access restricted; use `0` when clients connect directly. See [Client address](#client-address) |
 
 #### Login config
 
@@ -362,12 +362,14 @@ Rate limits, lockouts and audit records use one client address. By default
 `X-Forwarded-For` and `X-Real-IP` are ignored, because any client can send them.
 
 Behind reverse proxies, set `SELFHOST_TRUSTED_PROXIES` to the number of proxies
-that append to `X-Forwarded-For`. For example, use `1` for a single ingress or
-load balancer. The client address is then the Nth entry from the right, the one
+that append to `X-Forwarded-For`. Use `1` only for a single proxy that appends to the
+header (for example the Helm chart's ingress) and only when direct access to the
+pod or Service that bypasses that proxy is restricted; any other proxy chain
+needs its actual hop count. The client address is then the Nth entry from the right, the one
 the outermost trusted proxy appended. Entries further left are client-supplied
 and never trusted. With `password` enabled the variable must be set
 explicitly, even to `0`; unset or empty refuses to start and names the
-variable. Behind the Helm chart's ingress set `SELFHOST_TRUSTED_PROXIES=1`.
+variable. Use `0` when clients connect directly.
 Setting the number higher than the real proxy count lets
 clients pick their own address. Setting it lower makes every request share the
 proxy's address. The chosen entry is reduced to a bare IP (brackets, a port
@@ -386,8 +388,9 @@ server logs one warning per process saying the IP lockout is disabled until
 the variable is set.
 
 **Upgrade note.** Earlier builds took the leftmost `X-Forwarded-For` entry, then
-`X-Real-IP`. Deployments behind an ingress or load balancer must now set
-`SELFHOST_TRUSTED_PROXIES=1` (or the number of proxy hops); with the default
+`X-Real-IP`. Deployments behind a proxy must now set
+`SELFHOST_TRUSTED_PROXIES` to the number of proxy hops (`1` only for a single
+proxy that appends to the header, with direct pod or Service access restricted); with the default
 `0` every client shares the proxy's address for per-IP limits. With
 `password` enabled the variable must now be set explicitly (even to `0`), or
 the server refuses to start. `X-Real-IP` is no longer read.

@@ -260,7 +260,7 @@ service that append to `X-Forwarded-For`, default `0`):
   leftmost entry.
 
 - Deployments behind an ingress or load balancer MUST set
-  `SELFHOST_TRUSTED_PROXIES` to the number of proxy hops (usually `1`), and
+  `SELFHOST_TRUSTED_PROXIES` to the actual number of proxy hops (`1` only for a single proxy, with direct pod or Service access restricted), and
   each of those proxies must append to `X-Forwarded-For`.
 - The per-IP limit is defence in depth behind the per-session limit. It is not
   a security control on its own. The per-session key comes from the

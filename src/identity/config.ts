@@ -364,7 +364,7 @@ export function loadIdentityConfig(env: Env = process.env): IdentityConfig {
     if (!env.SELFHOST_TRUSTED_PROXIES?.trim()) {
       throw new Error(
         "SELFHOST_SIGNIN_METHODS includes password, so SELFHOST_TRUSTED_PROXIES must be set explicitly, even to 0: "
-        + "the number of reverse proxies in front of the server that append to X-Forwarded-For (0-99; 1 behind the Helm chart's ingress)",
+        + "the number of reverse proxies in front of the server that append to X-Forwarded-For (0-99; 1 only behind a single proxy that appends to the header, such as the chart ingress with direct pod access restricted)",
       );
     }
     trustedProxyHops(env);
