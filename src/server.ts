@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { browserOriginsFor, createApp } from "./app.js";
 import { createFactoryModule } from "./factory/routes.js";
 import { createAdminModule } from "./admin/routes.js";
+import { loadChiefControlUrl, relayChiefControlBackend } from "./chief/proxy.js";
 import { recordAudit } from "./admin/audit.js";
 import { configFingerprint, loadConfig, SELFHOST_API_VERSION } from "./config.js";
 import { PostgresDatabase } from "./database.js";
@@ -128,10 +129,13 @@ emitConfigLoaded(analytics, {
   flowsEnabled: true,
   operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
 });
+// Unset leaves every Chief route answering 503 chief_unavailable.
+const chiefControlUrl = loadChiefControlUrl(process.env, config);
 const server = createServer(createApp({
   config,
   store,
   flows,
+  ...(chiefControlUrl ? { chief: relayChiefControlBackend({ url: chiefControlUrl }) } : {}),
   admin,
   telemetry,
   identity,

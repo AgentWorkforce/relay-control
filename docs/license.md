@@ -73,5 +73,5 @@ and before any backend call. A refusal is 403:
 - `feature_not_licensed`: a paid feature is selected but not entitled.
   Chief never answers this.
 
-Chief selected with no backend configured still answers 503
-`chief_unavailable`.
+Chief selected with no backend configured (`RELAYCHIEF_CONTROL_URL` unset) still
+answers 503 `chief_unavailable`.

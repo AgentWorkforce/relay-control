@@ -60,6 +60,16 @@ cookie/bearer login and workspace membership checks. Setup and scans require an
 owner/admin; cookie mutations require same-origin JSON. Without a backend the
 routes return an explicit unavailable response.
 
+In production, set `RELAYCHIEF_CONTROL_URL` to the internal origin of the
+[relaychief-control](https://github.com/AgentWorkforce/relaychief-control) add-on
+to forward these routes to it. Those routes are cluster-internal on the add-on;
+its public Ingress serves only `/chief/v1`. Unset, every route keeps answering
+503 `chief_unavailable`. It also requires `RELAYCONTROL_INTROSPECT_SECRET` (the
+same secret on both services), the add-on's `RELAYCHIEF_CONTROL_PUBLIC_ORIGIN` in
+`SELFHOST_INTROSPECT_AUDIENCES`, and `chief` in `SELFHOST_FEATURES`. Control
+checks membership and role first, then forwards the caller's own token, which
+the add-on checks again through introspection.
+
 For integrated local validation, `scripts/dev-server.ts` accepts a trusted
 operator-selected `DEV_CHIEF_MODULE` exporting `createChiefBackend({dataDir})`,
 with `DEV_CHIEF_DATA_DIR` pointing to a private state directory. This development

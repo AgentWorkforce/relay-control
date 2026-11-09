@@ -1,6 +1,12 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-type Context = { organizationId: string; workspaceId: string };
+export type ChiefContext = {
+  organizationId: string;
+  workspaceId: string;
+  /** The caller's own token, for a backend that re-checks it out of process. */
+  accessToken?: string;
+};
+type Context = ChiefContext;
 /** The core and provider implementations live in relay-chief. This gateway owns authorization. */
 export interface ChiefBackend {
   repositories?(context: Context): unknown | Promise<unknown>;
@@ -19,7 +25,7 @@ export async function handleChiefRoutes(
       request: IncomingMessage,
       id: string,
       admin: boolean,
-    ): Promise<{ workspace: { id: string; organizationId: string } }>;
+    ): Promise<{ workspace: { id: string; organizationId: string }; token?: string }>;
     requestObject(request: IncomingMessage): Promise<Record<string, unknown>>;
     csrfAllowed(request: IncomingMessage): boolean;
     /** Throws the feature refusal (403) unless Chief is selected on this installation. */
@@ -69,6 +75,7 @@ export async function handleChiefRoutes(
   const context = {
     organizationId: access.workspace.organizationId,
     workspaceId: access.workspace.id,
+    ...(access.token ? { accessToken: access.token } : {}),
   };
   const id = match[2] ? decodeURIComponent(match[2]) : undefined;
   try {
