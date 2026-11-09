@@ -56,3 +56,6 @@ assigned at release.
   registration limit. An unreadable MCP OIDC `_FILE` now gives unavailable
   mode (`oidc_signing_key`, naming only the variable) instead of stopping
   start-up.
+- Fixed: `send_relay_message` to an exact machine address no longer sends both
+  `to` and `address` to Relaycast, which refused the body with 400; the
+  diagnostic now names `invalid_request`.
