@@ -924,3 +924,22 @@ test("introspection reports the live organization role, for add-on admin decisio
   const promoted = await env.introspect({ token: ownerToken, aud: HISTORY_PUBLIC });
   assert.equal(promoted.body.role, "admin");
 });
+
+test("an unexchanged desktop handoff is not introspectable, and its exchanged pair is", async (t) => {
+  const env = await setup(t);
+  const pending = await env.store.issueDesktopHandoff({
+    userId: env.ownerId,
+    organizationId: env.organizationId,
+    workspaceId: env.alpha,
+    codeChallenge: "a".repeat(43),
+  });
+  const refused = await env.introspect({ token: pending.accessToken, aud: HISTORY_PUBLIC });
+  assert.equal(refused.status, 200);
+  assert.deepEqual(refused.body, { active: false, reason: "unknown" });
+
+  const issued = await env.store.exchangeDesktopHandoff(pending.accessToken, () => true);
+  assert(issued);
+  const active = await env.introspect({ token: issued.accessToken, aud: HISTORY_PUBLIC });
+  assert.equal(active.body.active, true);
+  assert.equal(active.body.role, "owner");
+});
