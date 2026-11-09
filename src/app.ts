@@ -51,7 +51,7 @@ import {
 } from "./capture-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
 import {
-  assertSessionId,
+  erasureTarget,
   eraseSession,
   readSessionErasure,
   requireErasureApi,
@@ -1504,12 +1504,14 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (!bearer(request) && !cookieDeleteAllowed(request, browserOrigins)) {
         throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
       }
-      assertSessionId(sessionId);
-      const result = await eraseSession(store.database, requireErasureApi(config), {
-        organizationId,
-        sessionId,
-        actor: auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" },
-      });
+      const api = requireErasureApi(config);
+      const target = await erasureTarget(store.database, organizationId, sessionId, url.searchParams);
+      const result = await eraseSession(
+        store.database,
+        api,
+        target,
+        auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" },
+      );
       json(response, result.status === "completed" ? 200 : 202, result, true);
       return;
     }
@@ -1518,8 +1520,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     if (sessionErasure && method === "GET") {
       const [organizationId, sessionId] = sessionErasure as [string, string];
       await organizationAccess(request, organizationId, true);
-      assertSessionId(sessionId);
-      json(response, 200, await readSessionErasure(store.database, requireErasureApi(config), { organizationId, sessionId }), true);
+      const api = requireErasureApi(config);
+      const target = await erasureTarget(store.database, organizationId, sessionId, url.searchParams);
+      json(response, 200, await readSessionErasure(store.database, api, target), true);
       return;
     }
 

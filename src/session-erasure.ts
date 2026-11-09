@@ -6,23 +6,39 @@ import type { Database } from "./database.js";
 
 type ErasureApi = NonNullable<SelfhostConfig["sessionErasureApi"]>;
 
+/** A session is only unique within its organization, workspace and source. */
+export type ErasureTarget = {
+  organizationId: string;
+  workspaceId: string;
+  source: string;
+  sessionId: string;
+};
+
 const MAX_RECEIPT_BYTES = 16_384;
-const MAX_SESSION_ID = 512;
+const MAX_IDENTITY = 512;
 const CONTROL = /[\u0000-\u001f\u007f]/;
 const code = z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/);
 const timestamp = z.iso.datetime({ offset: true });
 
-// Unknown fields are stripped and artifact values are counts, so nothing but
-// ids, categories and numbers can be relayed to the operator.
+// Unknown fields are stripped and artifact values are counts and states, so
+// nothing but ids, categories and numbers can be relayed to the operator.
 const receiptSchema = z.object({
-  orgId: z.string().min(1).max(256),
-  sessionId: z.string().min(1).max(MAX_SESSION_ID),
-  requestId: z.string().min(1).max(256),
+  orgId: z.string().min(1).max(MAX_IDENTITY),
+  sessionId: z.string().min(1).max(MAX_IDENTITY),
+  requestId: z.string().min(1).max(MAX_IDENTITY),
   status: z.enum(["in_progress", "completed", "failed"]),
   requestedAt: timestamp,
   completedAt: timestamp.nullable(),
-  artifacts: z.record(code, z.number().int().nonnegative()),
+  artifacts: z.record(code, z.object({
+    count: z.number().int().nonnegative(),
+    state: z.enum(["done", "pending", "not_applicable"]),
+  })),
   uploadsFenced: z.boolean(),
+  unreadable: z.boolean(),
+  unreadableAt: timestamp.nullable(),
+  bytesErased: z.boolean(),
+  bytesErasedAt: timestamp.nullable(),
+  legacyScope: code,
   failure: z.object({ code }).nullable(),
 });
 
@@ -49,18 +65,43 @@ export class SessionErasureError extends Error {
   }
 }
 
-/** Accepts every id the session read routes accept, so any readable session can be erased. */
-export function assertSessionId(sessionId: string): void {
-  if (!sessionId.trim() || sessionId !== sessionId.trim() || sessionId.length > MAX_SESSION_ID || CONTROL.test(sessionId)) {
+/** Same rules as the session read routes, so any readable session can be erased. */
+function validIdentity(value: string): boolean {
+  return Boolean(value.trim()) && value === value.trim() && value.length <= MAX_IDENTITY && !CONTROL.test(value);
+}
+
+/** Resolves the required `workspaceId` and `source` query parameters. */
+export async function erasureTarget(
+  database: Database,
+  organizationId: string,
+  sessionId: string,
+  query: URLSearchParams,
+): Promise<ErasureTarget> {
+  if (!validIdentity(sessionId)) {
     throw new SessionErasureError(400, "invalid_session_id", "Session id is not valid");
   }
+  const workspaceId = query.get("workspaceId") ?? "";
+  const source = query.get("source") ?? "";
+  if (!validIdentity(workspaceId) || !validIdentity(source)) {
+    throw new SessionErasureError(400, "invalid_session_target", "workspaceId and source are required");
+  }
+  const workspace = await database.query(
+    `SELECT 1 FROM selfhost_workspaces WHERE id::text = $1 AND organization_id = $2`,
+    [workspaceId, organizationId],
+  );
+  if (workspace.rows.length === 0) {
+    throw new SessionErasureError(404, "workspace_not_found", "Workspace not found");
+  }
+  return { organizationId, workspaceId, source, sessionId };
 }
 
 export function requireErasureApi(config: SelfhostConfig): ErasureApi {
-  if (!config.sessionErasureApi) {
-    throw new SessionErasureError(501, "not_implemented", "Session erasure is not configured for this installation");
-  }
+  if (!config.sessionErasureApi) throw notImplemented();
   return config.sessionErasureApi;
+}
+
+function notImplemented(): SessionErasureError {
+  return new SessionErasureError(501, "not_implemented", "Session erasure is not configured for this installation");
 }
 
 function unavailable(): SessionErasureError {
@@ -74,11 +115,11 @@ function invalid(): SessionErasureError {
 async function callPipeline(
   api: ErasureApi,
   method: "GET" | "POST",
-  organizationId: string,
-  sessionId: string,
+  target: ErasureTarget,
   body?: unknown,
 ): Promise<{ status: number; value: unknown }> {
-  const path = `/internal/v1/session-erase/organizations/${encodeURIComponent(organizationId)}/sessions/${encodeURIComponent(sessionId)}`;
+  const enc = encodeURIComponent;
+  const path = `/internal/v1/session-erase/organizations/${enc(target.organizationId)}/workspaces/${enc(target.workspaceId)}/sources/${enc(target.source)}/sessions/${enc(target.sessionId)}`;
   let response: Response;
   try {
     response = await fetch(new URL(path, api.url), {
@@ -97,7 +138,7 @@ async function callPipeline(
   }
   if (response.status >= 500) {
     await response.body?.cancel();
-    throw unavailable();
+    throw response.status === 501 ? notImplemented() : unavailable();
   }
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -123,15 +164,20 @@ async function callPipeline(
 
 /**
  * A completed receipt is only believed when it names this session, has a
- * completion time and confirms late uploads are fenced. Anything less is an
+ * completion time, confirms late uploads are fenced, the session is unreadable,
+ * its bytes are verified erased and nothing is pending. Anything less is an
  * error: the route must never report an erase that did not happen.
  */
-function parseReceipt(value: unknown, organizationId: string, sessionId: string): ErasureReceipt {
+function parseReceipt(value: unknown, target: ErasureTarget): ErasureReceipt {
   const parsed = receiptSchema.safeParse(value);
   if (!parsed.success) throw invalid();
   const receipt = parsed.data;
-  if (receipt.orgId !== organizationId || receipt.sessionId !== sessionId) throw invalid();
-  if (receipt.status === "completed" && (!receipt.completedAt || !receipt.uploadsFenced)) throw invalid();
+  if (receipt.orgId !== target.organizationId || receipt.sessionId !== target.sessionId) throw invalid();
+  if (
+    receipt.status === "completed" &&
+    (!receipt.completedAt || !receipt.uploadsFenced || !receipt.unreadable || !receipt.bytesErased ||
+      Object.values(receipt.artifacts).some((artifact) => artifact.state === "pending"))
+  ) throw invalid();
   return receipt;
 }
 
@@ -157,6 +203,10 @@ function actorFrom(kind: string, id: string | null): AuditActor {
   return { kind: "bootstrap" };
 }
 
+function auditTarget(target: ErasureTarget, requestId: string): string {
+  return `session:${target.sessionId} source=${target.source} request=${requestId}`;
+}
+
 type ErasureRow = {
   request_id: string;
   actor_kind: string;
@@ -164,41 +214,39 @@ type ErasureRow = {
   completed_at: Date | string | null;
 };
 
+const TARGET_WHERE = "organization_id = $1 AND workspace_id::text = $2 AND source = $3 AND session_id = $4";
+
 /**
  * Audits a completed erase exactly once, attributed to whoever first asked for
  * it, and returns the ledger's audit view. Safe to call on every read: the
  * `completed_at IS NULL` claim makes concurrent callers race for one insert. A
  * receipt for another request id is not this erase, so it is never audited as one.
  */
-async function withAudit(
-  database: Database,
-  organizationId: string,
-  sessionId: string,
-  receipt: ErasureReceipt,
-): Promise<ErasureResult> {
+async function withAudit(database: Database, target: ErasureTarget, receipt: ErasureReceipt): Promise<ErasureResult> {
+  const key = [target.organizationId, target.workspaceId, target.source, target.sessionId];
   const row = await database.transaction(async (tx) => {
     if (receipt.status === "completed") {
       const claimed = await tx.query<ErasureRow>(
         `UPDATE selfhost_session_erasures SET completed_at = now()
-          WHERE organization_id = $1 AND session_id = $2 AND completed_at IS NULL AND request_id::text = $3
+          WHERE ${TARGET_WHERE} AND completed_at IS NULL AND request_id::text = $5
           RETURNING request_id, actor_kind, actor_id, completed_at`,
-        [organizationId, sessionId, receipt.requestId],
+        [...key, receipt.requestId],
       );
       const first = claimed.rows[0];
       if (first) {
         await recordAudit(tx, {
-          organizationId,
+          organizationId: target.organizationId,
+          workspaceId: target.workspaceId,
           actor: actorFrom(first.actor_kind, first.actor_id),
           action: "session.hard_deleted",
-          target: `session:${sessionId} request=${first.request_id}`,
+          target: auditTarget(target, first.request_id),
         });
         return first;
       }
     }
     const existing = await tx.query<ErasureRow>(
-      `SELECT request_id, actor_kind, actor_id, completed_at
-         FROM selfhost_session_erasures WHERE organization_id = $1 AND session_id = $2`,
-      [organizationId, sessionId],
+      `SELECT request_id, actor_kind, actor_id, completed_at FROM selfhost_session_erasures WHERE ${TARGET_WHERE}`,
+      key,
     );
     return existing.rows[0] ?? null;
   });
@@ -213,46 +261,45 @@ async function withAudit(
 export async function eraseSession(
   database: Database,
   api: ErasureApi,
-  input: { organizationId: string; sessionId: string; actor: AuditActor },
+  target: ErasureTarget,
+  actor: AuditActor,
 ): Promise<ErasureResult> {
-  const { organizationId, sessionId, actor } = input;
+  const key = [target.organizationId, target.workspaceId, target.source, target.sessionId];
   const actorId = actor.kind === "user" ? actor.userId : actor.kind === "service" ? actor.subject : null;
   const requestId = await database.transaction(async (tx) => {
     await tx.query(
-      `INSERT INTO selfhost_session_erasures (organization_id, session_id, request_id, actor_kind, actor_id)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (organization_id, session_id) DO NOTHING`,
-      [organizationId, sessionId, randomUUID(), actor.kind, actorId],
+      `INSERT INTO selfhost_session_erasures
+         (organization_id, workspace_id, source, session_id, request_id, actor_kind, actor_id)
+       VALUES ($1, $2::uuid, $3, $4, $5, $6, $7)
+       ON CONFLICT (organization_id, workspace_id, source, session_id) DO NOTHING`,
+      [...key, randomUUID(), actor.kind, actorId],
     );
     const row = await tx.query<{ request_id: string }>(
-      `SELECT request_id FROM selfhost_session_erasures WHERE organization_id = $1 AND session_id = $2`,
-      [organizationId, sessionId],
+      `SELECT request_id FROM selfhost_session_erasures WHERE ${TARGET_WHERE}`,
+      key,
     );
     const id = row.rows[0]!.request_id;
     await recordAudit(tx, {
-      organizationId,
+      organizationId: target.organizationId,
+      workspaceId: target.workspaceId,
       actor,
       action: "session.hard_delete.requested",
-      target: `session:${sessionId} request=${id}`,
+      target: auditTarget(target, id),
     });
     return id;
   });
 
-  const { status, value } = await callPipeline(api, "POST", organizationId, sessionId, {
+  const { status, value } = await callPipeline(api, "POST", target, {
     requestId,
     actor: { kind: actor.kind, id: actorId },
   });
   if (status === 404 && upstreamError(value) === "session_not_found") {
     // Nothing was erased, so nothing may be left looking like an erase.
-    await database.query(
-      `DELETE FROM selfhost_session_erasures
-        WHERE organization_id = $1 AND session_id = $2 AND completed_at IS NULL`,
-      [organizationId, sessionId],
-    );
+    await database.query(`DELETE FROM selfhost_session_erasures WHERE ${TARGET_WHERE} AND completed_at IS NULL`, key);
     throw new SessionErasureError(404, "session_not_found", "Session not found");
   }
   if (status !== 200 && status !== 202) throw invalid();
-  const result = await withAudit(database, organizationId, sessionId, parseReceipt(value, organizationId, sessionId));
+  const result = await withAudit(database, target, parseReceipt(value, target));
   if (result.status === "failed") {
     throw new SessionErasureError(502, "session_erasure_failed", "The session could not be fully erased; retry the request", result);
   }
@@ -263,13 +310,12 @@ export async function eraseSession(
 export async function readSessionErasure(
   database: Database,
   api: ErasureApi,
-  input: { organizationId: string; sessionId: string },
+  target: ErasureTarget,
 ): Promise<ErasureResult> {
-  const { organizationId, sessionId } = input;
-  const { status, value } = await callPipeline(api, "GET", organizationId, sessionId);
+  const { status, value } = await callPipeline(api, "GET", target);
   if (status === 404 && upstreamError(value) === "erasure_not_found") {
     throw new SessionErasureError(404, "erasure_not_found", "No erasure exists for this session");
   }
   if (status !== 200) throw invalid();
-  return withAudit(database, organizationId, sessionId, parseReceipt(value, organizationId, sessionId));
+  return withAudit(database, target, parseReceipt(value, target));
 }
