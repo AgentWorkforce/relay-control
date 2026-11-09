@@ -4,8 +4,9 @@
 // observed through a recording fsImpl.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import * as nodeFs from "node:fs/promises";
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import test from "node:test";
 import { SEGMENT_NAME, type CollectorFs } from "../src/analytics-collector/index.js";
@@ -89,6 +90,11 @@ const COMMIT_OPS = [
   "close segments",
 ];
 
+const RECOVER_SEGMENT_OPS = [
+  `open segments/<segment> ${constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK}`,
+  "close segments/<segment>",
+];
+
 function segmentName(epochMs: number, seq: number): string {
   return `${String(epochMs).padStart(13, "0")}-${String(seq).padStart(10, "0")}-${randomUUID()}.ndjson`;
 }
@@ -140,6 +146,94 @@ test("restart: committed segments survive and are re-indexed with the same accou
   assert.deepEqual((await readSegments(dataDir))[0]!.events, events);
 });
 
+test("restart: remount-broadened segment modes become 0600 before listening, without changing bytes", async (t) => {
+  const dataDir = await tempDir(t);
+  const first = await setup(t, { dataDir });
+  for (let i = 0; i < 3; i += 1) {
+    assert.equal((await post(first.origin, batch([installEvent()]), { token: TOKEN_A })).status, 204);
+  }
+  await first.collector.shutdown(1000);
+  const names = (await dirState(dataDir)).segments;
+  const bytes = await Promise.all(names.map((name) => readFile(join(dataDir, "segments", name))));
+  for (const [i, mode] of [0o660, 0o644, 0o600].entries()) await chmod(join(dataDir, "segments", names[i]!), mode);
+  const stray = join(dataDir, "segments", "operator-note");
+  await writeFile(stray, "leave this alone", { mode: 0o640 });
+
+  const second = await setup(t, { dataDir });
+  assert.equal(second.collector.health().segments, 3);
+  for (const [i, name] of names.entries()) {
+    const path = join(dataDir, "segments", name);
+    assert.equal((await stat(path)).mode & 0o7777, 0o600);
+    assert.deepEqual(await readFile(path), bytes[i]);
+  }
+  assert.equal((await stat(stray)).mode & 0o7777, 0o640);
+  await second.collector.shutdown(1000);
+  const third = await setup(t, { dataDir });
+  assert.equal(third.collector.health().segments, 3);
+});
+
+for (const fault of ["chmod", "sync", "unchanged-mode", "foreign-owner"] as const) {
+  test(`restart: ${fault} during private segment recovery refuses to start and preserves bytes`, async (t) => {
+    const dataDir = await tempDir(t);
+    await mkdir(join(dataDir, "segments"));
+    const path = join(dataDir, "segments", segmentName(Date.now(), 1));
+    const bytes = "synthetic retained event\n";
+    await writeFile(path, bytes, { mode: 0o660 });
+    let closed = false;
+    const fsImpl: CollectorFs = {
+      ...nodeFs,
+      open: (async (...args: Parameters<typeof nodeFs.open>) => {
+        const handle = await nodeFs.open(...args);
+        if (String(args[0]) !== path) return handle;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === "chmod" && fault === "chmod") return async () => { throw fsError("EPERM"); };
+            if (property === "sync" && fault === "sync") return async () => { throw fsError("EIO"); };
+            if (property === "chmod" && fault === "unchanged-mode") return async () => {};
+            if (property === "stat" && fault === "foreign-owner") return async () => {
+              const info = await target.stat();
+              info.uid = (process.getuid?.() ?? 0) + 1;
+              return info;
+            };
+            if (property === "close") return async () => { closed = true; await target.close(); };
+            const value = Reflect.get(target, property);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      }) as CollectorFs["open"],
+    };
+    await assert.rejects(setup(t, { dataDir, fsImpl }), /^Error: ANALYTICS_COLLECTOR_DATA_DIR recovery failed(?: \(E(?:PERM|IO)\))?$/);
+    assert.equal(closed, true);
+    assert.equal(await readFile(path, "utf8"), bytes);
+  });
+}
+
+test("recovery ignores existing symlinks and refuses a segment replaced with a symlink before open", async (t) => {
+  const dataDir = await tempDir(t);
+  await mkdir(join(dataDir, "segments"));
+  const outside = join(dataDir, "outside");
+  await writeFile(outside, "not a segment", { mode: 0o644 });
+  await symlink(outside, join(dataDir, "segments", segmentName(Date.now(), 1)));
+  const first = await setup(t, { dataDir });
+  assert.equal(first.collector.health().segments, 0);
+  await first.collector.shutdown(1000);
+  const replaced = join(dataDir, "segments", segmentName(Date.now(), 2));
+  await writeFile(replaced, "original", { mode: 0o600 });
+  const fsImpl: CollectorFs = {
+    ...nodeFs,
+    open: (async (...args: Parameters<typeof nodeFs.open>) => {
+      if (String(args[0]) === replaced) {
+        await nodeFs.unlink(replaced);
+        await symlink(outside, replaced);
+      }
+      return nodeFs.open(...args);
+    }) as CollectorFs["open"],
+  };
+  await assert.rejects(setup(t, { dataDir, fsImpl }), /ANALYTICS_COLLECTOR_DATA_DIR recovery failed \(ELOOP\)/);
+  assert.equal((await stat(outside)).mode & 0o7777, 0o644);
+  assert.equal(await readFile(outside, "utf8"), "not a segment");
+});
+
 test("an unusable data directory is a startup error naming the variable only", async (t) => {
   const dir = await tempDir(t);
   await assert.rejects(
@@ -165,10 +259,10 @@ test("durability on an existing layout: DATA_DIR is still fsynced exactly once a
   const dataDir = await tempDir(t);
   await mkdir(join(dataDir, "segments"));
   await mkdir(join(dataDir, "tmp"));
-  await writeFile(join(dataDir, "segments", segmentName(Date.now() - 1000, 3)), `${JSON.stringify(installEvent())}\n`);
+  await writeFile(join(dataDir, "segments", segmentName(Date.now() - 1000, 3)), `${JSON.stringify(installEvent())}\n`, { mode: 0o600 });
   const { ops, fsImpl } = recordingFs(dataDir);
   const ctx = await setup(t, { dataDir, fsImpl });
-  assert.deepEqual(ops, STARTUP_OPS);
+  assert.deepEqual(ops, [...STARTUP_OPS, ...RECOVER_SEGMENT_OPS]);
   const startup = ops.length;
   for (let i = 0; i < 2; i += 1) {
     assert.equal((await post(ctx.origin, batch([installEvent()]), { token: TOKEN_A })).status, 204);
