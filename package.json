@@ -16,8 +16,7 @@
     "openapi.yaml",
     "README.md",
     "LICENSE",
-    "NOTICE",
-    "npm-shrinkwrap.json"
+    "NOTICE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
