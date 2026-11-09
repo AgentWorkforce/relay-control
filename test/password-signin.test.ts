@@ -659,3 +659,14 @@ test("admin emails: the first to verify becomes owner, the rest admin", async (t
   assert.equal((await login(ctx, "first@partner.test", PASSWORD)).status, 200);
   assert.equal(await role("first@partner.test"), "member");
 });
+
+test("openapi.yaml documents login-config and every password route", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const spec = await readFile(new URL("../openapi.yaml", import.meta.url), "utf8");
+  for (const path of ["login-config", "password/register", "password/verify", "password/login", "password/reset", "password/reset/complete"]) {
+    assert.ok(spec.includes(`\n  /api/v1/auth/${path}:\n`), path);
+  }
+  for (const code of ["invalid_credentials", "signin_method_disabled", "password_common", "token_invalid", "password_already_set"]) {
+    assert.ok(spec.includes(code), code);
+  }
+});

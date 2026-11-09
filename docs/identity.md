@@ -10,8 +10,9 @@ teammates.
 
 | Variable | Meaning |
 |---|---|
-| `SELFHOST_BOOTSTRAP_ORG_NAME` | Organization name (set together with the admin email) |
+| `SELFHOST_BOOTSTRAP_ORG_NAME` | Organization name (set together with `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` or `SELFHOST_ADMIN_EMAILS`) |
 | `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` | The first owner |
+| `SELFHOST_ADMIN_EMAILS` | Optional comma list of admin addresses. The first listed address to sign in with a verified email becomes owner if the organization has none; the others become admins. Each grant is applied once, so a later demotion sticks. `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` is an alias for a listed address that is made owner at first boot |
 | `SELFHOST_BOOTSTRAP_ADMIN_NAME` | Optional display name until their first sign-in (default: the email's local part) |
 | `SELFHOST_BOOTSTRAP_WORKSPACE_NAME` | Optional, default `Default` |
 | `RELAYCAST_INTERNAL_SECRET[_FILE]` | Relaycast's internal admin secret (same value as Relaycast's `RELAYCAST_INTERNAL_SECRET`) |
@@ -123,6 +124,180 @@ their email address and receives a single-use link that expires after
 | `SELFHOST_EMAIL_FROM` | For example `Agent Relay <relay@example.com>` |
 
 SMTP alone, without `SELFHOST_EMAIL_LOGIN`, is used to email invites.
+
+### Email and password (optional)
+
+Turn it on with `SELFHOST_SIGNIN_METHODS`, a comma list of `email_link` and
+`password`. When the variable is unset the old behaviour holds:
+`SELFHOST_EMAIL_LOGIN=true` means `email_link` alone. Password sign-in needs
+SMTP, because every password starts from a verified email address. A method
+that is not listed answers `404 {"error":"signin_method_disabled"}` on all of
+its routes. That covers `/api/v1/auth/password/*` for `password`, and
+`/login/email` and `/login/email/verify` for `email_link`.
+
+| Variable | Meaning |
+|---|---|
+| `SELFHOST_SIGNIN_METHODS` | `email_link`, `password`, or both. The default is `email_link` when `SELFHOST_EMAIL_LOGIN=true`, otherwise none |
+| `SELFHOST_LOGIN_LOGO_URL` | Optional logo for the sign-in page. Must be an absolute `https` URL without credentials |
+| `SELFHOST_PASSWORD_PEPPER_FILE` | Optional file of versioned peppers, one `<version>:<secret>` per line (a single bare line is version 1). Each secret is at least 32 bytes. The highest version hashes new passwords |
+| `SELFHOST_PASSWORD_ARGON2_MEMORY_KIB` / `_TIME_COST` / `_PARALLELISM` | Optional. These can only raise argon2id above the baseline of 19456 KiB, 2 passes and 1 lane. A lower value refuses to start |
+| `SELFHOST_PASSWORD_HIBP` | `off` (the default) or `on`: also refuse passwords found in Have I Been Pwned |
+
+#### Login config
+
+`GET /api/v1/auth/login-config` is public and returns only what a sign-in page
+needs:
+
+```json
+{
+  "methods": ["email_link", "password"],
+  "oidc": { "displayName": "Okta" },
+  "logo_url": "https://cdn.example.com/logo.svg",
+  "allowed_domain_hint": true,
+  "password_policy": { "min_length": 12, "max_length": 128 }
+}
+```
+
+`allowed_domain_hint` is a boolean that says whether auto-join or OIDC
+domains are configured. The domains themselves are never returned. Neither are
+secrets, peppers or SMTP settings.
+
+#### Flows
+
+Every route is `POST` with a JSON body. Browsers must send a JSON content type
+and an `Origin` that matches `SELFHOST_PUBLIC_URL` or the dashboard origin.
+Anything else answers `403 csrf_rejected`. Unknown body fields are refused.
+
+1. **Register.** `POST /api/v1/auth/password/register {email, password}`
+   - The password policy (below) is checked first and reported as a `400`.
+   - Otherwise the answer is always `202 {"status":"verification_sent"}`.
+   - Mail goes only to an address that may join: a configured admin email, an
+     existing member, an open invite, or an auto-join domain. That address
+     receives a single-use link to `<dashboard>/password/verify?token=...`,
+     valid for 1 hour.
+   - The password is hashed at once and held with the pending registration.
+     It does nothing until the link is used.
+   - A newer registration cancels older pending ones.
+   - An address that already has a password receives a pointer to the reset
+     page instead.
+2. **Verify.** `POST /api/v1/auth/password/verify {token}`
+   - Creates the password and signs the person in: `200` with the session
+     cookie and `{userId, email, organizationId, workspaceId}`.
+   - Membership follows the usual sign-in rules for a verified address
+     (invites, auto-join, admin emails).
+   - A used, expired or unknown token answers `410 token_invalid`.
+   - If a password was set meanwhile, the answer is `409 password_already_set`.
+     Changing a password always goes through reset.
+3. **Sign in.** `POST /api/v1/auth/password/login {email, password}`
+   - `200` with the session cookie and the same body as verify.
+   - Every failure is `401 {"error":"invalid_credentials","message":"Incorrect email or password."}`:
+     an unknown address, a wrong password, a locked account or IP, and a
+     malformed address all look the same.
+4. **Request a reset.** `POST /api/v1/auth/password/reset {email}`
+   - Always `202 {"status":"reset_requested"}`, for every address.
+   - An address with a password receives a link to
+     `<dashboard>/password/reset?token=...`. The link is single-use and valid
+     for 30 minutes.
+   - The token is stored only as a SHA-256 hash, and a newer request cancels
+     older tokens.
+5. **Complete a reset.** `POST /api/v1/auth/password/reset/complete {token, password}`
+   - Checks the policy against the account's email, then sets the new password.
+   - In the same transaction it revokes every browser, CLI and Desktop session
+     of that person (`revoked_reason = password_reset`) and every MCP OAuth
+     grant. It also cancels outstanding reset, registration and email sign-in
+     tokens, and clears the account's lockout.
+   - Answers `200 {"status":"password_reset","sessionsRevoked":n}` and clears
+     the session cookie. The person then signs in again.
+   - Workspace API keys belong to the workspace rather than to the person, so
+     a reset does not revoke them. Rotate them separately if needed.
+
+Registration and reset mail are limited to 3 messages per address and
+10 per IP every 10 minutes. Above the limit the answer stays the same `202`
+and no mail is sent. Verify and reset-complete accept 30 attempts per IP every
+5 minutes (`429 rate_limited`).
+
+#### Error codes
+
+| Status | `error` | When |
+|---|---|---|
+| 400 | `invalid_request` | The body is not the expected JSON object |
+| 400 | `email_invalid` | Register with an address that is not an email |
+| 400 | `password_too_short` / `password_too_long` | Fewer than 12 or more than 128 characters |
+| 400 | `password_common` | On the bundled common-password list |
+| 400 | `password_contains_email` | Contains the address's local part |
+| 400 | `password_breached` | Found by the HIBP check (only when `SELFHOST_PASSWORD_HIBP=on`) |
+| 401 | `invalid_credentials` | Any failed sign-in |
+| 403 | `csrf_rejected` | Wrong content type or a foreign `Origin` |
+| 404 | `signin_method_disabled` | The method is not in `SELFHOST_SIGNIN_METHODS` |
+| 405 | `method_not_allowed` | Not `POST` |
+| 409 | `password_already_set` | Verify for an address that already has a password |
+| 410 | `token_invalid` | A used, expired or unknown verify or reset token |
+| 429 | `rate_limited` | Too many verify or reset-complete attempts from one IP |
+
+#### Password policy
+
+- Between 12 and 128 characters, counted as Unicode code points after NFC
+  normalisation. There are no composition rules.
+- Not on the bundled list of the 10,000 most common passwords (SecLists, MIT,
+  see `NOTICE`). The check ignores case and a short trailing run of digits or
+  symbols, so `Sunshine2024!` counts as common.
+- Does not contain the email's local part, when that is 3 characters or more.
+- With `SELFHOST_PASSWORD_HIBP=on`, it is also not in Have I Been Pwned. Only
+  the first 5 hex characters of the SHA-1 leave the server (k-anonymity range
+  API, with padding). If HIBP cannot be reached within 3 seconds the check
+  fails open: the password is accepted and a `password.hibp.unavailable`
+  audit event is recorded.
+
+#### Hashing
+
+- Passwords are hashed with argon2id, at least m=19456 KiB, t=2, p=1 (the
+  OWASP baseline), with a 16-byte random salt.
+- The hash is stored as a PHC string together with its parameters and pepper
+  version. The pepper itself is never stored.
+- With a pepper file, the password is first HMAC-SHA256'd with the current
+  pepper.
+- On a successful sign-in the password is re-hashed if the parameters were
+  raised or the pepper version changed. Keep an old version in the file until
+  its hashes have been re-hashed, because a removed version can no longer
+  verify.
+- The library is `@node-rs/argon2`. It ships prebuilt native binaries for
+  every platform we build on, so the image's `npm ci --ignore-scripts` needs no
+  compiler or install script. It wraps the reference RustCrypto argon2
+  implementation, and its verify compares in constant time.
+- An unknown or locked account still spends one argon2id verify against a
+  dummy hash, so its response time matches a wrong password.
+
+#### Lockout
+
+Failed sign-ins are counted in Postgres (`selfhost_login_attempts`), per
+account and per client IP. The client IP is the first `X-Forwarded-For` hop.
+
+| Subject | Free failures | Then |
+|---|---|---|
+| Account (normalized email, also for addresses with no account) | 5 | Locked for 30 s, doubling with each further failure, capped at 15 minutes |
+| IP | 30 | Same backoff |
+
+- A counter starts over after 1 hour without failures.
+- While a lock lasts, even the right password gets the same `401`. Attempts
+  made during a lock do not extend it.
+- The first successful sign-in after the lock clears the account counter. A
+  successful reset clears it too.
+
+#### Audit events
+
+All of these are recorded in `selfhost_admin_audit_events`. Targets carry the
+address and a reason, never a password, hash or token.
+- `login.password.success`, with `rehashed=true` when the hash was upgraded
+- `login.password.failure`, with reason `wrong_password`, `unknown_account`,
+  `invalid_email` or `locked`
+- `login.lockout`, with scope `account` or `ip`
+- `password.registration.completed`
+- `password.reset.requested`
+- `password.reset.completed`, with revocation counts
+- `password.hibp.unavailable`
+
+Migration `0029_password_signin.sql` adds the credential, pending
+registration, reset token, login attempt and admin email grant tables.
 
 ### Break-glass: the bootstrap bearer
 
