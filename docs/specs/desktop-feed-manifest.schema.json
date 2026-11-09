@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:agent-relay:desktop-feed:manifest:1",
   "title": "Desktop feed signed manifest, schema 1",
-  "$comment": "Status: proposed draft contract (relaycontrol docs/desktop-feed.md). Cloud team decides; not yet confirmed. Source: relay-desktop docs/enterprise-distribution.md at 21e61026, section Signed manifest. Self-contained: no external references. Cross-field rules a schema cannot state (unique asset ids and names, key_id naming the same profile, version newer than installed) are listed in docs/desktop-feed.md.",
+  "$comment": "Status: implemented (relaycontrol docs/desktop-feed.md; src/desktop-feed/schemas.ts embeds this file). Source: relay-desktop docs/enterprise-distribution.md at 21e61026, section Signed manifest. Self-contained: no external references. Cross-field rules a schema cannot state (unique asset ids and names, key_id naming the same profile, version newer than installed) are listed in docs/desktop-feed.md.",
   "type": "object",
   "additionalProperties": false,
   "required": [
