@@ -172,8 +172,10 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
   const hostOf = (site: string) => new URL(site).host;
   const limiter = new RateLimiter(() => input.now?.() ?? Date.now());
   const background = new Set<Promise<void>>();
-  // Compute the dummy hash now so the first unknown-account login is not slower.
-  void hasher.dummyVerify("warm-up").catch(() => undefined);
+  // Compute the dummy hash now so the first unknown-account login is not
+  // slower. Only the hash: a warm-up verify would take an argon2id slot at
+  // an unpredictable moment after start-up and refuse a real request (429).
+  void hasher.warmUp().catch(() => undefined);
 
   function limited(key: string, rule: { limit: number; windowMs: number }): boolean {
     return !limiter.consume(key, rule.limit, rule.windowMs).allowed;

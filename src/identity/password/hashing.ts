@@ -167,14 +167,27 @@ export class PasswordHasher {
   }
 
   /**
+   * Makes the dummy hash ahead of the first unknown-account sign-in. Takes
+   * no slot and verifies nothing, so background start-up work never holds
+   * request capacity.
+   */
+  async warmUp(): Promise<void> {
+    await this.dummyHash();
+  }
+
+  /** The one-off dummy hash, made outside the slots (once per hasher). */
+  private dummyHash(): Promise<string> {
+    this.dummy ??= argon2Hash(randomBytes(32), { ...this.options, salt: randomBytes(16) });
+    return this.dummy;
+  }
+
+  /**
    * Spends one verify at the current parameters, for accounts without a
    * password. Takes a slot like a real verify (HasherBusy when none is free),
    * so an unknown address is refused under load exactly like a known one.
    */
   async dummyVerify(password: string): Promise<void> {
-    // The one-off dummy hash is made outside the slots (once per process).
-    this.dummy ??= argon2Hash(randomBytes(32), { ...this.options, salt: randomBytes(16) });
-    const dummy = await this.dummy;
+    const dummy = await this.dummyHash();
     const input = this.input(password, this.config.currentPepperVersion) ?? Buffer.from(password, "utf8");
     await this.slot(async () => {
       try {
