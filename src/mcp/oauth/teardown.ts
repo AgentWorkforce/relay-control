@@ -13,10 +13,10 @@ type Participant = {
   session_hash:string|null; token_ciphertext:string;
 };
 type Workspace = {relaycast_workspace_id:string;relaycast_api_key_ciphertext:string};
-type Grant = {id:string;agent_remote_id:string|null;agent_name:string};
+type Grant = {id:string;agent_remote_id:string|null;agent_name:string;created_at:Date|string};
 /** Local state a remote decision is made against. Ciphertexts only; never logged. */
 type Snapshot = {workspace:Workspace|null;row:Participant|null;grants:Grant[]};
-type Claim = {intent:Intent&{agent_remote_id:string};snapshot:Snapshot};
+type Claim = {intent:Intent&{agent_remote_id:string;created_at:Date|string};snapshot:Snapshot};
 /** Why a revocation row completed (stored in `outcome`). */
 export type McpOAuthTeardownOutcome = "released"|"no_remote"|"kept"|"workspace_mismatch"|"decrypt_failed"
   |"metadata_mismatch"|"operator_abandoned";
@@ -147,7 +147,7 @@ export class McpOAuthTeardown {
   private claim(candidate:Intent):Promise<Claim|"completed"|"skipped"> {
     return this.locked(candidate,async tx=>{
       const now=this.clock();
-      const intent=(await tx.query<Intent&{attempts:number}>(`SELECT id,grant_id,organization_id,workspace_id,user_id,agent_name,agent_remote_id,attempts
+      const intent=(await tx.query<Intent&{attempts:number;created_at:Date|string}>(`SELECT id,grant_id,organization_id,workspace_id,user_id,agent_name,agent_remote_id,attempts,created_at
         FROM selfhost_mcp_oauth_revocations WHERE id=$1 AND user_id=$2 AND organization_id=$3
           AND completed_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at<=$4) FOR UPDATE SKIP LOCKED`,
       [candidate.id,candidate.user_id,candidate.organization_id,now])).rows[0];
@@ -174,7 +174,7 @@ export class McpOAuthTeardown {
       FROM selfhost_hosted_relay_participants p
       WHERE p.workspace_id=$1 AND p.user_id=$2 AND p.agent_remote_id=$3`,
     [intent.workspace_id,intent.user_id,intent.agent_remote_id])).rows[0]??null;
-    const grants=(await tx.query<Grant>(`SELECT id,agent_remote_id,agent_name FROM selfhost_mcp_oauth_grants
+    const grants=(await tx.query<Grant>(`SELECT id,agent_remote_id,agent_name,created_at FROM selfhost_mcp_oauth_grants
       WHERE organization_id=$1 AND workspace_id=$2 AND user_id=$3 AND revoked_at IS NULL ORDER BY id`,
     [intent.organization_id,intent.workspace_id,intent.user_id])).rows;
     return {workspace,row,grants};
@@ -232,15 +232,20 @@ export class McpOAuthTeardown {
     // Consent may have selected an existing identity, or a native session
     // may have reused it. Disconnecting the connector must keep it running.
     if(remote.metadata.created_by!=="mcp-oauth" || row?.session_hash) return {outcome:"kept"};
-    // A connection approved after the first pin may still be unused. The
-    // commit persists this verified immutable id on it before handing over
-    // cleanup responsibility, so its eventual revocation releases the same agent.
-    if(grants.some(grant=>grant.agent_remote_id===remote.id || (grant.agent_remote_id===null && grant.agent_name===remote.name))) {
+    // A connection approved after the first pin but before this retirement
+    // began may still be unused. The commit persists this verified immutable
+    // id on it before handing over cleanup responsibility, so its eventual
+    // revocation releases the same agent. A grant issued after retirement
+    // began never inherits an agent whose release may already be in flight.
+    if(grants.some(grant=>grant.agent_remote_id===remote.id ||
+        (grant.agent_remote_id===null && grant.agent_name===remote.name && issuedBefore(grant,intent)))) {
       return {outcome:"kept",transfer:remote};
     }
-    // Narrow the irreversible release to state rechecked just before it. A
-    // join committed between this recheck and the release is caught by the
-    // commit re-read; the row then retries and finds the agent released.
+    // The join paths refuse to bind a retiring identity (retiringIdentity):
+    // while this row is pending, no grant pins this agent and no native
+    // session binds its participant row. This recheck narrows the window for
+    // a binding committed before the revocation row existed; the commit
+    // re-read below is the last belt, and keeps the row pending if one appears.
     if(!await this.unchanged(claim)) return "pending";
     try {
       await this.deps.client.releaseHosted(key,remote.name,remote.id);
@@ -264,8 +269,8 @@ export class McpOAuthTeardown {
       const remote=decision.transfer;
       if(remote) await tx.query(`UPDATE selfhost_mcp_oauth_grants SET agent_remote_id=$4
         WHERE organization_id=$1 AND workspace_id=$2 AND user_id=$3 AND revoked_at IS NULL
-          AND agent_remote_id IS NULL AND agent_name=$5`,
-      [intent.organization_id,intent.workspace_id,intent.user_id,remote.id,remote.name]);
+          AND agent_remote_id IS NULL AND agent_name=$5 AND date_trunc('milliseconds',created_at)<=$6`,
+      [intent.organization_id,intent.workspace_id,intent.user_id,remote.id,remote.name,intent.created_at]);
       if(decision.deleteRow && snapshot.row) await tx.query(`DELETE FROM selfhost_hosted_relay_participants
         WHERE id=$1 AND workspace_id=$2 AND user_id=$3 AND agent_remote_id=$4`,
       [snapshot.row.id,intent.workspace_id,intent.user_id,intent.agent_remote_id]);
@@ -273,6 +278,15 @@ export class McpOAuthTeardown {
       return decision.outcome==="kept"?"kept":"completed";
     });
   }
+}
+
+/**
+ * Issued no later than the revocation row that began this retirement, at the
+ * millisecond precision both timestamps share once read; matches the commit's
+ * transfer predicate.
+ */
+function issuedBefore(grant:Grant,intent:Claim["intent"]):boolean {
+  return new Date(grant.created_at).getTime()<=new Date(intent.created_at).getTime();
 }
 
 function same(left:Snapshot,right:Snapshot):boolean {

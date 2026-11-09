@@ -3,6 +3,8 @@ import type { SqlExecutor } from "../../database.js";
 import { lockOrganization, lockUser, type TenancyMode } from "../../tenancy.js";
 import { MCP_EVENTS_SCOPE, MCP_RELAY_SCOPE, type McpOAuthResourcePath } from "./protocol.js";
 import type { McpOAuthAccess, McpOAuthSessions } from "./sessions.js";
+import { McpOAuthAgentRetiring, retiringIdentity } from "./retirement.js";
+export { McpOAuthAgentRetiring } from "./retirement.js";
 
 export class McpOAuthAccessRefused extends Error {
   constructor() { super("This connection no longer has access to this workspace. Reconnect the app."); }
@@ -78,6 +80,12 @@ export class McpOAuthConnection {
     if (!this.locked.has(tx) || participant.workspaceId !== principal.workspaceId ||
         participant.userId !== principal.userId || (agentRemoteId && agentRemoteId !== participant.agentRemoteId)) {
       throw new McpOAuthAccessRefused();
+    }
+    // The retirement fence: never pin, or let the same-name branch below
+    // adopt, an identity whose remote release may be in flight.
+    if (await retiringIdentity(tx, { organizationId: principal.organizationId, workspaceId: principal.workspaceId,
+      userId: principal.userId, agentRemoteId: participant.agentRemoteId, agentName: participant.agentName })) {
+      throw new McpOAuthAgentRetiring();
     }
     // Grants that approved this name before first use share its established
     // immutable identity. Already-pinned grants may learn only their own rename.

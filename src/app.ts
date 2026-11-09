@@ -5,6 +5,7 @@ import { connectorKind } from "./mcp/oauth/connector-kind.js";
 import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
+import { retiringIdentity } from "./mcp/oauth/retirement.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -466,8 +467,11 @@ export function createApp(input: {
       if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
       const remote=await oauthRelay.getAgent(workspace.relaycastApiKey,name);
       if(!remote) return "available";
-      return remote.metadata.source===HOSTED_SOURCE && remote.metadata.cloud_workspace_id===principal.workspaceId &&
-        remote.metadata.owner_hash===ownerHash(principal.userId)?"yours":"taken";
+      if(remote.metadata.source!==HOSTED_SOURCE || remote.metadata.cloud_workspace_id!==principal.workspaceId ||
+        remote.metadata.owner_hash!==ownerHash(principal.userId)) return "taken";
+      // An agent whose release may be in flight cannot be attached to.
+      return await retiringIdentity(store.database,{organizationId:principal.organizationId,workspaceId:principal.workspaceId,
+        userId:principal.userId,agentRemoteId:remote.id,agentName:remote.name})?"taken":"yours";
     },
     now:input.now,afterMutation:()=>oauthTeardown?.kick(),
   });
