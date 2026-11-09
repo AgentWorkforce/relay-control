@@ -95,14 +95,16 @@ export type SignInResult = {
   email: string;
   organizationId: string;
   workspaceId: string;
-  joined: { role: Role; via: "invite" | "auto_join" | "personal" } | null;
+  joined: { role: Role; via: "invite" | "auto_join" | "personal" | "admin_email" } | null;
   tokens: IssuedTokens;
 };
+
+export type SignInMethod = "oidc" | "email" | "password";
 
 type SignInInput = {
   name: string | null;
   inviteTokenHash: string | null;
-  method: "oidc" | "email";
+  method: SignInMethod;
   /**
    * Whether the identity provider asserted the address verified. Email links
    * are verified by construction; OIDC is verified only when the id_token
@@ -119,9 +121,11 @@ type SignInContext = {
   email: string;
   name: string | null;
   inviteTokenHash: string | null;
-  method: "oidc" | "email";
+  method: SignInMethod;
   /** The address is verified for domain auto-join (see signIn). */
   emailVerified: boolean;
+  /** The address was positively verified (email link, password, OIDC email_verified: true). */
+  addressVerified: boolean;
   userId: string | null;
   /** The person's memberships, updated as the sign-in joins organizations. */
   roles: Map<string, Role>;
@@ -144,8 +148,18 @@ export class IdentityStore {
       tenancy?: TenancyConfig;
       /** Creates the Relaycast workspace of a personal or self-serve organization (multi mode). */
       provisioner?: RelaycastProvisioner | null;
+      /**
+       * SELFHOST_ADMIN_EMAILS (without the boot-time SELFHOST_BOOTSTRAP_ADMIN_EMAIL
+       * owner): on a verified sign-in the first becomes owner of the bootstrap
+       * organization when it has none, the rest admin, once each.
+       */
+      adminEmails?: string[];
     },
   ) {}
+
+  get adminEmails(): readonly string[] {
+    return this.options.adminEmails ?? [];
+  }
 
   get tenancy(): TenancyConfig {
     return this.options.tenancy ?? SINGLE_TENANCY;
@@ -418,7 +432,7 @@ export class IdentityStore {
     adminGranted: boolean;
   } | { organizationId: null; skipped: "tenancy_mismatch"; organizations: number }> {
     return this.database.transaction(async (tx) => {
-      await lockIdentity(tx, bootstrap.adminEmail);
+      if (bootstrap.adminEmail) await lockIdentity(tx, bootstrap.adminEmail);
       const findOrganization = async (): Promise<string | undefined | "mismatch"> => {
         if (this.tenancy.mode === "single") {
           const orgs = await tx.query<{ id: string }>("SELECT id FROM selfhost_organizations ORDER BY created_at LIMIT 2");
@@ -466,7 +480,7 @@ export class IdentityStore {
         await recordAudit(tx, { organizationId, actor: BOOTSTRAP_ACTOR, action: "organization.bootstrap", target: bootstrap.organizationName });
       }
       let adminGranted = false;
-      if (created || state.rows[0]?.admin_email !== bootstrap.adminEmail) {
+      if (bootstrap.adminEmail && (created || state.rows[0]?.admin_email !== bootstrap.adminEmail)) {
         const user = await this.upsertUser(tx, bootstrap.adminEmail, bootstrap.adminName, false);
         const existing = await tx.query<{ role: Role }>(
           "SELECT role FROM selfhost_organization_memberships WHERE organization_id = $1 AND user_id = $2",
@@ -488,7 +502,7 @@ export class IdentityStore {
          VALUES (1, $1, $2, CASE WHEN $3::boolean THEN now() ELSE NULL END)
          ON CONFLICT (installation_slot) DO UPDATE
            SET organization_id = EXCLUDED.organization_id,
-               admin_email = EXCLUDED.admin_email,
+               admin_email = COALESCE(EXCLUDED.admin_email, selfhost_installation_bootstrap.admin_email),
                admin_granted_at = COALESCE(EXCLUDED.admin_granted_at, selfhost_installation_bootstrap.admin_granted_at),
                updated_at = now()`,
         [organizationId, bootstrap.adminEmail, adminGranted],
@@ -800,6 +814,7 @@ export class IdentityStore {
         await lockOrganization(tx, organization.id);
         const context = await this.signInContext(tx, email, input);
         await this.acceptInvites(tx, context, organization.id);
+        await this.grantAdminEmail(tx, context, organization.id);
         if (context.role(organization.id) === null) await this.autoJoin(tx, context, organization.id);
         if (context.role(organization.id) === null) {
           throw new IdentityError(403, "not_invited", `${email} doesn't have access to ${organization.name}. Ask an owner or admin to invite you.`);
@@ -924,10 +939,15 @@ export class IdentityStore {
         ORDER BY organization_id`,
       [email, new Date(this.now())],
     );
+    const invited = new Set(open.rows.map((row) => row.organization_id));
+    const adminOrganization = context.addressVerified && this.adminEmails.includes(email)
+      ? await this.bootstrapOrganizationIdIn(tx)
+      : null;
     // Locks in organization id order, so concurrent sign-ins cannot deadlock.
-    for (const row of open.rows) {
-      await lockOrganization(tx, row.organization_id);
-      await this.acceptInvites(tx, context, row.organization_id);
+    for (const organizationId of [...new Set([...invited, ...(adminOrganization ? [adminOrganization] : [])])].sort()) {
+      await lockOrganization(tx, organizationId);
+      if (invited.has(organizationId)) await this.acceptInvites(tx, context, organizationId);
+      if (organizationId === adminOrganization) await this.grantAdminEmail(tx, context, organizationId);
     }
     if (context.lastJoined) return { kind: "organization", organizationId: context.lastJoined, context };
     const memberships = await tx.query<{ organization_id: string }>(
@@ -981,6 +1001,7 @@ export class IdentityStore {
       inviteTokenHash: input.inviteTokenHash,
       method: input.method,
       emailVerified: input.emailVerified !== false,
+      addressVerified: input.emailVerified === true,
       userId,
       roles,
       joined: null,
@@ -1056,6 +1077,57 @@ export class IdentityStore {
     }
   }
 
+  /**
+   * SELFHOST_ADMIN_EMAILS: on the address's first verified sign-in, makes it
+   * owner when the organization has no owner yet (so the first listed admin
+   * to verify owns the installation) and admin otherwise. Recorded once per
+   * address, so a later demotion sticks. Never lowers a role. Caller holds
+   * the identity and organization locks, which serialize the owner choice.
+   */
+  private async grantAdminEmail(tx: SqlExecutor, context: SignInContext, organizationId: string): Promise<void> {
+    const { email } = context;
+    if (!context.addressVerified || !this.adminEmails.includes(email)) return;
+    const granted = await tx.query("SELECT 1 AS found FROM selfhost_admin_email_grants WHERE email = $1", [email]);
+    if (granted.rows[0]) return;
+    const owners = await tx.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM selfhost_organization_memberships WHERE organization_id = $1 AND role = 'owner'",
+      [organizationId],
+    );
+    const role: Role = owners.rows[0]!.n === 0 ? "owner" : "admin";
+    const user = await this.upsertUser(tx, email, context.name ?? email.slice(0, email.indexOf("@")), context.name !== null);
+    context.userId = user.id;
+    const current = context.role(organizationId);
+    if (current === null || ROLE_RANK[current] < ROLE_RANK[role]) {
+      await tx.query(
+        `INSERT INTO selfhost_organization_memberships (organization_id, user_id, role) VALUES ($1, $2, $3)
+         ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role, updated_at = now()`,
+        [organizationId, user.id, role],
+      );
+      context.roles.set(organizationId, role);
+      if (current === null) {
+        context.joined = { role, via: "admin_email" };
+        context.lastJoined = organizationId;
+      }
+      await recordAudit(tx, {
+        organizationId,
+        actor: { kind: "user", userId: user.id },
+        action: role === "owner" ? "membership.admin_email_owner" : "membership.admin_email_admin",
+        target: `${email} via=${context.method}`,
+      });
+    }
+    await tx.query(
+      "INSERT INTO selfhost_admin_email_grants (email, organization_id, role) VALUES ($1, $2, $3) ON CONFLICT (email) DO NOTHING",
+      [email, organizationId, role],
+    );
+  }
+
+  private async bootstrapOrganizationIdIn(tx: SqlExecutor): Promise<string | null> {
+    const state = await tx.query<{ organization_id: string | null }>(
+      "SELECT organization_id FROM selfhost_installation_bootstrap WHERE installation_slot = 1",
+    );
+    return state.rows[0]?.organization_id ?? null;
+  }
+
   /** Joins as member when the email's domain is an auto-join domain of the org. Caller holds the org lock. */
   private async autoJoin(tx: SqlExecutor, context: SignInContext, organizationId: string): Promise<void> {
     const { email } = context;
@@ -1090,7 +1162,7 @@ export class IdentityStore {
   }
 
   /** Picks the workspace, remembers the selection and issues the session. */
-  private async finishSignIn(tx: SqlExecutor, context: SignInContext, organizationId: string, method: "oidc" | "email"): Promise<SignInResult> {
+  private async finishSignIn(tx: SqlExecutor, context: SignInContext, organizationId: string, method: SignInMethod): Promise<SignInResult> {
     const userId = context.userId;
     if (userId === null || context.role(organizationId) === null) {
       throw new IdentityError(403, "not_invited", `${context.email} doesn't have access to this organization. Ask an owner or admin to invite you.`);
@@ -1117,7 +1189,7 @@ export class IdentityStore {
       userId,
       organizationId,
       workspaceId,
-      label: method === "oidc" ? "Browser sign-in (SSO)" : "Browser sign-in (email link)",
+      label: method === "oidc" ? "Browser sign-in (SSO)" : method === "password" ? "Browser sign-in (password)" : "Browser sign-in (email link)",
     });
     const joined = context.lastJoined === organizationId ? context.joined : null;
     return { userId, email: context.email, organizationId, workspaceId, joined, tokens };
@@ -1143,7 +1215,8 @@ export class IdentityStore {
     );
     // Multi mode: any address may sign in (it may land in a personal
     // organization); the route rate-limits per address and per IP.
-    if (this.tenancy.mode === "single" && !eligible.rows[0]?.ok && !await this.autoJoinEligible(email)) return null;
+    if (this.tenancy.mode === "single" && !eligible.rows[0]?.ok && !this.adminEmails.includes(email) &&
+      !await this.autoJoinEligible(email)) return null;
     const token = opaqueToken("sh_el_");
     await this.database.query(
       `INSERT INTO selfhost_email_login_tokens (id, email, token_hash, invite_token_hash, next_path, expires_at)
@@ -1151,6 +1224,26 @@ export class IdentityStore {
       [randomUUID(), email, hashSecret(token), inviteTokenHash, input.next, new Date(this.now() + EMAIL_LOGIN_TTL_MS)],
     );
     return token;
+  }
+
+  /**
+   * Whether an address may register a password: an existing member, an open
+   * invite to it, an auto-join domain, or an admin email. Unlike email links,
+   * multi mode does not open password registration to every address.
+   */
+  async passwordRegistrationEligible(email: string): Promise<boolean> {
+    if (this.adminEmails.includes(email)) return true;
+    const eligible = await this.database.query<{ ok: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM selfhost_organization_memberships m JOIN selfhost_users u ON u.id = m.user_id WHERE u.email = $1
+       ) OR EXISTS (
+         SELECT 1 FROM selfhost_organization_invitations
+          WHERE email = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > $2
+       ) AS ok`,
+      [email, new Date(this.now())],
+    );
+    if (eligible.rows[0]?.ok) return true;
+    return this.autoJoinEligible(email);
   }
 
   private async autoJoinEligible(email: string): Promise<boolean> {
