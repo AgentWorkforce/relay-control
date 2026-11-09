@@ -132,9 +132,9 @@ export async function readWorkspaceHistory(
   const query = new URLSearchParams(params);
   query.delete("workspace");
   query.set("workspace", identity.workspaceId);
-  // The base rollout serves unsearched lists and turns. Session events have
+  // The base rollout serves unsearched lists, turns and recorded summaries. Session events have
   // their own opt-in so existing list/turn-only readers keep the History path.
-  const rolloutPath = path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+\/turns$/.test(path);
+  const rolloutPath = path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+\/(?:turns|summary)$/.test(path);
   const eventPath = /^\/v1\/sessions\/[^/]+\/events$/.test(path);
   // Other admitted credential families retain their pre-existing History
   // transport; this connection never forwards them to a sh_at_-only Worker.

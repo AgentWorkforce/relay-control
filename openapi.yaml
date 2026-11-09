@@ -1792,6 +1792,74 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UnsupportedByBackend"
+  /cloud/api/v1/workspaces/{workspaceId}/sessions/{sessionId}/summary:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      operationId: getDashboardSessionSummary
+      description: |
+        Reads a recorded short summary from the configured session backend with
+        the authorized workspace. A ready summary contains the actual model and
+        generation timestamp; Control never generates text or supplies defaults.
+        The direct read API uses the caller token without login or fallback and
+        must attest the authorized workspace in X-Relayhistory-Workspace-Id.
+      parameters:
+        - name: source
+          in: query
+          required: true
+          schema: { type: string, maxLength: 512 }
+        - name: kind
+          in: query
+          schema: { type: string, enum: [short], default: short }
+      responses:
+        "200":
+          description: Recorded summary or explicit empty/unsupported state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [summary]
+                properties:
+                  summary:
+                    oneOf:
+                      - type: object
+                        additionalProperties: false
+                        required: [status, kind, summary, model, builtAt, state]
+                        properties:
+                          status: { type: string, enum: [ready] }
+                          kind: { type: string, enum: [short] }
+                          summary: { type: string, minLength: 1, pattern: '\S' }
+                          model: { type: string, minLength: 1, pattern: '\S' }
+                          builtAt: { type: string, format: date-time }
+                          state: { $ref: "#/components/schemas/RecordedSessionState" }
+                      - type: object
+                        additionalProperties: false
+                        required: [status, kind, state]
+                        properties:
+                          status: { type: string, enum: [empty] }
+                          kind: { type: string, enum: [short] }
+                          state: { $ref: "#/components/schemas/RecordedSessionState" }
+                      - type: object
+                        additionalProperties: false
+                        required: [status]
+                        properties:
+                          status: { type: string, enum: [unsupported] }
+        "400":
+          description: Invalid query or unsupported summary kind
+        "401":
+          description: Authentication is missing or invalid
+        "404":
+          description: Workspace is outside the authenticated tenant
+        "501":
+          description: Configured backend does not support summary reads
+        "502":
+          description: Invalid summary provenance, missing workspace attestation or upstream failure
+        "503":
+          description: Configured direct read API is unavailable; no fallback
   /cloud/api/v1/workspaces/{workspaceId}/sessions/{sessionId}/timing:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -5197,6 +5265,13 @@ components:
       description: A declared `expected_assets[].name`; one path segment.
       schema: { type: string, maxLength: 255, pattern: "^[A-Za-z0-9][A-Za-z0-9_+-]*(?:\\.[A-Za-z0-9_+-]+)*$" }
   schemas:
+    RecordedSessionState:
+      type: [object, "null"]
+      additionalProperties: false
+      required: [state, classifiedAt]
+      properties:
+        state: { type: string, enum: [active, done, abandoned, unknown] }
+        classifiedAt: { type: string, format: date-time }
     ProductCapabilities:
       type: object
       additionalProperties: false
