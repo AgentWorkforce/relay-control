@@ -7,7 +7,8 @@
   "description": "Minimal self-hosted Agent Relay sessions control plane",
   "bin": {
     "agent-relay-selfhost-api": "./dist/server.js",
-    "agent-relay-selfhost-migrate": "./dist/migrate-cli.js"
+    "agent-relay-selfhost-migrate": "./dist/migrate-cli.js",
+    "agent-relay-analytics-collector": "./dist/collector-cli.js"
   },
   "files": [
     "dist",

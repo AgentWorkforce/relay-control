@@ -170,6 +170,8 @@ export function sanitizeClientName(value: unknown): string | null {
 export type AuthorizationRequest = {
   clientId: string;
   redirectUri: string;
+  /** Server-derived authorization parameter presence; legacy callers default to required. */
+  redirectUriRequired?: boolean;
   codeChallenge: string;
   state: string | null;
   scopes: McpAuthorizationScope[];
@@ -518,6 +520,7 @@ export function createMcpOAuthProtocol(config: McpOAuthProtocolConfig) {
       value: {
         clientId: client.clientId,
         redirectUri,
+        redirectUriRequired: requestedRedirect !== undefined,
         codeChallenge: params.code_challenge,
         state,
         scopes,

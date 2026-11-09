@@ -162,8 +162,19 @@ export function createFlowsHandler(deps: {
   store: FlowsStore;
   publicBaseUrl: string;
   userAccess: FlowsUserAccess;
+  /**
+   * Throws the feature refusal (403) unless Flows is a capability. Every
+   * route calls it after its own authentication (membership, worker, run or
+   * callback credential) and before touching the store.
+   */
+  requireFeature: () => void;
 }): (request: IncomingMessage, response: ServerResponse, path: string, url: URL) => Promise<boolean> {
-  const { store, publicBaseUrl, userAccess } = deps;
+  const { store, publicBaseUrl, requireFeature } = deps;
+  const userAccess: FlowsUserAccess = async (request, admin) => {
+    const access = await deps.userAccess(request, admin);
+    requireFeature();
+    return access;
+  };
   const config = store.config;
   let lastMaintenance = 0;
 
@@ -176,6 +187,7 @@ export function createFlowsHandler(deps: {
   async function workerAuth(request: IncomingMessage, workerId: string) {
     const worker = await store.authenticateWorker(workerId, bearer(request));
     if (!worker) throw new FlowsError(401, "unauthorized", "Unauthorized");
+    requireFeature();
     return worker;
   }
 
@@ -189,6 +201,7 @@ export function createFlowsHandler(deps: {
   async function runTokenAuth(request: IncomingMessage, runId: string) {
     const run = await store.authenticateRunToken(runId, bearer(request));
     if (!run) throw new FlowsError(401, "unauthorized", "Invalid run token");
+    requireFeature();
     return run;
   }
 
@@ -307,6 +320,9 @@ export function createFlowsHandler(deps: {
 
     // ------------------------------------------------ worker protocol
     if (path === "/api/v1/workers/register" && method === "POST") {
+      // The enrollment token is the only credential and redeeming it is the
+      // store call, so refuse first: an unlicensed install never spends one.
+      requireFeature();
       const body = await jsonBody(request, 64 * 1024);
       const enrollmentToken = str(body, "enrollmentToken", true, 512);
       const name = str(body, "name", true, 128);
@@ -659,6 +675,8 @@ export function createFlowsHandler(deps: {
       return true;
     }
     if (path === "/api/v1/workflows/callback" && method === "POST") {
+      // The store authenticates and records the callback in one step.
+      requireFeature();
       const body = await jsonBody(request, 512 * 1024);
       const result = body.result;
       send(response, 200, await store.callback({

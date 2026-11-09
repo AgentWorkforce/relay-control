@@ -302,10 +302,12 @@ test("introspection names exactly one inactive reason, in contract order", async
   };
 
   // Never looked up as user tokens, even if well-formed for their own kind.
-  for (const token of [alpha.refreshToken, "sh_wk_workspace-token", BOOTSTRAP, INTERNAL, INTROSPECT_SECRET, "sh_dc_x", "nt_live_abcdefgh"]) {
+  for (const token of [alpha.refreshToken, BOOTSTRAP, INTERNAL, INTROSPECT_SECRET, "sh_dc_x", "nt_live_abcdefgh"]) {
     await inactive(token, "wrong-kind");
   }
   await inactive("sh_at_does-not-exist", "unknown");
+  // A workspace API token with no such record is unknown, not another kind.
+  await inactive("sh_wk_workspace-token", "unknown");
   // wrong-kind wins over everything else.
   await inactive(alpha.refreshToken, "wrong-kind", "https://elsewhere.test", env.beta);
 
@@ -455,6 +457,9 @@ test("readyz lists exactly the audiences introspection accepts, never the secret
   assert.deepEqual(ready.body, {
     status: "ready",
     introspection: { enabled: true, audiences: ["https://files.selfhosted.test", "http://history.svc:8080"] },
+    // No licence wired: core only.
+    license: { status: "absent" },
+    capabilities: { flows: false, relayfile: false, chief: false },
   });
   assert.equal(JSON.stringify(ready.body).includes(INTROSPECT_SECRET), false);
   const { accessToken } = await env.login(env.alpha);
