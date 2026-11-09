@@ -45,15 +45,18 @@ export type IssuedFlowRelayfileCredential = {
 };
 
 /** What the legacy Flows store needs at assignment time. */
+export type FlowRelayfileCredentialInput = {
+  workspaceId: string;
+  runId: string;
+  mountPaths: string[];
+  readOnly?: boolean;
+  aud?: string;
+  issuer?: string;
+};
+
 export type FlowRelayfileCredentialIssuer = {
-  issue(input: {
-    workspaceId: string;
-    runId: string;
-    mountPaths: string[];
-    readOnly?: boolean;
-    aud?: string;
-    issuer?: string;
-  }): Promise<IssuedFlowRelayfileCredential>;
+  issue(input: FlowRelayfileCredentialInput): Promise<IssuedFlowRelayfileCredential>;
+  issueForLocalRun(input: FlowRelayfileCredentialInput): Promise<IssuedFlowRelayfileCredential>;
 };
 
 /** What introspection needs to judge a presented `sh_fr_` token. */
@@ -165,16 +168,17 @@ export class FlowRunRelayfileCredentials implements FlowRelayfileCredentialIssue
    * Mints the run's credential, revoking any earlier active one for the run.
    * The audit row names the credential id, run, paths and expiry only.
    */
-  async issue(input: {
-    workspaceId: string;
-    runId: string;
-    mountPaths: string[];
-    readOnly?: boolean;
-    /** Optional expected audience; must match the worker Relayfile origin. */
-    aud?: string;
-    /** Audit actor subject; default relayfile-control (the broker caller). */
-    issuer?: string;
-  }): Promise<IssuedFlowRelayfileCredential> {
+  async issue(input: FlowRelayfileCredentialInput): Promise<IssuedFlowRelayfileCredential> {
+    // Broker runs may live in relayfile-control rather than workflow_runs.
+    return this.#issue(input, false);
+  }
+
+  /** Serializes local assignment issuance with the run's terminal transition. */
+  async issueForLocalRun(input: FlowRelayfileCredentialInput): Promise<IssuedFlowRelayfileCredential> {
+    return this.#issue(input, true);
+  }
+
+  async #issue(input: FlowRelayfileCredentialInput, localRun: boolean): Promise<IssuedFlowRelayfileCredential> {
     const config = this.#config();
     const aud = this.#audience(config, input.aud);
     const mountPaths = validateMountPaths(input.mountPaths, input.runId);
@@ -185,6 +189,21 @@ export class FlowRunRelayfileCredentials implements FlowRelayfileCredentialIssue
     const token = opaqueToken(FLOW_RUN_CREDENTIAL_PREFIX);
     const id = randomUUID();
     await this.database.transaction(async (tx) => {
+      if (localRun) {
+        // finishRun's UPDATE holds this same row lock until its credential
+        // revocation commits. Whichever transaction gets the row first wins:
+        // mint then finish revokes it; finish then mint refuses it.
+        const run = await tx.query<{ status: string }>(
+          "SELECT status FROM workflow_runs WHERE id = $1 AND workspace_id = $2 FOR UPDATE",
+          [input.runId, input.workspaceId],
+        );
+        if (!run.rows[0]) {
+          throw new FlowRelayfileCredentialError(404, "run_not_found", "Run not found");
+        }
+        if (run.rows[0].status !== "pending" && run.rows[0].status !== "running") {
+          throw new FlowRelayfileCredentialError(409, "run_not_active", "Run is no longer active");
+        }
+      }
       const workspace = await tx.query<{ organization_id: string }>(
         "SELECT organization_id FROM workspaces WHERE id = $1",
         [input.workspaceId],

@@ -3,6 +3,10 @@
 Notable changes to the self-hosted control plane. Dates and versions are
 assigned at release.
 
+## Unreleased
+
+- Fixed: local Flows run completion, failure and cancellation revoke the run's Relayfile credential atomically; assignment issuance racing a terminal transition cannot leave a new credential active.
+
 ## 0.5.8 (2026-11-09)
 
 - Added: per-run, path-scoped Relayfile credentials for Flows workers

@@ -67,6 +67,12 @@ requested `aud` does not match that origin (each with its own message).
 
 ## 4. Revocation
 
+- The in-process Flows store revokes the run's Relayfile credential in the
+  same transaction that completes, fails or cancels its local run. Local
+  assignment issuance locks the matching workspace/run row in its mint
+  transaction and refuses terminal runs, so an assignment racing completion
+  cannot leave a late credential active. This local check does not apply to
+  broker issuance: externally stored runs need no `workflow_runs` row here.
 - `POST /internal/v1/flows/credentials/revoke` `{ runId }` (existing route,
   already called by relayfile-control's run-end outbox) now also revokes the
   run's Relayfile credential. relayfile-control needs no new call for this.
