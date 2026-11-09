@@ -140,7 +140,7 @@ async function replace(
     await tx.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`desktop-identities:${workspace.id}:${principal.userId}:${sourceId}`]);
     if (rows.length > 0) {
       const conflict = await tx.query<{ id: string }>(
-        `SELECT id FROM selfhost_desktop_relay_identities
+        `SELECT id FROM desktop_relay_identities
           WHERE relaycast_workspace_id = $1 AND agent_remote_id = ANY($2::text[])
             AND NOT (workspace_id = $3 AND user_id = $4 AND source_id = $5)
           LIMIT 1`,
@@ -151,14 +151,14 @@ async function replace(
       }
     }
     await tx.query(
-      `DELETE FROM selfhost_desktop_relay_identities
+      `DELETE FROM desktop_relay_identities
         WHERE workspace_id = $1 AND user_id = $2 AND source_id = $3
           AND NOT (agent_remote_id = ANY($4::text[]) AND relaycast_workspace_id = $5)`,
       [workspace.id, principal.userId, sourceId, rows.map(row => row.remoteId), workspace.relaycastWorkspaceId],
     );
     for (const row of rows) {
       await tx.query(
-        `INSERT INTO selfhost_desktop_relay_identities
+        `INSERT INTO desktop_relay_identities
            (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id, agent_name,
             agent_remote_id, address, token_ciphertext, native_session_kind, native_session_id)
          VALUES ($12, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -178,12 +178,12 @@ async function replace(
       );
     }
     await tx.query(
-      `DELETE FROM selfhost_desktop_attestation_keys WHERE workspace_id = $1 AND user_id = $2 AND source_id = $3`,
+      `DELETE FROM desktop_attestation_keys WHERE workspace_id = $1 AND user_id = $2 AND source_id = $3`,
       [workspace.id, principal.userId, sourceId],
     );
     if (key && rows.length > 0) {
       await tx.query(
-        `INSERT INTO selfhost_desktop_attestation_keys (workspace_id, organization_id, user_id, source_id, kid, public_key)
+        `INSERT INTO desktop_attestation_keys (workspace_id, organization_id, user_id, source_id, kid, public_key)
          VALUES ($1, $2, $3, $4, $5, $6)`,
         [workspace.id, workspace.organizationId, principal.userId, sourceId, key.kid, key.public_key],
       );
@@ -264,7 +264,7 @@ export async function handleDesktopIdentityRoutes(
     }
     try {
       const rows = await deps.database.query<{ agent_remote_id: string }>(
-        `SELECT agent_remote_id FROM selfhost_desktop_relay_identities
+        `SELECT agent_remote_id FROM desktop_relay_identities
           WHERE workspace_id = $1 AND user_id = $2 AND source_id = $3 AND relaycast_workspace_id = $4
           ORDER BY created_at, agent_remote_id`,
         [access.workspace.id, access.principal.userId, sourceId.toLowerCase(), access.workspace.relaycastWorkspaceId],
@@ -346,7 +346,7 @@ export async function linkedDesktopIdentity(input: {
     token_ciphertext: string;
   }>(
     `SELECT source_id, relaycast_workspace_id, agent_name, agent_remote_id, address, token_ciphertext
-       FROM selfhost_desktop_relay_identities
+       FROM desktop_relay_identities
       WHERE workspace_id = $1 AND user_id = $2 AND native_session_kind = $3 AND native_session_id = $4`,
     [input.workspaceId, input.userId, input.nativeSession.kind, input.nativeSession.id],
   );

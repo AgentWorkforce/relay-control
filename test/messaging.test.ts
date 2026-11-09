@@ -512,7 +512,7 @@ test("person messaging round trip reads both authors and refuses the wrong calle
   assert.equal(credential.body.identity.relaycastUrl, "https://cast.selfhosted.example");
   assert.equal(fx.state.registerCalls, 1);
   const stored = await fx.database.query<{ token_ciphertext: string }>(
-    "SELECT token_ciphertext FROM selfhost_person_identities WHERE user_id = $1",
+    "SELECT token_ciphertext FROM person_identities WHERE user_id = $1",
     [fx.userId],
   );
   assert.equal(stored.rows.length, 1);
@@ -742,13 +742,13 @@ test("identity creation recovers a lost response and skips a foreign name", asyn
   };
   const failed = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: fx.accessToken });
   assert.equal(failed.status, 502);
-  const rows = await fx.database.query("SELECT id FROM selfhost_person_identities");
+  const rows = await fx.database.query("SELECT id FROM person_identities");
   assert.equal(rows.rows.length, 0);
   const recovered = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: fx.accessToken });
   assert.equal(recovered.status, 200);
   assert.equal(fx.state.takeoverCalls, 1);
   assert.equal(recovered.body.identity.token, "ar_ag_takeover_1");
-  assert.equal((await fx.database.query("SELECT id FROM selfhost_person_identities")).rows.length, 1);
+  assert.equal((await fx.database.query("SELECT id FROM person_identities")).rows.length, 1);
 
   const staged = await harness(t);
   let stagedFailures = 1;
@@ -756,7 +756,7 @@ test("identity creation recovers a lost response and skips a foreign name", asyn
     if (stagedFailures-- > 0) throw new Error("rolled back");
   };
   assert.equal((await jsonRequest(staged.origin, credentialPath(staged.workspaceId), { method: "POST", token: staged.accessToken })).status, 502);
-  assert.equal((await staged.database.query("SELECT id FROM selfhost_person_identities")).rows.length, 0);
+  assert.equal((await staged.database.query("SELECT id FROM person_identities")).rows.length, 0);
   const stagedRetry = await jsonRequest(staged.origin, credentialPath(staged.workspaceId), { method: "POST", token: staged.accessToken });
   assert.equal(stagedRetry.status, 200);
   assert.equal(staged.state.takeoverCalls, 1);
@@ -901,13 +901,13 @@ test("removing a member revokes the human credential and drops them from the dir
   assert.equal(member.status, 200);
   const memberUserId = membership.body.userId as string;
   await fx.database.query(
-    "UPDATE selfhost_person_identities SET relaycast_workspace_id = 'stale-binding' WHERE user_id = $1",
+    "UPDATE person_identities SET relaycast_workspace_id = 'stale-binding' WHERE user_id = $1",
     [memberUserId],
   );
   const hidden = await jsonRequest(fx.origin, `/api/v1/workspaces/${fx.workspaceId}/messaging/people`, { token: fx.accessToken });
   assert.equal(hidden.body.people.some((person: { userId: string }) => person.userId === memberUserId), false);
   await fx.database.query(
-    "UPDATE selfhost_person_identities SET relaycast_workspace_id = 'rc-first' WHERE user_id = $1",
+    "UPDATE person_identities SET relaycast_workspace_id = 'rc-first' WHERE user_id = $1",
     [memberUserId],
   );
   const visible = await jsonRequest(fx.origin, `/api/v1/workspaces/${fx.workspaceId}/messaging/people`, { token: fx.accessToken });
@@ -929,7 +929,7 @@ test("removing a member revokes the human credential and drops them from the dir
     body: JSON.stringify({ to: "helper", text: "still here" }),
   });
   assert.equal(direct.status, 401);
-  const identities = await fx.database.query("SELECT id FROM selfhost_person_identities WHERE user_id = $1", [memberUserId]);
+  const identities = await fx.database.query("SELECT id FROM person_identities WHERE user_id = $1", [memberUserId]);
   assert.equal(identities.rows.length, 0);
 
   const flaky = await harness(t);
@@ -946,21 +946,21 @@ test("removing a member revokes the human credential and drops them from the dir
     token: flaky.config.bootstrapToken,
   });
   assert.equal(queued.status, 204);
-  const waiting = await flaky.database.query("SELECT id FROM selfhost_person_revocations WHERE user_id = $1", [flakyMember.body.userId]);
+  const waiting = await flaky.database.query("SELECT id FROM person_revocations WHERE user_id = $1", [flakyMember.body.userId]);
   assert.equal(waiting.rows.length, 1);
   await jsonRequest(flaky.origin, `/api/v1/workspaces/${flaky.workspaceId}/messaging/people`, { token: flaky.accessToken });
-  const drained = await flaky.database.query("SELECT id FROM selfhost_person_revocations WHERE user_id = $1", [flakyMember.body.userId]);
+  const drained = await flaky.database.query("SELECT id FROM person_revocations WHERE user_id = $1", [flakyMember.body.userId]);
   assert.equal(drained.rows.length, 0);
   assert.equal(flaky.state.revokeCalls, 2);
 
   const raced = await harness(t);
   raced.hooks.beforeMembershipRecheck = async (tx) => {
-    await tx.query("DELETE FROM selfhost_organization_memberships WHERE user_id = $1", [raced.userId]);
+    await tx.query("DELETE FROM organization_memberships WHERE user_id = $1", [raced.userId]);
   };
   const blocked = await jsonRequest(raced.origin, credentialPath(raced.workspaceId), { method: "POST", token: raced.accessToken });
   assert.equal(blocked.status, 403);
   assert.equal(JSON.stringify(blocked.body).includes("ar_ag_"), false);
-  assert.equal((await raced.database.query("SELECT id FROM selfhost_person_identities")).rows.length, 0);
+  assert.equal((await raced.database.query("SELECT id FROM person_identities")).rows.length, 0);
   assert.equal(raced.state.revokeCalls, 1);
 });
 
@@ -1085,7 +1085,7 @@ test("register_human admission stays a typed conflict", async (t) => {
   const full = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: fx.accessToken });
   assert.equal(full.status, 409);
   assert.equal(full.body.error, "register_human_admission");
-  assert.equal((await fx.database.query("SELECT id FROM selfhost_person_identities")).rows.length, 0);
+  assert.equal((await fx.database.query("SELECT id FROM person_identities")).rows.length, 0);
 });
 
 test("relaycast client creates and deletes outbound subscriptions with the workspace key", async () => {
@@ -1159,13 +1159,13 @@ function resolvePath(workspaceId: string, cloud = false): string {
 
 async function resolveAudits(database: Database) {
   return (await database.query<Record<string, unknown>>(
-    "SELECT * FROM selfhost_admin_audit_events WHERE action = 'workspace.relaycast_key.resolved' ORDER BY created_at",
+    "SELECT * FROM admin_audit_events WHERE action = 'workspace.relaycast_key.resolved' ORDER BY created_at",
   )).rows;
 }
 
 async function dropCliAuth(database: Database, token: string): Promise<void> {
   const updated = await database.query(
-    "UPDATE selfhost_token_sessions SET scopes = ARRAY['rth:read']::text[] WHERE access_token_hash = $1 RETURNING id",
+    "UPDATE token_sessions SET scopes = ARRAY['rth:read']::text[] WHERE access_token_hash = $1 RETURNING id",
     [hashSecret(token)],
   );
   assert.equal(updated.rows.length, 1);

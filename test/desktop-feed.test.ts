@@ -418,7 +418,7 @@ test("profile admin: registration, binding, publisher tokens", async (t) => {
   const statuses = Object.fromEntries(detail.json.publisher_tokens.map((row: Json) => [row.label, row.status]));
   assert.deepEqual(statuses, { "ci-1": "revoked", "ci-2": "active", "ci-3": "active" });
   const stored = await world.database.query<{ token_hash: string }>(
-    "SELECT token_hash FROM selfhost_desktop_feed_publisher_tokens WHERE id = $1", [third.json.id],
+    "SELECT token_hash FROM desktop_feed_publisher_tokens WHERE id = $1", [third.json.id],
   );
   assert.equal(stored.rows[0]!.token_hash, sha(Buffer.from(third.json.token)));
   const firstUse = await world.call(`${FEED}/releases?include_drafts=true`, { token: first.json.token, profile: "acme" });
@@ -437,7 +437,7 @@ test("profile admin: registration, binding, publisher tokens", async (t) => {
   const unbound = await world.call(`${base}/acme/workspaces/${world.w1}`, { method: "DELETE", token: world.config.bootstrapToken });
   assert.deepEqual(unbound.json.workspaces, []);
   const audit = await world.database.query<{ action: string }>(
-    "SELECT action FROM selfhost_admin_audit_events WHERE action LIKE 'desktop_feed.%' ORDER BY created_at",
+    "SELECT action FROM admin_audit_events WHERE action LIKE 'desktop_feed.%' ORDER BY created_at",
   );
   assert.ok(audit.rows.some((row) => row.action === "desktop_feed.profile_create"));
   assert.ok(audit.rows.some((row) => row.action === "desktop_feed.workspace_unbind"));
@@ -686,14 +686,14 @@ test("publish and read: signed envelope, bearer, /cloud cookie, install token, a
   assert.equal(memberMint.status, 201);
   const memberInstall = { token: memberMint.json.token as string, profile: "acme" };
   assert.equal((await world.call(`${FEED}/manifest?channel=stable`, memberInstall)).status, 200);
-  await world.database.query("DELETE FROM selfhost_organization_memberships WHERE user_id = $1", [world.memberId]);
+  await world.database.query("DELETE FROM organization_memberships WHERE user_id = $1", [world.memberId]);
   assert.equal((await world.call(`${FEED}/manifest?channel=stable`, memberInstall)).json.error, "token_revoked");
 
   // Install tokens are stored hashed; no token value reaches an audit row.
-  const hashes = await world.database.query<{ token_hash: string }>("SELECT token_hash FROM selfhost_desktop_feed_install_tokens");
+  const hashes = await world.database.query<{ token_hash: string }>("SELECT token_hash FROM desktop_feed_install_tokens");
   assert.ok(hashes.rows.some((row) => row.token_hash === sha(Buffer.from(minted.json.token))));
-  const audit = await world.database.query<{ row: string }>("SELECT row_to_json(e)::text AS row FROM selfhost_desktop_feed_audit_events e");
-  const adminAudit = await world.database.query<{ row: string }>("SELECT row_to_json(e)::text AS row FROM selfhost_admin_audit_events e");
+  const audit = await world.database.query<{ row: string }>("SELECT row_to_json(e)::text AS row FROM desktop_feed_audit_events e");
+  const adminAudit = await world.database.query<{ row: string }>("SELECT row_to_json(e)::text AS row FROM admin_audit_events e");
   for (const row of [...audit.rows, ...adminAudit.rows]) {
     assert.ok(!/sh_df[ip]_[A-Za-z0-9_-]{43}/.test(row.row), row.row);
   }
@@ -908,7 +908,7 @@ test("refusals: 400, 401, 403, 404, 409, 413, 422 and 503 branches, in precedenc
 
   // Denials are audited.
   const denied = await world.database.query<{ n: number }>(
-    "SELECT count(*)::int AS n FROM selfhost_desktop_feed_audit_events WHERE action = 'desktop_feed.denied'",
+    "SELECT count(*)::int AS n FROM desktop_feed_audit_events WHERE action = 'desktop_feed.denied'",
   );
   assert.ok(denied.rows[0]!.n >= 15);
 });
@@ -1256,7 +1256,7 @@ test("credentials: an unexchanged Desktop handoff cannot read the feed", async (
   await provision(world, "acme", "Acme", world.w1);
   const token = await world.session(world.ownerId, world.w1);
   assert.equal((await world.call(`${FEED}/manifest?channel=stable`, { token, profile: "acme" })).status, 404, "an exchanged session reaches the feed");
-  await world.database.query(`UPDATE selfhost_token_sessions SET desktop_exchange_challenge = 'pending', desktop_exchanged_at = NULL`);
+  await world.database.query(`UPDATE token_sessions SET desktop_exchange_challenge = 'pending', desktop_exchanged_at = NULL`);
   const refused = await world.call(`${FEED}/manifest?channel=stable`, { token, profile: "acme" });
   assert.equal(refused.status, 403, refused.text);
   assert.equal(refused.json.error, "wrong_credential");
@@ -1269,8 +1269,8 @@ test("audit: a failed audit after a commit does not fail the write, and reads st
   const token = await world.session(world.ownerId, world.w1);
   const body = draftBody("Acme", "2026.11.0");
   await uploaded(world, "acme", publisher, body, BYTES_BY_INDEX);
-  await world.database.query(`DROP TABLE selfhost_admin_audit_events`);
-  await world.database.query(`DROP TABLE selfhost_desktop_feed_audit_events`);
+  await world.database.query(`DROP TABLE admin_audit_events`);
+  await world.database.query(`DROP TABLE desktop_feed_audit_events`);
   world.logs.length = 0;
   const published = await world.call(`${FEED}/releases/2026.11.0/publish`, { token: publisher, profile: "acme", body: { latest: true } });
   assert.equal(published.status, 200, published.text);

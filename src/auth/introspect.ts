@@ -19,7 +19,7 @@ import { NODE_ID_PATTERN, type ControlPlaneStore, type Principal } from "../stor
  *   inactive with `workspace`. `machine` is the caller's
  *   claimed machine id (a Relaycast node id, NODE_ID_PATTERN); it is only a
  *   claim. Once every token check passes it must be a node the token's user
- *   claimed in the token session's workspace (selfhost_fleet_node_owners,
+ *   claimed in the token session's workspace (fleet_node_owners,
  *   whether or not `workspace` was supplied), else
  *   inactive with `machine_not_owned` (another user's claim in this
  *   workspace), `machine_workspace_mismatch` (no claim in this workspace,

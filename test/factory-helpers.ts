@@ -413,14 +413,14 @@ export async function connectAndBind(env: FactoryEnv, options: { token?: string;
 }
 
 export async function bindingRow(env: FactoryEnv, id: string) {
-  const result = await env.database.query<Record<string, any>>("SELECT * FROM selfhost_factory_bindings WHERE id = $1", [id]);
+  const result = await env.database.query<Record<string, any>>("SELECT * FROM factory_bindings WHERE id = $1", [id]);
   assert.ok(result.rows[0], `binding ${id} not found`);
   return result.rows[0];
 }
 
 export async function deliveryRows(env: FactoryEnv, bindingId: string) {
   const result = await env.database.query<Record<string, any>>(
-    "SELECT * FROM selfhost_factory_deliveries WHERE binding_id = $1 ORDER BY created_at, message_id",
+    "SELECT * FROM factory_deliveries WHERE binding_id = $1 ORDER BY created_at, message_id",
     [bindingId],
   );
   return result.rows;
@@ -448,11 +448,11 @@ export async function seedDelivery(env: FactoryEnv, bindingId: string, options: 
   const messageId = options.messageId ?? `msg-${Math.random().toString(36).slice(2, 10)}`;
   const payload = encryptSecret(JSON.stringify({ sender: options.sender ?? "lead", text: "hello droid" }), env.config.encryptionKeyring.active);
   await env.database.query(
-    `INSERT INTO selfhost_factory_deliveries
+    `INSERT INTO factory_deliveries
        (binding_id, message_id, workspace_id, organization_id, relay_delivery_id, sender_agent_name,
         payload_envelope, state, attempts, reply_hash, reply_expires_at)
      SELECT id, $2, workspace_id, organization_id, $3, $4, $5, $6, 1, $7, now() + ($8::bigint * interval '1 millisecond')
-       FROM selfhost_factory_bindings WHERE id = $1`,
+       FROM factory_bindings WHERE id = $1`,
     [bindingId, messageId, `dlv-${messageId}`, options.sender ?? "lead", payload, options.state ?? "delivered", hash, options.expiresInMs ?? 3_600_000],
   );
   return { bearer, hash, messageId };

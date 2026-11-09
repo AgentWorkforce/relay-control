@@ -60,7 +60,7 @@ test("capture policy: member read, owner/admin write, revisions, audit and CSRF"
   assert.deepEqual(replaced.body, { version: 1, revision: 3, settings: { sharing_mode: "selected" } });
 
   const audit = await app.database.query<{ action: string; actor_id: string | null; target: string | null }>(
-    `SELECT action, actor_id, target FROM selfhost_admin_audit_events
+    `SELECT action, actor_id, target FROM admin_audit_events
       WHERE organization_id = $1 AND action LIKE 'capture_policy.%' ORDER BY created_at, target`,
     [tenant.organizationId],
   );
@@ -110,7 +110,7 @@ test("capture policy: member read, owner/admin write, revisions, audit and CSRF"
   assert.deepEqual(cleared.body, { version: 1, revision: 5, settings: {} });
   assert.deepEqual((await app.api(accessMe, { token: tenant.ownerToken })).body.policy, cleared.body);
   const clearedAudit = await app.database.query<{ target: string }>(
-    "SELECT target FROM selfhost_admin_audit_events WHERE action = 'capture_policy.cleared'",
+    "SELECT target FROM admin_audit_events WHERE action = 'capture_policy.cleared'",
   );
   assert.deepEqual(clearedAudit.rows.map((row) => row.target), [`${tenant.organizationId} revision=5`]);
 
@@ -166,7 +166,7 @@ test("capture policy: operator upload_control without a window serves the 900 s 
   assert.deepEqual(me.body.policy.settings, projected);
   // Storage keeps exactly what was written.
   const stored = await app.database.query<{ settings: unknown }>(
-    "SELECT settings FROM selfhost_capture_policies WHERE organization_id = $1",
+    "SELECT settings FROM capture_policies WHERE organization_id = $1",
     [tenant.organizationId],
   );
   assert.deepEqual(stored.rows[0]!.settings, { upload_control: "operator" });

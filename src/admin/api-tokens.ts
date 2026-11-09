@@ -126,8 +126,8 @@ function toRecord(row: Row): ApiTokenRecord {
 const SELECT = `SELECT t.id, t.label, t.purpose, t.scopes, t.token_prefix, t.created_by_user_id,
          u.name AS creator_name, u.email AS creator_email, t.created_at, t.expires_at,
          t.last_used_at, t.revoked_at, t.agent_name, t.aud
-    FROM selfhost_workspace_api_tokens t
-    LEFT JOIN selfhost_users u ON u.id = t.created_by_user_id`;
+    FROM workspace_api_tokens t
+    LEFT JOIN users u ON u.id = t.created_by_user_id`;
 
 export class ApiTokenStore {
   /**
@@ -261,14 +261,14 @@ export class ApiTokenStore {
       await this.database.transaction(async (tx) => {
         if (agentName !== null) {
           const existing = await tx.query(
-            `SELECT 1 FROM selfhost_workspace_api_tokens
+            `SELECT 1 FROM workspace_api_tokens
               WHERE workspace_id = $1 AND purpose = $2 AND agent_name = $3 AND revoked_at IS NULL`,
             [input.workspaceId, RELAYFILE_AGENT_PURPOSE, agentName],
           );
           if (existing.rows.length > 0) throw duplicate();
         }
         await tx.query(
-          `INSERT INTO selfhost_workspace_api_tokens
+          `INSERT INTO workspace_api_tokens
              (id, workspace_id, label, purpose, scopes, token_hash, token_prefix,
               created_by_user_id, expires_at, agent_name, aud)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
@@ -316,7 +316,7 @@ export class ApiTokenStore {
     if (!/^[0-9a-f-]{36}$/i.test(input.tokenId)) return false;
     return this.database.transaction(async (tx) => {
       const result = await tx.query(
-        `UPDATE selfhost_workspace_api_tokens
+        `UPDATE workspace_api_tokens
             SET revoked_at = now(), revoked_by_user_id = $3
           WHERE id = $1 AND workspace_id = $2 AND revoked_at IS NULL
           RETURNING id, agent_name`,
@@ -343,9 +343,9 @@ export class ApiTokenStore {
       organization_id: string;
       scopes: string[];
     }>(
-      `UPDATE selfhost_workspace_api_tokens t
+      `UPDATE workspace_api_tokens t
           SET last_used_at = now()
-         FROM selfhost_workspaces w
+         FROM workspaces w
         WHERE t.token_hash = $1
           AND t.revoked_at IS NULL
           AND (t.expires_at IS NULL OR t.expires_at > now())
@@ -388,8 +388,8 @@ export class ApiTokenStore {
               t.created_at, t.expires_at,
               t.revoked_at IS NOT NULL AS revoked,
               (t.expires_at IS NOT NULL AND t.expires_at <= now()) AS expired
-         FROM selfhost_workspace_api_tokens t
-         JOIN selfhost_workspaces w ON w.id = t.workspace_id
+         FROM workspace_api_tokens t
+         JOIN workspaces w ON w.id = t.workspace_id
         WHERE t.token_hash = $1`,
       [hashSecret(token)],
     );
@@ -400,7 +400,7 @@ export class ApiTokenStore {
       !row.revoked && !row.expired
     ) {
       await this.database.query(
-        "UPDATE selfhost_workspace_api_tokens SET last_used_at = now() WHERE id = $1",
+        "UPDATE workspace_api_tokens SET last_used_at = now() WHERE id = $1",
         [row.id],
       );
     }

@@ -80,7 +80,7 @@ export async function findConnection(
 ): Promise<FactoryConnectionRow | null> {
   const result = await executor.query<FactoryConnectionRow>(
     `SELECT workspace_id, organization_id, user_id, key_envelope, key_hint, validated_at
-       FROM selfhost_factory_connections WHERE workspace_id = $1${lock ? " FOR UPDATE" : ""}`,
+       FROM factory_connections WHERE workspace_id = $1${lock ? " FOR UPDATE" : ""}`,
     [workspaceId],
   );
   return result.rows[0] ?? null;
@@ -108,14 +108,14 @@ export async function writeConnection(
 ): Promise<boolean> {
   const result = expected
     ? await executor.query(
-      `UPDATE selfhost_factory_connections
+      `UPDATE factory_connections
           SET user_id = $3, key_envelope = $4, key_hint = $5, validated_at = now(), updated_at = now()
         WHERE workspace_id = $1 AND organization_id = $2 AND user_id = $6 AND key_envelope = $7
         RETURNING workspace_id`,
       [input.workspaceId, input.organizationId, input.userId, input.keyEnvelope, input.keyHint, expected.user_id, expected.key_envelope],
     )
     : await executor.query(
-      `INSERT INTO selfhost_factory_connections
+      `INSERT INTO factory_connections
          (workspace_id, organization_id, user_id, key_envelope, key_hint, validated_at)
        VALUES ($1, $2, $3, $4, $5, now())
        ON CONFLICT (workspace_id) DO NOTHING
@@ -136,7 +136,7 @@ export type FactorySetupSnapshot = { connection: FactoryConnectionRow | null; bi
 export async function setupSnapshot(executor: SqlExecutor, workspaceId: string): Promise<FactorySetupSnapshot> {
   const connection = await findConnection(executor, workspaceId);
   const bindings = await executor.query<FactoryBindingRow>(
-    `SELECT ${BINDING_COLUMNS} FROM selfhost_factory_bindings WHERE workspace_id = $1 ORDER BY id`,
+    `SELECT ${BINDING_COLUMNS} FROM factory_bindings WHERE workspace_id = $1 ORDER BY id`,
     [workspaceId],
   );
   return { connection, bindings: bindings.rows };
@@ -170,7 +170,7 @@ export function setupIdentity(snapshot: FactorySetupSnapshot): string {
 }
 
 export async function deleteConnection(executor: SqlExecutor, workspaceId: string): Promise<void> {
-  await executor.query("DELETE FROM selfhost_factory_connections WHERE workspace_id = $1", [workspaceId]);
+  await executor.query("DELETE FROM factory_connections WHERE workspace_id = $1", [workspaceId]);
 }
 
 /** True while the user is still a member of the organization (read inside the caller's transaction). */
@@ -185,7 +185,7 @@ export async function memberRole(
   userId: string,
 ): Promise<"owner" | "admin" | "member" | null> {
   const result = await executor.query<{ role: "owner" | "admin" | "member" }>(
-    `SELECT role FROM selfhost_organization_memberships WHERE organization_id = $1 AND user_id = $2`,
+    `SELECT role FROM organization_memberships WHERE organization_id = $1 AND user_id = $2`,
     [organizationId, userId],
   );
   return result.rows[0]?.role ?? null;
@@ -197,7 +197,7 @@ export async function memberRole(
  * commits first wins, and the late writer then re-reads the membership.
  */
 export async function lockOrganizationShared(executor: SqlExecutor, organizationId: string): Promise<void> {
-  await executor.query("SELECT id FROM selfhost_organizations WHERE id = $1 FOR SHARE", [organizationId]);
+  await executor.query("SELECT id FROM organizations WHERE id = $1 FOR SHARE", [organizationId]);
 }
 
 /**
@@ -227,14 +227,14 @@ export async function liveDeliveryTargetInTx(
   await lockOrganizationShared(tx, binding.organization_id);
   if (!await isMember(tx, binding.organization_id, binding.user_id)) return false;
   const connection = await tx.query<{ user_id: string }>(
-    "SELECT user_id FROM selfhost_factory_connections WHERE workspace_id = $1 FOR SHARE",
+    "SELECT user_id FROM factory_connections WHERE workspace_id = $1 FOR SHARE",
     [binding.workspace_id],
   );
   if (connection.rows[0]?.user_id !== binding.user_id) return false;
   const row = await tx.query<{ ok: boolean }>(
     `SELECT (state = 'bound' AND hosted_token_envelope IS NOT NULL AND user_id = $2
              AND generation = $3::bigint) AS ok
-       FROM selfhost_factory_bindings WHERE id = $1 FOR SHARE`,
+       FROM factory_bindings WHERE id = $1 FOR SHARE`,
     [binding.id, binding.user_id, String(binding.generation)],
   );
   return row.rows[0]?.ok === true;
@@ -248,7 +248,7 @@ export async function liveBindings(
   filter: { userId?: string; excludeUserId?: string; state?: "bound" } = {},
 ): Promise<FactoryBindingRow[]> {
   const result = await executor.query<FactoryBindingRow>(
-    `SELECT ${BINDING_COLUMNS} FROM selfhost_factory_bindings
+    `SELECT ${BINDING_COLUMNS} FROM factory_bindings
       WHERE workspace_id = $1 AND state <> 'retired'
         AND ($2::uuid IS NULL OR user_id = $2)
         AND ($3::uuid IS NULL OR user_id <> $3)
@@ -272,7 +272,7 @@ export async function setupBlockingBindings(
   workspaceId: string,
 ): Promise<Array<{ id: string; user_id: string; state: string }>> {
   const result = await executor.query<{ id: string; user_id: string; state: string }>(
-    `SELECT id, user_id, state FROM selfhost_factory_bindings
+    `SELECT id, user_id, state FROM factory_bindings
       WHERE workspace_id = $1 AND state <> 'retired'
       ORDER BY created_at, id`,
     [workspaceId],
@@ -286,7 +286,7 @@ export async function liveBindingForSession(
   lock = false,
 ): Promise<FactoryBindingRow | null> {
   const result = await executor.query<FactoryBindingRow>(
-    `SELECT ${BINDING_COLUMNS} FROM selfhost_factory_bindings
+    `SELECT ${BINDING_COLUMNS} FROM factory_bindings
       WHERE session_id = $1 AND state <> 'retired'${lock ? " FOR UPDATE" : ""}`,
     [sessionId],
   );
@@ -300,7 +300,7 @@ export async function liveSessionOwners(
 ): Promise<Array<{ session_id: string; workspace_id: string; user_id: string }>> {
   if (sessionIds.length === 0) return [];
   const result = await executor.query<{ session_id: string; workspace_id: string; user_id: string }>(
-    `SELECT session_id, workspace_id, user_id FROM selfhost_factory_bindings
+    `SELECT session_id, workspace_id, user_id FROM factory_bindings
       WHERE state <> 'retired' AND session_id = ANY($1::text[])`,
     [sessionIds],
   );
@@ -313,7 +313,7 @@ export async function findBinding(
   lock = false,
 ): Promise<FactoryBindingRow | null> {
   const result = await executor.query<FactoryBindingRow>(
-    `SELECT ${BINDING_COLUMNS} FROM selfhost_factory_bindings WHERE id = $1${lock ? " FOR UPDATE" : ""}`,
+    `SELECT ${BINDING_COLUMNS} FROM factory_bindings WHERE id = $1${lock ? " FOR UPDATE" : ""}`,
     [bindingId],
   );
   return result.rows[0] ?? null;
@@ -325,7 +325,7 @@ export async function bindingsForUser(
   userId: string,
 ): Promise<FactoryBindingRow[]> {
   const result = await executor.query<FactoryBindingRow>(
-    `SELECT ${BINDING_COLUMNS} FROM selfhost_factory_bindings
+    `SELECT ${BINDING_COLUMNS} FROM factory_bindings
       WHERE workspace_id = $1 AND user_id = $2 ORDER BY created_at, id`,
     [workspaceId, userId],
   );
@@ -347,7 +347,7 @@ export async function insertPreparingBinding(
   },
 ): Promise<FactoryBindingRow> {
   const result = await executor.query<FactoryBindingRow>(
-    `INSERT INTO selfhost_factory_bindings
+    `INSERT INTO factory_bindings
        (id, workspace_id, organization_id, user_id, session_id, computer_id, state,
         relay_agent_name, hook_secret_envelope, helper_secret_envelope)
      VALUES ($1, $2, $3, $4, $5, $6, 'preparing', $7, $8, $9)
@@ -368,7 +368,7 @@ export async function markBound(
   hostedTokenEnvelope: string,
 ): Promise<FactoryBindingRow | null> {
   const result = await executor.query<FactoryBindingRow>(
-    `UPDATE selfhost_factory_bindings
+    `UPDATE factory_bindings
         SET state = 'bound', generation = generation + 1, relay_agent_id = $2,
             hosted_token_envelope = $3, updated_at = now()
       WHERE id = $1 AND state = 'preparing'
@@ -379,7 +379,7 @@ export async function markBound(
 }
 
 export async function deleteBinding(executor: SqlExecutor, bindingId: string): Promise<void> {
-  await executor.query("DELETE FROM selfhost_factory_bindings WHERE id = $1", [bindingId]);
+  await executor.query("DELETE FROM factory_bindings WHERE id = $1", [bindingId]);
 }
 
 /**
@@ -404,13 +404,13 @@ export async function retireBindingsInTx(
       ? { sql: "workspace_id = $1 AND ($2::uuid IS NULL OR user_id = $2)", params: [filter.workspaceId, filter.userId ?? null] }
       : { sql: "organization_id = $1 AND user_id = $2", params: [filter.organizationId, filter.userId] };
   const locked = await tx.query<{ id: string }>(
-    `SELECT id FROM selfhost_factory_bindings WHERE ${where.sql} AND state <> 'retired' ORDER BY id FOR UPDATE`,
+    `SELECT id FROM factory_bindings WHERE ${where.sql} AND state <> 'retired' ORDER BY id FOR UPDATE`,
     where.params,
   );
   const ids = locked.rows.map((row) => row.id);
   if (ids.length === 0) return [];
   const retired = await tx.query<FactoryRelease>(
-    `UPDATE selfhost_factory_bindings
+    `UPDATE factory_bindings
         SET state = 'retired', retired_at = now(), generation = generation + 1,
             hosted_token_envelope = NULL, hook_secret_envelope = NULL,
             helper_secret_envelope = NULL, history_queued_at = NULL, updated_at = now()
@@ -419,7 +419,7 @@ export async function retireBindingsInTx(
     [ids],
   );
   await tx.query(
-    `UPDATE selfhost_factory_deliveries
+    `UPDATE factory_deliveries
         SET state = CASE state WHEN 'pending' THEN 'rejected' WHEN 'sending' THEN 'unknown' ELSE state END,
             code = CASE WHEN state IN ('pending', 'sending') THEN 'binding_retired' ELSE code END,
             lease_until = NULL, payload_envelope = NULL, reply_hash = NULL, reply_expires_at = NULL,
@@ -428,7 +428,7 @@ export async function retireBindingsInTx(
     [ids],
   );
   await tx.query(
-    `UPDATE selfhost_factory_history_syncs
+    `UPDATE factory_history_syncs
         SET active_job_id = NULL, active_job_lease_until = NULL, pending_envelope = NULL, updated_at = now()
       WHERE binding_id = ANY($1::uuid[])`,
     [ids],
@@ -450,23 +450,23 @@ export async function purgeMemberInTx(
   // §6.0 lock order: the caller holds the organization FOR UPDATE; the
   // member's connections are locked before any of their bindings.
   await tx.query(
-    "SELECT workspace_id FROM selfhost_factory_connections WHERE organization_id = $1 AND user_id = $2 ORDER BY workspace_id FOR UPDATE",
+    "SELECT workspace_id FROM factory_connections WHERE organization_id = $1 AND user_id = $2 ORDER BY workspace_id FOR UPDATE",
     [organizationId, userId],
   );
   const releases = await retireBindingsInTx(tx, { organizationId, userId });
   // Removal deletes the member's outbox rows outright (Cloud a749e46c): no
   // queued body, reply bearer or receipt of a departed member survives.
   await tx.query(
-    `DELETE FROM selfhost_factory_deliveries
-      WHERE binding_id IN (SELECT id FROM selfhost_factory_bindings WHERE organization_id = $1 AND user_id = $2)`,
+    `DELETE FROM factory_deliveries
+      WHERE binding_id IN (SELECT id FROM factory_bindings WHERE organization_id = $1 AND user_id = $2)`,
     [organizationId, userId],
   );
   const connections = await tx.query<{ workspace_id: string }>(
-    `DELETE FROM selfhost_factory_connections WHERE organization_id = $1 AND user_id = $2 RETURNING workspace_id`,
+    `DELETE FROM factory_connections WHERE organization_id = $1 AND user_id = $2 RETURNING workspace_id`,
     [organizationId, userId],
   );
   await tx.query(
-    "DELETE FROM selfhost_factory_history_syncs WHERE organization_id = $1 AND user_id = $2",
+    "DELETE FROM factory_history_syncs WHERE organization_id = $1 AND user_id = $2",
     [organizationId, userId],
   );
   return { releases, connections: connections.rows.map((row) => row.workspace_id) };
@@ -484,17 +484,17 @@ export async function cleanupWorkspaceFactory(
   workspaceId: string,
 ): Promise<{ releases: FactoryRelease[] }> {
   // §6.0 lock order: connection before bindings.
-  await tx.query("SELECT workspace_id FROM selfhost_factory_connections WHERE workspace_id = $1 FOR UPDATE", [workspaceId]);
+  await tx.query("SELECT workspace_id FROM factory_connections WHERE workspace_id = $1 FOR UPDATE", [workspaceId]);
   await retireBindingsInTx(tx, { workspaceId });
   const releases = await tx.query<FactoryRelease>(
-    `SELECT id, workspace_id, relay_agent_name, relay_agent_id FROM selfhost_factory_bindings
+    `SELECT id, workspace_id, relay_agent_name, relay_agent_id FROM factory_bindings
       WHERE workspace_id = $1 AND relay_agent_id IS NOT NULL`,
     [workspaceId],
   );
-  await tx.query("DELETE FROM selfhost_factory_history_syncs WHERE workspace_id = $1", [workspaceId]);
-  await tx.query("DELETE FROM selfhost_factory_deliveries WHERE workspace_id = $1", [workspaceId]);
-  await tx.query("DELETE FROM selfhost_factory_bindings WHERE workspace_id = $1", [workspaceId]);
-  await tx.query("DELETE FROM selfhost_factory_connections WHERE workspace_id = $1", [workspaceId]);
+  await tx.query("DELETE FROM factory_history_syncs WHERE workspace_id = $1", [workspaceId]);
+  await tx.query("DELETE FROM factory_deliveries WHERE workspace_id = $1", [workspaceId]);
+  await tx.query("DELETE FROM factory_bindings WHERE workspace_id = $1", [workspaceId]);
+  await tx.query("DELETE FROM factory_connections WHERE workspace_id = $1", [workspaceId]);
   return { releases: releases.rows };
 }
 
@@ -506,8 +506,8 @@ export async function pendingReleases(
 ): Promise<Array<FactoryRelease & { relaycast_api_key_ciphertext: string }>> {
   const result = await executor.query<FactoryRelease & { relaycast_api_key_ciphertext: string }>(
     `SELECT b.id, b.workspace_id, b.relay_agent_name, b.relay_agent_id, w.relaycast_api_key_ciphertext
-       FROM selfhost_factory_bindings b
-       JOIN selfhost_workspaces w ON w.id = b.workspace_id
+       FROM factory_bindings b
+       JOIN workspaces w ON w.id = b.workspace_id
       WHERE b.state = 'retired' AND b.relay_agent_id IS NOT NULL
         AND ($2::uuid IS NULL OR b.user_id = $2)
         AND ($3::text IS NULL OR b.session_id = $3)
@@ -521,7 +521,7 @@ export async function pendingReleases(
 /** The remote agent is gone: keep the retired row as a secret-free tombstone. */
 export async function markReleased(executor: SqlExecutor, bindingId: string): Promise<void> {
   await executor.query(
-    `UPDATE selfhost_factory_bindings SET relay_agent_id = NULL, remote_cleanup_code = NULL, updated_at = now()
+    `UPDATE factory_bindings SET relay_agent_id = NULL, remote_cleanup_code = NULL, updated_at = now()
       WHERE id = $1 AND state = 'retired'`,
     [bindingId],
   );
@@ -529,7 +529,7 @@ export async function markReleased(executor: SqlExecutor, bindingId: string): Pr
 
 export async function markReleaseFailed(executor: SqlExecutor, bindingId: string, code: string): Promise<void> {
   await executor.query(
-    `UPDATE selfhost_factory_bindings SET remote_cleanup_code = $2, updated_at = now()
+    `UPDATE factory_bindings SET remote_cleanup_code = $2, updated_at = now()
       WHERE id = $1 AND state = 'retired'`,
     [bindingId, code],
   );
@@ -558,7 +558,7 @@ export async function insertDelivery(
   },
 ): Promise<boolean> {
   const result = await executor.query(
-    `INSERT INTO selfhost_factory_deliveries
+    `INSERT INTO factory_deliveries
        (binding_id, message_id, workspace_id, organization_id, relay_delivery_id,
         sender_agent_name, sender_agent_id, payload_envelope, state, code)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -578,7 +578,7 @@ export async function findDelivery(
   messageId: string,
 ): Promise<FactoryDeliveryRow | null> {
   const result = await executor.query<FactoryDeliveryRow>(
-    `SELECT ${DELIVERY_COLUMNS} FROM selfhost_factory_deliveries WHERE binding_id = $1 AND message_id = $2`,
+    `SELECT ${DELIVERY_COLUMNS} FROM factory_deliveries WHERE binding_id = $1 AND message_id = $2`,
     [bindingId, messageId],
   );
   return result.rows[0] ?? null;
@@ -587,7 +587,7 @@ export async function findDelivery(
 /** Bound bindings for the inbox poll, oldest-polled first (soft cap per tick). */
 export async function boundBindings(executor: SqlExecutor, limit: number): Promise<FactoryBindingRow[]> {
   const result = await executor.query<FactoryBindingRow>(
-    `SELECT ${BINDING_COLUMNS} FROM selfhost_factory_bindings
+    `SELECT ${BINDING_COLUMNS} FROM factory_bindings
       WHERE state = 'bound' AND hosted_token_envelope IS NOT NULL
       ORDER BY id LIMIT $1`,
     [limit],

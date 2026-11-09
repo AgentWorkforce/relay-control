@@ -104,13 +104,13 @@ export interface CredentialObjectBackend {
   delete(key: string, executor?: SqlExecutor): Promise<void>;
 }
 
-/** Fallback: envelopes inline in selfhost_coding_agent_credential_blobs. */
+/** Fallback: envelopes inline in coding_agent_credential_blobs. */
 export class PostgresObjectBackend implements CredentialObjectBackend {
   readonly kind = "postgres" as const;
   constructor(private readonly database: Database) {}
   async put(key: string, body: string, executor: SqlExecutor = this.database): Promise<void> {
     await executor.query(
-      `INSERT INTO selfhost_coding_agent_credential_blobs (object_key, envelope)
+      `INSERT INTO coding_agent_credential_blobs (object_key, envelope)
        VALUES ($1, $2)
        ON CONFLICT (object_key) DO UPDATE SET envelope = EXCLUDED.envelope, updated_at = now()`,
       [key, body],
@@ -118,13 +118,13 @@ export class PostgresObjectBackend implements CredentialObjectBackend {
   }
   async get(key: string, executor: SqlExecutor = this.database): Promise<string | null> {
     const result = await executor.query<{ envelope: string }>(
-      "SELECT envelope FROM selfhost_coding_agent_credential_blobs WHERE object_key = $1",
+      "SELECT envelope FROM coding_agent_credential_blobs WHERE object_key = $1",
       [key],
     );
     return result.rows[0]?.envelope ?? null;
   }
   async delete(key: string, executor: SqlExecutor = this.database): Promise<void> {
-    await executor.query("DELETE FROM selfhost_coding_agent_credential_blobs WHERE object_key = $1", [key]);
+    await executor.query("DELETE FROM coding_agent_credential_blobs WHERE object_key = $1", [key]);
   }
 }
 

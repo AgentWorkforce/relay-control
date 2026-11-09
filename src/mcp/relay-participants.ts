@@ -79,7 +79,7 @@ function automaticParticipantName(user: { name: string; email: string }, session
 }
 
 // ---------------------------------------------------------------------------
-// Store: selfhost_hosted_relay_participants (migration 0012).
+// Store: hosted_relay_participants (migration 0012).
 
 export type ParticipantRow = {
   id: string;
@@ -114,8 +114,8 @@ async function findParticipant(executor: SqlExecutor, workspaceId: string, userI
   const [column, value] = "name" in selector ? ["agent_name", selector.name]
     : "agentRemoteId" in selector ? ["agent_remote_id", selector.agentRemoteId] : ["session_hash", selector.sessionHash];
   const result = await executor.query(
-    `SELECT ${COLUMNS} FROM selfhost_hosted_relay_participants p
-      JOIN selfhost_workspaces w ON w.id=p.workspace_id
+    `SELECT ${COLUMNS} FROM hosted_relay_participants p
+      JOIN workspaces w ON w.id=p.workspace_id
       WHERE p.workspace_id = $1 AND p.user_id = $2 AND w.organization_id=$3 AND p.${column} = $4`,
     [workspaceId, userId, organizationId, value],
   );
@@ -124,7 +124,7 @@ async function findParticipant(executor: SqlExecutor, workspaceId: string, userI
 
 async function insertParticipant(executor: SqlExecutor, row: Omit<ParticipantRow, "id">): Promise<void> {
   await executor.query(
-    `INSERT INTO selfhost_hosted_relay_participants
+    `INSERT INTO hosted_relay_participants
        (id, workspace_id, user_id, relaycast_workspace_id, session_hash, agent_name, agent_remote_id, token_ciphertext)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [randomUUID(), row.workspaceId, row.userId, row.relayWorkspaceId, row.sessionHash, row.agentName, row.agentRemoteId, row.tokenCiphertext],
@@ -134,7 +134,7 @@ async function insertParticipant(executor: SqlExecutor, row: Omit<ParticipantRow
 async function updateParticipant(executor: SqlExecutor, id: string,
   fields: { sessionHash?: string; agentName?: string; tokenCiphertext?: string }) {
   await executor.query(
-    `UPDATE selfhost_hosted_relay_participants
+    `UPDATE hosted_relay_participants
         SET session_hash = COALESCE($2, session_hash), agent_name = COALESCE($3, agent_name),
             token_ciphertext = COALESCE($4, token_ciphertext), updated_at = now()
       WHERE id = $1`,
@@ -143,7 +143,7 @@ async function updateParticipant(executor: SqlExecutor, id: string,
 }
 
 async function removeParticipant(executor: SqlExecutor, id: string): Promise<void> {
-  await executor.query("DELETE FROM selfhost_hosted_relay_participants WHERE id = $1", [id]);
+  await executor.query("DELETE FROM hosted_relay_participants WHERE id = $1", [id]);
 }
 
 // ---------------------------------------------------------------------------

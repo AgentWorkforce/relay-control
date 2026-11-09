@@ -410,7 +410,7 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
   }
 
   // A personal session without cli:auth is not an MCP credential.
-  await env.database.query("UPDATE selfhost_token_sessions SET scopes = ARRAY['rth:read']::text[]");
+  await env.database.query("UPDATE token_sessions SET scopes = ARRAY['rth:read']::text[]");
   const scoped = await rpc(env.origin, MCP_PATH, { headers: auth });
   assert.equal(scoped.status, 403);
   assert.deepEqual(scoped.body.error, { code: -32003, message: "Forbidden" });
@@ -612,7 +612,7 @@ test("join_relay by name registers a hosted participant with Cloud's metadata", 
   const registerCall = env.relay.calls.find(call => call.path === "/v1/agents" && call.authorization === "Bearer rk_live_first");
   assert.ok(registerCall);
 
-  const rows = await env.database.query<Record<string, any>>("SELECT * FROM selfhost_hosted_relay_participants");
+  const rows = await env.database.query<Record<string, any>>("SELECT * FROM hosted_relay_participants");
   assert.equal(rows.rows.length, 1);
   assert.equal(rows.rows[0]!.workspace_id, env.workspaceId);
   assert.equal(rows.rows[0]!.user_id, env.ownerId);
@@ -653,7 +653,7 @@ test("join_relay is idempotent, defaults its name, and refuses a foreign owner's
   const third = await relayClient(t, env);
   assert.equal(toolError(await third.callTool({ name: "join_relay", arguments: { name: "taken-name" } })),
     "That relay name is already taken. Choose another name.");
-  const rows = await env.database.query("SELECT agent_name FROM selfhost_hosted_relay_participants");
+  const rows = await env.database.query("SELECT agent_name FROM hosted_relay_participants");
   assert.deepEqual(rows.rows.map(row => String(row.agent_name)).sort(), ["owner-helper", defaulted.name].sort());
 
   // If the remote agent stops carrying this owner's metadata, it is refused too.
@@ -672,7 +672,7 @@ test("join_relay refuses desktop_address, and as_person is refused", async (t) =
   assert.match(toolError(await client.callTool({ name: "send_relay_message", arguments: { to: "nobody-here", text: "hi" } })),
     /Unknown agent name/);
   // Neither refusal joined anything.
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_hosted_relay_participants")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM hosted_relay_participants")).rows.length, 0);
 });
 
 test("send_relay_message auto-joins, sends, replies, and reads the conversation", async (t) => {
@@ -805,7 +805,7 @@ test("leave_relay releases the remote agent and deletes the participant", async 
   assert.equal(env.relay.world.agents.has("owner-leaver"), false);
   const release = env.relay.world.bodies.find(call => call.path === "/v1/agents/release-exact")!;
   assert.deepEqual(release.body, { name: "owner-leaver", expected_agent_id: remoteId, delete_agent: true, reason: "Hosted MCP participant left" });
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_hosted_relay_participants")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM hosted_relay_participants")).rows.length, 0);
   assert.deepEqual(structured(await client.callTool({ name: "leave_relay", arguments: {} })), { joined: false, already_left: true });
   assert.equal(structured(await client.callTool({ name: "relay_status", arguments: {} })).joined, false);
   // The name is free again.
@@ -820,7 +820,7 @@ const takeovers = (env: Env, name: string) => env.relay.world.bodies.filter(call
 
 async function storedCiphertext(env: Env, name: string): Promise<string> {
   const rows = await env.database.query<Record<string, any>>(
-    "SELECT token_ciphertext FROM selfhost_hosted_relay_participants WHERE agent_name = $1", [name]);
+    "SELECT token_ciphertext FROM hosted_relay_participants WHERE agent_name = $1", [name]);
   assert.equal(rows.rows.length, 1);
   return String(rows.rows[0]!.token_ciphertext);
 }
@@ -890,7 +890,7 @@ test("a rejected token fails every other relay tool explicitly, and leave_relay 
   const release = env.relay.world.bodies.find(call => call.path === "/v1/agents/release-exact")!;
   assert.equal(release.body!.expected_agent_id, remoteId);
   assert.equal(env.relay.world.agents.has("owner-stale"), false);
-  assert.equal((await env.database.query("SELECT 1 FROM selfhost_hosted_relay_participants")).rows.length, 0);
+  assert.equal((await env.database.query("SELECT 1 FROM hosted_relay_participants")).rows.length, 0);
 });
 
 test("a failed takeover leaves the stored participant unchanged", async (t) => {
@@ -949,14 +949,14 @@ test("a persistence failure after takeover fails join, and the next join repeats
   await env.database.query(`CREATE FUNCTION test_fail_token_update() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN RAISE EXCEPTION 'injected token persistence failure'; END $$`);
   await env.database.query(`CREATE TRIGGER test_fail_token_update BEFORE UPDATE OF token_ciphertext
-    ON selfhost_hosted_relay_participants FOR EACH ROW EXECUTE FUNCTION test_fail_token_update()`);
+    ON hosted_relay_participants FOR EACH ROW EXECUTE FUNCTION test_fail_token_update()`);
 
   const failed = await client.callTool({ name: "join_relay", arguments: { name: "owner-persist" } });
   assert.equal(failed.isError, true);
   assert.equal(takeovers(env, "owner-persist").length, 1);
   assert.equal(await storedCiphertext(env, "owner-persist"), before);
 
-  await env.database.query("DROP TRIGGER test_fail_token_update ON selfhost_hosted_relay_participants");
+  await env.database.query("DROP TRIGGER test_fail_token_update ON hosted_relay_participants");
   const recovered = structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-persist" } }));
   assert.deepEqual([recovered.already_joined, recovered.recovered], [true, true]);
   assert.equal(takeovers(env, "owner-persist").length, 2);

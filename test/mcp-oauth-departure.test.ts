@@ -18,10 +18,10 @@ const KEYRING={ active:{ id:"fake-key",key:Buffer.alloc(32,7) } };
 async function fixture(t:test.TestContext) {
   const database=new PGliteDatabase();t.after(()=>database.close());await migrate(database);
   const organizationId=randomUUID(),ownerId=randomUUID(),userId=randomUUID();
-  await database.query("INSERT INTO selfhost_organizations(id,name) VALUES ($1,'Fake Org')",[organizationId]);
+  await database.query("INSERT INTO organizations(id,name) VALUES ($1,'Fake Org')",[organizationId]);
   for(const [id,role] of [[ownerId,"owner"],[userId,"member"]]) {
-    await database.query("INSERT INTO selfhost_users(id,email,name) VALUES ($1,$2,'Fake User')",[id,`fake-${id}@example.test`]);
-    await database.query("INSERT INTO selfhost_organization_memberships(organization_id,user_id,role) VALUES ($1,$2,$3)",[organizationId,id,role]);
+    await database.query("INSERT INTO users(id,email,name) VALUES ($1,$2,'Fake User')",[id,`fake-${id}@example.test`]);
+    await database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,$3)",[organizationId,id,role]);
   }
   const store=new ControlPlaneStore(database,KEYRING,0,{tenancy:"multi"});
   const protocol=createMcpOAuthProtocol({publicOrigin:ORIGIN,enabledResources:["/api/v1/mcp/shared-sessions"]});
@@ -33,7 +33,7 @@ async function fixture(t:test.TestContext) {
   const pairs=[];
   for(let i=0;i<2;i++) {
     const workspaceId=randomUUID();
-    await database.query(`INSERT INTO selfhost_workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
+    await database.query(`INSERT INTO workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
       VALUES ($1,$2,'Fake Workspace',$3,'fake-envelope')`,[workspaceId,organizationId,`fake-${workspaceId}`]);
     const consent={userId,organizationId,workspaceId,agentName:"fake-agent"};
     const code=await oauth.createMcpOAuthAuthorizationCode(result.value,consent);
@@ -48,7 +48,7 @@ async function fixture(t:test.TestContext) {
     sessionReadApi:{url:"http://unused.test",publicUrl:"https://history.example.test",secret:"session-read-secret-".repeat(2)},
     bootstrapToken:"fake-bootstrap-at-least-thirty-two-bytes",
     encryptionKeyring:KEYRING,internalServiceToken:null,oauthRedirectUrl:`${ORIGIN}/unused`,dashboardUrl:ORIGIN,host:"127.0.0.1",port:3000};
-  const count=async(table:"sessions"|"revocations")=>(await database.query<{n:number}>(`SELECT count(*)::int AS n FROM selfhost_mcp_oauth_${table}`)).rows[0]!.n;
+  const count=async(table:"sessions"|"revocations")=>(await database.query<{n:number}>(`SELECT count(*)::int AS n FROM mcp_oauth_${table}`)).rows[0]!.n;
   return {database,store,oauth,organizationId,ownerId,userId,client,pairs,config,count};
 }
 
@@ -60,7 +60,7 @@ test("membership HTTP removal consumes the real OAuth departure hook; rejoin can
   assert.equal(response.status,204);
   assert.equal(await f.store.memberRole(f.organizationId,f.userId),null);
   assert.equal(await f.count("revocations"),2);assert.equal(await f.count("sessions"),2);
-  await f.database.query("INSERT INTO selfhost_organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')",[f.organizationId,f.userId]);
+  await f.database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')",[f.organizationId,f.userId]);
   for(const pair of f.pairs) {
     assert.equal(await f.oauth.sessions.resolveAccessToken(pair.access_token,RESOURCE),null);
     assert.equal((await f.oauth.refreshMcpOAuthToken({refreshToken:pair.refresh_token,clientId:f.client.clientId,resource:undefined})).ok,false);
@@ -83,7 +83,7 @@ test("last-owner refusal does not invoke departure; retry of an absent member ca
   const f=await fixture(t);let called=false;
   assert.equal(await f.store.deleteMembership(f.organizationId,f.ownerId,async()=>{called=true;}),false);
   assert.equal(called,false);assert.equal(await f.store.memberRole(f.organizationId,f.ownerId),"owner");
-  await f.database.query("DELETE FROM selfhost_organization_memberships WHERE organization_id=$1 AND user_id=$2",[f.organizationId,f.userId]);
+  await f.database.query("DELETE FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",[f.organizationId,f.userId]);
   assert.equal(await f.store.deleteMembership(f.organizationId,f.userId,(tx)=>revokeOrganizationMcpOAuthGrants(tx,{organizationId:f.organizationId,userId:f.userId})),false);
   assert.equal(await f.count("revocations"),2);
 });
@@ -105,14 +105,14 @@ test("Amp, Factory and OAuth departure cleanup commit or roll back together afte
     redirectUri:client.redirectUris[0],codeVerifier:VERIFIER,resource:undefined});
   assert.ok(issued.ok);
   const ampBinding=randomUUID(),ampDelivery=randomUUID();
-  await env.database.query(`INSERT INTO selfhost_amp_connections
+  await env.database.query(`INSERT INTO amp_connections
     (workspace_id,organization_id,user_id,key_ciphertext,key_hint)
     VALUES ($1,$2,$3,'fake-envelope','fake-hint')`,[env.workspaceId,env.organizationId,env.adminId]);
-  await env.database.query(`INSERT INTO selfhost_amp_bindings
+  await env.database.query(`INSERT INTO amp_bindings
     (id,workspace_id,organization_id,user_id,thread_id,state,agent_name,agent_remote_id,token_ciphertext,hook_ciphertext)
     VALUES ($1,$2,$3,$4,$5,'bound','fake-amp-agent','fake-amp-id','fake-token-envelope','fake-hook-envelope')`,
     [ampBinding,env.workspaceId,env.organizationId,env.adminId,"fake-thread-"+ampBinding]);
-  await env.database.query(`INSERT INTO selfhost_amp_deliveries
+  await env.database.query(`INSERT INTO amp_deliveries
     (id,binding_id,message_id,payload_ciphertext,state,reply_hash)
     VALUES ($1,$2,'fake-message','fake-payload-envelope','pending','fake-reply-hash')`,[ampDelivery,ampBinding]);
   const store=new ControlPlaneStore(env.database,env.config.encryptionKeyring,0);
@@ -123,22 +123,22 @@ test("Amp, Factory and OAuth departure cleanup commit or roll back together afte
     throw new Error("fake combined cleanup abort");
   }),/fake combined cleanup abort/);
   assert.equal((await bindingRow(env,bound.binding_id)).state,"bound");
-  assert.equal((await env.database.query("SELECT state FROM selfhost_amp_bindings WHERE id=$1",[ampBinding])).rows[0]!.state,"bound");
-  assert.equal((await env.database.query("SELECT reply_hash FROM selfhost_amp_deliveries WHERE id=$1",[ampDelivery])).rows[0]!.reply_hash,"fake-reply-hash");
-  assert.equal((await env.database.query("SELECT workspace_id FROM selfhost_amp_connections")).rows.length,1);
+  assert.equal((await env.database.query("SELECT state FROM amp_bindings WHERE id=$1",[ampBinding])).rows[0]!.state,"bound");
+  assert.equal((await env.database.query("SELECT reply_hash FROM amp_deliveries WHERE id=$1",[ampDelivery])).rows[0]!.reply_hash,"fake-reply-hash");
+  assert.equal((await env.database.query("SELECT workspace_id FROM amp_connections")).rows.length,1);
   assert.ok(await oauth.sessions.resolveAccessToken(issued.body.access_token,resource));
   assert.equal(await store.memberRole(env.organizationId,env.adminId),"admin");
-  assert.equal((await env.database.query("SELECT id FROM selfhost_mcp_oauth_revocations")).rows.length,0);
+  assert.equal((await env.database.query("SELECT id FROM mcp_oauth_revocations")).rows.length,0);
   assert.equal((await removeMember(env,env.adminId)).status,204);
   const retired=await bindingRow(env,bound.binding_id);
   assert.equal(retired.state,"retired");assert.equal(retired.hosted_token_envelope,null);
-  const ampRetired=(await env.database.query("SELECT state,token_ciphertext,hook_ciphertext FROM selfhost_amp_bindings WHERE id=$1",[ampBinding])).rows[0]!;
+  const ampRetired=(await env.database.query("SELECT state,token_ciphertext,hook_ciphertext FROM amp_bindings WHERE id=$1",[ampBinding])).rows[0]!;
   assert.deepEqual(ampRetired,{state:"retired",token_ciphertext:null,hook_ciphertext:null});
-  const deliveryRetired=(await env.database.query("SELECT state,payload_ciphertext,reply_hash FROM selfhost_amp_deliveries WHERE id=$1",[ampDelivery])).rows[0]!;
+  const deliveryRetired=(await env.database.query("SELECT state,payload_ciphertext,reply_hash FROM amp_deliveries WHERE id=$1",[ampDelivery])).rows[0]!;
   assert.deepEqual(deliveryRetired,{state:"rejected",payload_ciphertext:null,reply_hash:null});
-  assert.equal((await env.database.query("SELECT workspace_id FROM selfhost_amp_connections")).rows.length,0);
+  assert.equal((await env.database.query("SELECT workspace_id FROM amp_connections")).rows.length,0);
   assert.ok(env.relay.released.includes(bound.agent.id));
-  assert.equal((await env.database.query("SELECT id FROM selfhost_mcp_oauth_revocations")).rows.length,1);
-  await env.database.query("INSERT INTO selfhost_organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'admin')",[env.organizationId,env.adminId]);
+  assert.equal((await env.database.query("SELECT id FROM mcp_oauth_revocations")).rows.length,1);
+  await env.database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'admin')",[env.organizationId,env.adminId]);
   assert.equal(await oauth.sessions.resolveAccessToken(issued.body.access_token,resource),null);
 });

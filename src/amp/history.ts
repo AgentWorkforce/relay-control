@@ -186,12 +186,12 @@ const at = (deps: AmpDeps, offsetMs = 0) => new Date(deps.now().getTime() + offs
  */
 export async function scheduleHistory(deps: AmpDeps): Promise<number> {
   const result = await deps.database.query(
-    `UPDATE selfhost_amp_bindings b
+    `UPDATE amp_bindings b
         SET history_queued_at = $1
       WHERE b.state = 'bound'
         AND b.history_queued_at IS NULL
         AND (b.last_synced_at IS NULL OR b.last_synced_at <= $2)
-        AND EXISTS (SELECT 1 FROM selfhost_amp_connections c
+        AND EXISTS (SELECT 1 FROM amp_connections c
                      WHERE c.workspace_id = b.workspace_id AND c.user_id = b.user_id)
       RETURNING b.id`,
     [at(deps), at(deps, -AMP_HISTORY_INTERVAL_MS)],
@@ -206,11 +206,11 @@ export async function scheduleHistory(deps: AmpDeps): Promise<number> {
  */
 export async function queueHistory(deps: AmpDeps, bindingId: string, scheduledAt?: string): Promise<boolean> {
   const result = await deps.database.query(
-    `UPDATE selfhost_amp_bindings b
+    `UPDATE amp_bindings b
         SET history_queued_at = COALESCE(b.history_queued_at, $2)
       WHERE b.id = $1 AND b.state = 'bound'
         AND ($3::timestamptz IS NULL OR b.last_synced_at IS NULL OR b.last_synced_at < $3::timestamptz)
-        AND EXISTS (SELECT 1 FROM selfhost_amp_connections c
+        AND EXISTS (SELECT 1 FROM amp_connections c
                      WHERE c.workspace_id = b.workspace_id AND c.user_id = b.user_id)
       RETURNING b.id`,
     [bindingId, at(deps), scheduledAt ?? null],
@@ -240,11 +240,11 @@ export async function claimHistory(deps: AmpDeps, limit = AMP_HISTORY_PER_TICK):
   return deps.database.transaction(async (tx) => {
     const now = at(deps);
     const due = await tx.query<{ id: string }>(
-      `SELECT b.id FROM selfhost_amp_bindings b
+      `SELECT b.id FROM amp_bindings b
         WHERE b.state = 'bound'
           AND b.history_queued_at IS NOT NULL
           AND (b.history_lease_until IS NULL OR b.history_lease_until <= $1)
-          AND EXISTS (SELECT 1 FROM selfhost_amp_connections c
+          AND EXISTS (SELECT 1 FROM amp_connections c
                        WHERE c.workspace_id = b.workspace_id AND c.user_id = b.user_id)
         ORDER BY b.history_queued_at, b.id
         LIMIT $2
@@ -253,7 +253,7 @@ export async function claimHistory(deps: AmpDeps, limit = AMP_HISTORY_PER_TICK):
     );
     if (!due.rows.length) return [];
     const claimed = await tx.query<Omit<Claimed, "owner">>(
-      `UPDATE selfhost_amp_bindings
+      `UPDATE amp_bindings
           SET history_lease_owner = $2, history_lease_until = $3
         WHERE id = ANY($1::uuid[])
         RETURNING id, workspace_id, organization_id, user_id, thread_id, generation, last_synced_at, history_queued_at`,
@@ -281,7 +281,7 @@ export async function runHistory(
   const guard = <T>(work: (tx: SqlExecutor) => Promise<T>) =>
     withAmpLock(deps, scope, async (tx) => {
       const current = await tx.query<{ state: string; generation: number; user_id: string; history_lease_owner: string | null }>(
-        "SELECT state, generation, user_id, history_lease_owner FROM selfhost_amp_bindings WHERE id = $1 FOR UPDATE",
+        "SELECT state, generation, user_id, history_lease_owner FROM amp_bindings WHERE id = $1 FOR UPDATE",
         [row.id],
       );
       const binding = current.rows[0];
@@ -290,7 +290,7 @@ export async function runHistory(
         throw new StaleHistory();
       }
       const connection = await tx.query<{ user_id: string; key_ciphertext: string }>(
-        "SELECT user_id, key_ciphertext FROM selfhost_amp_connections WHERE workspace_id = $1 FOR SHARE",
+        "SELECT user_id, key_ciphertext FROM amp_connections WHERE workspace_id = $1 FOR SHARE",
         [row.workspace_id],
       );
       const conn = connection.rows[0];
@@ -299,7 +299,7 @@ export async function runHistory(
       }
       keyCiphertext = conn.key_ciphertext;
       await tx.query(
-        "UPDATE selfhost_amp_bindings SET history_lease_until = $2 WHERE id = $1",
+        "UPDATE amp_bindings SET history_lease_until = $2 WHERE id = $1",
         [row.id, at(deps, AMP_HISTORY_QUEUE_LEASE_MS)],
       );
       return work(tx);
@@ -319,7 +319,7 @@ export async function runHistory(
       // A poll that finished after this request was queued already covers it.
       await guard(async (tx) => {
         await tx.query(
-          `UPDATE selfhost_amp_bindings
+          `UPDATE amp_bindings
               SET history_lease_owner = NULL, history_lease_until = NULL,
                   history_queued_at = CASE WHEN history_queued_at = $2 THEN NULL ELSE history_queued_at END
             WHERE id = $1`,
@@ -331,12 +331,12 @@ export async function runHistory(
     const startedAt = at(deps);
     const ledger = await guard(async (tx) => {
       await tx.query(
-        `INSERT INTO selfhost_amp_history_syncs (workspace_id, thread_id) VALUES ($1, $2)
+        `INSERT INTO amp_history_syncs (workspace_id, thread_id) VALUES ($1, $2)
          ON CONFLICT (workspace_id, thread_id) DO NOTHING`,
         [row.workspace_id, row.thread_id],
       );
       const found = await tx.query<Ledger>(
-        `SELECT versions, pending_ciphertext, redactions_ciphertext FROM selfhost_amp_history_syncs
+        `SELECT versions, pending_ciphertext, redactions_ciphertext FROM amp_history_syncs
           WHERE workspace_id = $1 AND thread_id = $2`,
         [row.workspace_id, row.thread_id],
       );
@@ -372,7 +372,7 @@ export async function runHistory(
       // Acknowledge the page and retire its outbox entry in one durable mutation.
       await guard(async (tx) => {
         await tx.query(
-          `UPDATE selfhost_amp_history_syncs SET versions = $3::jsonb, pending_ciphertext = NULL
+          `UPDATE amp_history_syncs SET versions = $3::jsonb, pending_ciphertext = NULL
             WHERE workspace_id = $1 AND thread_id = $2`,
           [row.workspace_id, row.thread_id, JSON.stringify(versions)],
         );
@@ -399,7 +399,7 @@ export async function runHistory(
       const pending = preparePage(row, changed.slice(offset, offset + PAGE_RECORDS), versions);
       await guard(async (tx) => {
         await tx.query(
-          `UPDATE selfhost_amp_history_syncs SET pending_ciphertext = $3
+          `UPDATE amp_history_syncs SET pending_ciphertext = $3
             WHERE workspace_id = $1 AND thread_id = $2`,
           [row.workspace_id, row.thread_id, encrypt(deps, JSON.stringify(pending))],
         );
@@ -410,14 +410,14 @@ export async function runHistory(
       // Persist metadata-only backfills too; uploaded pages already committed theirs.
       if (backfilled && changed.length === 0) {
         await tx.query(
-          "UPDATE selfhost_amp_history_syncs SET versions = $3::jsonb WHERE workspace_id = $1 AND thread_id = $2",
+          "UPDATE amp_history_syncs SET versions = $3::jsonb WHERE workspace_id = $1 AND thread_id = $2",
           [row.workspace_id, row.thread_id, JSON.stringify(versions)],
         );
       }
       // The watermark moves only here, after every page was fully accepted.
       // Empty exports are successful polls.
       await tx.query(
-        `UPDATE selfhost_amp_bindings
+        `UPDATE amp_bindings
             SET last_synced_at = $2, history_error = NULL,
                 history_lease_owner = NULL, history_lease_until = NULL,
                 history_queued_at = CASE WHEN history_queued_at = $3 THEN NULL ELSE history_queued_at END
@@ -431,7 +431,7 @@ export async function runHistory(
       // Give back only this run's own lease (a key change, say); a newer
       // claim or a retired row is left untouched.
       await deps.database.query(
-        `UPDATE selfhost_amp_bindings SET history_lease_owner = NULL, history_lease_until = NULL
+        `UPDATE amp_bindings SET history_lease_owner = NULL, history_lease_until = NULL
           WHERE id = $1 AND history_lease_owner = $2`,
         [row.id, row.owner],
       ).catch(() => undefined);
@@ -441,7 +441,7 @@ export async function runHistory(
     // Fenced on the lease: a stale run never overwrites a newer run or a retired row.
     // The lease becomes the retry delay; history_queued_at stays so the thread is retried.
     await deps.database.query(
-      `UPDATE selfhost_amp_bindings
+      `UPDATE amp_bindings
           SET history_error = $3, history_lease_owner = NULL, history_lease_until = $4
         WHERE id = $1 AND history_lease_owner = $2 AND state = 'bound'`,
       [row.id, row.owner, code, at(deps, AMP_HISTORY_QUEUE_LEASE_MS)],
@@ -455,7 +455,7 @@ export async function runHistory(
 /** Without a push session nothing is exported or polled; only the reason is recorded. */
 export async function recordHistoryBlocked(deps: AmpDeps): Promise<void> {
   await deps.database.query(
-    `UPDATE selfhost_amp_bindings SET history_error = $1
+    `UPDATE amp_bindings SET history_error = $1
       WHERE state = 'bound' AND history_error IS DISTINCT FROM $1`,
     [HISTORY_PUSH_UNAVAILABLE],
   );

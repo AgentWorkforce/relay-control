@@ -39,7 +39,7 @@ export function startAmpWorker(deps: AmpDeps, intervalMs: number): AmpWorker {
       await processClaim(deps, claim);
     }
     const retired = await deps.database.query<{ id: string }>(
-      "SELECT id FROM selfhost_amp_bindings WHERE state = 'retired' ORDER BY updated_at LIMIT 10",
+      "SELECT id FROM amp_bindings WHERE state = 'retired' ORDER BY updated_at LIMIT 10",
     );
     for (const row of retired.rows) {
       if (stopped) break;

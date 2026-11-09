@@ -124,7 +124,7 @@ required setting. When the level is `off`, no telemetry setting is required.
 
 ## Delivery, buffering, and offline clusters
 
-Reports are written to a Postgres outbox (`selfhost_telemetry_outbox`) before
+Reports are written to a Postgres outbox (`telemetry_outbox`) before
 they are sent, so a cluster without egress loses nothing. Sending retries
 with exponential backoff and jitter: 30 seconds, doubling up to 6 hours. A
 report is dropped after 40 attempts or 14 days. Pending digests are capped

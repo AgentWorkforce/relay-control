@@ -55,7 +55,7 @@ export class TelemetryStore {
 
   async state(): Promise<{ salt: string; windowStartedAt: string; lastDigestAt: string | null }> {
     await this.database.query(
-      `INSERT INTO selfhost_telemetry_state (id, salt) VALUES (1, $1)
+      `INSERT INTO telemetry_state (id, salt) VALUES (1, $1)
        ON CONFLICT (id) DO NOTHING`,
       [randomBytes(32).toString("base64url")],
     );
@@ -63,7 +63,7 @@ export class TelemetryStore {
       salt: string;
       window_started_at: Date | string;
       last_digest_at: Date | string | null;
-    }>("SELECT salt, window_started_at, last_digest_at FROM selfhost_telemetry_state WHERE id = 1");
+    }>("SELECT salt, window_started_at, last_digest_at FROM telemetry_state WHERE id = 1");
     const row = result.rows[0]!;
     this.#salt = row.salt;
     return {
@@ -82,31 +82,31 @@ export class TelemetryStore {
     await this.database.transaction(async (tx) => {
       for (const counter of counters) {
         await tx.query(
-          `INSERT INTO selfhost_telemetry_counters (area, metric, value) VALUES ($1, $2, $3)
+          `INSERT INTO telemetry_counters (area, metric, value) VALUES ($1, $2, $3)
            ON CONFLICT (area, metric)
-           DO UPDATE SET value = selfhost_telemetry_counters.value + EXCLUDED.value`,
+           DO UPDATE SET value = telemetry_counters.value + EXCLUDED.value`,
           [counter.area, counter.metric, counter.value],
         );
       }
       for (const error of errors) {
         await tx.query(
-          `INSERT INTO selfhost_telemetry_errors
+          `INSERT INTO telemetry_errors
              (fingerprint, component, route, status, error_class, count, first_seen, last_seen)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            ON CONFLICT (fingerprint, component, route, status, error_class)
-           DO UPDATE SET count = selfhost_telemetry_errors.count + EXCLUDED.count,
-                         first_seen = LEAST(selfhost_telemetry_errors.first_seen, EXCLUDED.first_seen),
-                         last_seen = GREATEST(selfhost_telemetry_errors.last_seen, EXCLUDED.last_seen)`,
+           DO UPDATE SET count = telemetry_errors.count + EXCLUDED.count,
+                         first_seen = LEAST(telemetry_errors.first_seen, EXCLUDED.first_seen),
+                         last_seen = GREATEST(telemetry_errors.last_seen, EXCLUDED.last_seen)`,
           [
             error.fingerprint, error.component, error.route, error.status,
             error.errorClass, error.count, error.firstSeen, error.lastSeen,
           ],
         );
         await tx.query(
-          `INSERT INTO selfhost_telemetry_error_index (fingerprint, component, first_seen, last_seen)
+          `INSERT INTO telemetry_error_index (fingerprint, component, first_seen, last_seen)
            VALUES ($1, $2, $3, $4)
            ON CONFLICT (fingerprint, component)
-           DO UPDATE SET last_seen = GREATEST(selfhost_telemetry_error_index.last_seen, EXCLUDED.last_seen)`,
+           DO UPDATE SET last_seen = GREATEST(telemetry_error_index.last_seen, EXCLUDED.last_seen)`,
           [error.fingerprint, error.component, error.firstSeen, error.lastSeen],
         );
       }
@@ -119,13 +119,13 @@ export class TelemetryStore {
     errors: ErrorAggregate[];
   }> {
     const counters = await executor.query<{ area: string; metric: string; value: string | number }>(
-      "SELECT area, metric, value FROM selfhost_telemetry_counters ORDER BY area, metric",
+      "SELECT area, metric, value FROM telemetry_counters ORDER BY area, metric",
     );
     const errors = await executor.query<Record<string, unknown>>(
       `SELECT e.fingerprint, e.component, e.route, e.status, e.error_class, e.count,
               e.first_seen, e.last_seen, COALESCE(i.first_seen, e.first_seen) AS first_seen_ever
-         FROM selfhost_telemetry_errors e
-         LEFT JOIN selfhost_telemetry_error_index i
+         FROM telemetry_errors e
+         LEFT JOIN telemetry_error_index i
            ON i.fingerprint = e.fingerprint AND i.component = e.component
         ORDER BY e.count DESC, e.last_seen DESC
         LIMIT 200`,
@@ -161,14 +161,14 @@ export class TelemetryStore {
   ): Promise<string | null> {
     const taken = await this.database.transaction(async (tx) => {
       const state = await tx.query<{ window_started_at: Date | string }>(
-        "SELECT window_started_at FROM selfhost_telemetry_state WHERE id = 1 FOR UPDATE",
+        "SELECT window_started_at FROM telemetry_state WHERE id = 1 FOR UPDATE",
       );
       const windowStartedAt = state.rows[0] ? iso(state.rows[0].window_started_at) : new Date().toISOString();
       const window = await this.peekWindow(tx);
-      await tx.query("DELETE FROM selfhost_telemetry_counters");
-      await tx.query("DELETE FROM selfhost_telemetry_errors");
+      await tx.query("DELETE FROM telemetry_counters");
+      await tx.query("DELETE FROM telemetry_errors");
       await tx.query(
-        "UPDATE selfhost_telemetry_state SET window_started_at = now(), last_digest_at = now() WHERE id = 1",
+        "UPDATE telemetry_state SET window_started_at = now(), last_digest_at = now() WHERE id = 1",
       );
       return { ...window, windowStartedAt };
     });
@@ -191,7 +191,7 @@ export class TelemetryStore {
     organizationId: string | null = null,
   ): Promise<void> {
     await executor.query(
-      "INSERT INTO selfhost_telemetry_outbox (id, kind, body, organization_id) VALUES ($1, $2, $3, $4)",
+      "INSERT INTO telemetry_outbox (id, kind, body, organization_id) VALUES ($1, $2, $3, $4)",
       [id, kind, body, organizationId],
     );
   }
@@ -210,12 +210,12 @@ export class TelemetryStore {
   /** True when this fingerprint has not had a burst report in `quietSeconds`. */
   async claimBurst(fingerprint: string, component: string, quietSeconds: number): Promise<boolean> {
     const result = await this.database.query<{ fingerprint: string }>(
-      `INSERT INTO selfhost_telemetry_error_index (fingerprint, component, last_burst_reported_at)
+      `INSERT INTO telemetry_error_index (fingerprint, component, last_burst_reported_at)
        VALUES ($1, $2, now())
        ON CONFLICT (fingerprint, component) DO UPDATE
          SET last_burst_reported_at = now()
-       WHERE selfhost_telemetry_error_index.last_burst_reported_at IS NULL
-          OR selfhost_telemetry_error_index.last_burst_reported_at
+       WHERE telemetry_error_index.last_burst_reported_at IS NULL
+          OR telemetry_error_index.last_burst_reported_at
              < now() - make_interval(secs => $3)
        RETURNING fingerprint`,
       [fingerprint, component, quietSeconds],
@@ -225,7 +225,7 @@ export class TelemetryStore {
 
   async due(limit = 10): Promise<OutboxRow[]> {
     const result = await this.database.query<Record<string, unknown>>(
-      `SELECT * FROM selfhost_telemetry_outbox
+      `SELECT * FROM telemetry_outbox
         WHERE status = 'pending' AND next_attempt_at <= now()
         ORDER BY created_at
         LIMIT $1`,
@@ -236,7 +236,7 @@ export class TelemetryStore {
 
   async list(statuses: OutboxStatus[] = ["pending"], limit = 50): Promise<OutboxRow[]> {
     const result = await this.database.query<Record<string, unknown>>(
-      `SELECT * FROM selfhost_telemetry_outbox
+      `SELECT * FROM telemetry_outbox
         WHERE status = ANY($1::text[])
         ORDER BY created_at DESC
         LIMIT $2`,
@@ -248,7 +248,7 @@ export class TelemetryStore {
   /** Multi mode, an organisation admin: only the reports filed in that organisation. */
   async listForOrganization(organizationId: string, statuses: OutboxStatus[] = ["pending"], limit = 50): Promise<OutboxRow[]> {
     const result = await this.database.query<Record<string, unknown>>(
-      `SELECT * FROM selfhost_telemetry_outbox
+      `SELECT * FROM telemetry_outbox
         WHERE organization_id = $1 AND status = ANY($2::text[])
         ORDER BY created_at DESC
         LIMIT $3`,
@@ -259,7 +259,7 @@ export class TelemetryStore {
 
   async statsForOrganization(organizationId: string): Promise<Record<string, number>> {
     const counts = await this.database.query<{ status: string; count: string }>(
-      `SELECT status, count(*)::text AS count FROM selfhost_telemetry_outbox
+      `SELECT status, count(*)::text AS count FROM telemetry_outbox
         WHERE organization_id = $1 GROUP BY status`,
       [organizationId],
     );
@@ -268,7 +268,7 @@ export class TelemetryStore {
 
   async markSent(id: string): Promise<void> {
     await this.database.query(
-      `UPDATE selfhost_telemetry_outbox
+      `UPDATE telemetry_outbox
           SET status = 'sent', sent_at = now(), attempts = attempts + 1, last_error = NULL
         WHERE id = $1`,
       [id],
@@ -278,7 +278,7 @@ export class TelemetryStore {
   async markExported(ids: string[]): Promise<void> {
     if (!ids.length) return;
     await this.database.query(
-      `UPDATE selfhost_telemetry_outbox SET status = 'exported', sent_at = now()
+      `UPDATE telemetry_outbox SET status = 'exported', sent_at = now()
         WHERE id = ANY($1::uuid[]) AND status = 'pending'`,
       [ids],
     );
@@ -286,7 +286,7 @@ export class TelemetryStore {
 
   async markRetry(id: string, delaySeconds: number, error: string, dead: boolean): Promise<void> {
     await this.database.query(
-      `UPDATE selfhost_telemetry_outbox
+      `UPDATE telemetry_outbox
           SET attempts = attempts + 1,
               last_error = $2,
               next_attempt_at = now() + make_interval(secs => $3),
@@ -298,14 +298,14 @@ export class TelemetryStore {
 
   async stats(): Promise<Record<string, unknown>> {
     const counts = await this.database.query<{ status: string; count: string }>(
-      "SELECT status, count(*)::text AS count FROM selfhost_telemetry_outbox GROUP BY status",
+      "SELECT status, count(*)::text AS count FROM telemetry_outbox GROUP BY status",
     );
     const last = await this.database.query<{ sent_at: Date | string | null; last_error: string | null }>(
       `SELECT max(sent_at) FILTER (WHERE status = 'sent') AS sent_at,
-              (SELECT last_error FROM selfhost_telemetry_outbox
+              (SELECT last_error FROM telemetry_outbox
                 WHERE last_error IS NOT NULL AND status = 'pending'
                 ORDER BY next_attempt_at DESC LIMIT 1) AS last_error
-         FROM selfhost_telemetry_outbox`,
+         FROM telemetry_outbox`,
     );
     const state = await this.state();
     return {
@@ -320,13 +320,13 @@ export class TelemetryStore {
   /** Retention: drop delivered rows after 14 days and cap the pending backlog. */
   async prune(): Promise<void> {
     await this.database.query(
-      `DELETE FROM selfhost_telemetry_outbox
+      `DELETE FROM telemetry_outbox
         WHERE status IN ('sent', 'exported', 'dead') AND created_at < now() - interval '14 days'`,
     );
     await this.database.query(
-      `UPDATE selfhost_telemetry_outbox SET status = 'dead', last_error = 'backlog_cap'
+      `UPDATE telemetry_outbox SET status = 'dead', last_error = 'backlog_cap'
         WHERE id IN (
-          SELECT id FROM selfhost_telemetry_outbox
+          SELECT id FROM telemetry_outbox
            WHERE status = 'pending' AND kind = 'digest'
            ORDER BY created_at DESC OFFSET $1
         )`,

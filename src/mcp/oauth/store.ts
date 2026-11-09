@@ -82,14 +82,14 @@ export class McpOAuthStore {
   async registerMcpOAuthClient(input: ClientRegistrationInput): Promise<McpOAuthClient> {
     const client = { clientId: `mcpc_${randomBytes(18).toString("base64url")}`, clientName: input.clientName,
       redirectUris: [...input.redirectUris], createdAt: this.now() };
-    await this.database.query(`INSERT INTO selfhost_mcp_oauth_clients (client_id,client_name,redirect_uris,created_at)
+    await this.database.query(`INSERT INTO mcp_oauth_clients (client_id,client_name,redirect_uris,created_at)
       VALUES ($1,$2,$3,$4)`, [client.clientId, client.clientName, client.redirectUris, client.createdAt]);
     return client;
   }
 
   async getMcpOAuthClient(clientId: string | null | undefined): Promise<McpOAuthClient | null> {
     if (!clientId || clientId.length > 128) return null;
-    const result = await this.database.query<ClientRow>("SELECT * FROM selfhost_mcp_oauth_clients WHERE client_id=$1", [clientId]);
+    const result = await this.database.query<ClientRow>("SELECT * FROM mcp_oauth_clients WHERE client_id=$1", [clientId]);
     return result.rows[0] ? clientFromRow(result.rows[0]) : null;
   }
 
@@ -99,16 +99,16 @@ export class McpOAuthStore {
   private async lockWorkspaceAccess(tx: SqlExecutor, owner: McpOAuthOwner): Promise<boolean> {
     await lockUser(tx, owner.userId);
     await lockOrganization(tx, owner.organizationId);
-    const result = await tx.query(`SELECT w.id FROM selfhost_workspaces w
-      JOIN selfhost_organization_memberships m ON m.organization_id=w.organization_id AND m.user_id=$1
+    const result = await tx.query(`SELECT w.id FROM workspaces w
+      JOIN organization_memberships m ON m.organization_id=w.organization_id AND m.user_id=$1
       WHERE w.id=$2 AND w.organization_id=$3
-        AND ($4::text='multi' OR NOT EXISTS (SELECT 1 FROM selfhost_organizations other WHERE other.id<>$3)) FOR KEY SHARE OF m,w`,
+        AND ($4::text='multi' OR NOT EXISTS (SELECT 1 FROM organizations other WHERE other.id<>$3)) FOR KEY SHARE OF m,w`,
     [owner.userId, owner.workspaceId, owner.organizationId, this.options.tenancyMode]);
     return result.rows.length === 1;
   }
 
   private async connections(tx: SqlExecutor, request: AuthorizationRequest, principal: McpOAuthConsentPrincipal): Promise<ConnectionRow[]> {
-    const result = await tx.query<ConnectionRow>(`SELECT id,scopes FROM selfhost_mcp_oauth_grants
+    const result = await tx.query<ConnectionRow>(`SELECT id,scopes FROM mcp_oauth_grants
       WHERE client_id=$1 AND resource=$2 AND user_id=$3 AND organization_id=$4 AND workspace_id=$5
         AND agent_name=$6 AND revoked_at IS NULL FOR UPDATE`,
     [request.clientId, request.resource, principal.userId, principal.organizationId, principal.workspaceId, principal.agentName]);
@@ -128,7 +128,7 @@ export class McpOAuthStore {
       if (!await this.lockWorkspaceAccess(tx, principal)) {
         throw new McpOAuthContinuationError("Workspace access changed. Repeat consent after rejoining.");
       }
-      const clientResult = await tx.query<ClientRow>("SELECT * FROM selfhost_mcp_oauth_clients WHERE client_id=$1", [request.clientId]);
+      const clientResult = await tx.query<ClientRow>("SELECT * FROM mcp_oauth_clients WHERE client_id=$1", [request.clientId]);
       if (!clientResult.rows[0]) throw new McpOAuthContinuationError("The OAuth client is no longer available.");
       const client = clientFromRow(clientResult.rows[0]);
       const matches = stepUp ? await this.connections(tx, request, principal) : [];
@@ -141,7 +141,7 @@ export class McpOAuthStore {
       if (this.options.isGrokRoutine(request, client)) {
         // Both code issuance and the forthcoming redemption path must take
         // these same owner locks. Never rely on the advisory UI name lookup.
-        const collision = await tx.query(`SELECT id FROM selfhost_mcp_oauth_grants
+        const collision = await tx.query(`SELECT id FROM mcp_oauth_grants
           WHERE user_id=$1 AND organization_id=$2 AND workspace_id=$3 AND agent_name=$4
             AND revoked_at IS NULL AND ($5::uuid IS NULL OR id<>$5::uuid) LIMIT 1`,
         [principal.userId, principal.organizationId, principal.workspaceId, principal.agentName, continuationGrantId ?? null]);
@@ -151,7 +151,7 @@ export class McpOAuthStore {
         throw new McpOAuthContinuationError("Select the existing connection to retain its wake subscriptions and settings.");
       }
       const createdAt = this.now();
-      await tx.query(`INSERT INTO selfhost_mcp_oauth_authorization_codes
+      await tx.query(`INSERT INTO mcp_oauth_authorization_codes
         (code_hash,client_id,user_id,organization_id,workspace_id,agent_name,redirect_uri,code_challenge,
          scopes,resource,oidc_nonce,grant_id,expires_at,created_at,redirect_uri_required)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
@@ -166,14 +166,14 @@ export class McpOAuthStore {
     return this.database.transaction(async tx => {
       if (!await this.lockWorkspaceAccess(tx, owner)) return [];
       const result = await tx.query<{ workspace_id: string; agent_name: string }>(`SELECT DISTINCT workspace_id,agent_name
-        FROM selfhost_mcp_oauth_grants WHERE user_id=$1 AND organization_id=$2 AND workspace_id=$3 AND revoked_at IS NULL`,
+        FROM mcp_oauth_grants WHERE user_id=$1 AND organization_id=$2 AND workspace_id=$3 AND revoked_at IS NULL`,
       [owner.userId, owner.organizationId, owner.workspaceId]);
       return result.rows.map(row => ({ workspaceId: row.workspace_id, agentName: row.agent_name }));
     });
   }
 
   private async grant(tx: SqlExecutor,id: string): Promise<GrantRow|null> {
-    return (await tx.query<GrantRow>("SELECT * FROM selfhost_mcp_oauth_grants WHERE id=$1 FOR UPDATE",[id])).rows[0]??null;
+    return (await tx.query<GrantRow>("SELECT * FROM mcp_oauth_grants WHERE id=$1 FOR UPDATE",[id])).rows[0]??null;
   }
 
   private tokenResult(tokens:McpOAuthIssuedPair,idToken?:string):McpOAuthTokenResult {
@@ -193,9 +193,9 @@ export class McpOAuthStore {
     if(!isValidCodeVerifier(input.codeVerifier)) return { ok:false,status:400,error:{ error:"invalid_request",error_description:"code_verifier is malformed." } };
     const codeHash=hashSecret(input.code);
     return this.database.transaction(async tx=>{
-      const candidate=(await tx.query<CodeRow>("SELECT * FROM selfhost_mcp_oauth_authorization_codes WHERE code_hash=$1",[codeHash])).rows[0];
+      const candidate=(await tx.query<CodeRow>("SELECT * FROM mcp_oauth_authorization_codes WHERE code_hash=$1",[codeHash])).rows[0];
       if(!candidate || !await this.lockWorkspaceAccess(tx,{ userId:candidate.user_id,organizationId:candidate.organization_id,workspaceId:candidate.workspace_id })) return invalidGrant();
-      const row=(await tx.query<CodeRow>("SELECT * FROM selfhost_mcp_oauth_authorization_codes WHERE code_hash=$1 FOR UPDATE",[codeHash])).rows[0];
+      const row=(await tx.query<CodeRow>("SELECT * FROM mcp_oauth_authorization_codes WHERE code_hash=$1 FOR UPDATE",[codeHash])).rows[0];
       const now=this.now();
       if(!row || row.user_id!==candidate.user_id || row.organization_id!==candidate.organization_id || row.workspace_id!==candidate.workspace_id ||
         new Date(row.expires_at).getTime()<=now.getTime()) return invalidGrant();
@@ -211,11 +211,11 @@ export class McpOAuthStore {
         if(grant && (grant.user_id!==row.user_id || grant.organization_id!==row.organization_id || grant.workspace_id!==row.workspace_id ||
           grant.client_id!==row.client_id || grant.resource!==row.resource)) return invalidGrant();
         const previousSessions=grant && !grant.continued_at && resourcePath==="/api/v1/mcp/relay-events"
-          ? (await tx.query(`SELECT id FROM selfhost_mcp_oauth_sessions WHERE grant_id=$1 AND token_family_id=$2
+          ? (await tx.query(`SELECT id FROM mcp_oauth_sessions WHERE grant_id=$1 AND token_family_id=$2
               AND user_id=$3 AND organization_id=$4 AND workspace_id=$5 LIMIT 2`,
             [grant.id,grant.token_family_id,grant.user_id,grant.organization_id,grant.workspace_id])).rows:[];
         if(grant && (grant.continued_at || previousSessions.length===2)) {
-          if(!grant.continued_at) await tx.query("UPDATE selfhost_mcp_oauth_grants SET continued_at=$2 WHERE id=$1",[grant.id,now]);
+          if(!grant.continued_at) await tx.query("UPDATE mcp_oauth_grants SET continued_at=$2 WHERE id=$1",[grant.id,now]);
           if(row.issued_session_id) await this.sessions.revokeSession(tx,row.issued_session_id,ownerOf(grant),"authorization_code_replayed");
         } else if(grant) await this.revokeRows(tx,grant.id,"authorization_code_replayed");
         return invalidGrant("The authorization code was already used.");
@@ -226,11 +226,11 @@ export class McpOAuthStore {
       const matches=continuation?await this.connections(tx,authorization,context):[];
       const selected=row.grant_id?matches.find(grant=>grant.id===row.grant_id):undefined;
       if(row.grant_id && (!continuation || !selected || !selected.scopes.every(scope=>row.scopes.includes(scope)))) return invalidGrant("The selected existing connection changed or was revoked. Repeat consent.");
-      const clientRow=(await tx.query<ClientRow>("SELECT * FROM selfhost_mcp_oauth_clients WHERE client_id=$1",[row.client_id])).rows[0];
+      const clientRow=(await tx.query<ClientRow>("SELECT * FROM mcp_oauth_clients WHERE client_id=$1",[row.client_id])).rows[0];
       if(!clientRow) return invalidGrant();
       const client=clientFromRow(clientRow);
       if(this.options.isGrokRoutine(authorization,client)) {
-        const collision=await tx.query(`SELECT id FROM selfhost_mcp_oauth_grants WHERE user_id=$1 AND organization_id=$2
+        const collision=await tx.query(`SELECT id FROM mcp_oauth_grants WHERE user_id=$1 AND organization_id=$2
           AND workspace_id=$3 AND agent_name=$4 AND revoked_at IS NULL AND ($5::uuid IS NULL OR id<>$5::uuid) LIMIT 1`,
         [row.user_id,row.organization_id,row.workspace_id,row.agent_name,row.grant_id]);
         if(collision.rows.length) return { ok:false,status:409,error:{ error:"agent_name_taken",error_description:"That name is already in use. Choose another name." } };
@@ -240,17 +240,17 @@ export class McpOAuthStore {
       const previous=row.grant_id?await this.grant(tx,row.grant_id):null;
       const grantId=previous?.id??randomUUID(),tokenFamilyId=previous?.token_family_id??randomUUID();
       if(previous) {
-        await tx.query(`UPDATE selfhost_mcp_oauth_grants SET scopes=$2,setup_handoff_id=$3,continued_at=COALESCE(continued_at,$4) WHERE id=$1`,
+        await tx.query(`UPDATE mcp_oauth_grants SET scopes=$2,setup_handoff_id=$3,continued_at=COALESCE(continued_at,$4) WHERE id=$1`,
           [grantId,row.scopes,setupHandoff(input.code),now]);
       } else {
-        await tx.query(`INSERT INTO selfhost_mcp_oauth_grants
+        await tx.query(`INSERT INTO mcp_oauth_grants
           (id,client_id,client_name,user_id,organization_id,workspace_id,agent_name,scopes,resource,setup_handoff_id,token_family_id,created_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
         [grantId,row.client_id,client.clientName,row.user_id,row.organization_id,row.workspace_id,row.agent_name,row.scopes,row.resource,
           setupHandoff(input.code),tokenFamilyId,now]);
       }
       const tokens=await this.sessions.issue(tx,{ ...context,grantId,tokenFamilyId,scopes:row.scopes });
-      await tx.query(`UPDATE selfhost_mcp_oauth_authorization_codes SET consumed_at=$2,grant_id=$3,issued_session_id=$4 WHERE code_hash=$1`,
+      await tx.query(`UPDATE mcp_oauth_authorization_codes SET consumed_at=$2,grant_id=$3,issued_session_id=$4 WHERE code_hash=$1`,
         [codeHash,now,grantId,tokens.sessionId]);
       const idToken=row.scopes.includes("openid")?this.options.issueIdToken!({ issuer:this.options.protocol.mcpOAuthIssuer(),
         clientId:row.client_id,sectorIdentifier:oidcSectorIdentifierForRedirectUri(row.redirect_uri),userId:row.user_id,
@@ -266,9 +266,9 @@ export class McpOAuthStore {
       const session=await this.sessions.find(tx,"refresh",input.refreshToken);
       if(!session) {
         const retired=(await tx.query<{ grant_id:string; retired_at:Date|string }>(
-          "SELECT grant_id,retired_at FROM selfhost_mcp_oauth_retired_refresh_tokens WHERE token_hash=$1",[hashSecret(input.refreshToken)])).rows[0];
+          "SELECT grant_id,retired_at FROM mcp_oauth_retired_refresh_tokens WHERE token_hash=$1",[hashSecret(input.refreshToken)])).rows[0];
         if(!retired) return invalidGrant();
-        const candidate=(await tx.query<GrantRow>("SELECT * FROM selfhost_mcp_oauth_grants WHERE id=$1",[retired.grant_id])).rows[0];
+        const candidate=(await tx.query<GrantRow>("SELECT * FROM mcp_oauth_grants WHERE id=$1",[retired.grant_id])).rows[0];
         if(!candidate || !await this.lockWorkspaceAccess(tx,{ userId:candidate.user_id,organizationId:candidate.organization_id,workspaceId:candidate.workspace_id })) return invalidGrant();
         const grant=await this.grant(tx,candidate.id);
         if(!grant || grant.revoked_at || grant.client_id!==input.clientId) return invalidGrant();
@@ -288,7 +288,7 @@ export class McpOAuthStore {
   /** Internal cleanup entry; user-facing callers must authorize the grant owner. */
   async revokeMcpOAuthGrant(grantId:string,reason:string):Promise<boolean> {
     return this.database.transaction(async tx=>{
-      const candidate=(await tx.query<GrantRow>("SELECT * FROM selfhost_mcp_oauth_grants WHERE id=$1",[grantId])).rows[0];
+      const candidate=(await tx.query<GrantRow>("SELECT * FROM mcp_oauth_grants WHERE id=$1",[grantId])).rows[0];
       if(!candidate) return false;
       await lockUser(tx,candidate.user_id); await lockOrganization(tx,candidate.organization_id);
       return this.revokeRows(tx,grantId,reason);
@@ -307,10 +307,10 @@ export class McpOAuthStore {
 
   /** Membership-departure hook; caller already holds user->org locks. */
   async revokeWorkspaceMcpOAuthGrants(tx:SqlExecutor,owner:McpOAuthOwner):Promise<void> {
-    await tx.query(`UPDATE selfhost_mcp_oauth_authorization_codes SET expires_at=$4
+    await tx.query(`UPDATE mcp_oauth_authorization_codes SET expires_at=$4
       WHERE user_id=$1 AND organization_id=$2 AND workspace_id=$3 AND expires_at>$4`,
     [owner.userId,owner.organizationId,owner.workspaceId,this.now()]);
-    const grants=await tx.query<{ id:string }>(`SELECT id FROM selfhost_mcp_oauth_grants
+    const grants=await tx.query<{ id:string }>(`SELECT id FROM mcp_oauth_grants
       WHERE user_id=$1 AND organization_id=$2 AND workspace_id=$3 ORDER BY id`,[owner.userId,owner.organizationId,owner.workspaceId]);
     for(const { id } of grants.rows) await this.revokeRows(tx,id,"workspace_left");
   }
@@ -324,7 +324,7 @@ export class McpOAuthStore {
     if(!UUID.test(grantId)) return null;
     return this.database.transaction(async tx=>{
       if(!await this.lockWorkspaceAccess(tx,owner)) return null;
-      const row=(await tx.query<GrantRow>(`SELECT * FROM selfhost_mcp_oauth_grants
+      const row=(await tx.query<GrantRow>(`SELECT * FROM mcp_oauth_grants
         WHERE id=$1 AND user_id=$2 AND organization_id=$3 AND workspace_id=$4`,
       [grantId,owner.userId,owner.organizationId,owner.workspaceId])).rows[0];
       return row?mapGrant(row):null;
@@ -335,7 +335,7 @@ export class McpOAuthStore {
     if(!/^mcpos_[a-f0-9]{64}$/.test(handoff)) return null;
     return this.database.transaction(async tx=>{
       if(!await this.lockWorkspaceAccess(tx,owner)) return null;
-      const row=(await tx.query<GrantRow>(`SELECT * FROM selfhost_mcp_oauth_grants WHERE setup_handoff_id=$1
+      const row=(await tx.query<GrantRow>(`SELECT * FROM mcp_oauth_grants WHERE setup_handoff_id=$1
         AND user_id=$2 AND organization_id=$3 AND workspace_id=$4 AND revoked_at IS NULL`,
       [handoff,owner.userId,owner.organizationId,owner.workspaceId])).rows[0];
       return row?mapGrant(row):null;
@@ -346,7 +346,7 @@ export class McpOAuthStore {
     if(!/^mcpos_[a-f0-9]{64}$/.test(handoff)) return false;
     return this.database.transaction(async tx=>{
       if(!await this.lockWorkspaceAccess(tx,owner)) return false;
-      return (await tx.query(`SELECT code_hash FROM selfhost_mcp_oauth_authorization_codes WHERE code_hash=$1
+      return (await tx.query(`SELECT code_hash FROM mcp_oauth_authorization_codes WHERE code_hash=$1
         AND user_id=$2 AND organization_id=$3 AND workspace_id=$4 AND consumed_at IS NULL AND expires_at>$5`,
       [handoff.slice(6),owner.userId,owner.organizationId,owner.workspaceId,this.now()])).rows.length===1;
     });
@@ -361,7 +361,7 @@ export class McpOAuthStore {
     if(!this.options.protocol.parseMcpResource(resource)) return false;
     return this.database.transaction(async tx=>{
       if(!await this.lockWorkspaceAccess(tx,owner)) return false;
-      return (await tx.query(`SELECT g.id FROM selfhost_mcp_oauth_grants g JOIN selfhost_mcp_oauth_sessions s ON s.grant_id=g.id
+      return (await tx.query(`SELECT g.id FROM mcp_oauth_grants g JOIN mcp_oauth_sessions s ON s.grant_id=g.id
         WHERE g.user_id=$1 AND g.organization_id=$2 AND g.workspace_id=$3 AND g.resource=$4 AND g.revoked_at IS NULL
           AND s.revoked_at IS NULL AND s.refresh_token_expires_at>$5 LIMIT 1`,
       [owner.userId,owner.organizationId,owner.workspaceId,this.options.protocol.canonicalMcpResourceParam(resource),this.now()])).rows.length===1;
@@ -373,7 +373,7 @@ export class McpOAuthStore {
     const resource=connection?this.options.protocol.canonicalMcpResourceParam(connection.resource):undefined;
     return this.database.transaction(async tx=>{
       if(!await this.lockWorkspaceAccess(tx,owner)) return [];
-      const result=await tx.query<GrantRow>(`SELECT * FROM selfhost_mcp_oauth_grants WHERE user_id=$1 AND organization_id=$2
+      const result=await tx.query<GrantRow>(`SELECT * FROM mcp_oauth_grants WHERE user_id=$1 AND organization_id=$2
         AND workspace_id=$3 AND revoked_at IS NULL ${connection?"AND client_id=$4 AND resource=$5":""}
         ORDER BY created_at DESC,id ${connection?"":"LIMIT 200"}`,
       [owner.userId,owner.organizationId,owner.workspaceId,...(connection?[connection.clientId,resource]:[])]);

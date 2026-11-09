@@ -309,14 +309,14 @@ test("env vars: admin-only writes, write-only values, encryption at rest, runtim
 
   // Encryption at rest: ciphertext only, decryptable with the keyring.
   const rows = await ctx.database.query<{ name: string; value_ciphertext: string; masked_value: string }>(
-    "SELECT name, value_ciphertext, masked_value FROM selfhost_workspace_env_vars WHERE name = 'ANTHROPIC_API_KEY'",
+    "SELECT name, value_ciphertext, masked_value FROM workspace_env_vars WHERE name = 'ANTHROPIC_API_KEY'",
   );
   const stored = rows.rows[0]!;
   assert.match(stored.value_ciphertext, /^v2\.test-key\./);
   assert(!stored.value_ciphertext.includes(ANTHROPIC));
   assert(!JSON.stringify(rows.rows).includes(ANTHROPIC), "no plaintext in any column");
   assert.equal(decryptSecret(stored.value_ciphertext, KEYRING), `${ANTHROPIC}-rotated`);
-  const dump = await ctx.database.query("SELECT * FROM selfhost_workspace_env_vars");
+  const dump = await ctx.database.query("SELECT * FROM workspace_env_vars");
   assert(!JSON.stringify(dump.rows).includes("cookie-value-123456"));
 
   // No user-facing read returns plaintext.
@@ -357,7 +357,7 @@ test("env vars: admin-only writes, write-only values, encryption at rest, runtim
 
   // An undecryptable value is skipped and reported, never fatal.
   await ctx.database.query(
-    `INSERT INTO selfhost_workspace_env_vars (workspace_id, name, value_ciphertext, masked_value, value_bytes)
+    `INSERT INTO workspace_env_vars (workspace_id, name, value_ciphertext, masked_value, value_bytes)
      VALUES ($1, 'BROKEN', 'v2.retired-key.AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA.AAAA', '****', 4)`,
     [ctx.workspaceId],
   );
@@ -421,7 +421,7 @@ test("workspace API tokens: owner-only, shown once, scoped runtime credentials",
   assert.equal(listed.body.tokens.length, 1);
   assert(!listed.raw.includes(accessToken), "token is never listed again");
   assert.equal(listed.body.tokens[0].status, "active");
-  const hashes = await ctx.database.query("SELECT * FROM selfhost_workspace_api_tokens");
+  const hashes = await ctx.database.query("SELECT * FROM workspace_api_tokens");
   assert(!JSON.stringify(hashes.rows).includes(accessToken), "only the hash is stored");
 
   const env = await request(ctx.origin, `/internal/v1/workspaces/${ctx.workspaceId}/environment`, {
@@ -500,7 +500,7 @@ test("provider connections: BYO OAuth round trip, encrypted tokens, refresh, dis
   assert.equal(app.body.redirectUri, `${ctx.origin}/api/v1/integrations/oauth/callback`);
   assert(!app.raw.includes(secret));
   const appRows = await ctx.database.query<{ client_secret_ciphertext: string }>(
-    "SELECT * FROM selfhost_integration_oauth_apps",
+    "SELECT * FROM integration_oauth_apps",
   );
   assert(!JSON.stringify(appRows.rows).includes(secret), "client secret encrypted at rest");
   assert.equal(decryptSecret(appRows.rows[0]!.client_secret_ciphertext, KEYRING), secret);
@@ -567,7 +567,7 @@ test("provider connections: BYO OAuth round trip, encrypted tokens, refresh, dis
   assert.equal(status.body.connectionMatched, true);
 
   const connectionRows = await ctx.database.query<{ credentials_ciphertext: string }>(
-    "SELECT * FROM selfhost_integration_connections",
+    "SELECT * FROM integration_connections",
   );
   const dumped = JSON.stringify(connectionRows.rows);
   assert(!dumped.includes("at-1-secret-access") && !dumped.includes("rt-1"), "tokens encrypted at rest");
@@ -575,7 +575,7 @@ test("provider connections: BYO OAuth round trip, encrypted tokens, refresh, dis
     JSON.parse(decryptSecret(connectionRows.rows[0]!.credentials_ciphertext, KEYRING)),
     { accessToken: "at-1-secret-access", refreshToken: "rt-1" },
   );
-  const stateRows = await ctx.database.query("SELECT * FROM selfhost_integration_oauth_states");
+  const stateRows = await ctx.database.query("SELECT * FROM integration_oauth_states");
   assert(!JSON.stringify(stateRows.rows).includes(link.searchParams.get("state")!), "state stored hashed");
 
   // Runtime token fetch: service credential only.
@@ -589,7 +589,7 @@ test("provider connections: BYO OAuth round trip, encrypted tokens, refresh, dis
 
   // Near expiry -> refreshed transparently, rotated refresh token stored.
   await ctx.database.query(
-    "UPDATE selfhost_integration_connections SET access_token_expires_at = now() + interval '30 seconds'",
+    "UPDATE integration_connections SET access_token_expires_at = now() + interval '30 seconds'",
   );
   const refreshed = await request(ctx.origin, tokenPath, { method: "POST", token: SERVICE, body: {} });
   assert.equal(refreshed.status, 200);

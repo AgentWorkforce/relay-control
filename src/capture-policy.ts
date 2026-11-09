@@ -97,7 +97,7 @@ export function projectSettings(settings: CaptureSettings): CaptureSettings {
 
 export async function readCapturePolicy(database: Database, organizationId: string): Promise<CapturePolicy> {
   const result = await database.query<{ revision: number; settings: unknown }>(
-    "SELECT revision, settings FROM selfhost_capture_policies WHERE organization_id = $1",
+    "SELECT revision, settings FROM capture_policies WHERE organization_id = $1",
     [organizationId],
   );
   return project(result.rows[0]);
@@ -117,9 +117,9 @@ export async function writeCapturePolicy(database: Database, input: {
 }): Promise<CapturePolicy> {
   return database.transaction(async (tx) => {
     // Serializes writers per organization, including the first insert.
-    await tx.query("SELECT id FROM selfhost_organizations WHERE id = $1 FOR UPDATE", [input.organizationId]);
+    await tx.query("SELECT id FROM organizations WHERE id = $1 FOR UPDATE", [input.organizationId]);
     const current = project((await tx.query<{ revision: number; settings: unknown }>(
-      "SELECT revision, settings FROM selfhost_capture_policies WHERE organization_id = $1",
+      "SELECT revision, settings FROM capture_policies WHERE organization_id = $1",
       [input.organizationId],
     )).rows[0]);
     if (input.expectedRevision !== undefined && input.expectedRevision !== current.revision) {
@@ -129,7 +129,7 @@ export async function writeCapturePolicy(database: Database, input: {
     const revision = current.revision + 1;
     const userId = input.actor.kind === "user" ? input.actor.userId : null;
     await tx.query(
-      `INSERT INTO selfhost_capture_policies (organization_id, revision, settings, set_by_user_id, updated_at)
+      `INSERT INTO capture_policies (organization_id, revision, settings, set_by_user_id, updated_at)
        VALUES ($1, $2, $3::jsonb, $4, now())
        ON CONFLICT (organization_id) DO UPDATE
          SET revision = EXCLUDED.revision, settings = EXCLUDED.settings,

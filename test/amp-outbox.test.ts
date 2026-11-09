@@ -8,7 +8,7 @@ import { BOOTSTRAP } from "./flows-helpers.js";
 
 async function deliveryState(h: Awaited<ReturnType<typeof startAmp>>, messageId: string) {
   const row = await h.database.query<{ state: string; code: string | null; attempts: number }>(
-    "SELECT state, code, attempts FROM selfhost_amp_deliveries WHERE message_id = $1", [messageId]);
+    "SELECT state, code, attempts FROM amp_deliveries WHERE message_id = $1", [messageId]);
   return row.rows[0];
 }
 
@@ -61,10 +61,10 @@ test("amp outbox: finalize is conditional on lease owner and generation (req 4)"
   assert.equal(await finalize(deps, { ...claim, leaseOwner: "00000000-0000-4000-8000-000000000000" }, "delivered", null), false);
   assert.equal((await deliveryState(h, "m-1"))!.state, "sending");
   // A generation bump (as any revocation does) fences the claim.
-  await h.database.query("UPDATE selfhost_amp_bindings SET generation = generation + 1 WHERE id = $1", [binding.binding_id]);
+  await h.database.query("UPDATE amp_bindings SET generation = generation + 1 WHERE id = $1", [binding.binding_id]);
   assert.equal(await finalize(deps, claim, "delivered", null), false);
   assert.equal((await deliveryState(h, "m-1"))!.state, "sending");
-  await h.database.query("UPDATE selfhost_amp_bindings SET generation = generation - 1 WHERE id = $1", [binding.binding_id]);
+  await h.database.query("UPDATE amp_bindings SET generation = generation - 1 WHERE id = $1", [binding.binding_id]);
   // Control: the matching claim finalizes exactly once.
   assert.equal(await finalize(deps, claim, "delivered", null), true);
   assert.equal(await finalize(deps, claim, "delivered", null), false);
@@ -75,7 +75,7 @@ test("amp outbox: finalize is conditional on lease owner and generation (req 4)"
   const second = (await claimNext(deps))!;
   await h.api(ampPath(h, `/bindings/${binding.binding_id}`), { method: "DELETE", token: h.ownerToken });
   assert.equal(await finalize(deps, second, "delivered", null), false);
-  const rows = await h.database.query("SELECT 1 FROM selfhost_amp_deliveries");
+  const rows = await h.database.query("SELECT 1 FROM amp_deliveries");
   assert.equal(rows.rows.length, 0, "the released binding takes its outbox with it");
 });
 
@@ -91,19 +91,19 @@ test("amp member removal purges grants inside the membership transaction (req 5)
   // Atomicity: a failure later in the same transaction rolls the purge back with the membership.
   await assert.rejects(h.store.deleteMembership(h.organizationId, h.adminId, async (tx, member) => {
     await purgeMemberAmp(tx, member);
-    const inside = await tx.query<{ state: string }>("SELECT state FROM selfhost_amp_bindings");
+    const inside = await tx.query<{ state: string }>("SELECT state FROM amp_bindings");
     assert.equal(inside.rows[0]!.state, "retired");
     throw new Error("abort");
   }), /abort/);
-  const kept = await h.database.query<{ state: string }>("SELECT state FROM selfhost_amp_bindings");
+  const kept = await h.database.query<{ state: string }>("SELECT state FROM amp_bindings");
   assert.equal(kept.rows[0]!.state, "bound");
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_connections")).rows.length, 1);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_connections")).rows.length, 1);
 
   // The route: revoked in the transaction, released from Relaycast after commit.
   const removed = await h.api(`/api/v1/organizations/${h.organizationId}/memberships/${h.adminId}`, { method: "DELETE", token: BOOTSTRAP });
   assert.equal(removed.status, 204);
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_bindings")).rows.length, 0);
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_connections")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_bindings")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_connections")).rows.length, 0);
   assert.equal(h.world.agents.has(binding.agent), false);
   assert.equal(h.world.subscriptions.size, 0, "its Relaycast subscriptions are deleted");
   const reply = await h.api(new URL(capability.url).pathname, { method: "POST", token: capability.bearer, body: capability.request });
@@ -114,19 +114,19 @@ test("amp member removal with the feature off still revokes grants locally (req 
   // Grants left from a time the feature was on must not outlive the member.
   const h = await startAmp(t, { amp: null });
   await h.database.query(
-    `INSERT INTO selfhost_amp_connections (workspace_id, organization_id, user_id, key_ciphertext, key_hint, validated_at)
+    `INSERT INTO amp_connections (workspace_id, organization_id, user_id, key_ciphertext, key_hint, validated_at)
      VALUES ($1, $2, $3, 'ciphertext', 'sgamp_…mnop', now())`, [h.workspaceId, h.organizationId, h.adminId]);
   await h.database.query(
-    `INSERT INTO selfhost_amp_bindings (id, workspace_id, organization_id, user_id, thread_id, relaycast_workspace_id,
+    `INSERT INTO amp_bindings (id, workspace_id, organization_id, user_id, thread_id, relaycast_workspace_id,
        agent_name, state, token_ciphertext, hook_ciphertext)
      VALUES (gen_random_uuid(), $1, $2, $3, 'T-0123456789abcdef', 'rc-primary', 'amp-0123456789abcdef', 'bound', 'tok', 'hook')`,
     [h.workspaceId, h.organizationId, h.adminId]);
   const removed = await h.api(`/api/v1/organizations/${h.organizationId}/memberships/${h.adminId}`, { method: "DELETE", token: BOOTSTRAP });
   assert.equal(removed.status, 204);
   const row = await h.database.query<{ state: string; token_ciphertext: string | null; hook_ciphertext: string | null; generation: number }>(
-    "SELECT state, token_ciphertext, hook_ciphertext, generation FROM selfhost_amp_bindings");
+    "SELECT state, token_ciphertext, hook_ciphertext, generation FROM amp_bindings");
   assert.deepEqual(row.rows[0], { state: "retired", token_ciphertext: null, hook_ciphertext: null, generation: 2 });
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_connections")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_connections")).rows.length, 0);
 });
 
 test("amp cleanupWorkspaceAmp retires and releases every binding (req 5)", async (t) => {
@@ -138,14 +138,14 @@ test("amp cleanupWorkspaceAmp retires and releases every binding (req 5)", async
   // A failing release leaves the row for the worker rather than losing it.
   h.world.failNext("POST", "/v1/agents/release-exact", 503);
   assert.deepEqual(await cleanupWorkspaceAmp(deps, h.workspaceId), { released: 1, pending: 1 });
-  const left = await h.database.query<{ state: string }>("SELECT state FROM selfhost_amp_bindings");
+  const left = await h.database.query<{ state: string }>("SELECT state FROM amp_bindings");
   assert.deepEqual(left.rows.map((row) => row.state), ["retired"]);
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_connections")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_connections")).rows.length, 0);
   assert.deepEqual(await cleanupWorkspaceAmp(deps, h.workspaceId), { released: 1, pending: 0 });
   assert.equal(h.world.agents.has(first.agent), false);
   assert.equal(h.world.agents.has(second.agent), false);
   assert.equal(h.world.subscriptions.size, 0);
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_bindings")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_bindings")).rows.length, 0);
   assert.deepEqual(await cleanupWorkspaceAmp(deps, "00000000-0000-4000-8000-000000000000"), { released: 0, pending: 0 });
 });
 
@@ -159,7 +159,7 @@ const inboxReads = (h: Harness, from = 0) => h.world.bodies.slice(from)
   .filter((call) => call.method === "GET" && call.path === "/v1/deliveries").length;
 async function lastError(h: Harness, bindingId: string) {
   return (await h.database.query<{ last_error: string | null }>(
-    "SELECT last_error FROM selfhost_amp_bindings WHERE id = $1", [bindingId])).rows[0]?.last_error ?? null;
+    "SELECT last_error FROM amp_bindings WHERE id = $1", [bindingId])).rows[0]?.last_error ?? null;
 }
 
 test("amp inbox recovery: a message the webhook missed is queued, injected once and acknowledged", async (t) => {
@@ -180,7 +180,7 @@ test("amp inbox recovery: a message the webhook missed is queued, injected once 
   assert.deepEqual(h.world.pending(binding.agent), [], "acknowledged once the outbox row is committed");
 
   // The payload is stored encrypted, never as the plain text.
-  const stored = await h.database.query<{ payload_ciphertext: string }>("SELECT payload_ciphertext FROM selfhost_amp_deliveries");
+  const stored = await h.database.query<{ payload_ciphertext: string }>("SELECT payload_ciphertext FROM amp_deliveries");
   assert.doesNotMatch(stored.rows[0]!.payload_ciphertext, /alice|please review/);
 
   // A later pass reads an empty inbox and injects nothing more.
@@ -204,7 +204,7 @@ test("amp inbox recovery: own messages and untargeted channel posts are acknowle
 
   const result = await recoverInbox(deps, { after: null });
   assert.deepEqual(result, { polled: 1, queued: 1, failed: 0 });
-  const rows = await h.database.query<{ message_id: string }>("SELECT message_id FROM selfhost_amp_deliveries");
+  const rows = await h.database.query<{ message_id: string }>("SELECT message_id FROM amp_deliveries");
   assert.deepEqual(rows.rows.map((row) => row.message_id), [mention.id]);
   assert.deepEqual(h.world.pending(binding.agent), [], "dropped messages are acknowledged as the webhook drops them");
 });
@@ -233,7 +233,7 @@ test("amp inbox recovery and the webhook dedupe on (binding, message): one deliv
   await worker.tick();
   await worker.tick();
   assert.deepEqual(injectedIds(h), [first.message.id, second.message.id]);
-  const rows = await h.database.query<{ count: number }>("SELECT count(*)::int AS count FROM selfhost_amp_deliveries");
+  const rows = await h.database.query<{ count: number }>("SELECT count(*)::int AS count FROM amp_deliveries");
   assert.equal(rows.rows[0]!.count, 2);
 });
 
@@ -246,7 +246,7 @@ test("amp inbox recovery acknowledges only after the outbox commit; a failed com
   // The insert succeeds but the transaction fails at COMMIT.
   await h.database.query(`CREATE FUNCTION amp_test_fail_commit() RETURNS trigger LANGUAGE plpgsql AS
     $$ BEGIN RAISE EXCEPTION 'commit refused'; END $$`);
-  await h.database.query(`CREATE CONSTRAINT TRIGGER amp_test_fail_commit AFTER INSERT ON selfhost_amp_deliveries
+  await h.database.query(`CREATE CONSTRAINT TRIGGER amp_test_fail_commit AFTER INSERT ON amp_deliveries
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION amp_test_fail_commit()`);
   const from = h.world.bodies.length;
   assert.deepEqual(await recoverInbox(deps, { after: null }), { polled: 1, queued: 0, failed: 1 });
@@ -255,7 +255,7 @@ test("amp inbox recovery acknowledges only after the outbox commit; a failed com
   assert.equal(await deliveryState(h, sent.message.id), undefined);
   assert.equal(await lastError(h, binding.binding_id), "inbox_poll_failed");
 
-  await h.database.query("DROP TRIGGER amp_test_fail_commit ON selfhost_amp_deliveries");
+  await h.database.query("DROP TRIGGER amp_test_fail_commit ON amp_deliveries");
   assert.deepEqual(await recoverInbox(deps, { after: null }), { polled: 1, queued: 1, failed: 0 });
   assert.deepEqual(h.world.pending(binding.agent), []);
   assert.equal((await deliveryState(h, sent.message.id))!.state, "pending");
@@ -269,7 +269,7 @@ test("amp inbox recovery acknowledges only after the outbox commit; a failed com
   assert.deepEqual(await recoverInbox(deps, { after: null }), { polled: 1, queued: 1, failed: 1 });
   assert.deepEqual(await recoverInbox(deps, { after: null }), { polled: 1, queued: 0, failed: 0 });
   assert.deepEqual(h.world.pending(binding.agent), []);
-  const rows = await h.database.query("SELECT 1 FROM selfhost_amp_deliveries WHERE message_id = $1", [again.message.id]);
+  const rows = await h.database.query("SELECT 1 FROM amp_deliveries WHERE message_id = $1", [again.message.id]);
   assert.equal(rows.rows.length, 1);
 });
 
@@ -305,17 +305,17 @@ test("amp inbox recovery never polls or queues for a retired binding, even one r
   h.world.sendAs("alice", second.agent, "to the new binding");
   deps.relaycast.readHostedInbox = async (token) => {
     const rows = await read(token);
-    await h.database.query("UPDATE selfhost_amp_bindings SET generation = generation + 1 WHERE id = $1", [second.binding_id]);
+    await h.database.query("UPDATE amp_bindings SET generation = generation + 1 WHERE id = $1", [second.binding_id]);
     return rows;
   };
   assert.deepEqual(await recoverInbox(deps, { after: null }), { polled: 1, queued: 0, failed: 0 });
   deps.relaycast.readHostedInbox = read;
   assert.equal(h.world.pending(second.agent).length, 1);
-  await h.database.query("UPDATE selfhost_workspaces SET relaycast_workspace_id = 'rc-moved' WHERE id = $1", [h.workspaceId]);
+  await h.database.query("UPDATE workspaces SET relaycast_workspace_id = 'rc-moved' WHERE id = $1", [h.workspaceId]);
   const moved = h.world.bodies.length;
   assert.deepEqual(await recoverInbox(deps, { after: null }), { polled: 0, queued: 0, failed: 0 });
   assert.equal(inboxReads(h, moved), 0);
-  assert.equal((await h.database.query("SELECT 1 FROM selfhost_amp_deliveries")).rows.length, 0);
+  assert.equal((await h.database.query("SELECT 1 FROM amp_deliveries")).rows.length, 0);
 });
 
 test("amp inbox recovery: one binding's failure does not block another, and passes are capped and fair", async (t) => {
@@ -342,7 +342,7 @@ test("amp inbox recovery: one binding's failure does not block another, and pass
   assert.deepEqual(warnings, [["[amp] inbox_poll_failed", { bindingId: first!.binding_id, error: "relay_unavailable" }]],
     "only the error code is logged");
   // An outstanding send outcome is never overwritten by a poll failure.
-  await h.database.query("UPDATE selfhost_amp_bindings SET last_error = 'amp_send_unknown' WHERE id = $1", [second!.binding_id]);
+  await h.database.query("UPDATE amp_bindings SET last_error = 'amp_send_unknown' WHERE id = $1", [second!.binding_id]);
 
   // One binding per pass: round-robin, oldest-polled first.
   const cursor = { after: null as string | null };

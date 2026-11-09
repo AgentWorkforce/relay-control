@@ -185,7 +185,7 @@ export function createAdminModule(input: {
   async function workspaceOrganization(workspaceId: string): Promise<string | null> {
     if (!/^[0-9a-f-]{36}$/i.test(workspaceId)) return null;
     const result = await database.query<{ organization_id: string }>(
-      "SELECT organization_id FROM selfhost_workspaces WHERE id = $1",
+      "SELECT organization_id FROM workspaces WHERE id = $1",
       [workspaceId],
     );
     return result.rows[0]?.organization_id ?? null;
@@ -392,7 +392,7 @@ export function createAdminModule(input: {
       }
       const updated = await database.transaction(async (tx) => {
         const result = await tx.query<{ id: string; name: string }>(
-          `UPDATE selfhost_organizations SET name = $2, updated_at = now()
+          `UPDATE organizations SET name = $2, updated_at = now()
             WHERE id = $1 RETURNING id, name`,
           [organizationId, name],
         );
@@ -563,7 +563,7 @@ export function createAdminModule(input: {
         returnTo: safeReturnTo(body.returnTo),
       });
       const relayWorkspace = await database.query<{ relaycast_workspace_id: string }>(
-        "SELECT relaycast_workspace_id FROM selfhost_workspaces WHERE id = $1",
+        "SELECT relaycast_workspace_id FROM workspaces WHERE id = $1",
         [access.workspace.id],
       );
       json(response, 200, {

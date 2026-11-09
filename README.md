@@ -36,7 +36,7 @@ Included:
   credentials, serving the shared session reads, team activity (Relaycast roster
   and presence plus RelayHistory; no running flows), relay messaging (DMs,
   inbox and channels as a hosted Relaycast participant per MCP session or
-  `join_relay` name, kept in `selfhost_hosted_relay_participants`), and
+  `join_relay` name, kept in `hosted_relay_participants`), and
   capability discovery tool groups. Launches, person-identity sends
   (`as_person`) and desktop-linked identity (`join_relay desktop_address`) are
   not yet available.
@@ -157,7 +157,7 @@ server reads `DATABASE_URL_FILE`; `agent-relay-selfhost-migrate` reads only
 `DATABASE_MIGRATIONS_URL_FILE`. It never falls back to the runtime credential,
 and the server never reads the migration credential.
 The migrate command rejects a runtime role that is the connected migration
-owner, and never grants that role access to `selfhost_schema_migrations`.
+owner, and never grants that role access to `control_schema_migrations`.
 
 The two public service origins are intentionally separate from their internal
 counterparts. They must be bare HTTPS origins on multi-label public DNS hosts;
@@ -481,8 +481,14 @@ The dashboard session endpoints are deliberately not a general proxy:
   to RelayHistory's fixed `/v1/sessions` path.
 - `GET /cloud/api/v1/workspaces/:id/sessions/:sessionId/events` forwards only
   `source` to the fixed session-events path and requests ascending order.
+- `GET /cloud/api/v1/workspaces/:id/sessions/:sessionId/summary` accepts the
+  required `source` and optional `kind=short`. It returns the backend's recorded
+  description, model and generation time; missing provenance is an upstream
+  error, and an absent summary stays `status: empty`. With the direct read API
+  configured, this read uses the caller's workspace-bound token without issuing
+  a History session or falling back to another backend.
 
-Both upstream requests add `workspace=` from the tenant-authorized database
+These upstream requests add `workspace=` from the tenant-authorized database
 record. Caller-supplied origins, paths, workspace IDs, and credentials are
 never forwarded.
 
@@ -678,7 +684,7 @@ credential and version. Envelopes go to object storage:
 | `SELFHOST_CREDENTIAL_STORAGE` | Where |
 | --- | --- |
 | unset | `gcs` when `SELFHOST_FLOWS_STORAGE=gcs` (same bucket), else `postgres` |
-| `postgres` | inline in `selfhost_coding_agent_credential_blobs` |
+| `postgres` | inline in `coding_agent_credential_blobs` |
 | `gcs` | `SELFHOST_CREDENTIAL_GCS_BUCKET` (or `SELFHOST_FLOWS_GCS_BUCKET`), Workload Identity |
 | `s3` | `SELFHOST_CREDENTIAL_S3_BUCKET`, `SELFHOST_CREDENTIAL_S3_REGION`/`AWS_REGION`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`[/`AWS_SESSION_TOKEN`], optional `SELFHOST_CREDENTIAL_S3_ENDPOINT` (R2, MinIO) |
 

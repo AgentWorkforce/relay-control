@@ -133,15 +133,15 @@ export async function copilotAttestationFor(body: unknown, auth: {
 }
 
 /**
- * The shared key and nonce store: selfhost_desktop_attestation_keys and
- * selfhost_mcp_attestation_tool_uses (migration 0020). Every replica reads
+ * The shared key and nonce store: desktop_attestation_keys and
+ * mcp_attestation_tool_uses (migration 0020). Every replica reads
  * the same rows, so a nonce spent on one is spent on all.
  */
 export function postgresAttestationStore(database: SqlExecutor): AttestationStore {
   return {
     async publicKey(input) {
       const result = await database.query<{ public_key: string }>(
-        `SELECT public_key FROM selfhost_desktop_attestation_keys
+        `SELECT public_key FROM desktop_attestation_keys
           WHERE workspace_id = $1 AND user_id = $2 AND source_id = $3 AND kid = $4`,
         [input.workspaceId, input.userId, input.sourceId, input.kid],
       );
@@ -149,12 +149,12 @@ export function postgresAttestationStore(database: SqlExecutor): AttestationStor
     },
     async spend(input) {
       await database.query(
-        `DELETE FROM selfhost_mcp_attestation_tool_uses
+        `DELETE FROM mcp_attestation_tool_uses
           WHERE expires_at <= now() AND workspace_id = $1 AND user_id = $2`,
         [input.workspaceId, input.userId],
       );
       const result = await database.query<{ tool_use_id: string }>(
-        `INSERT INTO selfhost_mcp_attestation_tool_uses (workspace_id, user_id, tool_use_id, expires_at)
+        `INSERT INTO mcp_attestation_tool_uses (workspace_id, user_id, tool_use_id, expires_at)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (workspace_id, user_id, tool_use_id) DO NOTHING
          RETURNING tool_use_id`,
