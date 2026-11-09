@@ -85,3 +85,62 @@ export class PostgresDatabase implements Database {
     await this.#pool.query(sql);
   }
 }
+
+const UNAVAILABLE_SQLSTATES = new Set(["57P01", "57P02", "57P03", "53300"]);
+const UNAVAILABLE_ERRNOS = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EPIPE",
+]);
+
+/**
+ * True when `error` means the database could not be reached or dropped the
+ * connection (SQLSTATE class 08, admin/crash shutdown, cannot connect now,
+ * too many connections, socket errnos, pg-pool connect timeout, pg
+ * "Connection terminated"), directly, inside an AggregateError or through
+ * `cause`. False for everything else, including query and constraint errors.
+ */
+export function isDatabaseUnavailable(error: unknown): boolean {
+  return unavailable(error, 0);
+}
+
+function unavailable(error: unknown, depth: number): boolean {
+  if (depth > 8 || typeof error !== "object" || error === null) return false;
+  const { code, message, cause } = error as { code?: unknown; message?: unknown; cause?: unknown };
+  if (typeof code === "string" && (
+    code.startsWith("08") || UNAVAILABLE_SQLSTATES.has(code) || UNAVAILABLE_ERRNOS.has(code)
+  )) {
+    return true;
+  }
+  if (typeof message === "string" && (
+    /timeout exceeded when trying to connect/i.test(message) || /connection terminated/i.test(message)
+  )) {
+    return true;
+  }
+  if (error instanceof AggregateError && Array.isArray(error.errors) &&
+    error.errors.some((inner) => unavailable(inner, depth + 1))) {
+    return true;
+  }
+  return cause !== undefined && unavailable(cause, depth + 1);
+}
+
+/** The error's `code` (SQLSTATE or errno) for logs, else its constructor name. */
+export function databaseErrorCause(error: unknown): string {
+  let current = error;
+  for (let depth = 0; depth <= 8 && typeof current === "object" && current !== null; depth += 1) {
+    const { code, cause } = current as { code?: unknown; cause?: unknown };
+    if (typeof code === "string" && code) return code;
+    const next = current instanceof AggregateError && Array.isArray(current.errors)
+      ? current.errors.find((item) => isDatabaseUnavailable(item))
+      : undefined;
+    if (next !== undefined) current = next;
+    else if (cause !== undefined && isDatabaseUnavailable(cause)) current = cause;
+    else return current instanceof Error ? current.name : "unknown";
+  }
+  return "unknown";
+}

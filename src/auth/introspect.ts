@@ -2,8 +2,11 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { ApiTokenStore } from "../admin/api-tokens.js";
 import type { SelfhostConfig } from "../config.js";
+import { hashSecret } from "../crypto.js";
+import { databaseErrorCause, isDatabaseUnavailable } from "../database.js";
 import type { FlowRunRelayfileCredentials } from "../flows/relayfile-credentials.js";
-import { NODE_ID_PATTERN, type ControlPlaneStore, type Principal } from "../store.js";
+import { NODE_ID_PATTERN, type ControlPlaneStore, type IntrospectedToken, type Principal } from "../store.js";
+import type { IntrospectionHold } from "./introspection-hold.js";
 
 /**
  * POST /internal/v1/auth/introspect: the sessions pipeline (and relayfile)
@@ -60,6 +63,12 @@ import { NODE_ID_PATTERN, type ControlPlaneStore, type Principal } from "../stor
  *   reading its database. Each add-on is one more origin in
  *   SELFHOST_INTROSPECT_AUDIENCES; this service never depends on one existing.
  * - No caching here: the token session row is the truth on every call.
+ *   The one exception is the opt-in database outage hold
+ *   (SELFHOST_INTROSPECT_OUTAGE_HOLD_MS, docs/identity.md): only when the
+ *   `sh_at_` lookup fails with a connection-class database error, the last
+ *   ACTIVE verdict the database gave for that token within the hold answers
+ *   instead, marked `held: true` with `exp` clamped to the end of the hold.
+ *   Machine claims are never held.
  * - The token, its hash, the secret and the body are never logged.
  */
 export const INTROSPECT_PATH = "/internal/v1/auth/introspect";
@@ -100,6 +109,8 @@ export type IntrospectionResult =
     iat: number;
     exp: number;
     token_id: string;
+    /** Present (true) only for a database-outage hold answer. */
+    held?: true;
   }
   | {
     active: true;
@@ -131,6 +142,11 @@ export type IntrospectionResult =
     exp: number;
     token_id: string;
   };
+
+export type IntrospectionLog = (message: string, fields: Record<string, unknown>) => void;
+
+/** Only the HTTP route passes a hold; every in-process caller stays strict. */
+export type IntrospectionOptions = { hold?: IntrospectionHold; log?: IntrospectionLog };
 
 export type IntrospectionOutcome =
   | { status: 200; body: IntrospectionResult }
@@ -324,6 +340,7 @@ export async function introspect(
   request: IntrospectionRequest,
   apiTokens?: ApiTokenStore,
   flowRunCredentials?: FlowRunRelayfileCredentials,
+  options?: IntrospectionOptions,
 ): Promise<IntrospectionResult> {
   if (request.token.startsWith(WORKSPACE_API_TOKEN_PREFIX)) {
     return introspectWorkspaceApiToken(config, apiTokens, request);
@@ -336,10 +353,27 @@ export async function introspect(
   if (!request.token.startsWith(USER_ACCESS_TOKEN_PREFIX)) {
     return { active: false, reason: "wrong-kind" };
   }
-  const session = await store.introspectAccessToken(request.token);
+  const hold = options?.hold;
+  let session: IntrospectedToken | null;
+  let held: { checkedAt: number; validUntil: number; cause: string } | null = null;
+  let outage: unknown;
+  try {
+    session = await store.introspectAccessToken(request.token);
+  } catch (error) {
+    if (!hold || !isDatabaseUnavailable(error)) throw error;
+    const entry = hold.lookup(hashSecret(request.token));
+    if (!entry) throw error;
+    session = entry.session;
+    held = { checkedAt: entry.checkedAt, validUntil: entry.validUntil, cause: databaseErrorCause(error) };
+    outage = error;
+  }
+  if (!held) hold?.observe(session, session ? undefined : hashSecret(request.token));
   if (!session) return { active: false, reason: "unknown" };
   if (session.revoked) return { active: false, reason: "revoked" };
-  if (session.expired) return { active: false, reason: "expired" };
+  // A held verdict's flag was computed when it was checked: recompute it.
+  if (held ? session.expiresAt.getTime() <= Date.now() : session.expired) {
+    return { active: false, reason: "expired" };
+  }
   const requested = normalizedOrigin(request.aud);
   const aud = requested === null
     ? undefined
@@ -351,6 +385,8 @@ export async function introspect(
   }
   // Only now, so an inactive token never reveals anything about a machine.
   let machineId: string | null = null;
+  // Machine ownership needs the node-claims query: never answered from a hold.
+  if (request.machine !== undefined && held) throw outage;
   if (request.machine !== undefined) {
     const claims = await store.nodeClaimsFor(request.machine);
     const here = claims.find((claim) => claim.workspaceId === session.workspaceId);
@@ -359,6 +395,16 @@ export async function introspect(
     }
     if (here.userId !== session.userId) return { active: false, reason: "machine_not_owned" };
     machineId = request.machine;
+  }
+  const tokenId = tokenIdFor(session.accessTokenHash);
+  if (held) {
+    options?.log?.("[selfhost-api] token introspection held", {
+      token_id: tokenId,
+      aud,
+      workspace: session.workspaceId,
+      age_ms: Math.max(0, Date.now() - held.checkedAt),
+      cause: held.cause,
+    });
   }
   return {
     active: true,
@@ -373,8 +419,9 @@ export async function introspect(
     scopes: [...session.scopes],
     aud,
     iat: epochSeconds(session.issuedAt),
-    exp: epochSeconds(session.expiresAt),
-    token_id: tokenIdFor(session.accessTokenHash),
+    exp: epochSeconds(held ? new Date(held.validUntil) : session.expiresAt),
+    token_id: tokenId,
+    ...(held ? { held: true as const } : {}),
   };
 }
 
@@ -382,10 +429,11 @@ export async function handleIntrospection(
   config: SelfhostConfig,
   store: ControlPlaneStore,
   request: IncomingMessage,
-  log: (message: string, fields: Record<string, unknown>) => void = (message, fields) =>
+  log: IntrospectionLog = (message, fields) =>
     console.warn(message, fields),
   apiTokens?: ApiTokenStore,
   flowRunCredentials?: FlowRunRelayfileCredentials,
+  hold?: IntrospectionHold,
 ): Promise<IntrospectionOutcome> {
   const secret = config.introspectSecret;
   if (!secret) {
@@ -409,5 +457,5 @@ export async function handleIntrospection(
       message: "Body must be a JSON object with string token and aud, optionally a non-empty string (or null) workspace, and optionally a node-id string machine (at most 16 KiB)",
     };
   }
-  return { status: 200, body: await introspect(config, store, body, apiTokens, flowRunCredentials) };
+  return { status: 200, body: await introspect(config, store, body, apiTokens, flowRunCredentials, { hold, log }) };
 }

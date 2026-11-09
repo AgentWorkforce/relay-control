@@ -25,6 +25,7 @@ import { handleSessionRoutes } from "./sessions/routes.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, introspect, INTROSPECT_PATH } from "./auth/introspect.js";
+import { IntrospectionHold } from "./auth/introspection-hold.js";
 import { handleAcquisitionRoutes } from "./acquisition/routes.js";
 import { createDesktopFeedHandler, type DesktopFeedLimits } from "./desktop-feed/routes.js";
 import { AwsKmsDesktopFeedSigner, MemoryDesktopFeedSigner, type DesktopFeedSigner } from "./desktop-feed/signer.js";
@@ -392,6 +393,10 @@ export function createApp(input: {
   function requireFeature(feature: Feature): void {
     requireSelected(features, feature);
   }
+  // Database outage hold for POST /internal/v1/auth/introspect (opt-in, per process).
+  const introspectionHold = (config.introspectOutageHoldMs ?? 0) > 0
+    ? new IntrospectionHold(config.introspectOutageHoldMs!)
+    : undefined;
   const browserOrigins = browserOriginsFor(config);
   // The desktop sign-in pages post to a path-only action, so the form always
   // resolves to the page's own origin; both browser origins (API and
@@ -888,7 +893,11 @@ export function createApp(input: {
     }
     if (method === "GET" && path === "/readyz") {
       const readiness = await store.readiness();
-      const introspection = { enabled: Boolean(config.introspectSecret), audiences: acceptedAudiences(config) };
+      const introspection = {
+        enabled: Boolean(config.introspectSecret),
+        audiences: acceptedAudiences(config),
+        outageHoldMs: config.introspectOutageHoldMs ?? 0,
+      };
       json(response, readiness.ready ? 200 : 503, readiness.ready
         ? { status: "ready", introspection, capabilities: features }
         : { status: "not_ready", reason: readiness.reason, message: readiness.message, introspection, capabilities: features });
@@ -904,7 +913,7 @@ export function createApp(input: {
     // Internal only: never reachable through the /cloud alias.
     if (method === "POST" && publicPath === INTROSPECT_PATH) {
       const outcome = await handleIntrospection(
-        config, store, request, undefined, admin?.apiTokens, flowRelayfileCredentials,
+        config, store, request, undefined, admin?.apiTokens, flowRelayfileCredentials, introspectionHold,
       );
       if (outcome.status === 200) json(response, 200, outcome.body, true);
       else json(response, outcome.status, { error: outcome.error, message: outcome.message }, true);
