@@ -5,6 +5,12 @@ assigned at release.
 
 ## Unreleased
 
+- Fixed: after Approve on the desktop sign-in consent screen the page stayed
+  put in Chromium browsers. The screen's Content-Security-Policy allowed
+  `form-action 'self'` only, and Chromium applies form-action to the 303
+  that answers the form post, so the redirect to the app's loopback listener
+  was blocked. The consent page now also allows the validated loopback
+  origin of the sign-in's `redirect_uri`.
 - Fixed: the desktop sign-in consent token is now a shared single-use database
   record, so the approve/deny post may reach any Control replica and survives
   a rolling restart; before, it lived in one process's memory and failed with
