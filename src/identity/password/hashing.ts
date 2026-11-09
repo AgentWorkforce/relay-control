@@ -6,7 +6,7 @@ import type { Argon2Params, PasswordConfig, PasswordPepper } from "../config.js"
  * Password hashing: argon2id with a random 16-byte salt per hash, stored as
  * the library's PHC string ($argon2id$v=19$m=..,t=..,p=..$salt$hash), which
  * carries the salt and parameters. With a pepper file the password is first
- * HMAC-SHA256'd with the current pepper; the pepper version is stored next to
+ * HMAC-SHA256'd with the current pepper (base64 of the MAC is hashed); the pepper version is stored next to
  * the hash (never the pepper). Nothing here logs or returns password material.
  */
 
@@ -62,7 +62,9 @@ export class PasswordHasher {
     if (pepperVersion === null) return utf8;
     const pepper = this.peppers.get(pepperVersion);
     if (!pepper) return null;
-    return createHmac("sha256", pepper).update(utf8).digest();
+    // Base64 text, not the raw digest: @node-rs/argon2 does not round-trip
+    // arbitrary binary input between hash() and verify().
+    return Buffer.from(createHmac("sha256", pepper).update(utf8).digest("base64"), "utf8");
   }
 
   async hash(password: string): Promise<StoredPassword> {
