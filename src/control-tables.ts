@@ -35,6 +35,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "factory_history_syncs",
   "fleet_node_owners",
   "flow_definitions",
+  "flow_run_relayfile_credentials",
   "hosted_relay_participants",
   "installation_bootstrap",
   "integration_connections",
