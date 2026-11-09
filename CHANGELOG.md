@@ -3,7 +3,7 @@
 Notable changes to the self-hosted control plane. Dates and versions are
 assigned at release.
 
-## Unreleased
+## 0.5.6 (2026-11-09)
 
 - Fixed: the desktop browser sign-in consent screen was sent with
   `referrer-policy: no-referrer`, so browsers posted the person's decision with
