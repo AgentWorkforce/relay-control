@@ -10,6 +10,7 @@ import type { ProviderStatus } from "../providers/registry.js";
 import type { Principal } from "../store.js";
 import type { McpAuthMode, WorkspaceRole } from "./catalog.js";
 import type { DesktopCallContext } from "./desktop-call.js";
+import type { McpOAuthConnection } from "./oauth/admission.js";
 
 export type McpWorkspace = {
   id: string;
@@ -33,6 +34,8 @@ export type McpContext = {
   /** The URL this request was served at. */
   endpointUrl: string;
   desktopCall: DesktopCallContext;
+  /** Present only after the MCP-only OAuth resolver admits its exact resource. */
+  oauth?: McpOAuthConnection;
   /** GET a workspace-scoped RelayHistory path (with its query); throws SharedSessionsToolError. */
   readHistory: (path: string, options?: { timeoutMessage?: string }) => Promise<unknown>;
   members: () => Promise<McpMember[]>;
@@ -119,15 +122,12 @@ export function historyReader(
   };
 }
 
-export function toolError(error: unknown, options: { correlationId?: string; structured?: boolean } = {}) {
+export function toolError(error: unknown, options: { correlationId?: string } = {}) {
   const message = error instanceof SharedSessionsToolError ? error.publicMessage : UNAVAILABLE_MESSAGE;
   return {
     isError: true,
     content: [{ type: "text" as const, text: options.correlationId
       ? `${message}\ncorrelation_id: ${options.correlationId}` : message }],
-    ...(options.structured && options.correlationId ? { structuredContent: {
-      error: message, correlation_id: options.correlationId,
-    } } : {}),
   };
 }
 

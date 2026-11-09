@@ -11,6 +11,7 @@ import { createMcpOAuthConsentHandlers,resolveMcpConsentAccount,type McpConsentP
 const MAX_BODY=64*1024;
 const API=`${APP_BASE_PATH}/api/oauth`;
 const AUTHORIZE=`${APP_BASE_PATH}/oauth/authorize`;
+const GRANTS=`${APP_BASE_PATH}/api/v1/oauth/grants`;
 class BodyLimit extends Error {}
 function json(body:unknown,status=200) {
   return Response.json(body,{status,headers:{"cache-control":"no-store",pragma:"no-cache"}});
@@ -35,9 +36,15 @@ async function bounded(request:Request):Promise<Request> {
 
 type Connections = Array<{id:string;agentName:string}>;
 type TenantOwner = Pick<McpConsentPrincipal,"userId"|"organizationId"|"workspaceId">;
+type ManagedGrant = {
+  id:string;clientId:string;clientName:string|null;organizationId:string;workspaceId:string;
+  agentName:string;scopes:string[];resource:string;createdAt:Date;
+};
 type OAuthHttpStore = McpOAuthPublicStore & McpOAuthConsentStore & {
   listMcpOAuthGrantsForUser?(owner:Pick<McpConsentPrincipal,"userId"|"organizationId"|"workspaceId">,
-    connection:{clientId:string;resource:string}):Promise<Connections>;
+    connection?:{clientId:string;resource:string}):Promise<ManagedGrant[]>;
+  getOAuthGrant?(id:string,owner:TenantOwner):Promise<ManagedGrant|null>;
+  revokeMcpOAuthGrant?(id:string,reason:string):Promise<boolean>;
 };
 
 /** An HTTP composition. Callers declare only MCP resources they actually mounted. */
@@ -53,6 +60,7 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
   workspaceLabel?(principal:McpConsentPrincipal):Promise<string>;
   checkAgentNameAvailability(principal:TenantOwner,name:string):Promise<AgentNameAvailability>;
   now?:()=>Date;
+  afterMutation?():void;
 }) {
   const settings=deps.config.mcpOAuth;
   const enabled=settings?.enabled===true;
@@ -85,7 +93,8 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
 
   function recognizes(path:string):boolean {
     return enabled && (discovery.has(path)||metadata.has(path)||path===AUTHORIZE||path===`${API}/authorize`||
-      path===`${API}/authorize/agent-name`||[`${API}/register`,`${API}/token`,`${API}/revoke`,jwks].includes(path));
+      path===`${API}/authorize/agent-name`||path===GRANTS||path.startsWith(GRANTS+"/")||
+      [`${API}/register`,`${API}/token`,`${API}/revoke`,jwks].includes(path));
   }
   function cors(response:Response):Response {
     response.headers.set("access-control-allow-origin","*");
@@ -116,8 +125,9 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
     if(!await deps.workspaceAccess(principal)) return json({error:"invalid_workspace"},404);
     const workspace=await deps.workspaceLabel?.(principal)??principal.workspaceId;
     const requestValue=validated.value;
-    const existing=protocol!.canContinueEventsConsent(requestValue) && store.listMcpOAuthGrantsForUser
+    const existingRows=protocol!.canContinueEventsConsent(requestValue) && store.listMcpOAuthGrantsForUser
       ?await store.listMcpOAuthGrantsForUser(principal,{clientId:requestValue.clientId,resource:requestValue.resource}):[];
+    const existing:Connections=existingRows.map(({id,agentName})=>({id,agentName}));
     const nonce=randomBytes(18).toString("base64url");
     const payload=JSON.stringify({params,workspaceId:principal.workspaceId,connections:existing}).replaceAll("<","\\u003c");
     const suggested=requestValue.requestedAgentName??"mcp-agent";
@@ -146,6 +156,29 @@ form.addEventListener('submit',event=>{event.preventDefault();decide('approve');
     const finish=(response:Response)=>isPublic?cors(response):response;
     if(request.method==="OPTIONS" && isPublic) return finish(new Response(null,{status:204}));
     try {
+      if(path===GRANTS || path.startsWith(GRANTS+"/")) {
+        const principal=await resolveMcpConsentAccount(request,deps.resolveSession);
+        if(principal instanceof Response) return principal;
+        if(!await deps.workspaceAccess(principal)) return json({error:"not_found"},404);
+        if(request.method==="GET" && path===GRANTS && store.listMcpOAuthGrantsForUser) {
+          const grants=await store.listMcpOAuthGrantsForUser(principal);
+          return json({grants:grants.map(grant=>({
+            id:grant.id,client_id:grant.clientId,client_name:grant.clientName,
+            organization_id:grant.organizationId,workspace_id:grant.workspaceId,
+            agent_name:grant.agentName,scopes:grant.scopes,resource:grant.resource,created_at:grant.createdAt.toISOString(),
+          }))});
+        }
+        if(request.method==="DELETE" && store.getOAuthGrant && store.revokeMcpOAuthGrant) {
+          if(request.headers.get("origin")!==origin) return json({error:"forbidden"},403);
+          const id=path.slice(GRANTS.length+1);
+          if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(id)) return json({error:"not_found"},404);
+          const grant=await store.getOAuthGrant(id,principal);
+          if(!grant) return json({error:"not_found"},404);
+          await store.revokeMcpOAuthGrant(grant.id,"user_revoked");deps.afterMutation?.();
+          return new Response(null,{status:204,headers:{"cache-control":"no-store"}});
+        }
+        const result=json({error:"method_not_allowed"},405);result.headers.set("allow",path===GRANTS?"GET":"DELETE");return result;
+      }
       if(request.method==="GET") {
         if(discovery.has(path)) return finish(json(protocol!.authorizationServerMetadata()));
         if(metadata.has(path)) {
@@ -159,8 +192,12 @@ form.addEventListener('submit',event=>{event.preventDefault();decide('approve');
       if(request.method==="POST" && [`${API}/register`,`${API}/token`,`${API}/revoke`,`${API}/authorize`].includes(path)) {
         const ready=await bounded(request);addresses.set(ready,clientAddress);
         if(path===`${API}/register`) return finish(await publicHandlers.register(ready));
-        if(path===`${API}/token`) return finish(await publicHandlers.token(ready));
-        if(path===`${API}/revoke`) return finish(await publicHandlers.revoke(ready));
+        if(path===`${API}/token`) {
+          const result=await publicHandlers.token(ready);deps.afterMutation?.();return finish(result);
+        }
+        if(path===`${API}/revoke`) {
+          const result=await publicHandlers.revoke(ready);deps.afterMutation?.();return finish(result);
+        }
         return await consent!.authorize(ready);
       }
       const response=json({error:"method_not_allowed"},405);

@@ -339,7 +339,9 @@ export function registerSharedSessionReads(server: McpServer, context: McpContex
       });
     } catch (error) {
       console.error("[selfhost-mcp] Search failed", { correlationId });
-      return toolError(error, { correlationId, structured: true });
+      // Error content is not a successful SearchOutputSchema value. SDK
+      // clients validate any structuredContent even when isError is true.
+      return toolError(error, { correlationId });
     }
   });
 

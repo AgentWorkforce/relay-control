@@ -547,7 +547,7 @@ export function createMcpOAuthProtocol(config: McpOAuthProtocolConfig) {
   }
 
   return {
-    mcpOAuthOrigin, mcpOAuthIssuer, mcpResourcePathFor, mcpResourceUrl,
+    mcpOAuthOrigin, mcpOAuthIssuer, mcpOAuthResourceAvailable, mcpResourcePathFor, mcpResourceUrl,
     parseMcpResourceRequest, parseMcpResource, canonicalMcpResourceParam,
     requestAgentNameHint, protectedResourceMetadataUrl, protectedResourceMetadata,
     authorizationServerMetadata, mcpOAuthChallenge, mcpOAuthUnauthorized,
