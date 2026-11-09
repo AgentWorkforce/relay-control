@@ -26,3 +26,9 @@ and before any backend call. A feature that is not selected answers 403:
 ```json
 { "error": "feature_not_enabled", "message": "...", "feature": "chief" }
 ```
+
+Core startup and ordinary core routes do not initialize Flows storage or parse
+its optional configuration. Selecting Flows retains its startup validation.
+Disabled Flows protocol routes authenticate enrollment, worker, and run
+credentials before returning `feature_not_enabled`; they do not redeem an
+enrollment token, record callbacks, touch workers, or run queue maintenance.
