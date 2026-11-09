@@ -19,9 +19,15 @@ import { createRelaycastClient, RelaycastCallError, type RelaycastClient } from 
  * and that the agent belongs to the caller. Tokens are encrypted at rest and
  * never returned. The optional Ed25519 attestation key verifies Copilot
  * tool-call proofs for that Desktop source.
+ *
+ * A hosted MCP session links to one synced identity with join_relay
+ * desktop_address (table desktop_relay_session_bindings, migration 0035);
+ * sync reports that link back to the Desktop as linked_mcp / linked_at.
  */
 
 export const DESKTOP_SOURCE = "relay-desktop";
+/** Cloud's LINKED_MCP: what identity sync reports for an identity a hosted MCP session is linked to. */
+export const LINKED_MCP = "agent-relay-sessions";
 export const NATIVE_SESSION_IDENTITY_CAPABILITY_VERSION = 1;
 export const COPILOT_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
 
@@ -199,7 +205,7 @@ export async function syncDesktopIdentities(input: {
   sourceId: string;
   identities: Identity[];
   attestationKey?: AttestationKey;
-}): Promise<{ synced: number; skipped?: Skipped[]; identities: Array<{ agent_id: string; linked_mcp: null; linked_at: null }> }> {
+}): Promise<{ synced: number; skipped?: Skipped[]; identities: DesktopIdentityLink[] }> {
   const { access } = input;
   if (input.identities.length === 0) {
     await replace(input.database, input.keyring, access, input.sourceId, [], undefined);
@@ -215,11 +221,35 @@ export async function syncDesktopIdentities(input: {
   }
   const { verified, skipped } = await verify(input.client, access, input.identities);
   await replace(input.database, input.keyring, access, input.sourceId, verified, input.attestationKey);
+  const links = await desktopIdentityLinks(input.database, access.workspace.id, access.principal.userId, input.sourceId);
   return {
     synced: verified.length,
     ...(skipped.length > 0 ? { skipped } : {}),
-    identities: verified.map(row => ({ agent_id: row.agent_id, linked_mcp: null, linked_at: null })),
+    identities: reportLinks(verified.map(row => row.remoteId), links),
   };
+}
+
+export type DesktopIdentityLink = { agent_id: string; linked_mcp: typeof LINKED_MCP | null; linked_at: string | null };
+
+/** The newest hosted MCP session link of each identity one Desktop source has synced, by agent id. */
+async function desktopIdentityLinks(database: SqlExecutor, workspaceId: string, userId: string, sourceId: string) {
+  const rows = await database.query<{ agent_remote_id: string; linked_at: Date | string }>(
+    `SELECT i.agent_remote_id, max(b.created_at) AS linked_at
+       FROM desktop_relay_session_bindings b
+       JOIN desktop_relay_identities i ON i.id = b.desktop_identity_id
+      WHERE b.workspace_id = $1 AND b.user_id = $2
+        AND i.workspace_id = $1 AND i.user_id = $2 AND i.source_id = $3
+      GROUP BY i.agent_remote_id`,
+    [workspaceId, userId, sourceId.toLowerCase()],
+  );
+  return new Map(rows.rows.map(row => [row.agent_remote_id, new Date(row.linked_at)] as const));
+}
+
+function reportLinks(agentIds: string[], links: Map<string, Date>): DesktopIdentityLink[] {
+  return agentIds.map(agentId => {
+    const linkedAt = links.get(agentId);
+    return { agent_id: agentId, linked_mcp: linkedAt ? LINKED_MCP : null, linked_at: linkedAt?.toISOString() ?? null };
+  });
 }
 
 type JsonWriter = (response: ServerResponse, status: number, body: unknown, noStore?: boolean) => void;
@@ -269,8 +299,9 @@ export async function handleDesktopIdentityRoutes(
           ORDER BY created_at, agent_remote_id`,
         [access.workspace.id, access.principal.userId, sourceId.toLowerCase(), access.workspace.relaycastWorkspaceId],
       );
+      const links = await desktopIdentityLinks(deps.database, access.workspace.id, access.principal.userId, sourceId);
       deps.json(response, 200, {
-        identities: rows.rows.map(row => ({ agent_id: row.agent_remote_id, linked_mcp: null, linked_at: null })),
+        identities: reportLinks(rows.rows.map(row => row.agent_remote_id), links),
         capabilities: DESKTOP_IDENTITY_CAPABILITIES,
       }, true);
     } catch {
@@ -319,7 +350,150 @@ export const DESKTOP_IDENTITY_MESSAGES = {
   notSynced: "This native chat is not synced to your desktop account and workspace.",
 } as const;
 
-export type LinkedDesktopIdentity = { name: string; address: string; agentId: string; token: string };
+export type LinkedDesktopIdentity = { id: string; name: string; address: string; agentId: string; token: string };
+
+/** One owner's stored desktop identity row; the token stays encrypted until verified. */
+export type DesktopIdentityRow = {
+  id: string;
+  sourceId: string;
+  relaycastWorkspaceId: string;
+  agentName: string;
+  agentRemoteId: string;
+  address: string;
+  tokenCiphertext: string;
+};
+
+const IDENTITY_COLUMNS = `i.id, i.source_id, i.relaycast_workspace_id, i.agent_name, i.agent_remote_id, i.address, i.token_ciphertext`;
+
+function identityRow(row: Record<string, unknown>): DesktopIdentityRow {
+  return {
+    id: String(row.id),
+    sourceId: String(row.source_id),
+    relaycastWorkspaceId: String(row.relaycast_workspace_id),
+    agentName: String(row.agent_name),
+    agentRemoteId: String(row.agent_remote_id),
+    address: String(row.address),
+    tokenCiphertext: String(row.token_ciphertext),
+  };
+}
+
+/** This owner's synced identity at an exact address; workspace and user are always in the predicate. */
+export async function findDesktopIdentityByAddress(
+  database: SqlExecutor, workspaceId: string, userId: string, address: string,
+): Promise<DesktopIdentityRow | null> {
+  const result = await database.query(
+    `SELECT ${IDENTITY_COLUMNS} FROM desktop_relay_identities i
+      WHERE i.workspace_id = $1 AND i.user_id = $2 AND i.address = $3
+      ORDER BY i.updated_at DESC, i.id
+      LIMIT 1`,
+    [workspaceId, userId, address],
+  );
+  return result.rows[0] ? identityRow(result.rows[0]) : null;
+}
+
+/** This owner's newest synced identity with an exact agent name, for the alias hint when an address misses. */
+export async function findDesktopIdentityByName(
+  database: SqlExecutor, workspaceId: string, userId: string, name: string,
+): Promise<DesktopIdentityRow | null> {
+  const result = await database.query(
+    `SELECT ${IDENTITY_COLUMNS} FROM desktop_relay_identities i
+      WHERE i.workspace_id = $1 AND i.user_id = $2 AND i.agent_name = $3
+      ORDER BY i.updated_at DESC, i.id
+      LIMIT 1`,
+    [workspaceId, userId, name],
+  );
+  return result.rows[0] ? identityRow(result.rows[0]) : null;
+}
+
+/** The synced identity a hosted MCP session (by the hash of its Mcp-Session-Id) is linked to. */
+export async function findDesktopIdentityBySession(
+  database: SqlExecutor, workspaceId: string, userId: string, sessionHash: string,
+): Promise<DesktopIdentityRow | null> {
+  const result = await database.query(
+    `SELECT ${IDENTITY_COLUMNS} FROM desktop_relay_session_bindings b
+       JOIN desktop_relay_identities i ON i.id = b.desktop_identity_id
+      WHERE b.workspace_id = $1 AND b.user_id = $2 AND b.session_hash = $3
+        AND i.workspace_id = $1 AND i.user_id = $2
+      LIMIT 1`,
+    [workspaceId, userId, sessionHash],
+  );
+  return result.rows[0] ? identityRow(result.rows[0]) : null;
+}
+
+export const DESKTOP_BINDING_GONE = "The desktop identity is no longer synced to this owner and workspace.";
+
+/**
+ * Links a hosted MCP session to one of this owner's synced identities. The
+ * identity row is locked so a concurrent sync that drops it either runs
+ * first (this refuses) or waits and cascades the new binding away. A re-link
+ * refreshes created_at: sync reports it to the Desktop as linked_at.
+ */
+export async function bindDesktopSession(database: Database | SqlExecutor, input: {
+  workspaceId: string; userId: string; sessionHash: string; identityId: string;
+}): Promise<void> {
+  const run = async (tx: SqlExecutor) => {
+    const owned = await tx.query(
+      `SELECT id FROM desktop_relay_identities WHERE id = $1 AND workspace_id = $2 AND user_id = $3 FOR UPDATE`,
+      [input.identityId, input.workspaceId, input.userId],
+    );
+    if (owned.rows.length === 0) throw new DesktopIdentityUnavailable(DESKTOP_BINDING_GONE);
+    await tx.query(
+      `INSERT INTO desktop_relay_session_bindings (id, workspace_id, user_id, session_hash, desktop_identity_id)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (workspace_id, user_id, session_hash) DO UPDATE
+         SET desktop_identity_id = EXCLUDED.desktop_identity_id, created_at = now()`,
+      [randomUUID(), input.workspaceId, input.userId, input.sessionHash, input.identityId],
+    );
+  };
+  // Inside a caller's transaction the row lock is held until it commits.
+  return "transaction" in database ? database.transaction(run) : run(database);
+}
+
+/** Removes a hosted MCP session's desktop link; the synced identity is unchanged. */
+export async function unbindDesktopSession(database: SqlExecutor, input: {
+  workspaceId: string; userId: string; sessionHash: string;
+}): Promise<void> {
+  await database.query(
+    `DELETE FROM desktop_relay_session_bindings WHERE workspace_id = $1 AND user_id = $2 AND session_hash = $3`,
+    [input.workspaceId, input.userId, input.sessionHash],
+  );
+}
+
+/**
+ * Re-checks a stored identity with Relaycast: on this workspace's current
+ * relay, and its token still controls the same relay-desktop agent owned by
+ * this user. Throws DesktopIdentityUnavailable.
+ */
+export async function verifyDesktopIdentity(input: {
+  keyring: EncryptionKeyring;
+  client: RelaycastClient;
+  userId: string;
+  relaycastWorkspaceId: string;
+  row: DesktopIdentityRow;
+}): Promise<LinkedDesktopIdentity> {
+  const { row } = input;
+  if (row.relaycastWorkspaceId !== input.relaycastWorkspaceId) {
+    throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.otherRelay);
+  }
+  let token: string;
+  try {
+    token = decryptSecret(row.tokenCiphertext, input.keyring);
+  } catch {
+    throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
+  }
+  let agent;
+  try {
+    agent = await input.client.authenticatedAgent(token);
+  } catch (error) {
+    if (refused(error)) throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
+    throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.unverified);
+  }
+  if (agent.id !== row.agentRemoteId || agent.name !== row.agentName || agent.address !== row.address ||
+      agent.metadata.source !== DESKTOP_SOURCE || agent.metadata.owner_hash !== ownerHash(input.userId)) {
+    throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
+  }
+  return { id: row.id, name: row.agentName, address: row.address, agentId: row.agentRemoteId, token };
+}
 
 /**
  * The synced identity one verified native chat acts as. Re-checks the stored
@@ -337,46 +511,19 @@ export async function linkedDesktopIdentity(input: {
   nativeSession: { kind: string; id: string };
   sourceId?: string;
 }): Promise<LinkedDesktopIdentity> {
-  const result = await input.database.query<{
-    source_id: string;
-    relaycast_workspace_id: string;
-    agent_name: string;
-    agent_remote_id: string;
-    address: string;
-    token_ciphertext: string;
-  }>(
-    `SELECT source_id, relaycast_workspace_id, agent_name, agent_remote_id, address, token_ciphertext
-       FROM desktop_relay_identities
-      WHERE workspace_id = $1 AND user_id = $2 AND native_session_kind = $3 AND native_session_id = $4`,
+  const result = await input.database.query(
+    `SELECT ${IDENTITY_COLUMNS} FROM desktop_relay_identities i
+      WHERE i.workspace_id = $1 AND i.user_id = $2 AND i.native_session_kind = $3 AND i.native_session_id = $4`,
     [input.workspaceId, input.userId, input.nativeSession.kind, input.nativeSession.id],
   );
   if (result.rows.length > 1) throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.duplicate);
-  const row = result.rows[0];
+  const row = result.rows[0] ? identityRow(result.rows[0]) : null;
   if (!row) throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.notSynced);
-  if (input.sourceId !== undefined && row.source_id !== input.sourceId) {
+  if (input.sourceId !== undefined && row.sourceId !== input.sourceId) {
     throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.sourceMismatch);
   }
-  if (row.relaycast_workspace_id !== input.relaycastWorkspaceId) {
-    throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.otherRelay);
-  }
-  let token: string;
-  try {
-    token = decryptSecret(row.token_ciphertext, input.keyring);
-  } catch {
-    throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
-  }
-  let agent;
-  try {
-    agent = await input.client.authenticatedAgent(token);
-  } catch (error) {
-    if (refused(error)) throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
-    throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.unverified);
-  }
-  if (agent.id !== row.agent_remote_id || agent.name !== row.agent_name || agent.address !== row.address ||
-      agent.metadata.source !== DESKTOP_SOURCE || agent.metadata.owner_hash !== ownerHash(input.userId)) {
-    throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
-  }
-  return { name: row.agent_name, address: row.address, agentId: row.agent_remote_id, token };
+  return verifyDesktopIdentity({ keyring: input.keyring, client: input.client, userId: input.userId,
+    relaycastWorkspaceId: input.relaycastWorkspaceId, row });
 }
 
 export { COPILOT_ATTESTATION_CAPABILITY };

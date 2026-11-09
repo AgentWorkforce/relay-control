@@ -22,7 +22,7 @@ Ported from the hosted control plane's Copilot Desktop integration.
 | Provider credential routes (GET/POST collection, PUT/DELETE item) | `app/api/v1/workspaces/[workspaceId]/mcp/shared-sessions-tokens/**`, `lib/auth/desktop-provider-credentials.ts` | Ported for provider credentials. Dashboard-minted personal tokens (no-body POST) not ported |
 | Verified parent sign-in | Cloud desktop session provenance (migrations 0348/0349) | Ported: `desktop_host_name` and `desktop_verified_at` on `token_sessions`, set only by an approved browser consent redeemed with S256 |
 | Child token class `mcp:desktop` + `rth:read`, 15-minute renewable lease | same | Ported. Usable only at the shared-sessions MCP endpoint |
-| Desktop identity sync (GET/PUT `messaging/desktop-identities`) | `app/api/v1/workspaces/[workspaceId]/messaging/desktop-identities/route.ts`, `lib/messaging/desktop-identities.ts` | Ported. `linked_mcp`/`linked_at` are always null; `web_session_id` is accepted and ignored |
+| Desktop identity sync (GET/PUT `messaging/desktop-identities`) | `app/api/v1/workspaces/[workspaceId]/messaging/desktop-identities/route.ts`, `lib/messaging/desktop-identities.ts` | Ported. `linked_mcp`/`linked_at` report a hosted MCP session link; `web_session_id` is accepted and ignored |
 | Attestation key registration (`attestation_key`) | same | Ported |
 | Copilot tool-call attestation | `lib/mcp/copilot-attestation.ts`, `lib/mcp/claude-attestation.ts` helpers | Ported verbatim in behaviour; the Cloud fixture signed by the Rust Desktop signer verifies here |
 | Capability `copilot_session_attestation: 1` and MCP experimental `com.agentrelay/copilot-session-attestation` | same | Ported, advertised because verification exists |
@@ -31,7 +31,7 @@ Ported from the hosted control plane's Copilot Desktop integration.
 | Claude session attestation (`claude_session_attestation`) | `lib/mcp/claude-attestation.ts` | Not ported; not advertised |
 | Provider-native capability flags beyond `native_session_identity` | identities route | Not ported; not advertised |
 | Codex managed mode via `X-Agent-Relay-Desktop` on a parent connection | MCP route | Not ported; such calls keep the existing hosted participant behaviour |
-| Linked MCP connection (`linked_mcp`) | identities route | Not ported; always null |
+| Linked MCP connection (`join_relay desktop_address`, `linked_mcp`) | `lib/mcp/relay-service.ts`, `lib/mcp/relay-dependencies.ts`, identities route | Ported (migration 0035, `desktop_relay_session_bindings`); no Claude Code on the web auto-link |
 | Native wake / stop-hook delivery | Desktop | Out of scope (Desktop's job) |
 | Native history acquisition and upload | RelayHistory / Desktop upload edge | Out of scope here (owned by the history pipeline) |
 | Copilot API key / hosted model access | none | Intentionally absent |
@@ -96,9 +96,13 @@ the membership deletes the caller's sessions, which deletes every child.
 `/cloud` session cookie that passes the browser origin check. Provider child
 tokens are refused.
 
-- `GET ?source_id=<uuid>` returns `{identities: [{agent_id, linked_mcp: null,
-  linked_at: null}], capabilities: {native_session_identity: 1,
-  copilot_session_attestation: 1}}`. No token is returned.
+- `GET ?source_id=<uuid>` returns `{identities: [{agent_id, linked_mcp,
+  linked_at}], capabilities: {native_session_identity: 1,
+  copilot_session_attestation: 1}}`. `linked_mcp` is `"agent-relay-sessions"`
+  and `linked_at` the ISO time of the newest link when a hosted MCP session
+  has linked that identity with `join_relay desktop_address`, else both are
+  null. The PUT response reports the same pair per synced identity. No token
+  is returned.
 - `PUT` body (strict):
   `{source_id, identities: [{name, address, agent_id, token, web_session_id?,
   native_session?: {kind, id}}], attestation_key?: {kid, alg: "Ed25519",
@@ -190,7 +194,7 @@ provider credential routes.
 - POST does not echo `accessToken`; Cloud's provider POST returns it.
 - No dashboard personal tokens on these routes (no-body POST, dashboard list).
 - A parent from another workspace gets 404 `workspace_not_found`, not 403.
-- `linked_mcp` and `linked_at` are always null; `web_session_id` is ignored.
+- `web_session_id` is ignored: there is no Claude Code on the web auto-link.
 - `claude_session_attestation` and other provider-native capability flags are
   not advertised.
 - Codex `X-Agent-Relay-Desktop` calls on a parent connection keep the hosted

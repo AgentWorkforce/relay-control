@@ -5,6 +5,15 @@ assigned at release.
 
 ## 0.5.7 (2026-11-09)
 
+- Added: hosted MCP `join_relay desktop_address` links an MCP session to the
+  caller's synced Agent Relay Desktop identity (migration 0035,
+  `desktop_relay_session_bindings`), ported from Cloud. A linked session sends
+  DMs and channel posts as that identity, so replies reach the Desktop natively
+  instead of a hosted inbox; `as` still selects a hosted participant. Hosted
+  `join_relay name` and `leave_relay` unlink, the link is dropped when a
+  Desktop re-sync no longer lists the identity, and identity sync now reports
+  `linked_mcp` / `linked_at` for linked identities. OAuth connections cannot
+  link.
 - Fixed: the desktop sign-in workspace picker and consent screens now name
   both browser origins (API and dashboard) in `form-action` beside `'self'`
   and the loopback origin. The form action stays path-only, so the post
