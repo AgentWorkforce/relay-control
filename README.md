@@ -196,7 +196,12 @@ Both also accept the `/cloud` prefix.
 
 `SESSION_SEARCH_AGENT_TOKENS=true` (default false) reads `@name` tokens in API and MCP search text as agent filters. Enable it once the session backend's agent catalog is ready; until then those tokens stay ordinary search text. The explicit `agent` parameter does not need this setting and answers 501 `agent_filter_not_ready` until the backend is ready.
 
-`SESSION_READ_API_MCP_READS=true` (default false) gives MCP session reads their own per-user read pair. MCP obtains and refreshes the calling user's pair through Control, validates its user/organization/workspace, audience and `rth:read` scope, and uses the returned reader URL. Only `rth_at_read_` access tokens reach read routes; the MCP reader client has no internal issuer or service credential. Unsupported views (501) remain unavailable. A refused refresh requires reauthentication; an unavailable refresh retains the pair for a same-reader retry. When the setting is off, MCP reads use the dashboard read path below, which is the same read API, so cursors stay valid either way.
+`SESSION_READ_API_MCP_READS=true` (default false) gives MCP session reads their own per-user read pair. MCP obtains and refreshes the calling user's pair through Control, validates its user/organization/workspace, audience and `rth:read` scope, and uses the returned reader URL. Only `rth_at_read_` access tokens reach read routes; the MCP reader client has no internal issuer or service credential. Unsupported views (501) remain unavailable. A refused refresh requires reauthentication; an unavailable refresh retains the pair for a same-reader retry. When the setting is off, MCP reads use the dashboard read path below, which is the same read API, so cursors stay valid either way. With the setting on, Control calls its own
+`SELFHOST_PUBLIC_URL` handoff route and then `SESSION_READ_API_PUBLIC_URL` from
+inside the cluster, so both public origins must resolve and accept connections
+from the Control process itself (an ingress that does not hairpin fails the
+exchange with an upstream error); the default off path needs only the internal
+`SESSION_READ_API_URL`.
 
 Control authenticates the user, refuses unexchanged Desktop handoffs, checks
 live workspace membership and `rth:read` on every issue and refresh, and
