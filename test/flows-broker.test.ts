@@ -9,12 +9,12 @@ import type { SelfhostConfig } from "../src/config.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { close, listen, PGliteDatabase, request } from "./support/harness.js";
-import { testLicense } from "./support/license.js";
+import { testFeatures } from "./support/features.js";
 
 const secret = "broker-secret-that-is-at-least-32-bytes";
 const PREFIX = "/internal/v1/flows/credentials";
 
-async function setup(t: TestContext, options: { secret?: string | null; licensed?: boolean } = {}) {
+async function setup(t: TestContext, options: { secret?: string | null; flows?: boolean } = {}) {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -48,7 +48,7 @@ async function setup(t: TestContext, options: { secret?: string | null; licensed
     },
     runtimeEnvironment: record("environment", { workspaceId: workspace.id, env: { A: "1" }, secretEnvNames: ["A"], skipped: [], integrationErrors: [] }),
   } as unknown as AdminModule;
-  const app = createApp({ config, store, admin, ...(options.licensed === false ? {} : { license: testLicense() }) });
+  const app = createApp({ config, store, admin, ...(options.flows === false ? {} : { features: testFeatures() }) });
   const server = createServer(app);
   const origin = await listen(server);
   t.after(async () => { await close(server); await database.close(); });
@@ -74,7 +74,7 @@ test("only the broker secret reaches the store, and never through /cloud", async
 });
 
 test("an installation without Flows refuses the broker", async (t) => {
-  const env = await setup(t, { licensed: false });
+  const env = await setup(t, { flows: false });
   const answer = await env.post("revoke", { runId: randomUUID() });
   assert.equal(answer.status, 403);
   assert.deepEqual(env.calls, []);

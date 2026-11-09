@@ -329,7 +329,7 @@ async function startHistory(t: TestContext, historyOrigin: string, direct = fals
 async function setup(
   t: TestContext,
   now = new Date("2026-11-02T20:00:00.000Z"),
-  options: { relayauth?: boolean; directReadApi?: boolean; agentTokens?: boolean; relaycastFetch?: typeof fetch } = {},
+  options: { relayauth?: boolean; directReadApi?: boolean; nativeEvents?: boolean; agentTokens?: boolean; relaycastFetch?: typeof fetch } = {},
 ) {
   const relayauth = options.relayauth ?? true;
   const historyOrigin = "https://history.selfhosted.test";
@@ -346,6 +346,7 @@ async function setup(
     relayauthUrl: relayauth ? history.origin : null,
     relayhistoryUrl: history.origin,
     ...(readApi ? { relayhistoryReadApiUrl: readApi.origin } : {}),
+    relayhistoryReadApiEvents: options.nativeEvents ?? false,
     relayhistoryPublicUrl: historyOrigin,
     relayauthApiKey: relayauth ? "rak_test" : null,
     bootstrapToken,
@@ -1164,4 +1165,103 @@ test("direct read Worker: MCP reports an expired cursor with an explicit restart
   });
   assert.equal(env.history.requests.length, 0);
   assert.equal(env.readApi!.requests.length, 0);
+});
+
+test("native event transport: opted-in events preserve native IDs and omit only the legacy query option", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true, nativeEvents: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const nativeEvent = {
+    eventId: "provider-event-1", sessionId: "alpha-1", source: "codex",
+    ts: "2026-11-02T18:00:01.000Z", kind: "text", type: "prompt",
+    content: "Native event content", actorName: null, actorRole: null,
+    machineId: "machine-test", userId: "user-test",
+  };
+  env.readApi!.overrides.set("/v1/sessions/alpha-1/events", (_request, url) =>
+    url.searchParams.has("includeMessageId")
+      ? { status: 501, body: { error: { code: "unsupported_by_backend", reason: "param_includeMessageId" } } }
+      : { body: { events: [nativeEvent], nextCursor: null } });
+  const result = await call(env.origin, `/api/v1/workspaces/${env.alpha}/sessions/alpha-1/events?source=codex&order=desc&limit=20`, { token });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.events, [nativeEvent]);
+  assert(result.body.events[0]);
+  assert(!Object.hasOwn(result.body.events[0], "messageId"));
+  assert.deepEqual(env.readApi!.requests.map((r) => ({ path: r.path, query: r.query, token: r.token })), [{
+    path: "/v1/sessions/alpha-1/events",
+    query: { source: "codex", order: "desc", limit: "20", maxContent: "100000", workspace: env.alpha },
+    token,
+  }]);
+  assert.equal(env.history.requests.length, 0);
+});
+
+test("native event transport: missing auth and foreign workspace never reach either backend", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true, nativeEvents: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  assert.equal((await call(env.origin, `/api/v1/workspaces/${env.alpha}/sessions/alpha-1/events?source=codex`)).status, 401);
+  assert.equal((await call(env.origin, `/api/v1/workspaces/${env.beta}/sessions/beta-1/events?source=claude`, { token })).status, 404);
+  assert.equal((await call(env.origin, `/api/v1/workspaces/${env.alpha}/sessions/alpha-1/events?source=codex&workspace=${env.beta}`, { token })).status, 400);
+  assert.equal(env.readApi!.requests.length, 0);
+  assert.equal(env.history.requests.length, 0);
+});
+
+test("native event transport: upstream refusals and workspace mismatch never fall back or expose content", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true, nativeEvents: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  const path = `/api/v1/workspaces/${env.alpha}/sessions/alpha-1/events?source=codex`;
+  for (const status of [401, 403, 503]) {
+    env.readApi!.overrides.set("/v1/sessions/alpha-1/events", () => ({ status, body: { error: "private-refusal-content" } }));
+    const before = env.readApi!.requests.length;
+    const result = await call(env.origin, path, { token });
+    assert.equal(result.status, status === 503 ? 503 : 502);
+    assert.equal(result.body.upstreamStatus, status);
+    assert(!JSON.stringify(result.body).includes("private-refusal-content"));
+    assert.equal(env.readApi!.requests.length, before + 1);
+    assert.equal(env.history.requests.length, 0);
+  }
+  env.readApi!.overrides.set("/v1/sessions/alpha-1/events", () => ({ status: 501, body: { error: { code: "unsupported_by_backend", reason: "events_not_configured" } } }));
+  const unsupportedBefore = env.readApi!.requests.length;
+  assert.equal((await call(env.origin, path, { token })).status, 501);
+  assert.equal(env.readApi!.requests.length, unsupportedBefore + 1);
+  assert.equal(env.history.requests.length, 0);
+  for (const workspace of ["", env.beta]) {
+    env.readApi!.overrides.set("/v1/sessions/alpha-1/events", () => ({ headers: { "x-relayhistory-workspace-id": workspace }, body: { events: [{ eventId: "private", ts: "2026-11-02T18:00:01.000Z", content: "private-event-content" }] } }));
+    const result = await call(env.origin, path, { token });
+    assert.equal(result.status, 502);
+    assert(!JSON.stringify(result.body).includes("private-event-content"));
+  }
+  assert.equal(env.history.requests.length, 0);
+});
+
+test("native event transport: malformed native event is refused instead of inventing an ID", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true, nativeEvents: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  env.readApi!.overrides.set("/v1/sessions/alpha-1/events", () => ({ body: { events: [{ ts: "2026-11-02T18:00:01.000Z", content: "content-without-event-id" }] } }));
+  const result = await call(env.origin, `/api/v1/workspaces/${env.alpha}/sessions/alpha-1/events?source=codex`, { token });
+  assert.equal(result.status, 502);
+  assert(!JSON.stringify(result.body).includes("content-without-event-id"));
+  assert.equal(env.history.requests.length, 0);
+});
+
+test("native event transport: rollback refuses native cursors without restarting History", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true, nativeEvents: true });
+  const token = await env.login(env.ownerId, env.alpha);
+  env.config.relayhistoryReadApiEvents = false;
+  const result = await call(env.origin, `/api/v1/workspaces/${env.alpha}/sessions/alpha-1/events?source=codex&cursor=b96e1:opaque`, { token });
+  assert.equal(result.status, 410);
+  assert.equal(result.body.error, "cursor_expired");
+  assert.equal(env.history.requests.length, 0);
+  assert.equal(env.readApi!.requests.length, 0);
+});
+
+test("native event transport: other admitted credential families retain the legacy query", async (t) => {
+  const env = await setup(t, undefined, { directReadApi: true, nativeEvents: true });
+  const query = new URLSearchParams({ source: "codex", includeMessageId: "true" });
+  const read = await readWorkspaceHistory(env.config, {
+    userId: env.ownerId, organizationId: env.organizationId,
+    workspaceId: env.alpha, callerToken: "synthetic-admitted-oauth-token",
+  }, "/v1/sessions/alpha-1/events", query);
+  assert.equal(read.status, "ok");
+  assert.equal(env.readApi!.requests.length, 0);
+  const legacy = lastRequest(env.history.requests, (r) => r.path.endsWith("/events"));
+  assert.deepEqual(legacy?.query, { source: "codex", includeMessageId: "true", workspace: env.alpha });
+  assert.equal(query.get("includeMessageId"), "true");
 });

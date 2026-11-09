@@ -41,6 +41,7 @@ async function startReadApi(t: TestContext) {
   const issued: Array<{ path: string; body: Record<string, unknown>; bearer: string | undefined }> = [];
   const reads: string[] = [];
   const unexpected: string[] = [];
+  const eventQueries: string[] = [];
   let n = 0;
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const chunks: Buffer[] = [];
@@ -61,6 +62,14 @@ async function startReadApi(t: TestContext) {
         res.end(JSON.stringify({ sessions: [{ sessionId: "s", id: "s", source: "claude", startedAt: new Date().toISOString() }], nextCursor: null }));
         return;
       }
+      if (req.method === "GET" && path === "/v1/sessions/s/events") {
+        reads.push(`${req.headers.authorization}`);
+        const url = new URL(req.url ?? "/", "http://x");
+        eventQueries.push(url.search);
+        res.writeHead(200, { "content-type": "application/json", "x-relayhistory-workspace-id": url.searchParams.get("workspace") ?? "" });
+        res.end(JSON.stringify({ events: [{ eventId: "event-1", ts: "2026-11-02T18:00:01.000Z", source: "codex", kind: "text", type: "prompt", content: "test event" }], nextCursor: null }));
+        return;
+      }
       unexpected.push(`${req.method} ${path}`);
       res.writeHead(500);
       res.end("{}");
@@ -68,7 +77,7 @@ async function startReadApi(t: TestContext) {
   });
   const origin = await listen(server);
   t.after(() => close(server));
-  return { origin, issued, reads, unexpected };
+  return { origin, issued, reads, unexpected, eventQueries };
 }
 
 async function setup(t: TestContext) {
@@ -228,4 +237,29 @@ test("legacy config is unaffected", () => {
   });
   assert.equal(config.relayhistoryBackend, null);
   assert.equal(config.relayhistoryUrl, "http://relayhistory:8080");
+});
+
+
+test("native issuer mode preserves its existing credential, event query and cursor contract", async (t) => {
+  const env = await setup(t);
+  const result = await request(env.origin, `/api/v1/workspaces/${env.workspace}/sessions/s/events?source=codex&cursor=b96e1:opaque`, { token: env.token });
+  assert.equal(result.status, 200, result.raw);
+  assert.equal(result.body.events[0]?.eventId, "event-1");
+  assert.equal(env.readApi.issued.length, 1);
+  assert.match(env.readApi.reads[0]!, /^Bearer rth_at_read_/);
+  const query = new URLSearchParams(env.readApi.eventQueries[0]);
+  assert.equal(query.get("includeMessageId"), "true", "the independent issuer backend keeps its existing query contract");
+  assert.equal(query.get("cursor"), "b96e1:opaque", "issuer-native cursors do not enter the legacy rollback guard");
+  assert.deepEqual(env.readApi.unexpected, []);
+});
+
+test("direct events remain a separate explicit opt-in, never an issuer-native authority switch", () => {
+  const directEnv = { ...nativeEnv, RELAYHISTORY_BACKEND: undefined, RELAYHISTORY_URL: "http://history:8080", RELAYHISTORY_PUBLIC_URL: ORIGIN, RELAYHISTORY_READ_API_URL: ORIGIN };
+  assert.equal(loadConfig(directEnv).relayhistoryReadApiEvents, false);
+  const direct = loadConfig({ ...directEnv, RELAYHISTORY_READ_API_EVENTS: "true" });
+  assert.equal(direct.relayhistoryBackend, null);
+  assert.equal(direct.relayhistoryReadApiEvents, true);
+  assert.equal(direct.relayhistoryReadApiUrl, ORIGIN);
+  assert.throws(noisy({ ...nativeEnv, RELAYHISTORY_READ_API_EVENTS: "true" }), /requires RELAYHISTORY_READ_API_URL/);
+  assert.throws(noisy({ ...nativeEnv, RELAYHISTORY_READ_API_URL: ORIGIN, RELAYHISTORY_READ_API_EVENTS: "true" }), /refuses RELAYHISTORY_READ_API_URL/);
 });

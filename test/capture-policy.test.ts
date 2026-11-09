@@ -191,7 +191,7 @@ test("capture policy: SELFHOST_OPERATOR_CONTROLS gates writes only", async (t) =
   const { operatorControlsEntitled } = await import("../src/admin/operator-controls.js");
   assert.equal(operatorControlsEntitled({}), true);
   assert.equal(operatorControlsEntitled({ SELFHOST_OPERATOR_CONTROLS: "always" }), true);
-  assert.equal(operatorControlsEntitled({ SELFHOST_OPERATOR_CONTROLS: "licence" }), false);
+  assert.equal(operatorControlsEntitled({ SELFHOST_OPERATOR_CONTROLS: "bogus" }), false);
   assert.equal(operatorControlsEntitled({ SELFHOST_OPERATOR_CONTROLS: "off" }), false);
 
   const app = await startControlPlane();
@@ -206,7 +206,7 @@ test("capture policy: SELFHOST_OPERATOR_CONTROLS gates writes only", async (t) =
   });
   assert.equal(entitled.status, 200);
 
-  for (const mode of ["off", "licence"]) {
+  for (const mode of ["off", "bogus"]) {
     process.env.SELFHOST_OPERATOR_CONTROLS = mode;
     const put = await app.api(policyPath, {
       method: "PUT", token: tenant.ownerToken, body: { settings: { sharing_mode: "all" } },

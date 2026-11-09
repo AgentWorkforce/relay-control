@@ -189,18 +189,25 @@ export async function readWorkspaceHistory(
   const query = new URLSearchParams(params);
   query.delete("workspace");
   query.set("workspace", identity.workspaceId);
-  // Rollout 1: the GET-only Worker serves unsearched lists and turns. Session
-  // issuance, uploads, events/search and the other views keep the History path.
+  // The base rollout serves unsearched lists and turns. Session events have
+  // their own opt-in so existing list/turn-only readers keep the History path.
   const rolloutPath = path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+\/turns$/.test(path);
+  const eventPath = /^\/v1\/sessions\/[^/]+\/events$/.test(path);
   // Other admitted credential families retain their pre-existing History
   // transport; this connection never forwards them to a sh_at_-only Worker.
   const native = config.relayhistoryBackend === "native";
   const direct = Boolean(config.relayhistoryReadApiUrl && identity.callerToken.startsWith("sh_at_") &&
-    rolloutPath && !query.has("q") && !query.has("search"));
+    (rolloutPath || (eventPath && config.relayhistoryReadApiEvents)) && !query.has("q") && !query.has("search"));
   // A read-API cursor cannot be interpreted by History after configuration
   // rollback. Refuse instead of silently restarting on its first page.
-  if (!direct && !native && rolloutPath && /^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
+  if (!direct && !native && (rolloutPath || eventPath) && /^b96[a-z][0-9]+:/.test(query.get("cursor") ?? "")) {
     throw new ReadCursorExpiredError();
+  }
+  if (direct && eventPath) {
+    // Native events already carry their authoritative eventId. The legacy
+    // message-ID expansion option is unsupported there; do not request it or
+    // synthesize a messageId in Control. Legacy requests keep it unchanged.
+    query.delete("includeMessageId");
   }
   const origin = direct ? config.relayhistoryReadApiUrl! : config.relayhistoryUrl;
   const url = new URL(`${path}?${query}`, `${origin}/`);

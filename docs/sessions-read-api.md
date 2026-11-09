@@ -148,13 +148,28 @@ assertion, or service bearer is substituted. Workspace membership is checked
 before forwarding; the query always names the caller's authorized workspace;
 every successful response still needs the matching workspace attestation.
 
+Session events can be enabled separately with
+`RELAYHISTORY_READ_API_EVENTS=true` (default `false`). Startup requires the
+existing direct-reader URL and its normal introspection configuration. It is
+separate from `RELAYHISTORY_BACKEND=native`, which uses the independent read
+service's token issuance contract and refuses the direct-reader URL. This
+opt-in sends `GET /v1/sessions/:id/events` to that reader with the caller's
+`sh_at_` token and the authorized workspace. Only the legacy `includeMessageId`
+query option is omitted on these direct requests: native `eventId` values and
+event content pass through unchanged, and Control invents no message IDs. The
+reader must serve the accepted event response shape and attest the same
+workspace. A refusal, malformed event, missing attestation or wrong workspace
+never falls back to History. Disabling the opt-in restores legacy event
+requests; outstanding native event cursors are refused rather than restarted.
+
 All other views, search, session issuance and uploads keep the existing
 History connection. Selection follows the upstream read path, including calls
 through the shared MCP reader: the timing tool's initial unsearched session
 list uses the direct reader, while its timing requests and the MCP transcript
 and search requests stay on History. This option does not migrate dashboard
-metadata, events or search. Self-hosted installations using the read container
-can keep the original `RELAYHISTORY_URL` path without this option.
+metadata or search. Events require the separate opt-in above. Self-hosted
+installations using the read container can keep the original
+`RELAYHISTORY_URL` path without this option.
 
 Control configuration:
 

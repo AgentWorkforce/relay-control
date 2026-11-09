@@ -321,7 +321,7 @@ export function createFlowsHandler(deps: {
     // ------------------------------------------------ worker protocol
     if (path === "/api/v1/workers/register" && method === "POST") {
       // The enrollment token is the only credential and redeeming it is the
-      // store call, so refuse first: an unlicensed install never spends one.
+      // store call, so refuse first: an install without Flows never spends one.
       requireFeature();
       const body = await jsonBody(request, 64 * 1024);
       const enrollmentToken = str(body, "enrollmentToken", true, 512);
