@@ -113,3 +113,43 @@ export function confirmEmailPage(input: { email: string; token: string }): strin
 <form method="post" action="/login/email/verify"><input type="hidden" name="token" value="${escapeHtml(input.token)}">
 <button class="btn" type="submit">Continue</button></form>`);
 }
+
+/**
+ * The page an emailed password link opens: /login/password/verify (first
+ * password) or /login/password/reset (new password, or ask for a link).
+ * The link carries its token in the URL fragment, which browsers never send
+ * to a server, so it stays out of access logs and Referer headers; the
+ * inline script copies it into the form, drops it from the address bar, and
+ * the form POSTs it back to this origin. After a rejected password the server
+ * renders the token into the form itself (`token`).
+ */
+export function passwordLinkPage(input: {
+  kind: "verify" | "reset";
+  token?: string | null;
+  notice?: { kind: "error" | "ok"; text: string } | null;
+  minLength: number;
+}): string {
+  const verify = input.kind === "verify";
+  const title = verify ? "Set your password" : "Reset your password";
+  const action = verify ? "/login/password/verify" : "/login/password/reset";
+  const token = input.token ?? "";
+  const notice = input.notice ? `<div class="notice ${input.notice.kind}">${escapeHtml(input.notice.text)}</div>` : "";
+  const setForm = `<form id="set" method="post" action="${action}"${token ? "" : " hidden"}>
+<input type="hidden" name="token" id="token" value="${escapeHtml(token)}">
+<input type="password" name="password" required autocomplete="new-password" placeholder="New password" aria-label="New password" minlength="${input.minLength}" maxlength="1024">
+<button class="btn" type="submit">${verify ? "Set password and sign in" : "Change password"}</button>
+${verify ? "" : `<p class="muted">Changing the password signs you out everywhere.</p>`}</form>`;
+  const fallback = verify
+    ? `<div id="none"${token ? " hidden" : ""}><p class="muted">Open the link from your confirmation email to set a password.</p><a class="btn secondary" href="/login">Back to sign in</a></div>`
+    : `<form id="none" method="post" action="/login/password/reset"${token ? " hidden" : ""}>
+<p class="muted">Enter your email and we'll send you a reset link.</p>
+<input type="email" name="email" required autocomplete="email" placeholder="you@company.com" aria-label="Email address">
+<button class="btn" type="submit">Email me a reset link</button></form>`;
+  const script = `const m=/^#token=([^&]*)/.exec(location.hash);
+if(m){document.getElementById("token").value=decodeURIComponent(m[1]);document.getElementById("set").hidden=false;document.getElementById("none").hidden=true}
+if(location.hash)history.replaceState(null,"",location.pathname);`;
+  return page(title, `<h1>${title}</h1>
+${notice}
+${setForm}
+${fallback}`, script);
+}

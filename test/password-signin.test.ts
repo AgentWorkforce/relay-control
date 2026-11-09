@@ -51,7 +51,7 @@ test("hashing: argon2id at the OWASP baseline, a fresh salt per hash, constant-t
 });
 
 test("hashing: env overrides may only raise the argon2id parameters", () => {
-  const base = { ...SMTP, SELFHOST_SIGNIN_METHODS: "password" };
+  const base = { ...SMTP, SELFHOST_SIGNIN_METHODS: "password", SELFHOST_TRUSTED_PROXIES: "0" };
   assert.deepEqual(loadIdentityConfig(base).password!.argon2, ARGON2_BASELINE);
   assert.deepEqual(loadIdentityConfig({
     ...base,
@@ -90,7 +90,7 @@ test("pepper: versioned file, HMAC before hashing, rotation re-hashes, a dropped
   assert.throws(() => parsePepperFile("\n# nothing\n"), /empty/);
 
   const file = pepperFile(`v1:${v1}\nv2:${v2}\n`);
-  const loaded = loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "password", SELFHOST_PASSWORD_PEPPER_FILE: file }).password!;
+  const loaded = loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "password", SELFHOST_TRUSTED_PROXIES: "0", SELFHOST_PASSWORD_PEPPER_FILE: file }).password!;
   assert.equal(loaded.currentPepperVersion, 2);
 
   const unpeppered = await new PasswordHasher(passwordConfig()).hash(PASSWORD);
@@ -152,10 +152,10 @@ test("HIBP: k-anonymity range lookup; breached, clean and unreachable", async ()
 test("config: SELFHOST_SIGNIN_METHODS, logo URL and admin email lists", () => {
   assert.deepEqual(loadIdentityConfig({}).signinMethods, []);
   assert.deepEqual(loadIdentityConfig({ ...SMTP, SELFHOST_EMAIL_LOGIN: "true" }).signinMethods, ["email_link"], "email_link by default");
-  const both = loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "password, email_link" });
+  const both = loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "password, email_link", SELFHOST_TRUSTED_PROXIES: "1" });
   assert.deepEqual(both.signinMethods, ["password", "email_link"]);
   assert.equal(both.emailLogin, true);
-  assert.equal(loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "password" }).emailLogin, false);
+  assert.equal(loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "password", SELFHOST_TRUSTED_PROXIES: "0" }).emailLogin, false);
   assert.throws(() => loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "sms" }), /email_link and\/or password/);
   assert.throws(() => loadIdentityConfig({ SELFHOST_SIGNIN_METHODS: "password" }), /SMTP/);
   assert.throws(() => loadIdentityConfig({ ...SMTP, SELFHOST_EMAIL_LOGIN: "true", SELFHOST_SIGNIN_METHODS: "password" }), /conflicts/);
@@ -173,6 +173,24 @@ test("config: SELFHOST_SIGNIN_METHODS, logo URL and admin email lists", () => {
   assert.deepEqual(aliased.bootstrap!.adminEmails, ["root@acme.test", "bo@acme.test"]);
   assert.throws(() => loadIdentityConfig({ SELFHOST_ADMIN_EMAILS: "bo@acme.test" }), /SELFHOST_BOOTSTRAP_ORG_NAME/);
   assert.throws(() => loadIdentityConfig({ SELFHOST_BOOTSTRAP_ORG_NAME: "Acme", SELFHOST_ADMIN_EMAILS: "not-an-email" }), /email addresses/);
+});
+
+test("config: password sign-in needs SELFHOST_TRUSTED_PROXIES set explicitly, even to 0", () => {
+  const password = { ...SMTP, SELFHOST_SIGNIN_METHODS: "password" };
+  // Unset: refuse to start, naming the variable.
+  assert.throws(() => loadIdentityConfig(password), /SELFHOST_TRUSTED_PROXIES must be set explicitly, even to 0/);
+  // Empty (and blank) count as not set.
+  assert.throws(() => loadIdentityConfig({ ...password, SELFHOST_TRUSTED_PROXIES: "" }), /SELFHOST_TRUSTED_PROXIES must be set explicitly/);
+  assert.throws(() => loadIdentityConfig({ ...password, SELFHOST_TRUSTED_PROXIES: "  " }), /SELFHOST_TRUSTED_PROXIES must be set explicitly/);
+  // The literal 0 is an explicit answer: valid, zero hops.
+  assert.deepEqual(loadIdentityConfig({ ...password, SELFHOST_TRUSTED_PROXIES: "0" }).signinMethods, ["password"]);
+  assert.ok(loadIdentityConfig({ ...password, SELFHOST_TRUSTED_PROXIES: "1" }).password);
+  // Bad values keep the existing message.
+  for (const bad of ["-1", "100", "one", "1.5"]) {
+    assert.throws(() => loadIdentityConfig({ ...password, SELFHOST_TRUSTED_PROXIES: bad }), /SELFHOST_TRUSTED_PROXIES must be an integer from 0 to 99/, bad);
+  }
+  // Without password sign-in the variable stays optional (default 0).
+  assert.deepEqual(loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "email_link" }).signinMethods, ["email_link"]);
 });
 
 test("login-config: public, lists methods, logo and domain hint, never secrets", async (t) => {
@@ -227,7 +245,7 @@ test("registration: register takes no password; verify proves the address and mi
   await ctx.identity.idle();
   assert.equal(ctx.mailer.sent.length, 1, "only the eligible address gets mail");
   assert.equal(ctx.mailer.sent[0]!.to, "dev@acme.test");
-  const token = linkToken(ctx.mailer.sent[0]!, "/password/verify");
+  const token = linkToken(ctx.mailer.sent[0]!, "/login/password/verify");
   const pending = await ctx.database.query<{ token_hash: string }>("SELECT token_hash FROM selfhost_password_registrations");
   assert.notEqual(pending.rows[0]!.token_hash, token, "only the token hash is stored");
   const columns = await ctx.database.query<{ column_name: string }>(
@@ -269,12 +287,21 @@ test("registration: register takes no password; verify proves the address and mi
   assert.equal(signedIn.status, 200, signedIn.text);
   assert.equal((await session(ctx, sessionCookie(signedIn))).status, 200);
 
+  // The address hears that a password was added (in case it was not them).
+  await ctx.identity.idle();
+  assert.equal(ctx.mailer.sent.length, 2);
+  const added = ctx.mailer.sent[1]!;
+  assert.equal(added.to, "dev@acme.test");
+  assert.equal(added.subject, "A password was added to your Agent Relay account");
+  assert.equal(new URL(/https?:\/\/\S+/.exec(added.text)![0]).pathname, "/login/password/reset");
+  assert.doesNotMatch(added.text, /token=/);
+
   // Registering again mails a reset pointer instead of a link.
   await call(ctx.origin, `${API}/register`, { json: { email: "dev@acme.test" } });
   await ctx.identity.idle();
-  assert.equal(ctx.mailer.sent.length, 2);
-  assert.match(ctx.mailer.sent[1]!.text, /already has one/);
-  assert.doesNotMatch(ctx.mailer.sent[1]!.text, /token=/);
+  assert.equal(ctx.mailer.sent.length, 3);
+  assert.match(ctx.mailer.sent[2]!.text, /already has one/);
+  assert.doesNotMatch(ctx.mailer.sent[2]!.text, /token=/);
   assert.equal((await login(ctx, "dev@acme.test", PASSWORD)).status, 200, "the password did not change");
   const actions = (await auditActions(ctx)).map((e) => e.action);
   assert.ok(actions.includes("password.registration.verified"));
@@ -300,13 +327,18 @@ test("registration: invitees may register (invite carried through verify); polic
   assert.equal(invited.body.organizationId, organization);
 });
 
-test("registration: only the newest verification link works and links expire; so do set-password tokens", async (t) => {
+test("registration: a newer link leaves older ones working until one is used; links expire; so do set-password tokens", async (t) => {
   const ctx = await setup(t);
   const first = await verifyLink(ctx, "ex@acme.test");
   const second = await verifyLink(ctx, "ex@acme.test");
-  assert.equal((await call(ctx.origin, `${API}/verify`, { json: { token: first } })).status, 410);
+  // Asking again must not cancel a link someone is about to use.
+  const used = await call(ctx.origin, `${API}/verify`, { json: { token: first } });
+  assert.equal(used.status, 200, "an older link still works after a newer request");
+  // Using one link voids the address's others.
+  assert.equal((await call(ctx.origin, `${API}/verify`, { json: { token: second } })).status, 410);
+  const third = await verifyLink(ctx, "ex@acme.test");
   ctx.clock.now += REGISTRATION_TTL_MS + 60_000;
-  const expired = await call(ctx.origin, `${API}/verify`, { json: { token: second } });
+  const expired = await call(ctx.origin, `${API}/verify`, { json: { token: third } });
   assert.equal(expired.status, 410);
   assert.equal(expired.body.error, "token_invalid");
 
@@ -322,53 +354,37 @@ test("registration: only the newest verification link works and links expire; so
   assert.equal((await call(ctx.origin, `${API}/set`, { json: { token: "sh_ps_" + "x".repeat(300), password: PASSWORD } })).status, 400, "tokens are at most 256 characters");
 });
 
-test("set-password: an existing password is never replaced (409); a signed-in account without one may set it", async (t) => {
+test("set-password: only with a token; an account without a password gets one, then every pending link is void", async (t) => {
   const ctx = await setup(t);
   // Signed in another way (an email link): an account with no password.
   const linked = await ctx.identityStore.signIn({ email: "sso@acme.test", name: null, inviteTokenHash: null, method: "email", emailVerified: true });
   const cookie = `agent_relay_session=${encodeURIComponent(linked.tokens.accessToken)}`;
-  // A registration started before the password exists.
-  const setup_ = await setupToken(ctx, "sso@acme.test");
+  // A session alone never sets a password: the token (proof of the inbox) is required.
+  for (const path of [`/cloud${API}/set`, `${API}/set`]) {
+    const viaSession = await call(ctx.origin, path, { json: { password: PASSWORD }, cookie });
+    assert.equal(viaSession.status, 400, path);
+    assert.equal(viaSession.body.error, "invalid_request");
+  }
   const laterLink = await verifyLink(ctx, "sso@acme.test");
-
-  const anonymous = await call(ctx.origin, `/cloud${API}/set`, { json: { password: PASSWORD } });
-  assert.equal(anonymous.status, 401, "without a token the caller must be signed in");
-  const viaSession = await call(ctx.origin, `/cloud${API}/set`, { json: { password: PASSWORD }, cookie });
-  assert.equal(viaSession.status, 200, viaSession.text);
-  assert.deepEqual(viaSession.body, { status: "password_set" });
+  const setup_ = await setupToken(ctx, "sso@acme.test");
+  const set = await call(ctx.origin, `${API}/set`, { json: { token: setup_, password: PASSWORD } });
+  assert.equal(set.status, 200, set.text);
+  assert.equal(set.body.userId, linked.userId, "the existing account gets the password");
   assert.equal((await login(ctx, "sso@acme.test", PASSWORD)).status, 200);
-
-  const replace = await call(ctx.origin, `/cloud${API}/set`, { json: { password: "a different passphrase" }, cookie });
-  assert.equal(replace.status, 409, "changing a password is a reset");
-  assert.equal(replace.body.error, "password_already_set");
+  // The other pending link was voided when the password was set.
   const verifyLate = await call(ctx.origin, `${API}/verify`, { json: { token: laterLink } });
-  assert.equal(verifyLate.status, 409);
-  assert.equal(verifyLate.body.error, "password_already_set");
-  const setLate = await call(ctx.origin, `${API}/set`, { json: { token: setup_, password: "a different passphrase" } });
-  assert.equal(setLate.status, 409);
-  assert.equal(setLate.body.error, "password_already_set");
+  assert.equal(verifyLate.status, 410);
+  assert.equal(verifyLate.body.error, "token_invalid");
+  const reuse = await call(ctx.origin, `${API}/set`, { json: { token: setup_, password: "a different passphrase" } });
+  assert.equal(reuse.status, 410);
   assert.equal((await login(ctx, "sso@acme.test", PASSWORD)).status, 200, "unchanged");
-  assert.ok((await auditActions(ctx)).some((e) => e.action === "password.set.from_session"));
+  const actions = (await auditActions(ctx)).map((e) => e.action);
+  assert.ok(!actions.includes("password.set.from_session"));
   await ctx.identity.idle();
   const notice = ctx.mailer.sent.filter((mail) => mail.to === "sso@acme.test" && mail.subject === "A password was added to your Agent Relay account");
   assert.equal(notice.length, 1, "the account address is told a password was added");
   assert.match(notice[0]!.text, /If this was not you, reset your password\./);
-  assert.match(notice[0]!.text, /\/password\/reset/);
-
-  // A CLI or Desktop token is not an account session.
-  const started = await ctx.store.startDeviceAuthorization("relay-cli");
-  const member = await ctx.database.query<{ id: string; workspace_id: string }>(
-    `SELECT u.id, w.id AS workspace_id FROM selfhost_users u
-       JOIN selfhost_organization_memberships m ON m.user_id = u.id
-       JOIN selfhost_workspaces w ON w.organization_id = m.organization_id
-      WHERE u.email = 'sso@acme.test' LIMIT 1`,
-  );
-  assert.equal(await ctx.store.decideDeviceAuthorization({ userCode: started.userCode, approve: true, userId: member.rows[0]!.id, workspaceId: member.rows[0]!.workspace_id }), "approved");
-  const polled = await ctx.store.pollDeviceAuthorization(started.deviceCode);
-  assert.equal(polled.kind, "issued");
-  const cli = await call(ctx.origin, `${API}/set`, { json: { password: "a different passphrase" }, bearer: (polled as { tokens: { accessToken: string } }).tokens.accessToken });
-  assert.equal(cli.status, 403);
-  assert.equal(cli.body.error, "reauthentication_required");
+  assert.match(notice[0]!.text, /\/login\/password\/reset/);
 });
 
 test("HIBP on: breached passwords refused at set; unreachable fails open with an audit event; off never calls out", async (t) => {
@@ -420,17 +436,17 @@ test("login: unknown, wrong and locked answer the same 401 invalid_credentials",
   assert.equal((await login(ctx, "ghost@acme.test", PASSWORD)).text, locked.text);
 
   // After the backoff the right password works and clears the counter.
-  const lockRow = await ctx.database.query<{ failures: number }>("SELECT failures FROM selfhost_login_attempts WHERE subject = 'account:lock@acme.test'");
+  const lockRow = await ctx.database.query<{ failures: number }>("SELECT failures FROM selfhost_login_attempts WHERE subject = 'account-key:lock@acme.test|198.51.100.7'");
   assert.equal(lockRow.rows[0]!.failures, 5, "an attempt refused inside a lock is not counted");
-  ctx.clock.now += lockDelayMs(5, LOCKOUT.account.free) + 1_000;
+  ctx.clock.now += lockDelayMs(5, LOCKOUT.accountKey.free) + 1_000;
   const after = await login(ctx, "lock@acme.test", PASSWORD);
   assert.equal(after.status, 200, after.text);
-  const rows = await ctx.database.query("SELECT 1 FROM selfhost_login_attempts WHERE subject = 'account:lock@acme.test'");
-  assert.equal(rows.rows.length, 0);
+  const rows = await ctx.database.query("SELECT subject FROM selfhost_login_attempts WHERE subject LIKE '%lock@acme.test%'");
+  assert.deepEqual(rows.rows, [], "a successful sign-in clears the account's counters");
 
   const actions = await auditActions(ctx);
-  assert.ok(actions.some((e) => e.action === "login.lockout" && e.target!.includes("scope=account")));
-  assert.ok(actions.some((e) => e.action === "login.password.failure" && e.target!.includes("reason=locked")));
+  assert.ok(actions.some((e) => e.action === "login.lockout" && e.target!.includes("scope=account_key")));
+  assert.ok(!actions.some((e) => e.target?.includes("reason=locked")), "refused attempts write no audit row");
   assert.ok(actions.some((e) => e.action === "login.password.failure" && e.target!.includes("reason=unknown_account")));
   assert.ok(actions.some((e) => e.action === "login.password.success"));
   for (const event of actions) assert.ok(!(event.target ?? "").includes(PASSWORD) && !(event.target ?? "").includes("wrong password"), "no secrets in audit");
@@ -499,6 +515,7 @@ test("reset: identical 202s, single-use 30-minute token, revokes every session",
   const registered = await registerVerified(ctx, "rs@acme.test");
   const first = sessionCookie(registered);
   const second = sessionCookie(await login(ctx, "rs@acme.test", PASSWORD));
+  await ctx.identity.idle();
   const sent = ctx.mailer.sent.length;
 
   const known = await call(ctx.origin, "/api/v1/auth/password/reset", { json: { email: "rs@acme.test" } });
@@ -510,7 +527,7 @@ test("reset: identical 202s, single-use 30-minute token, revokes every session",
   }
   await ctx.identity.idle();
   assert.equal(ctx.mailer.sent.length, sent + 1, "mail only for an address with a password");
-  const token = linkToken(ctx.mailer.sent.at(-1)!, "/password/reset");
+  const token = linkToken(ctx.mailer.sent.at(-1)!, "/login/password/reset");
   const stored = await ctx.database.query<{ token_hash: string; expires_at: Date; created_at: Date }>("SELECT token_hash, expires_at FROM selfhost_password_reset_tokens");
   assert.notEqual(stored.rows[0]!.token_hash, token, "stored only as a hash");
   assert.ok(new Date(stored.rows[0]!.expires_at).getTime() - ctx.clock.now <= RESET_TTL_MS + 1_000);
@@ -531,11 +548,18 @@ test("reset: identical 202s, single-use 30-minute token, revokes every session",
   assert.equal((await call(ctx.origin, "/api/v1/auth/password/reset/complete", { json: { token, password: NEW } })).status, 410, "single use");
   assert.equal((await login(ctx, "rs@acme.test", PASSWORD)).status, 401, "the old password no longer works");
   assert.equal((await login(ctx, "rs@acme.test", NEW)).status, 200);
+  // The address is told the password changed.
+  await ctx.identity.idle();
+  const changed = ctx.mailer.sent.at(-1)!;
+  assert.equal(changed.to, "rs@acme.test");
+  assert.equal(changed.subject, "Your Agent Relay password was changed");
+  assert.match(changed.text, /If this was not you, reset your password now\./);
+  assert.doesNotMatch(changed.text, /token=/);
 
   // Expiry.
   await call(ctx.origin, "/api/v1/auth/password/reset", { json: { email: "rs@acme.test" } });
   await ctx.identity.idle();
-  const late = linkToken(ctx.mailer.sent.at(-1)!, "/password/reset");
+  const late = linkToken(ctx.mailer.sent.at(-1)!, "/login/password/reset");
   ctx.clock.now += RESET_TTL_MS + 1_000;
   const expired = await call(ctx.origin, "/api/v1/auth/password/reset/complete", { json: { token: late, password: "yet another passphrase" } });
   assert.equal(expired.status, 410);
@@ -587,13 +611,14 @@ test("openapi.yaml documents login-config and every password route", async () =>
   assert.equal(register.properties.invite.maxLength, 256);
   assert.equal(body("verify").properties.token.maxLength, 256);
   assert.equal(body("reset/complete").properties.token.maxLength, 256);
-  assert.deepEqual(body("set").required, ["password"]);
+  assert.deepEqual([...body("set").required].sort(), ["password", "token"], "no session-only set path");
   assert.equal(body("set").properties.token.maxLength, 256);
   const verified = spec.paths["/api/v1/auth/password/verify"].post.responses["200"].content["application/json"].schema;
   assert.ok(verified.required.includes("setupToken"));
-  for (const status of ["200", "403", "409", "410", "429"]) assert.ok(spec.paths["/api/v1/auth/password/set"].post.responses[status], `set ${status}`);
+  for (const status of ["200", "400", "409", "410", "429"]) assert.ok(spec.paths["/api/v1/auth/password/set"].post.responses[status], `set ${status}`);
+  for (const path of ["login", "set", "reset/complete"]) assert.ok(spec.paths[`/api/v1/auth/password/${path}`].post.responses["429"], `${path} 429 (busy)`);
   const reset = spec.paths["/api/v1/auth/password/reset/complete"].post.responses["200"].content["application/json"].schema;
-  assert.deepEqual(Object.keys(reset.properties.revoked.properties).sort(), ["deviceAuthorizations", "mcpCodes", "mcpGrants", "sessions"]);
+  assert.deepEqual(Object.keys(reset.properties.revoked.properties).sort(), ["desktopRelayIdentities", "deviceAuthorizations", "mcpCodes", "mcpGrants", "sessions"]);
   const text = await readFile(new URL("../openapi.yaml", import.meta.url), "utf8");
   for (const code of ["invalid_credentials", "signin_method_disabled", "password_common", "token_invalid", "password_already_set", "csrf_rejected", "rate_limited"]) {
     assert.ok(text.includes(code), code);

@@ -2,11 +2,11 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import { decryptSecret, encryptSecret, hashSecret, secureEqual, type EncryptionKeyring } from "../crypto.js";
 import { ACCOUNT_SCOPE, DASHBOARD_DEVICE_CLIENT, type ControlPlaneStore, type Principal } from "../store.js";
-import { clientIp, cookieRequestAllowed, RateLimiter, safeNextPath } from "../auth/device-approval.js";
+import { clientIp, cookieRequestAllowed, limiterKey, RateLimiter, safeNextPath } from "../auth/device-approval.js";
 import { emailDomain, type IdentityConfig } from "./config.js";
 import { inviteEmail, signInEmail, type Mailer } from "./mailer.js";
 import { OidcClient, OidcError, pkcePair, randomState } from "./oidc.js";
-import { confirmEmailPage, loginPage, messagePage, PAGE_CSP, type InviteBanner } from "./pages.js";
+import { confirmEmailPage, loginPage, messagePage, PAGE_CSP, passwordLinkPage, type InviteBanner } from "./pages.js";
 import { IdentityError, IdentityStore, type Role } from "./store.js";
 import type { Database } from "../database.js";
 import { PasswordHasher } from "./password/hashing.js";
@@ -175,6 +175,8 @@ export function createIdentityModule(input: {
   database?: Database;
   /** Test seam: the Have I Been Pwned range fetch (SELFHOST_PASSWORD_HIBP=on). */
   hibpFetch?: HibpFetch;
+  /** Test seam: the argon2id hasher (default: one per module, sharing the process-wide slots). */
+  passwordHasher?: PasswordHasher;
   now?: () => number;
   log?: (message: string, fields?: Record<string, unknown>) => void;
 }): IdentityModule {
@@ -190,7 +192,7 @@ export function createIdentityModule(input: {
     if (!input.database) throw new Error("password sign-in needs the database");
     passwordRoutes = createPasswordRoutes({
       config: config.password,
-      hasher: new PasswordHasher(config.password),
+      hasher: input.passwordHasher ?? new PasswordHasher(config.password),
       passwords: new PasswordStore(input.database, input.now ? { now: input.now } : {}),
       identityStore: store,
       controlStore,
@@ -321,7 +323,7 @@ export function createIdentityModule(input: {
         sendHtml(response, 404, messagePage({ title: "Single sign-on is not configured", message: "Ask your administrator to configure an OIDC identity provider." }));
         return true;
       }
-      if (limited(`oidc-start:${clientIp(request)}`, RATE.oidcStart)) {
+      if (limited(`oidc-start:${limiterKey(clientIp(request))}`, RATE.oidcStart)) {
         sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
         return true;
       }
@@ -361,7 +363,7 @@ export function createIdentityModule(input: {
 
     if (method === "GET" && publicPath === "/login/oidc/callback") {
       if (!oidc) return false;
-      if (limited(`oidc-callback:${clientIp(request)}`, RATE.callback)) {
+      if (limited(`oidc-callback:${limiterKey(clientIp(request))}`, RATE.callback)) {
         sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
         return true;
       }
@@ -406,7 +408,7 @@ export function createIdentityModule(input: {
           method: "oidc",
           emailVerified: identity.emailVerified,
           beforePersonalOrganization: () => {
-            if (limited(`personal-org-addr:${identity.email.toLowerCase()}`, RATE.personalOrgPerAddress) || limited(`personal-org-ip:${clientIp(request)}`, RATE.personalOrgPerIp)) {
+            if (limited(`personal-org-addr:${identity.email.toLowerCase()}`, RATE.personalOrgPerAddress) || limited(`personal-org-ip:${limiterKey(clientIp(request))}`, RATE.personalOrgPerIp)) {
               throw new IdentityError(429, "rate_limited", "Too many new organizations were created. Try again later.");
             }
           },
@@ -452,6 +454,65 @@ export function createIdentityModule(input: {
       return true;
     }
 
+    // ---- emailed password links (token in the URL fragment) ----------------------
+    if (publicPath === "/login/password/verify" || publicPath === "/login/password/reset") {
+      const kind = publicPath === "/login/password/verify" ? "verify" as const : "reset" as const;
+      if (method !== "GET" && method !== "POST") return false;
+      if (!passwordRoutes) {
+        disabledMethod(response, "password");
+        return true;
+      }
+      if (method === "GET") {
+        sendHtml(response, 200, passwordLinkPage({ kind, minLength: PASSWORD_MIN_LENGTH }));
+        return true;
+      }
+      if (!sameOriginForm(request, helpers)) {
+        sendHtml(response, 403, messagePage({ title: "Unable to continue", message: "Cross-origin request refused." }));
+        return true;
+      }
+      const form = await formBody(request);
+      const siteName = new URL(helpers.siteBaseUrl(request)).host;
+      const token = (form.get("token") ?? "").slice(0, 256);
+      const password = form.get("password") ?? "";
+      if (kind === "reset" && !token) {
+        passwordRoutes.formResetRequest(request, form.get("email") ?? "", siteName);
+        sendHtml(response, 200, messagePage({
+          title: "Check your email",
+          kind: "ok",
+          message: "If that address has a password here, we've sent it a reset link. It works once and expires in 30 minutes.",
+        }));
+        return true;
+      }
+      try {
+        if (kind === "verify") {
+          const result = await passwordRoutes.formCompleteRegistration(request, { token, password }, siteName);
+          redirect(response, 303, "/", [sessionCookie(result.tokens)]);
+        } else {
+          await passwordRoutes.formCompleteReset(request, { token, password }, siteName);
+          sendHtml(response, 200, messagePage({
+            title: "Password changed",
+            kind: "ok",
+            message: "Your password was changed and every session was signed out. Sign in with the new password.",
+          }), [clearCookie(SESSION_COOKIE, "/cloud")]);
+        }
+      } catch (error) {
+        const known = identityErrorResponse(error);
+        if (!known) throw error;
+        // A rejected password (policy, breach list) keeps the link usable:
+        // render the form again with the token in it.
+        if (known.status === 400) {
+          sendHtml(response, 400, passwordLinkPage({ kind, token, minLength: PASSWORD_MIN_LENGTH, notice: { kind: "error", text: known.body.message } }));
+        } else {
+          sendHtml(response, known.status, messagePage({
+            title: known.status === 410 ? "Link expired" : "Unable to continue",
+            message: known.body.message,
+            back: kind === "reset" ? "/login/password/reset" : "/login",
+          }));
+        }
+      }
+      return true;
+    }
+
     // ---- email sign-in links ---------------------------------------------------
     if (method === "POST" && publicPath === "/login/email") {
       if (!emailLogin) {
@@ -467,7 +528,7 @@ export function createIdentityModule(input: {
       const invite = inviteParam(form.get("invite"));
       const email = (form.get("email") ?? "").trim().toLowerCase().slice(0, 320);
       const back = `/login?next=${encodeURIComponent(next)}${invite ? `&invite=${encodeURIComponent(invite)}` : ""}`;
-      if (limited(`email-ip:${clientIp(request)}`, RATE.emailPerIp) || limited(`email-addr:${email}`, RATE.emailPerAddress)) {
+      if (limited(`email-ip:${limiterKey(clientIp(request))}`, RATE.emailPerIp) || limited(`email-addr:${email}`, RATE.emailPerAddress)) {
         sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in emails were requested. Try again in a few minutes.", back }));
         return true;
       }
@@ -518,7 +579,7 @@ export function createIdentityModule(input: {
         sendHtml(response, 403, messagePage({ title: "Unable to sign in", message: "Cross-origin request refused." }));
         return true;
       }
-      if (limited(`email-verify:${clientIp(request)}`, RATE.verify)) {
+      if (limited(`email-verify:${limiterKey(clientIp(request))}`, RATE.verify)) {
         sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
         return true;
       }
@@ -536,7 +597,7 @@ export function createIdentityModule(input: {
           method: "email",
           emailVerified: true,
           beforePersonalOrganization: () => {
-            if (limited(`personal-org-addr:${consumed.email}`, RATE.personalOrgPerAddress) || limited(`personal-org-ip:${clientIp(request)}`, RATE.personalOrgPerIp)) {
+            if (limited(`personal-org-addr:${consumed.email}`, RATE.personalOrgPerAddress) || limited(`personal-org-ip:${limiterKey(clientIp(request))}`, RATE.personalOrgPerIp)) {
               throw new IdentityError(429, "rate_limited", "Too many new organizations were created. Try again later.");
             }
           },
@@ -602,7 +663,7 @@ export function createIdentityModule(input: {
         throw new IdentityHttpError(403, "reauthentication_required", "Sign in to the dashboard to create an organization");
       }
       const body = parseBody(OrganizationCreate, await helpers.requestObject(request));
-      if (limited(`organization-user:${auth.principal.userId}`, RATE.organizationPerUser) || limited(`organization-ip:${clientIp(request)}`, RATE.organizationPerIp)) {
+      if (limited(`organization-user:${auth.principal.userId}`, RATE.organizationPerUser) || limited(`organization-ip:${limiterKey(clientIp(request))}`, RATE.organizationPerIp)) {
         throw new IdentityHttpError(429, "rate_limited", "Too many new organizations were created. Try again later.");
       }
       const created = await store.createOrganizationForUser({

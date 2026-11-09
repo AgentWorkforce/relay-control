@@ -33,20 +33,21 @@ test("lockout: a parallel burst gets no more than the free allowance", async (t)
   const burst = await Promise.all(Array.from({ length: 12 }, (_, i) => login(ctx, "burst@acme.test", `wrong password number ${i}`)));
   assert.ok(burst.every((res) => res.status === 401));
   const row = await ctx.database.query<{ failures: number; locked_until: Date | null }>(
-    "SELECT failures, locked_until FROM selfhost_login_attempts WHERE subject = 'account:burst@acme.test'",
+    "SELECT failures, locked_until FROM selfhost_login_attempts WHERE subject = 'account-key:burst@acme.test|198.51.100.7'",
   );
-  assert.equal(row.rows[0]!.failures, LOCKOUT.account.free, "attempts are reserved before argon2id, not counted after it");
+  assert.equal(row.rows[0]!.failures, LOCKOUT.accountKey.free, "attempts are reserved before argon2id, not counted after it");
   assert.ok(row.rows[0]!.locked_until);
-  const reasons = (await auditActions(ctx))
+  const events = await auditActions(ctx);
+  const reasons = events
     .filter((e) => e.action === "login.password.failure" && e.target!.includes("burst@acme.test"))
     .map((e) => /reason=(\w+)/.exec(e.target!)![1]);
-  assert.equal(reasons.filter((r) => r === "wrong_password").length, LOCKOUT.account.free, "only five passwords were checked");
-  assert.equal(reasons.filter((r) => r === "locked").length, 12 - LOCKOUT.account.free);
+  assert.deepEqual(reasons, Array(LOCKOUT.accountKey.free).fill("wrong_password"), "only five passwords were checked; refused attempts write nothing");
+  assert.equal(events.filter((e) => e.action === "login.lockout").length, 1, "one lockout event when the lock engaged");
   assert.equal((await login(ctx, "burst@acme.test", PASSWORD)).status, 401, "still locked");
 
   // Past the free allowance each lock admits one attempt, even a parallel
-  // one; the success clears the account counter for what follows.
-  ctx.clock.now += lockDelayMs(LOCKOUT.account.free, LOCKOUT.account.free) + 1_000;
+  // one; the success clears the account counters for what follows.
+  ctx.clock.now += lockDelayMs(LOCKOUT.accountKey.free, LOCKOUT.accountKey.free) + 1_000;
   const after = await Promise.all(Array.from({ length: 3 }, () => login(ctx, "burst@acme.test", PASSWORD)));
   assert.deepEqual(after.map((res) => res.status).sort(), [200, 401, 401]);
   assert.equal((await login(ctx, "burst@acme.test", PASSWORD)).status, 200);
@@ -81,17 +82,33 @@ test("lockout: a locked IP spraying new addresses does not grow selfhost_login_a
 });
 
 test("client IP: X-Forwarded-For is ignored unless SELFHOST_TRUSTED_PROXIES says how many proxies to trust", async (t) => {
+  {
+    // No trusted proxy and no header: the socket address is the client, and
+    // the IP lock applies.
+    const ctx = await setup(t, { trustedProxies: "0" });
+    await registerVerified(ctx, "direct@acme.test");
+    const direct = (email: string, password: string) => call(ctx.origin, `${API}/login`, { json: { email, password } });
+    for (let i = 0; i < LOCKOUT.ip.free; i += 1) await direct(`spray${i}@acme.test`, PASSWORD);
+    assert.equal((await direct("direct@acme.test", PASSWORD)).status, 401, "the IP is locked");
+    assert.ok((await auditActions(ctx)).some((e) => e.action === "login.lockout" && e.target!.includes("scope=ip")));
+  }
   for (const proxies of [null, "0"]) {
+    // No trusted proxy but X-Forwarded-For present: the server is behind a
+    // proxy it was not told about, so the socket address is shared by every
+    // client. The header is still not trusted, and the IP lock is skipped
+    // (the account rules still apply), so one client cannot lock out all.
     const ctx = await setup(t, { trustedProxies: proxies });
     await registerVerified(ctx, "spoof@acme.test");
-    // A different forged address on every attempt does not escape the IP lock:
-    // with no trusted proxy the socket address is the client.
-    for (let i = 0; i < LOCKOUT.ip.free; i += 1) await login(ctx, `spray${i}@acme.test`, PASSWORD, `203.0.113.${i + 1}`);
-    const blocked = await login(ctx, "spoof@acme.test", PASSWORD, "198.51.100.200");
-    assert.equal(blocked.status, 401, `proxies=${proxies}`);
-    const lockout = (await auditActions(ctx)).find((e) => e.action === "login.lockout" && e.target!.includes("scope=ip"));
-    assert.ok(lockout, `proxies=${proxies}`);
-    assert.doesNotMatch(lockout.target!, /203\.0\.113\./, "the forged header was not used");
+    for (let i = 0; i < LOCKOUT.ip.free + 5; i += 1) await login(ctx, `spray${i}@acme.test`, "wrong password here", `203.0.113.${i + 1}`);
+    assert.equal((await login(ctx, "spoof@acme.test", PASSWORD, "198.51.100.200")).status, 200, `proxies=${proxies}`);
+    const ipRows = await ctx.database.query("SELECT subject FROM selfhost_login_attempts WHERE subject LIKE 'ip:%'");
+    assert.equal(ipRows.rows.length, 0, "no IP subject is counted");
+    const events = await auditActions(ctx);
+    assert.ok(!events.some((e) => e.action === "login.lockout" && e.target!.includes("scope=ip")), `proxies=${proxies}`);
+    assert.ok(!events.some((e) => /203\.0\.113\./.test(e.target ?? "")), "the forged header was not used, even in audit");
+    // Each sprayed address is still counted per account.
+    const accountKeys = await ctx.database.query("SELECT subject FROM selfhost_login_attempts WHERE subject LIKE 'account-key:spray0@%'");
+    assert.equal(accountKeys.rows.length, 1);
   }
   // One trusted proxy: the last X-Forwarded-For entry is the client.
   const behind = await setup(t, { trustedProxies: "1" });
@@ -108,7 +125,7 @@ test("client IP: X-Forwarded-For is ignored unless SELFHOST_TRUSTED_PROXIES says
 
 test("pepper file: refused when group/other may read it; wrong passwords still fail with a pepper", async (t) => {
   const secret = "q".repeat(40);
-  const base = { ...SMTP, SELFHOST_SIGNIN_METHODS: "password" };
+  const base = { ...SMTP, SELFHOST_SIGNIN_METHODS: "password", SELFHOST_TRUSTED_PROXIES: "0" };
   for (const mode of [0o644, 0o640, 0o604]) {
     assert.throws(() => loadIdentityConfig({ ...base, SELFHOST_PASSWORD_PEPPER_FILE: pepperFile(`v1:${secret}`, mode) }), /group or others.*chmod 600/, mode.toString(8));
   }
@@ -172,16 +189,32 @@ test("reset: revokes CLI, Desktop and browser sessions and MCP grants; expires a
      VALUES ($1, 'mcp-client', $2, $3, $4, 'editor', 'http://127.0.0.1/cb', 'challenge', ARRAY['relay:mcp'], 'https://mcp.example.test', now() + interval '5 minutes')`,
     ["c".repeat(64), member.id, member.organization_id, member.workspace_id],
   );
+  // A Desktop relay identity (an agent token Relaycast minted for this person).
+  await ctx.database.query(
+    `INSERT INTO selfhost_desktop_relay_identities
+       (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id, agent_name, agent_remote_id, address, token_ciphertext)
+     VALUES ($1, $2, $3, $4, 'rc-ws', $5, 'desktop-agent', 'remote-1', 'desktop-agent@host', 'ciphertext')`,
+    [randomUUID(), member.workspace_id, member.organization_id, member.id, randomUUID()],
+  );
+  // A person messaging identity is not a session: kept.
+  await ctx.database.query(
+    `INSERT INTO selfhost_person_identities (id, workspace_id, user_id, agent_name, agent_remote_id, token_ciphertext, relaycast_workspace_id)
+     VALUES ($1, $2, $3, 'all', 'human-1', 'ciphertext', 'rc-ws')`,
+    [randomUUID(), member.workspace_id, member.id],
+  );
+  const identitiesBefore = Number((await ctx.database.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM selfhost_person_identities WHERE user_id = $1", [member.id])).rows[0]!.n);
   assert.ok(await ctx.store.authenticateAccessToken(cli.accessToken));
   assert.ok(await ctx.store.authenticateAccessToken(desktop.accessToken));
 
   await call(ctx.origin, `${API}/reset`, { json: { email: "all@acme.test" } });
   await ctx.identity.idle();
-  const token = linkToken(ctx.mailer.sent.at(-1)!, "/password/reset");
+  const token = linkToken(ctx.mailer.sent.at(-1)!, "/login/password/reset");
   const done = await call(ctx.origin, `${API}/reset/complete`, { json: { token, password: "a brand new long passphrase" } });
   assert.equal(done.status, 200, done.text);
   assert.equal(done.body.revoked.sessions, 3, "browser, CLI and Desktop");
   assert.equal(done.body.revoked.mcpGrants, 1);
+  assert.equal(done.body.revoked.desktopRelayIdentities, 1);
   assert.equal(done.body.revoked.deviceAuthorizations, 1);
   assert.equal(done.body.revoked.mcpCodes, 1);
 
@@ -207,7 +240,13 @@ test("reset: revokes CLI, Desktop and browser sessions and MCP grants; expires a
   assert.equal(code.rows[0]!.live, false, "the unredeemed MCP code is void (expired)");
   assert.equal(code.rows[0]!.consumed_at, null, "and not marked as redeemed");
   const audit = (await auditActions(ctx)).find((e) => e.action === "password.reset.completed");
-  assert.match(audit!.target!, /sessions_revoked=3 mcp_grants_revoked=1 device_authorizations_expired=1 mcp_codes_voided=1/);
+  assert.match(audit!.target!, /sessions_revoked=3 mcp_grants_revoked=1 desktop_relay_identities_deleted=1 device_authorizations_expired=1 mcp_codes_voided=1/);
+  const relayIdentities = await ctx.database.query("SELECT id FROM selfhost_desktop_relay_identities WHERE user_id = $1", [member.id]);
+  assert.equal(relayIdentities.rows.length, 0, "Desktop relay identities are deleted");
+  const identitiesAfter = Number((await ctx.database.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM selfhost_person_identities WHERE user_id = $1", [member.id])).rows[0]!.n);
+  assert.equal(identitiesBefore, 1);
+  assert.equal(identitiesAfter, identitiesBefore, "person messaging identities are not touched");
 });
 
 // ---- rate limits and the /login page ------------------------------------------------------

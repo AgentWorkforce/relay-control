@@ -14,6 +14,7 @@ import { createIdentityModule } from "../../src/identity/routes.js";
 import { bootstrapOnce, relaycastProvisioner } from "../../src/identity/bootstrap.js";
 import type { Mailer, OutgoingEmail } from "../../src/identity/mailer.js";
 import type { HibpFetch } from "../../src/identity/password/policy.js";
+import type { PasswordHasher } from "../../src/identity/password/hashing.js";
 import { close, listen, PGliteDatabase } from "./harness.js";
 
 /** Shared harness for the password sign-in tests (one control plane per test). */
@@ -100,7 +101,7 @@ export async function call(origin: string, path: string, init: {
   return { status: response.status, body: parsed, text, cookies, location: response.headers.get("location") };
 }
 
-export async function setup(t: test.TestContext, options: { env?: Record<string, string>; hibpFetch?: HibpFetch; trustedProxies?: string | null } = {}) {
+export async function setup(t: test.TestContext, options: { env?: Record<string, string>; hibpFetch?: HibpFetch; trustedProxies?: string | null; passwordHasher?: PasswordHasher } = {}) {
   // The tests stand behind one proxy (they send X-Forwarded-For) unless a
   // test asks otherwise; the variable is read per request.
   const previousProxies = process.env.SELFHOST_TRUSTED_PROXIES;
@@ -140,6 +141,8 @@ export async function setup(t: test.TestContext, options: { env?: Record<string,
     SELFHOST_AUTO_JOIN_DOMAINS: "acme.test",
     SELFHOST_SIGNIN_METHODS: "email_link,password",
     RELAYCAST_INTERNAL_SECRET: RELAYCAST_SECRET,
+    // Required (explicitly, even 0) whenever password sign-in is on.
+    SELFHOST_TRUSTED_PROXIES: proxies ?? "0",
     ...SMTP,
     ...options.env,
   });
@@ -164,6 +167,7 @@ export async function setup(t: test.TestContext, options: { env?: Record<string,
     now: () => clock.now,
     log: () => undefined,
     ...(options.hibpFetch ? { hibpFetch: options.hibpFetch } : {}),
+    ...(options.passwordHasher ? { passwordHasher: options.passwordHasher } : {}),
   });
   control.on("request", createApp({ config, store, identity }));
   t.after(async () => {
@@ -182,10 +186,14 @@ export async function setup(t: test.TestContext, options: { env?: Record<string,
 
 export type Ctx = Awaited<ReturnType<typeof setup>>;
 
+/** The token of an emailed password link: in the fragment, never the query. */
 export function linkToken(message: OutgoingEmail, path: string): string {
   const url = new URL(/https?:\/\/\S+/.exec(message.text)![0]);
   assert.equal(url.pathname, path);
-  return url.searchParams.get("token")!;
+  assert.equal(url.search, "", "the token must not be in the query string");
+  const token = new URLSearchParams(url.hash.slice(1)).get("token");
+  assert.ok(token, "the link carries #token=");
+  return token;
 }
 
 export function sessionCookie(res: Res): string {
@@ -204,7 +212,7 @@ export async function verifyLink(ctx: Ctx, email: string, invite?: string): Prom
   assert.equal(asked.status, 202, asked.text);
   await ctx.identity.idle();
   assert.equal(ctx.mailer.sent.length, before + 1);
-  return linkToken(ctx.mailer.sent.at(-1)!, "/password/verify");
+  return linkToken(ctx.mailer.sent.at(-1)!, "/login/password/verify");
 }
 
 /** Registers and verifies an address; returns the set-password token. */

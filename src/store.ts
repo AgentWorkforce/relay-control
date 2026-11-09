@@ -1294,10 +1294,22 @@ export class ControlPlaneStore {
 
   /**
    * Revokes every live session of a person (browser, CLI and Desktop token
-   * sessions, and MCP OAuth grants), e.g. after a password reset. Workspace
-   * API tokens belong to the workspace, not the person, and are kept.
+   * sessions, and MCP OAuth grants) and deletes the Desktop relay identity
+   * tokens they synced, e.g. after a password reset. Workspace API keys
+   * belong to the workspace, and person messaging identities
+   * (selfhost_person_identities, the person's human agent per workspace)
+   * are not sessions, so neither is touched.
    */
-  async revokeAllForUser(executor: SqlExecutor, userId: string, reason: string): Promise<{ sessions: number; mcpGrants: number }> {
+  async revokeAllForUser(
+    executor: SqlExecutor,
+    userId: string,
+    reason: string,
+  ): Promise<{ sessions: number; mcpGrants: number; desktopRelayIdentities: number }> {
+    // The user lock comes first, before any row is changed: it is the lock
+    // order (identity, user, organizations in id order) every writer of
+    // this person's sessions and grants follows, so nothing for this person
+    // commits between the session UPDATE and the grant revocation below.
+    await lockUser(executor, userId);
     const sessions = await executor.query<{ id: string }>(
       `UPDATE selfhost_token_sessions
           SET revoked_at = now(), revoked_reason = $2, updated_at = now()
@@ -1305,11 +1317,18 @@ export class ControlPlaneStore {
         RETURNING id`,
       [userId, reason],
     );
+    // Desktop relay identity tokens let the MCP endpoint act as the person's
+    // Desktop agents. They are deleted (the table has no revoked state);
+    // Desktop syncs them again after the person signs in. The tokens
+    // themselves are not revoked at Relaycast.
+    const desktopRelayIdentities = await executor.query<{ id: string }>(
+      "DELETE FROM selfhost_desktop_relay_identities WHERE user_id = $1 RETURNING id",
+      [userId],
+    );
     // MCP OAuth grants go through the MCP store's revoker so each grant's
     // session family ends and a revocation tombstone (Relaycast teardown)
     // commits with it. That revoker needs user->org locks, taken in the
-    // tenancy lock order (user, then organizations in id order).
-    await lockUser(executor, userId);
+    // tenancy lock order (user above, then organizations in id order).
     const organizations = await executor.query<{ organization_id: string }>(
       `SELECT DISTINCT organization_id FROM selfhost_mcp_oauth_grants
         WHERE user_id = $1 AND revoked_at IS NULL ORDER BY organization_id`,
@@ -1325,7 +1344,7 @@ export class ControlPlaneStore {
     for (const { id } of grants.rows) {
       if (await revokeMcpOAuthGrantRows(executor, id, reason, now)) mcpGrants += 1;
     }
-    return { sessions: sessions.rows.length, mcpGrants };
+    return { sessions: sessions.rows.length, mcpGrants, desktopRelayIdentities: desktopRelayIdentities.rows.length };
   }
 
   /**

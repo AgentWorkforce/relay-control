@@ -5,11 +5,14 @@
 -- One password per person. `pepper_version` names the pepper (from
 -- SELFHOST_PASSWORD_PEPPER_FILE) the hash was made with, NULL = none;
 -- `params` mirrors the argon2id m/t/p in the PHC string for operators.
+-- `lockout_notice_at` is when the owner was last emailed about an account
+-- lockout (at most one notice per 24 hours).
 CREATE TABLE IF NOT EXISTS selfhost_password_credentials (
   user_id uuid PRIMARY KEY REFERENCES selfhost_users(id) ON DELETE CASCADE,
   password_hash text NOT NULL CHECK (password_hash LIKE '$argon2id$%'),
   pepper_version integer CHECK (pepper_version IS NULL OR pepper_version >= 1),
   params text NOT NULL,
+  lockout_notice_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -64,11 +67,15 @@ CREATE INDEX IF NOT EXISTS selfhost_password_reset_tokens_user_idx
   ON selfhost_password_reset_tokens (user_id)
   WHERE used_at IS NULL;
 
--- Password sign-in attempts per subject ("account:<email>" or "ip:<address>"),
--- shared by every replica. Each attempt is reserved (counted) before the
--- password is checked; once the free allowance is used each further attempt
--- doubles locked_until (capped). A success clears the account row and refunds
--- the IP reservation. Rows idle for a whole window start over.
+-- Password sign-in attempts per subject, shared by every replica:
+--   "account-key:<email>|<client key>"  backoff after 5 attempts (30 s doubling, 15 min cap)
+--   "account:<email>"                   15 minute lock after 50 attempts within an hour
+--   "ip:<client key>"                   backoff after 30 attempts
+-- (the client key is the address, IPv6 bucketed by /64). Each attempt is
+-- reserved (counted) before the password is checked; an attempt refused
+-- inside a lock counts nothing. A success clears the account-key and
+-- account rows and refunds the IP reservation; a completed reset clears
+-- every row of the account. Backoff rows idle for an hour start over.
 CREATE TABLE IF NOT EXISTS selfhost_login_attempts (
   subject text PRIMARY KEY,
   failures integer NOT NULL DEFAULT 0 CHECK (failures >= 0),

@@ -106,7 +106,7 @@ export function passwordAlreadyRegisteredEmail(input: { to: string; url: string;
   };
 }
 
-/** Notice to the account address when a first password is added from a signed-in session. */
+/** Notice to the account address when its first password is set (register, verify, set). */
 export function passwordAddedEmail(input: { to: string; url: string; siteName: string }): OutgoingEmail {
   const intro = `A password was added to your Agent Relay (${input.siteName}) account. If this was not you, reset your password.`;
   const footer = "Resetting the password signs you out everywhere. If you added it, you can ignore this email.";
@@ -126,5 +126,29 @@ export function passwordResetEmail(input: { to: string; url: string; siteName: s
     subject: "Reset your Agent Relay password",
     text: `${intro}\n\nReset: ${input.url}\n\n${footer}\n`,
     html: layout("Reset your password", intro, "Choose a new password", input.url, footer),
+  };
+}
+
+/** Notice to the account address after a password reset completes. */
+export function passwordChangedEmail(input: { to: string; url: string; siteName: string }): OutgoingEmail {
+  const intro = `Your Agent Relay (${input.siteName}) password was changed, and every session was signed out. If this was not you, reset your password now.`;
+  const footer = "If you changed it, you can ignore this email.";
+  return {
+    to: input.to,
+    subject: "Your Agent Relay password was changed",
+    text: `${intro}\n\nReset your password: ${input.url}\n\n${footer}\n`,
+    html: layout("Your password was changed", intro, "Reset password", input.url, footer),
+  };
+}
+
+/** Sent at most once a day when too many failed sign-ins lock the account for a while. */
+export function accountLockedEmail(input: { to: string; url: string; siteName: string }): OutgoingEmail {
+  const intro = `Too many failed sign-ins to your Agent Relay (${input.siteName}) account; password sign-in is paused for 15 minutes. If this was not you, reset your password.`;
+  const footer = "Your password has not changed. If these attempts were yours, wait and try again.";
+  return {
+    to: input.to,
+    subject: "Too many failed sign-ins to your Agent Relay account",
+    text: `${intro}\n\nReset your password: ${input.url}\n\n${footer}\n`,
+    html: layout("Too many failed sign-ins", intro, "Reset password", input.url, footer),
   };
 }
