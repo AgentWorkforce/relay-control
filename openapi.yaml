@@ -12,6 +12,9 @@ info:
     identical methods, bodies, and responses. Bearer authentication remains
     available on both mounts; the `/cloud` mount additionally accepts the
     same-origin HttpOnly session cookie issued by `/login`.
+    The optional MCP OAuth issuer and grant-management APIs use explicit
+    /cloud/api/oauth/* and /cloud/api/v1/oauth/grants* prefixes; their bare
+    equivalents are not mounted.
     Client-visible Relaycast and RelayHistory URLs are explicit public HTTPS
     origins and are distinct from internal server-to-server upstream URLs.
     Desktop feed (`/api/v1/desktop/feed/*`, tag "Desktop feed") is
@@ -35,6 +38,8 @@ servers:
 security:
   - bearerAuth: []
 tags:
+  - name: MCP OAuth
+    description: Default-off MCP connector issuer (SELFHOST_MCP_OAUTH); see docs/mcp-oauth.md.
   - name: acquisition
     description: |
       Dormant cloud-class acquisition assertion issuer (flag
@@ -88,6 +93,375 @@ tags:
         ED25519_SHA_512, 4096-byte message cap), one key per profile,
         addressed by alias. A private key stored in Postgres is not a fallback.
 paths:
+  /mcp:
+    post:
+      operationId: mcpOAuthRoot
+      tags: [MCP OAuth]
+      summary: MCP root resource, enabled with SELFHOST_MCP_OAUTH.
+      description: |
+        Stateless JSON-RPC endpoint; /cloud/mcp is an RPC alias. OAuth tokens
+        must target the canonical public /mcp resource, including on the alias.
+        The approved agent is pinned by immutable ID across chats. Native
+        personal cli:auth bearers are also accepted. Cookies are accepted only
+        on the /cloud alias behind the native origin guard. OAuth connections
+        do not acquire native API, Desktop or transcript-history authority.
+        Disabled module returns 404. All responses disable caching.
+      security:
+        - oauthMcpBearer: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: JSON-RPC 2.0 request, notification or batch, at most 64 KiB.
+      responses:
+        "200":
+          description: JSON-RPC response
+        "202":
+          description: Notification accepted
+        "400":
+          description: Invalid JSON-RPC or MCP session metadata
+        "401":
+          description: Invalid credential or resource audience; Bearer challenge includes resource_metadata.
+        "403":
+          description: Insufficient issued scope, handoff artifact or cross-origin native request
+        "404":
+          description: Module disabled or workspace unavailable
+        "413":
+          description: Body exceeds 64 KiB
+  /cloud/.well-known/oauth-authorization-server:
+    get:
+      operationId: mcpOAuthAuthorizationServerMetadata
+      tags: [MCP OAuth]
+      summary: Discover the enabled OAuth issuer.
+      description: |
+        Also served at /.well-known/oauth-authorization-server/cloud and the
+        /cloud/.well-known/openid-configuration and
+        /.well-known/openid-configuration/cloud aliases. Only mounted
+        endpoints and enabled OIDC features are advertised. Public CORS;
+        no credentials required. Disabled module returns 404.
+      security: []
+      responses:
+        "200":
+          description: Authorization-server metadata; issuer is the configured public origin plus /cloud.
+          content:
+            application/json:
+              schema: {type: object}
+        "404":
+          description: Module disabled
+  /.well-known/oauth-protected-resource/mcp:
+    get:
+      operationId: mcpOAuthRootResourceMetadata
+      tags: [MCP OAuth]
+      summary: Discover the canonical root MCP resource.
+      security: []
+      responses:
+        "200":
+          description: Protected-resource metadata with canonical /mcp resource and mounted authorization server.
+          content:
+            application/json:
+              schema: {type: object}
+        "404":
+          description: Module disabled
+  /cloud/.well-known/oauth-protected-resource/cloud/api/v1/mcp/shared-sessions:
+    get:
+      operationId: mcpOAuthSharedResourceMetadata
+      tags: [MCP OAuth]
+      summary: Discover the shared-sessions MCP resource.
+      description: Also served at /.well-known/oauth-protected-resource/cloud/api/v1/mcp/shared-sessions. The existing Bearer challenge URL is preserved.
+      security: []
+      responses:
+        "200":
+          description: Metadata for the canonical /cloud/api/v1/mcp/shared-sessions audience.
+          content:
+            application/json:
+              schema: {type: object}
+        "404":
+          description: Module disabled
+  /cloud/.well-known/jwks.json:
+    get:
+      operationId: mcpOAuthJwks
+      tags: [MCP OAuth]
+      summary: Active and unexpired retained OIDC public keys.
+      security: []
+      responses:
+        "200":
+          description: Public JWK set; private key material is never returned.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: {type: object}
+        "404":
+          description: OAuth or OIDC disabled
+  /cloud/oauth/authorize:
+    get:
+      operationId: mcpOAuthConsentPage
+      tags: [MCP OAuth]
+      summary: Show the account's workspace-bound consent page.
+      description: |
+        Requires an account-capable native browser session; Authorization
+        headers are not accepted as browser authority. The account's issued
+        workspace is the only consent target. PKCE S256 and a registered
+        redirect URI are mandatory. Malformed requests never choose a redirect
+        before registration has been verified. Duplicate query keys are refused.
+      security:
+        - cookieAuth: []
+      parameters:
+        - {name: client_id, in: query, required: true, schema: {type: string}}
+        - {name: redirect_uri, in: query, schema: {type: string, format: uri}, description: Required when registration has multiple redirects.}
+        - {name: response_type, in: query, required: true, schema: {type: string, const: code}}
+        - {name: code_challenge, in: query, required: true, schema: {type: string, minLength: 43, maxLength: 43}}
+        - {name: code_challenge_method, in: query, required: true, schema: {type: string, const: S256}}
+        - {name: resource, in: query, required: true, schema: {type: string, format: uri}, description: Canonical root or shared-sessions resource URL.}
+        - {name: scope, in: query, schema: {type: string}, description: Space-separated scopes; omission chooses the resource baseline.}
+        - {name: state, in: query, schema: {type: string, maxLength: 1024}}
+        - {name: nonce, in: query, schema: {type: string, minLength: 1, maxLength: 1024}, description: Validated only for an enabled openid grant.}
+      responses:
+        "200":
+          description: Escaped HTML consent page with nonce-based Content-Security-Policy.
+          content:
+            text/html:
+              schema: {type: string}
+        "302":
+          description: Sign-in redirect or registered-client OAuth error redirect with state and issuer.
+        "400":
+          description: Invalid authorization request without a verified redirect
+        "403":
+          description: Account capability or handoff admission refused
+        "404":
+          description: Module disabled or workspace no longer accessible
+  /cloud/api/oauth/authorize:
+    post:
+      operationId: mcpOAuthConsent
+      tags: [MCP OAuth]
+      summary: Approve or deny a workspace-bound connection.
+      description: Native account cookie and exact configured public Origin required; no bearer authority or tenant selection.
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [params, decision]
+              properties:
+                params:
+                  type: object
+                  description: Original authorization parameters, revalidated against registration and PKCE.
+                  additionalProperties: {type: string}
+                decision: {type: string, enum: [approve, deny]}
+                workspace_id: {type: string, format: uuid, description: Must equal the account session's workspace on approval.}
+                agent_name: {type: string, maxLength: 128, description: Required approved name on approval.}
+      responses:
+        "200":
+          description: Validated redirect_to URL containing the current code or denial, state and issuer.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [redirect_to]
+                properties:
+                  redirect_to: {type: string, format: uri}
+        "400":
+          description: Invalid request, agent name or workspace
+        "401":
+          description: Browser account sign-in required
+        "403":
+          description: Invalid Origin, handoff or account capability
+        "404":
+          description: Module disabled
+        "413":
+          description: Body exceeds 64 KiB
+  /cloud/api/oauth/authorize/agent-name:
+    get:
+      operationId: mcpOAuthAgentName
+      tags: [MCP OAuth]
+      summary: Check an agent name in the signed-in account's workspace.
+      security:
+        - cookieAuth: []
+      parameters:
+        - {name: workspace_id, in: query, required: true, schema: {type: string, format: uuid}}
+        - {name: name, in: query, required: true, schema: {type: string, maxLength: 128}}
+      responses:
+        "200":
+          description: Name and availability status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  status: {type: string, enum: [available, yours, taken, unknown]}
+        "400":
+          description: Invalid agent name or workspace
+        "401":
+          description: Browser sign-in required
+        "403":
+          description: Account capability or handoff refused
+        "404":
+          description: Module disabled
+  /cloud/api/oauth/register:
+    post:
+      operationId: mcpOAuthRegister
+      tags: [MCP OAuth]
+      summary: Register a public OAuth client.
+      description: |
+        No client secret. JSON body, 64 KiB maximum. Redirects must be absolute
+        HTTPS or loopback HTTP without credentials or fragments. Limited to
+        20 requests per trusted client-address bucket per hour (IPv6 /64) and
+        500 per process per hour. SELFHOST_TRUSTED_PROXIES defaults to zero;
+        forwarded headers are then ignored and the socket peer is used.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [redirect_uris]
+              properties:
+                client_name: {type: string, maxLength: 100}
+                redirect_uris:
+                  type: array
+                  minItems: 1
+                  maxItems: 10
+                  items: {type: string, format: uri}
+                token_endpoint_auth_method: {type: string, const: none}
+                grant_types:
+                  type: array
+                  items: {type: string, enum: [authorization_code, refresh_token]}
+                response_types:
+                  type: array
+                  items: {type: string, const: code}
+      responses:
+        "201":
+          description: Registered client_id and validated redirect_uris; OIDC algorithm advertised only when enabled.
+          content:
+            application/json:
+              schema: {type: object}
+        "400":
+          description: invalid_client_metadata
+        "404":
+          description: Module disabled
+        "413":
+          description: Body exceeds 64 KiB
+        "429":
+          description: Registration rate limit (slow_down)
+  /cloud/api/oauth/token:
+    post:
+      operationId: mcpOAuthToken
+      tags: [MCP OAuth]
+      summary: Exchange a PKCE code or rotate an OAuth refresh token.
+      description: |
+        Public client_id is required. Code exchange verifies the bound client,
+        redirect, resource and PKCE before consuming the code. Refresh rotates
+        the pair without widening its issued scopes. Only this issuer's
+        mcp_rt_ credentials are accepted; no native session is minted.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/McpOAuthTokenRequest"}
+          application/x-www-form-urlencoded:
+            schema: {$ref: "#/components/schemas/McpOAuthTokenRequest"}
+      responses:
+        "200":
+          description: New access and refresh pair
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, token_type, expires_in, refresh_token, scope]
+                properties:
+                  access_token: {type: string, pattern: "^mcp_at_"}
+                  token_type: {type: string, const: Bearer}
+                  expires_in: {type: integer}
+                  refresh_token: {type: string, pattern: "^mcp_rt_"}
+                  scope: {type: string}
+                  id_token: {type: string, description: Present only for an enabled openid grant.}
+        "400":
+          description: invalid_request, invalid_grant, invalid_target or unsupported_grant_type
+        "401":
+          description: invalid_client
+        "404":
+          description: Module disabled
+        "413":
+          description: Body exceeds 64 KiB
+  /cloud/api/oauth/revoke:
+    post:
+      operationId: mcpOAuthRevoke
+      tags: [MCP OAuth]
+      summary: Revoke an OAuth token family.
+      description: RFC 7009; unknown tokens return the same empty success response. Local revocation queues durable remote cleanup.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/McpOAuthRevokeRequest"}
+          application/x-www-form-urlencoded:
+            schema: {$ref: "#/components/schemas/McpOAuthRevokeRequest"}
+      responses:
+        "200":
+          description: Empty response, including for unknown tokens
+        "400":
+          description: Missing token or malformed body
+        "404":
+          description: Module disabled
+        "413":
+          description: Body exceeds 64 KiB
+  /cloud/api/v1/oauth/grants:
+    get:
+      operationId: mcpOAuthListGrants
+      tags: [MCP OAuth]
+      summary: List the account's connections in its issued workspace.
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Non-secret metadata for live owned connections; query parameters cannot widen the tenant.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grants]
+                properties:
+                  grants:
+                    type: array
+                    items: {$ref: "#/components/schemas/McpOAuthGrant"}
+        "401":
+          description: Browser account sign-in required
+        "403":
+          description: Account capability or handoff refused
+        "404":
+          description: Module disabled or workspace inaccessible
+  /cloud/api/v1/oauth/grants/{grantId}:
+    delete:
+      operationId: mcpOAuthDisconnect
+      tags: [MCP OAuth]
+      summary: Revoke an owned connection and queue its remote cleanup.
+      description: Exact configured public Origin and workspace-bound browser account required.
+      security:
+        - cookieAuth: []
+      parameters:
+        - {name: grantId, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "204":
+          description: Local grant family revoked; remote cleanup retries independently.
+        "401":
+          description: Browser account sign-in required
+        "403":
+          description: Invalid Origin, account capability or handoff
+        "404":
+          description: Module disabled, workspace inaccessible or no owned grant
   /api/v1/mcp/shared-sessions:
     post:
       operationId: hostedMcpSharedSessions
@@ -129,7 +503,14 @@ paths:
         Copilot call without one gets a tool error and no relay action. See
         docs/integrations/copilot-vscode.md.
 
-        Requires a personal credential with `cli:auth`: a device bearer token,
+        With SELFHOST_MCP_OAUTH=on, an OAuth header bearer granted for
+        the canonical /cloud/api/v1/mcp/shared-sessions resource is accepted.
+        It acts only as its approved immutable relay-agent identity. The
+        cookie account and native API authority are not granted by OAuth;
+        transcript-history reads remain restricted on that connection.
+        Initialize omits desktop credential/attestation capabilities for OAuth.
+
+        Native access requires a personal credential with `cli:auth`: a device bearer token,
         or on the `/cloud` mount the session cookie behind the origin guard.
         Workspace API tokens (`sh_wk_`) and the internal service token are
         refused. Every tool is pinned to the credential's workspace. The
@@ -141,6 +522,7 @@ paths:
       security:
         - bearerAuth: []
         - cookieAuth: []
+        - oauthMcpBearer: []
       requestBody:
         required: true
         content:
@@ -6157,6 +6539,10 @@ paths:
           description: payload_too_large (64 KiB)
 components:
   securitySchemes:
+    oauthMcpBearer:
+      type: http
+      scheme: bearer
+      description: Opaque mcp_at_ token, restricted to its granted MCP resource. Never accepted by general API auth, native refresh or introspection.
     factoryReplyBearer:
       type: http
       scheme: bearer
@@ -6344,6 +6730,38 @@ components:
       description: A declared `expected_assets[].name`; one path segment.
       schema: { type: string, maxLength: 255, pattern: "^[A-Za-z0-9][A-Za-z0-9_+-]*(?:\\.[A-Za-z0-9_+-]+)*$" }
   schemas:
+    McpOAuthTokenRequest:
+      type: object
+      required: [grant_type, client_id]
+      properties:
+        grant_type: {type: string, enum: [authorization_code, refresh_token]}
+        client_id: {type: string}
+        code: {type: string, description: Required for authorization_code.}
+        code_verifier: {type: string, minLength: 43, maxLength: 128, description: Required for authorization_code.}
+        redirect_uri: {type: string, format: uri, description: Required if supplied during authorization.}
+        refresh_token: {type: string, description: Required for refresh_token.}
+        resource: {type: string, format: uri, description: Optional exact bound resource; cannot change the audience.}
+    McpOAuthRevokeRequest:
+      type: object
+      required: [token]
+      properties:
+        token: {type: string}
+        client_id: {type: string}
+    McpOAuthGrant:
+      type: object
+      required: [id, client_id, client_name, organization_id, workspace_id, agent_name, scopes, resource, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        client_id: {type: string}
+        client_name: {type: [string, "null"]}
+        organization_id: {type: string, format: uuid}
+        workspace_id: {type: string, format: uuid}
+        agent_name: {type: string}
+        scopes:
+          type: array
+          items: {type: string}
+        resource: {type: string, format: uri}
+        created_at: {type: string, format: date-time}
     LoginConfig:
       type: object
       required: [methods, oidc, logo_url, allowed_domain_hint, password_policy]

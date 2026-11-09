@@ -1,3 +1,9 @@
+import { revokeOrganizationMcpOAuthGrants } from "./mcp/oauth/revocations.js";
+import { createMcpOAuthHttpModule } from "./mcp/oauth/routes.js";
+import { McpOAuthStore } from "./mcp/oauth/store.js";
+import { connectorKind } from "./mcp/oauth/connector-kind.js";
+import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
+import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -338,6 +344,8 @@ export function createApp(input: {
   license?: LoadedLicense;
   /** Amp control (src/amp). Absent or disabled: every Amp route answers 404 before auth. */
   amp?: AmpModule;
+  /** Server-owned worker; absent tests use the same on-demand cleanup without a timer. */
+  mcpOAuthTeardown?: McpOAuthTeardown;
   /**
    * Runtime probes for the provider modules this build contains. Unset (the
    * default) means no provider module: each reports implemented, configured
@@ -422,9 +430,50 @@ export function createApp(input: {
   // Hosted MCP (shared-sessions facade): reads, team activity, capabilities.
   const amp = input.amp?.config.enabled ? input.amp : null;
   const providerProbes: ProviderProbes = input.providerProbes ?? {};
+  const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
+  const oauthTeardown=config.mcpOAuth?.enabled ? input.mcpOAuthTeardown??new McpOAuthTeardown({
+    database:store.database,keyring:config.encryptionKeyring,
+    client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch(input.messagingFetch)}),now:input.now,
+  }) : null;
+  const mcpOAuth = createMcpOAuthHttpModule({
+    config,mountedResources:["/mcp","/api/v1/mcp/shared-sessions"],
+    clientAddress:request=>limiterKey(clientIp(request)),
+    createStore:({protocol,issuer})=>new McpOAuthStore(store.database,{
+      protocol,tenancyMode:store.tenancy,now:input.now,issueIdToken:issuer?.issueMcpOidcIdToken,
+      isGrokRoutine:(request,client)=>request.resourcePath==="/api/v1/mcp/relay-events" &&
+        request.scopes.includes("relay:events") && connectorKind({
+          clientName:client.clientName,redirectUris:[request.redirectUri],
+        })==="grok-bot",
+    }),
+    resolveSession:async request=>{
+      if(request.headers.has("authorization")) return null;
+      const raw=(request.headers.get("cookie")??"").split(";").map(part=>part.trim())
+        .find(part=>part.startsWith(SESSION_COOKIE+"="))?.slice(SESSION_COOKIE.length+1);
+      if(!raw) return null;
+      let token:string;try {token=decodeURIComponent(raw);} catch {return null;}
+      const principal=await store.authenticateAccessToken(token);
+      return principal?{transport:"cookie" as const,principal}:null;
+    },
+    workspaceAccess:async principal=>{
+      if(!(await store.readiness()).ready) return false;
+      const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
+      return workspace?.organizationId===principal.organizationId;
+    },
+    workspaceLabel:async principal=>(await store.workspaceForUser(principal.workspaceId,principal.userId))?.name??principal.workspaceId,
+    checkAgentNameAvailability:async(principal,name)=>{
+      const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
+      if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
+      const remote=await oauthRelay.getAgent(workspace.relaycastApiKey,name);
+      if(!remote) return "available";
+      return remote.metadata.source===HOSTED_SOURCE && remote.metadata.cloud_workspace_id===principal.workspaceId &&
+        remote.metadata.owner_hash===ownerHash(principal.userId)?"yours":"taken";
+    },
+    now:input.now,afterMutation:()=>oauthTeardown?.kick(),
+  });
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
     ...(amp ? { amp: amp.deps } : {}),
+    ...(mcpOAuth.store ? {oauthSessions:mcpOAuth.store.sessions} : {}),
   });
   const desktopMcpCredentials = new DesktopMcpCredentials(store.database);
   const DESKTOP_MCP_RATE = { limit: 30, windowMs: 60_000 };
@@ -1607,7 +1656,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         throw new HttpError(409, "last_workspace", "An organization must keep at least one workspace");
       }
       if (outcome === "in_use") {
-        throw new HttpError(409, "workspace_in_use", "Tear down this workspace's Factory connection first");
+        throw new HttpError(409, "workspace_in_use", "Disconnect workspace integrations and finish their cleanup first");
       }
       response.writeHead(204);
       response.end();
@@ -1668,16 +1717,15 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         await store.memberRole(organizationId, userId) === "owner") {
         throw new HttpError(403, "forbidden", "Only an owner can remove an owner.");
       }
-      // Amp grants are revoked inside the membership transaction (even with
-      // the feature off, so stale grants never outlive a member), and so are
-      // Factory bindings; Relaycast release of the retired Amp identities runs
-      // after commit.
+      // Local Amp, Factory and OAuth authority retires atomically, including
+      // when a module is off. Remote release remains post-commit.
       const deleted = await store.deleteMembership(
         organizationId,
         userId,
         async (tx, member) => {
           await purgeMemberAmp(tx, member);
           await factory.purgeMemberInTx(tx, organizationId, userId);
+          await revokeOrganizationMcpOAuthGrants(tx, member, input.now?.() ?? new Date());
         },
       );
       if (!deleted) {
@@ -1690,6 +1738,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       await revokeRemovedMember(messagingDeps, organizationId, userId);
       if (amp) await releaseMemberAmp(amp.deps, { organizationId, userId }).catch(() => undefined);
       await factory.afterMemberRemoved(organizationId, userId);
+      oauthTeardown?.kick();
       response.writeHead(204);
       response.end();
       return;
@@ -2077,6 +2126,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     }
 
     if (await mcp(request, response, path, method)) return;
+    if (await mcpOAuth.handleNode(request,response)) return;
     if (desktopFeed && await desktopFeed(request, response, path, method)) return;
     if (await handleProviderRoutes(request, response, path, method, {
       probes: providerProbes, workspaceAccess: (incoming, id) => workspaceAccess(incoming, id), json,

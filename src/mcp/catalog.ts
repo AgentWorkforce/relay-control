@@ -112,11 +112,12 @@ export function registerToolPlan(plan: readonly ToolPlanEntry[], registrars: Too
   }
 }
 
-export type McpAuthMode = "session" | "cli_login";
+export type McpAuthMode = "session" | "cli_login" | "oauth";
 
 const AUTH_MODE_LABELS: Readonly<Record<McpAuthMode, string>> = {
   session: "browser session",
   cli_login: "Agent Relay CLI login",
+  oauth: "workspace-bound OAuth connection",
 };
 
 export type WorkspaceRole = "owner" | "admin" | "member" | "none" | null;
@@ -159,6 +160,11 @@ export function describeCapabilities(input: {
     const definition = TOOL_GROUPS[id];
     const base = { id, title: definition.title };
     const item = planned.get(id);
+    if (item && id === "shared_session_reads" && input.authMode === "oauth") {
+      return { ...base, status: "restricted", tools: [...item.tools],
+        reason: "This OAuth connection does not grant transcript-history access.",
+        how_to_enable: "Use an authorized native Agent Relay session for transcript reads." };
+    }
     if (item) return { ...base, status: "available", tools: [...item.tools] };
     return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: `${definition.title} are not part of the self-hosted Agent Relay edition.`,

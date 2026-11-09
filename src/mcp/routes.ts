@@ -16,6 +16,9 @@ import { historyReader, type McpContext, type McpMember } from "./context.js";
 import { CopilotAttestationError, copilotAttestationFor, postgresAttestationStore, type CopilotAttestation } from "./copilot-attestation.js";
 import { desktopCallContext, DesktopCallContextError } from "./desktop-call.js";
 import { buildMcpServer } from "./server.js";
+import { admitMcpOAuthBearer, type McpOAuthConnection } from "./oauth/admission.js";
+import type { McpOAuthSessions } from "./oauth/sessions.js";
+import { MCP_RELAY_SCOPE, type McpOAuthResourcePath } from "./oauth/protocol.js";
 
 /**
  * `POST /api/v1/mcp/shared-sessions` (also `/cloud/api/v1/...`, the path
@@ -104,6 +107,8 @@ export function createMcpHandler(input: {
   amp?: AmpDeps;
   /** Provider runtime probes (src/providers/registry.ts); empty when unset. */
   providerProbes?: ProviderProbes;
+  /** Own credential resolver, used only at these MCP routes when the module is enabled. */
+  oauthSessions?: McpOAuthSessions;
 }) {
   const { config, store } = input;
   const apiTokens = new ApiTokenStore(store.database);
@@ -112,6 +117,24 @@ export function createMcpHandler(input: {
   const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.fetchImpl });
   // Citations open the dashboard's session page.
   const citationOrigin = new URL(config.dashboardUrl).origin;
+  const oauthSessions = config.mcpOAuth?.enabled ? input.oauthSessions : undefined;
+  const oauthProtocol = oauthSessions?.options.protocol;
+  function resourceFor(path: string): McpOAuthResourcePath | null {
+    const clean = path.replace(/\/+$/u,"");
+    if (clean === "/mcp" || clean === "/cloud/mcp") return "/mcp";
+    if (clean === MCP_FACADE.path || clean === "/cloud"+MCP_FACADE.path) return "/api/v1/mcp/shared-sessions";
+    return null;
+  }
+  function challenge(path: string, invalid: boolean, scopes?: string[]): string {
+    const resource = resourceFor(path);
+    if (!oauthProtocol || !resource || !oauthProtocol.mcpOAuthResourceAvailable(resource)) {
+      return invalid ? 'Bearer error="invalid_token"' : "Bearer";
+    }
+    return oauthProtocol.mcpOAuthChallenge(oauthProtocol.mcpResourceUrl(resource),{
+      ...(invalid ? { error: "invalid_token" as const } : {}),
+      ...(scopes ? { error: "insufficient_scope" as const, scopes } : {}),
+    });
+  }
 
   /** Returns the context, or null after writing the refusal. */
   async function admit(request: IncomingMessage, response: ServerResponse, rawPath: string) {
@@ -124,7 +147,7 @@ export function createMcpHandler(input: {
     const cookieToken = rawPath.startsWith("/cloud/") ? cookieValue(request, SESSION_COOKIE) : null;
     const token = headerToken ?? cookieToken;
     if (!token) {
-      rpcError(response, 401, -32001, "Unauthorized", null, { "www-authenticate": "Bearer" });
+      rpcError(response, 401, -32001, "Unauthorized", null, { "www-authenticate": challenge(rawPath,false) });
       return null;
     }
     const forbidden = () => rpcError(response, 403, -32003, "Forbidden");
@@ -136,6 +159,25 @@ export function createMcpHandler(input: {
     if (headerToken?.startsWith("sh_wk_") && await apiTokens.authenticate(headerToken)) {
       forbidden();
       return null;
+    }
+    if (headerToken?.startsWith("mcp_at_") && oauthSessions) {
+      const resourcePath = resourceFor(rawPath);
+      const access = resourcePath ? await admitMcpOAuthBearer({sessions:oauthSessions,token:headerToken,resourcePath}) : null;
+      if (!access?.ok) {
+        const status = access?.status ?? 401;
+        rpcError(response,status,status===403?-32003:-32001,status===403?"Forbidden":"Unauthorized",null,{
+          "www-authenticate":challenge(rawPath,status!==403,status===403?[MCP_RELAY_SCOPE]:undefined),
+        });
+        return null;
+      }
+      const principal = access.connection.access.principal;
+      const workspace = await store.workspaceForUser(principal.workspaceId,principal.userId);
+      if (!workspace || workspace.organizationId !== principal.organizationId) {
+        rpcError(response,401,-32001,"Unauthorized",null,{"www-authenticate":challenge(rawPath,true)});
+        return null;
+      }
+      return {principal,workspace,authMode:"oauth" as McpAuthMode,token:headerToken,
+        provider:undefined as string|undefined,oauth:access.connection};
     }
     const principal = await store.authenticateAccessToken(token);
     // A Desktop provider credential (mcp:desktop child token) is honoured only
@@ -149,15 +191,15 @@ export function createMcpHandler(input: {
         return null;
       }
       return { principal: provider.principal, workspace, authMode: "cli_login" as McpAuthMode, token: headerToken!,
-        provider: provider.provider };
+        provider: provider.provider, oauth:undefined as McpOAuthConnection|undefined };
     }
     if (!principal) {
       rpcError(response, 401, -32001, "Unauthorized", null, {
-        "www-authenticate": headerToken ? 'Bearer error="invalid_token"' : "Bearer",
+        "www-authenticate": challenge(rawPath,Boolean(headerToken)),
       });
       return null;
     }
-    if (!principal.scopes.includes("cli:auth")) {
+    if (!principal.scopes.includes("cli:auth") || principal.pendingHandoff || principal.handoff) {
       forbidden();
       return null;
     }
@@ -173,7 +215,8 @@ export function createMcpHandler(input: {
     }
     const authMode: McpAuthMode = headerToken ? "cli_login" : "session";
     // The validated access token is used only for History reads, never exposed.
-    return { principal, workspace, authMode, token, provider: undefined as string | undefined };
+    return { principal, workspace, authMode, token, provider: undefined as string | undefined,
+      oauth:undefined as McpOAuthConnection|undefined };
   }
 
   return async function handle(
@@ -182,7 +225,7 @@ export function createMcpHandler(input: {
     path: string,
     method: string,
   ): Promise<boolean> {
-    if (path !== MCP_FACADE.path) return false;
+    if (path !== MCP_FACADE.path && !(oauthSessions && (path==="/mcp" || path==="/cloud/mcp"))) return false;
     if (method !== "POST") {
       rpcError(response, 405, -32000, "Method not allowed", null, { allow: "POST" });
       return true;
@@ -215,7 +258,7 @@ export function createMcpHandler(input: {
       return true;
     }
     const headers = webHeaders(request);
-    const { principal, workspace, authMode, token, provider } = admitted;
+    const { principal, workspace, authMode, token, provider, oauth } = admitted;
     let desktopCall;
     try {
       // Always strips `_agent_relay_attestation` from the arguments; a proof
@@ -241,6 +284,7 @@ export function createMcpHandler(input: {
       origin: citationOrigin,
       endpointUrl: `${site}${rawPath}`,
       desktopCall,
+      ...(oauth ? { oauth } : {}),
       readHistory: historyReader(config, principal, workspace, token),
       agentTokens: config.sessionSearchAgentTokens,
       members: async () => (await store.listMemberships(workspace.organizationId)).map((row): McpMember => ({
@@ -259,7 +303,7 @@ export function createMcpHandler(input: {
         client: relaycast,
         sessionId: typeof sessionId === "string" ? sessionId : undefined,
       },
-      ...(input.amp ? { amp: input.amp } : {}),
+      ...(!oauth && input.amp ? { amp: input.amp } : {}),
     };
 
     const server = buildMcpServer(context);

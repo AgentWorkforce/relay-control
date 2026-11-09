@@ -85,3 +85,21 @@ test("invalid, weak, duplicate, private or unbounded key configurations fail clo
     assert.throws(() => createMcpOidcIssuer({ ...configuration, previousPublicKeys }));
   }
 });
+
+
+test("operator JSON key ids must be strings and different kids cannot reuse RSA material", () => {
+  const publicJwk=pair.publicKey.export({ format:"jwk" });
+  for(const kid of [123,{},[],null]) {
+    assert.throws(()=>createMcpOidcIssuer({ ...configuration,previousPublicKeys:[{
+      kid:kid as unknown as string,publicJwk:previousPair.publicKey.export({ format:"jwk" }),expiresAt:"2026-01-02T00:00:00Z",
+    }] }),/key id/);
+  }
+  assert.throws(()=>createMcpOidcIssuer({ ...configuration,previousPublicKeys:[{
+    kid:"fake-different-id",publicJwk,expiresAt:"2026-01-02T00:00:00Z",
+  }] }),/material/);
+  const previous=previousPair.publicKey.export({ format:"jwk" });
+  assert.throws(()=>createMcpOidcIssuer({ ...configuration,previousPublicKeys:[
+    { kid:"fake-one",publicJwk:previous,expiresAt:"2026-01-02T00:00:00Z" },
+    { kid:"fake-two",publicJwk:previous,expiresAt:"2026-01-02T00:00:00Z" },
+  ] }),/material/);
+});

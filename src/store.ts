@@ -388,8 +388,8 @@ export class ControlPlaneStore {
    * Deletes a workspace of this organization. Foreign keys cascade its
    * sessions, tokens, credentials, flows and workspace-scoped audit events;
    * the deletion itself is recorded at organization level so it outlives them.
-   * A Factory connection or binding restricts the delete until it is torn
-   * down. The organization's rows are locked so two concurrent deletes cannot
+   * Factory connections/bindings and live MCP OAuth grants or pending cleanup
+   * restrict deletion until teardown finishes. The organization's rows are locked so two concurrent deletes cannot
    * both pass the last-workspace check. The Relaycast workspace is not touched.
    */
   async deleteWorkspace(input: {
@@ -407,6 +407,15 @@ export class ControlPlaneStore {
         const target = rows.rows.find((row) => row.id === input.workspaceId);
         if (!target) return "not_found";
         if (rows.rows.length === 1 && !input.allowLast) return "last_workspace";
+        // Keep the workspace key/location until connector cleanup commits.
+        // The workspace row lock also fences a new grant's FK insertion;
+        // revocation alone must not let CASCADE discard pending remote work.
+        const oauth = await tx.query(`SELECT 1 FROM selfhost_mcp_oauth_grants
+          WHERE organization_id=$1 AND workspace_id=$2 AND revoked_at IS NULL
+          UNION ALL SELECT 1 FROM selfhost_mcp_oauth_revocations
+          WHERE organization_id=$1 AND workspace_id=$2 AND completed_at IS NULL
+          LIMIT 1`, [input.organizationId,input.workspaceId]);
+        if (oauth.rows.length) return "in_use";
         await tx.query("DELETE FROM selfhost_workspaces WHERE id = $1 AND organization_id = $2", [
           input.workspaceId,
           input.organizationId,
@@ -529,10 +538,10 @@ export class ControlPlaneStore {
   }
 
   /**
-   * Removes a membership (never the last owner). `beforeCommit` runs inside
-   * the same transaction only when a row was deleted, so dependent grants
-   * (Amp bindings and connections, Factory bindings) are purged atomically
-   * with the membership.
+   * `beforeCommit` runs in the removal transaction after deletion (or an
+   * already-absent retry), with user->org locks held. A failure rolls back
+   * membership and dependent cleanup together. A remaining last owner never
+   * invokes cleanup.
    */
   async deleteMembership(
     organizationId: string,
@@ -540,6 +549,9 @@ export class ControlPlaneStore {
     beforeCommit?: (tx: SqlExecutor, member: { organizationId: string; userId: string }) => Promise<void>,
   ): Promise<boolean> {
     return this.database.transaction(async (tx) => {
+      // Consent/refresh and rejoin use this same order, before any membership row lock.
+      await lockUser(tx, userId);
+      await lockOrganization(tx, organizationId);
       await this.requireOrganization(tx, organizationId);
       const result = await tx.query<{ user_id: string }>(
         `DELETE FROM selfhost_organization_memberships
@@ -552,9 +564,14 @@ export class ControlPlaneStore {
           RETURNING user_id`,
         [organizationId, userId],
       );
-      if (result.rows.length !== 1) return false;
-      await beforeCommit?.(tx, { organizationId, userId });
-      return true;
+      const deleted=result.rows.length===1;
+      // An idempotent retry can repair credentials from an earlier departure;
+      // never invoke the hook when a remaining last-owner row blocks deletion.
+      if (deleted || !(await tx.query("SELECT user_id FROM selfhost_organization_memberships WHERE organization_id=$1 AND user_id=$2",
+        [organizationId,userId])).rows.length) {
+        await beforeCommit?.(tx, { organizationId, userId });
+      }
+      return deleted;
     });
   }
 

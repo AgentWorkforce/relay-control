@@ -6,6 +6,7 @@ import { PostgresDatabase,type Database,type SqlExecutor } from "../src/database
 import { migrate } from "../src/migrations.js";
 import { createMcpOAuthProtocol,pkceS256 } from "../src/mcp/oauth/protocol.js";
 import { McpOAuthStore } from "../src/mcp/oauth/store.js";
+import { admitMcpOAuthBearer,McpOAuthAccessRefused } from "../src/mcp/oauth/admission.js";
 
 const postgresUrl=process.env.TEST_DATABASE_URL;
 const options={ skip:postgresUrl?false:"TEST_DATABASE_URL is not set (OAuth multi-connection proof)",timeout:60_000 };
@@ -84,4 +85,34 @@ test("real Postgres: code issuance fences native membership deletion with a row 
   const result=await outcome; if("error" in result) throw result.error;
   await f.database.query("DELETE FROM selfhost_organization_memberships WHERE organization_id=$1 AND user_id=$2",[f.owner.organizationId,f.owner.userId]);
   assert.equal((await f.exchange(result.code)).ok,false);
+});
+
+test("real Postgres: admitted actor pin fence and grant revocation serialize across connections",options,async t=>{
+  const f=await fixture(t),code=await f.store.createMcpOAuthAuthorizationCode(f.request,f.owner);
+  const issued=await f.exchange(code);assert.ok(issued.ok);
+  const admitted=await admitMcpOAuthBearer({sessions:f.store.sessions,token:issued.body.access_token,resourcePath:SHARED});
+  assert.ok(admitted.ok);
+  let notify!:()=>void,release!:()=>void;
+  const locked=new Promise<void>(resolve=>{notify=resolve;});
+  const released=new Promise<void>(resolve=>{release=resolve;});
+  const actor=f.database.transaction(async tx=>{
+    await admitted.connection.lock(tx);notify();await released;
+  });
+  const holding=actor.then(()=>({ok:true as const}),error=>({ok:false as const,error}));
+  const bounded:Database={
+    query:f.database.query.bind(f.database),exec:f.database.exec.bind(f.database),close:async()=>{},
+    transaction:run=>f.database.transaction(async tx=>{
+      await tx.query("SET LOCAL lock_timeout='150ms'");return run(tx);
+    }),
+  };
+  const competing=new McpOAuthStore(bounded,f.storeOptions);
+  try {
+    await Promise.race([locked,holding.then(value=>{if(!value.ok)throw value.error;throw new Error("missing actor fence");})]);
+    await assert.rejects(competing.revokeMcpOAuthGrant(admitted.connection.access.grantId,"fake-disconnect"),
+      (error:unknown)=>typeof error==="object" && error!==null && "code" in error && error.code==="55P03");
+  } finally {release();}
+  const held=await holding;if(!held.ok)throw held.error;
+  await f.store.revokeMcpOAuthGrant(admitted.connection.access.grantId,"fake-disconnect");
+  assert.equal(await f.store.sessions.resolveAccessToken(issued.body.access_token,f.request.resource),null);
+  await assert.rejects(f.database.transaction(tx=>admitted.connection.lock(tx)),McpOAuthAccessRefused);
 });
