@@ -445,7 +445,8 @@ through `POST /internal/v1/auth/introspect`, authenticated with
 session, so removing a member, revoking a session or refreshing the token
 takes effect on the service's next check; refresh, bootstrap and worker
 tokens, and every workspace API token other than a relayfile agent or
-acquisition operator token (below), are always reported as `wrong-kind`. See
+acquisition operator token (below), are always reported as `wrong-kind` (an
+`sh_wk_` that matches no token is `unknown`). See
 [RelayAuth and RelayHistory](../README.md#relayauth-and-relayhistory).
 `GET /readyz` lists the accepted audiences (`introspection.audiences`, empty
 while introspection is disabled), so a scheme or port mismatch shows up there
@@ -493,7 +494,8 @@ the token's workspace, organization and scopes, `aud` (the stored audience),
 `iat` (mint time) and `exp`. `exp` is the token's own expiry when it has one;
 a token that never expires gets `now + 3600` recomputed on every call, so a
 caller may cache an answer for at most an hour and revocation takes effect on
-its next check. Inactive reasons: any other `sh_wk_` token is `wrong-kind`;
+its next check. Inactive reasons: an `sh_wk_` with no such token is
+`unknown`; any other `sh_wk_` token is `wrong-kind`;
 then `revoked`, `expired`, `audience` (the request `aud` must normalize to the
 token's stored `aud`), `workspace` (same rule as for users), and any `machine`
 is `machine_not_owned`, since an agent token is not a computer.

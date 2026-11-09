@@ -257,7 +257,7 @@ test("introspection inactive reasons for workspace API tokens", async (t) => {
     }
   };
 
-  // Another purpose, or no such token: wrong-kind, whatever else is asked.
+  // Another purpose: wrong-kind, whatever else is asked; no such token: unknown.
   for (const purpose of ["deployment", "workflow", "agent-runtime"]) {
     const other = await ctx.mint({ label: purpose, purpose, ...(purpose === "workflow" ? { neverExpires: true } : {}) });
     assert.equal(other.status, 201);
@@ -265,7 +265,7 @@ test("introspection inactive reasons for workspace API tokens", async (t) => {
     await request(ctx.origin, `${ctx.base}/${other.body.id}`, { method: "DELETE", token: ctx.owner });
     await inactive({ token: other.body.accessToken, aud: FILES }, "wrong-kind");
   }
-  await inactive({ token: "sh_wk_not-a-token", aud: FILES }, "wrong-kind");
+  await inactive({ token: "sh_wk_not-a-token", aud: FILES }, "unknown");
 
   await inactive({ token: agent.accessToken, aud: HISTORY }, "audience");
   await inactive({ token: agent.accessToken, aud: "https://elsewhere.test" }, "audience");

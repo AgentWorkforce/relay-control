@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { decryptSecret, encryptSecret } from "../crypto.js";
 import type { SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RosterAgent } from "../messaging/relaycast.js";
+import { DesktopIdentityUnavailable, DESKTOP_IDENTITY_MESSAGES, linkedDesktopIdentity } from "../messaging/desktop-identities.js";
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
 
@@ -14,10 +15,16 @@ import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
  * (`as`). The server keeps no state between requests: every call looks the
  * participant up again, verifies that the remote agent still carries this
  * owner's metadata, and serializes join/leave per owner with a Postgres
- * advisory lock. A desktop chat's native session context is not an identity
- * here: Cloud would act as the linked Desktop identity, which self-host
- * cannot link yet, so every caller acts as a hosted participant. Desktop-linked identities, person sends (`as_person`), OAuth
- * grants, events inboxes, launches and Capy are not part of self-host.
+ * advisory lock.
+ *
+ * Managed (Desktop provider) calls: a request admitted with a `mcp:desktop`
+ * provider credential acts only as the Desktop identity synced for its
+ * verified native chat (a Copilot chat named by a verified attestation). No
+ * verified chat, or no matching synced identity, means the actor tools are
+ * unavailable; they never fall back to a hosted participant.
+ * Other callers act as hosted participants; their native session context is
+ * not an identity here. Person sends (`as_person`), OAuth grants, events
+ * inboxes, launches and Capy are not part of self-host.
  */
 
 export class RelayToolError extends Error {
@@ -37,6 +44,9 @@ const AS_PERSON_UNAVAILABLE =
 
 export const RELAY_COORDINATION_GUIDANCE = "DM a specific agent by default. Use channels only to coordinate a larger swarm or broadcast to many agents, and subscribe only to channels you need. Reply to a channel post in that channel with post_relay_channel (thread_id for its thread), not by DM, unless the reply is private. At task start, check list_relay_agents and DM peers whose work your task affects, without waiting to be asked.";
 export const HOSTED_REPLY_GUIDANCE = "replies arrive in check_relay_inbox; poll it";
+export const DESKTOP_REPLY_GUIDANCE = "replies will be injected into your session by Agent Relay Desktop";
+export const MANAGED_AS_REFUSED = "This managed chat can only act as its verified desktop identity.";
+export const MANAGED_JOIN_REFUSED = "This chat can only use its verified desktop identity.";
 /** Cloud's DESKTOP_RELAY_GUIDANCE, adapted: self-host cannot link a desktop identity yet. */
 export const DESKTOP_RELAY_GUIDANCE = "This self-hosted site does not link Agent Relay Desktop identities yet: this MCP session messages as its hosted participant, and replies arrive in check_relay_inbox.";
 /** Cloud's UNLINKED_CHANNEL_GUIDANCE without the desktop link, which self-host does not offer. */
@@ -57,6 +67,7 @@ export function normalizeChannelName(channel: string): string {
 }
 const channelReplyHint = (channel: string, threadId: string) => `post_relay_channel channel=${channel} thread_id=${threadId}`;
 const hostedChannelDelivery = (channel: string) => `Posts in #${channel} will arrive in check_relay_inbox; poll it.`;
+const desktopChannelDelivery = (channel: string) => `Posts in #${channel} will be injected into this session by Agent Relay Desktop.`;
 
 function automaticParticipantName(user: { name: string; email: string }, sessionHash: string): string {
   const label = user.name.trim() || user.email.split("@")[0] || "agent";
@@ -212,6 +223,37 @@ export function relayService(context: McpContext) {
   const relayWorkspaceId = context.workspace.relaycastWorkspaceId;
   const sessionHash = sessionId ? ownerHash(sessionId) : null;
   const owner = ownerHash(userId);
+  const desktopCall = context.desktopCall;
+  /** A Desktop-provider credential: only the verified native chat's identity may act. */
+  const managed = desktopCall.provider !== undefined;
+  const linkedKind = managed ? "desktop" as const : "hosted" as const;
+  const channelDelivery = managed ? desktopChannelDelivery : hostedChannelDelivery;
+  let linked: Promise<{ name: string; address: string; token: string }> | undefined;
+
+  /** The synced Desktop identity of this call's verified native chat; throws when there is none. */
+  function desktop() {
+    linked ??= (async () => {
+      if (!desktopCall.nativeSession) throw new RelayToolError(DESKTOP_IDENTITY_MESSAGES.unverified);
+      try {
+        return await linkedDesktopIdentity({
+          database, keyring, client, workspaceId, userId, relaycastWorkspaceId: relayWorkspaceId,
+          nativeSession: desktopCall.nativeSession, sourceId: desktopCall.nativeSourceId,
+        });
+      } catch (error) {
+        if (error instanceof DesktopIdentityUnavailable) throw new RelayToolError(error.message);
+        throw error;
+      }
+    })();
+    return linked;
+  }
+
+  /** Managed calls cannot choose another actor. */
+  async function managedActorOnly(as?: string, alternate = false) {
+    if (managed && (as || alternate)) {
+      await desktop();
+      throw new RelayToolError(MANAGED_AS_REFUSED);
+    }
+  }
 
   /** Serializes join and leave for this owner in Postgres; every store access inside uses `tx`. */
   function withOwnerLock<T>(run: (tx: SqlExecutor) => Promise<T>): Promise<T> {
@@ -375,6 +417,14 @@ export function relayService(context: McpContext) {
   }
 
   async function join(input: { name?: string; description?: string; desktop_address?: string }) {
+    if (managed) {
+      const identity = await desktop();
+      if (input.name || input.description || (input.desktop_address && input.desktop_address !== identity.address)) {
+        throw new RelayToolError(MANAGED_JOIN_REFUSED);
+      }
+      return { joined: true, linked: "desktop" as const, name: identity.name, address: identity.address,
+        already_joined: true, reply_guidance: DESKTOP_REPLY_GUIDANCE };
+    }
     if (input.desktop_address) throw new RelayToolError(DESKTOP_ADDRESS_UNAVAILABLE);
     if (!sessionHash && !input.name) {
       throw new RelayToolError("Initialize MCP to receive Mcp-Session-Id, or pass an explicit name and use as on later calls.");
@@ -405,7 +455,11 @@ export function relayService(context: McpContext) {
   }
 
   /** The participant `as` names, else this session's, auto-joining this session when it has none. */
-  async function hostedActor<T>(as: string | undefined, fn: (identity: Hosted) => Promise<T>): Promise<T> {
+  async function hostedActor<T>(as: string | undefined, fn: (identity: Identity) => Promise<T>): Promise<T> {
+    if (managed) {
+      await managedActorOnly(as);
+      return fn(await desktop());
+    }
     let hosted = await participant(as);
     if (!hosted) {
       await join({});
@@ -422,10 +476,14 @@ export function relayService(context: McpContext) {
    * when `create`. Unchosen, `unlinked` decides: "error" throws, "none" acts
    * as nobody.
    */
-  async function channelActor<T>(input: ChannelInput, create: boolean, fn: (identity: Hosted) => Promise<T>,
+  async function channelActor<T>(input: ChannelInput, create: boolean, fn: (identity: Identity) => Promise<T>,
     unlinked: "error" | "none" = "error"): Promise<T | null> {
     if (input.as_person && input.as) throw new RelayToolError("Choose either as_person or as, not both.");
     if (input.hosted && (input.as_person || input.as)) throw new RelayToolError("Choose one of hosted, as or as_person.");
+    if (managed) {
+      await managedActorOnly(input.as, Boolean(input.hosted || input.as_person));
+      return fn(await desktop());
+    }
     if (input.as_person) throw new RelayToolError(AS_PERSON_UNAVAILABLE);
     if (!input.as) {
       const chosen = input.hosted || (sessionHash && await findParticipant(database, workspaceId, userId, { sessionHash }));
@@ -463,6 +521,11 @@ export function relayService(context: McpContext) {
     join,
 
     async leave(as?: string) {
+      if (managed) {
+        await managedActorOnly(as);
+        await desktop();
+        return { joined: false, desktop_agent_unchanged: true, native_chat_identity_retained: true };
+      }
       return withOwnerLock(async (tx) => {
         // Release uses the workspace key, so a rejected token can still leave.
         const hosted = await participant(as, { allowGone: true, allowRejected: true, executor: tx });
@@ -481,6 +544,12 @@ export function relayService(context: McpContext) {
     },
 
     async status(as?: string) {
+      if (managed) {
+        await managedActorOnly(as);
+        const identity = await desktop();
+        return { joined: true, linked: "desktop" as const, name: identity.name, address: identity.address,
+          unread_count: null, guidance: DESKTOP_REPLY_GUIDANCE };
+      }
       const hosted = await participant(as);
       if (!hosted) return { joined: false, name: null, address: null, unread_count: 0,
         guidance: "Send a message with send_relay_message to auto-join this MCP session, or call join_relay first." };
@@ -491,6 +560,13 @@ export function relayService(context: McpContext) {
     },
 
     async inbox(as: string | undefined, acknowledge: string[]) {
+      if (managed) {
+        await managedActorOnly(as);
+        const identity = await desktop();
+        return { linked: "desktop" as const, name: identity.name, address: identity.address, messages: [],
+          polling_needed: false,
+          guidance: "Replies are injected into your session by Agent Relay Desktop; check_relay_inbox is not used for this linked identity." };
+      }
       const hosted = await participant(as);
       if (!hosted) throw new RelayToolError("No hosted participant is bound to this MCP session. Send a message with send_relay_message to auto-join, or call join_relay first.");
       await touchPresence(hosted.token);
@@ -535,6 +611,7 @@ export function relayService(context: McpContext) {
     async send(input: { to: string; text: string; reply_to?: string; as?: string; as_person?: boolean; idempotency_key?: string },
       serverIdempotencyKey: string = randomUUID()) {
       if (input.as_person && input.as) throw new RelayToolError("Choose either as_person or as, not both.");
+      await managedActorOnly(input.as, Boolean(input.as_person));
       if (input.as_person) throw new RelayToolError(AS_PERSON_UNAVAILABLE);
       // The recipient is validated before any identity is joined, so an
       // unknown recipient never leaves a participant behind.
@@ -572,7 +649,8 @@ export function relayService(context: McpContext) {
           message_id: sent.message.id, conversation_id: sent.conversationId, idempotency_key: responseIdempotencyKey,
           delivery: peer.online ? "queued_unconfirmed" : "queued_offline",
           note: "Accepted by Relaycast; delivery and reading are not confirmed.",
-          reply_guidance: HOSTED_REPLY_GUIDANCE, desktop_relay_guidance: DESKTOP_RELAY_GUIDANCE };
+          ...(managed ? { reply_guidance: DESKTOP_REPLY_GUIDANCE }
+            : { reply_guidance: HOSTED_REPLY_GUIDANCE, desktop_relay_guidance: DESKTOP_RELAY_GUIDANCE }) };
       });
     },
 
@@ -580,7 +658,8 @@ export function relayService(context: McpContext) {
       // Names resolve within the actor's own DMs; only a machine address needs a lookup.
       const peerName = input.agent.includes("@") ? (await explicitAgent(input.agent))?.name : input.agent;
       if (!peerName) throw new RelayToolError("Unknown or stale machine address in this workspace.");
-      const hosted = await participant(input.as);
+      await managedActorOnly(input.as);
+      const hosted: Identity | null = managed ? await desktop() : await participant(input.as);
       if (!hosted) return { you: null, conversation_id: null, messages: [], earlier: null };
       await touchPresence(hosted.token);
       const conv = await conversation(hosted.token, hosted.name, peerName);
@@ -604,9 +683,9 @@ export function relayService(context: McpContext) {
         acted = true;
         return { you: identity.name, ids: new Set((await client.authenticatedAgent(identity.token)).channels.map(row => row.id)) };
       }, "none")]);
-      const unlinked = !acted && !input.as && !input.hosted &&
+      const unlinked = !managed && !acted && !input.as && !input.hosted &&
         !(sessionHash && await findParticipant(database, workspaceId, userId, { sessionHash }));
-      return { you: mine?.you ?? null, linked: mine ? "hosted" as const : null,
+      return { you: mine?.you ?? null, linked: mine ? linkedKind : null,
         ...(unlinked ? { note: UNLINKED_CHANNEL_GUIDANCE } : {}),
         channels: channels.filter(channel => !channel.archived && !channel.name.startsWith(RESERVED_CHANNEL_PREFIX)).map(channel => ({
           name: channel.name, topic: channel.topic, member_count: channel.memberCount, subscribed: mine?.ids.has(channel.id) ?? false })),
@@ -633,8 +712,8 @@ export function relayService(context: McpContext) {
             alreadySubscribed = (await client.joinChannel(identity.token, channel)).alreadyMember;
           }
         }
-        return { subscribed: true, channel, you: identity.name, linked: "hosted" as const, created,
-          already_subscribed: alreadySubscribed, delivery: hostedChannelDelivery(channel), reply_guidance: CHANNEL_REPLY_GUIDANCE };
+        return { subscribed: true, channel, you: identity.name, linked: linkedKind, created,
+          already_subscribed: alreadySubscribed, delivery: channelDelivery(channel), reply_guidance: CHANNEL_REPLY_GUIDANCE };
       }))!;
     },
 
@@ -668,10 +747,10 @@ export function relayService(context: McpContext) {
         } else {
           messageId = (await client.postChannelMessage({ token: identity.token, channel, text: input.text, idempotencyKey })).id;
         }
-        return { from: identity.name, channel, linked: "hosted" as const, message_id: messageId, thread_id: threadId,
+        return { from: identity.name, channel, linked: linkedKind, message_id: messageId, thread_id: threadId,
           idempotency_key: responseIdempotencyKey,
           note: "Accepted by Relaycast and delivered to the channel's subscribers; reading is not confirmed.",
-          reply_guidance: `${hostedChannelDelivery(channel)} Continue this thread with ${channelReplyHint(channel, threadId ?? messageId)}.` };
+          reply_guidance: `${channelDelivery(channel)} Continue this thread with ${channelReplyHint(channel, threadId ?? messageId)}.` };
       })) ?? notSubscribed(channel);
     },
 

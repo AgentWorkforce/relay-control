@@ -44,6 +44,11 @@ Included:
   `describe_capabilities`): Amp, Factory, Copilot, Capy, Replicas, Dot and Grok
   Bot descriptors with separate `implemented`/`configured`/`enabled` runtime
   states (all false until a build injects `providerProbes` into `createApp`).
+- Copilot in VS Code through Agent Relay Desktop: provider MCP credentials
+  (`/api/v1/workspaces/{ws}/mcp/shared-sessions-tokens`), Desktop identity
+  sync (`.../messaging/desktop-identities`) and Ed25519-attested Copilot tool
+  calls that act as the chat's own Desktop identity. No environment variables;
+  see [docs/integrations/copilot-vscode.md](docs/integrations/copilot-vscode.md)
 
 Explicitly absent: billing, fleet, and Relayfile.
 
@@ -82,6 +87,11 @@ is explicit. RelayAuth is optional: see
 | `RELAYAUTH_API_KEY` | Optional, set together with `RELAYAUTH_URL` (`_FILE` supported). Key allowed to mint RelayHistory assertions |
 | `RELAYCONTROL_INTROSPECT_SECRET` | Optional, at least 32 bytes (`_FILE` supported). Bearer for `POST /internal/v1/auth/introspect`, shared only with RelayHistory (and relayfile). Unset: that route answers 404 |
 | `SELFHOST_INTROSPECT_AUDIENCES` | Optional comma-separated http(s) origins a token may be introspected for, default `RELAYHISTORY_PUBLIC_URL`. Matched as normalized origins (scheme, lowercase host, port); `GET /readyz` lists them under `introspection.audiences` |
+| `SELFHOST_ACQUISITION_ISSUER_ENABLED` | Optional, default off (`true`/`false`). Turns on the dormant cloud-class acquisition assertion issuer ([docs/acquisition-issuer.md](docs/acquisition-issuer.md)); off, no other issuer variable is read and `/api/v1/acquisition/*` answers 404 |
+| `SELFHOST_ACQUISITION_ORIGIN` | Required when the issuer is enabled. The pipeline's `ACQUISITION_ORIGIN`; must also be listed in `SELFHOST_INTROSPECT_AUDIENCES` |
+| `SELFHOST_ACQUISITION_ISSUER_KEY_ID` | Required when the issuer is enabled. The `issuerKeyId` published and stamped into every assertion |
+| `SELFHOST_ACQUISITION_ISSUER_PRIVATE_KEY` | Required when the issuer is enabled (`_FILE` supported). Unencrypted PKCS#8 PEM Ed25519 key |
+| `SELFHOST_ACQUISITION_ISSUER_PREVIOUS_PUBLIC_KEYS` | Optional. JSON array of `{issuerKeyId, publicKeyBase64}` still published during a key rotation |
 | `SELFHOST_BOOTSTRAP_TOKEN` | At least 32 bytes; initial management bearer |
 | `SELFHOST_ENCRYPTION_KEY_ID` | 1-64 URL-safe characters; stamped into each new ciphertext |
 | `SELFHOST_ENCRYPTION_KEY` | Exactly 32 bytes encoded as 64 hex chars or base64 |

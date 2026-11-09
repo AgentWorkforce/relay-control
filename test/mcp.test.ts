@@ -322,7 +322,11 @@ test("initialize advertises the self-host server and the nineteen tools on both 
     assert.equal(raw.headers.get("cache-control"), "no-store");
     assert.match(raw.headers.get("mcp-session-id") ?? "", /^[A-Za-z0-9_-]{1,128}$/);
     assert.deepEqual(raw.body.result.serverInfo, { name: "agent-relay-selfhost", title: "Agent Relay Sessions", version: "0.1.0" });
-    assert.deepEqual(raw.body.result.capabilities.experimental, { "com.agentrelay/native-session-identity": { version: 1 } });
+    assert.deepEqual(raw.body.result.capabilities.experimental, {
+      "com.agentrelay/native-session-identity": { version: 1 },
+      "com.agentrelay/copilot-session-attestation": { version: 1 },
+      "com.agentrelay/desktop-provider-credentials": { version: 1, leaseSeconds: 900 },
+    });
     assert.equal(typeof raw.body.result.instructions, "string");
 
     const client = await connect(t, `${env.origin}${path}`, { authorization: `Bearer ${env.accessToken}` });

@@ -31,8 +31,9 @@ import { NODE_ID_PATTERN, type ControlPlaneStore, type Principal } from "../stor
  * - 200 for every well-formed authenticated request; inactive answers carry
  *   only `{active:false, reason}`.
  * - Relayfile agent tokens (v1.3): a workspace API token (`sh_wk_`) is
- *   accepted only when its purpose is `relayfile-agent`; every other `sh_wk_`
- *   (unknown, other purpose, revoked or not) is `wrong-kind`. Then `revoked`,
+ *   accepted only when its purpose is `relayfile-agent`; one with no such
+ *   record is `unknown`, every other `sh_wk_` (other purpose, revoked or not)
+ *   is `wrong-kind`. Then `revoked`,
  *   `expired`, `audience` (the request aud must normalize to the token's
  *   stored aud, which must still be an accepted audience) and `workspace` as
  *   for users. An agent has no machine: any `machine` is `machine_not_owned`.
@@ -56,7 +57,7 @@ import { NODE_ID_PATTERN, type ControlPlaneStore, type Principal } from "../stor
 export const INTROSPECT_PATH = "/internal/v1/auth/introspect";
 export const INTROSPECT_BODY_LIMIT = 16 * 1024;
 const USER_ACCESS_TOKEN_PREFIX = "sh_at_";
-const WORKSPACE_API_TOKEN_PREFIX = "sh_wk_";
+export const WORKSPACE_API_TOKEN_PREFIX = "sh_wk_";
 /** `exp` horizon for an agent token without an expiry, from each call. */
 export const AGENT_TOKEN_EXP_WINDOW_SECONDS = 3_600;
 
@@ -230,7 +231,8 @@ async function introspectWorkspaceApiToken(
   request: IntrospectionRequest,
 ): Promise<IntrospectionResult> {
   const token = apiTokens ? await apiTokens.introspect(request.token) : null;
-  if (!token?.aud) return { active: false, reason: "wrong-kind" };
+  if (!token) return { active: false, reason: "unknown" };
+  if (!token.aud) return { active: false, reason: "wrong-kind" };
   const kind = token.purpose === "relayfile-agent" && token.agentName
     ? "agent"
     : token.purpose === "acquisition-operator"
