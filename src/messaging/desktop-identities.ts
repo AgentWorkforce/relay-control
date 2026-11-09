@@ -391,6 +391,20 @@ export async function findDesktopIdentityByAddress(
   return result.rows[0] ? identityRow(result.rows[0]) : null;
 }
 
+/** This owner's newest synced identity with an exact agent name, for the alias hint when an address misses. */
+export async function findDesktopIdentityByName(
+  database: SqlExecutor, workspaceId: string, userId: string, name: string,
+): Promise<DesktopIdentityRow | null> {
+  const result = await database.query(
+    `SELECT ${IDENTITY_COLUMNS} FROM desktop_relay_identities i
+      WHERE i.workspace_id = $1 AND i.user_id = $2 AND i.agent_name = $3
+      ORDER BY i.updated_at DESC, i.id
+      LIMIT 1`,
+    [workspaceId, userId, name],
+  );
+  return result.rows[0] ? identityRow(result.rows[0]) : null;
+}
+
 /** The synced identity a hosted MCP session (by the hash of its Mcp-Session-Id) is linked to. */
 export async function findDesktopIdentityBySession(
   database: SqlExecutor, workspaceId: string, userId: string, sessionHash: string,

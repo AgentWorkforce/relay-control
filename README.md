@@ -37,9 +37,10 @@ Included:
   and presence plus RelayHistory; no running flows), relay messaging (DMs,
   inbox and channels as a hosted Relaycast participant per MCP session or
   `join_relay` name, kept in `hosted_relay_participants`), and
-  capability discovery tool groups. `join_relay desktop_address` (the address
-  from `GET /whoami` on the local relay socket, or an injected `[reply: ...]`
-  hint) links the MCP session to a synced Agent Relay Desktop identity, kept in
+  capability discovery tool groups. `join_relay desktop_address` (the direct
+  `name@machine` address Desktop syncs, as shown by `GET /whoami` on the local
+  relay socket or an injected `[reply: ...]` hint; an alias address is refused
+  with the direct one named) links the MCP session to a synced Agent Relay Desktop identity, kept in
   `desktop_relay_session_bindings`: DMs, channel posts, `relay_status` and
   `check_relay_inbox` then act as that identity and replies are injected by
   Desktop, while the hosted participant stays the fallback inbox. Hosted

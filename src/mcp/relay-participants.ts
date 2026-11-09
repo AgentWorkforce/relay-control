@@ -4,7 +4,7 @@ import type { SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RosterAgent } from "../messaging/relaycast.js";
 import {
   bindDesktopSession, DesktopIdentityUnavailable, DESKTOP_IDENTITY_MESSAGES, findDesktopIdentityByAddress,
-  findDesktopIdentityBySession, linkedDesktopIdentity, unbindDesktopSession, verifyDesktopIdentity,
+  findDesktopIdentityByName, findDesktopIdentityBySession, linkedDesktopIdentity, unbindDesktopSession, verifyDesktopIdentity,
   type DesktopIdentityRow, type LinkedDesktopIdentity,
 } from "../messaging/desktop-identities.js";
 import type { McpContext, McpMember } from "./context.js";
@@ -60,6 +60,9 @@ export const MANAGED_JOIN_REFUSED = "This chat can only use its verified desktop
 export const DESKTOP_RELAY_GUIDANCE = "If this session receives Agent Relay messages with a `[reply: curl --unix-socket …]` hint or has a desktop address from GET /whoami, call join_relay with desktop_address first; DMs and subscribed channel posts are then injected.";
 export const UNLINKED_CHANNEL_GUIDANCE = "This MCP session is not linked to Agent Relay Desktop, so channel posts would not reach your local session. Call join_relay with desktop_address (from GET /whoami on the relay socket, or an injected Agent Relay message), then retry. To use this MCP session's hosted inbox instead (posts arrive in check_relay_inbox; poll it), pass hosted: true.";
 export const DESKTOP_NOT_SYNCED = "That desktop identity is not synced to your account in this workspace. Is Agent Relay Desktop running and signed in?";
+/** Desktop syncs the direct name@machine address; relay-node's whoami may show an alias instead. */
+const desktopAliasHint = (direct: string) =>
+  `That address is not the synced one. desktop_address is the direct name@machine address Agent Relay Desktop syncs, not an alias; use desktop_address "${direct}".`;
 const DESKTOP_LINK_FIELDS = "desktop_address cannot be combined with name or description.";
 const DESKTOP_LINK_NEEDS_SESSION = "Initialize MCP to receive Mcp-Session-Id before linking a desktop identity.";
 const DESKTOP_LINK_OAUTH = "This connection acts only as the agent approved for it and cannot link a desktop identity. Use a native MCP session (one that keeps Mcp-Session-Id) to call join_relay with desktop_address.";
@@ -555,7 +558,11 @@ function createRelayService(context: McpContext) {
     const owned = { workspaceId, userId, sessionHash: linkedSession };
     const joined = await withOwnerLock(async (tx) => {
       const row = await findDesktopIdentityByAddress(tx, workspaceId, userId, address);
-      if (!row) throw new RelayToolError(DESKTOP_NOT_SYNCED);
+      if (!row) {
+        const at = address.lastIndexOf("@");
+        const named = at > 0 ? await findDesktopIdentityByName(tx, workspaceId, userId, address.slice(0, at)) : null;
+        throw new RelayToolError(named ? desktopAliasHint(named.address) : DESKTOP_NOT_SYNCED);
+      }
       const identity = await verifiedDesktop(row);
       const current = await findDesktopIdentityBySession(tx, workspaceId, userId, linkedSession);
       const bind = async () => {

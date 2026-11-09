@@ -127,6 +127,9 @@ test("unknown, unsynced, other-workspace and another owner's addresses are refus
   assert.equal(await refused("nobody@nowhere"), NOT_SYNCED);
   // Address matching is exact: no case folding.
   assert.equal(await refused(f.address.toUpperCase()), NOT_SYNCED);
+  // An alias address of a synced agent names the direct address Desktop synced.
+  assert.equal(await refused("desk-chat@alias-host"),
+    `That address is not the synced one. desktop_address is the direct name@machine address Agent Relay Desktop syncs, not an alias; use desktop_address "${f.address}".`);
   // An owned Desktop agent that was never synced.
   const unsynced = f.env.world.addAgent("never-synced", { source: "relay-desktop", owner_hash: ownerHash(f.env.ownerId) });
   assert.equal(await refused(`never-synced@cloud-${unsynced.id}`), NOT_SYNCED);

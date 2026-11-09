@@ -79,7 +79,7 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
 
   server.registerTool("join_relay", {
     description: "Link this MCP session to your local Agent Relay Desktop identity with desktop_address (the address from GET /whoami on the relay socket, or from an injected `[reply: ...]` hint); later sends, channel posts and status then act as that identity, and replies are injected into your session by Desktop. Without desktop_address, create or reuse a hosted inbox participant as the fallback, named by name or a default derived from your name (replies arrive in check_relay_inbox). Either binding belongs to this MCP session, is idempotent, and replaces the other. Joining an existing participant whose relay token Relaycast rejects recovers the token (recovered: true).",
-    inputSchema: { desktop_address: z.string().trim().min(3).max(512).optional().describe("Exact synced Agent Relay Desktop identity address owned by the signed-in person (GET /whoami on the relay socket); cannot be combined with name or description."),
+    inputSchema: { desktop_address: z.string().trim().min(3).max(512).optional().describe("Exact synced Agent Relay Desktop identity address owned by the signed-in person: the direct name@machine address (GET /whoami on the relay socket), not an alias; cannot be combined with name or description."),
       name: name.optional(), description: z.string().trim().max(1000).optional() },
     annotations: { ...annotations, readOnlyHint: false, idempotentHint: true },
   }, input => run(service => service.join(input), "join"));
