@@ -6,6 +6,7 @@ import { clientIp, cookieRequestAllowed, limiterKey, RateLimiter, safeNextPath }
 import { emailDomain, type IdentityConfig } from "./config.js";
 import { inviteEmail, signInEmail, type Mailer } from "./mailer.js";
 import { OidcClient, OidcError, pkcePair, randomState } from "./oidc.js";
+import { cloudPathForNext } from "../auth/desktop-login.js";
 import { confirmEmailPage, loginPage, messagePage, PAGE_CSP, passwordLinkPage, type InviteBanner } from "./pages.js";
 import { IdentityError, IdentityStore, type Role } from "./store.js";
 import type { Database } from "../database.js";
@@ -189,6 +190,17 @@ export function createIdentityModule(input: {
   // PAGE_CSP loads no images: only /login gets one, from the logo's own origin.
   const coBrand = config.logoUrl ? { logoUrl: config.logoUrl, orgName: config.loginOrgName } : null;
   const loginCsp = config.logoUrl ? `${PAGE_CSP}; img-src ${new URL(config.logoUrl).origin}` : PAGE_CSP;
+  /**
+   * The dashboard's forgot-password and register pages, keeping where the
+   * person was going. A `next` under /api/v1 moves to /cloud/api/v1, the only
+   * mount a separate dashboard host routes to this service.
+   */
+  function passwordPageLinks(next: string, invite: string | null): { forgot: string; register: string } {
+    const query = new URLSearchParams({ next: cloudPathForNext(next) });
+    if (invite) query.set("invite", invite);
+    const base = input.dashboardUrl.replace(/\/+$/, "");
+    return { forgot: `${base}/#/forgot-password?${query}`, register: `${base}/#/register?${query}` };
+  }
   const emailLogin = config.emailLogin && mailer !== null;
   let passwordRoutes: PasswordRoutes | null = null;
   if (config.signinMethods.includes("password") && config.password && mailer) {
@@ -309,6 +321,7 @@ export function createIdentityModule(input: {
         oidc: oidc ? { displayName: oidc.config.displayName } : null,
         emailLogin,
         password: passwordRoutes !== null,
+        passwordLinks: passwordRoutes ? passwordPageLinks(next, invite) : null,
         // Only a password form can produce this redirect.
         notice: passwordRoutes !== null && url.searchParams.get("error") === "invalid_credentials"
           ? { kind: "error", text: "Incorrect email or password." }
