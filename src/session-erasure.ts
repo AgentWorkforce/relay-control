@@ -7,7 +7,8 @@ import type { Database } from "./database.js";
 type ErasureApi = NonNullable<SelfhostConfig["sessionErasureApi"]>;
 
 const MAX_RECEIPT_BYTES = 16_384;
-const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+const MAX_SESSION_ID = 512;
+const CONTROL = /[\u0000-\u001f\u007f]/;
 const code = z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/);
 const timestamp = z.iso.datetime({ offset: true });
 
@@ -15,7 +16,7 @@ const timestamp = z.iso.datetime({ offset: true });
 // ids, categories and numbers can be relayed to the operator.
 const receiptSchema = z.object({
   orgId: z.string().min(1).max(256),
-  sessionId: z.string().min(1).max(256),
+  sessionId: z.string().min(1).max(MAX_SESSION_ID),
   requestId: z.string().min(1).max(256),
   status: z.enum(["in_progress", "completed", "failed"]),
   requestedAt: timestamp,
@@ -48,8 +49,9 @@ export class SessionErasureError extends Error {
   }
 }
 
+/** Accepts every id the session read routes accept, so any readable session can be erased. */
 export function assertSessionId(sessionId: string): void {
-  if (!SESSION_ID.test(sessionId)) {
+  if (!sessionId.trim() || sessionId !== sessionId.trim() || sessionId.length > MAX_SESSION_ID || CONTROL.test(sessionId)) {
     throw new SessionErasureError(400, "invalid_session_id", "Session id is not valid");
   }
 }
@@ -165,7 +167,8 @@ type ErasureRow = {
 /**
  * Audits a completed erase exactly once, attributed to whoever first asked for
  * it, and returns the ledger's audit view. Safe to call on every read: the
- * `completed_at IS NULL` claim makes concurrent callers race for one insert.
+ * `completed_at IS NULL` claim makes concurrent callers race for one insert. A
+ * receipt for another request id is not this erase, so it is never audited as one.
  */
 async function withAudit(
   database: Database,
@@ -177,9 +180,9 @@ async function withAudit(
     if (receipt.status === "completed") {
       const claimed = await tx.query<ErasureRow>(
         `UPDATE selfhost_session_erasures SET completed_at = now()
-          WHERE organization_id = $1 AND session_id = $2 AND completed_at IS NULL
+          WHERE organization_id = $1 AND session_id = $2 AND completed_at IS NULL AND request_id::text = $3
           RETURNING request_id, actor_kind, actor_id, completed_at`,
-        [organizationId, sessionId],
+        [organizationId, sessionId, receipt.requestId],
       );
       const first = claimed.rows[0];
       if (first) {

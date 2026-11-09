@@ -7,6 +7,8 @@ import { close, listen, seedTenant, startControlPlane } from "./flows-helpers.js
 const SECRET = "session-erase-secret-that-is-at-least-32-bytes";
 const ORIGIN = "https://control.selfhosted.company";
 const SESSION = "ses_01-abc";
+/** Replaced by the fake pipeline with the request id Control last sent. */
+const ECHO_REQUEST = "echo-the-request-id";
 
 type Reply = { status: number; body: unknown };
 type Call = { method: string; path: string; authorization?: string; body: any };
@@ -14,6 +16,7 @@ type Call = { method: string; path: string; authorization?: string; body: any };
 async function fakePipeline(t: TestContext) {
   const calls: Call[] = [];
   const state: { reply: (call: Call) => Reply } = { reply: () => ({ status: 503, body: {} }) };
+  let requestId = "";
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -26,9 +29,13 @@ async function fakePipeline(t: TestContext) {
         body: text ? JSON.parse(text) : undefined,
       };
       calls.push(call);
+      if (call.body?.requestId) requestId = call.body.requestId;
       const reply = state.reply(call);
+      const echoed = (reply.body as { requestId?: string }).requestId === ECHO_REQUEST
+        ? { ...(reply.body as object), requestId }
+        : reply.body;
       response.writeHead(reply.status, { "content-type": "application/json" });
-      response.end(JSON.stringify(reply.body));
+      response.end(JSON.stringify(echoed));
     });
   });
   const url = await listen(server);
@@ -40,7 +47,7 @@ function receipt(orgId: string, overrides: Record<string, unknown> = {}) {
   return {
     orgId,
     sessionId: SESSION,
-    requestId: "pipeline-request",
+    requestId: ECHO_REQUEST,
     status: "completed",
     requestedAt: "2026-01-01T00:00:00.000Z",
     completedAt: "2026-01-01T00:00:03.000Z",
@@ -137,11 +144,13 @@ test("session hard delete: authorization, entitlement and CSRF gates reach no pi
   assert.equal(gated.body.error, "operator_controls_not_entitled");
   delete process.env.SELFHOST_OPERATOR_CONTROLS;
 
-  const invalid = await app.api(`/api/v1/organizations/${tenant.organizationId}/sessions/${encodeURIComponent("a b")}`, {
-    method: "DELETE", token: tenant.ownerToken,
-  });
-  assert.equal(invalid.status, 400);
-  assert.equal(invalid.body.error, "invalid_session_id");
+  for (const id of ["a\u0001b", " padded ", "x".repeat(513)]) {
+    const invalid = await app.api(`/api/v1/organizations/${tenant.organizationId}/sessions/${encodeURIComponent(id)}`, {
+      method: "DELETE", token: tenant.ownerToken,
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal(invalid.body.error, "invalid_session_id");
+  }
 
   assert.equal(pipeline.calls.length, 0);
 });
@@ -201,6 +210,27 @@ test("session hard delete never reports success it cannot prove", async (t) => {
   const content = await app.api(path, { method: "DELETE", token: tenant.ownerToken });
   assert.equal(content.status, 502);
   assert.doesNotMatch(JSON.stringify(content.body), /secret text/);
+});
+
+test("session hard delete reaches a session id containing a slash", async (t) => {
+  const { tenant, app, pipeline } = await setup(t);
+  const id = "agent/run:1";
+  pipeline.state.reply = () => ({ status: 200, body: receipt(tenant.organizationId, { sessionId: id }) });
+  const result = await app.api(`/api/v1/organizations/${tenant.organizationId}/sessions/${encodeURIComponent(id)}`, {
+    method: "DELETE", token: tenant.ownerToken,
+  });
+  assert.equal(result.status, 200);
+  assert.equal(pipeline.calls[0]!.path, `/internal/v1/session-erase/organizations/${tenant.organizationId}/sessions/agent%2Frun%3A1`);
+});
+
+test("session hard delete does not audit a receipt for a different request", async (t) => {
+  const { tenant, app, pipeline, path, audits } = await setup(t);
+  pipeline.state.reply = () => ({ status: 200, body: receipt(tenant.organizationId, { requestId: "someone-else" }) });
+  const result = await app.api(path, { method: "DELETE", token: tenant.ownerToken });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.requestId, "someone-else");
+  assert.equal(result.body.audit, null);
+  assert.deepEqual((await audits()).map((event) => event.action), ["session.hard_delete.requested"]);
 });
 
 test("session hard delete: unknown session is a 404 and leaves no erasure behind", async (t) => {

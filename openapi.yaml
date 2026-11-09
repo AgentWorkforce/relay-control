@@ -1327,7 +1327,7 @@ paths:
       - name: sessionId
         in: path
         required: true
-        schema: { type: string, maxLength: 256 }
+        schema: { type: string, maxLength: 512 }
     delete:
       operationId: hardDeleteSession
       description: |
@@ -1361,7 +1361,7 @@ paths:
       - name: sessionId
         in: path
         required: true
-        schema: { type: string, maxLength: 256 }
+        schema: { type: string, maxLength: 512 }
     get:
       operationId: getSessionErasure
       description: |
@@ -5321,28 +5321,26 @@ components:
         requestId: { type: string }
         status: { type: string, enum: [in_progress, completed, failed] }
         requestedAt: { type: string, format: date-time }
-        completedAt: { type: string, format: date-time, nullable: true }
+        completedAt: { type: [string, "null"], format: date-time }
         artifacts:
           type: object
           description: Erased item count per artifact category; never content.
           additionalProperties: { type: integer, minimum: 0 }
         uploadsFenced: { type: boolean }
         failure:
-          type: object
-          nullable: true
+          type: [object, "null"]
           additionalProperties: false
           required: [code]
           properties:
             code: { type: string }
         audit:
-          type: object
-          nullable: true
+          type: [object, "null"]
           additionalProperties: false
           required: [action, actorKind, actorId, recordedAt]
           properties:
             action: { type: string, enum: [session.hard_deleted] }
             actorKind: { type: string }
-            actorId: { type: string, nullable: true }
+            actorId: { type: [string, "null"] }
             recordedAt: { type: string, format: date-time }
     CapturePolicy:
       type: object
