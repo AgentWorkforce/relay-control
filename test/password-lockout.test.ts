@@ -139,6 +139,26 @@ test("argon2id slots: a sign-in that finds the slots full after its reservation 
   assert.equal((await login(ctx, "late@acme.test", PASSWORD)).status, 200);
 });
 
+test("argon2id slots: the start-up warm-up makes the dummy hash without taking a slot", async (t) => {
+  // A warm-up verify used to take a slot whenever its dummy hash finished,
+  // so under load it could refuse the next real request with 429.
+  class CountingSlots extends HashSlots {
+    acquired = 0;
+    override tryAcquire(): (() => void) | null {
+      this.acquired += 1;
+      return super.tryAcquire();
+    }
+  }
+  const slots = new CountingSlots(1);
+  const hasher = new PasswordHasher(passwordConfig(), { slots });
+  await setup(t, { passwordHasher: hasher });
+  // The same memoized hash the routes started; anything chained on it has run.
+  await hasher.warmUp();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(slots.acquired, 0, "the warm-up took no slot");
+  assert.equal(slots.available, 1);
+});
+
 test("lockout: 50 failures in an hour from many clients lock the account for 15 minutes and mail the owner once a day", async (t) => {
   const ctx = await setup(t);
   await registerVerified(ctx, "target@acme.test");

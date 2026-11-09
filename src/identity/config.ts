@@ -59,6 +59,12 @@ export type OidcConfig = {
   redirectUrl: string | null;
   /** Test-only: allow an http:// issuer (e.g. an in-cluster Dex). */
   allowHttpIssuer: boolean;
+  /**
+   * The operator named this issuer in
+   * SELFHOST_OIDC_TRUST_MISSING_EMAIL_VERIFIED_ISSUER: an id_token without
+   * email_verified counts as verified. An explicit false is still refused.
+   */
+  trustMissingEmailVerified: boolean;
 };
 
 export type SmtpConfig = {
@@ -278,6 +284,26 @@ function loadPassword(env: Env): PasswordConfig {
   return { argon2, peppers, currentPepperVersion: peppers[0]?.version ?? null, hibp: hibpRaw === "on" };
 }
 
+/** Microsoft sign-in hosts, where the first path segment selects the tenant. */
+const MICROSOFT_ISSUER_HOST = /(^|\.)(microsoftonline\.(com|us|cn)|chinacloudapi\.cn|windows\.net)$/i;
+/** Tenant selectors that admit accounts from outside one directory (the GUID is the personal-account tenant). */
+const MICROSOFT_SHARED_TENANT = /^\/(common|organizations|consumers|9188040d-6c67-4c5b-b112-36a304b66dad|%7Btenantid%7D)(\/|$)/i;
+
+/** Whether the operator named this exact, single-directory issuer. Throws on anything else. */
+function trustMissingEmailVerified(env: Env, issuer: string): boolean {
+  const named = env.SELFHOST_OIDC_TRUST_MISSING_EMAIL_VERIFIED_ISSUER?.trim();
+  if (!named) return false;
+  const normalized = named.replace(/\/+$/, "");
+  if (normalized !== issuer) {
+    throw new Error("SELFHOST_OIDC_TRUST_MISSING_EMAIL_VERIFIED_ISSUER must equal SELFHOST_OIDC_ISSUER");
+  }
+  const url = new URL(normalized);
+  if (MICROSOFT_ISSUER_HOST.test(url.hostname) && MICROSOFT_SHARED_TENANT.test(url.pathname)) {
+    throw new Error("SELFHOST_OIDC_TRUST_MISSING_EMAIL_VERIFIED_ISSUER must name one tenant, not a shared Microsoft issuer");
+  }
+  return true;
+}
+
 function loadOidc(env: Env): OidcConfig | null {
   const issuer = env.SELFHOST_OIDC_ISSUER?.trim();
   const clientId = env.SELFHOST_OIDC_CLIENT_ID?.trim();
@@ -314,9 +340,10 @@ function loadOidc(env: Env): OidcConfig | null {
   const scopes = (env.SELFHOST_OIDC_SCOPES?.trim() || "openid email profile").split(/[\s,]+/).filter(Boolean);
   if (!scopes.includes("openid")) scopes.unshift("openid");
   if (!scopes.includes("email")) scopes.push("email");
+  const normalizedIssuer = issuer.replace(/\/+$/, "");
   return {
     // Kept byte-for-byte: the id_token `iss` must equal the discovery issuer.
-    issuer: issuer.replace(/\/+$/, ""),
+    issuer: normalizedIssuer,
     clientId,
     clientSecret,
     scopes,
@@ -324,6 +351,7 @@ function loadOidc(env: Env): OidcConfig | null {
     displayName: cleanLabel(env.SELFHOST_OIDC_DISPLAY_NAME ?? "") || "single sign-on",
     redirectUrl: redirect,
     allowHttpIssuer,
+    trustMissingEmailVerified: trustMissingEmailVerified(env, normalizedIssuer),
   };
 }
 

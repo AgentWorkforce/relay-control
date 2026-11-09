@@ -39,7 +39,10 @@ export type OidcIdentity = {
   subject: string;
   email: string;
   name: string | null;
-  /** The id_token said email_verified: true (absent is not verified). */
+  /**
+   * The id_token said email_verified: true. An absent claim is not verified
+   * unless the operator named this issuer as trusted for it.
+   */
   emailVerified: boolean;
 };
 
@@ -274,8 +277,11 @@ export class OidcClient {
       ? claims.name.trim()
       : [claims.given_name, claims.family_name].filter((part): part is string => typeof part === "string" && Boolean(part.trim())).join(" ") || null;
     // Only an explicit true counts as verified for operator-assigned domain
-    // auto-join in multi mode (an absent claim is still allowed to sign in).
-    const emailVerified = claims.email_verified === true || claims.email_verified === "true";
+    // auto-join in multi mode (an absent claim is still allowed to sign in),
+    // unless the operator trusts this issuer's directory. `iss` already
+    // matched the configured issuer above.
+    const emailVerified = claims.email_verified === true || claims.email_verified === "true"
+      || (claims.email_verified === undefined && this.config.trustMissingEmailVerified);
     return { subject: claims.sub, email, name, emailVerified };
   }
 }
