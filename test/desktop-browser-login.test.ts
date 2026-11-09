@@ -42,7 +42,7 @@ function fakeRelaycast(state: { nodes: Record<string, { id: string; name: string
   });
 }
 
-async function setup(t: test.TestContext) {
+async function setup(t: test.TestContext, overrides: Partial<SelfhostConfig> = {}) {
   const database = new PGliteDatabase();
   await migrate(database);
   const relaycastState = {
@@ -69,6 +69,7 @@ async function setup(t: test.TestContext) {
     dashboardUrl: `${origin}/`,
     port: 0,
     host: "127.0.0.1",
+    ...overrides,
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
   control.on("request", createApp({ config, store }));
@@ -249,7 +250,7 @@ test("a sign-in naming its host needs the person's approval on a same-origin con
   // page stays put after Approve.
   assert.equal(
     page.headers.get("content-security-policy"),
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' http://127.0.0.1:5123; base-uri 'none'; frame-ancestors 'none'",
+    `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${origin} http://127.0.0.1:5123; base-uri 'none'; frame-ancestors 'none'`,
   );
   const html = await page.text();
   assert.match(html, /Agent Relay Desktop on <strong>sf-mini<\/strong>/);
@@ -299,6 +300,45 @@ test("a sign-in naming its host needs the person's approval on a same-origin con
   const denied = await post({ consent_token: token3!, decision: "deny" });
   assert.equal(denied.status, 200);
   assert.match(await denied.text(), /Sign-in denied/);
+});
+
+test("the picker and consent pages keep a path-only form action and allow both browser origins", async (t) => {
+  // Dev serves the API on one origin and the dashboard on another; the page
+  // may be reached on either, so the form must post to the page's own origin
+  // (path-only action) and form-action must name both origins, or Chromium
+  // blocks the Approve post itself.
+  const dashboard = "https://dashboard.selfhosted.test";
+  const { origin, orgId, ownerId, workspaceId } = await setup(t, { dashboardUrl: `${dashboard}/` });
+  const session = await browserSession(origin, ownerId, workspaceId);
+  const consent = await fetch(`${origin}${loginPath({ desktop_host_name: "sf-mini" })}`, {
+    redirect: "manual", headers: { cookie: session },
+  });
+  assert.equal(consent.status, 200);
+  assert.equal(
+    consent.headers.get("content-security-policy"),
+    `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${origin} ${dashboard} http://127.0.0.1:5123; base-uri 'none'; frame-ancestors 'none'`,
+  );
+  const consentHtml = await consent.text();
+  assert.match(consentHtml, /<form method="post" action="\/cloud\/api\/v1\/cli\/login">/);
+  assert.doesNotMatch(consentHtml, /action="https?:/);
+
+  // With a second workspace and no `workspace` parameter the same session
+  // lands on the picker.
+  const second = await request(origin, `/api/v1/organizations/${orgId}/workspaces`, {
+    method: "POST",
+    token: BOOTSTRAP,
+    body: { name: "Second", relaycastApiKey: "rk_second", relaycastWorkspaceId: "rw_second" },
+  });
+  assert.equal(second.status, 201);
+  const picker = await fetch(`${origin}${loginPath({ desktop_host_name: "sf-mini" })}`, {
+    redirect: "manual", headers: { cookie: session },
+  });
+  assert.equal(picker.status, 200);
+  assert.equal(
+    picker.headers.get("content-security-policy"),
+    `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${origin} ${dashboard}; base-uri 'none'; frame-ancestors 'none'`,
+  );
+  assert.doesNotMatch(await picker.text(), /href="https?:\/\/[^"]*\/cloud\/api\/v1\/cli\/login/);
 });
 
 test("bad login requests are refused before any session work", async (t) => {
