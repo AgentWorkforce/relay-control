@@ -112,3 +112,19 @@ test("application config includes default-on MCP settings without retaining secr
   assert.equal(degraded.unavailable?.reason,"oidc_signing_key");
   assert.ok(!JSON.stringify(degraded).includes(invalid));
 });
+
+
+test("review repro: a missing MCP-only signing-key file produces sanitized unavailable mode", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "mcp-key-unavailable-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = load({
+    SELFHOST_MCP_OAUTH: "on",
+    SELFHOST_MCP_OIDC_SIGNING_KEY_ID: "fake-key",
+    SELFHOST_MCP_OIDC_SIGNING_KEY_FILE: join(directory, "missing-key.pem"),
+    SELFHOST_MCP_OIDC_SUBJECT_SALT: "fake-salt",
+  });
+  assert.ok(config.unavailable);
+  assert.equal(config.unavailable.reason, "oidc_signing_key");
+  assert.ok(!config.unavailable.detail.includes(directory));
+  assert.ok(!config.unavailable.detail.includes("fake-salt"));
+});
