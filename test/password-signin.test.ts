@@ -193,6 +193,32 @@ test("config: password sign-in needs SELFHOST_TRUSTED_PROXIES set explicitly, ev
   assert.deepEqual(loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "email_link" }).signinMethods, ["email_link"]);
 });
 
+test("/login: co-brands under the Agent Relay lockup and allows only the logo's origin", async (t) => {
+  const ctx = await setup(t, { env: { SELFHOST_LOGIN_LOGO_URL: "https://cdn.example.test/logo.svg", SELFHOST_LOGIN_ORG_NAME: "Example <Corp>" } });
+  const response = await fetch(`${ctx.origin}/login`);
+  const html = await response.text();
+  assert.match(response.headers.get("content-security-policy") ?? "", /; img-src https:\/\/cdn\.example\.test$/);
+  assert.match(html, /class="mark"/);
+  assert.match(html, /class="wordmark"[\s\S]*<hr><div class="cobrand"><img src="https:\/\/cdn\.example\.test\/logo\.svg" alt="" referrerpolicy="no-referrer"><strong>Example &lt;Corp&gt;<\/strong>/);
+});
+
+test("/login: without a logo shows only Agent Relay and publishes no name", async (t) => {
+  const ctx = await setup(t, { env: { SELFHOST_LOGIN_ORG_NAME: "Example Corp" } });
+  const response = await fetch(`${ctx.origin}/login`);
+  const html = await response.text();
+  assert.doesNotMatch(response.headers.get("content-security-policy") ?? "", /img-src/);
+  assert.match(html, /class="wordmark"/);
+  assert.doesNotMatch(html, /class="cobrand"|<hr>|Example Corp/);
+  assert.equal((await call(ctx.origin, "/api/v1/auth/login-config")).body.org_name, null);
+});
+
+test("SELFHOST_LOGIN_ORG_NAME falls back to the bootstrap organization", () => {
+  const bootstrap = { SELFHOST_BOOTSTRAP_ORG_NAME: "Example Corp", SELFHOST_BOOTSTRAP_ADMIN_EMAIL: "ops@example.test" };
+  assert.equal(loadIdentityConfig(bootstrap).loginOrgName, "Example Corp");
+  assert.equal(loadIdentityConfig({ ...bootstrap, SELFHOST_LOGIN_ORG_NAME: "  Example Labs " }).loginOrgName, "Example Labs");
+  assert.equal(loadIdentityConfig({}).loginOrgName, null);
+});
+
 test("login-config: public, lists methods, logo and domain hint, never secrets", async (t) => {
   const ctx = await setup(t, { env: { SELFHOST_LOGIN_LOGO_URL: "https://cdn.example.test/logo.svg", SELFHOST_PASSWORD_PEPPER_FILE: pepperFile("v1:" + "s".repeat(40)) } });
   const res = await call(ctx.origin, "/api/v1/auth/login-config");
@@ -201,6 +227,7 @@ test("login-config: public, lists methods, logo and domain hint, never secrets",
     methods: ["email_link", "password"],
     oidc: null,
     logo_url: "https://cdn.example.test/logo.svg",
+    org_name: "Acme",
     allowed_domain_hint: true,
     password_policy: { min_length: 12, max_length: 128 },
   });
