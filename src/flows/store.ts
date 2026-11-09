@@ -9,6 +9,11 @@ import {
   type EncryptionKeyring,
 } from "../crypto.js";
 import type { CliCredentialBroker, FlowsConfig } from "./config.js";
+import {
+  FlowRelayfileCredentialError,
+  type FlowRelayfileCredentialIssuer,
+  type IssuedFlowRelayfileCredential,
+} from "./relayfile-credentials.js";
 import { summarizeDefinition, type DeclaredStep } from "./definition.js";
 import { RunObjectStore } from "./objects.js";
 import { mergeRunEnvironment, type RuntimeEnvironment } from "./runtime-env.js";
@@ -215,6 +220,11 @@ export class FlowsStore {
   readonly objects: RunObjectStore;
   /** Set by server.ts once the admin module exists (subscription logins). */
   cliCredentials?: CliCredentialBroker;
+  /**
+   * Set by server.ts: mints each run's `sh_fr_` Relayfile credential at
+   * assignment. Unset: assignments carry no relayfileToken.
+   */
+  relayfileCredentials?: FlowRelayfileCredentialIssuer;
   readonly #listeners = new Set<() => void>();
 
   constructor(
@@ -1128,6 +1138,26 @@ export class FlowsStore {
     const cliReference = this.cliCredentials
       ? await this.cliCredentials.issueRunReference(row.workspace_id, row.id)
       : null;
+    // Never an empty token: without a credential the field is omitted and the
+    // run says why, so the worker refuses Flows-to-File with that reason.
+    let relayfile: IssuedFlowRelayfileCredential | null = null;
+    try {
+      if (!this.relayfileCredentials) {
+        throw new FlowRelayfileCredentialError(404, "relayfile_not_configured", "Relayfile credentials are not configured");
+      }
+      relayfile = await this.relayfileCredentials.issue({
+        workspaceId: row.workspace_id,
+        runId: row.id,
+        mountPaths: [`/workflows/runs/${row.id}`],
+        issuer: "flows",
+      });
+    } catch (error) {
+      const code = error instanceof FlowRelayfileCredentialError ? error.code : "relayfile_credential_failed";
+      await this.appendEvent(row.id, {
+        eventType: "run.relayfile_credential_unavailable",
+        payload: { error: code },
+      });
+    }
     return JSON.stringify({
       runId: row.id,
       workspaceId: row.workspace_id,
@@ -1135,7 +1165,13 @@ export class FlowsStore {
       relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.keyring),
       relaycastBaseUrl: this.config.workerRelaycastUrl ?? this.relaycastFallbackUrl,
       relayfileUrl: this.config.workerRelayfileUrl,
-      relayfileToken: "",
+      ...(relayfile
+        ? {
+            relayfileToken: relayfile.relayfileToken,
+            relayfileTokenExpiresAt: relayfile.relayfileTokenExpiresAt,
+            relayfileMountPaths: relayfile.relayfileMountPaths,
+          }
+        : {}),
       workflow: row.workflow,
       fileType: row.file_type,
       sourceFileType: row.file_type,

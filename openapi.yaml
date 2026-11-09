@@ -7809,10 +7809,14 @@ components:
       description: |
         `workflowRef.value` is a JSON-encoded WorkerWorkflowPayload built at
         delivery time (runId, workspaceId, relayWorkspaceId, relaycastApiKey,
-        relaycastBaseUrl, relayfileUrl, relayfileToken, workflow, fileType,
+        relaycastBaseUrl, relayfileUrl, relayfileToken?,
+        relayfileTokenExpiresAt?, relayfileMountPaths?, workflow, fileType,
         sourceFileType, workflowFileName, envSecrets?, metadata, s3CodeKey?,
         startFrom?). It carries decrypted workspace credentials; it is only
-        sent to the authenticated worker that claimed the assignment.
+        sent to the authenticated worker that claimed the assignment. The
+        relayfileToken fields are present only when a per-run Relayfile
+        credential was minted; otherwise the run records a
+        run.relayfile_credential_unavailable event.
       properties:
         id:
           type: string

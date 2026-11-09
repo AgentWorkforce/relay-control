@@ -628,6 +628,12 @@ acquisition operator token (below), are always reported as `wrong-kind` (an
 `GET /readyz` lists the accepted audiences (`introspection.audiences`, empty
 while introspection is disabled), so a scheme or port mismatch shows up there
 instead of as a runtime 401.
+Flows workers carry another kind: an opaque per-run `sh_fr_` Relayfile
+credential minted through the Flows credential broker. It introspects as
+principal `agent` (`agent_name` `flows-run-<runId>`) with only the run's
+`relayfile:fs:*` path scopes, for the worker Relayfile origin alone, and is
+revoked when the run ends. See
+[docs/flows-relayfile-credential.md](flows-relayfile-credential.md).
 The sessions pipeline ingest edge is such a service: it introspects the
 upload credential (the caller's own `sh_at_` token, handed back by
 `POST .../relayhistory/session` with `mode: "sync"`) with the public History

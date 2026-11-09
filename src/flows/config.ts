@@ -31,11 +31,21 @@ export type CliCredentialBroker = {
   writeBack(ref: string | null, runId: string, credentialId: string, content: unknown): Promise<{ updated: boolean }>;
 };
 
+/** SELFHOST_FLOWS_RELAYFILE_CREDENTIAL_TTL_MS bounds (docs/flows-relayfile-credential.md). */
+export const DEFAULT_RELAYFILE_CREDENTIAL_TTL_MS = 12 * 60 * 60 * 1_000;
+const MIN_RELAYFILE_CREDENTIAL_TTL_MS = 5 * 60 * 1_000;
+const MAX_RELAYFILE_CREDENTIAL_TTL_MS = 24 * 60 * 60 * 1_000;
+
 export type FlowsConfig = {
   /** Relaycast origin handed to workers in the assignment payload. */
   workerRelaycastUrl?: string;
   /** Relayfile origin handed to workers (empty when not deployed). */
   workerRelayfileUrl: string;
+  /**
+   * Hard expiry horizon of a run's `sh_fr_` Relayfile credential; revocation
+   * at run end is its real end of life.
+   */
+  relayfileCredentialTtlMs: number;
   /** Optional https dashboard origin used to build runUrl for mirrored runs. */
   dashboardUrl?: string;
   queueWaitMs: number;
@@ -96,6 +106,7 @@ function duration(env: Env, name: string, fallback: number, min: number, max: nu
 export function defaultFlowsConfig(overrides: Partial<FlowsConfig> = {}): FlowsConfig {
   return {
     workerRelayfileUrl: "",
+    relayfileCredentialTtlMs: DEFAULT_RELAYFILE_CREDENTIAL_TTL_MS,
     queueWaitMs: 10 * 60 * 1_000,
     enrollmentTokenTtlMs: 60 * 60 * 1_000,
     heartbeatIntervalMs: 30_000,
@@ -132,6 +143,13 @@ export function loadFlowsConfig(env: Env = process.env): FlowsConfig {
   return defaultFlowsConfig({
     workerRelaycastUrl: origin(env, "SELFHOST_FLOWS_WORKER_RELAYCAST_URL"),
     workerRelayfileUrl: origin(env, "SELFHOST_FLOWS_WORKER_RELAYFILE_URL") ?? "",
+    relayfileCredentialTtlMs: duration(
+      env,
+      "SELFHOST_FLOWS_RELAYFILE_CREDENTIAL_TTL_MS",
+      DEFAULT_RELAYFILE_CREDENTIAL_TTL_MS,
+      MIN_RELAYFILE_CREDENTIAL_TTL_MS,
+      MAX_RELAYFILE_CREDENTIAL_TTL_MS,
+    ),
     dashboardUrl,
     queueWaitMs: duration(env, "SELFHOST_FLOWS_QUEUE_WAIT_MS", 600_000, 10_000, 86_400_000),
     enrollmentTokenTtlMs: duration(
