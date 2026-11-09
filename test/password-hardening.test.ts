@@ -124,10 +124,19 @@ test("reset: revokes CLI, Desktop and browser sessions and MCP grants; expires a
   // An MCP OAuth grant and an authorization code not redeemed yet.
   await ctx.database.query("INSERT INTO selfhost_mcp_oauth_clients (client_id, client_name, redirect_uris) VALUES ('mcp-client', 'Editor', ARRAY['http://127.0.0.1/cb'])");
   const grantId = randomUUID();
+  const familyId = randomUUID();
   await ctx.database.query(
     `INSERT INTO selfhost_mcp_oauth_grants (id, client_id, user_id, organization_id, workspace_id, agent_name, scopes, resource, token_family_id)
      VALUES ($1, 'mcp-client', $2, $3, $4, 'editor', ARRAY['relay:mcp'], 'https://mcp.example.test', $5)`,
-    [grantId, member.id, member.organization_id, member.workspace_id, randomUUID()],
+    [grantId, member.id, member.organization_id, member.workspace_id, familyId],
+  );
+  // A live MCP OAuth session in the grant's token family.
+  await ctx.database.query(
+    `INSERT INTO selfhost_mcp_oauth_sessions
+       (id, grant_id, token_family_id, user_id, organization_id, workspace_id, scopes, access_token_hash, refresh_token_hash,
+        access_token_expires_at, refresh_token_expires_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, ARRAY['relay:mcp'], $7, $8, now() + interval '1 hour', now() + interval '30 days', now(), now())`,
+    [randomUUID(), grantId, familyId, member.id, member.organization_id, member.workspace_id, "a".repeat(64), "b".repeat(64)],
   );
   await ctx.database.query(
     `INSERT INTO selfhost_mcp_oauth_authorization_codes
@@ -157,6 +166,14 @@ test("reset: revokes CLI, Desktop and browser sessions and MCP grants; expires a
   assert.equal((late as { error: string }).error, "expired_token");
   const grant = await ctx.database.query<{ revoked_reason: string | null }>("SELECT revoked_reason FROM selfhost_mcp_oauth_grants WHERE id = $1", [grantId]);
   assert.equal(grant.rows[0]!.revoked_reason, "password_reset");
+  const family = await ctx.database.query<{ revoked_at: Date | null; revoked_reason: string | null }>(
+    "SELECT revoked_at, revoked_reason FROM selfhost_mcp_oauth_sessions WHERE grant_id = $1", [grantId]);
+  assert.ok(family.rows[0]!.revoked_at, "the grant's MCP session family is revoked with it");
+  assert.equal(family.rows[0]!.revoked_reason, "oauth_grant_password_reset");
+  const tombstone = await ctx.database.query<{ user_id: string; token_family_id: string; reason: string }>(
+    "SELECT user_id, token_family_id, reason FROM selfhost_mcp_oauth_revocations WHERE grant_id = $1", [grantId]);
+  assert.equal(tombstone.rows.length, 1, "a revocation tombstone drives Relaycast teardown");
+  assert.deepEqual(tombstone.rows[0], { user_id: member.id, token_family_id: familyId, reason: "password_reset" });
   const code = await ctx.database.query<{ consumed_at: Date | null }>("SELECT consumed_at FROM selfhost_mcp_oauth_authorization_codes");
   assert.ok(code.rows[0]!.consumed_at, "the unredeemed MCP code is void");
   const audit = (await auditActions(ctx)).find((e) => e.action === "password.reset.completed");

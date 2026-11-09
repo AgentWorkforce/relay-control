@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { recordAudit, type AuditActor } from "./admin/audit.js";
 import type { Database, SqlExecutor } from "./database.js";
+import { revokeMcpOAuthGrantRows } from "./mcp/oauth/store.js";
 import {
   lockIdentity,
   lockOrganization,
@@ -1304,14 +1305,27 @@ export class ControlPlaneStore {
         RETURNING id`,
       [userId, reason],
     );
-    const grants = await executor.query<{ id: string }>(
-      `UPDATE selfhost_mcp_oauth_grants
-          SET revoked_at = now(), revoked_reason = $2
-        WHERE user_id = $1 AND revoked_at IS NULL
-        RETURNING id`,
-      [userId, reason],
+    // MCP OAuth grants go through the MCP store's revoker so each grant's
+    // session family ends and a revocation tombstone (Relaycast teardown)
+    // commits with it. That revoker needs user->org locks, taken in the
+    // tenancy lock order (user, then organizations in id order).
+    await lockUser(executor, userId);
+    const organizations = await executor.query<{ organization_id: string }>(
+      `SELECT DISTINCT organization_id FROM selfhost_mcp_oauth_grants
+        WHERE user_id = $1 AND revoked_at IS NULL ORDER BY organization_id`,
+      [userId],
     );
-    return { sessions: sessions.rows.length, mcpGrants: grants.rows.length };
+    for (const { organization_id } of organizations.rows) await lockOrganization(executor, organization_id);
+    const grants = await executor.query<{ id: string }>(
+      `SELECT id FROM selfhost_mcp_oauth_grants WHERE user_id = $1 AND revoked_at IS NULL ORDER BY id`,
+      [userId],
+    );
+    const now = new Date();
+    let mcpGrants = 0;
+    for (const { id } of grants.rows) {
+      if (await revokeMcpOAuthGrantRows(executor, id, reason, now)) mcpGrants += 1;
+    }
+    return { sessions: sessions.rows.length, mcpGrants };
   }
 
   /**

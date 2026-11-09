@@ -10,7 +10,7 @@ import { lockOrganization, lockUser, type TenancyMode } from "../../tenancy.js";
 import { isValidCodeVerifier, pkceS256, oidcSectorIdentifierForRedirectUri,
   type AuthorizationRequest, type ClientRegistrationInput, type McpAuthorizationScope,
   type OAuthErrorBody, type createMcpOAuthProtocol } from "./protocol.js";
-import { McpOAuthSessions, MCP_OAUTH_REFRESH_PREFIX, type McpOAuthIssuedPair, type McpOAuthSessionOwner } from "./sessions.js";
+import { McpOAuthSessions, MCP_OAUTH_REFRESH_PREFIX, revokeMcpOAuthSessionFamily, type McpOAuthIssuedPair, type McpOAuthSessionOwner } from "./sessions.js";
 
 const CODE_TTL_SECONDS = 120;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -187,17 +187,7 @@ export class McpOAuthStore {
 
   /** Caller holds user->org locks. Authority and durable teardown commit together. */
   private async revokeRows(tx:SqlExecutor,id:string,reason:string):Promise<boolean> {
-    const grant=await this.grant(tx,id);
-    if(!grant) return false;
-    const now=this.now(),changed=grant.revoked_at===null;
-    await tx.query(`UPDATE selfhost_mcp_oauth_grants SET revoked_at=$2,revoked_reason=$3 WHERE id=$1 AND revoked_at IS NULL`,[id,now,reason]);
-    await this.sessions.revokeFamily(tx,ownerOf(grant),`oauth_grant_${grant.revoked_reason??reason}`);
-    await tx.query(`INSERT INTO selfhost_mcp_oauth_revocations
-      (id,grant_id,token_family_id,user_id,organization_id,workspace_id,client_id,agent_name,agent_remote_id,reason,created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (grant_id) DO NOTHING`,
-    [randomUUID(),id,grant.token_family_id,grant.user_id,grant.organization_id,grant.workspace_id,grant.client_id,
-      grant.agent_name,grant.agent_remote_id,grant.revoked_reason??reason,now]);
-    return changed;
+    return revokeMcpOAuthGrantRows(tx,id,reason,this.now());
   }
 
   /** Port of Cloud code redemption: verify bindings before consume/replay action. */
@@ -397,4 +387,24 @@ export class McpOAuthStore {
       return result.rows.map(mapGrant);
     });
   }
+}
+
+/**
+ * Revokes one grant, ends its session family and writes the durable
+ * revocation tombstone that drives Relaycast teardown, all on the caller's
+ * transaction. Caller holds user->org locks. Returns whether the grant was
+ * live before this call.
+ */
+export async function revokeMcpOAuthGrantRows(tx:SqlExecutor,id:string,reason:string,now:Date):Promise<boolean> {
+  const grant=(await tx.query<GrantRow>("SELECT * FROM selfhost_mcp_oauth_grants WHERE id=$1 FOR UPDATE",[id])).rows[0];
+  if(!grant) return false;
+  const changed=grant.revoked_at===null;
+  await tx.query(`UPDATE selfhost_mcp_oauth_grants SET revoked_at=$2,revoked_reason=$3 WHERE id=$1 AND revoked_at IS NULL`,[id,now,reason]);
+  await revokeMcpOAuthSessionFamily(tx,ownerOf(grant),`oauth_grant_${grant.revoked_reason??reason}`,now);
+  await tx.query(`INSERT INTO selfhost_mcp_oauth_revocations
+    (id,grant_id,token_family_id,user_id,organization_id,workspace_id,client_id,agent_name,agent_remote_id,reason,created_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (grant_id) DO NOTHING`,
+  [randomUUID(),id,grant.token_family_id,grant.user_id,grant.organization_id,grant.workspace_id,grant.client_id,
+    grant.agent_name,grant.agent_remote_id,grant.revoked_reason??reason,now]);
+  return changed;
 }
