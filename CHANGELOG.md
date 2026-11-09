@@ -18,6 +18,7 @@ assigned at release.
   name. `POST .../relayhistory/session` no longer answers 501
   `sync_not_served`: `mode=sync` returns the caller's own token for the ingest
   edge. See [docs/sessions-read-api.md](docs/sessions-read-api.md).
+- Added `RELAYCHIEF_CONTROL_RELAY_SECRET` and `POST /internal/v1/chief/workspaces/{id}/relay-agents`, which registers a chief as a Relaycast agent for relaychief-control.
 - Self-host licensing is gone. Control no longer reads `SELFHOST_LICENSE`,
   `SELFHOST_LICENSE_FILE` or a licence key, and never answers
   `feature_not_licensed`. `SELFHOST_FEATURES` alone turns Flows, Relayfile and

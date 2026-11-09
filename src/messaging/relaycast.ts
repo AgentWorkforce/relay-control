@@ -459,7 +459,7 @@ export function createRelaycastClient(input: {
     },
 
     /** The agent a token controls, with its channel memberships. */
-    async authenticatedAgent(token: string): Promise<RosterAgent & { channels: Array<{ id: string; name: string }> }> {
+    async authenticatedAgent(token: string): Promise<RosterAgent & { channels: Array<{ id: string; name: string }>; workspaceId: string | null }> {
       const data = await labeled("authenticated_agent", () => call("GET", "/v1/agent", token));
       const agent = rosterFrom(data);
       if (!agent) throw new RelaycastCallError(502, "", true);
@@ -469,7 +469,7 @@ export function createRelaycastClient(input: {
         const name = text(channel?.name);
         return id && name ? [{ id, name }] : [];
       });
-      return { ...agent, channels };
+      return { ...agent, channels, workspaceId: text(record(data)?.workspace_id) };
     },
 
     async heartbeat(token: string): Promise<void> {

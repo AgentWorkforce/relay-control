@@ -18,6 +18,7 @@ import { adminErrorResponse, type AdminModule } from "./admin/routes.js";
 import { ApiTokenStore } from "./admin/api-tokens.js";
 import { recordAudit } from "./admin/audit.js";
 import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
+import { handleChiefRelay } from "./chief-relay.js";
 import { handleFlowsBroker } from "./flows-broker.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
@@ -891,6 +892,18 @@ export function createApp(input: {
       admin,
       relaycastBinding: (id) => store.relaycastBinding(id),
       requireFlows: () => requireFeature("flows"),
+      bearer,
+      requestObject,
+      json,
+    })) {
+      return;
+    }
+
+    if (await handleChiefRelay(request, response, method, publicPath, {
+      secret: config.chiefRelaySecret,
+      relaycast: oauthRelay,
+      relaycastBinding: (id) => store.relaycastBinding(id),
+      requireChief: () => requireFeature("chief"),
       bearer,
       requestObject,
       json,
