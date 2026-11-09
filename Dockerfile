@@ -11,7 +11,9 @@ COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
 COPY migrations ./migrations
 COPY openapi.yaml README.md LICENSE NOTICE ./
+# A packed application needs a publishable lock; package-lock.json is excluded by npm pack.
 RUN npm run build \
+ && cp package-lock.json npm-shrinkwrap.json \
  && npm pack --pack-destination /tmp
 
 FROM ${NODE_IMAGE} AS runtime
