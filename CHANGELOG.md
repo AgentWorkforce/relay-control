@@ -5,6 +5,9 @@ assigned at release.
 
 ## Unreleased
 
+- Added: the analytics collector accepts registered session ingest, reader and
+  consumer producers with closed event vocabularies, scoped attribution and
+  separate producer tokens.
 - Fixed: local Flows run completion, failure and cancellation revoke the run's Relayfile credential atomically; assignment issuance racing a terminal transition cannot leave a new credential active.
 
 ## 0.5.8 (2026-11-09)
