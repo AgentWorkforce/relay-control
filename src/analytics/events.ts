@@ -5,6 +5,7 @@
 // scope fixes its attribution, and callers cannot choose a weaker scope.
 import { randomUUID } from "node:crypto";
 import type {
+  AnalyticsClient,
   AnalyticsEnvelope,
   AnalyticsEventKind,
   AnalyticsIdentityModel,
@@ -19,11 +20,24 @@ export type PropertySpec =
   | { type: "integer"; min: number; max: number }
   | { type: "enum"; values: readonly string[] }
   /** Short identifier-like strings only: no spaces, no URLs (no "//"). */
-  | { type: "token"; maxLength: number };
+  | { type: "token"; maxLength: number }
+  /** A UUID in canonical 8-4-4-4-12 hex form. */
+  | { type: "uuid" }
+  /**
+   * A client-reported release version: `MAJOR.MINOR.PATCH` (1-5 digits each),
+   * optional `-prerelease` and `+build` of dot-separated `[0-9A-Za-z-]+`
+   * identifiers, at most VERSION_MAX_LENGTH characters. Nothing else.
+   */
+  | { type: "version" };
 
 export type EventSpec = {
   scope: AnalyticsScope;
   properties: Record<string, PropertySpec>;
+  /**
+   * Clients that may send this kind through the client gateway. Absent: a
+   * server-only kind that no client may send.
+   */
+  clients?: readonly AnalyticsClient[];
 };
 
 const TELEMETRY_LEVEL = { type: "enum", values: ["off", "errors", "full"] } as const;
@@ -42,7 +56,40 @@ const MODEL_SCOPES: Record<AnalyticsIdentityModel, readonly AnalyticsScope[]> = 
   native_workspace: ["installation", "native_workspace"],
 };
 
-/** The registered event kinds. All initial kinds are installation-scoped. */
+/**
+ * Properties every client kind allows. `client` is set by the gateway from the
+ * credential check, never from the request body; `client_event_id` is the
+ * client's own dedupe id (the exported event_id is still minted at capture).
+ */
+export const CLIENT_PROPERTIES = {
+  client: { type: "enum", values: ["dashboard", "desktop"] },
+  client_event_id: { type: "uuid" },
+} as const satisfies Record<string, PropertySpec>;
+
+/** Properties of client kinds that only the gateway sets; a body naming them is invalid. */
+export const SERVER_SET_CLIENT_PROPERTIES: ReadonlySet<string> = new Set(Object.keys(CLIENT_PROPERTIES));
+
+/**
+ * Dashboard pages for `dashboard.page_viewed`. The repo names no full list of
+ * dashboard routes (only `#/device` and `#/flows/runs/{id}`), so this is a
+ * small fixed enum; a new page is a registry change.
+ */
+export const DASHBOARD_PAGES = [
+  "overview",
+  "sessions",
+  "agents",
+  "workflows",
+  "flows",
+  "settings",
+  "members",
+  "device",
+] as const;
+
+/**
+ * The registered event kinds. Server lifecycle kinds are installation-scoped
+ * and have no `clients`; client kinds are tenant- or workspace-scoped and name
+ * the one client that may send them.
+ */
 export const EVENT_REGISTRY: Record<AnalyticsEventKind, EventSpec> = {
   config_loaded: {
     scope: "installation",
@@ -69,6 +116,38 @@ export const EVENT_REGISTRY: Record<AnalyticsEventKind, EventSpec> = {
       reason: { type: "enum", values: ["SIGINT", "SIGTERM", "startup_failed"] },
     },
   },
+  "dashboard.page_viewed": {
+    scope: "workspace",
+    clients: ["dashboard"],
+    properties: {
+      ...CLIENT_PROPERTIES,
+      page: { type: "enum", values: DASHBOARD_PAGES },
+    },
+  },
+  "dashboard.session_opened": {
+    scope: "workspace",
+    clients: ["dashboard"],
+    properties: {
+      ...CLIENT_PROPERTIES,
+      source: { type: "enum", values: ["list", "search", "link"] },
+    },
+  },
+  "desktop.app_started": {
+    scope: "tenant",
+    clients: ["desktop"],
+    properties: {
+      ...CLIENT_PROPERTIES,
+      // Client-reported, so a reviewed version grammar rather than a generic
+      // token: an email, a secret or product text is not a version.
+      desktop_version: { type: "version" },
+      os: { type: "enum", values: ["macos", "windows", "linux"] },
+    },
+  },
+  "desktop.sign_in_completed": {
+    scope: "tenant",
+    clients: ["desktop"],
+    properties: { ...CLIENT_PROPERTIES },
+  },
 };
 
 /** Envelope fields that `properties` may never set. */
@@ -89,6 +168,13 @@ export const RESERVED_FIELDS: ReadonlySet<string> = new Set([
 const OPAQUE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const TRACE_ID = /^[A-Za-z0-9_-]{8,128}$/;
 const TOKEN_VALUE = /^[A-Za-z0-9][A-Za-z0-9_.+:@-]*$/;
+/** Longest accepted `version` property value. */
+export const VERSION_MAX_LENGTH = 32;
+const VERSION_IDENTIFIERS = "[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*";
+const VERSION_VALUE = new RegExp(
+  `^\\d{1,5}\\.\\d{1,5}\\.\\d{1,5}(?:-${VERSION_IDENTIFIERS})?(?:\\+${VERSION_IDENTIFIERS})?$`,
+);
+const UUID_VALUE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class AnalyticsProjectionError extends Error {
   override name = "AnalyticsProjectionError";
@@ -100,7 +186,8 @@ export type ProjectionContext = {
   now: () => number;
 };
 
-function propertyValue(spec: PropertySpec, value: AnalyticsPropertyValue): AnalyticsPropertyValue | undefined {
+/** The value if it satisfies its spec, else undefined. */
+export function propertyValue(spec: PropertySpec, value: AnalyticsPropertyValue): AnalyticsPropertyValue | undefined {
   switch (spec.type) {
     case "boolean":
       return typeof value === "boolean" ? value : undefined;
@@ -112,6 +199,12 @@ function propertyValue(spec: PropertySpec, value: AnalyticsPropertyValue): Analy
       return typeof value === "string" && spec.values.includes(value) ? value : undefined;
     case "token":
       return typeof value === "string" && value.length <= spec.maxLength && TOKEN_VALUE.test(value)
+        ? value
+        : undefined;
+    case "uuid":
+      return typeof value === "string" && UUID_VALUE.test(value) ? value.toLowerCase() : undefined;
+    case "version":
+      return typeof value === "string" && value.length <= VERSION_MAX_LENGTH && VERSION_VALUE.test(value)
         ? value
         : undefined;
   }
@@ -194,10 +287,14 @@ export function projectEvent(
   if (typeof traceId !== "string" || !TRACE_ID.test(traceId)) {
     throw new AnalyticsProjectionError("trace_id is not an opaque identifier");
   }
+  const occurredAt = input.occurredAt ?? context.now();
+  if (typeof occurredAt !== "number" || !Number.isFinite(occurredAt) || Number.isNaN(new Date(occurredAt).getTime())) {
+    throw new AnalyticsProjectionError("occurred_at is not a valid time");
+  }
   return {
     version: 1,
     event_id: randomUUID(),
-    occurred_at: new Date(context.now()).toISOString(),
+    occurred_at: new Date(occurredAt).toISOString(),
     component: "relaycontrol",
     deployment_id: context.deploymentId,
     event: input.event,

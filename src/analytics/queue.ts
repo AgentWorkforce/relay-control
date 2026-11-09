@@ -16,6 +16,7 @@ import {
   type AnalyticsClock,
   type AnalyticsEnvelope,
   type AnalyticsFailureReason,
+  type AnalyticsGatewayCounter,
   type AnalyticsLog,
   type AnalyticsPort,
   type AnalyticsSink,
@@ -52,7 +53,10 @@ export type AnalyticsQueueOptions = {
   bootTraceId?: string;
 };
 
-export type AnalyticsQueue = AnalyticsPort & { readonly bootTraceId: string };
+export type AnalyticsQueue = AnalyticsPort & {
+  readonly bootTraceId: string;
+  recordGateway(counter: AnalyticsGatewayCounter, amount?: number): void;
+};
 
 /** `deadline`: epoch ms on the queue's clock; enqueue time + DELIVERY_DEADLINE_MS. */
 type Queued = { envelope: AnalyticsEnvelope; bytes: number; deadline: number };
@@ -79,10 +83,25 @@ function emptyStats(): AnalyticsStats {
     queueBytes: 0,
     lastFailureReason: null,
     lastSuccessAt: null,
+    gateway: {
+      requests: 0,
+      accepted: 0,
+      rejected: {
+        auth: 0,
+        csrf: 0,
+        client_mismatch: 0,
+        body: 0,
+        invalid: 0,
+        reserved_field: 0,
+        rate_limited: 0,
+      },
+      clock_adjusted: 0,
+    },
   };
 }
 
-function droppedTotal(stats: AnalyticsStats): number {
+/** Sum of every `dropped` counter. */
+export function droppedTotal(stats: AnalyticsStats): number {
   return Object.values(stats.dropped).reduce((sum, count) => sum + count, 0);
 }
 
@@ -450,10 +469,24 @@ export function createAnalytics(options: AnalyticsQueueOptions): AnalyticsQueue 
     return { sent: stats.sent.events - sentBefore, dropped: droppedTotal(stats) - droppedBefore };
   }
 
+  function recordGateway(counter: AnalyticsGatewayCounter, amount = 1): void {
+    if (!Number.isSafeInteger(amount) || amount < 0) return;
+    const gateway = stats.gateway;
+    if (counter.startsWith("rejected.")) {
+      const reason = counter.slice("rejected.".length);
+      if (Object.hasOwn(gateway.rejected, reason)) {
+        gateway.rejected[reason as keyof typeof gateway.rejected] += amount;
+      }
+      return;
+    }
+    if (counter === "requests" || counter === "accepted" || counter === "clock_adjusted") gateway[counter] += amount;
+  }
+
   return {
     bootTraceId,
     capture,
     flush,
+    recordGateway,
     stats() {
       return {
         ...stats,
@@ -462,6 +495,7 @@ export function createAnalytics(options: AnalyticsQueueOptions): AnalyticsQueue 
         failures: { ...stats.failures },
         queueEvents: queue.length,
         queueBytes,
+        gateway: { ...stats.gateway, rejected: { ...stats.gateway.rejected } },
       };
     },
   };

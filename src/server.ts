@@ -116,7 +116,18 @@ emitConfigLoaded(analytics, {
   flowsEnabled: true,
   operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
 });
-const server = createServer(createApp({ config, store, flows, admin, telemetry, identity, factory, license, amp }));
+const server = createServer(createApp({
+  config,
+  store,
+  flows,
+  admin,
+  telemetry,
+  identity,
+  factory,
+  license,
+  amp,
+  analytics: { port: analytics, config: analyticsConfig },
+}));
 const bootstrapAbort = new AbortController();
 // Worker queue streams are long-lived SSE responses.
 server.requestTimeout = 0;

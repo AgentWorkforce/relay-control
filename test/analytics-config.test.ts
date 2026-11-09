@@ -35,6 +35,7 @@ test("analytics defaults to none and rejects unknown destinations", () => {
   assert.equal(config.maxAttempts, 4);
   assert.equal(config.flushIntervalMs, 5000);
   assert.equal(config.shutdownDeadlineMs, 3000);
+  assert.deepEqual(config.gateway, { maxBodyBytes: 32_768, maxEvents: 20 });
   assert.throws(
     () => loadAnalyticsConfig({ SELFHOST_ANALYTICS_DESTINATION: "file" }),
     /DESTINATION must be none, collector, or posthog/,
@@ -382,6 +383,11 @@ test("limits are bounded and ordered", () => {
     ["MAX_ATTEMPTS", "+3"],
     ["FLUSH_INTERVAL_MS", "5000.0"],
     ["REQUEST_TIMEOUT_MS", "0b1111101000"],
+    ["GATEWAY_MAX_BODY_BYTES", "1023"],
+    ["GATEWAY_MAX_BODY_BYTES", "262145"],
+    ["GATEWAY_MAX_BODY_BYTES", "32k"],
+    ["GATEWAY_MAX_EVENTS", "0"],
+    ["GATEWAY_MAX_EVENTS", "101"],
   ] as const) {
     assert.throws(
       () => loadAnalyticsConfig({ [`SELFHOST_ANALYTICS_${name}`]: bad }),
@@ -390,6 +396,13 @@ test("limits are bounded and ordered", () => {
     );
   }
   assert.equal(loadAnalyticsConfig({ SELFHOST_ANALYTICS_MAX_BATCH_EVENTS: "010" }).maxBatchEvents, 10);
+  const gateway = loadAnalyticsConfig({
+    SELFHOST_ANALYTICS_GATEWAY_MAX_BODY_BYTES: "4096",
+    SELFHOST_ANALYTICS_GATEWAY_MAX_EVENTS: "5",
+  });
+  assert.deepEqual(gateway.gateway, { maxBodyBytes: 4096, maxEvents: 5 });
+  assert.equal(describeAnalyticsConfig(gateway).gatewayMaxBodyBytes, 4096);
+  assert.equal(describeAnalyticsConfig(gateway).gatewayMaxEvents, 5);
   assert.equal(
     ANALYTICS_BATCH_OVERHEAD_BYTES,
     Buffer.byteLength(JSON.stringify({ schema: ANALYTICS_BATCH_SCHEMA, events: [] })),
