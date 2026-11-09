@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -82,6 +83,16 @@ import {
   type Feature,
   type LoadedLicense,
 } from "./license/resolver.js";
+import type { AnalyticsConfig } from "./analytics/config.js";
+import {
+  clientAttribution,
+  GATEWAY_RATE_LIMITS,
+  GATEWAY_REQUIRED_SCOPE,
+  GatewayRequestError,
+  parseClientBatch,
+} from "./analytics/gateway.js";
+import { droppedTotal } from "./analytics/queue.js";
+import type { AnalyticsGatewayCounter, AnalyticsGatewayRejection, AnalyticsPort } from "./analytics/types.js";
 import {
   clientIp,
   cookieRequestAllowed,
@@ -176,13 +187,22 @@ export function normalizeRoutePath(path: string): string {
     : path;
 }
 
-async function bodyText(request: IncomingMessage): Promise<string> {
+const DEFAULT_BODY_LIMIT_BYTES = 1024 * 1024;
+
+/** Reads the body, refusing it (413) as soon as the streamed bytes pass `maxBytes`. */
+async function bodyText(request: IncomingMessage, maxBytes = DEFAULT_BODY_LIMIT_BYTES): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > 1024 * 1024) throw new HttpError(413, "payload_too_large", "Body exceeds 1 MiB");
+    if (size > maxBytes) {
+      throw new HttpError(
+        413,
+        "payload_too_large",
+        maxBytes === DEFAULT_BODY_LIMIT_BYTES ? "Body exceeds 1 MiB" : `Body exceeds ${maxBytes} bytes`,
+      );
+    }
     chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString("utf8");
@@ -320,6 +340,17 @@ export function createApp(input: {
    * and enabled as false.
    */
   providerProbes?: ProviderProbes;
+  /**
+   * analytics lane: the product-analytics port and its configuration. The
+   * client gateway (POST /api/v1/analytics/events) is mounted only when the
+   * destination is not `none`.
+   */
+  analytics?: {
+    port: AnalyticsPort;
+    config: Pick<AnalyticsConfig, "destination" | "gateway">;
+    /** Test hook: gateway rate limits. Production leaves this unset (GATEWAY_RATE_LIMITS). */
+    rateLimits?: Partial<Record<keyof typeof GATEWAY_RATE_LIMITS, { limit: number; windowMs: number }>>;
+  };
   /** Person messaging. Tests pass fetchImpl; the server uses global fetch. */
   messagingFetch?: typeof fetch;
   /** Factory sessions (dormant unless SELFHOST_FACTORY_ENABLED). The server passes its module so it can run the worker. */
@@ -420,6 +451,86 @@ export function createApp(input: {
     const principal = await store.authenticateAccessToken(token);
     if (!principal) throw new HttpError(401, "unauthorized", "Invalid or expired token");
     return { kind: "user", principal, token };
+  }
+
+  // analytics lane: the client gateway. Authority comes only from the
+  // credential's principal; the body names events and properties, nothing else.
+  const analyticsGateway = input.analytics && input.analytics.config.destination !== "none"
+    ? input.analytics
+    : null;
+
+  async function analyticsEvents(
+    request: IncomingMessage,
+    response: ServerResponse,
+    gateway: NonNullable<typeof analyticsGateway>,
+  ): Promise<void> {
+    const { port } = gateway;
+    const count = (counter: AnalyticsGatewayCounter, amount = 1) => {
+      try {
+        port.recordGateway?.(counter, amount);
+      } catch {
+        // Counters never fail a request.
+      }
+    };
+    count("requests");
+    // Which gateway.rejected counter an HttpError at the current step maps to.
+    let step: AnalyticsGatewayRejection = "auth";
+    try {
+      // Bootstrap, internal and workspace API tokens resolve to no session: 401.
+      const auth = await authenticate(request);
+      if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      const { principal } = auth;
+      // authenticate() takes the bearer first and the cookie only under /cloud/.
+      const client = bearer(request) ? "desktop" : "dashboard";
+      if (client === "dashboard" && !cookieRequestAllowed(request, browserOrigins)) {
+        step = "csrf";
+        throw new HttpError(403, "forbidden", "Cross-origin analytics request refused");
+      }
+      if (!principal.scopes.includes(GATEWAY_REQUIRED_SCOPE)) {
+        throw new HttpError(403, "forbidden", `Scope ${GATEWAY_REQUIRED_SCOPE} required`);
+      }
+      step = "rate_limited";
+      const limited = "Too many analytics requests. Try again shortly.";
+      const limits = { ...GATEWAY_RATE_LIMITS, ...gateway.rateLimits };
+      rateLimit(response, `analytics:session:${principal.sessionId}`, limits.session, "rate_limited", limited);
+      // Keyed by clientIp(): the first X-Forwarded-For hop, as the auth limiters
+      // are. Only an ingress that overwrites that header makes it client-proof;
+      // see docs/analytics.md "Rate limits and the forwarded-header boundary".
+      rateLimit(response, `analytics:ip:${clientIp(request)}`, limits.ip, "rate_limited", limited);
+      // A membership revoked after the token was checked attributes nothing.
+      step = "auth";
+      const workspace = await store.workspaceForUser(principal.workspaceId, principal.userId);
+      if (!workspace) throw new HttpError(404, "workspace_not_found", "Workspace not found");
+      step = "body";
+      const raw = await bodyText(request, gateway.config.gateway.maxBodyBytes);
+      const now = (input.now?.() ?? new Date()).getTime();
+      const events = parseClientBatch(raw, { client, maxEvents: gateway.config.gateway.maxEvents, now });
+
+      const authority = { organizationId: principal.organizationId, workspaceId: principal.workspaceId };
+      const traceId = randomUUID();
+      const droppedBefore = droppedTotal(port.stats());
+      for (const event of events) {
+        port.capture({
+          event: event.event,
+          properties: event.properties,
+          traceId,
+          occurredAt: event.occurredAt,
+          ...clientAttribution(event.scope, authority),
+        });
+      }
+      const queued = droppedTotal(port.stats()) === droppedBefore;
+      count("accepted", events.length);
+      const adjusted = events.filter((event) => event.clockAdjusted).length;
+      if (adjusted > 0) count("clock_adjusted", adjusted);
+      json(response, 202, { accepted: events.length, queued }, true);
+    } catch (error) {
+      if (error instanceof GatewayRequestError) {
+        count(`rejected.${error.counter}`);
+        throw new HttpError(error.status, error.code, error.message);
+      }
+      if (error instanceof HttpError) count(`rejected.${step}`);
+      throw error;
+    }
   }
 
   async function organizationAccess(
@@ -1917,6 +2028,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       relaycastUrl: config.relaycastUrl,
       csrfAllowed: (incoming) => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
     })) return;
+
+    if (analyticsGateway && method === "POST" && path === "/api/v1/analytics/events") {
+      await analyticsEvents(request, response, analyticsGateway);
+      return;
+    }
 
     if (await mcp(request, response, path, method)) return;
     if (desktopFeed && await desktopFeed(request, response, path, method)) return;
