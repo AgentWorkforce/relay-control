@@ -25,6 +25,21 @@ const completeEnv = {
   SELFHOST_ENCRYPTION_KEY: "00".repeat(32),
 };
 
+test("the session erase API is default off and requires its full configuration", () => {
+  assert.equal(loadConfig(completeEnv).sessionErasureApi, null);
+  const eraser = {
+    SESSION_ERASE_API_URL: "http://eraser.sessions.svc.cluster.local:8080",
+    SESSION_ERASE_API_SECRET: "control-eraser-secret-".repeat(2),
+  };
+  assert.deepEqual(loadConfig({ ...completeEnv, ...eraser }).sessionErasureApi, {
+    url: eraser.SESSION_ERASE_API_URL,
+    secret: eraser.SESSION_ERASE_API_SECRET,
+  });
+  assert.throws(() => loadConfig({ ...completeEnv, SESSION_ERASE_API_URL: eraser.SESSION_ERASE_API_URL }), /SESSION_ERASE_API_SECRET/);
+  assert.throws(() => loadConfig({ ...completeEnv, SESSION_ERASE_API_SECRET: eraser.SESSION_ERASE_API_SECRET }), /SESSION_ERASE_API_URL/);
+  assert.throws(() => loadConfig({ ...completeEnv, ...eraser, SESSION_ERASE_API_SECRET: "short" }), /at least 32 bytes/);
+});
+
 test("the independent read API handoff is default off and requires its full configuration", () => {
   assert.equal(loadConfig(completeEnv).sessionReadApi, null);
   const reader = {

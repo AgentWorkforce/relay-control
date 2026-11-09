@@ -43,6 +43,9 @@ import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js
 import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.js";
 import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./factory/routes.js";
 import { createMcpHandler } from "./mcp/routes.js";
+import type { AmpModule } from "./amp/module.js";
+import { isAmpPath } from "./amp/routes.js";
+import { purgeMemberAmp, releaseMemberAmp } from "./amp/service.js";
 import { handleChiefRoutes, type ChiefBackend } from "./chief/routes.js";
 import { handleProviderRoutes } from "./providers/routes.js";
 import type { ProviderProbes } from "./providers/registry.js";
@@ -54,6 +57,13 @@ import {
   writeCapturePolicy,
 } from "./capture-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
+import {
+  assertSessionId,
+  eraseSession,
+  readSessionErasure,
+  requireErasureApi,
+  SessionErasureError,
+} from "./session-erasure.js";
 import {
   clientIp,
   cookieRequestAllowed,
@@ -265,6 +275,14 @@ export function browserOriginsFor(config: SelfhostConfig): string[] {
   ])];
 }
 
+/** A bodiless cookie DELETE needs an allowed Origin, or same-origin fetch metadata. */
+function cookieDeleteAllowed(request: IncomingMessage, browserOrigins: string[]): boolean {
+  const origin = request.headers.origin;
+  return typeof origin === "string" && origin && origin !== "null"
+    ? browserOrigins.includes(origin)
+    : request.headers["sec-fetch-site"] === "same-origin";
+}
+
 export function createApp(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
@@ -274,6 +292,8 @@ export function createApp(input: {
   /** bootstrap-signup lane: OIDC / email sign-in, invites (src/identity). */
   identity?: IdentityModule;
   chief?: ChiefBackend;
+  /** Amp control (src/amp). Absent or disabled: every Amp route answers 404 before auth. */
+  amp?: AmpModule;
   /**
    * Runtime probes for the provider modules this build contains. Unset (the
    * default) means no provider module: each reports implemented, configured
@@ -338,9 +358,11 @@ export function createApp(input: {
     return siteBases.get(host) ?? config.publicBaseUrl.replace(/\/+$/, "");
   }
   // Hosted MCP (shared-sessions facade): reads, team activity, capabilities.
+  const amp = input.amp?.config.enabled ? input.amp : null;
   const providerProbes: ProviderProbes = input.providerProbes ?? {};
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
+    ...(amp ? { amp: amp.deps } : {}),
   });
   function rateLimit(
     response: ServerResponse,
@@ -607,6 +629,14 @@ export function createApp(input: {
       return;
     }
 
+    // Amp control: gated before any authentication (off answers 404).
+    if (isAmpPath(path)) {
+      if (!amp) {
+        json(response, 404, { error: "Not found" }, true);
+        return;
+      }
+      if (await amp.handle(request, response, path, publicPath, method, { workspaceAccess, bearer, json })) return;
+    }
     // Factory sessions: 404 before auth when the flag is off.
     if (await factoryRoutes(request, response, path, publicPath, method)) return;
 
@@ -1446,10 +1476,17 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         await store.memberRole(organizationId, userId) === "owner") {
         throw new HttpError(403, "forbidden", "Only an owner can remove an owner.");
       }
+      // Amp grants are revoked inside the membership transaction (even with
+      // the feature off, so stale grants never outlive a member), and so are
+      // Factory bindings; Relaycast release of the retired Amp identities runs
+      // after commit.
       const deleted = await store.deleteMembership(
         organizationId,
         userId,
-        (tx) => factory.purgeMemberInTx(tx, organizationId, userId),
+        async (tx, member) => {
+          await purgeMemberAmp(tx, member);
+          await factory.purgeMemberInTx(tx, organizationId, userId);
+        },
       );
       if (!deleted) {
         if (!(await store.memberRole(organizationId, userId))) {
@@ -1459,6 +1496,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       await identity?.auditMembership({ organizationId, auth, action: "membership.remove", target: userId });
       await revokeRemovedMember(messagingDeps, organizationId, userId);
+      if (amp) await releaseMemberAmp(amp.deps, { organizationId, userId }).catch(() => undefined);
       await factory.afterMemberRemoved(organizationId, userId);
       response.writeHead(204);
       response.end();
@@ -1492,11 +1530,8 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // Cookie writes: JSON from an allowed origin; a bodiless DELETE needs
       // an allowed Origin (or same-origin fetch metadata).
       if (!bearer(request)) {
-        const origin = request.headers.origin;
         const allowed = method === "DELETE"
-          ? (typeof origin === "string" && origin && origin !== "null"
-            ? browserOrigins.includes(origin)
-            : request.headers["sec-fetch-site"] === "same-origin")
+          ? cookieDeleteAllowed(request, browserOrigins)
           : cookieRequestAllowed(request, browserOrigins);
         if (!allowed) throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
       }
@@ -1518,6 +1553,37 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         action: method === "PUT" ? "capture_policy.set" : "capture_policy.cleared",
       });
       json(response, 200, policy, true);
+      return;
+    }
+
+    // Operator session hard delete (docs/session-erasure.md). Erases session
+    // data only: organization membership is never touched.
+    const sessionErase = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/sessions\/([^/]+)$/);
+    if (sessionErase && method === "DELETE") {
+      const [organizationId, sessionId] = sessionErase as [string, string];
+      const auth = await organizationAccess(request, organizationId, true);
+      if (!operatorControlsEntitled()) {
+        throw new HttpError(403, "operator_controls_not_entitled", "Operator controls are not enabled for this installation");
+      }
+      if (!bearer(request) && !cookieDeleteAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      assertSessionId(sessionId);
+      const result = await eraseSession(store.database, requireErasureApi(config), {
+        organizationId,
+        sessionId,
+        actor: auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" },
+      });
+      json(response, result.status === "completed" ? 200 : 202, result, true);
+      return;
+    }
+
+    const sessionErasure = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/sessions\/([^/]+)\/erasure$/);
+    if (sessionErasure && method === "GET") {
+      const [organizationId, sessionId] = sessionErasure as [string, string];
+      await organizationAccess(request, organizationId, true);
+      assertSessionId(sessionId);
+      json(response, 200, await readSessionErasure(store.database, requireErasureApi(config), { organizationId, sessionId }), true);
       return;
     }
 
@@ -1763,6 +1829,14 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       if (error instanceof CapturePolicyError) {
         json(response, error.status, { error: error.code, message: error.message }, true);
+        return;
+      }
+      if (error instanceof SessionErasureError) {
+        json(response, error.status, {
+          error: error.code,
+          message: error.message,
+          ...(error.erasure ? { erasure: error.erasure } : {}),
+        }, true);
         return;
       }
       const identityError = identityErrorResponse(error);

@@ -35,6 +35,9 @@ servers:
 security:
   - bearerAuth: []
 tags:
+  - name: amp
+    description: |
+      Amp thread control (SELFHOST_AMP_ENABLED, default off). See docs/amp.md.
   - name: factory
     description: |
       Factory sessions (docs/factory-sessions.md). Every operation answers
@@ -1325,6 +1328,65 @@ paths:
         "403": { description: Owner/admin role required, or cross-origin cookie request }
         "404": { description: Organization not found }
         "409": { description: "`revision_mismatch`" }
+  /api/v1/organizations/{organizationId}/sessions/{sessionId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: sessionId
+        in: path
+        required: true
+        schema: { type: string, maxLength: 512 }
+    delete:
+      operationId: hardDeleteSession
+      description: |
+        Organization owner/admin or bootstrap bearer. Permanently erases one
+        session and its derived server-side artifacts through the session
+        pipeline; membership is untouched. Idempotent: repeating it returns the
+        same receipt. Audited as `session.hard_delete.requested` before any data
+        is touched and `session.hard_deleted` once on completion. Gated by
+        SELFHOST_OPERATOR_CONTROLS. Cookie callers need an allowed Origin or
+        same-origin fetch metadata. See docs/session-erasure.md.
+      responses:
+        "200":
+          description: Erase completed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "202":
+          description: Erase in progress; poll the erasure read
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "400": { description: "`invalid_session_id`" }
+        "403": { description: "Owner/admin role required, `operator_controls_not_entitled`, or cross-origin cookie request" }
+        "404": { description: Organization or session not found }
+        "501": { description: "`not_implemented`: the session pipeline erase is not configured" }
+        "502": { description: "`session_erasure_failed` (carries the receipt as `erasure`) or `invalid_session_erasure_response`" }
+        "503": { description: "`session_erasure_unavailable`: retry the request" }
+  /api/v1/organizations/{organizationId}/sessions/{sessionId}/erasure:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: sessionId
+        in: path
+        required: true
+        schema: { type: string, maxLength: 512 }
+    get:
+      operationId: getSessionErasure
+      description: |
+        Organization owner/admin or bootstrap bearer. The pipeline's erase
+        receipt plus the audit record, for verifying a delete. Never gated by
+        SELFHOST_OPERATOR_CONTROLS.
+      responses:
+        "200":
+          description: Erase receipt in any status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionErasure" }
+        "400": { description: "`invalid_session_id`" }
+        "403": { description: Owner/admin role required }
+        "404": { description: "Organization not found, or `erasure_not_found`" }
+        "501": { description: "`not_implemented`: the session pipeline erase is not configured" }
+        "502": { description: "`invalid_session_erasure_response`" }
+        "503": { description: "`session_erasure_unavailable`: retry the request" }
   /api/v1/workspaces/{workspaceId}/resolve:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -5018,6 +5080,231 @@ paths:
         "404": { $ref: "#/components/responses/FactoryError" }
         "405": { $ref: "#/components/responses/FactoryError" }
         "503": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/workspaces/{workspaceId}/amp:
+    get:
+      operationId: getAmpWorkspace
+      tags: [amp]
+      summary: Amp connection and binding summary (key hint only; history reported as unavailable with reason push_session_unavailable until a push-only RelayHistory session can be issued). Owner/admin person with cli:auth. 404 {"error":"Not found"} before auth when SELFHOST_AMP_ENABLED is off. Also under /cloud. See docs/amp.md.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{connection, bindings[{..., history: {state: unavailable|idle|queued|running|synced|error, reason?, lastSyncedAt, lastError, queuedAt}}], history: {available, reason?}}; never a secret"
+        "401":
+          description: unauthorized
+        "403":
+          description: forbidden (member, missing cli:auth, sh_wk_ workspace token or SELFHOST_INTERNAL_TOKEN)
+        "404":
+          description: Feature off ({"error":"Not found"}) or unknown workspace
+  /api/v1/workspaces/{workspaceId}/amp/connection:
+    post:
+      operationId: connectAmp
+      tags: [amp]
+      summary: Connect an Amp API key (validated by a read-only discover, stored encrypted). Only the connected key's owner may replace it while threads are bound.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key: { type: string, pattern: "^sgamp_", description: Never returned or logged }
+      responses:
+        "200":
+          description: Summary plus discovered threads
+        "400":
+          description: invalid_key or invalid_request
+        "403":
+          description: forbidden or not_connection_owner
+        "409":
+          description: connection_owner_locked or key_cannot_read_threads
+        "502":
+          description: amp_unavailable
+        "503":
+          description: amp_transport_not_configured
+    delete:
+      operationId: disconnectAmp
+      tags: [amp]
+      summary: Retire every binding, delete the stored key and release Relaycast identities after commit.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{disconnected: true} with cleanup: pending when a Relaycast release must be retried"
+  /api/v1/workspaces/{workspaceId}/amp/threads:
+    get:
+      operationId: discoverAmpThreads
+      tags: [amp]
+      summary: Up to 100 recent threads of the connected key. Connected key owner only.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{threads: [{id, title}]}"
+        "403":
+          description: forbidden or not_connection_owner
+        "409":
+          description: amp_not_connected
+  /api/v1/workspaces/{workspaceId}/amp/bindings:
+    post:
+      operationId: bindAmpThread
+      tags: [amp]
+      summary: Bind one explicitly chosen thread after the stored key exports it. Bind registers the Relaycast agent, mints a whsec_ secret (encrypted at rest, never returned) and creates two Relaycast subscriptions to the binding's relay-events URL (dm.received + thread.reply, and message.created filtered to mentions of the agent), signed with Standard Webhooks.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [threadId]
+              properties:
+                threadId: { type: string, description: "T-<id> or https://ampcode.com/threads/T-<id>" }
+      responses:
+        "201":
+          description: "{binding_id, thread_id, agent}"
+        "400":
+          description: invalid_thread
+        "403":
+          description: forbidden or not_connection_owner
+        "409":
+          description: amp_thread_unreadable, thread_owned or relay_name_taken
+        "502":
+          description: "relay_subscription_failed {error, message}: Relaycast refused or did not answer a subscription create. Subscriptions created by this attempt are deleted; the binding stays preparing and binding the thread again retries."
+  /api/v1/workspaces/{workspaceId}/amp/bindings/{bindingId}:
+    delete:
+      operationId: unbindAmpThread
+      tags: [amp]
+      summary: Retire the binding (generation bump revokes reply capabilities and fences in-flight deliveries), then delete both Relaycast subscriptions (404 counts as deleted) and release the Relaycast identity.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: "{disconnected: true} with cleanup: pending when the release must be retried"
+  /api/v1/workspaces/{workspaceId}/amp/bindings/{bindingId}/deliveries/{messageId}/check:
+    post:
+      operationId: checkAmpDelivery
+      tags: [amp]
+      summary: Read-only reconciliation (Cloud reconcileDelivery) of a delivery. Exports the bound thread and, only when the prompt's own marker is present, settles a pending, rejected or unknown row as delivered; a row under a live lease is left to the worker. Absence changes nothing and nothing is ever resent.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: messageId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: "{confirmed, state}: confirmed is whether the marker was found; state is the delivery state afterwards"
+        "400":
+          description: "{error: invalid_request, message}"
+        "403":
+          description: "{error: forbidden, message}: not a current owner or admin"
+        "404":
+          description: "{error: binding_not_found | delivery_not_found, message}; also when the binding was retired or rebound while the export ran"
+        "409":
+          description: "{error: relay_changed | amp_not_connected | amp_thread_unreadable, message}"
+  /api/v1/amp/agents/{bindingId}/messages:
+    post:
+      operationId: sendAmpReply
+      tags: [amp]
+      summary: Reply from an Amp thread through its scoped capability. Prompt-embedded helper; not proof of native MCP use.
+      security: [{ ampReplyBearer: [] }]
+      parameters:
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, text, message_id, request_id]
+              properties:
+                to: { type: string }
+                text: { type: string }
+                message_id: { type: string }
+                request_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: "{ok, message_id} or {ok, duplicate, message_id} for an identical repeat"
+        "401":
+          description: Wrong binding, unknown, revoked or expired capability, or owner no longer a member
+        "403":
+          description: Recipient, message or request mismatch
+        "409":
+          description: reply_already_sent
+        "413":
+          description: payload_too_large (64 KiB)
+        "502":
+          description: reply_uncertain (retry with the same request_id; the Relaycast idempotency key prevents a double send)
+  /api/v1/amp/relay-events/{bindingId}:
+    post:
+      operationId: receiveAmpRelayEvent
+      tags: [amp]
+      summary: Relaycast webhook for one binding, verified with Standard Webhooks v1 against the stored secret (300 s tolerance, 256 KiB body). Accepting only writes the outbox row.
+      security: []
+      parameters:
+        - { name: bindingId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: webhook-id, in: header, required: true, schema: { type: string } }
+        - { name: webhook-timestamp, in: header, required: true, schema: { type: string } }
+        - { name: webhook-signature, in: header, required: true, schema: { type: string, description: "v1,<base64 HMAC-SHA256>; space-separated list during rotation" } }
+      responses:
+        "200":
+          description: "{ok, queued} | {ok, duplicate} | {ok, delivered: false}"
+        "400":
+          description: invalid_request
+        "401":
+          description: Bad signature, stale timestamp or no stored secret
+        "410":
+          description: binding_gone
+        "413":
+          description: payload_too_large
+  /api/v1/internal/amp/job:
+    post:
+      operationId: runAmpJob
+      tags: [amp, internal]
+      summary: Scheduler entry for the Amp outbox. Not served under /cloud. 404 {"error":"Not found"} when the feature is off or SELFHOST_AMP_INTERNAL_SECRET is unset.
+      security: [{ ampInternalSecret: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, required: [v, kind], properties: { v: { const: 1 }, kind: { const: sweep } } }
+                - { type: object, required: [v, kind, bindingId, messageId], properties: { v: { const: 1 }, kind: { const: inject }, bindingId: { type: string }, messageId: { type: string } } }
+                - { type: object, required: [v, kind, bindingId], properties: { v: { const: 1 }, kind: { const: history }, bindingId: { type: string }, scheduledAt: { type: string, format: date-time } } }
+      responses:
+        "200":
+          description: "sweep {queued: 0, due, expired, deferred: true}; inject result or {ok, duplicate, state}; history {ok: true, queued: false, skipped: true} when not bound or already covered"
+        "202":
+          description: "history {ok: true, queued: true}: queued (coalesced) for src/amp/history.ts runHistory, which uploads to RelayHistory POST {baseUrl}/v1/ingest"
+        "501":
+          description: >-
+            history_push_unavailable: history is implemented to the upload
+            boundary (src/amp/history.ts) but inactive. It needs a
+            workspace-scoped push-only (rth:sync) RelayHistory session issued
+            without a caller token; src/relayhistory.ts
+            issueRelayhistorySession only exchanges a caller's sh_at_ token and
+            POST /internal/v1/auth/introspect answers only sh_at_ person tokens.
+            See docs/amp.md.
+        "400":
+          description: invalid_request
+        "401":
+          description: Bearer required
+        "403":
+          description: Wrong credential
+        "413":
+          description: payload_too_large (64 KiB)
 components:
   securitySchemes:
     factoryReplyBearer:
@@ -5046,6 +5333,14 @@ components:
       type: http
       scheme: bearer
       description: SELFHOST_INTERNAL_TOKEN, a workspace API token (sh_wk_) with the runtime scope, or a flows worker credential accepted by the runtime credential verifier. Never a user session.
+    ampReplyBearer:
+      type: http
+      scheme: bearer
+      description: "`amp_reply_<43 base64url>` capability embedded in one Amp prompt; stored only as a SHA-256 hash, bound to one binding, message and request, revoked on unbind, disconnect or member removal, expires after 24 h."
+    ampInternalSecret:
+      type: http
+      scheme: bearer
+      description: SELFHOST_AMP_INTERNAL_SECRET. Not SELFHOST_INTERNAL_TOKEN, a workspace token or a user session.
     introspectAuth:
       type: http
       scheme: bearer
@@ -5288,6 +5583,37 @@ components:
         upload_control: { type: string, enum: [operator, user] }
         oops_window_seconds: { type: integer, minimum: 0, maximum: 86400 }
         user_retroactive_delete: { type: boolean }
+    SessionErasure:
+      type: object
+      additionalProperties: false
+      required: [orgId, sessionId, requestId, status, requestedAt, completedAt, artifacts, uploadsFenced, failure, audit]
+      properties:
+        orgId: { type: string }
+        sessionId: { type: string }
+        requestId: { type: string }
+        status: { type: string, enum: [in_progress, completed, failed] }
+        requestedAt: { type: string, format: date-time }
+        completedAt: { type: [string, "null"], format: date-time }
+        artifacts:
+          type: object
+          description: Erased item count per artifact category; never content.
+          additionalProperties: { type: integer, minimum: 0 }
+        uploadsFenced: { type: boolean }
+        failure:
+          type: [object, "null"]
+          additionalProperties: false
+          required: [code]
+          properties:
+            code: { type: string }
+        audit:
+          type: [object, "null"]
+          additionalProperties: false
+          required: [action, actorKind, actorId, recordedAt]
+          properties:
+            action: { type: string, enum: [session.hard_deleted] }
+            actorKind: { type: string }
+            actorId: { type: [string, "null"] }
+            recordedAt: { type: string, format: date-time }
     CapturePolicy:
       type: object
       additionalProperties: false

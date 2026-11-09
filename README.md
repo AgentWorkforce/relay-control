@@ -114,7 +114,8 @@ is explicit. RelayAuth is optional: see
 | `SELFHOST_FACTORY_ENABLED` | Optional `true`/`false`, default `false`. Factory sessions: when off every Factory route is 404 and the worker does not start. See [docs/factory-sessions.md](docs/factory-sessions.md) |
 | `SELFHOST_FACTORY_API_URL` | Factory API origin, default `https://api.factory.ai`; absolute https only |
 | `SELFHOST_FACTORY_HISTORY_INTERVAL_MS` | Dormant Factory history loop cadence, default 300000, minimum 60000 |
-| `SELFHOST_OPERATOR_CONTROLS` | Operator-control writes (capture policy PUT/DELETE): `always` (default), `licence`, or `off`; an unrecognised value is treated as `off`. Reads are never gated. See [docs/capture-policy.md](docs/capture-policy.md) |
+| `SELFHOST_OPERATOR_CONTROLS` | Operator-control writes (capture policy PUT/DELETE, session hard delete): `always` (default), `licence`, or `off`; an unrecognised value is treated as `off`. Reads are never gated. See [docs/capture-policy.md](docs/capture-policy.md) and [docs/session-erasure.md](docs/session-erasure.md) |
+| `SESSION_ERASE_API_URL`, `SESSION_ERASE_API_SECRET` (or `_FILE`) | Internal origin and dedicated secret (at least 32 bytes) of the session pipeline's per-session erase. Unset, the session hard-delete routes answer 501. See [docs/session-erasure.md](docs/session-erasure.md) |
 | `SELFHOST_DESKTOP_FEED_SIGNER` / `SELFHOST_DESKTOP_FEED_STORAGE` | Optional, set together: turn on the signed Desktop release feed (`/api/v1/desktop/feed/*`). Signer `awskms` (or `memory`, tests and development only), storage `s3` (or `memory`). Unset: the feed routes answer 404. See [docs/desktop-feed.md](docs/desktop-feed.md) |
 | `SELFHOST_DESKTOP_FEED_KMS_REGION` / `SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES` | `awskms`: region (default `AWS_REGION`) and a JSON object of profile id to KMS alias, one Ed25519 key per profile. Credentials: the instance role via IMDSv2, or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` |
 | `SELFHOST_DESKTOP_FEED_KEY_LABEL` | The `key_id` label, default `k1` for `awskms` |
@@ -122,6 +123,10 @@ is explicit. RelayAuth is optional: see
 | `SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES` | Optional JSON object of profile id to token sha256 hex digests, for publisher tokens (`sh_dfp_...`) provisioned through env; tokens can also be minted through the admin routes |
 | `SELFHOST_TELEMETRY_LEVEL` | Telemetry: `off` (default when unset), `errors`, or `full`. See [docs/telemetry.md](docs/telemetry.md) for this and the other `SELFHOST_TELEMETRY_*` settings |
 | `PORT` | Listener port, default `3000` |
+| `SELFHOST_AMP_ENABLED` | Optional `true` turns on Amp control (default `false`). Off: every Amp route answers 404 `{"error":"Not found"}` before authentication and no outbox worker runs. See [docs/amp.md](docs/amp.md) |
+| `AMP_TRANSPORT_ORIGIN` / `AMP_TRANSPORT_TOKEN[_FILE]` | Optional, set together. Bare https origin of the persistent Amp process service and its bearer (at least 32 bytes); calls go to `POST /v1/internal/amp/operation`. Unset: every Amp operation answers 503 `amp_transport_not_configured` |
+| `SELFHOST_AMP_INTERNAL_SECRET` | Optional (`_FILE` supported), at least 32 bytes. Bearer for `POST /api/v1/internal/amp/job` (scheduler sweeps and inject jobs). Unset: that route answers 404 |
+| `SELFHOST_AMP_WORKER_INTERVAL_MS` / `SELFHOST_AMP_LEASE_MS` | Outbox drain interval, default 5000 (250-600000), and delivery lease, default 120000 (1000-3600000). An expired lease becomes `unknown` and is never resent |
 | `HOST` | Listener address, default `0.0.0.0` |
 
 Sensitive variables also accept a mutually exclusive `_FILE` form. The API
@@ -273,10 +278,10 @@ unique lowercase release tag, the exact selected commit SHA, and the
 configure its required reviewers before the first release.
 
 The workflow publishes `linux/amd64` and `linux/arm64` manifests to
-`ghcr.io/<repository-owner>/relay-control` (canonical) and, as a transition
-alias with the same digest, `ghcr.io/<repository-owner>/selfhost-api`. It
-refuses to overwrite the release tag or its `sha-<commit>` tag on either
-image, and reports the resulting digest in the run summary. Deploy by the canonical `image@sha256:...` reference when
+`ghcr.io/<repository-owner>/relay-control`. It refuses to overwrite the release
+tag or its `sha-<commit>` tag, and reports the resulting digest in the run
+summary. The legacy `selfhost-api` image name is deprecated and receives no new
+releases. Deploy by the `image@sha256:...` reference when
 immutability matters. BuildKit SBOM and max-mode provenance attestations are
 attached where GHCR supports them. The workflow only publishes this standalone
 image; it does not invoke or modify the hosted Cloud deployment.
@@ -284,12 +289,11 @@ image; it does not invoke or modify the hosted Cloud deployment.
 ### Verifying image provenance
 
 Each release also carries a signed Sigstore provenance bundle (GitHub artifact
-attestation) for the published index digest, under both names. Verify it with
+attestation) for the published index digest. Verify it with
 the GitHub CLI, using the digest from the run summary:
 
 ```sh
 gh attestation verify oci://ghcr.io/agentworkforce/relay-control@sha256:<digest> --owner AgentWorkforce
-gh attestation verify oci://ghcr.io/agentworkforce/selfhost-api@sha256:<digest> --owner AgentWorkforce
 ```
 
 Images published before signed attestations were added, including `0.4.0`

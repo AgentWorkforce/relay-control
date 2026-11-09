@@ -1,4 +1,4 @@
-// Postgres access for the desktop feed (migrations/0020_desktop_feed.sql).
+// Postgres access for the desktop feed (migrations/0027_desktop_feed.sql).
 // Token values never reach this layer: callers pass hashSecret(token).
 import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";

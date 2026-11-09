@@ -92,7 +92,11 @@ export function apiClient(origin: string): Api {
 
 export const BOOTSTRAP = "bootstrap-token-that-is-at-least-32-bytes";
 
-export async function startControlPlane(flowsOverrides: Partial<FlowsConfig> = {}, chief?: ChiefBackend) {
+export async function startControlPlane(
+  flowsOverrides: Partial<FlowsConfig> = {},
+  chief?: ChiefBackend,
+  configOverrides: Partial<SelfhostConfig> = {},
+) {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -111,6 +115,7 @@ export async function startControlPlane(flowsOverrides: Partial<FlowsConfig> = {
     internalServiceToken: null,
     oauthRedirectUrl: `https://control.selfhosted.company/api/v1/integrations/oauth/callback`,
     dashboardUrl: `https://control.selfhosted.company/`,
+    ...configOverrides,
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
   const flows = new FlowsStore(
