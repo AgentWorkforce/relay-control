@@ -617,8 +617,8 @@ test("operator abandonment keeps the retirement fence while an older release is 
   await reached;
   const store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
   try {
-    assert.equal(await store.abandonMcpOAuthCleanup({organizationId:f.owner.organizationId,
-      workspaceId:f.owner.workspaceId,actor:{kind:"bootstrap"}}),1);
+    assert.deepEqual(await store.abandonMcpOAuthCleanup({organizationId:f.owner.organizationId,
+      workspaceId:f.owner.workspaceId,actor:{kind:"bootstrap"}}),{abandoned:1,revoked:0});
     assert.equal((await revocation(f)).outcome,"operator_abandoned");
     const later=await laterConnection(f);
     await assert.rejects(later.service.join({}),/being retired after a disconnect/);
@@ -722,6 +722,36 @@ test("only the operator can abandon pending connector cleanup, which unblocks de
     "SELECT target,actor_kind FROM selfhost_admin_audit_events WHERE action='mcp_oauth.cleanup_abandoned' ORDER BY target")).rows;
   assert.deepEqual(audit.map(row=>row.target),[`${f.owner.workspaceId} (0 pending)`,`${f.owner.workspaceId} (1 pending)`]);
   assert.ok(audit.every(row=>row.actor_kind==="bootstrap"));
+  response=await remove();assert.equal(response.status,204);
+});
+
+test("with the module off the operator can revoke live grants and complete their cleanup so deletion proceeds",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  const config=appConfig(false),store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
+  const server=createServer(createApp({config,store,messagingFetch:f.fetchImpl}));
+  const base=await listen(server);t.after(()=>close(server));
+  const item=`${base}/api/v1/organizations/${f.owner.organizationId}/workspaces/${f.owner.workspaceId}`;
+  const operator={authorization:`Bearer ${config.bootstrapToken}`};
+  const abandon=(query="")=>fetch(item+"/mcp-oauth/abandon-cleanup"+query,{method:"POST",headers:operator});
+  const remove=()=>fetch(item,{method:"DELETE",headers:operator});
+  let response=await remove();assert.equal(response.status,409);assert.equal((await response.json()).error,"workspace_in_use");
+  response=await abandon("?revoke_live=maybe");assert.equal(response.status,400);
+  // Without the flag a live grant is untouched.
+  response=await abandon("?revoke_live=false");
+  assert.equal(response.status,200);assert.deepEqual(await response.json(),{abandoned:0});
+  assert.equal((await f.database.query("SELECT revoked_at FROM selfhost_mcp_oauth_grants WHERE id=$1",[f.owner.grantId])).rows[0]!.revoked_at,null);
+  response=await abandon("?revoke_live=true");
+  assert.equal(response.status,200);assert.deepEqual(await response.json(),{abandoned:1,revoked:1});
+  const grant=(await f.database.query<{revoked_at:Date|null;revoked_reason:string|null}>(
+    "SELECT revoked_at,revoked_reason FROM selfhost_mcp_oauth_grants WHERE id=$1",[f.owner.grantId])).rows[0]!;
+  assert.ok(grant.revoked_at);assert.equal(grant.revoked_reason,"operator_abandoned");
+  const row=await revocation(f);
+  assert.equal(row.outcome,"operator_abandoned");assert.ok(row.completed_at);
+  const sessions=await f.database.query("SELECT 1 FROM selfhost_mcp_oauth_sessions WHERE grant_id=$1 AND revoked_at IS NULL",[f.owner.grantId]);
+  assert.equal(sessions.rows.length,0);
+  const audit=(await f.database.query<{target:string}>(
+    "SELECT target FROM selfhost_admin_audit_events WHERE action='mcp_oauth.cleanup_abandoned' ORDER BY target")).rows;
+  assert.deepEqual(audit.map(r=>r.target),[`${f.owner.workspaceId} (0 pending)`,`${f.owner.workspaceId} (1 pending, 1 live revoked)`]);
   response=await remove();assert.equal(response.status,204);
 });
 

@@ -1681,11 +1681,18 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (auth.kind !== "bootstrap") {
         throw new HttpError(403, "operator_only", "Only the operator can abandon connector cleanup");
       }
-      const abandoned = isUuid(workspaceId)
-        ? await store.abandonMcpOAuthCleanup({ organizationId, workspaceId, actor: { kind: "bootstrap" } })
+      // revoke_live=true also revokes the workspace's live grants, for when the
+      // module is off or unavailable and nobody can disconnect them.
+      const revokeParam = new URL(request.url ?? "/", "http://local").searchParams.get("revoke_live");
+      if (revokeParam !== null && revokeParam !== "true" && revokeParam !== "false") {
+        throw new HttpError(400, "invalid_request", "revoke_live must be true or false");
+      }
+      const revokeLive = revokeParam === "true";
+      const result = isUuid(workspaceId)
+        ? await store.abandonMcpOAuthCleanup({ organizationId, workspaceId, actor: { kind: "bootstrap" }, revokeLive })
         : null;
-      if (abandoned === null) throw new HttpError(404, "workspace_not_found", "Workspace not found");
-      json(response, 200, { abandoned });
+      if (result === null) throw new HttpError(404, "workspace_not_found", "Workspace not found");
+      json(response, 200, revokeLive ? result : { abandoned: result.abandoned });
       return;
     }
 

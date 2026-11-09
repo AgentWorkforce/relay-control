@@ -171,6 +171,29 @@ audit action `mcp_oauth.cleanup_abandoned` is recorded. Live connections are
 not touched: disconnect them first, because workspace deletion still answers
 `409` while any remains.
 
+Add `?revoke_live=true` when nobody can disconnect them, for example while the
+module is `off` or unavailable:
+
+```sh
+curl -X POST -H "Authorization: Bearer $SELFHOST_BOOTSTRAP_TOKEN" \
+  "https://relay.example.com/api/v1/organizations/{organizationId}/workspaces/{workspaceId}/mcp-oauth/abandon-cleanup?revoke_live=true"
+```
+
+In one transaction this revokes every live connection of the workspace (reason
+`operator_abandoned`, ending its sessions and expiring unredeemed
+authorization codes), then completes all of the workspace's cleanup records,
+including the new ones, without releasing any Relaycast agent. The response
+is `{"abandoned": n, "revoked": m}` and the audit target records both counts.
+The workspace can then be deleted. The route works whether the module is on,
+`off` or unavailable.
+
+Turning the module `off` does not revoke connections and does not run
+cleanup: grants and their sessions are kept, and pending cleanup records stay
+pending while the module is off or unavailable. Turning it back on resumes
+cleanup and makes unexpired sessions usable again. To delete a workspace that
+still has connections while the module is off, use `revoke_live=true` as
+above.
+
 Issuer requests have a 64 KiB body limit. Public registration allows 20
 requests per client-address bucket per hour and 500 per process per hour.
 Control uses its `SELFHOST_TRUSTED_PROXIES` policy and groups IPv6 addresses
