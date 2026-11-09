@@ -6,6 +6,7 @@ import { DesktopIdentityUnavailable, DESKTOP_IDENTITY_MESSAGES, linkedDesktopIde
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
+import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } from "./oauth/retirement.js";
 
 /**
  * Hosted relay participants and the Relaycast operations behind the
@@ -212,6 +213,8 @@ type ParticipantOptions = {
   allowGone?: boolean;
   /** A participant whose token Relaycast rejects is returned (for join's recovery and leave). */
   allowRejected?: boolean;
+  /** The caller binds this MCP session to the selected row (native join); requires `executor` under the owner lock. */
+  bind?: boolean;
   executor?: SqlExecutor;
 };
 const rejectedToken = (name: string) => new RelayToolError(
@@ -271,6 +274,13 @@ function createRelayService(context: McpContext) {
     });
   }
 
+  /** Callers hold the owner lock; `tx` is the transaction that would write the binding. */
+  async function refuseRetiring(tx: SqlExecutor, agentRemoteId: string, agentName: string): Promise<void> {
+    if (await retiringIdentity(tx, { organizationId, workspaceId, userId, agentRemoteId, agentName })) {
+      throw new RelayToolError(MCP_OAUTH_RETIRING_MESSAGE);
+    }
+  }
+
   function ownsRemote(remote: { metadata: Record<string, unknown> }): boolean {
     return remote.metadata.source === HOSTED_SOURCE && remote.metadata.cloud_workspace_id === workspaceId
       && remote.metadata.owner_hash === owner;
@@ -315,6 +325,11 @@ function createRelayService(context: McpContext) {
     }
     if (row.relayWorkspaceId !== relayWorkspaceId) {
       throw new RelayToolError("The participant does not belong to you in this workspace's relay.");
+    }
+    // Retirement fence, before any Relaycast call: an unpinned OAuth grant
+    // would pin this row's agent, and a native join would bind its session.
+    if (((oauth && !approvedId) || (options.bind && !row.sessionHash)) && options.executor) {
+      await refuseRetiring(query, row.agentRemoteId, row.agentName);
     }
     const token = decryptSecret(row.tokenCiphertext, keyring);
     const { remote, tokenUsable } = await hostedRemote(row, token);
@@ -390,6 +405,8 @@ function createRelayService(context: McpContext) {
   async function registerParticipant(tx: SqlExecutor, name: string, boundSession: string | null, objective: string) {
     const remote = await client.getAgent(key, name);
     if (remote && !ownsRemote(remote)) throw new RelayToolError("That relay name is already taken. Choose another name.");
+    // Recovering an owned agent binds it again; its release may be in flight.
+    if (remote) await refuseRetiring(tx, remote.id, remote.name);
     // An owned agent without a row is an interrupted join: recover its token.
     const registered = remote
       ? await client.recoverHosted(key, name, remote.id, userId)
@@ -459,7 +476,8 @@ function createRelayService(context: McpContext) {
         throw new RelayToolError("This MCP session is already joined. Leave before choosing another name.");
       }
       const requestedName = oauth?.access.agentName ?? input.name ?? automaticParticipantName(context.principal, sessionHash!);
-      const existing = bound ?? await participant(requestedName, { allowMissing: true, allowRejected: true, executor: tx });
+      const existing = bound ?? await participant(requestedName, {
+        allowMissing: true, allowRejected: true, executor: tx, bind: Boolean(sessionHash) });
       if (existing) {
         if (sessionHash && existing.row.sessionHash && existing.row.sessionHash !== sessionHash) {
           throw new RelayToolError("That participant is bound to another MCP session. Use as to act as it without changing its binding, or choose a new name.");
@@ -814,7 +832,7 @@ export function relayService(context: McpContext) {
         const method = service[name] as (...values: unknown[]) => Promise<unknown>;
         return await method(...args);
       } catch (error) {
-        if (error instanceof McpOAuthAccessRefused || error instanceof McpOAuthActorRefused) {
+        if (error instanceof McpOAuthAccessRefused || error instanceof McpOAuthActorRefused || error instanceof McpOAuthAgentRetiring) {
           throw new RelayToolError(error.message);
         }
         throw error;

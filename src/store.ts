@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { recordAudit, type AuditActor } from "./admin/audit.js";
 import type { Database, SqlExecutor } from "./database.js";
 import { revokeMcpOAuthGrantRows } from "./mcp/oauth/store.js";
+import { DASHBOARD_DEVICE_CLIENT, isDeviceReservedClientName } from "./reserved-client-names.js";
 import {
   lockIdentity,
   lockOrganization,
@@ -45,12 +46,7 @@ const DEVICE_SCOPES = [...BROWSER_SESSION_SCOPES, "rth:acquire"];
  */
 export const ACCOUNT_SCOPE = "account";
 export const DESKTOP_WORKSPACES_SCOPE = "desktop:workspaces";
-/**
- * The client name GET /login starts its device-code sign-in with. Only that
- * flow, redeemed by POST /login/poll as the browser cookie, is a browser
- * sign-in (scope "account"); POST /api/v1/auth/device/start refuses the name.
- */
-export const DASHBOARD_DEVICE_CLIENT = "relay-dashboard";
+export { DASHBOARD_DEVICE_CLIENT };
 /** Browser sign-in sessions: no rth:acquire, plus "account". */
 const ACCOUNT_SCOPES = [...BROWSER_SESSION_SCOPES, ACCOUNT_SCOPE];
 /** Desktop sessions: device scopes (with rth:acquire) plus "desktop:workspaces". */
@@ -434,6 +430,78 @@ export class ControlPlaneStore {
     }
   }
 
+  /**
+   * Operator override for connector cleanup that can never finish (for
+   * example a Relaycast workspace that no longer exists). Completes every
+   * pending MCP OAuth teardown row of the workspace without a remote release,
+   * under the workspace row lock that deletion also takes. Live grants are
+   * untouched unless `revokeLive` is set: then every live grant of the
+   * workspace is revoked first (reason operator_abandoned, through the normal
+   * revocation path, so its sessions end and a revocation row is written),
+   * and that row is completed in the same transaction. This is the way out
+   * when the module is off or unavailable and nobody can disconnect.
+   * Returns null for an unknown workspace.
+   */
+  async abandonMcpOAuthCleanup(input: {
+    organizationId: string;
+    workspaceId: string;
+    actor: AuditActor;
+    revokeLive?: boolean;
+  }): Promise<{ abandoned: number; revoked: number } | null> {
+    for (let attempt = 0; ; attempt += 1) {
+      const result = await this.database.transaction(async (tx) => {
+        // Revocation needs the tenancy lock order: grant owners (user id
+        // order), then the organization, then the workspace row.
+        const owners = input.revokeLive ? (await tx.query<{ user_id: string }>(
+          `SELECT DISTINCT user_id FROM selfhost_mcp_oauth_grants
+            WHERE organization_id = $1 AND workspace_id = $2 AND revoked_at IS NULL ORDER BY user_id`,
+          [input.organizationId, input.workspaceId],
+        )).rows.map((row) => row.user_id) : [];
+        for (const userId of owners) await lockUser(tx, userId);
+        if (input.revokeLive) await lockOrganization(tx, input.organizationId);
+        const workspace = await tx.query(
+          "SELECT id FROM selfhost_workspaces WHERE id = $1 AND organization_id = $2 FOR UPDATE",
+          [input.workspaceId, input.organizationId],
+        );
+        if (!workspace.rows.length) return null;
+        let revoked = 0;
+        if (input.revokeLive) {
+          const live = await tx.query<{ id: string; user_id: string }>(
+            `SELECT id, user_id FROM selfhost_mcp_oauth_grants
+              WHERE organization_id = $1 AND workspace_id = $2 AND revoked_at IS NULL ORDER BY id`,
+            [input.organizationId, input.workspaceId],
+          );
+          // A grant issued to a new owner after the owner scan: start over
+          // so its owner is locked in order too.
+          if (live.rows.some((row) => !owners.includes(row.user_id))) return "retry" as const;
+          const now = new Date();
+          // Unredeemed codes would otherwise mint a fresh grant once the module is on.
+          await tx.query(`UPDATE selfhost_mcp_oauth_authorization_codes SET expires_at = $3
+            WHERE organization_id = $1 AND workspace_id = $2 AND expires_at > $3`,
+          [input.organizationId, input.workspaceId, now]);
+          for (const { id } of live.rows) {
+            if (await revokeMcpOAuthGrantRows(tx, id, "operator_abandoned", now)) revoked += 1;
+          }
+        }
+        const abandoned = await tx.query(`UPDATE selfhost_mcp_oauth_revocations
+          SET completed_at = now(), outcome = 'operator_abandoned'
+          WHERE organization_id = $1 AND workspace_id = $2 AND completed_at IS NULL RETURNING id`,
+        [input.organizationId, input.workspaceId]);
+        await recordAudit(tx, {
+          organizationId: input.organizationId,
+          actor: input.actor,
+          action: "mcp_oauth.cleanup_abandoned",
+          target: input.revokeLive
+            ? `${input.workspaceId} (${abandoned.rows.length} pending, ${revoked} live revoked)`
+            : `${input.workspaceId} (${abandoned.rows.length} pending)`,
+        });
+        return { abandoned: abandoned.rows.length, revoked };
+      });
+      if (result !== "retry") return result;
+      if (attempt >= 4) throw new Error("MCP OAuth grants kept changing during operator cleanup; retry");
+    }
+  }
+
   async listWorkspaces(organizationId: string): Promise<Array<Record<string, unknown>>> {
     const result = await this.database.query<{
       id: string;
@@ -725,7 +793,7 @@ export class ControlPlaneStore {
     const deviceCode = opaqueToken("sh_dc_");
     const expiresAt = new Date(Date.now() + DEVICE_CODE_TTL_MS);
     const client = clientName ? cleanName(clientName, "clientName") : null;
-    if (client === DASHBOARD_DEVICE_CLIENT && !options.reserved) {
+    if (client !== null && isDeviceReservedClientName(client) && !options.reserved) {
       throw new ReservedClientNameError("client_name is reserved");
     }
     for (let attempt = 0; attempt < 5; attempt += 1) {

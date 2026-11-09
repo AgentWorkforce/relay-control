@@ -8,6 +8,9 @@ import { hashSecret } from "../src/crypto.js";
 import { defaultMigrationsDirectory, migrate } from "../src/migrations.js";
 import { createMcpOAuthProtocol, pkceS256, type AuthorizationRequest } from "../src/mcp/oauth/protocol.js";
 import { McpOAuthStore, McpOAuthAgentNameTakenError, McpOAuthContinuationError } from "../src/mcp/oauth/store.js";
+import { MCP_OAUTH_CLIENT_TTL_MS, McpOAuthTeardown, pruneMcpOAuthClients } from "../src/mcp/oauth/teardown.js";
+import type { RelaycastClient } from "../src/messaging/relaycast.js";
+import type { Database } from "../src/database.js";
 import { PGliteDatabase } from "./support/harness.js";
 
 const ORIGIN = "https://relay.example.test";
@@ -78,6 +81,37 @@ test("OAuth clients/codes retain source IDs, exact redirect arrays, one-way code
   assert.equal(row.code_challenge, request.codeChallenge);
   assert.deepEqual(row.scopes, ["relay:mcp"]);
   assert.equal((await f.database.query("SELECT id FROM selfhost_token_sessions")).rows.length, 0);
+});
+
+test("unused registered clients are pruned after a day while clients with a grant or code are kept", async t => {
+  const f = await fixture(t);
+  const register = async (name: string, at: Date) => {
+    const client = await f.store.registerMcpOAuthClient({ clientName: name, redirectUris: ["https://client.example.test/cb"] });
+    await f.database.query("UPDATE selfhost_mcp_oauth_clients SET created_at=$2 WHERE client_id=$1", [client.clientId, at]);
+    return client.clientId;
+  };
+  const old = new Date(NOW.getTime() - MCP_OAUTH_CLIENT_TTL_MS - 1000), recent = new Date(NOW.getTime() - 60_000);
+  const unused = await register("fake-unused", old), fresh = await register("fake-fresh", recent);
+  const granted = await register("fake-granted", old), coded = await register("fake-coded", old);
+  await f.grant({ ...f.authorization(), clientId: granted });
+  await f.store.createMcpOAuthAuthorizationCode({ ...f.authorization(), clientId: coded }, f.owner);
+  const extra = await Promise.all(Array.from({ length: 3 }, (_, index) => register("fake-extra-" + index, old)));
+  const cutoff = new Date(NOW.getTime() - MCP_OAUTH_CLIENT_TTL_MS);
+  assert.equal(await pruneMcpOAuthClients(f.database, cutoff, 2), 2);
+  assert.equal(await pruneMcpOAuthClients(f.database, cutoff), 2);
+  assert.equal(await pruneMcpOAuthClients(f.database, cutoff), 0);
+  const left = (await f.database.query<{ client_id: string }>("SELECT client_id FROM selfhost_mcp_oauth_clients")).rows.map(row => row.client_id);
+  for (const id of [unused, ...extra]) assert.equal(left.includes(id), false);
+  for (const id of [fresh, granted, coded]) assert.equal(left.includes(id), true);
+  // The teardown pass runs the prune on its own clock.
+  const doomed = await register("fake-doomed", old);
+  const relaycast = {} as RelaycastClient;
+  const worker = new McpOAuthTeardown({ database: f.database, keyring: { active: { id: "fake-key", key: Buffer.alloc(32, 7) } },
+    client: relaycast, now: () => new Date(NOW) });
+  t.after(() => worker.stop());
+  assert.deepEqual(await worker.drain(), { completed: 0, kept: 0, pending: 0 });
+  assert.equal((await f.database.query("SELECT 1 FROM selfhost_mcp_oauth_clients WHERE client_id=$1", [doomed])).rows.length, 0);
+  assert.equal((await f.database.query("SELECT 1 FROM selfhost_mcp_oauth_clients WHERE client_id=$1", [fresh])).rows.length, 1);
 });
 
 test("one user in two organizations gets explicitly bound codes; mismatched workspace/org is refused", async t => {
@@ -157,25 +191,59 @@ test("OAuth migrations upgrade an existing database idempotently", async t => {
   const database = new PGliteDatabase();
   t.after(() => database.close());
   const source = defaultMigrationsDirectory();
-  const oauthMigrations=new Set(["0015_mcp_oauth.sql","0028_mcp_oauth_sessions.sql","0030_mcp_oauth_revocations.sql"]);
+  const oauthMigrations=new Set(["0015_mcp_oauth.sql","0028_mcp_oauth_sessions.sql","0030_mcp_oauth_revocations.sql","0032_mcp_oauth_revocation_attempts.sql"]);
   for (const name of await readdir(source)) if (name.endsWith(".sql") && !oauthMigrations.has(name)) await copyFile(join(source,name),join(directory,name));
   await migrate(database,directory);
-  assert.deepEqual(await migrate(database),["0015_mcp_oauth.sql","0028_mcp_oauth_sessions.sql","0030_mcp_oauth_revocations.sql"]);
+  assert.deepEqual(await migrate(database),[...oauthMigrations]);
   assert.deepEqual(await migrate(database),[]);
 });
 
-test("0028/0030 apply after the OAuth foundation without changing its checksum",async t=>{
+test("0028/0030/0032 apply after the OAuth foundation without changing its checksum",async t=>{
   const directory=await mkdtemp(join(tmpdir(),"mcp-oauth-foundation-upgrade-"));
   t.after(()=>rm(directory,{ recursive:true,force:true }));
   const database=new PGliteDatabase(); t.after(()=>database.close());
   const source=defaultMigrationsDirectory();
-  for(const name of await readdir(source)) if(name.endsWith(".sql") && name!=="0028_mcp_oauth_sessions.sql" && name!=="0030_mcp_oauth_revocations.sql") {
+  const later=["0028_mcp_oauth_sessions.sql","0030_mcp_oauth_revocations.sql","0032_mcp_oauth_revocation_attempts.sql"];
+  for(const name of await readdir(source)) if(name.endsWith(".sql") && !later.includes(name)) {
     await copyFile(join(source,name),join(directory,name));
   }
   await migrate(database,directory);
   const before=(await database.query<{ checksum:string }>("SELECT checksum FROM selfhost_schema_migrations WHERE name='0015_mcp_oauth.sql'")).rows[0]!.checksum;
-  assert.deepEqual(await migrate(database),["0028_mcp_oauth_sessions.sql","0030_mcp_oauth_revocations.sql"]);
+  assert.deepEqual(await migrate(database),later);
   const after=(await database.query<{ checksum:string }>("SELECT checksum FROM selfhost_schema_migrations WHERE name='0015_mcp_oauth.sql'")).rows[0]!.checksum;
   assert.equal(after,before);
   assert.deepEqual(await migrate(database),[]);
+});
+
+test("a database missing migration 0032 logs one hint and slows the teardown timer to five minutes until a pass succeeds", async t => {
+  let failing = true, queries = 0;
+  const undefinedColumn = () => Object.assign(new Error("fake undefined column"), { code: "42703" });
+  const database = {
+    async query() { queries++; if (failing) throw undefinedColumn(); return { rows: [] }; },
+    async transaction() { throw new Error("not reached"); },
+  } as unknown as Database;
+  const errors = t.mock.method(console, "error", () => undefined);
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let clock = NOW.getTime();
+  const worker = new McpOAuthTeardown({ database, keyring: { active: { id: "fake-key", key: Buffer.alloc(32, 7) } },
+    client: {} as RelaycastClient, now: () => new Date(clock) });
+  t.after(() => worker.stop());
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  const tick = async (ms = 15_000) => { clock += ms; t.mock.timers.tick(ms); await settle(); await settle(); };
+  const hints = () => errors.mock.calls.filter(call => call.arguments[0] === "[mcp-oauth] teardown needs migration 0032; apply pending migrations").length;
+  worker.start(); await settle(); await settle();
+  assert.equal(hints(), 1);
+  assert.equal(errors.mock.calls.some(call => call.arguments[0] === "[mcp-oauth] teardown deferred"), false);
+  const afterFirst = queries;
+  for (let index = 0; index < 19; index++) await tick();
+  assert.equal(queries, afterFirst, "no pass inside the five-minute back-off");
+  await tick();
+  assert.ok(queries > afterFirst, "the pass runs again after five minutes");
+  assert.equal(hints(), 1, "the hint is logged once");
+  failing = false;
+  for (let index = 0; index < 20; index++) await tick();
+  const recovered = queries;
+  await tick();
+  assert.ok(queries > recovered, "after a successful pass the timer runs every 15 seconds again");
+  assert.equal(hints(), 1);
 });

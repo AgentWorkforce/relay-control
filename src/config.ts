@@ -22,6 +22,13 @@ export type SelfhostConfig = {
    */
   relayauthUrl: string | null;
   relayhistoryUrl: string;
+  /**
+   * RELAYHISTORY_BACKEND=native: no RelayAuth and no standalone RelayHistory.
+   * relayhistoryUrl and relayhistoryPublicUrl are the read API's (see
+   * loadConfig); uploads go to the pipeline ingest edge at the same public
+   * origin. Absent means the legacy RelayHistory exchange.
+   */
+  relayhistoryBackend?: "native" | null;
   /** Optional GET-only pipeline reader for unsearched session lists and turns. */
   relayhistoryReadApiUrl?: string | null;
   /** RELAYHISTORY_READ_API_EVENTS: opt in to native session-event reads. Default off. */
@@ -318,8 +325,16 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   // Validated at boot; clientIp (src/auth/device-approval.ts) reads it per request.
   trustedProxyHops(env);
 
-  const relayhistoryPublicUrl = publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL");
+  const relayhistoryBackend = loadRelayhistoryBackend(env);
+  const sessionReadApi = loadSessionReadApiConfig(env);
+  const relayauth = loadRelayauthConfig(env);
+  // Native: one History origin, the read API's. Nothing may name a second one.
+  const nativeReadApi = relayhistoryBackend === "native"
+    ? nativeReadApiConfig(env, sessionReadApi, relayauth)
+    : null;
+  const relayhistoryPublicUrl = nativeReadApi ? nativeReadApi.publicUrl : publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL");
   const introspection = loadIntrospectionConfig(env, relayhistoryPublicUrl);
+  if (nativeReadApi) assertNativeIntrospection(introspection, nativeReadApi.publicUrl);
   const relayhistoryReadApiUrl = env.RELAYHISTORY_READ_API_URL?.trim()
     ? publicServiceUrl(env, "RELAYHISTORY_READ_API_URL") : null;
   const eventsFlag = env.RELAYHISTORY_READ_API_EVENTS?.trim();
@@ -344,12 +359,13 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     publicBaseUrl: serviceUrl(env, "SELFHOST_PUBLIC_URL"),
     relaycastUrl: serviceUrl(env, "RELAYCAST_URL"),
     relaycastPublicUrl: publicServiceUrl(env, "RELAYCAST_PUBLIC_URL"),
-    ...loadRelayauthConfig(env),
-    relayhistoryUrl: serviceUrl(env, "RELAYHISTORY_URL"),
+    ...relayauth,
+    relayhistoryBackend,
+    relayhistoryUrl: nativeReadApi ? nativeReadApi.url : serviceUrl(env, "RELAYHISTORY_URL"),
     relayhistoryPublicUrl,
     relayhistoryReadApiUrl,
     relayhistoryReadApiEvents,
-    sessionReadApi: loadSessionReadApiConfig(env),
+    sessionReadApi,
     relayfileControlBrokerSecret: loadBrokerSecret(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
@@ -360,7 +376,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     encryptionKeyring: loadEncryptionKeyring(env),
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     factory: loadFactoryConfig(env),
-    mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name)),
+    mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name), serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
   };
@@ -397,6 +413,59 @@ function loadBrokerSecret(env: Env): string | null {
   if (!secret) return null;
   if (Buffer.byteLength(secret) < 32) throw new Error("RELAYFILE_CONTROL_BROKER_SECRET (or _FILE) must be at least 32 bytes");
   return secret;
+}
+
+/** RELAYHISTORY_BACKEND: unset or `legacy` (default), or `native`; anything else refuses startup. */
+function loadRelayhistoryBackend(env: Env): "native" | null {
+  const raw = env.RELAYHISTORY_BACKEND?.trim() ?? "";
+  if (raw === "" || raw === "legacy") return null;
+  if (raw === "native") return "native";
+  throw new Error("RELAYHISTORY_BACKEND must be legacy or native");
+}
+
+/**
+ * RELAYHISTORY_BACKEND=native needs the read API handoff, refuses RelayAuth,
+ * and permits RELAYHISTORY_URL / _PUBLIC_URL only when they name the read API.
+ * Uploads use the same public origin: the ingest edge is routed there, so a
+ * caller's token is valid at exactly one audience.
+ */
+function nativeReadApiConfig(
+  env: Env,
+  sessionReadApi: SelfhostConfig["sessionReadApi"],
+  relayauth: { relayauthUrl: string | null; relayauthApiKey: string | null },
+): { url: string; publicUrl: string } {
+  if (!sessionReadApi) {
+    throw new Error("RELAYHISTORY_BACKEND=native requires SESSION_READ_API_URL, SESSION_READ_API_PUBLIC_URL and SESSION_READ_API_SECRET");
+  }
+  if (relayauth.relayauthUrl || relayauth.relayauthApiKey) {
+    throw new Error("RELAYHISTORY_BACKEND=native refuses RELAYAUTH_URL and RELAYAUTH_API_KEY");
+  }
+  if (env.RELAYHISTORY_READ_API_URL?.trim()) {
+    throw new Error("RELAYHISTORY_BACKEND=native refuses RELAYHISTORY_READ_API_URL");
+  }
+  if (new URL(sessionReadApi.publicUrl).origin !== sessionReadApi.publicUrl) {
+    throw new Error("SESSION_READ_API_PUBLIC_URL must be a bare origin with RELAYHISTORY_BACKEND=native");
+  }
+  if (env.RELAYHISTORY_URL?.trim() && serviceUrl(env, "RELAYHISTORY_URL") !== sessionReadApi.url) {
+    throw new Error("RELAYHISTORY_URL must equal SESSION_READ_API_URL (or be unset) with RELAYHISTORY_BACKEND=native");
+  }
+  if (env.RELAYHISTORY_PUBLIC_URL?.trim() && publicServiceUrl(env, "RELAYHISTORY_PUBLIC_URL") !== sessionReadApi.publicUrl) {
+    throw new Error("RELAYHISTORY_PUBLIC_URL must equal SESSION_READ_API_PUBLIC_URL (or be unset) with RELAYHISTORY_BACKEND=native");
+  }
+  return { url: sessionReadApi.url, publicUrl: sessionReadApi.publicUrl };
+}
+
+/** The ingest edge authorizes every upload through introspection of this audience. */
+function assertNativeIntrospection(
+  introspection: { introspectSecret: string | null; introspectAudiences: string[] },
+  publicUrl: string,
+): void {
+  if (!introspection.introspectSecret) {
+    throw new Error("RELAYHISTORY_BACKEND=native requires RELAYCONTROL_INTROSPECT_SECRET");
+  }
+  if (!introspection.introspectAudiences.includes(publicUrl)) {
+    throw new Error("SELFHOST_INTROSPECT_AUDIENCES must include SESSION_READ_API_PUBLIC_URL with RELAYHISTORY_BACKEND=native");
+  }
 }
 
 function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {

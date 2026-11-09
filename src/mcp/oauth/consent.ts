@@ -125,6 +125,25 @@ export function createMcpOAuthConsentHandlers(deps: {
     if (body.continue_grant_id !== undefined && typeof body.continue_grant_id !== "string") {
       return oauthJson({ error: "invalid_request", error_description: "Select an existing connection." }, 400);
     }
+    if (body.attach_existing !== undefined && typeof body.attach_existing !== "boolean") {
+      return oauthJson({ error: "invalid_request", error_description: "attach_existing must be a boolean." }, 400);
+    }
+    if (!body.continue_grant_id) {
+      // A new connection never lands on an existing agent by accident: another
+      // member's (or a retiring) agent is refused, and this user's own agent
+      // needs an explicit confirmation, since attaching shares its identity and inbox.
+      const availability = await deps.checkAgentNameAvailability(principal, agentName).catch((): AgentNameAvailability => "unknown");
+      if (availability === "unknown") {
+        return oauthJson({ error: "temporarily_unavailable", error_description: "The agent name could not be checked. Try again." }, 503);
+      }
+      if (availability === "taken") {
+        return oauthJson({ error: "agent_name_taken", error_description: "That name is already in use. Choose another name." }, 409);
+      }
+      if (availability === "yours" && body.attach_existing !== true) {
+        return oauthJson({ error: "agent_name_in_use", error_description:
+          "That name belongs to one of your existing agents. Confirm that this app should attach to it, or choose another name." }, 409);
+      }
+    }
     if (grok && !body.continue_grant_id) {
       const connected = await deps.store.listConnectedAgentNames(principal);
       if (connected.some(agent => agent.workspaceId === principal.workspaceId && agent.agentName === agentName)) {
