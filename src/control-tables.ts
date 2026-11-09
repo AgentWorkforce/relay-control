@@ -26,6 +26,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "desktop_feed_workspace_bindings",
   "desktop_mcp_credentials",
   "desktop_relay_identities",
+  "desktop_relay_session_bindings",
   "device_authorizations",
   "email_login_tokens",
   "factory_bindings",

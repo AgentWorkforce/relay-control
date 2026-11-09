@@ -9,8 +9,9 @@ import { ownerHash, relayFailure, relayService, type RelayToolOperation } from "
  * (the unpinned registration). Tool names and argument shapes match Cloud
  * exactly so Desktop's health check and existing prompts work unchanged.
  * `as_person` and `hosted` are accepted for that reason; self-host refuses
- * `as_person` because it has no person-identity sends, and `desktop_address`
- * because it cannot link Desktop identities yet.
+ * `as_person` because it has no person-identity sends. join_relay
+ * `desktop_address` links this MCP session to a synced Agent Relay Desktop
+ * identity (src/messaging/desktop-identities.ts).
  */
 
 const name = z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,46}[a-z0-9]$/);
@@ -77,14 +78,14 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
   }, input => run(service => service.read(input)));
 
   server.registerTool("join_relay", {
-    description: "Create or reuse a hosted inbox participant for this MCP session, named by name or a default derived from your name. The binding belongs to this MCP session and is idempotent. Joining an existing participant whose relay token Relaycast rejects recovers the token (recovered: true). desktop_address (linking an Agent Relay Desktop identity) is not yet available on this self-hosted site.",
-    inputSchema: { desktop_address: z.string().trim().min(3).max(512).optional().describe("Exact synced Agent Relay Desktop identity address. Not yet available on this self-hosted site."),
+    description: "Link this MCP session to your local Agent Relay Desktop identity with desktop_address (the address from GET /whoami on the relay socket, or from an injected `[reply: ...]` hint); later sends, channel posts and status then act as that identity, and replies are injected into your session by Desktop. Without desktop_address, create or reuse a hosted inbox participant as the fallback, named by name or a default derived from your name (replies arrive in check_relay_inbox). Either binding belongs to this MCP session, is idempotent, and replaces the other. Joining an existing participant whose relay token Relaycast rejects recovers the token (recovered: true).",
+    inputSchema: { desktop_address: z.string().trim().min(3).max(512).optional().describe("Exact synced Agent Relay Desktop identity address owned by the signed-in person: the direct name@machine address (GET /whoami on the relay socket), not an alias; cannot be combined with name or description."),
       name: name.optional(), description: z.string().trim().max(1000).optional() },
     annotations: { ...annotations, readOnlyHint: false, idempotentHint: true },
   }, input => run(service => service.join(input), "join"));
 
   server.registerTool("leave_relay", {
-    description: "Unlink this MCP session and remove its hosted inbox participant.",
+    description: "Unlink this MCP session: remove its desktop link (the Desktop's agent keeps running), or else remove its hosted inbox participant.",
     inputSchema: { as }, annotations: { ...annotations, readOnlyHint: false, destructiveHint: true, idempotentHint: true },
   }, input => run(service => service.leave(input.as), "leave"));
 
