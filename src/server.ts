@@ -21,6 +21,7 @@ import { gateCredentialVerifier } from "./license/resolver.js";
 import { loadAmpConfig } from "./amp/config.js";
 import { createAmpModule } from "./amp/module.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
+import { mcpOAuthActive } from "./mcp/oauth/config.js";
 import { createRelaycastClient } from "./messaging/relaycast.js";
 import { loadAnalyticsConfig } from "./analytics/config.js";
 import {
@@ -147,7 +148,8 @@ async function start(): Promise<void> {
   telemetry.start();
   identity.start();
   amp.start();
-  if(config.mcpOAuth?.enabled) mcpOAuthTeardown.start();
+  if(mcpOAuthActive(config)) mcpOAuthTeardown.start();
+  else if(config.mcpOAuth?.unavailable) console.warn("[selfhost-api] hosted MCP OAuth unavailable", { reason: config.mcpOAuth.unavailable.reason });
   factory.start();
   server.listen(config.port, config.host, () => {
     console.log("[selfhost-api] listening", {

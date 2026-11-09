@@ -4,6 +4,7 @@ import { McpOAuthStore } from "./mcp/oauth/store.js";
 import { connectorKind } from "./mcp/oauth/connector-kind.js";
 import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
+import { mcpOAuthActive } from "./mcp/oauth/config.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -431,7 +432,7 @@ export function createApp(input: {
   const amp = input.amp?.config.enabled ? input.amp : null;
   const providerProbes: ProviderProbes = input.providerProbes ?? {};
   const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
-  const oauthTeardown=config.mcpOAuth?.enabled ? input.mcpOAuthTeardown??new McpOAuthTeardown({
+  const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({
     database:store.database,keyring:config.encryptionKeyring,
     client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch(input.messagingFetch)}),now:input.now,
   }) : null;

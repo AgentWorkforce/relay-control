@@ -6,6 +6,7 @@ import { ApiTokenStore } from "../admin/api-tokens.js";
 import { cookieRequestAllowed } from "../auth/device-approval.js";
 import { DesktopMcpCredentials } from "../auth/desktop-mcp-credentials.js";
 import type { SelfhostConfig } from "../config.js";
+import { mcpOAuthActive } from "./oauth/config.js";
 import { secureEqual } from "../crypto.js";
 import type { AmpDeps } from "../amp/service.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
@@ -117,7 +118,7 @@ export function createMcpHandler(input: {
   const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.fetchImpl });
   // Citations open the dashboard's session page.
   const citationOrigin = new URL(config.dashboardUrl).origin;
-  const oauthSessions = config.mcpOAuth?.enabled ? input.oauthSessions : undefined;
+  const oauthSessions = mcpOAuthActive(config) ? input.oauthSessions : undefined;
   const oauthProtocol = oauthSessions?.options.protocol;
   function resourceFor(path: string): McpOAuthResourcePath | null {
     const clean = path.replace(/\/+$/u,"");

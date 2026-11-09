@@ -2,7 +2,8 @@ import { randomBytes } from "node:crypto";
 import type { IncomingMessage,ServerResponse } from "node:http";
 import type { SelfhostConfig } from "../../config.js";
 import { RateLimiter } from "../../auth/device-approval.js";
-import { APP_BASE_PATH,createMcpOAuthProtocol,type McpOAuthResourcePath } from "./protocol.js";
+import { APP_BASE_PATH,createMcpOAuthProtocol,mcpOAuthPublicOriginAllowed,type McpOAuthResourcePath } from "./protocol.js";
+import type { McpOAuthUnavailableReason } from "./config.js";
 import { createMcpOidcIssuer } from "./oidc.js";
 import { createMcpOAuthPublicHandlers,type McpOAuthPublicStore } from "./public-handlers.js";
 import { createMcpOAuthConsentHandlers,resolveMcpConsentAccount,type McpConsentPrincipal,
@@ -65,10 +66,13 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
 }) {
   const settings=deps.config.mcpOAuth;
   const enabled=settings?.enabled===true;
-  if(!enabled) return {enabled:false as const,protocol:null,oidcEnabled:false,issuer:null,store:null,
+  if(!enabled) return {enabled:false as const,degraded:null,protocol:null,oidcEnabled:false,issuer:null,store:null,
     handle:async(_request:Request,_clientAddress?:string):Promise<Response|null>=>null,
     handleNode:async(_request:IncomingMessage,_response:ServerResponse)=>false};
+  if(settings.unavailable) return unavailableMcpOAuthModule(settings.unavailable.reason);
   const origin=new URL(deps.config.publicBaseUrl).origin;
+  // loadConfig already applies this gate; a hand-built config still degrades instead of crashing.
+  if(!mcpOAuthPublicOriginAllowed(origin)) return unavailableMcpOAuthModule("public_url");
   const now=()=>deps.now?.()??new Date();
   const issuer=settings.oidc?createMcpOidcIssuer(settings.oidc):null;
   const oidcEnabled=issuer!==null;
@@ -92,8 +96,7 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
     const standard="/.well-known/oauth-protected-resource"+new URL(protocol.mcpResourceUrl(resource)).pathname;
     return [...new Set([primary,standard])].map(path=>[path,resource] as const);
   }));
-  const discovery=new Set([`${APP_BASE_PATH}/.well-known/oauth-authorization-server`,`${APP_BASE_PATH}/.well-known/openid-configuration`,
-    "/.well-known/oauth-authorization-server/cloud","/.well-known/openid-configuration/cloud"]);
+  const discovery=DISCOVERY;
   const jwks=`${APP_BASE_PATH}/.well-known/jwks.json`;
 
   function recognizes(path:string):boolean {
@@ -248,5 +251,44 @@ form.addEventListener('submit',event=>{event.preventDefault();decide('approve');
     const responseHeaders:Record<string,string>={};result.headers.forEach((value,key)=>{responseHeaders[key]=value;});
     response.writeHead(result.status,responseHeaders);response.end(Buffer.from(await result.arrayBuffer()));return true;
   }
-  return {enabled,protocol,oidcEnabled,issuer,store,handle,handleNode};
+  return {enabled,degraded:null,protocol,oidcEnabled,issuer,store,handle,handleNode};
+}
+
+const DISCOVERY=new Set([`${APP_BASE_PATH}/.well-known/oauth-authorization-server`,`${APP_BASE_PATH}/.well-known/openid-configuration`,
+  "/.well-known/oauth-authorization-server/cloud","/.well-known/openid-configuration/cloud"]);
+const STATIC_PUBLIC=[`${API}/register`,`${API}/token`,`${API}/revoke`,`${APP_BASE_PATH}/.well-known/jwks.json`];
+const PROTECTED_RESOURCE="/.well-known/oauth-protected-resource";
+
+/**
+ * Enabled but missing an input: every OAuth path answers 501 naming the reason,
+ * so clients see a stable refusal and nothing else is touched. Other paths fall through.
+ */
+function unavailableMcpOAuthModule(reason:McpOAuthUnavailableReason) {
+  const isPublic=(path:string)=>DISCOVERY.has(path)||STATIC_PUBLIC.includes(path)||path.startsWith(PROTECTED_RESOURCE);
+  const recognizes=(path:string)=>isPublic(path)||path===AUTHORIZE||path===`${API}/authorize`||
+    path===`${API}/authorize/agent-name`||path===GRANTS||path.startsWith(GRANTS+"/");
+  function answer(path:string):Response {
+    const response=json({error:"mcp_oauth_unavailable",reason},501);
+    if(isPublic(path)) {
+      response.headers.set("access-control-allow-origin","*");
+      response.headers.set("access-control-allow-methods","GET, POST, OPTIONS");
+      response.headers.set("access-control-allow-headers","content-type, authorization");
+    }
+    return response;
+  }
+  const clean=(raw:string)=>{
+    try { return new URL(raw,"http://localhost").pathname.replace(/\/+$/,"")||"/"; } catch { return null; }
+  };
+  return {enabled:false as const,degraded:{reason},protocol:null,oidcEnabled:false,issuer:null,store:null,
+    handle:async(request:Request,_clientAddress?:string):Promise<Response|null>=>{
+      const path=clean(request.url);
+      return path!==null && recognizes(path)?answer(path):null;
+    },
+    handleNode:async(request:IncomingMessage,response:ServerResponse):Promise<boolean>=>{
+      const path=clean(request.url??"/");
+      if(path===null || !recognizes(path)) return false;
+      const result=answer(path);
+      const headers:Record<string,string>={};result.headers.forEach((value,key)=>{headers[key]=value;});
+      response.writeHead(result.status,headers);response.end(Buffer.from(await result.arrayBuffer()));return true;
+    }};
 }

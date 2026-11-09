@@ -12,7 +12,7 @@ info:
     identical methods, bodies, and responses. Bearer authentication remains
     available on both mounts; the `/cloud` mount additionally accepts the
     same-origin HttpOnly session cookie issued by `/login`.
-    The optional MCP OAuth issuer and grant-management APIs use explicit
+    The MCP OAuth issuer (on by default) and grant-management APIs use explicit
     /cloud/api/oauth/* and /cloud/api/v1/oauth/grants* prefixes; their bare
     equivalents are not mounted.
     Client-visible Relaycast and RelayHistory URLs are explicit public HTTPS
@@ -39,7 +39,7 @@ security:
   - bearerAuth: []
 tags:
   - name: MCP OAuth
-    description: Default-off MCP connector issuer (SELFHOST_MCP_OAUTH); see docs/mcp-oauth.md.
+    description: MCP connector issuer, on by default (SELFHOST_MCP_OAUTH=off disables it; missing inputs answer 501 mcp_oauth_unavailable); see docs/mcp-oauth.md.
   - name: acquisition
     description: |
       Dormant cloud-class acquisition assertion issuer (flag
@@ -97,7 +97,7 @@ paths:
     post:
       operationId: mcpOAuthRoot
       tags: [MCP OAuth]
-      summary: MCP root resource, enabled with SELFHOST_MCP_OAUTH.
+      summary: MCP root resource, mounted while MCP OAuth is active (SELFHOST_MCP_OAUTH, on by default).
       description: |
         Stateless JSON-RPC endpoint; /cloud/mcp is an RPC alias. OAuth tokens
         must target the canonical public /mcp resource, including on the alias.
@@ -105,7 +105,8 @@ paths:
         personal cli:auth bearers are also accepted. Cookies are accepted only
         on the /cloud alias behind the native origin guard. OAuth connections
         do not acquire native API, Desktop or transcript-history authority.
-        Disabled module returns 404. All responses disable caching.
+        Disabled or unavailable module returns 404 (an mcp_at_ bearer is refused
+        with 401). All responses disable caching.
       security:
         - oauthMcpBearer: []
         - bearerAuth: []
@@ -150,6 +151,7 @@ paths:
               schema: {type: object}
         "404":
           description: Module disabled
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /.well-known/oauth-protected-resource/mcp:
     get:
       operationId: mcpOAuthRootResourceMetadata
@@ -164,6 +166,7 @@ paths:
               schema: {type: object}
         "404":
           description: Module disabled
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /cloud/.well-known/oauth-protected-resource/cloud/api/v1/mcp/shared-sessions:
     get:
       operationId: mcpOAuthSharedResourceMetadata
@@ -179,6 +182,7 @@ paths:
               schema: {type: object}
         "404":
           description: Module disabled
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /cloud/.well-known/jwks.json:
     get:
       operationId: mcpOAuthJwks
@@ -199,6 +203,7 @@ paths:
                     items: {type: object}
         "404":
           description: OAuth or OIDC disabled
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /cloud/oauth/authorize:
     get:
       operationId: mcpOAuthConsentPage
@@ -236,6 +241,7 @@ paths:
           description: Account capability or handoff admission refused
         "404":
           description: Module disabled or workspace no longer accessible
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /cloud/api/oauth/authorize:
     post:
       operationId: mcpOAuthConsent
@@ -279,6 +285,7 @@ paths:
           description: Module disabled
         "413":
           description: Body exceeds 64 KiB
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /cloud/api/oauth/authorize/agent-name:
     get:
       operationId: mcpOAuthAgentName
@@ -307,6 +314,7 @@ paths:
           description: Account capability or handoff refused
         "404":
           description: Module disabled
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /cloud/api/oauth/register:
     post:
       operationId: mcpOAuthRegister
@@ -354,6 +362,7 @@ paths:
           description: Body exceeds 64 KiB
         "429":
           description: Registration rate limit (slow_down)
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /cloud/api/oauth/token:
     post:
       operationId: mcpOAuthToken
@@ -395,6 +404,7 @@ paths:
           description: Module disabled
         "413":
           description: Body exceeds 64 KiB
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /cloud/api/oauth/revoke:
     post:
       operationId: mcpOAuthRevoke
@@ -418,6 +428,7 @@ paths:
           description: Module disabled
         "413":
           description: Body exceeds 64 KiB
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /cloud/api/v1/oauth/grants:
     get:
       operationId: mcpOAuthListGrants
@@ -443,6 +454,7 @@ paths:
           description: Account capability or handoff refused
         "404":
           description: Module disabled or workspace inaccessible
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /cloud/api/v1/oauth/grants/{grantId}:
     delete:
       operationId: mcpOAuthDisconnect
@@ -462,6 +474,7 @@ paths:
           description: Invalid Origin, account capability or handoff
         "404":
           description: Module disabled, workspace inaccessible or no owned grant
+        "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
   /api/v1/mcp/shared-sessions:
     post:
       operationId: hostedMcpSharedSessions
@@ -503,7 +516,7 @@ paths:
         Copilot call without one gets a tool error and no relay action. See
         docs/integrations/copilot-vscode.md.
 
-        With SELFHOST_MCP_OAUTH=on, an OAuth header bearer granted for
+        With MCP OAuth active (the default), an OAuth header bearer granted for
         the canonical /cloud/api/v1/mcp/shared-sessions resource is accepted.
         It acts only as its approved immutable relay-agent identity. The
         cookie account and native API authority are not granted by OAuth;
@@ -8655,6 +8668,19 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
         status: { enum: [active, expired, revoked] }
   responses:
+    McpOAuthUnavailable:
+      description: >-
+        MCP OAuth is enabled but cannot run because an input is missing or
+        invalid; every OAuth route answers this until the operator fixes it.
+        Public routes keep their CORS headers. Cache-Control is no-store.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, reason]
+            properties:
+              error: {type: string, const: mcp_oauth_unavailable}
+              reason: {type: string, enum: [public_url, oidc_signing_key]}
     PasswordSignedIn:
       description: Signed in; sets the `agent_relay_session` cookie (Path=/cloud). The token is never in the body.
       content:

@@ -260,3 +260,47 @@ for(const oidc of [false,true]) test("real store HTTP consent/exchange/refresh/r
   assert.equal(refused.status,400);
   assert.equal((await refused.json()).error,"invalid_grant");
 });
+
+test("an unavailable module answers every OAuth path with 501 naming only the reason and leaves other paths alone",async()=>{
+  const off=harness({enabled:false}).module;
+  assert.equal(off.degraded,null);
+  const created:string[]=[];
+  const settings=config(true,{SELFHOST_MCP_OIDC_SIGNING_KEY_ID:"fake-active"});
+  const modules=[["oidc_signing_key",settings],["public_url",{...config(),publicBaseUrl:"http://relay.example.test"}]] as const;
+  for(const [reason,value] of modules) {
+    const module=createMcpOAuthHttpModule({config:value,createStore:()=>{created.push(reason);return {} as never;},
+      mountedResources:[SHARED],resolveSession:async()=>null,workspaceAccess:async()=>true,
+      checkAgentNameAvailability:async()=>"available"});
+    assert.equal(module.enabled,false);
+    assert.deepEqual(module.degraded,{reason});
+    assert.equal(module.store,null);assert.equal(module.protocol,null);assert.equal(module.issuer,null);
+    const publicPaths:Array<[string,unknown?]>=[["/cloud/.well-known/oauth-authorization-server"],["/.well-known/openid-configuration/cloud"],
+      ["/cloud/.well-known/jwks.json"],["/.well-known/oauth-protected-resource/cloud"+SHARED],["/.well-known/oauth-protected-resource/mcp"],
+      [API+"/register",registration],[API+"/token",{grant_type:"authorization_code"}],[API+"/revoke",{token:"fake"}]];
+    for(const [path,body] of publicPaths) {
+      const response:Response=(await module.handle(web(path,body)))!;
+      assert.equal(response.status,501,path);
+      assert.equal(response.headers.get("cache-control"),"no-store");
+      assert.equal(response.headers.get("access-control-allow-origin"),"*",path);
+      assert.deepEqual(await response.json(),{error:"mcp_oauth_unavailable",reason});
+    }
+    for(const path of [pagePath,API+"/authorize/agent-name?name=x","/cloud/api/v1/oauth/grants","/cloud/api/v1/oauth/grants/"+randomUUID()]) {
+      const response:Response=(await module.handle(web(path)))!;
+      assert.equal(response.status,501,path);
+      assert.equal(response.headers.get("access-control-allow-origin"),null,path);
+      assert.equal((await response.json()).reason,reason);
+    }
+    for(const path of ["/cloud/api/v1/workspaces","/mcp","/api/oauth/register","/cloud"+SHARED]) assert.equal(await module.handle(web(path)),null,path);
+    const server=createServer(async(request,response)=>{
+      if(!await module.handleNode(request,response)) {response.writeHead(404);response.end();}
+    });
+    const base=await listen(server);
+    try {
+      const token=await fetch(base+API+"/token",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:"grant_type=x"});
+      assert.equal(token.status,501);assert.equal(token.headers.get("cache-control"),"no-store");
+      assert.deepEqual(await token.json(),{error:"mcp_oauth_unavailable",reason});
+      assert.equal((await fetch(base+"/cloud/api/v1/workspaces")).status,404);
+    } finally { await close(server); }
+  }
+  assert.deepEqual(created,[],"no OAuth store is built while unavailable");
+});

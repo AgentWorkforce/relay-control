@@ -28,7 +28,7 @@ import type { RelaycastClient } from "../src/messaging/relaycast.js";
 const ORIGIN="https://relay.example.test",SHARED="/api/v1/mcp/shared-sessions";
 const RESOURCE=ORIGIN+"/cloud"+SHARED;
 const KEYRING={active:{id:"fake-key",key:Buffer.alloc(32,7)}};
-function appConfig(enabled=true):SelfhostConfig {
+function appConfig(enabled=true,unavailable:{reason:"public_url"|"oidc_signing_key"}|null=null):SelfhostConfig {
   return {
     databaseUrl:"unused",publicBaseUrl:ORIGIN,dashboardUrl:ORIGIN,
     relaycastUrl:"http://fake-relay.test",relaycastPublicUrl:"https://cast.example.test",
@@ -36,7 +36,7 @@ function appConfig(enabled=true):SelfhostConfig {
     relayauthUrl:null,relayauthApiKey:null,internalServiceToken:null,
     bootstrapToken:"fake-bootstrap-token-at-least-thirty-two-bytes",encryptionKeyring:KEYRING,
     oauthRedirectUrl:ORIGIN+"/unused",host:"127.0.0.1",port:3000,
-    mcpOAuth:{enabled,eventsEnabled:false,pumpEnabled:false,oidc:null},
+    mcpOAuth:{enabled,unavailable,eventsEnabled:false,pumpEnabled:false,oidc:null},
   };
 }
 const INITIALIZE={jsonrpc:"2.0",id:1,method:"initialize",params:{
@@ -671,6 +671,29 @@ test("disabled module exposes no issuer, root facade or grant API and cannot adm
   },body:JSON.stringify(INITIALIZE)});
   assert.equal(rejected.status,401);
   assert.ok(!rejected.headers.get("www-authenticate")!.includes("resource_metadata"));
+});
+
+test("unavailable module answers 501 on OAuth paths, starts no worker and refuses stored bearers with 401",async t=>{
+  for(const [reason,config] of [["oidc_signing_key",appConfig(true,{reason:"oidc_signing_key"})],
+    ["public_url",{...appConfig(),publicBaseUrl:"http://relay.example.test"}]] as const) {
+    const f=await relayFixture(t);
+    const store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
+    const server=createServer(createApp({config,store,messagingFetch:f.fetchImpl}));
+    const base=await listen(server);t.after(()=>close(server));
+    for(const [path,init] of [["/cloud/.well-known/oauth-authorization-server",{}],["/.well-known/oauth-protected-resource/cloud"+SHARED,{}],
+      ["/cloud/api/v1/oauth/grants",{}],["/cloud/api/oauth/token",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:"grant_type=x"}]] as const) {
+      const response=await fetch(base+path,init);
+      assert.equal(response.status,501,path);
+      assert.equal(response.headers.get("cache-control"),"no-store");
+      assert.deepEqual(await response.json(),{error:"mcp_oauth_unavailable",reason});
+    }
+    assert.equal((await fetch(base+"/mcp")).status,404);
+    const rejected=await fetch(base+"/cloud"+SHARED,{method:"POST",headers:{
+      authorization:"Bearer "+f.pair.accessToken,"content-type":"application/json",accept:"application/json, text/event-stream",
+    },body:JSON.stringify(INITIALIZE)});
+    assert.equal(rejected.status,401,reason);
+    assert.ok(!rejected.headers.get("www-authenticate")!.includes("resource_metadata"));
+  }
 });
 
 test("native pending and exchanged handoff artifacts cannot gain MCP capability",async t=>{

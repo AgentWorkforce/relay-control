@@ -195,12 +195,17 @@ export type McpOAuthProtocolConfig = {
   oidcEnabled?: boolean;
 };
 
+/** Whether a configured public origin can host the OAuth issuer (the same gate the protocol applies). */
+export function mcpOAuthPublicOriginAllowed(publicOrigin: string): boolean {
+  const url = parseSafeOAuthUrl(publicOrigin);
+  return url !== null && (url.pathname === "/" || url.pathname === "") && !/[?#]/u.test(publicOrigin);
+}
+
 export function createMcpOAuthProtocol(config: McpOAuthProtocolConfig) {
-  const url = parseSafeOAuthUrl(config.publicOrigin);
-  if (!url || (url.pathname !== "/" && url.pathname !== "") ||
-      /[?#]/u.test(config.publicOrigin)) {
+  if (!mcpOAuthPublicOriginAllowed(config.publicOrigin)) {
     throw new Error("publicOrigin must be an HTTPS origin (or loopback HTTP), without path, credentials, query or fragment");
   }
+  const url = parseSafeOAuthUrl(config.publicOrigin)!;
   const origin = url.origin;
   const enabled = new Set(config.enabledResources ?? []);
   for (const path of enabled) {
