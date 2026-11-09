@@ -9,6 +9,7 @@ import { PostgresDatabase } from "./database.js";
 import { ControlPlaneStore } from "./store.js";
 import { loadFlowsConfig } from "./flows/config.js";
 import { FlowsStore } from "./flows/store.js";
+import { lazyFlowsStore } from "./flows/lazy.js";
 import { loadTelemetryConfig } from "./telemetry/config.js";
 import { createTelemetryModule } from "./telemetry/module.js";
 import { loadIdentityConfig } from "./identity/config.js";
@@ -65,22 +66,26 @@ const identity = createIdentityModule({
   dashboardUrl: config.dashboardUrl,
   mailer: identityConfig.smtp ? smtpMailer(identityConfig.smtp) : null,
 });
-const flows = new FlowsStore(
-  database,
-  config.encryptionKeyring,
-  loadFlowsConfig(),
-  config.relaycastPublicUrl,
-);
+const flows = lazyFlowsStore(() => {
+  const instance = new FlowsStore(
+    database,
+    config.encryptionKeyring,
+    loadFlowsConfig(),
+    config.relaycastPublicUrl,
+  );
+  instance.cliCredentials = admin.logins;
+  return instance;
+});
 const admin = createAdminModule({
   config,
   database,
   keyring: config.encryptionKeyring,
   // Flows worker credentials may read their own workspace's runtime environment.
   // Refused with the Flows feature code while Flows is not selected.
-  runtimeCredentialVerifier: gateCredentialVerifier((t: string) => flows.verifyRuntimeCredential(t), features, "flows"),
+  runtimeCredentialVerifier: gateCredentialVerifier((t: string) => flows().verifyRuntimeCredential(t), features, "flows"),
 });
-// Subscription logins reach runs through a reference in the assignment payload.
-flows.cliCredentials = admin.logins;
+// Selected Flows retains startup validation; core does not parse optional config.
+if (features.flows) flows();
 const telemetryConfig = loadTelemetryConfig(process.env, {
   probes: [
     { name: "relaycast", url: `${config.relaycastUrl}/health` },
@@ -123,8 +128,8 @@ emitConfigLoaded(analytics, {
     emailLink: identityConfig.emailLogin,
     smtp: identityConfig.smtp !== null,
   },
-  // The flows module is always mounted in this binary.
-  flowsEnabled: true,
+  // Report whether optional Flows is actually selected.
+  flowsEnabled: features.flows,
   operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
 });
 const server = createServer(createApp({

@@ -158,14 +158,14 @@ function objectKind(key: string): "log" | "code" | "artifact" {
   return "artifact";
 }
 
-export function createFlowsHandler(deps: {
+function createInitializedFlowsHandler(deps: {
   store: FlowsStore;
   publicBaseUrl: string;
   userAccess: FlowsUserAccess;
   /**
-   * Throws the feature refusal (403) unless Flows is a capability. Every
-   * route calls it after its own authentication (membership, worker, run or
-   * callback credential) and before touching the store.
+   * Throws the feature refusal (403) unless Flows is selected. Every
+   * route calls it after its own authentication (membership, worker, run,
+   * enrollment or callback credential) and before mutations or queue work.
    */
   requireFeature: () => void;
 }): (request: IncomingMessage, response: ServerResponse, path: string, url: URL) => Promise<boolean> {
@@ -179,6 +179,7 @@ export function createFlowsHandler(deps: {
   let lastMaintenance = 0;
 
   async function maintain(force = false): Promise<void> {
+    requireFeature();
     if (!force && Date.now() - lastMaintenance < 5_000) return;
     lastMaintenance = Date.now();
     await store.maintenance();
@@ -230,6 +231,7 @@ export function createFlowsHandler(deps: {
       for (const assignment of await store.unackedAssignments(worker.id)) emit("assignment", assignment);
       let lastPing = Date.now();
       while (!closed) {
+        requireFeature();
         if (await store.isWorkerRevoked(worker.id)) {
           emit("revoke", {});
           break;
@@ -320,12 +322,13 @@ export function createFlowsHandler(deps: {
 
     // ------------------------------------------------ worker protocol
     if (path === "/api/v1/workers/register" && method === "POST") {
-      // The enrollment token is the only credential and redeeming it is the
-      // store call, so refuse first: an install without Flows never spends one.
-      requireFeature();
       const body = await jsonBody(request, 64 * 1024);
       const enrollmentToken = str(body, "enrollmentToken", true, 512);
       const name = str(body, "name", true, 128);
+      if (!await store.authenticateEnrollmentToken(enrollmentToken)) {
+        throw new FlowsError(401, "invalid_enrollment_token", "Invalid enrollment token");
+      }
+      requireFeature();
       const hostInfo = body.hostInfo;
       if (hostInfo !== undefined && (!hostInfo || typeof hostInfo !== "object" || Array.isArray(hostInfo))) {
         throw new FlowsError(400, "invalid_request", "Invalid request body");
@@ -675,11 +678,9 @@ export function createFlowsHandler(deps: {
       return true;
     }
     if (path === "/api/v1/workflows/callback" && method === "POST") {
-      // The store authenticates and records the callback in one step.
-      requireFeature();
       const body = await jsonBody(request, 512 * 1024);
       const result = body.result;
-      send(response, 200, await store.callback({
+      const callback = {
         runId: str(body, "runId", true, 64),
         accessToken: bearer(request),
         callbackToken: str(body, "callbackToken", false, 512) ??
@@ -687,7 +688,10 @@ export function createFlowsHandler(deps: {
         status: str(body, "status", true, 32),
         result: result && typeof result === "object" && !Array.isArray(result) ? result as JsonObject : undefined,
         error: str(body, "error", false, 4_000),
-      }));
+      };
+      await store.authenticateCallback(callback);
+      requireFeature();
+      send(response, 200, await store.callback(callback));
       return true;
     }
     if ((params = match(path, /^\/api\/v1\/workflows\/runs\/([^/]+)$/)) && method === "GET") {
@@ -889,5 +893,22 @@ export function createFlowsHandler(deps: {
       }
       throw error;
     }
+  };
+}
+
+/** Core startup does not initialize optional storage or its configuration. */
+export function createFlowsHandler(deps: {
+  store: FlowsStore | (() => FlowsStore);
+  publicBaseUrl: string;
+  userAccess: FlowsUserAccess;
+  requireFeature: () => void;
+}): ReturnType<typeof createInitializedFlowsHandler> {
+  let handler: ReturnType<typeof createInitializedFlowsHandler> | undefined;
+  return async (request, response, path, url) => {
+    if (!/^\/api\/v1\/(?:workers|flows|workflows)(?:\/|$)/.test(path)) return false;
+    handler ??= createInitializedFlowsHandler({
+      ...deps, store: typeof deps.store === "function" ? deps.store() : deps.store,
+    });
+    return handler(request, response, path, url);
   };
 }

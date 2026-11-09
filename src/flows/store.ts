@@ -465,6 +465,18 @@ export class FlowsStore {
 
   // -------------------------------------------------------------- workers
 
+  /** A non-redeeming check; registration repeats it under its transaction lock. */
+  async authenticateEnrollmentToken(token: string): Promise<boolean> {
+    const value = token.trim();
+    if (!value.startsWith(ENROLLMENT_TOKEN_PREFIX)) return false;
+    const result = await this.database.query(
+      `SELECT id FROM selfhost_worker_enrollment_tokens
+        WHERE token_hash = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > now()`,
+      [hashSecret(value)],
+    );
+    return result.rows.length === 1;
+  }
+
   async registerWorker(input: {
     enrollmentToken: string;
     name: string;
@@ -1622,6 +1634,33 @@ export class FlowsStore {
     return { workspaceId: row.workspace_id, status: row.status };
   }
 
+  /** Read-only authentication before a feature refusal; no run/event is changed. */
+  async authenticateCallback(input: { runId: string; accessToken: string | null; callbackToken: string | null }) {
+    return this.checkCallbackCredentials(input, this.database, false);
+  }
+
+  private async checkCallbackCredentials(
+    input: { runId: string; accessToken: string | null; callbackToken: string | null },
+    executor: SqlExecutor,
+    lock: boolean,
+  ): Promise<{ workspaceId: string; status: RunStatus }> {
+    if (!input.accessToken?.startsWith(RUN_TOKEN_PREFIX) || !isUuid(input.runId)) {
+      throw new FlowsError(401, "unauthorized", "Invalid run token");
+    }
+    const result = await executor.query<{
+      workspace_id: string; status: RunStatus; access_token_hash: string | null; callback_token_hash: string | null;
+    }>(`SELECT workspace_id, status, access_token_hash, callback_token_hash FROM selfhost_workflow_runs
+          WHERE id = $1${lock ? " FOR UPDATE" : ""}`, [input.runId]);
+    const run = result.rows[0];
+    if (!run?.access_token_hash || !secureEqual(run.access_token_hash, hashSecret(input.accessToken))) {
+      throw new FlowsError(401, "unauthorized", "Invalid run token");
+    }
+    if (run.callback_token_hash && (!input.callbackToken || !secureEqual(run.callback_token_hash, hashSecret(input.callbackToken)))) {
+      throw new FlowsError(401, "unauthorized", "Invalid callback token");
+    }
+    return { workspaceId: run.workspace_id, status: run.status };
+  }
+
   async callback(input: {
     runId: string;
     accessToken: string | null;
@@ -1630,30 +1669,23 @@ export class FlowsStore {
     result?: Record<string, unknown>;
     error?: string;
   }): Promise<{ runId: string; status: RunStatus }> {
-    const run = await this.authenticateRunToken(input.runId, input.accessToken);
-    if (!run) throw new FlowsError(401, "unauthorized", "Invalid run token");
-    const stored = await this.database.query<{ callback_token_hash: string | null }>(
-      "SELECT callback_token_hash FROM selfhost_workflow_runs WHERE id = $1",
-      [input.runId],
-    );
-    const hash = stored.rows[0]?.callback_token_hash;
-    if (hash && (!input.callbackToken || !secureEqual(hash, hashSecret(input.callbackToken)))) {
-      throw new FlowsError(401, "unauthorized", "Invalid callback token");
-    }
-    if (!["completed", "failed", "cancelled"].includes(input.status)) {
-      throw new FlowsError(409, "local_run_status_not_reportable", "Only terminal statuses are reportable");
-    }
-    let status = input.status as "completed" | "failed" | "cancelled";
-    if (status === "completed" && input.result && input.result.ok === false) status = "failed";
-    const changed = await this.database.transaction((tx) =>
-      this.finishRun(tx, input.runId, status, {
+    return this.database.transaction(async (tx) => {
+      // Recheck credentials while holding the run lock before recording anything.
+      const run = await this.checkCallbackCredentials(input, tx, true);
+      if (!["completed", "failed", "cancelled"].includes(input.status)) {
+        throw new FlowsError(409, "local_run_status_not_reportable", "Only terminal statuses are reportable");
+      }
+      let status = input.status as "completed" | "failed" | "cancelled";
+      if (status === "completed" && input.result && input.result.ok === false) status = "failed";
+      const changed = await this.finishRun(tx, input.runId, status, {
         error: status === "failed" ? input.error ?? String(input.result?.completionReason ?? "failed") : null,
         result: input.result ?? null,
         summary: typeof input.result?.completionReason === "string" ? String(input.result.completionReason) : null,
-      }));
-    if (!changed && run.status !== status) {
-      throw new FlowsError(409, "run_already_terminal", `Run already ${run.status}`);
-    }
-    return { runId: input.runId, status };
+      });
+      if (!changed && run.status !== status) {
+        throw new FlowsError(409, "run_already_terminal", `Run already ${run.status}`);
+      }
+      return { runId: input.runId, status };
+    });
   }
 }

@@ -340,7 +340,7 @@ function cookieDeleteAllowed(request: IncomingMessage, browserOrigins: string[])
 export function createApp(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
-  flows?: FlowsStore;
+  flows?: FlowsStore | (() => FlowsStore);
   admin?: AdminModule;
   telemetry?: TelemetryModule;
   /** bootstrap-signup lane: OIDC / email sign-in, invites (src/identity). */

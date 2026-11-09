@@ -7,6 +7,7 @@ import type { ChiefBackend } from "../src/chief/routes.js";
 import { gateCredentialVerifier, loadSelectedFeatures, NO_FEATURES, type SelectedFeatures } from "../src/features.js";
 import { apiClient, BOOTSTRAP, close, listen, seedTenant, startControlPlane } from "./flows-helpers.js";
 import { testFeatures } from "./support/features.js";
+import { lazyFlowsStore } from "../src/flows/lazy.js";
 
 const chiefBackend: ChiefBackend = {
   list: () => ({ chiefs: [] }),
@@ -182,4 +183,136 @@ test("/readyz reports capabilities and no licence field", async (t) => {
   assert.equal(ready.status, 200);
   assert.equal("license" in ready.body, false);
   assert.deepEqual(ready.body.capabilities, { flows: true, relayfile: false, chief: true });
+});
+
+
+test("core startup, readiness and ordinary authenticated reads do not initialize Flows storage", async (t) => {
+  const cp = await plane(t, NO_FEATURES);
+  let initialized = 0;
+  const flows = lazyFlowsStore(() => { initialized++; throw new Error("optional storage must not initialize"); });
+  const server = createServer(createApp({ config: cp.config, store: cp.store, flows }));
+  const api = apiClient(await listen(server));
+  t.after(() => close(server));
+  for (const path of ["/healthz", "/readyz", "/api/v1/capabilities", "/api/v1/organizations"]) {
+    const response = await api(path, { token: cp.tenant.ownerToken });
+    assert.equal(response.status, 200, path);
+  }
+  assert.equal(initialized, 0);
+  const lazy = lazyFlowsStore(() => { initialized++; return cp.flows; });
+  assert.equal(lazy(), cp.flows);
+  assert.equal(lazy(), cp.flows);
+  assert.equal(initialized, 1);
+});
+
+
+test("core denies flow APIs after user authentication, before mutations and maintenance", async (t) => {
+  const cp = await plane(t, NO_FEATURES);
+  let maintenance = 0;
+  cp.flows.maintenance = async () => { maintenance++; return { timedOut: [] }; };
+  assert.equal((await cp.api("/api/v1/flows")).status, 401);
+  for (const path of ["/api/v1/flows", "/api/v1/workflows/runs", "/api/v1/workers"]) {
+    const refused = await cp.api(path, { token: cp.tenant.ownerToken });
+    assert.equal(refused.status, 403, path);
+    assert.equal(refused.body.error, "feature_not_enabled");
+    assert.equal(refused.body.feature, "flows");
+  }
+  const create = await cp.api("/api/v1/flows", { method: "POST", token: cp.tenant.ownerToken, body: {} });
+  assert.equal(create.status, 403);
+  assert.equal(maintenance, 0);
+  const flows = await cp.database.query<{ n: number }>("SELECT count(*)::int AS n FROM selfhost_flow_definitions");
+  assert.equal(flows.rows[0]!.n, 0);
+});
+
+
+test("core refuses worker registration without spending a valid enrollment token", async (t) => {
+  const cp = await plane(t, testFeatures("flows"));
+  const enrollment = await cp.api("/api/v1/workers/enrollment-tokens", {
+    method: "POST", token: cp.tenant.ownerToken, body: { name: "unit-worker" },
+  });
+  assert.equal(enrollment.status, 200);
+  const core = await restartWith(t, cp, NO_FEATURES);
+  const register = await core("/api/v1/workers/register", {
+    method: "POST", body: { enrollmentToken: enrollment.body.token, name: "unit-worker" },
+  });
+  assert.equal(register.status, 403);
+  const state = await cp.database.query<{ used_at: string | null }>("SELECT used_at FROM selfhost_worker_enrollment_tokens");
+  assert.equal(state.rows[0]!.used_at, null);
+  const workers = await cp.database.query<{ n: number }>("SELECT count(*)::int AS n FROM selfhost_workers");
+  assert.equal(workers.rows[0]!.n, 0);
+});
+
+
+test("previously enrolled workers cannot heartbeat, queue or read runtime secrets in core", async (t) => {
+  const cp = await plane(t, testFeatures("flows"));
+  const enrollment = await cp.api("/api/v1/workers/enrollment-tokens", {
+    method: "POST", token: cp.tenant.ownerToken, body: {},
+  });
+  const register = await cp.api("/api/v1/workers/register", {
+    method: "POST", body: { enrollmentToken: enrollment.body.token, name: "existing-unit-worker" },
+  });
+  assert.equal(register.status, 200);
+  const core = await restartWith(t, cp, NO_FEATURES);
+  let maintenance = 0, touches = 0;
+  cp.flows.maintenance = async () => { maintenance++; return { timedOut: [] }; };
+  cp.flows.touchWorker = async () => { touches++; };
+  for (const [path, method] of [
+    [`/api/v1/workers/${register.body.workerId}/heartbeat`, "POST"],
+    [`/api/v1/workers/${register.body.workerId}/queue`, "GET"],
+    [`/internal/v1/workspaces/${cp.tenant.workspaceId}/environment`, "GET"],
+  ] as const) {
+    const result = await core(path, { method, token: register.body.workerToken, ...(method === "POST" ? { body: {} } : {}) });
+    assert.equal(result.status, 403, path);
+    assert.equal(result.body.error, "feature_not_enabled");
+  }
+  assert.equal(maintenance, 0);
+  assert.equal(touches, 0);
+  const unknown = await core(`/api/v1/workers/${register.body.workerId}/heartbeat`, { method: "POST", token: "unknown", body: {} });
+  assert.equal(unknown.status, 401);
+});
+
+
+test("invalid enrollment and callback credentials remain unauthorized in core", async (t) => {
+  const cp = await plane(t, NO_FEATURES);
+  const register = await cp.api("/api/v1/workers/register", {
+    method: "POST", body: { enrollmentToken: "sh_wrk_enr_unknown", name: "unknown-worker" },
+  });
+  assert.equal(register.status, 401);
+  assert.equal(register.body.code, "invalid_enrollment_token");
+  const callback = await cp.api("/api/v1/workflows/callback", {
+    method: "POST", body: { runId: "00000000-0000-4000-8000-000000000001", status: "completed" },
+  });
+  assert.equal(callback.status, 401);
+  assert.equal(callback.body.code, "unauthorized");
+});
+
+
+test("authenticated callback refusal leaves the run and events unchanged; mutation rechecks the credential", async (t) => {
+  const cp = await plane(t, testFeatures("flows"));
+  const local = await cp.api("/api/v1/workflows/local-run", {
+    method: "POST", token: cp.tenant.memberToken,
+    body: { workflow: "version: '0.1.0'\nname: synthetic\nsteps: []\n", fileType: "yaml" },
+  });
+  assert.equal(local.status, 201);
+  const core = await restartWith(t, cp, NO_FEATURES);
+  const runId = local.body.runId as string;
+  const snapshot = async () => ({
+    run: (await cp.database.query("SELECT status, result, completed_at FROM selfhost_workflow_runs WHERE id = $1", [runId])).rows,
+    events: (await cp.database.query("SELECT * FROM selfhost_run_events WHERE run_id = $1 ORDER BY sequence", [runId])).rows,
+  });
+  const before = await snapshot();
+  const body = { runId, callbackToken: local.body.callbackToken, status: "completed", result: { ok: true } };
+  const invalid = await core("/api/v1/workflows/callback", {
+    method: "POST", token: local.body.accessToken, body: { ...body, callbackToken: "wrong" },
+  });
+  assert.equal(invalid.status, 401);
+  const denied = await core("/api/v1/workflows/callback", { method: "POST", token: local.body.accessToken, body });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.body.error, "feature_not_enabled");
+  assert.deepEqual(await snapshot(), before);
+  // A successful preflight is never cached as mutation authority.
+  const credentials = { runId, accessToken: local.body.accessToken, callbackToken: local.body.callbackToken };
+  await cp.flows.authenticateCallback(credentials);
+  await cp.database.query("UPDATE selfhost_workflow_runs SET callback_token_hash = 'rotated' WHERE id = $1", [runId]);
+  await assert.rejects(cp.flows.callback({ ...credentials, status: "completed" }), { code: "unauthorized" });
+  assert.deepEqual(await snapshot(), before);
 });
