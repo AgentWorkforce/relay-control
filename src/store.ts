@@ -894,7 +894,10 @@ export class ControlPlaneStore {
          JOIN selfhost_organization_memberships m
            ON m.organization_id = s.organization_id AND m.user_id = s.user_id
         WHERE s.access_token_hash = $1
-          AND s.revoked_at IS NULL AND s.access_token_expires_at > now()`,
+          AND s.revoked_at IS NULL AND s.access_token_expires_at > now()
+          -- Desktop-provider MCP credentials authenticate only at the MCP
+          -- endpoint (DesktopMcpCredentials.resolve), never at app routes.
+          AND NOT ('mcp:desktop' = ANY(s.scopes))`,
       [hashSecret(token)],
     );
     const row = result.rows[0];
@@ -940,7 +943,15 @@ export class ControlPlaneStore {
     }>(
       `SELECT s.user_id, u.email, s.organization_id, s.workspace_id, m.role, s.scopes,
               s.access_token_hash,
-              s.revoked_at IS NOT NULL AS revoked,
+              (s.revoked_at IS NOT NULL OR (
+                'mcp:desktop' = ANY(s.scopes) AND NOT EXISTS (
+                  SELECT 1
+                    FROM selfhost_desktop_mcp_credentials c
+                    JOIN selfhost_token_sessions p ON p.id = c.parent_session_id
+                   WHERE c.token_session_id = s.id
+                     AND p.revoked_at IS NULL AND p.refresh_token_expires_at > now()
+                     AND p.desktop_verified_at IS NOT NULL
+                ))) AS revoked,
               s.access_token_expires_at <= now() AS expired,
               COALESCE(s.last_refreshed_at, s.created_at) AS issued_at,
               s.access_token_expires_at AS expires_at
@@ -1016,12 +1027,16 @@ export class ControlPlaneStore {
    * bound to the app's S256 code_challenge. It authenticates like any access
    * token until it expires; the verifier redeems it once for a renewable pair
    * (exchangeDesktopHandoff). Its refresh token is never handed out.
+   * `consentedHostName` is set only when the person approved "Agent Relay
+   * Desktop on <host>" on the consent screen; it is what makes the redeemed
+   * session a verified Desktop sign-in (desktop MCP provider credentials).
    */
   async issueDesktopHandoff(input: {
     userId: string;
     organizationId: string;
     workspaceId: string;
     codeChallenge: string;
+    consentedHostName?: string;
   }): Promise<IssuedTokens> {
     return this.database.transaction((tx) =>
       this.issueTokens(tx, {
@@ -1034,6 +1049,7 @@ export class ControlPlaneStore {
         refreshTtlMs: DESKTOP_HANDOFF_TTL_MS,
         desktopExchangeChallenge: input.codeChallenge,
         scopes: DESKTOP_SCOPES,
+        desktopHostName: input.consentedHostName,
       }));
   }
 
@@ -1055,9 +1071,10 @@ export class ControlPlaneStore {
         token_family_id: string;
         desktop_exchange_challenge: string | null;
         scopes: string[];
+        desktop_host_name: string | null;
       }>(
         `SELECT id, user_id, organization_id, workspace_id, token_family_id,
-                desktop_exchange_challenge, scopes
+                desktop_exchange_challenge, scopes, desktop_host_name
            FROM selfhost_token_sessions
           WHERE access_token_hash = $1 AND revoked_at IS NULL
             AND desktop_exchanged_at IS NULL AND desktop_exchange_challenge IS NOT NULL
@@ -1082,9 +1099,14 @@ export class ControlPlaneStore {
         organizationId: row.organization_id,
         workspaceId: row.workspace_id,
         label: DESKTOP_SESSION_LABEL,
+      }, {
+        tokenFamilyId: row.token_family_id,
         // The handoff's own scopes: a handoff minted before desktop:workspaces
         // existed never gains it.
-      }, { tokenFamilyId: row.token_family_id, scopes: row.scopes });
+        scopes: row.scopes,
+        // Proven: consented host on the handoff plus the S256 verifier now.
+        ...(row.desktop_host_name ? { desktopHostName: row.desktop_host_name, desktopVerified: true } : {}),
+      });
     });
   }
 
@@ -1324,6 +1346,8 @@ export class ControlPlaneStore {
       refreshTtlMs?: number;
       tokenFamilyId?: string;
       desktopExchangeChallenge?: string;
+      desktopHostName?: string;
+      desktopVerified?: boolean;
     },
   ): Promise<IssuedTokens> {
     const context = await tx.query<{ valid: boolean }>(
@@ -1350,8 +1374,9 @@ export class ControlPlaneStore {
       `INSERT INTO selfhost_token_sessions
         (id, token_family_id, user_id, organization_id, workspace_id, label, scopes,
          access_token_hash, refresh_token_hash, access_token_expires_at, refresh_token_expires_at,
-         desktop_exchange_challenge)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+         desktop_exchange_challenge, desktop_host_name, desktop_verified_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+               CASE WHEN $14::boolean THEN now() ELSE NULL END)`,
       [
         sessionId,
         options.tokenFamilyId ?? randomUUID(),
@@ -1365,6 +1390,8 @@ export class ControlPlaneStore {
         accessExpires,
         refreshExpires,
         options.desktopExchangeChallenge ?? null,
+        options.desktopHostName ?? null,
+        options.desktopVerified === true,
       ],
     );
     return {

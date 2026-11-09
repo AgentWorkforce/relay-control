@@ -105,9 +105,24 @@ paths:
         participant owned by the caller, bound to the `Mcp-Session-Id` or chosen
         with `as`; replies arrive in `check_relay_inbox`. Launches,
         `as_person` and desktop-linked identity (`join_relay desktop_address`)
-        are not yet available. Initialize advertises the experimental capability
-        `com.agentrelay/native-session-identity` version 1 and returns an
-        `Mcp-Session-Id` header.
+        are not yet available. Initialize advertises the experimental
+        capabilities `com.agentrelay/native-session-identity`,
+        `com.agentrelay/copilot-session-attestation` and
+        `com.agentrelay/desktop-provider-credentials` (version 1 each) and
+        returns an `Mcp-Session-Id` header.
+
+        A Desktop provider credential (`mcp:desktop` child token, see
+        `/api/v1/workspaces/{workspaceId}/mcp/shared-sessions-tokens`) is also
+        accepted here, as a header bearer only, while its verified parent and
+        the membership are live. On a `copilot` credential, relay tools act as
+        the synced Desktop identity of the chat named by a verified
+        `_agent_relay_attestation` argument (Ed25519 JWS over the tool, exact
+        arguments, user, workspace, source, native session id and a single-use
+        nonce, at most 60 seconds). The argument is removed from every call
+        before dispatch. A proof that does not verify, a proof on any other
+        connection, or a proof in a batch is refused with 400 (-32602); a
+        Copilot call without one gets a tool error and no relay action. See
+        docs/integrations/copilot-vscode.md.
 
         Requires a personal credential with `cli:auth`: a device bearer token,
         or on the `/cloud` mount the session cookie behind the origin guard.
@@ -126,7 +141,7 @@ paths:
         content:
           application/json:
             schema:
-              description: A JSON-RPC 2.0 message or batch, at most 64 KiB.
+              description: A JSON-RPC 2.0 message or batch, at most 64 KiB (128 KiB on a copilot provider credential).
       responses:
         "200":
           description: JSON-RPC response
@@ -141,9 +156,173 @@ paths:
         "405":
           description: "Any method other than POST (-32000), with `Allow: POST`"
         "413":
-          description: Body larger than 64 KiB (-32600)
+          description: Body larger than 64 KiB, or 128 KiB on a copilot provider credential (-32600)
         "500":
           description: Internal server error (-32603)
+  /api/v1/workspaces/{workspaceId}/mcp/shared-sessions-tokens:
+    get:
+      operationId: listDesktopMcpCredentials
+      summary: The calling verified Desktop sign-in's live provider credentials. No secret is returned.
+      description: |
+        Header bearer only; the bearer must be a verified Desktop parent: a
+        live `cli:auth` session redeemed with its S256 verifier from an
+        approved browser consent that named the Desktop host. Device-flow,
+        cookie, handoff and provider child tokens are refused. Also served at
+        `/cloud/api/v1/...`; the session cookie is never accepted here.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: Provider credentials minted by this parent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tokens]
+                properties:
+                  tokens:
+                    type: array
+                    items: { $ref: "#/components/schemas/DesktopMcpCredential" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "405": { $ref: "#/components/responses/DesktopMcpError" }
+        "429": { $ref: "#/components/responses/DesktopMcpError" }
+    post:
+      operationId: registerDesktopMcpCredential
+      summary: Register a provider secret Desktop generated as a child MCP credential (scopes rth:read and mcp:desktop, 15-minute lease).
+      description: |
+        Idempotent: the same parent, installation, provider and secret renew
+        the lease and return the same id. The same installation and provider
+        with another secret, or a secret registered elsewhere, is 409
+        credential_conflict; when the conflict is with this parent's own
+        existing credential the 409 body also carries `credential_id` (the id
+        to DELETE before re-registering). Only the secret's hash is stored and the response
+        never echoes it. The lease never outlives the parent's refresh expiry.
+        Also served at `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DesktopMcpCredentialCreate" }
+      responses:
+        "201":
+          description: Registered or renewed (metadata only)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DesktopMcpCredential" }
+        "400": { $ref: "#/components/responses/DesktopMcpError" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "409": { $ref: "#/components/responses/DesktopMcpError" }
+        "429": { $ref: "#/components/responses/DesktopMcpError" }
+  /api/v1/workspaces/{workspaceId}/mcp/shared-sessions-tokens/{tokenId}:
+    put:
+      operationId: renewDesktopMcpCredential
+      summary: Renew one of this parent's provider credentials for another 15 minutes (capped at the parent's refresh expiry).
+      description: Same caller rules as the collection. Also served at `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: tokenId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Renewed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DesktopMcpCredential" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "429": { $ref: "#/components/responses/DesktopMcpError" }
+    delete:
+      operationId: revokeDesktopMcpCredential
+      summary: Revoke one of this parent's provider credentials. It stops working at MCP immediately.
+      description: Same caller rules as the collection. Also served at `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: tokenId, in: path, required: true, schema: { type: string } }
+      responses:
+        "204":
+          description: Revoked
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "429": { $ref: "#/components/responses/DesktopMcpError" }
+  /api/v1/workspaces/{workspaceId}/messaging/desktop-identities:
+    get:
+      operationId: listDesktopIdentities
+      summary: The caller's synced Desktop identities for one Desktop source, and the sync capabilities this server verifies.
+      description: |
+        Requires `cli:auth` (a Desktop bearer, or the session cookie on the
+        `/cloud` mount). Provider child tokens are refused. No token is
+        returned. Also served at `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: source_id, in: query, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Identities and capabilities
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [identities, capabilities]
+                properties:
+                  identities:
+                    type: array
+                    items: { $ref: "#/components/schemas/DesktopIdentityLink" }
+                  capabilities: { $ref: "#/components/schemas/DesktopIdentityCapabilities" }
+        "400": { $ref: "#/components/responses/DesktopMcpError" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "502": { $ref: "#/components/responses/DesktopMcpError" }
+    put:
+      operationId: syncDesktopIdentities
+      summary: Replace this Desktop source's identities and attestation key.
+      description: |
+        Each identity is kept only after Relaycast confirms its token controls
+        exactly that agent and the agent's metadata says source
+        `relay-desktop` with `owner_hash` = hex sha256 of the caller's user id;
+        others are returned in `skipped`. Identities not listed are removed and
+        the attestation key is replaced (or removed when absent). Agent tokens
+        are encrypted at rest and never returned. Cookie requests must pass
+        the origin check. Also served at `/cloud/api/v1/...`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DesktopIdentitySync" }
+      responses:
+        "200":
+          description: Sync result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DesktopIdentitySyncResult" }
+        "400": { $ref: "#/components/responses/DesktopMcpError" }
+        "401": { $ref: "#/components/responses/DesktopMcpError" }
+        "403": { $ref: "#/components/responses/DesktopMcpError" }
+        "404": { $ref: "#/components/responses/DesktopMcpError" }
+        "502": { $ref: "#/components/responses/DesktopMcpError" }
   /api/v1/workspaces/{workspaceId}/messaging/people:
     get:
       operationId: listMessagingPeople
@@ -6542,6 +6721,94 @@ components:
             name: { type: [string, "null"] }
             email: { type: [string, "null"] }
             avatarUrl: { type: "null" }
+    DesktopMcpCredentialCreate:
+      type: object
+      additionalProperties: false
+      required: [provider, installationId, accessToken]
+      properties:
+        provider: { type: string, pattern: "^[a-z][a-z0-9-]{0,63}$", examples: [copilot] }
+        installationId: { type: string, format: uuid }
+        accessToken:
+          type: string
+          pattern: "^sh_at_[A-Za-z0-9_-]{43}$"
+          description: Secret Desktop generated and saved before this call. Stored only as a hash.
+    DesktopMcpCredential:
+      type: object
+      required: [id, workspaceId, provider, installationId, accessTokenExpiresAt, leaseExpiresAt, createdAt, scopes]
+      properties:
+        id: { type: string }
+        workspaceId: { type: string }
+        provider: { type: string }
+        installationId: { type: string, format: uuid }
+        accessTokenExpiresAt: { type: string, format: date-time }
+        leaseExpiresAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        scopes:
+          type: array
+          items: { type: string, enum: ["rth:read", "mcp:desktop"] }
+    DesktopIdentityLink:
+      type: object
+      required: [agent_id, linked_mcp, linked_at]
+      properties:
+        agent_id: { type: string }
+        linked_mcp: { type: "null", description: Always null on self-host. }
+        linked_at: { type: "null", description: Always null on self-host. }
+    DesktopIdentityCapabilities:
+      type: object
+      required: [native_session_identity, copilot_session_attestation]
+      properties:
+        native_session_identity: { type: integer, const: 1 }
+        copilot_session_attestation: { type: integer, const: 1 }
+    DesktopIdentitySync:
+      type: object
+      additionalProperties: false
+      required: [source_id, identities]
+      properties:
+        source_id: { type: string, format: uuid }
+        identities:
+          type: array
+          maxItems: 200
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, address, agent_id, token]
+            properties:
+              name: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" }
+              address: { type: string, description: Must start with `name@`. }
+              agent_id: { type: string }
+              token: { type: string, minLength: 12, maxLength: 512, description: The agent's Relaycast token. Encrypted at rest, never returned. }
+              web_session_id: { type: string, description: Accepted for Cloud compatibility and ignored. }
+              native_session:
+                type: object
+                additionalProperties: false
+                required: [kind, id]
+                properties:
+                  kind: { type: string, enum: [codex, grok, pi, claude, copilot, opencode] }
+                  id: { type: string, description: A UUID, or `ses_...` for opencode. }
+        attestation_key:
+          type: object
+          additionalProperties: false
+          required: [kid, alg, public_key]
+          properties:
+            kid: { type: string, pattern: "^[A-Za-z0-9_-]{22}$", description: base64url of the first 16 bytes of SHA-256 of the raw public key. }
+            alg: { type: string, const: Ed25519 }
+            public_key: { type: string, description: base64url raw 32-byte Ed25519 public key. }
+    DesktopIdentitySyncResult:
+      type: object
+      required: [synced, identities]
+      properties:
+        synced: { type: integer }
+        skipped:
+          type: array
+          items:
+            type: object
+            required: [agent_id, reason]
+            properties:
+              agent_id: { type: string }
+              reason: { type: string, enum: [unverified, not_owned] }
+        identities:
+          type: array
+          items: { $ref: "#/components/schemas/DesktopIdentityLink" }
     DesktopFeedManifest:
       x-status: proposed
       type: object
@@ -7025,6 +7292,25 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/FactoryError" }
+    DesktopMcpError:
+      description: |
+        `{error, message}` with a stable code: invalid_request (400),
+        unauthorized (401), desktop_login_required, workspace_access_changed,
+        forbidden or csrf_rejected (403), workspace_not_found or
+        token_not_found (404), method_not_allowed (405, with Allow),
+        credential_conflict or too_many_credentials (409), rate_limited (429),
+        upstream_unavailable (502).
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, message]
+            properties:
+              error: { type: string }
+              message: { type: string }
+              credential_id:
+                type: string
+                description: Only on credential_conflict (409) for this parent's own surviving credential; the id to DELETE.
     CodingAgentStored:
       description: Stored credential (201 created, 200 existing or replaced)
       content:

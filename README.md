@@ -44,6 +44,11 @@ Included:
   `describe_capabilities`): Amp, Factory, Copilot, Capy, Replicas, Dot and Grok
   Bot descriptors with separate `implemented`/`configured`/`enabled` runtime
   states (all false until a build injects `providerProbes` into `createApp`).
+- Copilot in VS Code through Agent Relay Desktop: provider MCP credentials
+  (`/api/v1/workspaces/{ws}/mcp/shared-sessions-tokens`), Desktop identity
+  sync (`.../messaging/desktop-identities`) and Ed25519-attested Copilot tool
+  calls that act as the chat's own Desktop identity. No environment variables;
+  see [docs/integrations/copilot-vscode.md](docs/integrations/copilot-vscode.md)
 
 Explicitly absent: billing, fleet, and Relayfile.
 

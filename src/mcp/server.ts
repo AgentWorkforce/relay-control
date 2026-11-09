@@ -5,6 +5,8 @@ import { registerCapabilityDiscovery } from "./capabilities.js";
 import { ensureToolTitles, MCP_FACADE, planToolGroups, registerToolPlan } from "./catalog.js";
 import type { McpContext } from "./context.js";
 import { NATIVE_SESSION_CAPABILITY } from "./desktop-call.js";
+import { COPILOT_ATTESTATION_CAPABILITY } from "./copilot-attestation.js";
+import { DESKTOP_MCP_CAPABILITY, DESKTOP_MCP_LEASE_SECONDS } from "../auth/desktop-mcp-credentials.js";
 import { registerRelayMessaging } from "./relay-messaging.js";
 import { RELAY_COORDINATION_GUIDANCE } from "./relay-participants.js";
 import { registerSharedSessionReads } from "./shared-session-reads.js";
@@ -16,14 +18,21 @@ export const SELFHOST_MCP_INSTRUCTIONS =
   + `${RELAY_COORDINATION_GUIDANCE} Call describe_capabilities when an expected Agent Relay tool is missing.`;
 
 /**
- * One MCP server per request (stateless transport). Cloud's server also
- * advertises Claude/Copilot attestation and the desktop MCP lease; self-host
- * verifies neither, so only native session identity is advertised.
+ * One MCP server per request (stateless transport). Advertises native
+ * session identity, Copilot attestation and the Desktop provider-credential
+ * lease, as Cloud does. Claude attestation is not ported, so it is not
+ * advertised.
  */
 export function buildMcpServer(context: McpContext): McpServer {
   const server = new McpServer(
     { name: "agent-relay-selfhost", title: MCP_FACADE.name, version: SELFHOST_API_VERSION },
-    { instructions: SELFHOST_MCP_INSTRUCTIONS, capabilities: { experimental: { [NATIVE_SESSION_CAPABILITY]: { version: 1 } } } },
+    { instructions: SELFHOST_MCP_INSTRUCTIONS, capabilities: { experimental: {
+      [NATIVE_SESSION_CAPABILITY]: { version: 1 },
+      // Both are implemented here: Copilot proofs are verified (copilot-attestation.ts)
+      // and provider credentials are minted at /mcp/shared-sessions-tokens.
+      [COPILOT_ATTESTATION_CAPABILITY]: { version: 1 },
+      [DESKTOP_MCP_CAPABILITY]: { version: 1, leaseSeconds: DESKTOP_MCP_LEASE_SECONDS },
+    } } },
   );
   ensureToolTitles(server);
   // Which groups this connection gets is decided in the catalog; this server

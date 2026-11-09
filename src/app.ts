@@ -46,6 +46,14 @@ import { createMcpHandler } from "./mcp/routes.js";
 import type { AmpModule } from "./amp/module.js";
 import { isAmpPath } from "./amp/routes.js";
 import { purgeMemberAmp, releaseMemberAmp } from "./amp/service.js";
+import {
+  DESKTOP_MCP_TOKEN,
+  DesktopMcpCredentialError,
+  DesktopMcpCredentials,
+  PROVIDER,
+  UUID,
+} from "./auth/desktop-mcp-credentials.js";
+import { handleDesktopIdentityRoutes } from "./messaging/desktop-identities.js";
 import { handleChiefRoutes, type ChiefBackend } from "./chief/routes.js";
 import { handleProviderRoutes } from "./providers/routes.js";
 import type { ProviderProbes } from "./providers/registry.js";
@@ -96,7 +104,7 @@ const SESSION_COOKIE = "agent_relay_session";
 const DEVICE_COOKIE = "agent_relay_device";
 
 class HttpError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) {
+  constructor(readonly status: number, readonly code: string, message: string, readonly extra?: Record<string, string>) {
     super(message);
   }
 }
@@ -364,6 +372,8 @@ export function createApp(input: {
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
     ...(amp ? { amp: amp.deps } : {}),
   });
+  const desktopMcpCredentials = new DesktopMcpCredentials(store.database);
+  const DESKTOP_MCP_RATE = { limit: 30, windowMs: 60_000 };
   function rateLimit(
     response: ServerResponse,
     key: string,
@@ -836,12 +846,13 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         workspaceId: target.workspaceId,
         redirectUri: login.redirectUri,
       };
-      const issueHandoff = async (status: 303 | 307) => {
+      const issueHandoff = async (status: 303 | 307, consentedHostName?: string) => {
         const issued = await store.issueDesktopHandoff({
           userId: principal.userId,
           organizationId: target.organizationId,
           workspaceId: target.workspaceId,
           codeChallenge,
+          ...(consentedHostName ? { consentedHostName } : {}),
         });
         response.writeHead(status, {
           location: handoffCallbackUrl(login, issued, `${siteBaseUrl(request)}/cloud`),
@@ -898,7 +909,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         response.end(desktopConsentDeniedPage());
         return;
       }
-      await issueHandoff(303);
+      // Only an approved consent records the host: that is the provenance a
+      // verified Desktop sign-in (desktop MCP credentials) requires.
+      await issueHandoff(303, login.desktopHostName);
       return;
     }
 
@@ -1774,6 +1787,87 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    // Desktop-provider MCP credentials (Copilot in VS Code): Agent Relay
+    // Desktop registers the secret it saved, with its own verified sign-in.
+    const credentialCollection = routeMatch(
+      path,
+      /^\/api\/v1\/workspaces\/([^/]+)\/mcp\/shared-sessions-tokens$/,
+    );
+    const credentialItem = routeMatch(
+      path,
+      /^\/api\/v1\/workspaces\/([^/]+)\/mcp\/shared-sessions-tokens\/([^/]+)$/,
+    );
+    if (credentialCollection || credentialItem) {
+      const allowed = credentialCollection ? ["GET", "POST"] : ["PUT", "DELETE"];
+      if (!allowed.includes(method)) {
+        response.setHeader("allow", allowed.join(", "));
+        throw new HttpError(405, "method_not_allowed", "Method not allowed");
+      }
+      const workspaceId = (credentialCollection ?? credentialItem)![0]!;
+      // Only a header bearer can be a Desktop sign-in; cookies never are.
+      if (!bearer(request)) throw new HttpError(401, "unauthorized", "Authentication required");
+      const access = await workspaceAccess(request, workspaceId);
+      rateLimit(
+        response,
+        `desktop-mcp:${access.workspace.id}:${access.principal.userId}`,
+        DESKTOP_MCP_RATE,
+        "rate_limited",
+        "Too many provider credential requests. Try again shortly.",
+      );
+      try {
+        if (credentialCollection && method === "GET") {
+          json(response, 200, { tokens: await desktopMcpCredentials.list(access.token, access.workspace.id) }, true);
+          return;
+        }
+        if (credentialCollection) {
+          const body = await requestObject(request);
+          const keys = Object.keys(body).sort();
+          const { provider, installationId, accessToken } = body;
+          if (
+            keys.join(",") !== "accessToken,installationId,provider" ||
+            typeof provider !== "string" || !PROVIDER.test(provider) ||
+            typeof installationId !== "string" || !UUID.test(installationId) ||
+            typeof accessToken !== "string" || !DESKTOP_MCP_TOKEN.test(accessToken)
+          ) {
+            throw new HttpError(400, "invalid_request", "Invalid provider credential request");
+          }
+          const issued = await desktopMcpCredentials.issue({
+            parentToken: access.token,
+            workspaceId: access.workspace.id,
+            provider,
+            installationId,
+            accessToken,
+          });
+          // Metadata only: Desktop already holds the secret it sent.
+          json(response, 201, issued, true);
+          return;
+        }
+        const tokenId = credentialItem![1]!;
+        if (method === "PUT") {
+          json(response, 200, await desktopMcpCredentials.renew(access.token, access.workspace.id, tokenId), true);
+          return;
+        }
+        await desktopMcpCredentials.revoke(access.token, access.workspace.id, tokenId);
+        response.writeHead(204, { "cache-control": "no-store" });
+        response.end();
+        return;
+      } catch (error) {
+        if (error instanceof DesktopMcpCredentialError) throw new HttpError(error.status, error.code, error.message, error.extra);
+        throw error;
+      }
+    }
+
+    if (await handleDesktopIdentityRoutes(request, response, path, method, {
+      workspaceAccess,
+      requestObject,
+      json,
+      database: store.database,
+      keyring: config.encryptionKeyring,
+      fetchImpl: input.messagingFetch,
+      relaycastUrl: config.relaycastUrl,
+      csrfAllowed: (incoming) => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
+    })) return;
+
     if (await mcp(request, response, path, method)) return;
     if (desktopFeed && await desktopFeed(request, response, path, method)) return;
     if (await handleProviderRoutes(request, response, path, method, {
@@ -1824,7 +1918,8 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         return;
       }
       if (error instanceof HttpError || error instanceof MessagingHttpError) {
-        json(response, error.status, { error: error.code, message: error.message }, true);
+        const extra = error instanceof HttpError ? error.extra : undefined;
+        json(response, error.status, { error: error.code, message: error.message, ...extra }, true);
         return;
       }
       if (error instanceof CapturePolicyError) {
