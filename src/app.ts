@@ -1151,10 +1151,15 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           if (value !== null) consentParams.set(field, value);
         }
         consentParams.set("workspace", target.workspaceId);
+        // The consent form posts back to this origin, and the browser derives
+        // the POST's Origin header from the page's referrer policy: with
+        // no-referrer it would send "Origin: null", which the same-origin
+        // check below refuses. same-origin keeps the real origin on the
+        // form post and still withholds the URL from any other destination.
         response.writeHead(200, {
           "content-type": "text/html; charset=utf-8",
           "cache-control": "no-store",
-          "referrer-policy": "no-referrer",
+          "referrer-policy": "same-origin",
           "content-security-policy":
             "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
         });

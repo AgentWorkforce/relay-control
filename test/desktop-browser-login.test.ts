@@ -239,6 +239,10 @@ test("a sign-in naming its host needs the person's approval on a same-origin con
     redirect: "manual", headers: { cookie: session },
   });
   assert.equal(page.status, 200);
+  // A no-referrer page makes the browser send "Origin: null" on its own form
+  // post (Fetch: Origin header follows the referrer policy), which the consent
+  // check would refuse; the page must keep its origin on the same-origin post.
+  assert.equal(page.headers.get("referrer-policy"), "same-origin");
   const html = await page.text();
   assert.match(html, /Agent Relay Desktop on <strong>sf-mini<\/strong>/);
   assert.match(html, /<strong>Primary<\/strong>/);
