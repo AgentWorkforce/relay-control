@@ -16,7 +16,7 @@ type Workspace = {relaycast_workspace_id:string;relaycast_api_key_ciphertext:str
 type Grant = {id:string;agent_remote_id:string|null;agent_name:string;created_at:Date|string};
 /** Local state a remote decision is made against. Ciphertexts only; never logged. */
 type Snapshot = {workspace:Workspace|null;row:Participant|null;grants:Grant[]};
-type Claim = {intent:Intent&{agent_remote_id:string;created_at:Date|string};snapshot:Snapshot};
+type Claim = {intent:Intent&{agent_remote_id:string;created_at:Date|string;attempts:number};snapshot:Snapshot};
 /** Why a revocation row completed (stored in `outcome`). */
 export type McpOAuthTeardownOutcome = "released"|"no_remote"|"kept"|"workspace_mismatch"|"decrypt_failed"
   |"metadata_mismatch"|"operator_abandoned";
@@ -27,6 +27,12 @@ export type McpOAuthTeardownResult = {completed:number;kept:number;pending:numbe
 /** Retrying cannot fix these; the row completes so workspace deletion is not blocked forever. */
 const TERMINAL=new Set<McpOAuthTeardownOutcome>(["workspace_mismatch","decrypt_failed","metadata_mismatch"]);
 const PAGE=20;
+/**
+ * A workspace key that does not decrypt (a replica missing a retired key, a
+ * mis-mounted keyring) is retried with the normal backoff; after this many
+ * attempts (about four hours) the row completes as `decrypt_failed`.
+ */
+export const MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS=8;
 
 /** Exponential retry delay after the given attempt count: 60 s doubling, capped at one hour. */
 export function mcpOAuthTeardownBackoffMs(attempts:number):number {
@@ -163,7 +169,7 @@ export class McpOAuthTeardown {
         await this.complete(tx,intent.id,"workspace_mismatch");
         return "completed";
       }
-      return {intent:{...intent,agent_remote_id:remoteId},snapshot};
+      return {intent:{...intent,agent_remote_id:remoteId,attempts},snapshot};
     });
   }
 
@@ -200,7 +206,12 @@ export class McpOAuthTeardown {
     const {intent,snapshot:{workspace,row,grants}}=claim;
     let key:string;
     try {key=decryptSecret(workspace!.relaycast_api_key_ciphertext,this.deps.keyring);}
-    catch {return {outcome:"decrypt_failed"};}
+    catch {
+      if(intent.attempts>=MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS) return {outcome:"decrypt_failed"};
+      // Retryable: the claim already scheduled the next attempt.
+      console.warn("[mcp-oauth] teardown key unavailable",{revocationId:intent.id,attempts:intent.attempts});
+      return "pending";
+    }
     const byId=async()=>(await this.deps.client.listAgents(key,"all",{includeStale:true}))
       .find(agent=>agent.id===intent.agent_remote_id && agent.status!=="released")??null;
     let remote:RosterAgent|null;

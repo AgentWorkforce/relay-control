@@ -21,7 +21,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { close,listen } from "./support/harness.js";
 import { pkceS256 } from "../src/mcp/oauth/protocol.js";
 import { McpOAuthStore } from "../src/mcp/oauth/store.js";
-import { McpOAuthTeardown,mcpOAuthTeardownBackoffMs,mcpOAuthTeardownFetch } from "../src/mcp/oauth/teardown.js";
+import { MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS,McpOAuthTeardown,mcpOAuthTeardownBackoffMs,mcpOAuthTeardownFetch } from "../src/mcp/oauth/teardown.js";
 import { lockOrganization,lockUser } from "../src/tenancy.js";
 import type { RelaycastClient } from "../src/messaging/relaycast.js";
 
@@ -663,15 +663,47 @@ test("terminal teardown outcomes complete the row once, log only the outcome and
   assert.deepEqual(warn.mock.calls[0]!.arguments,["[mcp-oauth] teardown abandoned",{outcome:"metadata_mismatch",revocationId:id}]);
 });
 
-test("a workspace key sealed under a retired encryption key ends teardown as decrypt_failed",async t=>{
+test("a workspace key sealed under a retired encryption key keeps teardown pending until it decrypts again",async t=>{
   const f=await relayFixture(t);await f.service.join({});
-  t.mock.method(console,"warn",()=>undefined);
+  const warn=t.mock.method(console,"warn",()=>undefined);
   const retired={id:"fake-retired-key",key:Buffer.alloc(32,9)};
   await f.database.query("UPDATE selfhost_workspaces SET relaycast_api_key_ciphertext=$2 WHERE id=$1",
     [f.owner.workspaceId,encryptSecret("rk_fake",retired)]);
   await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:1});
+  const row=await revocation(f);
+  assert.equal(row.completed_at,null);assert.equal(row.outcome,null);assert.equal(row.attempts,1);
+  assert.equal(new Date(row.next_attempt_at!).getTime(),f.clock.at+60_000);
+  const id=(await f.database.query<{id:string}>("SELECT id FROM selfhost_mcp_oauth_revocations")).rows[0]!.id;
+  assert.deepEqual(warn.mock.calls.map(call=>call.arguments),[["[mcp-oauth] teardown key unavailable",{revocationId:id,attempts:1}]]);
+  assert.equal(releaseCount(f),0);assert.ok(f.world.agents.has("approved-agent"));
+  // The key is back (the replica got its keyring): the next due attempt releases.
+  await f.database.query("UPDATE selfhost_workspaces SET relaycast_api_key_ciphertext=$2 WHERE id=$1",
+    [f.owner.workspaceId,encryptSecret("rk_fake",KEYRING.active)]);
+  f.advance();
   assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
-  assert.equal((await revocation(f)).outcome,"decrypt_failed");
+  assert.equal((await revocation(f)).outcome,"released");
+  assert.equal(f.world.agents.has("approved-agent"),false);
+});
+
+test("an undecryptable workspace key ends teardown as decrypt_failed after the attempt limit",async t=>{
+  const f=await relayFixture(t);await f.service.join({});
+  const warn=t.mock.method(console,"warn",()=>undefined);
+  await f.database.query("UPDATE selfhost_workspaces SET relaycast_api_key_ciphertext=$2 WHERE id=$1",
+    [f.owner.workspaceId,encryptSecret("rk_fake",{id:"fake-retired-key",key:Buffer.alloc(32,9)})]);
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  for(let attempt=1;attempt<MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS;attempt++) {
+    assert.deepEqual(await f.teardown.drain(),{completed:0,kept:0,pending:1});
+    assert.equal((await revocation(f)).attempts,attempt);
+    f.advance();
+  }
+  assert.deepEqual(await f.teardown.drain(),{completed:1,kept:0,pending:0});
+  const row=await revocation(f);
+  assert.equal(row.outcome,"decrypt_failed");assert.equal(row.attempts,MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS);
+  const id=(await f.database.query<{id:string}>("SELECT id FROM selfhost_mcp_oauth_revocations")).rows[0]!.id;
+  const logged=warn.mock.calls.map(call=>call.arguments[0]);
+  assert.equal(logged.filter(line=>line==="[mcp-oauth] teardown key unavailable").length,MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS-1);
+  assert.deepEqual(warn.mock.calls.at(-1)!.arguments,["[mcp-oauth] teardown abandoned",{outcome:"decrypt_failed",revocationId:id}]);
   assert.equal(releaseCount(f),0);assert.ok(f.world.agents.has("approved-agent"));
 });
 

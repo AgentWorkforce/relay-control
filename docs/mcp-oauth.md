@@ -152,11 +152,16 @@ agent is still listed) retry after 60 seconds, doubling per attempt up to one
 hour. A pass handles at most 20 due records and stops after about 30 seconds,
 continuing immediately with the rest. A new disconnect is attempted at once.
 
-Some failures cannot be fixed by retrying: a missing or relocated workspace, a
-workspace key that no longer decrypts, or a remote agent whose identity does
-not match. These complete the record (`workspace_mismatch`, `decrypt_failed`,
-`metadata_mismatch`) without releasing anything and are logged once, so they
-no longer block workspace deletion.
+Some failures cannot be fixed by retrying: a missing or relocated workspace or
+a remote agent whose identity does not match. These complete the record
+(`workspace_mismatch`, `metadata_mismatch`) without releasing anything and are
+logged once, so they no longer block workspace deletion.
+
+A workspace key that does not decrypt (for example a replica missing a
+retired encryption key, or a mis-mounted keyring) is retried with the same
+backoff and logs `[mcp-oauth] teardown key unavailable` with the record id and
+attempt count on each attempt. After 8 attempts (about four hours) the record
+completes as `decrypt_failed` without releasing anything.
 
 If cleanup is still pending and can never finish, the operator can abandon it:
 
