@@ -17,6 +17,10 @@ import { handleSessionRoutes } from "./sessions/routes.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, INTROSPECT_PATH } from "./auth/introspect.js";
+import { createDesktopFeedHandler, type DesktopFeedLimits } from "./desktop-feed/routes.js";
+import { AwsKmsDesktopFeedSigner, MemoryDesktopFeedSigner, type DesktopFeedSigner } from "./desktop-feed/signer.js";
+import { MemoryDesktopFeedStorage, S3DesktopFeedStorage, type DesktopFeedStorage } from "./desktop-feed/storage.js";
+import { DesktopFeedStore } from "./desktop-feed/store.js";
 import {
   ACCOUNT_SCOPE,
   DASHBOARD_DEVICE_CLIENT,
@@ -300,6 +304,13 @@ export function createApp(input: {
   messagingFetch?: typeof fetch;
   /** Factory sessions (dormant unless SELFHOST_FACTORY_ENABLED). The server passes its module so it can run the worker. */
   factory?: FactoryModule;
+  /** Desktop feed overrides for tests; the feed itself is on only when config.desktopFeed is set. */
+  desktopFeed?: {
+    signer?: DesktopFeedSigner;
+    storage?: DesktopFeedStorage;
+    limits?: Partial<DesktopFeedLimits>;
+    log?: (message: string, fields: Record<string, unknown>) => void;
+  };
   now?: () => Date;
   /** Test hooks for claim leases and crash injection. Production leaves this unset. */
   messaging?: Pick<MessagingDeps,
@@ -448,6 +459,36 @@ export function createApp(input: {
     }
     return { principal: auth.principal, workspace, token: auth.token };
   }
+
+  // Desktop feed (docs/desktop-feed.md): off, so every route 404s, unless
+  // both SELFHOST_DESKTOP_FEED_SIGNER and _STORAGE are configured.
+  const feedConfig = config.desktopFeed ?? null;
+  const desktopFeed = feedConfig
+    ? createDesktopFeedHandler({
+      config,
+      controlStore: store,
+      store: new DesktopFeedStore(store.database),
+      signer: input.desktopFeed?.signer ?? (feedConfig.signer.kind === "awskms"
+        ? new AwsKmsDesktopFeedSigner({
+          region: feedConfig.signer.region, label: feedConfig.signer.label, keyAliases: feedConfig.signer.keyAliases,
+        })
+        : new MemoryDesktopFeedSigner({ label: feedConfig.signer.label })),
+      storage: input.desktopFeed?.storage ?? (feedConfig.storage.kind === "s3"
+        ? new S3DesktopFeedStorage({
+          bucket: feedConfig.storage.bucket, region: feedConfig.storage.region, prefix: feedConfig.storage.prefix,
+        })
+        : new MemoryDesktopFeedStorage()),
+      browserOrigins,
+      publisherTokenHashes: feedConfig.publisherTokenHashes,
+      now: input.now,
+      limits: input.desktopFeed?.limits,
+      log: input.desktopFeed?.log,
+      organizationAccess,
+      requestObject,
+      json,
+      httpError: (status, code, message) => new HttpError(status, code, message),
+    })
+    : null;
 
   const factoryRoutes = mountFactoryRoutes(factory, { workspaceAccess, requestObject, bearer, json });
 
@@ -1734,6 +1775,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     }
 
     if (await mcp(request, response, path, method)) return;
+    if (desktopFeed && await desktopFeed(request, response, path, method)) return;
     if (await handleProviderRoutes(request, response, path, method, {
       probes: providerProbes, workspaceAccess: (incoming, id) => workspaceAccess(incoming, id), json,
     })) return;

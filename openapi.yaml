@@ -14,15 +14,19 @@ info:
     same-origin HttpOnly session cookie issued by `/login`.
     Client-visible Relaycast and RelayHistory URLs are explicit public HTTPS
     origins and are distinct from internal server-to-server upstream URLs.
-    Desktop feed (`/api/v1/desktop/feed/*`, tag "Desktop feed (draft contract)")
-    is a draft contract only (x-status proposed; Cloud team decides, not yet
-    confirmed); this server implements none of it. Signing: the
+    Desktop feed (`/api/v1/desktop/feed/*`, tag "Desktop feed") is
+    implemented and off unless SELFHOST_DESKTOP_FEED_SIGNER and
+    SELFHOST_DESKTOP_FEED_STORAGE are set; operations still marked
+    x-status proposed deviate from this document (docs/desktop-feed.md,
+    "Deviations from the contract"). Signing: the
     hosted feed signs each release at publish with Ed25519 (RFC 8032) over the
     RFC 8785 (JCS) canonical UTF-8 bytes of the envelope's `manifest` object;
     `key_id` selects the key, and a client holds one key and refuses any
     other. Self-hosted and customer deployments import or mirror pre-signed
-    envelopes and verify them against the profile's public key; they hold no
-    private key. The signer provider is unresolved (x-status unresolved).
+    envelopes and verify them against the profile's public key. A
+    relaycontrol site signs each profile with that profile's own AWS KMS
+    Ed25519 key, addressed by alias (x-signer-provider awskms); the private
+    key never leaves KMS.
 servers:
   - url: "{controlPlaneUrl}"
     variables:
@@ -43,13 +47,13 @@ tags:
     description: |
       In-cluster service routes under /internal/v1. Never served through the
       /cloud alias; each operation names the service credential it accepts.
-  - name: Desktop feed (draft contract)
-    x-status: proposed
+  - name: Desktop feed
     description: |
       Private, workspace-authenticated release feed for enterprise Desktop
       profiles (relay-desktop docs/enterprise-distribution.md at 21e61026;
-      contract notes in docs/desktop-feed.md). Status: proposed, Cloud team
-      decides, not yet confirmed. Nothing here is implemented.
+      contract notes in docs/desktop-feed.md). Status: implemented; deviations
+      are listed in docs/desktop-feed.md and keep `x-status: proposed` on
+      their operations.
 
       Credentials: workspace bearer (`bearerAuth`, the desktop-core session),
       `installToken`, browser session (`cookieAuth`, `/cloud` mount only) and
@@ -72,12 +76,12 @@ tags:
       Rate limits on every endpoint answer 429 with Retry-After; per-profile
       quota and retention appear in the publisher's version listing
       (`DesktopFeedLimits`).
-    x-proposed-default: "gcpkms hosted, awskms non-production; see docs/desktop-feed.md Proposed defaults"
     x-signer-provider:
-      x-status: unresolved
+      provider: awskms
       description: |
-        The provider that holds the hosted feed's per-profile Ed25519 private
-        keys is unresolved. A private key stored in Postgres is not a fallback.
+        AWS KMS key (ECC_NIST_EDWARDS25519, Sign with MessageType RAW and
+        ED25519_SHA_512, 4096-byte message cap), one key per profile,
+        addressed by alias. A private key stored in Postgres is not a fallback.
 paths:
   /api/v1/mcp/shared-sessions:
     post:
@@ -4051,18 +4055,54 @@ paths:
           description: HTML page
           content:
             text/html: {}
-  # --- Desktop feed (draft contract; docs/desktop-feed.md). Status: proposed, Cloud team decides,
-  # not yet confirmed. Nothing below is implemented by this server.
+  # --- Desktop feed (docs/desktop-feed.md). Implemented; x-status proposed marks a deviation.
+  /api/v1/desktop/profiles:
+    get:
+      tags: [Desktop feed]
+      operationId: listDesktopFeedProfiles
+      summary: The Desktop feed profiles the signed-in workspace may read
+      description: |
+        Lets the dashboard downloads page learn the profile id to send in
+        X-Agent-Relay-Profile. Takes no profile header. A workspace without
+        an entitlement gets an empty list.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The workspace's profiles
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [profiles]
+                properties:
+                  profiles:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [id, asset_prefix]
+                      properties:
+                        id: { type: string, pattern: "^[a-z0-9]{1,32}$" }
+                        asset_prefix: { type: string }
+        "401": { $ref: "#/components/responses/DesktopFeedUnauthorized" }
+        "403":
+          description: wrong_credential (a publisher or install token)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DesktopFeedError" }
+        "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/manifest:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: getDesktopFeedManifest
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession]
       summary: Envelope of the current release of the profile's channel.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Accepts a workspace bearer (the desktop-core session), an install token,
         or the browser session cookie (on the `/cloud` mount only). A publisher
         token is refused with 403 `wrong_credential`; two credentials in one
@@ -4091,14 +4131,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: listDesktopFeedReleases
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession, publisherToken]
       summary: Published releases newest first (read), or the version listing with drafts (publisher).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Two callers, two shapes, chosen by the credential and `include_drafts`:
         - Read (workspace bearer, install token, browser session on `/cloud`):
           `include_drafts` must be absent or false. Returns
@@ -4148,14 +4187,15 @@ paths:
         "404": { $ref: "#/components/responses/DesktopFeedNoRelease" }
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: createDesktopFeedDraft
       x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
       summary: Create a draft release that declares its complete asset set.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
         Publisher token only. A workspace bearer, install token or browser
         session is 403 `wrong_credential`; mixed credentials are 400.
         Resolves an omission in the source design: the draft declares every
@@ -4205,11 +4245,13 @@ paths:
             invalid_release (version pattern, channel, or the beta.N rule),
             expected_assets_required (missing or empty), invalid_asset (an
             entry fails the asset rules, or names or platform/arch/kind/os_floor
-            tuples repeat), or quota_exceeded.
+            tuples repeat), quota_exceeded, or manifest_too_large (the signed
+            manifest would exceed the signer's limit; refused before any upload).
           content:
             application/json:
               schema:
                 oneOf:
+                  - $ref: "#/components/schemas/DesktopFeedManifestTooLarge"
                   - allOf:
                       - $ref: "#/components/schemas/DesktopFeedError"
                       - properties: { error: { enum: [invalid_release, expected_assets_required, invalid_asset] } }
@@ -4217,14 +4259,15 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases/import:
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: importDesktopFeedRelease
       x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
       summary: Open an import draft from a pre-signed envelope (on-prem path (a); also the store step of (b) and (c)).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed. The
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7). The
         endpoint itself is decided in the source design (open question 5:
         "verified against the profile's public key before it is stored"); its
         two-step shape here is a proposal, and whether it ships before or after
@@ -4279,14 +4322,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases/{version}/assets/{name}:
     put:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: uploadDesktopFeedAsset
-      x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
       summary: Upload one declared asset's bytes to a draft.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Publisher token only; workspace bearer, install token or browser
         session is 403 `wrong_credential`. Checks, in order:
         1. The release is an open draft (404 `draft_not_found`; 409
@@ -4361,22 +4403,21 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/releases/{version}/publish:
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: publishDesktopFeedRelease
       x-status: proposed
       x-desktop-feed-role: publisher
       x-desktop-feed-credentials: [publisherToken]
-      x-proposed-default: "gcpkms hosted, awskms non-production; see docs/desktop-feed.md Proposed defaults"
       x-signer-provider:
-        x-status: unresolved
+        provider: awskms
         description: |
-          Which provider holds the hosted feed's Ed25519 private keys is not
-          decided (the source design says Cloud's KMS; the Cloud team has not
-          confirmed a provider). A key held by this deployment's Postgres is
-          not a fallback.
+          AWS KMS key (ECC_NIST_EDWARDS25519, Sign with MessageType RAW and
+          ED25519_SHA_512, 4096-byte message cap), one profile per
+          installation. A private key stored in Postgres is not a fallback.
       summary: Verify the declared asset set, then sign (hosted draft) or store verbatim (import draft).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
         Publisher token only. Steps, in order; any failure leaves the release
         a draft, unsigned and invisible to the read API:
         1. Open draft (404 `draft_not_found`, 409 `not_a_draft`).
@@ -4457,14 +4498,13 @@ paths:
                   - properties: { error: { enum: [signer_unavailable] } }
   /api/v1/desktop/feed/assets/{assetId}/download-url:
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: issueDesktopFeedDownloadUrl
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession]
       summary: Short-lived signed GET URL for one published asset.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Accepts a workspace bearer, an install token, or the browser session
         cookie on the `/cloud` mount (cookie requests also pass the existing
         browser-origin check, else 403 `csrf_rejected`). A publisher token is
@@ -4505,15 +4545,14 @@ paths:
                   - properties: { error: { enum: [no_object_storage] } }
   /api/v1/desktop/feed/assets/{assetId}:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: streamDesktopFeedAsset
-      x-status: proposed
       x-desktop-feed-role: read
       x-desktop-feed-credentials: [workspaceBearer, installToken, browserSession]
       x-desktop-feed-redirects: never
       summary: Stream one published asset from the site itself.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Accepts a workspace bearer, an install token, or the browser session
         cookie on the `/cloud` mount. A publisher token is 403
         `wrong_credential`; mixed credentials are 400.
@@ -4573,14 +4612,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/install-tokens:
     get:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: listDesktopFeedInstallTokens
-      x-status: proposed
       x-desktop-feed-role: install-token
       x-desktop-feed-credentials: [browserSession]
       summary: The caller's install tokens for the profile (never the token values).
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Browser session cookie on the `/cloud` mount only (the downloads page).
         A workspace bearer, install token or publisher token is 403
         `wrong_credential`; mixed credentials are 400. Lists the caller's own
@@ -4607,14 +4645,15 @@ paths:
         "403": { $ref: "#/components/responses/DesktopFeedReadForbidden" }
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
     post:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: createDesktopFeedInstallToken
       x-status: proposed
       x-desktop-feed-role: install-token
       x-desktop-feed-credentials: [browserSession]
       summary: Mint a 1-hour install token for headless installs.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented with a deviation: a JSON body over 1 MiB answers
+        413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
         Browser session cookie on the `/cloud` mount only, with the existing
         browser-origin check (403 `csrf_rejected`). Any bearer, including a
         workspace bearer, is 403 `wrong_credential`; mixed credentials are 400.
@@ -4647,14 +4686,13 @@ paths:
         "429": { $ref: "#/components/responses/DesktopFeedRateLimited" }
   /api/v1/desktop/feed/install-tokens/{tokenId}:
     delete:
-      tags: [Desktop feed (draft contract)]
+      tags: [Desktop feed]
       operationId: revokeDesktopFeedInstallToken
-      x-status: proposed
       x-desktop-feed-role: install-token
       x-desktop-feed-credentials: [browserSession]
       summary: Revoke one of the caller's install tokens.
       description: |
-        Status: proposed, Cloud team decides, not yet confirmed.
+        Status: implemented.
         Browser session cookie on the `/cloud` mount only, with the
         browser-origin check. Revocation takes effect on the next request made
         with the token (401 `token_revoked`); a signed URL already issued with
@@ -5318,24 +5356,22 @@ components:
     installToken:
       type: http
       scheme: bearer
-      x-status: proposed
       description: |
         Desktop feed install token (proposed prefix `sh_dfi_`), minted by the
         downloads page from a browser session. Feed read for one profile
         through one workspace, lifetime 1 hour, revocable on the page and
         revoked with the user. Accepted by the four Desktop feed read
-        endpoints only. Status: proposed, Cloud team decides, not yet confirmed.
+        endpoints only. Status: implemented.
     publisherToken:
       type: http
       scheme: bearer
-      x-status: proposed
       description: |
         Desktop feed publisher token (proposed prefix `sh_dfp_`), the
         `DESKTOP_FEED_PUBLISHER_TOKEN` of one profile. Write-only on that
         profile's drafts plus the version listing; reads nothing else; never a
-        workspace user's token; rotatable and revocable by the admin tool (not
-        part of this contract). Status: proposed, Cloud team decides, not yet
-        confirmed.
+        workspace user's token; minted and revoked through
+        `/api/v1/organizations/{org}/desktop-feed/profiles/{id}/publisher-tokens`
+        (docs/desktop-feed.md). Status: implemented.
   parameters:
     FactoryBindingId:
       name: bindingId
@@ -6661,10 +6697,10 @@ components:
           pattern: ^fk_[a-z0-9]{1,32}_[a-z0-9]{1,16}$
       description: Envelope served by the feed; mirrors docs/specs/desktop-feed-envelope.schema.json. A received envelope whose JSON text has a duplicate member name at any depth (compared after escape decoding), a lone surrogate, or anything outside RFC 8259 (including a leading BOM) is rejected before canonicalising or verifying (RFC 8785 section 3.1 requires I-JSON, RFC 7493).
     DesktopFeedErrorCode:
-      x-status: proposed
       description: |
-        Every `error` code a Desktop feed endpoint may return. Status: proposed,
-        Cloud team decides, not yet confirmed. `not_entitled`,
+        Every `error` code a Desktop feed endpoint may return, besides the
+        app-wide 413 `payload_too_large` (docs/desktop-feed.md, deviation 7).
+        Status: implemented. `not_entitled`,
         `no_object_storage` and the 401/403/404/429 split come from the source
         design; the other names are proposals.
       type: string
