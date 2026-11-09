@@ -1,5 +1,6 @@
 import { revokeOrganizationMcpOAuthGrants } from "./mcp/oauth/revocations.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -18,6 +19,11 @@ import { handleSessionRoutes } from "./sessions/routes.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, INTROSPECT_PATH } from "./auth/introspect.js";
+import { handleAcquisitionRoutes } from "./acquisition/routes.js";
+import { createDesktopFeedHandler, type DesktopFeedLimits } from "./desktop-feed/routes.js";
+import { AwsKmsDesktopFeedSigner, MemoryDesktopFeedSigner, type DesktopFeedSigner } from "./desktop-feed/signer.js";
+import { MemoryDesktopFeedStorage, S3DesktopFeedStorage, type DesktopFeedStorage } from "./desktop-feed/storage.js";
+import { DesktopFeedStore } from "./desktop-feed/store.js";
 import {
   ACCOUNT_SCOPE,
   DASHBOARD_DEVICE_CLIENT,
@@ -40,6 +46,17 @@ import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js
 import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.js";
 import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./factory/routes.js";
 import { createMcpHandler } from "./mcp/routes.js";
+import type { AmpModule } from "./amp/module.js";
+import { isAmpPath } from "./amp/routes.js";
+import { purgeMemberAmp, releaseMemberAmp } from "./amp/service.js";
+import {
+  DESKTOP_MCP_TOKEN,
+  DesktopMcpCredentialError,
+  DesktopMcpCredentials,
+  PROVIDER,
+  UUID,
+} from "./auth/desktop-mcp-credentials.js";
+import { handleDesktopIdentityRoutes } from "./messaging/desktop-identities.js";
 import { handleChiefRoutes, type ChiefBackend } from "./chief/routes.js";
 import { handleProviderRoutes } from "./providers/routes.js";
 import type { ProviderProbes } from "./providers/registry.js";
@@ -51,6 +68,32 @@ import {
   writeCapturePolicy,
 } from "./capture-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
+import {
+  erasureTarget,
+  eraseSession,
+  readSessionErasure,
+  requireErasureApi,
+  SessionErasureError,
+} from "./session-erasure.js";
+import {
+  CORE_LICENSE,
+  FeatureRefusedError,
+  PAID_FEATURES,
+  requireCapability,
+  resolveLicense,
+  type Feature,
+  type LoadedLicense,
+} from "./license/resolver.js";
+import type { AnalyticsConfig } from "./analytics/config.js";
+import {
+  clientAttribution,
+  GATEWAY_RATE_LIMITS,
+  GATEWAY_REQUIRED_SCOPE,
+  GatewayRequestError,
+  parseClientBatch,
+} from "./analytics/gateway.js";
+import { droppedTotal } from "./analytics/queue.js";
+import type { AnalyticsGatewayCounter, AnalyticsGatewayRejection, AnalyticsPort } from "./analytics/types.js";
 import {
   clientIp,
   cookieRequestAllowed,
@@ -83,7 +126,7 @@ const SESSION_COOKIE = "agent_relay_session";
 const DEVICE_COOKIE = "agent_relay_device";
 
 class HttpError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) {
+  constructor(readonly status: number, readonly code: string, message: string, readonly extra?: Record<string, string>) {
     super(message);
   }
 }
@@ -145,13 +188,22 @@ export function normalizeRoutePath(path: string): string {
     : path;
 }
 
-async function bodyText(request: IncomingMessage): Promise<string> {
+const DEFAULT_BODY_LIMIT_BYTES = 1024 * 1024;
+
+/** Reads the body, refusing it (413) as soon as the streamed bytes pass `maxBytes`. */
+async function bodyText(request: IncomingMessage, maxBytes = DEFAULT_BODY_LIMIT_BYTES): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > 1024 * 1024) throw new HttpError(413, "payload_too_large", "Body exceeds 1 MiB");
+    if (size > maxBytes) {
+      throw new HttpError(
+        413,
+        "payload_too_large",
+        maxBytes === DEFAULT_BODY_LIMIT_BYTES ? "Body exceeds 1 MiB" : `Body exceeds ${maxBytes} bytes`,
+      );
+    }
     chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString("utf8");
@@ -262,6 +314,14 @@ export function browserOriginsFor(config: SelfhostConfig): string[] {
   ])];
 }
 
+/** A bodiless cookie DELETE needs an allowed Origin, or same-origin fetch metadata. */
+function cookieDeleteAllowed(request: IncomingMessage, browserOrigins: string[]): boolean {
+  const origin = request.headers.origin;
+  return typeof origin === "string" && origin && origin !== "null"
+    ? browserOrigins.includes(origin)
+    : request.headers["sec-fetch-site"] === "same-origin";
+}
+
 export function createApp(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
@@ -271,22 +331,51 @@ export function createApp(input: {
   /** bootstrap-signup lane: OIDC / email sign-in, invites (src/identity). */
   identity?: IdentityModule;
   chief?: ChiefBackend;
+  /** Startup licence and SELFHOST_FEATURES selection (src/license). Unset = core only. */
+  license?: LoadedLicense;
+  /** Amp control (src/amp). Absent or disabled: every Amp route answers 404 before auth. */
+  amp?: AmpModule;
   /**
    * Runtime probes for the provider modules this build contains. Unset (the
    * default) means no provider module: each reports implemented, configured
    * and enabled as false.
    */
   providerProbes?: ProviderProbes;
+  /**
+   * analytics lane: the product-analytics port and its configuration. The
+   * client gateway (POST /api/v1/analytics/events) is mounted only when the
+   * destination is not `none`.
+   */
+  analytics?: {
+    port: AnalyticsPort;
+    config: Pick<AnalyticsConfig, "destination" | "gateway">;
+    /** Test hook: gateway rate limits. Production leaves this unset (GATEWAY_RATE_LIMITS). */
+    rateLimits?: Partial<Record<keyof typeof GATEWAY_RATE_LIMITS, { limit: number; windowMs: number }>>;
+  };
   /** Person messaging. Tests pass fetchImpl; the server uses global fetch. */
   messagingFetch?: typeof fetch;
   /** Factory sessions (dormant unless SELFHOST_FACTORY_ENABLED). The server passes its module so it can run the worker. */
   factory?: FactoryModule;
+  /** Desktop feed overrides for tests; the feed itself is on only when config.desktopFeed is set. */
+  desktopFeed?: {
+    signer?: DesktopFeedSigner;
+    storage?: DesktopFeedStorage;
+    limits?: Partial<DesktopFeedLimits>;
+    log?: (message: string, fields: Record<string, unknown>) => void;
+  };
   now?: () => Date;
   /** Test hooks for claim leases and crash injection. Production leaves this unset. */
   messaging?: Pick<MessagingDeps,
     "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck">;
 }): (request: IncomingMessage, response: ServerResponse) => void {
   const { config, store, admin, telemetry, identity } = input;
+  const loadedLicense = input.license ?? CORE_LICENSE;
+  // Expiry is judged per request, so a licence that lapses while running stops granting.
+  const license = () => resolveLicense(loadedLicense, input.now?.() ?? new Date());
+  /** Throws the 403 refusal unless `feature` is a capability. Call after membership, before backends. */
+  function requireFeature(feature: Feature): void {
+    requireCapability(loadedLicense, feature, input.now?.() ?? new Date());
+  }
   const browserOrigins = browserOriginsFor(config);
   const messagingDeps: MessagingDeps = {
     database: store.database,
@@ -328,10 +417,14 @@ export function createApp(input: {
     return siteBases.get(host) ?? config.publicBaseUrl.replace(/\/+$/, "");
   }
   // Hosted MCP (shared-sessions facade): reads, team activity, capabilities.
+  const amp = input.amp?.config.enabled ? input.amp : null;
   const providerProbes: ProviderProbes = input.providerProbes ?? {};
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
+    ...(amp ? { amp: amp.deps } : {}),
   });
+  const desktopMcpCredentials = new DesktopMcpCredentials(store.database);
+  const DESKTOP_MCP_RATE = { limit: 30, windowMs: 60_000 };
   function rateLimit(
     response: ServerResponse,
     key: string,
@@ -359,6 +452,86 @@ export function createApp(input: {
     const principal = await store.authenticateAccessToken(token);
     if (!principal) throw new HttpError(401, "unauthorized", "Invalid or expired token");
     return { kind: "user", principal, token };
+  }
+
+  // analytics lane: the client gateway. Authority comes only from the
+  // credential's principal; the body names events and properties, nothing else.
+  const analyticsGateway = input.analytics && input.analytics.config.destination !== "none"
+    ? input.analytics
+    : null;
+
+  async function analyticsEvents(
+    request: IncomingMessage,
+    response: ServerResponse,
+    gateway: NonNullable<typeof analyticsGateway>,
+  ): Promise<void> {
+    const { port } = gateway;
+    const count = (counter: AnalyticsGatewayCounter, amount = 1) => {
+      try {
+        port.recordGateway?.(counter, amount);
+      } catch {
+        // Counters never fail a request.
+      }
+    };
+    count("requests");
+    // Which gateway.rejected counter an HttpError at the current step maps to.
+    let step: AnalyticsGatewayRejection = "auth";
+    try {
+      // Bootstrap, internal and workspace API tokens resolve to no session: 401.
+      const auth = await authenticate(request);
+      if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      const { principal } = auth;
+      // authenticate() takes the bearer first and the cookie only under /cloud/.
+      const client = bearer(request) ? "desktop" : "dashboard";
+      if (client === "dashboard" && !cookieRequestAllowed(request, browserOrigins)) {
+        step = "csrf";
+        throw new HttpError(403, "forbidden", "Cross-origin analytics request refused");
+      }
+      if (!principal.scopes.includes(GATEWAY_REQUIRED_SCOPE)) {
+        throw new HttpError(403, "forbidden", `Scope ${GATEWAY_REQUIRED_SCOPE} required`);
+      }
+      step = "rate_limited";
+      const limited = "Too many analytics requests. Try again shortly.";
+      const limits = { ...GATEWAY_RATE_LIMITS, ...gateway.rateLimits };
+      rateLimit(response, `analytics:session:${principal.sessionId}`, limits.session, "rate_limited", limited);
+      // Keyed by clientIp(): the first X-Forwarded-For hop, as the auth limiters
+      // are. Only an ingress that overwrites that header makes it client-proof;
+      // see docs/analytics.md "Rate limits and the forwarded-header boundary".
+      rateLimit(response, `analytics:ip:${clientIp(request)}`, limits.ip, "rate_limited", limited);
+      // A membership revoked after the token was checked attributes nothing.
+      step = "auth";
+      const workspace = await store.workspaceForUser(principal.workspaceId, principal.userId);
+      if (!workspace) throw new HttpError(404, "workspace_not_found", "Workspace not found");
+      step = "body";
+      const raw = await bodyText(request, gateway.config.gateway.maxBodyBytes);
+      const now = (input.now?.() ?? new Date()).getTime();
+      const events = parseClientBatch(raw, { client, maxEvents: gateway.config.gateway.maxEvents, now });
+
+      const authority = { organizationId: principal.organizationId, workspaceId: principal.workspaceId };
+      const traceId = randomUUID();
+      const droppedBefore = droppedTotal(port.stats());
+      for (const event of events) {
+        port.capture({
+          event: event.event,
+          properties: event.properties,
+          traceId,
+          occurredAt: event.occurredAt,
+          ...clientAttribution(event.scope, authority),
+        });
+      }
+      const queued = droppedTotal(port.stats()) === droppedBefore;
+      count("accepted", events.length);
+      const adjusted = events.filter((event) => event.clockAdjusted).length;
+      if (adjusted > 0) count("clock_adjusted", adjusted);
+      json(response, 202, { accepted: events.length, queued }, true);
+    } catch (error) {
+      if (error instanceof GatewayRequestError) {
+        count(`rejected.${error.counter}`);
+        throw new HttpError(error.status, error.code, error.message);
+      }
+      if (error instanceof HttpError) count(`rejected.${step}`);
+      throw error;
+    }
   }
 
   async function organizationAccess(
@@ -427,6 +600,36 @@ export function createApp(input: {
     }
     return { principal: auth.principal, workspace, token: auth.token };
   }
+
+  // Desktop feed (docs/desktop-feed.md): off, so every route 404s, unless
+  // both SELFHOST_DESKTOP_FEED_SIGNER and _STORAGE are configured.
+  const feedConfig = config.desktopFeed ?? null;
+  const desktopFeed = feedConfig
+    ? createDesktopFeedHandler({
+      config,
+      controlStore: store,
+      store: new DesktopFeedStore(store.database),
+      signer: input.desktopFeed?.signer ?? (feedConfig.signer.kind === "awskms"
+        ? new AwsKmsDesktopFeedSigner({
+          region: feedConfig.signer.region, label: feedConfig.signer.label, keyAliases: feedConfig.signer.keyAliases,
+        })
+        : new MemoryDesktopFeedSigner({ label: feedConfig.signer.label })),
+      storage: input.desktopFeed?.storage ?? (feedConfig.storage.kind === "s3"
+        ? new S3DesktopFeedStorage({
+          bucket: feedConfig.storage.bucket, region: feedConfig.storage.region, prefix: feedConfig.storage.prefix,
+        })
+        : new MemoryDesktopFeedStorage()),
+      browserOrigins,
+      publisherTokenHashes: feedConfig.publisherTokenHashes,
+      now: input.now,
+      limits: input.desktopFeed?.limits,
+      log: input.desktopFeed?.log,
+      organizationAccess,
+      requestObject,
+      json,
+      httpError: (status, code, message) => new HttpError(status, code, message),
+    })
+    : null;
 
   const factoryRoutes = mountFactoryRoutes(factory, { workspaceAccess, requestObject, bearer, json });
 
@@ -510,6 +713,7 @@ export function createApp(input: {
     ? createFlowsHandler({
       store: input.flows,
       publicBaseUrl: config.publicBaseUrl,
+      requireFeature: () => requireFeature("flows"),
       userAccess: async (request, admin = false) => {
         const auth = await authenticate(request);
         if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
@@ -547,9 +751,11 @@ export function createApp(input: {
     if (method === "GET" && path === "/readyz") {
       const readiness = await store.readiness();
       const introspection = { enabled: Boolean(config.introspectSecret), audiences: acceptedAudiences(config) };
+      const current = license();
+      const licenseFields = { license: { status: current.status }, capabilities: current.capabilities };
       json(response, readiness.ready ? 200 : 503, readiness.ready
-        ? { status: "ready", introspection }
-        : { status: "not_ready", reason: readiness.reason, message: readiness.message, introspection });
+        ? { status: "ready", introspection, ...licenseFields }
+        : { status: "not_ready", reason: readiness.reason, message: readiness.message, introspection, ...licenseFields });
       return;
     }
     if (method === "GET" && path === "/openapi.yaml") {
@@ -567,6 +773,21 @@ export function createApp(input: {
       return;
     }
 
+    // Dormant acquisition assertion issuer (docs/acquisition-issuer.md): every
+    // /api/v1/acquisition path is 404 until SELFHOST_ACQUISITION_ISSUER_ENABLED.
+    if (await handleAcquisitionRoutes({
+      config, store, apiTokens: admin?.apiTokens, request, response, method, path, now: input.now,
+    })) {
+      return;
+    }
+    // Amp control: gated before any authentication (off answers 404).
+    if (isAmpPath(path)) {
+      if (!amp) {
+        json(response, 404, { error: "Not found" }, true);
+        return;
+      }
+      if (await amp.handle(request, response, path, publicPath, method, { workspaceAccess, bearer, json })) return;
+    }
     // Factory sessions: 404 before auth when the flag is off.
     if (await factoryRoutes(request, response, path, publicPath, method)) return;
 
@@ -766,12 +987,13 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         workspaceId: target.workspaceId,
         redirectUri: login.redirectUri,
       };
-      const issueHandoff = async (status: 303 | 307) => {
+      const issueHandoff = async (status: 303 | 307, consentedHostName?: string) => {
         const issued = await store.issueDesktopHandoff({
           userId: principal.userId,
           organizationId: target.organizationId,
           workspaceId: target.workspaceId,
           codeChallenge,
+          ...(consentedHostName ? { consentedHostName } : {}),
         });
         response.writeHead(status, {
           location: handoffCallbackUrl(login, issued, `${siteBaseUrl(request)}/cloud`),
@@ -828,7 +1050,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         response.end(desktopConsentDeniedPage());
         return;
       }
-      await issueHandoff(303);
+      // Only an approved consent records the host: that is the provenance a
+      // verified Desktop sign-in (desktop MCP credentials) requires.
+      await issueHandoff(303, login.desktopHostName);
       return;
     }
 
@@ -1244,6 +1468,27 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    // Installation entitlement for any signed-in member; never secret material.
+    if (method === "GET" && path === "/api/v1/license") {
+      const auth = await authenticate(request);
+      if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      const current = license();
+      const claims = current.claims;
+      json(response, 200, {
+        status: current.status,
+        license_id: claims?.licenseId ?? null,
+        customer: claims?.customer ?? null,
+        expires_at: claims?.expiresAt ?? null,
+        seats: claims ? { limit: claims.seats, used: await store.countActiveMembers() } : null,
+        features: PAID_FEATURES.filter((feature) => current.entitled[feature]),
+        paid: [...PAID_FEATURES],
+        selected: current.selected,
+        entitled: current.entitled,
+        capabilities: current.capabilities,
+      }, true);
+      return;
+    }
+
     if (path === "/api/v1/organizations" && method === "GET") {
       const auth = await authenticate(request, true);
       json(response, 200, {
@@ -1406,10 +1651,17 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         await store.memberRole(organizationId, userId) === "owner") {
         throw new HttpError(403, "forbidden", "Only an owner can remove an owner.");
       }
-      const deleted = await store.deleteMembership(organizationId, userId, async (tx) => {
-        await factory.purgeMemberInTx(tx, organizationId, userId);
-        await revokeOrganizationMcpOAuthGrants(tx, { organizationId, userId }, input.now?.() ?? new Date());
-      });
+      // Local Amp, Factory and OAuth authority retires atomically, including
+      // when a module is off. Remote release remains post-commit.
+      const deleted = await store.deleteMembership(
+        organizationId,
+        userId,
+        async (tx, member) => {
+          await purgeMemberAmp(tx, member);
+          await factory.purgeMemberInTx(tx, organizationId, userId);
+          await revokeOrganizationMcpOAuthGrants(tx, member, input.now?.() ?? new Date());
+        },
+      );
       if (!deleted) {
         if (!(await store.memberRole(organizationId, userId))) {
           await revokeRemovedMember(messagingDeps, organizationId, userId);
@@ -1418,6 +1670,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       await identity?.auditMembership({ organizationId, auth, action: "membership.remove", target: userId });
       await revokeRemovedMember(messagingDeps, organizationId, userId);
+      if (amp) await releaseMemberAmp(amp.deps, { organizationId, userId }).catch(() => undefined);
       await factory.afterMemberRemoved(organizationId, userId);
       response.writeHead(204);
       response.end();
@@ -1451,11 +1704,8 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // Cookie writes: JSON from an allowed origin; a bodiless DELETE needs
       // an allowed Origin (or same-origin fetch metadata).
       if (!bearer(request)) {
-        const origin = request.headers.origin;
         const allowed = method === "DELETE"
-          ? (typeof origin === "string" && origin && origin !== "null"
-            ? browserOrigins.includes(origin)
-            : request.headers["sec-fetch-site"] === "same-origin")
+          ? cookieDeleteAllowed(request, browserOrigins)
           : cookieRequestAllowed(request, browserOrigins);
         if (!allowed) throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
       }
@@ -1477,6 +1727,40 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         action: method === "PUT" ? "capture_policy.set" : "capture_policy.cleared",
       });
       json(response, 200, policy, true);
+      return;
+    }
+
+    // Operator session hard delete (docs/session-erasure.md). Erases session
+    // data only: organization membership is never touched.
+    const sessionErase = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/sessions\/([^/]+)$/);
+    if (sessionErase && method === "DELETE") {
+      const [organizationId, sessionId] = sessionErase as [string, string];
+      const auth = await organizationAccess(request, organizationId, true);
+      if (!operatorControlsEntitled()) {
+        throw new HttpError(403, "operator_controls_not_entitled", "Operator controls are not enabled for this installation");
+      }
+      if (!bearer(request) && !cookieDeleteAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      const api = requireErasureApi(config);
+      const target = await erasureTarget(store.database, organizationId, sessionId, url.searchParams);
+      const result = await eraseSession(
+        store.database,
+        api,
+        target,
+        auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" },
+      );
+      json(response, result.status === "completed" ? 200 : 202, result, true);
+      return;
+    }
+
+    const sessionErasure = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/sessions\/([^/]+)\/erasure$/);
+    if (sessionErasure && method === "GET") {
+      const [organizationId, sessionId] = sessionErasure as [string, string];
+      await organizationAccess(request, organizationId, true);
+      const api = requireErasureApi(config);
+      const target = await erasureTarget(store.database, organizationId, sessionId, url.searchParams);
+      json(response, 200, await readSessionErasure(store.database, api, target), true);
       return;
     }
 
@@ -1667,12 +1951,100 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    // Desktop-provider MCP credentials (Copilot in VS Code): Agent Relay
+    // Desktop registers the secret it saved, with its own verified sign-in.
+    const credentialCollection = routeMatch(
+      path,
+      /^\/api\/v1\/workspaces\/([^/]+)\/mcp\/shared-sessions-tokens$/,
+    );
+    const credentialItem = routeMatch(
+      path,
+      /^\/api\/v1\/workspaces\/([^/]+)\/mcp\/shared-sessions-tokens\/([^/]+)$/,
+    );
+    if (credentialCollection || credentialItem) {
+      const allowed = credentialCollection ? ["GET", "POST"] : ["PUT", "DELETE"];
+      if (!allowed.includes(method)) {
+        response.setHeader("allow", allowed.join(", "));
+        throw new HttpError(405, "method_not_allowed", "Method not allowed");
+      }
+      const workspaceId = (credentialCollection ?? credentialItem)![0]!;
+      // Only a header bearer can be a Desktop sign-in; cookies never are.
+      if (!bearer(request)) throw new HttpError(401, "unauthorized", "Authentication required");
+      const access = await workspaceAccess(request, workspaceId);
+      rateLimit(
+        response,
+        `desktop-mcp:${access.workspace.id}:${access.principal.userId}`,
+        DESKTOP_MCP_RATE,
+        "rate_limited",
+        "Too many provider credential requests. Try again shortly.",
+      );
+      try {
+        if (credentialCollection && method === "GET") {
+          json(response, 200, { tokens: await desktopMcpCredentials.list(access.token, access.workspace.id) }, true);
+          return;
+        }
+        if (credentialCollection) {
+          const body = await requestObject(request);
+          const keys = Object.keys(body).sort();
+          const { provider, installationId, accessToken } = body;
+          if (
+            keys.join(",") !== "accessToken,installationId,provider" ||
+            typeof provider !== "string" || !PROVIDER.test(provider) ||
+            typeof installationId !== "string" || !UUID.test(installationId) ||
+            typeof accessToken !== "string" || !DESKTOP_MCP_TOKEN.test(accessToken)
+          ) {
+            throw new HttpError(400, "invalid_request", "Invalid provider credential request");
+          }
+          const issued = await desktopMcpCredentials.issue({
+            parentToken: access.token,
+            workspaceId: access.workspace.id,
+            provider,
+            installationId,
+            accessToken,
+          });
+          // Metadata only: Desktop already holds the secret it sent.
+          json(response, 201, issued, true);
+          return;
+        }
+        const tokenId = credentialItem![1]!;
+        if (method === "PUT") {
+          json(response, 200, await desktopMcpCredentials.renew(access.token, access.workspace.id, tokenId), true);
+          return;
+        }
+        await desktopMcpCredentials.revoke(access.token, access.workspace.id, tokenId);
+        response.writeHead(204, { "cache-control": "no-store" });
+        response.end();
+        return;
+      } catch (error) {
+        if (error instanceof DesktopMcpCredentialError) throw new HttpError(error.status, error.code, error.message, error.extra);
+        throw error;
+      }
+    }
+
+    if (await handleDesktopIdentityRoutes(request, response, path, method, {
+      workspaceAccess,
+      requestObject,
+      json,
+      database: store.database,
+      keyring: config.encryptionKeyring,
+      fetchImpl: input.messagingFetch,
+      relaycastUrl: config.relaycastUrl,
+      csrfAllowed: (incoming) => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
+    })) return;
+
+    if (analyticsGateway && method === "POST" && path === "/api/v1/analytics/events") {
+      await analyticsEvents(request, response, analyticsGateway);
+      return;
+    }
+
     if (await mcp(request, response, path, method)) return;
+    if (desktopFeed && await desktopFeed(request, response, path, method)) return;
     if (await handleProviderRoutes(request, response, path, method, {
       probes: providerProbes, workspaceAccess: (incoming, id) => workspaceAccess(incoming, id), json,
     })) return;
     if (await handleChiefRoutes(request, response, path, {
       backend: input.chief, workspaceAccess, requestObject, json,
+      requireFeature: () => requireFeature("chief"),
       csrfAllowed: incoming => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
     })) return;
 
@@ -1715,12 +2087,25 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         response.end();
         return;
       }
+      if (error instanceof FeatureRefusedError) {
+        json(response, error.status, { error: error.code, message: error.message, feature: error.feature }, true);
+        return;
+      }
       if (error instanceof HttpError || error instanceof MessagingHttpError) {
-        json(response, error.status, { error: error.code, message: error.message }, true);
+        const extra = error instanceof HttpError ? error.extra : undefined;
+        json(response, error.status, { error: error.code, message: error.message, ...extra }, true);
         return;
       }
       if (error instanceof CapturePolicyError) {
         json(response, error.status, { error: error.code, message: error.message }, true);
+        return;
+      }
+      if (error instanceof SessionErasureError) {
+        json(response, error.status, {
+          error: error.code,
+          message: error.message,
+          ...(error.erasure ? { erasure: error.erasure } : {}),
+        }, true);
         return;
       }
       const identityError = identityErrorResponse(error);

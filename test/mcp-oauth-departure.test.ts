@@ -9,6 +9,7 @@ import { ControlPlaneStore } from "../src/store.js";
 import { McpOAuthStore } from "../src/mcp/oauth/store.js";
 import { createMcpOAuthProtocol,pkceS256 } from "../src/mcp/oauth/protocol.js";
 import { revokeOrganizationMcpOAuthGrants } from "../src/mcp/oauth/revocations.js";
+import { purgeMemberAmp } from "../src/amp/service.js";
 import { PGliteDatabase,listen,close } from "./support/harness.js";
 
 const ORIGIN="https://relay.example.test",RESOURCE=`${ORIGIN}/cloud/api/v1/mcp/shared-sessions`,VERIFIER="a".repeat(43);
@@ -85,7 +86,7 @@ test("last-owner refusal does not invoke departure; retry of an absent member ca
   assert.equal(await f.count("revocations"),2);
 });
 
-test("Factory and OAuth departure cleanup commit or roll back together after main integration",async t=>{
+test("Amp, Factory and OAuth departure cleanup commit or roll back together after main integration",async t=>{
   const {startFactoryEnv,connectAndBind,bindingRow,removeMember}=await import("./factory-helpers.js");
   const env=await startFactoryEnv(t),bound=await connectAndBind(env,{token:env.adminToken});
   const origin=new URL(env.config.publicBaseUrl).origin;
@@ -101,19 +102,39 @@ test("Factory and OAuth departure cleanup commit or roll back together after mai
   const issued=await oauth.exchangeMcpOAuthAuthorizationCode({code,clientId:client.clientId,
     redirectUri:client.redirectUris[0],codeVerifier:VERIFIER,resource:undefined});
   assert.ok(issued.ok);
+  const ampBinding=randomUUID(),ampDelivery=randomUUID();
+  await env.database.query(`INSERT INTO selfhost_amp_connections
+    (workspace_id,organization_id,user_id,key_ciphertext,key_hint)
+    VALUES ($1,$2,$3,'fake-envelope','fake-hint')`,[env.workspaceId,env.organizationId,env.adminId]);
+  await env.database.query(`INSERT INTO selfhost_amp_bindings
+    (id,workspace_id,organization_id,user_id,thread_id,state,agent_name,agent_remote_id,token_ciphertext,hook_ciphertext)
+    VALUES ($1,$2,$3,$4,$5,'bound','fake-amp-agent','fake-amp-id','fake-token-envelope','fake-hook-envelope')`,
+    [ampBinding,env.workspaceId,env.organizationId,env.adminId,"fake-thread-"+ampBinding]);
+  await env.database.query(`INSERT INTO selfhost_amp_deliveries
+    (id,binding_id,message_id,payload_ciphertext,state,reply_hash)
+    VALUES ($1,$2,'fake-message','fake-payload-envelope','pending','fake-reply-hash')`,[ampDelivery,ampBinding]);
   const store=new ControlPlaneStore(env.database,env.config.encryptionKeyring,0);
   await assert.rejects(store.deleteMembership(env.organizationId,env.adminId,async tx=>{
+    await purgeMemberAmp(tx,{organizationId:env.organizationId,userId:env.adminId});
     await env.module.purgeMemberInTx(tx,env.organizationId,env.adminId);
     await revokeOrganizationMcpOAuthGrants(tx,owner);
     throw new Error("fake combined cleanup abort");
   }),/fake combined cleanup abort/);
   assert.equal((await bindingRow(env,bound.binding_id)).state,"bound");
+  assert.equal((await env.database.query("SELECT state FROM selfhost_amp_bindings WHERE id=$1",[ampBinding])).rows[0]!.state,"bound");
+  assert.equal((await env.database.query("SELECT reply_hash FROM selfhost_amp_deliveries WHERE id=$1",[ampDelivery])).rows[0]!.reply_hash,"fake-reply-hash");
+  assert.equal((await env.database.query("SELECT workspace_id FROM selfhost_amp_connections")).rows.length,1);
   assert.ok(await oauth.sessions.resolveAccessToken(issued.body.access_token,resource));
   assert.equal(await store.memberRole(env.organizationId,env.adminId),"admin");
   assert.equal((await env.database.query("SELECT id FROM selfhost_mcp_oauth_revocations")).rows.length,0);
   assert.equal((await removeMember(env,env.adminId)).status,204);
   const retired=await bindingRow(env,bound.binding_id);
   assert.equal(retired.state,"retired");assert.equal(retired.hosted_token_envelope,null);
+  const ampRetired=(await env.database.query("SELECT state,token_ciphertext,hook_ciphertext FROM selfhost_amp_bindings WHERE id=$1",[ampBinding])).rows[0]!;
+  assert.deepEqual(ampRetired,{state:"retired",token_ciphertext:null,hook_ciphertext:null});
+  const deliveryRetired=(await env.database.query("SELECT state,payload_ciphertext,reply_hash FROM selfhost_amp_deliveries WHERE id=$1",[ampDelivery])).rows[0]!;
+  assert.deepEqual(deliveryRetired,{state:"rejected",payload_ciphertext:null,reply_hash:null});
+  assert.equal((await env.database.query("SELECT workspace_id FROM selfhost_amp_connections")).rows.length,0);
   assert.ok(env.relay.released.includes(bound.agent.id));
   assert.equal((await env.database.query("SELECT id FROM selfhost_mcp_oauth_revocations")).rows.length,1);
   await env.database.query("INSERT INTO selfhost_organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'admin')",[env.organizationId,env.adminId]);

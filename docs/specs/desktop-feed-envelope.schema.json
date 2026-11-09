@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:agent-relay:desktop-feed:envelope:1",
   "title": "Desktop feed envelope (signed manifest as served)",
-  "$comment": "Status: proposed draft contract (relaycontrol docs/desktop-feed.md). Cloud team decides; not yet confirmed. Self-contained: $defs.manifest and $defs.asset are copies of desktop-feed-manifest.schema.json (the relaycontrol test suite keeps them identical). The signature is Ed25519 (RFC 8032) over the UTF-8 bytes of the RFC 8785 (JCS) canonical form of `manifest` as received.",
+  "$comment": "Status: implemented (relaycontrol docs/desktop-feed.md; src/desktop-feed/schemas.ts embeds this file). Self-contained: $defs.manifest and $defs.asset are copies of desktop-feed-manifest.schema.json (the relaycontrol test suite keeps them identical). The signature is Ed25519 (RFC 8032) over the UTF-8 bytes of the RFC 8785 (JCS) canonical form of `manifest` as received.",
   "type": "object",
   "additionalProperties": false,
   "required": [

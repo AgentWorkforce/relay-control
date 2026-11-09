@@ -515,6 +515,49 @@ test("the projector enforces the scope registry and the property allowlist", () 
   assert.throws(() => project({ event: "toString" }), /unregistered event kind/);
 });
 
+test("the projector honours occurredAt and the uuid property type", () => {
+  const registry: Record<string, EventSpec> = {
+    tenant_thing: { scope: "tenant", clients: ["desktop"], properties: { id: { type: "uuid" } } },
+  };
+  const context = { deploymentId: "dep_test_000001", traceId: "trace_test_0001", now: () => 0 };
+  const project = (input: Record<string, unknown>) => projectEvent(input as never, context, registry);
+  const at = Date.parse("2026-11-08T12:34:56.789Z");
+  assert.equal(project({ event: "tenant_thing", tenantId: "t_1", occurredAt: at }).occurred_at, "2026-11-08T12:34:56.789Z");
+  assert.equal(project({ event: "tenant_thing", tenantId: "t_1" }).occurred_at, "1970-01-01T00:00:00.000Z");
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 1e20, "2026-11-08T00:00:00Z"]) {
+    assert.throws(() => project({ event: "tenant_thing", tenantId: "t_1", occurredAt: bad }), /occurred_at/);
+  }
+  const uuid = "0E6A1F5C-3B2D-4C1A-9F8E-7D6C5B4A3F21";
+  assert.deepEqual(project({ event: "tenant_thing", tenantId: "t_1", properties: { id: uuid } }).properties, {
+    id: uuid.toLowerCase(),
+  });
+  assert.deepEqual(project({ event: "tenant_thing", tenantId: "t_1", properties: { id: "not-a-uuid" } }).properties, {});
+});
+
+test("gateway counters start at zero and only move through recordGateway", () => {
+  const analytics = createAnalytics({ limits: DEFAULTS, sink: noneSink, deploymentId: null, clock: fakeClock() });
+  assert.deepEqual(analytics.stats().gateway, {
+    requests: 0,
+    accepted: 0,
+    rejected: { auth: 0, csrf: 0, client_mismatch: 0, body: 0, invalid: 0, reserved_field: 0, rate_limited: 0 },
+    clock_adjusted: 0,
+  });
+  analytics.recordGateway("requests");
+  analytics.recordGateway("accepted", 3);
+  analytics.recordGateway("rejected.csrf");
+  analytics.recordGateway("clock_adjusted", 2);
+  analytics.recordGateway("rejected.bogus" as never);
+  analytics.recordGateway("accepted", -1);
+  const snapshot = analytics.stats();
+  assert.equal(snapshot.gateway.requests, 1);
+  assert.equal(snapshot.gateway.accepted, 3);
+  assert.equal(snapshot.gateway.rejected.csrf, 1);
+  assert.equal(snapshot.gateway.clock_adjusted, 2);
+  // stats() returns a copy.
+  snapshot.gateway.rejected.csrf = 99;
+  assert.equal(analytics.stats().gateway.rejected.csrf, 1);
+});
+
 test("the none destination only counts captures", async () => {
   const clock = fakeClock();
   const analytics = createAnalytics({ limits: DEFAULTS, sink: noneSink, deploymentId: null, clock });
@@ -713,7 +756,12 @@ test("the projector enforces the identity model: no missing ids, no extra ids, n
 
   // relaycontrol: tenant model (organization = tenant) by default.
   assert.equal(RELAYCONTROL_IDENTITY_MODEL, "tenant");
-  for (const spec of Object.values(EVENT_REGISTRY)) assert.equal(spec.scope, "installation");
+  // Server-only kinds are installation-scoped; client kinds (gateway only) are
+  // tenant- or workspace-scoped under the tenant model.
+  for (const spec of Object.values(EVENT_REGISTRY)) {
+    if (spec.clients === undefined) assert.equal(spec.scope, "installation");
+    else assert.ok(spec.scope === "tenant" || spec.scope === "workspace");
+  }
 
   // Missing required ids.
   assert.throws(() => project({ event: "tenant_thing" }), /require tenant_id/);

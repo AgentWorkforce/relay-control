@@ -26,6 +26,7 @@ def command(revision, directory):
     payload = base64.b64encode(json.dumps({
         "revision": revision,
         "lead_prompt": (directory / "lead-prompt.md").read_text(),
+        "node_test_guard": (directory / "node_test_guard.py").read_text(),
     }).encode()).decode()
     implementation = base64.b64encode((directory / "apply.py").read_bytes()).decode()
     return f"python3 - '{payload}' <<'CONTROL_AGENT_DEPLOY'\nimport base64\nexec(compile(base64.b64decode('{implementation}'), 'control-agent-apply.py', 'exec'))\nCONTROL_AGENT_DEPLOY"
