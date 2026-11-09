@@ -970,3 +970,73 @@ for(const endpoint of ["/mcp","/cloud/mcp","/cloud"+SHARED]) test("mounted app O
   assert.equal((await call(endpoint,init,{authorization:"Bearer "+pair.access_token})).status,401);
   assert.equal((await f.database.query("SELECT agent_remote_id FROM selfhost_mcp_oauth_revocations WHERE agent_remote_id=$1",[pinned])).rows.length,1);
 });
+
+for (const actor of ["oauth", "native", "abandon-oauth"] as const) test("review repro: cleanup must retain an identity rejoined by " + actor + " during remote release", async t => {
+  const f=await relayFixture(t);await f.service.join({});
+  const original=f.world.agents.get("approved-agent")!;
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId,"fake-disconnect");
+  let notify!:()=>void,release!:()=>void;
+  const started=new Promise<void>(resolve=>{notify=resolve;});
+  const held=new Promise<void>(resolve=>{release=resolve;});
+  const originalClient=f.teardown.deps.client;
+  const delayed:RelaycastClient={...originalClient,releaseHosted:async(key,name,id)=>{
+    notify();await held;await originalClient.releaseHosted(key,name,id);
+  }};
+  const worker=new McpOAuthTeardown({...f.teardown.deps,client:delayed});
+  const finished=worker.drain().then(value=>({value}),error=>({error}));
+  await Promise.race([started,finished.then(result=>{if("error" in result)throw result.error;throw new Error("release not reached");})]);
+  let connected=false, refused=false;
+  let beforeJoin=0;
+  try {
+    if(actor==="abandon-oauth") {
+      const store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
+      try {
+        const count=await store.abandonMcpOAuthCleanup({...f.owner,actor:{kind:"bootstrap"}});
+        assert.ok(count!==null,"the operator target exists");
+      } catch(error) {
+        // Refusing abandonment while remote work is in flight is also safe.
+        assert.match(String(error),/retir|teardown|cleanup|disconnect|connect|releas|pending|busy|in.?progress/i);
+      }
+    }
+    if(actor!=="native") {
+      const grantId=randomUUID(),tokenFamilyId=randomUUID();
+      await f.database.query(`INSERT INTO selfhost_mcp_oauth_grants
+        (id,client_id,user_id,organization_id,workspace_id,agent_name,scopes,resource,token_family_id)
+        SELECT $2,client_id,user_id,organization_id,workspace_id,agent_name,scopes,resource,$3
+        FROM selfhost_mcp_oauth_grants WHERE id=$1`,[f.owner.grantId,grantId,tokenFamilyId]);
+      const pair=await f.database.transaction(tx=>f.sessions.issue(tx,{...f.owner,grantId,tokenFamilyId,scopes:["relay:mcp"]}));
+      const admission=await admitMcpOAuthBearer({sessions:f.sessions,token:pair.accessToken,resourcePath:SHARED});
+      assert.ok(admission.ok);
+      const service=relayService({...f.context,principal:admission.connection.access.principal,oauth:admission.connection});
+      beforeJoin=f.world.bodies.length;
+      try {
+        assert.equal((await service.join({})).name,original.name);
+        connected=true;
+        assert.equal(admission.connection.access.agentRemoteId,original.id);
+      } catch(error) {
+        assert.match(String(error),/retir|teardown|cleanup|disconnect|connect|releas|pending|busy|in.?progress/i);
+        refused=true;
+        assert.equal(f.world.bodies.length,beforeJoin,"retiring identity must be refused before Relaycast I/O");
+        assert.equal((await f.database.query("SELECT agent_remote_id FROM selfhost_mcp_oauth_grants WHERE id=$1",[grantId])).rows[0]!.agent_remote_id,null);
+      }
+    } else {
+      const service=relayService({...f.context,oauth:undefined,authMode:"cli_login",
+        relay:{...f.context.relay,sessionId:"fake-native-reconnect"}});
+      beforeJoin=f.world.bodies.length;
+      try {
+        assert.equal((await service.join({name:original.name})).name,original.name);
+        connected=true;
+        assert.ok((await f.database.query("SELECT session_hash FROM selfhost_hosted_relay_participants")).rows[0]!.session_hash);
+      } catch(error) {
+        assert.match(String(error),/retir|teardown|cleanup|disconnect|connect|releas|pending|busy|in.?progress/i);
+        refused=true;
+        assert.equal(f.world.bodies.length,beforeJoin,"retiring native identity must be refused before Relaycast I/O");
+        assert.equal((await f.database.query("SELECT session_hash FROM selfhost_hosted_relay_participants")).rows[0]!.session_hash,null);
+      }
+    }
+    assert.equal(f.world.agents.get(original.name)!.id,original.id,"join succeeded against the live original identity");
+  } finally {release();}
+  const result=await finished;if("error" in result)throw result.error;
+  if(connected) assert.equal(f.world.agents.get(original.name)?.id,original.id,"cleanup deleted an identity after a successful reconnect");
+  else assert.ok(refused,"reconnect must either be refused or retain its identity");
+});
