@@ -61,6 +61,7 @@ break-glass path.
 | `SELFHOST_OIDC_SCOPES` | Default `openid email profile` |
 | `SELFHOST_OIDC_REDIRECT_URL` | Optional fixed redirect URI. The default is `<site>/login/oidc/callback`, where the site is the dashboard origin, or the API origin when sign-in starts there |
 | `SELFHOST_OIDC_ALLOW_HTTP_ISSUER` | Test only: accept an `http://` issuer (for example an in-cluster Dex) |
+| `SELFHOST_OIDC_TRUST_MISSING_EMAIL_VERIFIED_ISSUER` | Optional. Treats an `id_token` with no `email_verified` claim as verified, which matters for domain auto-join in multi mode. Must equal `SELFHOST_OIDC_ISSUER`. See [Providers that omit `email_verified`](#providers-that-omit-email_verified) |
 
 The flow is the authorization-code flow with PKCE (S256), `state` and
 `nonce`.
@@ -95,13 +96,95 @@ Register this redirect URI with the provider:
 1. Create an OIDC "Web Application" app integration with grant type
    Authorization Code.
 2. Use issuer `https://<org>.okta.com/oauth2/default` (or your custom
-   authorization server).
+   authorization server). The `email` scope, requested by default, puts both
+   `email` and `email_verified` in the `id_token`.
+3. Assign the people who should sign in to the app. Okta refuses anyone who
+   is not assigned.
 
 **Microsoft Entra ID**
-1. Create an app registration with a Web redirect URI.
-2. Use issuer `https://login.microsoftonline.com/<tenant-id>/v2.0`.
+1. Create an app registration with a Web redirect URI, for accounts in this
+   organizational directory only.
+2. Use issuer `https://login.microsoftonline.com/<tenant-id>/v2.0`, with the
+   directory (tenant) ID. The shared `common` and `organizations` issuers
+   are refused at sign-in: their discovery document names no single issuer.
 3. Add the optional `email` claim to the ID token. Entra omits
-   `email_verified`, and the email comes from your directory.
+   `email_verified`; see below. `preferred_username` and `upn` are never used
+   in place of `email`, so a person with no email on their directory record
+   is refused.
+
+#### Providers that omit `email_verified`
+
+Microsoft Entra ID sends no `email_verified` claim. An explicit `false` is
+always refused. When the claim is missing:
+
+| Path | Single mode | Multi mode |
+|---|---|---|
+| Bootstrap owner | Signs in as owner | Signs in as owner |
+| Existing member | Signs in | Signs in |
+| Invite (link or open invite) | Signs in with the invited role | Signs in with the invited role |
+| Domain auto-join | Joins as `member` | Does not join: personal organization when those are on, else `403 no_organization` |
+
+Single mode needs no setting. To let a provider's accounts auto-join assigned
+domains in multi mode, set
+`SELFHOST_OIDC_TRUST_MISSING_EMAIL_VERIFIED_ISSUER` to the exact value of
+`SELFHOST_OIDC_ISSUER`. Startup fails when it differs, or when it names a
+shared Microsoft issuer (`common`, `organizations`, `consumers`).
+
+Use it only when the people who can set an email address in that directory
+are people you trust with membership of the organization. Microsoft documents
+the `email` claim as mutable, so anyone able to edit a directory user's email
+could use it to take on that address here.
+
+### Test your SSO before go-live
+
+Run this after configuring the provider and before announcing sign-in. Use a
+private browser window for each person, so an earlier session can't answer
+for the next one.
+
+1. Check that the issuer is exact. The `issuer` printed must equal
+   `SELFHOST_OIDC_ISSUER`, without a trailing slash difference:
+
+   ```sh
+   curl -s "$SELFHOST_OIDC_ISSUER/.well-known/openid-configuration" | jq -r .issuer
+   ```
+
+2. Prepare test accounts at the provider:
+   - **Okta:** in the app's Assignments tab, assign the bootstrap admin, one
+     person at an auto-join domain, and one invited person. Use an issuer
+     from Security → API → Authorization Servers. If your org has no custom
+     authorization server, use `https://<org>.okta.com`.
+   - **Entra ID:** on each test user, confirm the Email field is filled in.
+     In the app registration, under Token configuration, confirm the optional
+     `email` claim is listed for ID tokens. Under API permissions, confirm
+     `openid`, `email` and `profile`, and grant admin consent if your tenant
+     requires it.
+
+3. Open `https://<dashboard host>/login` and choose "Continue with
+   <name>". Check each of these:
+
+   | Sign in as | Expected |
+   |---|---|
+   | `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` | Lands in the organization as owner |
+   | Someone at an auto-join domain, not yet a member | Joins as `member` (multi mode with Entra: see above) |
+   | Someone invited, using the invite link | Joins with the invited role |
+   | The same person a second time | Signs in with no new membership |
+   | Someone outside `SELFHOST_OIDC_ALLOWED_DOMAINS` | Refused: "Accounts from <domain> can't sign in here" |
+
+4. In the Agent Relay Desktop app, sign in to this installation. The browser
+   opens `/login`; after sign-in it returns to the app, signed in to the
+   workspace.
+
+5. If something fails:
+
+   | What you see | Likely cause |
+   |---|---|
+   | "Discovery issuer does not match" | `SELFHOST_OIDC_ISSUER` differs from the `issuer` in step 1, or names `common`/`organizations` |
+   | Entra `AADSTS50011`, or Okta's redirect URI error | The redirect URI registered with the provider isn't exactly `https://<dashboard host>/login/oidc/callback` |
+   | "did not share an email address" | Entra: no optional `email` claim, or no email on the directory user |
+   | "You cancelled the sign-in" on Okta, with no cancel | The person is not assigned to the app (Okta answers `access_denied`) |
+   | Entra `AADSTS50105` | The app requires assignment and the person isn't assigned |
+   | "The identity provider refused the sign-in (invalid_client)" | Wrong or expired client secret |
+   | "doesn't have access to <org>" | Not a member, not invited, and the domain is not in `SELFHOST_AUTO_JOIN_DOMAINS` |
 
 ### Email sign-in links (optional)
 
@@ -250,8 +333,8 @@ verbatim.
 
 ## Who may sign in
 
-**Single mode (the default).** A verified email signs in when one of these is
-true:
+**Single mode (the default).** An email the provider did not mark unverified
+signs in when one of these is true:
 1. it already belongs to a member;
 2. it followed an invite link sent to that same email;
 3. it has any open invite (invites are accepted automatically at sign-in,
@@ -393,8 +476,9 @@ Owners and admins get `403`: assigning a domain lets every address at it join
 the organization, which only the operator can vouch for. A domain belongs to
 at most one organization (it is the table's primary key). Only a verified
 email auto-joins: an OIDC `id_token` with `email_verified: true` (a provider
-that omits the claim signs in but never auto-joins), or an email sign-in link
-(the link proves the mailbox). An invite or an existing membership always
+that omits the claim signs in but does not auto-join, unless you name its
+issuer; see [Providers that omit `email_verified`](#providers-that-omit-email_verified)),
+or an email sign-in link (the link proves the mailbox). An invite or an existing membership always
 wins over a domain. Audit actions: `organization.domain_assign`,
 `organization.domain_remove`.
 
