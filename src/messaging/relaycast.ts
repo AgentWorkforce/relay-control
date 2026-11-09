@@ -280,7 +280,10 @@ export function createRelaycastClient(input: {
         "POST",
         "/v1/dm",
         input.token,
-        input.address ? { address: input.address, text: input.text } : { to: input.to, text: input.text },
+        // Presence selects the exact-address contract, including invalid/empty addresses.
+        input.address !== undefined
+          ? { address: input.address, text: input.text }
+          : { to: input.to, text: input.text },
         input.idempotencyKey,
       )));
       const message = record(data?.message);
