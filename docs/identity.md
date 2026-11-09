@@ -318,7 +318,10 @@ three steps: register, verify and set.
      anything else becomes `/`). On failure it redirects back to
      `/login?error=invalid_credentials`. This form is what lets CLI login and
      Desktop browser login, which both land on `/login`, work when `password`
-     is the only method.
+     is the only method. With `password` enabled the page also links to the
+     dashboard's forgot-password and register pages on the
+     `SELFHOST_DASHBOARD_URL` origin, carrying `next` and `invite`. The
+     emailed link itself does not carry them.
 5. **Request a reset.** `POST /api/v1/auth/password/reset {email}`
    - Always `202 {"status":"reset_requested"}`, for every address.
    - An address with a password receives a link to

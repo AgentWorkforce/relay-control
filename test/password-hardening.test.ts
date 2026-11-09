@@ -285,6 +285,30 @@ test("/login page: the invalid_credentials notice only shows when password sign-
   assert.doesNotMatch(page.text, /Incorrect email or password\./);
 });
 
+test("/login page: links to the dashboard's forgot and register pages, keeping next and invite", async (t) => {
+  const ctx = await setup(t, { dashboardUrl: "https://dash.acme.test/" });
+  const invite = `sh_inv_${"a".repeat(24)}`;
+  const next = "/api/v1/cli/login?state=s1&client=desktop";
+  const page = await call(ctx.origin, `/login?next=${encodeURIComponent(next)}&invite=${invite}`);
+  const query = `next=%2Fcloud%2Fapi%2Fv1%2Fcli%2Flogin%3Fstate%3Ds1%26client%3Ddesktop&amp;invite=${invite}`;
+  assert.ok(page.text.includes(`href="https://dash.acme.test/#/forgot-password?${query}">Forgot password?</a>`));
+  assert.ok(page.text.includes(`href="https://dash.acme.test/#/register?${query}">Create an account</a>`));
+});
+
+test("/login page: a dashboard URL's query does not swallow the password links", async (t) => {
+  const ctx = await setup(t, { dashboardUrl: "https://dash.acme.test/app/?ref=login" });
+  const page = await call(ctx.origin, "/login?next=%2F");
+  assert.ok(page.text.includes('href="https://dash.acme.test/app/#/forgot-password?next=%2F"'));
+  assert.ok(page.text.includes('href="https://dash.acme.test/app/#/register?next=%2F"'));
+});
+
+test("/login page: no forgot or register links when password sign-in is off", async (t) => {
+  const ctx = await setup(t, { env: { SELFHOST_SIGNIN_METHODS: "email_link" } });
+  const page = await call(ctx.origin, "/login?next=%2Fsettings");
+  assert.equal(page.status, 200);
+  assert.doesNotMatch(page.text, /Forgot password\?|Create an account/);
+});
+
 test("/login page: password form posts to /login/password and signs in with a cookie", async (t) => {
   const ctx = await setup(t);
   await registerVerified(ctx, "form@acme.test");

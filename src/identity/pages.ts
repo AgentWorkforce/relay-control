@@ -67,6 +67,8 @@ export function loginPage(input: {
   /** SELFHOST_SIGNIN_METHODS includes password: a same-origin form to POST /login/password. */
   password?: boolean;
   coBrand?: CoBrand | null;
+  /** Dashboard pages for people without a working password. Only with `password`. */
+  passwordLinks?: { forgot: string; register: string } | null;
   userCode: string;
   pollIntervalMs: number;
   notice?: { kind: "error" | "ok"; text: string } | null;
@@ -96,7 +98,8 @@ export function loginPage(input: {
 ${hidden}
 <input type="email" name="email" required autocomplete="username" placeholder="you@company.com" aria-label="Email address"${invitedEmail}>
 <input type="password" name="password" required autocomplete="current-password" placeholder="Password" aria-label="Password" maxlength="1024">
-<button class="btn${input.oidc ? " secondary" : ""}" type="submit">Sign in with password</button></form>`);
+<button class="btn${input.oidc ? " secondary" : ""}" type="submit">Sign in with password</button></form>${input.passwordLinks ? `
+<p class="muted"><a href="${escapeHtml(input.passwordLinks.forgot)}">Forgot password?</a> · <a href="${escapeHtml(input.passwordLinks.register)}">Create an account</a></p>` : ""}`);
   }
   if (input.emailLogin) {
     methods.push(`<form method="post" action="/login/email">
