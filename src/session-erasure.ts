@@ -20,10 +20,19 @@ const CONTROL = /[\u0000-\u001f\u007f]/;
 const code = z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/);
 const timestamp = z.iso.datetime({ offset: true });
 
+/** The stores a completed receipt must account for, exactly. */
+const ARTIFACT_KEYS = [
+  "transcriptObjects", "stagedObjects", "bufferedBatches", "bufferedRows", "pointerRows", "ledgerRows",
+  "directoryRows", "catalogRows", "largeReadJobs", "searchDocuments", "briefDocuments", "summaries", "briefs",
+  "replayPublications", "analysisPublications", "historyDerivedObjects",
+];
+
 // Unknown fields are stripped and artifact values are counts and states, so
 // nothing but ids, categories and numbers can be relayed to the operator.
 const receiptSchema = z.object({
   orgId: z.string().min(1).max(MAX_IDENTITY),
+  workspaceId: z.string().min(1).max(MAX_IDENTITY),
+  source: z.string().min(1).max(MAX_IDENTITY),
   sessionId: z.string().min(1).max(MAX_IDENTITY),
   requestId: z.string().min(1).max(MAX_IDENTITY),
   status: z.enum(["in_progress", "completed", "failed"]),
@@ -39,7 +48,7 @@ const receiptSchema = z.object({
   bytesErased: z.boolean(),
   bytesErasedAt: timestamp.nullable(),
   legacyScope: code,
-  failure: z.object({ code }).nullable(),
+  failure: z.object({ step: code, code, retryable: z.boolean() }).nullable(),
 });
 
 export type ErasureReceipt = z.infer<typeof receiptSchema>;
@@ -65,9 +74,9 @@ export class SessionErasureError extends Error {
   }
 }
 
-/** Same rules as the session read routes, so any readable session can be erased. */
+/** The pipeline's id rules: 1-512 UTF-8 bytes, no control characters. */
 function validIdentity(value: string): boolean {
-  return Boolean(value.trim()) && value === value.trim() && value.length <= MAX_IDENTITY && !CONTROL.test(value);
+  return Boolean(value.trim()) && value === value.trim() && Buffer.byteLength(value) <= MAX_IDENTITY && !CONTROL.test(value);
 }
 
 /** Resolves the required `workspaceId` and `source` query parameters. */
@@ -105,7 +114,7 @@ function notImplemented(): SessionErasureError {
 }
 
 function unavailable(): SessionErasureError {
-  return new SessionErasureError(503, "session_erasure_unavailable", "The session pipeline could not be reached; retry the request");
+  return new SessionErasureError(503, "session_erasure_unavailable", "The session pipeline is unavailable; retry the request");
 }
 
 function invalid(): SessionErasureError {
@@ -163,19 +172,25 @@ async function callPipeline(
 }
 
 /**
- * A completed receipt is only believed when it names this session, has a
- * completion time, confirms late uploads are fenced, the session is unreadable,
- * its bytes are verified erased and nothing is pending. Anything less is an
- * error: the route must never report an erase that did not happen.
+ * Every receipt must name this exact target. A completed one is only believed
+ * when it has a completion time, confirms late uploads are fenced, the session
+ * is unreadable, its bytes are verified erased, and every store is accounted
+ * for with nothing pending. Anything less is an error: the route must never
+ * report an erase that did not happen.
  */
 function parseReceipt(value: unknown, target: ErasureTarget): ErasureReceipt {
   const parsed = receiptSchema.safeParse(value);
   if (!parsed.success) throw invalid();
   const receipt = parsed.data;
-  if (receipt.orgId !== target.organizationId || receipt.sessionId !== target.sessionId) throw invalid();
+  if (
+    receipt.orgId !== target.organizationId || receipt.workspaceId !== target.workspaceId ||
+    receipt.source !== target.source || receipt.sessionId !== target.sessionId
+  ) throw invalid();
+  const keys = Object.keys(receipt.artifacts);
   if (
     receipt.status === "completed" &&
     (!receipt.completedAt || !receipt.uploadsFenced || !receipt.unreadable || !receipt.bytesErased ||
+      keys.length !== ARTIFACT_KEYS.length || !ARTIFACT_KEYS.every((key) => keys.includes(key)) ||
       Object.values(receipt.artifacts).some((artifact) => artifact.state === "pending"))
   ) throw invalid();
   return receipt;
@@ -291,13 +306,9 @@ export async function eraseSession(
 
   const { status, value } = await callPipeline(api, "POST", target, {
     requestId,
-    actor: { kind: actor.kind, id: actorId },
+    // The pipeline requires a non-empty actor id; the bootstrap bearer has none.
+    actor: { kind: actor.kind, id: actorId ?? "bootstrap" },
   });
-  if (status === 404 && upstreamError(value) === "session_not_found") {
-    // Nothing was erased, so nothing may be left looking like an erase.
-    await database.query(`DELETE FROM selfhost_session_erasures WHERE ${TARGET_WHERE} AND completed_at IS NULL`, key);
-    throw new SessionErasureError(404, "session_not_found", "Session not found");
-  }
   if (status !== 200 && status !== 202) throw invalid();
   const result = await withAudit(database, target, parseReceipt(value, target));
   if (result.status === "failed") {

@@ -1359,7 +1359,7 @@ paths:
               schema: { $ref: "#/components/schemas/SessionErasure" }
         "400": { description: "`invalid_session_id` or `invalid_session_target`" }
         "403": { description: "Owner/admin role required, `operator_controls_not_entitled`, or cross-origin cookie request" }
-        "404": { description: "Organization not found, `workspace_not_found`, or `session_not_found`" }
+        "404": { description: "Organization not found, or `workspace_not_found`" }
         "501": { description: "`not_implemented`: the session pipeline erase is not configured or not yet available" }
         "502": { description: "`session_erasure_failed` (carries the receipt as `erasure`) or `invalid_session_erasure_response`" }
         "503": { description: "`session_erasure_unavailable`: retry the request" }
@@ -5330,9 +5330,11 @@ components:
     SessionErasure:
       type: object
       additionalProperties: false
-      required: [orgId, sessionId, requestId, status, requestedAt, completedAt, artifacts, uploadsFenced, unreadable, unreadableAt, bytesErased, bytesErasedAt, legacyScope, failure, audit]
+      required: [orgId, workspaceId, source, sessionId, requestId, status, requestedAt, completedAt, artifacts, uploadsFenced, unreadable, unreadableAt, bytesErased, bytesErasedAt, legacyScope, failure, audit]
       properties:
         orgId: { type: string }
+        workspaceId: { type: string }
+        source: { type: string }
         sessionId: { type: string }
         requestId: { type: string }
         status: { type: string, enum: [in_progress, completed, failed] }
@@ -5357,9 +5359,11 @@ components:
         failure:
           type: [object, "null"]
           additionalProperties: false
-          required: [code]
+          required: [step, code, retryable]
           properties:
+            step: { type: string }
             code: { type: string }
+            retryable: { type: boolean }
         audit:
           type: [object, "null"]
           additionalProperties: false

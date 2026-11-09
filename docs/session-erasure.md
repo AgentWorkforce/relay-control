@@ -52,7 +52,7 @@ exists for that session.
 
 ```json
 {
-  "orgId": "…", "sessionId": "…", "requestId": "…",
+  "orgId": "…", "workspaceId": "…", "source": "…", "sessionId": "…", "requestId": "…",
   "status": "completed",
   "requestedAt": "2026-01-01T00:00:00.000Z", "completedAt": "2026-01-01T00:00:03.000Z",
   "artifacts": {
@@ -71,7 +71,9 @@ exists for that session.
 
 `artifacts` lists each store with its count and a state of `done`, `pending` or `not_applicable`. `uploadsFenced` turns
 true once the fence commits. `unreadable` means the session is hidden in every store, which happens immediately;
-`bytesErased` means every store's delete is verified. `status` is `completed` only when both are true.
+`bytesErased` means every store's delete is verified. `status` is `completed` only when both are true. An erase that is
+`unreadable` but still `in_progress` is hidden from everyone but not yet fully deleted. When a step fails, `failure` names
+the `step`, a `code`, and whether it is `retryable`.
 
 `legacyScope: "excluded"` means data held in older storage generations is **not** covered by this erase. Handle that
 data separately if your retention obligations include it.
@@ -94,7 +96,8 @@ Both events are written to `selfhost_admin_audit_events` with the organization a
 Control calls the pipeline with `Authorization: Bearer <SESSION_ERASE_API_SECRET>`.
 
 - `POST /internal/v1/session-erase/organizations/{org}/workspaces/{workspace}/sources/{source}/sessions/{id}` with
-  `{"requestId":"<uuid>","actor":{"kind":"user|bootstrap","id":"<id or null>"}}`. 200 completed, 202 in progress.
+  `{"requestId":"<uuid>","actor":{"kind":"user|bootstrap","id":"<user id, or bootstrap>"}}`. 200 completed or failed,
+  202 in progress.
   Idempotent per target: a repeat returns the existing receipt and never erases twice.
 - `GET` on the same path returns the receipt, or 404 `{"error":"erasure_not_found"}`.
 - 501 means the erase is not available yet, and other 5xx are retryable.

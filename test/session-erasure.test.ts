@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import test, { type TestContext } from "node:test";
-import { close, listen, seedTenant, startControlPlane } from "./flows-helpers.js";
+import { BOOTSTRAP, close, listen, seedTenant, startControlPlane } from "./flows-helpers.js";
 
 const SECRET = "session-erase-secret-that-is-at-least-32-bytes";
 const ORIGIN = "https://control.selfhosted.company";
@@ -10,6 +10,11 @@ const SESSION = "ses_01-abc";
 const SOURCE = "codex";
 /** Replaced by the fake pipeline with the request id Control last sent. */
 const ECHO_REQUEST = "echo-the-request-id";
+const ARTIFACTS = Object.fromEntries([
+  "transcriptObjects", "stagedObjects", "bufferedBatches", "bufferedRows", "pointerRows", "ledgerRows",
+  "directoryRows", "catalogRows", "largeReadJobs", "searchDocuments", "briefDocuments", "summaries", "briefs",
+  "replayPublications", "analysisPublications", "historyDerivedObjects",
+].map((key) => [key, { count: 1, state: "done" }]));
 
 type Reply = { status: number; body: unknown };
 type Call = { method: string; path: string; authorization?: string; body: any };
@@ -32,9 +37,16 @@ async function fakePipeline(t: TestContext) {
       calls.push(call);
       if (call.body?.requestId) requestId = call.body.requestId;
       const reply = state.reply(call);
-      const echoed = (reply.body as { requestId?: string }).requestId === ECHO_REQUEST
-        ? { ...(reply.body as object), requestId }
-        : reply.body;
+      const body = reply.body as Record<string, unknown>;
+      const segments = call.path.split("/").map(decodeURIComponent);
+      const echoed = "orgId" in body
+        ? {
+            workspaceId: segments[7],
+            source: segments[9],
+            ...body,
+            requestId: body.requestId === ECHO_REQUEST ? requestId : body.requestId,
+          }
+        : body;
       response.writeHead(reply.status, { "content-type": "application/json" });
       response.end(JSON.stringify(echoed));
     });
@@ -52,7 +64,7 @@ function receipt(orgId: string, overrides: Record<string, unknown> = {}) {
     status: "completed",
     requestedAt: "2026-01-01T00:00:00.000Z",
     completedAt: "2026-01-01T00:00:03.000Z",
-    artifacts: { transcriptObjects: { count: 3, state: "done" }, briefs: { count: 0, state: "not_applicable" } },
+    artifacts: ARTIFACTS,
     uploadsFenced: true,
     unreadable: true,
     unreadableAt: "2026-01-01T00:00:01.000Z",
@@ -167,7 +179,7 @@ test("session hard delete: authorization, entitlement and CSRF gates reach no pi
   assert.equal(gated.body.error, "operator_controls_not_entitled");
   delete process.env.SELFHOST_OPERATOR_CONTROLS;
 
-  for (const id of ["a\u0001b", " padded ", "x".repeat(513)]) {
+  for (const id of ["a\u0001b", " padded ", "x".repeat(513), "é".repeat(257)]) {
     const invalid = await app.api(`/api/v1/organizations/${tenant.organizationId}/sessions/${encodeURIComponent(id)}`, {
       method: "DELETE", token: tenant.ownerToken,
     });
@@ -206,8 +218,15 @@ test("session hard delete never reports success it cannot prove", async (t) => {
     [{ status: 200, body: receipt(org, { uploadsFenced: false }) }, 502, "invalid_session_erasure_response"],
     [{ status: 200, body: receipt(org, { unreadable: false }) }, 502, "invalid_session_erasure_response"],
     [{ status: 200, body: receipt(org, { bytesErased: false }) }, 502, "invalid_session_erasure_response"],
-    [{ status: 200, body: receipt(org, { artifacts: { ledgerRows: { count: 1, state: "pending" } } }) }, 502, "invalid_session_erasure_response"],
-    [{ status: 501, body: { error: "not_implemented" } }, 501, "not_implemented"],
+    [{ status: 200, body: receipt(org, { artifacts: { ...ARTIFACTS, ledgerRows: { count: 1, state: "pending" } } }) }, 502, "invalid_session_erasure_response"],
+    [{ status: 200, body: receipt(org, { artifacts: { ledgerRows: { count: 1, state: "done" } } }) }, 502, "invalid_session_erasure_response"],
+    [{ status: 200, body: receipt(org, { artifacts: { ...ARTIFACTS, invented: { count: 0, state: "done" } } }) }, 502, "invalid_session_erasure_response"],
+    [{ status: 200, body: receipt(org, { workspaceId: randomUUID() }) }, 502, "invalid_session_erasure_response"],
+    [{ status: 200, body: receipt(org, { source: "another-source" }) }, 502, "invalid_session_erasure_response"],
+    [{ status: 400, body: { error: "invalid_request", feature: "session_erase" } }, 502, "invalid_session_erasure_response"],
+    [{ status: 401, body: { error: "invalid_token", feature: "session_erase" } }, 502, "invalid_session_erasure_response"],
+    [{ status: 503, body: { error: "too_many_owners", feature: "session_erase" } }, 503, "session_erasure_unavailable"],
+    [{ status: 501, body: { error: "not_implemented", feature: "session_erase" } }, 501, "not_implemented"],
     [{ status: 200, body: receipt(randomUUID()) }, 502, "invalid_session_erasure_response"],
     [{ status: 200, body: receipt(org, { sessionId: "other" }) }, 502, "invalid_session_erasure_response"],
     [{ status: 200, body: { ok: true } }, 502, "invalid_session_erasure_response"],
@@ -224,7 +243,9 @@ test("session hard delete never reports success it cannot prove", async (t) => {
 
   pipeline.state.reply = () => ({
     status: 200,
-    body: receipt(org, { status: "failed", completedAt: null, failure: { code: "object_store_error" } }),
+    body: receipt(org, {
+      status: "failed", completedAt: null, failure: { step: "transcriptObjects", code: "object_store_error", retryable: true },
+    }),
   });
   const failed = await app.api(path, { method: "DELETE", token: tenant.ownerToken });
   assert.equal(failed.status, 502);
@@ -272,19 +293,26 @@ test("the same session id in another source is a separate erasure", async (t) =>
   assert.deepEqual(rows.rows.map((row) => row.source), ["claude", "codex"]);
 });
 
-test("session hard delete: unknown session is a 404 and leaves no erasure behind", async (t) => {
-  const { tenant, app, pipeline, path, erasure, audits } = await setup(t);
-  pipeline.state.reply = () => ({ status: 404, body: { error: "session_not_found" } });
-  const missing = await app.api(path, { method: "DELETE", token: tenant.ownerToken });
-  assert.equal(missing.status, 404);
-  assert.equal(missing.body.error, "session_not_found");
-  const rows = await app.database.query(
-    `SELECT 1 FROM selfhost_session_erasures WHERE organization_id = $1`, [tenant.organizationId],
-  );
-  assert.equal(rows.rows.length, 0);
-  assert.deepEqual((await audits()).map((event) => event.action), ["session.hard_delete.requested"]);
+test("the bootstrap bearer is sent to the pipeline with a non-empty actor id", async (t) => {
+  const { tenant, app, pipeline, path } = await setup(t);
+  pipeline.state.reply = () => ({ status: 200, body: receipt(tenant.organizationId) });
+  const result = await app.api(path, { method: "DELETE", token: BOOTSTRAP });
+  assert.equal(result.status, 200);
+  assert.deepEqual(pipeline.calls[0]!.body.actor, { kind: "bootstrap", id: "bootstrap" });
+});
 
-  pipeline.state.reply = () => ({ status: 404, body: { error: "erasure_not_found" } });
+test("a session with nothing stored is fenced with a zero-count receipt", async (t) => {
+  const { tenant, app, pipeline, path } = await setup(t);
+  const empty = Object.fromEntries(Object.keys(ARTIFACTS).map((key) => [key, { count: 0, state: "not_applicable" }]));
+  pipeline.state.reply = () => ({ status: 200, body: receipt(tenant.organizationId, { artifacts: empty }) });
+  const result = await app.api(path, { method: "DELETE", token: tenant.ownerToken });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.artifacts.ledgerRows.count, 0);
+});
+
+test("session hard delete: a read with no recorded erase is a 404", async (t) => {
+  const { tenant, app, pipeline, erasure } = await setup(t);
+  pipeline.state.reply = () => ({ status: 404, body: { error: "erasure_not_found", feature: "session_erase" } });
   const read = await app.api(erasure, { token: tenant.ownerToken });
   assert.equal(read.status, 404);
   assert.equal(read.body.error, "erasure_not_found");
