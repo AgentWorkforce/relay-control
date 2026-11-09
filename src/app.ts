@@ -4,6 +4,9 @@ import { McpOAuthStore } from "./mcp/oauth/store.js";
 import { connectorKind } from "./mcp/oauth/connector-kind.js";
 import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
+import { mcpOAuthActive } from "./mcp/oauth/config.js";
+import { retiringIdentity } from "./mcp/oauth/retirement.js";
+import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -431,7 +434,7 @@ export function createApp(input: {
   const amp = input.amp?.config.enabled ? input.amp : null;
   const providerProbes: ProviderProbes = input.providerProbes ?? {};
   const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
-  const oauthTeardown=config.mcpOAuth?.enabled ? input.mcpOAuthTeardown??new McpOAuthTeardown({
+  const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({
     database:store.database,keyring:config.encryptionKeyring,
     client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch(input.messagingFetch)}),now:input.now,
   }) : null;
@@ -465,8 +468,11 @@ export function createApp(input: {
       if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
       const remote=await oauthRelay.getAgent(workspace.relaycastApiKey,name);
       if(!remote) return "available";
-      return remote.metadata.source===HOSTED_SOURCE && remote.metadata.cloud_workspace_id===principal.workspaceId &&
-        remote.metadata.owner_hash===ownerHash(principal.userId)?"yours":"taken";
+      if(remote.metadata.source!==HOSTED_SOURCE || remote.metadata.cloud_workspace_id!==principal.workspaceId ||
+        remote.metadata.owner_hash!==ownerHash(principal.userId)) return "taken";
+      // An agent whose release may be in flight cannot be attached to.
+      return await retiringIdentity(store.database,{organizationId:principal.organizationId,workspaceId:principal.workspaceId,
+        userId:principal.userId,agentRemoteId:remote.id,agentName:remote.name})?"taken":"yours";
     },
     now:input.now,afterMutation:()=>oauthTeardown?.kick(),
   });
@@ -1325,7 +1331,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       );
       const body = await requestObject(request);
       const clientName = stringField(body, "client_name", false);
-      if (clientName?.trim() === DASHBOARD_DEVICE_CLIENT) {
+      if (clientName && isDeviceReservedClientName(clientName.trim())) {
         throw new HttpError(400, "invalid_request", "client_name is reserved");
       }
       const started = await store.startDeviceAuthorization(
@@ -1660,6 +1666,33 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       response.writeHead(204);
       response.end();
+      return;
+    }
+
+    const abandonCleanup = routeMatch(
+      path,
+      /^\/api\/v1\/organizations\/([^/]+)\/workspaces\/([^/]+)\/mcp-oauth\/abandon-cleanup$/,
+    );
+    if (abandonCleanup && method === "POST") {
+      // Operator-only escape hatch for connector cleanup that cannot finish.
+      // It skips the remote release, so organization admins cannot use it.
+      const [organizationId, workspaceId] = abandonCleanup as [string, string];
+      const auth = await organizationAccess(request, organizationId, true);
+      if (auth.kind !== "bootstrap") {
+        throw new HttpError(403, "operator_only", "Only the operator can abandon connector cleanup");
+      }
+      // revoke_live=true also revokes the workspace's live grants, for when the
+      // module is off or unavailable and nobody can disconnect them.
+      const revokeParam = new URL(request.url ?? "/", "http://local").searchParams.get("revoke_live");
+      if (revokeParam !== null && revokeParam !== "true" && revokeParam !== "false") {
+        throw new HttpError(400, "invalid_request", "revoke_live must be true or false");
+      }
+      const revokeLive = revokeParam === "true";
+      const result = isUuid(workspaceId)
+        ? await store.abandonMcpOAuthCleanup({ organizationId, workspaceId, actor: { kind: "bootstrap" }, revokeLive })
+        : null;
+      if (result === null) throw new HttpError(404, "workspace_not_found", "Workspace not found");
+      json(response, 200, revokeLive ? result : { abandoned: result.abandoned });
       return;
     }
 

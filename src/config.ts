@@ -349,7 +349,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     encryptionKeyring: loadEncryptionKeyring(env),
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     factory: loadFactoryConfig(env),
-    mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name)),
+    mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name), serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
   };

@@ -1,8 +1,32 @@
 # MCP OAuth connectors
 
-The optional OAuth module connects public MCP clients to a person's selected
-workspace. It is off by default. Set `SELFHOST_MCP_OAUTH=on` to enable it;
-the database migrations must already be applied.
+The OAuth module connects public MCP clients to a person's selected
+workspace. It is on by default; the database migrations must already be
+applied. To turn it off, set `SELFHOST_MCP_OAUTH=off` (`false` and `0` are
+accepted too; `on`, `true` and `1` enable it explicitly). Any other spelling
+stops start-up, so a typo never silently changes the setting.
+
+While on, the server exposes to the internet:
+
+- anonymous dynamic client registration: anyone can register a client (with
+  rate limits, see [Disconnect and operating limits](#disconnect-and-operating-limits));
+- the root MCP resource `/mcp` for OAuth bearers, next to the native endpoint;
+- the consent page, token, refresh and revocation endpoints. Access tokens
+  last one hour and refresh tokens 30 days.
+
+Nobody gets a connection without a signed-in account approving it on the
+consent page. When the module becomes active the server logs one line,
+`[selfhost-api] hosted MCP OAuth active`, naming the authorize, token and
+registration paths and the `SELFHOST_MCP_OAUTH=off` switch.
+
+Turning the module `off` hides these routes but does not revoke existing
+connections or drain pending cleanup; both are kept and resume when it is
+turned on again (see [Stuck cleanup](#stuck-cleanup)).
+
+OpenID Connect stays optional (see below). A partial or invalid OIDC key set
+no longer stops the server: the whole OAuth surface answers
+`501 mcp_oauth_unavailable` with reason `oidc_signing_key` until it is fixed
+(see [Unavailable mode](#unavailable-mode)).
 
 The existing native MCP endpoint continues to use native credentials.
 OAuth connections receive `mcp_at_` access tokens and `mcp_rt_` refresh
@@ -39,6 +63,34 @@ Shared-resource metadata is also available at
 `/.well-known/oauth-protected-resource/cloud/api/v1/mcp/shared-sessions`.
 Bare `/api/oauth/*` and `/api/v1/oauth/grants*` routes are not mounted.
 
+## Unavailable mode
+
+When the module is enabled but cannot run, the server still starts and every
+OAuth route above (discovery, protected-resource metadata, JWKS, consent,
+registration, token, revocation and the connection list) answers:
+
+```http
+HTTP/1.1 501 Not Implemented
+Cache-Control: no-store
+Content-Type: application/json
+
+{"error":"mcp_oauth_unavailable","reason":"oidc_signing_key"}
+```
+
+Public routes keep their CORS headers. Other routes are unaffected.
+
+| Reason | Cause | Fix |
+| --- | --- | --- |
+| `oidc_signing_key` | Some but not all of the OIDC inputs are set, the key, salt or retained public keys are invalid, or one of their `_FILE` paths cannot be read (the log names the variable, never the path) | Provide all three inputs correctly, or remove them all to run without OIDC |
+| `public_url` | `SELFHOST_PUBLIC_URL` is plain HTTP on a non-loopback host, so it cannot be an OAuth issuer | Serve the public origin over HTTPS |
+
+The server logs `[selfhost-api] hosted MCP OAuth unavailable` once at start-up
+with the reason and a short detail naming the input, never a configured value. Meanwhile `mcp_at_` bearers are
+refused with `401` at the MCP resources, the root `/mcp` resource is not
+mounted and the cleanup worker does not run. When the module is turned off
+explicitly nothing is logged. A value supplied both directly and through its
+`_FILE` variable is still a configuration error that stops start-up.
+
 ## Consent and credentials
 
 Clients register without a client secret and use authorization code with S256
@@ -47,6 +99,25 @@ organization and workspace. Switch the account's workspace before connecting
 to a different workspace. Request fields cannot choose another user or
 organization. Consent submission and connection deletion require the exact
 public Origin.
+
+Client names are self-reported by whoever registered the client. The consent
+page heading reads `Connect an app calling itself "<name>"`, and the page
+shows where the authorization code goes: `Returns to: <host>` from the
+registered redirect URI (`this computer` for loopback), with a caution line
+for any other host. Registration refuses names reserved for this product's own
+apps (compared ignoring case, spaces, hyphens and underscores, including any
+name starting with the product brand) and names over 100 characters, with
+`400 invalid_client_metadata`.
+
+The agent name field starts empty unless the client suggested a name; there
+is no shared default. A new connection may not take a name held by another
+member's agent or by an agent still being released after a disconnect
+(`409 agent_name_taken`). A name that belongs to one of the person's own
+agents needs explicit confirmation: the page shows "Attach to my existing
+agent", which sends `attach_existing: true`; without it the submission answers
+`409 agent_name_in_use`. Continuing an existing connection skips this check.
+If the name cannot be checked the submission answers `503` and no code is
+issued.
 
 An omitted scope receives the resource's baseline. A supplied scope that
 contains no resource permission is refused with `invalid_scope`. The shared
@@ -98,8 +169,7 @@ The account's connection list is restricted to its issued workspace.
 Disconnect and membership departure revoke local authority transactionally
 and queue remote cleanup. Cleanup retries after Relaycast failures, uses
 immutable IDs and preserves identities still used by another live connection
-or a bound native MCP session. Missing workspace credentials leave cleanup
-pending.
+or a bound native MCP session.
 
 Workspace deletion returns `409 workspace_in_use` while live connections or
 pending cleanup exist. Disconnect them and let cleanup finish before deleting
@@ -107,12 +177,79 @@ the workspace or disabling the module. This preserves the workspace credential
 needed to retry a failed remote release; teardown does not copy that secret
 into the cleanup record.
 
-The server retries cleanup every 15 seconds in batches of at most 20, rotating
-past blocked records. Database row locks coordinate workers. Each cleanup
-request to Relaycast has a 10-second abort deadline.
+### Stuck cleanup
+
+Each cleanup attempt claims its record in a short transaction, talks to
+Relaycast with no tenant lock held, then commits only if the local state it
+decided on is unchanged; otherwise the record stays pending for its next
+attempt. Each request to Relaycast has a 10-second abort deadline.
+
+Retryable failures (network errors, timeouts, 5xx, 429, or a 404 while the
+agent is still listed) retry after 60 seconds, doubling per attempt up to one
+hour. A pass handles at most 20 due records and stops after about 30 seconds,
+continuing immediately with the rest. A new disconnect is attempted at once.
+
+A database without migration 0032 makes every pass fail with an undefined
+column. The worker then logs `[mcp-oauth] teardown needs migration 0032; apply
+pending migrations` once and retries every five minutes instead of every 15
+seconds, until a pass succeeds.
+
+Some failures cannot be fixed by retrying: a missing or relocated workspace or
+a remote agent whose identity does not match. These complete the record
+(`workspace_mismatch`, `metadata_mismatch`) without releasing anything and are
+logged once, so they no longer block workspace deletion.
+
+A workspace key that does not decrypt (for example a replica missing a
+retired encryption key, or a mis-mounted keyring) is retried with the same
+backoff and logs `[mcp-oauth] teardown key unavailable` with the record id and
+attempt count on each attempt. After 8 attempts (about four hours) the record
+completes as `decrypt_failed` without releasing anything.
+
+If cleanup is still pending and can never finish, the operator can abandon it:
+
+```sh
+curl -X POST -H "Authorization: Bearer $SELFHOST_BOOTSTRAP_TOKEN" \
+  https://relay.example.com/api/v1/organizations/{organizationId}/workspaces/{workspaceId}/mcp-oauth/abandon-cleanup
+```
+
+Only the bootstrap token is accepted. The workspace's pending records complete
+as `operator_abandoned` without releasing their Relaycast agents, and the
+audit action `mcp_oauth.cleanup_abandoned` is recorded. Live connections are
+not touched: disconnect them first, because workspace deletion still answers
+`409` while any remains.
+
+Add `?revoke_live=true` when nobody can disconnect them, for example while the
+module is `off` or unavailable:
+
+```sh
+curl -X POST -H "Authorization: Bearer $SELFHOST_BOOTSTRAP_TOKEN" \
+  "https://relay.example.com/api/v1/organizations/{organizationId}/workspaces/{workspaceId}/mcp-oauth/abandon-cleanup?revoke_live=true"
+```
+
+In one transaction this revokes every live connection of the workspace (reason
+`operator_abandoned`, ending its sessions and expiring unredeemed
+authorization codes), then completes all of the workspace's cleanup records,
+including the new ones, without releasing any Relaycast agent. The response
+is `{"abandoned": n, "revoked": m}` and the audit target records both counts.
+The workspace can then be deleted. The route works whether the module is on,
+`off` or unavailable.
+
+Turning the module `off` does not revoke connections and does not run
+cleanup: grants and their sessions are kept, and pending cleanup records stay
+pending while the module is off or unavailable. Turning it back on resumes
+cleanup and makes unexpired sessions usable again. To delete a workspace that
+still has connections while the module is off, use `revoke_live=true` as
+above.
 
 Issuer requests have a 64 KiB body limit. Public registration allows 20
-requests per client-address bucket per hour and 500 per process per hour.
+requests per client-address bucket per hour and 500 per process per hour;
+token, refresh and revocation requests of registered clients never count
+against it. A registration holds at most 10 redirect URIs of up to 2048
+characters each and a `client_name` of up to 100 characters. While the module
+is active, the cleanup worker deletes registered clients older than 24 hours
+that have no connection and no pending authorization code, up to 500 per pass
+and at most every 15 minutes. A client that registered but never connected
+within a day registers again.
 Control uses its `SELFHOST_TRUSTED_PROXIES` policy and groups IPv6 addresses
 by /64. The default of zero trusted proxies ignores forwarded headers and
 uses the socket peer. Standalone module callers without an address resolver

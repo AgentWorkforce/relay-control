@@ -3,7 +3,7 @@ import test from "node:test";
 import { createServer, request as nodeRequest } from "node:http";
 import { createPublicKey, generateKeyPairSync, randomUUID, verify } from "node:crypto";
 import { loadConfig } from "../src/config.js";
-import { createMcpOAuthHttpModule } from "../src/mcp/oauth/routes.js";
+import { createMcpOAuthHttpModule, mcpOAuthActiveNotice } from "../src/mcp/oauth/routes.js";
 import { pkceS256 } from "../src/mcp/oauth/protocol.js";
 import type { McpConsentSession } from "../src/mcp/oauth/consent.js";
 import { McpOAuthStore } from "../src/mcp/oauth/store.js";
@@ -28,8 +28,9 @@ function config(enabled=true,extra:Record<string,string>={}) {
     SELFHOST_ENCRYPTION_KEY_ID:"fake-key",SELFHOST_ENCRYPTION_KEY:Buffer.alloc(32,7).toString("base64"),
     SELFHOST_MCP_OAUTH:enabled?"on":"off",...extra});
 }
-function harness(options:{enabled?:boolean;access?:boolean;session?:McpConsentSession|null;name?:string;fail?:boolean;
-  resources?:Array<typeof SHARED|"/mcp">;oidc?:Record<string,string>}={}) {
+function harness(options:{enabled?:boolean;access?:boolean;session?:McpConsentSession|null;name?:string|null;fail?:boolean;
+  resources?:Array<typeof SHARED|"/mcp">;oidc?:Record<string,string>;redirectUris?:string[];
+  availability?:"available"|"yours"|"taken"|"unknown"}={}) {
   const calls:string[]=[];
   const store={
     async registerMcpOAuthClient(input:{clientName:string|null;redirectUris:string[]}) {
@@ -37,9 +38,11 @@ function harness(options:{enabled?:boolean;access?:boolean;session?:McpConsentSe
     },
     async getMcpOAuthClient(id:string|undefined) {
       if(options.fail) throw new Error("fake secret must not escape");
-      return id===client.clientId?{...client,clientName:options.name??client.clientName}:null;
+      return id===client.clientId?{...client,clientName:options.name===undefined?client.clientName:options.name,
+        redirectUris:options.redirectUris??client.redirectUris}:null;
     },
-    async createMcpOAuthAuthorizationCode() {calls.push("code");return "mcpac_fake";},
+    async createMcpOAuthAuthorizationCode(_request:unknown,_owner:unknown,continuation?:string) {
+      calls.push(continuation?"code:"+continuation:"code");return "mcpac_fake";},
     async listConnectedAgentNames() {return [];},
     async exchangeMcpOAuthAuthorizationCode() {
       calls.push("exchange");return {ok:true as const,body:{access_token:"mcp_at_fake",refresh_token:"mcp_rt_fake",
@@ -55,7 +58,7 @@ function harness(options:{enabled?:boolean;access?:boolean;session?:McpConsentSe
     resolveSession:async()=>options.session===undefined?{transport:"cookie",principal}:options.session,
     workspaceAccess:async()=>options.access!==false,
     workspaceLabel:async()=>"<Fake workspace>",
-    checkAgentNameAvailability:async()=>"available",
+    checkAgentNameAvailability:async()=>{calls.push("name");return options.availability??"available";},
   });
   return {module,calls};
 }
@@ -183,6 +186,25 @@ test("bounded public requests, CSRF and per-peer registration limits apply befor
   assert.equal(redirect.searchParams.get("state"),"");
 });
 
+test("token, refresh and revocation for known clients never consume the registration limit",async()=>{
+  const {module,calls}=harness({resources:[SHARED]});
+  for(let index=0;index<500;index++) {
+    const response=await module.handle(web(API+"/register",registration),"fake-peer-"+index);
+    assert.equal(response!.status,201);
+  }
+  assert.equal((await module.handle(web(API+"/register",registration),"fake-peer-new"))!.status,429);
+  const before=calls.length;
+  const token=await module.handle(web(API+"/token",{grant_type:"authorization_code",client_id:client.clientId,code:"mcpac_fake",
+    code_verifier:verifier,redirect_uri:client.redirectUris[0],resource}),"fake-peer-new");
+  assert.equal(token!.status,200);
+  const refresh=await module.handle(web(API+"/token",{grant_type:"refresh_token",client_id:client.clientId,
+    refresh_token:"mcp_rt_fake",resource}),"fake-peer-new");
+  assert.equal(refresh!.status,400);assert.equal((await refresh!.json()).error,"invalid_grant");
+  const revoke=await module.handle(web(API+"/revoke",{token:"mcp_rt_fake",client_id:client.clientId}),"fake-peer-new");
+  assert.equal(revoke!.status,200);
+  assert.deepEqual(calls.slice(before),["exchange","refresh","revoke"]);
+});
+
 test("native HTTP adapter bounds chunked bodies and uses configured issuer instead of Host",async t=>{
   const {module,calls}=harness();
   const server=createServer((req,res)=>{void module.handleNode(req,res).then(handled=>{
@@ -259,4 +281,118 @@ for(const oidc of [false,true]) test("real store HTTP consent/exchange/refresh/r
   const refused=await call(API+"/token",{grant_type:"refresh_token",client_id:registered.client_id,refresh_token:next.refresh_token,resource});
   assert.equal(refused.status,400);
   assert.equal((await refused.json()).error,"invalid_grant");
+});
+
+test("an unavailable module answers every OAuth path with 501 naming only the reason and leaves other paths alone",async()=>{
+  const off=harness({enabled:false}).module;
+  assert.equal(off.degraded,null);
+  const created:string[]=[];
+  const settings=config(true,{SELFHOST_MCP_OIDC_SIGNING_KEY_ID:"fake-active"});
+  const modules=[["oidc_signing_key",settings],["public_url",{...config(),publicBaseUrl:"http://relay.example.test"}]] as const;
+  for(const [reason,value] of modules) {
+    const module=createMcpOAuthHttpModule({config:value,createStore:()=>{created.push(reason);return {} as never;},
+      mountedResources:[SHARED],resolveSession:async()=>null,workspaceAccess:async()=>true,
+      checkAgentNameAvailability:async()=>"available"});
+    assert.equal(module.enabled,false);
+    assert.deepEqual(module.degraded,{reason});
+    assert.equal(module.store,null);assert.equal(module.protocol,null);assert.equal(module.issuer,null);
+    const publicPaths:Array<[string,unknown?]>=[["/cloud/.well-known/oauth-authorization-server"],["/.well-known/openid-configuration/cloud"],
+      ["/cloud/.well-known/jwks.json"],["/.well-known/oauth-protected-resource/cloud"+SHARED],["/.well-known/oauth-protected-resource/mcp"],
+      [API+"/register",registration],[API+"/token",{grant_type:"authorization_code"}],[API+"/revoke",{token:"fake"}]];
+    for(const [path,body] of publicPaths) {
+      const response:Response=(await module.handle(web(path,body)))!;
+      assert.equal(response.status,501,path);
+      assert.equal(response.headers.get("cache-control"),"no-store");
+      assert.equal(response.headers.get("access-control-allow-origin"),"*",path);
+      assert.deepEqual(await response.json(),{error:"mcp_oauth_unavailable",reason});
+    }
+    for(const path of [pagePath,API+"/authorize/agent-name?name=x","/cloud/api/v1/oauth/grants","/cloud/api/v1/oauth/grants/"+randomUUID()]) {
+      const response:Response=(await module.handle(web(path)))!;
+      assert.equal(response.status,501,path);
+      assert.equal(response.headers.get("access-control-allow-origin"),null,path);
+      assert.equal((await response.json()).reason,reason);
+    }
+    for(const path of ["/cloud/api/v1/workspaces","/mcp","/api/oauth/register","/cloud"+SHARED]) assert.equal(await module.handle(web(path)),null,path);
+    const server=createServer(async(request,response)=>{
+      if(!await module.handleNode(request,response)) {response.writeHead(404);response.end();}
+    });
+    const base=await listen(server);
+    try {
+      const token=await fetch(base+API+"/token",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:"grant_type=x"});
+      assert.equal(token.status,501);assert.equal(token.headers.get("cache-control"),"no-store");
+      assert.deepEqual(await token.json(),{error:"mcp_oauth_unavailable",reason});
+      assert.equal((await fetch(base+"/cloud/api/v1/workspaces")).status,404);
+    } finally { await close(server); }
+  }
+  assert.deepEqual(created,[],"no OAuth store is built while unavailable");
+});
+
+test("consent page names where the code goes, labels the client name as self-reported and suggests no shared name",async()=>{
+  const remote=await (await harness({resources:[SHARED]}).module.handle(web(pagePath)))!.text();
+  assert.match(remote,/<h1>Connect an app calling itself &quot;Fake client&quot;<\/h1>/);
+  assert.match(remote,/Returns to: <strong>client\.example\.test<\/strong>/);
+  assert.match(remote,/id="caution"><strong>Caution:<\/strong> the app chose its own name/);
+  assert.ok(remote.indexOf("Returns to:")<remote.indexOf("This connection may:"));
+  assert.match(remote,/<input id="agent" maxlength="128" required value="">/);
+  assert.ok(!remote.includes("mcp-agent"));
+  assert.match(remote,/<p id="attach-row" hidden><label><input type="checkbox" id="attach"> Attach to my existing agent<\/label><\/p>/);
+  assert.match(remote,/attach_existing:true/);
+  const loopback="http://127.0.0.1:5000/callback";
+  const local=new URL(pagePath,ORIGIN);local.searchParams.set("redirect_uri",loopback);
+  const html=await (await harness({resources:[SHARED],redirectUris:[loopback],name:null}).module.handle(new Request(local)))!.text();
+  assert.match(html,/<h1>Connect an unnamed app<\/h1>/);
+  assert.match(html,/Returns to: <strong>this computer<\/strong>/);
+  assert.ok(!html.includes('id="caution"'));
+});
+
+test("authorization errors redirect only a signed-in account to the registered callback",async()=>{
+  const bad=new URL(pagePath,ORIGIN);bad.searchParams.set("response_type","nope");
+  for(const session of [null,{transport:"bearer",principal},{transport:"cookie",principal:{...principal,pendingHandoff:true}}] as Array<McpConsentSession|null>) {
+    const anonymous=(await harness({resources:[SHARED],session}).module.handle(new Request(bad)))!;
+    assert.equal(anonymous.status,400);
+    assert.equal(anonymous.headers.get("location"),null);
+    assert.equal((await anonymous.json()).error,"unsupported_response_type");
+  }
+  const signedIn=(await harness({resources:[SHARED]}).module.handle(new Request(bad)))!;
+  assert.equal(signedIn.status,302);
+  const location=new URL(signedIn.headers.get("location")!);
+  assert.equal(location.origin+location.pathname,client.redirectUris[0]);
+  assert.equal(location.searchParams.get("error"),"unsupported_response_type");
+});
+
+test("consent attaches a new connection to the user's existing agent only on explicit confirmation",async()=>{
+  const consent={params,decision:"approve",workspace_id:principal.workspaceId,agent_name:"fake-agent"};
+  const yours=harness({resources:[SHARED],availability:"yours"});
+  const unconfirmed=(await yours.module.handle(web(API+"/authorize",consent)))!;
+  assert.equal(unconfirmed.status,409);
+  const refusal=await unconfirmed.json();
+  assert.equal(refusal.error,"agent_name_in_use");
+  assert.match(refusal.error_description,/existing agents\. Confirm/);
+  assert.equal((await yours.module.handle(web(API+"/authorize",{...consent,attach_existing:false})))!.status,409);
+  assert.equal((await yours.module.handle(web(API+"/authorize",{...consent,attach_existing:"yes"})))!.status,400);
+  assert.equal(yours.calls.includes("code"),false);
+  assert.equal((await yours.module.handle(web(API+"/authorize",{...consent,attach_existing:true})))!.status,200);
+  assert.equal(yours.calls.filter(call=>call==="code").length,1);
+  const taken=harness({resources:[SHARED],availability:"taken"});
+  for(const extra of [{},{attach_existing:true}]) {
+    const response=(await taken.module.handle(web(API+"/authorize",{...consent,...extra})))!;
+    assert.equal(response.status,409);
+    assert.equal((await response.json()).error,"agent_name_taken");
+  }
+  const unknown=harness({resources:[SHARED],availability:"unknown"});
+  assert.equal((await unknown.module.handle(web(API+"/authorize",{...consent,attach_existing:true})))!.status,503);
+  assert.equal([...taken.calls,...unknown.calls].some(call=>call.startsWith("code")),false);
+  const continued=harness({resources:[SHARED],availability:"yours"});
+  assert.equal((await continued.module.handle(web(API+"/authorize",{...consent,continue_grant_id:"fake-existing-grant"})))!.status,200);
+  assert.deepEqual(continued.calls,["code:fake-existing-grant"]);
+});
+
+test("the start-up notice names the endpoints default-on exposes and the off switch",async()=>{
+  const {module}=harness({resources:[SHARED]});
+  const notice=mcpOAuthActiveNotice();
+  assert.deepEqual(notice,{authorize:"/cloud/oauth/authorize",token:API+"/token",register:API+"/register",disable:"SELFHOST_MCP_OAUTH=off"});
+  const metadata=await (await module.handle(web("/cloud/.well-known/oauth-authorization-server")))!.json();
+  assert.equal(metadata.authorization_endpoint,ORIGIN+notice.authorize);
+  assert.equal(metadata.token_endpoint,ORIGIN+notice.token);
+  assert.equal(metadata.registration_endpoint,ORIGIN+notice.register);
 });

@@ -16,14 +16,19 @@ const params = { client_id: client.clientId, response_type: "code", redirect_uri
 const body = { params, decision: "approve", workspace_id: principal.workspaceId, agent_name: "fake-agent" };
 
 function harness(options: { session?: McpConsentSession | null; access?: boolean; grok?: boolean; connected?: boolean;
-  continuationError?: boolean; nameTakenError?: boolean; setup?: boolean } = {}) {
+  continuationError?: boolean; nameTakenError?: boolean; setup?: boolean;
+  availability?: "available" | "yours" | "taken" | "unknown" | Error } = {}) {
   const calls: Array<{ operation: string; input?: unknown }> = [];
   const protocol = createMcpOAuthProtocol({ publicOrigin: ORIGIN, enabledResources: [SHARED, EVENTS] });
   const handlers = createMcpOAuthConsentHandlers({
     protocol,
     resolveSession: async () => options.session === undefined ? { transport: "cookie", principal } : options.session,
     workspaceAccess: async owner => { calls.push({ operation: "access", input: owner }); return options.access !== false; },
-    checkAgentNameAvailability: async (owner, name) => { calls.push({ operation: "name", input: { owner, name } }); return "available"; },
+    checkAgentNameAvailability: async (owner, name) => {
+      calls.push({ operation: "name", input: { owner, name } });
+      if (options.availability instanceof Error) throw options.availability;
+      return options.availability ?? "available";
+    },
     store: {
       async getMcpOAuthClient(id) { calls.push({ operation: "client", input: id }); return id === client.clientId
         ? { ...client, redirectUris: options.grok ? ["https://www.cursor.com/agents/fake/callback"] : client.redirectUris } : null; },
@@ -165,4 +170,36 @@ test("SQL store typed name collision maps to 409 even after advisory preflight p
   const response=await handlers.authorize(request());
   assert.equal(response.status,409);
   assert.equal((await response.json()).error,"agent_name_taken");
+});
+
+test("a new connection to the user's own agent needs attach_existing; another member's or a retiring name is refused", async () => {
+  const yours = harness({ availability: "yours" });
+  const refused = await yours.handlers.authorize(request());
+  assert.equal(refused.status, 409);
+  assert.equal((await refused.json()).error, "agent_name_in_use");
+  assert.equal((await yours.handlers.authorize(request({ ...body, attach_existing: "true" }))).status, 400);
+  assert.equal(yours.calls.some(call => call.operation === "code"), false);
+  assert.equal((await yours.handlers.authorize(request({ ...body, attach_existing: true }))).status, 200);
+  assert.deepEqual((yours.calls.find(call => call.operation === "name")!.input as { name: string }).name, "fake-agent");
+  const taken = harness({ availability: "taken" });
+  const response = await taken.handlers.authorize(request({ ...body, attach_existing: true }));
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).error, "agent_name_taken");
+  assert.equal(taken.calls.some(call => call.operation === "code"), false);
+  const denied = harness({ availability: "taken" });
+  assert.ok(new URL((await (await denied.handlers.authorize(request({ ...body, decision: "deny" }))).json()).redirect_to).searchParams.has("error"));
+  assert.equal(denied.calls.some(call => call.operation === "name"), false);
+});
+
+test("an unknown name check fails closed and an explicit continuation skips it", async () => {
+  for (const availability of ["unknown", new Error("fake relay outage")] as const) {
+    const { handlers, calls } = harness({ availability });
+    const response = await handlers.authorize(request({ ...body, attach_existing: true }));
+    assert.equal(response.status, 503);
+    assert.equal((await response.json()).error, "temporarily_unavailable");
+    assert.equal(calls.some(call => call.operation === "code"), false);
+  }
+  const continued = harness({ availability: "yours" });
+  assert.equal((await continued.handlers.authorize(request({ ...body, continue_grant_id: "fake-existing-grant" }))).status, 200);
+  assert.equal(continued.calls.some(call => call.operation === "name"), false);
 });

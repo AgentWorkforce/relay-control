@@ -2,7 +2,8 @@ import { randomBytes } from "node:crypto";
 import type { IncomingMessage,ServerResponse } from "node:http";
 import type { SelfhostConfig } from "../../config.js";
 import { RateLimiter } from "../../auth/device-approval.js";
-import { APP_BASE_PATH,createMcpOAuthProtocol,type McpOAuthResourcePath } from "./protocol.js";
+import { APP_BASE_PATH,createMcpOAuthProtocol,mcpOAuthPublicOriginAllowed,type McpOAuthResourcePath } from "./protocol.js";
+import type { McpOAuthUnavailableReason } from "./config.js";
 import { createMcpOidcIssuer } from "./oidc.js";
 import { createMcpOAuthPublicHandlers,type McpOAuthPublicStore } from "./public-handlers.js";
 import { createMcpOAuthConsentHandlers,resolveMcpConsentAccount,type McpConsentPrincipal,
@@ -32,6 +33,18 @@ async function bounded(request:Request):Promise<Request> {
     }
     return new Request(request.url,{method:request.method,headers:request.headers,body:Buffer.concat(chunks).toString("utf8")});
   } finally { await reader.cancel().catch(()=>{}); }
+}
+
+/** Start-up notice fields: the public endpoints default-on exposes and the switch that turns them off. */
+export function mcpOAuthActiveNotice():{authorize:string;token:string;register:string;disable:string} {
+  return {authorize:AUTHORIZE,token:`${API}/token`,register:`${API}/register`,disable:"SELFHOST_MCP_OAUTH=off"};
+}
+
+const LOOPBACK_HOSTS=new Set(["localhost","127.0.0.1","[::1]","::1"]);
+/** Where the authorization code goes, as the consent page names it. */
+function redirectDestination(uri:string):{label:string;loopback:boolean} {
+  const url=new URL(uri);
+  return LOOPBACK_HOSTS.has(url.hostname)?{label:"this computer",loopback:true}:{label:url.host,loopback:false};
 }
 
 type Connections = Array<{id:string;agentName:string}>;
@@ -65,10 +78,13 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
 }) {
   const settings=deps.config.mcpOAuth;
   const enabled=settings?.enabled===true;
-  if(!enabled) return {enabled:false as const,protocol:null,oidcEnabled:false,issuer:null,store:null,
+  if(!enabled) return {enabled:false as const,degraded:null,protocol:null,oidcEnabled:false,issuer:null,store:null,
     handle:async(_request:Request,_clientAddress?:string):Promise<Response|null>=>null,
     handleNode:async(_request:IncomingMessage,_response:ServerResponse)=>false};
+  if(settings.unavailable) return unavailableMcpOAuthModule(settings.unavailable.reason);
   const origin=new URL(deps.config.publicBaseUrl).origin;
+  // loadConfig already applies this gate; a hand-built config still degrades instead of crashing.
+  if(!mcpOAuthPublicOriginAllowed(origin)) return unavailableMcpOAuthModule("public_url");
   const now=()=>deps.now?.()??new Date();
   const issuer=settings.oidc?createMcpOidcIssuer(settings.oidc):null;
   const oidcEnabled=issuer!==null;
@@ -92,8 +108,7 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
     const standard="/.well-known/oauth-protected-resource"+new URL(protocol.mcpResourceUrl(resource)).pathname;
     return [...new Set([primary,standard])].map(path=>[path,resource] as const);
   }));
-  const discovery=new Set([`${APP_BASE_PATH}/.well-known/oauth-authorization-server`,`${APP_BASE_PATH}/.well-known/openid-configuration`,
-    "/.well-known/oauth-authorization-server/cloud","/.well-known/openid-configuration/cloud"]);
+  const discovery=DISCOVERY;
   const jwks=`${APP_BASE_PATH}/.well-known/jwks.json`;
 
   function recognizes(path:string):boolean {
@@ -118,11 +133,14 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
     const params=Object.fromEntries(url.searchParams);
     const client=await store.getMcpOAuthClient(params.client_id);
     const validated=protocol!.validateAuthorizationRequest(params,client);
+    // Anyone can register a redirect URI, so only a signed-in account is sent
+    // back to it with an error; anonymous requests get the error here instead
+    // of an open redirect (RFC 9700 section 4.11.2).
+    const principal=await resolveMcpConsentAccount(request,deps.resolveSession);
     if(!validated.ok) {
-      return validated.redirect?Response.redirect(protocol!.authorizationResponseUrl(validated.redirectUri,
+      return validated.redirect && !(principal instanceof Response)?Response.redirect(protocol!.authorizationResponseUrl(validated.redirectUri,
         {...validated.error,state:validated.state}),302):json(validated.error,400);
     }
-    const principal=await resolveMcpConsentAccount(request,deps.resolveSession);
     if(principal instanceof Response) {
       if(principal.status===401) return new Response(null,{status:302,headers:{location:`/login?${new URLSearchParams({next:url.pathname+url.search})}`,"cache-control":"no-store"}});
       return principal;
@@ -135,18 +153,26 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
     const existing:Connections=existingRows.map(({id,agentName})=>({id,agentName}));
     const nonce=randomBytes(18).toString("base64url");
     const payload=JSON.stringify({params,workspaceId:principal.workspaceId,connections:existing}).replaceAll("<","\\u003c");
-    const suggested=requestValue.requestedAgentName??"mcp-agent";
+    // No shared default: a typed name that matches an existing agent needs explicit confirmation.
+    const suggested=requestValue.requestedAgentName??"";
+    const destination=redirectDestination(requestValue.redirectUri);
     const labels:Record<string,string>={"relay:mcp":"Use available MCP tools in this workspace","relay:agents":"Request supported agent actions",
       "relay:events":"Receive subscribed workspace events",openid:"Share a stable identifier specific to this client"};
     const connectionSelect=existing.length?`<label>Existing connection <select id="connection"><option value="">New connection</option>${existing.map(row=>`<option value="${escaped(row.id)}">${escaped(row.agentName)}</option>`).join("")}</select></label>`:"";
+    const heading=client!.clientName?`Connect an app calling itself &quot;${escaped(client!.clientName)}&quot;`:"Connect an unnamed app";
+    const caution=destination.loopback?"":`<p id="caution"><strong>Caution:</strong> the app chose its own name, and nobody has verified it. Connect only if you trust ${escaped(destination.label)}.</p>`;
     const body=`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect Agent Relay</title>
-<body><main><h1>Connect ${escaped(client!.clientName??"MCP client")}</h1><p>Workspace: <strong>${escaped(workspace)}</strong></p>
+<body><main><h1>${heading}</h1><p id="returns-to">Returns to: <strong>${escaped(destination.label)}</strong></p>${caution}<p>Workspace: <strong>${escaped(workspace)}</strong></p>
 <p>This connection may:</p><ul>${requestValue.scopes.map(scope=>`<li>${escaped(labels[scope]??scope)}</li>`).join("")}</ul>
 <form id="consent">${connectionSelect}<p><label>Approved agent name <input id="agent" maxlength="128" required value="${escaped(suggested)}"></label></p>
+<p id="attach-row" hidden><label><input type="checkbox" id="attach"> Attach to my existing agent</label></p>
 <button type="submit">Connect</button> <button type="button" id="deny">Cancel</button></form><p id="error" role="alert"></p></main>
-<script nonce="${nonce}">const data=${payload};const form=document.getElementById('consent'),agent=document.getElementById('agent'),connection=document.getElementById('connection');
-if(connection)connection.addEventListener('change',()=>{const chosen=data.connections.find(row=>row.id===connection.value);if(chosen)agent.value=chosen.agentName;});
-async function decide(decision){const buttons=form.querySelectorAll('button');buttons.forEach(button=>button.disabled=true);try{const response=await fetch('${API}/authorize',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({params:data.params,workspace_id:data.workspaceId,agent_name:agent.value,decision,...(connection&&connection.value?{continue_grant_id:connection.value}:{})})});const value=await response.json();if(response.ok&&typeof value.redirect_to==='string'){location.assign(value.redirect_to);return;}document.getElementById('error').textContent=value.error_description||'Connection could not be completed.';}catch{document.getElementById('error').textContent='Connection could not be completed. Try again.';}buttons.forEach(button=>button.disabled=false);}
+<script nonce="${nonce}">const data=${payload};const form=document.getElementById('consent'),agent=document.getElementById('agent'),connection=document.getElementById('connection'),attachRow=document.getElementById('attach-row'),attach=document.getElementById('attach');
+function showAttach(show){attachRow.hidden=!show;if(!show)attach.checked=false;}
+let checking=0;async function check(){const name=agent.value.trim(),ticket=++checking;showAttach(false);if(!name)return;try{const response=await fetch('${API}/authorize/agent-name?'+new URLSearchParams({workspace_id:data.workspaceId,name}));const value=await response.json();if(ticket===checking)showAttach(response.ok&&value.status==='yours');}catch{}}
+agent.addEventListener('change',check);if(agent.value)check();
+if(connection)connection.addEventListener('change',()=>{const chosen=data.connections.find(row=>row.id===connection.value);if(chosen){agent.value=chosen.agentName;showAttach(false);}});
+async function decide(decision){const buttons=form.querySelectorAll('button');buttons.forEach(button=>button.disabled=true);try{const response=await fetch('${API}/authorize',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({params:data.params,workspace_id:data.workspaceId,agent_name:agent.value,decision,...(!attachRow.hidden&&attach.checked?{attach_existing:true}:{}),...(connection&&connection.value?{continue_grant_id:connection.value}:{})})});const value=await response.json();if(response.ok&&typeof value.redirect_to==='string'){location.assign(value.redirect_to);return;}if(value.error==='agent_name_in_use')showAttach(true);document.getElementById('error').textContent=value.error_description||'Connection could not be completed.';}catch{document.getElementById('error').textContent='Connection could not be completed. Try again.';}buttons.forEach(button=>button.disabled=false);}
 form.addEventListener('submit',event=>{event.preventDefault();decide('approve');});document.getElementById('deny').addEventListener('click',()=>decide('deny'));</script></body></html>`;
     return new Response(body,{headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store","referrer-policy":"no-referrer",
       "content-security-policy":`default-src 'none'; script-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
@@ -248,5 +274,44 @@ form.addEventListener('submit',event=>{event.preventDefault();decide('approve');
     const responseHeaders:Record<string,string>={};result.headers.forEach((value,key)=>{responseHeaders[key]=value;});
     response.writeHead(result.status,responseHeaders);response.end(Buffer.from(await result.arrayBuffer()));return true;
   }
-  return {enabled,protocol,oidcEnabled,issuer,store,handle,handleNode};
+  return {enabled,degraded:null,protocol,oidcEnabled,issuer,store,handle,handleNode};
+}
+
+const DISCOVERY=new Set([`${APP_BASE_PATH}/.well-known/oauth-authorization-server`,`${APP_BASE_PATH}/.well-known/openid-configuration`,
+  "/.well-known/oauth-authorization-server/cloud","/.well-known/openid-configuration/cloud"]);
+const STATIC_PUBLIC=[`${API}/register`,`${API}/token`,`${API}/revoke`,`${APP_BASE_PATH}/.well-known/jwks.json`];
+const PROTECTED_RESOURCE="/.well-known/oauth-protected-resource";
+
+/**
+ * Enabled but missing an input: every OAuth path answers 501 naming the reason,
+ * so clients see a stable refusal and nothing else is touched. Other paths fall through.
+ */
+function unavailableMcpOAuthModule(reason:McpOAuthUnavailableReason) {
+  const isPublic=(path:string)=>DISCOVERY.has(path)||STATIC_PUBLIC.includes(path)||path.startsWith(PROTECTED_RESOURCE);
+  const recognizes=(path:string)=>isPublic(path)||path===AUTHORIZE||path===`${API}/authorize`||
+    path===`${API}/authorize/agent-name`||path===GRANTS||path.startsWith(GRANTS+"/");
+  function answer(path:string):Response {
+    const response=json({error:"mcp_oauth_unavailable",reason},501);
+    if(isPublic(path)) {
+      response.headers.set("access-control-allow-origin","*");
+      response.headers.set("access-control-allow-methods","GET, POST, OPTIONS");
+      response.headers.set("access-control-allow-headers","content-type, authorization");
+    }
+    return response;
+  }
+  const clean=(raw:string)=>{
+    try { return new URL(raw,"http://localhost").pathname.replace(/\/+$/,"")||"/"; } catch { return null; }
+  };
+  return {enabled:false as const,degraded:{reason},protocol:null,oidcEnabled:false,issuer:null,store:null,
+    handle:async(request:Request,_clientAddress?:string):Promise<Response|null>=>{
+      const path=clean(request.url);
+      return path!==null && recognizes(path)?answer(path):null;
+    },
+    handleNode:async(request:IncomingMessage,response:ServerResponse):Promise<boolean>=>{
+      const path=clean(request.url??"/");
+      if(path===null || !recognizes(path)) return false;
+      const result=answer(path);
+      const headers:Record<string,string>={};result.headers.forEach((value,key)=>{headers[key]=value;});
+      response.writeHead(result.status,headers);response.end(Buffer.from(await result.arrayBuffer()));return true;
+    }};
 }

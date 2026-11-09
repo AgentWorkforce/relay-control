@@ -905,6 +905,9 @@ adds one.
 | Refreshed token | `POST /api/v1/auth/token/refresh` | Unchanged from the session it refreshes |
 | MCP, workspace API, worker and service tokens | Their own routes | Never `account` or `desktop:workspaces` |
 
+Hosted MCP OAuth connectors (`mcp_at_`/`mcp_rt_`) are on by default and work only
+at their granted MCP resource; see [mcp-oauth.md](mcp-oauth.md).
+
 `/login` starts its device code with the reserved client name
 `relay-dashboard`. Only that code, redeemed by `POST /login/poll` as the
 browser cookie, becomes an `account` session; `POST /api/v1/auth/device/start`
