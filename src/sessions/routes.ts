@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { SelfhostConfig } from "../config.js";
 import { UpstreamError } from "../relayhistory.js";
 import type { ControlPlaneStore, Principal } from "../store.js";
-import { AGENT_VALUE, agentPrefixTooShort, selectAgent } from "./agent-query.js";
+import { AGENT_VALUE, agentPrefixTooShort, MAX_AGENT_LENGTH, selectAgent } from "./agent-query.js";
 import {
   isRecord,
   nonEmptyString,
@@ -236,7 +236,7 @@ const LIST_RULES: Record<string, Rule> = {
   until: { max: 64, pattern: ISO_TIME },
   ranking: { values: ["hybrid"] },
   limit: { pattern: /^\d{1,2}$/ },
-  agent: { max: 512, pattern: AGENT_VALUE },
+  agent: { max: MAX_AGENT_LENGTH, pattern: AGENT_VALUE },
 };
 
 export async function handleSessionRoutes(ctx: SessionRouteContext): Promise<boolean> {
@@ -288,6 +288,9 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
     const until = instant(ctx, input.until, "until");
     const access = await ctx.workspaceAccess(ctx.request, workspaceId);
     const { agent, ignored, text } = selectAgent(input.agent, input.q, Boolean(ctx.config.sessionSearchAgentTokens));
+    if (agent && agent.length > MAX_AGENT_LENGTH) {
+      throw ctx.httpError(400, "invalid_request", "Invalid session parameter: agent");
+    }
     if (agent && agentPrefixTooShort(agent)) {
       throw ctx.httpError(400, "agent_prefix_too_short", "An agent prefix needs at least 3 letters or digits");
     }

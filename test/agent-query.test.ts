@@ -4,11 +4,11 @@ import { agentPrefixTooShort, parseAgentQuery, selectAgent } from "../src/sessio
 
 // Shared vectors: every client that parses `@name` should agree with these.
 const VECTORS: Array<[string, string, string[]]> = [
-  ["@layered-control", "", ["layered-control"]],
-  ["@Layered-Control", "", ["layered-control"]],
-  ["@layered-control@node", "", ["layered-control@node"]],
-  ["@layered-*", "", ["layered-*"]],
-  ["@layered-control@no*", "", ["layered-control@no*"]],
+  ["@example-agent", "", ["example-agent"]],
+  ["@Example-Agent", "", ["example-agent"]],
+  ["@example-agent@node", "", ["example-agent@node"]],
+  ["@example-*", "", ["example-*"]],
+  ["@example-agent@no*", "", ["example-agent@no*"]],
   ["fix the bug @a", "fix the bug", ["a"]],
   ["@a fix @b the bug", "fix the bug", ["a", "b"]],
   ["@a @A @b", "", ["a", "b"]],

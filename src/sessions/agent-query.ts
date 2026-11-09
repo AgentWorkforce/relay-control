@@ -14,6 +14,9 @@ export type AgentQuery = {
   agents: string[];
 };
 
+/** The session backend's limit on one agent value. */
+export const MAX_AGENT_LENGTH = 200;
+
 /** An explicit `agent` parameter: a token without its leading `@`. */
 export const AGENT_VALUE = /^[a-z0-9._-]+(?:@[a-z0-9._-]+)?\*?$/i;
 

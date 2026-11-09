@@ -426,6 +426,7 @@ export function createApp(input: {
   });
   const desktopMcpCredentials = new DesktopMcpCredentials(store.database);
   const DESKTOP_MCP_RATE = { limit: 30, windowMs: 60_000 };
+  const AGENT_NAMES_RATE = { limit: 60, windowMs: 60_000 };
   function rateLimit(
     response: ServerResponse,
     key: string,
@@ -1682,7 +1683,12 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     // Names for the session search `@name` autocomplete: names only, for members.
     const agentNames = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/session-agent-names$/);
     if (agentNames && method === "GET") {
-      const { workspace } = await workspaceAccess(request, agentNames[0]!);
+      const { principal, workspace } = await workspaceAccess(request, agentNames[0]!);
+      if (principal.pendingHandoff) {
+        throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      }
+      // Each call spends the workspace's server-side Relaycast key.
+      rateLimit(response, `session-agent-names:${principal.userId}`, AGENT_NAMES_RATE, "rate_limited", "Too many requests. Try again shortly.");
       let roster: RosterAgent[];
       try {
         roster = await createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch })

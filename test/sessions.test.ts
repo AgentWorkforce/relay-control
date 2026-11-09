@@ -1014,13 +1014,13 @@ test("agent filter: passes one agent to the read API and reports what it applied
     return reply;
   });
 
-  const exact = await call(env.origin, `${base}?agent=Layered-Control`, { token });
+  const exact = await call(env.origin, `${base}?agent=Example-Agent`, { token });
   assert.equal(exact.status, 200);
-  assert.equal(seen[0]!.searchParams.get("agent"), "layered-control");
+  assert.equal(seen[0]!.searchParams.get("agent"), "example-agent");
   assert.equal(seen[0]!.searchParams.has("q"), false);
   assert.deepEqual(
     { agent: exact.body.agent, ignoredAgents: exact.body.ignoredAgents, agentMatch: exact.body.agentMatch },
-    { agent: "layered-control", ignoredAgents: [], agentMatch: null },
+    { agent: "example-agent", ignoredAgents: [], agentMatch: null },
   );
 
   // Without parsing enabled, an @token is still ordinary search text.
@@ -1034,6 +1034,7 @@ test("agent filter: passes one agent to the read API and reports what it applied
     ["agent=a&agent=b", 400, "invalid_request"],
     ["agent=has%20space", 400, "invalid_request"],
     ["agent=ab*", 400, "agent_prefix_too_short"],
+    [`agent=${"a".repeat(201)}`, 400, "invalid_request"],
   ] as const) {
     const refused = await call(env.origin, `${base}?${suffix}`, { token });
     assert.equal(refused.status, status, suffix);
@@ -1046,21 +1047,21 @@ test("agent filter: passes one agent to the read API and reports what it applied
 
   // An older backend matches `foo*` literally, so its empty page is not a result.
   reply = { body: { sessions: [] } };
-  const unconfirmed = await call(env.origin, `${base}?agent=layered*`, { token });
+  const unconfirmed = await call(env.origin, `${base}?agent=example*`, { token });
   assert.equal(unconfirmed.status, 501);
   assert.equal(unconfirmed.body.reason, "agent_prefix_not_supported");
   reply = { headers: { "x-sessions-read-agent-match": "prefix" }, body: { sessions: [] } };
-  const prefix = await call(env.origin, `${base}?agent=layered*`, { token });
+  const prefix = await call(env.origin, `${base}?agent=example*`, { token });
   assert.equal(prefix.status, 200);
   assert.equal(prefix.body.agentMatch, "prefix");
-  assert.equal(seen.at(-1)!.searchParams.get("agent"), "layered*");
+  assert.equal(seen.at(-1)!.searchParams.get("agent"), "example*");
 
   reply = { status: 501, body: { error: "agent_filter_not_ready" } };
   const notReady = await call(env.origin, `${base}?agent=builder`, { token });
   assert.equal(notReady.status, 501);
   assert.equal(notReady.body.reason, "agent_filter_not_ready");
   reply = { status: 400, body: { error: "agent_prefix_too_broad", private: "must-not-echo" } };
-  const broad = await call(env.origin, `${base}?agent=layered*`, { token });
+  const broad = await call(env.origin, `${base}?agent=example*`, { token });
   assert.equal(broad.status, 400);
   assert.equal(broad.body.error, "agent_prefix_too_broad");
   assert(!JSON.stringify(broad.body).includes("must-not-echo"));
@@ -1105,6 +1106,12 @@ test("agent names for autocomplete: members only, names only, hidden agents left
   assert.deepEqual(listed.body, { names: ["alpha", "zeta"] });
   assert.equal((await call(env.origin, path)).status, 401);
   assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.beta}/session-agent-names`, { token })).status, 404);
+
+  // One already used above; the roster call spends a server-side key.
+  for (let used = 1; used < 60; used += 1) assert.equal((await call(env.origin, path, { token })).status, 200);
+  const limited = await call(env.origin, path, { token });
+  assert.equal(limited.status, 429);
+  assert.equal(limited.body.error, "rate_limited");
 });
 
 test("direct read Worker: redirects never forward the caller token to History", async (t) => {

@@ -4,7 +4,7 @@ import { z } from "zod";
 import { SHARED_SESSION_READ_TOOLS } from "./catalog.js";
 import { type McpContext, SharedSessionsToolError, sessionCitation, toolError } from "./context.js";
 import { registerSessionTimings } from "./session-timings.js";
-import { agentPrefixTooShort, AGENT_VALUE, selectAgent } from "../sessions/agent-query.js";
+import { agentPrefixTooShort, AGENT_VALUE, MAX_AGENT_LENGTH, selectAgent } from "../sessions/agent-query.js";
 
 /**
  * Shared-session transcript reads, ported from Cloud's
@@ -326,7 +326,7 @@ export function registerSharedSessionReads(server: McpServer, context: McpContex
       "Search the actual transcript event content shared in an authorized workspace. Returns bounded matching excerpts and source-session citation links, not merely session metadata. Set agent to instead list one agent's sessions, newest first, returned in sessions.",
     inputSchema: {
       query: z.string().trim().min(1).max(500).optional().describe("Case-insensitive transcript text to find. Required unless agent is set."),
-      agent: z.string().trim().min(1).max(512).regex(AGENT_VALUE).optional().describe("One agent's Relay name, without a leading @, to list that agent's sessions. Exact and case-insensitive. Cannot be combined with query text."),
+      agent: z.string().trim().min(1).max(MAX_AGENT_LENGTH).regex(AGENT_VALUE).optional().describe("One agent's Relay name, without a leading @, to list that agent's sessions. Exact and case-insensitive. Cannot be combined with query text."),
       workspace_id: WorkspaceIdSchema,
       source: SourceSchema,
       project: z.string().trim().min(1).max(512).optional(),
@@ -344,6 +344,7 @@ export function registerSharedSessionReads(server: McpServer, context: McpContex
       const workspaceId = resolveWorkspace(input.workspace_id, context);
       const { agent, ignored, text } = selectAgent(input.agent, input.query, Boolean(context.agentTokens));
       if (agent) {
+        if (agent.length > MAX_AGENT_LENGTH) throw new SharedSessionsToolError(`An agent name can be at most ${MAX_AGENT_LENGTH} characters.`);
         if (text) throw new SharedSessionsToolError("An agent search cannot be combined with transcript text yet. Search by agent or by text.");
         if (agent.endsWith("*") || agentPrefixTooShort(agent)) throw new SharedSessionsToolError("Agent prefix search is not available through this tool yet. Use the exact agent name.");
         const list = new URLSearchParams({ agent, limit: String(input.limit) });

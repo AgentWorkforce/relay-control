@@ -1715,7 +1715,9 @@ paths:
                   names:
                     type: array
                     items: { type: string }
+        "403": { description: "`handoff_not_exchanged`" }
         "404": { description: Workspace not found }
+        "429": { description: "`rate_limited`" }
         "502": { description: "`agent_roster_unavailable`" }
   /api/v1/workspaces/{workspaceId}/resolve:
     parameters:
@@ -1838,7 +1840,7 @@ paths:
             The response adds `agent`, `ignoredAgents` and `agentMatch`.
           schema:
             type: string
-            maxLength: 512
+            maxLength: 200
         - name: q
           in: query
           description: |
