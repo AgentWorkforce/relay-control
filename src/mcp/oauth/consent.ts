@@ -54,6 +54,18 @@ export function mcpOAuthSetupHandoff(code: string): string {
   return `mcpos_${createHash("sha256").update(code).digest("hex")}`;
 }
 
+/** Shared account admission for the consent API and its server-rendered page. */
+export async function resolveMcpConsentAccount(request:Request,
+  resolveSession:(request:Request)=>Promise<McpConsentSession|null>):Promise<McpConsentPrincipal|Response> {
+  const session=await resolveSession(request);
+  if(!session || session.transport!=="cookie") return oauthJson({error:"unauthorized"},401);
+  if(!session.principal.scopes.includes("account") || session.principal.pendingHandoff || session.principal.handoff) {
+    return oauthJson({error:"reauthentication_required"},403);
+  }
+  if(!new URL(request.url).pathname.startsWith(`${APP_BASE_PATH}/`)) return oauthJson({error:"unauthorized"},401);
+  return session.principal;
+}
+
 export function createMcpOAuthConsentHandlers(deps: {
   protocol: ReturnType<typeof createMcpOAuthProtocol>;
   store: McpOAuthConsentStore;
@@ -70,16 +82,7 @@ export function createMcpOAuthConsentHandlers(deps: {
   const grokSetupEnabled = deps.grokSetupEnabled === true;
   const now = deps.now ?? Date.now;
 
-  async function accountSession(request: Request): Promise<McpConsentPrincipal | Response> {
-    const session = await deps.resolveSession(request);
-    if (!session || session.transport !== "cookie") return oauthJson({ error: "unauthorized" }, 401);
-    if (!session.principal.scopes.includes("account") || session.principal.pendingHandoff || session.principal.handoff) {
-      return oauthJson({ error: "reauthentication_required" }, 403);
-    }
-    // Match the app's cookie path boundary even in isolated handler tests.
-    if (!new URL(request.url).pathname.startsWith(`${APP_BASE_PATH}/`)) return oauthJson({ error: "unauthorized" }, 401);
-    return session.principal;
-  }
+  const accountSession = (request:Request) => resolveMcpConsentAccount(request,deps.resolveSession);
 
   async function authorize(request: Request): Promise<Response> {
     const principal = await accountSession(request);
