@@ -6260,6 +6260,52 @@ paths:
         "204": { description: Disconnected }
         "403": { $ref: "#/components/responses/FactoryError" }
         "404": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/workspaces/{workspaceId}/factory/connection/acquisition/rotate:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [factory]
+      operationId: rotateFactoryAcquisition
+      description: |
+        Owner/admin with cli:auth; workspace API tokens and the internal token
+        are refused (403 factory_workspace_token). Needs a connection (404
+        factory_not_connected) and SELFHOST_ACQUISITION_ORIGIN (409
+        acquisition_unconfigured). In one transaction mints a new
+        acquisition-operator token and moves the previous enrollment to
+        draining; the worker revokes it later. The token is never returned.
+      responses:
+        "200":
+          description: Summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FactorySummary" }
+        "401": { $ref: "#/components/responses/FactoryError" }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+        "409": { $ref: "#/components/responses/FactoryError" }
+  /api/v1/workspaces/{workspaceId}/factory/connection/acquisition/revoke:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [factory]
+      operationId: revokeFactoryAcquisition
+      description: |
+        Owner/admin with cli:auth; workspace API tokens and the internal token
+        are refused (403 factory_workspace_token). 409
+        acquisition_unconfigured when SELFHOST_ACQUISITION_ORIGIN is unset; 404
+        factory_not_connected when there is neither a connection nor an
+        enrollment. Revokes every enrolled and draining acquisition-operator
+        token now.
+      responses:
+        "200":
+          description: Summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FactorySummary" }
+        "401": { $ref: "#/components/responses/FactoryError" }
+        "403": { $ref: "#/components/responses/FactoryError" }
+        "404": { $ref: "#/components/responses/FactoryError" }
+        "409": { $ref: "#/components/responses/FactoryError" }
   /api/v1/workspaces/{workspaceId}/factory/computers:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -7207,6 +7253,17 @@ components:
         user_is_owner: { type: boolean }
         bindings_count: { type: integer }
         history: { const: deferred }
+        acquisition:
+          type: object
+          description: |
+            Acquisition enrollment status. {state: unconfigured} when
+            SELFHOST_ACQUISITION_ORIGIN is unset or nothing is enrolled yet.
+            The enrollment token itself is never returned; token_prefix only.
+          required: [state]
+          properties:
+            state: { enum: [unconfigured, enrolled, draining, revoked] }
+            token_prefix: { type: string }
+            created_at: { type: string, format: date-time }
     FactoryBinding:
       type: object
       properties:

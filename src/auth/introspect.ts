@@ -50,7 +50,8 @@ import type { IntrospectionHold } from "./introspection-hold.js";
  *   any `machine` is `machine_not_owned`) and answers like an agent token
  *   except principal_type `service`, agent_name null and scopes
  *   `["acquisition:operate"]`. Minted only by a workspace owner/admin through
- *   the deployment-api-tokens routes.
+ *   the deployment-api-tokens routes, or by a Factory connect when
+ *   SELFHOST_ACQUISITION_ORIGIN is set (docs/factory-sessions.md).
  * - Flows run Relayfile credentials (v1.4, docs/flows-relayfile-credential.md):
  *   an `sh_fr_` token minted by the Flows credential broker for one run.
  *   Inactive reasons `unknown`, `revoked`, `expired`, `audience`, `workspace`

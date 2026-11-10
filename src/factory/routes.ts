@@ -6,6 +6,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ApiTokenStore } from "../admin/api-tokens.js";
 import { cookieRequestAllowed } from "../auth/device-approval.js";
+import { acceptedAudiences } from "../auth/introspect.js";
 import type { SelfhostConfig } from "../config.js";
 import { secureEqual } from "../crypto.js";
 import type { Database } from "../database.js";
@@ -64,6 +65,9 @@ export function createFactoryModule(input: {
   const log = input.log ?? defaultLog;
   const relaycast = createRelaycastClient({ internalOrigin: input.config.relaycastUrl, fetchImpl: input.relayFetch });
   const runtime = input.runtime ?? createFactoryRuntime({ apiUrl: factoryConfig.apiUrl, fetchImpl: input.factoryFetch });
+  // Audiences as introspection accepts them, so an acquisition-operator mint is
+  // refused for any origin introspection would not answer for.
+  const apiTokens = new ApiTokenStore(input.database, () => acceptedAudiences(input.config));
   const service = createFactoryService({
     database: input.database,
     keyring: input.config.encryptionKeyring,
@@ -71,8 +75,12 @@ export function createFactoryModule(input: {
     relaycast,
     log,
     beforeFinalWrite: input.hooks?.beforeFinalWrite,
+    acquisition: {
+      apiTokens,
+      origin: factoryConfig.acquisitionOrigin,
+      controlOrigin: new URL(input.config.publicBaseUrl).origin,
+    },
   });
-  const apiTokens = new ApiTokenStore(input.database);
   const worker = createFactoryWorker({
     database: input.database,
     keyring: input.config.encryptionKeyring,
@@ -82,6 +90,7 @@ export function createFactoryModule(input: {
     publicBaseUrl: input.config.publicBaseUrl,
     historyIntervalMs: factoryConfig.historyIntervalMs,
     releasePending: (limit) => service.releasePending({}, limit),
+    reconcileAcquisition: (limit) => service.reconcileAcquisition(limit),
     beforeInboxInsert: input.hooks?.beforeInboxInsert,
   });
 
@@ -128,9 +137,12 @@ export function createFactoryModule(input: {
     worker,
     log,
     internalServiceToken: input.config.internalServiceToken,
-    /** The worker runs only when the flag is on. */
+    /**
+     * The full worker runs only when the flag is on; the acquisition reconciler always runs so tokens drained by member removal or workspace cleanup are still revoked.
+     */
     start(): void {
       if (enabled) worker.start();
+      else worker.start({ reconcileOnly: true });
     },
     async stop(): Promise<void> {
       await worker.stop();
@@ -237,6 +249,12 @@ export function mountFactoryRoutes(module: FactoryModule, helpers: FactoryRouteH
         await service.disconnect(access);
         response.writeHead(204, { "cache-control": "no-store" }).end();
       };
+    } else if (route(["connection", "acquisition", "rotate"])) {
+      methods(["POST"]);
+      run = async (access) => json(response, 200, await service.rotateAcquisition(access), true);
+    } else if (route(["connection", "acquisition", "revoke"])) {
+      methods(["POST"]);
+      run = async (access) => json(response, 200, await service.revokeAcquisition(access), true);
     } else if (route(["computers"])) {
       methods(["GET"]);
       run = async (access) => json(response, 200, await service.computers(access), true);

@@ -280,13 +280,18 @@ test("factory worker cleanup loop retries a failed remote release", async (t) =>
   assert.equal((await bindingRow(env, bound.binding_id)).relay_agent_id, null);
 });
 
-test("factory worker starts only when SELFHOST_FACTORY_ENABLED is on", async (t) => {
+test("with SELFHOST_FACTORY_ENABLED off the worker runs only the acquisition reconciler", async (t) => {
   const off = await startFactoryEnv(t, { enabled: false });
   off.module.start();
+  assert.equal(off.module.worker.started, true);
+  assert.deepEqual(off.module.worker.loops, ["acquisition"]);
+  await off.module.stop();
   assert.equal(off.module.worker.started, false);
+  assert.deepEqual(off.module.worker.loops, []);
   const on = await startFactoryEnv(t);
   on.module.start();
   assert.equal(on.module.worker.started, true);
+  assert.deepEqual([...on.module.worker.loops].sort(), ["acquisition", "cleanup", "history", "inbox", "inject"]);
   await on.module.stop();
   assert.equal(on.module.worker.started, false);
 });

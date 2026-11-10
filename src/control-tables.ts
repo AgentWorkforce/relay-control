@@ -29,6 +29,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "desktop_relay_session_bindings",
   "device_authorizations",
   "email_login_tokens",
+  "factory_acquisition_operators",
   "factory_bindings",
   "factory_connections",
   "factory_deliveries",

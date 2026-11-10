@@ -112,6 +112,7 @@ test("factory connect validates the key, stores only an envelope and a hint, and
   const path = factoryPath(env.workspaceId, "/connection");
   assert.deepEqual((await env.api(path, { token: env.ownerToken })).body, {
     connected: false, key_hint: null, validated_at: null, user_is_owner: false, bindings_count: 0, history: "deferred",
+    acquisition: { state: "unconfigured" },
   });
   const bad = await env.api(path, { method: "PUT", token: env.ownerToken, body: { key: "short" } });
   assert.deepEqual(bad.body, { error: "invalid_factory_key", message: "Invalid Factory key" });
@@ -280,6 +281,8 @@ test("factory routes are documented in openapi.yaml with their methods and the s
   const user = "/api/v1/workspaces/{workspaceId}/factory";
   const expected: Record<string, string[]> = {
     [`${user}/connection`]: ["get", "put", "delete"],
+    [`${user}/connection/acquisition/rotate`]: ["post"],
+    [`${user}/connection/acquisition/revoke`]: ["post"],
     [`${user}/computers`]: ["get"],
     [`${user}/computers/{computerId}/sessions`]: ["get"],
     [`${user}/bindings`]: ["get", "post"],

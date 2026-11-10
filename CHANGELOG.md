@@ -5,6 +5,15 @@ assigned at release.
 
 ## Unreleased
 
+- Added: Factory acquisition enrollment (default off). With Factory on and
+  `SELFHOST_ACQUISITION_ORIGIN` set, connecting a Factory key mints one
+  encrypted, never-returned `acquisition-operator` workspace token for the
+  acquisition origin. Disconnect, rotate, owner removal and workspace cleanup
+  drain it, and the worker revokes it. Adds
+  `POST .../factory/connection/acquisition/{rotate,revoke}` and an `acquisition`
+  field on the connection summary. Startup fails unless the origin is in
+  `SELFHOST_INTROSPECT_AUDIENCES` and `RELAYCONTROL_INTROSPECT_SECRET` is set.
+  Migration 0037.
 - Added: Factory MCP tools `list_factory_sessions`, `bind_factory_session` and
   `unbind_factory_session` (owner/admin, person connections only), and
   `as=<factory agent>` resolution for send and read of the caller's own bound

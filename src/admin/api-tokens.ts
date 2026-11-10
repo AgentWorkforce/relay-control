@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Database } from "../database.js";
+import type { Database, SqlExecutor } from "../database.js";
 import { hashSecret, opaqueToken } from "../crypto.js";
 import { normalizedOrigin } from "../auth/introspect.js";
 import { NODE_ID_PATTERN } from "../store.js";
@@ -129,6 +129,21 @@ const SELECT = `SELECT t.id, t.label, t.purpose, t.scopes, t.token_prefix, t.cre
     FROM workspace_api_tokens t
     LEFT JOIN users u ON u.id = t.created_by_user_id`;
 
+export type CreateApiTokenInput = {
+  workspaceId: string;
+  organizationId: string;
+  label: unknown;
+  purpose: unknown;
+  expiryDays: unknown;
+  neverExpires: unknown;
+  agentName?: unknown;
+  aud?: unknown;
+  /** Any value here (the body's `scope` or `scopes`) is refused. */
+  scope?: unknown;
+  scopes?: unknown;
+  actor: AuditActor & { kind: "user" };
+};
+
 export class ApiTokenStore {
   /**
    * `audiences` lists the normalized origins introspection accepts (empty while
@@ -148,20 +163,21 @@ export class ApiTokenStore {
     return result.rows.map(toRecord);
   }
 
-  async create(input: {
-    workspaceId: string;
-    organizationId: string;
-    label: unknown;
-    purpose: unknown;
-    expiryDays: unknown;
-    neverExpires: unknown;
-    agentName?: unknown;
-    aud?: unknown;
-    /** Any value here (the body's `scope` or `scopes`) is refused. */
-    scope?: unknown;
-    scopes?: unknown;
-    actor: AuditActor & { kind: "user" };
-  }): Promise<ApiTokenRecord & { accessToken: string }> {
+  /** Mints one token in its own transaction; see createIn. */
+  async create(input: CreateApiTokenInput): Promise<ApiTokenRecord & { accessToken: string }> {
+    return this.database.transaction((tx) => this.createIn(tx, input));
+  }
+
+  /**
+   * Validates, inserts and audits one token on the caller's executor, so a
+   * caller can mint inside its own transaction (Factory acquisition
+   * enrollment). The plaintext `accessToken` is returned once and is never
+   * stored or audited.
+   */
+  async createIn(
+    tx: SqlExecutor,
+    input: CreateApiTokenInput,
+  ): Promise<ApiTokenRecord & { accessToken: string }> {
     if (typeof input.label !== "string" || !input.label.trim() || input.label.trim().length > 128) {
       throw new ApiTokenError(400, "invalid_request", "label must be 1-128 characters");
     }
@@ -258,52 +274,50 @@ export class ApiTokenStore {
         "An active relayfile-agent token already exists for this agent_name; revoke it first",
       );
     try {
-      await this.database.transaction(async (tx) => {
-        if (agentName !== null) {
-          const existing = await tx.query(
-            `SELECT 1 FROM workspace_api_tokens
-              WHERE workspace_id = $1 AND purpose = $2 AND agent_name = $3 AND revoked_at IS NULL`,
-            [input.workspaceId, RELAYFILE_AGENT_PURPOSE, agentName],
-          );
-          if (existing.rows.length > 0) throw duplicate();
-        }
-        await tx.query(
-          `INSERT INTO workspace_api_tokens
-             (id, workspace_id, label, purpose, scopes, token_hash, token_prefix,
-              created_by_user_id, expires_at, agent_name, aud)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-          [
-            id,
-            input.workspaceId,
-            label,
-            purpose,
-            scopes,
-            hashSecret(accessToken),
-            accessToken.slice(0, API_TOKEN_PREFIX.length + 4),
-            input.actor.userId,
-            expiresAt?.toISOString() ?? null,
-            agentName,
-            aud,
-          ],
+      if (agentName !== null) {
+        const existing = await tx.query(
+          `SELECT 1 FROM workspace_api_tokens
+            WHERE workspace_id = $1 AND purpose = $2 AND agent_name = $3 AND revoked_at IS NULL`,
+          [input.workspaceId, RELAYFILE_AGENT_PURPOSE, agentName],
         );
-        await recordAudit(tx, {
-          organizationId: input.organizationId,
-          workspaceId: input.workspaceId,
-          actor: input.actor,
-          action: "api_token.create",
-          target: agentName !== null
-            ? `${id} (${purpose}: ${agentName} -> ${aud})`
-            : aud !== null
-              ? `${id} (${purpose} -> ${aud})`
-              : `${id} (${purpose})`,
-        });
-      });
+        if (existing.rows.length > 0) throw duplicate();
+      }
+      await tx.query(
+        `INSERT INTO workspace_api_tokens
+           (id, workspace_id, label, purpose, scopes, token_hash, token_prefix,
+            created_by_user_id, expires_at, agent_name, aud)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          id,
+          input.workspaceId,
+          label,
+          purpose,
+          scopes,
+          hashSecret(accessToken),
+          accessToken.slice(0, API_TOKEN_PREFIX.length + 4),
+          input.actor.userId,
+          expiresAt?.toISOString() ?? null,
+          agentName,
+          aud,
+        ],
+      );
     } catch (error) {
       // A concurrent mint for the same agent loses on the partial unique index.
       if (agentName !== null && String((error as { code?: unknown }).code) === "23505") throw duplicate();
       throw error;
     }
-    const record = (await this.database.query<Row>(`${SELECT} WHERE t.id = $1`, [id])).rows[0]!;
+    await recordAudit(tx, {
+      organizationId: input.organizationId,
+      workspaceId: input.workspaceId,
+      actor: input.actor,
+      action: "api_token.create",
+      target: agentName !== null
+        ? `${id} (${purpose}: ${agentName} -> ${aud})`
+        : aud !== null
+          ? `${id} (${purpose} -> ${aud})`
+          : `${id} (${purpose})`,
+    });
+    const record = (await tx.query<Row>(`${SELECT} WHERE t.id = $1`, [id])).rows[0]!;
     return { ...toRecord(record), accessToken };
   }
 
@@ -314,25 +328,36 @@ export class ApiTokenStore {
     actor: AuditActor & { kind: "user" };
   }): Promise<boolean> {
     if (!/^[0-9a-f-]{36}$/i.test(input.tokenId)) return false;
-    return this.database.transaction(async (tx) => {
-      const result = await tx.query(
-        `UPDATE workspace_api_tokens
-            SET revoked_at = now(), revoked_by_user_id = $3
-          WHERE id = $1 AND workspace_id = $2 AND revoked_at IS NULL
-          RETURNING id, agent_name`,
-        [input.tokenId, input.workspaceId, input.actor.userId],
-      );
-      const revoked = result.rows[0] as { agent_name: string | null } | undefined;
-      if (!revoked) return false;
-      await recordAudit(tx, {
-        organizationId: input.organizationId,
-        workspaceId: input.workspaceId,
-        actor: input.actor,
-        action: "api_token.revoke",
-        target: revoked.agent_name === null ? input.tokenId : `${input.tokenId} (${revoked.agent_name})`,
-      });
-      return true;
+    return this.database.transaction((tx) => this.revokeIn(tx, input));
+  }
+
+  /**
+   * Revokes one active token of the workspace on the caller's executor and
+   * audits it. A non-user actor (a background reconciler) leaves
+   * revoked_by_user_id null. False when the token is absent or already revoked.
+   */
+  async revokeIn(
+    tx: SqlExecutor,
+    input: { workspaceId: string; organizationId: string; tokenId: string; actor: AuditActor },
+  ): Promise<boolean> {
+    if (!/^[0-9a-f-]{36}$/i.test(input.tokenId)) return false;
+    const result = await tx.query(
+      `UPDATE workspace_api_tokens
+          SET revoked_at = now(), revoked_by_user_id = $3
+        WHERE id = $1 AND workspace_id = $2 AND revoked_at IS NULL
+        RETURNING id, agent_name`,
+      [input.tokenId, input.workspaceId, input.actor.kind === "user" ? input.actor.userId : null],
+    );
+    const revoked = result.rows[0] as { agent_name: string | null } | undefined;
+    if (!revoked) return false;
+    await recordAudit(tx, {
+      organizationId: input.organizationId,
+      workspaceId: input.workspaceId,
+      actor: input.actor,
+      action: "api_token.revoke",
+      target: revoked.agent_name === null ? input.tokenId : `${input.tokenId} (${revoked.agent_name})`,
     });
+    return true;
   }
 
   async authenticate(token: string): Promise<ApiTokenPrincipal | null> {

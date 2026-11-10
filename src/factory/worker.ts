@@ -52,6 +52,8 @@ export type FactoryWorkerDeps = {
   historyIntervalMs: number;
   /** Remote cleanup of retired rows (the service's release path). */
   releasePending: (limit: number) => Promise<number>;
+  /** Acquisition enrollment reconciler (the service's draining-token revoke path). */
+  reconcileAcquisition?: (limit: number) => Promise<number>;
   leaseMs?: number;
   /** Test seam: runs after the inbox read, before the fenced insert transaction. */
   beforeInboxInsert?: () => Promise<void>;
@@ -424,6 +426,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
   // ------------------------------------------------------------- lifecycle
 
   const timers: NodeJS.Timeout[] = [];
+  const loops: string[] = [];
   const running = new Set<string>();
   let stopped = false;
 
@@ -438,6 +441,7 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
     }, ms);
     timer.unref();
     timers.push(timer);
+    loops.push(name);
   }
 
   return {
@@ -451,24 +455,36 @@ export function createFactoryWorker(deps: FactoryWorkerDeps) {
     claim,
     process,
     finalize,
-    /** True while the loop timers are installed. */
+    /** True while the loop timers are installed (all of them, or only the acquisition one after a reconcile-only start). */
     get started(): boolean {
       return timers.length > 0;
     },
-    start(): void {
+    /** Names of the installed loops: all of them, or only "acquisition" after a reconcile-only start. */
+    get loops(): readonly string[] {
+      return [...loops];
+    },
+    /** `reconcileOnly` installs just the acquisition reconciler, for a module whose Factory flag is off. */
+    start(options: { reconcileOnly?: boolean } = {}): void {
       if (timers.length > 0) return;
       stopped = false;
+      const reconcileAcquisition = deps.reconcileAcquisition;
+      if (options.reconcileOnly) {
+        if (reconcileAcquisition) every("acquisition", CLEANUP_INTERVAL_MS, () => reconcileAcquisition(50));
+        return;
+      }
       every("inbox", INBOX_INTERVAL_MS, () => pollInbox());
       every("inject", INJECT_INTERVAL_MS, async () => {
         await sweepLeases();
         await injectBatch();
       });
       every("cleanup", CLEANUP_INTERVAL_MS, () => deps.releasePending(50));
+      if (reconcileAcquisition) every("acquisition", CLEANUP_INTERVAL_MS, () => reconcileAcquisition(50));
       every("history", deps.historyIntervalMs, () => historyTick());
     },
     async stop(): Promise<void> {
       stopped = true;
       for (const timer of timers.splice(0)) clearInterval(timer);
+      loops.length = 0;
     },
   };
 }
