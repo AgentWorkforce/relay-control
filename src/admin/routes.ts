@@ -712,6 +712,7 @@ export function createAdminModule(input: {
           expiryDays: body.expiryDays,
           neverExpires: body.neverExpires,
           agentName: body.agent_name,
+          nodeName: body.nodeName,
           aud: body.aud,
           scope: body.scope,
           scopes: body.scopes,

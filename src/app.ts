@@ -19,6 +19,7 @@ import { ApiTokenStore } from "./admin/api-tokens.js";
 import { recordAudit } from "./admin/audit.js";
 import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
 import { handleChiefRelay } from "./chief-relay.js";
+import { handleRelayNode } from "./relay-node/broker.js";
 import { handleFlowsBroker } from "./flows-broker.js";
 import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
@@ -947,6 +948,22 @@ export function createApp(input: {
       requireChief: () => requireFeature("chief"),
       bearer,
       requestObject,
+      json,
+    })) {
+      return;
+    }
+
+    // Relay node broker (docs/relay-node-credential.md): a relay-node token
+    // runs allowlisted Relaycast workspace-key routes with the stored key.
+    // Never reachable through the /cloud alias.
+    if (await handleRelayNode(request, response, method, publicPath, {
+      apiTokens,
+      relaycastUrl: config.relaycastUrl,
+      relaycastBinding: (id) => store.relaycastBinding(id),
+      bearer,
+      rateLimit: (res, key, rule) =>
+        rateLimit(res, key, rule, "rate_limited", "Too many relay-node requests; retry later"),
+      bodyText: (incoming) => bodyText(incoming),
       json,
     })) {
       return;

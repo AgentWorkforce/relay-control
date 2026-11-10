@@ -751,6 +751,17 @@ Introspecting one answers like a relayfile agent token except
 (`revoked`, `expired`, `audience`, `workspace`, and any `machine` is
 `machine_not_owned`).
 
+#### Relay node tokens
+
+A relay node host presents a workspace API token of purpose `relay-node`,
+minted through the same routes with
+`{label, purpose: "relay-node", nodeName, expiryDays?}` (scopes fixed to
+`relay:workspace:read`, `relay:nodes:read`, `relay:nodes:enroll`,
+`relay:agents:read`; expires within 365 days; several per `nodeName`). It is
+accepted only by the `/relay-node/v1` broker; every other workspace API token
+gate treats it as no credential and introspection answers `wrong-kind`. See
+[relay-node-credential.md](relay-node-credential.md).
+
 #### Desktop session scopes
 
 Sessions issued to the Desktop (and CLI) through the device flow, and the

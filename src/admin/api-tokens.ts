@@ -31,12 +31,19 @@ export const API_TOKEN_PURPOSE_SCOPES = {
    * verifies it through introspection as a `service` principal.
    */
   "acquisition-operator": ["acquisition:operate"],
+  /**
+   * Presented by an agent-relay-node host to this service's /relay-node/v1
+   * broker (docs/relay-node-credential.md) instead of the workspace's
+   * Relaycast key. Bound to one node name; never passes the /api/v1 gate.
+   */
+  "relay-node": ["relay:workspace:read", "relay:nodes:read", "relay:nodes:enroll", "relay:agents:read"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type ApiTokenPurpose = keyof typeof API_TOKEN_PURPOSE_SCOPES;
 
 export const RELAYFILE_AGENT_PURPOSE = "relayfile-agent" satisfies ApiTokenPurpose;
 export const ACQUISITION_OPERATOR_PURPOSE = "acquisition-operator" satisfies ApiTokenPurpose;
+export const RELAY_NODE_PURPOSE = "relay-node" satisfies ApiTokenPurpose;
 
 export class ApiTokenError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -57,8 +64,13 @@ export type ApiTokenRecord = {
   lastUsedAt: string | null;
   revokedAt: string | null;
   status: "active" | "expired" | "revoked";
-  /** relayfile-agent only: the agent the token speaks for; else null. */
+  /**
+   * relayfile-agent: the agent the token speaks for; relay-node: the node
+   * name (same value as nodeName); else null.
+   */
   agent_name: string | null;
+  /** relay-node only: the node the token is bound to; else null. */
+  nodeName: string | null;
   /** relayfile-agent and acquisition-operator: the normalized audience origin; else null. */
   aud: string | null;
 };
@@ -68,6 +80,14 @@ export type ApiTokenPrincipal = {
   workspaceId: string;
   organizationId: string;
   scopes: string[];
+};
+
+/** A live relay-node token, as the /relay-node/v1 broker sees it. */
+export type RelayNodePrincipal = {
+  tokenId: string;
+  workspaceId: string;
+  organizationId: string;
+  nodeName: string;
 };
 
 type Row = {
@@ -119,6 +139,7 @@ function toRecord(row: Row): ApiTokenRecord {
     revokedAt: row.revoked_at ? iso(row.revoked_at) : null,
     status: row.revoked_at ? "revoked" : expired ? "expired" : "active",
     agent_name: row.agent_name,
+    nodeName: row.purpose === RELAY_NODE_PURPOSE ? row.agent_name : null,
     aud: row.aud,
   };
 }
@@ -137,6 +158,8 @@ export type CreateApiTokenInput = {
   expiryDays: unknown;
   neverExpires: unknown;
   agentName?: unknown;
+  /** relay-node only (the body's `nodeName`); refused for every other purpose. */
+  nodeName?: unknown;
   aud?: unknown;
   /** Any value here (the body's `scope` or `scopes`) is refused. */
   scope?: unknown;
@@ -211,6 +234,19 @@ export class ApiTokenStore {
         "agent_name is only accepted for relayfile-agent tokens",
       );
     }
+    if (purpose === RELAY_NODE_PURPOSE) {
+      if (typeof input.nodeName !== "string" || !NODE_ID_PATTERN.test(input.nodeName)) {
+        throw new ApiTokenError(
+          400,
+          "invalid_request",
+          "nodeName is required: 1-200 characters of letters, digits, '.', '_', ':' or '-'",
+        );
+      }
+      // Stored in agent_name. Several live tokens per node are allowed (rotation).
+      agentName = input.nodeName;
+    } else if (input.nodeName !== undefined) {
+      throw new ApiTokenError(400, "invalid_request", "nodeName is only accepted for relay-node tokens");
+    }
     if (purpose === RELAYFILE_AGENT_PURPOSE || purpose === ACQUISITION_OPERATOR_PURPOSE) {
       const accepted = this.audiences();
       if (accepted.length === 0) {
@@ -273,8 +309,9 @@ export class ApiTokenStore {
         "agent_name_conflict",
         "An active relayfile-agent token already exists for this agent_name; revoke it first",
       );
+    const oneLivePerAgent = purpose === RELAYFILE_AGENT_PURPOSE;
     try {
-      if (agentName !== null) {
+      if (oneLivePerAgent) {
         const existing = await tx.query(
           `SELECT 1 FROM workspace_api_tokens
             WHERE workspace_id = $1 AND purpose = $2 AND agent_name = $3 AND revoked_at IS NULL`,
@@ -303,7 +340,7 @@ export class ApiTokenStore {
       );
     } catch (error) {
       // A concurrent mint for the same agent loses on the partial unique index.
-      if (agentName !== null && String((error as { code?: unknown }).code) === "23505") throw duplicate();
+      if (oneLivePerAgent && String((error as { code?: unknown }).code) === "23505") throw duplicate();
       throw error;
     }
     await recordAudit(tx, {
@@ -311,7 +348,9 @@ export class ApiTokenStore {
       workspaceId: input.workspaceId,
       actor: input.actor,
       action: "api_token.create",
-      target: agentName !== null
+      target: purpose === RELAY_NODE_PURPOSE
+        ? `${id} (relay-node: ${agentName})`
+        : agentName !== null
         ? `${id} (${purpose}: ${agentName} -> ${aud})`
         : aud !== null
           ? `${id} (${purpose} -> ${aud})`
@@ -360,6 +399,11 @@ export class ApiTokenStore {
     return true;
   }
 
+  /**
+   * The /api/v1 gate (and every "workspace tokens are not a person" check):
+   * a live token of any purpose except relay-node, which is valid only at
+   * the /relay-node/v1 broker (authenticateRelayNode).
+   */
   async authenticate(token: string): Promise<ApiTokenPrincipal | null> {
     if (!token.startsWith(API_TOKEN_PREFIX)) return null;
     const result = await this.database.query<{
@@ -374,6 +418,7 @@ export class ApiTokenStore {
         WHERE t.token_hash = $1
           AND t.revoked_at IS NULL
           AND (t.expires_at IS NULL OR t.expires_at > now())
+          AND t.purpose <> 'relay-node'
           AND w.id = t.workspace_id
         RETURNING t.id, t.workspace_id, w.organization_id, t.scopes`,
       [hashSecret(token)],
@@ -385,6 +430,37 @@ export class ApiTokenStore {
           workspaceId: row.workspace_id,
           organizationId: row.organization_id,
           scopes: row.scopes,
+        }
+      : null;
+  }
+
+  /** A live relay-node token (not revoked, not expired), recording its use; else null. */
+  async authenticateRelayNode(token: string): Promise<RelayNodePrincipal | null> {
+    if (!token.startsWith(API_TOKEN_PREFIX)) return null;
+    const result = await this.database.query<{
+      id: string;
+      workspace_id: string;
+      organization_id: string;
+      agent_name: string | null;
+    }>(
+      `UPDATE workspace_api_tokens t
+          SET last_used_at = now()
+         FROM workspaces w
+        WHERE t.token_hash = $1
+          AND t.revoked_at IS NULL
+          AND (t.expires_at IS NULL OR t.expires_at > now())
+          AND t.purpose = 'relay-node'
+          AND w.id = t.workspace_id
+        RETURNING t.id, t.workspace_id, w.organization_id, t.agent_name`,
+      [hashSecret(token)],
+    );
+    const row = result.rows[0];
+    return row && row.agent_name
+      ? {
+          tokenId: row.id,
+          workspaceId: row.workspace_id,
+          organizationId: row.organization_id,
+          nodeName: row.agent_name,
         }
       : null;
   }

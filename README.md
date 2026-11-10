@@ -736,7 +736,11 @@ audiences; may never expire), which relayfile verifies through
 `acquisition-operator` (`acquisition:operate`; requires `aud`, one of the
 accepted introspection audiences, refuses `agent_name`; may never expire;
 several may coexist), which RelayHistory verifies through the same endpoint
-as a `service` principal. Scopes are fixed by purpose (`scope`/`scopes` in the
+as a `service` principal, and `relay-node` (`relay:workspace:read`,
+`relay:nodes:read`, `relay:nodes:enroll`, `relay:agents:read`; requires
+`nodeName`; expires within 365 days; several per node), accepted only by the
+`/relay-node/v1` Relaycast broker
+([docs/relay-node-credential.md](docs/relay-node-credential.md)). Scopes are fixed by purpose (`scope`/`scopes` in the
 body is a 400). Minted and revoked only through these owner/admin user-token
 routes, also served at `/cloud/api/v1`. Desktop-issued sessions (device flow,
 Desktop browser handoff and exchange) carry `cli:auth rth:read rth:sync
