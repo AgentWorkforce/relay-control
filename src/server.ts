@@ -22,6 +22,7 @@ import { relaycastProvisioner, startBootstrap } from "./identity/bootstrap.js";
 import { FEATURES, gateCredentialVerifier, loadSelectedFeatures } from "./features.js";
 import { loadAmpConfig } from "./amp/config.js";
 import { createAmpModule } from "./amp/module.js";
+import { buildProviderProbes } from "./providers/probes.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
 import { mcpOAuthActiveNotice } from "./mcp/oauth/routes.js";
@@ -148,6 +149,7 @@ const server = createServer(createApp({
   factory,
   features,
   amp,
+  providerProbes: buildProviderProbes({ factory, amp, config }),
   analytics: { port: analytics, config: analyticsConfig },
   mcpOAuthTeardown,
 }));
