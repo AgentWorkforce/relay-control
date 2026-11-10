@@ -39,6 +39,31 @@ const view = (row: ConnectionRow): RemoteConnection => ({
   validatedAt: new Date(row.validated_at).toISOString(),
 });
 
+// These responses prove a connection, not a transcript. Bound streamed bytes
+// before parsing, even when Content-Length is absent or misleading.
+const MAX_PROVIDER_RESPONSE_BYTES = 256 * 1024;
+async function providerObject(response: Response): Promise<Record<string, unknown>> {
+  if (!response.body) throw new Error("empty_provider_response");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_PROVIDER_RESPONSE_BYTES) throw new Error("provider_response_too_large");
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+  const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("invalid_provider_response");
+  return body as Record<string, unknown>;
+}
+
 export class RemoteAgentConnections {
   constructor(
     readonly database: Database,
@@ -103,10 +128,11 @@ export class RemoteAgentConnections {
             ...(provider === "replicas" ? { "X-Replicas-Api-Version": "2026-10-07" } : {}),
             ...(init.body ? { "content-type": "application/json" } : {}) },
         });
-        if (!response.ok) throw new Error("provider_refused");
-        const body: unknown = await response.json();
-        if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("invalid_provider_response");
-        return body as Record<string, unknown>;
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => undefined);
+          throw new Error("provider_refused");
+        }
+        return await providerObject(response);
       } catch {
         throw new RemoteAgentError(502, "credential_check_failed", "The provider could not validate this key. Check its permissions and try again.");
       }

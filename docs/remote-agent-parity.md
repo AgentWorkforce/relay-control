@@ -25,10 +25,10 @@ change does not duplicate that wiring.
 
 ## Connection API
 
-The Capy/Replicas UI is owned by existing webapp #117. The complementary
-webapp #118 adds Amp/Devin/Cursor and is stacked on that PR, without duplicate
-Capy/Replicas cards. Native Control runtime ports must consume this credential
-store and preserve its validation/fencing; do not add a second competing key.
+The combined provider settings UI is carried by webapp #117; #118 is closed
+as superseded. It uses the single `remote-agent-connections` contract below.
+Native Control runtime ports must consume this credential store and preserve
+its validation/fencing; do not add a second competing key.
 
 All paths also accept the `/cloud` prefix. All replies are `no-store`.
 
@@ -40,16 +40,11 @@ All paths also accept the `/cloud` prefix. All replies are `no-store`.
 - `DELETE` on that item removes the key. No key or encrypted envelope is
   returned by any public operation.
 
-The existing webapp contracts are also served directly: `GET/PUT/DELETE
-/api/v1/workspaces/{workspaceId}/capy/connection` uses `{key}` with masked
-snake-case summaries; `GET/POST/DELETE /api/v1/workspaces/{workspaceId}/replicas`
-uses `{api_key}` and the nullable camel-case connection/organization summary.
-Those aliases share this same storage and authority checks. They do not enable
-the provider runtime probes.
-
 Providers are exactly `capy`, `replicas`, `devin`, `cursor-cloud`. Origins are
 fixed in server source. Redirects and arbitrary origin/body overrides are
-refused. Both membership and the current stored key are rechecked after
+refused. Validation responses have a 256 KiB streamed-byte limit within the
+15-second request deadline; overflow cancels the body and refuses the connection
+without replacing an existing key. Both membership and the current stored key are rechecked after
 external validation; revocation or a concurrent saved-key change cannot be
 overwritten by a stale provider response. Provider response bodies never appear
 in errors or audit records. Replicas/Cursor/Devin account changes require an

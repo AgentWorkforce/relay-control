@@ -12,11 +12,13 @@ test("provider connection API validates upstream, encrypts keys, and preserves p
   const tenant = await seedTenant(control.api);
   const calls: Array<{ url: string; init: RequestInit }> = [];
   let replyOverride: Response | null = null;
+  let streamReply: (() => Response) | undefined;
   let onFetch: (() => Promise<void>) | undefined;
   const fetchImpl: typeof fetch = async (input, init = {}) => {
     calls.push({ url: String(input), init });
     await onFetch?.();
-    if (replyOverride) return replyOverride.clone();
+    if (streamReply) return streamReply();
+    if (replyOverride) return replyOverride;
     const url = String(input);
     if (url.endsWith("/projects")) return Response.json({ items: [] });
     if (url.endsWith("/whoami")) return Response.json({ organization: { id: "replica-org" } });
@@ -86,22 +88,40 @@ test("provider connection API validates upstream, encrypts keys, and preserves p
     assert.equal((await api(`${path}/capy`, { method: "POST", token, body: { key: "capy_" + "x".repeat(32) } })).status, 502);
     replyOverride = null;
   });
-  await t.test("Capy and Replicas aliases match the existing webapp contract without advertising runtime readiness", async () => {
-    const prefix = `/cloud/api/v1/workspaces/${tenant.workspaceId}`;
-    const capy = await api(`${prefix}/capy/connection`, { token: tenant.memberToken });
-    assert.equal(capy.status, 200);
-    assert.equal(capy.body.connected, true);
-    assert.equal(capy.body.key_hint, "…ssss");
-    assert.equal(capy.body.capabilities.relayBinding, false);
-    const saved = await api(`${prefix}/capy/connection`, { method: "PUT", token, body: { key: "capy_" + "s".repeat(32) } });
-    assert.equal(saved.status, 200);
-    assert.equal(saved.body.connected, true);
-    const replica = await api(`${prefix}/replicas`, { method: "POST", token, body: { api_key: "provider_key_" + "s".repeat(32) } });
-    assert.equal(replica.status, 200);
-    assert.equal(replica.body.organizationId, "replica-org");
-    assert.equal(replica.body.keyHint, "…ssss");
-    assert.equal(replica.body.capabilities.historySync, false);
-    assert.equal((await api(`${prefix}/replicas`, { token: tenant.memberToken })).body.organizationId, "replica-org");
+  await t.test("oversized chunked provider replies stop reading and preserve the existing key", async () => {
+    let cancelled = false;
+    let pulls = 0;
+    // Valid JSON that the old response.json() accepts. UTF-8 characters make
+    // the byte count exceed the cap before the character count reaches it.
+    const chunks = [Buffer.from('{"items":[],"padding":"'),
+      ...Array.from({ length: 5 }, () => Buffer.from("é".repeat(32 * 1024))), Buffer.from('"}')];
+    streamReply = () => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks[pulls++];
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 }), { headers: { "content-type": "application/json", "content-length": "1" } });
+    try {
+      const result = await api(`${path}/capy`, { method: "POST", token, body: { key: "capy_" + "x".repeat(32) } });
+      assert.equal(result.status, 502);
+      assert.equal(result.body.error, "credential_check_failed");
+      assert.equal(cancelled, true);
+      assert.ok(pulls < chunks.length, "overflow must cancel before the complete provider body is consumed");
+      assert.equal(result.text.includes("padding"), false);
+      assert.equal(await storage.keyFor(tenant.workspaceId, "capy"), "capy_" + "s".repeat(32));
+    } finally { streamReply = undefined; }
+  });
+  await t.test("a provider object exactly at the byte limit still validates", async () => {
+    const empty = JSON.stringify({ items: [], padding: "" });
+    const body = JSON.stringify({ items: [], padding: "a".repeat(256 * 1024 - Buffer.byteLength(empty)) });
+    replyOverride = new Response(body, { headers: { "content-type": "application/json" } });
+    try {
+      assert.equal(Buffer.byteLength(body), 256 * 1024);
+      const result = await api(`${path}/capy`, { method: "POST", token, body: { key: "capy_" + "s".repeat(32) } });
+      assert.equal(result.status, 200, result.text);
+    } finally { replyOverride = null; }
   });
   await t.test("cookie writes reject cross-site Origin and allow same-origin JSON", async () => {
     const count = calls.length;
