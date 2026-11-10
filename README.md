@@ -7,6 +7,10 @@ Cloud deployment.
 
 Included:
 
+- remote provider connection management (Amp, Capy, Replicas, Devin, Cursor
+  Cloud); see [the provider parity matrix](docs/remote-agent-parity.md) for
+  the runtime/history work still required before retiring Cloud
+
 - RFC 8628-style device start/approve/token flow
 - rotating access/refresh sessions and revocation
 - whoami, organizations, workspaces, and organization memberships

@@ -2535,6 +2535,77 @@ paths:
       responses:
         "200":
           description: Stored runtime configuration
+  /api/v1/workspaces/{workspaceId}/remote-agent-connections:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listRemoteAgentConnections
+      summary: Masked remote coding-agent connection summaries and separate runtime capability states.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Workspace-member view; no keys or encrypted envelopes. See docs/remote-agent-parity.md.
+        "401":
+          description: Person authentication required
+        "404":
+          description: Workspace not accessible
+  /api/v1/workspaces/{workspaceId}/remote-agent-connections/{provider}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - name: provider
+        in: path
+        required: true
+        schema:
+          enum: [capy, replicas, devin, cursor-cloud]
+    post:
+      operationId: connectRemoteAgent
+      summary: Validate and encrypt a remote agent API key (owner/admin person only).
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [key]
+              properties:
+                key:
+                  type: string
+                  writeOnly: true
+                orgId:
+                  type: string
+                  description: Required for Devin (Cognition organization ID).
+      responses:
+        "200":
+          description: Validated connection hint and timestamp, never the key
+        "400":
+          description: Invalid key, organization or field
+        "403":
+          description: Owner/admin person required or cross-origin write refused
+        "404":
+          description: Workspace or provider not found
+        "409":
+          description: Account or stored connection changed; disconnect or refresh first
+        "502":
+          description: Provider validation failed or returned an unsupported response
+    delete:
+      operationId: disconnectRemoteAgent
+      summary: Delete this workspace provider credential (owner/admin person only).
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Connection removed; does not revoke the API key at the external provider
+        "403":
+          description: Owner/admin person required or cross-origin write refused
+        "404":
+          description: Workspace or provider not found
   /api/v1/workspaces/{workspaceId}/providers:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -2589,11 +2660,26 @@ paths:
         `GET /v1/sessions`. The upstream query always includes
         `workspace={authorized workspace UUID}`; callers cannot provide or
         override an upstream origin, path, workspace, or credential.
+        Recorded agent metadata is an explicit native-reader opt-in. Without it,
+        list requests and response fields retain the existing backend contract.
       parameters:
         - name: metadata
           in: query
           schema:
             const: deferred
+        - name: includeAgentName
+          in: query
+          description: |
+            Opt in to optional top-level recorded agentName metadata from a
+            compatible native session reader. Forwarded as includeAgentName=recorded
+            with the authorized workspace; Control does not infer names or fetch
+            per-session catalogs. Missing or ambiguous names may be omitted.
+            An unavailable native read context returns 501 unsupported_by_backend
+            with reason param_includeAgentName. Unknown values or repeated
+            parameters return 400 invalid_request before any upstream request.
+          schema:
+            type: string
+            enum: [recorded]
         - name: agent
           in: query
           description: |
@@ -7580,6 +7666,9 @@ components:
                 type: string
               source:
                 type: string
+              agentName:
+                type: [string, "null"]
+                description: Optional recorded name returned by a compatible native reader when includeAgentName=recorded is requested; never inferred by Control.
               summary:
                 type: [string, "null"]
               lastTs:
