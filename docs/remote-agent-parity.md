@@ -8,6 +8,7 @@ durable deliveries and history uploads. No route here forwards to Cloud.
 
 | Provider | Settings / credentials | Relay operations in Control | History in Control |
 | --- | --- | --- | --- |
+| Factory | Existing webapp #117 adds keys and explicit existing-computer/chat binding controls | Existing Control Factory module; separate #75/#76 extend MCP/enrollment | Deferred; no transcript-upload proof from the connection card |
 | Amp | Webapp card, connect, discover threads, bind/unbind, inspect deliveries, disconnect | Existing `src/amp`, gated by `SELFHOST_AMP_ENABLED` and the Amp process transport | Existing scheduler/parser, **inactive** without a push-only sessions-pipeline credential issuer; see `amp.md` |
 | Capy | Validate projects access, encrypted workspace key, masked summary, replace/disconnect | Not ported: thread bindings, subscriptions, injection and spawn | Not ported |
 | Replicas | Validate organization identity, encrypted workspace key, masked summary, replace/disconnect | Not ported: durable launches, helper capabilities, delivery reconciliation and cleanup | Not ported |
@@ -24,6 +25,11 @@ change does not duplicate that wiring.
 
 ## Connection API
 
+The Capy/Replicas UI is owned by existing webapp #117. The complementary
+webapp #118 adds Amp/Devin/Cursor and is stacked on that PR, without duplicate
+Capy/Replicas cards. Native Control runtime ports must consume this credential
+store and preserve its validation/fencing; do not add a second competing key.
+
 All paths also accept the `/cloud` prefix. All replies are `no-store`.
 
 - `GET /api/v1/workspaces/{workspaceId}/remote-agent-connections`: members
@@ -33,6 +39,13 @@ All paths also accept the `/cloud` prefix. All replies are `no-store`.
   plus `{orgId}` for Devin. Check the actual provider before storing.
 - `DELETE` on that item removes the key. No key or encrypted envelope is
   returned by any public operation.
+
+The existing webapp contracts are also served directly: `GET/PUT/DELETE
+/api/v1/workspaces/{workspaceId}/capy/connection` uses `{key}` with masked
+snake-case summaries; `GET/POST/DELETE /api/v1/workspaces/{workspaceId}/replicas`
+uses `{api_key}` and the nullable camel-case connection/organization summary.
+Those aliases share this same storage and authority checks. They do not enable
+the provider runtime probes.
 
 Providers are exactly `capy`, `replicas`, `devin`, `cursor-cloud`. Origins are
 fixed in server source. Redirects and arbitrary origin/body overrides are

@@ -86,6 +86,23 @@ test("provider connection API validates upstream, encrypts keys, and preserves p
     assert.equal((await api(`${path}/capy`, { method: "POST", token, body: { key: "capy_" + "x".repeat(32) } })).status, 502);
     replyOverride = null;
   });
+  await t.test("Capy and Replicas aliases match the existing webapp contract without advertising runtime readiness", async () => {
+    const prefix = `/cloud/api/v1/workspaces/${tenant.workspaceId}`;
+    const capy = await api(`${prefix}/capy/connection`, { token: tenant.memberToken });
+    assert.equal(capy.status, 200);
+    assert.equal(capy.body.connected, true);
+    assert.equal(capy.body.key_hint, "…ssss");
+    assert.equal(capy.body.capabilities.relayBinding, false);
+    const saved = await api(`${prefix}/capy/connection`, { method: "PUT", token, body: { key: "capy_" + "s".repeat(32) } });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.connected, true);
+    const replica = await api(`${prefix}/replicas`, { method: "POST", token, body: { api_key: "provider_key_" + "s".repeat(32) } });
+    assert.equal(replica.status, 200);
+    assert.equal(replica.body.organizationId, "replica-org");
+    assert.equal(replica.body.keyHint, "…ssss");
+    assert.equal(replica.body.capabilities.historySync, false);
+    assert.equal((await api(`${prefix}/replicas`, { token: tenant.memberToken })).body.organizationId, "replica-org");
+  });
   await t.test("cookie writes reject cross-site Origin and allow same-origin JSON", async () => {
     const count = calls.length;
     const headers = { cookie: `agent_relay_session=${token}`, origin: "https://attacker.test" };
