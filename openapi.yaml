@@ -2535,6 +2535,77 @@ paths:
       responses:
         "200":
           description: Stored runtime configuration
+  /api/v1/workspaces/{workspaceId}/remote-agent-connections:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listRemoteAgentConnections
+      summary: Masked remote coding-agent connection summaries and separate runtime capability states.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Workspace-member view; no keys or encrypted envelopes. See docs/remote-agent-parity.md.
+        "401":
+          description: Person authentication required
+        "404":
+          description: Workspace not accessible
+  /api/v1/workspaces/{workspaceId}/remote-agent-connections/{provider}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - name: provider
+        in: path
+        required: true
+        schema:
+          enum: [capy, replicas, devin, cursor-cloud]
+    post:
+      operationId: connectRemoteAgent
+      summary: Validate and encrypt a remote agent API key (owner/admin person only).
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [key]
+              properties:
+                key:
+                  type: string
+                  writeOnly: true
+                orgId:
+                  type: string
+                  description: Required for Devin (Cognition organization ID).
+      responses:
+        "200":
+          description: Validated connection hint and timestamp, never the key
+        "400":
+          description: Invalid key, organization or field
+        "403":
+          description: Owner/admin person required or cross-origin write refused
+        "404":
+          description: Workspace or provider not found
+        "409":
+          description: Account or stored connection changed; disconnect or refresh first
+        "502":
+          description: Provider validation failed or returned an unsupported response
+    delete:
+      operationId: disconnectRemoteAgent
+      summary: Delete this workspace provider credential (owner/admin person only).
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Connection removed; does not revoke the API key at the external provider
+        "403":
+          description: Owner/admin person required or cross-origin write refused
+        "404":
+          description: Workspace or provider not found
   /api/v1/workspaces/{workspaceId}/providers:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"

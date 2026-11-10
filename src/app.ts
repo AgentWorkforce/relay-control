@@ -66,6 +66,8 @@ import {
 import { handleDesktopIdentityRoutes } from "./messaging/desktop-identities.js";
 import { handleChiefRoutes, type ChiefBackend } from "./chief/routes.js";
 import { handleProviderRoutes } from "./providers/routes.js";
+import { RemoteAgentConnections } from "./remote-agents/connections.js";
+import { remoteAgentRoutes } from "./remote-agents/routes.js";
 import type { ProviderProbes } from "./providers/registry.js";
 import {
   CapturePolicyError,
@@ -360,6 +362,8 @@ export function createApp(input: {
    * and enabled as false.
    */
   providerProbes?: ProviderProbes;
+  /** Fixed-origin provider credential checks; injectable for offline tests. */
+  remoteAgentFetch?: typeof fetch;
   /**
    * analytics lane: the product-analytics port and its configuration. The
    * client gateway (POST /api/v1/analytics/events) is mounted only when the
@@ -444,6 +448,7 @@ export function createApp(input: {
   // Hosted MCP (shared-sessions facade): reads, team activity, capabilities.
   const amp = input.amp?.config.enabled ? input.amp : null;
   const providerProbes: ProviderProbes = input.providerProbes ?? {};
+  const remoteAgents = remoteAgentRoutes(new RemoteAgentConnections(store.database, config.encryptionKeyring, input.remoteAgentFetch));
   const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
   const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({
     database:store.database,keyring:config.encryptionKeyring,
@@ -2238,6 +2243,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     if (desktopFeed && await desktopFeed(request, response, path, method)) return;
     if (await handleProviderRoutes(request, response, path, method, {
       probes: providerProbes, workspaceAccess: (incoming, id) => workspaceAccess(incoming, id), json,
+    })) return;
+    if (await remoteAgents(request, response, path, method, {
+      workspaceAccess, requestObject, json,
+      csrfAllowed: incoming => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
     })) return;
     if (await handleChiefRoutes(request, response, path, {
       backend: input.chief, workspaceAccess, requestObject, json,
