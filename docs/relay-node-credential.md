@@ -70,7 +70,7 @@ Not served through the `/cloud` alias.
 
 | Route | Relaycast call | Notes |
 | --- | --- | --- |
-| `GET /workspace` | `GET /v1/workspace` | Answers only `{"id", "name"}` |
+| `GET /workspace` | `GET /v1/workspace` | Answers only `{"ok": true, "data": {"id", "name"}}` |
 | `GET /nodes` | `GET /v1/nodes` | Forwards only the `status`, `limit` and `cursor` query keys |
 | `GET /nodes/{name}` | `GET /v1/nodes/{name}` | |
 | `POST /nodes` | `POST /v1/nodes` | Body `name` must equal the token's `nodeName`; forwards the body unchanged with `Content-Type`, `Idempotency-Key` and `X-Relaycast-Node-Token` |
@@ -82,10 +82,10 @@ can carry node tokens; relay-control does not log them.
 
 ## Errors
 
-Every answer is `Cache-Control: no-store`, with a JSON body `{error, message}`
-for the broker's own errors:
+Every answer is `Cache-Control: no-store`, and the broker's own errors use Relaycast's
+envelope `{"ok": false, "error": {"code", "message"}}`:
 
-| Status | `error` | When |
+| Status | `code` | When |
 | --- | --- | --- |
 | 401 | `token_invalid` | No bearer, or not a live (unrevoked, unexpired) relay-node token |
 | 403 | `scope_denied` | Path or method outside the table above |

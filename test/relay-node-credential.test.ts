@@ -269,7 +269,8 @@ test("broker authentication: only a live relay-node token, else 401 token_invali
     for (const path of ["/relay-node/v1/workspace", "/relay-node/v1/anything"]) {
       const answer = await ctx.broker(path, token);
       assert.equal(answer.status, 401, `${path} ${String(token).slice(0, 10)}`);
-      assert.equal(answer.body.error, "token_invalid");
+      assert.equal(answer.body.error.code, "token_invalid");
+      assert.equal(answer.body.ok, false);
       assert.equal(answer.headers.get("cache-control"), "no-store");
     }
   }
@@ -296,7 +297,7 @@ test("broker GET routes run against Relaycast with the stored key", async (t) =>
 
   const workspace = await ctx.broker("/relay-node/v1/workspace", node.accessToken);
   assert.equal(workspace.status, 200);
-  assert.deepEqual(workspace.body, { id: "rw-1", name: "Relay WS" });
+  assert.deepEqual(workspace.body, { ok: true, data: { id: "rw-1", name: "Relay WS" } });
   assert.equal(workspace.headers.get("cache-control"), "no-store");
   assert(!workspace.raw.includes(WORKSPACE_KEY) && !workspace.raw.includes(ctx.workspaceId));
 
@@ -337,7 +338,8 @@ test("broker POST nodes enrolls only the token's own node and forwards node head
       headers: { "content-type": "application/json" },
     });
     assert.equal(refused.status, 403, JSON.stringify(body));
-    assert.equal(refused.body.error, "node_mismatch");
+    assert.equal(refused.body.error.code, "node_mismatch");
+    assert.equal(refused.body.ok, false);
   }
   assert.equal(ctx.calls.length, 0);
 
@@ -398,11 +400,13 @@ test("broker refuses everything outside the allowlist with 403 scope_denied", as
   for (const [method, path] of cases) {
     const answer = await ctx.broker(path, node.accessToken, { method });
     assert.equal(answer.status, 403, `${method} ${path}`);
-    assert.equal(answer.body.error, "scope_denied", `${method} ${path}`);
+    assert.equal(answer.body.error.code, "scope_denied", `${method} ${path}`);
   }
   assert.equal(ctx.calls.length, 0);
   // Not reachable through the /cloud alias.
-  assert.notEqual((await ctx.broker("/cloud/relay-node/v1/workspace", node.accessToken)).body.error, "token_invalid");
+  const aliased = await ctx.broker("/cloud/relay-node/v1/workspace", node.accessToken);
+  assert.notEqual(aliased.status, 200);
+  assert(!aliased.raw.includes("token_invalid"));
 });
 
 test("broker maps Relaycast failures: refused stored key and outages are 502, other statuses pass through", async (t) => {
@@ -414,7 +418,7 @@ test("broker maps Relaycast failures: refused stored key and outages are 502, ot
   for (const path of ["/relay-node/v1/workspace", "/relay-node/v1/nodes/node-a"]) {
     const answer = await get(path);
     assert.equal(answer.status, 502, `401 ${path}`);
-    assert.equal(answer.body.error, "relaycast_unavailable");
+    assert.equal(answer.body.error.code, "relaycast_unavailable");
   }
   // A 403 is Relaycast's decision about the request (suspended workspace, node ownership): passed through.
   ctx.setReply(() => ({ status: 403, body: { ok: false, error: { code: "workspace_suspended" } } }));
@@ -451,6 +455,6 @@ test("broker maps Relaycast failures: refused stored key and outages are 502, ot
   await ctx.stopRelaycast();
   const down = await get();
   assert.equal(down.status, 502);
-  assert.equal(down.body.error, "relaycast_unavailable");
+  assert.equal(down.body.error.code, "relaycast_unavailable");
   assert(!down.raw.includes(WORKSPACE_KEY));
 });
