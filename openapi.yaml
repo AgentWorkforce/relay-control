@@ -2546,7 +2546,7 @@ paths:
         `/cloud/api/v1/workspaces/{workspaceId}/providers`. Every known
         provider (Amp, Factory, GitHub Copilot, Capy, Replicas, Dot, Grok Bot)
         is listed with its descriptor and three separate runtime states:
-        `implemented` (a provider module is mounted in this build),
+        `implemented` (a provider module is present in this build),
         `configured` (its configuration resolves) and `enabled` (the module is
         mounted and switched on). A build without a provider module reports
         all three as false. `mcpGroupsRegistered` is true only when the
