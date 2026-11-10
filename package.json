@@ -26,6 +26,7 @@
     "migrate": "node dist/migrate-cli.js"
   },
   "dependencies": {
+    "@babel/parser": "7.29.13",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@node-rs/argon2": "^2.2.2",
     "nodemailer": "^8.0.11",

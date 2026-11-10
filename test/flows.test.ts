@@ -686,3 +686,35 @@ test("assignment payloads carry the workspace runtime environment at delivery ti
   assert.equal(await cp.flows.verifyRuntimeCredential("sh_wrk_enr_x"), null);
   assert.equal(await cp.flows.verifyRuntimeCredential(tenant.memberToken), null);
 });
+
+
+test("flow source syntax is checked before create/update, preserving the last valid definition", async (t) => {
+  const cp = await startControlPlane();
+  t.after(() => cp.stop());
+  const { api } = cp;
+  const tenant = await seedTenant(api);
+  for (const [fileType, source] of [["ts", "this is not valid TypeScript !!!"], ["yaml", "steps: [unterminated"]] as const) {
+    const invalid = await api("/cloud/api/v1/flows", {
+      method: "POST", token: tenant.ownerToken,
+      body: { name: `invalid-${fileType}`, fileType, source },
+    });
+    assert.equal(invalid.status, 400, invalid.text);
+    assert.equal(invalid.body.code, "flow_source_invalid");
+  }
+  const source = 'type Input = { text: string }; export default async function run(input: Input) { return input.text; }';
+  const saved = await api("/cloud/api/v1/flows", {
+    method: "POST", token: tenant.ownerToken, body: { name: "valid-flow", fileType: "ts", source },
+  });
+  assert.equal(saved.status, 201, saved.text);
+  const id = saved.body.flow.id;
+  const invalid = await api(`/cloud/api/v1/flows/${id}`, {
+    method: "PATCH", token: tenant.ownerToken, body: { source: "this is not valid TypeScript !!!" },
+  });
+  assert.equal(invalid.status, 400, invalid.text);
+  assert.equal(invalid.body.code, "flow_source_invalid");
+  const current = await api(`/cloud/api/v1/flows/${id}`, { token: tenant.ownerToken });
+  assert.equal(current.body.flow.source, source);
+  assert.equal(current.body.flow.updatedAt, saved.body.flow.updatedAt);
+  const count = await cp.database.query<{ count: number }>("SELECT count(*)::int AS count FROM flow_definitions");
+  assert.equal(count.rows[0]!.count, 1);
+});
