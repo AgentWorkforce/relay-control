@@ -15,6 +15,7 @@ import {
   type Collector,
   type CollectorConfig,
   type CollectorFs,
+  type CollectorRegistries,
   type ProducerRegistry,
 } from "../../src/analytics-collector/index.js";
 
@@ -166,6 +167,7 @@ export function faultyFs(hooks: FsHooks): CollectorFs {
 export type SetupOptions = {
   config?: Partial<Omit<CollectorConfig, "producersFile">>;
   producers?: ProducerRegistry;
+  registries?: CollectorRegistries;
   fsImpl?: CollectorFs;
   now?: () => number;
   /** Use this data directory instead of a fresh one (to restart over the same store). */
@@ -200,7 +202,7 @@ export async function setup(t: TestContext, options: SetupOptions = {}): Promise
       ...options.config,
     },
     producers: options.producers ?? createProducerRegistry(PRODUCERS),
-    registries: { relaycontrol: EVENT_REGISTRY },
+    registries: options.registries ?? { relaycontrol: EVENT_REGISTRY },
     fsImpl: options.fsImpl,
     now: options.now,
     log: (message, fields) => logs.push({ message, fields }),

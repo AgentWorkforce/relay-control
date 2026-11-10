@@ -4,7 +4,7 @@ import { EVENT_REGISTRY, type PropertySpec } from "../analytics/events.js";
 import type { CollectorRegistries } from "./validate.js";
 
 // Sessions producer contract: relayhistory-pipeline src/shared/analytics.ts at
-// c8c892feb8bfc87aec6898cd4c4a0db816b0e595. A vocabulary change needs review
+// 0acd0e747390a04d40265c417a16731c6c189dd9. A vocabulary change needs review
 // in both repositories; request paths and session content are never properties.
 const LATENCY: PropertySpec = {
   type: "enum",
@@ -38,7 +38,7 @@ export const COLLECTOR_REGISTRIES: CollectorRegistries = {
             "/v1/events", "/v1/sessions", "/v1/sessions/activity", "/v1/sessions/output", "/v1/sessions/titles",
             "/v1/sessions/:sessionId/events", "/v1/sessions/:sessionId/timing", "/v1/sessions/:sessionId/turns",
             "/v1/sessions/:sessionId/metadata", "/v1/sessions/:sessionId/summary", "/v1/sessions/:sessionId/catalog",
-            "/v1/digest/daily", "/v1/delivery/records", "other",
+            "/v1/digest/daily", "/v1/coordination/overlaps", "/v1/delivery/records", "other",
           ],
         },
         outcome: {
@@ -60,6 +60,21 @@ export const COLLECTOR_REGISTRIES: CollectorRegistries = {
         stale: COUNT,
         tombstoned: COUNT,
         complete: { type: "boolean" },
+        latency_bucket: LATENCY,
+      },
+    },
+  },
+  "session-brief": {
+    "session_brief.tick_completed": {
+      scope: "installation",
+      properties: {
+        claimed: COUNT,
+        generated: COUNT,
+        reused: COUNT,
+        rate_limited: COUNT,
+        throttled: COUNT,
+        retrying: COUNT,
+        failed: COUNT,
         latency_bucket: LATENCY,
       },
     },
