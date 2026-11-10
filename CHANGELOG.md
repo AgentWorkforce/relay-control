@@ -3,7 +3,7 @@
 Notable changes to the self-hosted control plane. Dates and versions are
 assigned at release.
 
-## Unreleased
+## 0.5.9 (2026-11-10)
 
 - Added: Factory acquisition enrollment (default off). With Factory on and
   `SELFHOST_ACQUISITION_ORIGIN` set, connecting a Factory key mints one
