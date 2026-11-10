@@ -44,6 +44,7 @@ export const RELAY_TOOLS = ["list_relay_agents", "send_relay_message", "read_rel
   "post_relay_channel", "read_relay_channel"] as const;
 const RELAY_SPAWN_TOOLS = ["list_relay_spawn_targets", "spawn_relay_agent", "get_relay_spawn_status", "release_relay_agent"] as const;
 const AMP_TOOLS = ["list_amp_threads", "bind_amp_thread", "unbind_amp_thread"] as const;
+const FACTORY_TOOLS = ["list_factory_sessions", "bind_factory_session", "unbind_factory_session"] as const;
 const REPLICAS_TOOLS = ["list_replicas_environments", "spawn_replica", "get_replica_spawn", "recover_replica_spawn",
   "bind_replica", "release_replica"] as const;
 const CAPY_BINDING_TOOLS = ["bind_capy_thread", "unbind_capy_thread"] as const;
@@ -61,7 +62,7 @@ const CONNECT_TOOLS = ["create_connect", "host_connect_agent", "join_connect", "
 export const CAPABILITY_DISCOVERY_TOOL = "describe_capabilities";
 
 export type ToolGroupId =
-  | "shared_session_reads" | "team_activity" | "relay_messaging" | "hosted_launch" | "replicas" | "amp" | "capy_binding"
+  | "shared_session_reads" | "team_activity" | "relay_messaging" | "hosted_launch" | "replicas" | "amp" | "factory" | "capy_binding"
   | "customer_support" | "capy_launch" | "connect" | "events" | "relay_inbox_app" | "screens" | "events_settings" | "capability_discovery";
 
 type GroupDefinition = {
@@ -79,6 +80,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
   customer_support: { title: "Private customer support", tools: ["ask_customer_support"] },
   hosted_launch: { title: "Hosted agent launches", tools: RELAY_SPAWN_TOOLS },
   amp: { title: "Amp threads", tools: AMP_TOOLS },
+  factory: { title: "Factory Droid sessions", tools: FACTORY_TOOLS },
   replicas: { title: "Replicas agents", tools: REPLICAS_TOOLS },
   capy_binding: { title: "Capy thread binding", tools: CAPY_BINDING_TOOLS },
   capy_launch: { title: "Capy thread launches", tools: CAPY_SPAWN_TOOLS },
@@ -93,10 +95,12 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean } = {}): ToolPlanEntry[] {
   const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relay_messaging"];
   // Amp tools exist only when SELFHOST_AMP_ENABLED is on.
   if (options.amp) groups.push("amp");
+  // Factory tools exist only when SELFHOST_FACTORY_ENABLED is on.
+  if (options.factory) groups.push("factory");
   groups.push("capability_discovery");
   return groups.map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
 }
@@ -153,9 +157,10 @@ export function describeCapabilities(input: {
   workspaceId: string;
   role: WorkspaceRole;
   amp?: boolean;
+  factory?: boolean;
   providers: ProviderStatus[];
 }): CapabilityReport {
-  const planned = new Map(planToolGroups({ amp: input.amp }).map(item => [item.group, item]));
+  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory }).map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
     const definition = TOOL_GROUPS[id];
     const base = { id, title: definition.title };

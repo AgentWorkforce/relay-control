@@ -53,6 +53,7 @@ const AS_PERSON_UNAVAILABLE =
 
 export const RELAY_COORDINATION_GUIDANCE = "DM a specific agent by default. Use channels only to coordinate a larger swarm or broadcast to many agents, and subscribe only to channels you need. Reply to a channel post in that channel with post_relay_channel (thread_id for its thread), not by DM, unless the reply is private. At task start, check list_relay_agents and DM peers whose work your task affects, without waiting to be asked.";
 export const HOSTED_REPLY_GUIDANCE = "replies arrive in check_relay_inbox; poll it";
+export const FACTORY_REPLY_GUIDANCE = "Replies to this Factory agent are delivered into its Droid session by the Factory worker; check_relay_inbox does not serve Factory agents. Read the conversation with read_relay_conversation as=<this agent>.";
 export const DESKTOP_REPLY_GUIDANCE = "replies will be injected into your session by Agent Relay Desktop";
 export const MANAGED_AS_REFUSED = "This managed chat can only act as its verified desktop identity.";
 export const MANAGED_JOIN_REFUSED = "This chat can only use its verified desktop identity.";
@@ -215,7 +216,7 @@ export function relayFailure(error: unknown, operation?: RelayToolOperation) {
 // The per-request relay service.
 
 /** `desktop` marks a synced Agent Relay Desktop identity; its deliveries are injected, not polled. */
-type Identity = { name: string; token: string; desktop?: boolean };
+type Identity = { name: string; token: string; desktop?: boolean; factory?: boolean };
 type DesktopActor = LinkedDesktopIdentity & { desktop: true };
 /**
  * `remotePresent` and the ownership checks come from the token or, when
@@ -234,6 +235,7 @@ type ParticipantOptions = {
   bind?: boolean;
   executor?: SqlExecutor;
 };
+const NO_PARTICIPANT_MESSAGE = "No hosted participant with that name is owned by you in this workspace.";
 const rejectedToken = (name: string) => new RelayToolError(
   `The relay token for participant ${name} was rejected by Relaycast. Call join_relay with name=${name} to recover it, or leave_relay to remove it.`);
 type ChannelInput = { as?: string; as_person?: boolean; hosted?: boolean };
@@ -360,7 +362,7 @@ function createRelayService(context: McpContext) {
     const row = selector ? await findParticipant(query, workspaceId, userId, organizationId, selector) : null;
     if (!row) {
       if (approvedId && !allowGone) throw new RelayToolError("The approved agent is no longer available. Reconnect the app to choose an agent.");
-      if (as && !allowMissing && !(oauth && !requested) && !approvedId) throw new RelayToolError("No hosted participant with that name is owned by you in this workspace.");
+      if (as && !allowMissing && !(oauth && !requested) && !approvedId) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
       return null;
     }
     if (row.relayWorkspaceId !== relayWorkspaceId) {
@@ -603,8 +605,25 @@ function createRelayService(context: McpContext) {
       already_joined: joined.alreadyJoined, reply_guidance: DESKTOP_REPLY_GUIDANCE };
   }
 
-  /** The linked Desktop identity, else the participant `as` names or this session's, auto-joining this session when it has none. */
-  async function hostedActor<T>(as: string | undefined, fn: (identity: Identity) => Promise<T>): Promise<T> {
+  /** Whether `as` may fall back to the Factory hook: native, unmanaged calls naming an agent, with Factory on. */
+  const factoryFallback = (as: string | undefined): as is string => Boolean(as && !managed && !oauth && context.factory);
+
+  /**
+   * The caller's own bound Factory agent named `as`, else the original
+   * missing-participant error. Factory agents are hosted by the Factory
+   * service's bindings, not participant rows, so `participant()` never finds
+   * them; no participant row is created and nothing auto-joins.
+   */
+  async function factoryActor(as: string): Promise<Identity> {
+    const found = await context.factory!.agentFor(workspaceId, userId, as);
+    if (!found) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
+    return { name: found.name, token: found.token, factory: true };
+  }
+
+  /** The linked Desktop identity, else the participant `as` names or this session's, auto-joining this session when it has none. Only send opts into the Factory hook. */
+  async function hostedActor<T>(as: string | undefined, fn: (identity: Identity) => Promise<T>,
+    options: { factory?: boolean } = {}): Promise<T> {
+    const viaFactory = options.factory === true && factoryFallback(as);
     if (managed) {
       await managedActorOnly(as);
       return fn(await desktop());
@@ -613,7 +632,8 @@ function createRelayService(context: McpContext) {
       const linkedIdentity = await linkedDesktop();
       if (linkedIdentity) return fn(linkedIdentity);
     }
-    let hosted = await participant(as, { allowMissing: Boolean(oauth) });
+    let hosted = await participant(as, { allowMissing: Boolean(oauth) || viaFactory });
+    if (!hosted && viaFactory) return fn(await factoryActor(as));
     if (!hosted) {
       await join({});
       hosted = await participant();
@@ -827,8 +847,9 @@ function createRelayService(context: McpContext) {
           delivery: peer.online ? "queued_unconfirmed" : "queued_offline",
           note: "Accepted by Relaycast; delivery and reading are not confirmed.",
           ...(identity.desktop ? { reply_guidance: DESKTOP_REPLY_GUIDANCE }
+            : identity.factory ? { reply_guidance: FACTORY_REPLY_GUIDANCE }
             : { reply_guidance: HOSTED_REPLY_GUIDANCE, desktop_relay_guidance: DESKTOP_RELAY_GUIDANCE }) };
-      });
+      }, { factory: true });
     },
 
     async read(input: { agent: string; as?: string; before?: string; limit: number }) {
@@ -837,7 +858,9 @@ function createRelayService(context: McpContext) {
       if (!peerName) throw new RelayToolError("Unknown or stale machine address in this workspace.");
       await managedActorOnly(input.as);
       const hosted: Identity | null = managed ? await desktop()
-        : (input.as ? null : await linkedDesktop()) ?? await participant(input.as);
+        : (input.as ? null : await linkedDesktop())
+          ?? await participant(input.as, { allowMissing: factoryFallback(input.as) })
+          ?? (factoryFallback(input.as) ? await factoryActor(input.as) : null);
       if (!hosted) return { you: null, conversation_id: null, messages: [], earlier: null };
       await touchPresence(hosted.token);
       const conv = await conversation(hosted.token, hosted.name, peerName);

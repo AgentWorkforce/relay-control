@@ -9,6 +9,7 @@ import type { SelfhostConfig } from "../config.js";
 import { mcpOAuthActive } from "./oauth/config.js";
 import { secureEqual } from "../crypto.js";
 import type { AmpDeps } from "../amp/service.js";
+import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
 import { providerStatuses, type ProviderProbes } from "../providers/registry.js";
 import type { ControlPlaneStore } from "../store.js";
@@ -106,6 +107,8 @@ export function createMcpHandler(input: {
   fetchImpl?: typeof fetch;
   /** Amp control dependencies, only when SELFHOST_AMP_ENABLED is on. */
   amp?: AmpDeps;
+  /** Factory tools and resolver hook, only when SELFHOST_FACTORY_ENABLED is on. */
+  factory?: FactoryMcpDeps;
   /** Provider runtime probes (src/providers/registry.ts); empty when unset. */
   providerProbes?: ProviderProbes;
   /** Own credential resolver, used only at these MCP routes when the module is enabled. */
@@ -305,6 +308,7 @@ export function createMcpHandler(input: {
         sessionId: typeof sessionId === "string" ? sessionId : undefined,
       },
       ...(!oauth && input.amp ? { amp: input.amp } : {}),
+      ...(!oauth && input.factory ? { factory: input.factory } : {}),
     };
 
     const server = buildMcpServer(context);

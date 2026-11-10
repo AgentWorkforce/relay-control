@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAmpTools } from "../amp/mcp-tools.js";
+import { registerFactoryTools } from "../factory/mcp-tools.js";
 import { SELFHOST_API_VERSION } from "../config.js";
 import { registerCapabilityDiscovery } from "./capabilities.js";
 import { ensureToolTitles, MCP_FACADE, planToolGroups, registerToolPlan } from "./catalog.js";
@@ -44,12 +45,14 @@ export function buildMcpServer(context: McpContext): McpServer {
   // Which groups this connection gets is decided in the catalog; this server
   // only supplies how each group registers.
   const amp = context.amp;
-  registerToolPlan(planToolGroups({ amp: Boolean(amp) }), {
+  const factory = context.factory;
+  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory) }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),
     team_activity: () => registerTeamActivity(server, context),
     relay_messaging: () => registerRelayMessaging(server, context),
     capability_discovery: () => registerCapabilityDiscovery(server, context),
     ...(amp ? { amp: () => registerAmpTools(server, context, amp) } : {}),
+    ...(factory ? { factory: () => registerFactoryTools(server, context, factory) } : {}),
   });
   return server;
 }

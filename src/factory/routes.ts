@@ -16,6 +16,7 @@ import type { Principal } from "../store.js";
 import { MAX_REPLY_BODY_BYTES, parseReplyBody, replyBearer } from "./reply-capability.js";
 import { createFactoryRuntime, type FactoryRuntime } from "./runtime.js";
 import { createFactoryWorker } from "./worker.js";
+import type { FactoryMcpDeps } from "./mcp-tools.js";
 import {
   createFactoryService,
   bindingHash,
@@ -119,9 +120,13 @@ export function createFactoryModule(input: {
     return { principal: access.principal, workspace: access.workspace };
   }
 
+  /** The MCP tool group and send/read resolver hook; app.ts passes it only when enabled. */
+  const mcp: FactoryMcpDeps = { service, agentFor: service.agentFor };
+
   return {
     enabled,
     service,
+    mcp,
     runtime,
     relaycast,
     userAccess,
