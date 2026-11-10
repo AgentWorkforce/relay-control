@@ -12,12 +12,12 @@ test("provider connection API validates upstream, encrypts keys, and preserves p
   const tenant = await seedTenant(control.api);
   const calls: Array<{ url: string; init: RequestInit }> = [];
   let replyOverride: Response | null = null;
-  let streamResponse: (() => Response) | undefined;
+  let streamResponse: ((url: string) => Response) | undefined;
   let onFetch: (() => Promise<void>) | undefined;
   const fetchImpl: typeof fetch = async (input, init = {}) => {
     calls.push({ url: String(input), init });
     await onFetch?.();
-    if (streamResponse) return streamResponse();
+    if (streamResponse) return streamResponse(String(input));
     if (replyOverride) return replyOverride.clone();
     const url = String(input);
     if (url.endsWith("/projects")) return Response.json({ items: [] });
@@ -130,6 +130,22 @@ test("provider connection API validates upstream, encrypts keys, and preserves p
     assert.equal(result.status, 502);
     assert.equal(result.body.error, "credential_check_failed");
     assert.equal(await storage.keyFor(tenant.workspaceId, "capy"), "capy_" + "s".repeat(32));
+  });
+  await t.test("Devin probe cleanup cannot hold a successful connection open", { timeout: 1_000 }, async child => {
+    let cancelled = false;
+    streamResponse = url => url.endsWith("/messages")
+      ? new Response(new ReadableStream<Uint8Array>({
+        cancel() { cancelled = true; return new Promise<void>(() => {}); },
+      }), { status: 404 })
+      : Response.json({ items: [] });
+    child.after(() => { streamResponse = undefined; });
+    const key = "provider_key_" + "s".repeat(32);
+    const result = await api(`${path}/devin`, { method: "POST", token, body: { key, orgId: "cognition-org" } });
+    assert.equal(cancelled, true);
+    assert.equal(result.status, 200);
+    assert.equal(result.body.connection.providerAccount, "cognition-org");
+    assert.equal(result.text.includes(key), false);
+    assert.equal(await storage.keyFor(tenant.workspaceId, "devin"), key);
   });
   await t.test("cookie writes reject cross-site Origin and allow same-origin JSON", async () => {
     const count = calls.length;

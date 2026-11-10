@@ -180,7 +180,8 @@ export class RemoteAgentConnections {
         throw new RemoteAgentError(502, "credential_check_failed", "Devin could not confirm the key's session-management permission.");
       }
       if (response.status !== 404 && !response.ok) throw new RemoteAgentError(502, "credential_check_failed", "Devin could not confirm the key's session-management permission.");
-      await response.body?.cancel();
+      // The status is sufficient; cleanup must not extend the validation deadline.
+      void response.body?.cancel().catch(() => undefined);
       account = org;
     } else {
       const result = await check("https://api.cursor.com/v1/me");
