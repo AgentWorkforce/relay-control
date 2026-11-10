@@ -53,6 +53,14 @@ tags:
       Factory sessions (docs/factory-sessions.md). Every operation answers
       404 not_found when SELFHOST_FACTORY_ENABLED is off. Errors are
       {error, message} with stable codes; secrets are never returned.
+  - name: relay-node
+    description: |
+      Relay node broker (docs/relay-node-credential.md). A relay node host
+      presents a `relay-node` workspace API token (`sh_wk_`) and this service
+      runs a fixed set of Relaycast workspace-key routes with the workspace's
+      stored Relaycast key. Any other path or method under /relay-node/v1 is
+      403 scope_denied. Every answer is Cache-Control: no-store. Not served
+      through the /cloud alias.
   - name: internal
     description: |
       In-cluster service routes under /internal/v1. Never served through the
@@ -4935,14 +4943,22 @@ paths:
         neverExpires, requires aud and refuses agent_name; an operator
         service presents it to RelayHistory, which verifies it through
         POST /internal/v1/auth/introspect as a `service` principal. Several
-        acquisition-operator tokens may coexist in a workspace. These routes
+        acquisition-operator tokens may coexist in a workspace. relay-node
+        grants exactly relay:workspace:read, relay:nodes:read,
+        relay:nodes:enroll and relay:agents:read, requires nodeName, refuses
+        aud, agent_name and neverExpires, and is accepted only by the
+        /relay-node/v1 broker (never by the /api/v1 workspace token gate;
+        introspection reports `wrong-kind`); several relay-node tokens may
+        coexist for one nodeName (rotation: mint a successor, place it,
+        revoke the predecessor). See docs/relay-node-credential.md. These routes
         (also served at /cloud/api/v1) are the only way to mint or revoke
         one: a workspace owner/admin user token, never a workspace API token,
         the internal service token or the bootstrap token (401). agent_name
-        is a 400 for any purpose but relayfile-agent, aud a 400 for any
+        is a 400 for any purpose but relayfile-agent, nodeName a 400 for any
+        purpose but relay-node, aud a 400 for any
         purpose but relayfile-agent and acquisition-operator, and scope or
         scopes a 400 for every purpose (scopes are fixed by purpose).
-        neverExpires is a 400 for agent-runtime and deployment. expiryDays
+        neverExpires is a 400 for agent-runtime, deployment and relay-node. expiryDays
         1-365, default 90. accessToken (sh_wk_...) is returned only here.
       requestBody:
         required: true
@@ -4953,7 +4969,7 @@ paths:
               required: [label]
               properties:
                 label: { type: string, maxLength: 128 }
-                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator] }
+                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node] }
                 expiryDays: { type: integer, minimum: 1, maximum: 365 }
                 neverExpires:
                   type: boolean
@@ -4967,6 +4983,13 @@ paths:
                     relayfile-agent only, required. The agent the token speaks for;
                     unique per workspace among non-revoked relayfile-agent tokens
                     (409 agent_name_conflict otherwise).
+                nodeName:
+                  type: string
+                  pattern: "^[A-Za-z0-9._:-]{1,200}$"
+                  description: >-
+                    relay-node only, required. The node the token is bound to; the
+                    broker's POST /relay-node/v1/nodes only enrolls this name. Not
+                    unique: several non-revoked tokens may share it.
                 aud:
                   type: string
                   description: >-
@@ -4999,6 +5022,122 @@ paths:
       responses:
         "204": { description: Revoked }
         "404": { description: token_not_found }
+  /relay-node/v1/workspace:
+    get:
+      operationId: relayNodeWorkspace
+      tags: [relay-node]
+      summary: The Relaycast workspace behind the token (Relaycast GET /v1/workspace), reduced to its id and name.
+      security: [{ relayNodeBearer: [] }]
+      responses:
+        "200":
+          description: Relaycast's own workspace id and name.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, name]
+                additionalProperties: false
+                properties:
+                  id: { type: string }
+                  name: { type: string }
+        "401": { $ref: "#/components/responses/RelayNodeTokenInvalid" }
+        "403": { $ref: "#/components/responses/RelayNodeScopeDenied" }
+        "502": { $ref: "#/components/responses/RelayNodeRelaycastUnavailable" }
+        default: { $ref: "#/components/responses/RelayNodePassthrough" }
+  /relay-node/v1/nodes:
+    get:
+      operationId: relayNodeListNodes
+      tags: [relay-node]
+      summary: Relaycast GET /v1/nodes. Only the status, limit and cursor query keys are forwarded.
+      security: [{ relayNodeBearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/RelayNodeStatus"
+        - $ref: "#/components/parameters/RelayNodeLimit"
+        - $ref: "#/components/parameters/RelayNodeCursor"
+      responses:
+        "200": { $ref: "#/components/responses/RelayNodePassthrough" }
+        "401": { $ref: "#/components/responses/RelayNodeTokenInvalid" }
+        "403": { $ref: "#/components/responses/RelayNodeScopeDenied" }
+        "502": { $ref: "#/components/responses/RelayNodeRelaycastUnavailable" }
+        default: { $ref: "#/components/responses/RelayNodePassthrough" }
+    post:
+      operationId: relayNodeEnrollNode
+      tags: [relay-node]
+      summary: >-
+        Relaycast POST /v1/nodes for the token's own node. The body is
+        forwarded unchanged with Content-Type, Idempotency-Key and
+        X-Relaycast-Node-Token when present; its `name` must equal the
+        token's nodeName. The answer can carry a node token.
+      security: [{ relayNodeBearer: [] }]
+      parameters:
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
+        - { name: X-Relaycast-Node-Token, in: header, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              additionalProperties: true
+              properties:
+                name: { type: string, description: Must equal the token's nodeName. }
+      responses:
+        "201": { $ref: "#/components/responses/RelayNodePassthrough" }
+        "400": { description: "invalid_request: the body is not JSON; Relaycast's own 400 also passes through" }
+        "401": { $ref: "#/components/responses/RelayNodeTokenInvalid" }
+        "403":
+          description: "node_mismatch: body.name is not the token's nodeName (nothing is forwarded); or scope_denied"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RelayNodeError" }
+        "413": { description: "payload_too_large: body over 1 MiB" }
+        "502": { $ref: "#/components/responses/RelayNodeRelaycastUnavailable" }
+        default: { $ref: "#/components/responses/RelayNodePassthrough" }
+  /relay-node/v1/nodes/{name}:
+    get:
+      operationId: relayNodeGetNode
+      tags: [relay-node]
+      summary: Relaycast GET /v1/nodes/{name}.
+      security: [{ relayNodeBearer: [] }]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/RelayNodePassthrough" }
+        "401": { $ref: "#/components/responses/RelayNodeTokenInvalid" }
+        "403": { $ref: "#/components/responses/RelayNodeScopeDenied" }
+        "502": { $ref: "#/components/responses/RelayNodeRelaycastUnavailable" }
+        default: { $ref: "#/components/responses/RelayNodePassthrough" }
+  /relay-node/v1/agents:
+    get:
+      operationId: relayNodeListAgents
+      tags: [relay-node]
+      summary: Relaycast GET /v1/agents. Only the status, limit and cursor query keys are forwarded.
+      security: [{ relayNodeBearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/RelayNodeStatus"
+        - $ref: "#/components/parameters/RelayNodeLimit"
+        - $ref: "#/components/parameters/RelayNodeCursor"
+      responses:
+        "200": { $ref: "#/components/responses/RelayNodePassthrough" }
+        "401": { $ref: "#/components/responses/RelayNodeTokenInvalid" }
+        "403": { $ref: "#/components/responses/RelayNodeScopeDenied" }
+        "502": { $ref: "#/components/responses/RelayNodeRelaycastUnavailable" }
+        default: { $ref: "#/components/responses/RelayNodePassthrough" }
+  /relay-node/v1/agents/{name}:
+    get:
+      operationId: relayNodeGetAgent
+      tags: [relay-node]
+      summary: Relaycast GET /v1/agents/{name}.
+      security: [{ relayNodeBearer: [] }]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/RelayNodePassthrough" }
+        "401": { $ref: "#/components/responses/RelayNodeTokenInvalid" }
+        "403": { $ref: "#/components/responses/RelayNodeScopeDenied" }
+        "502": { $ref: "#/components/responses/RelayNodeRelaycastUnavailable" }
+        default: { $ref: "#/components/responses/RelayNodePassthrough" }
   /api/v1/workspaces/{workspaceId}/admin/audit:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -6830,6 +6969,10 @@ paths:
           description: payload_too_large (64 KiB)
 components:
   securitySchemes:
+    relayNodeBearer:
+      type: http
+      scheme: bearer
+      description: A live `relay-node` workspace API token (sh_wk_). Accepted only under /relay-node/v1.
     oauthMcpBearer:
       type: http
       scheme: bearer
@@ -6900,6 +7043,9 @@ components:
         `/api/v1/organizations/{org}/desktop-feed/profiles/{id}/publisher-tokens`
         (docs/desktop-feed.md). Status: implemented.
   parameters:
+    RelayNodeStatus: { name: status, in: query, required: false, schema: { type: string } }
+    RelayNodeLimit: { name: limit, in: query, required: false, schema: { type: string } }
+    RelayNodeCursor: { name: cursor, in: query, required: false, schema: { type: string } }
     FactoryBindingId:
       name: bindingId
       in: path
@@ -7021,6 +7167,12 @@ components:
       description: A declared `expected_assets[].name`; one path segment.
       schema: { type: string, maxLength: 255, pattern: "^[A-Za-z0-9][A-Za-z0-9_+-]*(?:\\.[A-Za-z0-9_+-]+)*$" }
   schemas:
+    RelayNodeError:
+      type: object
+      required: [error, message]
+      properties:
+        error: { type: string, enum: [token_invalid, scope_denied, node_mismatch, relaycast_unavailable, invalid_request, payload_too_large, rate_limited] }
+        message: { type: string }
     RecordedSessionState:
       type: [object, "null"]
       additionalProperties: false
@@ -8269,8 +8421,9 @@ components:
       properties:
         id: { type: string }
         label: { type: string }
-        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator] }
-        agent_name: { type: [string, "null"], description: relayfile-agent only; null for other purposes }
+        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node] }
+        agent_name: { type: [string, "null"], description: "relayfile-agent: the agent name; relay-node: the node name (same as nodeName); null for other purposes" }
+        nodeName: { type: [string, "null"], description: relay-node only; null for other purposes }
         aud: { type: [string, "null"], description: "relayfile-agent and acquisition-operator: the normalized audience origin; null for other purposes" }
         scopes:
           type: array
@@ -8900,6 +9053,34 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
         status: { enum: [active, expired, revoked] }
   responses:
+    RelayNodeTokenInvalid:
+      description: "token_invalid: no bearer, or not a live (unrevoked, unexpired) relay-node token."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/RelayNodeError" }
+    RelayNodeScopeDenied:
+      description: "scope_denied: the path or method is outside the relay-node allowlist."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/RelayNodeError" }
+    RelayNodeRelaycastUnavailable:
+      description: >-
+        relaycast_unavailable: the workspace has no Relaycast binding, Relaycast
+        is unreachable, redirected, or answered something other than JSON, or
+        Relaycast refused this service's stored workspace key (its 401/403 is
+        never passed through, so a node never reads it as its own token being
+        rejected).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/RelayNodeError" }
+    RelayNodePassthrough:
+      description: >-
+        Relaycast's status and JSON body, passed through unchanged (for example
+        200, 201, 400, 404, 409, 429 with Retry-After, 5xx). A 429 rate_limited
+        can also come from this service (600 requests per minute per token).
+      content:
+        application/json:
+          schema: { type: object, additionalProperties: true }
     McpOAuthUnavailable:
       description: >-
         MCP OAuth is enabled but cannot run because an input is missing or
