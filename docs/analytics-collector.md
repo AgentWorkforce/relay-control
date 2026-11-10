@@ -69,8 +69,8 @@ the value.
 - `name` and `component` are lowercase identifiers (`[a-z0-9][a-z0-9_.-]{0,63}`).
 - `deployment_id` follows the opaque ID grammar of `events.ts`.
 - `component` must have a registered event registry. The CLI supports
-  `relaycontrol`, `session-ingest`, `session-read-api` and
-  `session-pipeline-consumer`; another component is a startup error.
+  `relaycontrol`, `session-ingest`, `session-read-api`,
+  `session-pipeline-consumer` and `session-brief`; another component is a startup error.
 - `token_file` (a Secret mount) is read once at startup and trimmed. The token
   must be 32 to 512 bytes of visible ASCII.
 - Only the SHA-256 digest of each token is kept. A request token is hashed and
@@ -87,7 +87,10 @@ The session components use the closed vocabularies in
 `session_ingest.batch_completed` and the reader only
 `session_read.request_completed`, both with verified tenant and workspace
 attribution. The consumer may emit only `session_pipeline.index_tick_completed`,
-which is installation-scoped and carries neither attribution field. Properties
+which is installation-scoped and carries neither attribution field. The brief
+worker may emit only `session_brief.tick_completed`, also installation-scoped,
+with bounded counts (`claimed`, `generated`, `reused`, `rate_limited`,
+`throttled`, `retrying`, `failed`) and a latency bucket. Properties
 are route patterns, outcome/status classes, latency buckets, bounded counts and
 a completion boolean. Concrete paths, queries, session content and arbitrary
 properties are refused. Each component requires a separate producer token;

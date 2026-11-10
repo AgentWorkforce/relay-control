@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { projectEvent } from "../src/analytics/events.js";
 import { createCollectorSink } from "../src/analytics/sinks/collector.js";
 import { ANALYTICS_BATCH_SCHEMA } from "../src/analytics/types.js";
+import { COLLECTOR_REGISTRIES } from "../src/analytics-collector/registries.js";
 import {
   createProducerRegistry,
   loadCollectorConfig,
@@ -463,6 +464,54 @@ test("a valid batch is 204 with an empty body: exactly one new segment whose lin
   assert.equal(health.segments, 1);
   assert.equal(health.disk_bytes, Buffer.byteLength(content));
   assert.deepEqual(health.accepted, { batches: 1, events: 3 });
+});
+
+test("session-brief: its installation-scoped tick is accepted and the vocabulary is closed per component", async (t) => {
+  const ctx = await setup(t, {
+    registries: COLLECTOR_REGISTRIES,
+    producers: createProducerRegistry([{ name: "brief-a", component: "session-brief", deploymentId: DEPLOYMENT_A, token: TOKEN_A }]),
+  });
+  const tick = (overrides: Record<string, unknown> = {}) => installEvent({
+    component: "session-brief",
+    event: "session_brief.tick_completed",
+    properties: {
+      claimed: 3, generated: 2, reused: 1, rate_limited: 0, throttled: 0, retrying: 0, failed: 0, latency_bucket: "lt_1s",
+    },
+    ...overrides,
+  });
+  assert.equal((await post(ctx.origin, batch([tick()]), { token: TOKEN_A })).status, 204);
+  const scoped = await post(ctx.origin, batch([tick({ tenant_id: "org_synthetic", workspace_id: "ws_synthetic" })]), { token: TOKEN_A });
+  assert.equal(scoped.status, 400);
+  assert.deepEqual(scoped.body, { error: "invalid_batch", index: 0 });
+  const extra = await post(ctx.origin, batch([tick({
+    properties: {
+      claimed: 3, generated: 2, reused: 1, rate_limited: 0, throttled: 0, retrying: 0, failed: 0, latency_bucket: "lt_1s", session_id: "abc",
+    },
+  })]), { token: TOKEN_A });
+  assert.equal(extra.status, 400);
+  assert.deepEqual(extra.body, { error: "invalid_batch", index: 0 });
+  const foreign = await post(ctx.origin, batch([tick({
+    event: "session_pipeline.index_tick_completed",
+    properties: { collected: 1, failed: 0, requeued: 0, stale: 0, tombstoned: 0, complete: true, latency_bucket: "lt_1s" },
+  })]), { token: TOKEN_A });
+  assert.equal(foreign.status, 400);
+  assert.deepEqual(foreign.body, { error: "invalid_batch", index: 0 });
+  assert.equal((await readSegments(ctx.dataDir)).length, 1);
+});
+
+test("session-read-api: the coordination overlaps route is accepted", async (t) => {
+  const ctx = await setup(t, {
+    registries: COLLECTOR_REGISTRIES,
+    producers: createProducerRegistry([{ name: "read-a", component: "session-read-api", deploymentId: DEPLOYMENT_A, token: TOKEN_A }]),
+  });
+  const event = installEvent({
+    component: "session-read-api",
+    event: "session_read.request_completed",
+    tenant_id: "org_synthetic",
+    workspace_id: "ws_synthetic",
+    properties: { route: "/v1/coordination/overlaps", outcome: "served", status_class: "2xx", latency_bucket: "lt_250ms" },
+  });
+  assert.equal((await post(ctx.origin, batch([event]), { token: TOKEN_A })).status, 204);
 });
 
 test("busy gate: beyond MAX_IN_FLIGHT is 429 busy with Retry-After", async (t) => {
