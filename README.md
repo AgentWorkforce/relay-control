@@ -592,6 +592,16 @@ What the dashboard sees:
 Local development without Postgres: `npx tsx scripts/dev-server.ts` runs the
 API on PGlite at `http://127.0.0.1:8787` with fixed development secrets.
 
+New flow definitions and inline run submissions are parsed as TypeScript or a
+single YAML document before saving; duplicate YAML keys are rejected. Source
+errors answer 400 `flow_source_invalid` with only the format and numeric
+line/column, never a source excerpt. Missing/blank source or malformed request
+fields answer 400 `invalid_request`; source over 256 KiB answers 413
+`workflow_too_large`. A rejected edit preserves the prior definition, including
+when only its format changes. Invoking saved definitions and retrying or
+resuming persisted run snapshots queues their stored bytes without new syntax
+checks; blank/byte guards still apply.
+
 ## Security boundaries
 
 - Access tokens are bound to one user, organization, and workspace.
