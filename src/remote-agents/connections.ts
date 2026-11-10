@@ -39,6 +39,46 @@ const view = (row: ConnectionRow): RemoteConnection => ({
   validatedAt: new Date(row.validated_at).toISOString(),
 });
 
+const MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024;
+const invalidProviderResponse = () => new RemoteAgentError(
+  502, "invalid_provider_response", "The provider returned an unsupported response.",
+);
+
+/** Bound decoded response bytes and every stream read by the existing operation deadline. */
+async function providerJson(response: Response, signal: AbortSignal): Promise<unknown> {
+  if (!response.body) throw invalidProviderResponse();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      let onAbort!: () => void;
+      const aborted = new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        signal.throwIfAborted();
+        chunk = await Promise.race([reader.read(), aborted]);
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > MAX_PROVIDER_RESPONSE_BYTES) throw invalidProviderResponse();
+      chunks.push(chunk.value);
+    }
+    signal.throwIfAborted();
+    try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+    catch { throw invalidProviderResponse(); }
+  } finally {
+    // An uncooperative upstream cancellation must not extend the deadline.
+    void reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
 export class RemoteAgentConnections {
   constructor(
     readonly database: Database,
@@ -104,10 +144,11 @@ export class RemoteAgentConnections {
             ...(init.body ? { "content-type": "application/json" } : {}) },
         });
         if (!response.ok) throw new Error("provider_refused");
-        const body: unknown = await response.json();
+        const body: unknown = await providerJson(response, signal);
         if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("invalid_provider_response");
         return body as Record<string, unknown>;
-      } catch {
+      } catch (error) {
+        if (error instanceof RemoteAgentError) throw error;
         throw new RemoteAgentError(502, "credential_check_failed", "The provider could not validate this key. Check its permissions and try again.");
       }
     };

@@ -12,10 +12,12 @@ test("provider connection API validates upstream, encrypts keys, and preserves p
   const tenant = await seedTenant(control.api);
   const calls: Array<{ url: string; init: RequestInit }> = [];
   let replyOverride: Response | null = null;
+  let streamResponse: (() => Response) | undefined;
   let onFetch: (() => Promise<void>) | undefined;
   const fetchImpl: typeof fetch = async (input, init = {}) => {
     calls.push({ url: String(input), init });
     await onFetch?.();
+    if (streamResponse) return streamResponse();
     if (replyOverride) return replyOverride.clone();
     const url = String(input);
     if (url.endsWith("/projects")) return Response.json({ items: [] });
@@ -85,6 +87,49 @@ test("provider connection API validates upstream, encrypts keys, and preserves p
     replyOverride = Response.json(null);
     assert.equal((await api(`${path}/capy`, { method: "POST", token, body: { key: "capy_" + "x".repeat(32) } })).status, 502);
     replyOverride = null;
+  });
+  await t.test("an oversized provider stream is cancelled without replacing the stored key", async child => {
+    let cancelled = false;
+    const body = JSON.stringify({ items: [], padding: "界".repeat(22_000) });
+    assert.ok(body.length < 64 * 1024);
+    assert.ok(Buffer.byteLength(body) > 64 * 1024);
+    streamResponse = () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new TextEncoder().encode(body)); },
+      pull(controller) { controller.close(); },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 }));
+    child.after(() => { streamResponse = undefined; });
+    const result = await api(`${path}/capy`, { method: "POST", token, body: { key: "capy_" + "x".repeat(32) } });
+    assert.equal(result.status, 502);
+    assert.equal(result.body.error, "invalid_provider_response");
+    assert.equal(cancelled, true);
+    assert.equal(result.text.includes("padding"), false);
+    assert.equal(await storage.keyFor(tenant.workspaceId, "capy"), "capy_" + "s".repeat(32));
+  });
+  await t.test("a stalled provider body respects the operation deadline even when cancellation stalls", { timeout: 4_000 }, async child => {
+    const deadline = new AbortController();
+    let cancelled = false;
+    let pendingRead = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    child.mock.method(AbortSignal, "timeout", (milliseconds: number) => {
+      assert.equal(milliseconds, 15_000);
+      return deadline.signal;
+    });
+    streamResponse = () => {
+      timer = setTimeout(() => deadline.abort(new DOMException("deadline", "TimeoutError")), 20);
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new TextEncoder().encode('{"items":[')); },
+        pull() { pendingRead = true; return new Promise<void>(() => {}); },
+        cancel() { cancelled = true; return new Promise<void>(() => {}); },
+      }, { highWaterMark: 0 }));
+    };
+    child.after(() => { clearTimeout(timer); streamResponse = undefined; });
+    const result = await api(`${path}/capy`, { method: "POST", token, body: { key: "capy_" + "x".repeat(32) } });
+    assert.equal(pendingRead, true);
+    assert.equal(cancelled, true);
+    assert.equal(result.status, 502);
+    assert.equal(result.body.error, "credential_check_failed");
+    assert.equal(await storage.keyFor(tenant.workspaceId, "capy"), "capy_" + "s".repeat(32));
   });
   await t.test("Capy and Replicas aliases match the existing webapp contract without advertising runtime readiness", async () => {
     const prefix = `/cloud/api/v1/workspaces/${tenant.workspaceId}`;
