@@ -60,6 +60,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "person_identities",
   "person_messages",
   "person_revocations",
+  "remote_agent_connections",
   "run_events",
   "run_objects",
   "run_steps",

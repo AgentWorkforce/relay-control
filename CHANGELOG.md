@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Added: shared-cookie remote provider connection settings for Capy, Replicas,
+  Devin and Cursor Cloud (migration 0038). Keys are checked against the provider
+  and encrypted with the Control keyring; members receive masked summaries,
+  while owner/admin people manage keys. This ports connection management only;
+  provider Relay runtimes/history remain separate deprecation blockers listed
+  in [the parity matrix](docs/remote-agent-parity.md).
+
 - Added: `SELFHOST_INTROSPECT_OUTAGE_HOLD_MS` (default off) lets
   `POST /internal/v1/auth/introspect` answer a Desktop `sh_at_` token from its
   last active verdict, marked `held: true` with `exp` clamped, while the
