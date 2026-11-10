@@ -13,7 +13,7 @@ export function escapeHtml(value: string): string {
 
 // Agent Relay brand tokens, matching the dashboard's sign-in page
 // (relay-dashboard src/sign-in/SignInPage.tsx and src/styles.css).
-const STYLE = `:root{color-scheme:light dark;--mark:#4a90c2;--bg:#f9fafb;--card:#fff;--fg:#111827;--muted:#4b5563;--border:#d7e0e8;--field:#b6c4d0;--field-bg:#fff;--link:#2f6f9f;--focus:#2f6f9f;--accent:#2d6a9c;--accent-hover:#4a90c2;--accent-border:#234969;--accent-fg:#fff;--secondary-hover:#eef2f6;--danger:#b91c1c;--danger-soft:#fef2f2;--ok-soft:#f0fdf4}
+const STYLE = `:root{color-scheme:light dark;--mark:#4a90c2;--bg:#f9fafb;--card:#fff;--fg:#111827;--muted:#4b5563;--border:#d7e0e8;--field:#b6c4d0;--field-bg:#fff;--link:#2f6f9f;--focus:#2f6f9f;--accent:#2d6a9c;--accent-hover:#234969;--accent-border:#234969;--accent-fg:#fff;--secondary-hover:#eef2f6;--danger:#b91c1c;--danger-soft:#fef2f2;--ok-soft:#f0fdf4}
 @media (prefers-color-scheme:dark){:root{--mark:#74b8e2;--bg:#101c29;--card:#182838;--fg:#e8f0f7;--muted:#a9bdce;--border:#30485e;--field:#30485e;--field-bg:#101c29;--link:#80bfe5;--focus:#80bfe5;--secondary-hover:#24394b;--danger:#f87171;--danger-soft:#2a1212;--ok-soft:#0f2417}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
 main{max-width:28rem;margin:10vh auto;padding:0 24px}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:28px}
@@ -24,7 +24,7 @@ a:focus-visible,.btn:focus-visible,summary:focus-visible{outline:2px solid var(-
 .btn:hover{background:var(--accent-hover);text-decoration:none}.btn:visited{color:var(--accent-fg)}
 .btn.secondary{background:transparent;color:var(--fg);border-color:var(--field)}.btn.secondary:hover{background:var(--secondary-hover)}.btn.secondary:visited{color:var(--fg)}
 input[type=email],input[type=password]{width:100%;padding:10px 14px;border-radius:6px;border:1px solid var(--field);background:var(--field-bg);color:var(--fg);font:inherit;font-size:.92rem;margin:0 0 10px;outline:none}
-input[type=email]:focus,input[type=password]:focus{border-color:var(--focus);box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 30%,transparent)}
+input[type=email]:focus,input[type=password]:focus{border-color:var(--focus);box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 30%,transparent)}@media (forced-colors:active){input[type=email]:focus,input[type=password]:focus{outline:2px solid CanvasText;outline-offset:1px}}
 .or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:.8rem;margin:18px 0}.or:before,.or:after{content:"";flex:1;border-top:1px solid var(--border)}
 .notice{border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin:0 0 16px;font-size:.92rem}.notice.error{border-color:var(--danger);background:var(--danger-soft);color:var(--danger)}.notice.ok{background:var(--ok-soft)}
 dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0 0 16px;font-size:.92rem}dt{color:var(--muted)}dd{margin:0;word-break:break-all}
