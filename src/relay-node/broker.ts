@@ -7,6 +7,10 @@ import type { ApiTokenStore } from "../admin/api-tokens.js";
  * Relaycast key; this broker runs a fixed set of Relaycast workspace-key
  * routes for it with the stored key, which never leaves this service.
  *
+ * Answers use Relaycast's envelopes: `{ok: true, data}` on success and
+ * `{ok: false, error: {code, message}}` for the broker's own errors, so the
+ * Relaycast SDKs can parse them.
+ *
  * - 401 token_invalid: no bearer, or not a live relay-node token.
  * - 403 scope_denied: any path or method outside the allowlist.
  * - 403 node_mismatch: POST nodes whose body names another node; nothing is forwarded.
@@ -71,39 +75,59 @@ export async function handleRelayNode(
 ): Promise<boolean> {
   if (path !== RELAY_NODE_PREFIX && !path.startsWith(`${RELAY_NODE_PREFIX}/`)) return false;
   const send = (status: number, body: unknown) => deps.json(response, status, body, true);
+  const fail = (status: number, code: string, message: string) =>
+    send(status, { ok: false, error: { code, message } });
+  // deps.rateLimit (429) and deps.bodyText (413) throw an HttpError-shaped error.
+  const failThrown = (error: unknown): boolean => {
+    const thrown = error as { status?: unknown; code?: unknown; message?: unknown } | null;
+    if (!thrown || typeof thrown.status !== "number" || typeof thrown.code !== "string") return false;
+    fail(thrown.status, thrown.code, typeof thrown.message === "string" ? thrown.message : thrown.code);
+    return true;
+  };
   const token = deps.bearer(request);
   const principal = token ? await deps.apiTokens.authenticateRelayNode(token) : null;
   if (!principal) {
-    send(401, { error: "token_invalid", message: "A live relay-node token is required" });
+    fail(401, "token_invalid", "A live relay-node token is required");
     return true;
   }
-  deps.rateLimit(response, `relay-node:${principal.tokenId}`, RELAY_NODE_RATE_LIMIT);
+  try {
+    deps.rateLimit(response, `relay-node:${principal.tokenId}`, RELAY_NODE_RATE_LIMIT);
+  } catch (error) {
+    if (failThrown(error)) return true;
+    throw error;
+  }
   const route = plan(method, path);
   if (route === "denied") {
-    send(403, { error: "scope_denied", message: "This route is not available to relay-node tokens" });
+    fail(403, "scope_denied", "This route is not available to relay-node tokens");
     return true;
   }
   if (route === "malformed") {
-    send(400, { error: "invalid_request", message: "Malformed path segment" });
+    fail(400, "invalid_request", "Malformed path segment");
     return true;
   }
 
   let forwardBody: string | undefined;
   const headers: Record<string, string> = {};
   if (route.kind === "enroll") {
-    const raw = await deps.bodyText(request);
+    let raw: string;
+    try {
+      raw = await deps.bodyText(request);
+    } catch (error) {
+      if (failThrown(error)) return true;
+      throw error;
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      send(400, { error: "invalid_request", message: "Body must be valid JSON" });
+      fail(400, "invalid_request", "Body must be valid JSON");
       return true;
     }
     const name = parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>).name
       : undefined;
     if (typeof name !== "string" || name !== principal.nodeName) {
-      send(403, { error: "node_mismatch", message: "This token may only enroll its own node" });
+      fail(403, "node_mismatch", "This token may only enroll its own node");
       return true;
     }
     forwardBody = raw;
@@ -116,7 +140,7 @@ export async function handleRelayNode(
 
   const binding = await deps.relaycastBinding(principal.workspaceId);
   if (!binding) {
-    send(502, { error: "relaycast_unavailable", message: "Relaycast is not available for this workspace" });
+    fail(502, "relaycast_unavailable", "Relaycast is not available for this workspace");
     return true;
   }
   headers.authorization = `Bearer ${binding.relaycastApiKey}`;
@@ -142,14 +166,14 @@ export async function handleRelayNode(
       const id = data?.id;
       const name = data?.name;
       if (typeof id !== "string" || typeof name !== "string") throw new Unavailable();
-      send(200, { id, name });
+      send(200, { ok: true, data: { id, name } });
       return true;
     }
     if (answer.retryAfter) response.setHeader("retry-after", answer.retryAfter);
     send(answer.status, answer.body);
   } catch (error) {
     if (!(error instanceof Unavailable)) throw error;
-    send(502, { error: "relaycast_unavailable", message: "Relaycast could not complete the request" });
+    fail(502, "relaycast_unavailable", "Relaycast could not complete the request");
   }
   return true;
 }
