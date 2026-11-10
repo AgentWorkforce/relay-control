@@ -51,7 +51,7 @@ const DAY_MS = 86_400_000;
 export const ACTIVITY_DAYS_PER_READ = 92;
 const MAX_ACTIVITY_DAYS = 366;
 
-type Rule = { max?: number; pattern?: RegExp; values?: readonly string[] };
+type Rule = { max?: number; pattern?: RegExp; values?: readonly string[]; trim?: boolean };
 
 /** Strict query validation: unknown or repeated parameters are rejected. */
 function query(
@@ -66,7 +66,8 @@ function query(
     if (!rule || params.getAll(name).length !== 1) {
       throw ctx.httpError(400, "invalid_request", `Invalid session parameter: ${name}`);
     }
-    const value = params.get(name)!.trim();
+    const raw = params.get(name)!;
+    const value = rule.trim === false ? raw : raw.trim();
     if (
       CONTROL.test(value) ||
       value.length > (rule.max ?? 512) ||
@@ -231,6 +232,7 @@ const LIST_RULES: Record<string, Rule> = {
   q: { max: 500 },
   cursor: { max: 4_096 },
   metadata: { values: ["deferred"] },
+  includeAgentName: { values: ["recorded"], trim: false },
   source: { max: 64 },
   project: { max: 512 },
   since: { max: 64, pattern: ISO_TIME },
@@ -288,6 +290,9 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
     const since = instant(ctx, input.since, "since");
     const until = instant(ctx, input.until, "until");
     const access = await ctx.workspaceAccess(ctx.request, workspaceId);
+    if (input.includeAgentName && !ctx.config.sessionReadApi) {
+      throw new UnsupportedView("param_includeAgentName");
+    }
     const { agent, ignored, text } = selectAgent(input.agent, input.q, Boolean(ctx.config.sessionSearchAgentTokens));
     if (agent && agent.length > MAX_AGENT_LENGTH) {
       throw ctx.httpError(400, "invalid_request", "Invalid session parameter: agent");
@@ -306,6 +311,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
       project: input.project,
       since,
       until,
+      includeAgentName: input.includeAgentName,
       ...(input.ranking ? { search: "hybrid" } : {}),
     }), { agentFilter: Boolean(agent) });
     // An older backend matches `foo*` literally, so its page is not a prefix result.
