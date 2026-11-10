@@ -1,4 +1,5 @@
 import type { AmpDeps } from "../amp/service.js";
+import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { readWorkspaceHistory } from "../sessions/history.js";
@@ -57,6 +58,8 @@ export type McpContext = {
   };
   /** Amp control (SELFHOST_AMP_ENABLED); absent when the feature is off. */
   amp?: AmpDeps;
+  /** Factory sessions (SELFHOST_FACTORY_ENABLED); absent when the feature is off. */
+  factory?: FactoryMcpDeps;
 };
 
 export class SharedSessionsToolError extends Error {

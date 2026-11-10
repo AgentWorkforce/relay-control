@@ -495,6 +495,7 @@ export function createApp(input: {
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
     ...(amp ? { amp: amp.deps } : {}),
+    ...(factory.enabled ? { factory: factory.mcp } : {}),
     ...(mcpOAuth.store ? {oauthSessions:mcpOAuth.store.sessions} : {}),
   });
   const desktopMcpCredentials = new DesktopMcpCredentials(store.database);

@@ -5,6 +5,10 @@ assigned at release.
 
 ## Unreleased
 
+- Added: Factory MCP tools `list_factory_sessions`, `bind_factory_session` and
+  `unbind_factory_session` (owner/admin, person connections only), and
+  `as=<factory agent>` resolution for send and read of the caller's own bound
+  Factory agents, only when `SELFHOST_FACTORY_ENABLED` is on.
 - Added: shared-cookie remote provider connection settings for Capy, Replicas,
   Devin and Cursor Cloud (migration 0038). Keys are checked against the provider
   and encrypted with the Control keyring; members receive masked summaries,
