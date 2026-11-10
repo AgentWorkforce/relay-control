@@ -11,19 +11,25 @@ export function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
-const STYLE = `:root{color-scheme:light dark;--mark:#4a90c2;--bg:#fafaf9;--card:#fff;--fg:#171717;--muted:#57534e;--border:#e7e5e4;--accent:#171717;--accent-fg:#fff;--danger:#b91c1c;--danger-soft:#fef2f2;--ok-soft:#f0fdf4}
-@media (prefers-color-scheme:dark){:root{--mark:#74b8e2;--bg:#0c0a09;--card:#1c1917;--fg:#f5f5f4;--muted:#a8a29e;--border:#292524;--accent:#f5f5f4;--accent-fg:#0c0a09;--danger:#f87171;--danger-soft:#2a1212;--ok-soft:#0f2417}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:26rem;margin:10vh auto;padding:0 16px}.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:28px}
-h1{font-size:1.35rem;margin:0 0 6px}p{margin:0 0 14px}.muted{color:var(--muted);font-size:.9rem}
-.btn{display:block;width:100%;text-align:center;padding:10px 16px;border-radius:999px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);font:inherit;font-weight:600;text-decoration:none;cursor:pointer}
-.btn.secondary{background:transparent;color:var(--fg);border-color:var(--border)}
-input[type=email],input[type=password]{width:100%;padding:9px 14px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--fg);font:inherit;margin:0 0 10px}
+// Agent Relay brand tokens, matching the dashboard's sign-in page
+// (relay-dashboard src/sign-in/SignInPage.tsx and src/styles.css).
+const STYLE = `:root{color-scheme:light dark;--mark:#4a90c2;--bg:#f9fafb;--card:#fff;--fg:#111827;--muted:#4b5563;--border:#d7e0e8;--field:#b6c4d0;--field-bg:#fff;--link:#2f6f9f;--focus:#2f6f9f;--accent:#2d6a9c;--accent-hover:#4a90c2;--accent-border:#234969;--accent-fg:#fff;--secondary-hover:#eef2f6;--danger:#b91c1c;--danger-soft:#fef2f2;--ok-soft:#f0fdf4}
+@media (prefers-color-scheme:dark){:root{--mark:#74b8e2;--bg:#101c29;--card:#182838;--fg:#e8f0f7;--muted:#a9bdce;--border:#30485e;--field:#30485e;--field-bg:#101c29;--link:#80bfe5;--focus:#80bfe5;--secondary-hover:#24394b;--danger:#f87171;--danger-soft:#2a1212;--ok-soft:#0f2417}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:28rem;margin:10vh auto;padding:0 24px}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:28px}
+h1{font-size:1.35rem;font-weight:600;letter-spacing:-.01em;margin:0 0 6px}p{margin:0 0 14px}.muted{color:var(--muted);font-size:.9rem}
+a{color:var(--link);text-underline-offset:2px;text-decoration:none}a:hover{text-decoration:underline}a:visited{color:var(--link)}
+a:focus-visible,.btn:focus-visible,summary:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:4px}
+.btn{display:block;width:100%;text-align:center;min-height:40px;padding:9px 16px;border-radius:6px;border:1px solid var(--accent-border);background:var(--accent);color:var(--accent-fg);font:inherit;font-size:.92rem;font-weight:500;text-decoration:none;cursor:pointer;transition:background-color .15s}
+.btn:hover{background:var(--accent-hover);text-decoration:none}.btn:visited{color:var(--accent-fg)}
+.btn.secondary{background:transparent;color:var(--fg);border-color:var(--field)}.btn.secondary:hover{background:var(--secondary-hover)}.btn.secondary:visited{color:var(--fg)}
+input[type=email],input[type=password]{width:100%;padding:10px 14px;border-radius:6px;border:1px solid var(--field);background:var(--field-bg);color:var(--fg);font:inherit;font-size:.92rem;margin:0 0 10px;outline:none}
+input[type=email]:focus,input[type=password]:focus{border-color:var(--focus);box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 30%,transparent)}
 .or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:.8rem;margin:18px 0}.or:before,.or:after{content:"";flex:1;border-top:1px solid var(--border)}
 .notice{border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin:0 0 16px;font-size:.92rem}.notice.error{border-color:var(--danger);background:var(--danger-soft);color:var(--danger)}.notice.ok{background:var(--ok-soft)}
 dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0 0 16px;font-size:.92rem}dt{color:var(--muted)}dd{margin:0;word-break:break-all}
-.brand{display:grid;grid-template-columns:auto minmax(0,1fr);column-gap:10px;align-items:center;margin:0 0 20px}.brand .mark{height:24px;width:auto;color:var(--mark)}.brand .wordmark{height:20px;width:auto;color:var(--fg)}
-.brand hr{grid-column:2;width:150px;max-width:100%;margin:14px 0;border:0;border-top:1px solid var(--border)}.cobrand{grid-column:2;display:flex;align-items:center;gap:10px;min-width:0}.cobrand img{height:22px;width:auto;max-width:160px;object-fit:contain;object-position:left;flex:none}.cobrand strong{font-size:16px;font-weight:700;min-width:0;overflow-wrap:anywhere}
+.brand{display:flex;flex-direction:column;align-items:flex-start;margin:0 0 24px}.brand .lockup{display:inline-flex;align-items:center;gap:10px}.brand .mark{height:24px;width:auto;color:var(--mark)}.brand .wordmark{height:20px;width:auto;color:var(--fg)}
+.brand hr{align-self:flex-start;width:150px;max-width:100%;margin:14px 0;border:0;border-top:1px solid var(--border)}.cobrand{display:flex;align-items:center;gap:10px;min-width:0;max-width:100%}.cobrand img{height:22px;width:auto;max-width:160px;object-fit:contain;object-position:left;flex:none}.cobrand strong{font-size:16px;font-weight:700;letter-spacing:-.01em;min-width:0;overflow-wrap:anywhere}
 details{margin-top:18px;font-size:.9rem}summary{cursor:pointer;color:var(--muted)}code{font-size:1.6rem;letter-spacing:.12em}`;
 
 export const PAGE_CSP =
@@ -48,14 +54,16 @@ function roleText(role: string): string {
 export type CoBrand = { logoUrl: string; orgName: string | null };
 
 /**
- * The lockup above the card. An `<img>` never runs script inside an SVG, and
- * the CSS caps how large the logo can draw.
+ * The lockup above the card: the Agent Relay lockup, a rule and the customer
+ * lockup stacked flush left in one column (co-brand option A, stacked). An
+ * `<img>` never runs script inside an SVG, and the CSS caps how large the logo
+ * can draw.
  */
 function brandHeader(coBrand: CoBrand | null): string {
   const customer = coBrand
     ? `<hr><div class="cobrand"><img src="${escapeHtml(coBrand.logoUrl)}" alt="${coBrand.orgName ? "" : "Organization logo"}" referrerpolicy="no-referrer">${coBrand.orgName ? `<strong>${escapeHtml(coBrand.orgName)}</strong>` : ""}</div>`
     : "";
-  return `<header class="brand">${AGENT_RELAY_MARK}${AGENT_RELAY_WORDMARK}${customer}</header>`;
+  return `<header class="brand"><span class="lockup">${AGENT_RELAY_MARK}${AGENT_RELAY_WORDMARK}</span>${customer}</header>`;
 }
 
 export function loginPage(input: {

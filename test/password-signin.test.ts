@@ -200,6 +200,21 @@ test("/login: co-brands under the Agent Relay lockup and allows only the logo's 
   assert.match(response.headers.get("content-security-policy") ?? "", /; img-src https:\/\/cdn\.example\.test$/);
   assert.match(html, /class="mark"/);
   assert.match(html, /class="wordmark"[\s\S]*<hr><div class="cobrand"><img src="https:\/\/cdn\.example\.test\/logo\.svg" alt="" referrerpolicy="no-referrer"><strong>Example &lt;Corp&gt;<\/strong>/);
+  // Option A, stacked: the Agent Relay lockup, the rule and the customer lockup share one flush-left column.
+  assert.match(html, /<header class="brand"><span class="lockup"><svg[^>]*class="mark"[\s\S]*class="wordmark"[\s\S]*<\/span><hr><div class="cobrand">/);
+  assert.match(html, /\.brand\{display:flex;flex-direction:column;align-items:flex-start/);
+  assert.doesNotMatch(html, /grid-column/);
+});
+
+test("/login: uses the Agent Relay brand palette with explicit link colours", async (t) => {
+  const ctx = await setup(t);
+  const html = await (await fetch(`${ctx.origin}/login`)).text();
+  for (const token of ["--bg:#f9fafb", "--card:#fff", "--border:#d7e0e8", "--link:#2f6f9f", "--bg:#101c29", "--card:#182838", "--border:#30485e", "--link:#80bfe5"]) {
+    assert.ok(html.includes(token), token);
+  }
+  assert.match(html, /a\{color:var\(--link\)/);
+  assert.match(html, /a:visited\{color:var\(--link\)\}/);
+  assert.doesNotMatch(html, /#fafaf9|#0c0a09|#1c1917/);
 });
 
 test("/login: without a logo shows only Agent Relay and publishes no name", async (t) => {
