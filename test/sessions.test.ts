@@ -906,6 +906,98 @@ test("read API: a downstream refusal is never echoed or retried", async (t) => {
   assert.equal(env.history.mints, 1, "a refusal never asks for another handoff");
 });
 
+test("recorded agent list opt-in forwards exactly once with scoped auth and preserves legacy defaults", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}/sessions`;
+  const seen: URL[] = [];
+  env.history.overrides.set("/v1/sessions", (_request, url) => {
+    seen.push(url);
+    return { body: { sessions: [{
+      sessionId: "alpha-1", source: "codex", title: "Recorded title", models: ["recorded-model"],
+      ...(url.searchParams.get("includeAgentName") === "recorded" ? { agentName: "example-agent" } : {}),
+    }] } };
+  });
+
+  const legacy = await call(env.origin, `${base}?metadata=deferred`, { token });
+  assert.equal(legacy.status, 200);
+  assert.equal(seen[0]!.search, `?limit=50&workspace=${env.alpha}`);
+  assert.equal(Object.hasOwn(legacy.body.items[0], "agentName"), false);
+  const before = env.history.requests.length;
+  const recorded = await call(env.origin, `${base}?metadata=deferred&agent=example-agent&includeAgentName=recorded`, { token });
+  assert.equal(recorded.status, 200);
+  assert.equal(recorded.body.items[0].agentName, "example-agent");
+  assert.equal(recorded.body.items[0].title, "Recorded title");
+  assert.deepEqual(recorded.body.items[0].models, ["recorded-model"]);
+  assert.equal(recorded.headers.get("cache-control"), "no-store");
+  assert.deepEqual(seen[1]!.searchParams.getAll("includeAgentName"), ["recorded"]);
+  assert.equal(seen[1]!.searchParams.get("agent"), "example-agent");
+  assert.equal(seen[1]!.searchParams.get("workspace"), env.alpha);
+  const reads = env.history.requests.slice(before);
+  assert.deepEqual(reads.map((entry) => entry.path), ["/v1/sessions"], "no catalog fan-out or extra handoff");
+  assert.match(reads[0]!.token ?? "", /^rth_at_read_/);
+  assert.notEqual(reads[0]!.token, token);
+  assert.equal(env.history.mints, 1);
+
+  const legacyAgain = await call(env.origin, `${base}?metadata=deferred`, { token });
+  assert.deepEqual(legacyAgain.body, legacy.body);
+  assert.equal(seen[2]!.search, seen[0]!.search);
+});
+
+test("recorded agent list opt-in rejects invalid or duplicate values before any upstream request", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/api/v1/workspaces/${env.alpha}/sessions`;
+  const before = env.history.requests.length;
+  for (const suffix of [
+    "includeAgentName=", "includeAgentName=Recorded", "includeAgentName=false",
+    "includeAgentName=must-not-echo", "includeAgentName=%20recorded%20", "includeAgentName=%0Arecorded",
+    "includeAgentName=recorded&includeAgentName=recorded", "includeAgentName=recorded&includeAgentName=false",
+  ]) {
+    const refused = await call(env.origin, `${base}?${suffix}`, { token });
+    assert.equal(refused.status, 400, suffix);
+    assert.equal(refused.body.error, "invalid_request");
+    assert.equal(refused.body.message, "Invalid session parameter: includeAgentName");
+    assert(!JSON.stringify(refused.body).includes("must-not-echo"));
+  }
+  assert.equal(env.history.requests.length, before);
+  assert.equal(env.history.mints, 0);
+});
+
+test("recorded agent metadata preserves member and upstream workspace attestation guards", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.memberId, env.alpha);
+  const path = `/api/v1/workspaces/${env.alpha}/sessions?includeAgentName=recorded`;
+  const before = env.history.requests.length;
+  assert.equal((await call(env.origin, path)).status, 401);
+  assert.equal((await call(env.origin, `/api/v1/workspaces/${env.beta}/sessions?includeAgentName=recorded`, { token })).status, 404);
+  assert.equal((await call(env.origin, `${path}&workspace=${env.beta}`, { token })).status, 400);
+  assert.equal(env.history.requests.length, before);
+  env.history.overrides.set("/v1/sessions", () => ({
+    headers: { "x-relayhistory-workspace-id": env.beta },
+    body: { sessions: [{ sessionId: "beta-1", source: "codex", agentName: "private-foreign-name" }] },
+  }));
+  const refused = await call(env.origin, path, { token });
+  assert.equal(refused.status, 502);
+  assert(!JSON.stringify(refused.body).includes("private-foreign-name"));
+});
+
+test("recorded agent list opt-in requires the native read context and returns safe unsupported metadata", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  // Current loadConfig requires native; simulate an unsupported legacy route context.
+  Reflect.deleteProperty(env.config, "sessionReadApi");
+  const before = env.history.requests.length;
+  const result = await call(env.origin, `/api/v1/workspaces/${env.alpha}/sessions?includeAgentName=recorded`, { token });
+  assert.equal(result.status, 501);
+  assert.equal(result.body.error, "unsupported_by_backend");
+  assert.equal(result.body.reason, "param_includeAgentName");
+  assert.equal(result.body.message, "The configured session backend does not serve this view");
+  assert.equal(result.headers.get("cache-control"), "no-store");
+  assert.equal(env.history.requests.length, before);
+  assert.equal(env.history.mints, 0);
+});
+
 test("agent filter: passes one agent to the read API and reports what it applied", async (t) => {
   const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);

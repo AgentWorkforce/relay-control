@@ -2589,11 +2589,26 @@ paths:
         `GET /v1/sessions`. The upstream query always includes
         `workspace={authorized workspace UUID}`; callers cannot provide or
         override an upstream origin, path, workspace, or credential.
+        Recorded agent metadata is an explicit native-reader opt-in. Without it,
+        list requests and response fields retain the existing backend contract.
       parameters:
         - name: metadata
           in: query
           schema:
             const: deferred
+        - name: includeAgentName
+          in: query
+          description: |
+            Opt in to optional top-level recorded agentName metadata from a
+            compatible native session reader. Forwarded as includeAgentName=recorded
+            with the authorized workspace; Control does not infer names or fetch
+            per-session catalogs. Missing or ambiguous names may be omitted.
+            An unavailable native read context returns 501 unsupported_by_backend
+            with reason param_includeAgentName. Unknown values or repeated
+            parameters return 400 invalid_request before any upstream request.
+          schema:
+            type: string
+            enum: [recorded]
         - name: agent
           in: query
           description: |
@@ -7523,6 +7538,9 @@ components:
                 type: string
               source:
                 type: string
+              agentName:
+                type: [string, "null"]
+                description: Optional recorded name returned by a compatible native reader when includeAgentName=recorded is requested; never inferred by Control.
               summary:
                 type: [string, "null"]
               lastTs:
