@@ -100,8 +100,19 @@ export interface HistoryUploadConfig {
   region: string;
   /** Top-level key root shared with the sessions pipeline (default 96bulls). */
   keyRoot: string;
-  roleArn: string;
-  kmsKeyArn: string;
+  /**
+   * Public S3-compatible endpoint origin upload clients reach (path-style
+   * URLs), or null for AWS S3 (virtual-hosted URLs).
+   */
+  endpoint: string | null;
+  /** Endpoint Control reads privacy journals through; null only when endpoint is null. */
+  internalEndpoint: string | null;
+  /** Upload role for STS AssumeRole on AWS; null with an endpoint (presigned URLs only). */
+  roleArn: string | null;
+  /** KMS key ARN on AWS (always set); an optional opaque key id with an endpoint. */
+  kmsKeyArn: string | null;
+  /** Static keys of the dedicated issuer user of an S3-compatible store (null on AWS). Never logged. */
+  storeCredentials: { accessKeyId: string; secretAccessKey: string } | null;
   /** HMAC key bytes for the privacy witness, shared with the pipeline consumer. Never logged. */
   witnessKey: Buffer;
   maxObjectBytes: number;
@@ -862,12 +873,43 @@ export function loadDesktopFeedConfig(env: Env = process.env): DesktopFeedConfig
 }
 const UPLOAD_ROLE_ARN = /^arn:aws(-[a-z]+)*:iam::\d{12}:role\/[\w+=,.@/-]{1,512}$/;
 const UPLOAD_KMS_KEY_ARN = /^arn:aws(-[a-z]+)*:kms:[a-z0-9-]+:\d{12}:key\/[0-9a-f-]{36}$/;
+/** With an endpoint the key is opaque: stores such as MinIO name keys rather than use ARNs. */
+const UPLOAD_KMS_KEY_ID = /^[A-Za-z0-9:/_.+=,@-]{1,2048}$/;
+
+/** An endpoint origin (optionally with a path) or null when unset; errors name the variable only. */
+function uploadEndpoint(env: Env, name: string): string | null {
+  const raw = env[name]?.trim();
+  if (!raw) return null;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`${name} must be an http(s) URL`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error(`${name} must be an http(s) URL`);
+  if (url.username || url.password) throw new Error(`${name} must not contain credentials`);
+  // URL drops an empty "?" or "#", so check the raw text as well.
+  if (url.search || url.hash || raw.includes("?") || raw.includes("#")) {
+    throw new Error(`${name} must not contain a query or fragment`);
+  }
+  return url.toString().replace(/\/+$/, "");
+}
 
 /**
  * SELFHOST_HISTORY_UPLOAD_DIRECT (off | allowlist | on) turns on
  * POST .../relayhistory/upload-credentials (docs/sessions-read-api.md). Unset
  * or off: null, and the route answers 404. Errors name the variable, never
  * its value.
+ *
+ * Without SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT the store is AWS S3: the
+ * role and KMS key ARNs are required and clients get STS credentials or
+ * presigned URLs. With it the store is S3-compatible (for example a bundled
+ * MinIO): presigned URLs only, signed with the dedicated issuer user's keys
+ * from SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID/SECRET_ACCESS_KEY (or _FILE,
+ * both required), so the role must be unset and the KMS key is an optional
+ * key id. Those keys serve only the upload issuer; the process-wide AWS
+ * credential chain is untouched. SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT
+ * (default: the public endpoint) is where Control reads privacy journals.
  */
 export function loadHistoryUploadConfig(env: Env = process.env): HistoryUploadConfig | null {
   const mode = env.SELFHOST_HISTORY_UPLOAD_DIRECT?.trim() || "off";
@@ -891,10 +933,40 @@ export function loadHistoryUploadConfig(env: Env = process.env): HistoryUploadCo
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(keyRoot)) {
     throw new Error("SELFHOST_HISTORY_UPLOAD_KEY_ROOT must match ^[a-z0-9][a-z0-9-]{0,62}$");
   }
-  const roleArn = required(env, "SELFHOST_HISTORY_UPLOAD_ROLE_ARN");
-  if (!UPLOAD_ROLE_ARN.test(roleArn)) throw new Error("SELFHOST_HISTORY_UPLOAD_ROLE_ARN must be an IAM role ARN");
-  const kmsKeyArn = required(env, "SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN");
-  if (!UPLOAD_KMS_KEY_ARN.test(kmsKeyArn)) throw new Error("SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN must be a KMS key ARN");
+  const endpoint = uploadEndpoint(env, "SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT");
+  const internalOverride = uploadEndpoint(env, "SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT");
+  if (internalOverride && !endpoint) {
+    throw new Error("SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT requires SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT");
+  }
+  const internalEndpoint = internalOverride ?? endpoint;
+  let roleArn: string | null;
+  let kmsKeyArn: string | null;
+  if (!endpoint) {
+    roleArn = required(env, "SELFHOST_HISTORY_UPLOAD_ROLE_ARN");
+    if (!UPLOAD_ROLE_ARN.test(roleArn)) throw new Error("SELFHOST_HISTORY_UPLOAD_ROLE_ARN must be an IAM role ARN");
+    kmsKeyArn = required(env, "SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN");
+    if (!UPLOAD_KMS_KEY_ARN.test(kmsKeyArn)) throw new Error("SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN must be a KMS key ARN");
+  } else {
+    if (env.SELFHOST_HISTORY_UPLOAD_ROLE_ARN?.trim()) {
+      throw new Error("SELFHOST_HISTORY_UPLOAD_ROLE_ARN is not supported with SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT (S3-compatible stores issue presigned URLs only)");
+    }
+    roleArn = null;
+    kmsKeyArn = env.SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN?.trim() || null;
+    if (kmsKeyArn !== null && !UPLOAD_KMS_KEY_ID.test(kmsKeyArn)) {
+      throw new Error("SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN must be a key id without whitespace");
+    }
+  }
+  let storeCredentials: HistoryUploadConfig["storeCredentials"] = null;
+  if (endpoint) {
+    const accessKeyId = readSecret(env, "SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID");
+    if (!accessKeyId) throw new Error("SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID (or _FILE) is required with SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT");
+    const secretAccessKey = readSecret(env, "SELFHOST_HISTORY_UPLOAD_SECRET_ACCESS_KEY");
+    if (!secretAccessKey) throw new Error("SELFHOST_HISTORY_UPLOAD_SECRET_ACCESS_KEY (or _FILE) is required with SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT");
+    storeCredentials = { accessKeyId, secretAccessKey };
+  } else if (["SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID", "SELFHOST_HISTORY_UPLOAD_SECRET_ACCESS_KEY"]
+    .some((name) => env[name]?.trim() || env[`${name}_FILE`]?.trim())) {
+    throw new Error("SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID and SELFHOST_HISTORY_UPLOAD_SECRET_ACCESS_KEY are only used with SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT");
+  }
   const witnessKeyText = readSecret(env, "SELFHOST_HISTORY_UPLOAD_WITNESS_KEY");
   if (!witnessKeyText) throw new Error("SELFHOST_HISTORY_UPLOAD_WITNESS_KEY (or _FILE) is required");
   // base64url of the shared key bytes, unpadded or padded.
@@ -913,8 +985,11 @@ export function loadHistoryUploadConfig(env: Env = process.env): HistoryUploadCo
     bucket,
     region,
     keyRoot,
+    endpoint,
+    internalEndpoint,
     roleArn,
     kmsKeyArn,
+    storeCredentials,
     witnessKey,
     maxObjectBytes,
   };

@@ -35,7 +35,7 @@ import { createDesktopFeedHandler, type DesktopFeedLimits } from "./desktop-feed
 import { AwsKmsDesktopFeedSigner, MemoryDesktopFeedSigner, type DesktopFeedSigner } from "./desktop-feed/signer.js";
 import { MemoryDesktopFeedStorage, S3DesktopFeedStorage, type DesktopFeedStorage } from "./desktop-feed/storage.js";
 import { DesktopFeedStore } from "./desktop-feed/store.js";
-import { DefaultAwsCredentialProvider, type AwsCredentialProvider } from "./aws/sigv4.js";
+import { DefaultAwsCredentialProvider, StaticAwsCredentialProvider, type AwsCredentialProvider } from "./aws/sigv4.js";
 import { AwsStsClient, type StsClient } from "./aws/sts.js";
 import {
   HistoryUploadCredentials,
@@ -761,12 +761,17 @@ export function createApp(input: {
 
   // Direct-to-S3 session uploads (docs/sessions-read-api.md): off, so the
   // upload-credentials route 404s, unless SELFHOST_HISTORY_UPLOAD_DIRECT is
-  // allowlist or on. One AWS credential provider serves STS and the journal.
+  // allowlist or on. One AWS credential provider serves STS, the journal and
+  // (S3-compatible stores) presigned URLs: the AWS chain on AWS, the dedicated
+  // issuer user's static keys on an S3-compatible store.
   const uploadConfig = config.historyUpload ?? null;
   const historyUpload = uploadConfig
     ? (() => {
       const hooks = input.historyUpload;
-      const credentials = hooks?.credentials ?? new DefaultAwsCredentialProvider();
+      const credentials = hooks?.credentials
+        ?? (uploadConfig.storeCredentials
+          ? new StaticAwsCredentialProvider(uploadConfig.storeCredentials)
+          : new DefaultAwsCredentialProvider());
       return new HistoryUploadCredentials({
         config: uploadConfig,
         sts: hooks?.sts ?? new AwsStsClient({
@@ -776,10 +781,13 @@ export function createApp(input: {
           bucket: uploadConfig.bucket,
           region: uploadConfig.region,
           credentials,
-          endpoint: hooks?.endpoints?.s3,
+          // The internal endpoint (in-cluster service URL) avoids hairpinning
+          // through the public ingress the upload clients use.
+          endpoint: hooks?.endpoints?.s3 ?? uploadConfig.internalEndpoint ?? undefined,
           fetchImpl: hooks?.fetchImpl,
           now: input.now,
         }),
+        credentials,
         now: input.now,
       });
     })()
