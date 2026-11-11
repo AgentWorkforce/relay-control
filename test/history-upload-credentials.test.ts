@@ -577,3 +577,28 @@ test("route: GET is 405 with allow POST, and session sync still returns the call
   assert.equal(sync.status, 200, sync.raw);
   assert.equal(sync.body.accessToken, env.token);
 });
+
+// ---- relay-upload-inbox-v1 contract vectors (sessions pipeline decision 0004) ----
+
+test("relay-upload-inbox-v1 contract vectors: user segment, journal key, prefix, key shape and witness", () => {
+  // Synthetic ids from the pipeline's relay-upload-inbox-v1.vectors.json. The witness key is the
+  // vectors' TEST ONLY key (bytes 0x00..0x1f) and must never be configured anywhere.
+  const tenant = { orgId: "org-synthetic", workspaceId: "ws-synthetic", userId: "user-synthetic-a" };
+  const uh = "5a3b60a76d453cbeead919bae088d3b5";
+  const prefix = `96bulls/.upload-inbox/org-synthetic/v1/ws=ws-synthetic/u=${uh}/`;
+  assert.equal(uploadUserHash(tenant), uh);
+  assert.equal(journalKey("96bulls", tenant),
+    `96bulls/.admission-inbox/org-synthetic/v1/ws=ws-synthetic/m=srv_${uh}/privacy-journal.json`);
+  assert.equal(uploadInboxPrefix("96bulls", tenant), prefix);
+  const relativeKey = "o=origin-synthetic/b=f671c6d71e203808d157b293a8f29b25/d=36d61817e86f05e696d3b4af66dbb3ff-w7.json.zst";
+  assert.equal(uploadKeyValid(relativeKey), true);
+  assert.equal(prefix + relativeKey,
+    `96bulls/.upload-inbox/org-synthetic/v1/ws=ws-synthetic/u=${uh}/o=origin-synthetic/b=f671c6d71e203808d157b293a8f29b25/d=36d61817e86f05e696d3b4af66dbb3ff-w7.json.zst`);
+  const testOnlyKey = Buffer.from("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "base64url");
+  const payload = { v: 1 as const, org: "org-synthetic", ws: "ws-synthetic", user: "user-synthetic-a", seq: 7, exp: 1_794_355_200 };
+  const token = "v1.eyJ2IjoxLCJvcmciOiJvcmctc3ludGhldGljIiwid3MiOiJ3cy1zeW50aGV0aWMiLCJ1c2VyIjoidXNlci1zeW50aGV0aWMtYSIsInNlcSI6NywiZXhwIjoxNzk0MzU1MjAwfQ.Q8WhA5OtmmCFKH3UPe85UnVBjjo_SQgGfDv-nDrRSO8";
+  assert.equal(signWitness(testOnlyKey, payload), token);
+  assert.deepEqual(verifyWitness(testOnlyKey, token), payload);
+  // The vectors' bad-MAC refusal (last character changed).
+  assert.equal(verifyWitness(testOnlyKey, token.slice(0, -1) + "A"), null);
+});
