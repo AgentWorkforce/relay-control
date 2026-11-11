@@ -1,7 +1,8 @@
 // AWS Signature Version 4 and credential resolution for the Desktop feed's S3
-// object store and KMS signer (src/desktop-feed/). Hand-rolled on node:crypto so
+// object store and KMS signer (src/desktop-feed/), STS and credential blobs. Hand-rolled on node:crypto so
 // self-host carries no AWS SDK dependency.
 import { createHash, createHmac } from "node:crypto";
+import { readFile } from "node:fs/promises";
 
 export type AwsCredentials = { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
 
@@ -124,19 +125,59 @@ export interface AwsCredentialProvider {
   get(): Promise<AwsCredentials>;
 }
 
+type CachedCredentials = { value: AwsCredentials; expiresAt: number };
+type ReadFileLike = (path: string) => Promise<string>;
+
+/** Hosts an http:// AWS_CONTAINER_CREDENTIALS_FULL_URI may name (as the AWS SDKs allow). */
+const CONTAINER_HTTP_HOSTS = new Set(["169.254.170.2", "169.254.170.23", "[fd00:ec2::23]", "localhost", "[::1]"]);
+const CONTAINER_TIMEOUT_MS = 5_000;
+const IMDS_TIMEOUT_MS = 5_000;
+const STS_TIMEOUT_MS = 10_000;
+/** AWS error codes are short identifiers; anything else is not echoed. */
+const AWS_ERROR_CODE = /^[A-Za-z0-9._-]{1,64}$/;
+
+function containerHostAllowed(url: URL): boolean {
+  if (url.protocol === "https:") return true;
+  if (url.protocol !== "http:") return false;
+  return CONTAINER_HTTP_HOSTS.has(url.hostname) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(url.hostname);
+}
+
+function xmlElement(xml: string, name: string): string | null {
+  const match = new RegExp(`<${name}>([^<]*)</${name}>`).exec(xml);
+  const value = match
+    ? match[1]!.trim()
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, "\"").replace(/&apos;/g, "'").replace(/&amp;/g, "&")
+    : "";
+  return value || null;
+}
+
 /**
- * Static AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (+ AWS_SESSION_TOKEN) when
- * set, otherwise the EC2 instance role through IMDSv2. Instance-role
- * credentials are cached until five minutes before they expire. Credential
- * values are never logged or put into error messages.
+ * The standard AWS SDK credential chain, without the SDK:
+ *
+ * 1. static AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (+ AWS_SESSION_TOKEN);
+ * 2. container credentials: AWS_CONTAINER_CREDENTIALS_RELATIVE_URI against
+ *    169.254.170.2 (ECS), or AWS_CONTAINER_CREDENTIALS_FULL_URI (EKS Pod
+ *    Identity, http only to the link-local agent or loopback), authorised by
+ *    AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE (re-read on every refresh, it
+ *    rotates) or AWS_CONTAINER_AUTHORIZATION_TOKEN;
+ * 3. web identity (EKS IRSA): AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN via
+ *    STS AssumeRoleWithWebIdentity on the regional endpoint;
+ * 4. the EC2 instance role through IMDSv2.
+ *
+ * Temporary credentials are cached until five minutes before they expire, and
+ * concurrent refreshes share one request. Credential values, tokens and
+ * response bodies are never logged or put into error messages.
  */
 export class DefaultAwsCredentialProvider implements AwsCredentialProvider {
-  #cached: { value: AwsCredentials; expiresAt: number } | null = null;
+  #cached: CachedCredentials | null = null;
+  #pending: Promise<AwsCredentials> | null = null;
   constructor(
     private readonly env: Env = process.env,
     private readonly fetchImpl: FetchLike = (url, init) => fetch(url, init),
     private readonly imdsBase = "http://169.254.169.254",
     private readonly now: () => number = () => Date.now(),
+    private readonly readFileImpl: ReadFileLike = (path) => readFile(path, "utf8"),
+    private readonly ecsBase = "http://169.254.170.2",
   ) {}
 
   async get(): Promise<AwsCredentials> {
@@ -146,7 +187,128 @@ export class DefaultAwsCredentialProvider implements AwsCredentialProvider {
       return { accessKeyId, secretAccessKey, sessionToken: this.env.AWS_SESSION_TOKEN?.trim() || undefined };
     }
     if (this.#cached && this.#cached.expiresAt > this.now() + 300_000) return this.#cached.value;
-    const signal = AbortSignal.timeout(5_000);
+    this.#pending ??= this.#refresh().finally(() => {
+      this.#pending = null;
+    });
+    return this.#pending;
+  }
+
+  async #refresh(): Promise<AwsCredentials> {
+    const relativeUri = this.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI?.trim();
+    const fullUri = this.env.AWS_CONTAINER_CREDENTIALS_FULL_URI?.trim();
+    const webIdentityTokenFile = this.env.AWS_WEB_IDENTITY_TOKEN_FILE?.trim();
+    const roleArn = this.env.AWS_ROLE_ARN?.trim();
+    const fresh = relativeUri || fullUri
+      ? await this.#container(relativeUri, fullUri)
+      : webIdentityTokenFile && roleArn
+        ? await this.#webIdentity(webIdentityTokenFile, roleArn)
+        : await this.#imds();
+    this.#cached = fresh;
+    return fresh.value;
+  }
+
+  #expiry(expiration: string | undefined | null): number {
+    const parsed = expiration ? Date.parse(expiration) : Number.NaN;
+    return Number.isFinite(parsed) ? parsed : this.now() + 900_000;
+  }
+
+  async #container(relativeUri: string | undefined, fullUri: string | undefined): Promise<CachedCredentials> {
+    let url: URL;
+    if (relativeUri) {
+      if (!relativeUri.startsWith("/")) throw new Error("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must start with /");
+      url = new URL(`${this.ecsBase.replace(/\/+$/, "")}${relativeUri}`);
+    } else {
+      try {
+        url = new URL(fullUri!);
+      } catch {
+        throw new Error("AWS_CONTAINER_CREDENTIALS_FULL_URI is not a URL");
+      }
+      if (!containerHostAllowed(url)) {
+        throw new Error("AWS_CONTAINER_CREDENTIALS_FULL_URI must be https or http to loopback, 169.254.170.2, 169.254.170.23 or [fd00:ec2::23]");
+      }
+    }
+    const headers: Record<string, string> = {};
+    const tokenFile = this.env.AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE?.trim();
+    let authorization: string | undefined;
+    if (tokenFile) {
+      try {
+        authorization = (await this.readFileImpl(tokenFile)).trim();
+      } catch {
+        throw new Error("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE could not be read");
+      }
+    } else {
+      authorization = this.env.AWS_CONTAINER_AUTHORIZATION_TOKEN?.trim() || undefined;
+    }
+    if (authorization !== undefined) {
+      if (!authorization || /[\r\n]/.test(authorization)) throw new Error("container authorization token is empty or malformed");
+      headers.authorization = authorization;
+    }
+    let response: Response;
+    let body: { AccessKeyId?: string; SecretAccessKey?: string; Token?: string; Expiration?: string };
+    try {
+      response = await this.fetchImpl(url.toString(), { method: "GET", headers, signal: AbortSignal.timeout(CONTAINER_TIMEOUT_MS) });
+    } catch {
+      throw new Error("container credential endpoint could not be reached");
+    }
+    if (!response.ok) throw new Error(`container credential request failed: ${response.status}`);
+    try {
+      body = await response.json() as typeof body;
+    } catch {
+      throw new Error("container credential response is not JSON");
+    }
+    if (!body?.AccessKeyId || !body.SecretAccessKey) throw new Error("container credential response is incomplete");
+    return {
+      value: { accessKeyId: body.AccessKeyId, secretAccessKey: body.SecretAccessKey, sessionToken: body.Token || undefined },
+      expiresAt: this.#expiry(body.Expiration),
+    };
+  }
+
+  async #webIdentity(tokenFile: string, roleArn: string): Promise<CachedCredentials> {
+    let token: string;
+    try {
+      token = (await this.readFileImpl(tokenFile)).trim();
+    } catch {
+      throw new Error("AWS_WEB_IDENTITY_TOKEN_FILE could not be read");
+    }
+    if (!token) throw new Error("AWS_WEB_IDENTITY_TOKEN_FILE is empty");
+    const region = this.env.AWS_REGION?.trim() || this.env.AWS_DEFAULT_REGION?.trim();
+    if (region && !/^[a-z0-9-]+$/.test(region)) throw new Error("AWS_REGION is not a region");
+    const endpoint = region ? `https://sts.${region}.amazonaws.com/` : "https://sts.amazonaws.com/";
+    const sessionName = this.env.AWS_ROLE_SESSION_NAME?.trim() || `relay-control-${this.now()}`;
+    const params: Record<string, string> = {
+      Action: "AssumeRoleWithWebIdentity",
+      RoleArn: roleArn,
+      RoleSessionName: sessionName,
+      Version: "2011-06-15",
+      WebIdentityToken: token,
+    };
+    const body = Object.keys(params).map((name) => `${encodeRfc3986(name)}=${encodeRfc3986(params[name]!)}`).join("&");
+    let response: Response;
+    let text: string;
+    try {
+      response = await this.fetchImpl(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded; charset=utf-8" },
+        body,
+        signal: AbortSignal.timeout(STS_TIMEOUT_MS),
+      });
+      text = await response.text();
+    } catch {
+      throw new Error("AssumeRoleWithWebIdentity request failed");
+    }
+    if (!response.ok) {
+      const code = xmlElement(text, "Code");
+      throw new Error(`AssumeRoleWithWebIdentity refused: ${code && AWS_ERROR_CODE.test(code) ? code : `http_${response.status}`}`);
+    }
+    const accessKeyId = xmlElement(text, "AccessKeyId");
+    const secretAccessKey = xmlElement(text, "SecretAccessKey");
+    const sessionToken = xmlElement(text, "SessionToken");
+    if (!accessKeyId || !secretAccessKey || !sessionToken) throw new Error("AssumeRoleWithWebIdentity response is incomplete");
+    return { value: { accessKeyId, secretAccessKey, sessionToken }, expiresAt: this.#expiry(xmlElement(text, "Expiration")) };
+  }
+
+  async #imds(): Promise<CachedCredentials> {
+    const signal = AbortSignal.timeout(IMDS_TIMEOUT_MS);
     const tokenResponse = await this.fetchImpl(`${this.imdsBase}/latest/api/token`, {
       method: "PUT",
       headers: { "x-aws-ec2-metadata-token-ttl-seconds": "21600" },
@@ -168,10 +330,10 @@ export class DefaultAwsCredentialProvider implements AwsCredentialProvider {
       AccessKeyId?: string; SecretAccessKey?: string; Token?: string; Expiration?: string;
     };
     if (!body.AccessKeyId || !body.SecretAccessKey) throw new Error("IMDSv2 credential response is incomplete");
-    const value = { accessKeyId: body.AccessKeyId, secretAccessKey: body.SecretAccessKey, sessionToken: body.Token };
-    const expiresAt = body.Expiration ? Date.parse(body.Expiration) : this.now() + 900_000;
-    this.#cached = { value, expiresAt: Number.isFinite(expiresAt) ? expiresAt : this.now() + 900_000 };
-    return value;
+    return {
+      value: { accessKeyId: body.AccessKeyId, secretAccessKey: body.SecretAccessKey, sessionToken: body.Token },
+      expiresAt: this.#expiry(body.Expiration),
+    };
   }
 }
 

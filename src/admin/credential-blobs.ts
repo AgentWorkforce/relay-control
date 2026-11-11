@@ -16,6 +16,7 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../crypto.js";
+import { DefaultAwsCredentialProvider, type AwsCredentialProvider } from "../aws/sigv4.js";
 
 export type CredentialEnvelope = {
   v: 1;
@@ -189,8 +190,9 @@ export type S3Credentials = { accessKeyId: string; secretAccessKey: string; sess
 
 /**
  * S3 (or any S3-compatible store: R2, MinIO) with AWS Signature V4, the
- * semantics hosted's R2 credential store uses. Static credentials come from
- * the standard AWS_* environment variables.
+ * semantics hosted's R2 credential store uses. Credentials are either static
+ * or an AwsCredentialProvider (from the environment: the shared AWS chain of
+ * static keys, container/Pod Identity, web identity, then IMDSv2).
  */
 export class S3ObjectBackend implements CredentialObjectBackend {
   readonly kind = "s3" as const;
@@ -200,7 +202,7 @@ export class S3ObjectBackend implements CredentialObjectBackend {
       region: string;
       prefix: string;
       endpoint?: string;
-      credentials: S3Credentials;
+      credentials: S3Credentials | AwsCredentialProvider;
       forcePathStyle?: boolean;
     },
     private readonly fetchImpl: FetchLike = (url, init) => fetch(url, init),
@@ -221,13 +223,21 @@ export class S3ObjectBackend implements CredentialObjectBackend {
   }
   private async request(method: "GET" | "PUT" | "DELETE", key: string, body?: string): Promise<Response> {
     const url = this.url(key);
+    const source = this.options.credentials;
+    let credentials: S3Credentials;
+    try {
+      credentials = "get" in source ? await source.get() : source;
+    } catch (error) {
+      // Provider messages carry no credential values.
+      throw new CredentialBlobError("backend_failed", `S3 credentials unavailable: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
     const headers = signV4({
       method,
       url,
       region: this.options.region,
       service: "s3",
       body: body ?? "",
-      credentials: this.options.credentials,
+      credentials,
       now: this.now(),
       extraHeaders: body !== undefined ? { "content-type": "application/json" } : {},
     });
@@ -333,18 +343,33 @@ export function credentialBackendFromEnv(
   if (kind === "s3") {
     const bucket = env.SELFHOST_CREDENTIAL_S3_BUCKET?.trim();
     const region = env.SELFHOST_CREDENTIAL_S3_REGION?.trim() || env.AWS_REGION?.trim();
-    const accessKeyId = env.AWS_ACCESS_KEY_ID?.trim();
-    const secretAccessKey = env.AWS_SECRET_ACCESS_KEY?.trim();
-    if (!bucket || !region || !accessKeyId || !secretAccessKey) {
-      throw new Error("s3 credential storage needs SELFHOST_CREDENTIAL_S3_BUCKET, a region, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
+    if (!bucket || !region) {
+      throw new Error("s3 credential storage needs SELFHOST_CREDENTIAL_S3_BUCKET and a region (SELFHOST_CREDENTIAL_S3_REGION or AWS_REGION)");
+    }
+    const endpoint = env.SELFHOST_CREDENTIAL_S3_ENDPOINT?.trim() || undefined;
+    const staticKeys = Boolean(env.AWS_ACCESS_KEY_ID?.trim() && env.AWS_SECRET_ACCESS_KEY?.trim());
+    if (endpoint && !staticKeys) {
+      // Ambient AWS role credentials must never be sent to a non-AWS store
+      // (R2, MinIO); AWS VPC/PrivateLink endpoints may still use them.
+      let host: string;
+      try {
+        host = new URL(endpoint).hostname.toLowerCase();
+      } catch {
+        throw new Error("SELFHOST_CREDENTIAL_S3_ENDPOINT is not a URL");
+      }
+      if (!(host === "amazonaws.com" || host.endsWith(".amazonaws.com"))) {
+        throw new Error("a non-AWS SELFHOST_CREDENTIAL_S3_ENDPOINT needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
+      }
     }
     return new S3ObjectBackend({
       bucket,
       region,
       prefix,
-      endpoint: env.SELFHOST_CREDENTIAL_S3_ENDPOINT?.trim() || undefined,
+      endpoint,
       forcePathStyle: env.SELFHOST_CREDENTIAL_S3_FORCE_PATH_STYLE === "true",
-      credentials: { accessKeyId, secretAccessKey, sessionToken: env.AWS_SESSION_TOKEN?.trim() || undefined },
+      // Static AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY still win; otherwise the
+      // ambient role (EKS Pod Identity, IRSA, ECS task role, EC2 instance role).
+      credentials: new DefaultAwsCredentialProvider(env),
     }, fetchImpl);
   }
   throw new Error("SELFHOST_CREDENTIAL_STORAGE must be postgres, gcs or s3");
