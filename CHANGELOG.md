@@ -17,11 +17,15 @@ assigned at release.
   No AWS SDK: AssumeRole runs over the STS query API on the existing SigV4
   helper. See docs/sessions-read-api.md.
 - Added: S3-compatible stores for direct session uploads (for example a
-  bundled MinIO). `SELFHOST_HISTORY_UPLOAD_ENDPOINT` names the origin upload
-  clients reach and `SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT` (default: the
-  endpoint) the origin Control reads privacy journals through. With an
-  endpoint Control signs path-style presigned PUT URLs with its own static
-  keys (`kind: "sts"` answers 501 `unsupported_by_backend`), the response
+  bundled MinIO). `SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT` names the origin
+  upload clients reach and `SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT`
+  (default: the public endpoint) the origin Control reads privacy journals
+  through. With a public endpoint Control signs path-style presigned PUT URLs
+  with the store's dedicated issuer keys,
+  `SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID` /
+  `SELFHOST_HISTORY_UPLOAD_SECRET_ACCESS_KEY` (or `_FILE`, required, used only
+  by the upload issuer so the process-wide AWS credential chain is untouched;
+  `kind: "sts"` answers 501 `unsupported_by_backend`), the response
   `endpoint` is the client origin, `SELFHOST_HISTORY_UPLOAD_ROLE_ARN` must be
   unset and `SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN` becomes an optional opaque
   key id: when unset, `kmsKeyId` is null and no SSE-KMS headers are signed.

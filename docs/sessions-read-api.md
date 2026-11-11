@@ -118,8 +118,9 @@ Configuration (all read once at start-up; errors name the variable only):
 | `SELFHOST_HISTORY_UPLOAD_BUCKET` | pipeline bucket |
 | `SELFHOST_HISTORY_UPLOAD_REGION` (or `AWS_REGION`) | bucket and STS region |
 | `SELFHOST_HISTORY_UPLOAD_KEY_ROOT` | top-level key root shared with the pipeline (default `96bulls`) |
-| `SELFHOST_HISTORY_UPLOAD_ENDPOINT` | optional S3-compatible endpoint origin upload clients reach (for example a bundled MinIO); unset means AWS S3 |
-| `SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT` | optional endpoint Control reads privacy journals through (an in-cluster service URL); only with `SELFHOST_HISTORY_UPLOAD_ENDPOINT`, defaults to it |
+| `SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT` | optional public S3-compatible endpoint origin upload clients reach (for example a bundled MinIO); unset means AWS S3 |
+| `SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT` | optional endpoint Control reads privacy journals through (an in-cluster service URL); only with `SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT`, defaults to it |
+| `SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` (or `_FILE`) | static keys of the store's dedicated issuer user; required with `SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT`, unset otherwise |
 | `SELFHOST_HISTORY_UPLOAD_ROLE_ARN` | upload role Control assumes; AWS only (unset with an endpoint) |
 | `SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN` | KMS key every object must be encrypted with; required on AWS; optional key id with an endpoint |
 | `SELFHOST_HISTORY_UPLOAD_WITNESS_KEY` (or `_FILE`) | witness HMAC key: base64url of 32 random bytes, shared with the pipeline consumer (must decode to at least 32 bytes) |
@@ -163,7 +164,7 @@ consumer.
 
 #### S3-compatible stores
 
-With `SELFHOST_HISTORY_UPLOAD_ENDPOINT` set:
+With `SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT` set:
 
 - `endpoint` in the response is the endpoint origin, and clients build
   path-style URLs `<endpoint>/<bucket>/<key>` (presigned URLs already are).
@@ -171,10 +172,11 @@ With `SELFHOST_HISTORY_UPLOAD_ENDPOINT` set:
   not send them.
 - `kind: "sts"` answers 501 `unsupported_by_backend`; clients request
   `presigned`.
-- URLs are signed with Control's own static keys (`AWS_ACCESS_KEY_ID` /
-  `AWS_SECRET_ACCESS_KEY`, required for a non-AWS endpoint so ambient AWS
-  role credentials are never sent to it). They must belong to a store user
-  allowed to PUT under `<keyRoot>/.upload-inbox/` and GET
+- URLs (and journal reads) are signed with the dedicated issuer user's keys
+  from `SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID` /
+  `SELFHOST_HISTORY_UPLOAD_SECRET_ACCESS_KEY` (or `_FILE`), required with the
+  public endpoint. Only the upload issuer uses them, so the process-wide AWS
+  credential chain is untouched. The user must be allowed to PUT under `<keyRoot>/.upload-inbox/` and GET
   `<keyRoot>/.admission-inbox/*/privacy-journal.json`. Because one key
   signs every user's URLs, the per-user prefix is enforced by Control
   choosing the signed key, not by a session policy.

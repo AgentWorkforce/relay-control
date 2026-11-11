@@ -387,7 +387,7 @@ export class HistoryUploadCredentials {
       config: HistoryUploadConfig;
       sts: StsClient;
       journal: PrivacyJournalReader;
-      /** Control's own credentials, which sign presigned URLs for an S3-compatible endpoint. */
+      /** The store's issuer credentials, which sign presigned URLs for an S3-compatible endpoint. */
       credentials?: AwsCredentialProvider;
       now?: () => Date;
     },
@@ -434,8 +434,8 @@ export class HistoryUploadCredentials {
     });
 
     if (config.roleArn === null) {
-      // S3-compatible store: no STS, so URLs are signed with Control's own
-      // store keys and are only as long-lived as PRESIGNED_URL_MAX_MS.
+      // S3-compatible store: no STS, so URLs are signed with the dedicated
+      // issuer user's keys and are only as long-lived as PRESIGNED_URL_MAX_MS.
       let credentials: AwsCredentials;
       try {
         credentials = await (this.#credentials ??= this.options.credentials ?? new DefaultAwsCredentialProvider()).get();
@@ -491,7 +491,7 @@ export class HistoryUploadCredentials {
     }, prefix, now, timing);
   }
 
-  /** The presigned response shared by AWS (STS session keys) and S3-compatible stores (Control's keys). */
+  /** The presigned response shared by AWS (STS session keys) and S3-compatible stores (issuer keys). */
   #presignedResponse(
     common: Record<string, unknown>,
     witness: string,

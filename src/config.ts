@@ -96,8 +96,8 @@ export interface HistoryUploadConfig {
   /** Top-level key root shared with the sessions pipeline (default 96bulls). */
   keyRoot: string;
   /**
-   * S3-compatible endpoint origin upload clients reach (path-style URLs), or
-   * null for AWS S3 (virtual-hosted URLs).
+   * Public S3-compatible endpoint origin upload clients reach (path-style
+   * URLs), or null for AWS S3 (virtual-hosted URLs).
    */
   endpoint: string | null;
   /** Endpoint Control reads privacy journals through; null only when endpoint is null. */
@@ -106,6 +106,8 @@ export interface HistoryUploadConfig {
   roleArn: string | null;
   /** KMS key ARN on AWS (always set); an optional opaque key id with an endpoint. */
   kmsKeyArn: string | null;
+  /** Static keys of the dedicated issuer user of an S3-compatible store (null on AWS). Never logged. */
+  storeCredentials: { accessKeyId: string; secretAccessKey: string } | null;
   /** HMAC key bytes for the privacy witness, shared with the pipeline consumer. Never logged. */
   witnessKey: Buffer;
   maxObjectBytes: number;
@@ -893,14 +895,15 @@ function uploadEndpoint(env: Env, name: string): string | null {
  * or off: null, and the route answers 404. Errors name the variable, never
  * its value.
  *
- * Without SELFHOST_HISTORY_UPLOAD_ENDPOINT the store is AWS S3: the role and
- * KMS key ARNs are required and clients get STS credentials or presigned
- * URLs. With it the store is S3-compatible (for example a bundled MinIO):
- * presigned URLs only, signed with Control's own keys, so the role must be
- * unset, the KMS key is an optional key id, and a non-AWS endpoint needs
- * static AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY so ambient AWS role
- * credentials are never sent to it. SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT
- * (default: the endpoint) is where Control reads privacy journals.
+ * Without SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT the store is AWS S3: the
+ * role and KMS key ARNs are required and clients get STS credentials or
+ * presigned URLs. With it the store is S3-compatible (for example a bundled
+ * MinIO): presigned URLs only, signed with the dedicated issuer user's keys
+ * from SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID/SECRET_ACCESS_KEY (or _FILE,
+ * both required), so the role must be unset and the KMS key is an optional
+ * key id. Those keys serve only the upload issuer; the process-wide AWS
+ * credential chain is untouched. SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT
+ * (default: the public endpoint) is where Control reads privacy journals.
  */
 export function loadHistoryUploadConfig(env: Env = process.env): HistoryUploadConfig | null {
   const mode = env.SELFHOST_HISTORY_UPLOAD_DIRECT?.trim() || "off";
@@ -924,10 +927,10 @@ export function loadHistoryUploadConfig(env: Env = process.env): HistoryUploadCo
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(keyRoot)) {
     throw new Error("SELFHOST_HISTORY_UPLOAD_KEY_ROOT must match ^[a-z0-9][a-z0-9-]{0,62}$");
   }
-  const endpoint = uploadEndpoint(env, "SELFHOST_HISTORY_UPLOAD_ENDPOINT");
+  const endpoint = uploadEndpoint(env, "SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT");
   const internalOverride = uploadEndpoint(env, "SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT");
   if (internalOverride && !endpoint) {
-    throw new Error("SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT requires SELFHOST_HISTORY_UPLOAD_ENDPOINT");
+    throw new Error("SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT requires SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT");
   }
   const internalEndpoint = internalOverride ?? endpoint;
   let roleArn: string | null;
@@ -939,22 +942,24 @@ export function loadHistoryUploadConfig(env: Env = process.env): HistoryUploadCo
     if (!UPLOAD_KMS_KEY_ARN.test(kmsKeyArn)) throw new Error("SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN must be a KMS key ARN");
   } else {
     if (env.SELFHOST_HISTORY_UPLOAD_ROLE_ARN?.trim()) {
-      throw new Error("SELFHOST_HISTORY_UPLOAD_ROLE_ARN is not supported with SELFHOST_HISTORY_UPLOAD_ENDPOINT (S3-compatible stores issue presigned URLs only)");
+      throw new Error("SELFHOST_HISTORY_UPLOAD_ROLE_ARN is not supported with SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT (S3-compatible stores issue presigned URLs only)");
     }
     roleArn = null;
     kmsKeyArn = env.SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN?.trim() || null;
     if (kmsKeyArn !== null && !UPLOAD_KMS_KEY_ID.test(kmsKeyArn)) {
       throw new Error("SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN must be a key id without whitespace");
     }
-    // Ambient AWS role credentials must never be sent to a non-AWS store
-    // (src/admin/credential-blobs.ts precedent). An AWS endpoint may use
-    // them, but a presigned URL then outlives a role session that expires
-    // first; AWS deployments should leave the endpoint unset instead.
-    const host = new URL(endpoint).hostname.toLowerCase();
-    const aws = host === "amazonaws.com" || host.endsWith(".amazonaws.com");
-    if (!aws && !(env.AWS_ACCESS_KEY_ID?.trim() && env.AWS_SECRET_ACCESS_KEY?.trim())) {
-      throw new Error("a non-AWS SELFHOST_HISTORY_UPLOAD_ENDPOINT needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
-    }
+  }
+  let storeCredentials: HistoryUploadConfig["storeCredentials"] = null;
+  if (endpoint) {
+    const accessKeyId = readSecret(env, "SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID");
+    if (!accessKeyId) throw new Error("SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID (or _FILE) is required with SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT");
+    const secretAccessKey = readSecret(env, "SELFHOST_HISTORY_UPLOAD_SECRET_ACCESS_KEY");
+    if (!secretAccessKey) throw new Error("SELFHOST_HISTORY_UPLOAD_SECRET_ACCESS_KEY (or _FILE) is required with SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT");
+    storeCredentials = { accessKeyId, secretAccessKey };
+  } else if (["SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID", "SELFHOST_HISTORY_UPLOAD_SECRET_ACCESS_KEY"]
+    .some((name) => env[name]?.trim() || env[`${name}_FILE`]?.trim())) {
+    throw new Error("SELFHOST_HISTORY_UPLOAD_ACCESS_KEY_ID and SELFHOST_HISTORY_UPLOAD_SECRET_ACCESS_KEY are only used with SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT");
   }
   const witnessKeyText = readSecret(env, "SELFHOST_HISTORY_UPLOAD_WITNESS_KEY");
   if (!witnessKeyText) throw new Error("SELFHOST_HISTORY_UPLOAD_WITNESS_KEY (or _FILE) is required");
@@ -978,6 +983,7 @@ export function loadHistoryUploadConfig(env: Env = process.env): HistoryUploadCo
     internalEndpoint,
     roleArn,
     kmsKeyArn,
+    storeCredentials,
     witnessKey,
     maxObjectBytes,
   };

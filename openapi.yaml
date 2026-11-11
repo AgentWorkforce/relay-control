@@ -3379,12 +3379,13 @@ paths:
         Every PUT must carry `If-None-Match: *` (create only) and, when
         `kmsKeyId` is non-null, `x-amz-server-side-encryption: aws:kms` and
         `x-amz-server-side-encryption-aws-kms-key-id: <kmsKeyId>`. With an
-        S3-compatible endpoint (SELFHOST_HISTORY_UPLOAD_ENDPOINT) `endpoint`
-        is non-null, URLs are path style and only `kind=presigned` is
-        served. Presigned PUTs must also send
-        `Content-Encoding: zstd` and `x-amz-checksum-sha256: <sha256>`
-        verbatim; all of these headers are signed into the URL. Objects over
-        `maxObjectBytes` are refused by the pipeline consumer. Renew at
+        S3-compatible endpoint (SELFHOST_HISTORY_UPLOAD_PUBLIC_ENDPOINT)
+        `endpoint` is non-null, URLs are path style, signed with the store's
+        dedicated issuer keys, and only `kind=presigned` is served.
+        Presigned PUTs must also send `Content-Encoding: zstd` and
+        `x-amz-checksum-sha256: <sha256>` verbatim; all of these headers are
+        signed into the URL. Objects over `maxObjectBytes` are refused by the
+        pipeline consumer. Renew at
         `refreshAfter`. When this route answers 404 `history_upload_direct_off`
         or 503, fall back to the ingest-edge upload (POST
         .../relayhistory/session mode=sync). Replies carry
