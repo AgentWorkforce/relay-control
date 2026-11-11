@@ -1754,3 +1754,34 @@ test("usage people: a slow read API stops at the time budget with partial counts
   assert.equal(result.body.people.truncated, true);
   assert.ok(elapsed < 2_400, `took ${elapsed.toFixed(0)}ms`);
 });
+
+test("usage people: a workspace that ends on a full 200-session page still pages on", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  const hour = 3_600_000;
+  // alpha: exactly 200 newer sessions; beta: 30 older ones.
+  const rows = [
+    ...Array.from({ length: 200 }, (_, index) => ({
+      sessionId: `a${index}`, workspaceId: env.alpha, userIds: [env.memberId],
+      lastTs: new Date(Date.parse("2026-11-02T19:00:00.000Z") - index * 60_000).toISOString(),
+    })),
+    ...Array.from({ length: 30 }, (_, index) => ({
+      sessionId: `b${index}`, workspaceId: env.beta, userIds: [env.memberId],
+      lastTs: new Date(Date.parse("2026-11-01T00:00:00.000Z") - index * hour).toISOString(),
+    })),
+  ];
+  peopleSessions(env, rows);
+  const owner = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/organizations/${env.organizationId}/usage/people/${env.memberId}/sessions?days=7`;
+  let cursor: string | null = null;
+  const seen: string[] = [];
+  for (let page = 0; page < 20; page += 1) {
+    const result: Awaited<ReturnType<typeof call>> = await call(env.origin, cursor ? `${base}&cursor=${encodeURIComponent(cursor)}` : base, { token: owner });
+    assert.equal(result.status, 200, `page ${page}`);
+    seen.push(...result.body.sessions.map((session: any) => session.sessionId));
+    cursor = result.body.nextCursor;
+    if (!cursor) break;
+  }
+  assert.equal(seen.length, 230);
+  assert.equal(new Set(seen).size, 230);
+  assert.deepEqual(seen.slice(199, 201), ["a199", "b0"]);
+});

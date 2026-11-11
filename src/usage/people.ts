@@ -364,7 +364,7 @@ function decodeCursor(raw: string | undefined, workspaces: number): Stream[] {
     const value: unknown = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
     if (isRecord(value) && Array.isArray(value.s) && value.s.length === workspaces && value.s.every((stream) =>
       isRecord(stream) && typeof stream.d === "boolean" &&
-      Number.isSafeInteger(stream.k) && (stream.k as number) >= 0 && (stream.k as number) < AGGREGATE_PAGE &&
+      Number.isSafeInteger(stream.k) && (stream.k as number) >= 0 && (stream.k as number) <= AGGREGATE_PAGE &&
       (stream.c === null || (typeof stream.c === "string" && stream.c.length > 0 && stream.c.length <= 4096)))) {
       return value.s as Stream[];
     }
@@ -449,6 +449,8 @@ export async function personSessions(input: {
       stream.k = 0;
     } else {
       stream.d = true;
+      stream.c = null;
+      stream.k = 0;
     }
   }
   // Recorded summaries for this page only, within the same time budget: a
