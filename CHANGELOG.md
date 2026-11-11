@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `SELFHOST_DESKTOP_RELEASES_REPO` (owner/repository, unset by default)
+  and `GET /api/v1/desktop/releases`: the latest release of a public GitHub
+  releases repo, in the downloads card's manifest shape, with checksums from
+  each asset's `.sha256` sidecar. Fixed GitHub hosts only, bounded, cached 5
+  minutes, `release: null` on any upstream failure. For installs without the
+  signed Desktop feed. See docs/desktop-feed.md, "GitHub releases source".
+
 - Added: events shim, a webhook inbox that wakes an agent, behind a new
   `events_shim` feature (off by default). `POST /api/v1/events-shim/shims`
   (signed-in person, 20 per person per hour) returns an MCP URL, webhook URLs

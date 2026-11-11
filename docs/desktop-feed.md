@@ -767,3 +767,36 @@ endpoints now exist (see "Implementation"); the remaining items still hold.
   I-JSON rule (it states it in prose only), the check precedence, the quota arithmetic or the Range arithmetic. Those are in this
   document and in the reference functions in
   `test/desktop-feed-contract.test.ts`.
+
+## GitHub releases source
+
+An install without the signed feed (for example a local Kind stack whose
+Desktop is published to a public GitHub releases repository) can still show
+downloads. Set `SELFHOST_DESKTOP_RELEASES_REPO=<owner>/<repository>`
+(`^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`). Unset, `GET /api/v1/desktop/releases`
+answers 404 and nothing changes.
+
+`GET /api/v1/desktop/releases` (any signed-in member) returns
+`{ source: { kind: "github", repo, releasesUrl }, release }`. `release` is the
+newest non-draft release (pre-releases included) in the downloads card's
+manifest shape (`version`, `tag`, `prerelease`, `published_at`, `assets`), or
+`null` when there is none or GitHub cannot be read. Each asset carries the
+card's `platform`, `arch`, `kind` and macOS `os_floor`, parsed from
+`Desktop-<profile>-<version>-<OS>-<arch>[-probe|-Setup].<ext>`; anything else is
+skipped.
+
+- Control calls only `https://api.github.com/repos/<owner>/<repo>/releases`:
+  the release list, and each checksum sidecar through its API asset URL, whose
+  single redirect may go only to a `*.githubusercontent.com` host. No token.
+  The list is capped at 2 MiB, a sidecar at 1 KiB, the whole read at 8
+  seconds; the result (also a failure) is cached for 5 minutes.
+- An asset is served only with a `<name>.sha256` sidecar from the same release
+  whose digest (and file name, when present) matches; if GitHub reports its
+  own `sha256:` digest for the asset, it must agree.
+- `url` is the asset's `browser_download_url`, kept only when it is
+  `https://github.com` or `https://objects.githubusercontent.com` under
+  `/<owner>/<repo>/releases/download/`.
+
+The checksums give integrity, not publisher authenticity: they come from the
+same release. The dashboard labels this source as GitHub releases, not the
+signed Desktop feed, and uses it only when the signed feed has no profiles.
