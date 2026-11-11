@@ -24,7 +24,7 @@ user-configurable provider URL.
 ## Binding-owned identity registry (internal, not mounted)
 
 `src/capy/bindings.ts` adds native person-side identity custody with migration
-`0044_capy_bindings.sql`. It uses the existing encrypted connection and requires
+`0045_capy_bindings.sql`. It uses the existing encrypted connection and requires
 the acting person to be its current owner and a live owner/admin. It proves
 the key can see a thread before reserving that thread globally, then rechecks
 the same key/Relay route before claiming a binding.
