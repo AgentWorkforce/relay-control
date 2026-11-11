@@ -14,6 +14,26 @@ assigned at release.
   first-page searches are recorded by Control while the feature is on, with
   users stored as an HMAC under a per-install secret. Migration
   `0040_usage_counters.sql`. See docs/usage.md.
+- Added: first-time setup without email. `SELFHOST_SETUP_KEY[_FILE]` is a
+  one-time setup key for the bootstrap admin (no default; generate one per
+  install). While that admin has never signed in, `/login` offers
+  "First-time setup: enter setup key"; a valid key asks for the admin's
+  password and only then signs in, and is then spent. It expires 24 hours
+  after the server first records it, is stored only as a SHA-256 hash, and
+  wrong keys are audited and rate-limited. `POST /api/v1/installation/setup-key`
+  (bootstrap bearer) mints a fresh one. `POST /api/v1/auth/password/setup-key`
+  is the JSON form; `login-config` adds `setup_key`. Migration 0041.
+- Added: temporary passwords. Owners (any member) and admins (members only)
+  set one with `POST /api/v1/organizations/{id}/memberships/{userId}/temporary-password`,
+  `POST .../invitations/{id}/temporary-password`, or `temporaryPassword: true`
+  on `POST .../invitations`. Generated, returned once, argon2id-hashed, never
+  emailed, single use, 72 hours by default. Login with one answers 403
+  `password_change_required` and no session; `POST /api/v1/auth/password/change`
+  sets the person's own password and signs in.
+- Changed: `SELFHOST_SIGNIN_METHODS=password` no longer requires SMTP. Without
+  it, register and reset answer 404 `email_not_configured` and the sign-in
+  page hides their links; `login-config` adds `password_self_service`. With
+  SMTP configured, behaviour is unchanged. `email_link` still requires SMTP.
 
 - Added: direct-to-S3 session upload credentials,
   `POST /api/v1/workspaces/{ws}/relayhistory/upload-credentials`, behind

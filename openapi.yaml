@@ -1402,6 +1402,21 @@ paths:
           description: Not a workspace the person belongs to
         "429":
           description: Rate limited
+  /api/v1/installation/setup-key:
+    post:
+      security: [{ bearerAuth: [] }]
+      operationId: mintSetupKey
+      description: |
+        Bootstrap bearer only. Mints a one-time setup key for the bootstrap admin, returned
+        once (stored only as a SHA-256 hash), and revokes every earlier one, including
+        `SELFHOST_SETUP_KEY`. For when the configured key expired or none was configured.
+        It works for 24 hours, once, and only while the admin has never signed in.
+      responses:
+        "201":
+          description: "{ setupKey, email, expiresAt }"
+        "403": { description: Not the bootstrap bearer }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "409": { description: "`admin_already_signed_in` or `setup_key_unavailable` (no bootstrap admin email)" }
   /api/v1/installation/settings:
     get:
       security: [{ bearerAuth: [] }]
@@ -1972,13 +1987,22 @@ paths:
               properties:
                 email: { type: string, format: email }
                 role: { enum: [owner, admin, member], default: member }
+                temporaryPassword:
+                  type: boolean
+                  description: |
+                    Also set a temporary password for the invitee (see
+                    `.../memberships/{userId}/temporary-password`), returned once as
+                    `temporaryPassword`; never emailed. Admins may set one only for a member invite.
+                expiresInHours: { type: integer, minimum: 1, maximum: 168, default: 72, description: With temporaryPassword. }
       responses:
         "201":
-          description: "{ invitation, inviteUrl, emailDelivery: sent|failed|not_configured }"
+          description: "{ invitation, inviteUrl, emailDelivery: sent|failed|not_configured, temporaryPassword?, temporaryPasswordExpiresAt? }"
         "403":
           description: Not an owner/admin, or an admin inviting an owner
+        "404":
+          description: "`signin_method_disabled`: temporaryPassword without password sign-in"
         "409":
-          description: Already a member
+          description: Already a member, or (`member_of_other_organizations`) temporaryPassword for someone in another organization
   /api/v1/organizations/{organizationId}/invitations/{invitationId}:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -1990,6 +2014,64 @@ paths:
           description: "{ revoked: true }"
         "409":
           description: Already accepted or revoked
+  /api/v1/organizations/{organizationId}/invitations/{invitationId}/temporary-password:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - { name: invitationId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      operationId: setInvitationTemporaryPassword
+      description: |
+        Organization owner/admin or bootstrap bearer (admins only for a member invite). Sets
+        a temporary password for an open invite's address, replacing any earlier one. Same
+        rules as the membership route; canceling the invite cancels it.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TemporaryPasswordRequest" }
+      responses:
+        "201":
+          description: "{ invitationId, email, temporaryPassword, expiresAt }"
+        "403": { description: Not allowed for this role }
+        "404": { description: "`invitation_not_found` or `signin_method_disabled`" }
+        "409": { description: "The invite is not open, or `member_of_other_organizations`" }
+  /api/v1/organizations/{organizationId}/memberships/{userId}/temporary-password:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      operationId: setMemberTemporaryPassword
+      description: |
+        An owner or the bootstrap bearer for anyone; an admin only for a member. Generates a
+        temporary password (returned once, stored only as an argon2id hash, never emailed),
+        replacing any earlier one for the address. It works once, until it expires (72 hours
+        by default): POST /api/v1/auth/password/login with it answers 403
+        `password_change_required` and no session; POST /api/v1/auth/password/change with it
+        sets the member's own password and signs in. Until then the member's existing
+        password keeps working. Requires the dashboard's account session (not a CLI or
+        Desktop token) or the bootstrap bearer, and password sign-in enabled. Refused (409
+        `member_of_other_organizations`) for someone who also belongs to another
+        organization. Audited as `password.temporary.create`.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TemporaryPasswordRequest" }
+      responses:
+        "201":
+          description: Returned once
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [userId, email, temporaryPassword, expiresAt]
+                properties:
+                  userId: { type: string, format: uuid }
+                  email: { type: string }
+                  temporaryPassword: { type: string }
+                  expiresAt: { type: string, format: date-time }
+        "403": { description: "`forbidden` (an admin for an owner or admin) or `reauthentication_required`" }
+        "404": { description: "`membership_not_found` or `signin_method_disabled`" }
+        "409": { description: "`member_of_other_organizations`" }
+        "429": { description: "`rate_limited`" }
   /api/v1/organizations/{organizationId}/invitations/{invitationId}/link:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -2013,7 +2095,7 @@ paths:
       description: Any signed-in member. Which sign-in methods and invite delivery are configured.
       responses:
         "200":
-          description: "{ oidc: {displayName, allowedDomains}|null, microsoft: {displayName}|null, emailLink, password, inviteEmail, autoJoinDomains, inviteTtlHours }"
+          description: "{ oidc: {displayName, allowedDomains}|null, microsoft: {displayName}|null, emailLink, password, passwordSelfService, temporaryPasswords, inviteEmail, autoJoinDomains, inviteTtlHours }"
   /api/v1/auth/login-config:
     get:
       operationId: loginConfig
@@ -2156,6 +2238,10 @@ paths:
         sign-in or a completed reset clears the account counters. Attempts refused inside
         a lock are not counted and write no audit event; one `login.lockout` event is
         written when a lock starts or grows.
+
+        A live temporary password (set by an owner or admin) answers 403
+        `password_change_required` with no session; send it as `currentPassword` to
+        POST /api/v1/auth/password/change.
       security: []
       requestBody:
         required: true
@@ -2259,6 +2345,66 @@ paths:
         "404": { $ref: "#/components/responses/SignInMethodDisabled" }
         "410": { description: "`token_invalid`: used, expired or unknown" }
         "429": { description: "`rate_limited`: more than 30 attempts per IP in 5 minutes, or every password-hashing slot is busy (answered at once)" }
+  /api/v1/auth/password/change:
+    post:
+      operationId: passwordChangeTemporary
+      description: |
+        Replaces a temporary password (after login answered 403 `password_change_required`)
+        with one the person chooses, then signs in. `currentPassword` is checked like a login
+        (the same lockout counters and audit); a policy rejection (400) leaves it usable.
+        Spending it, writing the new password and issuing the session commit together.
+        Audited as `password.temporary.changed`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email, currentPassword, newPassword]
+              properties:
+                email: { type: string, maxLength: 320 }
+                currentPassword: { type: string, maxLength: 1024, description: The temporary password }
+                newPassword: { type: string, maxLength: 1024 }
+      responses:
+        "200": { $ref: "#/components/responses/PasswordSignedIn" }
+        "400": { $ref: "#/components/responses/PasswordPolicyError" }
+        "401": { description: "`invalid_credentials`: wrong, used, expired or no temporary password" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "429": { description: "`rate_limited`" }
+  /api/v1/auth/password/setup-key:
+    post:
+      operationId: passwordSetupKey
+      description: |
+        First-time setup without email: a valid setup key (`SELFHOST_SETUP_KEY`, or one
+        minted with POST /api/v1/installation/setup-key) signs in as the bootstrap admin and
+        sets their first password (12-128 characters, the usual policy) in one step; there is
+        no session without the password. The key is then spent. It works only while the
+        admin has never signed in and has no password, and for 24 hours after it was first
+        recorded. Wrong keys are audited (`setup_key.failure`, never the key) and limited per
+        client (20 per 10 minutes, and 5 free then 30 s doubling backoff shared by every
+        replica). A policy rejection (400) does not spend the key.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [setupKey, password]
+              properties:
+                setupKey: { type: string, maxLength: 256 }
+                password: { type: string, maxLength: 1024 }
+      responses:
+        "200": { $ref: "#/components/responses/PasswordSignedIn" }
+        "400": { $ref: "#/components/responses/PasswordPolicyError" }
+        "401": { description: "`setup_key_invalid`: wrong, used, expired or revoked, or the admin already signed in" }
+        "403": { $ref: "#/components/responses/PasswordCsrfRejected" }
+        "404": { $ref: "#/components/responses/SignInMethodDisabled" }
+        "429": { description: "`rate_limited`" }
   /login/oidc/start:
     get:
       operationId: oidcStart
@@ -7382,7 +7528,7 @@ components:
         created_at: {type: string, format: date-time}
     LoginConfig:
       type: object
-      required: [methods, oidc, microsoft, logo_url, org_name, allowed_domain_hint, password_policy]
+      required: [methods, oidc, microsoft, logo_url, org_name, allowed_domain_hint, password_policy, password_self_service, setup_key]
       properties:
         methods:
           type: array
@@ -7404,6 +7550,19 @@ components:
           properties:
             min_length: { type: integer, example: 12 }
             max_length: { type: integer, example: 128 }
+        password_self_service:
+          type: boolean
+          description: Register and reset (emailed links) are available, i.e. SMTP is configured. False hides "Forgot password?" and "Create an account".
+        setup_key:
+          type: boolean
+          description: |
+            Show "First-time setup: enter setup key" (POST /api/v1/auth/password/setup-key): a
+            setup key is live and the bootstrap admin has never signed in and has no password.
+    TemporaryPasswordRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        expiresInHours: { type: integer, minimum: 1, maximum: 168, default: 72 }
     PasswordError:
       type: object
       required: [error, message]
@@ -7428,6 +7587,10 @@ components:
             - method_not_allowed
             - password_already_set
             - token_invalid
+            - email_not_configured
+            - password_change_required
+            - password_unchanged
+            - setup_key_invalid
             - rate_limited
         message: { type: string }
     PasswordSignIn:
@@ -9386,7 +9549,7 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/PasswordError" }
     SignInMethodDisabled:
-      description: "`signin_method_disabled`: the method is not in SELFHOST_SIGNIN_METHODS"
+      description: "`signin_method_disabled`: the method is not in SELFHOST_SIGNIN_METHODS. register and reset also answer `email_not_configured` without SMTP."
       content:
         application/json:
           schema: { $ref: "#/components/schemas/PasswordError" }

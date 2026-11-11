@@ -7,13 +7,13 @@ import { emailDomain, type IdentityConfig } from "./config.js";
 import { inviteEmail, signInEmail, type Mailer } from "./mailer.js";
 import { OidcClient, OidcError, pkcePair, randomState } from "./oidc.js";
 import { cloudPathForNext } from "../auth/desktop-login.js";
-import { confirmEmailPage, loginPage, messagePage, PAGE_CSP, passwordLinkPage, type InviteBanner } from "./pages.js";
+import { choosePasswordPage, confirmEmailPage, loginPage, messagePage, PAGE_CSP, passwordLinkPage, type InviteBanner } from "./pages.js";
 import { IdentityError, IdentityStore, type Role } from "./store.js";
 import type { Database } from "../database.js";
 import { PasswordHasher } from "./password/hashing.js";
 import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, type HibpFetch } from "./password/policy.js";
-import { createPasswordRoutes, disabledMethod, PASSWORD_PATH_PREFIX, PasswordHttpError, type PasswordRoutes } from "./password/routes.js";
-import { PasswordStore } from "./password/store.js";
+import { createPasswordRoutes, disabledMethod, isChangeRequired, PASSWORD_PATH_PREFIX, PasswordHttpError, type PasswordRoutes } from "./password/routes.js";
+import { PasswordStore, TEMPORARY_PASSWORD_MAX_TTL_MS, TEMPORARY_PASSWORD_TTL_MS } from "./password/store.js";
 
 type JsonObject = Record<string, unknown>;
 type Auth = { kind: "bootstrap" } | { kind: "user"; principal: Principal };
@@ -44,6 +44,11 @@ const RATE = {
 const OrganizationCreate = z.object({
   name: z.string().trim().min(1).max(120),
 }).passthrough();
+
+const TemporaryPasswordRequest = z.object({
+  /** Lifetime in hours; default 72, at most 168. */
+  expiresInHours: z.number().int().min(1).max(TEMPORARY_PASSWORD_MAX_TTL_MS / 3_600_000).optional(),
+}).strict();
 
 const InstallationSettingsPatch = z.object({
   personalOrgSignupEnabled: z.boolean().nullable().optional(),
@@ -234,7 +239,7 @@ export function createIdentityModule(input: {
   }
   const emailLogin = config.emailLogin && mailer !== null;
   let passwordRoutes: PasswordRoutes | null = null;
-  if (config.signinMethods.includes("password") && config.password && mailer) {
+  if (config.signinMethods.includes("password") && config.password) {
     if (!input.database) throw new Error("password sign-in needs the database");
     passwordRoutes = createPasswordRoutes({
       config: config.password,
@@ -243,6 +248,8 @@ export function createIdentityModule(input: {
       identityStore: store,
       controlStore,
       mailer,
+      setupKeyEmail: config.bootstrap?.adminEmail ?? config.bootstrap?.adminEmails[0] ?? null,
+      setupKey: config.setupKey,
       sessionCookie: (tokens) => sessionCookie(tokens),
       clearSessionCookie: () => clearCookie(SESSION_COOKIE, "/cloud"),
       ...(input.hibpFetch ? { hibpFetch: input.hibpFetch } : {}),
@@ -319,6 +326,59 @@ export function createIdentityModule(input: {
       return;
     }
     throw error;
+  }
+
+  /** Owners and the operator may set anyone's; admins only a member's. */
+  function temporaryPasswordAllowed(auth: Auth, targetRole: Role): void {
+    if (auth.kind === "bootstrap") return;
+    // Setting a password is an account action: only the dashboard's account
+    // session carries it, never a CLI, Desktop or legacy token.
+    if (!auth.principal.scopes.includes(ACCOUNT_SCOPE) || auth.principal.pendingHandoff || auth.principal.handoff) {
+      throw new IdentityHttpError(403, "reauthentication_required", "Sign in to the dashboard to set a temporary password");
+    }
+    if (auth.principal.role !== "owner" && targetRole !== "member") {
+      throw new IdentityHttpError(403, "forbidden", "Only an owner can set a temporary password for an owner or admin.");
+    }
+  }
+
+  function temporaryPasswordTtlMs(body: JsonObject): number {
+    const parsed = parseBody(TemporaryPasswordRequest, body);
+    return parsed.expiresInHours ? parsed.expiresInHours * 3_600_000 : TEMPORARY_PASSWORD_TTL_MS;
+  }
+
+  /**
+   * Issues the temporary password (returned once, never emailed) after the
+   * checks every path shares: password sign-in is on, and the address is not
+   * a member of any other organization (an owner here must not be able to
+   * take over an account that belongs somewhere else too).
+   */
+  async function issueTemporaryPassword(input: {
+    organizationId: string;
+    email: string;
+    auth: Auth;
+    ttlMs: number;
+    target: string;
+  }): Promise<{ password: string; expiresAt: string }> {
+    if (!passwordRoutes) {
+      throw new IdentityHttpError(404, "signin_method_disabled", "Password sign-in is not enabled on this installation.");
+    }
+    if (await store.otherOrganizationCount(input.organizationId, input.email) > 0) {
+      throw new IdentityHttpError(409, "member_of_other_organizations", "That person also belongs to another organization here, so only they can change their password.");
+    }
+    const issued = await passwordRoutes.issueTemporaryPassword({
+      organizationId: input.organizationId,
+      email: input.email,
+      actorUserId: input.auth.kind === "user" ? input.auth.principal.userId : null,
+      ttlMs: input.ttlMs,
+    });
+    // Never the password itself.
+    await store.audit({
+      organizationId: input.organizationId,
+      actor: input.auth.kind === "user" ? { kind: "user", userId: input.auth.principal.userId } : { kind: "bootstrap" },
+      action: "password.temporary.create",
+      target: `${input.target} ${input.email} expires=${issued.expiresAt.toISOString()}`,
+    });
+    return { password: issued.password, expiresAt: issued.expiresAt.toISOString() };
   }
 
   function actorFor(auth: Auth): { kind: "user"; userId: string; role: Role } | { kind: "bootstrap" } {
@@ -459,11 +519,16 @@ export function createIdentityModule(input: {
         microsoft: microsoft ? { displayName: microsoft.config.displayName } : null,
         emailLogin,
         password: passwordRoutes !== null,
-        passwordLinks: passwordRoutes ? passwordPageLinks(next, invite) : null,
-        // Only a password form can produce this redirect.
-        notice: passwordRoutes !== null && url.searchParams.get("error") === "invalid_credentials"
-          ? { kind: "error", text: "Incorrect email or password." }
-          : null,
+        passwordLinks: passwordRoutes?.selfService ? passwordPageLinks(next, invite) : null,
+        setupKey: passwordRoutes ? await passwordRoutes.setupKeyOffered() : false,
+        // Only a password or setup-key form can produce these redirects.
+        notice: passwordRoutes === null
+          ? null
+          : url.searchParams.get("error") === "invalid_credentials"
+            ? { kind: "error", text: "Incorrect email or password." }
+            : url.searchParams.get("error") === "setup_key_invalid"
+              ? { kind: "error", text: "That setup key is not valid. It works once, for 24 hours, and only before the administrator first signs in." }
+              : null,
         userCode: started.userCode,
         pollIntervalMs: Math.max(1, started.intervalSeconds) * 1_000,
         coBrand,
@@ -510,8 +575,103 @@ export function createIdentityModule(input: {
           redirect(response, 303, `${back}&error=invalid_credentials`);
           return true;
         }
+        if (isChangeRequired(result)) {
+          sendHtml(response, 200, choosePasswordPage({
+            kind: "temporary",
+            email: result.email,
+            secret: (form.get("password") ?? "").slice(0, 1_024),
+            next,
+            minLength: PASSWORD_MIN_LENGTH,
+          }));
+          return true;
+        }
         redirect(response, 303, next, [sessionCookie(result.tokens)]);
       } catch (error) {
+        signInErrorPage(response, error, back);
+      }
+      return true;
+    }
+
+    // ---- temporary password: choose a new one (the /login form's second step) ---
+    if (method === "POST" && publicPath === "/login/password/change") {
+      if (!passwordRoutes) {
+        disabledMethod(response, "password");
+        return true;
+      }
+      if (!sameOriginForm(request, helpers)) {
+        sendHtml(response, 403, messagePage({ title: "Unable to sign in", message: "Cross-origin request refused." }));
+        return true;
+      }
+      const form = await formBody(request);
+      const next = safeNextPath(form.get("next"));
+      const back = `/login?next=${encodeURIComponent(next)}`;
+      const email = (form.get("email") ?? "").slice(0, 320);
+      const current = (form.get("current") ?? "").slice(0, 1_024);
+      try {
+        const result = await passwordRoutes.formChangeTemporary(request, { email, current, password: form.get("password") ?? "" }, helpers.siteBaseUrl(request));
+        if (!result) {
+          redirect(response, 303, `${back}&error=invalid_credentials`);
+          return true;
+        }
+        redirect(response, 303, next, [sessionCookie(result.tokens)]);
+      } catch (error) {
+        const known = identityErrorResponse(error);
+        if (known?.status === 400) {
+          sendHtml(response, 400, choosePasswordPage({ kind: "temporary", email, secret: current, next, minLength: PASSWORD_MIN_LENGTH, notice: { kind: "error", text: known.body.message } }));
+          return true;
+        }
+        signInErrorPage(response, error, back);
+      }
+      return true;
+    }
+
+    // ---- first-time setup key (the /login form) ----------------------------------
+    // Step one (setup_key only) checks the key and asks for a password; step
+    // two (setup_key and password) spends the key, sets the password and
+    // signs in. No session exists before the password is set.
+    if (method === "POST" && publicPath === "/login/setup") {
+      if (!passwordRoutes) {
+        disabledMethod(response, "password");
+        return true;
+      }
+      if (!sameOriginForm(request, helpers)) {
+        sendHtml(response, 403, messagePage({ title: "Unable to sign in", message: "Cross-origin request refused." }));
+        return true;
+      }
+      const form = await formBody(request);
+      const next = safeNextPath(form.get("next"));
+      const back = `/login?next=${encodeURIComponent(next)}`;
+      const key = (form.get("setup_key") ?? "").slice(0, 256);
+      const password = form.get("password");
+      try {
+        if (password === null) {
+          const checked = await passwordRoutes.formCheckSetupKey(request, key);
+          if (!checked) {
+            redirect(response, 303, `${back}&error=setup_key_invalid`);
+            return true;
+          }
+          sendHtml(response, 200, choosePasswordPage({ kind: "setup_key", email: checked.email, secret: key, next, minLength: PASSWORD_MIN_LENGTH }));
+          return true;
+        }
+        const result = await passwordRoutes.formCompleteSetupKey(request, { key, password });
+        if (!result) {
+          redirect(response, 303, `${back}&error=setup_key_invalid`);
+          return true;
+        }
+        redirect(response, 303, next, [sessionCookie(result.tokens)]);
+      } catch (error) {
+        const known = identityErrorResponse(error);
+        if (known?.status === 400) {
+          sendHtml(response, 400, choosePasswordPage({
+            kind: "setup_key",
+            email: config.bootstrap?.adminEmail ?? config.bootstrap?.adminEmails[0] ?? "",
+            secret: key,
+            next,
+            minLength: PASSWORD_MIN_LENGTH,
+            notice: { kind: "error", text: known.body.message },
+          }));
+          return true;
+        }
         signInErrorPage(response, error, back);
       }
       return true;
@@ -537,6 +697,13 @@ export function createIdentityModule(input: {
       const site = helpers.siteBaseUrl(request);
       const token = (form.get("token") ?? "").slice(0, 256);
       const password = form.get("password") ?? "";
+      if (kind === "reset" && !token && !passwordRoutes.selfService) {
+        sendHtml(response, 404, messagePage({
+          title: "Email is not configured",
+          message: "This installation cannot email reset links. Ask an owner or admin to set a temporary password for you.",
+        }));
+        return true;
+      }
       if (kind === "reset" && !token) {
         passwordRoutes.formResetRequest(request, form.get("email") ?? "", site);
         sendHtml(response, 200, messagePage({
@@ -685,6 +852,12 @@ export function createIdentityModule(input: {
         // Whether only some email domains may join (never the list itself).
         allowed_domain_hint: config.autoJoinDomains.length > 0 || (oidc?.config.allowedDomains.length ?? 0) > 0,
         password_policy: passwordRoutes ? { min_length: PASSWORD_MIN_LENGTH, max_length: PASSWORD_MAX_LENGTH } : null,
+        // Register and reset (emailed links) are available: SMTP is configured.
+        password_self_service: passwordRoutes?.selfService ?? false,
+        // Show the "First-time setup: enter setup key" field (POST
+        // /api/v1/auth/password/setup-key): a key is live and the bootstrap
+        // admin has never signed in.
+        setup_key: passwordRoutes ? await passwordRoutes.setupKeyOffered() : false,
       });
       return true;
     }
@@ -707,6 +880,8 @@ export function createIdentityModule(input: {
         microsoft: microsoft ? { displayName: microsoft.config.displayName } : null,
         emailLink: emailLogin,
         password: passwordRoutes !== null,
+        passwordSelfService: passwordRoutes?.selfService ?? false,
+        temporaryPasswords: passwordRoutes !== null,
         inviteEmail: mailer !== null,
         autoJoinDomains: config.autoJoinDomains,
         inviteTtlHours: Math.round(config.inviteTtlMs / 3_600_000),
@@ -768,6 +943,47 @@ export function createIdentityModule(input: {
       return true;
     }
 
+    // ---- API: first-time setup key (bootstrap bearer only) --------------------------
+    // Mints a fresh one-time key for the bootstrap admin, returned once, and
+    // revokes any earlier one (including SELFHOST_SETUP_KEY). For when the
+    // configured key expired or none was configured.
+    if (path === "/api/v1/installation/setup-key" && method === "POST") {
+      const auth = await helpers.authenticateWithBootstrap(request);
+      if (auth.kind !== "bootstrap") throw new IdentityHttpError(403, "forbidden", "Bootstrap token required");
+      if (!passwordRoutes) {
+        disabledMethod(response, "password");
+        return true;
+      }
+      if (limited("installation-setup-key", RATE.settings)) {
+        throw new IdentityHttpError(429, "rate_limited", "Too many setup keys were minted. Try again later.");
+      }
+      const minted = await passwordRoutes.mintSetupKey();
+      sendJson(response, 201, { setupKey: minted.setupKey, email: minted.email, expiresAt: minted.expiresAt.toISOString() });
+      return true;
+    }
+
+    // ---- API: temporary password for a member -----------------------------------------
+    const memberTemporary = /^\/api\/v1\/organizations\/([^/]+)\/memberships\/([^/]+)\/temporary-password$/.exec(path);
+    if (memberTemporary) {
+      if (method !== "POST") throw new IdentityHttpError(405, "method_not_allowed", "Use POST");
+      const organizationId = decodeURIComponent(memberTemporary[1]!);
+      const userId = decodeURIComponent(memberTemporary[2]!);
+      const auth = await helpers.organizationAccess(request, organizationId, true);
+      if (!helpers.bearer(request) && !cookieRequestAllowed(request, helpers.browserOrigins)) {
+        throw new IdentityHttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      const ttlMs = temporaryPasswordTtlMs(await helpers.requestObject(request));
+      if (auth.kind === "user" && limited(`temporary-password:${auth.principal.userId}`, RATE.invite)) {
+        throw new IdentityHttpError(429, "rate_limited", "Too many temporary passwords. Try again later.");
+      }
+      const member = await store.memberForTemporaryPassword(organizationId, userId);
+      if (!member) throw new IdentityHttpError(404, "membership_not_found", "That person is not a member of this organization.");
+      temporaryPasswordAllowed(auth, member.role);
+      const issued = await issueTemporaryPassword({ organizationId, email: member.email, auth, ttlMs, target: `user=${userId}` });
+      sendJson(response, 201, { userId, email: member.email, temporaryPassword: issued.password, expiresAt: issued.expiresAt });
+      return true;
+    }
+
     // ---- API: operator-assigned auto-join domains (DG-002) ------------------------
     // Assigning a domain lets every verified address at it join the
     // organization, so only the installation operator (bootstrap bearer) may
@@ -808,8 +1024,9 @@ export function createIdentityModule(input: {
     const collection = /^\/api\/v1\/organizations\/([^/]+)\/invitations$/.exec(path);
     const item = /^\/api\/v1\/organizations\/([^/]+)\/invitations\/([^/]+)$/.exec(path);
     const link = /^\/api\/v1\/organizations\/([^/]+)\/invitations\/([^/]+)\/link$/.exec(path);
-    if (!collection && !item && !link) return false;
-    const organizationId = decodeURIComponent((collection ?? item ?? link)![1]!);
+    const inviteTemporary = /^\/api\/v1\/organizations\/([^/]+)\/invitations\/([^/]+)\/temporary-password$/.exec(path);
+    if (!collection && !item && !link && !inviteTemporary) return false;
+    const organizationId = decodeURIComponent((collection ?? item ?? link ?? inviteTemporary)![1]!);
     const mutating = method !== "GET";
     const auth = await helpers.organizationAccess(request, organizationId, true);
     // A bodiless DELETE carries no content type; its Origin must still match.
@@ -833,14 +1050,54 @@ export function createIdentityModule(input: {
       if (role !== "owner" && role !== "admin" && role !== "member") {
         throw new IdentityHttpError(400, "invalid_request", "role must be owner, admin, or member");
       }
+      // temporaryPassword: true also sets a temporary password for the
+      // invitee (returned once), so a copied invite link works without email.
+      const temporary = body.temporaryPassword === true;
+      if (body.temporaryPassword !== undefined && typeof body.temporaryPassword !== "boolean") {
+        throw new IdentityHttpError(400, "invalid_request", "temporaryPassword must be a boolean");
+      }
+      let ttlMs = TEMPORARY_PASSWORD_TTL_MS;
+      if (temporary) {
+        if (!passwordRoutes) throw new IdentityHttpError(404, "signin_method_disabled", "Password sign-in is not enabled on this installation.");
+        temporaryPasswordAllowed(auth, role);
+        ttlMs = temporaryPasswordTtlMs(body.expiresInHours === undefined ? {} : { expiresInHours: body.expiresInHours });
+        if (await store.otherOrganizationCount(organizationId, email) > 0) {
+          throw new IdentityHttpError(409, "member_of_other_organizations", "That person also belongs to another organization here, so only they can change their password.");
+        }
+      }
       const created = await store.createInvitation({ organizationId, email, role, actor: actorFor(auth) });
+      const issued = temporary
+        ? await issueTemporaryPassword({ organizationId, email: created.invitation.email, auth, ttlMs, target: `invitation=${created.invitation.id}` })
+        : null;
       const emailDelivery = await sendInvite(created.invitation, created.token, organizationId, auth);
-      sendJson(response, 201, { invitation: created.invitation, inviteUrl: inviteUrl(created.token), emailDelivery });
+      sendJson(response, 201, {
+        invitation: created.invitation,
+        inviteUrl: inviteUrl(created.token),
+        emailDelivery,
+        ...(issued ? { temporaryPassword: issued.password, temporaryPasswordExpiresAt: issued.expiresAt } : {}),
+      });
       return true;
     }
     if (item && method === "DELETE") {
-      await store.revokeInvitation({ organizationId, id: decodeURIComponent(item[2]!), actor: actorFor(auth) });
+      const id = decodeURIComponent(item[2]!);
+      const invitation = await store.invitationById(organizationId, id);
+      await store.revokeInvitation({ organizationId, id, actor: actorFor(auth) });
+      // A canceled invite's temporary password stops working too.
+      if (invitation && passwordRoutes) await passwordRoutes.revokeTemporaryPasswords(organizationId, invitation.email);
       sendJson(response, 200, { revoked: true });
+      return true;
+    }
+    if (inviteTemporary && method === "POST") {
+      const id = decodeURIComponent(inviteTemporary[2]!);
+      const ttlMs = temporaryPasswordTtlMs(await helpers.requestObject(request));
+      const invitation = await store.invitationById(organizationId, id);
+      if (!invitation) throw new IdentityHttpError(404, "invitation_not_found", "Invitation not found");
+      if (invitation.status !== "pending") {
+        throw new IdentityHttpError(409, `invitation_${invitation.status}`, "Only an open invite can get a temporary password.");
+      }
+      temporaryPasswordAllowed(auth, invitation.role);
+      const issued = await issueTemporaryPassword({ organizationId, email: invitation.email, auth, ttlMs, target: `invitation=${id}` });
+      sendJson(response, 201, { invitationId: id, email: invitation.email, temporaryPassword: issued.password, expiresAt: issued.expiresAt });
       return true;
     }
     if (link && method === "POST") {

@@ -1303,6 +1303,29 @@ export class IdentityStore {
     return result.rows[0]?.name ?? null;
   }
 
+  /** How many organizations other than this one the address belongs to. */
+  async otherOrganizationCount(organizationId: string, email: string): Promise<number> {
+    const normalized = normalizeEmailAddress(email);
+    if (!normalized) return 0;
+    const result = await this.database.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM organization_memberships m JOIN users u ON u.id = m.user_id
+        WHERE u.email = $1 AND m.organization_id <> $2`,
+      [normalized, organizationId],
+    );
+    return result.rows[0]?.n ?? 0;
+  }
+
+  /** A member's address and role, for setting a temporary password. */
+  async memberForTemporaryPassword(organizationId: string, userId: string): Promise<{ email: string; role: Role } | null> {
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) return null;
+    const result = await this.database.query<{ email: string; role: Role }>(
+      `SELECT u.email, m.role FROM organization_memberships m JOIN users u ON u.id = m.user_id
+        WHERE m.organization_id = $1 AND m.user_id = $2`,
+      [organizationId, userId],
+    );
+    return result.rows[0] ?? null;
+  }
+
   async userSummary(userId: string): Promise<{ name: string; email: string } | null> {
     const result = await this.database.query<{ name: string; email: string }>("SELECT name, email FROM users WHERE id = $1", [userId]);
     return result.rows[0] ?? null;

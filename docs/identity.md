@@ -297,8 +297,14 @@ SMTP alone, without `SELFHOST_EMAIL_LOGIN`, is used to email invites.
 
 Turn it on with `SELFHOST_SIGNIN_METHODS`, a comma list of `email_link` and
 `password`. When the variable is unset the old behaviour holds:
-`SELFHOST_EMAIL_LOGIN=true` means `email_link` alone. Password sign-in needs
-SMTP, because every password starts from a verified email address. A method
+`SELFHOST_EMAIL_LOGIN=true` means `email_link` alone. `email_link` needs SMTP.
+`password` does not: without SMTP, password sign-in, the
+[first-time setup key](#first-time-setup-without-email) and
+[temporary passwords](#temporary-passwords) work, and only self-service
+registration and reset (which mail a link) answer
+`404 {"error":"email_not_configured"}`; the sign-in page then hides
+"Forgot password?" and "Create an account". With SMTP configured, every
+self-registered password still starts from a verified email address. A method
 that is not listed answers `404 {"error":"signin_method_disabled"}` on all of
 its routes. That covers `/api/v1/auth/password/*` and `/login/password` for
 `password`, and `/login/email` and `/login/email/verify` for `email_link`.
@@ -325,9 +331,16 @@ needs:
   "logo_url": "https://cdn.example.com/logo.svg",
   "org_name": "Example Corp",
   "allowed_domain_hint": true,
-  "password_policy": { "min_length": 12, "max_length": 128 }
+  "password_policy": { "min_length": 12, "max_length": 128 },
+  "password_self_service": true,
+  "setup_key": false
 }
 ```
+
+`password_self_service` is whether register and reset (emailed links) are
+available, i.e. SMTP is configured. `setup_key` is whether to show the
+"First-time setup: enter setup key" field (see
+[First-time setup without email](#first-time-setup-without-email)).
 
 `allowed_domain_hint` is a boolean that says whether auto-join or OIDC
 domains are configured. The domains themselves are never returned. Neither are
@@ -655,10 +668,20 @@ address and a reason, never a password, hash or token.
 - `password.reset.completed`, with revocation counts (including
   `desktop_relay_identities_deleted`)
 - `password.hibp.unavailable`
+- `setup_key.used` (with `source=configured|minted`), `setup_key.failure`
+  (reason `invalid_key`, `spent` or `password_already_set`; never the key),
+  `setup_key.lockout`, `setup_key.minted`, and `setup_key.revoked` (the admin
+  signed in another way)
+- `password.temporary.create` (in the organization's audit, with the setter as
+  actor and the expiry; never the password), `login.temporary_password.accepted`,
+  `password.temporary.changed`; a wrong one is `login.password.failure` with
+  reason `wrong_temporary_password`, `no_temporary_password` or
+  `temporary_password_spent` / `temporary_password_not_a_member`
 
 #### Limitations
 
-- A password can only be added through a mailed link, never from a
+- A password can only be added through a mailed link, the one-time setup
+  key, or a temporary password an owner or admin set, never from a
   signed-in session. Sessions carry no sign-in time, so a session path could
   not check recency, and a stolen session cookie could have been turned into
   a durable password. Someone with mailbox access can still add a password to
@@ -675,6 +698,76 @@ address and a reason, never a password, hash or token.
 Migration `0029_password_signin.sql` adds the credential, pending
 registration, set-password token, reset token, login attempt and admin email
 grant tables.
+
+### First-time setup without email
+
+A fresh install does not need SMTP, SSO or the operator sign-in code to get
+its first administrator in.
+
+**Setup key.** `SELFHOST_SETUP_KEY` (or `SELFHOST_SETUP_KEY_FILE`) is a
+one-time key for the bootstrap admin (`SELFHOST_BOOTSTRAP_ADMIN_EMAIL`, else
+the first `SELFHOST_ADMIN_EMAILS` entry). There is no default: generate one
+per install, like the bootstrap token, and keep it in the Kubernetes Secret.
+It must be 32-256 bytes without spaces and needs `password` in
+`SELFHOST_SIGNIN_METHODS`.
+
+```sh
+# at install, into the chart's existing Secret
+kubectl -n <ns> create secret generic <secret> ... \
+  --from-literal=selfhost-setup-key="$(openssl rand -hex 32)"
+# the operator reads it back once
+kubectl -n <ns> get secret <secret> -o jsonpath='{.data.selfhost-setup-key}' | base64 -d
+```
+
+- `/login` shows "First-time setup: enter setup key" (and `login-config`
+  answers `setup_key: true`) only while a key is live and the admin has never
+  signed in and has no password.
+- A valid key asks for the admin's password (the usual 12-128 character
+  policy) and only then signs in: there is no session before the password is
+  set. The JSON form is `POST /api/v1/auth/password/setup-key`
+  `{setupKey, password}`. A rejected password does not spend the key.
+- Then the key is spent. It also stops working 24 hours after the server
+  first recorded it, used or not, and as soon as the admin signs in any other
+  way. A restart never renews it.
+- Only its SHA-256 hash is stored (`setup_keys`, migration 0041); it is
+  compared in constant time and never logged or audited in clear. Wrong keys
+  are audited (`setup_key.failure`) and limited per client: 20 per 10 minutes
+  in memory, and 5 free then a 30 s doubling backoff shared by every replica.
+- Lost or expired? `POST /api/v1/installation/setup-key` with the bootstrap
+  bearer mints a fresh key, returned once, and revokes the earlier ones
+  (including `SELFHOST_SETUP_KEY`). It answers 409 `admin_already_signed_in`
+  once the admin has signed in.
+- The bootstrap token is unaffected and remains the break-glass.
+
+### Temporary passwords
+
+An owner or admin can give someone a temporary password, so a copied invite
+link works without SMTP and a member who forgot their password can be let back
+in without a reset email.
+
+- `POST /api/v1/organizations/{id}/memberships/{userId}/temporary-password`
+  for an existing member, `POST .../invitations/{invitationId}/temporary-password`
+  for an open invite, or `temporaryPassword: true` on
+  `POST .../invitations`. Optional `expiresInHours` (1-168, default 72).
+- The server generates it (144 random bits) and returns it once. It is stored
+  only as an argon2id hash (`temporary_passwords`, migration 0041), never
+  emailed and never shown again. A newer one replaces the older; canceling the
+  invite cancels it.
+- Owners (and the bootstrap bearer) may set one for anyone; admins only for a
+  member. A user principal needs the dashboard's account session (not a CLI
+  or Desktop token). Refused with 409 `member_of_other_organizations` for
+  someone who also belongs to another organization, so an owner here cannot
+  take over an account that is used elsewhere.
+- Signing in with it never issues a session: `POST /api/v1/auth/password/login`
+  answers 403 `password_change_required` (the `/login` form shows "Choose a
+  new password"). `POST /api/v1/auth/password/change`
+  `{email, currentPassword, newPassword}` then sets the person's own password
+  and signs in. It is checked like a login (the same lockout and audit); the
+  new password must pass the policy and differ from the temporary one.
+- It works once and until it expires. Until it is used, the member's existing
+  password keeps working; using it replaces that password. Existing sessions
+  are not revoked.
+- With SMTP configured, emailed verification, invites and reset are unchanged.
 
 ### Break-glass: the bootstrap bearer
 

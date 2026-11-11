@@ -106,6 +106,11 @@ export type IdentityConfig = {
   loginOrgName: string | null;
   /** Password sign-in settings, or null when "password" is not enabled. */
   password: PasswordConfig | null;
+  /**
+   * SELFHOST_SETUP_KEY[_FILE]: the one-time first-admin setup key (at least
+   * 32 bytes, random per install), or null. Only its SHA-256 hash is stored.
+   */
+  setupKey: string | null;
 };
 
 type Env = Record<string, string | undefined>;
@@ -438,8 +443,11 @@ export function loadIdentityConfig(env: Env = process.env): IdentityConfig {
   const emailLoginFlag = flag(env, "SELFHOST_EMAIL_LOGIN");
   if (emailLoginFlag && !smtp) throw new Error("SELFHOST_EMAIL_LOGIN=true requires SELFHOST_SMTP_HOST");
   const signinMethods = loadSigninMethods(env, emailLoginFlag);
-  if (signinMethods.length > 0 && !smtp) {
-    throw new Error("SELFHOST_SIGNIN_METHODS (email_link and password both send email) requires SELFHOST_SMTP_HOST");
+  // Password sign-in works without SMTP (sign-in, the setup key and
+  // temporary passwords send no email); only self-service registration and
+  // reset, which mail a link, are off until SMTP is configured.
+  if (signinMethods.includes("email_link") && !smtp) {
+    throw new Error("SELFHOST_SIGNIN_METHODS=email_link (it sends email) requires SELFHOST_SMTP_HOST");
   }
   if (signinMethods.includes("password")) {
     // Password sign-in locks out by client address, so the server must know
@@ -479,6 +487,16 @@ export function loadIdentityConfig(env: Env = process.env): IdentityConfig {
       );
     }
   }
+  const setupKey = readSecret(env, "SELFHOST_SETUP_KEY") ?? null;
+  if (setupKey !== null) {
+    if (Buffer.byteLength(setupKey) < 32 || Buffer.byteLength(setupKey) > 256 || /\s/.test(setupKey)) {
+      throw new Error("SELFHOST_SETUP_KEY must be 32-256 bytes without spaces (e.g. openssl rand -hex 32)");
+    }
+    if (!bootstrap) throw new Error("SELFHOST_SETUP_KEY requires SELFHOST_BOOTSTRAP_ORG_NAME and SELFHOST_BOOTSTRAP_ADMIN_EMAIL");
+    if (!signinMethods.includes("password")) {
+      throw new Error("SELFHOST_SETUP_KEY requires SELFHOST_SIGNIN_METHODS to include password (the setup key sets the admin's password)");
+    }
+  }
   return {
     bootstrap,
     relaycastInternalSecret,
@@ -493,5 +511,6 @@ export function loadIdentityConfig(env: Env = process.env): IdentityConfig {
     logoUrl: loadLogoUrl(env),
     loginOrgName: cleanLabel(env.SELFHOST_LOGIN_ORG_NAME ?? "") || bootstrap?.organizationName || null,
     password: signinMethods.includes("password") ? loadPassword(env) : null,
+    setupKey,
   };
 }

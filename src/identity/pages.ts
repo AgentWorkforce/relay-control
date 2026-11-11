@@ -23,8 +23,8 @@ a:focus-visible,.btn:focus-visible,summary:focus-visible{outline:2px solid var(-
 .btn{display:block;width:100%;text-align:center;min-height:40px;padding:9px 16px;border-radius:6px;border:1px solid var(--accent-border);background:var(--accent);color:var(--accent-fg);font:inherit;font-size:.92rem;font-weight:500;text-decoration:none;cursor:pointer;transition:background-color .15s}
 .btn:hover{background:var(--accent-hover);text-decoration:none}.btn:visited{color:var(--accent-fg)}
 .btn.secondary{background:transparent;color:var(--fg);border-color:var(--field)}.btn.secondary:hover{background:var(--secondary-hover)}.btn.secondary:visited{color:var(--fg)}
-input[type=email],input[type=password]{width:100%;padding:10px 14px;border-radius:6px;border:1px solid var(--field);background:var(--field-bg);color:var(--fg);font:inherit;font-size:.92rem;margin:0 0 10px;outline:none}
-input[type=email]:focus,input[type=password]:focus{border-color:var(--focus);box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 30%,transparent)}@media (forced-colors:active){input[type=email]:focus,input[type=password]:focus{outline:2px solid CanvasText;outline-offset:1px}}
+input[type=email],input[type=password],input[type=text]{width:100%;padding:10px 14px;border-radius:6px;border:1px solid var(--field);background:var(--field-bg);color:var(--fg);font:inherit;font-size:.92rem;margin:0 0 10px;outline:none}
+input[type=email]:focus,input[type=password]:focus,input[type=text]:focus{border-color:var(--focus);box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 30%,transparent)}@media (forced-colors:active){input[type=email]:focus,input[type=password]:focus,input[type=text]:focus{outline:2px solid CanvasText;outline-offset:1px}}
 .or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:.8rem;margin:18px 0}.or:before,.or:after{content:"";flex:1;border-top:1px solid var(--border)}
 .notice{border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin:0 0 16px;font-size:.92rem}.notice.error{border-color:var(--danger);background:var(--danger-soft);color:var(--danger)}.notice.ok{background:var(--ok-soft)}
 dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0 0 16px;font-size:.92rem}dt{color:var(--muted)}dd{margin:0;word-break:break-all}
@@ -79,6 +79,11 @@ export function loginPage(input: {
   coBrand?: CoBrand | null;
   /** Dashboard pages for people without a working password. Only with `password`. */
   passwordLinks?: { forgot: string; register: string } | null;
+  /**
+   * The first-time setup key field: only while a setup key is live and the
+   * bootstrap admin has never signed in.
+   */
+  setupKey?: boolean;
   userCode: string;
   pollIntervalMs: number;
   notice?: { kind: "error" | "ok"; text: string } | null;
@@ -122,6 +127,13 @@ ${hidden}
 <button class="btn${provider || input.password ? " secondary" : ""}" type="submit">Email me a sign-in link</button></form>`);
   }
   parts.push(methods.join(`<div class="or">or</div>`));
+  if (input.setupKey) {
+    parts.push(`<div class="or">first-time setup</div><form method="post" action="/login/setup">
+<input type="hidden" name="next" value="${escapeHtml(input.next)}">
+<p class="muted">First-time setup: enter the setup key from your installation's secret to sign in as the administrator and choose a password.</p>
+<input type="password" name="setup_key" required autocomplete="off" placeholder="Setup key" aria-label="Setup key" maxlength="256">
+<button class="btn secondary" type="submit">Continue with setup key</button></form>`);
+  }
   const hasMethod = methods.length > 0;
   if (!hasMethod) {
     parts.push(`<p class="muted">No sign-in method is configured for this installation yet. Ask your administrator to set up single sign-on (OIDC), email links or passwords.</p>`);
@@ -188,4 +200,36 @@ if(location.hash)history.replaceState(null,"",location.pathname);`;
 ${notice}
 ${setForm}
 ${fallback}`, script);
+}
+
+/**
+ * The second step of a one-time secret (the first-time setup key or a
+ * temporary password): choose the real password. The secret rides along in
+ * a hidden field of this no-store page and is checked again on submit; no
+ * session exists until the new password is set.
+ */
+export function choosePasswordPage(input: {
+  kind: "setup_key" | "temporary";
+  email: string;
+  secret: string;
+  next: string;
+  minLength: number;
+  notice?: { kind: "error" | "ok"; text: string } | null;
+}): string {
+  const setup = input.kind === "setup_key";
+  const title = setup ? "Set the administrator password" : "Choose a new password";
+  const notice = input.notice ? `<div class="notice ${input.notice.kind}">${escapeHtml(input.notice.text)}</div>` : "";
+  const hidden = setup
+    ? `<input type="hidden" name="setup_key" value="${escapeHtml(input.secret)}">`
+    : `<input type="hidden" name="email" value="${escapeHtml(input.email)}"><input type="hidden" name="current" value="${escapeHtml(input.secret)}">`;
+  return page(title, `<h1>${title}</h1>
+<p class="muted">${setup
+    ? `Signing in as <strong>${escapeHtml(input.email)}</strong>. Choose the password you will use from now on; the setup key stops working once it is set.`
+    : `<strong>${escapeHtml(input.email)}</strong> signed in with a temporary password. Choose your own password to continue; the temporary one stops working.`}</p>
+${notice}
+<form method="post" action="${setup ? "/login/setup" : "/login/password/change"}">
+<input type="hidden" name="next" value="${escapeHtml(input.next)}">${hidden}
+<input type="email" name="username" value="${escapeHtml(input.email)}" autocomplete="username" aria-label="Email address" readonly hidden>
+<input type="password" name="password" required autocomplete="new-password" placeholder="New password" aria-label="New password" minlength="${input.minLength}" maxlength="1024">
+<button class="btn" type="submit">Set password and sign in</button></form>`);
 }

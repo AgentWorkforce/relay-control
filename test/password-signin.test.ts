@@ -157,7 +157,10 @@ test("config: SELFHOST_SIGNIN_METHODS, logo URL and admin email lists", () => {
   assert.equal(both.emailLogin, true);
   assert.equal(loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "password", SELFHOST_TRUSTED_PROXIES: "0" }).emailLogin, false);
   assert.throws(() => loadIdentityConfig({ ...SMTP, SELFHOST_SIGNIN_METHODS: "sms" }), /email_link and\/or password/);
-  assert.throws(() => loadIdentityConfig({ SELFHOST_SIGNIN_METHODS: "password" }), /SMTP/);
+  // Password sign-in needs no SMTP (only register and reset do); email links do.
+  assert.deepEqual(loadIdentityConfig({ SELFHOST_SIGNIN_METHODS: "password", SELFHOST_TRUSTED_PROXIES: "0" }).signinMethods, ["password"]);
+  assert.throws(() => loadIdentityConfig({ SELFHOST_SIGNIN_METHODS: "email_link" }), /SMTP/);
+  assert.throws(() => loadIdentityConfig({ SELFHOST_SIGNIN_METHODS: "password,email_link", SELFHOST_TRUSTED_PROXIES: "0" }), /SMTP/);
   assert.throws(() => loadIdentityConfig({ ...SMTP, SELFHOST_EMAIL_LOGIN: "true", SELFHOST_SIGNIN_METHODS: "password" }), /conflicts/);
 
   assert.equal(loadIdentityConfig({ SELFHOST_LOGIN_LOGO_URL: "https://cdn.example.test/logo.svg" }).logoUrl, "https://cdn.example.test/logo.svg");
@@ -246,6 +249,8 @@ test("login-config: public, lists methods, logo and domain hint, never secrets",
     org_name: "Acme",
     allowed_domain_hint: true,
     password_policy: { min_length: 12, max_length: 128 },
+    password_self_service: true,
+    setup_key: false,
   });
   assert.ok(!res.text.includes("sss"), "no pepper");
   assert.ok(!res.text.includes("acme.test"), "the hint is a boolean, not the domain list");
