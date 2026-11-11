@@ -1,7 +1,7 @@
 # Optional features
 
 `SELFHOST_FEATURES` selects which optional components an installation serves.
-It is a comma list of `flows`, `relayfile`, `chief`, `usage` and `launch`, read once at startup.
+It is a comma list of `flows`, `relayfile`, `chief`, `usage`, `launch` and `usage_people`, read once at startup.
 Unset selects `usage` and `usage_people` (the owner-only usage pages); an explicit list, including an empty one, is exact. An unknown name stops startup. Everything
 else is core and always on.
 
@@ -17,7 +17,7 @@ else is core and always on.
 ## Reading it
 
 - `GET /api/v1/capabilities` (also `/cloud/api/v1/capabilities`): any signed-in
-  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool, "usage": bool, "launch": bool } }`.
+  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool, "usage": bool, "launch": bool, "usage_people": bool } }`.
 - `/readyz` includes the same `capabilities` object.
 
 ## Refusals
