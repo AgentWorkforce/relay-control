@@ -9,6 +9,7 @@ import { migrate } from "../src/migrations.js";
 import { NO_FEATURES, type SelectedFeatures } from "../src/features.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { readWorkspaceHistory } from "../src/sessions/history.js";
+import { forgetPeopleCache, PEOPLE_MAX_UPSTREAM_CALLS } from "../src/usage/people.js";
 import { historyReader } from "../src/mcp/context.js";
 
 class PGliteDatabase implements Database {
@@ -179,6 +180,9 @@ async function startHistory(t: TestContext) {
     if (scope) response.setHeader("x-relayhistory-workspace-id", scope);
     const override = overrides.get(url.pathname)?.(request, url);
     if (override) {
+      const delayMs = (override as { delayMs?: number }).delayMs;
+      if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (response.destroyed || response.writableEnded) return;
       for (const [name, value] of Object.entries(override.headers ?? {})) {
         response.setHeader(name, value);
       }
@@ -1425,6 +1429,8 @@ function peopleSessions(env: Awaited<ReturnType<typeof setup>>, rows: Array<{
     const after = Date.parse(url.searchParams.get("lastTsAfter")!);
     const before = Date.parse(url.searchParams.get("lastTsBefore")!);
     const limit = Number(url.searchParams.get("limit"));
+    // The real directory list refuses more than 200 (501 `limit`).
+    if (!(limit >= 1 && limit <= 200)) return { status: 501, body: { error: { code: "unsupported", reason: "limit" } } };
     const offset = Number(url.searchParams.get("cursor") ?? "0");
     const matching = rows
       .filter((row) => row.workspaceId === workspace && (!user || row.userIds.includes(user)))
@@ -1608,4 +1614,174 @@ test("usage people: the drill-down merges workspaces newest first", async (t) =>
   const expected = [...rows].sort((a, b) => Date.parse(b.lastTs) - Date.parse(a.lastTs)).map((row) => row.sessionId);
   assert.deepEqual(seen, expected);
   assert.equal(seen[0], "b-newest");
+});
+
+test("usage people: every read API list page stays within the directory's 200 limit", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  // 450 sessions in alpha: the aggregate needs three pages of at most 200.
+  const rows = Array.from({ length: 450 }, (_, index) => ({
+    sessionId: `m${index}`, workspaceId: env.alpha, userIds: [env.memberId],
+    lastTs: new Date(Date.parse("2026-11-02T19:00:00.000Z") - index * 60_000).toISOString(),
+  }));
+  peopleSessions(env, rows);
+  const owner = await env.login(env.ownerId, env.alpha);
+  const people = await call(env.origin, `/cloud/api/v1/organizations/${env.organizationId}/usage/people?days=7`, { token: owner });
+  assert.equal(people.status, 200);
+  assert.deepEqual(people.body.people.unavailable, []);
+  // No aggregate (404, one call) and then two list pages of 200 fill the
+  // three-call budget: a lower bound, marked as such.
+  assert.equal(people.body.people.members.find((member: any) => member.userId === env.memberId).sessionsUploaded, 400);
+  assert.equal(people.body.people.truncated, true);
+  assert.equal(people.body.people.source, "sample");
+  // Page through the drill-down far enough to grow each read.
+  const base = `/cloud/api/v1/organizations/${env.organizationId}/usage/people/${env.memberId}/sessions?days=7`;
+  let cursor: string | null = null;
+  let seen = 0;
+  for (let page = 0; page < 12; page += 1) {
+    const result: Awaited<ReturnType<typeof call>> = await call(env.origin, cursor ? `${base}&cursor=${encodeURIComponent(cursor)}` : base, { token: owner });
+    assert.equal(result.status, 200);
+    seen += result.body.sessions.length;
+    cursor = result.body.nextCursor;
+    if (!cursor) break;
+  }
+  assert.equal(seen, 240);
+  const limits = env.history.requests.filter((entry) => entry.path === "/v1/sessions").map((entry) => Number(entry.query.limit));
+  assert.ok(limits.length > 0 && limits.every((limit) => limit >= 1 && limit <= 200), `limits ${limits}`);
+});
+
+/** A read API /v1/sessions/users double: one GROUP BY per workspace, optionally slow. */
+function peopleAggregate(env: Awaited<ReturnType<typeof setup>>, rows: Array<{
+  sessionId: string; workspaceId: string; userIds: string[]; lastTs: string; projectId?: string;
+}>, delayMs = 0) {
+  env.history.overrides.set("/v1/sessions/users", (_request, url) => {
+    const workspace = url.searchParams.get("workspace");
+    const after = Date.parse(url.searchParams.get("lastTsAfter")!);
+    const before = Date.parse(url.searchParams.get("lastTsBefore")!);
+    const users = new Map<string, { sessions: number; lastSessionAt: string; projects: Map<string, number> }>();
+    for (const row of rows) {
+      if (row.workspaceId !== workspace || Date.parse(row.lastTs) < after || Date.parse(row.lastTs) > before) continue;
+      for (const userId of new Set(row.userIds)) {
+        const entry = users.get(userId) ?? { sessions: 0, lastSessionAt: row.lastTs, projects: new Map() };
+        entry.sessions += 1;
+        if (Date.parse(row.lastTs) > Date.parse(entry.lastSessionAt)) entry.lastSessionAt = row.lastTs;
+        if (row.projectId) entry.projects.set(row.projectId, (entry.projects.get(row.projectId) ?? 0) + 1);
+        users.set(userId, entry);
+      }
+    }
+    const body = {
+      users: [...users.entries()].map(([userId, entry]) => ({
+        userId, sessions: entry.sessions, lastSessionAt: entry.lastSessionAt,
+        topProjects: [...entry.projects.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name, sessions]) => ({ name, sessions })),
+      })),
+      truncated: false,
+    };
+    return delayMs ? { body, delayMs } as any : { body };
+  });
+}
+
+test("usage people: the read API aggregate gives exact counts in one call per workspace", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  const rows = Array.from({ length: 900 }, (_, index) => ({
+    sessionId: `x${index}`, workspaceId: index % 3 === 0 ? env.beta : env.alpha,
+    userIds: index % 2 === 0 ? [env.memberId] : [env.ownerId],
+    lastTs: new Date(Date.parse("2026-11-02T19:00:00.000Z") - index * 60_000).toISOString(), projectId: "relay",
+  }));
+  peopleSessions(env, rows);
+  peopleAggregate(env, rows);
+  const owner = await env.login(env.ownerId, env.alpha);
+  const path = `/cloud/api/v1/organizations/${env.organizationId}/usage/people?days=7`;
+  const result = await call(env.origin, path, { token: owner });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.people.source, "aggregate");
+  assert.equal(result.body.people.truncated, false);
+  const byId = Object.fromEntries(result.body.people.members.map((m: any) => [m.userId, m]));
+  assert.equal(byId[env.memberId].sessionsUploaded, 450);
+  assert.equal(byId[env.ownerId].sessionsUploaded, 450);
+  assert.deepEqual(byId[env.memberId].topProjects, [{ name: "relay", sessions: 450 }]);
+  const upstream = () => env.history.requests.filter((entry) => entry.path.startsWith("/v1/sessions")).length;
+  // alpha + beta: two aggregate calls and no list pages.
+  assert.equal(upstream(), 2);
+  assert.equal(env.history.requests.filter((entry) => entry.path === "/v1/sessions").length, 0);
+  // Cached for five minutes: a reload makes no read API call.
+  const before = upstream();
+  assert.equal((await call(env.origin, path, { token: owner })).status, 200);
+  assert.equal(upstream(), before);
+});
+
+test("usage people: load: 10k sessions, 50 users, bounded calls and p95 under 500ms", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  const users = Array.from({ length: 50 }, (_, index) => index === 0 ? env.memberId : `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`);
+  const rows = Array.from({ length: 10_000 }, (_, index) => ({
+    sessionId: `l${index}`, workspaceId: index % 2 === 0 ? env.alpha : env.beta, userIds: [users[index % 50]!],
+    lastTs: new Date(Date.parse("2026-11-02T19:00:00.000Z") - (index % 5000) * 100_000).toISOString(), projectId: `p${index % 7}`,
+  }));
+  peopleSessions(env, rows);
+  const owner = await env.login(env.ownerId, env.alpha);
+  const path = `/cloud/api/v1/organizations/${env.organizationId}/usage/people?days=30`;
+  const upstream = () => env.history.requests.filter((entry) => entry.path.startsWith("/v1/sessions")).length;
+  for (const mode of ["sample", "aggregate"] as const) {
+    if (mode === "aggregate") peopleAggregate(env, rows);
+    const timings: number[] = [];
+    for (let run = 0; run < 20; run += 1) {
+      forgetPeopleCache(env.config);
+      const before = upstream();
+      const started = performance.now();
+      const result = await call(env.origin, path, { token: owner });
+      timings.push(performance.now() - started);
+      assert.equal(result.status, 200);
+      assert.ok(upstream() - before <= PEOPLE_MAX_UPSTREAM_CALLS, `${mode}: ${upstream() - before} read API calls`);
+      assert.equal(result.body.people.source, mode);
+      assert.equal(result.body.people.truncated, mode === "sample");
+    }
+    timings.sort((a, b) => a - b);
+    const p95 = timings[Math.ceil(timings.length * 0.95) - 1]!;
+    assert.ok(p95 < 500, `${mode} p95 ${p95.toFixed(1)}ms`);
+  }
+  const limits = env.history.requests.filter((entry) => entry.path === "/v1/sessions").map((entry) => Number(entry.query.limit));
+  assert.ok(limits.every((limit) => limit <= 200));
+});
+
+test("usage people: a slow read API stops at the time budget with partial counts", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  const rows = [{ sessionId: "s", workspaceId: env.alpha, userIds: [env.memberId], lastTs: "2026-11-02T10:00:00.000Z" }];
+  peopleSessions(env, rows);
+  peopleAggregate(env, rows, 2_500);
+  const owner = await env.login(env.ownerId, env.alpha);
+  const started = performance.now();
+  const result = await call(env.origin, `/cloud/api/v1/organizations/${env.organizationId}/usage/people`, { token: owner });
+  const elapsed = performance.now() - started;
+  assert.equal(result.status, 200);
+  assert.equal(result.body.people.truncated, true);
+  assert.ok(elapsed < 2_400, `took ${elapsed.toFixed(0)}ms`);
+});
+
+test("usage people: a workspace that ends on a full 200-session page still pages on", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  const hour = 3_600_000;
+  // alpha: exactly 200 newer sessions; beta: 30 older ones.
+  const rows = [
+    ...Array.from({ length: 200 }, (_, index) => ({
+      sessionId: `a${index}`, workspaceId: env.alpha, userIds: [env.memberId],
+      lastTs: new Date(Date.parse("2026-11-02T19:00:00.000Z") - index * 60_000).toISOString(),
+    })),
+    ...Array.from({ length: 30 }, (_, index) => ({
+      sessionId: `b${index}`, workspaceId: env.beta, userIds: [env.memberId],
+      lastTs: new Date(Date.parse("2026-11-01T00:00:00.000Z") - index * hour).toISOString(),
+    })),
+  ];
+  peopleSessions(env, rows);
+  const owner = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/organizations/${env.organizationId}/usage/people/${env.memberId}/sessions?days=7`;
+  let cursor: string | null = null;
+  const seen: string[] = [];
+  for (let page = 0; page < 20; page += 1) {
+    const result: Awaited<ReturnType<typeof call>> = await call(env.origin, cursor ? `${base}&cursor=${encodeURIComponent(cursor)}` : base, { token: owner });
+    assert.equal(result.status, 200, `page ${page}`);
+    seen.push(...result.body.sessions.map((session: any) => session.sessionId));
+    cursor = result.body.nextCursor;
+    if (!cursor) break;
+  }
+  assert.equal(seen.length, 230);
+  assert.equal(new Set(seen).size, 230);
+  assert.deepEqual(seen.slice(199, 201), ["a199", "b0"]);
 });

@@ -20,9 +20,13 @@ import { usageDates } from "./routes.js";
  */
 export const PEOPLE_AUDIT_ACTION = "usage.people.viewed";
 const DAY_MS = 86_400_000;
-/** Read API page size for the aggregate; at most this many pages per workspace. */
-const AGGREGATE_PAGE = 500;
-const AGGREGATE_PAGES = 10;
+/**
+ * Largest page the read API's directory list serves (DIRECTORY_LIST_MAX_LIMIT;
+ * more is 501 `limit`). Every /v1/sessions read here stays at or below it.
+ */
+export const READ_API_MAX_LIMIT = 200;
+/** List page size when the read API has no /v1/sessions/users aggregate. */
+const AGGREGATE_PAGE = READ_API_MAX_LIMIT;
 const DRILL_PAGE = 20;
 const SUMMARY_CONCURRENCY = 5;
 const TOP_PROJECTS = 3;
@@ -161,6 +165,136 @@ function newest(a: string | null, b: string | null): string | null {
   return Date.parse(a) >= Date.parse(b) ? a : b;
 }
 
+type UserTotals = { sessions: number; lastSessionAt: string | null; projects: Map<string, number> };
+
+/** At most this many read API calls and this much time per People load; past either, counts are partial. */
+export const PEOPLE_MAX_UPSTREAM_CALLS = 3;
+export const PEOPLE_BUDGET_MS = 2_000;
+const PEOPLE_CACHE_MS = 5 * 60_000;
+const PEOPLE_CACHE_ENTRIES = 200;
+/** How long a read API without /v1/sessions/users is remembered as such. */
+const AGGREGATE_ABSENT_MS = 10 * 60_000;
+
+type SessionTotals = { byUser: Map<string, UserTotals>; partial: boolean; source: "aggregate" | "sample" | "mixed" };
+const peopleCaches = new WeakMap<SelfhostConfig, Map<string, { expiresAt: number; value: SessionTotals }>>();
+const aggregateAbsent = new WeakMap<SelfhostConfig, number>();
+
+/** Test hook: drop cached People session totals for this configuration. */
+export function forgetPeopleCache(config: SelfhostConfig): void {
+  peopleCaches.delete(config);
+  aggregateAbsent.delete(config);
+}
+
+class BudgetExhausted extends Error {}
+
+function addTotals(byUser: Map<string, UserTotals>, userId: string, count: number, lastSessionAt: string | null, projects: Array<[string, number]>) {
+  const totals = byUser.get(userId) ?? { sessions: 0, lastSessionAt: null, projects: new Map<string, number>() };
+  totals.sessions += count;
+  totals.lastSessionAt = newest(totals.lastSessionAt, lastSessionAt);
+  for (const [name, sessions] of projects) totals.projects.set(name, (totals.projects.get(name) ?? 0) + sessions);
+  byUser.set(userId, totals);
+}
+
+/**
+ * Per-user session totals for the owner's workspaces, bounded: at most
+ * PEOPLE_MAX_UPSTREAM_CALLS read API calls (each list page <= 200) within
+ * PEOPLE_BUDGET_MS. Prefers the read API aggregate /v1/sessions/users (one
+ * call per workspace); without it, counts the newest sessions from list
+ * pages. Anything not read in budget makes the totals `partial` (lower
+ * bounds). Throws when the read API cannot be read at all.
+ */
+async function sessionTotals(config: SelfhostConfig, identities: HistoryIdentity[], range: Range): Promise<SessionTotals> {
+  const byUser = new Map<string, UserTotals>();
+  const deadline = Date.now() + PEOPLE_BUDGET_MS;
+  let calls = 0;
+  let partial = false;
+  const used = new Set<"aggregate" | "sample">();
+  const call = async <T>(run: () => Promise<T>): Promise<T> => {
+    const remaining = deadline - Date.now();
+    if (calls >= PEOPLE_MAX_UPSTREAM_CALLS || remaining <= 0) throw new BudgetExhausted();
+    calls += 1;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        run(),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new BudgetExhausted()), remaining); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  try {
+    for (const identity of identities) {
+      const absentUntil = aggregateAbsent.get(config) ?? 0;
+      if (absentUntil <= Date.now()) {
+        const read = await call(() => readWorkspaceHistory(config, identity, "/v1/sessions/users", new URLSearchParams({
+          lastTsAfter: range.lastTsAfter, lastTsBefore: range.lastTsBefore,
+        }), { allowNotFound: true }));
+        if (read.status === "ok" && Array.isArray(read.body.users)) {
+          used.add("aggregate");
+          if (read.body.truncated === true) partial = true;
+          for (const row of read.body.users) {
+            if (!isRecord(row) || !nonEmptyString(row.userId) || !Number.isSafeInteger(row.sessions) || (row.sessions as number) < 0) {
+              throw new Error("invalid users aggregate");
+            }
+            const projects = Array.isArray(row.topProjects)
+              ? row.topProjects.flatMap((project): Array<[string, number]> =>
+                isRecord(project) && nonEmptyString(project.name) && Number.isSafeInteger(project.sessions)
+                  ? [[project.name, project.sessions as number]] : [])
+              : [];
+            addTotals(byUser, row.userId, row.sessions as number,
+              typeof row.lastSessionAt === "string" ? row.lastSessionAt : null, projects);
+          }
+          continue;
+        }
+        if (read.status === "ok") throw new Error("invalid users aggregate");
+        // 404 or 501: an older read API. Remember it and sample instead.
+        aggregateAbsent.set(config, Date.now() + AGGREGATE_ABSENT_MS);
+      }
+      used.add("sample");
+      let cursor: string | undefined;
+      for (;;) {
+        let page: Awaited<ReturnType<typeof sessionPage>>;
+        try {
+          page = await call(() => sessionPage(config, identity, range, { limit: AGGREGATE_PAGE, cursor }));
+        } catch (error) {
+          if (!(error instanceof BudgetExhausted)) throw error;
+          partial = true;
+          break;
+        }
+        for (const session of page.sessions) {
+          for (const userId of new Set(session.userIds)) {
+            addTotals(byUser, userId, 1, session.lastTs, session.project ? [[session.project, 1]] : []);
+          }
+        }
+        if (!page.nextCursor) break;
+        cursor = page.nextCursor;
+      }
+    }
+  } catch (error) {
+    if (!(error instanceof BudgetExhausted)) throw error;
+    partial = true;
+  }
+  return { byUser, partial, source: used.size === 2 ? "mixed" : used.has("aggregate") ? "aggregate" : "sample" };
+}
+
+async function cachedSessionTotals(config: SelfhostConfig, identities: HistoryIdentity[], range: Range, key: string) {
+  let cache = peopleCaches.get(config);
+  if (!cache) {
+    cache = new Map();
+    peopleCaches.set(config, cache);
+  }
+  const hit = cache.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit.value;
+  const value = await sessionTotals(config, identities, range);
+  if (cache.size >= PEOPLE_CACHE_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, { expiresAt: Date.now() + PEOPLE_CACHE_MS, value });
+  return value;
+}
+
 export async function peopleReport(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
@@ -172,53 +306,44 @@ export async function peopleReport(input: {
 }) {
   const range = rangeOf(input.days, input.now);
   const members = await input.store.listMemberships(input.organizationId);
+  // Control's own counters are one indexed query: always fresh.
   const counters = await input.people.read(input.organizationId, range.from, range.to);
-  const byUser = new Map<string, Session[]>();
-  let truncated = false;
-  let sessionsAvailable = true;
+  const identities = await ownerIdentities(input.store, input.organizationId, input.owner);
+  let totals: SessionTotals | null = null;
   try {
-    for (const identity of await ownerIdentities(input.store, input.organizationId, input.owner)) {
-      let cursor: string | undefined;
-      for (let page = 0; page < AGGREGATE_PAGES; page += 1) {
-        const result = await sessionPage(input.config, identity, range, { limit: AGGREGATE_PAGE, cursor });
-        for (const session of result.sessions) {
-          for (const userId of new Set(session.userIds)) {
-            const list = byUser.get(userId) ?? [];
-            list.push(session);
-            byUser.set(userId, list);
-          }
-        }
-        if (!result.nextCursor) break;
-        cursor = result.nextCursor;
-        if (page === AGGREGATE_PAGES - 1) truncated = true;
-      }
-    }
+    totals = await cachedSessionTotals(input.config, identities, range, JSON.stringify([
+      input.organizationId, input.owner.userId, range.days, range.to, identities.map((i) => i.workspaceId),
+    ]));
   } catch {
-    sessionsAvailable = false;
-    byUser.clear();
+    totals = null;
   }
   const rows = members.flatMap((member) => {
     if (typeof member.userId !== "string") return [];
-    const sessions = byUser.get(member.userId) ?? [];
+    const own = totals?.byUser.get(member.userId);
     const counted = counters.get(member.userId);
     return [{
       userId: member.userId,
       name: typeof member.name === "string" ? member.name : null,
       email: typeof member.email === "string" ? member.email : null,
       role: member.role,
-      sessionsUploaded: sessionsAvailable ? sessions.length : null,
+      sessionsUploaded: totals ? own?.sessions ?? 0 : null,
       searches: counted?.searches ?? 0,
       lastActiveAt: counted?.lastActiveAt ?? null,
-      lastSessionAt: sessions.reduce<string | null>((latest, session) => newest(latest, session.lastTs), null),
-      topProjects: topProjects(sessions, TOP_PROJECTS),
+      lastSessionAt: own?.lastSessionAt ?? null,
+      topProjects: own
+        ? [...own.projects.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+          .slice(0, TOP_PROJECTS).map(([name, sessions]) => ({ name, sessions }))
+        : [],
     }];
   });
   rows.sort((a, b) => (b.sessionsUploaded ?? 0) - (a.sessionsUploaded ?? 0) || String(a.email).localeCompare(String(b.email)));
   return {
     range: { days: range.days, from: range.from, to: range.to },
     members: rows,
-    truncated,
-    unavailable: sessionsAvailable ? [] : ["sessionsUploaded"],
+    // Lower bounds: not every session was read within the budget.
+    truncated: totals?.partial ?? false,
+    source: totals?.source ?? null,
+    unavailable: totals ? [] : ["sessionsUploaded"],
   };
 }
 
@@ -239,7 +364,7 @@ function decodeCursor(raw: string | undefined, workspaces: number): Stream[] {
     const value: unknown = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
     if (isRecord(value) && Array.isArray(value.s) && value.s.length === workspaces && value.s.every((stream) =>
       isRecord(stream) && typeof stream.d === "boolean" &&
-      Number.isSafeInteger(stream.k) && (stream.k as number) >= 0 && (stream.k as number) < AGGREGATE_PAGE &&
+      Number.isSafeInteger(stream.k) && (stream.k as number) >= 0 && (stream.k as number) <= AGGREGATE_PAGE &&
       (stream.c === null || (typeof stream.c === "string" && stream.c.length > 0 && stream.c.length <= 4096)))) {
       return value.s as Stream[];
     }
@@ -324,12 +449,22 @@ export async function personSessions(input: {
       stream.k = 0;
     } else {
       stream.d = true;
+      stream.c = null;
+      stream.k = 0;
     }
   }
-  const sessions = await mapLimited(shown, SUMMARY_CONCURRENCY, async (session) => ({
-    ...session,
-    summary: await summaryOf(input.config, identities[session.stream]!, session),
-  }));
+  // Recorded summaries for this page only, within the same time budget: a
+  // summary not read in time is shown as none rather than slowing the page.
+  const summaryDeadline = Date.now() + PEOPLE_BUDGET_MS;
+  const sessions = await mapLimited(shown, SUMMARY_CONCURRENCY, async (session) => {
+    const remaining = summaryDeadline - Date.now();
+    let timer: NodeJS.Timeout | undefined;
+    const summary = remaining <= 0 ? null : await Promise.race([
+      summaryOf(input.config, identities[session.stream]!, session),
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), remaining); }),
+    ]).finally(() => clearTimeout(timer));
+    return { ...session, summary };
+  });
   const nextCursor = streams.every((stream) => stream.d) ? null : encodeCursor(streams);
 
   let rollup: { titles: string[]; projects: Array<{ name: string; sessions: number }> } | null = null;
