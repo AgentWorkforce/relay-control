@@ -39,7 +39,7 @@ into:
 | `SELFHOST_DESKTOP_FEED_S3_BUCKET` | `s3`: private bucket name, without dots (TLS on the virtual-hosted host). Its virtual-hosted host `<bucket>.s3.<region>.amazonaws.com` is signed into `download_hosts` |
 | `SELFHOST_DESKTOP_FEED_S3_REGION` | `s3`: bucket region; default `AWS_REGION`, then `SELFHOST_DESKTOP_FEED_KMS_REGION` |
 | `SELFHOST_DESKTOP_FEED_S3_PREFIX` | `s3`: key prefix, default `desktop-feed` (also when set empty or to `/`). Segments of `[A-Za-z0-9._-]` separated by `/`; `.` and `..` segments and any other character are a startup error |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | Optional static credentials. Unset: the EC2 instance role through IMDSv2, cached until five minutes before expiry |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | Optional static credentials. Unset: container credentials (`AWS_CONTAINER_CREDENTIALS_FULL_URI` + `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` for EKS Pod Identity, `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` for ECS), then web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, IRSA), then the EC2 instance role through IMDSv2; temporary credentials are cached until five minutes before expiry |
 
 The role needs `kms:Sign` and `kms:GetPublicKey` on each profile's key, and
 `s3:PutObject`, `s3:GetObject` and `s3:DeleteObject` on

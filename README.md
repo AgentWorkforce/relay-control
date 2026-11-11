@@ -150,7 +150,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_OPERATOR_CONTROLS` | Operator-control writes (capture policy PUT/DELETE, session hard delete): `always` (default) or `off`; an unrecognised value is treated as `off`. Reads are never gated. See [docs/capture-policy.md](docs/capture-policy.md) and [docs/session-erasure.md](docs/session-erasure.md) |
 | `SESSION_ERASE_API_URL`, `SESSION_ERASE_API_SECRET` (or `_FILE`) | Internal origin and dedicated secret (at least 32 bytes) of the session pipeline's per-session erase. Unset, the session hard-delete routes answer 501. See [docs/session-erasure.md](docs/session-erasure.md) |
 | `SELFHOST_DESKTOP_FEED_SIGNER` / `SELFHOST_DESKTOP_FEED_STORAGE` | Optional, set together: turn on the signed Desktop release feed (`/api/v1/desktop/feed/*`). Signer `awskms` (or `memory`, tests and development only), storage `s3` (or `memory`). Unset: the feed routes answer 404. See [docs/desktop-feed.md](docs/desktop-feed.md) |
-| `SELFHOST_DESKTOP_FEED_KMS_REGION` / `SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES` | `awskms`: region (default `AWS_REGION`) and a JSON object of profile id to KMS alias, one Ed25519 key per profile. Credentials: the instance role via IMDSv2, or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` |
+| `SELFHOST_DESKTOP_FEED_KMS_REGION` / `SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES` | `awskms`: region (default `AWS_REGION`) and a JSON object of profile id to KMS alias, one Ed25519 key per profile. Credentials: the standard AWS chain: static `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, container credentials (EKS Pod Identity, ECS task role), web identity (EKS IRSA), then the EC2 instance role via IMDSv2 |
 | `SELFHOST_DESKTOP_FEED_KEY_LABEL` | The `key_id` label, default `k1` for `awskms` |
 | `SELFHOST_DESKTOP_FEED_S3_BUCKET` / `_S3_REGION` / `_S3_PREFIX` | `s3`: private bucket without dots, its region (default `AWS_REGION`, then the KMS region) and key prefix (default `desktop-feed`) |
 | `SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES` | Optional JSON object of profile id to token sha256 hex digests, for publisher tokens (`sh_dfp_...`) provisioned through env; tokens can also be minted through the admin routes |
@@ -718,7 +718,7 @@ credential and version. Envelopes go to object storage:
 | unset | `gcs` when `SELFHOST_FLOWS_STORAGE=gcs` (same bucket), else `postgres` |
 | `postgres` | inline in `coding_agent_credential_blobs` |
 | `gcs` | `SELFHOST_CREDENTIAL_GCS_BUCKET` (or `SELFHOST_FLOWS_GCS_BUCKET`), Workload Identity |
-| `s3` | `SELFHOST_CREDENTIAL_S3_BUCKET`, `SELFHOST_CREDENTIAL_S3_REGION`/`AWS_REGION`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`[/`AWS_SESSION_TOKEN`], optional `SELFHOST_CREDENTIAL_S3_ENDPOINT` (R2, MinIO) |
+| `s3` | `SELFHOST_CREDENTIAL_S3_BUCKET`, `SELFHOST_CREDENTIAL_S3_REGION`/`AWS_REGION`, credentials from the standard AWS chain (static `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`[/`AWS_SESSION_TOKEN`], required for R2/MinIO; else EKS Pod Identity, IRSA, ECS or the EC2 instance role), optional `SELFHOST_CREDENTIAL_S3_ENDPOINT` (R2, MinIO) |
 
 Objects are `${SELFHOST_CREDENTIAL_PREFIX:-coding-agent-credentials}/workspaces/<ws>/accounts/<id>/v<n>.json.enc`.
 A login is sandbox-only (never an env var). When a workspace has a selected
