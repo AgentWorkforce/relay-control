@@ -18,11 +18,14 @@ import type {
 export type PropertySpec =
   | { type: "boolean" }
   | { type: "integer"; min: number; max: number }
+  | { type: "nonnegative_number" }
   | { type: "enum"; values: readonly string[] }
   /** Short identifier-like strings only: no spaces, no URLs (no "//"). */
   | { type: "token"; maxLength: number }
   /** A UUID in canonical 8-4-4-4-12 hex form. */
   | { type: "uuid" }
+  /** An engine-generated Relaycast identifier, never a display name. */
+  | { type: "relaycast_id" }
   /**
    * A client-reported release version: `MAJOR.MINOR.PATCH` (1-5 digits each),
    * optional `-prerelease` and `+build` of dot-separated `[0-9A-Za-z-]+`
@@ -178,6 +181,7 @@ const VERSION_VALUE = new RegExp(
 );
 /** A UUID in canonical 8-4-4-4-12 hex form (either case). */
 export const UUID_VALUE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const RELAYCAST_PREFIXED_ID = /^(?:dm|dmch|gdm|sub|wh|whd|inv|act|file|aud|cmd|node)_[A-Za-z0-9-]{8,96}$/;
 
 export class AnalyticsProjectionError extends Error {
   override name = "AnalyticsProjectionError";
@@ -198,6 +202,8 @@ export function propertyValue(spec: PropertySpec, value: AnalyticsPropertyValue)
       return typeof value === "number" && Number.isInteger(value) && value >= spec.min && value <= spec.max
         ? value
         : undefined;
+    case "nonnegative_number":
+      return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
     case "enum":
       return typeof value === "string" && spec.values.includes(value) ? value : undefined;
     case "token":
@@ -206,6 +212,10 @@ export function propertyValue(spec: PropertySpec, value: AnalyticsPropertyValue)
         : undefined;
     case "uuid":
       return typeof value === "string" && UUID_VALUE.test(value) ? value.toLowerCase() : undefined;
+    case "relaycast_id":
+      return typeof value === "string" && (/^[0-9]{1,20}$/.test(value) || UUID_VALUE.test(value) || RELAYCAST_PREFIXED_ID.test(value))
+        ? value
+        : undefined;
     case "version":
       return typeof value === "string" && value.length <= VERSION_MAX_LENGTH && VERSION_VALUE.test(value)
         ? value

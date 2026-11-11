@@ -499,6 +499,53 @@ test("session-brief: its installation-scoped tick is accepted and the vocabulary
   assert.equal((await readSegments(ctx.dataDir)).length, 1);
 });
 
+test("relaycast: the collector enforces native workspace and installation scopes and closed facts", async (t) => {
+  const ctx = await setup(t, {
+    registries: COLLECTOR_REGISTRIES,
+    producers: createProducerRegistry([{ name: "cast-a", component: "relaycast", deploymentId: DEPLOYMENT_A, token: TOKEN_A }]),
+  });
+  const dmProperties = {
+    conversation_id: "dmch_synthetic01",
+    message_id: "1234567890123456789",
+    actor_type: "agent",
+    origin_app: "agent-relay-broker",
+    origin_actor_type: "agent",
+    origin_client: "@relaycast/sdk-rust",
+  };
+  const dm = installEvent({
+    component: "relaycast", event: "dm.sent", workspace_id: "18446744073709551615", properties: dmProperties,
+  });
+  const exception = installEvent({
+    component: "relaycast",
+    event: "exception",
+    properties: { error_name: "TypeError", error_code: "internal_error", operation: "inbox.get" },
+  });
+  const rating = installEvent({
+    component: "relaycast",
+    event: "directory.rating.upserted",
+    workspace_id: "1",
+    properties: { score: 0.75 },
+  });
+  assert.equal((await post(ctx.origin, batch([dm, exception, rating]), { token: TOKEN_A })).status, 204);
+  for (const invalid of [
+    { ...dm, tenant_id: "org_synthetic" },
+    { ...dm, workspace_id: "customer_workspace" },
+    { ...dm, workspace_id: "01" },
+    { ...dm, workspace_id: "18446744073709551616" },
+    { ...dm, properties: { ...dmProperties, message_id: "customer_selected_text" } },
+    { ...dm, properties: { ...dmProperties, text: "private message body" } },
+    { ...dm, properties: { ...dmProperties, origin_client: "unknown-client-value" } },
+    { ...exception, workspace_id: "1" },
+    { ...exception, properties: { error_name: "UnregisteredError" } },
+    { ...rating, properties: { score: -0.75 } },
+  ]) {
+    const refused = await post(ctx.origin, batch([dm, invalid]), { token: TOKEN_A });
+    assert.equal(refused.status, 400);
+    assert.deepEqual(refused.body, { error: "invalid_batch", index: 1 });
+  }
+  assert.deepEqual((await readSegments(ctx.dataDir)).map((segment) => segment.events), [[dm, exception, rating]]);
+});
+
 test("session-read-api: the coordination overlaps route is accepted", async (t) => {
   const ctx = await setup(t, {
     registries: COLLECTOR_REGISTRIES,
