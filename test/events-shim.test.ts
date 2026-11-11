@@ -377,8 +377,8 @@ test("an expired sending lease makes a dead wake's post readable again", async (
   assert.deepEqual(read.map((event) => event.id), [a.id]);
   assert.equal(read[0]!.delivery, "read");
   // The dead sender's late results change nothing.
-  await s.store.confirmWake(s.shim.id, a.id, s.now);
-  await s.store.releaseWake(s.shim.id, a.id, "late failure");
+  await s.store.confirmWake(s.shim.id, a.id, claimedAt, s.now);
+  await s.store.releaseWake(s.shim.id, a.id, claimedAt, "late failure");
   assert.equal((await s.state(a.id)).delivery, "read");
   assert.equal((await s.state(a.id)).wakeError, undefined);
 });
@@ -386,19 +386,48 @@ test("an expired sending lease makes a dead wake's post readable again", async (
 test("confirmWake and releaseWake apply only while sending", async (t) => {
   const s = await bareStore(t);
   const [a, b] = [await s.fresh(1), await s.fresh(2)];
-  await s.store.claimPending(s.shim.id, { limit: 2, staleBefore: NOT_STALE }, "sending", s.now);
-  await s.store.confirmWake(s.shim.id, a.id, s.now);
+  const claims = await s.store.claimPending(s.shim.id, { limit: 2, staleBefore: NOT_STALE }, "sending", s.now);
+  // claimedAt is the deliveredAt the claim returned; it must round-trip exactly.
+  const claimedAt = claims[0]!.deliveredAt!;
+  assert.equal(claimedAt, s.now);
+  await s.store.confirmWake(s.shim.id, a.id, claimedAt, s.now);
   assert.equal((await s.state(a.id)).delivery, "woken");
-  await s.store.releaseWake(s.shim.id, a.id, "late failure");
+  await s.store.releaseWake(s.shim.id, a.id, claimedAt, "late failure");
   assert.equal((await s.state(a.id)).delivery, "woken", "release never demotes woken");
 
-  await s.store.releaseWake(s.shim.id, b.id, "relay down");
+  await s.store.releaseWake(s.shim.id, b.id, claims[1]!.deliveredAt!, "relay down");
   const released = await s.state(b.id);
   assert.equal(released.delivery, "pending");
   assert.equal(released.wakeError, "relay down");
   assert.equal(released.deliveredAt, undefined);
-  await s.store.confirmWake(s.shim.id, b.id, s.now);
+  await s.store.confirmWake(s.shim.id, b.id, claimedAt, s.now);
   assert.equal((await s.state(b.id)).delivery, "pending", "confirm needs a live claim");
+});
+
+test("an old sender cannot undo a newer claim of the same post", async (t) => {
+  const s = await bareStore(t);
+  const a = await s.fresh(1);
+  const first = (await s.store.claimPending(s.shim.id, { limit: 1, staleBefore: NOT_STALE }, "sending", "2026-01-01T00:00:00.123Z"))[0]!;
+  // The first lease expires; a second sender re-claims the post.
+  const second = (await s.store.claimPending(
+    s.shim.id, { limit: 1, staleBefore: "2026-01-01T00:05:00.000Z" }, "sending", "2026-01-01T00:05:00.456Z",
+  ))[0]!;
+  assert.equal(second.id, a.id);
+  assert.notEqual(second.deliveredAt, first.deliveredAt);
+
+  // The first sender's late results are no-ops.
+  await s.store.releaseWake(s.shim.id, a.id, first.deliveredAt!, "first sender failed");
+  await s.store.confirmWake(s.shim.id, a.id, first.deliveredAt!, "2026-01-01T00:05:01.000Z");
+  const held = await s.state(a.id);
+  assert.equal(held.delivery, "sending");
+  assert.equal(held.deliveredAt, second.deliveredAt);
+  assert.equal(held.wakeError, undefined);
+
+  // The second sender's confirm lands.
+  await s.store.confirmWake(s.shim.id, a.id, second.deliveredAt!, "2026-01-01T00:05:02.000Z");
+  const woken = await s.state(a.id);
+  assert.equal(woken.delivery, "woken");
+  assert.equal(woken.deliveredAt, "2026-01-01T00:05:02.000Z");
 });
 
 test("a claim for a stale or broken wake link claims nothing", async (t) => {

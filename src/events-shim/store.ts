@@ -346,19 +346,23 @@ export class PostgresEventsShimStore implements EventsShimStore {
     return result.rows.map(eventFrom).sort((a, b) => a.seq - b.seq);
   }
 
-  async confirmWake(shimId: string, eventId: string, at: string): Promise<void> {
+  // Both apply only to this sender's own claim: once its lease expires and
+  // another caller re-claims the post, delivered_at no longer matches.
+  // claimedAt is the deliveredAt claimPending returned (ISO, millisecond
+  // precision, written from the same JS string), so the comparison is exact.
+  async confirmWake(shimId: string, eventId: string, claimedAt: string, at: string): Promise<void> {
     await this.database.query(
-      `UPDATE events_shim_events SET delivery = 'woken', delivered_at = $3
-        WHERE shim_id = $1 AND id = $2 AND delivery = 'sending'`,
-      [shimId, eventId, at],
+      `UPDATE events_shim_events SET delivery = 'woken', delivered_at = $4
+        WHERE shim_id = $1 AND id = $2 AND delivery = 'sending' AND delivered_at = $3::timestamptz`,
+      [shimId, eventId, claimedAt, at],
     );
   }
 
-  async releaseWake(shimId: string, eventId: string, wakeError: string): Promise<void> {
+  async releaseWake(shimId: string, eventId: string, claimedAt: string, wakeError: string): Promise<void> {
     await this.database.query(
-      `UPDATE events_shim_events SET delivery = 'pending', delivered_at = NULL, wake_error = $3
-        WHERE shim_id = $1 AND id = $2 AND delivery = 'sending'`,
-      [shimId, eventId, wakeError],
+      `UPDATE events_shim_events SET delivery = 'pending', delivered_at = NULL, wake_error = $4
+        WHERE shim_id = $1 AND id = $2 AND delivery = 'sending' AND delivered_at = $3::timestamptz`,
+      [shimId, eventId, claimedAt, wakeError],
     );
   }
 
