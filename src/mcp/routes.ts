@@ -122,6 +122,8 @@ export function createMcpHandler(input: {
   launch?: boolean;
   /** Own credential resolver, used only at these MCP routes when the module is enabled. */
   oauthSessions?: McpOAuthSessions;
+  /** Clock for shared-session read audit records; tests inject it. */
+  now?: () => Date;
 }) {
   const { config, store } = input;
   const apiTokens = new ApiTokenStore(store.database);
@@ -326,6 +328,7 @@ export function createMcpHandler(input: {
       ...(!oauth && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && input.factory ? { factory: input.factory } : {}),
       ...(!oauth && input.launch ? { launch: true } : {}),
+      readAudit: { database: store.database, ...(input.now ? { now: input.now } : {}) },
     };
 
     const server = buildMcpServer(context);

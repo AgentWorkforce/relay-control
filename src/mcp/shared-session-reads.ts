@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { SHARED_SESSION_READ_TOOLS } from "./catalog.js";
 import { type McpContext, SharedSessionsToolError, sessionCitation, toolError } from "./context.js";
+import { withReadAudit } from "./read-audit.js";
 import { registerSessionTimings } from "./session-timings.js";
 import { agentPrefixTooShort, AGENT_VALUE, MAX_AGENT_LENGTH, selectAgent } from "../sessions/agent-query.js";
 
@@ -290,9 +291,12 @@ function parsePage<T extends z.ZodType>(schema: T, body: unknown): z.infer<T> {
 
 /**
  * The open entrypoint, the three transcript reads and list_session_timings.
- * Registration does no I/O; every read goes through the request context.
+ * Registration does no I/O; every read goes through the request context, and
+ * every call is audited.
  */
-export function registerSharedSessionReads(server: McpServer, context: McpContext): void {
+export function registerSharedSessionReads(mcpServer: McpServer, context: McpContext): void {
+  // Every read below writes one shared_session_read_audit row (docs/shared-session-read-audit.md).
+  const server = withReadAudit(mcpServer, context);
   const origin = context.origin;
 
   server.registerTool(SHARED_SESSION_READ_TOOLS[0], {
