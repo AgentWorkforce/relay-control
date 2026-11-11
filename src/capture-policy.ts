@@ -73,8 +73,12 @@ export function parseIfMatch(header: string | string[] | undefined): number | un
   return Number(match[1]);
 }
 
-function project(row: { revision: number; settings: unknown } | undefined): CapturePolicy {
-  if (!row) return { ...UNSET_CAPTURE_POLICY, settings: {} };
+/**
+ * The served policy for a stored row (absent: unset). Shared with token
+ * introspection, which joins the row onto the token session.
+ */
+export function capturePolicyFromRow(row: { revision: number | string; settings: unknown } | null | undefined): CapturePolicy {
+  if (!row || row.revision === null || row.revision === undefined) return { ...UNSET_CAPTURE_POLICY, settings: {} };
   const settings = row.settings && typeof row.settings === "object" && !Array.isArray(row.settings)
     ? row.settings as CaptureSettings
     : {};
@@ -100,7 +104,7 @@ export async function readCapturePolicy(database: Database, organizationId: stri
     "SELECT revision, settings FROM capture_policies WHERE organization_id = $1",
     [organizationId],
   );
-  return project(result.rows[0]);
+  return capturePolicyFromRow(result.rows[0]);
 }
 
 /**
@@ -118,7 +122,7 @@ export async function writeCapturePolicy(database: Database, input: {
   return database.transaction(async (tx) => {
     // Serializes writers per organization, including the first insert.
     await tx.query("SELECT id FROM organizations WHERE id = $1 FOR UPDATE", [input.organizationId]);
-    const current = project((await tx.query<{ revision: number; settings: unknown }>(
+    const current = capturePolicyFromRow((await tx.query<{ revision: number; settings: unknown }>(
       "SELECT revision, settings FROM capture_policies WHERE organization_id = $1",
       [input.organizationId],
     )).rows[0]);

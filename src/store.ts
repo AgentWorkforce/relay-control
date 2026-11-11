@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { recordAudit, type AuditActor } from "./admin/audit.js";
+import { capturePolicyFromRow, type CapturePolicy } from "./capture-policy.js";
 import { consentAttemptKey, type ConsentAttempt } from "./auth/desktop-login.js";
 import type { Database, SqlExecutor } from "./database.js";
 import { revokeMcpOAuthGrantRows } from "./mcp/oauth/store.js";
@@ -145,6 +146,11 @@ export type IntrospectedToken = {
   expired: boolean;
   issuedAt: Date;
   expiresAt: Date;
+  /**
+   * The organization's capture policy (docs/capture-policy.md) read in the
+   * same query, so the sessions pipeline can enforce it without its own copy.
+   */
+  capturePolicy: CapturePolicy;
 };
 
 type TokenContextRow = {
@@ -1064,6 +1070,8 @@ export class ControlPlaneStore {
       expired: boolean;
       issued_at: Date | string;
       expires_at: Date | string;
+      policy_revision: number | null;
+      policy_settings: unknown;
     }>(
       `SELECT s.user_id, u.email, s.organization_id, s.workspace_id, m.role, s.scopes,
               s.access_token_hash,
@@ -1078,13 +1086,15 @@ export class ControlPlaneStore {
                 ))) AS revoked,
               s.access_token_expires_at <= now() AS expired,
               COALESCE(s.last_refreshed_at, s.created_at) AS issued_at,
-              s.access_token_expires_at AS expires_at
+              s.access_token_expires_at AS expires_at,
+              cp.revision AS policy_revision, cp.settings AS policy_settings
          FROM token_sessions s
          JOIN users u ON u.id = s.user_id
          JOIN workspaces w
            ON w.id = s.workspace_id AND w.organization_id = s.organization_id
          JOIN organization_memberships m
            ON m.organization_id = s.organization_id AND m.user_id = s.user_id
+         LEFT JOIN capture_policies cp ON cp.organization_id = s.organization_id
         WHERE s.access_token_hash = $1
           AND NOT (s.desktop_exchange_challenge IS NOT NULL AND s.desktop_exchanged_at IS NULL)
           AND ($2::text = 'multi' OR NOT EXISTS (
@@ -1112,6 +1122,9 @@ export class ControlPlaneStore {
       expired: row.expired,
       issuedAt: new Date(row.issued_at),
       expiresAt: new Date(row.expires_at),
+      capturePolicy: capturePolicyFromRow(
+        row.policy_revision === null ? null : { revision: row.policy_revision, settings: row.policy_settings },
+      ),
     };
   }
 

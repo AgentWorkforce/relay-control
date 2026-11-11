@@ -35,6 +35,16 @@ cookie `DELETE` needs an allowed Origin or `Sec-Fetch-Site: same-origin`):
 **Erasure**: erasure never removes membership; erase and offboard are separate operator actions. See
 [session-erasure.md](session-erasure.md) for the per-session hard delete, which shares this switch.
 
+**Server enforcement**: token introspection (`POST /internal/v1/auth/introspect`) returns this served policy as
+`capture_policy` on every active user-token answer, next to the caller's live `role`. The sessions pipeline enforces it
+from there rather than storing a copy:
+
+- `user_retroactive_delete: false`: the ingest edge refuses a member's own Cloud delete
+  (`POST /v1/delivery/sessions/selection` with `enabled: false`, and reset) with 403 `policy_forbids_user_delete`.
+  Organization owners and admins can still delete, and the operator hard delete
+  ([session-erasure.md](session-erasure.md)) is owner/admin only and unaffected.
+- An older Control without `capture_policy` in its answers leaves deletes unrestricted, as before.
+
 **Desktop semantics**: a key present in `settings` locks that choice; Desktop hides the matching user control
 (hidden, not disabled). An absent key means the user chooses. Desktop reads the policy at sign-in, token refresh
 and every 15 minutes.
