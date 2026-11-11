@@ -2,7 +2,7 @@ import type { SqlExecutor } from "../database.js";
 
 type Scope = { organizationId: string; workspaceId: string; userId?: never }
   | { organizationId: string; userId: string; workspaceId?: never };
-type Reason = "capy_connection_replaced" | "capy_disconnected" | "capy_member_removed";
+type Reason = "capy_connection_replaced" | "capy_disconnected" | "capy_member_removed" | "capy_member_demoted";
 
 /** Transaction-local revocation, after the caller's tenancy/connection locks.
  * No external calls: commit it atomically with the owning key/member change.

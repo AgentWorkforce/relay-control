@@ -47,6 +47,18 @@ test("Capy lifecycle revocation commits with its owning control operation", asyn
     finally {await c.database.exec("DROP TRIGGER refuse_capy_delete ON remote_agent_connections; DROP FUNCTION refuse_capy_delete();");}
     assert.equal((await row(id)).state,"bound");assert.equal(await keys.keyFor(actor.workspaceId,"capy"),key);
   });
+  await t.test("manager demotion retires authority, last-owner refusal preserves it, promotion never revives it",async()=>{
+    const id=await seed();
+    const change=(role:"owner"|"admin"|"member")=>c.store.putMembership({organizationId:actor.organizationId,email:"owner@acme.test",name:"Owner",role,operator:true});
+    await assert.rejects(change("member"),/last owner cannot be demoted/);
+    assert.equal((await row(id)).state,"bound");
+    const second=await c.store.putMembership({organizationId:actor.organizationId,email:"demotion-guard@acme.test",name:"Guard",role:"owner",operator:true});
+    try {
+      await change("admin");assert.equal((await row(id)).state,"bound");
+      await change("member");await retired(id);assert.equal((await row(id)).last_error,"capy_member_demoted");
+      await change("owner");await retired(id);
+    } finally {await change("owner");await c.store.deleteMembership(actor.organizationId,String(second.userId));}
+  });
   await t.test("last-owner refusal leaves bindings live; membership removal retires them atomically",async()=>{
     const id=await seed();assert.equal(await c.store.deleteMembership(actor.organizationId,userId),false);
     assert.equal((await row(id)).state,"bound");

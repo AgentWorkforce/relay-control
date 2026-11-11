@@ -606,6 +606,7 @@ export class ControlPlaneStore {
           throw new MembershipConflictError("The last owner cannot be demoted");
         }
       }
+      if (input.role === "member") await retireCapyBindingsInTx(tx,{organizationId:input.organizationId,userId:user.id},"capy_member_demoted");
       await tx.query(
         `INSERT INTO organization_memberships (organization_id, user_id, role)
          VALUES ($1, $2, $3)

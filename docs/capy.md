@@ -51,7 +51,7 @@ late registration. External waits are bounded; a timeout is not a claim that
 the remote write was cancelled.
 
 This registry has no public bind route or native resolver integration. Runtime
-capability remains false. Key replacement/disconnect and member removal now
+capability remains false. Key replacement/disconnect, manager demotion and member removal now
 retire identities in the same transaction as the owning operation: generation
 advances, usable tokens and claims are cleared, and remote cleanup stays pending.
 An unsuccessful operation rolls that retirement back with its other writes.
