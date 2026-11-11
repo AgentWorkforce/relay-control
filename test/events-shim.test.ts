@@ -487,7 +487,7 @@ test("listStalledWakes finds linked inboxes with an old enough stalled post; the
     receivedAt, mode: "open", contentType: "application/json", body: JSON.stringify({ n }), headers: {},
   }, { feedSize: 50, dedupeSince: new Date(0).toISOString() });
   await append(old, 1);
-  const window = { staleBefore: NOT_STALE, receivedBefore: new Date(Date.now() - 30_000).toISOString(), limit: 10 };
+  const window = { staleBefore: NOT_STALE, receivedBefore: new Date(Date.now() - 30_000).toISOString(), activeSince: new Date(Date.now() - 60 * 60_000).toISOString(), limit: 10 };
   assert.deepEqual(await s.store.listStalledWakes(window), [], "no wake link yet");
   await s.store.setWakeTarget(s.shim.id, { url: RELAY_HOOK, secret: RELAY_SECRET, linkedAt: old });
   const listed = await s.store.listStalledWakes(window);
@@ -495,6 +495,8 @@ test("listStalledWakes finds linked inboxes with an old enough stalled post; the
   assert.equal(listed[0]!.wake?.secret, RELAY_SECRET, "the wake secret is decrypted for the sweep");
   assert.deepEqual(await s.store.listStalledWakes({ ...window, receivedBefore: old }), [], "a post that is too young waits");
   assert.deepEqual(await s.store.listStalledWakes({ ...window, limit: 0 }), []);
+  assert.deepEqual(await s.store.listStalledWakes({ ...window, activeSince: new Date(Date.now() + 60_000).toISOString() }), [],
+    "an expired inbox is left out before the limit");
 
   const calls: string[] = [];
   const sweeper = new EventsShimWakeSweeper({
@@ -521,7 +523,7 @@ test("listStalledWakes skips an inbox whose creator left the organization", asyn
   await store.setWakeTarget(id, { url: RELAY_HOOK, secret: RELAY_SECRET, linkedAt: old });
   await store.appendEvent(id, { receivedAt: old, mode: "open", contentType: "application/json", body: "{}", headers: {} },
     { feedSize: 50, dedupeSince: new Date(0).toISOString() });
-  const window = { staleBefore: NOT_STALE, receivedBefore: new Date(Date.now() - 30_000).toISOString(), limit: 10 };
+  const window = { staleBefore: NOT_STALE, receivedBefore: new Date(Date.now() - 30_000).toISOString(), activeSince: new Date(Date.now() - 60 * 60_000).toISOString(), limit: 10 };
   assert.equal((await store.listStalledWakes(window)).length, 1);
   await p.database.query("DELETE FROM organization_memberships WHERE user_id = $1", [p.ownerId]);
   assert.deepEqual(await store.listStalledWakes(window), []);

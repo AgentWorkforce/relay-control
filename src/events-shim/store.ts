@@ -302,30 +302,36 @@ export class PostgresEventsShimStore implements EventsShimStore {
     return result.rows.map(eventFrom);
   }
 
-  async listStalledWakes(input: { staleBefore: string; receivedBefore: string; limit: number }): Promise<ShimRecord[]> {
+  async listStalledWakes(input: {
+    staleBefore: string;
+    receivedBefore: string;
+    activeSince: string;
+    limit: number;
+  }): Promise<ShimRecord[]> {
     if (input.limit <= 0) return [];
-    // A working wake link, a claimable post old enough that its own delivery
-    // pass is over, and (like every lookup) a creator still in the workspace's
-    // organization. Oldest stalled post first.
+    // Live inboxes with a working wake link and a claimable post old enough
+    // that its own delivery pass is over, whose creator (like every lookup)
+    // is still in the workspace's organization. Random order, so inboxes whose
+    // relay keeps failing cannot hold every slot run after run.
     const result = await this.database.query<ShimRow>(
       `SELECT ${SHIM_COLUMNS} FROM events_shims s
-         JOIN (
-           SELECT shim_id, min(received_at) AS oldest FROM events_shim_events
-            WHERE (delivery = 'pending' OR (delivery = 'sending' AND delivered_at < $1))
-              AND received_at < $2
-            GROUP BY shim_id
-         ) stalled ON stalled.shim_id = s.id
         WHERE s.wake_url IS NOT NULL AND s.wake_broken_at IS NULL
+          AND s.last_used_at >= $3
+          AND EXISTS (
+            SELECT 1 FROM events_shim_events e
+             WHERE e.shim_id = s.id
+               AND (e.delivery = 'pending' OR (e.delivery = 'sending' AND e.delivered_at < $1))
+               AND e.received_at < $2)
           AND (s.user_id IS NULL OR EXISTS (
             SELECT 1 FROM workspaces w
               JOIN organization_memberships m
                 ON m.organization_id = w.organization_id AND m.user_id = s.user_id
              WHERE w.id = s.workspace_id))
-        ORDER BY stalled.oldest, s.id
-        LIMIT $3`,
-      [input.staleBefore, input.receivedBefore, input.limit],
+        ORDER BY random()
+        LIMIT $4`,
+      [input.staleBefore, input.receivedBefore, input.activeSince, input.limit],
     );
-    return Promise.all(result.rows.map((row) => this.record(row)));
+    return result.rows.map((row) => this.record(row));
   }
 
   async countPending(shimId: string, staleBefore: string): Promise<number> {
