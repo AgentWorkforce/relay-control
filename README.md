@@ -154,6 +154,12 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_DESKTOP_FEED_KEY_LABEL` | The `key_id` label, default `k1` for `awskms` |
 | `SELFHOST_DESKTOP_FEED_S3_BUCKET` / `_S3_REGION` / `_S3_PREFIX` | `s3`: private bucket without dots, its region (default `AWS_REGION`, then the KMS region) and key prefix (default `desktop-feed`) |
 | `SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES` | Optional JSON object of profile id to token sha256 hex digests, for publisher tokens (`sh_dfp_...`) provisioned through env; tokens can also be minted through the admin routes |
+| `SELFHOST_HISTORY_UPLOAD_DIRECT` | Direct-to-S3 session upload credentials (`POST .../relayhistory/upload-credentials`): `off` (default), `allowlist` or `on`. Off: the route answers 404 `history_upload_direct_off`. See [docs/sessions-read-api.md](docs/sessions-read-api.md) |
+| `SELFHOST_HISTORY_UPLOAD_ALLOWLIST` | `allowlist` mode: comma-separated user ids (required); ignored for `on` |
+| `SELFHOST_HISTORY_UPLOAD_BUCKET` / `_REGION` / `_KEY_ROOT` | Pipeline bucket, its region (default `AWS_REGION`) and the shared key root (default `96bulls`) |
+| `SELFHOST_HISTORY_UPLOAD_ROLE_ARN` / `_KMS_KEY_ARN` | Upload role Control assumes (role chaining, 1 h sessions) and the KMS key every upload must use |
+| `SELFHOST_HISTORY_UPLOAD_WITNESS_KEY` (or `_FILE`) | Privacy witness HMAC key, at least 32 bytes, shared with the pipeline consumer |
+| `SELFHOST_HISTORY_UPLOAD_MAX_OBJECT_BYTES` | Per-object cap reported to clients, default 2097152 (1024 to 104857600) |
 | `SELFHOST_TELEMETRY_LEVEL` | Telemetry: `off` (default when unset), `errors`, or `full`. See [docs/telemetry.md](docs/telemetry.md) for this and the other `SELFHOST_TELEMETRY_*` settings |
 | `PORT` | Listener port, default `3000` |
 | `SELFHOST_AMP_ENABLED` | Optional `true` turns on Amp control (default `false`). Off: every Amp route answers 404 `{"error":"Not found"}` before authentication and no outbox worker runs. See [docs/amp.md](docs/amp.md) |

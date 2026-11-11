@@ -81,9 +81,26 @@ export type SelfhostConfig = {
    * and every feed route answers 404 like any unknown path.
    */
   desktopFeed?: DesktopFeedConfig | null;
+  /** Direct-to-S3 session uploads (docs/sessions-read-api.md). null: the upload-credentials route answers 404. */
+  historyUpload?: HistoryUploadConfig | null;
   port: number;
   host: string;
 };
+
+export interface HistoryUploadConfig {
+  mode: "allowlist" | "on";
+  /** User ids allowed when mode is allowlist (empty when mode is on). */
+  allowlist: string[];
+  bucket: string;
+  region: string;
+  /** Top-level key root shared with the sessions pipeline (default 96bulls). */
+  keyRoot: string;
+  roleArn: string;
+  kmsKeyArn: string;
+  /** HMAC key for the privacy witness, shared with the pipeline consumer. */
+  witnessKey: string;
+  maxObjectBytes: number;
+}
 
 export type DesktopFeedSignerConfig =
   | { kind: "memory"; label: string }
@@ -354,6 +371,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     factory: loadFactoryConfig(env, introspection),
     mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name), serviceUrl(env, "SELFHOST_PUBLIC_URL")),
+    historyUpload: loadHistoryUploadConfig(env),
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
   };
@@ -836,6 +854,64 @@ export function loadDesktopFeedConfig(env: Env = process.env): DesktopFeedConfig
   }
   return { signer, storage, publisherTokenHashes };
 }
+const UPLOAD_ROLE_ARN = /^arn:aws(-[a-z]+)*:iam::\d{12}:role\/[\w+=,.@/-]{1,512}$/;
+const UPLOAD_KMS_KEY_ARN = /^arn:aws(-[a-z]+)*:kms:[a-z0-9-]+:\d{12}:key\/[0-9a-f-]{36}$/;
+
+/**
+ * SELFHOST_HISTORY_UPLOAD_DIRECT (off | allowlist | on) turns on
+ * POST .../relayhistory/upload-credentials (docs/sessions-read-api.md). Unset
+ * or off: null, and the route answers 404. Errors name the variable, never
+ * its value.
+ */
+export function loadHistoryUploadConfig(env: Env = process.env): HistoryUploadConfig | null {
+  const mode = env.SELFHOST_HISTORY_UPLOAD_DIRECT?.trim() || "off";
+  if (mode === "off") return null;
+  if (mode !== "allowlist" && mode !== "on") {
+    throw new Error("SELFHOST_HISTORY_UPLOAD_DIRECT must be off, allowlist or on");
+  }
+  const listed = (env.SELFHOST_HISTORY_UPLOAD_ALLOWLIST ?? "").split(",").map((id) => id.trim()).filter(Boolean);
+  if (mode === "allowlist" && listed.length === 0) {
+    throw new Error("SELFHOST_HISTORY_UPLOAD_ALLOWLIST must name at least one user id when SELFHOST_HISTORY_UPLOAD_DIRECT is allowlist");
+  }
+  const bucket = required(env, "SELFHOST_HISTORY_UPLOAD_BUCKET");
+  if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(bucket)) {
+    throw new Error("SELFHOST_HISTORY_UPLOAD_BUCKET must be a bucket name without dots");
+  }
+  const region = env.SELFHOST_HISTORY_UPLOAD_REGION?.trim() || env.AWS_REGION?.trim() || "";
+  if (!/^[a-z0-9-]+$/.test(region)) {
+    throw new Error("SELFHOST_HISTORY_UPLOAD_REGION (or AWS_REGION) is required");
+  }
+  const keyRoot = env.SELFHOST_HISTORY_UPLOAD_KEY_ROOT?.trim() || "96bulls";
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(keyRoot)) {
+    throw new Error("SELFHOST_HISTORY_UPLOAD_KEY_ROOT must match ^[a-z0-9][a-z0-9-]{0,62}$");
+  }
+  const roleArn = required(env, "SELFHOST_HISTORY_UPLOAD_ROLE_ARN");
+  if (!UPLOAD_ROLE_ARN.test(roleArn)) throw new Error("SELFHOST_HISTORY_UPLOAD_ROLE_ARN must be an IAM role ARN");
+  const kmsKeyArn = required(env, "SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN");
+  if (!UPLOAD_KMS_KEY_ARN.test(kmsKeyArn)) throw new Error("SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN must be a KMS key ARN");
+  const witnessKey = readSecret(env, "SELFHOST_HISTORY_UPLOAD_WITNESS_KEY");
+  if (!witnessKey) throw new Error("SELFHOST_HISTORY_UPLOAD_WITNESS_KEY (or _FILE) is required");
+  if (Buffer.byteLength(witnessKey) < 32) {
+    throw new Error("SELFHOST_HISTORY_UPLOAD_WITNESS_KEY (or _FILE) must be at least 32 bytes");
+  }
+  const rawMax = env.SELFHOST_HISTORY_UPLOAD_MAX_OBJECT_BYTES?.trim();
+  const maxObjectBytes = !rawMax ? 2_097_152 : /^\d+$/.test(rawMax) ? Number(rawMax) : Number.NaN;
+  if (!Number.isInteger(maxObjectBytes) || maxObjectBytes < 1024 || maxObjectBytes > 104_857_600) {
+    throw new Error("SELFHOST_HISTORY_UPLOAD_MAX_OBJECT_BYTES must be an integer from 1024 to 104857600");
+  }
+  return {
+    mode,
+    allowlist: mode === "allowlist" ? listed : [],
+    bucket,
+    region,
+    keyRoot,
+    roleArn,
+    kmsKeyArn,
+    witnessKey,
+    maxObjectBytes,
+  };
+}
+
 export function loadDatabaseUrl(env: Env = process.env): string {
   return required(env, "DATABASE_URL", true);
 }
