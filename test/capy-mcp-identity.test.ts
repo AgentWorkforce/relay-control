@@ -151,6 +151,10 @@ test("generic join cannot recover Capy metadata into a participant, including OA
   for(const metadata of [
     {source:HOSTED_SOURCE,cloud_workspace_id:e.actor.workspaceId,owner_hash:ownerHash(e.owner),capy_binding_id:null},
     {source:HOSTED_SOURCE,cloud_workspace_id:e.actor.workspaceId,owner_hash:ownerHash(e.owner),created_by:"capy-binding"},
+    {source:HOSTED_SOURCE,cloud_workspace_id:e.actor.workspaceId,owner_hash:ownerHash(e.owner),factory_binding_id:null},
+    {source:HOSTED_SOURCE,cloud_workspace_id:e.actor.workspaceId,owner_hash:ownerHash(e.owner),created_by:"factory-binding"},
+    {source:HOSTED_SOURCE,cloud_workspace_id:e.actor.workspaceId,owner_hash:ownerHash(e.owner),amp_binding_id:null},
+    {source:HOSTED_SOURCE,cloud_workspace_id:e.actor.workspaceId,owner_hash:ownerHash(e.owner),created_by:"amp-binding"},
   ]) {
     agent.metadata=metadata;
     await assert.rejects(relayService(e.context()).join({name}),/name is already taken/);
@@ -161,8 +165,11 @@ test("generic join cannot recover Capy metadata into a participant, including OA
   assert.equal(joined.name,"capy-support");assert.equal(await e.participantCount(),1);
   await relayService(e.context()).send({to:"peer",text:"ordinary participant",as:"capy-support"});
   assert.equal(e.writes.length,1);
-  e.agents.get("capy-support")!.metadata.capy_binding_id=e.binding.id;
-  await assert.rejects(relayService(e.context()).send({to:"peer",text:"cannot adopt",as:"capy-support"}),/identity changed/);
+  const ordinaryMetadata={...e.agents.get("capy-support")!.metadata};
+  for(const marker of ["capy_binding_id","factory_binding_id","amp_binding_id"]) {
+    e.agents.get("capy-support")!.metadata={...ordinaryMetadata,[marker]:e.binding.id};
+    await assert.rejects(relayService(e.context()).send({to:"peer",text:"cannot adopt",as:"capy-support"}),/identity changed/);
+  }
   assert.equal(e.writes.length,1,"even an existing generic row cannot act as a Capy identity");
 });
 

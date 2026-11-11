@@ -1056,7 +1056,7 @@ test("an OAuth grant stays on its approved agent even with a Desktop marker and 
   assert.equal(sent.from,"approved-agent");
 });
 
-test("OAuth consent and live actor admission never adopt Capy binding identities",async t=>{
+test("OAuth consent and live actor admission never adopt provider binding identities",async t=>{
   const f=await relayFixture(t),config=appConfig();
   const store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
   const account=await f.database.transaction(tx=>store.issueBrowserSession(tx,{...f.owner,label:"capy-domain-test"}));
@@ -1071,7 +1071,9 @@ test("OAuth consent and live actor admission never adopt Capy binding identities
     assert.equal(response.status,200);return (await response.json()).status;
   };
   assert.equal(await check(remote.name),"yours");
-  for(const marker of [{capy_binding_id:randomUUID()},{capy_binding_id:null},{created_by:"capy-binding"}]) {
+  for(const marker of [{capy_binding_id:randomUUID()},{capy_binding_id:null},{created_by:"capy-binding"},
+    {factory_binding_id:randomUUID()},{factory_binding_id:null},{created_by:"factory-binding"},
+    {amp_binding_id:randomUUID()},{amp_binding_id:null},{created_by:"amp-binding"}]) {
     remote.metadata={...metadata,...marker};
     assert.equal(await check(remote.name),"taken");
     await assert.rejects(relayService({...f.context,capy:trap}).join({name:remote.name}),/name is already taken/);

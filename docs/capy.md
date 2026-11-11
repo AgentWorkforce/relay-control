@@ -71,7 +71,8 @@ The optional internal MCP resolver now supports sends as an owned native Capy
 binding, only for `!managed && !oauth` calls. The server does not supply it yet.
 It creates no participant alias and grants no join, launch, Desktop-link, inbox,
 conversation-read or channel rights. OAuth admission/pinning never adopts a
-Capy-owned remote identity, even when a binding marker is malformed; ordinary
+provider-owned remote identity (Capy, Factory or Amp), even when a binding marker
+is malformed; ordinary
 participant names beginning with `capy-` remain usable.
 
 The send resolves live custody before preparing the message and again after
