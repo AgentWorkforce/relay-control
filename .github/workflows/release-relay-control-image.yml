@@ -218,3 +218,38 @@ jobs:
             echo "A signed GitHub artifact attestation (SLSA provenance) was pushed."
             echo "No hosted Cloud deployment was performed."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  notify-release-candidate:
+    name: Notify Agent Relay release candidate
+    needs: [validate, publish]
+    if: ${{ needs.publish.result == 'success' && github.ref == 'refs/heads/main' }}
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Mint infra dispatch token
+        id: pusher
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.GH_APP_PUSHER_ID }}
+          private-key: ${{ secrets.GH_APP_PUSHER_PRIVATE_KEY }}
+          owner: AgentWorkforce
+          repositories: infra
+          permission-contents: write
+
+      - name: Dispatch immutable component publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.pusher.outputs.token }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          gh api --method POST repos/AgentWorkforce/infra/dispatches \
+            -f 'event_type=component-published' \
+            -f 'client_payload[component]=relay-control' \
+            -f "client_payload[digest]=$DIGEST" \
+            -f "client_payload[source_sha]=$SOURCE_SHA"
