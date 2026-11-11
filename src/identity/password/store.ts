@@ -17,6 +17,12 @@ export const REGISTRATION_TTL_MS = 60 * 60 * 1_000;
 export const RESET_TTL_MS = 30 * 60 * 1_000;
 /** A set-password token (minted by verify) lives this long: at most 15 minutes. */
 export const SETUP_TTL_MS = 15 * 60 * 1_000;
+/** A setup key works for at most this long after it is recorded. */
+export const SETUP_KEY_TTL_MS = 24 * 60 * 60 * 1_000;
+/** A temporary password's default lifetime (POST .../temporary-password may shorten or extend it). */
+export const TEMPORARY_PASSWORD_TTL_MS = 72 * 60 * 60 * 1_000;
+/** The longest lifetime a temporary password may be given. */
+export const TEMPORARY_PASSWORD_MAX_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 /** Retention: login attempt rows idle this long are deleted. */
 export const ATTEMPT_RETENTION_MS = 24 * 60 * 60 * 1_000;
 /** Retention: spent or expired registration, set-password and reset tokens older than this are deleted. */
@@ -66,6 +72,22 @@ export class CredentialChanged extends Error {
     super("credential_changed");
   }
 }
+
+/** Thrown inside the setup-key or temporary-password transaction to roll it back. */
+export class OneTimeRefused extends Error {
+  constructor(readonly reason: "spent" | "password_already_set" | "not_a_member" | "already_signed_in" | "other_organization") {
+    super(reason);
+  }
+}
+
+export type LiveSetupKey = { id: string; keyHash: string; source: "configured" | "minted"; expiresAt: Date };
+export type LiveTemporaryPassword = {
+  id: string;
+  organizationId: string;
+  hash: string;
+  pepperVersion: number | null;
+  expiresAt: Date;
+};
 
 /** Thrown inside the set-password transaction to roll it back. */
 export class SetupRefused extends Error {
@@ -517,9 +539,189 @@ export class PasswordStore {
       await tx.query("UPDATE password_registrations SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
       await tx.query("UPDATE password_setup_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
       await tx.query("UPDATE email_login_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
+      // A temporary password set before the reset must not undo it.
+      await tx.query("UPDATE temporary_passwords SET revoked_at = now() WHERE email = $1 AND used_at IS NULL AND revoked_at IS NULL", [user.email]);
       await this.clearAccount(tx, user.email);
       return { userId, email: user.email };
     });
+  }
+
+  // ---- setup key (first admin) -----------------------------------------------------
+
+  /**
+   * Records a configured key (SELFHOST_SETUP_KEY) the first time the server
+   * sees it; the 24 hours start then. A key seen before keeps its row (and
+   * its expiry, use or revocation), so a restart never renews it.
+   */
+  async recordConfiguredSetupKey(email: string, keyHash: string): Promise<void> {
+    await this.database.query(
+      `INSERT INTO setup_keys (id, email, key_hash, source, expires_at)
+       VALUES ($1, $2, $3, 'configured', $4) ON CONFLICT (key_hash) DO NOTHING`,
+      [randomUUID(), email, keyHash, new Date(this.now() + SETUP_KEY_TTL_MS)],
+    );
+  }
+
+  /** Mints a key for `email`, revoking every earlier live one. Returns it once. */
+  async mintSetupKey(email: string): Promise<{ key: string; expiresAt: Date }> {
+    const key = opaqueToken("sh_sk_");
+    const expiresAt = new Date(this.now() + SETUP_KEY_TTL_MS);
+    await this.database.transaction(async (tx) => {
+      // Serializes concurrent mints (and redemptions) for the address.
+      await lockIdentity(tx, email);
+      await tx.query("UPDATE setup_keys SET revoked_at = now() WHERE email = $1 AND used_at IS NULL AND revoked_at IS NULL", [email]);
+      await tx.query(
+        "INSERT INTO setup_keys (id, email, key_hash, source, expires_at) VALUES ($1, $2, $3, 'minted', $4)",
+        [randomUUID(), email, hashSecret(key), expiresAt],
+      );
+    });
+    return { key, expiresAt };
+  }
+
+  /** Live (unused, unrevoked, unexpired) keys for the address, newest first. */
+  async liveSetupKeys(email: string): Promise<LiveSetupKey[]> {
+    const result = await this.database.query<{ id: string; key_hash: string; source: "configured" | "minted"; expires_at: Date | string }>(
+      `SELECT id, key_hash, source, expires_at FROM setup_keys
+        WHERE email = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > $2
+        ORDER BY created_at DESC`,
+      [email, new Date(this.now())],
+    );
+    return result.rows.map((row) => ({ id: row.id, keyHash: row.key_hash, source: row.source, expiresAt: new Date(row.expires_at) }));
+  }
+
+  /**
+   * Whether `email` has never finished a sign-in here and has no password:
+   * the only time a setup key is offered or accepted.
+   */
+  async neverSignedIn(email: string): Promise<boolean> {
+    const result = await this.database.query<{ signed_in: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM users u
+          WHERE u.email = $1
+            AND (u.last_organization_id IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM password_credentials c WHERE c.user_id = u.id)
+                 OR EXISTS (SELECT 1 FROM token_sessions s WHERE s.user_id = u.id))
+       ) AS signed_in`,
+      [email],
+    );
+    return result.rows[0]?.signed_in !== true;
+  }
+
+  /** Revokes every live key for the address (the admin signed in another way). */
+  async revokeSetupKeys(email: string): Promise<number> {
+    const result = await this.database.query(
+      "UPDATE setup_keys SET revoked_at = now() WHERE email = $1 AND used_at IS NULL AND revoked_at IS NULL RETURNING id",
+      [email],
+    );
+    return result.rows.length;
+  }
+
+  /**
+   * Inside the sign-in transaction: spends the key and writes the admin's
+   * first password. Throws OneTimeRefused (rolling the sign-in back) when
+   * the key is no longer live or a password exists.
+   */
+  async redeemSetupKey(tx: SqlExecutor, keyId: string, userId: string, stored: StoredPassword): Promise<void> {
+    const spent = await tx.query<{ email: string }>(
+      `UPDATE setup_keys SET used_at = now()
+        WHERE id = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > $2
+        RETURNING email`,
+      [keyId, new Date(this.now())],
+    );
+    const email = spent.rows[0]?.email;
+    if (!email) throw new OneTimeRefused("spent");
+    // Under the identity lock the sign-in holds: the session this sign-in
+    // just issued must be the person's only one ever, so a sign-in by any
+    // other method that committed after the key was checked wins.
+    const sessions = await tx.query<{ n: number }>("SELECT count(*)::int AS n FROM token_sessions WHERE user_id = $1", [userId]);
+    if (sessions.rows[0]!.n > 1) throw new OneTimeRefused("already_signed_in");
+    if (!await this.insertFirstCredential(tx, userId, stored)) throw new OneTimeRefused("password_already_set");
+    await tx.query("UPDATE setup_keys SET revoked_at = now() WHERE email = $1 AND used_at IS NULL AND revoked_at IS NULL", [email]);
+  }
+
+  // ---- temporary passwords ------------------------------------------------------------
+
+  /**
+   * Stores a temporary password for `email` in `organizationId`, revoking
+   * any earlier live one for the address.
+   */
+  async createTemporaryPassword(input: {
+    organizationId: string;
+    email: string;
+    stored: StoredPassword;
+    createdByUserId: string | null;
+    ttlMs: number;
+  }): Promise<{ id: string; expiresAt: Date }> {
+    const id = randomUUID();
+    const expiresAt = new Date(this.now() + input.ttlMs);
+    await this.database.transaction(async (tx) => {
+      // Serializes concurrent setters for the address (one live row each).
+      await lockIdentity(tx, input.email);
+      await tx.query(
+        "UPDATE temporary_passwords SET revoked_at = now() WHERE email = $1 AND used_at IS NULL AND revoked_at IS NULL",
+        [input.email],
+      );
+      await tx.query(
+        `INSERT INTO temporary_passwords
+           (id, organization_id, email, password_hash, pepper_version, params, created_by_user_id, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [id, input.organizationId, input.email, input.stored.hash, input.stored.pepperVersion, input.stored.params, input.createdByUserId, expiresAt],
+      );
+    });
+    return { id, expiresAt };
+  }
+
+  async liveTemporaryPassword(email: string): Promise<LiveTemporaryPassword | null> {
+    const result = await this.database.query<{ id: string; organization_id: string; password_hash: string; pepper_version: number | null; expires_at: Date | string }>(
+      `SELECT id, organization_id, password_hash, pepper_version, expires_at FROM temporary_passwords
+        WHERE email = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > $2`,
+      [email, new Date(this.now())],
+    );
+    const row = result.rows[0];
+    return row
+      ? { id: row.id, organizationId: row.organization_id, hash: row.password_hash, pepperVersion: row.pepper_version, expiresAt: new Date(row.expires_at) }
+      : null;
+  }
+
+  /** Revokes the live temporary password of an address in an organization (invite canceled). */
+  async revokeTemporaryPasswords(organizationId: string, email: string): Promise<number> {
+    const result = await this.database.query(
+      `UPDATE temporary_passwords SET revoked_at = now()
+        WHERE organization_id = $1 AND email = $2 AND used_at IS NULL AND revoked_at IS NULL RETURNING id`,
+      [organizationId, email],
+    );
+    return result.rows.length;
+  }
+
+  /**
+   * Inside the sign-in transaction: spends the temporary password and writes
+   * the person's new password. Throws OneTimeRefused (rolling the sign-in
+   * back) when it is no longer live or the person is not a member of the
+   * organization that set it.
+   */
+  async redeemTemporaryPassword(tx: SqlExecutor, id: string, userId: string, stored: StoredPassword): Promise<void> {
+    const spent = await tx.query<{ organization_id: string; email: string }>(
+      `UPDATE temporary_passwords SET used_at = now()
+        WHERE id = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > $2
+        RETURNING organization_id, email`,
+      [id, new Date(this.now())],
+    );
+    const row = spent.rows[0];
+    if (!row) throw new OneTimeRefused("spent");
+    const member = await tx.query(
+      "SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
+      [row.organization_id, userId],
+    );
+    if (!member.rows.length) throw new OneTimeRefused("not_a_member");
+    // Checked again here, after this sign-in accepted any open invites: a
+    // password one organization set must not reach another organization
+    // the person belongs to (or was invited to) as well.
+    const other = await tx.query(
+      "SELECT 1 FROM organization_memberships WHERE user_id = $1 AND organization_id <> $2 LIMIT 1",
+      [userId, row.organization_id],
+    );
+    if (other.rows.length) throw new OneTimeRefused("other_organization");
+    await this.upsertCredential(tx, userId, stored);
+    await this.clearAccount(tx, row.email);
   }
 
   // ---- retention -----------------------------------------------------------------
@@ -529,7 +731,7 @@ export class PasswordStore {
    * locked: every lock is at most 15 minutes) and registration, set-password
    * and reset tokens that were spent or expired more than 7 days ago.
    */
-  async sweep(): Promise<{ attempts: number; registrations: number; setups: number; resets: number }> {
+  async sweep(): Promise<{ attempts: number; registrations: number; setups: number; resets: number; setupKeys: number; temporaryPasswords: number }> {
     const now = this.now();
     const attemptCutoff = new Date(now - ATTEMPT_RETENTION_MS);
     const tokenCutoff = new Date(now - TOKEN_RETENTION_MS);
@@ -549,7 +751,24 @@ export class PasswordStore {
       "DELETE FROM password_reset_tokens WHERE COALESCE(used_at, expires_at) < $1 RETURNING id",
       [tokenCutoff],
     );
-    return { attempts: attempts.rows.length, registrations: registrations.rows.length, setups: setups.rows.length, resets: resets.rows.length };
+    // A configured setup key keeps its row: deleting it would let the same
+    // SELFHOST_SETUP_KEY be recorded again, with a fresh 24 hours.
+    const setupKeys = await this.database.query(
+      "DELETE FROM setup_keys WHERE source = 'minted' AND COALESCE(used_at, revoked_at, expires_at) < $1 RETURNING id",
+      [tokenCutoff],
+    );
+    const temporaryPasswords = await this.database.query(
+      "DELETE FROM temporary_passwords WHERE COALESCE(used_at, revoked_at, expires_at) < $1 RETURNING id",
+      [tokenCutoff],
+    );
+    return {
+      attempts: attempts.rows.length,
+      registrations: registrations.rows.length,
+      setups: setups.rows.length,
+      resets: resets.rows.length,
+      setupKeys: setupKeys.rows.length,
+      temporaryPasswords: temporaryPasswords.rows.length,
+    };
   }
 
   // ---- audit ---------------------------------------------------------------------

@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
-import { hashSecret } from "../../crypto.js";
+import { randomBytes } from "node:crypto";
+import { hashSecret, secureEqual } from "../../crypto.js";
 import type { ControlPlaneStore } from "../../store.js";
 import { clientIp, cookieRequestAllowed, limiterKey, RateLimiter } from "../../auth/device-approval.js";
 import { emailDomain, normalizeEmailAddress, type PasswordConfig } from "../config.js";
@@ -12,6 +13,7 @@ import {
   passwordResetEmail,
   passwordVerifyEmail,
   type Mailer,
+  type OutgoingEmail,
 } from "../mailer.js";
 import { IdentityError, type IdentityStore, type SignInResult } from "../store.js";
 import { HasherBusy, type PasswordHasher, type StoredPassword } from "./hashing.js";
@@ -22,10 +24,13 @@ import {
   CredentialChanged,
   ipSubject,
   LOCKOUT,
+  OneTimeRefused,
   REGISTRATION_TTL_MS,
   RESET_TTL_MS,
   SetupRefused,
+  type LiveSetupKey,
   type Lock,
+  type LockoutRule,
   type PasswordStore,
 } from "./store.js";
 
@@ -38,6 +43,14 @@ import {
  *   POST /api/v1/auth/password/login           200 + session cookie | 401 invalid_credentials
  *   POST /api/v1/auth/password/reset           202, always
  *   POST /api/v1/auth/password/reset/complete  200 (every session and pending grant revoked)
+ *   POST /api/v1/auth/password/change          {email, currentPassword, newPassword} -> 200 + session cookie
+ *                                              (replaces a temporary password; login answers 403
+ *                                              password_change_required for one)
+ *   POST /api/v1/auth/password/setup-key       {setupKey, password} -> 200 + session cookie
+ *                                              (first-time setup of the bootstrap admin)
+ *
+ * Without SMTP, register and reset answer 404 email_not_configured; sign-in,
+ * the setup key and temporary passwords send no email and keep working.
  *
  * The emailed links open server pages instead (/login/password/verify and
  * /login/password/reset, token in the URL fragment); identity/routes.ts
@@ -68,7 +81,12 @@ const RATE = {
   loginPerIp: { limit: 60, windowMs: 60 * 1_000 },
   personalOrgPerAddress: { limit: 3, windowMs: 60 * 60 * 1_000 },
   personalOrgPerIp: { limit: 10, windowMs: 60 * 60 * 1_000 },
+  /** In-memory, in front of the Postgres backoff below. */
+  setupKeyPerIp: { limit: 20, windowMs: 10 * 60 * 1_000 },
 };
+
+/** Setup-key attempts per client key ("setup-key-ip:"), shared by every replica. */
+const SETUP_KEY_LOCKOUT: LockoutRule = { kind: "backoff", free: 5 };
 
 // Bounded so a huge body cannot buy extra hashing work; the policy caps
 // passwords at 128 code points, so a longer one is simply never valid.
@@ -80,11 +98,16 @@ const TokenOnly = z.object({ token: Token }).strict();
 const SetPassword = z.object({ token: Token, password: Secret }).strict();
 const ResetRequest = z.object({ email: z.string().max(320) }).strict();
 const ResetComplete = z.object({ token: Token, password: Secret }).strict();
+const ChangePassword = z.object({ email: z.string().max(320), currentPassword: Secret, newPassword: Secret }).strict();
+const SetupKey = z.object({ setupKey: Token, password: Secret }).strict();
 const INVITE_TOKEN = /^sh_inv_[A-Za-z0-9_-]{20,200}$/;
 const TOKEN_GONE = "This link has expired or was already used. Register again.";
 const ALREADY_SET = "This address already has a password. Sign in, or reset the password instead.";
 const RESET_GONE = "This reset link has expired or was already used. Request a new one.";
 const BUSY = "The server is busy. Try again in a moment.";
+const SETUP_KEY_INVALID = "That setup key is not valid. It works once, for 24 hours, and only before the administrator first signs in.";
+const CHANGE_REQUIRED = "This is a temporary password. Choose a new password to finish signing in.";
+const NO_EMAIL = "Email is not configured on this installation. Ask an administrator for a temporary password.";
 
 /** Every argon2id slot is busy: answer at once, without hashing. */
 function busy(): IdentityError {
@@ -122,7 +145,15 @@ export type PasswordRoutesInput = {
   passwords: PasswordStore;
   identityStore: IdentityStore;
   controlStore: ControlPlaneStore;
-  mailer: Mailer;
+  /** Null without SMTP: register and reset are off, nothing is emailed. */
+  mailer: Mailer | null;
+  /**
+   * The bootstrap admin the setup key signs in (SELFHOST_BOOTSTRAP_ADMIN_EMAIL,
+   * else the first SELFHOST_ADMIN_EMAILS entry), or null.
+   */
+  setupKeyEmail?: string | null;
+  /** SELFHOST_SETUP_KEY: recorded (hashed) the first time it is needed. */
+  setupKey?: string | null;
   sessionCookie: (tokens: SignInResult["tokens"]) => string;
   clearSessionCookie: () => string;
   /** Test seam for the Have I Been Pwned range API. */
@@ -145,7 +176,32 @@ export type PasswordRoutes = {
    * `site` is helpers.siteBaseUrl(request), as for the other form calls:
    * the origin emailed links point at.
    */
-  formLogin(request: IncomingMessage, input: { email: string; password: string; invite: string | null }, site: string): Promise<SignInResult | null>;
+  formLogin(request: IncomingMessage, input: { email: string; password: string; invite: string | null }, site: string): Promise<SignInResult | ChangeRequired | null>;
+  /**
+   * Replaces a temporary password: the same lockout and audit as a login.
+   * Null means refused. Throws PasswordHttpError (policy) or IdentityError.
+   */
+  formChangeTemporary(request: IncomingMessage, input: { email: string; current: string; password: string }, site: string): Promise<SignInResult | null>;
+  /** Whether /login offers the first-time setup key field right now. */
+  setupKeyOffered(): Promise<boolean>;
+  /** The setup-key form, first step: null when the key is refused (audited). */
+  formCheckSetupKey(request: IncomingMessage, key: string): Promise<{ email: string } | null>;
+  /** The setup-key form, second step. Null when refused; throws PasswordHttpError (policy). */
+  formCompleteSetupKey(request: IncomingMessage, input: { key: string; password: string }): Promise<SignInResult | null>;
+  /**
+   * Mints a setup key for the bootstrap admin (bootstrap bearer only),
+   * revoking any earlier one. Throws PasswordHttpError when none can be used.
+   */
+  mintSetupKey(): Promise<{ setupKey: string; email: string; expiresAt: Date }>;
+  /**
+   * A generated temporary password for `email`, returned once and stored
+   * only as an argon2id hash. The caller checks who may set it.
+   */
+  issueTemporaryPassword(input: { organizationId: string; email: string; actorUserId: string | null; ttlMs: number }): Promise<{ password: string; expiresAt: Date }>;
+  /** Cancels the live temporary password of an address in an organization. */
+  revokeTemporaryPasswords(organizationId: string, email: string): Promise<number>;
+  /** Whether register and reset (emailed links) are available. */
+  readonly selfService: boolean;
   /**
    * The /login/password/verify page: redeems a verification link (sh_pv_)
    * and sets the first password. Throws PasswordHttpError or IdentityError.
@@ -160,6 +216,21 @@ export type PasswordRoutes = {
   /** Resolves when background mail work (register, reset) has finished. */
   idle(): Promise<void>;
 };
+
+/** A temporary password was right: no session until a new password is chosen. */
+export type ChangeRequired = { changeRequired: true; email: string };
+
+export function isChangeRequired(value: unknown): value is ChangeRequired {
+  return typeof value === "object" && value !== null && (value as { changeRequired?: unknown }).changeRequired === true;
+}
+
+/** A generated temporary password: 144 random bits, passes the policy. */
+function generateTemporaryPassword(email: string): string {
+  for (;;) {
+    const candidate = randomBytes(18).toString("base64url");
+    if (!checkPasswordPolicy(candidate, email)) return candidate;
+  }
+}
 
 export type Revoked = { sessions: number; mcpGrants: number; desktopRelayIdentities: number; deviceAuthorizations: number; mcpCodes: number };
 
@@ -179,6 +250,11 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
 
   function limited(key: string, rule: { limit: number; windowMs: number }): boolean {
     return !limiter.consume(key, rule.limit, rule.windowMs).allowed;
+  }
+
+  /** Sends nothing without SMTP. */
+  async function send(message: OutgoingEmail): Promise<void> {
+    if (mailer) await mailer.send(message);
   }
 
   /** Runs mail work after the response so its timing reveals nothing. */
@@ -249,7 +325,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       const to = email!;
       later("account lockout notice", async () => {
         if (!await passwords.claimLockoutNotice(to)) return;
-        await mailer.send(accountLockedEmail({ to, url: resetPage(site), siteName: hostOf(site) }));
+        await send(accountLockedEmail({ to, url: resetPage(site), siteName: hostOf(site) }));
       });
     } else {
       await audit(userId, "login.lockout", `scope=ip ip=${ip} until=${until}`);
@@ -275,7 +351,61 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     password: string,
     inviteTokenHash: string | null,
     site: string,
-  ): Promise<SignInResult | null> {
+  ): Promise<SignInResult | ChangeRequired | null> {
+    const guard = await reserve(request, rawEmail, site);
+    if (!guard) return null;
+    const { email, credential, temporary, fail } = guard;
+    let outcome: { ok: boolean; needsRehash: boolean };
+    try {
+      // A live temporary password is tried first. Right, it never signs in:
+      // the person must choose a new password (POST .../change).
+      if (temporary && (await hasher.verify(password, temporary)).ok) {
+        await guard.proven();
+        await audit(credential?.userId ?? null, "login.temporary_password.accepted", `email=${email} ip=${guard.ip}`);
+        return { changeRequired: true, email: email! };
+      }
+      if (!credential) {
+        await hasher.dummyVerify(password);
+        return fail(email ? "unknown_account" : "invalid_email");
+      }
+      outcome = await hasher.verify(password, credential);
+    } catch (error) {
+      return guard.busy(error);
+    }
+    if (!outcome.ok) return fail("wrong_password");
+    let result: SignInResult;
+    try {
+      // Inside the sign-in transaction, which holds the identity lock a
+      // reset also takes: the hash must still be the one just verified, or
+      // the session rolls back (see PasswordStore.completeReset).
+      result = await signInFor(request, email!, inviteTokenHash, (tx, userId) => passwords.assertCredentialUnchanged(tx, userId, credential.hash));
+    } catch (error) {
+      if (error instanceof CredentialChanged) return fail("credential_changed");
+      throw error;
+    }
+    await guard.proven();
+    let rehashed = false;
+    if (outcome.needsRehash) {
+      // Parameters were raised or the pepper rotated: upgrade while the
+      // plaintext is at hand. A concurrent change wins (compare-and-set).
+      // Skipped when the hasher is busy; the next sign-in tries again.
+      try {
+        rehashed = await passwords.rehash(credential.userId, credential.hash, await hasher.hash(password));
+      } catch (error) {
+        if (!(error instanceof HasherBusy)) throw error;
+      }
+    }
+    await audit(result.userId, "login.password.success", `email=${email} ip=${guard.ip}${rehashed ? " rehashed=true" : ""}`);
+    return result;
+  }
+
+  /**
+   * The shared front of every password check (login and the temporary
+   * password change): the per-IP in-memory limit, the argon2id capacity
+   * check, then one reservation against the three lockout counters. Null
+   * when a lock is in force (refused without an audit row).
+   */
+  async function reserve(request: IncomingMessage, rawEmail: string, site: string) {
     // The full address goes into audit records; limits use its key (IPv6 /64).
     const ip = clientIp(request).slice(0, 64);
     const key = limiterKey(ip);
@@ -293,63 +423,188 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
         { subject: accountSubject(email), rule: LOCKOUT.account },
       ] : []),
     ];
-    const [reservation, credential] = await Promise.all([
+    const [reservation, credential, temporary] = await Promise.all([
       passwords.reserveAttempt(rules),
       email ? passwords.credentialByEmail(email) : Promise.resolve(null),
+      email ? passwords.liveTemporaryPassword(email) : Promise.resolve(null),
     ]);
     if (!reservation.allowed) return null;
     for (const lock of reservation.locks) await lockEngaged(lock, email, ip, credential?.userId ?? null, site);
-    const fail = async (reason: string) => {
-      await audit(credential?.userId ?? null, "login.password.failure", `email=${email ?? "invalid"} ip=${ip} reason=${reason}`);
-      return null;
+    return {
+      email,
+      ip,
+      credential,
+      temporary,
+      fail: async (reason: string): Promise<null> => {
+        await audit(credential?.userId ?? null, "login.password.failure", `email=${email ?? "invalid"} ip=${ip} reason=${reason}`);
+        return null;
+      },
+      /** The secret was right: clear the account's counters, refund the IP reservation. */
+      proven: async (): Promise<void> => {
+        await passwords.clearSubject(passwords.executor, accountKeySubject(email!, key));
+        await passwords.clearSubject(passwords.executor, accountSubject(email!));
+        await passwords.refundAttempt(ipSubject(key), LOCKOUT.ip);
+      },
+      /**
+       * The slots filled after the pre-check: the attempt was counted but
+       * never checked, so give it back before answering 429.
+       */
+      busy: async (error: unknown): Promise<never> => {
+        if (error instanceof HasherBusy) {
+          await passwords.refundAttempts(rules);
+          throw busy();
+        }
+        throw error;
+      },
     };
-    let outcome: { ok: boolean; needsRehash: boolean };
+  }
+
+  /**
+   * Replaces a temporary password with one the person chooses, then signs
+   * in. The temporary password is checked like a login (lockout, audit); a
+   * policy rejection leaves it usable. Spending it, writing the new
+   * credential and issuing the session commit together.
+   */
+  async function changeTemporary(
+    request: IncomingMessage,
+    form: { email: string; current: string; password: string },
+    site: string,
+  ): Promise<SignInResult | null> {
+    const guard = await reserve(request, form.email, site);
+    if (!guard) return null;
+    const { email, temporary, fail } = guard;
     try {
-      if (!credential) {
-        await hasher.dummyVerify(password);
-        return fail(email ? "unknown_account" : "invalid_email");
+      if (!temporary) {
+        await hasher.dummyVerify(form.current);
+        return fail(email ? "no_temporary_password" : "invalid_email");
       }
-      outcome = await hasher.verify(password, credential);
+      if (!(await hasher.verify(form.current, temporary)).ok) return fail("wrong_temporary_password");
     } catch (error) {
-      if (error instanceof HasherBusy) {
-        // The slots filled after the pre-check: the attempt was counted but
-        // never checked, so give it back before answering 429.
-        await passwords.refundAttempts(rules);
-        throw busy();
-      }
-      throw error;
+      return guard.busy(error);
     }
-    if (!outcome.ok) return fail("wrong_password");
+    await guard.proven();
+    if (form.password === form.current) {
+      throw new PasswordHttpError(400, "password_unchanged", "Choose a new password, not the temporary one.");
+    }
+    await policyOrThrow(form.password, email!);
+    const stored = await hashOrBusy(form.password);
     let result: SignInResult;
     try {
-      // Inside the sign-in transaction, which holds the identity lock a
-      // reset also takes: the hash must still be the one just verified, or
-      // the session rolls back (see PasswordStore.completeReset).
-      result = await signInFor(request, email!, inviteTokenHash, (tx, userId) => passwords.assertCredentialUnchanged(tx, userId, credential.hash));
+      result = await signInFor(request, email!, null, (tx, userId) => passwords.redeemTemporaryPassword(tx, temporary.id, userId, stored));
     } catch (error) {
-      if (error instanceof CredentialChanged) return fail("credential_changed");
+      if (error instanceof OneTimeRefused) return fail(`temporary_password_${error.reason}`);
       throw error;
     }
-    await passwords.clearSubject(passwords.executor, accountKeySubject(email!, key));
-    await passwords.clearSubject(passwords.executor, accountSubject(email!));
-    await passwords.refundAttempt(ipSubject(key), LOCKOUT.ip);
-    let rehashed = false;
-    if (outcome.needsRehash) {
-      // Parameters were raised or the pepper rotated: upgrade while the
-      // plaintext is at hand. A concurrent change wins (compare-and-set).
-      // Skipped when the hasher is busy; the next sign-in tries again.
-      try {
-        rehashed = await passwords.rehash(credential.userId, credential.hash, await hasher.hash(password));
-      } catch (error) {
-        if (!(error instanceof HasherBusy)) throw error;
-      }
-    }
-    await audit(result.userId, "login.password.success", `email=${email} ip=${ip}${rehashed ? " rehashed=true" : ""}`);
+    await audit(result.userId, "password.temporary.changed", `email=${email} ip=${guard.ip}`);
     return result;
+  }
+
+  // ---- setup key ----------------------------------------------------------------
+
+  const setupEmail = input.setupKeyEmail ?? null;
+  const configuredKeyHash = input.setupKey ? hashSecret(input.setupKey) : null;
+  let configuredRecorded = false;
+
+  async function recordConfiguredKey(): Promise<void> {
+    if (!setupEmail || !configuredKeyHash || configuredRecorded) return;
+    await passwords.recordConfiguredSetupKey(setupEmail, configuredKeyHash);
+    configuredRecorded = true;
+  }
+
+  /** Live keys, revoking them once the admin has signed in some other way. */
+  async function usableSetupKeys(): Promise<LiveSetupKey[]> {
+    if (!setupEmail) return [];
+    await recordConfiguredKey();
+    const live = await passwords.liveSetupKeys(setupEmail);
+    if (!live.length) return [];
+    if (await passwords.neverSignedIn(setupEmail)) return live;
+    const revoked = await passwords.revokeSetupKeys(setupEmail);
+    if (revoked) await audit(null, "setup_key.revoked", `email=${setupEmail} reason=admin_signed_in keys=${revoked}`);
+    return [];
+  }
+
+  /**
+   * One setup-key check: the per-IP in-memory limit, then a Postgres
+   * backoff per client key, then a constant-time comparison of the key's
+   * hash with every live key. Failures are audited; the key never is.
+   */
+  async function checkSetupKey(request: IncomingMessage, rawKey: string): Promise<LiveSetupKey | null> {
+    const ip = clientIp(request).slice(0, 64);
+    const key = limiterKey(ip);
+    if (limited(`setup-key-ip:${key}`, RATE.setupKeyPerIp)) {
+      throw new IdentityError(429, "rate_limited", "Too many setup key attempts. Try again in a few minutes.");
+    }
+    const subject = `setup-key-ip:${key.slice(0, 64)}`;
+    const reservation = await passwords.reserveAttempt([{ subject, rule: SETUP_KEY_LOCKOUT }]);
+    if (!reservation.allowed) {
+      throw new IdentityError(429, "rate_limited", "Too many setup key attempts. Try again in a few minutes.");
+    }
+    for (const lock of reservation.locks) {
+      await audit(null, "setup_key.lockout", `ip=${ip} until=${lock.until.toISOString()}`);
+    }
+    const presented = hashSecret(rawKey.trim().slice(0, 256));
+    let match: LiveSetupKey | null = null;
+    // Every live key is compared, so the answer's timing says nothing.
+    for (const live of await usableSetupKeys()) {
+      if (secureEqual(presented, live.keyHash)) match = live;
+    }
+    if (!match) {
+      await audit(null, "setup_key.failure", `ip=${ip} reason=invalid_key`);
+      return null;
+    }
+    await passwords.clearSubject(passwords.executor, subject);
+    return match;
+  }
+
+  async function completeSetupKey(request: IncomingMessage, form: { key: string; password: string }): Promise<SignInResult | null> {
+    const match = await checkSetupKey(request, form.key);
+    if (!match || !setupEmail) return null;
+    // Checked before the key is spent, so a rejected password can be retried.
+    await policyOrThrow(form.password, setupEmail);
+    const stored = await hashOrBusy(form.password);
+    const ip = clientIp(request).slice(0, 64);
+    let result: SignInResult;
+    try {
+      result = await signInFor(request, setupEmail, null, async (tx, userId) => {
+        await passwords.redeemSetupKey(tx, match.id, userId, stored);
+        await passwords.clearAccount(tx, setupEmail);
+      });
+    } catch (error) {
+      if (error instanceof OneTimeRefused) {
+        await audit(null, "setup_key.failure", `ip=${ip} reason=${error.reason}`);
+        return null;
+      }
+      throw error;
+    }
+    await audit(result.userId, "setup_key.used", `email=${setupEmail} ip=${ip} source=${match.source}`);
+    return result;
+  }
+
+  function setupKeyResponse(response: ServerResponse, result: SignInResult | null): void {
+    if (!result) {
+      sendJson(response, 401, { error: "setup_key_invalid", message: SETUP_KEY_INVALID });
+      return;
+    }
+    signedIn(response, result);
   }
 
   async function login(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof Login>, site: string): Promise<void> {
     const result = await attempt(request, body.email, body.password, null, site);
+    if (!result) {
+      sendJson(response, 401, { error: "invalid_credentials", message: INVALID_CREDENTIALS });
+      return;
+    }
+    if (isChangeRequired(result)) {
+      // No session: the client sends POST .../change with the same email and
+      // password as currentPassword, and the new one.
+      sendJson(response, 403, { error: "password_change_required", message: CHANGE_REQUIRED, email: result.email });
+      return;
+    }
+    signedIn(response, result);
+  }
+
+  async function change(request: IncomingMessage, response: ServerResponse, body: z.infer<typeof ChangePassword>, site: string): Promise<void> {
+    const result = await changeTemporary(request, { email: body.email, current: body.currentPassword, password: body.newPassword }, site);
     if (!result) {
       sendJson(response, 401, { error: "invalid_credentials", message: INVALID_CREDENTIALS });
       return;
@@ -366,11 +621,11 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       later("password registration", async () => {
         if (!await identityStore.passwordRegistrationEligible(email)) return;
         if (await passwords.credentialByEmail(email)) {
-          await mailer.send(passwordAlreadyRegisteredEmail({ to: email, url: resetPage(site), siteName: hostOf(site) }));
+          await send(passwordAlreadyRegisteredEmail({ to: email, url: resetPage(site), siteName: hostOf(site) }));
           return;
         }
         const token = await passwords.createRegistration({ email, inviteTokenHash: invite ? hashSecret(invite) : null });
-        await mailer.send(passwordVerifyEmail({
+        await send(passwordVerifyEmail({
           to: email,
           // In the fragment: never sent to a server, so never in an access log.
           url: `${site}/login/password/verify#token=${encodeURIComponent(token)}`,
@@ -443,7 +698,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     await audit(result.userId, "password.registration.completed", `email=${setup.email}`);
     const to = setup.email;
     later("password added notice", async () => {
-      await mailer.send(passwordAddedEmail({ to, url: resetPage(site), siteName: hostOf(site) }));
+      await send(passwordAddedEmail({ to, url: resetPage(site), siteName: hostOf(site) }));
     });
     return result;
   }
@@ -471,6 +726,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
   }
 
   function requestReset(request: IncomingMessage, rawEmail: string, site: string): void {
+    if (!mailer) return;
     const email = normalizeEmailAddress(rawEmail);
     const ip = clientIp(request).slice(0, 64);
     const key = limiterKey(ip);
@@ -479,7 +735,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       const created = await passwords.createReset(email);
       if (!created) return;
       await passwords.audit({ userId: created.userId, action: "password.reset.requested", target: `email=${email} ip=${ip}` });
-      await mailer.send(passwordResetEmail({
+      await send(passwordResetEmail({
         to: email,
         url: `${resetPage(site)}#token=${encodeURIComponent(created.token)}`,
         siteName: hostOf(site),
@@ -517,7 +773,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     });
     const to = completed.email;
     later("password changed notice", async () => {
-      await mailer.send(passwordChangedEmail({ to, url: resetPage(site), siteName: hostOf(site) }));
+      await send(passwordChangedEmail({ to, url: resetPage(site), siteName: hostOf(site) }));
     });
     return revoked;
   }
@@ -531,15 +787,22 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     async handle(request, response, path, helpers) {
       if (!path.startsWith(PASSWORD_PATH_PREFIX)) return false;
       const route = path.slice(PASSWORD_PATH_PREFIX.length);
-      if (!["login", "register", "verify", "set", "reset", "reset/complete"].includes(route)) return false;
+      if (!["login", "register", "verify", "set", "reset", "reset/complete", "change", "setup-key"].includes(route)) return false;
       if (request.method !== "POST") throw new PasswordHttpError(405, "method_not_allowed", "Use POST");
       // Browser-only JSON: an allowed Origin (or same-origin fetch) and a JSON body.
       if (!cookieRequestAllowed(request, helpers.browserOrigins)) {
         throw new PasswordHttpError(403, "csrf_rejected", "Cross-origin request refused");
       }
+      if (!mailer && (route === "register" || route === "reset")) {
+        throw new PasswordHttpError(404, "email_not_configured", NO_EMAIL);
+      }
       const raw = await helpers.requestObject(request);
       const site = helpers.siteBaseUrl(request);
-      if (route === "login") await login(request, response, parse(Login, raw), site);
+      if (route === "change") await change(request, response, parse(ChangePassword, raw), site);
+      else if (route === "setup-key") {
+        const body = parse(SetupKey, raw);
+        setupKeyResponse(response, await completeSetupKey(request, { key: body.setupKey, password: body.password }));
+      } else if (route === "login") await login(request, response, parse(Login, raw), site);
       else if (route === "register") await register(request, response, parse(Register, raw), site);
       else if (route === "verify") await verify(request, response, parse(TokenOnly, raw));
       else if (route === "set") await setPassword(request, response, parse(SetPassword, raw), site);
@@ -551,6 +814,54 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
       const invite = form.invite && INVITE_TOKEN.test(form.invite) ? hashSecret(form.invite) : null;
       return attempt(request, form.email.slice(0, 320), form.password.slice(0, 1_024), invite, site);
     },
+    async formChangeTemporary(request, form, site) {
+      return changeTemporary(request, {
+        email: form.email.slice(0, 320),
+        current: form.current.slice(0, 1_024),
+        password: form.password.slice(0, 1_024),
+      }, site);
+    },
+    async setupKeyOffered() {
+      return (await usableSetupKeys()).length > 0;
+    },
+    async formCheckSetupKey(request, key) {
+      const match = await checkSetupKey(request, key);
+      return match && setupEmail ? { email: setupEmail } : null;
+    },
+    async formCompleteSetupKey(request, form) {
+      return completeSetupKey(request, { key: form.key, password: form.password.slice(0, 1_024) });
+    },
+    async mintSetupKey() {
+      if (!setupEmail) {
+        throw new PasswordHttpError(409, "setup_key_unavailable", "Set SELFHOST_BOOTSTRAP_ADMIN_EMAIL to use a setup key.");
+      }
+      if (!await passwords.neverSignedIn(setupEmail)) {
+        throw new PasswordHttpError(409, "admin_already_signed_in", "The bootstrap admin has already signed in or has a password; a setup key is no longer needed.");
+      }
+      // Recorded first, so minting revokes the configured key too.
+      await recordConfiguredKey();
+      const minted = await passwords.mintSetupKey(setupEmail);
+      await audit(null, "setup_key.minted", `email=${setupEmail}`);
+      return { setupKey: minted.key, email: setupEmail, expiresAt: minted.expiresAt };
+    },
+    async issueTemporaryPassword(request) {
+      const email = normalizeEmailAddress(request.email);
+      if (!email) throw new PasswordHttpError(400, "invalid_request", "That email address is not valid.");
+      const password = generateTemporaryPassword(email);
+      const stored = await hashOrBusy(password);
+      const created = await passwords.createTemporaryPassword({
+        organizationId: request.organizationId,
+        email,
+        stored,
+        createdByUserId: request.actorUserId,
+        ttlMs: request.ttlMs,
+      });
+      return { password, expiresAt: created.expiresAt };
+    },
+    async revokeTemporaryPasswords(organizationId, email) {
+      return passwords.revokeTemporaryPasswords(organizationId, email);
+    },
+    selfService: mailer !== null,
     async formCompleteRegistration(request, form, site) {
       return completeRegistration(request, { token: form.token.slice(0, 256), password: form.password.slice(0, 1_024) }, site);
     },
@@ -562,7 +873,7 @@ export function createPasswordRoutes(input: PasswordRoutesInput): PasswordRoutes
     },
     async sweep() {
       const swept = await passwords.sweep();
-      if (swept.attempts + swept.registrations + swept.setups + swept.resets > 0) log("password retention sweep", swept);
+      if (Object.values(swept).some((count) => count > 0)) log("password retention sweep", swept);
     },
     async idle() {
       while (background.size) await Promise.allSettled([...background]);

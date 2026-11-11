@@ -101,7 +101,15 @@ export async function call(origin: string, path: string, init: {
   return { status: response.status, body: parsed, text, cookies, location: response.headers.get("location") };
 }
 
-export async function setup(t: test.TestContext, options: { env?: Record<string, string>; hibpFetch?: HibpFetch; trustedProxies?: string | null; passwordHasher?: PasswordHasher; dashboardUrl?: string } = {}) {
+export async function setup(t: test.TestContext, options: {
+  env?: Record<string, string>;
+  hibpFetch?: HibpFetch;
+  trustedProxies?: string | null;
+  passwordHasher?: PasswordHasher;
+  dashboardUrl?: string;
+  /** false: no SMTP and no mailer (SELFHOST_SIGNIN_METHODS=password). */
+  smtp?: boolean;
+} = {}) {
   // The tests stand behind one proxy (they send X-Forwarded-For) unless a
   // test asks otherwise; the variable is read per request.
   const previousProxies = process.env.SELFHOST_TRUSTED_PROXIES;
@@ -138,11 +146,11 @@ export async function setup(t: test.TestContext, options: { env?: Record<string,
     SELFHOST_BOOTSTRAP_ORG_NAME: "Acme",
     SELFHOST_BOOTSTRAP_ADMIN_EMAIL: "admin@acme.test",
     SELFHOST_AUTO_JOIN_DOMAINS: "acme.test",
-    SELFHOST_SIGNIN_METHODS: "email_link,password",
+    SELFHOST_SIGNIN_METHODS: options.smtp === false ? "password" : "email_link,password",
     RELAYCAST_INTERNAL_SECRET: RELAYCAST_SECRET,
     // Required (explicitly, even 0) whenever password sign-in is on.
     SELFHOST_TRUSTED_PROXIES: proxies ?? "0",
-    ...SMTP,
+    ...(options.smtp === false ? {} : SMTP),
     ...options.env,
   });
   const clock = { now: Date.now() };
@@ -152,6 +160,7 @@ export async function setup(t: test.TestContext, options: { env?: Record<string,
   const identityStore = new IdentityStore(database, KEYRING, {
     inviteTtlMs: identityConfig.inviteTtlMs,
     autoJoinDomains: identityConfig.autoJoinDomains,
+    tenancy: identityConfig.tenancy,
     issueSession: (tx, session) => store.issueBrowserSession(tx, session),
     adminEmails: bootstrap.adminEmails.filter((email) => email !== bootstrap.adminEmail),
   });
@@ -162,7 +171,7 @@ export async function setup(t: test.TestContext, options: { env?: Record<string,
     database,
     keyring: KEYRING,
     dashboardUrl: config.dashboardUrl,
-    mailer,
+    mailer: options.smtp === false ? null : mailer,
     now: () => clock.now,
     log: () => undefined,
     ...(options.hibpFetch ? { hibpFetch: options.hibpFetch } : {}),
