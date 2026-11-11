@@ -15,6 +15,17 @@ assigned at release.
   hosted Cloud (yours, a teammate's with "Allow teammates to spawn here",
   unclaimed brokers; never an unclaimed desktop). Launches are journaled in
   `relay_spawns` (migration 0041) before they are sent. See docs/agent-launch.md.
+
+- Fixed: Agent Relay Desktop's browser links ("View on web", workspace setup,
+  Relaycast upgrade, downloads, Amp connections) 404'd when the dashboard has
+  its own host, because Desktop builds them on the API origin. A browser
+  GET/HEAD to `/cloud/dashboard/...` or `/dashboard/...` on the API host now
+  answers 302 (no-store, no-referrer) to the matching dashboard route on
+  `SELFHOST_DASHBOARD_URL`: `sessions/<id>` to `?session=<id>[&source=]`,
+  `/cloud/dashboard/settings` to `#/settings/workspace`, `/dashboard/settings`
+  to `#/settings/connections`, `downloads` to `/downloads`, anything else to the
+  dashboard root. Nothing changes when the dashboard shares the API origin.
+
 - Added: owner-only usage counts, `GET /api/v1/organizations/{org}/usage?days=7|30|90`,
   behind a new `usage` value in `SELFHOST_FEATURES` (off by default). Returns
   per-day and total active users, sessions uploaded, searches and session
