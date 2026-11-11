@@ -10,9 +10,8 @@
 // already arrived on the dashboard host, nothing is redirected.
 
 const DASHBOARD_PATH = /^\/(cloud\/)?dashboard(?:\/(.*))?$/;
-/** History sources are harness names (`claude`, `codex`, ...). */
-const SOURCE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const MAX_SESSION_ID = 256;
+/** The session read routes' limits (src/sessions/routes.ts): 512, no control characters. */
+const MAX_IDENTITY = 512;
 
 export type DashboardLinkInput = {
   method: string;
@@ -48,13 +47,13 @@ export function dashboardLinkRedirect(input: DashboardLinkInput): string | null 
 
   const [section, ...rest] = segments;
   if (section === "sessions" && rest.length === 1) {
-    const sessionId = sessionIdFrom(rest[0]!);
+    const sessionId = identity(safeDecode(rest[0]!));
     if (!sessionId) return root;
     // relay-webapp's sessionHref: `<base>?session=<id>&source=<source>`. A
     // Desktop link carries no source; the webapp then opens the session list.
     const params = new URLSearchParams({ session: sessionId });
-    const source = target.searchParams.get("source");
-    if (source && SOURCE.test(source)) params.set("source", source);
+    const source = identity(target.searchParams.get("source"));
+    if (source) params.set("source", source);
     return `${root}?${params}`;
   }
   if (section === "settings") {
@@ -67,13 +66,17 @@ export function dashboardLinkRedirect(input: DashboardLinkInput): string | null 
   return root;
 }
 
-function sessionIdFrom(segment: string): string | null {
-  let value: string;
+function safeDecode(segment: string): string | null {
   try {
-    value = decodeURIComponent(segment);
+    return decodeURIComponent(segment);
   } catch {
     return null;
   }
-  if (!value || value.length > MAX_SESSION_ID || /[\p{C}]/u.test(value)) return null;
+}
+
+/** Session id or source: always re-encoded into the query, so only its shape is checked. */
+function identity(raw: string | null): string | null {
+  const value = raw?.trim();
+  if (!value || value.length > MAX_IDENTITY || /[\p{C}]/u.test(value)) return null;
   return value;
 }

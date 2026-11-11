@@ -43,15 +43,22 @@ test("a session id is decoded once and re-encoded as a query value", () => {
   // Undecodable, control characters or oversized: the dashboard root instead.
   assert.equal(redirect("/cloud/dashboard/sessions/%E0%A4%A"), "https://proof.test/");
   assert.equal(redirect("/cloud/dashboard/sessions/a%0Ab"), "https://proof.test/");
-  assert.equal(redirect(`/cloud/dashboard/sessions/${"a".repeat(257)}`), "https://proof.test/");
+  assert.equal(redirect(`/cloud/dashboard/sessions/${"a".repeat(512)}`), `https://proof.test/?session=${"a".repeat(512)}`);
+  assert.equal(redirect(`/cloud/dashboard/sessions/${"a".repeat(513)}`), "https://proof.test/");
 });
 
-test("a citation link keeps a valid source and drops an invalid one", () => {
+test("a citation link keeps its source and drops an invalid one", () => {
   assert.equal(
     redirect("/dashboard/sessions/s-1?source=claude&workspace=ignored"),
     "https://proof.test/?session=s-1&source=claude",
   );
-  assert.equal(redirect("/dashboard/sessions/s-1?source=%3Cscript%3E"), "https://proof.test/?session=s-1");
+  // Any source the read routes accept is passed on, encoded.
+  assert.equal(
+    redirect("/dashboard/sessions/s-1?source=claude%2Bremote"),
+    "https://proof.test/?session=s-1&source=claude%2Bremote",
+  );
+  assert.equal(redirect("/dashboard/sessions/s-1?source=a%0Ab"), "https://proof.test/?session=s-1");
+  assert.equal(redirect(`/dashboard/sessions/s-1?source=${"a".repeat(513)}`), "https://proof.test/?session=s-1");
 });
 
 test("settings, downloads and other dashboard paths map to webapp routes", () => {
