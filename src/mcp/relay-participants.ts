@@ -1,4 +1,4 @@
-import { isCapyBindingIdentity } from "../capy/identity.js";
+import { isBindingOwnedIdentity } from "../messaging/binding-identities.js";
 import { createHash, randomUUID } from "node:crypto";
 import { decryptSecret, encryptSecret } from "../crypto.js";
 import type { SqlExecutor } from "../database.js";
@@ -351,7 +351,7 @@ function createRelayService(context: McpContext) {
   }
 
   function ownsRemote(remote: { metadata: Record<string, unknown> }): boolean {
-    return !isCapyBindingIdentity(remote.metadata) && remote.metadata.source === HOSTED_SOURCE && remote.metadata.cloud_workspace_id === workspaceId
+    return !isBindingOwnedIdentity(remote.metadata) && remote.metadata.source === HOSTED_SOURCE && remote.metadata.cloud_workspace_id === workspaceId
       && remote.metadata.owner_hash === owner;
   }
 

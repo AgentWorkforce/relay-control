@@ -5,6 +5,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerFactoryTools } from "../src/factory/mcp-tools.js";
 import { planToolGroups } from "../src/mcp/catalog.js";
 import type { McpContext } from "../src/mcp/context.js";
+import { createRelaycastClient } from "../src/messaging/relaycast.js";
 import { FACTORY_REPLY_GUIDANCE, relayService } from "../src/mcp/relay-participants.js";
 import { buildMcpServer } from "../src/mcp/server.js";
 import { assertNoSecrets, bindingRow, connectAndBind, removeMember, startFactoryEnv, type FactoryEnv } from "./factory-helpers.js";
@@ -200,4 +201,32 @@ test("send and read accept as=<own bound factory agent>; inbox, leave and channe
     .send({ to: "peer-agent", text: "x", as: name }), { message: NO_PARTICIPANT });
   await assert.rejects(relayService(context(false)).send({ to: "peer-agent", text: "x", as: name }), { message: NO_PARTICIPANT });
   assert.equal(sent.length, 1);
+});
+
+
+for (const retired of [false,true]) test(`generic join refuses ${retired?"retired cleanup-pending":"live"} Factory binding custody`,async t=>{
+  const env=await startFactoryEnv(t),bound=await connectAndBind(env),name=bound.agent.name;
+  const originalToken=env.relay.agents.get(name)!.token;
+  if(retired) {
+    env.relay.failRelease=true;
+    const disconnected=await env.api(`/api/v1/workspaces/${env.workspaceId}/factory/connection`,{method:"DELETE",token:env.ownerToken});
+    assert.equal(disconnected.status,204);
+    assert.equal((await bindingRow(env,bound.binding_id)).state,"retired");
+    assert.equal(await env.module.mcp.agentFor(env.workspaceId,env.ownerId,name),null);
+    assert.ok(env.relay.agents.has(name),"failed cleanup preserves the original remote obligation");
+  }
+  const before={registered:env.relay.registered,recovered:env.relay.recovered};
+  const base=mcpContext(env,env.ownerId);
+  const context=mcpContext(env,env.ownerId,{principal:{...base.principal,name:"Owner",email:"owner@acme.test"},
+    relay:{database:env.database,keyring:env.config.encryptionKeyring,
+      client:createRelaycastClient({internalOrigin:env.config.relaycastUrl}),sessionId:undefined}});
+  await assert.rejects(relayService(context).join({name}),/name is already taken/);
+  assert.deepEqual({registered:env.relay.registered,recovered:env.relay.recovered},before);
+  assert.equal(env.relay.agents.get(name)!.token,originalToken,"generic recovery cannot rotate the provider token");
+  assert.equal((await env.database.query("SELECT id FROM hosted_relay_participants")).rows.length,0);
+  if(!retired) {
+    assert.deepEqual(await env.module.mcp.agentFor(env.workspaceId,env.ownerId,name),{name,token:originalToken});
+    const ordinary=await relayService(context).join({name:"factory-support"});
+    assert.equal(ordinary.name,"factory-support","provider prefixes alone are not reserved");
+  }
 });

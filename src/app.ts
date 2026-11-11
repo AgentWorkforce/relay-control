@@ -67,7 +67,7 @@ import type { TelemetryModule } from "./telemetry/module.js";
 import { identityErrorResponse, type IdentityModule } from "./identity/routes.js";
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
 import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.js";
-import { isCapyBindingIdentity } from "./capy/identity.js";
+import { isBindingOwnedIdentity } from "./messaging/binding-identities.js";
 import type { McpContext } from "./mcp/context.js";
 import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./factory/routes.js";
 import { createMcpHandler } from "./mcp/routes.js";
@@ -536,7 +536,7 @@ export function createApp(input: {
       if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
       const remote=await oauthRelay.getAgent(workspace.relaycastApiKey,name);
       if(!remote) return "available";
-      if(isCapyBindingIdentity(remote.metadata) || remote.metadata.source!==HOSTED_SOURCE || remote.metadata.cloud_workspace_id!==principal.workspaceId ||
+      if(isBindingOwnedIdentity(remote.metadata) || remote.metadata.source!==HOSTED_SOURCE || remote.metadata.cloud_workspace_id!==principal.workspaceId ||
         remote.metadata.owner_hash!==ownerHash(principal.userId)) return "taken";
       // An agent whose release may be in flight cannot be attached to.
       return await retiringIdentity(store.database,{organizationId:principal.organizationId,workspaceId:principal.workspaceId,
