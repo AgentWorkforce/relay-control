@@ -1839,10 +1839,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         const result = await personSessions({
           config, store, organizationId, owner, subjectUserId, days, cursor, now,
         });
-        if (cursor === undefined) {
-          // Written before the member's sessions leave Control.
-          await recordPeopleView(store.database, { organizationId, viewerUserId: owner.userId, subjectUserId, days });
-        }
+        // Every page is audited, whatever the cursor says, before the member's
+        // sessions leave Control.
+        await recordPeopleView(store.database, {
+          organizationId, viewerUserId: owner.userId, subjectUserId, days, page: cursor === undefined ? "first" : "next",
+        });
         json(response, 200, result, true);
       } catch (error) {
         if (error instanceof PersonNotFoundError) throw new HttpError(404, "user_not_found", "Not a member of this organization");

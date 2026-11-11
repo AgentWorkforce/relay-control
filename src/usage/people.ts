@@ -16,7 +16,7 @@ import { usageDates } from "./routes.js";
  * - sessions, projects, titles and summaries: the session read API with the
  *   owner's authority, one workspace per read, filtered by `user`. Erased
  *   sessions are removed upstream, so they never appear.
- * Every drill-down (first page) writes an audit row that owners can list.
+ * Every drill-down request (each page) writes an audit row that owners can list.
  */
 export const PEOPLE_AUDIT_ACTION = "usage.people.viewed";
 const DAY_MS = 86_400_000;
@@ -222,18 +222,26 @@ export async function peopleReport(input: {
   };
 }
 
-/** Opaque drill-down cursor: which workspace, and the read API cursor within it. */
-function encodeCursor(value: { w: number; c: string | null }): string {
-  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+/**
+ * Opaque drill-down cursor: per workspace, the read API cursor of the page
+ * being consumed (null = its first page), how many of that page's sessions
+ * are already shown, and whether the workspace is exhausted.
+ */
+type Stream = { c: string | null; k: number; d: boolean };
+
+function encodeCursor(streams: Stream[]): string {
+  return Buffer.from(JSON.stringify({ s: streams }), "utf8").toString("base64url");
 }
 
-function decodeCursor(raw: string | undefined): { w: number; c: string | null } {
-  if (raw === undefined) return { w: 0, c: null };
+function decodeCursor(raw: string | undefined, workspaces: number): Stream[] {
+  if (raw === undefined) return Array.from({ length: workspaces }, () => ({ c: null, k: 0, d: false }));
   try {
     const value: unknown = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
-    if (isRecord(value) && Number.isSafeInteger(value.w) && (value.w as number) >= 0 &&
-      (value.c === null || (typeof value.c === "string" && value.c.length > 0 && value.c.length <= 4096))) {
-      return { w: value.w as number, c: value.c as string | null };
+    if (isRecord(value) && Array.isArray(value.s) && value.s.length === workspaces && value.s.every((stream) =>
+      isRecord(stream) && typeof stream.d === "boolean" &&
+      Number.isSafeInteger(stream.k) && (stream.k as number) >= 0 && (stream.k as number) < AGGREGATE_PAGE &&
+      (stream.c === null || (typeof stream.c === "string" && stream.c.length > 0 && stream.c.length <= 4096)))) {
+      return value.s as Stream[];
     }
   } catch {
     // fall through
@@ -280,32 +288,49 @@ export async function personSessions(input: {
     .find((row) => row.userId === input.subjectUserId);
   if (!member) throw new PersonNotFoundError("user_not_found");
   const range = rangeOf(input.days, input.now);
-  const position = decodeCursor(input.cursor);
   const identities = await ownerIdentities(input.store, input.organizationId, input.owner);
-  if (position.w > identities.length) throw new PeopleInputError("Invalid cursor");
-  const sessions: Array<Session & { summary: string | null }> = [];
-  let workspace = position.w;
-  let upstream = position.c;
-  let nextCursor: string | null = null;
-  // Fill one page, workspace by workspace (most installs have one).
-  while (workspace < identities.length && sessions.length < DRILL_PAGE) {
-    const identity = identities[workspace]!;
-    const page = await sessionPage(input.config, identity, range, {
-      limit: DRILL_PAGE - sessions.length,
-      cursor: upstream ?? undefined,
-      user: input.subjectUserId,
+  const streams = decodeCursor(input.cursor, identities.length);
+  // Merge the workspaces newest first: read each live workspace's next
+  // DRILL_PAGE sessions (past the ones already shown), then take the newest
+  // DRILL_PAGE overall. A workspace advances only by what was shown.
+  type Candidate = Session & { stream: number };
+  const candidates: Candidate[] = [];
+  const fetched: Array<{ count: number; next: string | null }> = [];
+  for (const [index, stream] of streams.entries()) {
+    if (stream.d) {
+      fetched.push({ count: 0, next: null });
+      continue;
+    }
+    const limit = Math.min(stream.k + DRILL_PAGE, AGGREGATE_PAGE);
+    const page = await sessionPage(input.config, identities[index]!, range, {
+      limit, cursor: stream.c ?? undefined, user: input.subjectUserId,
     });
-    const own = page.sessions.filter((session) => session.userIds.includes(input.subjectUserId));
-    const summaries = await mapLimited(own, SUMMARY_CONCURRENCY, (session) => summaryOf(input.config, identity, session));
-    own.forEach((session, index) => sessions.push({ ...session, summary: summaries[index]! }));
-    if (page.nextCursor) {
-      upstream = page.nextCursor;
+    fetched.push({ count: page.sessions.length, next: page.nextCursor });
+    for (const session of page.sessions.slice(stream.k)) candidates.push({ ...session, stream: index });
+  }
+  // Each workspace's rows are newest first, so what a page takes from one is
+  // always a prefix of it; `k` counts that prefix.
+  candidates.sort((a, b) => Date.parse(b.lastTs ?? "") - Date.parse(a.lastTs ?? "") || a.sessionId.localeCompare(b.sessionId));
+  const taken = candidates.slice(0, DRILL_PAGE);
+  for (const session of taken) streams[session.stream]!.k += 1;
+  // The read API filters by user; anything else is consumed but never shown.
+  const shown = taken.filter((session) => session.userIds.includes(input.subjectUserId));
+  for (const [index, stream] of streams.entries()) {
+    if (stream.d) continue;
+    const { count, next } = fetched[index]!;
+    if (stream.k < count) continue;
+    if (next) {
+      stream.c = next;
+      stream.k = 0;
     } else {
-      workspace += 1;
-      upstream = null;
+      stream.d = true;
     }
   }
-  if (workspace < identities.length) nextCursor = encodeCursor({ w: workspace, c: upstream });
+  const sessions = await mapLimited(shown, SUMMARY_CONCURRENCY, async (session) => ({
+    ...session,
+    summary: await summaryOf(input.config, identities[session.stream]!, session),
+  }));
+  const nextCursor = streams.every((stream) => stream.d) ? null : encodeCursor(streams);
 
   let rollup: { titles: string[]; projects: Array<{ name: string; sessions: number }> } | null = null;
   if (input.cursor === undefined) {
@@ -322,7 +347,7 @@ export async function personSessions(input: {
     },
     range: { days: range.days, from: range.from, to: range.to },
     rollup,
-    sessions: sessions.map(({ userIds: _users, ...session }) => session),
+    sessions: sessions.map(({ userIds: _users, stream: _stream, ...session }) => session),
     nextCursor,
   };
 }
@@ -332,31 +357,33 @@ export async function recordPeopleView(database: Database, input: {
   viewerUserId: string;
   subjectUserId: string;
   days: number;
+  page: "first" | "next";
 }): Promise<void> {
   await recordAudit(database, {
     organizationId: input.organizationId,
     actor: { kind: "user", userId: input.viewerUserId },
     action: PEOPLE_AUDIT_ACTION,
-    target: `user:${input.subjectUserId} days:${input.days}`,
+    target: `user:${input.subjectUserId} days:${input.days} page:${input.page}`,
   });
 }
 
 export async function peopleAudit(database: Database, store: ControlPlaneStore, organizationId: string) {
   const result = await database.query<{ actor_id: string | null; target: string | null; created_at: Date | string }>(
     `SELECT actor_id, target, created_at FROM admin_audit_events
-      WHERE organization_id = $1 AND action = $2 ORDER BY created_at DESC LIMIT 50`,
+      WHERE organization_id = $1 AND action = $2 ORDER BY created_at DESC LIMIT 200`,
     [organizationId, PEOPLE_AUDIT_ACTION],
   );
   const names = new Map((await store.listMemberships(organizationId))
     .map((row) => [String(row.userId), typeof row.name === "string" ? row.name : null]));
   return result.rows.map((row) => {
-    const match = /^user:(\S+) days:(\d+)$/.exec(row.target ?? "");
+    const match = /^user:(\S+) days:(\d+)(?: page:(first|next))?$/.exec(row.target ?? "");
     return {
       viewerUserId: row.actor_id,
       viewerName: row.actor_id ? names.get(row.actor_id) ?? null : null,
       subjectUserId: match?.[1] ?? null,
       subjectName: match ? names.get(match[1]!) ?? null : null,
       days: match ? Number(match[2]) : null,
+      page: match?.[3] ?? "first",
       createdAt: new Date(row.created_at).toISOString(),
     };
   });

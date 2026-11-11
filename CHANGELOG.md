@@ -8,7 +8,7 @@ assigned at release.
 - Added: owner-only People drill-down behind a new `usage_people` feature:
   `GET /api/v1/organizations/{org}/usage/people`, `.../usage/people/{userId}/sessions`
   (a member's sessions with their recorded titles and summaries; no new
-  generation) and `.../usage/people/audit`. Every drill-down writes an
+  generation) and `.../usage/people/audit`. Every drill-down page writes an
   organization-level `usage.people.viewed` audit row. Unlike the v1 counts,
   this view shows member names and emails. Migration `0042_usage_people.sql`.
 - Changed: with `SELFHOST_FEATURES` unset, `usage` and `usage_people` are now

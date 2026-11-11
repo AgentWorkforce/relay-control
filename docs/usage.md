@@ -69,15 +69,17 @@ recorded titles and summaries.
   written only while `usage_people` is selected; `lastSessionAt` (the newest
   session in the range) covers activity from before that.
 - `GET /api/v1/organizations/{org}/usage/people/{userId}/sessions?days&cursor`:
-  that member's sessions in the range, newest first, 20 per page, each with
+  that member's sessions in the range, newest first across all the
+  organization's workspaces (merged by session time), 20 per page, each with
   its recorded title, the recorded short summary (`/v1/sessions/{id}/summary`,
   `null` when none is ready), agent name, project and times. The first page
   also carries a `rollup` built only from recorded titles and projects.
   Nothing is generated. A user who is not a member is 404 `user_not_found`.
-- Every drill-down (its first page) writes an organization-level audit row
-  `usage.people.viewed` (viewer, subject, range) before answering.
-  `GET /api/v1/organizations/{org}/usage/people/audit` lists the latest 50 for
-  owners. These rows have no workspace, so a workspace's admin audit view does
+- Every drill-down request, each page whatever its cursor, writes an
+  organization-level audit row `usage.people.viewed` (viewer, subject, range,
+  first or next page) before answering.
+  `GET /api/v1/organizations/{org}/usage/people/audit` lists the latest 200
+  for owners. These rows have no workspace, so a workspace's admin audit view does
   not list them.
 
 Erased sessions are removed by the session pipeline and never appear here.

@@ -1513,14 +1513,26 @@ test("usage people: drill-down lists a member's sessions with recorded summaries
   // One audit row per drill-down (first page only), visible to owners.
   const audit = await call(env.origin, `/cloud/api/v1/organizations/${env.organizationId}/usage/people/audit`, { token: owner });
   assert.equal(audit.status, 200);
-  assert.equal(audit.body.events.length, 1);
-  assert.deepEqual({ ...audit.body.events[0], createdAt: undefined }, {
-    viewerUserId: env.ownerId, viewerName: "Owner", subjectUserId: env.memberId, subjectName: "Member", days: 7, createdAt: undefined,
-  });
+  // Every page is audited, newest first.
+  assert.equal(audit.body.events.length, 2);
+  assert.deepEqual(audit.body.events.map((event: any) => ({ ...event, createdAt: undefined })).sort((a: any, b: any) => a.page.localeCompare(b.page)), [
+    { viewerUserId: env.ownerId, viewerName: "Owner", subjectUserId: env.memberId, subjectName: "Member", days: 7, page: "first", createdAt: undefined },
+    { viewerUserId: env.ownerId, viewerName: "Owner", subjectUserId: env.memberId, subjectName: "Member", days: 7, page: "next", createdAt: undefined },
+  ]);
   const { rows: auditRows } = await env.database.query<{ action: string; workspace_id: string | null }>(
     "SELECT action, workspace_id FROM admin_audit_events WHERE action = 'usage.people.viewed'");
   // Organization-level: not listed by a workspace admin's audit view.
-  assert.deepEqual(auditRows, [{ action: "usage.people.viewed", workspace_id: null }]);
+  assert.deepEqual(auditRows, [
+    { action: "usage.people.viewed", workspace_id: null }, { action: "usage.people.viewed", workspace_id: null },
+  ]);
+
+  // A hand-made "first page" cursor is still audited.
+  const forged = Buffer.from(JSON.stringify({ s: [{ c: null, k: 0, d: false }, { c: null, k: 0, d: false }] })).toString("base64url");
+  const forgedRead = await call(env.origin, `${base}&cursor=${forged}`, { token: owner });
+  assert.equal(forgedRead.status, 200);
+  const { rows: afterForged } = await env.database.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM admin_audit_events WHERE action = 'usage.people.viewed'");
+  assert.equal(afterForged[0]!.n, 3);
 });
 
 test("usage people: owner-only, its own flag, unknown members and bad input", async (t) => {
@@ -1569,4 +1581,31 @@ test("usage people: an unreadable session backend is unavailable, never zero", a
   assert.equal(result.status, 200);
   assert.deepEqual(result.body.people.unavailable, ["sessionsUploaded"]);
   assert.ok(result.body.people.members.every((member: any) => member.sessionsUploaded === null));
+});
+
+test("usage people: the drill-down merges workspaces newest first", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  const hour = 3_600_000;
+  const at = (hours: number) => new Date(Date.parse("2026-11-02T19:00:00.000Z") - hours * hour).toISOString();
+  // alpha (created first) holds 25 older sessions; beta holds the newest one and one in the middle.
+  const rows = Array.from({ length: 25 }, (_, index) => ({
+    sessionId: `a${index}`, workspaceId: env.alpha, userIds: [env.memberId], lastTs: at(2 + index),
+  }));
+  rows.push({ sessionId: "b-newest", workspaceId: env.beta, userIds: [env.memberId], lastTs: at(0) });
+  rows.push({ sessionId: "b-middle", workspaceId: env.beta, userIds: [env.memberId], lastTs: at(10.5) });
+  peopleSessions(env, rows);
+  const owner = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/organizations/${env.organizationId}/usage/people/${env.memberId}/sessions?days=7`;
+  const seen: string[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < 5; page += 1) {
+    const result: Awaited<ReturnType<typeof call>> = await call(env.origin, cursor ? `${base}&cursor=${encodeURIComponent(cursor)}` : base, { token: owner });
+    assert.equal(result.status, 200);
+    seen.push(...result.body.sessions.map((session: any) => session.sessionId));
+    cursor = result.body.nextCursor;
+    if (!cursor) break;
+  }
+  const expected = [...rows].sort((a, b) => Date.parse(b.lastTs) - Date.parse(a.lastTs)).map((row) => row.sessionId);
+  assert.deepEqual(seen, expected);
+  assert.equal(seen[0], "b-newest");
 });
