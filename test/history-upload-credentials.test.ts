@@ -796,3 +796,55 @@ test("relay-upload-inbox-v1 contract vectors: user segment, journal key, prefix,
   // The vectors' bad-MAC refusal (last character changed).
   assert.equal(verifyWitness(testOnlyKey, token.slice(0, -1) + "A"), null);
 });
+
+test("relay-upload-inbox-v1 contract vectors: credentials.presignedSelfhost (S3-compatible endpoint with a path prefix, no KMS)", async () => {
+  // The pipeline's credentials.presignedSelfhost vector: endpoint = origin plus an optional path
+  // prefix, kmsKeyId null (clients send no SSE headers), presigned only. The vector's URL and
+  // witness are placeholders, so the signed URL is pinned by origin, path and signed headers and
+  // the witness by its payload; its exp is the URL expiry (Control's rule).
+  const vector = {
+    contract: "relay-upload-inbox-v1", kind: "presigned", bucket: "example-upload-bucket", region: "us-east-1",
+    endpoint: "https://objects.example.test:9000/relayhistory",
+    keyPrefix: "96bulls/.upload-inbox/org-synthetic/v1/ws=ws-synthetic/u=5a3b60a76d453cbeead919bae088d3b5/",
+    kmsKeyId: null, maxObjectBytes: 2097152, refreshAfter: "2026-11-11T00:10:00Z", witnessSeq: 7,
+  };
+  const vectorUrl = {
+    key: "o=origin-synthetic/b=f671c6d71e203808d157b293a8f29b25/d=36d61817e86f05e696d3b4af66dbb3ff-w7.json.zst",
+    expiresAt: "2026-11-11T00:15:00Z",
+  };
+  const testOnlyKey = Buffer.from("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "base64url");
+  const tenant = { orgId: "org-synthetic", workspaceId: "ws-synthetic", userId: "user-synthetic-a" };
+  const issuer = new HistoryUploadCredentials({
+    config: uploadConfig({
+      bucket: vector.bucket, endpoint: vector.endpoint, internalEndpoint: vector.endpoint,
+      roleArn: null, kmsKeyArn: null, storeCredentials: STORE_CREDS, witnessKey: testOnlyKey,
+    }),
+    sts: { assumeRole: async () => assert.fail("no STS call with an endpoint") },
+    journal: { seq: async () => 7 },
+    credentials: new StaticAwsCredentialProvider(STORE_CREDS),
+    now: () => new Date("2026-11-11T00:00:00Z"),
+  });
+  await assert.rejects(
+    issuer.issue(tenant, { originId: "origin-synthetic", kind: "sts" }),
+    (error: Error & { status?: number; code?: string }) => error.status === 501 && error.code === "unsupported_by_backend",
+  );
+  const issued = await issuer.issue(tenant, { originId: "origin-synthetic", kind: "presigned", keys: [{ key: vectorUrl.key, sha256: SHA_A }] });
+  assert.deepEqual(Object.keys(issued).sort(), [...Object.keys(vector), "urls", "witness"].sort());
+  const { witness, urls, refreshAfter, ...common } = issued as { witness: string; urls: Array<{ key: string; url: string; expiresAt: string }>; refreshAfter: string } & Record<string, unknown>;
+  const { refreshAfter: vectorRefreshAfter, ...vectorCommon } = vector;
+  assert.deepEqual(common, vectorCommon);
+  // Both are RFC 3339 instants; Control writes milliseconds, the vector does not.
+  assert.equal(Date.parse(refreshAfter), Date.parse(vectorRefreshAfter));
+  assert.equal(urls.length, 1);
+  const entry = urls[0]!;
+  assert.equal(entry.key, vectorUrl.key);
+  assert.equal(Date.parse(entry.expiresAt), Date.parse(vectorUrl.expiresAt));
+  const payload = verifyWitness(testOnlyKey, witness);
+  assert.deepEqual(payload, { v: 1, org: tenant.orgId, ws: tenant.workspaceId, user: tenant.userId, seq: 7, exp: Math.floor(Date.parse(vectorUrl.expiresAt) / 1000) });
+  const url = new URL(entry.url);
+  assert.equal(url.origin, "https://objects.example.test:9000");
+  assert.equal(url.pathname.split("/").map(decodeURIComponent).join("/"), `/relayhistory/${vector.bucket}/${vector.keyPrefix}${vectorUrl.key}`);
+  assert.equal(url.searchParams.get("X-Amz-SignedHeaders"), "content-encoding;host;if-none-match;x-amz-checksum-sha256;x-amz-meta-relay-witness");
+  assert.equal(url.searchParams.get("X-Amz-Expires"), "900");
+  assert.equal(url.searchParams.has("X-Amz-Security-Token"), false);
+});
