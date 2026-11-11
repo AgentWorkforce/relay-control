@@ -14,6 +14,7 @@ when a change touches Flows or provider ingestion.
 | Credential-broker server, run-bound subscription/Relayfile credential issuance and revocation, workspace Relaycast binding | `relay-control` |
 | Flow definitions and source validation; runs, steps, events, logs, artifacts and storage; Flows worker enrollment, assignment and lifecycle | `relayfile-control` |
 | Provider webhook ingress, integration bindings, durable envelope intake, deduplication, queues, retries, backpressure, dead letters and replay | `relayfile-control` |
+| Provider file/record storage, materialization and digests; provider contracts in adapter/provider packages | `relayfile` OSS runtime and its packages |
 | Hosted dashboard/UI, integration setup and the provider-readiness aggregation currently implemented in Cloud | `cloud` (UI ports in `relay-webapp` where implemented) |
 
 Flows service changes belong in `../relayfile-control`, including validation
@@ -43,8 +44,9 @@ sessions, provider logins or workspace credential storage out of this repo.
 
 ## Legacy code is not ownership
 
-Some 0.5.x builds still mount legacy `src/flows` routes here. Their presence
-is not a reason to mirror new Flows features or fixes into both repos.
+The current 0.5.x implementation still includes legacy `src/flows` handlers.
+Verify the deployed build and ingress before assuming those handlers are retired.
+Their presence is not a reason to mirror new Flows features or fixes into both repos.
 A legacy compatibility patch must be separately justified by a verified active
 deployment and a tracked cutover/retirement plan; never add it automatically
 for parity. Do not delete or disable live handlers just to match this document.
