@@ -308,7 +308,8 @@ test("a creator removed from the organization loses every inbox URL", async (t) 
   assert.equal(mcp.status, 404);
 });
 
-test("delivery state only moves forward: pending -> woken -> read", async (t) => {
+/** The Postgres store on its own, with one shim and an append helper. */
+async function bareStore(t: TestContext) {
   const database = new PGliteDatabase();
   t.after(() => database.close());
   await migrate(database);
@@ -317,33 +318,100 @@ test("delivery state only moves forward: pending -> woken -> read", async (t) =>
   const shim = await store.createShim({
     id: crypto.randomUUID(), mcpTokenHash: "m", hookToken: "esh_x", hookTokenHash: "h", manageTokenHash: "k", now,
   });
-  const append = async (n: number) => (await store.appendEvent(shim.id, {
-    receivedAt: now, mode: "open", contentType: "application/json", body: JSON.stringify({ n }), headers: {},
-  }, 50)).event;
-  const state = async (id: string) =>
-    (await store.listRecent(shim.id, 50)).find((event) => event.id === id)!;
+  const append = async (n: number, idempotencyKey?: string, dedupeSince = new Date(0).toISOString()) =>
+    store.appendEvent(shim.id, {
+      receivedAt: now, mode: "open", contentType: "application/json", body: JSON.stringify({ n }), headers: {},
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+    }, { feedSize: 50, dedupeSince });
+  const fresh = async (n: number) => {
+    const appended = await append(n);
+    assert.equal(appended.duplicate, false);
+    return (appended as { event: { id: string; seq: number } }).event;
+  };
+  const state = async (id: string) => (await store.listRecent(shim.id, 50)).find((event) => event.id === id)!;
+  return { database, store, shim, now, append, fresh, state };
+}
 
-  // A wake succeeds, then a later failure for the same post lands: it stays woken.
-  const a = await append(1);
-  await store.markDelivery(shim.id, [a.id], "woken", now);
-  await store.markDelivery(shim.id, [a.id], "pending", now, "late failure");
-  assert.equal((await state(a.id)).delivery, "woken");
-  assert.equal((await state(a.id)).wakeError, undefined);
+test("concurrent claims never hand out the same event", async (t) => {
+  const s = await bareStore(t);
+  for (let n = 0; n < 30; n += 1) await s.fresh(n);
+  assert.equal(await s.store.countPending(s.shim.id), 30);
+  const batches = await Promise.all(Array.from({ length: 8 }, (_, n) =>
+    s.store.claimPending(s.shim.id, { limit: 5 }, n % 2 ? "read" : "woken", s.now)));
+  const ids = batches.flat().map((event) => event.id);
+  assert.equal(ids.length, 30, "every event claimed");
+  assert.equal(new Set(ids).size, 30, "no event claimed twice");
+  assert.equal(await s.store.countPending(s.shim.id), 0);
+  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 5 }, "read", s.now), []);
+});
 
-  // Read, then a late woken: it stays read.
-  await store.markDelivery(shim.id, [a.id], "read", now);
-  await store.markDelivery(shim.id, [a.id], "woken", now);
-  await store.markDelivery(shim.id, [a.id], "pending", now, "later failure");
-  assert.equal((await state(a.id)).delivery, "read");
+test("claimPending takes the oldest first or only the named ids, and only pending ones", async (t) => {
+  const s = await bareStore(t);
+  const [a, b, c] = [await s.fresh(1), await s.fresh(2), await s.fresh(3)];
+  const named = await s.store.claimPending(s.shim.id, { limit: 10, ids: [c.id] }, "read", s.now);
+  assert.deepEqual(named.map((event) => event.id), [c.id]);
+  assert.equal(named[0]!.delivery, "read");
+  const oldest = await s.store.claimPending(s.shim.id, { limit: 1 }, "woken", s.now);
+  assert.deepEqual(oldest.map((event) => event.id), [a.id]);
+  assert.equal(oldest[0]!.deliveredAt, new Date(s.now).toISOString());
+  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 10, ids: [a.id, c.id] }, "read", s.now), []);
+  assert.equal((await s.state(b.id)).delivery, "pending");
+});
 
-  // A failure on a still-pending post records the error; success clears it.
-  const b = await append(2);
-  await store.markDelivery(shim.id, [b.id], "pending", now, "relay down");
-  assert.equal((await state(b.id)).delivery, "pending");
-  assert.equal((await state(b.id)).wakeError, "relay down");
-  await store.markDelivery(shim.id, [b.id], "woken", now);
-  assert.equal((await state(b.id)).delivery, "woken");
-  assert.equal((await state(b.id)).wakeError, undefined);
+test("releaseWake returns only a still-woken event to pending", async (t) => {
+  const s = await bareStore(t);
+  const [a, b] = [await s.fresh(1), await s.fresh(2)];
+  await s.store.claimPending(s.shim.id, { limit: 1, ids: [a.id] }, "woken", s.now);
+  await s.store.releaseWake(s.shim.id, a.id, "relay down");
+  const released = await s.state(a.id);
+  assert.equal(released.delivery, "pending");
+  assert.equal(released.wakeError, "relay down");
+  assert.equal(released.deliveredAt, undefined);
+
+  // Read by the agent before the failed wake reported: stays read.
+  await s.store.claimPending(s.shim.id, { limit: 10 }, "read", s.now);
+  await s.store.releaseWake(s.shim.id, a.id, "late failure");
+  await s.store.releaseWake(s.shim.id, b.id, "late failure");
+  assert.equal((await s.state(a.id)).delivery, "read");
+  assert.equal((await s.state(a.id)).wakeError, undefined);
+  assert.equal((await s.state(b.id)).delivery, "read");
+});
+
+test("markWakeBroken ignores a stale link", async (t) => {
+  const s = await bareStore(t);
+  const oldLink = "2026-01-01T00:00:00.000Z";
+  const newLink = "2026-01-02T00:00:00.000Z";
+  await s.store.setWakeTarget(s.shim.id, { url: RELAY_HOOK, secret: RELAY_SECRET, linkedAt: newLink });
+  await s.store.markWakeBroken(s.shim.id, oldLink, "gone", s.now);
+  assert.equal((await s.store.findByMcpTokenHash("m"))!.wake!.brokenAt, undefined);
+  await s.store.markWakeBroken(s.shim.id, newLink, "gone", s.now);
+  const wake = (await s.store.findByMcpTokenHash("m"))!.wake!;
+  assert.equal(wake.brokenAt, new Date(s.now).toISOString());
+  assert.equal(wake.brokenReason, "gone");
+  // A removed link is never recreated.
+  await s.store.setWakeTarget(s.shim.id, null);
+  await s.store.markWakeBroken(s.shim.id, newLink, "gone", s.now);
+  assert.equal((await s.store.findByMcpTokenHash("m"))!.wake, undefined);
+});
+
+test("an idempotency key outlives feed pruning, then expires with the dedupe window", async (t) => {
+  const s = await bareStore(t);
+  const first = await s.append(0, "delivery-1");
+  assert.equal(first.duplicate, false);
+  const original = (first as { event: { id: string; seq: number } }).event;
+  for (let n = 1; n <= 55; n += 1) await s.fresh(n);
+  assert.equal((await s.database.query("SELECT 1 FROM events_shim_events WHERE id = $1", [original.id])).rows.length, 0, "pruned from the feed");
+  assert.deepEqual(await s.append(99, "delivery-1"), { duplicate: true, eventId: original.id, seq: original.seq });
+
+  // Older than dedupeSince: it no longer counts and is deleted.
+  const later = new Date(Date.parse(s.now) + 1000).toISOString();
+  const again = await s.append(100, "delivery-1", later);
+  assert.equal(again.duplicate, false);
+  const keys = await s.database.query<{ event_id: string }>("SELECT event_id FROM events_shim_idempotency_keys");
+  assert.deepEqual(keys.rows.map((row) => row.event_id), [(again as { event: { id: string } }).event.id]);
+
+  await s.store.prune({ idleBefore: new Date(0).toISOString(), feedBefore: later });
+  assert.equal((await s.database.query("SELECT 1 FROM events_shim_idempotency_keys")).rows.length, 0);
 });
 
 test("feature off: every events-shim path answers 404 before authentication", async (t) => {

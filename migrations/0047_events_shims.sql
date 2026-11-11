@@ -48,6 +48,16 @@ CREATE TABLE events_shim_events (
   wake_error text,
   UNIQUE (shim_id, seq)
 );
-CREATE UNIQUE INDEX events_shim_events_idempotency
-  ON events_shim_events(shim_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX events_shim_events_delivery ON events_shim_events(shim_id, delivery, seq);
+
+-- Idempotency keys live in their own ledger so feed pruning never forgets
+-- one; a key stops counting (and is deleted) once older than the dedupe window.
+CREATE TABLE events_shim_idempotency_keys (
+  shim_id uuid NOT NULL REFERENCES events_shims(id) ON DELETE CASCADE,
+  key text NOT NULL,
+  event_id uuid NOT NULL,
+  seq integer NOT NULL,
+  created_at timestamptz NOT NULL,
+  PRIMARY KEY (shim_id, key)
+);
+CREATE INDEX events_shim_idempotency_keys_created ON events_shim_idempotency_keys(created_at);

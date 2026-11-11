@@ -9,7 +9,7 @@ import type {
   WakeTarget,
 } from "@agent-relay/events-shim";
 import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../crypto.js";
-import type { Database, SqlExecutor } from "../database.js";
+import type { Database } from "../database.js";
 
 /** The signed-in person a new inbox is recorded against. */
 export type EventsShimCreator = { workspaceId: string; userId: string };
@@ -196,6 +196,15 @@ export class PostgresEventsShimStore implements EventsShimStore {
     );
   }
 
+  async markWakeBroken(shimId: string, linkedAt: string, reason: string, at: string): Promise<void> {
+    // Only the link that failed: a late result never touches a newer or removed link.
+    await this.database.query(
+      `UPDATE events_shims SET wake_broken_at = $3, wake_broken_reason = $4
+        WHERE id = $1 AND wake_url IS NOT NULL AND wake_linked_at = $2::timestamptz`,
+      [shimId, linkedAt, at, reason],
+    );
+  }
+
   async touch(shimId: string, now: string, agent: boolean): Promise<void> {
     await this.database.query(
       agent
@@ -235,16 +244,24 @@ export class PostgresEventsShimStore implements EventsShimStore {
   async appendEvent(
     shimId: string,
     input: NewShimEvent,
-    feedSize: number,
-  ): Promise<{ event: ShimEvent; duplicate: boolean }> {
+    options: { feedSize: number; dedupeSince: string },
+  ): Promise<{ duplicate: false; event: ShimEvent } | { duplicate: true; eventId: string; seq: number }> {
     return this.database.transaction(async (tx) => {
-      // The row lock serializes appends per shim, so the duplicate check
-      // below sees any concurrent post with the same key that committed first.
+      // The row lock serializes appends per shim, so the ledger check below
+      // sees any concurrent post with the same key that committed first.
       const locked = await tx.query("SELECT 1 FROM events_shims WHERE id = $1 FOR UPDATE", [shimId]);
       if (locked.rows.length === 0) throw new Error(`unknown shim ${shimId}`);
+      // Keys older than the dedupe window no longer count.
+      await tx.query("DELETE FROM events_shim_idempotency_keys WHERE shim_id = $1 AND created_at < $2", [
+        shimId,
+        options.dedupeSince,
+      ]);
       if (input.idempotencyKey) {
-        const existing = await this.byKey(tx, shimId, input.idempotencyKey);
-        if (existing) return { event: existing, duplicate: true };
+        const seen = await tx.query<{ event_id: string; seq: number }>(
+          "SELECT event_id, seq FROM events_shim_idempotency_keys WHERE shim_id = $1 AND key = $2",
+          [shimId, input.idempotencyKey],
+        );
+        if (seen.rows[0]) return { duplicate: true as const, eventId: seen.rows[0].event_id, seq: Number(seen.rows[0].seq) };
       }
       const seq = await tx.query<{ seq: number }>(
         "UPDATE events_shims SET next_seq = next_seq + 1 WHERE id = $1 RETURNING next_seq - 1 AS seq",
@@ -254,7 +271,6 @@ export class PostgresEventsShimStore implements EventsShimStore {
         `INSERT INTO events_shim_events
            (id, shim_id, seq, received_at, mode, event_type, idempotency_key, content_type, body, headers)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
-         ON CONFLICT (shim_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
          RETURNING ${EVENT_COLUMNS}`,
         [
           crypto.randomUUID(), shimId, seq.rows[0]!.seq, input.receivedAt, input.mode,
@@ -262,23 +278,20 @@ export class PostgresEventsShimStore implements EventsShimStore {
           JSON.stringify(input.headers),
         ],
       );
-      if (inserted.rows.length === 0) {
-        // Unreachable under the row lock; kept so a conflict can never surface as an error.
-        const existing = await this.byKey(tx, shimId, input.idempotencyKey!);
-        return { event: existing!, duplicate: true };
-      }
       const event = eventFrom(inserted.rows[0]!);
-      await tx.query("DELETE FROM events_shim_events WHERE shim_id = $1 AND seq <= $2", [shimId, event.seq - feedSize]);
-      return { event, duplicate: false };
+      if (input.idempotencyKey) {
+        await tx.query(
+          `INSERT INTO events_shim_idempotency_keys (shim_id, key, event_id, seq, created_at)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [shimId, input.idempotencyKey, event.id, event.seq, input.receivedAt],
+        );
+      }
+      await tx.query("DELETE FROM events_shim_events WHERE shim_id = $1 AND seq <= $2", [
+        shimId,
+        event.seq - options.feedSize,
+      ]);
+      return { duplicate: false as const, event };
     });
-  }
-
-  private async byKey(tx: SqlExecutor, shimId: string, key: string): Promise<ShimEvent | null> {
-    const result = await tx.query<EventRow>(
-      `SELECT ${EVENT_COLUMNS} FROM events_shim_events WHERE shim_id = $1 AND idempotency_key = $2`,
-      [shimId, key],
-    );
-    return result.rows[0] ? eventFrom(result.rows[0]) : null;
   }
 
   async listRecent(shimId: string, limit: number): Promise<ShimEvent[]> {
@@ -289,38 +302,45 @@ export class PostgresEventsShimStore implements EventsShimStore {
     return result.rows.map(eventFrom);
   }
 
-  async listUndelivered(shimId: string, limit: number, includeWoken: boolean): Promise<ShimEvent[]> {
-    const result = await this.database.query<EventRow>(
-      `SELECT ${EVENT_COLUMNS} FROM events_shim_events
-        WHERE shim_id = $1 AND delivery = ANY($2::text[])
-        ORDER BY seq ASC LIMIT $3`,
-      [shimId, includeWoken ? ["pending", "woken"] : ["pending"], limit],
+  async countPending(shimId: string): Promise<number> {
+    const result = await this.database.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM events_shim_events WHERE shim_id = $1 AND delivery = 'pending'",
+      [shimId],
     );
-    return result.rows.map(eventFrom);
+    return result.rows[0]?.n ?? 0;
   }
 
-  async markDelivery(
+  async claimPending(
     shimId: string,
-    eventIds: string[],
-    state: DeliveryState,
+    options: { limit: number; ids?: string[] },
+    state: "woken" | "read",
     at: string,
-    wakeError?: string,
-  ): Promise<void> {
-    if (eventIds.length === 0) return;
-    // Forward only: pending -> woken -> read. A failed wake (pending) applies
-    // only to posts still pending, and a late woken never overwrites read.
-    if (state === "pending") {
-      await this.database.query(
-        `UPDATE events_shim_events SET wake_error = COALESCE($3, wake_error)
-          WHERE shim_id = $1 AND id = ANY($2::uuid[]) AND delivery = 'pending'`,
-        [shimId, eventIds, wakeError ?? null],
-      );
-      return;
-    }
+  ): Promise<ShimEvent[]> {
+    // One statement, the pick materialized once: rows another caller holds are
+    // skipped and rows it already moved no longer match 'pending', so two
+    // callers never get the same event.
+    const result = await this.database.query<EventRow>(
+      `WITH picked AS MATERIALIZED (
+         SELECT id FROM events_shim_events
+          WHERE shim_id = $1 AND delivery = 'pending'
+            AND ($5::uuid[] IS NULL OR id = ANY($5::uuid[]))
+          ORDER BY seq ASC
+          LIMIT $4::int
+          FOR UPDATE SKIP LOCKED)
+       UPDATE events_shim_events e SET delivery = $2, delivered_at = $3, wake_error = NULL
+         FROM picked
+        WHERE e.id = picked.id AND e.delivery = 'pending'
+        RETURNING ${EVENT_COLUMNS.split(",").map((column) => `e.${column.trim()}`).join(", ")}`,
+      [shimId, state, at, options.limit, options.ids ?? null],
+    );
+    return result.rows.map(eventFrom).sort((a, b) => a.seq - b.seq);
+  }
+
+  async releaseWake(shimId: string, eventId: string, wakeError: string): Promise<void> {
     await this.database.query(
-      `UPDATE events_shim_events SET delivery = $3, delivered_at = $4, wake_error = NULL
-        WHERE shim_id = $1 AND id = ANY($2::uuid[]) AND ($3 = 'read' OR delivery <> 'read')`,
-      [shimId, eventIds, state, at],
+      `UPDATE events_shim_events SET delivery = 'pending', delivered_at = NULL, wake_error = $3
+        WHERE shim_id = $1 AND id = $2 AND delivery = 'woken'`,
+      [shimId, eventId, wakeError],
     );
   }
 
@@ -331,6 +351,7 @@ export class PostgresEventsShimStore implements EventsShimStore {
         WHERE e.shim_id = s.id AND s.last_used_at < $1`,
       [input.feedBefore],
     );
+    await this.database.query("DELETE FROM events_shim_idempotency_keys WHERE created_at < $1", [input.feedBefore]);
   }
 }
 
