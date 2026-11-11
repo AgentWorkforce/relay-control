@@ -1553,6 +1553,48 @@ paths:
           description: "Not an owner of the organization (`forbidden`), or the feature is not selected (`feature_not_enabled`)"
         "404":
           description: Organization not found for this token
+  /api/v1/organizations/{organizationId}/usage/people:
+    get:
+      operationId: getOrganizationUsagePeople
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: |
+        Owner-only per-member usage (docs/usage.md, "People"). Requires
+        `usage_people`. Shows member names and emails.
+      parameters:
+        - { name: organizationId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: days, in: query, required: false, schema: { type: integer, enum: [7, 30, 90], default: 30 } }
+      responses:
+        "200": { description: "`{ people: { range, members[], truncated, unavailable } }`" }
+        "400": { description: Invalid parameters }
+        "403": { description: "`forbidden` (not an owner) or `feature_not_enabled`" }
+  /api/v1/organizations/{organizationId}/usage/people/{userId}/sessions:
+    get:
+      operationId: getOrganizationUsagePersonSessions
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: |
+        Owner-only: one member's sessions in the range, newest first, with
+        recorded titles and summaries, merged across workspaces. Every page
+        writes a `usage.people.viewed` audit row; the first carries a `rollup`.
+      parameters:
+        - { name: organizationId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: userId, in: path, required: true, schema: { type: string } }
+        - { name: days, in: query, required: false, schema: { type: integer, enum: [7, 30, 90], default: 30 } }
+        - { name: cursor, in: query, required: false, schema: { type: string } }
+      responses:
+        "200": { description: "`{ person, range, rollup, sessions[], nextCursor }`" }
+        "400": { description: Invalid parameters or cursor }
+        "403": { description: "`forbidden` or `feature_not_enabled`" }
+        "404": { description: "`user_not_found`: not a member of the organization" }
+  /api/v1/organizations/{organizationId}/usage/people/audit:
+    get:
+      operationId: getOrganizationUsagePeopleAudit
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: Owner-only list of the latest 200 People drill-down page views.
+      parameters:
+        - { name: organizationId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "`{ events: [{ viewerUserId, viewerName, subjectUserId, subjectName, days, page, createdAt }] }`" }
+        "403": { description: "`forbidden` or `feature_not_enabled`" }
   /api/v1/analytics/events:
     post:
       operationId: captureClientAnalyticsEvents
@@ -8109,14 +8151,16 @@ components:
               description: SELFHOST_INTROSPECT_OUTAGE_HOLD_MS in effect (0 = off); how long a Desktop token's last active verdict may answer during a database outage.
     FeatureCapabilities:
       type: object
-      required: [flows, relayfile, chief, usage]
+      required: [flows, relayfile, chief, usage, launch, usage_people]
       additionalProperties: false
-      description: Names in SELFHOST_FEATURES (unset or empty selects nothing).
+      description: Names in SELFHOST_FEATURES (unset selects usage and usage_people; an explicit list, including empty, is exact).
       properties:
         flows: { type: boolean }
         relayfile: { type: boolean }
         chief: { type: boolean }
         usage: { type: boolean }
+        launch: { type: boolean }
+        usage_people: { type: boolean }
     UsageCounts:
       type: object
       required: [activeUsers, sessionsUploaded, searches, summaries]

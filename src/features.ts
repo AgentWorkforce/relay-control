@@ -1,18 +1,25 @@
 /**
  * Optional components an installation serves, chosen by the operator with
- * SELFHOST_FEATURES (comma list; unset or empty selects nothing). Read once
+ * SELFHOST_FEATURES (comma list). Unset selects DEFAULT_FEATURES (the owner-only
+ * usage pages); an explicit list, including an empty one, is exact. Read once
  * at startup. Everything else is core and always on.
  */
-export const FEATURES = ["flows", "relayfile", "chief", "usage", "launch"] as const;
+export const FEATURES = ["flows", "relayfile", "chief", "usage", "launch", "usage_people"] as const;
 export type Feature = (typeof FEATURES)[number];
 export type SelectedFeatures = Record<Feature, boolean>;
 
-export const NO_FEATURES: SelectedFeatures = { flows: false, relayfile: false, chief: false, usage: false, launch: false };
+export const NO_FEATURES: SelectedFeatures = {
+  flows: false, relayfile: false, chief: false, usage: false, launch: false, usage_people: false,
+};
+
+/** Selected when SELFHOST_FEATURES is unset. Set it (to "" for none) to choose otherwise. */
+export const DEFAULT_FEATURES: SelectedFeatures = { ...NO_FEATURES, usage: true, usage_people: true };
 
 /** An unknown name is a startup configuration error. */
 export function loadSelectedFeatures(env: Record<string, string | undefined> = process.env): SelectedFeatures {
+  if (env.SELFHOST_FEATURES === undefined) return { ...DEFAULT_FEATURES };
   const selected = { ...NO_FEATURES };
-  for (const name of (env.SELFHOST_FEATURES ?? "").split(",").map((v) => v.trim().toLowerCase()).filter(Boolean)) {
+  for (const name of env.SELFHOST_FEATURES.split(",").map((v) => v.trim().toLowerCase()).filter(Boolean)) {
     if (!(FEATURES as readonly string[]).includes(name)) {
       throw new Error(`SELFHOST_FEATURES names unknown feature "${name}" (expected ${FEATURES.join(", ")})`);
     }
@@ -21,7 +28,9 @@ export function loadSelectedFeatures(env: Record<string, string | undefined> = p
   return selected;
 }
 
-const DISPLAY: Record<Feature, string> = { flows: "Flows", relayfile: "Relayfile", chief: "Chief", usage: "Usage", launch: "Agent launch" };
+const DISPLAY: Record<Feature, string> = {
+  flows: "Flows", relayfile: "Relayfile", chief: "Chief", usage: "Usage", launch: "Agent launch", usage_people: "Usage people",
+};
 
 /** A 403 refusal for a feature route: `{ error, message, feature }`. */
 export class FeatureRefusedError extends Error {

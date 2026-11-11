@@ -78,6 +78,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "token_sessions",
   "usage_daily_counters",
   "usage_daily_users",
+  "usage_people_daily",
   "usage_state",
   "users",
   "work_assignments",

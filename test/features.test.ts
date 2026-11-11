@@ -4,7 +4,7 @@ import test, { type TestContext } from "node:test";
 import { createAdminModule } from "../src/admin/routes.js";
 import { createApp } from "../src/app.js";
 import type { ChiefBackend } from "../src/chief/routes.js";
-import { gateCredentialVerifier, loadSelectedFeatures, NO_FEATURES, type SelectedFeatures } from "../src/features.js";
+import { DEFAULT_FEATURES, gateCredentialVerifier, loadSelectedFeatures, NO_FEATURES, type SelectedFeatures } from "../src/features.js";
 import { apiClient, BOOTSTRAP, close, listen, seedTenant, startControlPlane } from "./flows-helpers.js";
 import { testFeatures } from "./support/features.js";
 import { lazyFlowsStore } from "../src/flows/lazy.js";
@@ -38,9 +38,11 @@ async function restartWith(t: TestContext, cp: Awaited<ReturnType<typeof plane>>
 }
 
 test("SELFHOST_FEATURES: parsing, empty selects nothing, unknown names stop startup", () => {
-  assert.deepEqual(loadSelectedFeatures({}), NO_FEATURES);
+  // Unset selects the owner-only usage pages; an explicit empty list selects nothing.
+  assert.deepEqual(loadSelectedFeatures({}), DEFAULT_FEATURES);
+  assert.deepEqual(DEFAULT_FEATURES, { ...NO_FEATURES, usage: true, usage_people: true });
   assert.deepEqual(loadSelectedFeatures({ SELFHOST_FEATURES: "" }), NO_FEATURES);
-  assert.deepEqual(loadSelectedFeatures({ SELFHOST_FEATURES: " Flows , ,chief," }), { flows: true, relayfile: false, chief: true, usage: false, launch: false });
+  assert.deepEqual(loadSelectedFeatures({ SELFHOST_FEATURES: " Flows , ,chief," }), { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false });
   assert.throws(() => loadSelectedFeatures({ SELFHOST_FEATURES: "flows,teleport" }), /unknown feature "teleport"/);
 });
 
@@ -53,7 +55,7 @@ test("GET /api/v1/capabilities: exact shape, any member, cookie alias, 401 witho
   const read = await cp.api("/api/v1/capabilities", { token: cp.tenant.memberToken });
   assert.equal(read.status, 200);
   assert.equal(read.headers.get("cache-control"), "no-store");
-  assert.deepEqual(read.body, { capabilities: { flows: true, relayfile: false, chief: true, usage: false, launch: false } });
+  assert.deepEqual(read.body, { capabilities: { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false } });
 
   const cookie = await cp.api("/cloud/api/v1/capabilities", {
     headers: { cookie: `agent_relay_session=${cp.tenant.ownerToken}` },
@@ -182,7 +184,7 @@ test("/readyz reports capabilities and no licence field", async (t) => {
   const ready = await cp.api("/readyz");
   assert.equal(ready.status, 200);
   assert.equal("license" in ready.body, false);
-  assert.deepEqual(ready.body.capabilities, { flows: true, relayfile: false, chief: true, usage: false, launch: false });
+  assert.deepEqual(ready.body.capabilities, { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false });
 });
 
 

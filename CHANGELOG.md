@@ -5,6 +5,14 @@ assigned at release.
 
 ## Unreleased
 
+- Added: owner-only People drill-down behind a new `usage_people` feature:
+  `GET /api/v1/organizations/{org}/usage/people`, `.../usage/people/{userId}/sessions`
+  (a member's sessions with their recorded titles and summaries; no new
+  generation) and `.../usage/people/audit`. Every drill-down page writes an
+  organization-level `usage.people.viewed` audit row. Unlike the v1 counts,
+  this view shows member names and emails. Migration `0043_usage_people.sql`.
+- Changed: with `SELFHOST_FEATURES` unset, `usage` and `usage_people` are now
+  selected by default. An explicit list (including `""`) is still exact.
 - Added: shared-session read audit. Every MCP shared-session read
   (`open_shared_sessions`, `search_shared_sessions`, `get_shared_session`,
   `get_shared_session_context`, `list_session_timings`), successful or failed,

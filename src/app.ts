@@ -26,6 +26,9 @@ import { handleSessionRoutes } from "./sessions/routes.js";
 import { UsageRangeError, usageDays, usageReport } from "./usage/routes.js";
 import { UsageStore } from "./usage/store.js";
 import { listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError } from "./mcp/read-audit.js";
+import {
+  PeopleInputError, PersonNotFoundError, peopleAudit, peopleReport, personSessions, recordPeopleView, UsagePeopleStore,
+} from "./usage/people.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, introspect, INTROSPECT_PATH } from "./auth/introspect.js";
@@ -417,17 +420,24 @@ export function createApp(input: {
   const features = input.features ?? NO_FEATURES;
   // Usage page counters: written only while the `usage` feature is selected.
   const usage = new UsageStore(store.database, () => input.now?.() ?? new Date());
+  const people = new UsagePeopleStore(store.database, () => input.now?.() ?? new Date());
+  // Counters never fail or slow a request; each is written only while its feature is on.
   const recordUsage = (write: () => Promise<void>): void => {
     if (!features.usage) return;
-    // Counters never fail or slow a request.
+    void write().catch(() => {});
+  };
+  const recordPeople = (write: () => Promise<void>): void => {
+    if (!features.usage_people) return;
     void write().catch(() => {});
   };
   // Every route that authenticates an access token (API, dashboard account
   // pages, Desktop, MCP, and introspection by ingest and the read API)
   // counts its user as active today.
-  if (features.usage) {
-    store.onAuthenticated = (user) =>
+  if (features.usage || features.usage_people) {
+    store.onAuthenticated = (user) => {
       recordUsage(() => usage.recordActiveUser(user.organizationId, user.userId));
+      recordPeople(() => people.recordActive(user.organizationId, user.userId));
+    };
   }
   /** Throws the 403 refusal unless `feature` is selected. Call after membership, before backends. */
   function requireFeature(feature: Feature): void {
@@ -1786,6 +1796,71 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    // Usage page People drill-down (docs/usage.md, "People"): owner-only, per member.
+    // routeMatch would turn an absent optional group into "undefined".
+    const peopleRoute = /^\/api\/v1\/organizations\/([^/]+)\/usage\/people(?:\/(audit|[^/]+\/sessions))?$/.exec(path);
+    if (peopleRoute && method === "GET") {
+      let organizationId: string;
+      try {
+        organizationId = decodeURIComponent(peopleRoute[1]!);
+      } catch {
+        throw new HttpError(400, "invalid_request", "Invalid organization id");
+      }
+      const auth = await organizationAccess(request, organizationId);
+      if (auth.kind !== "user" || await store.memberRole(organizationId, auth.principal.userId) !== "owner") {
+        throw new HttpError(403, "forbidden", "Organization owner role required");
+      }
+      requireFeature("usage_people");
+      const sub = peopleRoute[2];
+      const owner = { userId: auth.principal.userId, token: auth.token };
+      const now = input.now?.() ?? new Date();
+      if (sub === "audit") {
+        if ([...url.searchParams.keys()].length > 0) throw new HttpError(400, "invalid_request", "No parameters are accepted");
+        json(response, 200, { events: await peopleAudit(store.database, store, organizationId) }, true);
+        return;
+      }
+      const cursor = url.searchParams.get("cursor") ?? undefined;
+      const query = new URL(url);
+      query.searchParams.delete("cursor");
+      if (sub === undefined && cursor !== undefined) throw new HttpError(400, "invalid_request", "cursor is not accepted here");
+      if (url.searchParams.getAll("cursor").length > 1) throw new HttpError(400, "invalid_request", "cursor must be given once");
+      let days: number;
+      try {
+        days = usageDays(query);
+      } catch (error) {
+        if (error instanceof UsageRangeError) throw new HttpError(400, "invalid_request", error.message);
+        throw error;
+      }
+      if (sub === undefined) {
+        json(response, 200, {
+          people: await peopleReport({ config, store, people, organizationId, owner, days, now }),
+        }, true);
+        return;
+      }
+      let subjectUserId: string;
+      try {
+        subjectUserId = decodeURIComponent(sub.slice(0, -"/sessions".length));
+      } catch {
+        throw new HttpError(400, "invalid_request", "Invalid user id");
+      }
+      try {
+        const result = await personSessions({
+          config, store, organizationId, owner, subjectUserId, days, cursor, now,
+        });
+        // Every page is audited, whatever the cursor says, before the member's
+        // sessions leave Control.
+        await recordPeopleView(store.database, {
+          organizationId, viewerUserId: owner.userId, subjectUserId, days, page: cursor === undefined ? "first" : "next",
+        });
+        json(response, 200, result, true);
+      } catch (error) {
+        if (error instanceof PersonNotFoundError) throw new HttpError(404, "user_not_found", "Not a member of this organization");
+        if (error instanceof PeopleInputError) throw new HttpError(400, "invalid_request", error.message);
+        throw error;
+      }
+      return;
+    }
+
     // Usage page (docs/usage.md): owner-only daily counts for one organization.
     const usageRoute = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/usage$/);
     if (usageRoute && method === "GET") {
@@ -2229,7 +2304,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       httpError: (status, code, message) => new HttpError(status, code, message),
       json,
       now: input.now,
-      onSearch: (organizationId) => recordUsage(() => usage.increment(organizationId, "searches")),
+      onSearch: (organizationId, userId) => {
+        recordUsage(() => usage.increment(organizationId, "searches"));
+        recordPeople(() => people.recordSearch(organizationId, userId));
+      },
     })) {
       return;
     }

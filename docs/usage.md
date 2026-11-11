@@ -1,8 +1,10 @@
 # Usage page
 
 An owner-only view of how an installation is used, for the dashboard's
-Settings > Usage page. Off by default: select it with `usage` in
-`SELFHOST_FEATURES` ([features.md](features.md)).
+Settings > Usage page. `usage` (counts) and `usage_people` (the per-member
+drill-down below) are selected by default when `SELFHOST_FEATURES` is unset;
+set it explicitly to choose otherwise (for example `""` for none)
+([features.md](features.md)).
 
 ## API
 
@@ -48,3 +50,38 @@ ids. Control stores `usage_daily_counters` (organization, day, metric,
 value) and `usage_daily_users` (organization, day, user hash). The user hash
 is HMAC-SHA256 of the user id under a random per-install secret in
 `usage_state`. Neither the secret nor any hash is returned by any API.
+
+## People (`usage_people`)
+
+Owner-only, a separate feature from `usage`. Unlike the counts above, this
+view is per member and shows member names, emails and their sessions'
+recorded titles and summaries.
+
+- `GET /api/v1/organizations/{org}/usage/people?days=7|30|90`: every member
+  (name, email, role) with `sessionsUploaded`, `searches`, `lastActiveAt`,
+  `lastSessionAt` and `topProjects` for the range. Sessions come from the read
+  API's `/v1/sessions`, read with the owner's authority for each organization
+  workspace the owner belongs to, and grouped by the session's `userIds`. At
+  most 5,000 sessions are read per workspace; past that `truncated` is true
+  and counts are lower bounds. If the read API cannot be read,
+  `sessionsUploaded` is `null` and listed in `unavailable`.
+  `searches` and `lastActiveAt` come from `usage_people_daily`, which is
+  written only while `usage_people` is selected; `lastSessionAt` (the newest
+  session in the range) covers activity from before that.
+- `GET /api/v1/organizations/{org}/usage/people/{userId}/sessions?days&cursor`:
+  that member's sessions in the range, newest first across all the
+  organization's workspaces (merged by session time), 20 per page, each with
+  its recorded title, the recorded short summary (`/v1/sessions/{id}/summary`,
+  `null` when none is ready), agent name, project and times. The first page
+  also carries a `rollup` built only from recorded titles and projects.
+  Nothing is generated. A user who is not a member is 404 `user_not_found`.
+- Every drill-down request, each page whatever its cursor, writes an
+  organization-level audit row `usage.people.viewed` (viewer, subject, range,
+  first or next page) before answering.
+  `GET /api/v1/organizations/{org}/usage/people/audit` lists the latest 200
+  for owners. These rows have no workspace, so a workspace's admin audit view does
+  not list them.
+
+Erased sessions are removed by the session pipeline and never appear here.
+Admin, member and the bootstrap bearer are 403 `forbidden` on all three
+routes; with `usage_people` off they are 403 `feature_not_enabled`.
