@@ -102,7 +102,7 @@ const telemetryConfig = loadTelemetryConfig(process.env, {
     { name: "relayhistory", url: `${config.relayhistoryUrl}/healthz` },
   ],
 });
-const relaycontrolVersion = process.env.SELFHOST_IMAGE_VERSION?.trim() || SELFHOST_API_VERSION;
+const relaycontrolVersion = config.imageVersion ?? SELFHOST_API_VERSION;
 const telemetry = createTelemetryModule({
   config: telemetryConfig,
   database,

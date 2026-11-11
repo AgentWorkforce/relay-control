@@ -25,6 +25,12 @@ const completeEnv = {
   SELFHOST_ENCRYPTION_KEY: "00".repeat(32),
 };
 
+test("the image version is read from SELFHOST_IMAGE_VERSION and null from source", () => {
+  assert.equal(loadConfig(completeEnv).imageVersion, null);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_IMAGE_VERSION: "  " }).imageVersion, null);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_IMAGE_VERSION: " 0.5.12 " }).imageVersion, "0.5.12");
+});
+
 test("session search @name parsing is default off and strictly boolean", () => {
   assert.equal(loadConfig(completeEnv).sessionSearchAgentTokens, false);
   assert.equal(loadConfig({ ...completeEnv, SESSION_SEARCH_AGENT_TOKENS: "true" }).sessionSearchAgentTokens, true);

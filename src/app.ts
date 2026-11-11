@@ -956,6 +956,7 @@ export function createApp(input: {
         status: "ok",
         timestamp: new Date().toISOString(),
         version: SELFHOST_API_VERSION,
+        imageVersion: config.imageVersion ?? null,
       }, true);
       return;
     }

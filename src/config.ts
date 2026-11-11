@@ -83,6 +83,11 @@ export type SelfhostConfig = {
   desktopFeed?: DesktopFeedConfig | null;
   /** Direct-to-S3 session uploads (docs/sessions-read-api.md). null: the upload-credentials route answers 404. */
   historyUpload?: HistoryUploadConfig | null;
+  /**
+   * SELFHOST_IMAGE_VERSION: the image tag, set by the image (Dockerfile).
+   * Null when run from source. Shown by GET /cloud/api/health and telemetry.
+   */
+  imageVersion?: string | null;
   port: number;
   host: string;
 };
@@ -372,6 +377,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     factory: loadFactoryConfig(env, introspection),
     mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name), serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     historyUpload: loadHistoryUploadConfig(env),
+    imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
   };

@@ -116,7 +116,7 @@ curl -s "$SELFHOST_PUBLIC_URL/api/v1/organizations/$ORG_ID/telemetry/preview" \
 | `SELFHOST_TELEMETRY_BURST_WINDOW_SECONDS` | 60 to 3600, default 300 |
 | `SELFHOST_TELEMETRY_PROBES` | Extra health probes, `name=url,...` (for example `96bulls=http://alleyoop:8080/readyz,relayfile=http://relayfile:8080/health`). Relaycast `/health` and the sessions pipeline read API `/healthz` are always probed through their internal URLs. |
 | `SELFHOST_TELEMETRY_DEPLOYMENT` | JSON deployment shape rendered by the chart. Only short keys, numbers, booleans and version-like strings are kept. |
-| `SELFHOST_IMAGE_VERSION` | Set by the image; reported as the relaycontrol version |
+| `SELFHOST_IMAGE_VERSION` | Set by the image; reported as the relaycontrol version and as `imageVersion` on `GET /cloud/api/health` |
 | `SELFHOST_INTERNAL_TOKEN` | Optional. The same service token as `/internal/v1`; also authorizes the service routes for issue reports and preview. |
 
 If telemetry is misconfigured, startup fails, as it does for any other
