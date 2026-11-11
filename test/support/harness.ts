@@ -69,9 +69,11 @@ export async function request(
     body?: unknown;
     contentType?: string;
     rawBody?: string;
+    /** Extra request headers. */
+    headers?: Record<string, string>;
   } = {},
 ): Promise<JsonResponse> {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...options.headers };
   if (options.token) headers.authorization = `Bearer ${options.token}`;
   if (options.cookie) headers.cookie = options.cookie;
   let body: string | undefined;

@@ -142,7 +142,10 @@ test("capture policy: member read, owner/admin write, revisions, audit and CSRF"
     method: "PUT", headers: { cookie, origin: ORIGIN }, body,
   });
   assert.equal(cookiePut.status, 200);
-  assert.deepEqual(cookiePut.body, { version: 1, revision: 6, settings: { sharing_mode: "new" } });
+  assert.deepEqual(cookiePut.body, {
+    version: 1, revision: 6, settings: { sharing_mode: "new" }, sharing_mode_since: cookiePut.body.sharing_mode_since,
+  });
+  assert.ok(!Number.isNaN(Date.parse(cookiePut.body.sharing_mode_since)));
   const cookieDelete = await app.api(`/cloud${policyPath}`, {
     method: "DELETE", headers: { cookie, origin: ORIGIN },
   });
@@ -219,7 +222,40 @@ test("capture policy: SELFHOST_OPERATOR_CONTROLS gates writes only", async (t) =
     // Reads are never gated.
     const me = await app.api(accessMe, { token: tenant.memberToken });
     assert.equal(me.status, 200);
-    assert.deepEqual(me.body.policy, { version: 1, revision: 2, settings: { sharing_mode: "new" } });
+    assert.deepEqual(me.body.policy, {
+      version: 1, revision: 2, settings: { sharing_mode: "new" }, sharing_mode_since: entitled.body.sharing_mode_since,
+    });
     assert.equal((await app.api(policyPath, { token: tenant.ownerToken })).status, 200);
   }
+});
+
+test("capture policy: sharing_mode_since marks when sharing_mode became new, kept across writes that keep it", async (t) => {
+  const app = await startControlPlane();
+  t.after(() => app.stop());
+  const tenant = await seedTenant(app.api);
+  const policyPath = `/api/v1/organizations/${tenant.organizationId}/capture-policy`;
+  const put = async (settings: Record<string, unknown>) => {
+    const answer = await app.api(policyPath, { method: "PUT", token: tenant.ownerToken, body: { settings } });
+    assert.equal(answer.status, 200);
+    return answer.body;
+  };
+
+  const all = await put({ sharing_mode: "all" });
+  assert.equal("sharing_mode_since" in all, false);
+  const before = Date.now();
+  const first = await put({ sharing_mode: "new" });
+  const since = Date.parse(first.sharing_mode_since);
+  assert.ok(since >= before - 1_000 && since <= Date.now() + 1_000, first.sharing_mode_since);
+  // Another write that keeps `new` keeps the time; the GET serves it too.
+  const kept = await put({ sharing_mode: "new", user_retroactive_delete: false });
+  assert.equal(kept.sharing_mode_since, first.sharing_mode_since);
+  assert.equal((await app.api(policyPath, { token: tenant.ownerToken })).body.sharing_mode_since, first.sharing_mode_since);
+  // Leaving `new` clears it; coming back starts a new time.
+  const selected = await put({ sharing_mode: "selected" });
+  assert.equal("sharing_mode_since" in selected, false);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const again = await put({ sharing_mode: "new" });
+  assert.ok(Date.parse(again.sharing_mode_since) > since);
+  const cleared = await app.api(policyPath, { method: "DELETE", token: tenant.ownerToken });
+  assert.equal("sharing_mode_since" in cleared.body, false);
 });

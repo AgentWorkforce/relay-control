@@ -5,6 +5,15 @@ assigned at release.
 
 ## Unreleased
 
+- Added: capture policy upload check. `POST .../relayhistory/upload-credentials`
+  compares the caller's `X-Agent-Relay-Capture-Policy-Revision` with the
+  organization's policy revision when the policy sets any key:
+  `SELFHOST_CAPTURE_POLICY_UPLOADS=report` (default) logs a missing or older
+  revision, `enforce` refuses it 409 `capture_policy_stale`. The policy now
+  carries `sharing_mode_since` (migration 0044) while `sharing_mode` is `new`,
+  served by the capture-policy routes and introspection, so the sessions
+  pipeline can refuse sessions started before it. See docs/capture-policy.md.
+
 - Added: token introspection answers for user tokens carry `capture_policy`,
   the organization's served capture policy (`{version, revision, settings}`,
   as `GET .../capture-policy` returns it), read in the same query as the

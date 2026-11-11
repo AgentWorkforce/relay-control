@@ -84,6 +84,13 @@ export type SelfhostConfig = {
   /** Direct-to-S3 session uploads (docs/sessions-read-api.md). null: the upload-credentials route answers 404. */
   historyUpload?: HistoryUploadConfig | null;
   /**
+   * SELFHOST_CAPTURE_POLICY_UPLOADS (docs/capture-policy.md): `report`
+   * (default) logs an upload-credentials ask made under a missing or older
+   * capture policy revision and answers it; `enforce` refuses it with 409
+   * `capture_policy_stale`. Absent means `report`.
+   */
+  capturePolicyUploads?: "report" | "enforce";
+  /**
    * SELFHOST_IMAGE_VERSION: the image tag, set by the image (Dockerfile).
    * Null when run from source. Shown by GET /cloud/api/health and telemetry.
    */
@@ -388,6 +395,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     factory: loadFactoryConfig(env, introspection),
     mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name), serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     historyUpload: loadHistoryUploadConfig(env),
+    capturePolicyUploads: loadCapturePolicyUploads(env),
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
@@ -911,6 +919,15 @@ function uploadEndpoint(env: Env, name: string): string | null {
  * credential chain is untouched. SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT
  * (default: the public endpoint) is where Control reads privacy journals.
  */
+/** SELFHOST_CAPTURE_POLICY_UPLOADS: `report` (default) or `enforce`; anything else refuses startup. */
+export function loadCapturePolicyUploads(env: Env = process.env): "report" | "enforce" {
+  const mode = env.SELFHOST_CAPTURE_POLICY_UPLOADS?.trim() || "report";
+  if (mode !== "report" && mode !== "enforce") {
+    throw new Error("SELFHOST_CAPTURE_POLICY_UPLOADS must be report or enforce");
+  }
+  return mode;
+}
+
 export function loadHistoryUploadConfig(env: Env = process.env): HistoryUploadConfig | null {
   const mode = env.SELFHOST_HISTORY_UPLOAD_DIRECT?.trim() || "off";
   if (mode === "off") return null;

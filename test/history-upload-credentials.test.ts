@@ -107,6 +107,8 @@ async function setup(t: TestContext, options: {
   omitS3Hook?: boolean;
   /** Leave out the credentials hook so URLs and the journal read are signed with config.storeCredentials. */
   omitCredentialsHook?: boolean;
+  /** SELFHOST_CAPTURE_POLICY_UPLOADS; absent is report. */
+  capturePolicyUploads?: "report" | "enforce";
 } = {}) {
   const aws = await fakeAws(t);
   const database = new PGliteDatabase();
@@ -130,6 +132,7 @@ async function setup(t: TestContext, options: {
     port: 3000,
     host: "127.0.0.1",
     historyUpload: upload,
+    ...(options.capturePolicyUploads ? { capturePolicyUploads: options.capturePolicyUploads } : {}),
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
   const server = createServer(createApp({
@@ -167,6 +170,7 @@ async function setup(t: TestContext, options: {
   const tenant = { orgId: org.body.id as string, workspaceId: workspace, userId };
   return {
     origin, aws, database, workspace, userId, tenant, token: tokens.body.access_token as string,
+    organizationId: org.body.id as string,
     path: `/api/v1/workspaces/${workspace}/relayhistory/upload-credentials`,
   };
 }
@@ -575,6 +579,42 @@ test("route: a caller not on the allowlist gets the same 404; mode on serves eve
   const open = await setup(t, { upload: uploadConfig({ mode: "on" }), allowOwner: false });
   const served = await request(open.origin, open.path, { method: "POST", token: open.token, body: stsBody });
   assert.equal(served.status, 200, served.raw);
+});
+
+test("route: the capture policy revision is reported by default and enforced with SELFHOST_CAPTURE_POLICY_UPLOADS=enforce", async (t) => {
+  const HEADER = "X-Agent-Relay-Capture-Policy-Revision";
+  for (const mode of ["report", "enforce"] as const) {
+    const env = await setup(t, { capturePolicyUploads: mode });
+    const ask = (revision?: string) => request(env.origin, env.path, {
+      method: "POST", token: env.token, body: stsBody, ...(revision !== undefined ? { headers: { [HEADER]: revision } } : {}),
+    });
+    // No mandated setting: no revision is needed in either mode.
+    assert.equal((await ask()).status, 200, mode);
+    const policyPath = `/api/v1/organizations/${env.organizationId}/capture-policy`;
+    assert.equal((await request(env.origin, policyPath, {
+      method: "PUT", token: BOOTSTRAP, body: { settings: { sharing_mode: "all" } },
+    })).status, 200);
+    const warned: unknown[][] = [];
+    t.mock.method(console, "warn", (...args: unknown[]) => { warned.push(args); });
+    for (const revision of [undefined, "1", "nope"]) {
+      const answer = await ask(revision);
+      if (mode === "enforce") {
+        assert.equal(answer.status, 409, `${mode} ${revision}`);
+        assert.equal(answer.body.error, "capture_policy_stale");
+      } else {
+        assert.equal(answer.status, 200, `${mode} ${revision}`);
+      }
+    }
+    const logged = warned.filter(([message]) => message === "[selfhost-api] capture policy upload check").map(([, fields]) => fields);
+    assert.deepEqual(logged.map((fields) => (fields as { outcome: string }).outcome), ["missing", "stale", "missing"]);
+    assert.ok(logged.every((fields) => (fields as { mode: string; revision: number }).mode === mode && (fields as { revision: number }).revision === 2));
+    // The current revision (or a newer one) passes, unlogged.
+    warned.length = 0;
+    assert.equal((await ask("2")).status, 200, mode);
+    assert.equal((await ask("3")).status, 200, mode);
+    assert.equal(warned.length, 0);
+    t.mock.restoreAll();
+  }
 });
 
 test("route: a browser cookie session under /cloud gets 403 forbidden", async (t) => {
