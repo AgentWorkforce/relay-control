@@ -134,7 +134,7 @@ async function startHistory(t: TestContext) {
     if (url.pathname === "/v1/sessions") {
       send(200, {
         sessions: url.searchParams.get("agent") === "builder"
-          ? [{ sessionId: "sess-1", source: "codex", lastTs: "2026-11-07T10:01:00.000Z" }]
+          ? [{ sessionId: "sess-1", source: "codex", lastTs: "2026-11-07T10:01:00.000Z", userIds: ["teammate-1"] }]
           : [],
         nextCursor: null,
       });
@@ -1351,4 +1351,39 @@ test("read audit export: owner/admin only, paginated, JSON and CSV", async (t) =
   const csvAll = await (await get(`${exportPath}?format=csv`, env.accessToken)).text();
   // Caller-supplied text cannot become a spreadsheet formula.
   assert(csvAll.includes("'=HYPERLINK(1)"));
+});
+
+test("read audit: agent searches keep recorded owners; a sourceless read groups events by their own source", async (t) => {
+  const env = await setup(t);
+  seedAuditHistory(env);
+  env.history.events.push(
+    { eventId: "e4", sessionId: "sess-1", source: "claude", kind: "prompt", type: "user_message", ts: "2026-11-07T12:00:00.000Z", content: "Other source", workspaceId: env.workspaceId, userId: "teammate-3" },
+  );
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  const listed = structured(await client.callTool({ name: "search_shared_sessions", arguments: { agent: "builder" } }));
+  assert.equal(listed.sessions[0].user_ids, undefined, "the tool output is unchanged");
+  structured(await client.callTool({ name: "get_shared_session", arguments: { session_id: "sess-1" } }));
+  const [agent, read] = await auditRows(env);
+  assert.equal(agent!.agent_filter, "builder");
+  assert.deepEqual(agent!.result_sessions, [{ session_id: "sess-1", source: "codex", owner_user_ids: ["teammate-1"] }]);
+  assert.deepEqual(read!.result_sessions, [
+    { session_id: "sess-1", source: "codex", owner_user_ids: ["teammate-1"] },
+    { session_id: "sess-1", source: "claude", owner_user_ids: ["teammate-3"] },
+  ]);
+});
+
+test("read audit: a call refused by input validation is recorded once", async (t) => {
+  const env = await setup(t);
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  const invalid = await client.callTool({ name: "list_session_timings", arguments: {} });
+  assert.equal(invalid.isError, true);
+  const tooLong = await client.callTool({ name: "search_shared_sessions", arguments: { query: "x".repeat(900) } });
+  assert.equal(tooLong.isError, true);
+  structured(await client.callTool({ name: "open_shared_sessions", arguments: {} }));
+  const rows = await auditRows(env);
+  assert.deepEqual(rows.map((row) => [row.tool_name, row.outcome]), [
+    ["list_session_timings", "error"], ["search_shared_sessions", "error"], ["open_shared_sessions", "ok"],
+  ]);
+  assert.equal(rows[0]!.error_message, "Input validation error.");
+  assert.equal(rows[1]!.query_text.length, 500);
 });

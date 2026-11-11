@@ -105,8 +105,20 @@ function filtersOf(input: Record<string, unknown>): Record<string, string | bool
   return filters;
 }
 
+/**
+ * Owners a tool knows but does not return (an agent search's recorded
+ * `userIds`), keyed by the result object so the tool's output contract is
+ * unchanged.
+ */
+const knownOwners = new WeakMap<object, Map<string, string[]>>();
+
+export function noteResultOwners(result: object, owners: Array<{ sessionId: string; source: string | null; userIds: string[] }>): void {
+  knownOwners.set(result, new Map(owners.map((owner) => [JSON.stringify([owner.sessionId, owner.source]), owner.userIds])));
+}
+
 /** The sessions a result cites, with the owners recorded on their events or member list. */
-export function resultSessionsOf(toolName: string, structured: Record<string, unknown> | undefined): {
+export function resultSessionsOf(toolName: string, structured: Record<string, unknown> | undefined,
+  owners?: Map<string, string[]>): {
   count: number; sessions: ReadAuditSession[]; truncated: boolean;
 } {
   if (!structured) return { count: 0, sessions: [], truncated: false };
@@ -131,11 +143,16 @@ export function resultSessionsOf(toolName: string, structured: Record<string, un
     const sessions = list(structured.sessions);
     count = matches.length + sessions.length;
     for (const match of matches) add(match.session_id, match.source, [match.user_id]);
-    for (const session of sessions) add(session.session_id, session.source, []);
+    for (const session of sessions) {
+      const source = typeof session.source === "string" ? session.source : null;
+      add(session.session_id, session.source, owners?.get(JSON.stringify([session.session_id, source])) ?? []);
+    }
   } else if (toolName === "get_shared_session" || toolName === "get_shared_session_context") {
     const events = list(structured.events);
     count = events.length;
-    add(structured.session_id, structured.source, events.map((event) => event.user_id));
+    // Each event names its own source: a read without `source` can span several.
+    for (const event of events) add(event.session_id, event.source, [event.user_id]);
+    if (events.length === 0) add(structured.session_id, structured.source, []);
   } else if (toolName === "list_session_timings") {
     const sessions = list(structured.sessions);
     count = sessions.length;
@@ -173,7 +190,9 @@ export function buildReadAuditRecord(input: {
   const { context, toolName, args, result } = input;
   const failed = !result || result.isError === true;
   const error = failed ? errorMessageOf(result) : { message: null, correlationId: null };
-  const sessions = failed ? { count: 0, sessions: [], truncated: false } : resultSessionsOf(toolName, result.structuredContent);
+  const sessions = failed
+    ? { count: 0, sessions: [], truncated: false }
+    : resultSessionsOf(toolName, result.structuredContent, knownOwners.get(result));
   const structuredCorrelation = result?.structuredContent?.correlation_id;
   return {
     id: randomUUID(),
@@ -223,6 +242,13 @@ export async function insertReadAudit(executor: SqlExecutor, record: ReadAuditRe
 
 type Handler = (args: unknown, extra: unknown) => Promise<ToolResult>;
 
+const INVALID_ARGUMENTS_MESSAGE = "Input validation error.";
+
+function requestIdOf(extra: unknown): string | null {
+  const id = (extra as { requestId?: unknown } | null)?.requestId;
+  return typeof id === "string" || typeof id === "number" ? JSON.stringify(id) : null;
+}
+
 /**
  * Returns a view of `server` whose `registerTool` audits every call of the
  * shared-session read tools. One insert per call, awaited so the record is
@@ -237,6 +263,8 @@ export function withReadAudit(server: McpServer, context: McpContext): McpServer
     if (!audited.has(name)) return register(name, config, handler);
     return register(name, config, async (args, extra) => {
       const startedAt = Date.now();
+      const requestId = requestIdOf(extra);
+      if (requestId !== null) audit.handled?.add(requestId);
       let result: ToolResult | undefined;
       try {
         result = await handler(args, extra);
@@ -266,6 +294,40 @@ export function withReadAudit(server: McpServer, context: McpContext): McpServer
       return Reflect.get(target, property, receiver);
     },
   });
+}
+
+/**
+ * The SDK refuses arguments that fail a tool's input schema before the
+ * wrapped handler runs. After the transport answers, this writes one error
+ * record for each audited `tools/call` in `body` that no handler recorded.
+ * The validation detail is not stored, only a fixed message.
+ */
+export async function auditUnhandledReadCalls(context: McpContext, body: unknown, startedAt: number): Promise<void> {
+  const audit = context.readAudit;
+  if (!audit) return;
+  const audited = new Set<string>(AUDITED_READ_TOOLS);
+  for (const message of Array.isArray(body) ? body : [body]) {
+    const call = message as { method?: unknown; id?: unknown; params?: { name?: unknown; arguments?: unknown } } | null;
+    if (call?.method !== "tools/call" || typeof call.params?.name !== "string" || !audited.has(call.params.name)) continue;
+    const id = typeof call.id === "string" || typeof call.id === "number" ? JSON.stringify(call.id) : null;
+    if (id === null || audit.handled?.has(id)) continue;
+    const args = call.params.arguments;
+    try {
+      await insertReadAudit(audit.database, buildReadAuditRecord({
+        context,
+        toolName: call.params.name,
+        args: args !== null && typeof args === "object" && !Array.isArray(args) ? args as Record<string, unknown> : {},
+        result: { isError: true, content: [{ type: "text", text: INVALID_ARGUMENTS_MESSAGE }] },
+        startedAt,
+        now: audit.now?.() ?? null,
+      }));
+    } catch (error) {
+      console.error("[selfhost-mcp] Shared-session read audit write failed", {
+        tool: call.params.name,
+        error: error instanceof Error ? error.message : "unknown",
+      });
+    }
+  }
 }
 
 // ---- Export ---------------------------------------------------------------
@@ -393,9 +455,9 @@ export async function listReadAudit(executor: SqlExecutor, workspaceId: string, 
             native_session_id, native_session_provider, native_session_verified,
             tool_name, outcome, error_message, query_text, agent_filter, requested_session_id, requested_source,
             filters, result_count, result_sessions, result_sessions_truncated, correlation_id, duration_ms
-       FROM shared_session_read_audit
+       FROM shared_session_read_audit audit
       WHERE ${where.join(" AND ")}
-      ORDER BY occurred_at, id
+      ORDER BY audit.occurred_at, audit.id
       LIMIT $${params.length}`,
     params,
   );

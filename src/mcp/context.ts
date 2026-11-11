@@ -63,7 +63,12 @@ export type McpContext = {
   /** Factory sessions (SELFHOST_FACTORY_ENABLED); absent when the feature is off. */
   factory?: FactoryMcpDeps;
   /** Where shared-session read calls are audited (src/mcp/read-audit.ts); absent writes nothing. */
-  readAudit?: { database: SqlExecutor; now?: () => Date };
+  readAudit?: {
+    database: SqlExecutor;
+    now?: () => Date;
+    /** JSON-RPC request ids whose read a tool handler recorded (validation failures are recorded after). */
+    handled?: Set<string>;
+  };
 };
 
 export class SharedSessionsToolError extends Error {

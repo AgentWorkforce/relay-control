@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { SHARED_SESSION_READ_TOOLS } from "./catalog.js";
 import { type McpContext, SharedSessionsToolError, sessionCitation, toolError } from "./context.js";
-import { withReadAudit } from "./read-audit.js";
+import { noteResultOwners, withReadAudit } from "./read-audit.js";
 import { registerSessionTimings } from "./session-timings.js";
 import { agentPrefixTooShort, AGENT_VALUE, MAX_AGENT_LENGTH, selectAgent } from "../sessions/agent-query.js";
 
@@ -146,6 +146,8 @@ const AgentSessionsPageSchema = z.object({
     sessionId: z.string().min(1),
     source: z.string().nullish(),
     lastTs: z.string().nullish(),
+    /** Recorded member ids: kept for the read audit, not returned. */
+    userIds: z.array(z.string()).nullish(),
   })),
   nextCursor: z.string().nullish(),
 });
@@ -359,7 +361,7 @@ export function registerSharedSessionReads(mcpServer: McpServer, context: McpCon
         if (input.cursor) list.set("cursor", input.cursor);
         const sessions = parsePage(AgentSessionsPageSchema,
           await context.readHistory(`/v1/sessions?${list.toString()}`, { timeoutMessage: SEARCH_TIMEOUT_MESSAGE }));
-        return toolSuccess({
+        const listed = toolSuccess({
           workspace_id: workspaceId,
           matches: [],
           sessions: sessions.sessions.map((row) => ({
@@ -372,6 +374,10 @@ export function registerSharedSessionReads(mcpServer: McpServer, context: McpCon
           next_cursor: sessions.nextCursor ?? null,
           correlation_id: correlationId,
         });
+        noteResultOwners(listed, sessions.sessions.map((row) => ({
+          sessionId: row.sessionId, source: row.source ?? null, userIds: row.userIds ?? [],
+        })));
+        return listed;
       }
       if (!input.query) throw new SharedSessionsToolError("Provide query text or an agent.");
       const params = new URLSearchParams({ q: input.query, limit: String(input.limit), order: "desc", maxContent: String(input.max_content) });

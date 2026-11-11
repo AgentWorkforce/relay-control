@@ -15,7 +15,8 @@ Always on; there is no setting. Nothing leaves the installation.
 `open_shared_sessions`, `search_shared_sessions`, `get_shared_session`,
 `get_shared_session_context` and `list_session_timings`. Successful and failed
 calls alike (a refused workspace, an unknown session, a History outage, a
-timeout). Other MCP tools are not recorded here.
+timeout, arguments refused by the input schema: recorded as `Input validation
+error.` without the validation detail). Other MCP tools are not recorded here.
 
 ## The record
 
@@ -39,7 +40,7 @@ timeout). Other MCP tools are not recorded here.
 | `requested_session_id`, `requested_source` | The session asked for by id |
 | `filters` | Other request filters: `source`, `project`, `since`, `until`, `user_id`, `focus_timestamp`, `order`, and `cursor: true` for a continuation page (never the cursor value) |
 | `result_count` | Matches, events or sessions returned |
-| `result_sessions` | The returned (cited) sessions, `[{ session_id, source, owner_user_ids }]`, at most 50 sessions and 10 owners each; owners are the user ids recorded on the returned events (or the recorded members, for timings) |
+| `result_sessions` | The returned (cited) sessions, `[{ session_id, source, owner_user_ids }]`, at most 50 sessions and 10 owners each; owners are the user ids recorded on the returned events, grouped by each event's own source (or the session's recorded members, for timings and agent searches) |
 | `result_sessions_truncated` | `true` when that list was cut |
 | `correlation_id` | The History correlation id, or the search's own id on a failed search |
 | `duration_ms` | Time spent in the tool |
