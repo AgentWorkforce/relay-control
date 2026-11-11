@@ -99,7 +99,7 @@ export type SignInResult = {
   tokens: IssuedTokens;
 };
 
-export type SignInMethod = "oidc" | "email" | "password";
+export type SignInMethod = "oidc" | "microsoft" | "email" | "password";
 
 type SignInInput = {
   /**
@@ -1201,7 +1201,7 @@ export class IdentityStore {
       userId,
       organizationId,
       workspaceId,
-      label: method === "oidc" ? "Browser sign-in (SSO)" : method === "password" ? "Browser sign-in (password)" : "Browser sign-in (email link)",
+      label: method === "oidc" ? "Browser sign-in (SSO)" : method === "microsoft" ? "Browser sign-in (Microsoft)" : method === "password" ? "Browser sign-in (password)" : "Browser sign-in (email link)",
     });
     if (onSignedIn) await onSignedIn(tx, userId);
     const joined = context.lastJoined === organizationId ? context.joined : null;

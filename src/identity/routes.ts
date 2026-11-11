@@ -21,6 +21,7 @@ type Auth = { kind: "bootstrap" } | { kind: "user"; principal: Principal };
 const SESSION_COOKIE = "agent_relay_session";
 const DEVICE_COOKIE = "agent_relay_device";
 const OIDC_COOKIE = "agent_relay_oidc";
+const MICROSOFT_COOKIE = "agent_relay_microsoft";
 const OIDC_ATTEMPT_TTL_MS = 10 * 60 * 1_000;
 /** Password sign-in retention sweep (login attempts, spent tokens). */
 const SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
@@ -172,6 +173,8 @@ export function createIdentityModule(input: {
   dashboardUrl: string;
   mailer: Mailer | null;
   oidcClient?: OidcClient | null;
+  /** Test seam like oidcClient, for SELFHOST_MICROSOFT_* (default: from config.microsoft). */
+  microsoftClient?: OidcClient | null;
   /** Needed when password sign-in is enabled (its Postgres state). */
   database?: Database;
   /** Test seam: the Have I Been Pwned range fetch (SELFHOST_PASSWORD_HIBP=on). */
@@ -186,6 +189,33 @@ export function createIdentityModule(input: {
   const log = input.log ?? ((message, fields) => console.log(`[selfhost-api] ${message}`, fields ?? {}));
   const limiter = new RateLimiter(now);
   const oidc = input.oidcClient !== undefined ? input.oidcClient : config.oidc ? new OidcClient(config.oidc) : null;
+  const microsoft = input.microsoftClient !== undefined
+    ? input.microsoftClient
+    : config.microsoft ? new OidcClient(config.microsoft) : null;
+  /** The browser OIDC providers: /login/<slug>/start and /login/<slug>/callback. */
+  type Provider = {
+    slug: "oidc" | "microsoft";
+    client: OidcClient | null;
+    cookie: string;
+    method: "oidc" | "microsoft";
+    notConfigured: { title: string; message: string };
+  };
+  const providers: Provider[] = [
+    {
+      slug: "oidc",
+      client: oidc,
+      cookie: OIDC_COOKIE,
+      method: "oidc",
+      notConfigured: { title: "Single sign-on is not configured", message: "Ask your administrator to configure an OIDC identity provider." },
+    },
+    {
+      slug: "microsoft",
+      client: microsoft,
+      cookie: MICROSOFT_COOKIE,
+      method: "microsoft",
+      notConfigured: { title: "Microsoft sign-in is not configured", message: "Ask your administrator to configure Microsoft sign-in." },
+    },
+  ];
   const dashboardOrigin = new URL(input.dashboardUrl).origin;
   // PAGE_CSP loads no images: only /login gets one, from the logo's own origin.
   const coBrand = config.logoUrl ? { logoUrl: config.logoUrl, orgName: config.loginOrgName } : null;
@@ -277,14 +307,15 @@ export function createIdentityModule(input: {
     }
   }
 
-  function signInErrorPage(response: ServerResponse, error: unknown, back: string): void {
+  function signInErrorPage(response: ServerResponse, error: unknown, back: string, provider: Provider = providers[0]!): void {
+    const clear = clearCookie(provider.cookie, `/login/${provider.slug}`);
     if (error instanceof IdentityError) {
-      sendHtml(response, error.status, messagePage({ title: error.code === "not_ready" ? "Almost ready" : "Unable to sign in", message: error.message, back }), [clearCookie(OIDC_COOKIE, "/login/oidc")]);
+      sendHtml(response, error.status, messagePage({ title: error.code === "not_ready" ? "Almost ready" : "Unable to sign in", message: error.message, back }), [clear]);
       return;
     }
     if (error instanceof OidcError) {
-      log("oidc sign-in failed", { code: error.code, error: error.message });
-      sendHtml(response, 502, messagePage({ title: "Unable to sign in", message: error.message, back }), [clearCookie(OIDC_COOKIE, "/login/oidc")]);
+      log(`${provider.slug} sign-in failed`, { code: error.code, error: error.message });
+      sendHtml(response, 502, messagePage({ title: "Unable to sign in", message: error.message, back }), [clear]);
       return;
     }
     throw error;
@@ -292,6 +323,111 @@ export function createIdentityModule(input: {
 
   function actorFor(auth: Auth): { kind: "user"; userId: string; role: Role } | { kind: "bootstrap" } {
     return auth.kind === "user" ? { kind: "user", userId: auth.principal.userId, role: auth.principal.role } : { kind: "bootstrap" };
+  }
+
+  /** GET /login/<slug>/start: PKCE + state + nonce in an encrypted cookie, then the provider. */
+  async function providerStart(request: IncomingMessage, response: ServerResponse, url: URL, helpers: IdentityRouteHelpers, provider: Provider): Promise<void> {
+    const client = provider.client;
+    if (!client) {
+      sendHtml(response, 404, messagePage(provider.notConfigured));
+      return;
+    }
+    if (limited(`${provider.slug}-start:${limiterKey(clientIp(request))}`, RATE.oidcStart)) {
+      sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
+      return;
+    }
+    const next = safeNextPath(url.searchParams.get("next"));
+    const invite = inviteParam(url.searchParams.get("invite"));
+    const redirectUri = client.config.redirectUrl ?? `${helpers.siteBaseUrl(request)}/login/${provider.slug}/callback`;
+    const pkce = pkcePair();
+    const attempt = {
+      p: `${provider.slug}-attempt`,
+      state: randomState(),
+      nonce: randomState(),
+      verifier: pkce.verifier,
+      next,
+      invite,
+      redirectUri,
+      exp: now() + OIDC_ATTEMPT_TTL_MS,
+    };
+    let location: string;
+    try {
+      const described = invite ? await store.describeInvitation(invite) : null;
+      location = await client.authorizationUrl({
+        redirectUri,
+        state: attempt.state,
+        nonce: attempt.nonce,
+        codeChallenge: pkce.challenge,
+        ...(described?.status === "pending" ? { loginHint: described.email } : {}),
+      });
+    } catch (error) {
+      signInErrorPage(response, error, `/login?next=${encodeURIComponent(next)}`, provider);
+      return;
+    }
+    redirect(response, 302, location, [
+      setCookie(provider.cookie, encryptSecret(JSON.stringify(attempt), keyring.active), `/login/${provider.slug}`, OIDC_ATTEMPT_TTL_MS / 1_000),
+    ]);
+  }
+
+  /** GET /login/<slug>/callback: checks the attempt, exchanges the code and signs in. */
+  async function providerCallback(request: IncomingMessage, response: ServerResponse, url: URL, provider: Provider): Promise<void> {
+    const client = provider.client!;
+    const clear = clearCookie(provider.cookie, `/login/${provider.slug}`);
+    if (limited(`${provider.slug}-callback:${limiterKey(clientIp(request))}`, RATE.callback)) {
+      sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
+      return;
+    }
+    let attempt: { p: string; state: string; nonce: string; verifier: string; next: string; invite: string | null; redirectUri: string; exp: number } | null = null;
+    try {
+      const raw = cookie(request, provider.cookie);
+      attempt = raw ? JSON.parse(decryptSecret(raw, keyring)) : null;
+    } catch {
+      attempt = null;
+    }
+    const back = `/login?next=${encodeURIComponent(attempt?.next ?? "/")}${attempt?.invite ? `&invite=${encodeURIComponent(attempt.invite)}` : ""}`;
+    const state = url.searchParams.get("state") ?? "";
+    if (!attempt || attempt.p !== `${provider.slug}-attempt` || attempt.exp < now() || !state || !secureEqual(state, attempt.state)) {
+      sendHtml(response, 400, messagePage({ title: "Sign-in expired", message: "This sign-in attempt expired or was started in another browser. Start again." , back }), [clear]);
+      return;
+    }
+    const idpError = url.searchParams.get("error");
+    if (idpError) {
+      const cancelled = idpError === "access_denied";
+      sendHtml(response, 400, messagePage({
+        title: cancelled ? "Sign-in cancelled" : "Unable to sign in",
+        message: cancelled ? "You cancelled the sign-in." : `The identity provider returned an error (${idpError.slice(0, 64).replace(/[^\w.-]/g, "")}).`,
+        back,
+      }), [clear]);
+      return;
+    }
+    const code = url.searchParams.get("code");
+    if (!code) {
+      sendHtml(response, 400, messagePage({ title: "Unable to sign in", message: "The identity provider returned no authorization code.", back }), [clear]);
+      return;
+    }
+    try {
+      const identity = await client.complete({ code, redirectUri: attempt.redirectUri, codeVerifier: attempt.verifier, nonce: attempt.nonce });
+      const allowed = client.config.allowedDomains;
+      if (allowed.length && !allowed.includes(emailDomain(identity.email))) {
+        throw new IdentityError(403, "domain_not_allowed", `Accounts from ${emailDomain(identity.email)} can't sign in here. Use your ${allowed.join(" or ")} account.`);
+      }
+      const result = await store.signIn({
+        email: identity.email,
+        name: identity.name,
+        inviteTokenHash: attempt.invite ? hashSecret(attempt.invite) : null,
+        method: provider.method,
+        emailVerified: identity.emailVerified,
+        beforePersonalOrganization: () => {
+          if (limited(`personal-org-addr:${identity.email.toLowerCase()}`, RATE.personalOrgPerAddress) || limited(`personal-org-ip:${limiterKey(clientIp(request))}`, RATE.personalOrgPerIp)) {
+            throw new IdentityError(429, "rate_limited", "Too many new organizations were created. Try again later.");
+          }
+        },
+      });
+      if (result.joined) log("member joined", { via: result.joined.via, role: result.joined.role, domain: emailDomain(result.email) });
+      redirect(response, 303, attempt.next, [sessionCookie(result.tokens), clear]);
+    } catch (error) {
+      signInErrorPage(response, error, back, provider);
+    }
   }
 
   async function handle(
@@ -320,6 +456,7 @@ export function createIdentityModule(input: {
         invite,
         banner: await banner(invite ?? (url.searchParams.has("invite") ? "invalid" : null)),
         oidc: oidc ? { displayName: oidc.config.displayName } : null,
+        microsoft: microsoft ? { displayName: microsoft.config.displayName } : null,
         emailLogin,
         password: passwordRoutes !== null,
         passwordLinks: passwordRoutes ? passwordPageLinks(next, invite) : null,
@@ -334,108 +471,17 @@ export function createIdentityModule(input: {
       return true;
     }
 
-    // ---- OIDC ----------------------------------------------------------------
-    if (method === "GET" && publicPath === "/login/oidc/start") {
-      if (!oidc) {
-        sendHtml(response, 404, messagePage({ title: "Single sign-on is not configured", message: "Ask your administrator to configure an OIDC identity provider." }));
+    // ---- OIDC and Microsoft ------------------------------------------------------
+    for (const provider of providers) {
+      if (method === "GET" && publicPath === `/login/${provider.slug}/start`) {
+        await providerStart(request, response, url, helpers, provider);
         return true;
       }
-      if (limited(`oidc-start:${limiterKey(clientIp(request))}`, RATE.oidcStart)) {
-        sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
+      if (method === "GET" && publicPath === `/login/${provider.slug}/callback`) {
+        if (!provider.client) return false;
+        await providerCallback(request, response, url, provider);
         return true;
       }
-      const next = safeNextPath(url.searchParams.get("next"));
-      const invite = inviteParam(url.searchParams.get("invite"));
-      const redirectUri = oidc.config.redirectUrl ?? `${helpers.siteBaseUrl(request)}/login/oidc/callback`;
-      const pkce = pkcePair();
-      const attempt = {
-        p: "oidc-attempt",
-        state: randomState(),
-        nonce: randomState(),
-        verifier: pkce.verifier,
-        next,
-        invite,
-        redirectUri,
-        exp: now() + OIDC_ATTEMPT_TTL_MS,
-      };
-      let location: string;
-      try {
-        const described = invite ? await store.describeInvitation(invite) : null;
-        location = await oidc.authorizationUrl({
-          redirectUri,
-          state: attempt.state,
-          nonce: attempt.nonce,
-          codeChallenge: pkce.challenge,
-          ...(described?.status === "pending" ? { loginHint: described.email } : {}),
-        });
-      } catch (error) {
-        signInErrorPage(response, error, `/login?next=${encodeURIComponent(next)}`);
-        return true;
-      }
-      redirect(response, 302, location, [
-        setCookie(OIDC_COOKIE, encryptSecret(JSON.stringify(attempt), keyring.active), "/login/oidc", OIDC_ATTEMPT_TTL_MS / 1_000),
-      ]);
-      return true;
-    }
-
-    if (method === "GET" && publicPath === "/login/oidc/callback") {
-      if (!oidc) return false;
-      if (limited(`oidc-callback:${limiterKey(clientIp(request))}`, RATE.callback)) {
-        sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
-        return true;
-      }
-      let attempt: { p: string; state: string; nonce: string; verifier: string; next: string; invite: string | null; redirectUri: string; exp: number } | null = null;
-      try {
-        const raw = cookie(request, OIDC_COOKIE);
-        attempt = raw ? JSON.parse(decryptSecret(raw, keyring)) : null;
-      } catch {
-        attempt = null;
-      }
-      const back = `/login?next=${encodeURIComponent(attempt?.next ?? "/")}${attempt?.invite ? `&invite=${encodeURIComponent(attempt.invite)}` : ""}`;
-      const state = url.searchParams.get("state") ?? "";
-      if (!attempt || attempt.p !== "oidc-attempt" || attempt.exp < now() || !state || !secureEqual(state, attempt.state)) {
-        sendHtml(response, 400, messagePage({ title: "Sign-in expired", message: "This sign-in attempt expired or was started in another browser. Start again." , back }), [clearCookie(OIDC_COOKIE, "/login/oidc")]);
-        return true;
-      }
-      const idpError = url.searchParams.get("error");
-      if (idpError) {
-        const cancelled = idpError === "access_denied";
-        sendHtml(response, 400, messagePage({
-          title: cancelled ? "Sign-in cancelled" : "Unable to sign in",
-          message: cancelled ? "You cancelled the sign-in." : `The identity provider returned an error (${idpError.slice(0, 64).replace(/[^\w.-]/g, "")}).`,
-          back,
-        }), [clearCookie(OIDC_COOKIE, "/login/oidc")]);
-        return true;
-      }
-      const code = url.searchParams.get("code");
-      if (!code) {
-        sendHtml(response, 400, messagePage({ title: "Unable to sign in", message: "The identity provider returned no authorization code.", back }), [clearCookie(OIDC_COOKIE, "/login/oidc")]);
-        return true;
-      }
-      try {
-        const identity = await oidc.complete({ code, redirectUri: attempt.redirectUri, codeVerifier: attempt.verifier, nonce: attempt.nonce });
-        const allowed = oidc.config.allowedDomains;
-        if (allowed.length && !allowed.includes(emailDomain(identity.email))) {
-          throw new IdentityError(403, "domain_not_allowed", `Accounts from ${emailDomain(identity.email)} can't sign in here. Use your ${allowed.join(" or ")} account.`);
-        }
-        const result = await store.signIn({
-          email: identity.email,
-          name: identity.name,
-          inviteTokenHash: attempt.invite ? hashSecret(attempt.invite) : null,
-          method: "oidc",
-          emailVerified: identity.emailVerified,
-          beforePersonalOrganization: () => {
-            if (limited(`personal-org-addr:${identity.email.toLowerCase()}`, RATE.personalOrgPerAddress) || limited(`personal-org-ip:${limiterKey(clientIp(request))}`, RATE.personalOrgPerIp)) {
-              throw new IdentityError(429, "rate_limited", "Too many new organizations were created. Try again later.");
-            }
-          },
-        });
-        if (result.joined) log("member joined", { via: result.joined.via, role: result.joined.role, domain: emailDomain(result.email) });
-        redirect(response, 303, attempt.next, [sessionCookie(result.tokens), clearCookie(OIDC_COOKIE, "/login/oidc")]);
-      } catch (error) {
-        signInErrorPage(response, error, back);
-      }
-      return true;
     }
 
     // ---- password form (the /login page) ---------------------------------------
@@ -632,6 +678,7 @@ export function createIdentityModule(input: {
       sendJson(response, 200, {
         methods: signinMethods,
         oidc: oidc ? { displayName: oidc.config.displayName } : null,
+        microsoft: microsoft ? { displayName: microsoft.config.displayName } : null,
         logo_url: config.logoUrl,
         // Shown beside the logo, so it is only public once a logo is set.
         org_name: config.logoUrl ? config.loginOrgName : null,
@@ -657,6 +704,7 @@ export function createIdentityModule(input: {
       void auth;
       sendJson(response, 200, {
         oidc: oidc ? { displayName: oidc.config.displayName, allowedDomains: oidc.config.allowedDomains } : null,
+        microsoft: microsoft ? { displayName: microsoft.config.displayName } : null,
         emailLink: emailLogin,
         password: passwordRoutes !== null,
         inviteEmail: mailer !== null,

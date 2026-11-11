@@ -47,6 +47,12 @@ export type PasswordConfig = {
 };
 
 export type OidcConfig = {
+  /**
+   * "generic": the operator's own IdP (SELFHOST_OIDC_*), strict single issuer.
+   * "microsoft": Microsoft accounts (SELFHOST_MICROSOFT_*), per-tenant issuer
+   * and Microsoft's email verification rule (src/identity/oidc.ts).
+   */
+  kind: "generic" | "microsoft";
   issuer: string;
   clientId: string;
   clientSecret: string;
@@ -82,6 +88,8 @@ export type IdentityConfig = {
   /** Relaycast's internal admin secret, for provisioning the default workspace. */
   relaycastInternalSecret: string | null;
   oidc: OidcConfig | null;
+  /** SELFHOST_MICROSOFT_*: "Continue with Microsoft", beside any generic OIDC provider. */
+  microsoft: OidcConfig | null;
   smtp: SmtpConfig | null;
   /** Email sign-in links (needs smtp). */
   emailLogin: boolean;
@@ -344,6 +352,7 @@ function loadOidc(env: Env): OidcConfig | null {
   if (!scopes.includes("email")) scopes.push("email");
   const normalizedIssuer = issuer.replace(/\/+$/, "");
   return {
+    kind: "generic",
     // Kept byte-for-byte: the id_token `iss` must equal the discovery issuer.
     issuer: normalizedIssuer,
     clientId,
@@ -354,6 +363,52 @@ function loadOidc(env: Env): OidcConfig | null {
     redirectUrl: redirect,
     allowHttpIssuer,
     trustMissingEmailVerified: trustMissingEmailVerified(env, normalizedIssuer),
+  };
+}
+
+/** The tenant Microsoft issues personal (Outlook.com, Hotmail, Live) accounts from. */
+export const MICROSOFT_PERSONAL_ACCOUNT_TENANT = "9188040d-6c67-4c5b-b112-36a304b66dad";
+const MICROSOFT_TENANT = /^(common|consumers|organizations|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+
+/**
+ * SELFHOST_MICROSOFT_*: Microsoft accounts as a second provider. The issuer
+ * is derived from the tenant; scopes, domains and email trust are fixed.
+ */
+function loadMicrosoft(env: Env): OidcConfig | null {
+  const clientId = env.SELFHOST_MICROSOFT_CLIENT_ID?.trim();
+  const clientSecret = readSecret(env, "SELFHOST_MICROSOFT_CLIENT_SECRET");
+  if (!clientId && !clientSecret) return null;
+  if (!clientId || !clientSecret) {
+    throw new Error("SELFHOST_MICROSOFT_CLIENT_ID and SELFHOST_MICROSOFT_CLIENT_SECRET (or _FILE) must be set together");
+  }
+  const tenant = env.SELFHOST_MICROSOFT_TENANT?.trim() || "common";
+  if (!MICROSOFT_TENANT.test(tenant)) {
+    throw new Error("SELFHOST_MICROSOFT_TENANT must be common, consumers, organizations or a tenant id (a lowercase UUID)");
+  }
+  const redirect = env.SELFHOST_MICROSOFT_REDIRECT_URL?.trim() || null;
+  if (redirect) {
+    let url: URL;
+    try {
+      url = new URL(redirect);
+    } catch {
+      throw new Error("SELFHOST_MICROSOFT_REDIRECT_URL must be an absolute URL");
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("SELFHOST_MICROSOFT_REDIRECT_URL must use http or https");
+    if (url.pathname !== "/login/microsoft/callback" || url.search || url.hash || url.username || url.password) {
+      throw new Error("SELFHOST_MICROSOFT_REDIRECT_URL must be <origin>/login/microsoft/callback");
+    }
+  }
+  return {
+    kind: "microsoft",
+    issuer: `https://login.microsoftonline.com/${tenant}/v2.0`,
+    clientId,
+    clientSecret,
+    scopes: ["openid", "email", "profile"],
+    allowedDomains: [],
+    displayName: "Microsoft",
+    redirectUrl: redirect,
+    allowHttpIssuer: false,
+    trustMissingEmailVerified: false,
   };
 }
 
@@ -428,6 +483,7 @@ export function loadIdentityConfig(env: Env = process.env): IdentityConfig {
     bootstrap,
     relaycastInternalSecret,
     oidc: loadOidc(env),
+    microsoft: loadMicrosoft(env),
     smtp,
     emailLogin,
     autoJoinDomains,

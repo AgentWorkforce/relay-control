@@ -1217,7 +1217,9 @@ paths:
         alias; a signed-out browser is redirected to /login and returned here.
         Hosted's provider starts, /cloud/api/auth/google/start and
         /cloud/api/auth/microsoft/start with next=/api/v1/cli/login?..., also
-        land on /login here with the inner parameters kept. Unknown query
+        land on the /login chooser here with the inner parameters kept, never
+        on one provider (only the Microsoft start goes to
+        /login/microsoft/start, when Microsoft sign-in is configured). Unknown query
         parameters (workspace_selection) are ignored.
         With client=desktop and an S256 code_challenge, issues a 15-minute
         handoff access token bound to the challenge and redirects (307) to the
@@ -1946,7 +1948,7 @@ paths:
       description: Any signed-in member. Which sign-in methods and invite delivery are configured.
       responses:
         "200":
-          description: "{ oidc: {displayName, allowedDomains}|null, emailLink, password, inviteEmail, autoJoinDomains, inviteTtlHours }"
+          description: "{ oidc: {displayName, allowedDomains}|null, microsoft: {displayName}|null, emailLink, password, inviteEmail, autoJoinDomains, inviteTtlHours }"
   /api/v1/auth/login-config:
     get:
       operationId: loginConfig
@@ -2208,6 +2210,29 @@ paths:
           description: To `next` with the session cookie
         "403":
           description: Not invited, wrong domain, or invite email mismatch (HTML)
+  /login/microsoft/start:
+    get:
+      operationId: microsoftStart
+      description: Starts Microsoft sign-in (SELFHOST_MICROSOFT_*), authorization code + PKCE; `next` (safe path) and `invite` are carried through. 404 when not configured.
+      responses:
+        "302":
+          description: To login.microsoftonline.com
+        "404":
+          description: Microsoft sign-in is not configured (HTML)
+  /login/microsoft/callback:
+    get:
+      operationId: microsoftCallback
+      description: |
+        Verifies the id_token (per-tenant issuer), requires a verified email (a personal
+        Microsoft account, or a tenant account with `xms_edov` true), resolves membership
+        and sets the session cookie.
+      responses:
+        "303":
+          description: To `next` with the session cookie
+        "403":
+          description: Not invited, or invite email mismatch (HTML)
+        "502":
+          description: The email is not verified, or the id_token was refused (HTML)
   /login/password:
     post:
       operationId: passwordFormLogin
@@ -7214,7 +7239,7 @@ components:
         created_at: {type: string, format: date-time}
     LoginConfig:
       type: object
-      required: [methods, oidc, logo_url, org_name, allowed_domain_hint, password_policy]
+      required: [methods, oidc, microsoft, logo_url, org_name, allowed_domain_hint, password_policy]
       properties:
         methods:
           type: array
@@ -7223,6 +7248,11 @@ components:
           type: [object, "null"]
           properties:
             displayName: { type: string }
+        microsoft:
+          type: [object, "null"]
+          description: Microsoft sign-in (SELFHOST_MICROSOFT_*), at /login/microsoft/start.
+          properties:
+            displayName: { type: string, example: Microsoft }
         logo_url: { type: [string, "null"], format: uri }
         org_name: { type: [string, "null"], description: Shown beside the logo. Null when no logo is set. }
         allowed_domain_hint: { type: boolean }

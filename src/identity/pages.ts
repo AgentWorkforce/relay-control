@@ -71,6 +71,8 @@ export function loginPage(input: {
   invite: string | null;
   banner: InviteBanner | null;
   oidc: { displayName: string } | null;
+  /** SELFHOST_MICROSOFT_*: "Continue with Microsoft", after the OIDC button. */
+  microsoft?: { displayName: string } | null;
   emailLogin: boolean;
   /** SELFHOST_SIGNIN_METHODS includes password: a same-origin form to POST /login/password. */
   password?: boolean;
@@ -99,6 +101,10 @@ export function loginPage(input: {
   if (input.oidc) {
     methods.push(`<a class="btn" href="/login/oidc/start?${escapeHtml(query.toString())}">Continue with ${escapeHtml(input.oidc.displayName)}</a>`);
   }
+  if (input.microsoft) {
+    methods.push(`<a class="btn${input.oidc ? " secondary" : ""}" href="/login/microsoft/start?${escapeHtml(query.toString())}">Continue with ${escapeHtml(input.microsoft.displayName)}</a>`);
+  }
+  const provider = Boolean(input.oidc || input.microsoft);
   const invitedEmail = input.banner?.kind === "valid" ? ` value="${escapeHtml(input.banner.email)}"` : "";
   const hidden = `<input type="hidden" name="next" value="${escapeHtml(input.next)}">${input.invite ? `<input type="hidden" name="invite" value="${escapeHtml(input.invite)}">` : ""}`;
   if (input.password) {
@@ -106,14 +112,14 @@ export function loginPage(input: {
 ${hidden}
 <input type="email" name="email" required autocomplete="username" placeholder="you@company.com" aria-label="Email address"${invitedEmail}>
 <input type="password" name="password" required autocomplete="current-password" placeholder="Password" aria-label="Password" maxlength="1024">
-<button class="btn${input.oidc ? " secondary" : ""}" type="submit">Sign in with password</button></form>${input.passwordLinks ? `
+<button class="btn${provider ? " secondary" : ""}" type="submit">Sign in with password</button></form>${input.passwordLinks ? `
 <p class="muted"><a href="${escapeHtml(input.passwordLinks.forgot)}">Forgot password?</a> · <a href="${escapeHtml(input.passwordLinks.register)}">Create an account</a></p>` : ""}`);
   }
   if (input.emailLogin) {
     methods.push(`<form method="post" action="/login/email">
 <input type="hidden" name="next" value="${escapeHtml(input.next)}">${input.invite ? `<input type="hidden" name="invite" value="${escapeHtml(input.invite)}">` : ""}
 <input type="email" name="email" required autocomplete="email" placeholder="you@company.com" aria-label="Email address"${input.banner?.kind === "valid" ? ` value="${escapeHtml(input.banner.email)}"` : ""}>
-<button class="btn${input.oidc || input.password ? " secondary" : ""}" type="submit">Email me a sign-in link</button></form>`);
+<button class="btn${provider || input.password ? " secondary" : ""}" type="submit">Email me a sign-in link</button></form>`);
   }
   parts.push(methods.join(`<div class="or">or</div>`));
   const hasMethod = methods.length > 0;

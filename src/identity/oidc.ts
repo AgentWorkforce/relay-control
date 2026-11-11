@@ -7,7 +7,7 @@ import {
   type JsonWebKey,
   type KeyObject,
 } from "node:crypto";
-import type { OidcConfig } from "./config.js";
+import { MICROSOFT_PERSONAL_ACCOUNT_TENANT, type OidcConfig } from "./config.js";
 
 /**
  * Minimal OpenID Connect relying party: discovery, the authorization-code
@@ -20,6 +20,9 @@ const FETCH_TIMEOUT_MS = 10_000;
 const DISCOVERY_TTL_MS = 60 * 60 * 1_000;
 const JWKS_REFRESH_FLOOR_MS = 60 * 1_000;
 const CLOCK_SKEW_S = 120;
+/** The issuer Microsoft's multi-tenant discovery documents publish (common, organizations). */
+const MICROSOFT_TEMPLATE_ISSUER = "https://login.microsoftonline.com/{tenantid}/v2.0";
+const MICROSOFT_TENANT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export class OidcError extends Error {
   constructor(readonly code: string, message: string) {
@@ -33,6 +36,8 @@ type Discovery = {
   token_endpoint: string;
   jwks_uri: string;
   token_endpoint_auth_methods_supported?: string[];
+  /** Microsoft only: the document published the {tenantid} template issuer. */
+  templated?: boolean;
 };
 
 export type OidcIdentity = {
@@ -128,7 +133,17 @@ export class OidcClient {
     });
     if (status !== 200 || !body) throw new OidcError("discovery_failed", `OIDC discovery answered ${status}`);
     const issuer = typeof body.issuer === "string" ? body.issuer : "";
-    if (issuer.replace(/\/+$/, "") !== this.config.issuer) {
+    // Microsoft's multi-tenant authorities publish a template; each id_token
+    // then names its own tenant (checked in verifyMicrosoft).
+    const templated = this.config.kind === "microsoft" && issuer === MICROSOFT_TEMPLATE_ISSUER;
+    if (this.config.kind === "microsoft") {
+      // `consumers` publishes the personal-account tenant as its issuer.
+      const consumers = this.config.issuer === "https://login.microsoftonline.com/consumers/v2.0"
+        && issuer === `https://login.microsoftonline.com/${MICROSOFT_PERSONAL_ACCOUNT_TENANT}/v2.0`;
+      if (!templated && !consumers && issuer !== this.config.issuer) {
+        throw new OidcError("discovery_invalid", "Discovery issuer does not match the Microsoft tenant");
+      }
+    } else if (issuer.replace(/\/+$/, "") !== this.config.issuer) {
       throw new OidcError("discovery_invalid", "Discovery issuer does not match SELFHOST_OIDC_ISSUER");
     }
     const allowHttp = this.config.allowHttpIssuer;
@@ -140,6 +155,7 @@ export class OidcClient {
       ...(Array.isArray(body.token_endpoint_auth_methods_supported)
         ? { token_endpoint_auth_methods_supported: body.token_endpoint_auth_methods_supported.filter((m): m is string => typeof m === "string") }
         : {}),
+      ...(templated ? { templated: true } : {}),
     };
     this.#discovery = { value, fetchedAt: this.now() };
     return value;
@@ -158,7 +174,8 @@ export class OidcClient {
     url.searchParams.set("code_challenge_method", "S256");
     if (input.loginHint) url.searchParams.set("login_hint", input.loginHint);
     // Google Workspace: preselect the hosted domain when exactly one is allowed.
-    if (this.config.allowedDomains.length === 1) url.searchParams.set("hd", this.config.allowedDomains[0]!);
+    // Never for Microsoft (it has no allowed domains anyway).
+    if (this.config.kind !== "microsoft" && this.config.allowedDomains.length === 1) url.searchParams.set("hd", this.config.allowedDomains[0]!);
     return url.toString();
   }
 
@@ -252,7 +269,15 @@ export class OidcClient {
     if (!valid) throw new OidcError("id_token_invalid", "id_token signature is invalid");
 
     const nowS = Math.floor(this.now() / 1_000);
-    if (claims.iss !== resolved.issuer) throw new OidcError("id_token_invalid", "id_token issuer does not match");
+    if (this.config.kind === "microsoft") {
+      const tid = claims.tid;
+      if (typeof tid !== "string" || !MICROSOFT_TENANT_ID.test(tid)) {
+        throw new OidcError("id_token_invalid", "id_token has no Microsoft tenant");
+      }
+      if (claims.iss !== `https://login.microsoftonline.com/${tid}/v2.0` || (!resolved.templated && claims.iss !== resolved.issuer)) {
+        throw new OidcError("id_token_invalid", "id_token issuer does not match");
+      }
+    } else if (claims.iss !== resolved.issuer) throw new OidcError("id_token_invalid", "id_token issuer does not match");
     const aud = claims.aud;
     const audiences = Array.isArray(aud) ? aud : [aud];
     if (!audiences.includes(this.config.clientId)) throw new OidcError("id_token_invalid", "id_token audience does not match");
@@ -268,6 +293,7 @@ export class OidcClient {
     if (!email) {
       throw new OidcError("email_missing", "Your identity provider did not share an email address. Ask your administrator to add the email claim.");
     }
+    if (this.config.kind === "microsoft") return this.microsoftIdentity(claims, email);
     // Providers that send email_verified must mark it true. (Microsoft Entra
     // ID omits it; its email comes from the tenant directory.)
     if (claims.email_verified === false || claims.email_verified === "false") {
@@ -283,5 +309,25 @@ export class OidcClient {
     const emailVerified = claims.email_verified === true || claims.email_verified === "true"
       || (claims.email_verified === undefined && this.config.trustMissingEmailVerified);
     return { subject: claims.sub, email, name, emailVerified };
+  }
+
+  /**
+   * Microsoft accounts (`common` reaches every tenant in the world, and a
+   * tenant admin can set any `email`): a personal account's address is
+   * verified by Microsoft; a tenant account's only when `xms_edov` (email
+   * domain owner verified) is true. Anything else is refused.
+   */
+  private microsoftIdentity(claims: Record<string, unknown>, email: string): OidcIdentity {
+    const verified = claims.tid === MICROSOFT_PERSONAL_ACCOUNT_TENANT || claims.xms_edov === true || claims.xms_edov === "true";
+    if (!verified) {
+      throw new OidcError(
+        "email_unverified",
+        "Your Microsoft account's email address isn't verified. Sign in with a personal Microsoft account (Outlook.com, Hotmail or Live), or ask your administrator to add the xms_edov claim to the app registration.",
+      );
+    }
+    const name = typeof claims.name === "string" && claims.name.trim()
+      ? claims.name.trim()
+      : [claims.given_name, claims.family_name].filter((part): part is string => typeof part === "string" && Boolean(part.trim())).join(" ") || null;
+    return { subject: claims.sub as string, email, name, emailVerified: true };
   }
 }

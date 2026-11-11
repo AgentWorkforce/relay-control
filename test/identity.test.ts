@@ -7,7 +7,7 @@ import type { SelfhostConfig } from "../src/config.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { loadIdentityConfig, type IdentityConfig } from "../src/identity/config.js";
-import { OidcClient, type OidcError } from "../src/identity/oidc.js";
+import { OidcClient, type FetchLike, type OidcError } from "../src/identity/oidc.js";
 import { IdentityStore } from "../src/identity/store.js";
 import { createIdentityModule } from "../src/identity/routes.js";
 import { bootstrapOnce, relaycastProvisioner, startBootstrap, type RelaycastProvisioner } from "../src/identity/bootstrap.js";
@@ -27,7 +27,16 @@ type IdpCode = { email: string; name?: string; nonce: string; challenge: string;
 function fakeIdp() {
   const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const codes = new Map<string, IdpCode>();
-  const state = { issuer: "", tokenCalls: 0, signWith: privateKey as KeyObject, kid: "k1" };
+  const state = {
+    issuer: "",
+    tokenCalls: 0,
+    signWith: privateKey as KeyObject,
+    kid: "k1",
+    /** Overrides the discovery `issuer` (e.g. Microsoft's {tenantid} template). */
+    discoveryIssuer: null as string | null,
+    /** Overrides the base of the discovery endpoints (rewritten back by the client's fetch). */
+    endpointBase: null as string | null,
+  };
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", state.issuer);
     const reply = (status: number, body: unknown) => {
@@ -35,11 +44,12 @@ function fakeIdp() {
       res.end(JSON.stringify(body));
     };
     if (url.pathname === "/.well-known/openid-configuration") {
+      const base = state.endpointBase ?? state.issuer;
       return reply(200, {
-        issuer: state.issuer,
-        authorization_endpoint: `${state.issuer}/authorize`,
-        token_endpoint: `${state.issuer}/token`,
-        jwks_uri: `${state.issuer}/jwks`,
+        issuer: state.discoveryIssuer ?? state.issuer,
+        authorization_endpoint: `${base}/authorize`,
+        token_endpoint: `${base}/token`,
+        jwks_uri: `${base}/jwks`,
         token_endpoint_auth_methods_supported: ["client_secret_basic"],
       });
     }
@@ -188,12 +198,27 @@ async function setup(t: test.TestContext, options: {
   multi?: boolean;
   /** Name the fake provider's issuer in SELFHOST_OIDC_TRUST_MISSING_EMAIL_VERIFIED_ISSUER. */
   trustMissingEmailVerified?: boolean;
+  /**
+   * SELFHOST_MICROSOFT_*, served by a second fake provider behind
+   * login.microsoftonline.com. `discoveryIssuer` defaults to the template for
+   * common/organizations and to the tenant issuer otherwise.
+   */
+  microsoft?: { tenant?: string; discoveryIssuer?: string };
 } = {}) {
   const database = new PGliteDatabase();
   await migrate(database);
   const idp = fakeIdp();
   const idpUrl = await listen(idp.server);
   idp.state.issuer = idpUrl;
+  const msIdp = options.microsoft ? fakeIdp() : null;
+  const msIdpUrl = msIdp ? await listen(msIdp.server) : null;
+  if (msIdp && options.microsoft) {
+    const tenant = options.microsoft.tenant ?? "common";
+    msIdp.state.issuer = msIdpUrl!;
+    msIdp.state.discoveryIssuer = options.microsoft.discoveryIssuer
+      ?? (tenant === "common" || tenant === "organizations" ? MICROSOFT_TEMPLATE_ISSUER : `${MICROSOFT_HOST}/${tenant}/v2.0`);
+    msIdp.state.endpointBase = `${MICROSOFT_HOST}/${tenant}/oauth2/v2.0`;
+  }
   const relaycast = fakeRelaycast();
   const relaycastUrl = await listen(relaycast.server);
   const control = createServer();
@@ -226,6 +251,11 @@ async function setup(t: test.TestContext, options: {
     ...(options.multi ? { SELFHOST_TENANCY: "multi" } : {}),
     ...(options.trustMissingEmailVerified ? { SELFHOST_OIDC_TRUST_MISSING_EMAIL_VERIFIED_ISSUER: idpUrl } : {}),
     ...(options.mailer ? { SELFHOST_SMTP_HOST: "smtp.acme.test", SELFHOST_EMAIL_FROM: "Relay <relay@acme.test>", SELFHOST_EMAIL_LOGIN: "true" } : {}),
+    ...(options.microsoft ? {
+      SELFHOST_MICROSOFT_CLIENT_ID: CLIENT_ID,
+      SELFHOST_MICROSOFT_CLIENT_SECRET: CLIENT_SECRET,
+      ...(options.microsoft.tenant ? { SELFHOST_MICROSOFT_TENANT: options.microsoft.tenant } : {}),
+    } : {}),
     ...options.env,
   });
   const mailer = fakeMailer();
@@ -244,19 +274,67 @@ async function setup(t: test.TestContext, options: {
     keyring: KEYRING,
     dashboardUrl: config.dashboardUrl,
     mailer: options.mailer ? mailer : null,
+    ...(msIdp ? { microsoftClient: new OidcClient(identityConfig.microsoft!, microsoftFetch(msIdpUrl!)) } : {}),
     log: () => undefined,
   });
   control.on("request", createApp({ config, store, identity }));
   t.after(async () => {
     await close(control);
     await close(idp.server);
+    if (msIdp) await close(msIdp.server);
     await close(relaycast.server);
     await database.close();
   });
   if (options.bootstrap !== false) {
     assert.equal(await bootstrapOnce({ bootstrap: identityConfig.bootstrap!, store: identityStore, provisioner, log: () => undefined }), "done");
   }
-  return { database, origin, idp, relaycast, mailer, identityConfig, identityStore, provisioner, store };
+  return { database, origin, idp, msIdp, relaycast, mailer, identityConfig, identityStore, provisioner, store };
+}
+
+const MICROSOFT_HOST = "https://login.microsoftonline.com";
+const MICROSOFT_TEMPLATE_ISSUER = `${MICROSOFT_HOST}/{tenantid}/v2.0`;
+const PERSONAL_TENANT = "9188040d-6c67-4c5b-b112-36a304b66dad";
+const WORK_TENANT = "6f1e2d3c-4b5a-4978-8a6b-5c4d3e2f1a0b";
+
+/** The client's fetch: login.microsoftonline.com URLs go to the fake provider. */
+function microsoftFetch(idpUrl: string): FetchLike {
+  return (input, init) => {
+    const url = new URL(input);
+    assert.equal(url.origin, MICROSOFT_HOST, `unexpected fetch ${input}`);
+    const path = url.pathname.endsWith("/.well-known/openid-configuration")
+      ? "/.well-known/openid-configuration"
+      : `/${url.pathname.split("/").pop()}`;
+    return globalThis.fetch(`${idpUrl}${path}${url.search}`, init);
+  };
+}
+
+/** A Microsoft v2.0 id_token: per-tenant `iss`, `tid`, `oid`, no email_verified. */
+function msAccount(email: string, tid: string | null = PERSONAL_TENANT, claims: Record<string, unknown> = {}): Partial<IdpCode> & { email: string } {
+  return {
+    email,
+    emailVerified: null,
+    claims: {
+      iss: `${MICROSOFT_HOST}/${tid ?? PERSONAL_TENANT}/v2.0`,
+      ...(tid === null ? {} : { tid }),
+      oid: randomUUID(),
+      ver: "2.0",
+      ...claims,
+    },
+  };
+}
+
+/** Full browser round trip through /login/microsoft/*. */
+async function microsoftSignIn(ctx: Awaited<ReturnType<typeof setup>>, person: Partial<IdpCode> & { email: string }, query = "") {
+  const start = await call(ctx.origin, `/login/microsoft/start${query}`);
+  assert.equal(start.status, 302, start.text);
+  const attempt = start.cookies.agent_relay_microsoft;
+  assert(attempt, "attempt cookie");
+  const approved = ctx.msIdp!.approve(start.headers.get("location")!, person);
+  const callback = await call(ctx.origin, `/login/microsoft/callback?code=${approved.code}&state=${approved.state}`, {
+    cookie: `agent_relay_microsoft=${encodeURIComponent(attempt)}`,
+  });
+  const session = callback.cookies.agent_relay_session;
+  return { start, callback, cookie: session ? `agent_relay_session=${encodeURIComponent(session)}` : null };
 }
 
 /** Full browser OIDC round trip; returns the session cookie header (or the failing response). */
@@ -436,10 +514,10 @@ test("oidc: the admin email signs in as owner through the full code + PKCE flow"
   assert.equal(me.body.currentOrganization.role, "owner");
   assert.equal(me.body.currentWorkspace.name, "Default");
 
-  // Desktop / CLI provider start goes straight to the IdP.
+  // Desktop / CLI provider start lands on the /login chooser, never on one provider.
   const google = await call(ctx.origin, "/cloud/api/auth/google/start?next=%2Fapi%2Fv1%2Fcli%2Flogin");
   assert.equal(google.status, 302);
-  assert.match(google.headers.get("location")!, /^\/login\/oidc\/start\?next=/);
+  assert.equal(google.headers.get("location"), `/login?next=${encodeURIComponent("/cloud/api/v1/cli/login")}`);
 });
 
 test("oidc: refuses strangers, other domains, unverified email, forged state and bad tokens", async (t) => {
@@ -644,6 +722,237 @@ test("oidc: before the workspace exists, sign-in says the installation is still 
   const result = await oidcSignIn(ctx, { email: "admin@acme.test" });
   assert.equal(result.callback.status, 503);
   assert.match(result.callback.text, /still creating/);
+});
+
+// ---- Microsoft accounts (SELFHOST_MICROSOFT_*) ----------------------------------------
+
+/** An owner signs in through the generic OIDC provider and invites `email`; returns the link token. */
+async function ownerInvite(ctx: Awaited<ReturnType<typeof setup>>, email: string, role: "admin" | "member" = "member") {
+  const owner = (await oidcSignIn(ctx, { email: "admin@acme.test", name: "Ada Admin" })).cookie!;
+  const organizationId = (await whoami(ctx.origin, owner)).body.currentOrganization.id as string;
+  const created = await call(ctx.origin, `/cloud/api/v1/organizations/${organizationId}/invitations`, {
+    method: "POST", cookie: owner, json: { email, role },
+  });
+  assert.equal(created.status, 201, created.text);
+  return { organizationId, owner, token: new URL(created.body.inviteUrl).searchParams.get("invite")! };
+}
+
+test("microsoft config: pairs, tenant, redirect URL, coexists with SELFHOST_OIDC_*", () => {
+  assert.equal(loadIdentityConfig({}).microsoft, null);
+  const base = { SELFHOST_MICROSOFT_CLIENT_ID: "a", SELFHOST_MICROSOFT_CLIENT_SECRET: "b" };
+  assert.throws(() => loadIdentityConfig({ SELFHOST_MICROSOFT_CLIENT_ID: "a" }), /must be set together/);
+  assert.throws(() => loadIdentityConfig({ SELFHOST_MICROSOFT_CLIENT_SECRET: "b" }), /must be set together/);
+  const microsoft = loadIdentityConfig(base).microsoft!;
+  assert.deepEqual(microsoft, {
+    kind: "microsoft",
+    issuer: "https://login.microsoftonline.com/common/v2.0",
+    clientId: "a",
+    clientSecret: "b",
+    scopes: ["openid", "email", "profile"],
+    allowedDomains: [],
+    displayName: "Microsoft",
+    redirectUrl: null,
+    allowHttpIssuer: false,
+    trustMissingEmailVerified: false,
+  });
+  for (const tenant of ["common", "consumers", "organizations", WORK_TENANT]) {
+    assert.equal(loadIdentityConfig({ ...base, SELFHOST_MICROSOFT_TENANT: tenant }).microsoft!.issuer, `https://login.microsoftonline.com/${tenant}/v2.0`);
+  }
+  for (const tenant of ["contoso", "Common", WORK_TENANT.toUpperCase(), "contoso.onmicrosoft.com", "common/v2.0"]) {
+    assert.throws(() => loadIdentityConfig({ ...base, SELFHOST_MICROSOFT_TENANT: tenant }), /SELFHOST_MICROSOFT_TENANT must be/, tenant);
+  }
+  assert.equal(
+    loadIdentityConfig({ ...base, SELFHOST_MICROSOFT_REDIRECT_URL: "https://relay.acme.test/login/microsoft/callback" }).microsoft!.redirectUrl,
+    "https://relay.acme.test/login/microsoft/callback",
+  );
+  for (const redirect of ["https://relay.acme.test/login/oidc/callback", "https://relay.acme.test/login/microsoft/callback?x=1", "not a url"]) {
+    assert.throws(() => loadIdentityConfig({ ...base, SELFHOST_MICROSOFT_REDIRECT_URL: redirect }), /SELFHOST_MICROSOFT_REDIRECT_URL must/, redirect);
+  }
+  const both = loadIdentityConfig({ ...base, SELFHOST_OIDC_ISSUER: "https://idp.acme.test", SELFHOST_OIDC_CLIENT_ID: "c", SELFHOST_OIDC_CLIENT_SECRET: "d" });
+  assert.equal(both.oidc!.kind, "generic");
+  assert.equal(both.oidc!.issuer, "https://idp.acme.test");
+  assert.equal(both.microsoft!.kind, "microsoft");
+});
+
+test("microsoft: an invite to a personal account redeems through Continue with Microsoft", async (t) => {
+  const ctx = await setup(t, { microsoft: {} });
+  const { organizationId, owner, token } = await ownerInvite(ctx, "x@outlook.com", "member");
+
+  const page = await call(ctx.origin, `/login?next=%2Fsettings&invite=${token}`);
+  assert.equal(page.status, 200);
+  assert.match(page.text, /<h1>Join Acme<\/h1>/);
+  assert.match(page.text, /Ada Admin invited you to join as a member/);
+  assert.match(page.text, /Sign in with your invited email to continue\./);
+  const href = `/login/microsoft/start?next=%2Fsettings&amp;invite=${token}`;
+  assert(page.text.includes(`<a class="btn secondary" href="${href}">Continue with Microsoft</a>`), page.text);
+
+  // Wrong account first: refused, the way back keeps next + invite, no membership.
+  const wrong = await microsoftSignIn(ctx, msAccount("other@outlook.com"), `?next=%2Fsettings&invite=${token}`);
+  assert.equal(wrong.callback.status, 403);
+  assert.match(wrong.callback.text, /This invite was sent to x@outlook\.com/);
+  assert(wrong.callback.text.includes(`href="/login?next=%2Fsettings&amp;invite=${token}">Back to sign in</a>`), wrong.callback.text);
+  assert.equal(wrong.cookie, null);
+  const members = await call(ctx.origin, `/cloud/api/v1/organizations/${organizationId}/memberships`, { cookie: owner });
+  assert.equal(members.status, 200, members.text);
+  assert.equal(members.body.memberships.some((m: any) => m.email === "other@outlook.com" || m.email === "x@outlook.com"), false);
+
+  const accepted = await microsoftSignIn(ctx, { ...msAccount("X@Outlook.com"), name: "Xavier" }, `?next=%2Fsettings&invite=${token}`);
+  const location = new URL(accepted.start.headers.get("location")!);
+  assert.equal(location.origin + location.pathname, `${MICROSOFT_HOST}/common/oauth2/v2.0/authorize`);
+  assert.equal(location.searchParams.get("login_hint"), "x@outlook.com");
+  assert.equal(location.searchParams.get("redirect_uri"), `${ctx.origin}/login/microsoft/callback`);
+  assert.equal(location.searchParams.get("scope"), "openid email profile");
+  assert.equal(location.searchParams.get("hd"), null);
+  assert.match(accepted.start.headers.get("set-cookie")!, /agent_relay_microsoft=.*Path=\/login\/microsoft;.*HttpOnly/);
+  assert.equal(accepted.callback.status, 303, accepted.callback.text);
+  assert.equal(accepted.callback.headers.get("location"), "/settings");
+  assert.match(accepted.callback.headers.getSetCookie().join("\n"), /agent_relay_microsoft=; Path=\/login\/microsoft; Max-Age=0/);
+  const me = await whoami(ctx.origin, accepted.cookie!);
+  assert.equal(me.body.user.email, "x@outlook.com");
+  assert.equal(me.body.user.name, "Xavier");
+  assert.equal(me.body.currentOrganization.id, organizationId);
+  assert.equal(me.body.currentOrganization.role, "member");
+  const audit = await ctx.database.query<{ target: string }>("SELECT target FROM admin_audit_events WHERE action = 'invitation.accept'");
+  assert.equal(audit.rows.length, 1);
+  assert.match(audit.rows[0]!.target, /x@outlook\.com role=member via=microsoft$/);
+});
+
+test("microsoft: tenant accounts need xms_edov; the issuer must name the token's tenant", async (t) => {
+  const ctx = await setup(t, { microsoft: {} });
+  const { token } = await ownerInvite(ctx, "dev@fabrikam.test", "member");
+  const query = `?invite=${token}`;
+
+  const unverified = await microsoftSignIn(ctx, msAccount("dev@fabrikam.test", WORK_TENANT), query);
+  assert.equal(unverified.callback.status, 502);
+  assert.match(unverified.callback.text, /isn&#39;t verified/);
+  assert.equal(unverified.cookie, null);
+
+  const falseClaim = await microsoftSignIn(ctx, msAccount("dev@fabrikam.test", WORK_TENANT, { xms_edov: false }), query);
+  assert.equal(falseClaim.callback.status, 502);
+  assert.match(falseClaim.callback.text, /isn&#39;t verified/);
+
+  const otherIssuer = await microsoftSignIn(ctx, msAccount("dev@fabrikam.test", WORK_TENANT, {
+    xms_edov: true,
+    iss: `${MICROSOFT_HOST}/${PERSONAL_TENANT}/v2.0`,
+  }), query);
+  assert.equal(otherIssuer.callback.status, 502);
+  assert.match(otherIssuer.callback.text, /issuer does not match/);
+
+  const noTenant = await microsoftSignIn(ctx, msAccount("dev@fabrikam.test", null, { xms_edov: true }), query);
+  assert.equal(noTenant.callback.status, 502);
+  assert.match(noTenant.callback.text, /no Microsoft tenant/);
+
+  const noEmail = await microsoftSignIn(ctx, { ...msAccount("dev@fabrikam.test", WORK_TENANT, { xms_edov: true }), noEmail: true }, query);
+  assert.equal(noEmail.callback.status, 502);
+  assert.match(noEmail.callback.text, /did not share an email address/);
+
+  const verified = await microsoftSignIn(ctx, msAccount("dev@fabrikam.test", WORK_TENANT, { xms_edov: true }), query);
+  assert.equal(verified.callback.status, 303, verified.callback.text);
+  assert.equal((await whoami(ctx.origin, verified.cookie!)).body.currentOrganization.role, "member");
+
+  // The string form Entra sometimes sends counts too.
+  const { token: second } = await ownerInvite(ctx, "ops@fabrikam.test", "member");
+  const stringClaim = await microsoftSignIn(ctx, msAccount("ops@fabrikam.test", WORK_TENANT, { xms_edov: "true" }), `?invite=${second}`);
+  assert.equal(stringClaim.callback.status, 303, stringClaim.callback.text);
+});
+
+test("microsoft: consumers and single-tenant authorities only accept their own tenant", async (t) => {
+  const consumers = await setup(t, { microsoft: { tenant: "consumers", discoveryIssuer: `${MICROSOFT_HOST}/${PERSONAL_TENANT}/v2.0` } });
+  const { token } = await ownerInvite(consumers, "x@outlook.com", "member");
+  const work = await microsoftSignIn(consumers, msAccount("x@outlook.com", WORK_TENANT, { xms_edov: true }), `?invite=${token}`);
+  assert.equal(work.callback.status, 502);
+  assert.match(work.callback.text, /issuer does not match/);
+  assert.equal(new URL(work.start.headers.get("location")!).pathname, "/consumers/oauth2/v2.0/authorize");
+  const personal = await microsoftSignIn(consumers, msAccount("x@outlook.com"), `?invite=${token}`);
+  assert.equal(personal.callback.status, 303, personal.callback.text);
+
+  // Discovery: the configured issuer, consumers' personal-account issuer, or the template; nothing else.
+  const document = (issuer: string): FetchLike => async () => new Response(JSON.stringify({
+    issuer,
+    authorization_endpoint: `${MICROSOFT_HOST}/x/oauth2/v2.0/authorize`,
+    token_endpoint: `${MICROSOFT_HOST}/x/oauth2/v2.0/token`,
+    jwks_uri: `${MICROSOFT_HOST}/x/discovery/v2.0/keys`,
+  }), { status: 200 });
+  const client = (tenant: string, issuer: string) => new OidcClient(loadIdentityConfig({
+    SELFHOST_MICROSOFT_CLIENT_ID: "a",
+    SELFHOST_MICROSOFT_CLIENT_SECRET: "b",
+    SELFHOST_MICROSOFT_TENANT: tenant,
+  }).microsoft!, document(issuer));
+  const accepted = async (tenant: string, issuer: string) => {
+    try {
+      return Boolean(await client(tenant, issuer).discovery());
+    } catch (error) {
+      assert.equal((error as OidcError).code, "discovery_invalid");
+      return false;
+    }
+  };
+  assert.equal(await accepted("consumers", `${MICROSOFT_HOST}/consumers/v2.0`), true);
+  assert.equal(await accepted("consumers", `${MICROSOFT_HOST}/${PERSONAL_TENANT}/v2.0`), true);
+  assert.equal(await accepted("consumers", `${MICROSOFT_HOST}/${WORK_TENANT}/v2.0`), false);
+  assert.equal(await accepted("common", MICROSOFT_TEMPLATE_ISSUER), true);
+  assert.equal(await accepted("common", `${MICROSOFT_HOST}/${WORK_TENANT}/v2.0`), false);
+  assert.equal(await accepted(WORK_TENANT, `${MICROSOFT_HOST}/${WORK_TENANT}/v2.0`), true);
+  assert.equal(await accepted(WORK_TENANT, `${MICROSOFT_HOST}/${PERSONAL_TENANT}/v2.0`), false);
+  assert.equal(await accepted(WORK_TENANT, `${MICROSOFT_HOST}/${WORK_TENANT}/v2.0/`), false);
+});
+
+test("microsoft: a single-tenant authority refuses tokens from another tenant", async (t) => {
+  const ctx = await setup(t, { microsoft: { tenant: WORK_TENANT } });
+  const { token } = await ownerInvite(ctx, "dev@fabrikam.test", "member");
+  const other = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+  const foreign = await microsoftSignIn(ctx, msAccount("dev@fabrikam.test", other, { xms_edov: true }), `?invite=${token}`);
+  assert.equal(foreign.callback.status, 502);
+  assert.match(foreign.callback.text, /issuer does not match/);
+  const own = await microsoftSignIn(ctx, msAccount("dev@fabrikam.test", WORK_TENANT, { xms_edov: true }), `?invite=${token}`);
+  assert.equal(own.callback.status, 303, own.callback.text);
+});
+
+test("microsoft beside generic OIDC: both buttons, both public configs, Desktop start", async (t) => {
+  const ctx = await setup(t, { microsoft: {} });
+  const login = await call(ctx.origin, "/login");
+  const sso = login.text.indexOf(`<a class="btn" href="/login/oidc/start?next=%2F">Continue with Acme SSO</a>`);
+  const ms = login.text.indexOf(`<a class="btn secondary" href="/login/microsoft/start?next=%2F">Continue with Microsoft</a>`);
+  assert(sso >= 0 && ms > sso, login.text);
+
+  // The generic flow is unchanged.
+  const owner = await oidcSignIn(ctx, { email: "admin@acme.test" });
+  assert.equal(owner.callback.status, 303, owner.callback.text);
+  assert.equal((await whoami(ctx.origin, owner.cookie!)).body.currentOrganization.role, "owner");
+
+  const config = await call(ctx.origin, "/api/v1/auth/login-config");
+  assert.deepEqual(config.body.oidc, { displayName: "Acme SSO" });
+  assert.deepEqual(config.body.microsoft, { displayName: "Microsoft" });
+  const methods = await call(ctx.origin, "/cloud/api/v1/auth/methods", { cookie: owner.cookie! });
+  assert.equal(methods.status, 200, methods.text);
+  assert.deepEqual(methods.body.microsoft, { displayName: "Microsoft" });
+  assert.equal(methods.body.oidc.displayName, "Acme SSO");
+
+  const next = encodeURIComponent("/api/v1/cli/login");
+  const microsoft = await call(ctx.origin, `/cloud/api/auth/microsoft/start?next=${next}`);
+  assert.equal(microsoft.status, 302);
+  assert.equal(microsoft.headers.get("location"), `/login/microsoft/start?next=${encodeURIComponent("/cloud/api/v1/cli/login")}`);
+  assert.equal(microsoft.headers.get("set-cookie"), null);
+  const google = await call(ctx.origin, `/cloud/api/auth/google/start?next=${next}`);
+  assert.equal(google.status, 302);
+  assert.equal(google.headers.get("location"), `/login?next=${encodeURIComponent("/cloud/api/v1/cli/login")}`);
+});
+
+test("microsoft not configured: no button, start answers 404, Desktop start lands on the /login chooser", async (t) => {
+  const ctx = await setup(t);
+  const login = await call(ctx.origin, "/login");
+  assert.doesNotMatch(login.text, /Continue with Microsoft/);
+  const start = await call(ctx.origin, "/login/microsoft/start");
+  assert.equal(start.status, 404);
+  assert.match(start.text, /Microsoft sign-in is not configured/);
+  assert.equal((await call(ctx.origin, "/api/v1/auth/login-config")).body.microsoft, null);
+  // Generic OIDC is configured here, yet the Microsoft start lands on the chooser.
+  const next = encodeURIComponent("/api/v1/cli/login");
+  const microsoft = await call(ctx.origin, `/cloud/api/auth/microsoft/start?next=${next}`);
+  assert.equal(microsoft.status, 302);
+  assert.equal(microsoft.headers.get("location"), `/login?next=${encodeURIComponent("/cloud/api/v1/cli/login")}`);
+  assert.equal(microsoft.headers.get("set-cookie"), null);
+  const google = await call(ctx.origin, `/cloud/api/auth/google/start?next=${next}`);
+  assert.equal(google.headers.get("location"), `/login?next=${encodeURIComponent("/cloud/api/v1/cli/login")}`);
 });
 
 // ---- invites ------------------------------------------------------------------------

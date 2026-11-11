@@ -241,6 +241,7 @@ test("login-config: public, lists methods, logo and domain hint, never secrets",
   assert.deepEqual(res.body, {
     methods: ["email_link", "password"],
     oidc: null,
+    microsoft: null,
     logo_url: "https://cdn.example.test/logo.svg",
     org_name: "Acme",
     allowed_domain_hint: true,
