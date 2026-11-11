@@ -37,7 +37,7 @@ function relaycastFetch(roster: unknown[], world: RelaycastWorld): typeof fetch 
   }) as typeof fetch;
 }
 
-export async function copilotDesktopSetup(t: TestContext) {
+export async function copilotDesktopSetup(t: TestContext, modules: Pick<Parameters<typeof createApp>[0], "capy"> = {}) {
   const database = new PGliteDatabase();
   await migrate(database);
   const roster: unknown[] = [];
@@ -61,7 +61,7 @@ export async function copilotDesktopSetup(t: TestContext) {
     host: "127.0.0.1",
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
-  control.on("request", createApp({ config, store, messagingFetch: relaycastFetch(roster, world) }));
+  control.on("request", createApp({ config, store, messagingFetch: relaycastFetch(roster, world), ...modules }));
   t.after(async () => {
     await close(control);
     await database.close();

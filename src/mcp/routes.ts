@@ -117,6 +117,8 @@ export function createMcpHandler(input: {
   amp?: AmpDeps;
   /** Factory tools and resolver hook, only when SELFHOST_FACTORY_ENABLED is on. */
   factory?: FactoryMcpDeps;
+  /** Internal native send resolver, never supplied to OAuth or managed calls. */
+  capy?: McpContext["capy"];
   /** Provider runtime probes (src/providers/registry.ts); empty when unset. */
   providerProbes?: ProviderProbes;
   /** SELFHOST_FEATURES launch: register the agent launch tools. */
@@ -328,6 +330,7 @@ export function createMcpHandler(input: {
       },
       ...(!oauth && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && input.factory ? { factory: input.factory } : {}),
+      ...(!oauth && !desktopCall.required && desktopCall.provider === undefined && input.capy ? { capy: input.capy } : {}),
       ...(!oauth && input.launch ? { launch: true } : {}),
       readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
     };

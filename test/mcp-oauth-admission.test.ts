@@ -1055,3 +1055,30 @@ test("an OAuth grant stays on its approved agent even with a Desktop marker and 
   const sent=await service.send({to:"peer",text:"from the grant"});
   assert.equal(sent.from,"approved-agent");
 });
+
+test("OAuth consent and live actor admission never adopt Capy binding identities",async t=>{
+  const f=await relayFixture(t),config=appConfig();
+  const store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
+  const account=await f.database.transaction(tx=>store.issueBrowserSession(tx,{...f.owner,label:"capy-domain-test"}));
+  const trap={agentFor:async()=>{assert.fail("OAuth must never invoke native Capy authority");}};
+  const server=createServer(createApp({config,store,messagingFetch:f.fetchImpl,mcpOAuthTeardown:f.teardown,capy:trap}));
+  const base=await listen(server);t.after(()=>close(server));
+  const metadata={source:HOSTED_SOURCE,cloud_workspace_id:f.owner.workspaceId,owner_hash:ownerHash(f.owner.userId)};
+  const remote=f.world.addAgent("approved-agent",metadata);
+  const check=async(name:string)=>{
+    const response=await fetch(base+"/cloud/api/oauth/authorize/agent-name?"+new URLSearchParams({workspace_id:f.owner.workspaceId,name}),
+      {headers:{cookie:"agent_relay_session="+account.accessToken}});
+    assert.equal(response.status,200);return (await response.json()).status;
+  };
+  assert.equal(await check(remote.name),"yours");
+  for(const marker of [{capy_binding_id:randomUUID()},{capy_binding_id:null},{created_by:"capy-binding"}]) {
+    remote.metadata={...metadata,...marker};
+    assert.equal(await check(remote.name),"taken");
+    await assert.rejects(relayService({...f.context,capy:trap}).join({name:remote.name}),/name is already taken/);
+  }
+  assert.equal((await f.database.query("SELECT id FROM hosted_relay_participants")).rows.length,0);
+  assert.equal((await f.database.query("SELECT agent_remote_id FROM mcp_oauth_grants WHERE id=$1",[f.owner.grantId])).rows[0]!.agent_remote_id,null);
+  assert.equal(f.world.bodies.some(call=>call.path.includes("takeover")),false);
+  f.world.addAgent("capy-support",metadata);
+  assert.equal(await check("capy-support"),"yours","name prefix alone does not reserve provider custody");
+});

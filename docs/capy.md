@@ -50,7 +50,7 @@ Lease expiry or a concurrent retirement/member/key change cannot finalize a
 late registration. External waits are bounded; a timeout is not a claim that
 the remote write was cancelled.
 
-This registry has no public bind route or native resolver integration. Runtime
+This registry has no public bind route. Runtime
 capability remains false. Key replacement/disconnect, manager demotion and member removal now
 retire identities in the same transaction as the owning operation: generation
 advances, usable tokens and claims are cleared, and remote cleanup stays pending.
@@ -67,8 +67,23 @@ release is idempotent and generation/ownership checks remain in the service.
 A failed release or moved route retains a coded obligation. It is not silently
 abandoned to unblock workspace deletion. Logs contain only a fixed scan code.
 
-Before mounting new work, add the native `!managed && !oauth` resolver
-integration, routes, callback verification, subscriptions and durable delivery.
+The optional internal MCP resolver now supports sends as an owned native Capy
+binding, only for `!managed && !oauth` calls. The server does not supply it yet.
+It creates no participant alias and grants no join, launch, Desktop-link, inbox,
+conversation-read or channel rights. OAuth admission/pinning never adopts a
+Capy-owned remote identity, even when a binding marker is malformed; ordinary
+participant names beginning with `capy-` remain usable.
+
+The send resolves live custody before preparing the message and again after
+parent/address reads, immediately before the write. A changed token or retired
+binding refuses the send; a verification outage remains an error. This doubles
+the live verification on a send, so measure latency before mounting it. It
+cannot revoke a write already accepted by Relaycast. Retry ambiguous writes
+with the same idempotency key. The receipt confirms Relaycast acceptance only,
+not provider delivery or reading.
+
+Before mounting new work, add routes, callback verification, subscriptions and
+durable delivery.
 No production caller writes binding rows yet.
 
 OAuth `assertActor`/`pin` is unchanged. A future OAuth-bound Capy journey is a

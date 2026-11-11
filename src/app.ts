@@ -67,6 +67,8 @@ import type { TelemetryModule } from "./telemetry/module.js";
 import { identityErrorResponse, type IdentityModule } from "./identity/routes.js";
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
 import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.js";
+import { isCapyBindingIdentity } from "./capy/identity.js";
+import type { McpContext } from "./mcp/context.js";
 import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./factory/routes.js";
 import { createMcpHandler } from "./mcp/routes.js";
 import type { AmpModule } from "./amp/module.js";
@@ -398,6 +400,8 @@ export function createApp(input: {
   messagingFetch?: typeof fetch;
   /** Factory sessions (dormant unless SELFHOST_FACTORY_ENABLED). The server passes its module so it can run the worker. */
   factory?: FactoryModule;
+  /** Internal dormant Capy send resolver; server wiring requires a complete runtime. */
+  capy?: McpContext["capy"];
   /** Desktop feed overrides for tests; the feed itself is on only when config.desktopFeed is set. */
   desktopFeed?: {
     signer?: DesktopFeedSigner;
@@ -532,7 +536,7 @@ export function createApp(input: {
       if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
       const remote=await oauthRelay.getAgent(workspace.relaycastApiKey,name);
       if(!remote) return "available";
-      if(remote.metadata.source!==HOSTED_SOURCE || remote.metadata.cloud_workspace_id!==principal.workspaceId ||
+      if(isCapyBindingIdentity(remote.metadata) || remote.metadata.source!==HOSTED_SOURCE || remote.metadata.cloud_workspace_id!==principal.workspaceId ||
         remote.metadata.owner_hash!==ownerHash(principal.userId)) return "taken";
       // An agent whose release may be in flight cannot be attached to.
       return await retiringIdentity(store.database,{organizationId:principal.organizationId,workspaceId:principal.workspaceId,
@@ -544,6 +548,7 @@ export function createApp(input: {
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
     ...(amp ? { amp: amp.deps } : {}),
     ...(factory.enabled ? { factory: factory.mcp } : {}),
+    ...(input.capy ? { capy: input.capy } : {}),
     ...(features.launch ? { launch: true } : {}),
     ...(mcpOAuth.store ? {oauthSessions:mcpOAuth.store.sessions} : {}),
     ...(input.now ? { now: input.now } : {}),
