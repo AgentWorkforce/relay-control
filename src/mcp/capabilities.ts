@@ -23,6 +23,7 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       role: context.role,
       amp: Boolean(context.amp),
       factory: Boolean(context.factory),
+      launch: Boolean(context.launch),
       providers: await context.providers(),
     });
     return {

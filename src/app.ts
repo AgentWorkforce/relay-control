@@ -530,6 +530,7 @@ export function createApp(input: {
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
     ...(amp ? { amp: amp.deps } : {}),
     ...(factory.enabled ? { factory: factory.mcp } : {}),
+    ...(features.launch ? { launch: true } : {}),
     ...(mcpOAuth.store ? {oauthSessions:mcpOAuth.store.sessions} : {}),
   });
   const desktopMcpCredentials = new DesktopMcpCredentials(store.database);

@@ -84,6 +84,48 @@ export type Conversation = {
   participants: string[];
 };
 
+
+/** A live fleet node as Relaycast's GET /v1/nodes reports it (see src/mcp/relay-spawn.ts). */
+export type RelaySpawnTarget = {
+  id: string;
+  name: string;
+  live: boolean;
+  handlersLive: boolean;
+  /** Only well-formed `spawn:<harness>` capabilities. */
+  capabilities: string[];
+  activeAgents: number;
+  reservedAgents: number;
+  /** 0 is Relaycast's unlimited sentinel. */
+  maxAgents: number;
+  stale: boolean;
+  /** The raw node record, for the allowlisted placement reader. */
+  raw: Record<string, unknown>;
+};
+
+/** A native spawn or release action invocation. */
+export type RelaySpawnInvocation = {
+  id: string;
+  status: string;
+  callerId: string | null;
+  nodeId: string | null;
+  name: string | null;
+  spawned: boolean;
+  ready: boolean;
+  taskUnconfirmed: boolean;
+  /** The upstream error code prefix only (never the free-text reason). */
+  errorCode: string | null;
+  /** A structured spawn refusal code, when Relaycast attached one. */
+  errorDetailsCode: string | null;
+};
+
+/** `spawn:<harness id>`: lowercase letters, digits and hyphens, at most 32 characters. */
+export const RELAY_HARNESS_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
+export function isRelayHarnessCapability(capability: string): boolean {
+  return capability.startsWith("spawn:") && RELAY_HARNESS_ID_PATTERN.test(capability.slice("spawn:".length));
+}
+
+const INVOCATION_STATUSES = new Set(["pending", "dispatched", "running", "completed", "failed"]);
+
 type FetchImpl = typeof fetch;
 
 export function personMetadata(owner: PersonOwner): Record<string, unknown> {
@@ -217,6 +259,26 @@ export function createRelaycastClient(input: {
     const name = text(data?.name);
     if (!data || !id || !name) throw new RelaycastCallError(502, "", true);
     return { id, name, metadata: record(data.metadata) ?? {} };
+  }
+
+  function invocationFrom(value: unknown, write: boolean): RelaySpawnInvocation {
+    const data = record(value);
+    const output = record(data?.output);
+    const id = text(data?.invocation_id) ?? text(data?.id);
+    const status = text(data?.status);
+    if (!id || !status || !INVOCATION_STATUSES.has(status)) throw new RelaycastCallError(502, "", write);
+    const error = text(data?.error);
+    const details = record(data?.error_details);
+    const warning = output?.warning;
+    return {
+      id, status, callerId: text(data?.caller_id),
+      nodeId: text(data?.dispatched_node_id) ?? text(data?.handler_node_id),
+      name: text(output?.name), spawned: output?.spawned === true, ready: output?.ready === true,
+      taskUnconfirmed: warning === "spawn_task_unconfirmed" || record(warning)?.code === "spawn_task_unconfirmed",
+      // Free text can echo tokens: keep only a code-shaped prefix.
+      errorCode: error ? (/^([a-z_]{1,64})(?::|$)/.exec(error)?.[1] ?? "spawn_failed") : null,
+      errorDetailsCode: text(details?.code),
+    };
   }
 
   return {
@@ -612,6 +674,72 @@ export function createRelaycastClient(input: {
       // Snowflake ids: a shorter decimal string is an earlier message.
       messages.sort((left, right) => left.id.length - right.id.length || left.id.localeCompare(right.id));
       return { messages, hasEarlier: data.length >= options.limit };
+    },
+
+    /**
+     * Fleet nodes visible to this workspace key, online only by default. The
+     * key belongs to one Relaycast workspace, so a node enrolled in another
+     * workspace or another installation is never listed.
+     */
+    async listSpawnTargets(workspaceKey: string, options: { includeOffline?: boolean } = {}): Promise<RelaySpawnTarget[]> {
+      const data = await labeled("list_spawn_targets", () =>
+        call("GET", options.includeOffline ? "/v1/nodes?limit=100" : "/v1/nodes?status=online&limit=100", workspaceKey));
+      if (!Array.isArray(data)) throw new RelaycastCallError(502, "", true);
+      return data.flatMap((value): RelaySpawnTarget[] => {
+        const node = record(value);
+        const id = text(node?.id);
+        const name = text(node?.name);
+        if (!node || !id || !name || !Array.isArray(node.capabilities) || !Number.isInteger(node.active_agents)
+          || !Number.isInteger(node.max_agents) || (node.max_agents as number) < 0 || (node.active_agents as number) < 0) return [];
+        // An absent count means no reservations; a malformed one means capacity is unknown.
+        const reserved = node.reserved_agents ?? 0;
+        const reservedValid = Number.isInteger(reserved) && (reserved as number) >= 0;
+        const capabilities = [...new Set((node.capabilities as unknown[])
+          .map(item => typeof item === "string" ? item : text(record(item)?.name))
+          .filter((item): item is string => typeof item === "string" && isRelayHarnessCapability(item)))];
+        return [{
+          id, name, live: node.live === true, handlersLive: node.handlers_live === true, capabilities,
+          activeAgents: node.active_agents as number, reservedAgents: reservedValid ? reserved as number : 0,
+          maxAgents: node.max_agents as number,
+          stale: node.live !== true || node.active_agents_stale === true || !reservedValid,
+          raw: node,
+        }];
+      });
+    },
+
+    /** Sends one native spawn as the hosted actor (agent token); never retried. */
+    async spawnRelayAgent(token: string, input: { name: string; cli: string; task: string; target_node: string; worker_cwd?: string },
+      idempotencyKey: string): Promise<RelaySpawnInvocation> {
+      const data = await labeled("spawn_agent", () => call("POST", "/v1/actions/spawn/invoke", token,
+        { input: { ...input, verify_ready: true } }, idempotencyKey));
+      return invocationFrom(data, true);
+    },
+
+    async getRelayInvocation(token: string, action: "spawn" | "release", id: string): Promise<RelaySpawnInvocation> {
+      const data = await labeled("spawn_status", () =>
+        call("GET", `/v1/actions/${action}/invocations/${encodeURIComponent(id)}`, token));
+      return invocationFrom(data, false);
+    },
+
+    /** Exact release of one immutable worker identity, as the actor that launched it. */
+    async releaseSpawnedAgent(token: string, name: string, expectedAgentId: string, idempotencyKey: string):
+      Promise<{ id: string | null; status: string }> {
+      const data = record(await labeled("release_spawned_agent", () => call("POST", "/v1/agents/release-exact", token, {
+        name, expected_agent_id: expectedAgentId, delete_agent: true, reason: "Released by the owning MCP connection",
+      }, idempotencyKey)));
+      if (data?.status === "completed") return { id: text(data.invocation_id) ?? text(data.id), status: "completed" };
+      const invocation = invocationFrom(data, true);
+      return { id: invocation.id, status: invocation.status };
+    },
+
+    /** The roster entry for a name, with its origin node (spawn readiness checks). */
+    async getSpawnedAgent(workspaceKey: string, name: string): Promise<(RosterAgent & { originNodeId: string | null }) | null> {
+      const data = await labeled("get_spawned_agent", () =>
+        call("GET", `/v1/agents/${encodeURIComponent(name)}`, workspaceKey, undefined, undefined, true));
+      if (data === null) return null;
+      const agent = rosterFrom(data);
+      if (!agent) throw new RelaycastCallError(502, "", true);
+      return { ...agent, originNodeId: text(record(data)?.origin_node_id) };
     },
 
     /** Fresh presence from expiring broker keys, independent of roster status. */

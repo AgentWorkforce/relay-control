@@ -9,6 +9,7 @@ import { NATIVE_SESSION_CAPABILITY } from "./desktop-call.js";
 import { COPILOT_ATTESTATION_CAPABILITY } from "./copilot-attestation.js";
 import { DESKTOP_MCP_CAPABILITY, DESKTOP_MCP_LEASE_SECONDS } from "../auth/desktop-mcp-credentials.js";
 import { registerRelayMessaging } from "./relay-messaging.js";
+import { registerRelaySpawnTools } from "./relay-spawn.js";
 import { RELAY_COORDINATION_GUIDANCE } from "./relay-participants.js";
 import { registerSharedSessionReads } from "./shared-session-reads.js";
 import { registerTeamActivity } from "./team-activity.js";
@@ -46,11 +47,14 @@ export function buildMcpServer(context: McpContext): McpServer {
   // only supplies how each group registers.
   const amp = context.amp;
   const factory = context.factory;
-  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory) }), {
+  // OAuth connections never get launch tools (describe_capabilities says why).
+  const launch = Boolean(context.launch) && !context.oauth;
+  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), launch }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),
     team_activity: () => registerTeamActivity(server, context),
     relay_messaging: () => registerRelayMessaging(server, context),
     capability_discovery: () => registerCapabilityDiscovery(server, context),
+    ...(launch ? { hosted_launch: () => registerRelaySpawnTools(server, context) } : {}),
     ...(amp ? { amp: () => registerAmpTools(server, context, amp) } : {}),
     ...(factory ? { factory: () => registerFactoryTools(server, context, factory) } : {}),
   });

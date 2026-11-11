@@ -34,8 +34,9 @@ import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } f
  * session acts as that identity unless `as` names a hosted participant, so
  * DMs and channel posts reach the Desktop natively; an unlinked session acts
  * as its hosted participant. OAuth grants act only as their approved agent
- * and never link. Person sends (`as_person`), events inboxes, launches and
- * Capy are not part of self-host.
+ * and never link. Person sends (`as_person`), events inboxes and Capy are not
+ * part of self-host; launches (SELFHOST_FEATURES launch) go through
+ * withSpawnActor and src/mcp/relay-spawn.ts.
  */
 
 export class RelayToolError extends Error {
@@ -235,6 +236,22 @@ type ParticipantOptions = {
   bind?: boolean;
   executor?: SqlExecutor;
 };
+/** The hosted participant every agent launch of one owner is sent as (src/mcp/relay-spawn.ts). */
+export type SpawnActor = { id: string; name: string; token: string; relaycastWorkspaceId: string };
+/** The owner's launcher name: never derived from a display name. */
+export const launcherName = (userId: string) => `launcher-${ownerHash(userId).slice(0, 16)}`;
+export const LAUNCH_OAUTH_REFUSED = "Agent launches are not available through an OAuth MCP connection on this self-hosted site. Connect with an Agent Relay CLI login or Agent Relay Desktop.";
+const ACTIVE_LAUNCHES = "This participant still owns agent launches that have not been released. Release them with release_relay_agent first.";
+
+/** Whether a hosted actor still owns a launch that is not terminal; its token is needed to release it. */
+async function hasActiveLaunches(executor: SqlExecutor, workspaceId: string, actorId: string): Promise<boolean> {
+  const result = await executor.query(
+    `SELECT 1 FROM relay_spawns WHERE workspace_id = $1 AND actor_id = $2 AND state NOT IN ('failed', 'released') LIMIT 1`,
+    [workspaceId, actorId],
+  );
+  return result.rows.length > 0;
+}
+
 const NO_PARTICIPANT_MESSAGE = "No hosted participant with that name is owned by you in this workspace.";
 const rejectedToken = (name: string) => new RelayToolError(
   `The relay token for participant ${name} was rejected by Relaycast. Call join_relay with name=${name} to recover it, or leave_relay to remove it.`);
@@ -582,6 +599,7 @@ function createRelayService(context: McpContext) {
         return { identity, alreadyJoined: true };
       }
       const hosted = await participant(undefined, { allowGone: true, allowRejected: true, executor: tx });
+      if (hosted && await hasActiveLaunches(tx, workspaceId, hosted.row.agentRemoteId)) throw new RelayToolError(ACTIVE_LAUNCHES);
       await bind();
       try {
         if (hosted) {
@@ -684,7 +702,37 @@ function createRelayService(context: McpContext) {
     throw new RelayToolError(`You are not subscribed to #${channel}. Call subscribe_relay_channel first.`);
   }
 
+  /**
+   * The owner's launcher participant, created on first use. Every launch is
+   * sent as it, never as a person, a Desktop identity or another session's
+   * participant, so leaving or relinking a chat cannot strand a launch. A
+   * managed (Desktop provider) chat or a session linked to a Desktop identity
+   * must still prove that identity, or it launches nothing.
+   */
+  async function withSpawnActor<T>(fn: (actor: SpawnActor) => Promise<T>): Promise<T> {
+    if (oauth) throw new RelayToolError(LAUNCH_OAUTH_REFUSED);
+    if (managed) await desktop();
+    else if (sessionHash) {
+      const linkedRow = await findDesktopIdentityBySession(executor, workspaceId, userId, sessionHash);
+      if (linkedRow) await verifiedDesktop(linkedRow);
+    }
+    const name = launcherName(userId);
+    const actor = await withOwnerLock(async (tx) => {
+      let hosted = await participant(name, { allowMissing: true, allowRejected: true, executor: tx });
+      if (!hosted) {
+        await registerParticipant(tx, name, null, "Launches agents for its owner through MCP");
+        hosted = await participant(name, { executor: tx });
+        if (!hosted) throw new RelayToolError("Could not create the launcher participant. Retry.");
+      }
+      const token = hosted.tokenUsable ? hosted.token : await recoverToken(tx, hosted);
+      return { id: hosted.row.agentRemoteId, name: hosted.name, token, relaycastWorkspaceId: relayWorkspaceId };
+    });
+    return fn(actor);
+  }
+
   return {
+    withSpawnActor,
+
     async list(input: { status: "live" | "all" | "offline"; person?: string; query?: string; include_stale?: boolean }) {
       const query = input.query?.toLowerCase();
       const person = input.person?.toLowerCase();
@@ -718,6 +766,7 @@ function createRelayService(context: McpContext) {
         if (oauth && await oauth.claimedByOther(tx, { agentName: hosted.name, agentRemoteId: hosted.row.agentRemoteId })) {
           throw new RelayToolError("Another active connection still uses this agent. Disconnect it before leaving.");
         }
+        if (await hasActiveLaunches(tx, workspaceId, hosted.row.agentRemoteId)) throw new RelayToolError(ACTIVE_LAUNCHES);
         if (hosted.remotePresent) {
           try {
             await client.releaseHosted(key, hosted.name, hosted.row.agentRemoteId);

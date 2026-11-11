@@ -78,7 +78,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
   team_activity: { title: "Workspace team activity", tools: ["list_team_activity"] },
   relay_messaging: { title: "Relay messaging and channels", tools: RELAY_TOOLS },
   customer_support: { title: "Private customer support", tools: ["ask_customer_support"] },
-  hosted_launch: { title: "Hosted agent launches", tools: RELAY_SPAWN_TOOLS },
+  hosted_launch: { title: "Agent launches", tools: RELAY_SPAWN_TOOLS },
   amp: { title: "Amp threads", tools: AMP_TOOLS },
   factory: { title: "Factory Droid sessions", tools: FACTORY_TOOLS },
   replicas: { title: "Replicas agents", tools: REPLICAS_TOOLS },
@@ -95,8 +95,11 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; launch?: boolean } = {}): ToolPlanEntry[] {
   const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relay_messaging"];
+  // Launch tools exist only when SELFHOST_FEATURES selects launch; role and
+  // connection kind are checked on every call.
+  if (options.launch) groups.push("hosted_launch");
   // Amp tools exist only when SELFHOST_AMP_ENABLED is on.
   if (options.amp) groups.push("amp");
   // Factory tools exist only when SELFHOST_FACTORY_ENABLED is on.
@@ -115,6 +118,9 @@ export function registerToolPlan(plan: readonly ToolPlanEntry[], registrars: Too
     register(planned);
   }
 }
+
+/** The owner/admin refusal shared by describe_capabilities and every launch tool. */
+export const LAUNCH_ROLE_REFUSAL = "Only current workspace owners and admins can manage agent launches. Call describe_capabilities for details.";
 
 export type McpAuthMode = "session" | "cli_login" | "oauth";
 
@@ -148,7 +154,9 @@ export type CapabilityReport = {
  * What this connection can use and, for everything else, why not. Derived
  * from the same plan the server registered. Cloud's report also names its
  * relay-events endpoint (`other_endpoint`); self-host does not serve one, so
- * the field is omitted, and launches are never available (`can_launch` false).
+ * the field is omitted. `can_launch` is true only when the launch feature is
+ * selected, this is a person connection (not OAuth) and the role read at
+ * admission is owner or admin; each launch call checks again.
  */
 export function describeCapabilities(input: {
   endpointUrl: string;
@@ -158,9 +166,13 @@ export function describeCapabilities(input: {
   role: WorkspaceRole;
   amp?: boolean;
   factory?: boolean;
+  launch?: boolean;
   providers: ProviderStatus[];
 }): CapabilityReport {
-  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory }).map(item => [item.group, item]));
+  const launchRole = input.role === "owner" || input.role === "admin";
+  const canLaunch = Boolean(input.launch) && input.authMode !== "oauth" && launchRole;
+  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, launch: input.launch && input.authMode !== "oauth" })
+    .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
     const definition = TOOL_GROUPS[id];
     const base = { id, title: definition.title };
@@ -170,7 +182,22 @@ export function describeCapabilities(input: {
         reason: "This OAuth connection does not grant transcript-history access.",
         how_to_enable: "Use an authorized native Agent Relay session for transcript reads." };
     }
+    if (item && id === "hosted_launch" && !launchRole) {
+      return { ...base, status: "restricted", tools: [...item.tools],
+        reason: LAUNCH_ROLE_REFUSAL,
+        how_to_enable: "Ask a workspace owner to make you an owner or admin." };
+    }
     if (item) return { ...base, status: "available", tools: [...item.tools] };
+    if (id === "hosted_launch" && input.launch && input.authMode === "oauth") {
+      return { ...base, status: "unavailable", tools: [...definition.tools],
+        reason: "Agent launches are not available through an OAuth MCP connection on this self-hosted site.",
+        how_to_enable: "Connect with an Agent Relay CLI login or Agent Relay Desktop." };
+    }
+    if (id === "hosted_launch") {
+      return { ...base, status: "unavailable", tools: [...definition.tools],
+        reason: "Agent launches are not enabled on this self-hosted installation.",
+        how_to_enable: "An operator adds launch to SELFHOST_FEATURES (chart selectedFeatures)." };
+    }
     return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: `${definition.title} are not part of the self-hosted Agent Relay edition.`,
       how_to_enable: "Use the hosted Agent Relay Cloud for these tools." };
@@ -178,7 +205,7 @@ export function describeCapabilities(input: {
   return {
     endpoint: { facade: MCP_FACADE.facade, name: MCP_FACADE.name, url: input.endpointUrl },
     connection: { auth_mode: input.authMode, description: AUTH_MODE_LABELS[input.authMode], scopes: [...input.scopes] },
-    workspace: { workspace_id: input.workspaceId, role: input.role ?? "unknown", can_launch: false },
+    workspace: { workspace_id: input.workspaceId, role: input.role ?? "unknown", can_launch: canLaunch },
     groups,
     providers: input.providers,
   };

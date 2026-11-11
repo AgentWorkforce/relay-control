@@ -58,6 +58,8 @@ export type McpContext = {
   };
   /** Amp control (SELFHOST_AMP_ENABLED); absent when the feature is off. */
   amp?: AmpDeps;
+  /** Agent launch tools (SELFHOST_FEATURES launch); false or absent when the feature is off. */
+  launch?: boolean;
   /** Factory sessions (SELFHOST_FACTORY_ENABLED); absent when the feature is off. */
   factory?: FactoryMcpDeps;
 };
