@@ -596,7 +596,7 @@ test("route: the capture policy revision is reported by default and enforced wit
     })).status, 200);
     const warned: unknown[][] = [];
     t.mock.method(console, "warn", (...args: unknown[]) => { warned.push(args); });
-    for (const revision of [undefined, "1", "nope"]) {
+    for (const revision of [undefined, "1", "0", "nope"]) {
       const answer = await ask(revision);
       if (mode === "enforce") {
         assert.equal(answer.status, 409, `${mode} ${revision}`);
@@ -606,7 +606,7 @@ test("route: the capture policy revision is reported by default and enforced wit
       }
     }
     const logged = warned.filter(([message]) => message === "[selfhost-api] capture policy upload check").map(([, fields]) => fields);
-    assert.deepEqual(logged.map((fields) => (fields as { outcome: string }).outcome), ["missing", "stale", "missing"]);
+    assert.deepEqual(logged.map((fields) => (fields as { outcome: string }).outcome), ["missing", "stale", "stale", "missing"]);
     assert.ok(logged.every((fields) => (fields as { mode: string; revision: number }).mode === mode && (fields as { revision: number }).revision === 2));
     // The current revision (or a newer one) passes, unlogged.
     warned.length = 0;
