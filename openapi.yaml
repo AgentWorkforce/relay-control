@@ -3349,6 +3349,84 @@ paths:
           description: The read API handoff failed or its reply failed identity/scope/token validation
         "503":
           description: The read API refused because its credential backend is unavailable
+  /api/v1/workspaces/{workspaceId}/relayhistory/upload-credentials:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: issueRelayhistoryUploadCredentials
+      summary: Issue direct-to-S3 session upload credentials (SELFHOST_HISTORY_UPLOAD_DIRECT).
+      description: |
+        Off by default (SELFHOST_HISTORY_UPLOAD_DIRECT unset or `off`); the
+        `allowlist` mode serves only the listed user ids, `on` serves every
+        caller. Bearer clients holding a live `sh_at_` token with `rth:sync`
+        only, under the same caller checks as POST .../relayhistory/session
+        mode=sync. Also served under /cloud, where a cookie session gets 403.
+
+        `kind=sts` returns AWS session credentials (1 hour, the role chaining
+        cap) that can only create SSE-KMS objects under `keyPrefix`.
+        `kind=presigned` returns one presigned PUT URL (at most 15 minutes)
+        per requested `{ key, sha256 }`. Object keys are `keyPrefix` plus a
+        relative key: 1 to 512 characters of `/`-separated segments, each
+        matching `^[A-Za-z0-9][A-Za-z0-9._=-]{0,159}$`. Control validates
+        only this segment rule; the pipeline's layout (informative) is
+        `o=<originId>/b=<sha256hex(batchId)[:32]>/d=<sha256hex(objectBytes)[:32]>-w<witnessSeq>.json.zst`,
+        where originId is itself a segment (up to 128 characters). Both
+        responses lead with `contract: relay-upload-inbox-v1`.
+
+        `witness` is opaque: send it verbatim as the object metadata header
+        `x-amz-meta-relay-witness`. `witnessSeq` is the privacy journal seq
+        signed inside the witness; clients name their object key with it.
+        Every PUT must carry `x-amz-server-side-encryption: aws:kms`,
+        `x-amz-server-side-encryption-aws-kms-key-id: <kmsKeyId>` and
+        `If-None-Match: *` (create only). Presigned PUTs must also send
+        `Content-Encoding: zstd` and `x-amz-checksum-sha256: <sha256>`
+        verbatim; all of these headers are signed into the URL. Objects over
+        `maxObjectBytes` are refused by the pipeline consumer. Renew at
+        `refreshAfter`. When this route answers 404 `history_upload_direct_off`
+        or 503, fall back to the ingest-edge upload (POST
+        .../relayhistory/session mode=sync). Replies carry
+        Cache-Control: no-store. See docs/sessions-read-api.md.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HistoryUploadCredentialsRequest"
+      responses:
+        "200":
+          description: Upload credentials for the requested kind.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HistoryUploadCredentials"
+        "400":
+          description: |
+            `invalid_request`: the body fails the request schema.
+            `invalid_tenant`: the organization id cannot be an upload key segment.
+        "401":
+          description: |
+            `unauthorized`: missing, expired or revoked user token, a non-`sh_at_`
+            token, or a token not valid for uploads (no live `rth:sync`).
+        "403":
+          description: |
+            `forbidden`: a browser cookie session. `handoff_not_exchanged`:
+            unexchanged Desktop sign-in handoff.
+        "404":
+          description: |
+            `workspace_not_found`: the workspace does not exist or is outside
+            the bearer tenant. `history_upload_direct_off`: direct uploads are
+            off for this caller (the feature is off, or the caller is not
+            allowlisted); fall back to the ingest-edge upload. Authentication
+            and authorization refusals are always 401/403, never 404.
+        "405":
+          description: Only POST is allowed (when the feature is on for the deployment).
+        "429":
+          description: More than 12 upload credential requests per user/workspace per minute (retry-after set).
+        "503":
+          description: |
+            `upload_credentials_unavailable` (AssumeRole failed) or
+            `privacy_journal_unavailable` (the privacy journal could not be
+            read or is invalid); fall back to the ingest-edge upload.
   /api/v1/workspaces/{workspaceId}/session-read/session:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -7317,6 +7395,100 @@ components:
           items: { type: string, enum: ["rth:sync"] }
         orgId: { type: string }
         workspaceId: { type: string }
+    HistoryUploadCredentialsRequest:
+      type: object
+      required: [originId, kind]
+      properties:
+        originId:
+          type: string
+          pattern: '^[A-Za-z0-9._-]{1,128}$'
+          description: A key segment (not dot-leading); it becomes the `o=<originId>` segment of the object key.
+        kind: { type: string, enum: [sts, presigned] }
+        keys:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: |
+            Required for kind=presigned (one URL per entry, unique keys);
+            validated and ignored for kind=sts. The PUT must send
+            `Content-Encoding: zstd` and `x-amz-checksum-sha256: <sha256>`
+            verbatim; both are signed into the URL.
+          items:
+            type: object
+            required: [key, sha256]
+            properties:
+              key:
+                type: string
+                minLength: 1
+                maxLength: 512
+                description: |
+                  Relative to keyPrefix; `/`-separated segments matching `^[A-Za-z0-9][A-Za-z0-9._=-]{0,159}$`.
+                  Control validates only this segment rule; the pipeline's layout (informative) is
+                  `o=<originId>/b=<sha256hex(batchId)[:32]>/d=<sha256hex(objectBytes)[:32]>-w<witnessSeq>.json.zst`.
+              sha256:
+                type: string
+                pattern: '^[A-Za-z0-9+/]{43}=$'
+                description: Base64 of the raw 32-byte SHA-256 of the object bytes as uploaded (zstd wire bytes).
+    HistoryUploadCredentials:
+      oneOf:
+        - $ref: "#/components/schemas/HistoryUploadStsCredentials"
+        - $ref: "#/components/schemas/HistoryUploadPresignedCredentials"
+      discriminator:
+        propertyName: kind
+        mapping:
+          sts: "#/components/schemas/HistoryUploadStsCredentials"
+          presigned: "#/components/schemas/HistoryUploadPresignedCredentials"
+    HistoryUploadStsCredentials:
+      type: object
+      description: |
+        Session credentials that can only PutObject (create-only, SSE-KMS with
+        kmsKeyId) and AbortMultipartUpload under keyPrefix. 1 hour lifetime.
+      required: [contract, kind, bucket, region, endpoint, keyPrefix, kmsKeyId, credentials, witness, witnessSeq, maxObjectBytes, refreshAfter]
+      properties:
+        contract: { type: string, enum: [relay-upload-inbox-v1] }
+        kind: { type: string, enum: [sts] }
+        bucket: { type: string }
+        region: { type: string }
+        endpoint: { type: [string, "null"], description: Always null (the AWS regional endpoint). }
+        keyPrefix: { type: string, description: "`<keyRoot>/.upload-inbox/<org>/v1/ws=<ws>/u=<userHash>/`" }
+        kmsKeyId: { type: string }
+        credentials:
+          type: object
+          required: [accessKeyId, secretAccessKey, sessionToken, expiresAt]
+          properties:
+            accessKeyId: { type: string }
+            secretAccessKey: { type: string }
+            sessionToken: { type: string }
+            expiresAt: { type: string, format: date-time }
+        witness: { type: string, description: Opaque; send verbatim as x-amz-meta-relay-witness. }
+        witnessSeq: { type: integer, minimum: 0, description: The privacy journal seq signed inside the witness. }
+        maxObjectBytes: { type: integer }
+        refreshAfter: { type: string, format: date-time, description: 10 minutes before expiry (at least 1 minute from now). }
+    HistoryUploadPresignedCredentials:
+      type: object
+      description: One presigned PUT URL per requested key; no credentials field.
+      required: [contract, kind, bucket, region, endpoint, keyPrefix, kmsKeyId, witness, witnessSeq, maxObjectBytes, refreshAfter, urls]
+      properties:
+        contract: { type: string, enum: [relay-upload-inbox-v1] }
+        kind: { type: string, enum: [presigned] }
+        bucket: { type: string }
+        region: { type: string }
+        endpoint: { type: [string, "null"], description: Always null (the AWS regional endpoint). }
+        keyPrefix: { type: string }
+        kmsKeyId: { type: string }
+        witness: { type: string, description: Opaque; send verbatim as x-amz-meta-relay-witness (signed into each URL). }
+        witnessSeq: { type: integer, minimum: 0, description: The privacy journal seq signed inside the witness. }
+        maxObjectBytes: { type: integer }
+        refreshAfter: { type: string, format: date-time, description: 5 minutes before the URLs expire (at least 1 minute from now). }
+        urls:
+          type: array
+          items:
+            type: object
+            required: [key, url, expiresAt]
+            properties:
+              key: { type: string }
+              url: { type: string, format: uri }
+              expiresAt: { type: string, format: date-time }
     SessionReadCredentials:
       type: object
       additionalProperties: false

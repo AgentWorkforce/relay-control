@@ -78,7 +78,11 @@ export function signV4(input: {
   };
 }
 
-/** Query-string presigning (S3 GET), host as the only signed header, UNSIGNED-PAYLOAD. */
+/**
+ * Query-string presigning with UNSIGNED-PAYLOAD. `host` is always signed;
+ * `signedHeaders` adds headers the client must then send with exactly these
+ * values (names are lower-cased). Without it, host is the only signed header.
+ */
 export function presignV4(input: {
   method: string;
   url: URL;
@@ -87,6 +91,7 @@ export function presignV4(input: {
   credentials: AwsCredentials;
   now: Date;
   expiresSeconds: number;
+  signedHeaders?: Record<string, string>;
 }): URL {
   const { amzDate, date } = amzDates(input.now);
   const scope = `${date}/${input.region}/${input.service}/aws4_request`;
@@ -96,9 +101,16 @@ export function presignV4(input: {
   url.searchParams.set("X-Amz-Date", amzDate);
   url.searchParams.set("X-Amz-Expires", String(input.expiresSeconds));
   if (input.credentials.sessionToken) url.searchParams.set("X-Amz-Security-Token", input.credentials.sessionToken);
-  url.searchParams.set("X-Amz-SignedHeaders", "host");
+  const headers: Record<string, string> = {
+    ...Object.fromEntries(Object.entries(input.signedHeaders ?? {}).map(([k, v]) => [k.toLowerCase(), v.trim()])),
+    host: url.host,
+  };
+  const names = Object.keys(headers).sort();
+  const signedHeaders = names.join(";");
+  url.searchParams.set("X-Amz-SignedHeaders", signedHeaders);
   const query = canonicalQuery(url.searchParams.entries());
-  const canonicalRequest = [input.method, url.pathname, query, `host:${url.host}\n`, "host", "UNSIGNED-PAYLOAD"].join("\n");
+  const canonicalHeaders = names.map((name) => `${name}:${headers[name]}\n`).join("");
+  const canonicalRequest = [input.method, url.pathname, query, canonicalHeaders, signedHeaders, "UNSIGNED-PAYLOAD"].join("\n");
   const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha256Hex(canonicalRequest)].join("\n");
   const sig = signature(input.credentials.secretAccessKey, date, input.region, input.service, stringToSign);
   url.search = `${query}&X-Amz-Signature=${sig}`;

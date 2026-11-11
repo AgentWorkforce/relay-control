@@ -3,6 +3,20 @@
 Notable changes to the self-hosted control plane. Dates and versions are
 assigned at release.
 
+## Unreleased
+
+- Added: direct-to-S3 session upload credentials,
+  `POST /api/v1/workspaces/{ws}/relayhistory/upload-credentials`, behind
+  `SELFHOST_HISTORY_UPLOAD_DIRECT` (`off` by default, `allowlist`, `on`). A
+  bearer client holding `rth:sync` gets STS session credentials scoped to its
+  own upload inbox prefix (`<keyRoot>/.upload-inbox/<org>/v1/ws=<ws>/u=<userHash>/`,
+  create-only SSE-KMS PutObject) or presigned PUT URLs for the keys it names,
+  plus a signed `v1.` privacy witness and its `witnessSeq`. Both responses
+  carry `contract: relay-upload-inbox-v1` as their first field; the witness
+  key is base64url of at least 32 bytes.
+  No AWS SDK: AssumeRole runs over the STS query API on the existing SigV4
+  helper. See docs/sessions-read-api.md.
+
 ## 0.5.11 (2026-11-11)
 
 - Added: Microsoft sign-in ("Continue with Microsoft") for Outlook.com, Hotmail

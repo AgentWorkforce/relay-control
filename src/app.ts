@@ -32,6 +32,15 @@ import { createDesktopFeedHandler, type DesktopFeedLimits } from "./desktop-feed
 import { AwsKmsDesktopFeedSigner, MemoryDesktopFeedSigner, type DesktopFeedSigner } from "./desktop-feed/signer.js";
 import { MemoryDesktopFeedStorage, S3DesktopFeedStorage, type DesktopFeedStorage } from "./desktop-feed/storage.js";
 import { DesktopFeedStore } from "./desktop-feed/store.js";
+import { DefaultAwsCredentialProvider, type AwsCredentialProvider } from "./aws/sigv4.js";
+import { AwsStsClient, type StsClient } from "./aws/sts.js";
+import {
+  HistoryUploadCredentials,
+  parseUploadCredentialsRequest,
+  S3PrivacyJournalReader,
+  UploadCredentialsError,
+  type PrivacyJournalReader,
+} from "./history-upload/credentials.js";
 import {
   ACCOUNT_SCOPE,
   DASHBOARD_DEVICE_CLIENT,
@@ -387,6 +396,14 @@ export function createApp(input: {
     limits?: Partial<DesktopFeedLimits>;
     log?: (message: string, fields: Record<string, unknown>) => void;
   };
+  /** Direct-to-S3 upload credential overrides for tests; the route is on only when config.historyUpload is set. */
+  historyUpload?: {
+    sts?: StsClient;
+    journal?: PrivacyJournalReader;
+    credentials?: AwsCredentialProvider;
+    endpoints?: { sts?: string; s3?: string };
+    fetchImpl?: typeof fetch;
+  };
   now?: () => Date;
   /** Test hooks for claim leases and crash injection. Production leaves this unset. */
   messaging?: Pick<MessagingDeps,
@@ -722,6 +739,55 @@ export function createApp(input: {
     })
     : null;
 
+  // Direct-to-S3 session uploads (docs/sessions-read-api.md): off, so the
+  // upload-credentials route 404s, unless SELFHOST_HISTORY_UPLOAD_DIRECT is
+  // allowlist or on. One AWS credential provider serves STS and the journal.
+  const uploadConfig = config.historyUpload ?? null;
+  const historyUpload = uploadConfig
+    ? (() => {
+      const hooks = input.historyUpload;
+      const credentials = hooks?.credentials ?? new DefaultAwsCredentialProvider();
+      return new HistoryUploadCredentials({
+        config: uploadConfig,
+        sts: hooks?.sts ?? new AwsStsClient({
+          region: uploadConfig.region, credentials, endpoint: hooks?.endpoints?.sts, fetchImpl: hooks?.fetchImpl, now: input.now,
+        }),
+        journal: hooks?.journal ?? new S3PrivacyJournalReader({
+          bucket: uploadConfig.bucket,
+          region: uploadConfig.region,
+          credentials,
+          endpoint: hooks?.endpoints?.s3,
+          fetchImpl: hooks?.fetchImpl,
+          now: input.now,
+        }),
+        now: input.now,
+      });
+    })()
+    : null;
+
+  /**
+   * The bearer-client checks shared by sync mode of .../relayhistory/session
+   * and .../relayhistory/upload-credentials: a browser session, an
+   * unexchanged handoff, a non-user token or a token not live for rth:sync
+   * is refused. Returns the introspection result.
+   */
+  async function assertNativeUploadCaller(
+    request: IncomingMessage,
+    access: Awaited<ReturnType<typeof workspaceAccess>>,
+  ) {
+    const { principal, workspace, token } = access;
+    if (!bearer(request)) throw new HttpError(403, "forbidden", "Browser clients cannot obtain upload credentials");
+    if (principal.pendingHandoff) {
+      throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+    }
+    if (!token.startsWith(ACCESS_TOKEN_PREFIX)) throw new HttpError(401, "unauthorized", "User token required");
+    const active = await introspect(config, store, { token, aud: config.sessionReadApi.publicUrl, workspace: workspace.id });
+    if (!active.active || !active.scopes.includes("rth:sync")) {
+      throw new HttpError(401, "unauthorized", "Token is not valid for uploads");
+    }
+    return active;
+  }
+
   /**
    * POST .../relayhistory/session, served by the sessions pipeline (the only
    * History backend). `read` is the read API handoff. `sync` hands a bearer
@@ -761,12 +827,7 @@ export function createApp(input: {
       const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
       return browser ? accessOnly : session;
     }
-    if (browser) throw new HttpError(403, "forbidden", "Browser clients cannot obtain upload credentials");
-    if (!token.startsWith(ACCESS_TOKEN_PREFIX)) throw new HttpError(401, "unauthorized", "User token required");
-    const active = await introspect(config, store, { token, aud: api.publicUrl, workspace: workspace.id });
-    if (!active.active || !active.scopes.includes("rth:sync")) {
-      throw new HttpError(401, "unauthorized", "Token is not valid for uploads");
-    }
+    const active = await assertNativeUploadCaller(request, access);
     const expiresAt = new Date(Math.min(active.exp * 1_000, Date.now() + NATIVE_UPLOAD_SESSION_MAX_MS)).toISOString();
     return {
       baseUrl: api.publicUrl,
@@ -2171,6 +2232,40 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       const label = stringField(body, "label", false);
       json(response, 200, await nativeHistorySession(request, response, access, mode, label), true);
+      return;
+    }
+
+    // Direct-to-S3 upload credentials (docs/sessions-read-api.md). Off and
+    // not-allowlisted answer the same 404 so a client cannot tell them apart.
+    const historyUploadCredentials = routeMatch(
+      path,
+      /^\/api\/v1\/workspaces\/([^/]+)\/relayhistory\/upload-credentials$/,
+    );
+    if (historyUploadCredentials) {
+      if (!historyUpload || !uploadConfig) {
+        throw new HttpError(404, "history_upload_direct_off", "Direct session uploads are not enabled");
+      }
+      if (method !== "POST") {
+        response.setHeader("allow", "POST");
+        throw new HttpError(405, "method_not_allowed", "Method not allowed");
+      }
+      const access = await workspaceAccess(request, historyUploadCredentials[0]!);
+      await assertNativeUploadCaller(request, access);
+      const { principal, workspace } = access;
+      if (uploadConfig.mode === "allowlist" && !uploadConfig.allowlist.includes(principal.userId)) {
+        throw new HttpError(404, "history_upload_direct_off", "Direct session uploads are not enabled");
+      }
+      rateLimit(response, `history-upload-credentials:${principal.userId}:${workspace.id}`,
+        { limit: 12, windowMs: 60_000 }, "rate_limited", "Too many upload credential requests");
+      try {
+        const parsed = parseUploadCredentialsRequest(await requestObject(request));
+        json(response, 200, await historyUpload.issue({
+          orgId: workspace.organizationId, workspaceId: workspace.id, userId: principal.userId,
+        }, parsed), true);
+      } catch (error) {
+        if (error instanceof UploadCredentialsError) throw new HttpError(error.status, error.code, error.message);
+        throw error;
+      }
       return;
     }
 
