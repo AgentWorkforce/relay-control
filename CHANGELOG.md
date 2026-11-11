@@ -9,8 +9,11 @@ assigned at release.
   `POST /api/v1/workspaces/{ws}/relayhistory/upload-credentials`, behind
   `SELFHOST_HISTORY_UPLOAD_DIRECT` (`off` by default, `allowlist`, `on`). A
   bearer client holding `rth:sync` gets STS session credentials scoped to its
-  own quarantine prefix (create-only SSE-KMS PutObject) or presigned PUT URLs
-  for the keys it names, plus a signed privacy witness and its `witnessSeq`.
+  own upload inbox prefix (`<keyRoot>/.upload-inbox/<org>/v1/ws=<ws>/u=<userHash>/`,
+  create-only SSE-KMS PutObject) or presigned PUT URLs for the keys it names,
+  plus a signed `v1.` privacy witness and its `witnessSeq`. Both responses
+  carry `contract: relay-upload-inbox-v1` as their first field; the witness
+  key is base64url of at least 32 bytes.
   No AWS SDK: AssumeRole runs over the STS query API on the existing SigV4
   helper. See docs/sessions-read-api.md.
 

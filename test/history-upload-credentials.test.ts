@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
@@ -13,10 +14,11 @@ import {
   journalKey,
   JournalUnavailableError,
   layoutComponent,
-  quarantinePrefix,
+  uploadInboxPrefix,
   S3PrivacyJournalReader,
   sessionPolicy,
   signWitness,
+  UPLOAD_CONTRACT,
   uploadKeyValid,
   uploadUserHash,
   verifyWitness,
@@ -31,7 +33,9 @@ const INTERNAL = "internal-service-token-at-least-32-bytes!";
 const INTROSPECT_SECRET = "introspect-secret-that-is-at-least-32-bytes";
 const READ_SECRET = "session-read-secret-that-is-at-least-32-b";
 const ORIGIN = "https://history.selfhosted.company";
-const WITNESS_KEY = "witness-test-key-0123456789abcdef0123456789abcdef";
+/** base64url of the 32 ASCII bytes "witness-test-key-0123456789abcde". */
+const WITNESS_KEY = "d2l0bmVzcy10ZXN0LWtleS0wMTIzNDU2Nzg5YWJjZGU";
+const WITNESS_KEY_BYTES = Buffer.from(WITNESS_KEY, "base64url");
 const ROLE_ARN = "arn:aws:iam::123456789012:role/history-upload-test";
 const KMS_ARN = "arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555";
 const BUCKET = "history-upload-test";
@@ -89,7 +93,7 @@ async function fakeAws(t: TestContext) {
 function uploadConfig(overrides: Partial<HistoryUploadConfig> = {}): HistoryUploadConfig {
   return {
     mode: "allowlist", allowlist: [], bucket: BUCKET, region: "us-east-1", keyRoot: "96bulls",
-    roleArn: ROLE_ARN, kmsKeyArn: KMS_ARN, witnessKey: WITNESS_KEY, maxObjectBytes: 2_097_152, ...overrides,
+    roleArn: ROLE_ARN, kmsKeyArn: KMS_ARN, witnessKey: WITNESS_KEY_BYTES, maxObjectBytes: 2_097_152, ...overrides,
   };
 }
 
@@ -170,55 +174,65 @@ test("layoutComponent keeps safe ids, maps unsafe characters and hashes long ids
   assert.match(mapped, /^x{119}-[0-9a-f]{8}$/);
 });
 
-test("user hash, journal key and quarantine prefix match the pipeline vectors", () => {
+test("user hash, journal key and upload inbox prefix match the pipeline vectors", () => {
   assert.equal(uploadUserHash(TENANT), "44185655a8bf362ce1034afe32f7ae4c");
   assert.equal(journalKey("96bulls", TENANT),
     "96bulls/.admission-inbox/org-a/v1/ws=ws-a/m=srv_44185655a8bf362ce1034afe32f7ae4c/privacy-journal.json");
-  assert.equal(quarantinePrefix("96bulls", TENANT),
-    "96bulls/.upload-quarantine/org-a/v1/ws=ws-a/u=44185655a8bf362ce1034afe32f7ae4c/");
+  assert.equal(uploadInboxPrefix("96bulls", TENANT),
+    "96bulls/.upload-inbox/org-a/v1/ws=ws-a/u=44185655a8bf362ce1034afe32f7ae4c/");
   const colon = { ...TENANT, workspaceId: "ws:b" };
-  assert.match(quarantinePrefix("96bulls", colon), /^96bulls\/\.upload-quarantine\/org-a\/v1\/ws=ws_b\/u=[0-9a-f]{32}\/$/);
+  assert.match(uploadInboxPrefix("96bulls", colon), /^96bulls\/\.upload-inbox\/org-a\/v1\/ws=ws_b\/u=[0-9a-f]{32}\/$/);
 });
 
 test("sessionPolicy renders the exact policy", () => {
   assert.equal(
-    sessionPolicy({ bucket: "b1", prefix: "96bulls/.upload-quarantine/org-a/v1/ws=ws-a/u=44185655a8bf362ce1034afe32f7ae4c/", kmsKeyArn: KMS_ARN }),
+    sessionPolicy({ bucket: "b1", prefix: "96bulls/.upload-inbox/org-a/v1/ws=ws-a/u=44185655a8bf362ce1034afe32f7ae4c/", kmsKeyArn: KMS_ARN }),
     '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:AbortMultipartUpload"],'
-    + '"Resource":"arn:aws:s3:::b1/96bulls/.upload-quarantine/org-a/v1/ws=ws-a/u=44185655a8bf362ce1034afe32f7ae4c/*",'
+    + '"Resource":"arn:aws:s3:::b1/96bulls/.upload-inbox/org-a/v1/ws=ws-a/u=44185655a8bf362ce1034afe32f7ae4c/*",'
     + '"Condition":{"StringEquals":{"s3:x-amz-server-side-encryption":"aws:kms","s3:x-amz-server-side-encryption-aws-kms-key-id":"'
     + KMS_ARN + '"},"Null":{"s3:if-none-match":"false"}}},{"Effect":"Allow","Action":"kms:GenerateDataKey","Resource":"'
     + KMS_ARN + '","Condition":{"StringLike":{"kms:EncryptionContext:aws:s3:arn":'
-    + '"arn:aws:s3:::b1/96bulls/.upload-quarantine/org-a/v1/ws=ws-a/u=44185655a8bf362ce1034afe32f7ae4c/*"}}}]}',
+    + '"arn:aws:s3:::b1/96bulls/.upload-inbox/org-a/v1/ws=ws-a/u=44185655a8bf362ce1034afe32f7ae4c/*"}}}]}',
   );
   assert.equal(
-    sessionPolicy({ bucket: "b2", prefix: "root/.upload-quarantine/o/v1/ws=w/u=0/", kmsKeyArn: "k" }),
+    sessionPolicy({ bucket: "b2", prefix: "root/.upload-inbox/o/v1/ws=w/u=0/", kmsKeyArn: "k" }),
     '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:AbortMultipartUpload"],'
-    + '"Resource":"arn:aws:s3:::b2/root/.upload-quarantine/o/v1/ws=w/u=0/*",'
+    + '"Resource":"arn:aws:s3:::b2/root/.upload-inbox/o/v1/ws=w/u=0/*",'
     + '"Condition":{"StringEquals":{"s3:x-amz-server-side-encryption":"aws:kms","s3:x-amz-server-side-encryption-aws-kms-key-id":"k"},'
     + '"Null":{"s3:if-none-match":"false"}}},{"Effect":"Allow","Action":"kms:GenerateDataKey","Resource":"k",'
-    + '"Condition":{"StringLike":{"kms:EncryptionContext:aws:s3:arn":"arn:aws:s3:::b2/root/.upload-quarantine/o/v1/ws=w/u=0/*"}}}]}',
+    + '"Condition":{"StringLike":{"kms:EncryptionContext:aws:s3:arn":"arn:aws:s3:::b2/root/.upload-inbox/o/v1/ws=w/u=0/*"}}}]}',
   );
 });
 
 test("uploadKeyValid accepts relative keys and refuses traversal and bad segments", () => {
-  for (const key of ["sessions/2026/abc.ndjson.zst", "a=1/b"]) assert.equal(uploadKeyValid(key), true, key);
-  for (const key of ["", "/a", "a//b", ".hidden", "a/../b", "a/./b", "a".repeat(513), `a/${"b".repeat(129)}`, "a b"]) {
+  for (const key of ["sessions/2026/abc.ndjson.zst", "a=1/b", `a/${"b".repeat(160)}`]) assert.equal(uploadKeyValid(key), true, key);
+  for (const key of ["", "/a", "a//b", ".hidden", "a/../b", "a/./b", "a".repeat(513), `a/${"b".repeat(161)}`, "a b", ":a"]) {
     assert.equal(uploadKeyValid(key), false, JSON.stringify(key.slice(0, 20)));
   }
 });
 
+test("uploadKeyValid accepts the pipeline's o=/b=/d= key with a 128-char colon-bearing originId", () => {
+  const originId = `desktop:${"m".repeat(120)}`;
+  assert.equal(originId.length, 128);
+  const hex = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 32);
+  const key = `o=${originId}/b=${hex("batch-1")}/d=${hex("object bytes")}-w7.json.zst`;
+  assert.equal(uploadKeyValid(key), true);
+});
+
 test("witness round-trips, refuses tampering and wrong keys, and matches the pinned vector", () => {
   const payload = { v: 1 as const, org: "org-a", ws: "ws-a", user: "user-1", seq: 3, exp: 1_800_000_000 };
-  const token = signWitness(WITNESS_KEY, payload);
+  const token = signWitness(WITNESS_KEY_BYTES, payload);
   assert.equal(token,
-    "eyJ2IjoxLCJvcmciOiJvcmctYSIsIndzIjoid3MtYSIsInVzZXIiOiJ1c2VyLTEiLCJzZXEiOjMsImV4cCI6MTgwMDAwMDAwMH0.RAr9XwQHqmKUtPIPM3R8WBHpnSBS91PwlB-gNQSfyGc");
-  assert.deepEqual(verifyWitness(WITNESS_KEY, token), payload);
-  const [body, mac] = token.split(".") as [string, string];
+    "v1.eyJ2IjoxLCJvcmciOiJvcmctYSIsIndzIjoid3MtYSIsInVzZXIiOiJ1c2VyLTEiLCJzZXEiOjMsImV4cCI6MTgwMDAwMDAwMH0.2uLZTDYatGcpZFcz89_6ck9yrNwigxlPUW4ng9-H33A");
+  assert.deepEqual(verifyWitness(WITNESS_KEY_BYTES, token), payload);
+  const [, body, mac] = token.split(".") as [string, string, string];
   const forged = Buffer.from(JSON.stringify({ ...payload, seq: 4 })).toString("base64url");
-  assert.equal(verifyWitness(WITNESS_KEY, `${forged}.${mac}`), null);
-  assert.equal(verifyWitness(WITNESS_KEY, `${body}.${mac.slice(0, -2)}AA`), null);
-  assert.equal(verifyWitness("another-witness-key-0123456789abcdef0123456789", token), null);
-  assert.equal(verifyWitness(WITNESS_KEY, "not-a-witness"), null);
+  assert.equal(verifyWitness(WITNESS_KEY_BYTES, `v1.${forged}.${mac}`), null);
+  assert.equal(verifyWitness(WITNESS_KEY_BYTES, `v1.${body}.${mac.slice(0, -2)}AA`), null);
+  assert.equal(verifyWitness(Buffer.from("another-witness-key-0123456789ab"), token), null);
+  assert.equal(verifyWitness(WITNESS_KEY_BYTES, "not-a-witness"), null);
+  assert.equal(verifyWitness(WITNESS_KEY_BYTES, `${body}.${mac}`), null);
+  assert.equal(verifyWitness(WITNESS_KEY_BYTES, `v2.${body}.${mac}`), null);
 });
 
 // ---- config ----
@@ -248,8 +262,12 @@ test("loadHistoryUploadConfig parses modes, requires every input and bounds the 
   for (const name of ["SELFHOST_HISTORY_UPLOAD_BUCKET", "SELFHOST_HISTORY_UPLOAD_ROLE_ARN", "SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN", "SELFHOST_HISTORY_UPLOAD_WITNESS_KEY"]) {
     assert.throws(() => loadHistoryUploadConfig(uploadEnv({ [name]: undefined })), new RegExp(name));
   }
-  assert.throws(() => loadHistoryUploadConfig(uploadEnv({ SELFHOST_HISTORY_UPLOAD_WITNESS_KEY: "short-fake-key" })),
-    (error: Error) => /SELFHOST_HISTORY_UPLOAD_WITNESS_KEY/.test(error.message) && !error.message.includes("short-fake-key"));
+  for (const bad of ["c2hvcnQ", "short-fake-key", "not base64url at all, though longer than forty-four chars"]) {
+    assert.throws(() => loadHistoryUploadConfig(uploadEnv({ SELFHOST_HISTORY_UPLOAD_WITNESS_KEY: bad })),
+      (error: Error) => error.message === "SELFHOST_HISTORY_UPLOAD_WITNESS_KEY (or _FILE) must be base64url of at least 32 bytes"
+        && !error.message.includes(bad));
+  }
+  assert.deepEqual(loadHistoryUploadConfig(uploadEnv({ SELFHOST_HISTORY_UPLOAD_WITNESS_KEY: `${WITNESS_KEY}=` }))?.witnessKey, WITNESS_KEY_BYTES);
   assert.throws(() => loadHistoryUploadConfig(uploadEnv({ SELFHOST_HISTORY_UPLOAD_MAX_OBJECT_BYTES: "1023" })), /MAX_OBJECT_BYTES/);
   assert.throws(() => loadHistoryUploadConfig(uploadEnv({ SELFHOST_HISTORY_UPLOAD_MAX_OBJECT_BYTES: "104857601" })), /MAX_OBJECT_BYTES/);
   assert.throws(() => loadHistoryUploadConfig(uploadEnv({ SELFHOST_HISTORY_UPLOAD_MAX_OBJECT_BYTES: "2e6" })), /MAX_OBJECT_BYTES/);
@@ -260,7 +278,7 @@ test("loadHistoryUploadConfig parses modes, requires every input and bounds the 
     const file = join(dir, "witness");
     writeFileSync(file, `${WITNESS_KEY}\n`);
     const fromFile = loadHistoryUploadConfig(uploadEnv({ SELFHOST_HISTORY_UPLOAD_WITNESS_KEY: undefined, SELFHOST_HISTORY_UPLOAD_WITNESS_KEY_FILE: file }));
-    assert.equal(fromFile?.witnessKey, WITNESS_KEY);
+    assert.deepEqual(fromFile?.witnessKey, WITNESS_KEY_BYTES);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -271,7 +289,7 @@ test("loadHistoryUploadConfig parses modes, requires every input and bounds the 
 test("AwsStsClient posts a signed AssumeRole form and parses the credentials", async (t) => {
   const aws = await fakeAws(t);
   const client = new AwsStsClient({ region: "us-east-1", credentials: new StaticAwsCredentialProvider(STATIC_CREDS), endpoint: aws.origin });
-  const policy = sessionPolicy({ bucket: BUCKET, prefix: quarantinePrefix("96bulls", TENANT), kmsKeyArn: KMS_ARN });
+  const policy = sessionPolicy({ bucket: BUCKET, prefix: uploadInboxPrefix("96bulls", TENANT), kmsKeyArn: KMS_ARN });
   const input = { roleArn: ROLE_ARN, roleSessionName: "history-upload-test", sourceIdentity: "u_test", policy, durationSeconds: 3600 };
   const creds = await client.assumeRole(input);
   assert.deepEqual({ ...creds, expiresAt: creds.expiresAt.toISOString() }, { ...ASSUMED, expiresAt: aws.state.expiresAt!.toISOString() });
@@ -360,10 +378,13 @@ test("route: sts issues prefix-scoped credentials with a witness over the journa
   const issued = await request(env.origin, env.path, { method: "POST", token: env.token, body: stsBody });
   assert.equal(issued.status, 200, issued.raw);
   assert.equal(issued.headers.get("cache-control"), "no-store");
-  const prefix = quarantinePrefix("96bulls", env.tenant);
+  const prefix = uploadInboxPrefix("96bulls", env.tenant);
   const expiresAt = env.aws.state.expiresAt!;
+  assert.equal(Object.keys(issued.body)[0], "contract");
+  assert.equal(issued.body.contract, UPLOAD_CONTRACT);
+  assert.equal(issued.body.contract, "relay-upload-inbox-v1");
   assert.deepEqual(Object.keys(issued.body).sort(), [
-    "bucket", "credentials", "endpoint", "keyPrefix", "kind", "kmsKeyId", "maxObjectBytes", "refreshAfter", "region", "witness", "witnessSeq",
+    "bucket", "contract", "credentials", "endpoint", "keyPrefix", "kind", "kmsKeyId", "maxObjectBytes", "refreshAfter", "region", "witness", "witnessSeq",
   ]);
   assert.equal(issued.body.kind, "sts");
   assert.equal(issued.body.bucket, BUCKET);
@@ -374,7 +395,7 @@ test("route: sts issues prefix-scoped credentials with a witness over the journa
   assert.equal(issued.body.maxObjectBytes, 2_097_152);
   assert.deepEqual(issued.body.credentials, { ...ASSUMED, expiresAt: expiresAt.toISOString() });
   assert.equal(issued.body.refreshAfter, new Date(expiresAt.getTime() - 600_000).toISOString());
-  const witness = verifyWitness(WITNESS_KEY, issued.body.witness);
+  const witness = verifyWitness(WITNESS_KEY_BYTES, issued.body.witness);
   assert.deepEqual(witness, {
     v: 1, org: env.tenant.orgId, ws: env.workspace, user: env.userId, seq: 7, exp: Math.floor(expiresAt.getTime() / 1000),
   });
@@ -399,11 +420,13 @@ test("route: presigned issues one signed PUT per key with the checksum and witne
   });
   const after = Date.now();
   assert.equal(issued.status, 200, issued.raw);
+  assert.equal(Object.keys(issued.body)[0], "contract");
+  assert.equal(issued.body.contract, "relay-upload-inbox-v1");
   assert.equal(issued.body.kind, "presigned");
   assert.equal("credentials" in issued.body, false);
   assert.equal(issued.body.witnessSeq, 7);
-  assert.equal(verifyWitness(WITNESS_KEY, issued.body.witness)?.seq, issued.body.witnessSeq);
-  const prefix = quarantinePrefix("96bulls", env.tenant);
+  assert.equal(verifyWitness(WITNESS_KEY_BYTES, issued.body.witness)?.seq, issued.body.witnessSeq);
+  const prefix = uploadInboxPrefix("96bulls", env.tenant);
   assert.equal(issued.body.urls.length, 2);
   for (const [index, sha256] of [SHA_A, SHA_B].entries()) {
     const entry = issued.body.urls[index];

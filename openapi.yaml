@@ -3367,7 +3367,11 @@ paths:
         `kind=presigned` returns one presigned PUT URL (at most 15 minutes)
         per requested `{ key, sha256 }`. Object keys are `keyPrefix` plus a
         relative key: 1 to 512 characters of `/`-separated segments, each
-        matching `^[A-Za-z0-9][A-Za-z0-9._=-]{0,127}$`.
+        matching `^[A-Za-z0-9][A-Za-z0-9._:=-]{0,159}$`. Control validates
+        only this segment rule; the pipeline's layout (informative) is
+        `o=<originId>/b=<sha256hex(batchId)[:32]>/d=<sha256hex(objectBytes)[:32]>-w<witnessSeq>.json.zst`,
+        where originId may contain `:` and be up to 128 characters. Both
+        responses lead with `contract: relay-upload-inbox-v1`.
 
         `witness` is opaque: send it verbatim as the object metadata header
         `x-amz-meta-relay-witness`. `witnessSeq` is the privacy journal seq
@@ -7414,7 +7418,10 @@ components:
                 type: string
                 minLength: 1
                 maxLength: 512
-                description: Relative to keyPrefix; `/`-separated segments matching `^[A-Za-z0-9][A-Za-z0-9._=-]{0,127}$`.
+                description: |
+                  Relative to keyPrefix; `/`-separated segments matching `^[A-Za-z0-9][A-Za-z0-9._:=-]{0,159}$`.
+                  Control validates only this segment rule; the pipeline's layout (informative) is
+                  `o=<originId>/b=<sha256hex(batchId)[:32]>/d=<sha256hex(objectBytes)[:32]>-w<witnessSeq>.json.zst`.
               sha256:
                 type: string
                 pattern: '^[A-Za-z0-9+/]{43}=$'
@@ -7433,13 +7440,14 @@ components:
       description: |
         Session credentials that can only PutObject (create-only, SSE-KMS with
         kmsKeyId) and AbortMultipartUpload under keyPrefix. 1 hour lifetime.
-      required: [kind, bucket, region, endpoint, keyPrefix, kmsKeyId, credentials, witness, witnessSeq, maxObjectBytes, refreshAfter]
+      required: [contract, kind, bucket, region, endpoint, keyPrefix, kmsKeyId, credentials, witness, witnessSeq, maxObjectBytes, refreshAfter]
       properties:
+        contract: { type: string, enum: [relay-upload-inbox-v1] }
         kind: { type: string, enum: [sts] }
         bucket: { type: string }
         region: { type: string }
         endpoint: { type: [string, "null"], description: Always null (the AWS regional endpoint). }
-        keyPrefix: { type: string, description: "`<keyRoot>/.upload-quarantine/<org>/v1/ws=<ws>/u=<userHash>/`" }
+        keyPrefix: { type: string, description: "`<keyRoot>/.upload-inbox/<org>/v1/ws=<ws>/u=<userHash>/`" }
         kmsKeyId: { type: string }
         credentials:
           type: object
@@ -7456,8 +7464,9 @@ components:
     HistoryUploadPresignedCredentials:
       type: object
       description: One presigned PUT URL per requested key; no credentials field.
-      required: [kind, bucket, region, endpoint, keyPrefix, kmsKeyId, witness, witnessSeq, maxObjectBytes, refreshAfter, urls]
+      required: [contract, kind, bucket, region, endpoint, keyPrefix, kmsKeyId, witness, witnessSeq, maxObjectBytes, refreshAfter, urls]
       properties:
+        contract: { type: string, enum: [relay-upload-inbox-v1] }
         kind: { type: string, enum: [presigned] }
         bucket: { type: string }
         region: { type: string }

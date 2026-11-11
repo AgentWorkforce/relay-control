@@ -97,8 +97,8 @@ export interface HistoryUploadConfig {
   keyRoot: string;
   roleArn: string;
   kmsKeyArn: string;
-  /** HMAC key for the privacy witness, shared with the pipeline consumer. */
-  witnessKey: string;
+  /** HMAC key bytes for the privacy witness, shared with the pipeline consumer. Never logged. */
+  witnessKey: Buffer;
   maxObjectBytes: number;
 }
 
@@ -889,10 +889,12 @@ export function loadHistoryUploadConfig(env: Env = process.env): HistoryUploadCo
   if (!UPLOAD_ROLE_ARN.test(roleArn)) throw new Error("SELFHOST_HISTORY_UPLOAD_ROLE_ARN must be an IAM role ARN");
   const kmsKeyArn = required(env, "SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN");
   if (!UPLOAD_KMS_KEY_ARN.test(kmsKeyArn)) throw new Error("SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN must be a KMS key ARN");
-  const witnessKey = readSecret(env, "SELFHOST_HISTORY_UPLOAD_WITNESS_KEY");
-  if (!witnessKey) throw new Error("SELFHOST_HISTORY_UPLOAD_WITNESS_KEY (or _FILE) is required");
-  if (Buffer.byteLength(witnessKey) < 32) {
-    throw new Error("SELFHOST_HISTORY_UPLOAD_WITNESS_KEY (or _FILE) must be at least 32 bytes");
+  const witnessKeyText = readSecret(env, "SELFHOST_HISTORY_UPLOAD_WITNESS_KEY");
+  if (!witnessKeyText) throw new Error("SELFHOST_HISTORY_UPLOAD_WITNESS_KEY (or _FILE) is required");
+  // base64url of the shared key bytes, unpadded or padded.
+  const witnessKey = /^[A-Za-z0-9_-]+={0,2}$/.test(witnessKeyText) ? Buffer.from(witnessKeyText, "base64url") : Buffer.alloc(0);
+  if (witnessKey.length < 32) {
+    throw new Error("SELFHOST_HISTORY_UPLOAD_WITNESS_KEY (or _FILE) must be base64url of at least 32 bytes");
   }
   const rawMax = env.SELFHOST_HISTORY_UPLOAD_MAX_OBJECT_BYTES?.trim();
   const maxObjectBytes = !rawMax ? 2_097_152 : /^\d+$/.test(rawMax) ? Number(rawMax) : Number.NaN;

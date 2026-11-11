@@ -106,7 +106,7 @@ new pair once; a second 401 is an upstream error.
 Direct-to-S3 session uploads. A bearer client that passes the same caller
 checks as `mode: "sync"` above (live `sh_at_` token with `rth:sync`, no
 unexchanged handoff, no browser cookie) gets credentials to write session
-objects straight into a per-user quarantine prefix of the pipeline bucket,
+objects straight into a per-user upload inbox prefix of the pipeline bucket,
 plus a signed privacy witness. The ingest edge stays the fallback.
 
 Configuration (all read once at start-up; errors name the variable only):
@@ -120,22 +120,29 @@ Configuration (all read once at start-up; errors name the variable only):
 | `SELFHOST_HISTORY_UPLOAD_KEY_ROOT` | top-level key root shared with the pipeline (default `96bulls`) |
 | `SELFHOST_HISTORY_UPLOAD_ROLE_ARN` | upload role Control assumes |
 | `SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN` | KMS key every object must be encrypted with |
-| `SELFHOST_HISTORY_UPLOAD_WITNESS_KEY` (or `_FILE`) | witness HMAC key (32+ bytes), shared with the pipeline consumer |
+| `SELFHOST_HISTORY_UPLOAD_WITNESS_KEY` (or `_FILE`) | witness HMAC key: base64url of 32 random bytes, shared with the pipeline consumer (must decode to at least 32 bytes) |
 | `SELFHOST_HISTORY_UPLOAD_MAX_OBJECT_BYTES` | per-object cap reported to clients (default 2097152, 1024 to 104857600) |
 
 Request: `{ originId, kind: "sts" | "presigned", keys? }`. `keys` is 1 to 64
 `{ key, sha256 }` objects with unique keys, required for `presigned` and
 validated but ignored for `sts`. `key` is relative to `keyPrefix`: 1 to 512
 characters of `/`-separated segments matching
-`^[A-Za-z0-9][A-Za-z0-9._=-]{0,127}$`. `sha256` is base64 of the raw 32-byte
-SHA-256 of the object bytes as uploaded (the zstd wire bytes).
+`^[A-Za-z0-9][A-Za-z0-9._:=-]{0,159}$`. Control validates only the segment
+rule; the pipeline's layout under the prefix is (informative)
+`o=<originId>/b=<sha256hex(batchId)[:32]>/d=<sha256hex(objectBytes)[:32]>-w<witnessSeq>.json.zst`,
+where originId may contain `:` and be up to 128 characters. `sha256` is
+base64 of the raw 32-byte SHA-256 of the object bytes as uploaded (the zstd
+wire bytes).
 
-- `kind: "sts"`: `{ kind, bucket, region, endpoint: null, keyPrefix,
+Both responses lead with `contract: "relay-upload-inbox-v1"` (the sessions
+pipeline's frozen upload contract).
+
+- `kind: "sts"`: `{ contract, kind, bucket, region, endpoint: null, keyPrefix,
   kmsKeyId, credentials: { accessKeyId, secretAccessKey, sessionToken,
   expiresAt }, witness, witnessSeq, maxObjectBytes, refreshAfter }`. The
   session lasts 1 hour (the role chaining cap); `refreshAfter` is 10 minutes
   before expiry.
-- `kind: "presigned"`: the same fields without `credentials`, plus
+- `kind: "presigned"`: the same fields (`contract` first) without `credentials`, plus
   `urls: [{ key, url, expiresAt }]`, one presigned PUT per requested key,
   valid for at most 15 minutes; `refreshAfter` is 5 minutes before the URLs
   expire. Each URL signs `Content-Encoding: zstd`, `If-None-Match: *`,
@@ -147,18 +154,23 @@ Every PUT carries `x-amz-server-side-encryption: aws:kms`,
 `If-None-Match: *` and `x-amz-meta-relay-witness: <witness>`. Objects over
 `maxObjectBytes` are refused by the consumer.
 
-Key layout: `<keyRoot>/.upload-quarantine/<org>/v1/ws=<ws>/u=<userHash>/`,
+Key layout: `<keyRoot>/.upload-inbox/<org>/v1/ws=<ws>/u=<userHash>/`,
 where `<ws>` is the pipeline's layout component of the workspace id and
 `<userHash>` is the pipeline's admission user hash (the first 32 hex of
 sha256 of `["admission-user-v1", ws, user]` as JSON), the same hash as the
 user's admission inbox directory. STS `SourceIdentity` is `u_<userHash>`; the
-raw user id never reaches AWS.
+raw user id never reaches AWS. `.upload-inbox` is distinct from the
+pipeline's `.admission-inbox` (privacy journals) and from the unrelated
+non-dotted `upload-inbox/v1` root.
 
 Witness: `witness` is opaque to clients. Control reads the user's privacy
 journal (`<keyRoot>/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<userHash>/privacy-journal.json`;
 missing means seq 0, unreadable or invalid fails closed with 503) and signs
-`{ v: 1, org, ws, user, seq, exp }` with HMAC-SHA256 under the witness key.
-The consumer verifies it before admitting a quarantined object, so an object
+`{ v: 1, org, ws, user, seq, exp }` as `v1.<payload>.<mac>`: `<payload>` is
+unpadded base64url of that JSON (in that key order) and `<mac>` is unpadded
+base64url of HMAC-SHA256 under the decoded witness key bytes over
+`"relay-upload-witness-v1\n" + <payload>`.
+The consumer verifies it before admitting an uploaded object, so an object
 uploaded before a privacy change (a higher journal seq) is not admitted
 silently. `witnessSeq` is that same seq as a plain field; clients name their
 object key with it.

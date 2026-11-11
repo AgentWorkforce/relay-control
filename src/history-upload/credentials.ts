@@ -1,6 +1,6 @@
 // Direct-to-S3 session upload credentials (docs/sessions-read-api.md).
 // POST .../relayhistory/upload-credentials hands a bearer client holding
-// rth:sync either STS session credentials scoped to its own quarantine prefix
+// rth:sync either STS session credentials scoped to its own upload inbox prefix
 // or presigned PUT URLs for keys it names, plus a signed privacy witness the
 // pipeline consumer checks before it admits an object. Credential values, the
 // witness key and witnesses are never logged.
@@ -16,7 +16,14 @@ import {
 } from "../aws/sigv4.js";
 import { StsError, type StsClient } from "../aws/sts.js";
 
-export const UPLOAD_QUARANTINE_NAMESPACE = ".upload-quarantine";
+/**
+ * Per-user upload inbox namespace (relay-upload-inbox-v1). Distinct from the
+ * pipeline's `.admission-inbox` (privacy journals) and from the unrelated
+ * non-dotted `upload-inbox/v1` root.
+ */
+export const UPLOAD_INBOX_NAMESPACE = ".upload-inbox";
+/** The contract both credential responses name as their first field. */
+export const UPLOAD_CONTRACT = "relay-upload-inbox-v1";
 export const ADMISSION_INBOX_NAMESPACE = ".admission-inbox";
 export const WITNESS_METADATA_KEY = "x-amz-meta-relay-witness";
 /** Role chaining caps an assumed-role session at one hour. */
@@ -60,7 +67,7 @@ export function assertTenantSegment(keyRoot: string, orgId: string): void {
 /**
  * The pipeline's admission user hash (async-admission.ts `userDir`), so one
  * user hash identifies the user across the admission inbox and the
- * quarantine prefix.
+ * upload inbox prefix.
  */
 export function uploadUserHash(tenant: UploadTenant): string {
   return sha256Hex(JSON.stringify(["admission-user-v1", tenant.workspaceId, tenant.userId])).slice(0, 32);
@@ -75,8 +82,8 @@ export function journalKey(keyRoot: string, tenant: UploadTenant): string {
 }
 
 /** The only prefix a caller's credentials can write under (ends with `/`). */
-export function quarantinePrefix(keyRoot: string, tenant: UploadTenant): string {
-  return `${keyRoot}/${UPLOAD_QUARANTINE_NAMESPACE}/${tenant.orgId}/v1/ws=${layoutComponent(tenant.workspaceId)}/u=${uploadUserHash(tenant)}/`;
+export function uploadInboxPrefix(keyRoot: string, tenant: UploadTenant): string {
+  return `${keyRoot}/${UPLOAD_INBOX_NAMESPACE}/${tenant.orgId}/v1/ws=${layoutComponent(tenant.workspaceId)}/u=${uploadUserHash(tenant)}/`;
 }
 
 /** STS SourceIdentity: the user hash, never the raw user id. */
@@ -115,7 +122,13 @@ export function sessionPolicy(input: { bucket: string; prefix: string; kmsKeyArn
   });
 }
 
-const KEY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._=-]{0,127}$/;
+/**
+ * Control validates only this segment rule. The pipeline's layout under the
+ * prefix (informative) is
+ * `o=<originId>/b=<sha256hex(batchId)[:32]>/d=<sha256hex(objectBytes)[:32]>-w<witnessSeq>.json.zst`,
+ * where originId may contain `:` and be up to 128 chars, hence `:` and 160.
+ */
+const KEY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._:=-]{0,159}$/;
 
 /** A relative object key under the prefix: 1..512 chars of non-empty, non-dot-leading segments. */
 export function uploadKeyValid(key: string): boolean {
@@ -136,23 +149,31 @@ export interface WitnessPayload {
   exp: number;
 }
 
+const WITNESS_VERSION = "v1";
+const WITNESS_DOMAIN = "relay-upload-witness-v1\n";
 const b64url = (value: string | Buffer) => Buffer.from(value).toString("base64url");
-const witnessMac = (key: string, payload: string) => createHmac("sha256", key).update(payload).digest();
+const witnessMac = (key: Buffer, body: string) => createHmac("sha256", key).update(WITNESS_DOMAIN + body).digest();
 
-/** `<base64url(payload JSON)>.<base64url(HMAC-SHA256(key, that base64url))>`. Opaque to clients. */
-export function signWitness(key: string, payload: WitnessPayload): string {
+/**
+ * Decision 0004 (relay-upload-inbox-v1): `v1.<payloadB64url>.<macB64url>`,
+ * where payloadB64url is unpadded base64url of the payload JSON in key order
+ * `{ v, org, ws, user, seq, exp }` and mac is
+ * HMAC-SHA256(key bytes, "relay-upload-witness-v1\n" + payloadB64url).
+ * Opaque to clients.
+ */
+export function signWitness(key: Buffer, payload: WitnessPayload): string {
   const body = b64url(JSON.stringify({
     v: payload.v, org: payload.org, ws: payload.ws, user: payload.user, seq: payload.seq, exp: payload.exp,
   }));
-  return `${body}.${b64url(witnessMac(key, body))}`;
+  return `${WITNESS_VERSION}.${body}.${b64url(witnessMac(key, body))}`;
 }
 
-/** The payload when the MAC and shape are valid, otherwise null. Expiry is the consumer's check. */
-export function verifyWitness(key: string, token: string): WitnessPayload | null {
+/** The payload when the version, MAC and shape are valid, otherwise null. Expiry is the consumer's check. */
+export function verifyWitness(key: Buffer, token: string): WitnessPayload | null {
   if (typeof token !== "string") return null;
   const parts = token.split(".");
-  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
-  const [body, mac] = parts as [string, string];
+  if (parts.length !== 3 || parts[0] !== WITNESS_VERSION || !parts[1] || !parts[2]) return null;
+  const [, body, mac] = parts as [string, string, string];
   const expected = witnessMac(key, body);
   const given = Buffer.from(mac, "base64url");
   if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
@@ -299,7 +320,7 @@ export class UploadCredentialsError extends Error {
 }
 
 export interface UploadKeyRequest {
-  /** Object key relative to the caller's quarantine prefix. */
+  /** Object key relative to the caller's upload inbox prefix. */
   key: string;
   /** Base64 of the raw 32-byte SHA-256 of the object bytes as uploaded (zstd wire bytes). */
   sha256: string;
@@ -369,7 +390,7 @@ export class HistoryUploadCredentials {
       console.warn("[history-upload] privacy journal unavailable", { code: error.code });
       throw new UploadCredentialsError(503, "privacy_journal_unavailable", "Upload credentials are unavailable; use the ingest edge");
     }
-    const prefix = quarantinePrefix(config.keyRoot, tenant);
+    const prefix = uploadInboxPrefix(config.keyRoot, tenant);
     const policy = sessionPolicy({ bucket: config.bucket, prefix, kmsKeyArn: config.kmsKeyArn });
     let creds;
     try {
@@ -404,6 +425,7 @@ export class HistoryUploadCredentials {
     };
     if (request.kind === "sts") {
       return {
+        contract: UPLOAD_CONTRACT,
         kind: "sts",
         ...common,
         credentials: {
@@ -443,6 +465,7 @@ export class HistoryUploadCredentials {
       expiresAt: urlExpiresAt.toISOString(),
     }));
     return {
+      contract: UPLOAD_CONTRACT,
       kind: "presigned",
       ...common,
       witness,
