@@ -17,8 +17,8 @@ import { createRelaycastClient, RelaycastCallError, type RelaycastClient } from 
  * syncs that identity here so the MCP endpoint can act as it. A row is kept
  * only after Relaycast confirms the token controls exactly the named agent
  * and that the agent belongs to the caller. Tokens are encrypted at rest and
- * never returned. The optional Ed25519 attestation key verifies Copilot
- * tool-call proofs for that Desktop source.
+ * never returned. The optional Ed25519 attestation key verifies Claude Code
+ * and Copilot tool-call proofs for that Desktop source.
  *
  * A hosted MCP session links to one synced identity with join_relay
  * desktop_address (table desktop_relay_session_bindings, migration 0035);
@@ -29,11 +29,16 @@ export const DESKTOP_SOURCE = "relay-desktop";
 /** Cloud's LINKED_MCP: what identity sync reports for an identity a hosted MCP session is linked to. */
 export const LINKED_MCP = "agent-relay-sessions";
 export const NATIVE_SESSION_IDENTITY_CAPABILITY_VERSION = 1;
+export const CLAUDE_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
 export const COPILOT_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
 
-/** What GET advertises. copilot_session_attestation exists because MCP verifies it (src/mcp/copilot-attestation.ts). */
+/**
+ * What GET advertises. Each attestation flag exists because MCP verifies and
+ * enforces that proof (src/mcp/claude-attestation.ts, src/mcp/copilot-attestation.ts).
+ */
 export const DESKTOP_IDENTITY_CAPABILITIES = {
   native_session_identity: NATIVE_SESSION_IDENTITY_CAPABILITY_VERSION,
+  claude_session_attestation: CLAUDE_SESSION_ATTESTATION_CAPABILITY_VERSION,
   copilot_session_attestation: COPILOT_SESSION_ATTESTATION_CAPABILITY_VERSION,
 } as const;
 

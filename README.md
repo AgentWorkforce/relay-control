@@ -60,6 +60,10 @@ Included:
   sync (`.../messaging/desktop-identities`) and Ed25519-attested Copilot tool
   calls that act as the chat's own Desktop identity. No environment variables;
   see [docs/integrations/copilot-vscode.md](docs/integrations/copilot-vscode.md)
+- Claude Code chat identity through Agent Relay Desktop: per-call Ed25519
+  hook proofs (`claude_session_attestation`) verified on the hosted MCP
+  endpoint, so a Claude Code chat sends as its own Desktop identity; see
+  [docs/integrations/claude-code.md](docs/integrations/claude-code.md)
 
 Explicitly absent: billing, fleet, and Relayfile.
 

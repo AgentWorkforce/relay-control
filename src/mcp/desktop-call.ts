@@ -6,8 +6,8 @@
  * `provider` is the Desktop provider bound to the admitted credential (a
  * `mcp:desktop` child token), never a model argument or header. Any provider
  * makes the call managed: actor tools then need a verified native chat and
- * never fall back to a hosted participant. `attested` is a Copilot call proof
- * the route already verified (`copilotAttestationFor`).
+ * never fall back to a hosted participant. `attested` is a Claude or Copilot call proof
+ * the route already verified (`claudeAttestationFor` / `copilotAttestationFor`).
  */
 export type NativeSession = { kind: "codex" | "grok" | "pi" | "opencode" | "claude" | "copilot"; id: string };
 /** `nativeSourceId` is set when a signed proof names the desktop source that must own the chat. */
