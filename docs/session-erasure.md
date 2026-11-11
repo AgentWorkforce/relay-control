@@ -37,6 +37,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 | 502 `session_erasure_failed` | Erase failed; the receipt is in `erasure`. Repeat the `DELETE` to retry |
 | 502 `invalid_session_erasure_response` | The pipeline's reply could not be trusted; treat the erase as not done |
 | 503 `session_erasure_unavailable` | The pipeline could not be reached; repeat the `DELETE` |
+| 503 `session_erasure_unsupported_storage` | The pipeline cannot erase this session with its current storage or ingest configuration; do not repeat the request, an operator change or supported cutover is required |
 
 The route is idempotent: repeating a completed delete returns the same receipt. A 200 is only returned when the
 pipeline reports completion with a completion time, nothing pending, and late uploads for that session fenced off.
