@@ -202,6 +202,7 @@ export function uploadPolicyVerdict(
 ): "current" | "unset" | "missing" | "stale" {
   if (Object.keys(policy.settings).length === 0) return "unset";
   const raw = (Array.isArray(header) ? header[0] ?? "" : header ?? "").trim();
-  if (!/^[1-9][0-9]{0,9}$/.test(raw)) return "missing";
+  // A revision is a non-negative integer; 0 is one (always older than a set policy's).
+  if (!/^(?:0|[1-9][0-9]{0,9})$/.test(raw)) return "missing";
   return Number(raw) < policy.revision ? "stale" : "current";
 }
