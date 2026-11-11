@@ -119,7 +119,10 @@ export function createCapyRuntime(options: { fetchImpl?: typeof fetch; timeoutMs
         try { decoded = await json(response); }
         catch {
           if (signal.aborted) throw new CapyRuntimeError(write ? "unknown" : "rejected", "capy_deadline");
-          throw new CapyRuntimeError(write ? "unknown" : "rejected", "capy_invalid_response", response.status);
+          if (response.ok) throw new CapyRuntimeError(write ? "unknown" : "rejected", "capy_invalid_response", response.status);
+          // Empty, HTML or oversized error bodies do not erase a definitive
+          // HTTP rejection. They supply no model/retry hint, so use status only.
+          decoded = {};
         }
         if (!response.ok) {
           const error = decoded && typeof decoded === "object" && !Array.isArray(decoded)

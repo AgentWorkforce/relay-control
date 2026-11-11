@@ -96,6 +96,27 @@ test("Capy rate-limit retry hint is bounded and errors do not echo provider tags
   });
 });
 
+test("Capy preserves definitive HTTP rejections even without a valid JSON error body", async () => {
+  for (const status of [401, 403, 429, 503]) {
+    for (const body of [null, `<html>${key}</html>`, "x".repeat(2 * 1024 * 1024 + 1)]) {
+      let calls = 0;
+      const runtime = createCapyRuntime({ fetchImpl: async () => {
+        calls++;
+        return new Response(body, { status });
+      } });
+      await assert.rejects(runtime.sendMessage(key, thread, message), (error: unknown) => {
+        assert.ok(error instanceof CapyRuntimeError);
+        assert.equal(error.outcome, status >= 500 ? "unknown" : "rejected");
+        assert.equal(error.code, `capy_http_${status}`);
+        assert.equal(error.status, status);
+        assert.equal(JSON.stringify(error).includes(key), false);
+        return true;
+      });
+      assert.equal(calls, 1);
+    }
+  }
+});
+
 test("Capy validates scope-free transport inputs before any external request", async () => {
   let calls = 0;
   const runtime = createCapyRuntime({ fetchImpl: async () => { calls++; return Response.json({}); } });
