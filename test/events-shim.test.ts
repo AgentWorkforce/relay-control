@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import test, { type TestContext } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -278,6 +278,33 @@ test("bodies over 64 KiB are refused before they are read", async (t) => {
   const shim = await p.create(await p.signIn());
   const big = await request(p.origin, shim.webhook_url.slice(p.origin.length), { method: "POST", rawBody: "x".repeat(64 * 1024 + 1) });
   assert.equal(big.status, 413);
+  assert.equal((await p.database.query("SELECT 1 FROM events_shim_events")).rows.length, 0);
+});
+
+test("a chunked body that passes 64 KiB still gets a 413", async (t) => {
+  const p = await plane(t);
+  const shim = await p.create(await p.signIn());
+  const url = new URL(shim.webhook_url);
+  const status = await new Promise<number>((resolve, reject) => {
+    const req = httpRequest(
+      { host: url.hostname, port: url.port, path: url.pathname, method: "POST", headers: { "content-type": "text/plain" } },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode ?? 0);
+      },
+    );
+    req.on("error", reject);
+    // No Content-Length: Node sends it chunked, so only reading can tell it is too big.
+    // Keep sending after the limit, slowly, as a real streaming sender would.
+    void (async () => {
+      for (let i = 0; i < 8 && !req.destroyed; i += 1) {
+        req.write("x".repeat(40 * 1024));
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      req.end();
+    })();
+  });
+  assert.equal(status, 413);
   assert.equal((await p.database.query("SELECT 1 FROM events_shim_events")).rows.length, 0);
 });
 
