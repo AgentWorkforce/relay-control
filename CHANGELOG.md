@@ -3,6 +3,38 @@
 Notable changes to the self-hosted control plane. Dates and versions are
 assigned at release.
 
+## 0.5.11 (2026-11-11)
+
+- Added: Microsoft sign-in ("Continue with Microsoft") for Outlook.com, Hotmail
+  and Live personal accounts and Entra ID work or school accounts, as a second
+  browser provider beside the generic OIDC one. Configured with
+  `SELFHOST_MICROSOFT_CLIENT_ID`, `SELFHOST_MICROSOFT_CLIENT_SECRET[_FILE]`,
+  `SELFHOST_MICROSOFT_TENANT` (default `common`) and
+  `SELFHOST_MICROSOFT_REDIRECT_URL`; served at `/login/microsoft/start` and
+  `/login/microsoft/callback`. A Microsoft email is trusted only for the
+  personal-account tenant or when `xms_edov` is true. Invites to Microsoft
+  addresses redeem through the Microsoft button and a different account is
+  refused with the invite kept. `/cloud/api/auth/microsoft/start` bounces to
+  the Microsoft start when configured; it and `/cloud/api/auth/google/start`
+  otherwise land on the `/login` chooser. `login-config` and `auth/methods`
+  publish a `microsoft` entry.
+- Added: the analytics collector registers the `session-brief` vocabulary
+  (`session_brief.tick_completed`) and accepts `/v1/coordination/overlaps` on
+  the session read route enum.
+- Fixed: every broker-originated answer on `/relay-node/v1` uses the Relaycast
+  envelope (`{ok: true, data}` / `{ok: false, error: {code, message}}`) so
+  Relaycast SDKs can decode the workspace answer and broker errors.
+
+## 0.5.10 (2026-11-10)
+
+- Added: `relay-node` purpose for workspace API tokens (`sh_wk_`) bound to a
+  node name with fixed read/enroll scopes and a bounded lifetime, accepted only
+  by the new `/relay-node/v1` broker, which serves an allow-listed set of
+  Relaycast routes with the stored workspace key so a node host no longer
+  needs that key. Migration 0039.
+- Fixed: the server-rendered `/login` stacks the co-brand lockup flush left and
+  uses the Agent Relay palette.
+
 ## 0.5.9 (2026-11-10)
 
 - Added: Factory acquisition enrollment (default off). With Factory on and
