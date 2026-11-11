@@ -118,25 +118,49 @@ test("a late response from a fetch that ignored cancellation is canceled",async(
 });
 
 
-test("the same deadline still owns the response after headers",async()=>{
-  // A manual deadline avoids elapsed-time assertions on busy hosts.
-  const original=AbortSignal.timeout,controllers:AbortController[]=[];
-  let reading!:()=>void,settled=false;
+test("the same deadline still owns the response after headers",async t=>{
+  // Advance fetch and body time separately without elapsed-time thresholds.
+  t.mock.timers.enable({apis:["setTimeout"]});
+  let reading!:()=>void,settled=false,body:ReadableStreamDefaultController<Uint8Array>|undefined;
   const started=new Promise<void>(resolve=>{reading=resolve;});
-  AbortSignal.timeout=()=>{const c=new AbortController();controllers.push(c);return c.signal;};
   let pending:Promise<unknown>|undefined;
   try {
-    const r=createReplicasRuntime({fetchImpl:async()=>new Response(new ReadableStream({pull(){reading();}}))});
+    const r=createReplicasRuntime({fetchImpl:async()=>{
+      t.mock.timers.tick(20_000);
+      return new Response(new ReadableStream<Uint8Array>({start(c){body=c;},pull(){reading();}}));
+    }});
     pending=r.identity(KEY).then(()=>{settled=true;},error=>{settled=true;return error;});
     await started;await new Promise(resolve=>setImmediate(resolve));
-    controllers[0]!.abort(new Error("manual deadline"));
+    t.mock.timers.tick(25_000);
     await new Promise(resolve=>setImmediate(resolve));
     assert.equal(settled,true,"headers must not renew the operation's deadline");
     failure("replicas_deadline","rejected")(await pending);
   } finally {
-    for(const c of controllers) c.abort();
-    await pending;AbortSignal.timeout=original;
+    // Complete an intentionally broken mutant's body too; no pending test is
+    // abandoned when the shared-budget assertion detects a regression.
+    try {body?.close();} catch {}
+    await pending;t.mock.timers.reset();
   }
+});
+
+test("completed calls clear their owned deadline on success and every failure path",async t=>{
+  t.mock.timers.enable({apis:["setTimeout"]});
+  try {
+    for(const mode of ["success","http","network","body","schema"] as const) {
+      let signal:AbortSignal|undefined;
+      const r=createReplicasRuntime({fetchImpl:async(_url,init)=>{
+        signal=init!.signal!;
+        if(mode==="network") throw new Error("synthetic failure");
+        if(mode==="http") return new Response(null,{status:401});
+        if(mode==="body") return new Response("invalid json");
+        return Response.json(mode==="schema"?{}:{organization:{id:"org",name:"Org"}});
+      }});
+      if(mode==="success") await r.identity(KEY);
+      else await assert.rejects(()=>r.identity(KEY));
+      assert.ok(signal);t.mock.timers.tick(45_000);
+      assert.equal(signal.aborted,false,`completed ${mode} call retained its deadline`);
+    }
+  } finally {t.mock.timers.reset();}
 });
 
 test("a stalled error body cannot erase a definitive HTTP rejection",async()=>{

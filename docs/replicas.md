@@ -18,10 +18,11 @@ and page identity must match the request; UUID casing does not change identity.
 Unknown provider status strings remain readable, and transcript event payloads
 are preserved for the later history projection.
 
-Fetch and every body read share a 45-second operation deadline (the provider
-exec request has a 30-second command budget). A caller may choose a shorter
-budget. Decoded responses are limited to 2 MiB, and an ignored abort cannot keep
-the caller waiting or retain a late response. No raw body, header, API key or
+Fetch and every body read share one referenced timer for a 45-second operation
+deadline (the provider exec request has a 30-second command budget). A caller
+may choose a shorter budget. The timer is cleared on completion, including all
+failure paths. Decoded responses are limited to 2 MiB, and an ignored abort
+cannot keep the caller waiting or retain a late response. No raw body, header, API key or
 transport exception enters an error. Definitive HTTP refusals retain their
 status even when their body is empty, HTML, oversized or stalled.
 

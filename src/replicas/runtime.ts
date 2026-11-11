@@ -61,7 +61,10 @@ export function createReplicasRuntime(options:{fetchImpl?:typeof fetch;timeoutMs
   const timeoutMs=input(z.number().int().min(1).max(TIMEOUT_MS),options.timeoutMs??TIMEOUT_MS);
   async function call<T>(key:string,path:string,schema:z.ZodType<T>,body?:Record<string,unknown>,allowEmpty=false):Promise<T> {
     input(z.string().regex(/^[A-Za-z0-9_.-]{16,512}$/),key); // canonical remote-agent-connections grammar
-    const write=body!==undefined,signal=AbortSignal.timeout(timeoutMs);
+    const write=body!==undefined,controller=new AbortController(),signal=controller.signal;
+    // Own a ref'd deadline: even a non-cooperative fetch in an otherwise
+    // idle process must settle the caller, rather than let Node exit early.
+    const timer=setTimeout(()=>controller.abort(new Error("replicas_deadline")),timeoutMs);
     try {
       const response=await bounded(()=>fetchImpl(ORIGIN+path,{method:write?"POST":"GET",redirect:"error",cache:"no-store",signal,
         headers:{authorization:`Bearer ${key}`,"X-Replicas-Api-Version":VERSION,accept:"application/json","content-type":"application/json"},
@@ -86,7 +89,7 @@ export function createReplicasRuntime(options:{fetchImpl?:typeof fetch;timeoutMs
     } catch(error) {
       if(error instanceof ReplicasRuntimeError) throw error;
       throw new ReplicasRuntimeError(write?"unknown":"rejected",signal.aborted?"replicas_deadline":"replicas_transport_unavailable");
-    }
+    } finally {clearTimeout(timer);}
   }
   return {
     identity:(key:string)=>call(key,"/whoami",z.object({organization:z.object({id:identifier,name:z.string().max(4096)})})),
