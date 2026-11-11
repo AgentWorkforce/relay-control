@@ -22,6 +22,9 @@ import { relaycastProvisioner, startBootstrap } from "./identity/bootstrap.js";
 import { FEATURES, gateCredentialVerifier, loadSelectedFeatures } from "./features.js";
 import { loadAmpConfig } from "./amp/config.js";
 import { createAmpModule } from "./amp/module.js";
+import { CapyBindings } from "./capy/bindings.js";
+import { CapyCleanup,capyCleanupFetch } from "./capy/cleanup.js";
+import { createCapyRuntime } from "./capy/runtime.js";
 import { buildProviderProbes } from "./providers/probes.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
@@ -114,6 +117,11 @@ const telemetry = createTelemetryModule({
 });
 // Amp control: off unless SELFHOST_AMP_ENABLED=true; off starts no worker.
 const amp = createAmpModule({ amp: loadAmpConfig(process.env), config, database });
+// Cleanup runs with new Capy work still off; it has no provider dispatch path.
+const capyCleanup=new CapyCleanup({database,bindings:new CapyBindings({
+  database,keyring:config.encryptionKeyring,runtime:createCapyRuntime(),
+  relaycast:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:capyCleanupFetch()}),
+}),log:event=>console.warn("[capy] cleanup deferred",event)});
 const mcpOAuthTeardown = new McpOAuthTeardown({
   database,keyring:config.encryptionKeyring,
   client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch()}),
@@ -162,6 +170,7 @@ async function start(): Promise<void> {
   telemetry.start();
   identity.start();
   amp.start();
+  capyCleanup.start();
   if(mcpOAuthActive(config)) {
     console.log("[selfhost-api] hosted MCP OAuth active", mcpOAuthActiveNotice());
     mcpOAuthTeardown.start();
@@ -225,6 +234,7 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   bootstrapAbort.abort();
   await telemetry.stop();
   await amp.stop();
+  await capyCleanup.stop();
   await mcpOAuthTeardown.stop();
   await factory.stop();
   identity.stop();

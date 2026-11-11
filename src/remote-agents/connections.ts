@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../crypto.js";
 import type { Database, SqlExecutor } from "../database.js";
 import { recordAudit } from "../admin/audit.js";
+import { retireCapyBindingsInTx } from "../capy/lifecycle.js";
 
 /** Connection checks ported from Cloud main 8865fe718, not generic API-key storage.
  * Fixed provider origins, no redirects, no provider bodies/errors in public replies.
@@ -206,6 +207,7 @@ export class RemoteAgentConnections {
       if (existing.rows[0] && existing.rows[0].provider_account !== account) {
         throw new RemoteAgentError(409, "provider_account_changed", "Disconnect this provider before connecting a different account.");
       }
+      if (provider === "capy") await retireCapyBindingsInTx(tx,{organizationId:actor.organizationId,workspaceId:actor.workspaceId},"capy_connection_replaced");
       const saved = await tx.query<ConnectionRow>(
         `INSERT INTO remote_agent_connections(workspace_id,provider,key_ciphertext,key_hint,provider_account,created_by_user_id)
           VALUES($1,$2,$3,$4,$5,$6)
@@ -223,6 +225,7 @@ export class RemoteAgentConnections {
 
   async disconnect(actor: ConnectionActor, provider: RemoteAgentId): Promise<void> {
     await this.authorized(actor, async tx => {
+      if (provider === "capy") await retireCapyBindingsInTx(tx,{organizationId:actor.organizationId,workspaceId:actor.workspaceId},"capy_disconnected");
       await tx.query("DELETE FROM remote_agent_connections WHERE workspace_id=$1 AND provider=$2", [actor.workspaceId, provider]);
       await recordAudit(tx, { workspaceId: actor.workspaceId, organizationId: actor.organizationId,
         actor: { kind: "user", userId: actor.userId }, action: "remote_agent.disconnect", target: provider });

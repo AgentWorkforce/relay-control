@@ -267,6 +267,8 @@ test("Capy native identity custody preserves ownership, unknown outcomes and ret
     await c.database.query("UPDATE organization_memberships SET role='owner' WHERE organization_id=$1 AND user_id=$2",[actor.organizationId,actor.userId]);
     await keys.connect(actor,"capy",{key}); // new ciphertext generation, even with same key bytes
     assert.equal(await service.agentFor(actor.workspaceId,actor.userId,name),null);
-    await assert.rejects(service.bind(actor,thread),{code:"capy_binding_changed"});
+    const stored=await row(thread);
+    assert.equal(stored.state,"retired");assert.equal(stored.token_ciphertext,null);assert.equal(stored.cleanup_pending,true);
+    await assert.rejects(service.bind(actor,thread),{code:"capy_cleanup_pending"});
   });
 });

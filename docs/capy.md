@@ -50,12 +50,26 @@ Lease expiry or a concurrent retirement/member/key change cannot finalize a
 late registration. External waits are bounded; a timeout is not a claim that
 the remote write was cancelled.
 
-This registry is not mounted by the app and starts no worker. Runtime capability
-remains false. Before mounting it, the delivery/lifecycle slice must add the
-native `!managed && !oauth` resolver integration, member/workspace/key cleanup
-hooks, routes, callback verification and durable delivery. In particular,
-workspace deletion must drain retained identity-cleanup obligations before
-removing referenced rows. No production caller writes binding rows yet.
+This registry has no public bind route or native resolver integration. Runtime
+capability remains false. Key replacement/disconnect and member removal now
+retire identities in the same transaction as the owning operation: generation
+advances, usable tokens and claims are cleared, and remote cleanup stays pending.
+An unsuccessful operation rolls that retirement back with its other writes.
+Workspace deletion refuses active or pending custody and deletes only completed
+retired records; it preserves the live Relay key until cleanup finishes.
+
+A cleanup-only loop starts with the server even while new Capy work is off.
+Each scan takes at most five retired obligations, with a 30-second retry interval;
+native fetches and service waits have 10-second limits. It uses exact immutable
+identity release, never calls Capy, registers or recovers an agent, or acquires a
+provider key. Multiple replicas may reconcile the same obligation: exact-id
+release is idempotent and generation/ownership checks remain in the service.
+A failed release or moved route retains a coded obligation. It is not silently
+abandoned to unblock workspace deletion. Logs contain only a fixed scan code.
+
+Before mounting new work, add the native `!managed && !oauth` resolver
+integration, routes, callback verification, subscriptions and durable delivery.
+No production caller writes binding rows yet.
 
 OAuth `assertActor`/`pin` is unchanged. A future OAuth-bound Capy journey is a
 separate admission/parity change, not an alias-table bypass in this registry.
@@ -63,7 +77,8 @@ separate admission/parity change, not an alias-table bypass in this registry.
 ## Required next slices
 
 - Mount the person/workspace-scoped registry only with its complete native
-  entry points, generation/revocation fences and cleanup integrations.
+  entry points and generation/revocation fences; lifecycle/cleanup alone is not
+  runtime availability.
 - Durable subscription/outbox delivery, explicit unknown-outcome reconciliation,
   disconnect/revocation fencing and partial cleanup.
 - Native spawn, Relay/MCP entry points and Webapp controls using those services.
