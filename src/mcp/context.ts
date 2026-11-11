@@ -65,6 +65,8 @@ export type McpContext = {
   factory?: FactoryMcpDeps;
   /** Internal native send resolver; absent until a complete Capy module is mounted. */
   capy?: Pick<CapyBindings, "agentFor">;
+  /** Explicit exact-grant reply permits; never the native resolver or a persona pin. */
+  capyPermits?: Pick<CapyBindings, "bindGrant" | "unbindGrant" | "agentForGrant">;
   /** Where shared-session read calls are audited (src/mcp/read-audit.ts); absent writes nothing. */
   readAudit?: {
     database: SqlExecutor;

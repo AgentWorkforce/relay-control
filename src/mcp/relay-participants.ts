@@ -222,7 +222,7 @@ export function relayFailure(error: unknown, operation?: RelayToolOperation) {
 // The per-request relay service.
 
 /** `desktop` marks a synced Agent Relay Desktop identity; its deliveries are injected, not polled. */
-type Identity = { name: string; token: string; desktop?: boolean; factory?: boolean; capy?: boolean };
+type Identity = { name: string; token: string; desktop?: boolean; factory?: boolean; capy?: boolean; capyGrant?: boolean };
 type DesktopActor = LinkedDesktopIdentity & { desktop: true };
 /**
  * `remotePresent` and the ownership checks come from the token or, when
@@ -651,8 +651,15 @@ function createRelayService(context: McpContext) {
   const capyFallback = (as: string | undefined): as is string => Boolean(
     as?.startsWith("capy-") && !managed && !oauth && context.capy);
 
-  async function capyActor(as: string): Promise<Identity> {
-    const found = await context.capy!.agentFor(workspaceId, userId, as);
+  async function capyActor(as: string, grant = false): Promise<Identity | null> {
+    if (grant && (!oauth || oauth.access.principal.userId!==userId ||
+      oauth.access.principal.organizationId!==organizationId || oauth.access.principal.workspaceId!==workspaceId ||
+      context.principal.organizationId!==organizationId || context.principal.workspaceId!==workspaceId)) {
+      throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
+    }
+    const found = grant ? await context.capyPermits!.agentForGrant(oauth!,as)
+      : await context.capy!.agentFor(workspaceId, userId, as);
+    if (!found && grant) return null; // No permit: retain the original persona/assertActor path.
     if (!found || found.name !== as || !found.token) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
     // agentFor resolves current custody. The recipient was resolved using this
     // request's admitted route: never mix it with a newly rebound workspace.
@@ -661,7 +668,7 @@ function createRelayService(context: McpContext) {
       [workspaceId,organizationId])).rows[0];
     if (!route || route.relaycast_workspace_id !== relayWorkspaceId ||
         decryptSecret(route.relaycast_api_key_ciphertext,keyring) !== key) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
-    return { name: found.name, token: found.token, capy: true };
+    return { name: found.name, token: found.token, capy: true, ...(grant ? { capyGrant:true } : {}) };
   }
 
   /** Native provider identities never become participant rows. Only send opts into Capy. */
@@ -673,12 +680,16 @@ function createRelayService(context: McpContext) {
       await managedActorOnly(as);
       return fn(await desktop());
     }
+    if (options.capy && as?.startsWith("capy-") && oauth && context.capyPermits && as!==oauth.access.agentName) {
+      const permitted = await capyActor(as,true);
+      if (permitted) return fn(permitted);
+    }
     if (!as) {
       const linkedIdentity = await linkedDesktop();
       if (linkedIdentity) return fn(linkedIdentity);
     }
     let hosted = await participant(as, { allowMissing: Boolean(oauth) || viaFactory || viaCapy });
-    if (!hosted && viaCapy) return fn(await capyActor(as));
+    if (!hosted && viaCapy) return fn((await capyActor(as))!);
     if (!hosted && viaFactory) return fn(await factoryActor(as));
     if (!hosted) {
       await join({});
@@ -912,8 +923,8 @@ function createRelayService(context: McpContext) {
         // Parent/address reads may cross a disconnect or key rotation. Resolve
         // the same binding again immediately before the external write.
         if (identity.capy) {
-          const current = await capyActor(identity.name);
-          if (current.token !== identity.token) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
+          const current = await capyActor(identity.name,identity.capyGrant);
+          if (!current || current.token !== identity.token) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
         }
         let sent;
         if (input.reply_to) {

@@ -95,7 +95,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; launch?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; launch?: boolean; capyPermits?: boolean } = {}): ToolPlanEntry[] {
   const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relay_messaging"];
   // Launch tools exist only when SELFHOST_FEATURES selects launch; role and
   // connection kind are checked on every call.
@@ -104,6 +104,7 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; laun
   if (options.amp) groups.push("amp");
   // Factory tools exist only when SELFHOST_FACTORY_ENABLED is on.
   if (options.factory) groups.push("factory");
+  if (options.capyPermits) groups.push("capy_binding");
   groups.push("capability_discovery");
   return groups.map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
 }
@@ -167,11 +168,13 @@ export function describeCapabilities(input: {
   amp?: boolean;
   factory?: boolean;
   launch?: boolean;
+  capyPermits?: boolean;
   providers: ProviderStatus[];
 }): CapabilityReport {
   const launchRole = input.role === "owner" || input.role === "admin";
   const canLaunch = Boolean(input.launch) && input.authMode !== "oauth" && launchRole;
-  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, launch: input.launch && input.authMode !== "oauth" })
+  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, launch: input.launch && input.authMode !== "oauth",
+    capyPermits: input.capyPermits && input.authMode === "oauth" })
     .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
     const definition = TOOL_GROUPS[id];

@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAmpTools } from "../amp/mcp-tools.js";
 import { registerFactoryTools } from "../factory/mcp-tools.js";
+import { registerCapyPermitTools } from "../capy/mcp-permits.js";
 import { SELFHOST_API_VERSION } from "../config.js";
 import { registerCapabilityDiscovery } from "./capabilities.js";
 import { ensureToolTitles, MCP_FACADE, planToolGroups, registerToolPlan } from "./catalog.js";
@@ -33,7 +34,8 @@ const OAUTH_MCP_INSTRUCTIONS =
 export function buildMcpServer(context: McpContext): McpServer {
   const server = new McpServer(
     { name: "agent-relay-selfhost", title: MCP_FACADE.name, version: SELFHOST_API_VERSION },
-    { instructions: context.oauth ? OAUTH_MCP_INSTRUCTIONS : SELFHOST_MCP_INSTRUCTIONS,
+    { instructions: context.oauth ? OAUTH_MCP_INSTRUCTIONS + (context.capyPermits
+      ? " Explicit bind_capy_thread may additionally permit send_relay_message as that existing Capy binding. This never grants inbox, channel, history or launch access as Capy." : "") : SELFHOST_MCP_INSTRUCTIONS,
       capabilities: context.oauth ? {} : { experimental: {
       [NATIVE_SESSION_CAPABILITY]: { version: 1 },
       // All are implemented here: Claude and Copilot proofs are verified
@@ -51,7 +53,8 @@ export function buildMcpServer(context: McpContext): McpServer {
   const factory = context.factory;
   // OAuth connections never get launch tools (describe_capabilities says why).
   const launch = Boolean(context.launch) && !context.oauth;
-  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), launch }), {
+  const capyPermits = Boolean(context.oauth && context.capyPermits);
+  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), launch,capyPermits }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),
     team_activity: () => registerTeamActivity(server, context),
     relay_messaging: () => registerRelayMessaging(server, context),
@@ -59,6 +62,7 @@ export function buildMcpServer(context: McpContext): McpServer {
     ...(launch ? { hosted_launch: () => registerRelaySpawnTools(server, context) } : {}),
     ...(amp ? { amp: () => registerAmpTools(server, context, amp) } : {}),
     ...(factory ? { factory: () => registerFactoryTools(server, context, factory) } : {}),
+    ...(capyPermits ? { capy_binding: () => registerCapyPermitTools(server,context) } : {}),
   });
   return server;
 }

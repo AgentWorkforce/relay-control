@@ -87,8 +87,30 @@ Before mounting new work, add routes, callback verification, subscriptions and
 durable delivery.
 No production caller writes binding rows yet.
 
-OAuth `assertActor`/`pin` is unchanged. A future OAuth-bound Capy journey is a
-separate admission/parity change, not an alias-table bypass in this registry.
+## Explicit OAuth reply permits (internal, not mounted)
+
+Migration `0046_capy_grant_permits.sql` keeps reply authority separate from the
+native binding. Optional `bind_capy_thread(thread_id)` requires an existing bound
+thread owned by this grant's person, current owner/admin membership and ownership
+of the connected key. It creates one live permit for the exact grant and binding,
+snapshotting generation, immutable remote ID and name. Repeated binds return the
+existing binding with `already_bound: true`; they never create or transfer a
+binding or change the approved OAuth persona.
+
+Only `send_relay_message as=<binding agent>` may resolve this permit. Generic
+`assertActor`/`pin`, retirement, inbox, conversation, channel, launch and Desktop
+identity rules remain unchanged. Every send checks the live bearer and permit,
+canonical key/role/route and remote custody before and after verification and
+again after parent/address reads. Revoking the grant revokes its permits in the
+same transaction. Binding retirement or generation/identity changes fail closed.
+Revocation cannot retract a write already accepted by Relaycast.
+
+`unbind_capy_thread(thread_id)` revokes only this grant's reply permit; other
+grants and native inbound delivery retain their independent binding authority.
+The optional MCP module is not supplied by the application server and runtime
+capability remains false. Before mounting, measure the extra remote checks and
+complete Control-owned callback/subscription/durable delivery. Those messaging
+callbacks do not belong to the separate provider-file ingestion lane.
 
 ## Required next slices
 

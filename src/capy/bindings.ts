@@ -3,12 +3,13 @@ import { decryptSecret, encryptSecret, hashSecret, type EncryptionKeyring } from
 import type { Database, SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RelaycastClient, type RemoteAgent } from "../messaging/relaycast.js";
 import { HOSTED_SOURCE, ownerHash } from "../mcp/relay-participants.js";
+import type { McpOAuthConnection } from "../mcp/oauth/admission.js";
 import { lockOrganization, lockUser } from "../tenancy.js";
 import { CapyRuntimeError, type CapyRuntime } from "./runtime.js";
 
 /** Internal service, called only after person admission. Never pass model/user
- * supplied acting IDs here. Native integration must use !managed && !oauth,
- * exactly like Factory; this service does not extend OAuth assertActor/pin.
+ * supplied acting IDs here. Native integration uses !managed && !oauth.
+ * OAuth replies require a separate exact-grant permit; assertActor/pin stay unchanged.
  */
 export type CapyActor = { userId: string; organizationId: string; workspaceId: string };
 export class CapyBindingError extends Error {
@@ -29,6 +30,7 @@ export const capyAgentName = (threadId: string) => `capy-${hashSecret(threadId).
 const THREAD = /^jam_[A-Za-z0-9]{6,64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const changed = () => new CapyBindingError(409, "capy_binding_changed");
+type Permit = { id: string; binding_id: string; binding_generation: number; agent_remote_id: string; agent_name: string };
 
 export class CapyBindings {
   private readonly now: () => Date;
@@ -235,6 +237,90 @@ export class CapyBindings {
         return null;
       }
       throw new CapyBindingError(503,"capy_binding_unavailable");
+    }
+  }
+
+  /** Explicit self-bind adds only this grant's send permit to an existing
+   * native binding. It never creates/reassigns a binding or pins a persona.
+   */
+  async bindGrant(connection: McpOAuthConnection, threadId: string): Promise<CapyBindingView & { already_bound: true }> {
+    if (!THREAD.test(threadId)) throw new CapyBindingError(400,"capy_invalid_thread");
+    const actor = connection.access.principal;
+    return this.locked(actor, async tx => {
+      await connection.lock(tx);
+      const row = (await tx.query<Row>(`SELECT * FROM capy_bindings WHERE thread_id=$1
+        AND workspace_id=$2 AND organization_id=$3 AND user_id=$4 AND state='bound' FOR UPDATE`,
+      [threadId,actor.workspaceId,actor.organizationId,actor.userId])).rows[0];
+      if (!row) throw new CapyBindingError(404,"capy_binding_not_found");
+      const live = await this.current(tx,actor,row);
+      if (!live.token_ciphertext || !live.agent_remote_id || capyAgentName(threadId) !== live.agent_name) throw changed();
+      // A stale generation/name is not repaired by use. Only an explicit bind
+      // under this grant may replace its old permit with a fresh snapshot.
+      await tx.query(`UPDATE capy_grant_permits SET revoked_at=$3,revoke_reason='binding_changed'
+        WHERE grant_id=$1 AND binding_id=$2 AND revoked_at IS NULL
+          AND (binding_generation<>$4 OR agent_remote_id<>$5 OR agent_name<>$6)`,
+      [connection.access.grantId,live.id,this.now(),live.generation,live.agent_remote_id,live.agent_name]);
+      await tx.query(`INSERT INTO capy_grant_permits
+        (id,organization_id,workspace_id,user_id,grant_id,binding_id,binding_generation,agent_remote_id,agent_name,created_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        ON CONFLICT (grant_id,binding_id) WHERE revoked_at IS NULL DO NOTHING`,
+      [randomUUID(),actor.organizationId,actor.workspaceId,actor.userId,connection.access.grantId,
+        live.id,live.generation,live.agent_remote_id,live.agent_name,this.now()]);
+      return { ...view(live),already_bound:true };
+    });
+  }
+
+  /** Revoke only this grant's reply permit. Native binding/injection remains. */
+  async unbindGrant(connection: McpOAuthConnection, threadId: string): Promise<{ revoked: boolean }> {
+    if (!THREAD.test(threadId)) throw new CapyBindingError(400,"capy_invalid_thread");
+    const actor = connection.access.principal;
+    return this.locked(actor, async tx => {
+      await connection.lock(tx);
+      const result = await tx.query(`UPDATE capy_grant_permits p SET revoked_at=$5,revoke_reason='explicit_unbind'
+        FROM capy_bindings b WHERE p.binding_id=b.id AND p.grant_id=$1 AND p.user_id=$2
+        AND p.organization_id=$3 AND p.workspace_id=$4 AND b.thread_id=$6 AND p.revoked_at IS NULL RETURNING p.id`,
+      [connection.access.grantId,actor.userId,actor.organizationId,actor.workspaceId,this.now(),threadId]);
+      return { revoked:result.rows.length>0 };
+    });
+  }
+
+  private async grantPermit(tx: SqlExecutor, connection: McpOAuthConnection, name: string) {
+    await connection.lock(tx);
+    const actor = connection.access.principal;
+    const permit = (await tx.query<Permit>(`SELECT p.* FROM capy_grant_permits p
+      WHERE p.grant_id=$1 AND p.organization_id=$2 AND p.workspace_id=$3 AND p.user_id=$4
+        AND p.agent_name=$5 AND p.revoked_at IS NULL FOR UPDATE`,
+    [connection.access.grantId,actor.organizationId,actor.workspaceId,actor.userId,name])).rows[0];
+    if (!permit) return null;
+    const row = (await tx.query<Row>("SELECT * FROM capy_bindings WHERE id=$1 FOR UPDATE",[permit.binding_id])).rows[0];
+    if (!row || row.state!=="bound" || row.generation!==permit.binding_generation ||
+      row.agent_remote_id!==permit.agent_remote_id || row.agent_name!==permit.agent_name ||
+      !row.token_ciphertext || capyAgentName(row.thread_id)!==name) return null;
+    return { permit,row:await this.current(tx,actor,row) };
+  }
+
+  /** Send-only OAuth resolver. Never becomes a generic participant/identity. */
+  async agentForGrant(connection: McpOAuthConnection, name: string): Promise<{ name: string; token: string } | null> {
+    if (!name.startsWith("capy-")) return null;
+    const actor = connection.access.principal;
+    try {
+      const selected = await this.locked(actor,tx=>this.grantPermit(tx,connection,name));
+      if (!selected) return null;
+      // Remote verification takes place outside SQL locks. Recheck the same
+      // permit and exact binding/token afterwards, including grant revocation.
+      const found = await this.agentFor(actor.workspaceId,actor.userId,name);
+      if (!found) return null;
+      return this.locked(actor,async tx=>{
+        const current = await this.grantPermit(tx,connection,name);
+        if (!current || current.permit.id!==selected.permit.id || current.row.id!==selected.row.id ||
+          current.row.generation!==selected.row.generation || current.row.agent_remote_id!==selected.row.agent_remote_id ||
+          current.row.token_ciphertext!==selected.row.token_ciphertext ||
+          decryptSecret(current.row.token_ciphertext!,this.deps.keyring)!==found.token) return null;
+        return found;
+      });
+    } catch (error) {
+      if (error instanceof CapyBindingError && error.status!==503) return null;
+      throw error;
     }
   }
 
