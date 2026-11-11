@@ -73,6 +73,7 @@ import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./f
 import { createMcpHandler } from "./mcp/routes.js";
 import type { AmpModule } from "./amp/module.js";
 import { isAmpPath } from "./amp/routes.js";
+import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
 import { purgeMemberAmp, releaseMemberAmp } from "./amp/service.js";
 import {
   DESKTOP_MCP_TOKEN,
@@ -554,6 +555,34 @@ export function createApp(input: {
     ...(input.now ? { now: input.now } : {}),
   });
   const desktopMcpCredentials = new DesktopMcpCredentials(store.database);
+  // Events shim (docs/events-shim.md): webhook inboxes that wake an agent.
+  // Off unless the events_shim feature is selected; then every route but
+  // create is capability-based (the token in the URL or the manage bearer).
+  const EVENTS_SHIM_CREATE_RATE = { limit: 20, windowMs: 60 * 60_000 };
+  const eventsShim = features.events_shim ? createEventsShimRoutes({
+    database: store.database,
+    keyring: config.encryptionKeyring,
+    publicBaseUrl: config.publicBaseUrl,
+    relayOrigins: config.eventsShimRelayOrigins ?? [new URL(config.relaycastPublicUrl).origin],
+    fetchImpl: input.messagingFetch,
+    now: input.now,
+    authorizeCreate: async (request, response) => {
+      const auth = await authenticate(request);
+      if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      const { principal } = auth;
+      if (principal.pendingHandoff) {
+        throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      }
+      if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      const workspace = await store.workspaceForUser(principal.workspaceId, principal.userId);
+      if (!workspace) throw new HttpError(404, "workspace_not_found", "Workspace not found");
+      rateLimit(response, `events-shim-create:${principal.userId}`, EVENTS_SHIM_CREATE_RATE,
+        "rate_limited", "Too many webhook inboxes created. Try again later.");
+      return { workspaceId: workspace.id, userId: principal.userId };
+    },
+  }) : null;
   const DESKTOP_MCP_RATE = { limit: 30, windowMs: 60_000 };
   const AGENT_NAMES_RATE = { limit: 60, windowMs: 60_000 };
   function rateLimit(
@@ -1100,6 +1129,13 @@ export function createApp(input: {
         return;
       }
       if (await amp.handle(request, response, path, publicPath, method, { workspaceAccess, bearer, json })) return;
+    }
+    // Events shim: 404 before any authentication while the feature is off.
+    if (isEventsShimPath(path)) {
+      if (!eventsShim || !(await eventsShim(request, response, path, method))) {
+        json(response, 404, { error: "Not found" }, true);
+      }
+      return;
     }
     // Factory sessions: 404 before auth when the flag is off.
     if (await factoryRoutes(request, response, path, publicPath, method)) return;

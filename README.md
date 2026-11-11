@@ -64,6 +64,14 @@ Included:
   hook proofs (`claude_session_attestation`) verified on the hosted MCP
   endpoint, so a Claude Code chat sends as its own Desktop identity; see
   [docs/integrations/claude-code.md](docs/integrations/claude-code.md)
+- events shim (`SELFHOST_FEATURES=events_shim`, off by default): a webhook
+  inbox that wakes an agent. A signed-in person creates one and gets an MCP
+  URL (`claude mcp add --transport http webhooks <mcp_url>`) and a webhook
+  URL; each post is stored and forwarded to the agent's own Agent Relay
+  session webhook, so Agent Relay Desktop injects it and wakes an idle
+  session (without Desktop the agent long-polls `wait_for_webhook`). Served by
+  `@agent-relay/events-shim`; see [docs/events-shim.md](docs/events-shim.md).
+  Not the separate `SELFHOST_MCP_EVENTS` module
 
 Explicitly absent: billing, fleet, and Relayfile.
 
@@ -148,7 +156,8 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_PERSONAL_ORG_ON_SIGNIN` | Multi mode only, default `true`: a first sign-in with no invite, membership or assigned domain creates a personal organization. The bootstrap bearer can override it at runtime via `PATCH /api/v1/installation/settings` |
 | `SELFHOST_SELF_SERVE_ORGANIZATIONS` | Multi mode only, default `true`: signed-in people may create organizations. Overridable the same way |
 | `SELFHOST_INVITE_TTL_HOURS` | Invite link lifetime, default 168 (7 days), 1-720 |
-| `SELFHOST_FEATURES` | Comma list of optional components to serve: `flows`, `relayfile`, `chief`, `usage`, `launch`, `usage_people`. Unset selects `usage,usage_people`; `""` selects nothing. Unselected routes answer 403 `feature_not_enabled`. See [docs/features.md](docs/features.md) |
+| `SELFHOST_FEATURES` | Comma list of optional components to serve: `flows`, `relayfile`, `chief`, `usage`, `launch`, `usage_people`, `events_shim`. Unset selects `usage,usage_people`; `""` selects nothing. Unselected routes answer 403 `feature_not_enabled` (`events_shim` routes answer 404). See [docs/features.md](docs/features.md) |
+| `SELFHOST_EVENTS_SHIM_RELAY_ORIGINS` | Optional comma list of https origins (no path) an events-shim inbox may forward wake posts to (`link_relay_wake`). Default: the `RELAYCAST_PUBLIC_URL` origin. Set it, e.g. to `https://cast.agentrelay.com`, when your agents' Agent Relay uses another Relaycast. See [docs/events-shim.md](docs/events-shim.md) |
 | `SELFHOST_FACTORY_ENABLED` | Optional `true`/`false`, default `false`. Factory sessions: when off every Factory route is 404 and the worker does not start. See [docs/factory-sessions.md](docs/factory-sessions.md) |
 | `SELFHOST_FACTORY_API_URL` | Factory API origin, default `https://api.factory.ai`; absolute https only |
 | `SELFHOST_FACTORY_HISTORY_INTERVAL_MS` | Dormant Factory history loop cadence, default 300000, minimum 60000 |
