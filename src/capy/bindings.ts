@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { decryptSecret, encryptSecret, hashSecret, type EncryptionKeyring } from "../crypto.js";
 import type { Database, SqlExecutor } from "../database.js";
-import type { RelaycastClient, RemoteAgent } from "../messaging/relaycast.js";
+import { RelaycastCallError, type RelaycastClient, type RemoteAgent } from "../messaging/relaycast.js";
 import { HOSTED_SOURCE, ownerHash } from "../mcp/relay-participants.js";
 import { lockOrganization, lockUser } from "../tenancy.js";
 import { CapyRuntimeError, type CapyRuntime } from "./runtime.js";
@@ -17,7 +17,7 @@ export class CapyBindingError extends Error {
 type Row = {
   id: string; workspace_id: string; organization_id: string; user_id: string; thread_id: string;
   state: "preparing" | "bound" | "retired"; generation: number; connection_digest: string;
-  relaycast_workspace_id: string; relaycast_key_ciphertext: string | null; agent_name: string;
+  relaycast_workspace_id: string; agent_name: string;
   agent_remote_id: string | null; token_ciphertext: string | null; registration_attempted: boolean;
   lease_owner: string | null; lease_until: Date | string | null; cleanup_pending: boolean; last_error: string | null;
 };
@@ -140,10 +140,10 @@ export class CapyBindings {
       } else {
         row = (await tx.query<Row & { busy: boolean }>(`INSERT INTO capy_bindings
           (id,workspace_id,organization_id,user_id,thread_id,state,connection_digest,
-           relaycast_workspace_id,relaycast_key_ciphertext,agent_name)
-          VALUES($1,$2,$3,$4,$5,'preparing',$6,$7,$8,$9) RETURNING *`,
+           relaycast_workspace_id,agent_name)
+          VALUES($1,$2,$3,$4,$5,'preparing',$6,$7,$8) RETURNING *`,
         [randomUUID(),actor.workspaceId,actor.organizationId,actor.userId,threadId,
-          hashSecret(access.ciphertext),access.relayId,access.relayKeyCiphertext,capyAgentName(threadId)])).rows[0]!;
+          hashSecret(access.ciphertext),access.relayId,capyAgentName(threadId)])).rows[0]!;
       }
       await tx.query("UPDATE capy_bindings SET lease_owner=$2,lease_until=$3,updated_at=$4 WHERE id=$1",
         [row.id,claim,new Date(this.now().getTime()+120_000),this.now()]);
@@ -220,11 +220,22 @@ export class CapyBindings {
     try {
       await this.locked(actor, tx => this.current(tx,actor,row));
       const token = decryptSecret(row.token_ciphertext,this.deps.keyring);
-      const remote = await this.external(() => this.deps.relaycast.authenticatedAgent(token));
+      const remote = await this.external(() => this.deps.relaycast.authenticatedAgent(token))
+        .catch((error: unknown) => {
+          if (error instanceof RelaycastCallError && [401,403,404].includes(error.status)) return null;
+          throw new CapyBindingError(503,"capy_relay_unavailable");
+        });
+      if (!remote) return null;
       if (remote.id !== row.agent_remote_id || remote.workspaceId !== row.relaycast_workspace_id || !this.owns(remote,row)) return null;
       await this.locked(actor, tx => this.current(tx,actor,row));
       return { name,token };
-    } catch { return null; }
+    } catch (error) {
+      if (error instanceof CapyBindingError) {
+        if (error.status === 503) throw error;
+        return null;
+      }
+      throw new CapyBindingError(503,"capy_binding_unavailable");
+    }
   }
 
   async retire(actor: CapyActor, id: string): Promise<void> {
@@ -243,26 +254,38 @@ export class CapyBindings {
 
   /** System cleanup: only the original route and this binding's immutable
    * remote identity are touched. Unknown registration absence stays pending.
+   * Never expose this method in a user route; use retire(actor,id) or a system worker.
    */
   async cleanup(id: string): Promise<boolean> {
     if (!UUID.test(id)) return false;
-    const row = (await this.deps.database.query<Row>("SELECT * FROM capy_bindings WHERE id=$1 AND state='retired' AND cleanup_pending", [id])).rows[0];
+    const row = (await this.deps.database.query<Row & {
+      live_relaycast_workspace_id: string | null; live_relaycast_key_ciphertext: string | null;
+    }>(`SELECT b.*,w.relaycast_workspace_id AS live_relaycast_workspace_id,
+        w.relaycast_api_key_ciphertext AS live_relaycast_key_ciphertext
+      FROM capy_bindings b LEFT JOIN workspaces w ON w.id=b.workspace_id AND w.organization_id=b.organization_id
+      WHERE b.id=$1 AND b.state='retired' AND b.cleanup_pending`, [id])).rows[0];
     if (!row) return true;
+    const defer = async (code: string) => {
+      await this.deps.database.query(`UPDATE capy_bindings SET last_error=$3,updated_at=$4
+        WHERE id=$1 AND state='retired' AND generation=$2 AND cleanup_pending`, [id,row.generation,code,this.now()]);
+      return false;
+    };
     try {
       if (row.registration_attempted) {
-        if (!row.relaycast_key_ciphertext) return false;
-        const key = decryptSecret(row.relaycast_key_ciphertext,this.deps.keyring);
+        if (row.live_relaycast_workspace_id !== row.relaycast_workspace_id) return await defer("capy_cleanup_relay_changed");
+        if (!row.live_relaycast_key_ciphertext) return await defer("capy_cleanup_relay_unavailable");
+        const key = decryptSecret(row.live_relaycast_key_ciphertext,this.deps.keyring);
         const remote = await this.external(() => this.deps.relaycast.getRosterAgent(key,row.agent_name));
-        if (!remote && !row.agent_remote_id) return false;
+        if (!remote && !row.agent_remote_id) return await defer("capy_cleanup_registration_unknown");
         if (remote) {
-          if (!this.owns(remote,row) || (row.agent_remote_id && remote.id !== row.agent_remote_id)) return false;
+          if (!this.owns(remote,row) || (row.agent_remote_id && remote.id !== row.agent_remote_id)) return await defer("capy_cleanup_identity_changed");
           await this.external(() => this.deps.relaycast.releaseHosted(key,row.agent_name,remote.id));
         }
       }
       await this.deps.database.query(`UPDATE capy_bindings SET cleanup_pending=false,
-        relaycast_key_ciphertext=NULL,agent_remote_id=NULL,last_error=NULL,updated_at=$3
+        agent_remote_id=NULL,last_error=NULL,updated_at=$3
         WHERE id=$1 AND state='retired' AND generation=$2`, [id,row.generation,this.now()]);
       return true;
-    } catch { return false; }
+    } catch { return defer("capy_cleanup_relay_unavailable"); }
   }
 }

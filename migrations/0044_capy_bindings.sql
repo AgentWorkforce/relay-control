@@ -10,8 +10,6 @@ CREATE TABLE capy_bindings (
   generation integer NOT NULL DEFAULT 1 CHECK (generation > 0),
   connection_digest text NOT NULL,
   relaycast_workspace_id text NOT NULL,
-  -- Retained encrypted cleanup credential for this exact original Relay route.
-  relaycast_key_ciphertext text,
   agent_name text NOT NULL,
   agent_remote_id text,
   token_ciphertext text,
@@ -24,6 +22,7 @@ CREATE TABLE capy_bindings (
   updated_at timestamptz NOT NULL DEFAULT now(),
   FOREIGN KEY (workspace_id,organization_id) REFERENCES workspaces(id,organization_id) ON DELETE RESTRICT,
   CHECK (state <> 'bound' OR (agent_remote_id IS NOT NULL AND token_ciphertext IS NOT NULL)),
+  CHECK (state <> 'preparing' OR token_ciphertext IS NULL),
   CHECK (state <> 'retired' OR token_ciphertext IS NULL)
 );
 -- One active owner globally; a second workspace must not adopt the same thread.

@@ -36,10 +36,16 @@ registered again or declared cleaned up from an absent roster entry alone.
 The binding keeps its hosted token encrypted and never creates a participant
 alias. `agentFor` rechecks live membership, key generation, Relay workspace,
 immutable ID and ownership metadata before and after its remote check.
+Remote verification outages return retryable errors rather than appearing as
+missing or changed bindings. Measure this check's latency before mounting it.
 
 Retirement increments the generation and clears usable identity credentials
-before remote cleanup. Cleanup retains its original encrypted Relay-route
-credential on failure and never deletes a successor which reused the name.
+before remote cleanup. Cleanup uses the live workspace admin key only while
+the workspace still points to the original Relay route. Key rotation therefore
+needs no per-binding credential copy. A moved route leaves a coded cleanup
+obligation pending; cleanup never deletes a successor which reused the name.
+The cleanup method is system-only; user entry points must call actor-scoped
+retirement instead.
 Lease expiry or a concurrent retirement/member/key change cannot finalize a
 late registration. External waits are bounded; a timeout is not a claim that
 the remote write was cancelled.

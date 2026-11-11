@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
+import { encryptSecret } from "../src/crypto.js";
 import { CapyBindings, capyAgentName, type CapyActor } from "../src/capy/bindings.js";
 import { RemoteAgentConnections } from "../src/remote-agents/connections.js";
 import { CapyRuntimeError } from "../src/capy/runtime.js";
+import { RelaycastCallError } from "../src/messaging/relaycast.js";
 import { BOOTSTRAP, seedTenant, startControlPlane } from "./flows-helpers.js";
 
 test("Capy native identity custody preserves ownership, unknown outcomes and retirement", async t => {
@@ -23,7 +25,7 @@ test("Capy native identity custody preserves ownership, unknown outcomes and ret
   const keys = new RemoteAgentConnections(c.database,c.config.encryptionKeyring,async () => Response.json({ items: [] }));
   await keys.connect(actor,"capy",{ key });
   const agents = new Map<string,{ id: string; name: string; token: string; metadata: Record<string,unknown> }>();
-  let registers = 0, recovers = 0, releases = 0, providerReads = 0;
+  let registers = 0, recovers = 0, releases = 0, providerReads = 0, rosterReads = 0;
   let failure: "before" | "after" | null = null;
   let onThread: (() => Promise<void>) | null = null;
   let onRoster: (() => Promise<void>) | null = null;
@@ -32,6 +34,9 @@ test("Capy native identity custody preserves ownership, unknown outcomes and ret
   let releaseFails = false;
   let hangRegistration = false;
   let nowMillis = Date.now();
+  let expectedRelayKey = "rk_live_primary";
+  let authenticatedUnavailable = false;
+  let authenticationStatus: number | null = null;
   const roster = (a: NonNullable<ReturnType<typeof agents.get>>) => ({ ...a, address: null, kind: "agent", persona: null, status: "active", lastSeen: null });
   const service = new CapyBindings({
     database:c.database, keyring:c.config.encryptionKeyring,now:()=>new Date(nowMillis),
@@ -39,7 +44,7 @@ test("Capy native identity custody preserves ownership, unknown outcomes and ret
       providerReads++;assert.equal(receivedKey,key);await onThread?.();return { id,title:null,status:"active" };
     } },
     relaycast:{
-      getRosterAgent:async (_key,name) => { await onRoster?.();const a=agents.get(name);return a?roster(a):null; },
+      getRosterAgent:async (relayKey,name) => { assert.equal(relayKey,expectedRelayKey);rosterReads++;await onRoster?.();const a=agents.get(name);return a?roster(a):null; },
       registerHosted:async (_key,name,metadata) => {
         registers++;
         if (hangRegistration) await new Promise<void>(()=>{});
@@ -53,13 +58,16 @@ test("Capy native identity custody preserves ownership, unknown outcomes and ret
         recovers++;const a=agents.get(name)!;assert.equal(a.id,id);a.token=`native-agent-${randomUUID()}`;return {id,name,token:a.token};
       },
       authenticatedAgent:async token => {
+        if (authenticatedUnavailable) throw new Error(`upstream ${key}`);
+        if (authenticationStatus) throw new RelaycastCallError(authenticationStatus,`upstream ${key}`);
         const a=[...agents.values()].find(value=>value.token===token);assert.ok(a);
         await onAuthenticated?.();
         return { ...roster(a),id:changeIdentity==="id"?randomUUID():a.id,
           metadata:changeIdentity==="metadata"?{...a.metadata,owner_hash:"foreign"}:a.metadata,
           workspaceId:changeIdentity==="workspace"?"foreign-relay":"rc-primary",channels:[] };
       },
-      releaseHosted:async (_key,name,id) => {
+      releaseHosted:async (relayKey,name,id) => {
+        assert.equal(relayKey,expectedRelayKey);
         if (releaseFails) throw new Error(`upstream ${key}`);
         assert.equal(agents.get(name)?.id,id);releases++;agents.delete(name);
       },
@@ -102,6 +110,37 @@ test("Capy native identity custody preserves ownership, unknown outcomes and ret
     await c.database.query("UPDATE workspaces SET relaycast_workspace_id='moved-relay' WHERE id=$1",[actor.workspaceId]);
     assert.equal(await service.agentFor(actor.workspaceId,actor.userId,name),null);
     await c.database.query("UPDATE workspaces SET relaycast_workspace_id='rc-primary' WHERE id=$1",[actor.workspaceId]);
+  });
+  await t.test("a Relay outage stays retryable instead of masquerading as a changed binding",async () => {
+    const name=capyAgentName("jam_owned000"),before=registers;
+    authenticatedUnavailable=true;
+    try {
+      for (const invoke of [()=>service.agentFor(actor.workspaceId,actor.userId,name),()=>service.bind(actor,"jam_owned000")]) {
+        await assert.rejects(invoke,(error:unknown)=>{
+          assert.ok(error && typeof error === "object");
+          assert.equal((error as {status:number}).status,503);
+          assert.equal((error as {code:string}).code,"capy_relay_unavailable");
+          assert.equal(JSON.stringify(error).includes(key),false);return true;
+        });
+      }
+      assert.equal(registers,before);
+    } finally { authenticatedUnavailable=false; }
+  });
+  await t.test("definitive remote identity denial stays distinct from a retryable outage",async () => {
+    try {
+      for (const status of [401,403,404]) {
+        authenticationStatus=status;
+        assert.equal(await service.agentFor(actor.workspaceId,actor.userId,capyAgentName("jam_owned000")),null);
+      }
+      authenticationStatus=503;
+      await assert.rejects(service.agentFor(actor.workspaceId,actor.userId,capyAgentName("jam_owned000")),{status:503,code:"capy_relay_unavailable"});
+    } finally { authenticationStatus=null; }
+  });
+  await t.test("the schema refuses a usable token in a preparing identity",async () => {
+    const bound=await service.bind(actor,"jam_shape000");
+    try {
+      await assert.rejects(c.database.query("UPDATE capy_bindings SET state='preparing' WHERE id=$1",[bound.id]),{code:"23514"});
+    } finally { await c.database.query("UPDATE capy_bindings SET state='bound' WHERE id=$1",[bound.id]); }
   });
   await t.test("a foreign workspace cannot claim a live thread even with its own valid key",async () => {
     const other={...actor,workspaceId:tenant.otherWorkspaceId};await keys.connect(other,"capy",{key});
@@ -193,7 +232,7 @@ test("Capy native identity custody preserves ownership, unknown outcomes and ret
     assert.equal(await service.agentFor(actor.workspaceId,actor.userId,stored.agent_name),null);
     assert.equal((await row(thread)).cleanup_pending,true);assert.equal((await row(thread)).token_ciphertext,null);
     releaseFails=false;assert.equal(await service.cleanup(stored.id),true);assert.equal(releases,before+1);
-    assert.equal((await row(thread)).cleanup_pending,false);assert.equal((await row(thread)).relaycast_key_ciphertext,null);
+    assert.equal((await row(thread)).cleanup_pending,false);
   });
   await t.test("cleanup never deletes a successor that reused an old binding's agent name",async () => {
     const thread="jam_lostack0",stored=await row(thread),before=releases;
@@ -201,6 +240,25 @@ test("Capy native identity custody preserves ownership, unknown outcomes and ret
     const prior=agents.get(stored.agent_name)!;agents.set(stored.agent_name,{...prior,id:randomUUID()});
     assert.equal(await service.cleanup(stored.id),false);assert.equal(releases,before);
     assert.equal(agents.has(stored.agent_name),true);assert.equal((await row(thread)).cleanup_pending,true);
+  });
+  await t.test("cleanup uses the rotated live workspace key without retaining a duplicate credential",async () => {
+    const thread="jam_relaykey0",bound=await service.bind(actor,thread),before=releases;
+    expectedRelayKey="rk_live_rotated";
+    await c.database.query("UPDATE workspaces SET relaycast_api_key_ciphertext=$2 WHERE id=$1",[actor.workspaceId,encryptSecret(expectedRelayKey,c.config.encryptionKeyring.active)]);
+    await service.retire(actor,bound.id);
+    const stored=await row(thread);
+    assert.equal(stored.cleanup_pending,false);assert.equal(releases,before+1);
+    assert.equal(Object.hasOwn(stored,"relaycast_key_ciphertext"),false);
+  });
+  await t.test("a moved Relay route keeps a coded cleanup obligation without using an old credential",async () => {
+    const thread="jam_movedkey0",bound=await service.bind(actor,thread),before=releases,reads=rosterReads;
+    await c.database.query("UPDATE workspaces SET relaycast_workspace_id='moved-relay' WHERE id=$1",[actor.workspaceId]);
+    try {
+      await service.retire(actor,bound.id);
+      const stored=await row(thread);assert.equal(stored.cleanup_pending,true);
+      assert.equal(stored.last_error,"capy_cleanup_relay_changed");
+      assert.equal(releases,before);assert.equal(rosterReads,reads);
+    } finally { await c.database.query("UPDATE workspaces SET relaycast_workspace_id='rc-primary' WHERE id=$1",[actor.workspaceId]); }
   });
   await t.test("key replacement and membership changes immediately stop native identity resolution",async () => {
     const thread="jam_overlap0",name=capyAgentName(thread);
