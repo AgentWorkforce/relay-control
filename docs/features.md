@@ -1,7 +1,7 @@
 # Optional features
 
 `SELFHOST_FEATURES` selects which optional components an installation serves.
-It is a comma list of `flows`, `relayfile` and `chief`, read once at startup.
+It is a comma list of `flows`, `relayfile`, `chief` and `usage`, read once at startup.
 Unset or empty selects nothing, and an unknown name stops startup. Everything
 else is core and always on.
 
@@ -10,11 +10,12 @@ else is core and always on.
 | `flows` (Relayflows) | Flows routes, worker enrolment and the worker protocol serve |
 | `relayfile` | Reported as a capability; Control has no Relayfile routes |
 | `chief` | Chief routes serve; with no backend configured they answer 503 `chief_unavailable` |
+| `usage` | The owner-only usage API serves and Control records daily counts ([usage.md](usage.md)); nothing is recorded while it is off |
 
 ## Reading it
 
 - `GET /api/v1/capabilities` (also `/cloud/api/v1/capabilities`): any signed-in
-  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool } }`.
+  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool, "usage": bool } }`.
 - `/readyz` includes the same `capabilities` object.
 
 ## Refusals

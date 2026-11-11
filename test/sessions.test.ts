@@ -6,6 +6,7 @@ import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
 import type { Database, SqlExecutor, SqlResult } from "../src/database.js";
 import { migrate } from "../src/migrations.js";
+import { NO_FEATURES, type SelectedFeatures } from "../src/features.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { readWorkspaceHistory } from "../src/sessions/history.js";
 import { historyReader } from "../src/mcp/context.js";
@@ -294,7 +295,7 @@ async function startHistory(t: TestContext) {
 async function setup(
   t: TestContext,
   now = new Date("2026-11-02T20:00:00.000Z"),
-  options: { agentTokens?: boolean; relaycastFetch?: typeof fetch } = {},
+  options: { agentTokens?: boolean; relaycastFetch?: typeof fetch; features?: SelectedFeatures } = {},
 ) {
   const historyOrigin = "https://history.selfhosted.test";
   const history = await startHistory(t);
@@ -319,7 +320,9 @@ async function setup(
     sessionSearchAgentTokens: options.agentTokens,
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
-  const control = createServer(createApp({ config, store, now: () => now, messagingFetch: options.relaycastFetch }));
+  const control = createServer(createApp({
+    config, store, now: () => now, messagingFetch: options.relaycastFetch, features: options.features,
+  }));
   const origin = await listen(control);
   t.after(async () => {
     await close(control);
@@ -388,6 +391,7 @@ async function setup(
     organizationId: org.body.id as string,
     bootstrapToken,
     login,
+    database,
   };
 }
 
@@ -1214,5 +1218,170 @@ test("recorded summaries fail closed on missing provenance, tenant attestation a
     assert.equal(result.status, status === 501 ? 501 : status === 503 ? 503 : 502);
     // A 401 evicts the cached read token and retries once with a fresh handoff.
     assert.equal(reads(), before + (status === 401 ? 2 : 1));
+  }
+});
+
+// Usage page (docs/usage.md): owner-only, counts only.
+
+const USAGE_ON: SelectedFeatures = { ...NO_FEATURES, usage: true };
+
+function dailyActivity(total: (date: string) => number) {
+  return (_request: IncomingMessage, url: URL) => {
+    const since = Date.parse(url.searchParams.get("since")!);
+    const until = Date.parse(url.searchParams.get("until")!);
+    const days = [];
+    for (let at = since; at <= until; at += 86_400_000) {
+      const date = new Date(at).toISOString().slice(0, 10);
+      days.push({ date, total: total(date), bySource: { codex: total(date) } });
+    }
+    return { body: { days } };
+  };
+}
+
+/** Counters are written off the request path; poll until `ready` holds. */
+async function usageUntil(
+  origin: string,
+  path: string,
+  token: string,
+  ready: (body: Record<string, any>) => boolean,
+) {
+  let last: Awaited<ReturnType<typeof call>> | undefined;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    last = await call(origin, path, { token });
+    if (last.status !== 200 || ready(last.body)) return last;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return last!;
+}
+
+test("usage: an owner gets daily counts from the session directory and Control counters", async (t) => {
+  const env = await setup(t, undefined, { features: USAGE_ON });
+  env.history.overrides.set("/v1/sessions/activity", dailyActivity((date) => date === "2026-11-02" ? 4 : 1));
+  env.history.overrides.set("/v1/sessions/summaries/activity", dailyActivity((date) => date === "2026-11-01" ? 2 : 0));
+  const owner = await env.login(env.ownerId, env.alpha);
+  const member = await env.login(env.memberId, env.alpha);
+  // Two first-page searches count; a later page of the same search does not.
+  assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions/search?q=fix`, { token: member })).status, 200);
+  assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions?q=fix`, { token: owner })).status, 200);
+  assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions/search?q=fix&cursor=next`, { token: member })).status, 200);
+  assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions`, { token: owner })).status, 200);
+
+  const path = `/cloud/api/v1/organizations/${env.organizationId}/usage?days=7`;
+  const result = await usageUntil(env.origin, path, owner, (body) =>
+    body.usage.totals.searches === 2 && body.usage.totals.activeUsers === 2);
+  assert.equal(result.status, 200);
+  assert.equal(result.headers.get("cache-control"), "no-store");
+  const usage = result.body.usage;
+  assert.deepEqual(usage.range, { days: 7, from: "2026-10-27", to: "2026-11-02" });
+  assert.equal(usage.days.length, 7);
+  // The owner reads both workspaces (alpha and beta): 1 + 1 per day, 4 + 4 today.
+  assert.deepEqual(usage.days.at(-1), { date: "2026-11-02", activeUsers: 2, sessionsUploaded: 8, searches: 2, summaries: 0 });
+  assert.deepEqual(usage.days[0], { date: "2026-10-27", activeUsers: 0, sessionsUploaded: 2, searches: 0, summaries: 0 });
+  assert.deepEqual(usage.totals, { activeUsers: 2, sessionsUploaded: 20, searches: 2, summaries: 4 });
+  assert.deepEqual(usage.unavailable, []);
+  const reads = env.history.requests.filter((entry) => entry.path === "/v1/sessions/activity");
+  assert.deepEqual(new Set(reads.map((entry) => entry.query.workspace)), new Set([env.alpha, env.beta]));
+  assert.equal(reads.at(-1)!.query.since, "2026-10-27T00:00:00.000Z");
+  assert.equal(reads.at(-1)!.query.until, "2026-11-02T20:00:00.000Z");
+});
+
+test("usage: no identities, emails, names or the install secret in the response", async (t) => {
+  const env = await setup(t, undefined, { features: USAGE_ON });
+  env.history.overrides.set("/v1/sessions/activity", dailyActivity(() => 1));
+  const owner = await env.login(env.ownerId, env.alpha);
+  const result = await usageUntil(env.origin, `/cloud/api/v1/organizations/${env.organizationId}/usage`, owner,
+    (body) => body.usage.totals.activeUsers === 1);
+  assert.equal(result.status, 200);
+  assert.deepEqual(Object.keys(result.body.usage).sort(), ["days", "range", "totals", "unavailable"]);
+  for (const day of result.body.usage.days) {
+    assert.deepEqual(Object.keys(day).sort(), ["activeUsers", "date", "searches", "sessionsUploaded", "summaries"]);
+  }
+  const text = JSON.stringify(result.body);
+  const { rows: [state] } = await env.database.query<{ salt: string }>("SELECT salt FROM usage_state");
+  const { rows: hashes } = await env.database.query<{ user_hash: string }>("SELECT user_hash FROM usage_daily_users");
+  assert.ok(state && hashes.length === 1);
+  for (const secret of [
+    "owner@example.test", "member@example.test", "Owner", "Member", env.ownerId, env.memberId,
+    env.alpha, env.beta, state.salt, hashes[0]!.user_hash,
+  ]) {
+    assert.equal(text.includes(secret), false, `response leaks ${secret}`);
+  }
+  // Stored rows are keyed by an HMAC under the install secret, never the user id.
+  assert.notEqual(hashes[0]!.user_hash, env.ownerId);
+});
+
+test("usage: only an owner; admin, member and the bootstrap operator get 403", async (t) => {
+  const env = await setup(t, undefined, { features: USAGE_ON });
+  const admin = await call(env.origin, `/api/v1/organizations/${env.organizationId}/memberships`, {
+    method: "POST",
+    token: env.bootstrapToken,
+    body: { email: "admin@example.test", name: "Admin", role: "admin" },
+  });
+  assert.equal(admin.status, 200);
+  const path = `/cloud/api/v1/organizations/${env.organizationId}/usage`;
+  for (const token of [
+    await env.login(admin.body.userId, env.alpha),
+    await env.login(env.memberId, env.alpha),
+    env.bootstrapToken,
+  ]) {
+    const refused = await call(env.origin, path, { token });
+    assert.equal(refused.status, 403);
+    assert.equal(refused.body.error, "forbidden");
+    assert.equal(refused.body.usage, undefined);
+  }
+  assert.equal((await call(env.origin, path)).status, 401);
+  const owner = await env.login(env.ownerId, env.alpha);
+  assert.equal((await call(env.origin, `/cloud/api/v1/organizations/00000000-0000-4000-8000-000000000000/usage`, { token: owner })).status, 404);
+});
+
+test("usage: off by default, with nothing recorded", async (t) => {
+  const env = await setup(t);
+  const owner = await env.login(env.ownerId, env.alpha);
+  assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions/search?q=fix`, { token: owner })).status, 200);
+  const refused = await call(env.origin, `/cloud/api/v1/organizations/${env.organizationId}/usage`, { token: owner });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.error, "feature_not_enabled");
+  const capabilities = await call(env.origin, "/cloud/api/v1/capabilities", { token: owner });
+  assert.equal(capabilities.body.capabilities.usage, false);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  for (const table of ["usage_daily_users", "usage_daily_counters", "usage_state"]) {
+    const { rows } = await env.database.query<{ n: number }>(`SELECT count(*)::int AS n FROM ${table}`);
+    assert.equal(rows[0]!.n, 0, table);
+  }
+});
+
+test("usage: empty state is zeros, and an unreadable source is null, never zero", async (t) => {
+  const env = await setup(t, undefined, { features: USAGE_ON });
+  env.history.overrides.set("/v1/sessions/activity", dailyActivity(() => 0));
+  const owner = await env.login(env.ownerId, env.alpha);
+  const path = `/cloud/api/v1/organizations/${env.organizationId}/usage?days=90`;
+  const empty = await usageUntil(env.origin, path, owner, (body) => body.usage.totals.activeUsers === 1);
+  assert.equal(empty.status, 200);
+  assert.equal(empty.body.usage.days.length, 90);
+  assert.deepEqual(empty.body.usage.range, { days: 90, from: "2026-08-05", to: "2026-11-02" });
+  // The fake read API does not serve summaries (404): unavailable, not zero.
+  assert.deepEqual(empty.body.usage.totals, { activeUsers: 1, sessionsUploaded: 0, searches: 0, summaries: null });
+  assert.deepEqual(empty.body.usage.unavailable, ["summaries"]);
+  assert.equal(empty.body.usage.days[0].summaries, null);
+
+  env.history.overrides.set("/v1/sessions/activity", () => ({ status: 503, body: { error: { code: "not_configured" } } }));
+  const degraded = await call(env.origin, path, { token: owner });
+  assert.equal(degraded.status, 200);
+  assert.equal(degraded.body.usage.totals.sessionsUploaded, null);
+  assert.deepEqual(degraded.body.usage.unavailable, ["sessionsUploaded", "summaries"]);
+});
+
+test("usage: the range is 7, 30 or 90 days ending today", async (t) => {
+  const env = await setup(t, undefined, { features: USAGE_ON });
+  env.history.overrides.set("/v1/sessions/activity", dailyActivity(() => 0));
+  const owner = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/organizations/${env.organizationId}/usage`;
+  const defaulted = await call(env.origin, base, { token: owner });
+  assert.equal(defaulted.status, 200);
+  assert.deepEqual(defaulted.body.usage.range, { days: 30, from: "2026-10-04", to: "2026-11-02" });
+  for (const query of ["days=0", "days=14", "days=365", "days=-7", "days=abc", "days=7&days=30", "days=7&from=2026-01-01", "from=2026-01-01"]) {
+    const refused = await call(env.origin, `${base}?${query}`, { token: owner });
+    assert.equal(refused.status, 400, query);
+    assert.equal(refused.body.error, "invalid_request", query);
   }
 });
