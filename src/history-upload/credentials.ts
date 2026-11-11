@@ -13,6 +13,7 @@ import {
   sha256Hex,
   signV4,
   type AwsCredentialProvider,
+  type AwsCredentials,
 } from "../aws/sigv4.js";
 import { StsError, type StsClient } from "../aws/sts.js";
 
@@ -367,15 +368,32 @@ export function parseUploadCredentialsRequest(body: unknown): UploadCredentialsR
   return { originId, kind, ...(keys !== undefined ? { keys: (keys as UploadKeyRequest[]).map(({ key, sha256 }) => ({ key, sha256 })) } : {}) };
 }
 
+/**
+ * The URL for an absolute object key: path style against an S3-compatible
+ * endpoint (bucket names need no wildcard DNS there), virtual-hosted on AWS.
+ */
+export function objectUrl(config: Pick<HistoryUploadConfig, "bucket" | "region" | "endpoint">, key: string): URL {
+  const encoded = key.split("/").map(encodeRfc3986).join("/");
+  if (config.endpoint) return new URL(`${config.endpoint}/${config.bucket}/${encoded}`);
+  return new URL(`https://${config.bucket}.s3.${config.region}.amazonaws.com/${encoded}`);
+}
+
+const unavailable = () =>
+  new UploadCredentialsError(503, "upload_credentials_unavailable", "Upload credentials are unavailable; use the ingest edge");
+
 export class HistoryUploadCredentials {
   constructor(
     private readonly options: {
       config: HistoryUploadConfig;
       sts: StsClient;
       journal: PrivacyJournalReader;
+      /** Control's own credentials, which sign presigned URLs for an S3-compatible endpoint. */
+      credentials?: AwsCredentialProvider;
       now?: () => Date;
     },
   ) {}
+
+  #credentials: AwsCredentialProvider | null = null;
 
   async issue(tenant: UploadTenant, request: UploadCredentialsRequest): Promise<Record<string, unknown>> {
     const { config, sts, journal } = this.options;
@@ -383,6 +401,11 @@ export class HistoryUploadCredentials {
       assertTenantSegment(config.keyRoot, tenant.orgId);
     } catch {
       throw new UploadCredentialsError(400, "invalid_tenant", "The organization id cannot be used as an upload key segment");
+    }
+    // Without a role there is nothing to scope STS credentials with, so the
+    // request is refused before the journal read it could never use.
+    if (config.roleArn === null && request.kind === "sts") {
+      throw new UploadCredentialsError(501, "unsupported_by_backend", "This installation issues presigned upload URLs only; request kind presigned");
     }
     let seq: number;
     try {
@@ -393,6 +416,41 @@ export class HistoryUploadCredentials {
       throw new UploadCredentialsError(503, "privacy_journal_unavailable", "Upload credentials are unavailable; use the ingest edge");
     }
     const prefix = uploadInboxPrefix(config.keyRoot, tenant);
+    // witnessSeq is the seq inside the signed witness, readable by clients that treat the witness as opaque.
+    const common = {
+      bucket: config.bucket,
+      region: config.region,
+      endpoint: config.endpoint,
+      keyPrefix: prefix,
+      kmsKeyId: config.kmsKeyArn,
+    };
+    const witnessFor = (exp: Date) => signWitness(config.witnessKey, {
+      v: 1,
+      org: tenant.orgId,
+      ws: tenant.workspaceId,
+      user: tenant.userId,
+      seq,
+      exp: Math.floor(exp.getTime() / 1000),
+    });
+
+    if (config.roleArn === null) {
+      // S3-compatible store: no STS, so URLs are signed with Control's own
+      // store keys and are only as long-lived as PRESIGNED_URL_MAX_MS.
+      let credentials: AwsCredentials;
+      try {
+        credentials = await (this.#credentials ??= this.options.credentials ?? new DefaultAwsCredentialProvider()).get();
+      } catch {
+        // The provider's error can name hosts or files; it is not logged.
+        console.warn("[history-upload] credentials unavailable");
+        throw unavailable();
+      }
+      const now = this.options.now?.() ?? new Date();
+      const timing = presignTiming(now, now.getTime() + PRESIGNED_URL_MAX_MS);
+      const witness = witnessFor(timing.urlExpiresAt);
+      return this.#presignedResponse(common, witness, seq, request, credentials, prefix, now, timing);
+    }
+
+    if (config.kmsKeyArn === null) throw new Error("kmsKeyArn is required with roleArn");
     const policy = sessionPolicy({ bucket: config.bucket, prefix, kmsKeyArn: config.kmsKeyArn });
     let creds;
     try {
@@ -406,25 +464,10 @@ export class HistoryUploadCredentials {
     } catch (error) {
       if (!(error instanceof StsError)) throw error;
       console.warn("[history-upload] AssumeRole failed", { code: error.code });
-      throw new UploadCredentialsError(503, "upload_credentials_unavailable", "Upload credentials are unavailable; use the ingest edge");
+      throw unavailable();
     }
-    const witness = signWitness(config.witnessKey, {
-      v: 1,
-      org: tenant.orgId,
-      ws: tenant.workspaceId,
-      user: tenant.userId,
-      seq,
-      exp: Math.floor(creds.expiresAt.getTime() / 1000),
-    });
+    const witness = witnessFor(creds.expiresAt);
     const now = this.options.now?.() ?? new Date();
-    // witnessSeq is the seq inside the signed witness, readable by clients that treat the witness as opaque.
-    const common = {
-      bucket: config.bucket,
-      region: config.region,
-      endpoint: null,
-      keyPrefix: prefix,
-      kmsKeyId: config.kmsKeyArn,
-    };
     if (request.kind === "sts") {
       return {
         contract: UPLOAD_CONTRACT,
@@ -442,29 +485,47 @@ export class HistoryUploadCredentials {
         refreshAfter: new Date(Math.max(now.getTime() + 60_000, creds.expiresAt.getTime() - 10 * 60_000)).toISOString(),
       };
     }
-    const urlLimit = Math.min(creds.expiresAt.getTime(), now.getTime() + PRESIGNED_URL_MAX_MS);
-    const expiresSeconds = Math.max(1, Math.floor((urlLimit - now.getTime()) / 1000));
-    const urlExpiresAt = new Date(now.getTime() + expiresSeconds * 1000);
-    const baseHeaders = {
+    const timing = presignTiming(now, Math.min(creds.expiresAt.getTime(), now.getTime() + PRESIGNED_URL_MAX_MS));
+    return this.#presignedResponse(common, witness, seq, request, {
+      accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey, sessionToken: creds.sessionToken,
+    }, prefix, now, timing);
+  }
+
+  /** The presigned response shared by AWS (STS session keys) and S3-compatible stores (Control's keys). */
+  #presignedResponse(
+    common: Record<string, unknown>,
+    witness: string,
+    seq: number,
+    request: UploadCredentialsRequest,
+    credentials: AwsCredentials,
+    prefix: string,
+    now: Date,
+    timing: { expiresSeconds: number; urlExpiresAt: Date },
+  ): Record<string, unknown> {
+    const { config } = this.options;
+    const baseHeaders: Record<string, string> = {
       "content-encoding": "zstd",
       "if-none-match": "*",
       [WITNESS_METADATA_KEY]: witness,
-      "x-amz-server-side-encryption": "aws:kms",
-      "x-amz-server-side-encryption-aws-kms-key-id": config.kmsKeyArn,
+      // Without a key the store's default encryption applies, and the client
+      // must not send SSE headers that were not signed.
+      ...(config.kmsKeyArn !== null
+        ? { "x-amz-server-side-encryption": "aws:kms", "x-amz-server-side-encryption-aws-kms-key-id": config.kmsKeyArn }
+        : {}),
     };
     const urls = (request.keys ?? []).map(({ key, sha256 }) => ({
       key,
       url: presignV4({
         method: "PUT",
-        url: new URL(`https://${config.bucket}.s3.${config.region}.amazonaws.com/${`${prefix}${key}`.split("/").map(encodeRfc3986).join("/")}`),
+        url: objectUrl(config, `${prefix}${key}`),
         region: config.region,
         service: "s3",
-        credentials: { accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey, sessionToken: creds.sessionToken },
+        credentials,
         now,
-        expiresSeconds,
+        expiresSeconds: timing.expiresSeconds,
         signedHeaders: { ...baseHeaders, "x-amz-checksum-sha256": sha256 },
       }).toString(),
-      expiresAt: urlExpiresAt.toISOString(),
+      expiresAt: timing.urlExpiresAt.toISOString(),
     }));
     return {
       contract: UPLOAD_CONTRACT,
@@ -473,8 +534,14 @@ export class HistoryUploadCredentials {
       witness,
       witnessSeq: seq,
       maxObjectBytes: config.maxObjectBytes,
-      refreshAfter: new Date(Math.max(now.getTime() + 60_000, urlExpiresAt.getTime() - 5 * 60_000)).toISOString(),
+      refreshAfter: new Date(Math.max(now.getTime() + 60_000, timing.urlExpiresAt.getTime() - 5 * 60_000)).toISOString(),
       urls,
     };
   }
+}
+
+/** Whole-second URL lifetime up to urlLimit (epoch ms), at least one second. */
+function presignTiming(now: Date, urlLimit: number): { expiresSeconds: number; urlExpiresAt: Date } {
+  const expiresSeconds = Math.max(1, Math.floor((urlLimit - now.getTime()) / 1000));
+  return { expiresSeconds, urlExpiresAt: new Date(now.getTime() + expiresSeconds * 1000) };
 }

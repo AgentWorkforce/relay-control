@@ -3376,9 +3376,12 @@ paths:
         `witness` is opaque: send it verbatim as the object metadata header
         `x-amz-meta-relay-witness`. `witnessSeq` is the privacy journal seq
         signed inside the witness; clients name their object key with it.
-        Every PUT must carry `x-amz-server-side-encryption: aws:kms`,
-        `x-amz-server-side-encryption-aws-kms-key-id: <kmsKeyId>` and
-        `If-None-Match: *` (create only). Presigned PUTs must also send
+        Every PUT must carry `If-None-Match: *` (create only) and, when
+        `kmsKeyId` is non-null, `x-amz-server-side-encryption: aws:kms` and
+        `x-amz-server-side-encryption-aws-kms-key-id: <kmsKeyId>`. With an
+        S3-compatible endpoint (SELFHOST_HISTORY_UPLOAD_ENDPOINT) `endpoint`
+        is non-null, URLs are path style and only `kind=presigned` is
+        served. Presigned PUTs must also send
         `Content-Encoding: zstd` and `x-amz-checksum-sha256: <sha256>`
         verbatim; all of these headers are signed into the URL. Objects over
         `maxObjectBytes` are refused by the pipeline consumer. Renew at
@@ -3422,9 +3425,14 @@ paths:
           description: Only POST is allowed (when the feature is on for the deployment).
         "429":
           description: More than 12 upload credential requests per user/workspace per minute (retry-after set).
+        "501":
+          description: |
+            `unsupported_by_backend`: `kind=sts` against an S3-compatible
+            endpoint, which issues presigned URLs only; request `kind=presigned`.
         "503":
           description: |
-            `upload_credentials_unavailable` (AssumeRole failed) or
+            `upload_credentials_unavailable` (AssumeRole failed, or Control's
+            own credentials are unavailable) or
             `privacy_journal_unavailable` (the privacy journal could not be
             read or is invalid); fall back to the ingest-edge upload.
   /api/v1/workspaces/{workspaceId}/session-read/session:
@@ -7449,9 +7457,9 @@ components:
         kind: { type: string, enum: [sts] }
         bucket: { type: string }
         region: { type: string }
-        endpoint: { type: [string, "null"], description: Always null (the AWS regional endpoint). }
+        endpoint: { type: [string, "null"], description: Null (the AWS regional endpoint); kind=sts is AWS only and answers 501 against an S3-compatible endpoint. }
         keyPrefix: { type: string, description: "`<keyRoot>/.upload-inbox/<org>/v1/ws=<ws>/u=<userHash>/`" }
-        kmsKeyId: { type: string }
+        kmsKeyId: { type: string, description: The KMS key ARN (always set on AWS). }
         credentials:
           type: object
           required: [accessKeyId, secretAccessKey, sessionToken, expiresAt]
@@ -7473,9 +7481,9 @@ components:
         kind: { type: string, enum: [presigned] }
         bucket: { type: string }
         region: { type: string }
-        endpoint: { type: [string, "null"], description: Always null (the AWS regional endpoint). }
+        endpoint: { type: [string, "null"], description: "Null on AWS (virtual-hosted URLs); otherwise the S3-compatible endpoint origin, addressed path style as `<endpoint>/<bucket>/<key>`." }
         keyPrefix: { type: string }
-        kmsKeyId: { type: string }
+        kmsKeyId: { type: [string, "null"], description: The KMS key id signed into each URL; null means no SSE headers are signed and none may be sent. }
         witness: { type: string, description: Opaque; send verbatim as x-amz-meta-relay-witness (signed into each URL). }
         witnessSeq: { type: integer, minimum: 0, description: The privacy journal seq signed inside the witness. }
         maxObjectBytes: { type: integer }

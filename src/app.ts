@@ -741,7 +741,8 @@ export function createApp(input: {
 
   // Direct-to-S3 session uploads (docs/sessions-read-api.md): off, so the
   // upload-credentials route 404s, unless SELFHOST_HISTORY_UPLOAD_DIRECT is
-  // allowlist or on. One AWS credential provider serves STS and the journal.
+  // allowlist or on. One AWS credential provider serves STS, the journal and
+  // (S3-compatible stores) presigned URLs.
   const uploadConfig = config.historyUpload ?? null;
   const historyUpload = uploadConfig
     ? (() => {
@@ -756,10 +757,13 @@ export function createApp(input: {
           bucket: uploadConfig.bucket,
           region: uploadConfig.region,
           credentials,
-          endpoint: hooks?.endpoints?.s3,
+          // The internal endpoint (in-cluster service URL) avoids hairpinning
+          // through the public ingress the upload clients use.
+          endpoint: hooks?.endpoints?.s3 ?? uploadConfig.internalEndpoint ?? undefined,
           fetchImpl: hooks?.fetchImpl,
           now: input.now,
         }),
+        credentials,
         now: input.now,
       });
     })()

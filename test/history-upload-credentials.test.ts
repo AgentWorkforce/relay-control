@@ -11,6 +11,7 @@ import { AwsStsClient, StsError } from "../src/aws/sts.js";
 import { loadHistoryUploadConfig, type HistoryUploadConfig, type SelfhostConfig } from "../src/config.js";
 import { hashSecret } from "../src/crypto.js";
 import {
+  HistoryUploadCredentials,
   journalKey,
   JournalUnavailableError,
   layoutComponent,
@@ -94,15 +95,22 @@ async function fakeAws(t: TestContext) {
 function uploadConfig(overrides: Partial<HistoryUploadConfig> = {}): HistoryUploadConfig {
   return {
     mode: "allowlist", allowlist: [], bucket: BUCKET, region: "us-east-1", keyRoot: "96bulls",
-    roleArn: ROLE_ARN, kmsKeyArn: KMS_ARN, witnessKey: WITNESS_KEY_BYTES, maxObjectBytes: 2_097_152, ...overrides,
+    endpoint: null, internalEndpoint: null, roleArn: ROLE_ARN, kmsKeyArn: KMS_ARN, witnessKey: WITNESS_KEY_BYTES, maxObjectBytes: 2_097_152, ...overrides,
   };
 }
 
-async function setup(t: TestContext, options: { upload?: HistoryUploadConfig | null; allowOwner?: boolean } = {}) {
+async function setup(t: TestContext, options: {
+  /** A config, or one built from the fake AWS origin (for S3-compatible endpoints). */
+  upload?: HistoryUploadConfig | null | ((awsOrigin: string) => HistoryUploadConfig);
+  allowOwner?: boolean;
+  /** Leave out the S3 endpoint hook so the journal read follows config.internalEndpoint. */
+  omitS3Hook?: boolean;
+} = {}) {
   const aws = await fakeAws(t);
   const database = new PGliteDatabase();
   await migrate(database);
-  const upload = options.upload === undefined ? uploadConfig() : options.upload;
+  const upload = options.upload === undefined ? uploadConfig()
+    : typeof options.upload === "function" ? options.upload(aws.origin) : options.upload;
   const config: SelfhostConfig = {
     databaseUrl: "unused-in-test",
     publicBaseUrl: "https://control.internal.example",
@@ -127,7 +135,7 @@ async function setup(t: TestContext, options: { upload?: HistoryUploadConfig | n
     store,
     historyUpload: {
       credentials: new StaticAwsCredentialProvider(STATIC_CREDS),
-      endpoints: { sts: aws.origin, s3: aws.origin },
+      endpoints: options.omitS3Hook ? { sts: aws.origin } : { sts: aws.origin, s3: aws.origin },
     },
   }));
   const origin = await listen(server);
@@ -287,6 +295,57 @@ test("loadHistoryUploadConfig parses modes, requires every input and bounds the 
     assert.deepEqual(fromFile?.witnessKey, WITNESS_KEY_BYTES);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadHistoryUploadConfig: an S3-compatible endpoint drops the role, makes KMS optional and needs static keys", () => {
+  const staticKeys = { AWS_ACCESS_KEY_ID: "fake-store-access", AWS_SECRET_ACCESS_KEY: "fake-store-secret" };
+  const s3 = (extra: Record<string, string | undefined> = {}) => uploadEnv({
+    SELFHOST_HISTORY_UPLOAD_ENDPOINT: "https://store.example.test/s3/",
+    SELFHOST_HISTORY_UPLOAD_ROLE_ARN: undefined,
+    SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN: undefined,
+    ...staticKeys,
+    ...extra,
+  });
+  const parsed = loadHistoryUploadConfig(s3());
+  assert.equal(parsed?.endpoint, "https://store.example.test/s3");
+  assert.equal(parsed?.internalEndpoint, "https://store.example.test/s3");
+  assert.equal(parsed?.roleArn, null);
+  assert.equal(parsed?.kmsKeyArn, null);
+  assert.equal("AWS_ACCESS_KEY_ID" in (parsed as object), false);
+  assert.equal(loadHistoryUploadConfig(s3({ SELFHOST_HISTORY_UPLOAD_ENDPOINT: "http://store:9000" }))?.endpoint, "http://store:9000");
+  assert.equal(
+    loadHistoryUploadConfig(s3({ SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT: "http://store.cluster.local:9000/" }))?.internalEndpoint,
+    "http://store.cluster.local:9000",
+  );
+  assert.equal(loadHistoryUploadConfig(s3({ SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN: "upload-key" }))?.kmsKeyArn, "upload-key");
+  assert.equal(loadHistoryUploadConfig(s3({ SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN: KMS_ARN }))?.kmsKeyArn, KMS_ARN);
+  assert.throws(() => loadHistoryUploadConfig(s3({ SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN: "upload key" })),
+    /^Error: SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN must be a key id without whitespace$/);
+  assert.throws(() => loadHistoryUploadConfig(s3({ SELFHOST_HISTORY_UPLOAD_ROLE_ARN: ROLE_ARN })),
+    /^Error: SELFHOST_HISTORY_UPLOAD_ROLE_ARN is not supported with SELFHOST_HISTORY_UPLOAD_ENDPOINT/);
+  assert.throws(() => loadHistoryUploadConfig(uploadEnv({ SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT: "http://store:9000" })),
+    /^Error: SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT requires SELFHOST_HISTORY_UPLOAD_ENDPOINT$/);
+  // Ambient AWS role credentials must never reach a non-AWS store.
+  for (const missing of ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]) {
+    assert.throws(() => loadHistoryUploadConfig(s3({ [missing]: undefined })),
+      /^Error: a non-AWS SELFHOST_HISTORY_UPLOAD_ENDPOINT needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY$/);
+  }
+  const aws = loadHistoryUploadConfig(s3({
+    SELFHOST_HISTORY_UPLOAD_ENDPOINT: "https://s3.us-east-1.amazonaws.com", AWS_ACCESS_KEY_ID: undefined, AWS_SECRET_ACCESS_KEY: undefined,
+  }));
+  assert.equal(aws?.endpoint, "https://s3.us-east-1.amazonaws.com");
+  for (const [name, bad] of [
+    ["SELFHOST_HISTORY_UPLOAD_ENDPOINT", "store.example.test"],
+    ["SELFHOST_HISTORY_UPLOAD_ENDPOINT", "ftp://store.example.test"],
+    ["SELFHOST_HISTORY_UPLOAD_ENDPOINT", "https://fake-user:fake-pass@store.example.test"],
+    ["SELFHOST_HISTORY_UPLOAD_ENDPOINT", "https://store.example.test/?region=x"],
+    ["SELFHOST_HISTORY_UPLOAD_ENDPOINT", "https://store.example.test/#frag"],
+    ["SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT", "store:9000/path"],
+    ["SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT", "http://fake-user@store:9000"],
+  ] as const) {
+    assert.throws(() => loadHistoryUploadConfig(s3({ [name]: bad })),
+      (error: Error) => error.message.startsWith(`${name} `) && !error.message.includes(bad), `${name}=${bad}`);
   }
 });
 
@@ -582,6 +641,102 @@ test("route: GET is 405 with allow POST, and session sync still returns the call
   });
   assert.equal(sync.status, 200, sync.raw);
   assert.equal(sync.body.accessToken, env.token);
+});
+
+// ---- route: S3-compatible endpoint ----
+
+const s3Compatible = (kmsKeyArn: string | null) => (origin: string) =>
+  uploadConfig({ endpoint: origin, internalEndpoint: origin, roleArn: null, kmsKeyArn });
+
+test("route: S3-compatible presigned without KMS signs path-style URLs with Control's keys and no SSE headers", async (t) => {
+  const env = await setup(t, { upload: s3Compatible(null), omitS3Hook: true });
+  const issued = await request(env.origin, env.path, {
+    method: "POST", token: env.token,
+    body: { originId: "machine-1", kind: "presigned", keys: [{ key: "s/1.zst", sha256: SHA_A }, { key: "s/2.zst", sha256: SHA_B }] },
+  });
+  assert.equal(issued.status, 200, issued.raw);
+  assert.equal(issued.body.endpoint, env.aws.origin);
+  assert.equal(issued.body.kmsKeyId, null);
+  assert.equal(issued.body.witnessSeq, 7);
+  // The journal was read through config.internalEndpoint, and no STS call was made.
+  const journalGet = env.aws.state.requests.find((r) => r.method === "GET");
+  assert.ok(journalGet);
+  assert.equal(journalGet.path.split("/").map(decodeURIComponent).join("/"), `/${BUCKET}/${journalKey("96bulls", env.tenant)}`);
+  assert.equal(env.aws.state.requests.some((r) => r.method === "POST"), false);
+  const prefix = uploadInboxPrefix("96bulls", env.tenant);
+  const witness = verifyWitness(WITNESS_KEY_BYTES, issued.body.witness);
+  assert.ok(witness);
+  assert.equal(witness.seq, 7);
+  assert.equal(issued.body.urls.length, 2);
+  for (const [index, sha256] of [SHA_A, SHA_B].entries()) {
+    const entry = issued.body.urls[index];
+    const url = new URL(entry.url);
+    assert.equal(url.origin, env.aws.origin);
+    assert.equal(url.pathname.split("/").map(decodeURIComponent).join("/"), `/${BUCKET}/${prefix}${entry.key}`);
+    assert.equal(witness.exp, Math.floor(Date.parse(entry.expiresAt) / 1000));
+    const signedHeaders = url.searchParams.get("X-Amz-SignedHeaders")!;
+    assert.equal(signedHeaders, "content-encoding;host;if-none-match;x-amz-checksum-sha256;x-amz-meta-relay-witness");
+    assert.equal(signedHeaders.includes("x-amz-server-side-encryption"), false);
+    assert.ok(url.searchParams.get("X-Amz-Credential")!.startsWith(`${STATIC_CREDS.accessKeyId}/`));
+    assert.equal(url.searchParams.has("X-Amz-Security-Token"), false);
+    assert.equal(Number(url.searchParams.get("X-Amz-Expires")), 900);
+    const amzDate = url.searchParams.get("X-Amz-Date")!;
+    const now = new Date(`${amzDate.slice(0, 4)}-${amzDate.slice(4, 6)}-${amzDate.slice(6, 8)}T${amzDate.slice(9, 11)}:${amzDate.slice(11, 13)}:${amzDate.slice(13, 15)}Z`);
+    const resigned = presignV4({
+      method: "PUT",
+      url: new URL(`${url.origin}${url.pathname}`),
+      region: "us-east-1",
+      service: "s3",
+      credentials: STATIC_CREDS,
+      now,
+      expiresSeconds: 900,
+      signedHeaders: {
+        "content-encoding": "zstd",
+        "if-none-match": "*",
+        "x-amz-checksum-sha256": sha256,
+        "x-amz-meta-relay-witness": issued.body.witness,
+      },
+    });
+    assert.equal(url.searchParams.get("X-Amz-Signature"), resigned.searchParams.get("X-Amz-Signature"));
+  }
+});
+
+test("route: S3-compatible presigned with a KMS key name signs both SSE headers", async (t) => {
+  const env = await setup(t, { upload: s3Compatible("upload-key") });
+  const issued = await request(env.origin, env.path, {
+    method: "POST", token: env.token, body: { originId: "machine-1", kind: "presigned", keys: [{ key: "s/1.zst", sha256: SHA_A }] },
+  });
+  assert.equal(issued.status, 200, issued.raw);
+  assert.equal(issued.body.kmsKeyId, "upload-key");
+  assert.equal(issued.body.endpoint, env.aws.origin);
+  const url = new URL(issued.body.urls[0].url);
+  assert.equal(url.searchParams.get("X-Amz-SignedHeaders"), UPLOAD_SIGNED_HEADERS);
+  assert.equal(env.aws.state.requests.some((r) => r.method === "POST"), false);
+});
+
+test("route: S3-compatible kind sts answers 501 unsupported_by_backend before any journal read", async (t) => {
+  const env = await setup(t, { upload: s3Compatible(null), omitS3Hook: true });
+  env.aws.state.requests.length = 0;
+  const refused = await request(env.origin, env.path, { method: "POST", token: env.token, body: stsBody });
+  assert.equal(refused.status, 501, refused.raw);
+  assert.equal(refused.body.error, "unsupported_by_backend");
+  assert.equal(env.aws.state.requests.length, 0);
+});
+
+test("route: S3-compatible credentials that cannot be loaded answer 503 upload_credentials_unavailable", async (t) => {
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+  const issuer = new HistoryUploadCredentials({
+    config: uploadConfig({ endpoint: "http://store.invalid", internalEndpoint: "http://store.invalid", roleArn: null, kmsKeyArn: null }),
+    sts: { assumeRole: async () => assert.fail("no STS call with an endpoint") },
+    journal: { seq: async () => 3 },
+    credentials: { get: async () => { throw new Error("fake provider detail /secret/path"); } },
+  });
+  await assert.rejects(
+    issuer.issue(TENANT, { originId: "m", kind: "presigned", keys: [{ key: "a", sha256: SHA_A }] }),
+    (error: Error & { status?: number; code?: string }) => error.status === 503 && error.code === "upload_credentials_unavailable",
+  );
+  assert.deepEqual(warnings, [["[history-upload] credentials unavailable"]]);
 });
 
 // ---- relay-upload-inbox-v1 contract vectors (sessions pipeline decision 0004) ----

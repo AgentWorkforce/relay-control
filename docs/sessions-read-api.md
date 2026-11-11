@@ -118,8 +118,10 @@ Configuration (all read once at start-up; errors name the variable only):
 | `SELFHOST_HISTORY_UPLOAD_BUCKET` | pipeline bucket |
 | `SELFHOST_HISTORY_UPLOAD_REGION` (or `AWS_REGION`) | bucket and STS region |
 | `SELFHOST_HISTORY_UPLOAD_KEY_ROOT` | top-level key root shared with the pipeline (default `96bulls`) |
-| `SELFHOST_HISTORY_UPLOAD_ROLE_ARN` | upload role Control assumes |
-| `SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN` | KMS key every object must be encrypted with |
+| `SELFHOST_HISTORY_UPLOAD_ENDPOINT` | optional S3-compatible endpoint origin upload clients reach (for example a bundled MinIO); unset means AWS S3 |
+| `SELFHOST_HISTORY_UPLOAD_INTERNAL_ENDPOINT` | optional endpoint Control reads privacy journals through (an in-cluster service URL); only with `SELFHOST_HISTORY_UPLOAD_ENDPOINT`, defaults to it |
+| `SELFHOST_HISTORY_UPLOAD_ROLE_ARN` | upload role Control assumes; AWS only (unset with an endpoint) |
+| `SELFHOST_HISTORY_UPLOAD_KMS_KEY_ARN` | KMS key every object must be encrypted with; required on AWS; optional key id with an endpoint |
 | `SELFHOST_HISTORY_UPLOAD_WITNESS_KEY` (or `_FILE`) | witness HMAC key: base64url of 32 random bytes, shared with the pipeline consumer (must decode to at least 32 bytes) |
 | `SELFHOST_HISTORY_UPLOAD_MAX_OBJECT_BYTES` | per-object cap reported to clients (default 2097152, 1024 to 104857600) |
 
@@ -138,22 +140,46 @@ wire bytes).
 Both responses lead with `contract: "relay-upload-inbox-v1"` (the sessions
 pipeline's frozen upload contract).
 
-- `kind: "sts"`: `{ contract, kind, bucket, region, endpoint: null, keyPrefix,
+- `kind: "sts"`: `{ contract, kind, bucket, region, endpoint, keyPrefix,
   kmsKeyId, credentials: { accessKeyId, secretAccessKey, sessionToken,
-  expiresAt }, witness, witnessSeq, maxObjectBytes, refreshAfter }`. The
+  expiresAt }, witness, witnessSeq, maxObjectBytes, refreshAfter }`.
+  `endpoint` is always null (`sts` is served on AWS only). The
   session lasts 1 hour (the role chaining cap); `refreshAfter` is 10 minutes
   before expiry.
 - `kind: "presigned"`: the same fields (`contract` first) without `credentials`, plus
   `urls: [{ key, url, expiresAt }]`, one presigned PUT per requested key,
   valid for at most 15 minutes; `refreshAfter` is 5 minutes before the URLs
   expire. Each URL signs `Content-Encoding: zstd`, `If-None-Match: *`,
-  `x-amz-checksum-sha256: <sha256>`, the witness metadata header and both
-  SSE-KMS headers, so the client must send all of them verbatim.
+  `x-amz-checksum-sha256: <sha256>`, the witness metadata header and, when
+  `kmsKeyId` is non-null, both SSE-KMS headers, so the client must send all
+  of them verbatim.
 
-Every PUT carries `x-amz-server-side-encryption: aws:kms`,
-`x-amz-server-side-encryption-aws-kms-key-id: <kmsKeyId>`,
-`If-None-Match: *` and `x-amz-meta-relay-witness: <witness>`. Objects over
-`maxObjectBytes` are refused by the consumer.
+Every PUT carries `If-None-Match: *` and
+`x-amz-meta-relay-witness: <witness>`, plus
+`x-amz-server-side-encryption: aws:kms` and
+`x-amz-server-side-encryption-aws-kms-key-id: <kmsKeyId>` only when
+`kmsKeyId` is non-null. Objects over `maxObjectBytes` are refused by the
+consumer.
+
+#### S3-compatible stores
+
+With `SELFHOST_HISTORY_UPLOAD_ENDPOINT` set:
+
+- `endpoint` in the response is the endpoint origin, and clients build
+  path-style URLs `<endpoint>/<bucket>/<key>` (presigned URLs already are).
+- `kmsKeyId` may be null; then no SSE headers are signed and the client must
+  not send them.
+- `kind: "sts"` answers 501 `unsupported_by_backend`; clients request
+  `presigned`.
+- URLs are signed with Control's own static keys (`AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY`, required for a non-AWS endpoint so ambient AWS
+  role credentials are never sent to it). They must belong to a store user
+  allowed to PUT under `<keyRoot>/.upload-inbox/` and GET
+  `<keyRoot>/.admission-inbox/*/privacy-journal.json`. Because one key
+  signs every user's URLs, the per-user prefix is enforced by Control
+  choosing the signed key, not by a session policy.
+- The store must honour `x-amz-checksum-sha256`, conditional
+  `If-None-Match: *` PUTs and `x-amz-meta-*` metadata (recent MinIO does).
 
 Key layout: `<keyRoot>/.upload-inbox/<org>/v1/ws=<ws>/u=<userHash>/`,
 where `<ws>` is the pipeline's layout component of the workspace id and
@@ -197,7 +223,9 @@ are indistinguishable) and the client falls back to the ingest edge.
 Authentication and authorization refusals are always 401/403, never 404:
 401 `unauthorized`, 403 `forbidden` (browser cookie) and 403
 `handoff_not_exchanged`. Also 400 `invalid_request` / `invalid_tenant`, 429
-`rate_limited` (12 per user/workspace per minute), and 503
+`rate_limited` (12 per user/workspace per minute), 501
+`unsupported_by_backend` (`kind: "sts"` against an S3-compatible endpoint;
+request `presigned`), and 503
 `upload_credentials_unavailable` / `privacy_journal_unavailable` (fall back
 to the ingest edge).
 
