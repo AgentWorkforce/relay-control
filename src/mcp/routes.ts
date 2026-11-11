@@ -48,6 +48,12 @@ function rpcError(response: ServerResponse, status: number, code: number, messag
   response.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id }));
 }
 
+function withoutDesktopMarker(headers: Headers): Headers {
+  const copy = new Headers(headers);
+  copy.delete("x-agent-relay-desktop");
+  return copy;
+}
+
 function bearerToken(request: IncomingMessage): string | null {
   const match = /^Bearer\s+(.+)$/i.exec(request.headers.authorization ?? "");
   return match?.[1]?.trim() || null;
@@ -273,10 +279,13 @@ export function createMcpHandler(input: {
       // Copilot credentials carry a Copilot proof; every other call may carry
       // a Claude Code proof, which counts only on desktop-managed calls (as Cloud).
       const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider };
+      // An OAuth grant acts only as its approved agent: the Desktop marker
+      // never makes it managed, so its proofs are stripped and ignored.
+      const callHeaders = oauth ? withoutDesktopMarker(headers) : headers;
       const attested: CopilotAttestation | ClaudeAttestation | undefined = provider === "copilot"
         ? await copilotAttestationFor(body, auth, attestations)
-        : await claudeAttestationFor(body, headers, auth, attestations);
-      desktopCall = desktopCallContext(body, headers, provider, attested);
+        : await claudeAttestationFor(body, callHeaders, auth, attestations);
+      desktopCall = desktopCallContext(body, callHeaders, provider, attested);
     } catch (error) {
       // Store failures are server errors, not a refused proof.
       if (!(error instanceof CopilotAttestationError) && !(error instanceof ClaudeAttestationError) &&

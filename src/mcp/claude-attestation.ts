@@ -98,7 +98,9 @@ export async function verifyClaudeAttestation(input: {
       !Number.isSafeInteger(payload.iat) || !Number.isSafeInteger(payload.exp)) {
     return fail("unexpected payload");
   }
-  const { sid, src, tuid, tool } = payload as { sid: string; src: string; tuid: string; tool: string };
+  const { sid, tuid, tool } = payload as { sid: string; tuid: string; tool: string };
+  // Identity sync stores source ids lowercase.
+  const src = (payload.src as string).toLowerCase();
   const iat = payload.iat as number;
   const exp = payload.exp as number;
 

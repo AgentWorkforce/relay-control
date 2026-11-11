@@ -273,9 +273,10 @@ function createRelayService(context: McpContext) {
   /**
    * A desktop-managed call (a Desktop-provider credential, or the app bearer
    * with X-Agent-Relay-Desktop: 1, as Cloud): only the verified native chat's
-   * identity may act, and a missing or unverified chat fails closed.
+   * identity may act, and a missing or unverified chat fails closed. OAuth
+   * grants are never managed: they act only as their approved agent.
    */
-  const managed = desktopCall.required || desktopCall.provider !== undefined;
+  const managed = !oauth && (desktopCall.required || desktopCall.provider !== undefined);
   const linkedKind = (identity: Identity) => identity.desktop ? "desktop" as const : "hosted" as const;
   const channelDelivery = (identity: Identity, channel: string) =>
     identity.desktop ? desktopChannelDelivery(channel) : hostedChannelDelivery(channel);

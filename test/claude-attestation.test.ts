@@ -136,3 +136,9 @@ test("outside desktop management a proof is stripped and ignored; no proof yield
   const unproven = { method: "tools/call", params: { name: "send_relay_message", arguments: { text: "hi" } } };
   assert.equal(await claudeAttestationFor(unproven, desktopHeaders, auth, store), undefined);
 });
+
+test("an uppercase source id resolves to the lowercase source identity sync stored", async () => {
+  const { src, sid, store, call } = await fixture();
+  const result = await claudeAttestationFor(await call({ src: src.toUpperCase() }), desktopHeaders, auth, store);
+  assert.deepEqual(result, { nativeSession: { kind: "claude", id: sid }, sourceId: src });
+});
