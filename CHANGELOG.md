@@ -10,7 +10,7 @@ assigned at release.
   (a member's sessions with their recorded titles and summaries; no new
   generation) and `.../usage/people/audit`. Every drill-down page writes an
   organization-level `usage.people.viewed` audit row. Unlike the v1 counts,
-  this view shows member names and emails. Migration `0042_usage_people.sql`.
+  this view shows member names and emails. Migration `0043_usage_people.sql`.
 - Changed: with `SELFHOST_FEATURES` unset, `usage` and `usage_people` are now
   selected by default. An explicit list (including `""`) is still exact.
 - Added: shared-session read audit. Every MCP shared-session read
