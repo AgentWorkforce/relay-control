@@ -129,6 +129,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `RELAYCAST_INTERNAL_SECRET` | Optional (`_FILE` supported), at least 32 bytes, equal to Relaycast's own internal secret. Lets the bootstrap create the default workspace through Relaycast's `POST /internal/workspaces` |
 | `SELFHOST_OIDC_ISSUER` / `SELFHOST_OIDC_CLIENT_ID` / `SELFHOST_OIDC_CLIENT_SECRET[_FILE]` | Optional OpenID Connect sign-in (Google Workspace, Okta, Entra ID, Keycloak...). Authorization code + PKCE. See [docs/identity.md](docs/identity.md) |
 | `SELFHOST_OIDC_ALLOWED_DOMAINS` / `SELFHOST_OIDC_DISPLAY_NAME` / `SELFHOST_OIDC_SCOPES` / `SELFHOST_OIDC_REDIRECT_URL` | Optional OIDC refinements: email domains allowed to sign in, button label, scopes (default `openid email profile`), and a fixed redirect URI (default `<site>/login/oidc/callback`) |
+| `SELFHOST_MICROSOFT_CLIENT_ID` / `SELFHOST_MICROSOFT_CLIENT_SECRET[_FILE]` / `SELFHOST_MICROSOFT_TENANT` / `SELFHOST_MICROSOFT_REDIRECT_URL` | Optional "Continue with Microsoft" sign-in for personal Microsoft accounts (Outlook.com, Hotmail) and Entra ID work or school accounts. Client ID and secret are set together; tenant `common` (default), `consumers`, `organizations` or a tenant ID; redirect URI default `<site>/login/microsoft/callback`. Works beside `SELFHOST_OIDC_*`. See [docs/identity.md](docs/identity.md#microsoft-accounts-outlookcom-hotmail-and-entra-id) |
 | `SELFHOST_SMTP_HOST` / `_PORT` / `_SECURITY` / `_USERNAME` / `_PASSWORD[_FILE]`, `SELFHOST_EMAIL_FROM` | Optional SMTP for invite emails and sign-in links |
 | `SELFHOST_EMAIL_LOGIN` | Optional `true`: email sign-in links (requires SMTP) |
 | `SELFHOST_SIGNIN_METHODS` | Optional comma list of `email_link` and `password` (both require SMTP). Default: `email_link` when `SELFHOST_EMAIL_LOGIN=true`. Unlisted methods answer 404 `signin_method_disabled`. Failed password sign-ins lock per account and client (5 free, then 30 s doubling to 15 min) and per account across all clients (50 in an hour locks it for 15 min and mails the owner, at most once a day). See [docs/identity.md](docs/identity.md#email-and-password-optional) and [Lockout](docs/identity.md#lockout) |
@@ -425,8 +426,9 @@ See `openapi.yaml` (also served at `/openapi.yaml`) for the exact contract.
 Desktop's GUI signs in with hosted Cloud's browser flow, not the device flow:
 it opens `$SELFHOST_PUBLIC_URL/cloud/api/v1/cli/login?redirect_uri=http://127.0.0.1:<port>/callback/<state>&state=<state>&client=desktop&workspace_selection=desktop&code_challenge=<S256>&code_challenge_method=S256[&desktop_host_name=<host>]`
 (or hosted's `/cloud/api/auth/google/start` and `/cloud/api/auth/microsoft/start`
-with `next=/api/v1/cli/login?...`, which here just land on `/login` with the
-inner parameters kept). A signed-out browser goes through `/login` and
+with `next=/api/v1/cli/login?...`, which here land on `/login` with the
+inner parameters kept; the Microsoft start goes to `/login/microsoft/start`
+when `SELFHOST_MICROSOFT_*` is configured). A signed-out browser goes through `/login` and
 returns. With a session cookie the API issues a 15-minute handoff access
 token bound to the challenge and redirects to the loopback `redirect_uri`
 with `state`, `access_token`, `access_token_expires_at` and

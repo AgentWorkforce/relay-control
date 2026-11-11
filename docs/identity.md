@@ -136,6 +136,89 @@ are people you trust with membership of the organization. Microsoft documents
 the `email` claim as mutable, so anyone able to edit a directory user's email
 could use it to take on that address here.
 
+### Microsoft accounts (Outlook.com, Hotmail and Entra ID)
+
+A second, Microsoft-specific provider for people who sign in with a personal
+Microsoft account (Outlook.com, Hotmail, Live) or a work or school account in
+any Entra ID tenant. It uses the same authorization code + PKCE flow as the
+generic provider, at `/login/microsoft/start` and `/login/microsoft/callback`,
+and shows a "Continue with Microsoft" button.
+
+| Variable | Meaning |
+|---|---|
+| `SELFHOST_MICROSOFT_CLIENT_ID` | Application (client) ID of the app registration |
+| `SELFHOST_MICROSOFT_CLIENT_SECRET[_FILE]` | Client secret value. Set together with the client ID; one without the other refuses to start. Mount it from a Secret |
+| `SELFHOST_MICROSOFT_TENANT` | Optional. `common` (default: work or school and personal accounts), `consumers` (personal accounts only), `organizations` (work or school accounts only), or one tenant ID as a lowercase UUID. Anything else refuses to start |
+| `SELFHOST_MICROSOFT_REDIRECT_URL` | Optional fixed redirect URI. It must be `<origin>/login/microsoft/callback`. The default is `<site>/login/microsoft/callback`, as for the generic provider |
+
+The issuer is `https://login.microsoftonline.com/<tenant>/v2.0`, the scopes are
+`openid email profile` and the button label is "Microsoft". None of these can be
+changed. There is no domain allow-list for this provider: who may join is
+decided by invites, `SELFHOST_ADMIN_EMAILS` and `SELFHOST_AUTO_JOIN_DOMAINS`
+(see [Who may sign in](#who-may-sign-in)).
+
+#### Register the app
+
+In the Microsoft Entra admin center, under App registrations, choose New
+registration:
+
+1. **Supported account types:** "Accounts in any organizational directory and
+   personal Microsoft accounts" for `common`. Choose "Personal Microsoft
+   accounts only" for `consumers`, "Accounts in any organizational directory"
+   for `organizations`, or "Accounts in this organizational directory only"
+   for a single tenant ID.
+2. **Redirect URI:** platform Web, `https://<dashboard host>/login/microsoft/callback`.
+3. Under Certificates & secrets, create a client secret. Set its value as
+   `SELFHOST_MICROSOFT_CLIENT_SECRET` and the application (client) ID as
+   `SELFHOST_MICROSOFT_CLIENT_ID`.
+4. Under Token configuration, choose Add optional claim, token type ID, and add
+   `email` and `xms_edov`.
+
+#### Which email addresses count as verified
+
+Every token must carry a tenant ID (`tid`), and its issuer must be
+`https://login.microsoftonline.com/<tid>/v2.0`. With a single tenant ID, or with
+`consumers`, the token must also come from that tenant. The `email` claim is
+required.
+
+- **Personal accounts** (Outlook.com, Hotmail, Live): Microsoft verifies the
+  address, so it is accepted.
+- **Work or school accounts:** accepted only when the token carries
+  `xms_edov` set to true, which means the tenant has verified the address's
+  domain. Add the optional claim in step 4.
+- Anything else is refused: "Your Microsoft account's email address isn't
+  verified." Nothing is created and no session is issued.
+
+#### Beside SELFHOST_OIDC_*
+
+Both providers can be configured at once. The login page then shows "Continue
+with <name>" for the generic provider first and "Continue with Microsoft"
+below it. `GET /api/v1/auth/login-config` and `GET /api/v1/auth/methods`
+publish `microsoft: { displayName }` (or `null`) beside `oidc`. When
+Microsoft is configured, Agent Relay Desktop's "Continue with Microsoft" opens
+`/login/microsoft/start`; otherwise it opens the `/login` chooser, which
+lists every configured provider, even when `SELFHOST_OIDC_*` is set.
+
+#### Invites
+
+An invite to a personal address such as `x@outlook.com` is redeemed through
+"Continue with Microsoft" on the invite link, and the invite's address is sent
+as the sign-in hint. Signing in with a different account is refused with "This
+invite was sent to x@outlook.com. You signed in as <address>. Sign in with the
+invited account.", and the way back keeps the invite. Audit rows record
+`via=microsoft`.
+
+#### Troubleshooting
+
+| What you see | Likely cause |
+|---|---|
+| `AADSTS50011` | The redirect URI registered on the app isn't exactly `https://<dashboard host>/login/microsoft/callback` |
+| "Your Microsoft account's email address isn't verified" | A work or school account without `xms_edov`: the optional claim is missing from the app registration, or the address's domain isn't verified in that tenant |
+| "did not share an email address" | No optional `email` claim, or no email on the directory user |
+| "id_token issuer does not match" | The account belongs to a tenant that `SELFHOST_MICROSOFT_TENANT` excludes |
+| "Discovery issuer does not match the Microsoft tenant" | `SELFHOST_MICROSOFT_TENANT` names a tenant that Microsoft doesn't publish |
+| "The identity provider refused the sign-in (invalid_client)" | Wrong or expired client secret |
+
 ### Test your SSO before go-live
 
 Run this after configuring the provider and before announcing sign-in. Use a
@@ -170,6 +253,7 @@ for the next one.
    | Someone invited, using the invite link | Joins with the invited role |
    | The same person a second time | Signs in with no new membership |
    | Someone outside `SELFHOST_OIDC_ALLOWED_DOMAINS` | Refused: "Accounts from <domain> can't sign in here" |
+| Microsoft: someone invited, choosing "Continue with Microsoft" with a different account | Refused: "This invite was sent to ... Sign in with the invited account." No membership |
 
 4. In the Agent Relay Desktop app, sign in to this installation. The browser
    opens `/login`; after sign-in it returns to the app, signed in to the
