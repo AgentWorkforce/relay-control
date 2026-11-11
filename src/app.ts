@@ -23,6 +23,8 @@ import { handleRelayNode } from "./relay-node/broker.js";
 import { handleFlowsBroker } from "./flows-broker.js";
 import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
+import { UsageRangeError, usageDays, usageReport } from "./usage/routes.js";
+import { UsageStore } from "./usage/store.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, introspect, INTROSPECT_PATH } from "./auth/introspect.js";
@@ -411,6 +413,20 @@ export function createApp(input: {
 }): (request: IncomingMessage, response: ServerResponse) => void {
   const { config, store, admin, telemetry, identity } = input;
   const features = input.features ?? NO_FEATURES;
+  // Usage page counters: written only while the `usage` feature is selected.
+  const usage = new UsageStore(store.database, () => input.now?.() ?? new Date());
+  const recordUsage = (write: () => Promise<void>): void => {
+    if (!features.usage) return;
+    // Counters never fail or slow a request.
+    void write().catch(() => {});
+  };
+  // Every route that authenticates an access token (API, dashboard account
+  // pages, Desktop, MCP, and introspection by ingest and the read API)
+  // counts its user as active today.
+  if (features.usage) {
+    store.onAuthenticated = (user) =>
+      recordUsage(() => usage.recordActiveUser(user.organizationId, user.userId));
+  }
   /** Throws the 403 refusal unless `feature` is selected. Call after membership, before backends. */
   function requireFeature(feature: Feature): void {
     requireSelected(features, feature);
@@ -1747,6 +1763,35 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    // Usage page (docs/usage.md): owner-only daily counts for one organization.
+    const usageRoute = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/usage$/);
+    if (usageRoute && method === "GET") {
+      const auth = await organizationAccess(request, usageRoute[0]!);
+      if (auth.kind !== "user" || await store.memberRole(usageRoute[0]!, auth.principal.userId) !== "owner") {
+        throw new HttpError(403, "forbidden", "Organization owner role required");
+      }
+      requireFeature("usage");
+      let days: number;
+      try {
+        days = usageDays(url);
+      } catch (error) {
+        if (error instanceof UsageRangeError) throw new HttpError(400, "invalid_request", error.message);
+        throw error;
+      }
+      json(response, 200, {
+        usage: await usageReport({
+          config,
+          store,
+          usage,
+          organizationId: usageRoute[0]!,
+          owner: { userId: auth.principal.userId, token: auth.token },
+          days,
+          now: input.now?.() ?? new Date(),
+        }),
+      }, true);
+      return;
+    }
+
     if (path === "/api/v1/organizations" && method === "GET") {
       const auth = await authenticate(request, true);
       json(response, 200, {
@@ -2134,6 +2179,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       httpError: (status, code, message) => new HttpError(status, code, message),
       json,
       now: input.now,
+      onSearch: (organizationId) => recordUsage(() => usage.increment(organizationId, "searches")),
     })) {
       return;
     }

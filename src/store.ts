@@ -981,7 +981,27 @@ export class ControlPlaneStore {
     });
   }
 
+  /**
+   * Called after every successful access-token authentication, whichever
+   * route did it (the usage page's active-user counter). Must not throw or block.
+   */
+  onAuthenticated: ((user: { organizationId: string; userId: string }) => void) | null = null;
+
+  private notifyAuthenticated(user: { organizationId: string; userId: string }): void {
+    try {
+      this.onAuthenticated?.(user);
+    } catch {
+      // Usage counters never fail authentication.
+    }
+  }
+
   async authenticateAccessToken(token: string): Promise<Principal | null> {
+    const principal = await this.lookupAccessToken(token);
+    if (principal) this.notifyAuthenticated(principal);
+    return principal;
+  }
+
+  private async lookupAccessToken(token: string): Promise<Principal | null> {
     const result = await this.database.query<TokenContextRow>(
       `SELECT s.id AS session_id, s.token_family_id, s.user_id, u.email,
               u.name AS user_name, s.organization_id, o.name AS organization_name,
@@ -1076,6 +1096,10 @@ export class ControlPlaneStore {
     );
     const row = result.rows[0];
     if (!row) return null;
+    // A live token presented to another service (ingest, read API) is use too.
+    if (!row.revoked && !row.expired) {
+      this.notifyAuthenticated({ organizationId: row.organization_id, userId: row.user_id });
+    }
     return {
       userId: row.user_id,
       email: row.email,

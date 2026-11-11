@@ -1469,6 +1469,71 @@ paths:
                     $ref: "#/components/schemas/FeatureCapabilities"
         "401":
           description: Missing, invalid, or expired user token
+  /api/v1/organizations/{organizationId}/usage:
+    get:
+      operationId: getOrganizationUsage
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      description: |
+        Owner-only daily usage counts for the organization (see
+        `docs/usage.md`). Counts only: no content, identities or emails.
+        Requires `usage` in SELFHOST_FEATURES. `activeUsers` and `searches`
+        are counted by Control from when the feature was selected;
+        `sessionsUploaded` and `summaries` come from the session directory
+        through the read API. A source that cannot be read is `null` and
+        listed in `unavailable`, never reported as 0. `totals.activeUsers`
+        is distinct users over the range.
+      parameters:
+        - name: organizationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: days
+          in: query
+          required: false
+          schema: { type: integer, enum: [7, 30, 90], default: 30 }
+      responses:
+        "200":
+          description: Daily counts for the last `days` UTC days, oldest first, ending today
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [usage]
+                properties:
+                  usage:
+                    type: object
+                    required: [range, totals, days, unavailable]
+                    properties:
+                      range:
+                        type: object
+                        required: [days, from, to]
+                        properties:
+                          days: { type: integer }
+                          from: { type: string, format: date }
+                          to: { type: string, format: date }
+                      totals: { $ref: "#/components/schemas/UsageCounts" }
+                      days:
+                        type: array
+                        items:
+                          allOf:
+                            - $ref: "#/components/schemas/UsageCounts"
+                            - type: object
+                              required: [date]
+                              properties:
+                                date: { type: string, format: date }
+                      unavailable:
+                        type: array
+                        items: { type: string, enum: [activeUsers, sessionsUploaded, searches, summaries] }
+        "400":
+          description: "`days` is not 7, 30 or 90, or another query parameter was given"
+        "401":
+          description: Missing, invalid, or expired token
+        "403":
+          description: "Not an owner of the organization (`forbidden`), or the feature is not selected (`feature_not_enabled`)"
+        "404":
+          description: Organization not found for this token
   /api/v1/analytics/events:
     post:
       operationId: captureClientAnalyticsEvents
@@ -7784,13 +7849,22 @@ components:
               description: SELFHOST_INTROSPECT_OUTAGE_HOLD_MS in effect (0 = off); how long a Desktop token's last active verdict may answer during a database outage.
     FeatureCapabilities:
       type: object
-      required: [flows, relayfile, chief]
+      required: [flows, relayfile, chief, usage]
       additionalProperties: false
       description: Names in SELFHOST_FEATURES (unset or empty selects nothing).
       properties:
         flows: { type: boolean }
         relayfile: { type: boolean }
         chief: { type: boolean }
+        usage: { type: boolean }
+    UsageCounts:
+      type: object
+      required: [activeUsers, sessionsUploaded, searches, summaries]
+      properties:
+        activeUsers: { type: [integer, "null"], minimum: 0 }
+        sessionsUploaded: { type: [integer, "null"], minimum: 0 }
+        searches: { type: [integer, "null"], minimum: 0 }
+        summaries: { type: [integer, "null"], minimum: 0 }
     FeatureRefusal:
       type: object
       required: [error, message, feature]

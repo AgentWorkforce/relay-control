@@ -5,6 +5,16 @@ assigned at release.
 
 ## Unreleased
 
+- Added: owner-only usage counts, `GET /api/v1/organizations/{org}/usage?days=7|30|90`,
+  behind a new `usage` value in `SELFHOST_FEATURES` (off by default). Returns
+  per-day and total active users, sessions uploaded, searches and session
+  summaries for the dashboard Usage page. Counts only. Sessions and summaries
+  come from the read API (`/v1/sessions/activity`; summaries are `null` until
+  the read API serves `/v1/sessions/summaries/activity`). Active users and
+  first-page searches are recorded by Control while the feature is on, with
+  users stored as an HMAC under a per-install secret. Migration
+  `0040_usage_counters.sql`. See docs/usage.md.
+
 - Added: direct-to-S3 session upload credentials,
   `POST /api/v1/workspaces/{ws}/relayhistory/upload-credentials`, behind
   `SELFHOST_HISTORY_UPLOAD_DIRECT` (`off` by default, `allowlist`, `on`). A

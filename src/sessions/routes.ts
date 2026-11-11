@@ -42,6 +42,8 @@ export type SessionRouteContext = {
   httpError: (status: number, code: string, message: string) => Error;
   json: (response: ServerResponse, status: number, body: unknown, noStore?: boolean) => void;
   now?: () => Date;
+  /** Usage page: a first-page search by a member of this organization (counts only). */
+  onSearch?: (organizationId: string) => void;
 };
 
 const PREFIX = /^\/api\/v1\/workspaces\/([^/]+)\/sessions(?:\/(.*))?$/;
@@ -302,6 +304,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
     }
     // The backend cannot combine these, and narrowing a page here would hide matches.
     if (agent && (text || input.ranking)) throw new UnsupportedView("agent_with_text");
+    if (input.q && !input.cursor) ctx.onSearch?.(access.workspace.organizationId);
     const read = await readWorkspaceHistory(ctx.config, identityOf(access), "/v1/sessions", params({
       limit: String(limit ?? 50),
       q: agent ? undefined : input.q,
@@ -434,6 +437,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
     const since = instant(ctx, input.since, "since");
     const until = instant(ctx, input.until, "until");
     const access = await ctx.workspaceAccess(ctx.request, workspaceId);
+    if (!input.cursor) ctx.onSearch?.(access.workspace.organizationId);
     const read = await readWorkspaceHistory(ctx.config, identityOf(access), "/v1/events", params({
       q: input.q,
       limit: String(limit),
