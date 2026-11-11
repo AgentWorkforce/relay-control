@@ -375,3 +375,38 @@ test("a ready worker missing from the roster is never marked released without pr
   const rows = await env.database.query<{ state: string }>("SELECT state FROM relay_spawns");
   assert.deepEqual(rows.rows.map(row => row.state), ["ready"]);
 });
+
+test("a lost release response is recovered by replaying the same key, even after the worker is gone", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop")]);
+  await env.claim("node-1");
+  const client = await env.connect();
+  const receipt = data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("node-1") }));
+  assert.equal(data(await client.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: receipt.spawn_id } })).status, "ready");
+  // Relaycast stops the worker but the response is lost.
+  env.world.failNext("POST", "/v1/agents/release-exact", 502, { after: true });
+  errorText(await client.callTool({ name: "release_relay_agent", arguments: { spawn_id: receipt.spawn_id } }));
+  assert.equal(env.world.agents.has("reviewer-1"), false);
+  const released = data(await client.callTool({ name: "release_relay_agent", arguments: { spawn_id: receipt.spawn_id } }));
+  assert.equal(released.status, "released");
+  const keys = env.world.bodies.filter(body => body.path === "/v1/agents/release-exact" && body.body?.name === "reviewer-1");
+  assert.equal(keys.length, 2, "the replay reused the original request");
+});
+
+test("a failed exact release can be retried with a new attempt; the worker binding is kept", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop")]);
+  await env.claim("node-1");
+  const client = await env.connect();
+  const receipt = data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("node-1") }));
+  assert.equal(data(await client.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: receipt.spawn_id } })).status, "ready");
+  env.world.releaseOutcome.mode = "failed";
+  const failed = data(await client.callTool({ name: "release_relay_agent", arguments: { spawn_id: receipt.spawn_id } }));
+  assert.equal(failed.status, "releasing");
+  assert.match(failed.note, /retry/);
+  assert.equal(env.world.agents.has("reviewer-1"), true);
+  env.world.releaseOutcome.mode = "completed";
+  const released = data(await client.callTool({ name: "release_relay_agent", arguments: { spawn_id: receipt.spawn_id } }));
+  assert.equal(released.status, "released");
+  assert.equal(env.world.agents.has("reviewer-1"), false);
+});

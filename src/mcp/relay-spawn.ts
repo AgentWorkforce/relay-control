@@ -54,7 +54,7 @@ export type SpawnRow = SpawnOwner & {
   taskUnconfirmed: boolean; revision: number; audit: SpawnAudit[]; updatedAt: Date;
 };
 type SpawnPatch = Partial<Pick<SpawnRow, "state" | "invocationId" | "workerId" | "workerAddress" | "releaseInvocationId" | "taskUnconfirmed">> &
-  { failure?: SpawnFailure };
+  { failure?: SpawnFailure; event?: string; clearReleaseInvocation?: boolean };
 
 const COLUMNS = `id, workspace_id, user_id, authority_hash, relaycast_workspace_id, actor_id, idempotency_hash, request_hash,
   agent_name, cli, node_id, state, invocation_id, worker_id, worker_address, release_invocation_id, task_unconfirmed,
@@ -128,16 +128,17 @@ export function spawnStore(database: { query: SqlExecutor["query"]; transaction<
     /** Revision compare-and-swap; a lost race returns the current row. */
     async update(row: SpawnRow, patch: SpawnPatch): Promise<SpawnRow> {
       assertSpawnPatch(row, patch);
-      const { failure, ...columns } = patch;
-      const audit = [...row.audit, { event: patch.state ?? "updated", at: new Date().toISOString(), ...(failure ? { failure } : {}) }];
+      const { failure, event, clearReleaseInvocation, ...columns } = patch;
+      const audit = [...row.audit, { event: event ?? patch.state ?? "updated", at: new Date().toISOString(), ...(failure ? { failure } : {}) }];
       const changed = await database.query(
         `UPDATE relay_spawns SET state = COALESCE($8, state), invocation_id = COALESCE($9, invocation_id),
            worker_id = COALESCE($10, worker_id), worker_address = COALESCE($11, worker_address),
-           release_invocation_id = COALESCE($12, release_invocation_id), task_unconfirmed = COALESCE($13, task_unconfirmed),
+           release_invocation_id = CASE WHEN $15 THEN NULL ELSE COALESCE($12, release_invocation_id) END, task_unconfirmed = COALESCE($13, task_unconfirmed),
            audit = $14::jsonb, revision = revision + 1, updated_at = now()
          WHERE ${OWNED} AND id = $6 AND revision = $7 RETURNING ${COLUMNS}`,
         [...ownedParams(row), row.id, row.revision, columns.state ?? null, columns.invocationId ?? null, columns.workerId ?? null,
-          columns.workerAddress ?? null, columns.releaseInvocationId ?? null, columns.taskUnconfirmed ?? null, JSON.stringify(audit)],
+          columns.workerAddress ?? null, columns.releaseInvocationId ?? null, columns.taskUnconfirmed ?? null, JSON.stringify(audit),
+          clearReleaseInvocation === true],
       );
       if (changed.rows[0]) return rowFrom(changed.rows[0]);
       const current = await find(row, row.id);
@@ -187,12 +188,20 @@ function upstreamSpawnCode(error: RelaycastCallError): string | null {
   }
 }
 
+/** Whether the current release attempt (since the last failed one) was already dispatched. */
+function releaseDispatched(row: SpawnRow): boolean {
+  const events = row.audit.map(entry => entry.event);
+  return events.slice(events.lastIndexOf("release_failed") + 1).includes("release_dispatch");
+}
+
 function result(row: SpawnRow) {
   const recorded = [...row.audit].reverse().find(entry => entry.failure)?.failure ?? failure(null, row.nodeId, row.cli);
   return {
     spawn_id: row.id, name: row.agentName, cli: row.cli, target_node: row.nodeId, status: row.state,
     ready: row.state === "ready", address: row.state === "ready" ? row.workerAddress : null,
     ...(row.taskUnconfirmed ? { warning: "spawn_task_unconfirmed" } : {}),
+    ...(row.state === "releasing" && row.audit.at(-1)?.event === "release_failed"
+      ? { note: "The last exact release failed and the worker may still be running. Call release_relay_agent again to retry." } : {}),
     ...(row.state === "failed" ? { error: recorded } : {}),
     ...(row.state === "unknown" || row.state === "reserved"
       ? { note: "Launch outcome is unconfirmed. Do not retry with a new idempotency key; keep this spawn_id." } : {}),
@@ -240,7 +249,8 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
     if (row.state === "releasing" && row.releaseInvocationId) {
       const release = await deps.client.getRelayInvocation(actor.token, "release", row.releaseInvocationId);
       if (release.callerId !== actor.id) throw new RelayToolError("Release provenance could not be verified.");
-      if (release.status === "failed") throw new RelayToolError("The exact release failed. Keep this spawn_id; termination is not confirmed.");
+      // A failed exact release keeps the worker binding; the next release_relay_agent sends a new attempt.
+      if (release.status === "failed") return deps.store.update(row, { event: "release_failed", clearReleaseInvocation: true });
       if (release.status === "completed") {
         const agent = await deps.client.getSpawnedAgent(deps.workspaceKey, row.agentName);
         if (!agent || agent.id !== row.workerId || agent.status === "released") return deps.store.update(row, { state: "released" });
@@ -370,13 +380,22 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         throw new RelayToolError("Launch must have a verified identity before release. Check status again; unconfirmed launches remain reserved.");
       }
       if (remote && remote.id !== row.workerId) throw new RelayToolError("The agent name now belongs to a different launch. Release was blocked.");
-      if (!remote || remote.status === "released") {
+      // A release already dispatched whose receipt was lost is replayed with the same key below,
+      // so its receipt can be recovered; roster absence alone is never treated as proof.
+      const dispatched = row.state === "releasing" && !row.releaseInvocationId && releaseDispatched(row);
+      if (!dispatched && (!remote || remote.status === "released")) {
         // Absence from the roster is not proof the worker stopped.
         throw new RelayToolError("The original agent is absent without a verified release. Keep this spawn_id and ask an operator to confirm termination; release was not dispatched.");
       }
       if (row.state === "ready") row = await deps.store.update(row, { state: "releasing" });
       if (!row.releaseInvocationId) {
-        const release = await deps.client.releaseSpawnedAgent(actor.token, row.agentName, row.workerId!, `selfhost-release:${row.id}`);
+        const attempt = row.audit.filter(entry => entry.event === "release_failed").length;
+        // Journal the dispatch before sending, so a lost response is replayed with this same key.
+        if (!releaseDispatched(row)) {
+          row = await deps.store.update(row, { event: "release_dispatch" });
+        }
+        const release = await deps.client.releaseSpawnedAgent(actor.token, row.agentName, row.workerId!,
+          attempt === 0 ? `selfhost-release:${row.id}` : `selfhost-release:${row.id}:${attempt}`);
         if (release.status === "completed") return result(await deps.store.update(row, { state: "released", ...(release.id ? { releaseInvocationId: release.id } : {}) }));
         if (!release.id) throw new RelayToolError("Release receipt was not confirmed. Retry release_relay_agent with the same spawn_id.");
         row = await deps.store.update(row, { releaseInvocationId: release.id });

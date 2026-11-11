@@ -46,6 +46,8 @@ export function createRelaycastWorld(roster: unknown[]) {
   /** Native spawn/release invocations. `spawnOutcome` decides how the next spawn completes. */
   const invocations = new Map<string, Record<string, any>>();
   const spawnOutcome = { mode: "ready" as "ready" | "pending" | "failed" | "rejected" };
+  /** How the next agent-token exact release ends: stop the worker, or fail and leave it running. */
+  const releaseOutcome = { mode: "completed" as "completed" | "failed" };
 
   const rosterEntry = (agent: Agent) => ({
     id: agent.id, name: agent.name, type: agent.type, metadata: agent.metadata,
@@ -147,9 +149,13 @@ export function createRelaycastWorld(roster: unknown[]) {
       const agent = agents.get(body!.name);
       if (!agent) return fail(404, "agent_not_found");
       if (agent.id !== body!.expected_agent_id) return fail(409, "agent_identity_conflict");
+      const id = `inv_${next()}`;
+      if (releaseOutcome.mode === "failed") {
+        invocations.set(id, { id, status: "failed", caller_id: caller.id, error: "release_failed: broker unreachable" });
+        return once(ok({ invocation_id: id, status: "pending" }));
+      }
       agents.delete(agent.name);
       syncRoster();
-      const id = `inv_${next()}`;
       invocations.set(id, { id, status: "completed", caller_id: caller.id });
       return once(ok({ invocation_id: id, status: "pending" }));
     }
@@ -296,7 +302,7 @@ export function createRelaycastWorld(roster: unknown[]) {
 
   return {
     agents, conversations, messages, deliveries, channels, subscriptions, bodies, handle, addAgent,
-    nodes, invocations, spawnOutcome,
+    nodes, invocations, spawnOutcome, releaseOutcome,
     /** An agent's unacknowledged deliveries. */
     pending(agent: string) {
       return deliveries.filter(row => row.agent === agent && !row.acked);
