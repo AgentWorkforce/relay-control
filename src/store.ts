@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { recordAudit, type AuditActor } from "./admin/audit.js";
+import { removeCompletedWorkspaceCapyInTx, retireCapyBindingsInTx } from "./capy/lifecycle.js";
 import { capturePolicyFromRow, type CapturePolicy } from "./capture-policy.js";
 import { consentAttemptKey, type ConsentAttempt } from "./auth/desktop-login.js";
 import type { Database, SqlExecutor } from "./database.js";
@@ -422,6 +423,7 @@ export class ControlPlaneStore {
           WHERE organization_id=$1 AND workspace_id=$2 AND completed_at IS NULL
           LIMIT 1`, [input.organizationId,input.workspaceId]);
         if (oauth.rows.length) return "in_use";
+        if (!await removeCompletedWorkspaceCapyInTx(tx,input.organizationId,input.workspaceId)) return "in_use";
         await tx.query("DELETE FROM workspaces WHERE id = $1 AND organization_id = $2", [
           input.workspaceId,
           input.organizationId,
@@ -604,6 +606,7 @@ export class ControlPlaneStore {
           throw new MembershipConflictError("The last owner cannot be demoted");
         }
       }
+      if (input.role === "member") await retireCapyBindingsInTx(tx,{organizationId:input.organizationId,userId:user.id},"capy_member_demoted");
       await tx.query(
         `INSERT INTO organization_memberships (organization_id, user_id, role)
          VALUES ($1, $2, $3)
@@ -647,6 +650,7 @@ export class ControlPlaneStore {
       // never invoke the hook when a remaining last-owner row blocks deletion.
       if (deleted || !(await tx.query("SELECT user_id FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",
         [organizationId,userId])).rows.length) {
+        await retireCapyBindingsInTx(tx,{organizationId,userId},"capy_member_removed");
         await beforeCommit?.(tx, { organizationId, userId });
       }
       return deleted;
