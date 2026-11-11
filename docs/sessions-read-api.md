@@ -127,10 +127,11 @@ Request: `{ originId, kind: "sts" | "presigned", keys? }`. `keys` is 1 to 64
 `{ key, sha256 }` objects with unique keys, required for `presigned` and
 validated but ignored for `sts`. `key` is relative to `keyPrefix`: 1 to 512
 characters of `/`-separated segments matching
-`^[A-Za-z0-9][A-Za-z0-9._:=-]{0,159}$`. Control validates only the segment
+`^[A-Za-z0-9][A-Za-z0-9._=-]{0,159}$`. Control validates only the segment
 rule; the pipeline's layout under the prefix is (informative)
-`o=<originId>/b=<sha256hex(batchId)[:32]>/d=<sha256hex(objectBytes)[:32]>-w<witnessSeq>.json.zst`,
-where originId may contain `:` and be up to 128 characters. `sha256` is
+`o=<originId>/b=<sha256hex(batchId)[:32]>/d=<sha256hex(objectBytes)[:32]>-w<witnessSeq>.json.zst`.
+`originId` is itself a key segment (`^[A-Za-z0-9._-]{1,128}$`, not
+dot-leading). `sha256` is
 base64 of the raw 32-byte SHA-256 of the object bytes as uploaded (the zstd
 wire bytes).
 

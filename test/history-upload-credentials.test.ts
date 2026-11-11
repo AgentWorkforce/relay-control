@@ -14,6 +14,7 @@ import {
   journalKey,
   JournalUnavailableError,
   layoutComponent,
+  parseUploadCredentialsRequest,
   uploadInboxPrefix,
   S3PrivacyJournalReader,
   sessionPolicy,
@@ -160,7 +161,7 @@ async function setup(t: TestContext, options: { upload?: HistoryUploadConfig | n
   };
 }
 
-const stsBody = { originId: "machine-1:claude", kind: "sts" };
+const stsBody = { originId: "machine-1.claude", kind: "sts" };
 
 // ---- pure helpers ----
 
@@ -211,12 +212,17 @@ test("uploadKeyValid accepts relative keys and refuses traversal and bad segment
   }
 });
 
-test("uploadKeyValid accepts the pipeline's o=/b=/d= key with a 128-char colon-bearing originId", () => {
-  const originId = `desktop:${"m".repeat(120)}`;
+test("uploadKeyValid accepts the pipeline's o=/b=/d= key with a 128-char originId; originId follows the segment rule", () => {
+  const originId = `desktop-${"m".repeat(120)}`;
   assert.equal(originId.length, 128);
   const hex = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 32);
   const key = `o=${originId}/b=${hex("batch-1")}/d=${hex("object bytes")}-w7.json.zst`;
   assert.equal(uploadKeyValid(key), true);
+  assert.equal(uploadKeyValid("o=desktop:1/b=x/d=y-w1.json.zst"), false);
+  assert.equal(parseUploadCredentialsRequest({ originId, kind: "sts" }).originId, originId);
+  for (const bad of ["desktop:1", ".dot", "a".repeat(129), ""]) {
+    assert.throws(() => parseUploadCredentialsRequest({ originId: bad, kind: "sts" }), /originId must match/);
+  }
 });
 
 test("witness round-trips, refuses tampering and wrong keys, and matches the pinned vector", () => {

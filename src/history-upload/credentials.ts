@@ -126,9 +126,10 @@ export function sessionPolicy(input: { bucket: string; prefix: string; kmsKeyArn
  * Control validates only this segment rule. The pipeline's layout under the
  * prefix (informative) is
  * `o=<originId>/b=<sha256hex(batchId)[:32]>/d=<sha256hex(objectBytes)[:32]>-w<witnessSeq>.json.zst`,
- * where originId may contain `:` and be up to 128 chars, hence `:` and 160.
+ * where originId is itself a segment (`[A-Za-z0-9._-]{1,128}`, not
+ * dot-leading), so `o=<originId>` needs up to 130 characters, hence 160.
  */
-const KEY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._:=-]{0,159}$/;
+const KEY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._=-]{0,159}$/;
 
 /** A relative object key under the prefix: 1..512 chars of non-empty, non-dot-leading segments. */
 export function uploadKeyValid(key: string): boolean {
@@ -342,14 +343,15 @@ function keyEntryValid(entry: unknown): entry is UploadKeyRequest {
     && Buffer.from(sha256, "base64").length === 32;
 }
 
-const ORIGIN_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+/** originId becomes the `o=` key segment, so it follows the contract's segment rule. */
+const originIdValid = (value: string) => SEGMENT.test(value) && !value.startsWith(".");
 
 export function parseUploadCredentialsRequest(body: unknown): UploadCredentialsRequest {
   const invalid = (message: string) => new UploadCredentialsError(400, "invalid_request", message);
   if (!body || typeof body !== "object" || Array.isArray(body)) throw invalid("Body must be a JSON object");
   const { originId, kind, keys } = body as Record<string, unknown>;
-  if (typeof originId !== "string" || !ORIGIN_ID.test(originId)) {
-    throw invalid("originId must match ^[A-Za-z0-9._:-]{1,128}$");
+  if (typeof originId !== "string" || !originIdValid(originId)) {
+    throw invalid("originId must match ^[A-Za-z0-9._-]{1,128}$ and not start with '.'");
   }
   if (kind !== "sts" && kind !== "presigned") throw invalid("kind must be sts or presigned");
   if (keys !== undefined) {
