@@ -167,7 +167,7 @@ test("hold on: an outage answers the last active verdict, marked held with a cla
   assert.equal(held.status, 200);
   assert.equal(held.body.active, true);
   assert.equal(held.body.held, true);
-  for (const field of ["sub", "email", "principal_type", "org", "workspace", "role", "scopes", "aud", "iat", "token_id", "machine_id"]) {
+  for (const field of ["sub", "email", "principal_type", "org", "workspace", "role", "scopes", "aud", "iat", "token_id", "machine_id", "capture_policy"]) {
     assert.deepEqual(held.body[field], fresh.body[field], field);
   }
   assert.ok(held.body.exp <= Math.floor((after + holdMs) / 1_000) + 1);
@@ -268,6 +268,7 @@ function token(hash: string, overrides: Partial<IntrospectedToken> = {}): Intros
     expired: false,
     issuedAt: new Date(0),
     expiresAt: new Date(1_000_000),
+    capturePolicy: { version: 1, revision: 1, settings: {} },
     ...overrides,
   };
 }

@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { ApiTokenStore } from "../admin/api-tokens.js";
 import type { SelfhostConfig } from "../config.js";
+import type { CapturePolicy } from "../capture-policy.js";
 import { hashSecret } from "../crypto.js";
 import { databaseErrorCause, isDatabaseUnavailable } from "../database.js";
 import type { FlowRunRelayfileCredentials } from "../flows/relayfile-credentials.js";
@@ -63,6 +64,13 @@ import type { IntrospectionHold } from "./introspection-hold.js";
  *   add-on services can make the same admin decisions as this service without
  *   reading its database. Each add-on is one more origin in
  *   SELFHOST_INTROSPECT_AUDIENCES; this service never depends on one existing.
+ * - User tokens also carry `capture_policy` (v1.5), the organization's served
+ *   capture policy `{version, revision, settings}` exactly as
+ *   GET .../capture-policy returns it (docs/capture-policy.md), read in the
+ *   same query as the token. The sessions pipeline enforces it from here
+ *   (e.g. `user_retroactive_delete: false` refuses a member's own session
+ *   delete) instead of keeping a copy. A held answer carries the policy as it
+ *   was when the held verdict was checked. Agent and service tokens carry none.
  * - No caching here: the token session row is the truth on every call.
  *   The one exception is the opt-in database outage hold
  *   (SELFHOST_INTROSPECT_OUTAGE_HOLD_MS, docs/identity.md): only when the
@@ -110,6 +118,8 @@ export type IntrospectionResult =
     iat: number;
     exp: number;
     token_id: string;
+    /** The organization's served capture policy (v1.5). */
+    capture_policy: CapturePolicy;
     /** Present (true) only for a database-outage hold answer. */
     held?: true;
   }
@@ -422,6 +432,7 @@ export async function introspect(
     iat: epochSeconds(session.issuedAt),
     exp: epochSeconds(held ? new Date(held.validUntil) : session.expiresAt),
     token_id: tokenId,
+    capture_policy: session.capturePolicy,
     ...(held ? { held: true as const } : {}),
   };
 }

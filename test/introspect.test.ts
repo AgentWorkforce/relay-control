@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import test, { type TestContext } from "node:test";
+import { Ajv2020 } from "ajv/dist/2020.js";
+import { parse as parseYaml } from "yaml";
 import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { migrate } from "../src/migrations.js";
@@ -170,6 +173,16 @@ async function setup(
   };
 }
 
+/** The published 200 schema for POST /internal/v1/auth/introspect (openapi.yaml). */
+function introspectionResponseValidator() {
+  const spec = parseYaml(readFileSync(new URL("../openapi.yaml", import.meta.url), "utf8"));
+  const ajv = new Ajv2020({ strict: false, validateFormats: false });
+  ajv.addSchema({ $id: "openapi", components: spec.components });
+  const schema = spec.paths["/internal/v1/auth/introspect"].post.responses["200"].content["application/json"].schema;
+  // Component refs resolve against the spec's own components.
+  return ajv.compile(JSON.parse(JSON.stringify(schema).replaceAll('"#/components/', '"openapi#/components/')));
+}
+
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -201,6 +214,7 @@ test("introspection describes an active access token and rotates token_id on ref
     iat: Math.floor(new Date(session.created_at).getTime() / 1_000),
     exp: Math.floor(new Date(session.access_token_expires_at).getTime() / 1_000),
     token_id: expectedTokenId,
+    capture_policy: { version: 1, revision: 1, settings: {} },
   });
   assert.equal("product_id" in active.body, false);
   assert.match(active.body.token_id, /^[0-9a-f]{32}$/);
@@ -753,6 +767,44 @@ test("introspection reports the live organization role, for add-on admin decisio
   );
   const promoted = await env.introspect({ token: ownerToken, aud: HISTORY_PUBLIC });
   assert.equal(promoted.body.role, "admin");
+});
+
+test("introspection carries the organization's served capture policy, read live", async (t) => {
+  const env = await setup(t);
+  const { accessToken } = await env.login(env.alpha);
+  const unset = await env.introspect({ token: accessToken, aud: HISTORY_PUBLIC });
+  assert.deepEqual(unset.body.capture_policy, { version: 1, revision: 1, settings: {} });
+
+  const policyPath = `/api/v1/organizations/${env.organizationId}/capture-policy`;
+  const set = await request(env.origin, policyPath, {
+    method: "PUT",
+    token: BOOTSTRAP,
+    body: { settings: { user_retroactive_delete: false, upload_control: "operator" } },
+  });
+  assert.equal(set.status, 200);
+  const enforced = await env.introspect({ token: accessToken, aud: HISTORY_PUBLIC });
+  // The served projection, as GET .../capture-policy answers it (the default oops window included).
+  assert.deepEqual(enforced.body.capture_policy, (await request(env.origin, policyPath, { token: BOOTSTRAP })).body);
+  assert.deepEqual(enforced.body.capture_policy, {
+    version: 1,
+    revision: 2,
+    settings: { user_retroactive_delete: false, upload_control: "operator", oops_window_seconds: 900 },
+  });
+
+  const cleared = await request(env.origin, policyPath, { method: "DELETE", token: BOOTSTRAP });
+  assert.equal(cleared.status, 200);
+  const after = await env.introspect({ token: accessToken, aud: HISTORY_PUBLIC });
+  assert.deepEqual(after.body.capture_policy, { version: 1, revision: 3, settings: {} });
+
+  // Inactive answers never carry it.
+  const inactive = await env.introspect({ token: "sh_at_not-a-real-token", aud: HISTORY_PUBLIC });
+  assert.deepEqual(inactive.body, { active: false, reason: "unknown" });
+
+  // Every answer above matches the published response schema (additionalProperties: false).
+  const validate = introspectionResponseValidator();
+  for (const answer of [unset, enforced, after, inactive]) {
+    assert.ok(validate(answer.body), JSON.stringify(validate.errors));
+  }
 });
 
 test("an unexchanged desktop handoff is not introspectable, and its exchanged pair is", async (t) => {

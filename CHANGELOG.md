@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Added: token introspection answers for user tokens carry `capture_policy`,
+  the organization's served capture policy (`{version, revision, settings}`,
+  as `GET .../capture-policy` returns it), read in the same query as the
+  token. The sessions pipeline uses it to enforce the policy server-side
+  (`user_retroactive_delete: false` refuses a member's own Cloud delete)
+  without keeping its own copy. See docs/capture-policy.md.
+
 - Added: owner-only People drill-down behind a new `usage_people` feature:
   `GET /api/v1/organizations/{org}/usage/people`, `.../usage/people/{userId}/sessions`
   (a member's sessions with their recorded titles and summaries; no new
