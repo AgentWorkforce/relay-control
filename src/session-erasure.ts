@@ -15,6 +15,8 @@ export type ErasureTarget = {
 };
 
 const MAX_RECEIPT_BYTES = 16_384;
+/** A 5xx error body is only read to recognise one fixed refusal shape. */
+const MAX_ERROR_BYTES = 4_096;
 const MAX_IDENTITY = 512;
 const CONTROL = /[\u0000-\u001f\u007f]/;
 const code = z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/);
@@ -117,6 +119,18 @@ function unavailable(): SessionErasureError {
   return new SessionErasureError(503, "session_erasure_unavailable", "The session pipeline is unavailable; retry the request");
 }
 
+/**
+ * The pipeline cannot erase this session with its current storage or ingest
+ * state. Repeating the request will not help, so no retry hint is given.
+ */
+function unsupportedStorage(): SessionErasureError {
+  return new SessionErasureError(
+    503,
+    "session_erasure_unsupported_storage",
+    "This session cannot be erased with the current storage or ingest configuration.",
+  );
+}
+
 function invalid(): SessionErasureError {
   return new SessionErasureError(502, "invalid_session_erasure_response", "The session pipeline returned an invalid response");
 }
@@ -146,29 +160,50 @@ async function callPipeline(
     throw unavailable();
   }
   if (response.status >= 500) {
-    await response.body?.cancel();
-    throw response.status === 501 ? notImplemented() : unavailable();
-  }
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error("empty");
-    try {
-      for (;;) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        size += chunk.value.byteLength;
-        if (size > MAX_RECEIPT_BYTES) throw new Error("too large");
-        chunks.push(chunk.value);
-      }
-    } finally {
-      await reader.cancel();
+    if (response.status === 501) {
+      await response.body?.cancel();
+      throw notImplemented();
     }
-    return { status: response.status, value: JSON.parse(Buffer.concat(chunks).toString("utf8")) };
+    if (response.status === 503) {
+      // readJson cancels the reader itself, including on an oversized body.
+      const value = await readJson(response, MAX_ERROR_BYTES).catch(() => null);
+      throw isUnsupportedStorage(value) ? unsupportedStorage() : unavailable();
+    }
+    await response.body?.cancel();
+    throw unavailable();
+  }
+  try {
+    return { status: response.status, value: await readJson(response, MAX_RECEIPT_BYTES) };
   } catch {
     throw invalid();
   }
+}
+
+/** Reads at most `limit` bytes of JSON, cancelling the reader on every path. */
+async function readJson(response: Response, limit: number): Promise<unknown> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("empty");
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > limit) throw new Error("too large");
+      chunks.push(chunk.value);
+    }
+  } finally {
+    await reader.cancel();
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+/** Exactly the pipeline's authenticated, non-retryable erase refusal. */
+function isUnsupportedStorage(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const { error, feature } = value as { error?: unknown; feature?: unknown };
+  return error === "unsupported_storage" && feature === "session_erase";
 }
 
 /**

@@ -16,7 +16,8 @@ const ARTIFACTS = Object.fromEntries([
   "replayPublications", "analysisPublications", "historyDerivedObjects",
 ].map((key) => [key, { count: 1, state: "done" }]));
 
-type Reply = { status: number; body: unknown };
+/** `raw` is sent verbatim instead of the JSON-serialized `body`. */
+type Reply = { status: number; body: unknown; raw?: string; headers?: Record<string, string> };
 type Call = { method: string; path: string; authorization?: string; body: any };
 
 async function fakePipeline(t: TestContext) {
@@ -37,9 +38,14 @@ async function fakePipeline(t: TestContext) {
       calls.push(call);
       if (call.body?.requestId) requestId = call.body.requestId;
       const reply = state.reply(call);
+      if (reply.raw !== undefined) {
+        response.writeHead(reply.status, { "content-type": "application/json", ...reply.headers });
+        response.end(reply.raw);
+        return;
+      }
       const body = reply.body as Record<string, unknown>;
       const segments = call.path.split("/").map(decodeURIComponent);
-      const echoed = "orgId" in body
+      const echoed = body && typeof body === "object" && "orgId" in body
         ? {
             workspaceId: segments[7],
             source: segments[9],
@@ -47,7 +53,7 @@ async function fakePipeline(t: TestContext) {
             requestId: body.requestId === ECHO_REQUEST ? requestId : body.requestId,
           }
         : body;
-      response.writeHead(reply.status, { "content-type": "application/json" });
+      response.writeHead(reply.status, { "content-type": "application/json", ...reply.headers });
       response.end(JSON.stringify(echoed));
     });
   });
@@ -258,6 +264,72 @@ test("session hard delete never reports success it cannot prove", async (t) => {
   const content = await app.api(path, { method: "DELETE", token: tenant.ownerToken });
   assert.equal(content.status, 502);
   assert.doesNotMatch(JSON.stringify(content.body), /secret text/);
+});
+
+test("session hard delete maps only the pipeline's exact unsupported_storage refusal to a static 503", async (t) => {
+  const { tenant, app, pipeline, path, erasure } = await setup(t);
+  const UNSUPPORTED = { error: "unsupported_storage", feature: "session_erase" };
+  const MESSAGE = "This session cannot be erased with the current storage or ingest configuration.";
+  const expectUnsupported = (result: Awaited<ReturnType<typeof app.api>>, label: string) => {
+    assert.equal(result.status, 503, label);
+    assert.equal(result.body.error, "session_erasure_unsupported_storage", label);
+    assert.equal(result.body.message, MESSAGE, label);
+    assert.equal(result.headers.get("retry-after"), null, label);
+    assert.doesNotMatch(result.text, /retry/i, label);
+  };
+
+  // The erase request.
+  pipeline.state.reply = () => ({ status: 503, body: UNSUPPORTED, headers: { "retry-after": "60" } });
+  expectUnsupported(await app.api(path, { method: "DELETE", token: tenant.ownerToken }), "DELETE");
+
+  // The verification read of an erase that was recorded.
+  pipeline.state.reply = () => ({
+    status: 202,
+    body: receipt(tenant.organizationId, { status: "in_progress", completedAt: null, bytesErased: false, bytesErasedAt: null }),
+  });
+  assert.equal((await app.api(path, { method: "DELETE", token: tenant.ownerToken })).status, 202);
+  pipeline.state.reply = () => ({ status: 503, body: UNSUPPORTED, headers: { "retry-after": "60" } });
+  expectUnsupported(await app.api(erasure, { token: tenant.ownerToken }), "GET");
+  assert.equal(pipeline.calls.at(-1)!.method, "GET");
+
+  // Provider text alongside the exact shape is never echoed.
+  pipeline.state.reply = () => ({ status: 503, body: { ...UNSUPPORTED, detail: "secret provider text" } });
+  const detailed = await app.api(path, { method: "DELETE", token: tenant.ownerToken });
+  expectUnsupported(detailed, "detail");
+  assert.doesNotMatch(detailed.text, /secret provider text/);
+
+  // Anything other than the exact shape on a 503 stays the static retryable error.
+  const prefix = JSON.stringify(UNSUPPORTED).slice(0, -1);
+  const oversized = `${prefix},"pad":"${"x".repeat(8_192)}"}`;
+  const fallbacks: Reply[] = [
+    { status: 503, body: { error: "unsupported_storage", feature: "other" } },
+    { status: 503, body: { error: "unsupported_storage" } },
+    { status: 503, body: { error: "UNSUPPORTED_STORAGE", feature: "session_erase" } },
+    { status: 503, body: { error: "too_many_owners", feature: "session_erase" } },
+    { status: 503, body: [] },
+    { status: 503, body: "unsupported_storage" },
+    { status: 503, body: null, raw: "not json" },
+    { status: 503, body: null, raw: "" },
+    { status: 503, body: null, raw: oversized },
+  ];
+  for (const reply of fallbacks) {
+    pipeline.state.reply = () => reply;
+    const label = reply.raw === undefined ? JSON.stringify(reply.body) : `raw ${reply.raw.slice(0, 40)}`;
+    const result = await app.api(path, { method: "DELETE", token: tenant.ownerToken });
+    assert.equal(result.status, 503, label);
+    assert.equal(result.body.error, "session_erasure_unavailable", label);
+    assert.equal(result.headers.get("retry-after"), null, label);
+  }
+
+  // Other 5xx statuses never read the body.
+  pipeline.state.reply = () => ({ status: 501, body: UNSUPPORTED });
+  const notImplemented = await app.api(path, { method: "DELETE", token: tenant.ownerToken });
+  assert.equal(notImplemented.status, 501);
+  assert.equal(notImplemented.body.error, "not_implemented");
+  pipeline.state.reply = () => ({ status: 500, body: UNSUPPORTED });
+  const serverError = await app.api(path, { method: "DELETE", token: tenant.ownerToken });
+  assert.equal(serverError.status, 503);
+  assert.equal(serverError.body.error, "session_erasure_unavailable");
 });
 
 test("session hard delete reaches a session id containing a slash", async (t) => {

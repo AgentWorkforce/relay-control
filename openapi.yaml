@@ -2719,7 +2719,7 @@ paths:
         "404": { description: "Organization not found, or `workspace_not_found`" }
         "501": { description: "`not_implemented`: the session pipeline erase is not configured or not yet available" }
         "502": { description: "`session_erasure_failed` (carries the receipt as `erasure`) or `invalid_session_erasure_response`" }
-        "503": { description: "`session_erasure_unavailable`: retry the request" }
+        "503": { description: "`session_erasure_unavailable`: retry the request; or `session_erasure_unsupported_storage`: the pipeline cannot erase this session with its current storage or ingest configuration, do not repeat the request (an operator change or supported cutover is required)" }
   /api/v1/organizations/{organizationId}/sessions/{sessionId}/erasure:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -2752,7 +2752,7 @@ paths:
         "404": { description: "Organization not found, `workspace_not_found`, or `erasure_not_found`" }
         "501": { description: "`not_implemented`: the session pipeline erase is not configured or not yet available" }
         "502": { description: "`invalid_session_erasure_response`" }
-        "503": { description: "`session_erasure_unavailable`: retry the request" }
+        "503": { description: "`session_erasure_unavailable`: retry the request; or `session_erasure_unsupported_storage`: the pipeline cannot erase this session with its current storage or ingest configuration, do not repeat the request (an operator change or supported cutover is required)" }
   /api/v1/workspaces/{workspaceId}/session-agent-names:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
