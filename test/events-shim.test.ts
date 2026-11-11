@@ -332,49 +332,90 @@ async function bareStore(t: TestContext) {
   return { database, store, shim, now, append, fresh, state };
 }
 
+/** A lease cutoff before every claim in these tests: no claim has expired. */
+const NOT_STALE = new Date(0).toISOString();
+
 test("concurrent claims never hand out the same event", async (t) => {
   const s = await bareStore(t);
   for (let n = 0; n < 30; n += 1) await s.fresh(n);
-  assert.equal(await s.store.countPending(s.shim.id), 30);
+  assert.equal(await s.store.countPending(s.shim.id, NOT_STALE), 30);
   const batches = await Promise.all(Array.from({ length: 8 }, (_, n) =>
-    s.store.claimPending(s.shim.id, { limit: 5 }, n % 2 ? "read" : "woken", s.now)));
+    s.store.claimPending(s.shim.id, { limit: 5, staleBefore: NOT_STALE }, n % 2 ? "read" : "sending", s.now)));
   const ids = batches.flat().map((event) => event.id);
   assert.equal(ids.length, 30, "every event claimed");
   assert.equal(new Set(ids).size, 30, "no event claimed twice");
-  assert.equal(await s.store.countPending(s.shim.id), 0);
-  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 5 }, "read", s.now), []);
+  assert.equal(await s.store.countPending(s.shim.id, NOT_STALE), 0);
+  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 5, staleBefore: NOT_STALE }, "read", s.now), []);
 });
 
-test("claimPending takes the oldest first or only the named ids, and only pending ones", async (t) => {
+test("claimPending takes the oldest first or only the named ids, and only claimable ones", async (t) => {
   const s = await bareStore(t);
   const [a, b, c] = [await s.fresh(1), await s.fresh(2), await s.fresh(3)];
-  const named = await s.store.claimPending(s.shim.id, { limit: 10, ids: [c.id] }, "read", s.now);
+  const named = await s.store.claimPending(s.shim.id, { limit: 10, ids: [c.id], staleBefore: NOT_STALE }, "read", s.now);
   assert.deepEqual(named.map((event) => event.id), [c.id]);
   assert.equal(named[0]!.delivery, "read");
-  const oldest = await s.store.claimPending(s.shim.id, { limit: 1 }, "woken", s.now);
+  const oldest = await s.store.claimPending(s.shim.id, { limit: 1, staleBefore: NOT_STALE }, "sending", s.now);
   assert.deepEqual(oldest.map((event) => event.id), [a.id]);
+  assert.equal(oldest[0]!.delivery, "sending");
   assert.equal(oldest[0]!.deliveredAt, new Date(s.now).toISOString());
-  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 10, ids: [a.id, c.id] }, "read", s.now), []);
+  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 10, ids: [a.id, c.id], staleBefore: NOT_STALE }, "read", s.now), []);
   assert.equal((await s.state(b.id)).delivery, "pending");
 });
 
-test("releaseWake returns only a still-woken event to pending", async (t) => {
+test("an expired sending lease makes a dead wake's post readable again", async (t) => {
+  const s = await bareStore(t);
+  const a = await s.fresh(1);
+  const claimedAt = "2026-01-01T00:00:00.000Z";
+  await s.store.claimPending(s.shim.id, { limit: 1, staleBefore: NOT_STALE }, "sending", claimedAt);
+  // Lease still live: not claimable, not counted.
+  assert.equal(await s.store.countPending(s.shim.id, claimedAt), 0);
+  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: claimedAt }, "read", s.now), []);
+  // Lease expired (the sender died): counted, and the agent can read it.
+  const expired = "2026-01-01T00:05:00.000Z";
+  assert.equal(await s.store.countPending(s.shim.id, expired), 1);
+  const read = await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: expired }, "read", s.now);
+  assert.deepEqual(read.map((event) => event.id), [a.id]);
+  assert.equal(read[0]!.delivery, "read");
+  // The dead sender's late results change nothing.
+  await s.store.confirmWake(s.shim.id, a.id, s.now);
+  await s.store.releaseWake(s.shim.id, a.id, "late failure");
+  assert.equal((await s.state(a.id)).delivery, "read");
+  assert.equal((await s.state(a.id)).wakeError, undefined);
+});
+
+test("confirmWake and releaseWake apply only while sending", async (t) => {
   const s = await bareStore(t);
   const [a, b] = [await s.fresh(1), await s.fresh(2)];
-  await s.store.claimPending(s.shim.id, { limit: 1, ids: [a.id] }, "woken", s.now);
-  await s.store.releaseWake(s.shim.id, a.id, "relay down");
-  const released = await s.state(a.id);
+  await s.store.claimPending(s.shim.id, { limit: 2, staleBefore: NOT_STALE }, "sending", s.now);
+  await s.store.confirmWake(s.shim.id, a.id, s.now);
+  assert.equal((await s.state(a.id)).delivery, "woken");
+  await s.store.releaseWake(s.shim.id, a.id, "late failure");
+  assert.equal((await s.state(a.id)).delivery, "woken", "release never demotes woken");
+
+  await s.store.releaseWake(s.shim.id, b.id, "relay down");
+  const released = await s.state(b.id);
   assert.equal(released.delivery, "pending");
   assert.equal(released.wakeError, "relay down");
   assert.equal(released.deliveredAt, undefined);
+  await s.store.confirmWake(s.shim.id, b.id, s.now);
+  assert.equal((await s.state(b.id)).delivery, "pending", "confirm needs a live claim");
+});
 
-  // Read by the agent before the failed wake reported: stays read.
-  await s.store.claimPending(s.shim.id, { limit: 10 }, "read", s.now);
-  await s.store.releaseWake(s.shim.id, a.id, "late failure");
-  await s.store.releaseWake(s.shim.id, b.id, "late failure");
-  assert.equal((await s.state(a.id)).delivery, "read");
-  assert.equal((await s.state(a.id)).wakeError, undefined);
-  assert.equal((await s.state(b.id)).delivery, "read");
+test("a claim for a stale or broken wake link claims nothing", async (t) => {
+  const s = await bareStore(t);
+  const a = await s.fresh(1);
+  const oldLink = "2026-01-01T00:00:00.000Z";
+  const newLink = "2026-01-02T00:00:00.000Z";
+  await s.store.setWakeTarget(s.shim.id, { url: RELAY_HOOK, secret: RELAY_SECRET, linkedAt: newLink });
+  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: NOT_STALE, linkedAt: oldLink }, "sending", s.now), []);
+  await s.store.markWakeBroken(s.shim.id, newLink, "gone", s.now);
+  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: NOT_STALE, linkedAt: newLink }, "sending", s.now), []);
+  await s.store.setWakeTarget(s.shim.id, null);
+  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: NOT_STALE, linkedAt: newLink }, "sending", s.now), []);
+  assert.equal((await s.state(a.id)).delivery, "pending");
+  await s.store.setWakeTarget(s.shim.id, { url: RELAY_HOOK, secret: RELAY_SECRET, linkedAt: newLink });
+  const claimed = await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: NOT_STALE, linkedAt: newLink }, "sending", s.now);
+  assert.deepEqual(claimed.map((event) => event.id), [a.id]);
 });
 
 test("markWakeBroken ignores a stale link", async (t) => {

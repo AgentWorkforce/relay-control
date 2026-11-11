@@ -43,7 +43,7 @@ CREATE TABLE events_shim_events (
   content_type text NOT NULL,
   body text NOT NULL,
   headers jsonb NOT NULL DEFAULT '{}',
-  delivery text NOT NULL DEFAULT 'pending' CHECK (delivery IN ('pending','woken','read')),
+  delivery text NOT NULL DEFAULT 'pending' CHECK (delivery IN ('pending','sending','woken','read')),
   delivered_at timestamptz,
   wake_error text,
   UNIQUE (shim_id, seq)

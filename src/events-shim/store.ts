@@ -302,44 +302,62 @@ export class PostgresEventsShimStore implements EventsShimStore {
     return result.rows.map(eventFrom);
   }
 
-  async countPending(shimId: string): Promise<number> {
+  async countPending(shimId: string, staleBefore: string): Promise<number> {
     const result = await this.database.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM events_shim_events WHERE shim_id = $1 AND delivery = 'pending'",
-      [shimId],
+      `SELECT count(*)::int AS n FROM events_shim_events
+        WHERE shim_id = $1
+          AND (delivery = 'pending' OR (delivery = 'sending' AND delivered_at < $2))`,
+      [shimId, staleBefore],
     );
     return result.rows[0]?.n ?? 0;
   }
 
   async claimPending(
     shimId: string,
-    options: { limit: number; ids?: string[] },
-    state: "woken" | "read",
+    options: { limit: number; ids?: string[]; staleBefore: string; linkedAt?: string },
+    state: "sending" | "read",
     at: string,
   ): Promise<ShimEvent[]> {
     // One statement, the pick materialized once: rows another caller holds are
-    // skipped and rows it already moved no longer match 'pending', so two
-    // callers never get the same event.
+    // skipped and rows it already moved no longer match, so two callers never
+    // get the same event. Claimable: pending, or sending with an expired lease.
+    // With linkedAt, nothing is claimed unless that link is still current and
+    // unbroken, checked in the same statement.
     const result = await this.database.query<EventRow>(
       `WITH picked AS MATERIALIZED (
          SELECT id FROM events_shim_events
-          WHERE shim_id = $1 AND delivery = 'pending'
+          WHERE shim_id = $1
+            AND (delivery = 'pending' OR (delivery = 'sending' AND delivered_at < $6::timestamptz))
             AND ($5::uuid[] IS NULL OR id = ANY($5::uuid[]))
+            AND ($7::timestamptz IS NULL OR EXISTS (
+              SELECT 1 FROM events_shims s
+               WHERE s.id = $1 AND s.wake_url IS NOT NULL
+                 AND s.wake_linked_at = $7::timestamptz AND s.wake_broken_at IS NULL))
           ORDER BY seq ASC
           LIMIT $4::int
           FOR UPDATE SKIP LOCKED)
        UPDATE events_shim_events e SET delivery = $2, delivered_at = $3, wake_error = NULL
          FROM picked
-        WHERE e.id = picked.id AND e.delivery = 'pending'
+        WHERE e.id = picked.id
+          AND (e.delivery = 'pending' OR (e.delivery = 'sending' AND e.delivered_at < $6::timestamptz))
         RETURNING ${EVENT_COLUMNS.split(",").map((column) => `e.${column.trim()}`).join(", ")}`,
-      [shimId, state, at, options.limit, options.ids ?? null],
+      [shimId, state, at, options.limit, options.ids ?? null, options.staleBefore, options.linkedAt ?? null],
     );
     return result.rows.map(eventFrom).sort((a, b) => a.seq - b.seq);
+  }
+
+  async confirmWake(shimId: string, eventId: string, at: string): Promise<void> {
+    await this.database.query(
+      `UPDATE events_shim_events SET delivery = 'woken', delivered_at = $3
+        WHERE shim_id = $1 AND id = $2 AND delivery = 'sending'`,
+      [shimId, eventId, at],
+    );
   }
 
   async releaseWake(shimId: string, eventId: string, wakeError: string): Promise<void> {
     await this.database.query(
       `UPDATE events_shim_events SET delivery = 'pending', delivered_at = NULL, wake_error = $3
-        WHERE shim_id = $1 AND id = $2 AND delivery = 'woken'`,
+        WHERE shim_id = $1 AND id = $2 AND delivery = 'sending'`,
       [shimId, eventId, wakeError],
     );
   }
