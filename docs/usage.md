@@ -32,7 +32,7 @@ query parameter is 400. The range is the last `days` UTC days, ending today.
 |---|---|
 | `sessionsUploaded` | The session directory, through the read API `/v1/sessions/activity`, read once per workspace of the organization that the owner belongs to and summed |
 | `summaries` | The read API `/v1/sessions/summaries/activity` (`{ days: [{ date, total }] }`, workspace-attested), when it serves it |
-| `activeUsers` | Control: a user who authenticated to Control that day |
+| `activeUsers` | Control: a user whose access token Control accepted that day (dashboard, Desktop, MCP, or introspection by session ingest and the read API) |
 | `searches` | Control: a first-page session search (`/sessions/search`, or `/sessions?q=`); later pages of the same search are not counted |
 
 A source that cannot be read (the read API is down, or does not serve the

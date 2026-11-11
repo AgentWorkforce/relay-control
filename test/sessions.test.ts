@@ -1402,6 +1402,8 @@ test("usage: any route that authenticates a token counts its user (not only the 
   const member = await env.login(env.memberId, env.alpha);
   // Desktop, MCP and dashboard account routes authenticate through the store directly.
   assert.ok(await env.store.authenticateAccessToken(member));
+  // So does introspection of a live token by ingest or the read API.
+  assert.ok(await env.store.introspectAccessToken(member));
   const result = await usageUntil(env.origin, `/cloud/api/v1/organizations/${env.organizationId}/usage?days=7`, owner,
     (body) => body.usage.totals.activeUsers === 2);
   assert.equal(result.body.usage.totals.activeUsers, 2);

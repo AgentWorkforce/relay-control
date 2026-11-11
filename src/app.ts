@@ -421,10 +421,11 @@ export function createApp(input: {
     void write().catch(() => {});
   };
   // Every route that authenticates an access token (API, dashboard account
-  // pages, Desktop, MCP) counts its user as active today.
+  // pages, Desktop, MCP, and introspection by ingest and the read API)
+  // counts its user as active today.
   if (features.usage) {
-    store.onAuthenticated = (principal) =>
-      recordUsage(() => usage.recordActiveUser(principal.organizationId, principal.userId));
+    store.onAuthenticated = (user) =>
+      recordUsage(() => usage.recordActiveUser(user.organizationId, user.userId));
   }
   /** Throws the 403 refusal unless `feature` is selected. Call after membership, before backends. */
   function requireFeature(feature: Feature): void {
