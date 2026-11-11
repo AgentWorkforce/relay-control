@@ -7861,10 +7861,10 @@ components:
       type: object
       required: [activeUsers, sessionsUploaded, searches, summaries]
       properties:
-        activeUsers: { type: integer, minimum: 0, nullable: true }
-        sessionsUploaded: { type: integer, minimum: 0, nullable: true }
-        searches: { type: integer, minimum: 0, nullable: true }
-        summaries: { type: integer, minimum: 0, nullable: true }
+        activeUsers: { type: [integer, "null"], minimum: 0 }
+        sessionsUploaded: { type: [integer, "null"], minimum: 0 }
+        searches: { type: [integer, "null"], minimum: 0 }
+        summaries: { type: [integer, "null"], minimum: 0 }
     FeatureRefusal:
       type: object
       required: [error, message, feature]

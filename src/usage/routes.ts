@@ -78,10 +78,13 @@ async function historyDaily(
       const read = await readWorkspaceHistory(config, identity, path, new URLSearchParams({ since, until }), {
         allowNotFound: true,
       });
-      if (read.status !== "ok" || !Array.isArray(read.body.days)) return null;
-      for (const row of read.body.days) {
-        if (!isRecord(row) || typeof row.date !== "string" || !isCount(row.total)) return null;
-        if (totals.has(row.date)) totals.set(row.date, totals.get(row.date)! + row.total);
+      // Exactly one row per requested day, in order; anything else is not a
+      // complete answer, so the metric is unavailable rather than undercounted.
+      const rows = read.status === "ok" && Array.isArray(read.body.days) ? read.body.days : null;
+      if (!rows || rows.length !== dates.length) return null;
+      for (const [index, row] of rows.entries()) {
+        if (!isRecord(row) || row.date !== dates[index] || !isCount(row.total)) return null;
+        totals.set(dates[index]!, totals.get(dates[index]!)! + row.total);
       }
     }
   } catch {

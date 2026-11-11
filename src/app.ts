@@ -420,6 +420,12 @@ export function createApp(input: {
     // Counters never fail or slow a request.
     void write().catch(() => {});
   };
+  // Every route that authenticates an access token (API, dashboard account
+  // pages, Desktop, MCP) counts its user as active today.
+  if (features.usage) {
+    store.onAuthenticated = (principal) =>
+      recordUsage(() => usage.recordActiveUser(principal.organizationId, principal.userId));
+  }
   /** Throws the 403 refusal unless `feature` is selected. Call after membership, before backends. */
   function requireFeature(feature: Feature): void {
     requireSelected(features, feature);
@@ -554,7 +560,6 @@ export function createApp(input: {
     }
     const principal = await store.authenticateAccessToken(token);
     if (!principal) throw new HttpError(401, "unauthorized", "Invalid or expired token");
-    recordUsage(() => usage.recordActiveUser(principal.organizationId, principal.userId));
     return { kind: "user", principal, token };
   }
 

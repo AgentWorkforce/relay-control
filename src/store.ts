@@ -981,7 +981,25 @@ export class ControlPlaneStore {
     });
   }
 
+  /**
+   * Called after every successful access-token authentication, whichever
+   * route did it (the usage page's active-user counter). Must not throw or block.
+   */
+  onAuthenticated: ((principal: Principal) => void) | null = null;
+
   async authenticateAccessToken(token: string): Promise<Principal | null> {
+    const principal = await this.lookupAccessToken(token);
+    if (principal && this.onAuthenticated) {
+      try {
+        this.onAuthenticated(principal);
+      } catch {
+        // Usage counters never fail authentication.
+      }
+    }
+    return principal;
+  }
+
+  private async lookupAccessToken(token: string): Promise<Principal | null> {
     const result = await this.database.query<TokenContextRow>(
       `SELECT s.id AS session_id, s.token_family_id, s.user_id, u.email,
               u.name AS user_name, s.organization_id, o.name AS organization_name,

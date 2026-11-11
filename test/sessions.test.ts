@@ -1364,6 +1364,16 @@ test("usage: empty state is zeros, and an unreadable source is null, never zero"
   assert.deepEqual(empty.body.usage.unavailable, ["summaries"]);
   assert.equal(empty.body.usage.days[0].summaries, null);
 
+  // A page missing a day (or with days out of order) is not a complete answer.
+  env.history.overrides.set("/v1/sessions/activity", (request, url) => {
+    const full = dailyActivity(() => 1)(request, url);
+    return { body: { days: full.body.days.slice(1) } };
+  });
+  const partial = await call(env.origin, path, { token: owner });
+  assert.equal(partial.status, 200);
+  assert.equal(partial.body.usage.totals.sessionsUploaded, null);
+  assert.equal(partial.body.usage.days[5].sessionsUploaded, null);
+
   env.history.overrides.set("/v1/sessions/activity", () => ({ status: 503, body: { error: { code: "not_configured" } } }));
   const degraded = await call(env.origin, path, { token: owner });
   assert.equal(degraded.status, 200);
@@ -1384,4 +1394,17 @@ test("usage: the range is 7, 30 or 90 days ending today", async (t) => {
     assert.equal(refused.status, 400, query);
     assert.equal(refused.body.error, "invalid_request", query);
   }
+});
+
+test("usage: any route that authenticates a token counts its user (not only the API helper)", async (t) => {
+  const env = await setup(t, undefined, { features: USAGE_ON });
+  const owner = await env.login(env.ownerId, env.alpha);
+  const member = await env.login(env.memberId, env.alpha);
+  // Desktop, MCP and dashboard account routes authenticate through the store directly.
+  assert.ok(await env.store.authenticateAccessToken(member));
+  const result = await usageUntil(env.origin, `/cloud/api/v1/organizations/${env.organizationId}/usage?days=7`, owner,
+    (body) => body.usage.totals.activeUsers === 2);
+  assert.equal(result.body.usage.totals.activeUsers, 2);
+  const { rows } = await env.database.query<{ n: number }>("SELECT count(*)::int AS n FROM usage_daily_users");
+  assert.equal(rows[0]!.n, 2);
 });
