@@ -5,6 +5,19 @@ assigned at release.
 
 ## Unreleased
 
+- Added: shared-session read audit. Every MCP shared-session read
+  (`open_shared_sessions`, `search_shared_sessions`, `get_shared_session`,
+  `get_shared_session_context`, `list_session_timings`), successful or failed,
+  writes one append-only row to `shared_session_read_audit` (migration 0042):
+  caller, identity kind (Desktop, hosted, OAuth), calling native chat and
+  whether a signed proof verified it, tool, bounded query text or requested
+  session, result count, and the returned sessions with their recorded
+  owners. No transcript content. An audit write failure is logged and never
+  fails the read. Workspace owners and admins export it with
+  `GET /api/v1/workspaces/{workspace}/shared-session-read-audit` (JSON or
+  CSV, time range, cursor pages). Kept until an operator deletes rows. See
+  docs/shared-session-read-audit.md.
+
 - Added: agent launches over the shared-sessions MCP endpoint, behind
   `SELFHOST_FEATURES=launch` (off by default). Registers
   `list_relay_spawn_targets`, `spawn_relay_agent`, `get_relay_spawn_status` and

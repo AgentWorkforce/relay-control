@@ -5,7 +5,7 @@ import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { readWorkspaceHistory } from "../sessions/history.js";
 import { readViaSessionRead } from "./session-read-reader.js";
 import type { EncryptionKeyring } from "../crypto.js";
-import type { Database } from "../database.js";
+import type { Database, SqlExecutor } from "../database.js";
 import type { RelaycastClient, RosterAgent, PresenceRow } from "../messaging/relaycast.js";
 import type { ProviderStatus } from "../providers/registry.js";
 import type { Principal } from "../store.js";
@@ -62,6 +62,13 @@ export type McpContext = {
   launch?: boolean;
   /** Factory sessions (SELFHOST_FACTORY_ENABLED); absent when the feature is off. */
   factory?: FactoryMcpDeps;
+  /** Where shared-session read calls are audited (src/mcp/read-audit.ts); absent writes nothing. */
+  readAudit?: {
+    database: SqlExecutor;
+    now?: () => Date;
+    /** JSON-RPC request ids whose read a tool handler recorded (validation failures are recorded after). */
+    handled?: Set<string>;
+  };
 };
 
 export class SharedSessionsToolError extends Error {

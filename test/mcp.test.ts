@@ -58,7 +58,7 @@ const READ_API_SECRET = "session-read-secret-".repeat(2);
 
 type HistoryEvent = {
   eventId: string; sessionId: string; source: string; kind: string; type: string; ts: string; content: string;
-  workspaceId: string; taskTitle?: string;
+  workspaceId: string; taskTitle?: string; userId?: string;
 };
 
 /**
@@ -134,7 +134,7 @@ async function startHistory(t: TestContext) {
     if (url.pathname === "/v1/sessions") {
       send(200, {
         sessions: url.searchParams.get("agent") === "builder"
-          ? [{ sessionId: "sess-1", source: "codex", lastTs: "2026-11-07T10:01:00.000Z" }]
+          ? [{ sessionId: "sess-1", source: "codex", lastTs: "2026-11-07T10:01:00.000Z", userIds: ["teammate-1"] }]
           : [],
         nextCursor: null,
       });
@@ -1142,4 +1142,248 @@ test("an addressed MCP send pins one machine and retains its retry receipt", asy
   const refused = await client.callTool({ name: "send_relay_message", arguments: { ...args, to: "machine-peer@another-machine" } });
   assert.match(toolError(refused), /Unknown agent name or stale machine address/);
   assert.equal(env.relay.world.bodies.filter(call => call.path === "/v1/dm").length, beforeRefusal);
+});
+
+type AuditRow = Record<string, any>;
+
+async function auditRows(env: Awaited<ReturnType<typeof setup>>): Promise<AuditRow[]> {
+  return (await env.database.query<AuditRow>(
+    "SELECT * FROM shared_session_read_audit ORDER BY occurred_at, id")).rows;
+}
+
+/** A plain member of the organization, signed in to the primary workspace. */
+async function memberToken(env: Awaited<ReturnType<typeof setup>>, role: "admin" | "member"): Promise<{ userId: string; token: string }> {
+  const call = async (path: string, body: Record<string, unknown>) => {
+    const response = await fetch(`${env.origin}${path}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.config.bootstrapToken}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status < 300, true, path);
+    return await response.json() as Record<string, any>;
+  };
+  const membership = await call(`/api/v1/organizations/${env.orgId}/memberships`, { email: `${role}@example.test`, name: role, role });
+  const started = await call("/api/v1/auth/device/start", { client_name: "audit-test" });
+  await call("/api/v1/auth/device/approve", {
+    action: "approve", user_code: started.user_code, user_id: membership.userId, workspace_id: env.workspaceId,
+  });
+  const tokens = await call("/api/v1/auth/device/token", { device_code: started.device_code });
+  return { userId: membership.userId as string, token: tokens.access_token as string };
+}
+
+function seedAuditHistory(env: Awaited<ReturnType<typeof setup>>) {
+  env.history.events.push(
+    { eventId: "e1", sessionId: "sess-1", source: "codex", kind: "prompt", type: "user_message", ts: "2026-11-07T10:00:00.000Z", content: "Fix the deploy pipeline TRANSCRIPT-MARKER-ALPHA", workspaceId: env.workspaceId, userId: "teammate-1" },
+    { eventId: "e2", sessionId: "sess-1", source: "codex", kind: "assistant", type: "agent_message", ts: "2026-11-07T10:01:00.000Z", content: "Deploy pipeline fixed TRANSCRIPT-MARKER-BETA", workspaceId: env.workspaceId, userId: "teammate-1" },
+    { eventId: "e3", sessionId: "sess-2", source: "claude", kind: "prompt", type: "user_message", ts: "2026-11-07T11:00:00.000Z", content: "Deploy rollback notes TRANSCRIPT-MARKER-GAMMA", workspaceId: env.workspaceId, userId: "teammate-2" },
+  );
+}
+
+test("read audit: every shared-session read tool writes one record, without transcript content", async (t) => {
+  const env = await setup(t);
+  seedAuditHistory(env);
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+
+  await client.callTool({ name: "open_shared_sessions", arguments: {} });
+  structured(await client.callTool({ name: "search_shared_sessions", arguments: { query: "deploy" } }));
+  structured(await client.callTool({ name: "get_shared_session", arguments: { session_id: "sess-1", source: "codex" } }));
+  structured(await client.callTool({ name: "get_shared_session_context", arguments: { session_id: "sess-2" } }));
+  await client.callTool({ name: "list_session_timings", arguments: { since: "2026-11-01T00:00:00.000Z" } });
+  // Tools outside the shared-session reads are not audited.
+  await client.callTool({ name: "describe_capabilities", arguments: {} });
+
+  const rows = await auditRows(env);
+  assert.deepEqual(rows.map((row) => row.tool_name), [
+    "open_shared_sessions", "search_shared_sessions", "get_shared_session", "get_shared_session_context", "list_session_timings",
+  ]);
+  for (const row of rows) {
+    assert.equal(row.organization_id, env.orgId);
+    assert.equal(row.workspace_id, env.workspaceId);
+    assert.equal(row.caller_user_id, env.ownerId);
+    assert.equal(row.identity_kind, "hosted");
+    assert.equal(row.auth_mode, "cli_login");
+    assert.equal(row.native_session_verified, false);
+  }
+  const [open, search, session, context] = rows;
+  assert.equal(open!.outcome, "ok");
+  assert.equal(open!.result_count, 0);
+
+  assert.equal(search!.outcome, "ok");
+  assert.equal(search!.query_text, "deploy");
+  assert.equal(search!.result_count, 3);
+  assert.equal(search!.correlation_id, "corr-search");
+  assert.deepEqual(search!.result_sessions, [
+    { session_id: "sess-1", source: "codex", owner_user_ids: ["teammate-1"] },
+    { session_id: "sess-2", source: "claude", owner_user_ids: ["teammate-2"] },
+  ]);
+
+  assert.equal(session!.requested_session_id, "sess-1");
+  assert.equal(session!.requested_source, "codex");
+  assert.equal(session!.result_count, 2);
+  assert.deepEqual(session!.result_sessions, [{ session_id: "sess-1", source: "codex", owner_user_ids: ["teammate-1"] }]);
+
+  assert.equal(context!.requested_session_id, "sess-2");
+  assert.deepEqual(context!.result_sessions, [{ session_id: "sess-2", source: "claude", owner_user_ids: ["teammate-2"] }]);
+
+  const stored = JSON.stringify(rows);
+  assert.equal(/TRANSCRIPT-MARKER/.test(stored), false, "no transcript content is stored");
+  assert.equal(stored.includes(env.accessToken), false);
+});
+
+test("read audit: a failed read is recorded with its public error and correlation id", async (t) => {
+  const env = await setup(t);
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  const foreign = await client.callTool({ name: "search_shared_sessions", arguments: { query: "deploy", workspace_id: env.otherWorkspaceId } });
+  assert.equal(foreign.isError, true);
+  const missing = await client.callTool({ name: "get_shared_session", arguments: { session_id: "no-such-session" } });
+  assert.equal(missing.isError, true);
+
+  const [search, get] = await auditRows(env);
+  assert.equal(search!.outcome, "error");
+  assert.equal(search!.query_text, "deploy");
+  assert.equal(search!.error_message, "The requested workspace is not available to this credential.");
+  assert.match(search!.correlation_id, /^[0-9a-f-]{36}$/);
+  assert.equal(search!.result_count, 0);
+  assert.deepEqual(search!.result_sessions, []);
+  assert.equal(search!.filters.workspace_id, undefined);
+  assert.equal(get!.outcome, "error");
+  assert.equal(get!.requested_session_id, "no-such-session");
+  assert.match(get!.error_message, /No shared session was found/);
+});
+
+test("read audit: a desktop call records its calling native chat as unverified without a signed proof", async (t) => {
+  const env = await setup(t);
+  seedAuditHistory(env);
+  const thread = "0198c0de-0000-7000-8000-000000000001";
+  const called = await rpc(env.origin, MCP_PATH, {
+    headers: { authorization: `Bearer ${env.accessToken}`, "x-agent-relay-desktop": "1", "mcp-session-id": "mcp-sess-1" },
+    body: {
+      jsonrpc: "2.0", id: 9, method: "tools/call",
+      params: { name: "search_shared_sessions", arguments: { query: "rollback" }, _meta: { threadId: thread } },
+    },
+  });
+  assert.equal(called.status, 200);
+  const [row] = await auditRows(env);
+  assert.equal(row!.identity_kind, "desktop");
+  assert.equal(row!.native_session_provider, "codex");
+  assert.equal(row!.native_session_id, thread);
+  assert.equal(row!.native_session_verified, false);
+  assert.equal(row!.mcp_session_id, "mcp-sess-1");
+  assert.deepEqual(row!.result_sessions, [{ session_id: "sess-2", source: "claude", owner_user_ids: ["teammate-2"] }]);
+});
+
+test("read audit: an audit write failure is logged and never fails the read", async (t) => {
+  const env = await setup(t);
+  seedAuditHistory(env);
+  await env.database.exec("ALTER TABLE shared_session_read_audit RENAME TO shared_session_read_audit_moved");
+  const logged: unknown[][] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args); };
+  t.after(() => { console.error = original; });
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  const search = structured(await client.callTool({ name: "search_shared_sessions", arguments: { query: "deploy" } }));
+  console.error = original;
+  assert.equal(search.matches.length, 3);
+  assert(logged.some((args) => String(args[0]).includes("Shared-session read audit write failed")));
+});
+
+test("read audit: the table is append-only", async (t) => {
+  const env = await setup(t);
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  await client.callTool({ name: "open_shared_sessions", arguments: {} });
+  await assert.rejects(env.database.query("UPDATE shared_session_read_audit SET query_text = 'changed'"), /append-only/);
+  // An operator purge (docs/shared-session-read-audit.md) is a DELETE.
+  await env.database.query("DELETE FROM shared_session_read_audit WHERE occurred_at < now() + interval '1 day'");
+  assert.equal((await auditRows(env)).length, 0);
+});
+
+test("read audit export: owner/admin only, paginated, JSON and CSV", async (t) => {
+  const env = await setup(t);
+  seedAuditHistory(env);
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  for (const query of ["deploy", "rollback", "=HYPERLINK(1)"]) {
+    await client.callTool({ name: "search_shared_sessions", arguments: { query } });
+  }
+  const exportPath = `/api/v1/workspaces/${env.workspaceId}/shared-session-read-audit`;
+  const get = (path: string, token: string) => fetch(`${env.origin}${path}`, { headers: { authorization: `Bearer ${token}` } });
+
+  const member = await memberToken(env, "member");
+  const refused = await get(exportPath, member.token);
+  assert.equal(refused.status, 403);
+  assert.equal(((await refused.json()) as Record<string, any>).error, "forbidden");
+  const foreign = await get(`/api/v1/workspaces/${env.otherWorkspaceId}/shared-session-read-audit`, env.accessToken);
+  assert.equal(foreign.status, 404);
+  const anonymous = await fetch(`${env.origin}${exportPath}`);
+  assert.equal(anonymous.status, 401);
+  assert.equal((await get(`${exportPath}?limit=0`, env.accessToken)).status, 400);
+  assert.equal((await get(`${exportPath}?since=yesterday`, env.accessToken)).status, 400);
+  assert.equal((await get(`${exportPath}?cursor=bogus`, env.accessToken)).status, 400);
+  assert.equal((await get(`${exportPath}?workspace=x`, env.accessToken)).status, 400);
+
+  const first = await get(`${exportPath}?limit=2`, env.accessToken);
+  assert.equal(first.status, 200);
+  assert.equal(first.headers.get("cache-control"), "no-store");
+  const page1 = await first.json() as Record<string, any>;
+  assert.equal(page1.workspace_id, env.workspaceId);
+  assert.deepEqual(page1.records.map((row: any) => row.query_text), ["deploy", "rollback"]);
+  assert.equal(page1.records[0].caller_user_id, env.ownerId);
+  assert.equal(page1.records[0].tool_name, "search_shared_sessions");
+  assert.equal(typeof page1.next_cursor, "string");
+  const page2 = await (await get(`${exportPath}?limit=2&cursor=${page1.next_cursor}`, env.accessToken)).json() as Record<string, any>;
+  assert.deepEqual(page2.records.map((row: any) => row.query_text), ["=HYPERLINK(1)"]);
+  assert.equal(page2.next_cursor, null);
+
+  // A time range excludes everything outside it.
+  const future = await (await get(`${exportPath}?since=2999-01-01T00:00:00Z`, env.accessToken)).json() as Record<string, any>;
+  assert.deepEqual(future.records, []);
+
+  // A workspace admin may export too.
+  const admin = await memberToken(env, "admin");
+  assert.equal((await get(exportPath, admin.token)).status, 200);
+
+  const csv = await get(`${exportPath}?format=csv&limit=2`, env.accessToken);
+  assert.equal(csv.status, 200);
+  assert.match(csv.headers.get("content-type") ?? "", /^text\/csv/);
+  assert.equal(typeof csv.headers.get("x-next-cursor"), "string");
+  const lines = (await csv.text()).trimEnd().split("\r\n");
+  assert.equal(lines.length, 3);
+  assert(lines[0]!.startsWith("id,occurred_at,organization_id,workspace_id,caller_user_id,identity_kind"));
+  const csvAll = await (await get(`${exportPath}?format=csv`, env.accessToken)).text();
+  // Caller-supplied text cannot become a spreadsheet formula.
+  assert(csvAll.includes("'=HYPERLINK(1)"));
+});
+
+test("read audit: agent searches keep recorded owners; a sourceless read groups events by their own source", async (t) => {
+  const env = await setup(t);
+  seedAuditHistory(env);
+  env.history.events.push(
+    { eventId: "e4", sessionId: "sess-1", source: "claude", kind: "prompt", type: "user_message", ts: "2026-11-07T12:00:00.000Z", content: "Other source", workspaceId: env.workspaceId, userId: "teammate-3" },
+  );
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  const listed = structured(await client.callTool({ name: "search_shared_sessions", arguments: { agent: "builder" } }));
+  assert.equal(listed.sessions[0].user_ids, undefined, "the tool output is unchanged");
+  structured(await client.callTool({ name: "get_shared_session", arguments: { session_id: "sess-1" } }));
+  const [agent, read] = await auditRows(env);
+  assert.equal(agent!.agent_filter, "builder");
+  assert.deepEqual(agent!.result_sessions, [{ session_id: "sess-1", source: "codex", owner_user_ids: ["teammate-1"] }]);
+  assert.deepEqual(read!.result_sessions, [
+    { session_id: "sess-1", source: "codex", owner_user_ids: ["teammate-1"] },
+    { session_id: "sess-1", source: "claude", owner_user_ids: ["teammate-3"] },
+  ]);
+});
+
+test("read audit: a call refused by input validation is recorded once", async (t) => {
+  const env = await setup(t);
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  const invalid = await client.callTool({ name: "list_session_timings", arguments: {} });
+  assert.equal(invalid.isError, true);
+  const tooLong = await client.callTool({ name: "search_shared_sessions", arguments: { query: "x".repeat(900) } });
+  assert.equal(tooLong.isError, true);
+  structured(await client.callTool({ name: "open_shared_sessions", arguments: {} }));
+  const rows = await auditRows(env);
+  assert.deepEqual(rows.map((row) => [row.tool_name, row.outcome]), [
+    ["list_session_timings", "error"], ["search_shared_sessions", "error"], ["open_shared_sessions", "ok"],
+  ]);
+  assert.equal(rows[0]!.error_message, "Input validation error.");
+  assert.equal(rows[1]!.query_text.length, 500);
 });

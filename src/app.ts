@@ -25,6 +25,7 @@ import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { UsageRangeError, usageDays, usageReport } from "./usage/routes.js";
 import { UsageStore } from "./usage/store.js";
+import { listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError } from "./mcp/read-audit.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, introspect, INTROSPECT_PATH } from "./auth/introspect.js";
@@ -533,6 +534,7 @@ export function createApp(input: {
     ...(factory.enabled ? { factory: factory.mcp } : {}),
     ...(features.launch ? { launch: true } : {}),
     ...(mcpOAuth.store ? {oauthSessions:mcpOAuth.store.sessions} : {}),
+    ...(input.now ? { now: input.now } : {}),
   });
   const desktopMcpCredentials = new DesktopMcpCredentials(store.database);
   const DESKTOP_MCP_RATE = { limit: 30, windowMs: 60_000 };
@@ -1801,6 +1803,33 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           now: input.now?.() ?? new Date(),
         }),
       }, true);
+      return;
+    }
+
+    // Shared-session read audit export (docs/shared-session-read-audit.md):
+    // workspace owner/admin only, oldest first, keyset-paginated, JSON or CSV.
+    const readAuditRoute = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/shared-session-read-audit$/);
+    if (readAuditRoute && method === "GET") {
+      const access = await workspaceAccess(request, readAuditRoute[0]!, true);
+      let query;
+      try {
+        query = parseReadAuditQuery(url);
+      } catch (error) {
+        if (error instanceof ReadAuditQueryError) throw new HttpError(400, "invalid_request", error.message);
+        throw error;
+      }
+      const page = await listReadAudit(store.database, access.workspace.id, query);
+      if (query.format === "csv") {
+        response.writeHead(200, {
+          "content-type": "text/csv; charset=utf-8",
+          "cache-control": "no-store",
+          "content-disposition": `attachment; filename="shared-session-read-audit-${access.workspace.id}.csv"`,
+          ...(page.nextCursor ? { "x-next-cursor": page.nextCursor } : {}),
+        });
+        response.end(readAuditCsv(page.records));
+        return;
+      }
+      json(response, 200, { workspace_id: access.workspace.id, records: page.records, next_cursor: page.nextCursor }, true);
       return;
     }
 

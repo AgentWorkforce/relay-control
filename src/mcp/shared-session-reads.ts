@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { SHARED_SESSION_READ_TOOLS } from "./catalog.js";
 import { type McpContext, SharedSessionsToolError, sessionCitation, toolError } from "./context.js";
+import { noteResultOwners, withReadAudit } from "./read-audit.js";
 import { registerSessionTimings } from "./session-timings.js";
 import { agentPrefixTooShort, AGENT_VALUE, MAX_AGENT_LENGTH, selectAgent } from "../sessions/agent-query.js";
 
@@ -145,6 +146,8 @@ const AgentSessionsPageSchema = z.object({
     sessionId: z.string().min(1),
     source: z.string().nullish(),
     lastTs: z.string().nullish(),
+    /** Recorded member ids: kept for the read audit, not returned. */
+    userIds: z.array(z.string()).nullish(),
   })),
   nextCursor: z.string().nullish(),
 });
@@ -290,9 +293,12 @@ function parsePage<T extends z.ZodType>(schema: T, body: unknown): z.infer<T> {
 
 /**
  * The open entrypoint, the three transcript reads and list_session_timings.
- * Registration does no I/O; every read goes through the request context.
+ * Registration does no I/O; every read goes through the request context, and
+ * every call is audited.
  */
-export function registerSharedSessionReads(server: McpServer, context: McpContext): void {
+export function registerSharedSessionReads(mcpServer: McpServer, context: McpContext): void {
+  // Every read below writes one shared_session_read_audit row (docs/shared-session-read-audit.md).
+  const server = withReadAudit(mcpServer, context);
   const origin = context.origin;
 
   server.registerTool(SHARED_SESSION_READ_TOOLS[0], {
@@ -355,7 +361,7 @@ export function registerSharedSessionReads(server: McpServer, context: McpContex
         if (input.cursor) list.set("cursor", input.cursor);
         const sessions = parsePage(AgentSessionsPageSchema,
           await context.readHistory(`/v1/sessions?${list.toString()}`, { timeoutMessage: SEARCH_TIMEOUT_MESSAGE }));
-        return toolSuccess({
+        const listed = toolSuccess({
           workspace_id: workspaceId,
           matches: [],
           sessions: sessions.sessions.map((row) => ({
@@ -368,6 +374,10 @@ export function registerSharedSessionReads(server: McpServer, context: McpContex
           next_cursor: sessions.nextCursor ?? null,
           correlation_id: correlationId,
         });
+        noteResultOwners(listed, sessions.sessions.map((row) => ({
+          sessionId: row.sessionId, source: row.source ?? null, userIds: row.userIds ?? [],
+        })));
+        return listed;
       }
       if (!input.query) throw new SharedSessionsToolError("Provide query text or an agent.");
       const params = new URLSearchParams({ q: input.query, limit: String(input.limit), order: "desc", maxContent: String(input.max_content) });

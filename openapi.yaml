@@ -5477,6 +5477,90 @@ paths:
                         action: { type: string }
                         target: { type: [string, "null"] }
                         createdAt: { type: string, format: date-time }
+  /api/v1/workspaces/{workspaceId}/shared-session-read-audit:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: exportSharedSessionReadAudit
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      description: |
+        Workspace owner/admin. Exports the shared-session read audit (see
+        `docs/shared-session-read-audit.md`): one record per MCP
+        shared-session read tool call, oldest first, keyset-paginated. Never
+        contains transcript content. A member is 403; another workspace 404.
+      parameters:
+        - { name: since, in: query, required: false, schema: { type: string, format: date-time }, description: Inclusive }
+        - { name: until, in: query, required: false, schema: { type: string, format: date-time }, description: Exclusive }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 100 } }
+        - { name: cursor, in: query, required: false, schema: { type: string } }
+        - { name: format, in: query, required: false, schema: { type: string, enum: [json, csv], default: json } }
+      responses:
+        "200":
+          description: One page of records. For CSV the next cursor is in `x-next-cursor`.
+          headers:
+            x-next-cursor:
+              schema: { type: string }
+              description: CSV only; absent on the last page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [workspace_id, records, next_cursor]
+                properties:
+                  workspace_id: { type: string }
+                  next_cursor: { type: [string, "null"] }
+                  records:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        occurred_at: { type: string, format: date-time }
+                        organization_id: { type: string }
+                        workspace_id: { type: string }
+                        caller_user_id: { type: string }
+                        identity_kind: { enum: [desktop, hosted, oauth] }
+                        auth_mode: { enum: [cli_login, session, oauth] }
+                        desktop_provider: { type: [string, "null"] }
+                        oauth_client_id: { type: [string, "null"] }
+                        oauth_grant_id: { type: [string, "null"] }
+                        mcp_session_id: { type: [string, "null"] }
+                        native_session_id: { type: [string, "null"] }
+                        native_session_provider: { type: [string, "null"] }
+                        native_session_verified: { type: boolean }
+                        tool_name: { type: string }
+                        outcome: { enum: [ok, error] }
+                        error_message: { type: [string, "null"] }
+                        query_text: { type: [string, "null"], maxLength: 500 }
+                        agent_filter: { type: [string, "null"] }
+                        requested_session_id: { type: [string, "null"] }
+                        requested_source: { type: [string, "null"] }
+                        filters: { type: object }
+                        result_count: { type: integer }
+                        result_sessions:
+                          type: array
+                          maxItems: 50
+                          items:
+                            type: object
+                            properties:
+                              session_id: { type: string }
+                              source: { type: [string, "null"] }
+                              owner_user_ids: { type: array, maxItems: 10, items: { type: string } }
+                        result_sessions_truncated: { type: boolean }
+                        correlation_id: { type: [string, "null"] }
+                        duration_ms: { type: integer }
+            text/csv:
+              schema: { type: string }
+        "400":
+          description: Invalid `since`/`until`/`limit`/`cursor`/`format`, or an unknown query parameter
+        "401":
+          description: No user credential
+        "403":
+          description: Not a workspace owner or admin
+        "404":
+          description: Not this credential's workspace
   /internal/v1/auth/introspect:
     post:
       tags: [internal]

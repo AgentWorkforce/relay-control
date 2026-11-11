@@ -18,6 +18,7 @@ import { historyReader, type McpContext, type McpMember } from "./context.js";
 import { ClaudeAttestationError, claudeAttestationFor, type ClaudeAttestation } from "./claude-attestation.js";
 import { CopilotAttestationError, copilotAttestationFor, postgresAttestationStore, type CopilotAttestation } from "./copilot-attestation.js";
 import { desktopCallContext, DesktopCallContextError } from "./desktop-call.js";
+import { auditUnhandledReadCalls } from "./read-audit.js";
 import { buildMcpServer } from "./server.js";
 import { admitMcpOAuthBearer, type McpOAuthConnection } from "./oauth/admission.js";
 import type { McpOAuthSessions } from "./oauth/sessions.js";
@@ -122,6 +123,8 @@ export function createMcpHandler(input: {
   launch?: boolean;
   /** Own credential resolver, used only at these MCP routes when the module is enabled. */
   oauthSessions?: McpOAuthSessions;
+  /** Clock for shared-session read audit records; tests inject it. */
+  now?: () => Date;
 }) {
   const { config, store } = input;
   const apiTokens = new ApiTokenStore(store.database);
@@ -326,9 +329,11 @@ export function createMcpHandler(input: {
       ...(!oauth && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && input.factory ? { factory: input.factory } : {}),
       ...(!oauth && input.launch ? { launch: true } : {}),
+      readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
     };
 
     const server = buildMcpServer(context);
+    const startedAt = Date.now();
     try {
       const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
@@ -346,6 +351,8 @@ export function createMcpHandler(input: {
       out["cache-control"] = "no-store";
       if (isInitialize(body)) out["mcp-session-id"] = typeof sessionId === "string" ? sessionId : randomUUID();
       const payload = Buffer.from(await webResponse.arrayBuffer());
+      // Reads refused by input validation never reach the audited handler.
+      await auditUnhandledReadCalls(context, body, startedAt);
       response.writeHead(webResponse.status, out);
       response.end(payload);
     } catch (error) {

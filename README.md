@@ -642,6 +642,17 @@ API on PGlite at `http://127.0.0.1:8787` with fixed development secrets.
 - Browser access/refresh tokens are never returned in HTML or JSON; only the
   opaque access credential is carried in a Secure HttpOnly same-origin cookie.
 
+## Shared-session read audit
+
+Every MCP shared-session read (search, session and context reads, timings,
+open) writes an append-only `shared_session_read_audit` row: who asked, from
+which calling chat (and whether a signed proof verified it), the bounded
+query or requested session, and the returned sessions with their owners.
+Never transcript content. Owners and admins export it as JSON or CSV with
+`GET /api/v1/workspaces/:id/shared-session-read-audit`; rows are kept until an
+operator deletes them. See
+[docs/shared-session-read-audit.md](docs/shared-session-read-audit.md).
+
 ## Workspace admin
 
 Ported from the hosted dashboard's Settings (Environment, Connections, API
