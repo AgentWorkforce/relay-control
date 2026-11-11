@@ -302,6 +302,32 @@ export class PostgresEventsShimStore implements EventsShimStore {
     return result.rows.map(eventFrom);
   }
 
+  async listStalledWakes(input: { staleBefore: string; receivedBefore: string; limit: number }): Promise<ShimRecord[]> {
+    if (input.limit <= 0) return [];
+    // A working wake link, a claimable post old enough that its own delivery
+    // pass is over, and (like every lookup) a creator still in the workspace's
+    // organization. Oldest stalled post first.
+    const result = await this.database.query<ShimRow>(
+      `SELECT ${SHIM_COLUMNS} FROM events_shims s
+         JOIN (
+           SELECT shim_id, min(received_at) AS oldest FROM events_shim_events
+            WHERE (delivery = 'pending' OR (delivery = 'sending' AND delivered_at < $1))
+              AND received_at < $2
+            GROUP BY shim_id
+         ) stalled ON stalled.shim_id = s.id
+        WHERE s.wake_url IS NOT NULL AND s.wake_broken_at IS NULL
+          AND (s.user_id IS NULL OR EXISTS (
+            SELECT 1 FROM workspaces w
+              JOIN organization_memberships m
+                ON m.organization_id = w.organization_id AND m.user_id = s.user_id
+             WHERE w.id = s.workspace_id))
+        ORDER BY stalled.oldest, s.id
+        LIMIT $3`,
+      [input.staleBefore, input.receivedBefore, input.limit],
+    );
+    return Promise.all(result.rows.map((row) => this.record(row)));
+  }
+
   async countPending(shimId: string, staleBefore: string): Promise<number> {
     const result = await this.database.query<{ n: number }>(
       `SELECT count(*)::int AS n FROM events_shim_events

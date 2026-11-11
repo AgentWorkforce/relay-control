@@ -24,6 +24,8 @@ import { loadAmpConfig } from "./amp/config.js";
 import { createAmpModule } from "./amp/module.js";
 import { CapyBindings } from "./capy/bindings.js";
 import { CapyCleanup,capyCleanupFetch } from "./capy/cleanup.js";
+import { PostgresEventsShimStore } from "./events-shim/store.js";
+import { EventsShimWakeSweeper } from "./events-shim/sweeper.js";
 import { createCapyRuntime } from "./capy/runtime.js";
 import { buildProviderProbes } from "./providers/probes.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
@@ -122,6 +124,13 @@ const capyCleanup=new CapyCleanup({database,bindings:new CapyBindings({
   database,keyring:config.encryptionKeyring,runtime:createCapyRuntime(),
   relaycast:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:capyCleanupFetch()}),
 }),log:event=>console.warn("[capy] cleanup deferred",event)});
+// Events shim: recover webhook wakes a Relaycast outage left pending. Off with the feature.
+const eventsShimSweeper = features.events_shim
+  ? new EventsShimWakeSweeper({
+      store: new PostgresEventsShimStore(database, config.encryptionKeyring),
+      log: (event) => console.warn("[events-shim] wake sweep deferred", event),
+    })
+  : null;
 const mcpOAuthTeardown = new McpOAuthTeardown({
   database,keyring:config.encryptionKeyring,
   client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch()}),
@@ -171,6 +180,7 @@ async function start(): Promise<void> {
   identity.start();
   amp.start();
   capyCleanup.start();
+  eventsShimSweeper?.start();
   if(mcpOAuthActive(config)) {
     console.log("[selfhost-api] hosted MCP OAuth active", mcpOAuthActiveNotice());
     mcpOAuthTeardown.start();
@@ -235,6 +245,7 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   await telemetry.stop();
   await amp.stop();
   await capyCleanup.stop();
+  await eventsShimSweeper?.stop();
   await mcpOAuthTeardown.stop();
   await factory.stop();
   identity.stop();
