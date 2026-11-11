@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import test, { type TestContext } from "node:test";
+import { Ajv2020 } from "ajv/dist/2020.js";
+import { parse as parseYaml } from "yaml";
 import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { migrate } from "../src/migrations.js";
@@ -168,6 +171,16 @@ async function setup(
     login,
     introspect,
   };
+}
+
+/** The published 200 schema for POST /internal/v1/auth/introspect (openapi.yaml). */
+function introspectionResponseValidator() {
+  const spec = parseYaml(readFileSync(new URL("../openapi.yaml", import.meta.url), "utf8"));
+  const ajv = new Ajv2020({ strict: false, validateFormats: false });
+  ajv.addSchema({ $id: "openapi", components: spec.components });
+  const schema = spec.paths["/internal/v1/auth/introspect"].post.responses["200"].content["application/json"].schema;
+  // Component refs resolve against the spec's own components.
+  return ajv.compile(JSON.parse(JSON.stringify(schema).replaceAll('"#/components/', '"openapi#/components/')));
 }
 
 function sha256(value: string): string {
@@ -786,6 +799,12 @@ test("introspection carries the organization's served capture policy, read live"
   // Inactive answers never carry it.
   const inactive = await env.introspect({ token: "sh_at_not-a-real-token", aud: HISTORY_PUBLIC });
   assert.deepEqual(inactive.body, { active: false, reason: "unknown" });
+
+  // Every answer above matches the published response schema (additionalProperties: false).
+  const validate = introspectionResponseValidator();
+  for (const answer of [unset, enforced, after, inactive]) {
+    assert.ok(validate(answer.body), JSON.stringify(validate.errors));
+  }
 });
 
 test("an unexchanged desktop handoff is not introspectable, and its exchanged pair is", async (t) => {

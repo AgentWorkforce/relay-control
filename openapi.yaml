@@ -5714,7 +5714,7 @@ paths:
                 oneOf:
                   - type: object
                     additionalProperties: false
-                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, scopes, aud, iat, exp, token_id]
+                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, role, scopes, aud, iat, exp, token_id, capture_policy]
                     properties:
                       active: { const: true }
                       sub: { type: string, description: relaycontrol user id }
@@ -5733,6 +5733,18 @@ paths:
                       iat: { type: integer }
                       exp: { type: integer }
                       token_id: { type: string, pattern: "^[0-9a-f]{32}$" }
+                      role:
+                        type: string
+                        enum: [owner, admin, member]
+                        description: The user's live organization role
+                      capture_policy:
+                        $ref: "#/components/schemas/CapturePolicy"
+                        description: >-
+                          Contract v1.5. The organization's served capture policy, exactly as
+                          GET /api/v1/organizations/{org}/capture-policy answers it, read in the
+                          same query as the token. The sessions pipeline enforces it from here
+                          (docs/capture-policy.md). A held answer carries the policy as of the
+                          held verdict.
                       held:
                         const: true
                         description: Present and true only when the answer was served from Control's last authoritative verification during a database outage; `exp` is then clamped to the end of the hold.
