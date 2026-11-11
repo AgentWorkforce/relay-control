@@ -10,6 +10,8 @@ import {
   strictRawPublicKey,
 } from "./acquisition/assertion.js";
 
+import { loadDesktopReleasesRepo } from "./desktop-releases.js";
+
 export type SelfhostConfig = {
   databaseUrl: string;
   publicBaseUrl: string;
@@ -81,6 +83,12 @@ export type SelfhostConfig = {
    * and every feed route answers 404 like any unknown path.
    */
   desktopFeed?: DesktopFeedConfig | null;
+  /**
+   * SELFHOST_DESKTOP_RELEASES_REPO (owner/repository): a public GitHub releases
+   * repo whose latest release the downloads card shows when the signed feed
+   * has nothing. Null or absent: GET /api/v1/desktop/releases answers 404.
+   */
+  desktopReleasesRepo?: string | null;
   /** Direct-to-S3 session uploads (docs/sessions-read-api.md). null: the upload-credentials route answers 404. */
   historyUpload?: HistoryUploadConfig | null;
   /**
@@ -768,6 +776,7 @@ function loadAdminConfig(env: Env, publicBaseUrl: string): {
   dashboardUrl: string;
   operatorOAuthApps: Record<string, OperatorOAuthApp>;
   desktopFeed: DesktopFeedConfig | null;
+  desktopReleasesRepo: string | null;
 } {
   const internalServiceToken = readSecret(env, "SELFHOST_INTERNAL_TOKEN") ?? null;
   if (internalServiceToken !== null && Buffer.byteLength(internalServiceToken) < 32) {
@@ -787,6 +796,7 @@ function loadAdminConfig(env: Env, publicBaseUrl: string): {
     dashboardUrl: absoluteHttpUrl(env, "SELFHOST_DASHBOARD_URL", `${publicBaseUrl}/`),
     operatorOAuthApps: loadOperatorOAuthApps(env),
     desktopFeed: loadDesktopFeedConfig(env),
+    desktopReleasesRepo: loadDesktopReleasesRepo(env),
   };
 }
 

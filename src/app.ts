@@ -25,6 +25,7 @@ import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { UsageRangeError, usageDays, usageReport } from "./usage/routes.js";
 import { UsageStore } from "./usage/store.js";
+import { GitHubDesktopReleases } from "./desktop-releases.js";
 import { listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError } from "./mcp/read-audit.js";
 import {
   PeopleInputError, PersonNotFoundError, peopleAudit, peopleReport, personSessions, recordPeopleView, UsagePeopleStore,
@@ -403,6 +404,8 @@ export function createApp(input: {
   factory?: FactoryModule;
   /** Internal dormant Capy send resolver; server wiring requires a complete runtime. */
   capy?: McpContext["capy"];
+  /** Test hook: the GitHub fetch behind GET /api/v1/desktop/releases. */
+  desktopReleasesFetch?: typeof fetch;
   /** Desktop feed overrides for tests; the feed itself is on only when config.desktopFeed is set. */
   desktopFeed?: {
     signer?: DesktopFeedSigner;
@@ -427,6 +430,9 @@ export function createApp(input: {
   const features = input.features ?? NO_FEATURES;
   // Usage page counters: written only while the `usage` feature is selected.
   const usage = new UsageStore(store.database, () => input.now?.() ?? new Date());
+  const desktopReleases = config.desktopReleasesRepo
+    ? new GitHubDesktopReleases(config.desktopReleasesRepo, input.desktopReleasesFetch ?? globalThis.fetch)
+    : null;
   const people = new UsagePeopleStore(store.database, () => input.now?.() ?? new Date());
   // Counters never fail or slow a request; each is written only while its feature is on.
   const recordUsage = (write: () => Promise<void>): void => {
@@ -1836,6 +1842,16 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       const auth = await authenticate(request);
       if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
       json(response, 200, { capabilities: features }, true);
+      return;
+    }
+
+    // Desktop downloads from a configured public GitHub releases repo
+    // (docs/desktop-feed.md, "GitHub releases source"). Unset: 404 like any
+    // unknown path. Any signed-in member, like the downloads card.
+    if (path === "/api/v1/desktop/releases" && method === "GET" && desktopReleases) {
+      const auth = await authenticate(request);
+      if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      json(response, 200, await desktopReleases.latest(), true);
       return;
     }
 

@@ -299,7 +299,10 @@ async function startHistory(t: TestContext) {
 async function setup(
   t: TestContext,
   now = new Date("2026-11-02T20:00:00.000Z"),
-  options: { agentTokens?: boolean; relaycastFetch?: typeof fetch; features?: SelectedFeatures } = {},
+  options: {
+    agentTokens?: boolean; relaycastFetch?: typeof fetch; features?: SelectedFeatures;
+    desktopReleasesRepo?: string; desktopReleasesFetch?: typeof fetch;
+  } = {},
 ) {
   const historyOrigin = "https://history.selfhosted.test";
   const history = await startHistory(t);
@@ -322,10 +325,12 @@ async function setup(
     oauthRedirectUrl: "https://control.internal.example/api/v1/integrations/oauth/callback",
     dashboardUrl: "https://control.internal.example/",
     sessionSearchAgentTokens: options.agentTokens,
+    desktopReleasesRepo: options.desktopReleasesRepo ?? null,
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
   const control = createServer(createApp({
     config, store, now: () => now, messagingFetch: options.relaycastFetch, features: options.features,
+    desktopReleasesFetch: options.desktopReleasesFetch,
   }));
   const origin = await listen(control);
   t.after(async () => {
@@ -1784,4 +1789,32 @@ test("usage people: a workspace that ends on a full 200-session page still pages
   assert.equal(seen.length, 230);
   assert.equal(new Set(seen).size, 230);
   assert.deepEqual(seen.slice(199, 201), ["a199", "b0"]);
+});
+
+test("desktop releases: 404 unless a repo is configured; any signed-in member reads it", async (t) => {
+  const off = await setup(t);
+  const offToken = await off.login(off.memberId, off.alpha);
+  assert.equal((await call(off.origin, "/cloud/api/v1/desktop/releases", { token: offToken })).status, 404);
+
+  const calls: string[] = [];
+  const env = await setup(t, undefined, {
+    desktopReleasesRepo: "AgentWorkforce/relay-desktop-kind-releases",
+    desktopReleasesFetch: (async (input: string | URL) => {
+      calls.push(String(input));
+      return new Response("[]", { status: 200 });
+    }) as typeof fetch,
+  });
+  assert.equal((await call(env.origin, "/cloud/api/v1/desktop/releases")).status, 401);
+  const member = await env.login(env.memberId, env.alpha);
+  const result = await call(env.origin, "/cloud/api/v1/desktop/releases", { token: member });
+  assert.equal(result.status, 200);
+  assert.equal(result.headers.get("cache-control"), "no-store");
+  assert.deepEqual(result.body, {
+    source: {
+      kind: "github", repo: "AgentWorkforce/relay-desktop-kind-releases",
+      releasesUrl: "https://github.com/AgentWorkforce/relay-desktop-kind-releases/releases",
+    },
+    release: null,
+  });
+  assert.deepEqual(calls, ["https://api.github.com/repos/AgentWorkforce/relay-desktop-kind-releases/releases?per_page=10"]);
 });

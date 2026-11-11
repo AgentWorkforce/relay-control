@@ -1603,6 +1603,20 @@ paths:
       responses:
         "200": { description: "`{ events: [{ viewerUserId, viewerName, subjectUserId, subjectName, days, page, createdAt }] }`" }
         "403": { description: "`forbidden` or `feature_not_enabled`" }
+  /api/v1/desktop/releases:
+    get:
+      operationId: getDesktopGitHubReleases
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: |
+        The latest release of the public GitHub releases repo in
+        SELFHOST_DESKTOP_RELEASES_REPO, in the downloads card's manifest shape,
+        with sidecar checksums (docs/desktop-feed.md, "GitHub releases
+        source"). Any signed-in member. 404 when the setting is unset.
+        `release` is null when there is none or GitHub cannot be read.
+      responses:
+        "200": { description: "`{ source: { kind: github, repo, releasesUrl }, release: null | { version, tag, prerelease, published_at, assets[] } }`" }
+        "401": { description: Missing, invalid, or expired user token }
+        "404": { description: No releases repo configured }
   /api/v1/analytics/events:
     post:
       operationId: captureClientAnalyticsEvents
