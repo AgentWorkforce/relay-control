@@ -5,6 +5,17 @@ assigned at release.
 
 ## Unreleased
 
+- Added: events shim, a webhook inbox that wakes an agent, behind a new
+  `events_shim` feature (off by default). `POST /api/v1/events-shim/shims`
+  (signed-in person, 20 per person per hour) returns an MCP URL, webhook URLs
+  and a manage token; each post is stored and forwarded to the agent's own
+  Agent Relay session webhook (Relaycast inbound hook) so Desktop wakes the
+  session; without it the agent long-polls `wait_for_webhook`. Logic comes
+  from `@agent-relay/events-shim` 18.2.0; storage is migration 0047
+  (`events_shims`, `events_shim_posts`, `events_shim_events`). Wake links are
+  limited to `SELFHOST_EVENTS_SHIM_RELAY_ORIGINS` (default the
+  `RELAYCAST_PUBLIC_URL` origin). See docs/events-shim.md.
+
 - Fixed: the Usage People table reported sessions as unavailable against the
   native read API (it asked for pages of 500; the directory list serves at
   most 200). People totals are now bounded: the read API aggregate

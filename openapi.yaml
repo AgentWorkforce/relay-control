@@ -48,6 +48,14 @@ tags:
   - name: amp
     description: |
       Amp thread control (SELFHOST_AMP_ENABLED, default off). See docs/amp.md.
+  - name: events-shim
+    description: |
+      Webhook inboxes that wake an agent (docs/events-shim.md), served by the
+      @agent-relay/events-shim package. Off unless SELFHOST_FEATURES selects
+      `events_shim`; while off every path under /api/v1/events-shim answers
+      404 {"error":"Not found"} before authentication. Creating an inbox needs
+      a signed-in person; every other route is capability-based: the token in
+      the URL or the manage bearer. Inboxes expire after 7 idle days.
   - name: factory
     description: |
       Factory sessions (docs/factory-sessions.md). Every operation answers
@@ -7449,8 +7457,172 @@ paths:
           description: Wrong credential
         "413":
           description: payload_too_large (64 KiB)
+  /api/v1/events-shim/shims:
+    post:
+      operationId: createEventsShim
+      tags: [events-shim]
+      summary: Create a webhook inbox. Returns its MCP URL, webhook URLs (one per verification mode) and a manage token, each shown once; only hashes are stored. Rate limited to 20 per person per hour.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [shim_id, mcp_url, webhook_url, webhook_urls, manage_token, limits]
+                properties:
+                  shim_id: { type: string, format: uuid }
+                  mcp_url: { type: string, description: "<public origin>/api/v1/events-shim/t/<esm_ token>/mcp" }
+                  webhook_url: { type: string, description: "<public origin>/api/v1/events-shim/h/<esh_ token> (open mode)" }
+                  webhook_urls:
+                    type: object
+                    properties:
+                      open: { type: string }
+                      github: { type: string }
+                      stripe: { type: string }
+                      linear: { type: string }
+                      bearer: { type: string }
+                  manage_token: { type: string, description: "esk_ capability for the /shims/current routes" }
+                  limits: { type: object }
+        "401":
+          description: unauthorized (no signed-in person)
+        "403":
+          description: handoff_not_exchanged or csrf_rejected (cookie without a same-origin JSON request)
+        "404":
+          description: Feature off, or workspace_not_found
+        "429":
+          description: rate_limited (Retry-After)
+  /api/v1/events-shim/shims/current:
+    get:
+      operationId: readEventsShimFeed
+      tags: [events-shim]
+      summary: The inbox feed (last 50 posts), webhook URLs, which secrets are set and whether an agent is connected and linked for wake.
+      security: [{ eventsShimManageBearer: [] }]
+      responses:
+        "200":
+          description: "{shim_id, webhook_urls, secrets_set, agent: {connected, last_seen_at, wake: linked|broken|none, wake_error}, expires_at, events[], limits}"
+        "404":
+          description: not_found (unknown, expired or wrong token; or the feature is off)
+  /api/v1/events-shim/shims/current/rotate:
+    post:
+      operationId: rotateEventsShimWebhook
+      tags: [events-shim]
+      summary: Replace the webhook token; the old webhook URLs stop working immediately. Answers the feed with the new URLs.
+      security: [{ eventsShimManageBearer: [] }]
+      responses:
+        "200":
+          description: The feed, as GET /shims/current.
+        "404":
+          description: not_found
+  /api/v1/events-shim/shims/current/secrets/{mode}:
+    put:
+      operationId: setEventsShimSecret
+      tags: [events-shim]
+      summary: Set (or with null clear) the signing secret for a verification mode. For bearer, omitting secret generates one, returned once.
+      security: [{ eventsShimManageBearer: [] }]
+      parameters:
+        - { name: mode, in: path, required: true, schema: { type: string, enum: [github, stripe, linear, bearer] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                secret: { type: [string, "null"], minLength: 8, maxLength: 256 }
+      responses:
+        "200":
+          description: "{mode, set, secret?, webhook_url}"
+        "400":
+          description: invalid_request
+        "404":
+          description: not_found (also for mode open)
+  /api/v1/events-shim/h/{hookToken}:
+    post:
+      operationId: receiveEventsShimWebhook
+      tags: [events-shim]
+      summary: Receive a webhook post (open mode, unverified). Stored once per idempotency key (Idempotency-Key, X-GitHub-Delivery, ...) and forwarded to the linked Relaycast inbound webhook to wake the agent. 64 KiB body, 60 posts per hour and 500 per day per inbox.
+      security: []
+      parameters:
+        - { name: hookToken, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          "*/*":
+            schema: {}
+      responses:
+        "200":
+          description: "{ok, duplicate: true, event_id, seq}"
+        "202":
+          description: "{ok, event_id, seq, wake: forwarded|queued}"
+        "404":
+          description: not_found (unknown, rotated or expired URL)
+        "405":
+          description: method_not_allowed
+        "413":
+          description: payload_too_large
+        "429":
+          description: rate_limited (Retry-After)
+  /api/v1/events-shim/h/{hookToken}/{mode}:
+    post:
+      operationId: receiveEventsShimVerifiedWebhook
+      tags: [events-shim]
+      summary: Receive a webhook post verified for one sender (github, stripe, linear signatures or a bearer secret) against the secret set for that mode. Otherwise as the open URL.
+      security: []
+      parameters:
+        - { name: hookToken, in: path, required: true, schema: { type: string } }
+        - { name: mode, in: path, required: true, schema: { type: string, enum: [open, github, stripe, linear, bearer] } }
+      requestBody:
+        content:
+          "*/*":
+            schema: {}
+      responses:
+        "200":
+          description: Duplicate.
+        "202":
+          description: Accepted.
+        "401":
+          description: signature_invalid (signature, timestamp or bearer check failed)
+        "404":
+          description: not_found
+        "409":
+          description: verification_not_configured (no secret set for the mode)
+        "413":
+          description: payload_too_large
+        "429":
+          description: rate_limited
+  /api/v1/events-shim/t/{mcpToken}/mcp:
+    post:
+      operationId: eventsShimMcp
+      tags: [events-shim]
+      summary: Stateless Streamable HTTP MCP endpoint (JSON responses) for one inbox. Tools watch_webhooks, link_relay_wake, unlink_relay_wake, get_webhook_events, wait_for_webhook. The token in the path is the capability; link_relay_wake accepts only a Relaycast /v1/hooks/<id> URL on SELFHOST_EVENTS_SHIM_RELAY_ORIGINS (default the RELAYCAST_PUBLIC_URL origin).
+      security: []
+      parameters:
+        - { name: mcpToken, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: JSON-RPC 2.0 }
+      responses:
+        "200":
+          description: JSON-RPC response.
+        "202":
+          description: Notification accepted.
+        "400":
+          description: Body is not JSON-RPC.
+        "404":
+          description: Unknown or expired MCP URL (JSON-RPC error body).
+        "405":
+          description: Only POST.
+        "413":
+          description: Request over 64 KiB.
 components:
   securitySchemes:
+    eventsShimManageBearer:
+      type: http
+      scheme: bearer
+      description: "`esk_<43 base64url>` manage capability returned once by POST /api/v1/events-shim/shims; stored only as a SHA-256 hash. Unknown or expired tokens answer 404."
     relayNodeBearer:
       type: http
       scheme: bearer
@@ -8184,7 +8356,7 @@ components:
               description: SELFHOST_INTROSPECT_OUTAGE_HOLD_MS in effect (0 = off); how long a Desktop token's last active verdict may answer during a database outage.
     FeatureCapabilities:
       type: object
-      required: [flows, relayfile, chief, usage, launch, usage_people]
+      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim]
       additionalProperties: false
       description: Names in SELFHOST_FEATURES (unset selects usage and usage_people; an explicit list, including empty, is exact).
       properties:
@@ -8194,6 +8366,7 @@ components:
         usage: { type: boolean }
         launch: { type: boolean }
         usage_people: { type: boolean }
+        events_shim: { type: boolean }
     UsageCounts:
       type: object
       required: [activeUsers, sessionsUploaded, searches, summaries]

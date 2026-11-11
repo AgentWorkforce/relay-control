@@ -1,0 +1,89 @@
+# Events shim: a webhook inbox that wakes your agent
+
+The events shim gives an agent a webhook URL. A signed-in person creates an
+inbox and gets two URLs:
+
+- an **MCP URL** for the agent: `claude mcp add --transport http webhooks <mcp_url>`
+- a **webhook URL** to paste into GitHub, Stripe, Linear or anything that posts
+
+Each post to the webhook URL is stored and forwarded to the agent's own Agent
+Relay session webhook (a Relaycast inbound hook). Agent Relay Desktop injects
+it into the session, waking it when idle. Without Desktop the agent calls
+`wait_for_webhook` in the background, which blocks until a post arrives.
+
+All behaviour (routes, MCP tools, verification, limits, wake text) comes from
+the `@agent-relay/events-shim` package. This server provides storage
+(Postgres) and mounts the routes. Hosted Agent Relay Cloud serves the same
+feature separately.
+
+This is not the `SELFHOST_MCP_EVENTS` setting, which belongs to a different module.
+
+## Turning it on
+
+Add `events_shim` to `SELFHOST_FEATURES` (for example
+`SELFHOST_FEATURES=usage,usage_people,events_shim`). While it is off, every
+path under `/api/v1/events-shim` (and `/cloud/api/v1/events-shim`) answers
+404 `{"error":"Not found"}` before any authentication.
+
+| Variable | Meaning |
+|---|---|
+| `SELFHOST_FEATURES` | Include `events_shim` to serve the routes |
+| `SELFHOST_EVENTS_SHIM_RELAY_ORIGINS` | Optional comma list of https origins a wake link may name. Default: the origin of `RELAYCAST_PUBLIC_URL`. Set it (for example to `https://cast.agentrelay.com`) when your agents' Agent Relay uses another Relaycast |
+
+URLs are built on `SELFHOST_PUBLIC_URL`, so it must be reachable by whatever
+posts webhooks and by the agent's MCP client.
+
+## Routes
+
+All under `/api/v1/events-shim` (also `/cloud/api/v1/events-shim`).
+
+| Route | Authority |
+|---|---|
+| `POST /shims` | A signed-in person (bearer access token, or the session cookie on `/cloud` with a same-origin JSON request). Records the person and workspace; at most 20 per person per hour |
+| `GET /shims/current` | `Authorization: Bearer <manage token>`: the feed |
+| `POST /shims/current/rotate` | Manage token: replaces the webhook URL; the old one answers 404 at once |
+| `PUT /shims/current/secrets/{github,stripe,linear,bearer}` | Manage token: sets (`{"secret": "..."}`) or clears (`null`) a verification secret; `bearer` with no secret generates one, shown once |
+| `POST /h/<hook token>[/<mode>]` | The token in the URL. `open` is unverified; the other modes check the sender's signature or bearer against the stored secret |
+| `POST /t/<mcp token>/mcp` | The token in the URL. Stateless Streamable HTTP MCP |
+
+`POST /shims` answers `{shim_id, mcp_url, webhook_url, webhook_urls, manage_token, limits}`.
+The three tokens are shown once; an unknown or expired token answers 404.
+
+MCP tools: `watch_webhooks` (start here), `link_relay_wake`,
+`unlink_relay_wake`, `get_webhook_events`, `wait_for_webhook`.
+
+## Waking the agent
+
+Inside an Agent Relay session the agent runs
+`agent-relay-probe webhook --socket <relay socket>`, which prints a Relaycast
+inbound hook (`https://<relaycast>/v1/hooks/<id>`) and its `wh_live_` secret,
+and passes both to `link_relay_wake`. The link is checked with a test post
+before it is stored. Only `/v1/hooks/<id>` URLs on an allowed origin are
+accepted, so holding an MCP URL cannot make this server post anywhere else.
+A wake answered 401, 403, 404 or 410 marks the link broken; posts then wait
+for `get_webhook_events` or `wait_for_webhook` until the agent relinks.
+
+## Limits
+
+Set by the package: 64 KiB per body (larger bodies are refused before they
+are read), 60 posts per hour and 500 per day per inbox, the last 50 posts kept,
+and an inbox expires after 7 days without a post or MCP call. Duplicate
+posts (same `Idempotency-Key`, `X-GitHub-Delivery`, `Linear-Delivery` or
+Stripe event id) are stored once and still count toward the limits.
+
+## Storage
+
+Migration 0047 adds `events_shims`, `events_shim_posts` and
+`events_shim_events`.
+
+- MCP, webhook and manage tokens are stored as SHA-256 hashes. The webhook
+  token is also stored encrypted with `SELFHOST_ENCRYPTION_KEY` so the MCP
+  tools can tell the agent its URL; verification secrets and the wake
+  `wh_live_` secret are encrypted the same way.
+- Post sequence numbers come from `events_shims.next_seq`; appends are
+  serialized per inbox, and `(shim_id, idempotency_key)` is unique.
+- An inbox belongs to its creator: deleting the person or the workspace
+  deletes it. Expired inboxes and feeds idle for a day are pruned when someone
+  creates an inbox.
+- A post the agent has already read stays `read` when a late wake result
+  arrives.

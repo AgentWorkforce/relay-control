@@ -91,6 +91,12 @@ export type SelfhostConfig = {
    */
   capturePolicyUploads?: "report" | "enforce";
   /**
+   * SELFHOST_EVENTS_SHIM_RELAY_ORIGINS (docs/events-shim.md): the Relaycast
+   * origins an events-shim inbox may forward wake posts to. Null or absent:
+   * the origin of relaycastPublicUrl.
+   */
+  eventsShimRelayOrigins?: string[] | null;
+  /**
    * SELFHOST_IMAGE_VERSION: the image tag, set by the image (Dockerfile).
    * Null when run from source. Shown by GET /cloud/api/health and telemetry.
    */
@@ -396,6 +402,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name), serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     historyUpload: loadHistoryUploadConfig(env),
     capturePolicyUploads: loadCapturePolicyUploads(env),
+    eventsShimRelayOrigins: loadEventsShimRelayOrigins(env),
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
@@ -920,6 +927,32 @@ function uploadEndpoint(env: Env, name: string): string | null {
  * (default: the public endpoint) is where Control reads privacy journals.
  */
 /** SELFHOST_CAPTURE_POLICY_UPLOADS: `report` (default) or `enforce`; anything else refuses startup. */
+/**
+ * SELFHOST_EVENTS_SHIM_RELAY_ORIGINS: comma list of https origins (no path,
+ * query or credentials). Unset or empty: null (use RELAYCAST_PUBLIC_URL).
+ */
+export function loadEventsShimRelayOrigins(env: Env = process.env): string[] | null {
+  const raw = env.SELFHOST_EVENTS_SHIM_RELAY_ORIGINS?.trim();
+  if (!raw) return null;
+  const origins = new Set<string>();
+  for (const value of raw.split(",").map((part) => part.trim()).filter(Boolean)) {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error("SELFHOST_EVENTS_SHIM_RELAY_ORIGINS must list absolute https origins");
+    }
+    if (
+      url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
+      (url.pathname !== "" && url.pathname !== "/") || /[?#]/.test(value)
+    ) {
+      throw new Error("SELFHOST_EVENTS_SHIM_RELAY_ORIGINS must list https origins without credentials, path, query, or fragment");
+    }
+    origins.add(url.origin);
+  }
+  return origins.size > 0 ? [...origins] : null;
+}
+
 export function loadCapturePolicyUploads(env: Env = process.env): "report" | "enforce" {
   const mode = env.SELFHOST_CAPTURE_POLICY_UPLOADS?.trim() || "report";
   if (mode !== "report" && mode !== "enforce") {
