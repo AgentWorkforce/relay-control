@@ -5,6 +5,16 @@ assigned at release.
 
 ## Unreleased
 
+- Added: agent launches over the shared-sessions MCP endpoint, behind
+  `SELFHOST_FEATURES=launch` (off by default). Registers
+  `list_relay_spawn_targets`, `spawn_relay_agent`, `get_relay_spawn_status` and
+  `release_relay_agent`; `describe_capabilities` reports `can_launch`. Current
+  workspace owners and admins on a person connection (CLI login, browser
+  session or Agent Relay Desktop) only; OAuth connections are refused.
+  Targets are this workspace's own Relaycast nodes, and placement follows
+  hosted Cloud (yours, a teammate's with "Allow teammates to spawn here",
+  unclaimed brokers; never an unclaimed desktop). Launches are journaled in
+  `relay_spawns` (migration 0041) before they are sent. See docs/agent-launch.md.
 - Added: owner-only usage counts, `GET /api/v1/organizations/{org}/usage?days=7|30|90`,
   behind a new `usage` value in `SELFHOST_FEATURES` (off by default). Returns
   per-day and total active users, sessions uploaded, searches and session

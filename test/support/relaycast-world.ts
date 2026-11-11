@@ -41,6 +41,11 @@ export function createRelaycastWorld(roster: unknown[]) {
    * request fails before it has any effect.
    */
   const failures = new Map<string, Array<{ status: number; code: string; after: boolean }>>();
+  /** Fleet nodes per workspace key (GET /v1/nodes), raw as Relaycast serves them. */
+  const nodes = new Map<string, Array<Record<string, any>>>();
+  /** Native spawn/release invocations. `spawnOutcome` decides how the next spawn completes. */
+  const invocations = new Map<string, Record<string, any>>();
+  const spawnOutcome = { mode: "ready" as "ready" | "pending" | "failed" | "rejected" };
 
   const rosterEntry = (agent: Agent) => ({
     id: agent.id, name: agent.name, type: agent.type, metadata: agent.metadata,
@@ -110,6 +115,43 @@ export function createRelaycastWorld(roster: unknown[]) {
       const agent = addAgent(body!.name, body!.metadata ?? {});
       agent.type = body!.type;
       return ok({ id: agent.id, name: agent.name, token: agent.token }, 201);
+    }
+    if (method === "GET" && path === "/v1/nodes" && workspace) {
+      const listed = (nodes.get(bearer) ?? []).filter(node => query.get("status") !== "online" || node.live === true);
+      return ok(listed);
+    }
+    if (method === "POST" && path === "/v1/actions/spawn/invoke" && caller) {
+      const input = body!.input as Record<string, any>;
+      if (spawnOutcome.mode === "rejected") return fail(409, "spawn_capacity_exceeded");
+      const node = [...nodes.values()].flat().find(item => item.name === input.target_node);
+      if (!node) return fail(404, "spawn_target_unavailable");
+      const id = `inv_${next()}`;
+      const invocation: Record<string, any> = { id, status: "running", caller_id: caller.id, dispatched_node_id: node.id, input };
+      if (spawnOutcome.mode === "ready") {
+        const worker = addAgent(input.name, { fleet: { invocation_id: id, node_id: node.id } });
+        invocation.status = "completed";
+        invocation.output = { name: worker.name, spawned: true, ready: true };
+      } else if (spawnOutcome.mode === "failed") {
+        invocation.status = "failed";
+        invocation.error = "spawn_failed: harness exited (token at_secret)";
+      }
+      invocations.set(id, invocation);
+      return once(ok({ invocation_id: id, status: invocation.status === "completed" ? "dispatched" : invocation.status }, 202));
+    }
+    if ((match = /^\/v1\/actions\/(spawn|release)\/invocations\/([^/]+)$/.exec(path)) && method === "GET" && caller) {
+      const invocation = invocations.get(decodeURIComponent(match[2]!));
+      if (!invocation || invocation.caller_id !== caller.id) return fail(404, "not_found");
+      return ok(invocation);
+    }
+    if (method === "POST" && path === "/v1/agents/release-exact" && caller) {
+      const agent = agents.get(body!.name);
+      if (!agent) return fail(404, "agent_not_found");
+      if (agent.id !== body!.expected_agent_id) return fail(409, "agent_identity_conflict");
+      agents.delete(agent.name);
+      syncRoster();
+      const id = `inv_${next()}`;
+      invocations.set(id, { id, status: "completed", caller_id: caller.id });
+      return once(ok({ invocation_id: id, status: "pending" }));
     }
     if (method === "POST" && path === "/v1/agents/release-exact" && workspace) {
       const agent = agents.get(body!.name);
@@ -254,6 +296,7 @@ export function createRelaycastWorld(roster: unknown[]) {
 
   return {
     agents, conversations, messages, deliveries, channels, subscriptions, bodies, handle, addAgent,
+    nodes, invocations, spawnOutcome,
     /** An agent's unacknowledged deliveries. */
     pending(agent: string) {
       return deliveries.filter(row => row.agent === agent && !row.acked);
