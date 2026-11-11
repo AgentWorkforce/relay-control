@@ -21,10 +21,49 @@ runtime capability is enabled by adding it. Existing credential management
 continues to use `remote-agent-connections`; there is no second key store or
 user-configurable provider URL.
 
+## Binding-owned identity registry (internal, not mounted)
+
+`src/capy/bindings.ts` adds native person-side identity custody with migration
+`0045_capy_bindings.sql`. It uses the existing encrypted connection and requires
+the acting person to be its current owner and a live owner/admin. It proves
+the key can see a thread before reserving that thread globally, then rechecks
+the same key/Relay route before claiming a binding.
+
+Registration intent is persisted before an external write. A lost response may
+recover only the matching binding-owned immutable agent ID. An attempted
+registration with no positive remote receipt stays unknown; it is never blindly
+registered again or declared cleaned up from an absent roster entry alone.
+The binding keeps its hosted token encrypted and never creates a participant
+alias. `agentFor` rechecks live membership, key generation, Relay workspace,
+immutable ID and ownership metadata before and after its remote check.
+Remote verification outages return retryable errors rather than appearing as
+missing or changed bindings. Measure this check's latency before mounting it.
+
+Retirement increments the generation and clears usable identity credentials
+before remote cleanup. Cleanup uses the live workspace admin key only while
+the workspace still points to the original Relay route. Key rotation therefore
+needs no per-binding credential copy. A moved route leaves a coded cleanup
+obligation pending; cleanup never deletes a successor which reused the name.
+The cleanup method is system-only; user entry points must call actor-scoped
+retirement instead.
+Lease expiry or a concurrent retirement/member/key change cannot finalize a
+late registration. External waits are bounded; a timeout is not a claim that
+the remote write was cancelled.
+
+This registry is not mounted by the app and starts no worker. Runtime capability
+remains false. Before mounting it, the delivery/lifecycle slice must add the
+native `!managed && !oauth` resolver integration, member/workspace/key cleanup
+hooks, routes, callback verification and durable delivery. In particular,
+workspace deletion must drain retained identity-cleanup obligations before
+removing referenced rows. No production caller writes binding rows yet.
+
+OAuth `assertActor`/`pin` is unchanged. A future OAuth-bound Capy journey is a
+separate admission/parity change, not an alias-table bypass in this registry.
+
 ## Required next slices
 
-- Person/workspace-scoped bindings using the existing encrypted connection,
-  current membership checks and immutable Relay identity.
+- Mount the person/workspace-scoped registry only with its complete native
+  entry points, generation/revocation fences and cleanup integrations.
 - Durable subscription/outbox delivery, explicit unknown-outcome reconciliation,
   disconnect/revocation fencing and partial cleanup.
 - Native spawn, Relay/MCP entry points and Webapp controls using those services.

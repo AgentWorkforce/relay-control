@@ -9,6 +9,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "amp_deliveries",
   "amp_history_syncs",
   "capture_policies",
+  "capy_bindings",
   "cli_credential_refs",
   "coding_agent_credential_blobs",
   "coding_agent_credentials",
