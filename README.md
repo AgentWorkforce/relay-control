@@ -718,7 +718,7 @@ credential and version. Envelopes go to object storage:
 | unset | `gcs` when `SELFHOST_FLOWS_STORAGE=gcs` (same bucket), else `postgres` |
 | `postgres` | inline in `coding_agent_credential_blobs` |
 | `gcs` | `SELFHOST_CREDENTIAL_GCS_BUCKET` (or `SELFHOST_FLOWS_GCS_BUCKET`), Workload Identity |
-| `s3` | `SELFHOST_CREDENTIAL_S3_BUCKET`, `SELFHOST_CREDENTIAL_S3_REGION`/`AWS_REGION`, credentials from the standard AWS chain (static `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`[/`AWS_SESSION_TOKEN`], required for R2/MinIO; else EKS Pod Identity, IRSA, ECS or the EC2 instance role), optional `SELFHOST_CREDENTIAL_S3_ENDPOINT` (R2, MinIO) |
+| `s3` | `SELFHOST_CREDENTIAL_S3_BUCKET`, `SELFHOST_CREDENTIAL_S3_REGION`/`AWS_REGION`, credentials from the standard AWS chain (static `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`[/`AWS_SESSION_TOKEN`], required (checked at startup) for a non-AWS `SELFHOST_CREDENTIAL_S3_ENDPOINT` such as R2/MinIO; else EKS Pod Identity, IRSA, ECS or the EC2 instance role), optional `SELFHOST_CREDENTIAL_S3_ENDPOINT` (R2, MinIO) |
 
 Objects are `${SELFHOST_CREDENTIAL_PREFIX:-coding-agent-credentials}/workspaces/<ws>/accounts/<id>/v<n>.json.enc`.
 A login is sandbox-only (never an env var). When a workspace has a selected

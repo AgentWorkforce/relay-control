@@ -222,6 +222,14 @@ test("credential-blobs s3 backend uses the shared chain when no static keys are 
   const database = {} as Database;
   assert(credentialBackendFromEnv({ SELFHOST_CREDENTIAL_STORAGE: "s3", SELFHOST_CREDENTIAL_S3_BUCKET: "customer-bucket", AWS_REGION: "us-east-1" }, database) instanceof S3ObjectBackend);
   assert.throws(() => credentialBackendFromEnv({ SELFHOST_CREDENTIAL_STORAGE: "s3", SELFHOST_CREDENTIAL_S3_BUCKET: "customer-bucket" }, database), /region/);
+  const s3 = { SELFHOST_CREDENTIAL_STORAGE: "s3", SELFHOST_CREDENTIAL_S3_BUCKET: "customer-bucket", AWS_REGION: "us-east-1" };
+  assert.throws(
+    () => credentialBackendFromEnv({ ...s3, SELFHOST_CREDENTIAL_S3_ENDPOINT: "https://acct.r2.cloudflarestorage.com" }, database),
+    /non-AWS SELFHOST_CREDENTIAL_S3_ENDPOINT needs AWS_ACCESS_KEY_ID/,
+    "ambient AWS credentials are never sent to a non-AWS endpoint",
+  );
+  assert(credentialBackendFromEnv({ ...s3, SELFHOST_CREDENTIAL_S3_ENDPOINT: "https://acct.r2.cloudflarestorage.com", AWS_ACCESS_KEY_ID: "AKID", AWS_SECRET_ACCESS_KEY: "s" }, database) instanceof S3ObjectBackend);
+  assert(credentialBackendFromEnv({ ...s3, SELFHOST_CREDENTIAL_S3_ENDPOINT: "https://bucket.vpce-123.s3.us-east-1.vpce.amazonaws.com" }, database) instanceof S3ObjectBackend);
   const { calls, fetchImpl } = fakeFetch((call) => call.url.startsWith("http://169.254.170.23")
     ? Response.json({ AccessKeyId: "ASIAPODID", SecretAccessKey: SECRET, Token: SESSION, Expiration: "2026-11-10T16:00:00Z" })
     : new Response("{}"));

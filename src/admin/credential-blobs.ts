@@ -346,11 +346,26 @@ export function credentialBackendFromEnv(
     if (!bucket || !region) {
       throw new Error("s3 credential storage needs SELFHOST_CREDENTIAL_S3_BUCKET and a region (SELFHOST_CREDENTIAL_S3_REGION or AWS_REGION)");
     }
+    const endpoint = env.SELFHOST_CREDENTIAL_S3_ENDPOINT?.trim() || undefined;
+    const staticKeys = Boolean(env.AWS_ACCESS_KEY_ID?.trim() && env.AWS_SECRET_ACCESS_KEY?.trim());
+    if (endpoint && !staticKeys) {
+      // Ambient AWS role credentials must never be sent to a non-AWS store
+      // (R2, MinIO); AWS VPC/PrivateLink endpoints may still use them.
+      let host: string;
+      try {
+        host = new URL(endpoint).hostname.toLowerCase();
+      } catch {
+        throw new Error("SELFHOST_CREDENTIAL_S3_ENDPOINT is not a URL");
+      }
+      if (!(host === "amazonaws.com" || host.endsWith(".amazonaws.com"))) {
+        throw new Error("a non-AWS SELFHOST_CREDENTIAL_S3_ENDPOINT needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
+      }
+    }
     return new S3ObjectBackend({
       bucket,
       region,
       prefix,
-      endpoint: env.SELFHOST_CREDENTIAL_S3_ENDPOINT?.trim() || undefined,
+      endpoint,
       forcePathStyle: env.SELFHOST_CREDENTIAL_S3_FORCE_PATH_STYLE === "true",
       // Static AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY still win; otherwise the
       // ambient role (EKS Pod Identity, IRSA, ECS task role, EC2 instance role).
