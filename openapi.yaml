@@ -3647,6 +3647,18 @@ paths:
         or 503, fall back to the ingest-edge upload (POST
         .../relayhistory/session mode=sync). Replies carry
         Cache-Control: no-store. See docs/sessions-read-api.md.
+
+        Capture policy (docs/capture-policy.md): when the organization's
+        policy sets any key, the caller names the policy revision it applies
+        in `X-Agent-Relay-Capture-Policy-Revision`. A missing or older
+        revision is logged; with SELFHOST_CAPTURE_POLICY_UPLOADS=enforce it
+        is refused 409 `capture_policy_stale`.
+      parameters:
+        - name: X-Agent-Relay-Capture-Policy-Revision
+          in: header
+          required: false
+          description: The capture policy revision the caller applies.
+          schema: { type: string, pattern: "^[1-9][0-9]{0,9}$" }
       requestBody:
         required: true
         content:
@@ -3681,6 +3693,11 @@ paths:
             and authorization refusals are always 401/403, never 404.
         "405":
           description: Only POST is allowed (when the feature is on for the deployment).
+        "409":
+          description: |
+            `capture_policy_stale`: SELFHOST_CAPTURE_POLICY_UPLOADS=enforce and the
+            organization's capture policy sets a key, but the request named no
+            revision or an older one. Read the policy again and retry.
         "429":
           description: More than 12 upload credential requests per user/workspace per minute (retry-after set).
         "501":
@@ -8114,6 +8131,10 @@ components:
         version: { type: integer, enum: [1] }
         revision: { type: integer, minimum: 1, description: Monotonic per organization; 1 when never set }
         settings: { $ref: "#/components/schemas/CaptureSettings" }
+        sharing_mode_since:
+          type: string
+          format: date-time
+          description: When `sharing_mode` last became `new`; present only while it is `new`. The sessions pipeline refuses a session that started earlier (when enforcing).
     TelemetryIssueInput:
       type: object
       additionalProperties: false

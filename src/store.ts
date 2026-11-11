@@ -1072,6 +1072,7 @@ export class ControlPlaneStore {
       expires_at: Date | string;
       policy_revision: number | null;
       policy_settings: unknown;
+      policy_sharing_mode_since: Date | string | null;
     }>(
       `SELECT s.user_id, u.email, s.organization_id, s.workspace_id, m.role, s.scopes,
               s.access_token_hash,
@@ -1087,7 +1088,8 @@ export class ControlPlaneStore {
               s.access_token_expires_at <= now() AS expired,
               COALESCE(s.last_refreshed_at, s.created_at) AS issued_at,
               s.access_token_expires_at AS expires_at,
-              cp.revision AS policy_revision, cp.settings AS policy_settings
+              cp.revision AS policy_revision, cp.settings AS policy_settings,
+              cp.sharing_mode_since AS policy_sharing_mode_since
          FROM token_sessions s
          JOIN users u ON u.id = s.user_id
          JOIN workspaces w
@@ -1123,7 +1125,11 @@ export class ControlPlaneStore {
       issuedAt: new Date(row.issued_at),
       expiresAt: new Date(row.expires_at),
       capturePolicy: capturePolicyFromRow(
-        row.policy_revision === null ? null : { revision: row.policy_revision, settings: row.policy_settings },
+        row.policy_revision === null ? null : {
+          revision: row.policy_revision,
+          settings: row.policy_settings,
+          sharing_mode_since: row.policy_sharing_mode_since,
+        },
       ),
     };
   }

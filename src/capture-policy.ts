@@ -13,7 +13,18 @@ export type CaptureSettings = {
   user_retroactive_delete?: boolean;
 };
 
-export type CapturePolicy = { version: 1; revision: number; settings: CaptureSettings };
+export type CapturePolicy = {
+  version: 1;
+  revision: number;
+  settings: CaptureSettings;
+  /**
+   * When `sharing_mode` last became `new` (ISO 8601). Present only while it
+   * is `new`; the sessions pipeline refuses a session that started earlier.
+   */
+  sharing_mode_since?: string;
+};
+
+type CapturePolicyRow = { revision: number | string; settings: unknown; sharing_mode_since?: Date | string | null };
 
 export const UNSET_CAPTURE_POLICY: CapturePolicy = Object.freeze({
   version: 1,
@@ -77,12 +88,20 @@ export function parseIfMatch(header: string | string[] | undefined): number | un
  * The served policy for a stored row (absent: unset). Shared with token
  * introspection, which joins the row onto the token session.
  */
-export function capturePolicyFromRow(row: { revision: number | string; settings: unknown } | null | undefined): CapturePolicy {
+export function capturePolicyFromRow(row: CapturePolicyRow | null | undefined): CapturePolicy {
   if (!row || row.revision === null || row.revision === undefined) return { ...UNSET_CAPTURE_POLICY, settings: {} };
   const settings = row.settings && typeof row.settings === "object" && !Array.isArray(row.settings)
     ? row.settings as CaptureSettings
     : {};
-  return { version: 1, revision: Number(row.revision), settings: projectSettings(settings) };
+  const since = settings.sharing_mode === "new" && row.sharing_mode_since
+    ? new Date(row.sharing_mode_since).toISOString()
+    : undefined;
+  return {
+    version: 1,
+    revision: Number(row.revision),
+    settings: projectSettings(settings),
+    ...(since ? { sharing_mode_since: since } : {}),
+  };
 }
 
 /** Default oops window (15 min) served when the operator mandates upload. */
@@ -100,8 +119,8 @@ export function projectSettings(settings: CaptureSettings): CaptureSettings {
 }
 
 export async function readCapturePolicy(database: Database, organizationId: string): Promise<CapturePolicy> {
-  const result = await database.query<{ revision: number; settings: unknown }>(
-    "SELECT revision, settings FROM capture_policies WHERE organization_id = $1",
+  const result = await database.query<CapturePolicyRow>(
+    "SELECT revision, settings, sharing_mode_since FROM capture_policies WHERE organization_id = $1",
     [organizationId],
   );
   return capturePolicyFromRow(result.rows[0]);
@@ -122,8 +141,8 @@ export async function writeCapturePolicy(database: Database, input: {
   return database.transaction(async (tx) => {
     // Serializes writers per organization, including the first insert.
     await tx.query("SELECT id FROM organizations WHERE id = $1 FOR UPDATE", [input.organizationId]);
-    const current = capturePolicyFromRow((await tx.query<{ revision: number; settings: unknown }>(
-      "SELECT revision, settings FROM capture_policies WHERE organization_id = $1",
+    const current = capturePolicyFromRow((await tx.query<CapturePolicyRow>(
+      "SELECT revision, settings, sharing_mode_since FROM capture_policies WHERE organization_id = $1",
       [input.organizationId],
     )).rows[0]);
     if (input.expectedRevision !== undefined && input.expectedRevision !== current.revision) {
@@ -132,12 +151,21 @@ export async function writeCapturePolicy(database: Database, input: {
     }
     const revision = current.revision + 1;
     const userId = input.actor.kind === "user" ? input.actor.userId : null;
-    await tx.query(
-      `INSERT INTO capture_policies (organization_id, revision, settings, set_by_user_id, updated_at)
-       VALUES ($1, $2, $3::jsonb, $4, now())
+    // sharing_mode_since: kept while sharing_mode stays `new`, now() when it
+    // becomes `new`, cleared otherwise.
+    const written = await tx.query<{ sharing_mode_since: Date | string | null }>(
+      `INSERT INTO capture_policies (organization_id, revision, settings, set_by_user_id, updated_at, sharing_mode_since)
+       VALUES ($1, $2, $3::jsonb, $4, now(), CASE WHEN $3::jsonb->>'sharing_mode' = 'new' THEN now() END)
        ON CONFLICT (organization_id) DO UPDATE
          SET revision = EXCLUDED.revision, settings = EXCLUDED.settings,
-             set_by_user_id = EXCLUDED.set_by_user_id, updated_at = now()`,
+             set_by_user_id = EXCLUDED.set_by_user_id, updated_at = now(),
+             sharing_mode_since = CASE
+               WHEN EXCLUDED.settings->>'sharing_mode' IS DISTINCT FROM 'new' THEN NULL
+               WHEN capture_policies.settings->>'sharing_mode' = 'new'
+                 THEN COALESCE(capture_policies.sharing_mode_since, now())
+               ELSE now()
+             END
+       RETURNING sharing_mode_since`,
       [input.organizationId, revision, JSON.stringify(input.settings), userId],
     );
     // The audit row names the keys, never their values.
@@ -148,6 +176,30 @@ export async function writeCapturePolicy(database: Database, input: {
       action: input.action,
       target: `${input.organizationId} revision=${revision}${keys.length ? ` keys=${keys.join(",")}` : ""}`,
     });
-    return { version: 1, revision, settings: projectSettings(input.settings) };
+    return capturePolicyFromRow({ revision, settings: input.settings, sharing_mode_since: written.rows[0]?.sharing_mode_since ?? null });
   });
+}
+
+/**
+ * The header Agent Relay Desktop sends with each upload and each
+ * direct-upload credentials ask: the policy revision it applies.
+ */
+export const CAPTURE_POLICY_REVISION_HEADER = "x-agent-relay-capture-policy-revision";
+
+/** SELFHOST_CAPTURE_POLICY_UPLOADS: log a stale upload (`report`) or refuse it (`enforce`). */
+export type CapturePolicyUploadsMode = "report" | "enforce";
+
+/**
+ * How an upload's applied revision compares with the organization's policy.
+ * `unset`: no setting is mandated, so no revision is needed. `missing`: the
+ * header is absent or not a revision. `stale`: older than the current one.
+ */
+export function uploadPolicyVerdict(
+  policy: CapturePolicy,
+  header: string | string[] | undefined,
+): "current" | "unset" | "missing" | "stale" {
+  if (Object.keys(policy.settings).length === 0) return "unset";
+  const raw = (Array.isArray(header) ? header[0] ?? "" : header ?? "").trim();
+  if (!/^[1-9][0-9]{0,9}$/.test(raw)) return "missing";
+  return Number(raw) < policy.revision ? "stale" : "current";
 }

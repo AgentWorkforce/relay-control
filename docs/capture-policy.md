@@ -44,6 +44,14 @@ from there rather than storing a copy:
   Organization owners and admins can still delete, and the operator hard delete
   ([session-erasure.md](session-erasure.md)) is owner/admin only and unaffected.
 - An older Control without `capture_policy` in its answers leaves deletes unrestricted, as before.
+- Uploads: Agent Relay Desktop names the policy revision it applies in `X-Agent-Relay-Capture-Policy-Revision` on every
+  upload and every direct-upload credentials ask. When the policy sets any key, a missing or older revision is logged
+  (`capture_policy_upload_violation`) and, in enforce mode, refused 409 `capture_policy_stale` so Desktop reads the
+  policy again. Control checks the credentials ask (`SELFHOST_CAPTURE_POLICY_UPLOADS`); the sessions pipeline ingest
+  edge checks batch uploads (`RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS`). Both are `report` (log only) by default.
+- `sharing_mode_since`: served with the policy while `sharing_mode` is `new`, the time it became `new` (kept across
+  writes that keep it). In enforce mode the ingest edge refuses (422 `capture_policy_session_predates_policy`) a
+  batch carrying a session record whose first activity is earlier.
 
 **Desktop semantics**: a key present in `settings` locks that choice; Desktop hides the matching user control
 (hidden, not disabled). An absent key means the user chooses. Desktop reads the policy at sign-in, token refresh

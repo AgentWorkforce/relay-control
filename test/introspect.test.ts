@@ -791,10 +791,18 @@ test("introspection carries the organization's served capture policy, read live"
     settings: { user_retroactive_delete: false, upload_control: "operator", oops_window_seconds: 900 },
   });
 
+  // sharing_mode new: the time it became new rides along (the pipeline refuses older sessions).
+  assert.equal((await request(env.origin, policyPath, {
+    method: "PUT", token: BOOTSTRAP, body: { settings: { sharing_mode: "new" } },
+  })).status, 200);
+  const sharingNew = await env.introspect({ token: accessToken, aud: HISTORY_PUBLIC });
+  assert.deepEqual(sharingNew.body.capture_policy, (await request(env.origin, policyPath, { token: BOOTSTRAP })).body);
+  assert.ok(!Number.isNaN(Date.parse(sharingNew.body.capture_policy.sharing_mode_since)));
+
   const cleared = await request(env.origin, policyPath, { method: "DELETE", token: BOOTSTRAP });
   assert.equal(cleared.status, 200);
   const after = await env.introspect({ token: accessToken, aud: HISTORY_PUBLIC });
-  assert.deepEqual(after.body.capture_policy, { version: 1, revision: 3, settings: {} });
+  assert.deepEqual(after.body.capture_policy, { version: 1, revision: 4, settings: {} });
 
   // Inactive answers never carry it.
   const inactive = await env.introspect({ token: "sh_at_not-a-real-token", aud: HISTORY_PUBLIC });
@@ -802,7 +810,7 @@ test("introspection carries the organization's served capture policy, read live"
 
   // Every answer above matches the published response schema (additionalProperties: false).
   const validate = introspectionResponseValidator();
-  for (const answer of [unset, enforced, after, inactive]) {
+  for (const answer of [unset, enforced, sharingNew, after, inactive]) {
     assert.ok(validate(answer.body), JSON.stringify(validate.errors));
   }
 });

@@ -90,6 +90,8 @@ import {
   parseCaptureSettings,
   parseIfMatch,
   readCapturePolicy,
+  CAPTURE_POLICY_REVISION_HEADER,
+  uploadPolicyVerdict,
   writeCapturePolicy,
 } from "./capture-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
@@ -2431,6 +2433,26 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       rateLimit(response, `history-upload-credentials:${principal.userId}:${workspace.id}`,
         { limit: 12, windowMs: 60_000 }, "rate_limited", "Too many upload credential requests");
+      // Capture policy revision (docs/capture-policy.md): Desktop names the policy it applies. Report mode logs a
+      // missing or older one; enforce refuses it so Desktop reads the policy again (its POST fallback is checked
+      // the same way by the sessions pipeline).
+      const capturePolicy = await readCapturePolicy(store.database, workspace.organizationId);
+      const verdict = uploadPolicyVerdict(capturePolicy, request.headers[CAPTURE_POLICY_REVISION_HEADER]);
+      if (verdict === "missing" || verdict === "stale") {
+        const mode = config.capturePolicyUploads ?? "report";
+        console.warn("[selfhost-api] capture policy upload check", {
+          metric: "capture_policy_upload_violation",
+          outcome: verdict,
+          mode,
+          organization: workspace.organizationId,
+          workspace: workspace.id,
+          revision: capturePolicy.revision,
+        });
+        if (mode === "enforce") {
+          throw new HttpError(409, "capture_policy_stale",
+            `Uploads need capture policy revision ${capturePolicy.revision}; read the policy again and retry`);
+        }
+      }
       try {
         const parsed = parseUploadCredentialsRequest(await requestObject(request));
         json(response, 200, await historyUpload.issue({
