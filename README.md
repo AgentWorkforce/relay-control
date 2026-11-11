@@ -421,6 +421,14 @@ otherwise `SELFHOST_PUBLIC_URL`. A Host that matches neither falls back to
 signs in. The same rule applies to `verification_uri`, the browser handoff's
 `api_url` and the desktop session's `apiUrl`.
 
+Desktop opens its browser links (session "View on web", settings, downloads) as
+`<site>/cloud/dashboard/...` or `<site>/dashboard/...`. When
+`SELFHOST_DASHBOARD_URL` has a different origin from `SELFHOST_PUBLIC_URL`, a
+GET or HEAD to those paths on the API host answers 302 to the matching dashboard
+route (`src/dashboard-links.ts`); the target is always the configured dashboard
+origin. A Desktop session link carries no `source`, so it opens
+`?session=<id>` and the dashboard shows the session list.
+
 Rate limits match hosted Cloud and are per process: device start 10 per 5 minutes
 and token polling 120 per minute per client address (the TCP peer, or the
 `X-Forwarded-For` entry chosen by `SELFHOST_TRUSTED_PROXIES`), and approval 30 per 5 minutes per signed-in user. Desktop's PKCE proof

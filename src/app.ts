@@ -125,6 +125,7 @@ import {
   safeNextPath,
   sanitizeDesktopHostName,
 } from "./auth/device-approval.js";
+import { dashboardLinkRedirect } from "./dashboard-links.js";
 import {
   challengeMatches,
   cloudPathForNext,
@@ -966,6 +967,16 @@ export function createApp(input: {
 
     if (method === "GET" && path === "/healthz") {
       json(response, 200, { status: "ok" });
+      return;
+    }
+    // Agent Relay Desktop's Cloud-shaped browser links on a separate dashboard host.
+    const dashboardLink = dashboardLinkRedirect({
+      method, target: request.url ?? "/", host: request.headers.host,
+      publicBaseUrl: config.publicBaseUrl, dashboardUrl: config.dashboardUrl,
+    });
+    if (dashboardLink) {
+      response.writeHead(302, { location: dashboardLink, "cache-control": "no-store", "referrer-policy": "no-referrer" });
+      response.end();
       return;
     }
     if (method === "GET" && publicPath === "/cloud/api/health") {
