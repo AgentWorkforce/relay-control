@@ -157,9 +157,15 @@ test("signed-in create, MCP watch + relay wake link, a post wakes the agent and 
 
   const posted = await p.post(shim.webhook_url, { action: "opened", number: 7 }, { "x-event-type": "pull_request.opened" });
   assert.equal(posted.status, 202, posted.raw);
-  assert.equal(posted.body.wake, "forwarded");
+  // Acknowledged first; the wake is forwarded in the background.
+  assert.equal(posted.body.wake, "forwarding");
   assert.equal(posted.body.seq, 1);
 
+  let feed = await request(p.origin, `${SHIM}/shims/current`, { token: shim.manage_token });
+  for (let i = 0; i < 100 && feed.body.events?.[0]?.delivery !== "woken"; i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+    feed = await request(p.origin, `${SHIM}/shims/current`, { token: shim.manage_token });
+  }
   assert.equal(p.relayCalls.length, 2);
   const wake = p.relayCalls[1]!;
   assert.equal(wake.url, RELAY_HOOK);
@@ -170,7 +176,6 @@ test("signed-in create, MCP watch + relay wake link, a post wakes the agent and 
   assert.match(wake.body.text, /"number": 7/);
   assert.equal(wake.body.payload.events_shim_event_id, posted.body.event_id);
 
-  const feed = await request(p.origin, `${SHIM}/shims/current`, { token: shim.manage_token });
   assert.equal(feed.status, 200, feed.raw);
   assert.equal(feed.headers.get("cache-control"), "no-store");
   assert.equal(feed.body.agent.connected, true);
