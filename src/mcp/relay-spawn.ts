@@ -239,7 +239,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
   async function refresh(actor: SpawnActor, row: SpawnRow): Promise<SpawnRow> {
     if (row.state === "releasing" && row.releaseInvocationId) {
       const release = await deps.client.getRelayInvocation(actor.token, "release", row.releaseInvocationId);
-      if (release.callerId !== null && release.callerId !== actor.id) throw new RelayToolError("Release provenance could not be verified.");
+      if (release.callerId !== actor.id) throw new RelayToolError("Release provenance could not be verified.");
       if (release.status === "failed") throw new RelayToolError("The exact release failed. Keep this spawn_id; termination is not confirmed.");
       if (release.status === "completed") {
         const agent = await deps.client.getSpawnedAgent(deps.workspaceKey, row.agentName);
@@ -249,7 +249,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
     }
     if (!["accepted", "unknown"].includes(row.state) || !row.invocationId) return row;
     const invocation: RelaySpawnInvocation = await deps.client.getRelayInvocation(actor.token, "spawn", row.invocationId);
-    if (invocation.callerId !== actor.id || (invocation.nodeId !== null && invocation.nodeId !== row.nodeId)) {
+    if (invocation.callerId !== actor.id || invocation.nodeId !== row.nodeId) {
       throw new RelayToolError("Launch provenance could not be verified.");
     }
     if (invocation.status === "failed") {
@@ -371,8 +371,8 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
       }
       if (remote && remote.id !== row.workerId) throw new RelayToolError("The agent name now belongs to a different launch. Release was blocked.");
       if (!remote || remote.status === "released") {
-        // The exact identity is already gone from the roster.
-        return result(await deps.store.update(row, { state: "released" }));
+        // Absence from the roster is not proof the worker stopped.
+        throw new RelayToolError("The original agent is absent without a verified release. Keep this spawn_id and ask an operator to confirm termination; release was not dispatched.");
       }
       if (row.state === "ready") row = await deps.store.update(row, { state: "releasing" });
       if (!row.releaseInvocationId) {

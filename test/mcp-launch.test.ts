@@ -361,3 +361,17 @@ test("a failed native launch is terminal with a redacted failure; a rejected sen
   assert.equal(body.error.code, "spawn_capacity_exceeded");
   assert.equal(env.world.bodies.filter(item => item.path === "/v1/actions/spawn/invoke").length, 2);
 });
+
+test("a ready worker missing from the roster is never marked released without proof", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("node-1", "studio-desktop")]);
+  await env.claim("node-1");
+  const client = await env.connect();
+  const receipt = data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("node-1") }));
+  assert.equal(data(await client.callTool({ name: "get_relay_spawn_status", arguments: { spawn_id: receipt.spawn_id } })).status, "ready");
+  env.world.agents.delete("reviewer-1");
+  assert.match(errorText(await client.callTool({ name: "release_relay_agent", arguments: { spawn_id: receipt.spawn_id } })),
+    /absent without a verified release/);
+  const rows = await env.database.query<{ state: string }>("SELECT state FROM relay_spawns");
+  assert.deepEqual(rows.rows.map(row => row.state), ["ready"]);
+});
