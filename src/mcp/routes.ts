@@ -15,6 +15,7 @@ import { providerStatuses, type ProviderProbes } from "../providers/registry.js"
 import type { ControlPlaneStore } from "../store.js";
 import { MCP_FACADE, type McpAuthMode } from "./catalog.js";
 import { historyReader, type McpContext, type McpMember } from "./context.js";
+import { ClaudeAttestationError, claudeAttestationFor, type ClaudeAttestation } from "./claude-attestation.js";
 import { CopilotAttestationError, copilotAttestationFor, postgresAttestationStore, type CopilotAttestation } from "./copilot-attestation.js";
 import { desktopCallContext, DesktopCallContextError } from "./desktop-call.js";
 import { buildMcpServer } from "./server.js";
@@ -45,6 +46,12 @@ function rpcError(response: ServerResponse, status: number, code: number, messag
     ...headers,
   });
   response.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id }));
+}
+
+function withoutDesktopMarker(headers: Headers): Headers {
+  const copy = new Headers(headers);
+  copy.delete("x-agent-relay-desktop");
+  return copy;
 }
 
 function bearerToken(request: IncomingMessage): string | null {
@@ -269,13 +276,20 @@ export function createMcpHandler(input: {
     try {
       // Always strips `_agent_relay_attestation` from the arguments; a proof
       // that does not verify refuses the call (no unattested fallback).
-      const attested: CopilotAttestation | undefined = await copilotAttestationFor(body, {
-        workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider,
-      }, attestations);
-      desktopCall = desktopCallContext(body, headers, provider, attested);
+      // Copilot credentials carry a Copilot proof; every other call may carry
+      // a Claude Code proof, which counts only on desktop-managed calls (as Cloud).
+      const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider };
+      // An OAuth grant acts only as its approved agent: the Desktop marker
+      // never makes it managed, so its proofs are stripped and ignored.
+      const callHeaders = oauth ? withoutDesktopMarker(headers) : headers;
+      const attested: CopilotAttestation | ClaudeAttestation | undefined = provider === "copilot"
+        ? await copilotAttestationFor(body, auth, attestations)
+        : await claudeAttestationFor(body, callHeaders, auth, attestations);
+      desktopCall = desktopCallContext(body, callHeaders, provider, attested);
     } catch (error) {
       // Store failures are server errors, not a refused proof.
-      if (!(error instanceof CopilotAttestationError) && !(error instanceof DesktopCallContextError)) throw error;
+      if (!(error instanceof CopilotAttestationError) && !(error instanceof ClaudeAttestationError) &&
+          !(error instanceof DesktopCallContextError)) throw error;
       const parsed = JSONRPCRequestSchema.safeParse(body);
       rpcError(response, 400, -32602, "Invalid native chat context.", parsed.success ? parsed.data.id : null);
       return true;

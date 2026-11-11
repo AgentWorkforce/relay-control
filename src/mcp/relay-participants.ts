@@ -23,9 +23,10 @@ import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } f
  * owner's metadata, and serializes join/leave per owner with a Postgres
  * advisory lock.
  *
- * Managed (Desktop provider) calls: a request admitted with a `mcp:desktop`
- * provider credential acts only as the Desktop identity synced for its
- * verified native chat (a Copilot chat named by a verified attestation). No
+ * Managed calls: a request admitted with a `mcp:desktop` provider credential,
+ * or the Desktop app bearer marked `X-Agent-Relay-Desktop: 1`, acts only as
+ * the Desktop identity synced for its verified native chat (a Codex threadId,
+ * or a Claude Code / Copilot chat named by a verified attestation). No
  * verified chat, or no matching synced identity, means the actor tools are
  * unavailable; they never fall back to a hosted participant.
  * Other native MCP sessions may link to one of the owner's synced Desktop
@@ -269,8 +270,13 @@ function createRelayService(context: McpContext) {
   const sessionHash = !oauth && sessionId ? ownerHash(sessionId) : null;
   const owner = ownerHash(userId);
   const desktopCall = context.desktopCall;
-  /** A Desktop-provider credential: only the verified native chat's identity may act. */
-  const managed = desktopCall.provider !== undefined;
+  /**
+   * A desktop-managed call (a Desktop-provider credential, or the app bearer
+   * with X-Agent-Relay-Desktop: 1, as Cloud): only the verified native chat's
+   * identity may act, and a missing or unverified chat fails closed. OAuth
+   * grants are never managed: they act only as their approved agent.
+   */
+  const managed = !oauth && (desktopCall.required || desktopCall.provider !== undefined);
   const linkedKind = (identity: Identity) => identity.desktop ? "desktop" as const : "hosted" as const;
   const channelDelivery = (identity: Identity, channel: string) =>
     identity.desktop ? desktopChannelDelivery(channel) : hostedChannelDelivery(channel);

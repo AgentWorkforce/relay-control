@@ -68,7 +68,7 @@ test("desktop identities round-trip and advertise copilot_session_attestation", 
     assert.equal(listed.status, 200);
     assert.deepEqual(listed.body, {
       identities: [{ agent_id: chat.id, linked_mcp: null, linked_at: null }],
-      capabilities: { native_session_identity: 1, copilot_session_attestation: 1 },
+      capabilities: { native_session_identity: 1, claude_session_attestation: 1, copilot_session_attestation: 1 },
     });
   }
   const initialized = await rpc(env.origin, parent.accessToken, {
@@ -190,8 +190,17 @@ test("bad proofs are refused: replay, wrong key, stale, mismatched args, other w
   invalid(await rpc(env.origin, secret, await call("relay_status", {}, { workspace: env.otherWorkspaceId })), "other workspace");
   invalid(await rpc(env.origin, secret, await call("relay_status", {}, { src: randomUUID() })), "other source");
 
-  // A proof on a connection that is not a Copilot credential.
-  invalid(await rpc(env.origin, parent.accessToken, await call("relay_status", {})), "not copilot");
+  // A Copilot proof on a desktop-managed app bearer is checked as a Claude
+  // proof and refused; without the desktop marker it is stripped and ignored (as Cloud).
+  const managed = await fetch(`${env.origin}${MCP_PATH}`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${parent.accessToken}`, "x-agent-relay-desktop": "1",
+      accept: "application/json, text/event-stream", "content-type": "application/json" },
+    body: JSON.stringify(await call("relay_status", {})),
+  });
+  invalid({ status: managed.status, body: await managed.json() as Record<string, any> }, "not copilot");
+  const unmanaged = await rpc(env.origin, parent.accessToken, await call("relay_status", {}));
+  assert.equal(unmanaged.status, 200, "unmanaged: stripped and ignored");
   assert.equal(env.world.bodies.some((row) => row.method === "POST" && row.path === "/v1/dm"), false);
 });
 

@@ -309,6 +309,7 @@ test("initialize advertises the self-host server and the nineteen tools on both 
     assert.deepEqual(raw.body.result.serverInfo, { name: "agent-relay-selfhost", title: "Agent Relay Sessions", version: "0.1.0" });
     assert.deepEqual(raw.body.result.capabilities.experimental, {
       "com.agentrelay/native-session-identity": { version: 1 },
+      "com.agentrelay/claude-session-attestation": { version: 1 },
       "com.agentrelay/copilot-session-attestation": { version: 1 },
       "com.agentrelay/desktop-provider-credentials": { version: 1, leaseSeconds: 900 },
     });

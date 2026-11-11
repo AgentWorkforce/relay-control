@@ -6,6 +6,7 @@ import { registerCapabilityDiscovery } from "./capabilities.js";
 import { ensureToolTitles, MCP_FACADE, planToolGroups, registerToolPlan } from "./catalog.js";
 import type { McpContext } from "./context.js";
 import { NATIVE_SESSION_CAPABILITY } from "./desktop-call.js";
+import { CLAUDE_ATTESTATION_CAPABILITY } from "./claude-attestation.js";
 import { COPILOT_ATTESTATION_CAPABILITY } from "./copilot-attestation.js";
 import { DESKTOP_MCP_CAPABILITY, DESKTOP_MCP_LEASE_SECONDS } from "../auth/desktop-mcp-credentials.js";
 import { registerRelayMessaging } from "./relay-messaging.js";
@@ -26,9 +27,8 @@ const OAUTH_MCP_INSTRUCTIONS =
 
 /**
  * One MCP server per request (stateless transport). Advertises native
- * session identity, Copilot attestation and the Desktop provider-credential
- * lease, as Cloud does. Claude attestation is not ported, so it is not
- * advertised.
+ * session identity, Claude and Copilot attestation and the Desktop
+ * provider-credential lease, as Cloud does.
  */
 export function buildMcpServer(context: McpContext): McpServer {
   const server = new McpServer(
@@ -36,8 +36,10 @@ export function buildMcpServer(context: McpContext): McpServer {
     { instructions: context.oauth ? OAUTH_MCP_INSTRUCTIONS : SELFHOST_MCP_INSTRUCTIONS,
       capabilities: context.oauth ? {} : { experimental: {
       [NATIVE_SESSION_CAPABILITY]: { version: 1 },
-      // Both are implemented here: Copilot proofs are verified (copilot-attestation.ts)
-      // and provider credentials are minted at /mcp/shared-sessions-tokens.
+      // All are implemented here: Claude and Copilot proofs are verified
+      // (claude-attestation.ts, copilot-attestation.ts) and provider
+      // credentials are minted at /mcp/shared-sessions-tokens.
+      [CLAUDE_ATTESTATION_CAPABILITY]: { version: 1 },
       [COPILOT_ATTESTATION_CAPABILITY]: { version: 1 },
       [DESKTOP_MCP_CAPABILITY]: { version: 1, leaseSeconds: DESKTOP_MCP_LEASE_SECONDS },
     } } },

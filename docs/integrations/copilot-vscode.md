@@ -26,11 +26,11 @@ Ported from the hosted control plane's Copilot Desktop integration.
 | Attestation key registration (`attestation_key`) | same | Ported |
 | Copilot tool-call attestation | `lib/mcp/copilot-attestation.ts`, `lib/mcp/claude-attestation.ts` helpers | Ported verbatim in behaviour; the Cloud fixture signed by the Rust Desktop signer verifies here |
 | Capability `copilot_session_attestation: 1` and MCP experimental `com.agentrelay/copilot-session-attestation` | same | Ported, advertised because verification exists |
-| Managed join/send as the verified Desktop identity | `lib/mcp/relay-participants` desktop path | Ported for provider-bound (child credential) connections |
+| Managed join/send as the verified Desktop identity | `lib/mcp/relay-participants` desktop path | Ported for provider-bound (child credential) connections and `X-Agent-Relay-Desktop: 1` parent connections |
 | 128 KiB Copilot body cap | MCP route | Ported (64 KiB for every other caller) |
-| Claude session attestation (`claude_session_attestation`) | `lib/mcp/claude-attestation.ts` | Not ported; not advertised |
+| Claude session attestation (`claude_session_attestation`) | `lib/mcp/claude-attestation.ts` | Ported and advertised; see [claude-code.md](claude-code.md) |
 | Provider-native capability flags beyond `native_session_identity` | identities route | Not ported; not advertised |
-| Codex managed mode via `X-Agent-Relay-Desktop` on a parent connection | MCP route | Not ported; such calls keep the existing hosted participant behaviour |
+| Managed mode via `X-Agent-Relay-Desktop` on a parent connection (Codex `threadId`, Claude proofs) | MCP route | Ported: such calls act only as the verified chat's Desktop identity and fail closed without one |
 | Linked MCP connection (`join_relay desktop_address`, `linked_mcp`) | `lib/mcp/relay-service.ts`, `lib/mcp/relay-dependencies.ts`, identities route | Ported (migration 0035, `desktop_relay_session_bindings`); no Claude Code on the web auto-link |
 | Native wake / stop-hook delivery | Desktop | Out of scope (Desktop's job) |
 | Native history acquisition and upload | RelayHistory / Desktop upload edge | Out of scope here (owned by the history pipeline) |
@@ -98,7 +98,7 @@ tokens are refused.
 
 - `GET ?source_id=<uuid>` returns `{identities: [{agent_id, linked_mcp,
   linked_at}], capabilities: {native_session_identity: 1,
-  copilot_session_attestation: 1}}`. `linked_mcp` is `"agent-relay-sessions"`
+  claude_session_attestation: 1, copilot_session_attestation: 1}}`. `linked_mcp` is `"agent-relay-sessions"`
   and `linked_at` the ISO time of the newest link when a hosted MCP session
   has linked that identity with `join_relay desktop_address`, else both are
   null. The PUT response reports the same pair per synced identity. No token
@@ -195,10 +195,9 @@ provider credential routes.
 - No dashboard personal tokens on these routes (no-body POST, dashboard list).
 - A parent from another workspace gets 404 `workspace_not_found`, not 403.
 - `web_session_id` is ignored: there is no Claude Code on the web auto-link.
-- `claude_session_attestation` and other provider-native capability flags are
-  not advertised.
-- Codex `X-Agent-Relay-Desktop` calls on a parent connection keep the hosted
-  participant path instead of Cloud's managed path.
+- Provider-native capability flags beyond `native_session_identity`,
+  `claude_session_attestation` and `copilot_session_attestation` (such as
+  `provider_native_session_identity`) are not advertised.
 
 ## Release verification
 

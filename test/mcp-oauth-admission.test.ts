@@ -1043,3 +1043,15 @@ for (const actor of ["oauth", "native", "abandon-oauth"] as const) test("review 
   if(connected) assert.equal(f.world.agents.get(original.name)?.id,original.id,"cleanup deleted an identity after a successful reconnect");
   else assert.ok(refused,"reconnect must either be refused or retain its identity");
 });
+
+test("an OAuth grant stays on its approved agent even with a Desktop marker and a native chat id",async t=>{
+  const f=await relayFixture(t);
+  f.world.addAgent("peer");
+  const marked=desktopCallContext(
+    {method:"tools/call",params:{name:"send_relay_message",arguments:{},_meta:{threadId:randomUUID()}}},
+    new Headers({"x-agent-relay-desktop":"1"}));
+  assert.equal(marked.required,true);
+  const service=relayService({...f.context,desktopCall:marked});
+  const sent=await service.send({to:"peer",text:"from the grant"});
+  assert.equal(sent.from,"approved-agent");
+});
