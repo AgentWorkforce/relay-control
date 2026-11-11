@@ -16,6 +16,12 @@ the `@agent-relay/events-shim` package. This server provides storage
 (Postgres) and mounts the routes. Hosted Agent Relay Cloud serves the same
 feature separately.
 
+It is a per-agent inbox, not provider ingestion: it never subscribes to a
+provider, syncs provider state or feeds Relayfile, and the GitHub, Stripe and
+Linear modes only verify the sender's signature on posts a person points at
+their own inbox, as the bearer mode does. Provider webhook ingress stays with
+relayfile-control.
+
 This is not the `SELFHOST_MCP_EVENTS` setting, which belongs to a different module.
 
 ## Turning it on

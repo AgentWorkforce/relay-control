@@ -128,8 +128,17 @@ export class PostgresEventsShimStore implements EventsShimStore {
   }
 
   private async findBy(column: "mcp_token_hash" | "hook_token_hash" | "manage_token_hash", hash: string) {
+    // An inbox lives only while its creator is still a member of the
+    // organization that owns its workspace: removing the member turns off
+    // every URL at once (the rows themselves go when the user or workspace does).
     const result = await this.database.query<ShimRow>(
-      `SELECT ${SHIM_COLUMNS} FROM events_shims WHERE ${column} = $1`,
+      `SELECT ${SHIM_COLUMNS} FROM events_shims s
+        WHERE s.${column} = $1
+          AND (s.user_id IS NULL OR EXISTS (
+            SELECT 1 FROM workspaces w
+              JOIN organization_memberships m
+                ON m.organization_id = w.organization_id AND m.user_id = s.user_id
+             WHERE w.id = s.workspace_id))`,
       [hash],
     );
     return result.rows[0] ? this.record(result.rows[0]) : null;
@@ -196,21 +205,31 @@ export class PostgresEventsShimStore implements EventsShimStore {
     );
   }
 
-  async countPostsSince(shimId: string, since: string): Promise<number> {
-    const result = await this.database.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM events_shim_posts WHERE shim_id = $1 AND at >= $2",
-      [shimId, since],
-    );
-    return result.rows[0]?.n ?? 0;
-  }
-
-  async recordPost(shimId: string, at: string): Promise<void> {
-    await this.database.query("INSERT INTO events_shim_posts (shim_id, at) VALUES ($1, $2)", [shimId, at]);
-    // Nothing older than a day is ever counted.
-    await this.database.query("DELETE FROM events_shim_posts WHERE shim_id = $1 AND at < $2", [
-      shimId,
-      new Date(Date.parse(at) - DAY_MS).toISOString(),
-    ]);
+  async reservePost(
+    shimId: string,
+    at: string,
+    windows: { since: string; limit: number; name: "hour" | "day" }[],
+  ): Promise<{ ok: true } | { ok: false; window: "hour" | "day" }> {
+    return this.database.transaction(async (tx) => {
+      // The row lock serializes reservations per shim, so concurrent posts
+      // cannot all pass the count before any of them inserts.
+      const locked = await tx.query("SELECT 1 FROM events_shims WHERE id = $1 FOR UPDATE", [shimId]);
+      if (locked.rows.length === 0) throw new Error(`unknown shim ${shimId}`);
+      for (const window of windows) {
+        const counted = await tx.query<{ n: number }>(
+          "SELECT count(*)::int AS n FROM events_shim_posts WHERE shim_id = $1 AND at >= $2",
+          [shimId, window.since],
+        );
+        if ((counted.rows[0]?.n ?? 0) >= window.limit) return { ok: false as const, window: window.name };
+      }
+      await tx.query("INSERT INTO events_shim_posts (shim_id, at) VALUES ($1, $2)", [shimId, at]);
+      // Nothing older than a day is ever counted.
+      await tx.query("DELETE FROM events_shim_posts WHERE shim_id = $1 AND at < $2", [
+        shimId,
+        new Date(Date.parse(at) - DAY_MS).toISOString(),
+      ]);
+      return { ok: true as const };
+    });
   }
 
   async appendEvent(
@@ -288,11 +307,12 @@ export class PostgresEventsShimStore implements EventsShimStore {
     wakeError?: string,
   ): Promise<void> {
     if (eventIds.length === 0) return;
-    // A post the agent already read stays read when a late wake result lands.
+    // Forward only: pending -> woken -> read. A failed wake (pending) applies
+    // only to posts still pending, and a late woken never overwrites read.
     if (state === "pending") {
       await this.database.query(
-        `UPDATE events_shim_events SET delivery = 'pending', wake_error = COALESCE($3, wake_error)
-          WHERE shim_id = $1 AND id = ANY($2::uuid[]) AND delivery <> 'read'`,
+        `UPDATE events_shim_events SET wake_error = COALESCE($3, wake_error)
+          WHERE shim_id = $1 AND id = ANY($2::uuid[]) AND delivery = 'pending'`,
         [shimId, eventIds, wakeError ?? null],
       );
       return;

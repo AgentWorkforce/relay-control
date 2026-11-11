@@ -8,6 +8,7 @@ import type { SelfhostConfig } from "../src/config.js";
 import { loadEventsShimRelayOrigins } from "../src/config.js";
 import { NO_FEATURES, type SelectedFeatures } from "../src/features.js";
 import { migrate } from "../src/migrations.js";
+import { PostgresEventsShimStore } from "../src/events-shim/store.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { close, listen, PGliteDatabase, request } from "./support/harness.js";
 
@@ -280,6 +281,69 @@ test("the inbox is deleted with its creator's workspace", async (t) => {
   await p.create(await p.signIn());
   await p.database.query("DELETE FROM workspaces WHERE id = $1", [p.workspaceId]);
   assert.equal((await p.database.query("SELECT 1 FROM events_shims")).rows.length, 0);
+});
+
+test("concurrent posts cannot exceed the hourly limit", async (t) => {
+  const p = await plane(t);
+  const shim = await p.create(await p.signIn());
+  const answers = await Promise.all(Array.from({ length: 80 }, (_, n) => p.post(shim.webhook_url, { n })));
+  const statuses = answers.map((answer) => answer.status);
+  assert.equal(statuses.filter((status) => status === 202).length, 60, JSON.stringify(statuses));
+  assert.equal(statuses.filter((status) => status === 429).length, 20);
+  assert.equal((await p.database.query("SELECT 1 FROM events_shim_posts")).rows.length, 60);
+});
+
+test("a creator removed from the organization loses every inbox URL", async (t) => {
+  const p = await plane(t);
+  const shim = await p.create(await p.signIn());
+  assert.equal((await p.post(shim.webhook_url, { n: 1 })).status, 202);
+  await p.database.query("DELETE FROM organization_memberships WHERE user_id = $1", [p.ownerId]);
+  // The row stays (the user still exists) but nothing reaches it.
+  assert.equal((await p.database.query("SELECT 1 FROM events_shims")).rows.length, 1);
+  assert.equal((await p.post(shim.webhook_url, { n: 2 })).status, 404);
+  assert.equal((await request(p.origin, `${SHIM}/shims/current`, { token: shim.manage_token })).status, 404);
+  const mcp = await request(p.origin, shim.mcp_url.slice(p.origin.length), {
+    method: "POST", body: { jsonrpc: "2.0", id: 1, method: "tools/list" },
+  });
+  assert.equal(mcp.status, 404);
+});
+
+test("delivery state only moves forward: pending -> woken -> read", async (t) => {
+  const database = new PGliteDatabase();
+  t.after(() => database.close());
+  await migrate(database);
+  const store = new PostgresEventsShimStore(database, KEYRING);
+  const now = new Date().toISOString();
+  const shim = await store.createShim({
+    id: crypto.randomUUID(), mcpTokenHash: "m", hookToken: "esh_x", hookTokenHash: "h", manageTokenHash: "k", now,
+  });
+  const append = async (n: number) => (await store.appendEvent(shim.id, {
+    receivedAt: now, mode: "open", contentType: "application/json", body: JSON.stringify({ n }), headers: {},
+  }, 50)).event;
+  const state = async (id: string) =>
+    (await store.listRecent(shim.id, 50)).find((event) => event.id === id)!;
+
+  // A wake succeeds, then a later failure for the same post lands: it stays woken.
+  const a = await append(1);
+  await store.markDelivery(shim.id, [a.id], "woken", now);
+  await store.markDelivery(shim.id, [a.id], "pending", now, "late failure");
+  assert.equal((await state(a.id)).delivery, "woken");
+  assert.equal((await state(a.id)).wakeError, undefined);
+
+  // Read, then a late woken: it stays read.
+  await store.markDelivery(shim.id, [a.id], "read", now);
+  await store.markDelivery(shim.id, [a.id], "woken", now);
+  await store.markDelivery(shim.id, [a.id], "pending", now, "later failure");
+  assert.equal((await state(a.id)).delivery, "read");
+
+  // A failure on a still-pending post records the error; success clears it.
+  const b = await append(2);
+  await store.markDelivery(shim.id, [b.id], "pending", now, "relay down");
+  assert.equal((await state(b.id)).delivery, "pending");
+  assert.equal((await state(b.id)).wakeError, "relay down");
+  await store.markDelivery(shim.id, [b.id], "woken", now);
+  assert.equal((await state(b.id)).delivery, "woken");
+  assert.equal((await state(b.id)).wakeError, undefined);
 });
 
 test("feature off: every events-shim path answers 404 before authentication", async (t) => {
