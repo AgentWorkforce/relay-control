@@ -1066,8 +1066,17 @@ export function createIdentityModule(input: {
         }
       }
       const created = await store.createInvitation({ organizationId, email, role, actor: actorFor(auth) });
+      // The invite this one replaced loses its temporary password too.
+      if (passwordRoutes) await passwordRoutes.revokeTemporaryPasswords(organizationId, created.invitation.email);
       const issued = temporary
-        ? await issueTemporaryPassword({ organizationId, email: created.invitation.email, auth, ttlMs, target: `invitation=${created.invitation.id}` })
+        ? await issueTemporaryPassword({
+          organizationId,
+          email: created.invitation.email,
+          auth,
+          // Never outlives the invite it lets the person accept.
+          ttlMs: Math.min(ttlMs, Date.parse(created.invitation.expiresAt) - now()),
+          target: `invitation=${created.invitation.id}`,
+        })
         : null;
       const emailDelivery = await sendInvite(created.invitation, created.token, organizationId, auth);
       sendJson(response, 201, {
@@ -1096,7 +1105,13 @@ export function createIdentityModule(input: {
         throw new IdentityHttpError(409, `invitation_${invitation.status}`, "Only an open invite can get a temporary password.");
       }
       temporaryPasswordAllowed(auth, invitation.role);
-      const issued = await issueTemporaryPassword({ organizationId, email: invitation.email, auth, ttlMs, target: `invitation=${id}` });
+      const issued = await issueTemporaryPassword({
+        organizationId,
+        email: invitation.email,
+        auth,
+        ttlMs: Math.min(ttlMs, Date.parse(invitation.expiresAt) - now()),
+        target: `invitation=${id}`,
+      });
       sendJson(response, 201, { invitationId: id, email: invitation.email, temporaryPassword: issued.password, expiresAt: issued.expiresAt });
       return true;
     }

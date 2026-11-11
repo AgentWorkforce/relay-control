@@ -160,6 +160,7 @@ export async function setup(t: test.TestContext, options: {
   const identityStore = new IdentityStore(database, KEYRING, {
     inviteTtlMs: identityConfig.inviteTtlMs,
     autoJoinDomains: identityConfig.autoJoinDomains,
+    tenancy: identityConfig.tenancy,
     issueSession: (tx, session) => store.issueBrowserSession(tx, session),
     adminEmails: bootstrap.adminEmails.filter((email) => email !== bootstrap.adminEmail),
   });

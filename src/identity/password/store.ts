@@ -75,7 +75,7 @@ export class CredentialChanged extends Error {
 
 /** Thrown inside the setup-key or temporary-password transaction to roll it back. */
 export class OneTimeRefused extends Error {
-  constructor(readonly reason: "spent" | "password_already_set" | "not_a_member") {
+  constructor(readonly reason: "spent" | "password_already_set" | "not_a_member" | "already_signed_in" | "other_organization") {
     super(reason);
   }
 }
@@ -539,6 +539,8 @@ export class PasswordStore {
       await tx.query("UPDATE password_registrations SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
       await tx.query("UPDATE password_setup_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
       await tx.query("UPDATE email_login_tokens SET consumed_at = now() WHERE email = $1 AND consumed_at IS NULL", [user.email]);
+      // A temporary password set before the reset must not undo it.
+      await tx.query("UPDATE temporary_passwords SET revoked_at = now() WHERE email = $1 AND used_at IS NULL AND revoked_at IS NULL", [user.email]);
       await this.clearAccount(tx, user.email);
       return { userId, email: user.email };
     });
@@ -564,6 +566,8 @@ export class PasswordStore {
     const key = opaqueToken("sh_sk_");
     const expiresAt = new Date(this.now() + SETUP_KEY_TTL_MS);
     await this.database.transaction(async (tx) => {
+      // Serializes concurrent mints (and redemptions) for the address.
+      await lockIdentity(tx, email);
       await tx.query("UPDATE setup_keys SET revoked_at = now() WHERE email = $1 AND used_at IS NULL AND revoked_at IS NULL", [email]);
       await tx.query(
         "INSERT INTO setup_keys (id, email, key_hash, source, expires_at) VALUES ($1, $2, $3, 'minted', $4)",
@@ -594,7 +598,8 @@ export class PasswordStore {
          SELECT 1 FROM users u
           WHERE u.email = $1
             AND (u.last_organization_id IS NOT NULL
-                 OR EXISTS (SELECT 1 FROM password_credentials c WHERE c.user_id = u.id))
+                 OR EXISTS (SELECT 1 FROM password_credentials c WHERE c.user_id = u.id)
+                 OR EXISTS (SELECT 1 FROM token_sessions s WHERE s.user_id = u.id))
        ) AS signed_in`,
       [email],
     );
@@ -624,6 +629,11 @@ export class PasswordStore {
     );
     const email = spent.rows[0]?.email;
     if (!email) throw new OneTimeRefused("spent");
+    // Under the identity lock the sign-in holds: the session this sign-in
+    // just issued must be the person's only one ever, so a sign-in by any
+    // other method that committed after the key was checked wins.
+    const sessions = await tx.query<{ n: number }>("SELECT count(*)::int AS n FROM token_sessions WHERE user_id = $1", [userId]);
+    if (sessions.rows[0]!.n > 1) throw new OneTimeRefused("already_signed_in");
     if (!await this.insertFirstCredential(tx, userId, stored)) throw new OneTimeRefused("password_already_set");
     await tx.query("UPDATE setup_keys SET revoked_at = now() WHERE email = $1 AND used_at IS NULL AND revoked_at IS NULL", [email]);
   }
@@ -644,6 +654,8 @@ export class PasswordStore {
     const id = randomUUID();
     const expiresAt = new Date(this.now() + input.ttlMs);
     await this.database.transaction(async (tx) => {
+      // Serializes concurrent setters for the address (one live row each).
+      await lockIdentity(tx, input.email);
       await tx.query(
         "UPDATE temporary_passwords SET revoked_at = now() WHERE email = $1 AND used_at IS NULL AND revoked_at IS NULL",
         [input.email],
@@ -700,6 +712,14 @@ export class PasswordStore {
       [row.organization_id, userId],
     );
     if (!member.rows.length) throw new OneTimeRefused("not_a_member");
+    // Checked again here, after this sign-in accepted any open invites: a
+    // password one organization set must not reach another organization
+    // the person belongs to (or was invited to) as well.
+    const other = await tx.query(
+      "SELECT 1 FROM organization_memberships WHERE user_id = $1 AND organization_id <> $2 LIMIT 1",
+      [userId, row.organization_id],
+    );
+    if (other.rows.length) throw new OneTimeRefused("other_organization");
     await this.upsertCredential(tx, userId, stored);
     await this.clearAccount(tx, row.email);
   }

@@ -728,7 +728,8 @@ kubectl -n <ns> get secret <secret> -o jsonpath='{.data.selfhost-setup-key}' | b
   `{setupKey, password}`. A rejected password does not spend the key.
 - Then the key is spent. It also stops working 24 hours after the server
   first recorded it, used or not, and as soon as the admin signs in any other
-  way. A restart never renews it.
+  way (checked again under the sign-in lock when it is spent). A restart
+  never renews it.
 - Only its SHA-256 hash is stored (`setup_keys`, migration 0041); it is
   compared in constant time and never logged or audited in clear. Wrong keys
   are audited (`setup_key.failure`) and limited per client: 20 per 10 minutes
@@ -764,9 +765,12 @@ in without a reset email.
   `{email, currentPassword, newPassword}` then sets the person's own password
   and signs in. It is checked like a login (the same lockout and audit); the
   new password must pass the policy and differ from the temporary one.
-- It works once and until it expires. Until it is used, the member's existing
-  password keeps working; using it replaces that password. Existing sessions
-  are not revoked.
+- It works once and until it expires (never past the invite it was set
+  with). Until it is used, the member's existing password keeps working; using
+  it replaces that password. Existing sessions are not revoked. A completed
+  reset, a replaced or canceled invite, or a newer temporary password cancels
+  it, and redeeming it is refused if the person belongs to (or would accept an
+  invite to) any other organization by then.
 - With SMTP configured, emailed verification, invites and reset are unchanged.
 
 ### Break-glass: the bootstrap bearer

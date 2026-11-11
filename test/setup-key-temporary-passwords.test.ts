@@ -7,6 +7,7 @@ import {
   auditActions,
   BOOTSTRAP,
   call,
+  linkToken,
   login,
   PASSWORD,
   registerVerified,
@@ -359,6 +360,56 @@ test("temporary password: with SMTP configured, emailed verification and invites
   await ctx.identity.idle();
   assert.match(ctx.mailer.sent.at(-1)!.text, /\/login\/password\/verify#token=/);
   assert.equal((await call(ctx.origin, "/login")).text.includes("Forgot password?"), true);
+});
+
+test("review fixes: a reset, a later second organization, a replaced invite and a competing sign-in all win", async (t) => {
+  // An emailed reset revokes an outstanding temporary password.
+  const mailed = await setup(t);
+  const owner = sessionCookie(await registerVerified(mailed, ADMIN));
+  await joinWithTemporary(mailed, owner, "rs@acme.test");
+  const org = await organizationId(mailed);
+  const memberId = await userId(mailed, "rs@acme.test");
+  const issued = await call(mailed.origin, `/cloud/api/v1/organizations/${org}/memberships/${memberId}/temporary-password`, { cookie: owner, json: {} });
+  assert.equal(issued.status, 201);
+  await mailed.identity.idle();
+  await call(mailed.origin, `${API}/reset`, { json: { email: "rs@acme.test" } });
+  await mailed.identity.idle();
+  const token = linkToken(mailed.mailer.sent.at(-1)!, "/login/password/reset");
+  assert.equal((await call(mailed.origin, `${API}/reset/complete`, { json: { token, password: "a fresh reset passphrase" } })).status, 200);
+  assert.equal((await change(mailed, "rs@acme.test", issued.body.temporaryPassword, "an attacker passphrase")).status, 401);
+
+  // Replacing an invite without a temporary password cancels the old one.
+  const first = await invite(mailed, owner, "swap@acme.test");
+  assert.equal((await invite(mailed, owner, "swap@acme.test", "member", {})).status, 201);
+  assert.equal((await login(mailed, "swap@acme.test", first.body.temporaryPassword)).status, 401);
+
+  // A session from another sign-in method makes the setup key unusable.
+  const ctx = await noSmtp(t);
+  const adminId = await userId(ctx, ADMIN);
+  const workspace = (await ctx.database.query<{ id: string }>("SELECT id FROM workspaces LIMIT 1")).rows[0]!.id;
+  const adminOrg = await organizationId(ctx);
+  await ctx.database.transaction((tx) => ctx.store.issueBrowserSession(tx, { userId: adminId, organizationId: adminOrg, workspaceId: workspace, label: "Browser sign-in (SSO)" }));
+  assert.equal((await call(ctx.origin, "/api/v1/auth/login-config")).body.setup_key, false);
+  assert.equal((await useSetupKey(ctx, SETUP_KEY)).status, 401);
+});
+
+test("temporary password: multi mode, joining or being invited to another organization blocks redemption", async (t) => {
+  const ctx = await setup(t, { smtp: false, env: { SELFHOST_SETUP_KEY: SETUP_KEY, SELFHOST_TENANCY: "multi", SELFHOST_AUTO_JOIN_DOMAINS: "" } });
+  const owner = await ownerCookie(ctx);
+  const org = await organizationId(ctx);
+  await joinWithTemporary(ctx, owner, "multi@acme.test");
+  const memberId = await userId(ctx, "multi@acme.test");
+  const issued = await call(ctx.origin, `/cloud/api/v1/organizations/${org}/memberships/${memberId}/temporary-password`, { cookie: owner, json: {} });
+  assert.equal(issued.status, 201, issued.text);
+  const otherOrg = "00000000-0000-4000-8000-000000000098";
+  await ctx.database.query("INSERT INTO organizations (id, name) VALUES ($1, 'Other')", [otherOrg]);
+  await ctx.database.query("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'member')", [otherOrg, memberId]);
+  // The sign-in still lands in the issuing organization (the last one used).
+  await ctx.database.query("UPDATE users SET last_organization_id = $2 WHERE id = $1", [memberId, org]);
+  const crossed = await change(ctx, "multi@acme.test", issued.body.temporaryPassword, "cross org passphrase");
+  assert.equal(crossed.status, 401, crossed.text);
+  assert.equal((await login(ctx, "multi@acme.test", NEW_PASSWORD, "198.51.100.61")).status, 200, "password untouched");
+  assert.ok((await auditActions(ctx)).some((row) => row.target?.includes("reason=temporary_password_other_organization")));
 });
 
 test("openapi.yaml documents the setup key and temporary password routes", async () => {
