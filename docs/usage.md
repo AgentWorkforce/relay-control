@@ -59,18 +59,25 @@ recorded titles and summaries.
 
 - `GET /api/v1/organizations/{org}/usage/people?days=7|30|90`: every member
   (name, email, role) with `sessionsUploaded`, `searches`, `lastActiveAt`,
-  `lastSessionAt` and `topProjects` for the range. Sessions come from the read
-  API's `/v1/sessions`, read with the owner's authority for each organization
-  workspace the owner belongs to, and grouped by the session's `userIds`. At
-  most 5,000 sessions are read per workspace; past that `truncated` is true
-  and counts are lower bounds. If the read API cannot be read,
-  `sessionsUploaded` is `null` and listed in `unavailable`.
-  `searches` and `lastActiveAt` come from `usage_people_daily`, which is
-  written only while `usage_people` is selected; `lastSessionAt` (the newest
-  session in the range) covers activity from before that.
+  `lastSessionAt` and `topProjects` for the range. Session totals come from
+  the read API with the owner's authority, for each organization workspace
+  the owner belongs to, and are bounded:
+  - Control prefers the read API aggregate `/v1/sessions/users` (one grouped
+    query per workspace, `source: "aggregate"`). A read API without it (404
+    or 501, remembered for 10 minutes) is sampled instead: the newest
+    sessions from `/v1/sessions` pages of at most 200 (`source: "sample"`).
+  - At most 3 read API calls and 2 seconds per load. Whatever is not read
+    in that budget makes `truncated` true: the counts are lower bounds.
+  - Session totals are cached in-process for 5 minutes per organization,
+    owner and range. Control's own counters are always read fresh.
+  If the read API cannot be read, `sessionsUploaded` is `null` and listed in
+  `unavailable`. `searches` and `lastActiveAt` come from `usage_people_daily`,
+  which is written only while `usage_people` is selected; `lastSessionAt` (the
+  newest session in the range) covers activity from before that.
 - `GET /api/v1/organizations/{org}/usage/people/{userId}/sessions?days&cursor`:
   that member's sessions in the range, newest first across all the
-  organization's workspaces (merged by session time), 20 per page, each with
+  organization's workspaces (merged by session time), 20 per page, read on
+  demand with no prefetch (summaries not read within 2 seconds are `null`), each with
   its recorded title, the recorded short summary (`/v1/sessions/{id}/summary`,
   `null` when none is ready), agent name, project and times. The first page
   also carries a `rollup` built only from recorded titles and projects.

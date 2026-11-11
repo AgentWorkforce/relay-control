@@ -6,9 +6,12 @@ assigned at release.
 ## Unreleased
 
 - Fixed: the Usage People table reported sessions as unavailable against the
-  native read API, because it asked for pages of 500 and the directory list
-  serves at most 200 (501 `limit`). People reads now use pages of at most
-  200 (still up to 5,000 sessions per workspace before `truncated`).
+  native read API (it asked for pages of 500; the directory list serves at
+  most 200). People totals are now bounded: the read API aggregate
+  `/v1/sessions/users` when it is served (one call per workspace), otherwise
+  newest-first list pages of at most 200; at most 3 read API calls and 2
+  seconds per load, then `truncated` (lower bounds); cached for 5 minutes.
+  Drill-down summaries share the 2-second budget.
 
 - Added: capture policy upload check. `POST .../relayhistory/upload-credentials`
   compares the caller's `X-Agent-Relay-Capture-Policy-Revision` with the
