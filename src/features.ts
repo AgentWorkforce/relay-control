@@ -3,11 +3,11 @@
  * SELFHOST_FEATURES (comma list; unset or empty selects nothing). Read once
  * at startup. Everything else is core and always on.
  */
-export const FEATURES = ["flows", "relayfile", "chief", "usage"] as const;
+export const FEATURES = ["flows", "relayfile", "chief", "usage", "launch"] as const;
 export type Feature = (typeof FEATURES)[number];
 export type SelectedFeatures = Record<Feature, boolean>;
 
-export const NO_FEATURES: SelectedFeatures = { flows: false, relayfile: false, chief: false, usage: false };
+export const NO_FEATURES: SelectedFeatures = { flows: false, relayfile: false, chief: false, usage: false, launch: false };
 
 /** An unknown name is a startup configuration error. */
 export function loadSelectedFeatures(env: Record<string, string | undefined> = process.env): SelectedFeatures {
@@ -21,7 +21,7 @@ export function loadSelectedFeatures(env: Record<string, string | undefined> = p
   return selected;
 }
 
-const DISPLAY: Record<Feature, string> = { flows: "Flows", relayfile: "Relayfile", chief: "Chief", usage: "Usage" };
+const DISPLAY: Record<Feature, string> = { flows: "Flows", relayfile: "Relayfile", chief: "Chief", usage: "Usage", launch: "Agent launch" };
 
 /** A 403 refusal for a feature route: `{ error, message, feature }`. */
 export class FeatureRefusedError extends Error {

@@ -111,6 +111,8 @@ export function createMcpHandler(input: {
   factory?: FactoryMcpDeps;
   /** Provider runtime probes (src/providers/registry.ts); empty when unset. */
   providerProbes?: ProviderProbes;
+  /** SELFHOST_FEATURES launch: register the agent launch tools. */
+  launch?: boolean;
   /** Own credential resolver, used only at these MCP routes when the module is enabled. */
   oauthSessions?: McpOAuthSessions;
 }) {
@@ -309,6 +311,7 @@ export function createMcpHandler(input: {
       },
       ...(!oauth && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && input.factory ? { factory: input.factory } : {}),
+      ...(!oauth && input.launch ? { launch: true } : {}),
     };
 
     const server = buildMcpServer(context);

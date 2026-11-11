@@ -402,7 +402,7 @@ test("readyz lists exactly the audiences introspection accepts, never the secret
     status: "ready",
     introspection: { enabled: true, audiences: ["https://files.selfhosted.test", "http://history.svc:8080"], outageHoldMs: 0 },
     // No features wired: core only.
-    capabilities: { flows: false, relayfile: false, chief: false, usage: false },
+    capabilities: { flows: false, relayfile: false, chief: false, usage: false, launch: false },
   });
   assert.equal(JSON.stringify(ready.body).includes(INTROSPECT_SECRET), false);
   const { accessToken } = await env.login(env.alpha);
