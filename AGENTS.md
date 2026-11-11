@@ -3,7 +3,8 @@
 ## Service ownership
 
 `relay-control` is the identity, session and workspace credential control plane.
-Read the matching [relayfile-control boundary](../relayfile-control/AGENTS.md)
+Read the matching [relayfile-control boundary](https://github.com/AgentWorkforce/relayfile-control/blob/main/AGENTS.md)
+(local checkout: `../relayfile-control/AGENTS.md`)
 when a change touches Flows or provider ingestion.
 
 | Responsibility | Canonical owner |
@@ -34,7 +35,7 @@ implementation here merely because an older copy is still checked out.
   least-privilege scopes, audience checks and refusal-versus-outage behavior.
 - A broker or introspection contract change needs corresponding consumer
   updates and contract coverage. See [the broker contract](docs/flows-relayfile-credential.md)
-  and [the consumer seams](../relayfile-control/README.md#seams).
+  and [the consumer seams](https://github.com/AgentWorkforce/relayfile-control#seams).
 
 Flows worker enrollment tokens and encrypted, scoped run-credential caches
 are Flow-domain state in `relayfile-control`. They do not move canonical user
