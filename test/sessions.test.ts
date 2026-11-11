@@ -1425,6 +1425,8 @@ function peopleSessions(env: Awaited<ReturnType<typeof setup>>, rows: Array<{
     const after = Date.parse(url.searchParams.get("lastTsAfter")!);
     const before = Date.parse(url.searchParams.get("lastTsBefore")!);
     const limit = Number(url.searchParams.get("limit"));
+    // The real directory list refuses more than 200 (501 `limit`).
+    if (!(limit >= 1 && limit <= 200)) return { status: 501, body: { error: { code: "unsupported", reason: "limit" } } };
     const offset = Number(url.searchParams.get("cursor") ?? "0");
     const matching = rows
       .filter((row) => row.workspaceId === workspace && (!user || row.userIds.includes(user)))
@@ -1608,4 +1610,33 @@ test("usage people: the drill-down merges workspaces newest first", async (t) =>
   const expected = [...rows].sort((a, b) => Date.parse(b.lastTs) - Date.parse(a.lastTs)).map((row) => row.sessionId);
   assert.deepEqual(seen, expected);
   assert.equal(seen[0], "b-newest");
+});
+
+test("usage people: every read API list page stays within the directory's 200 limit", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  // 450 sessions in alpha: the aggregate needs three pages of at most 200.
+  const rows = Array.from({ length: 450 }, (_, index) => ({
+    sessionId: `m${index}`, workspaceId: env.alpha, userIds: [env.memberId],
+    lastTs: new Date(Date.parse("2026-11-02T19:00:00.000Z") - index * 60_000).toISOString(),
+  }));
+  peopleSessions(env, rows);
+  const owner = await env.login(env.ownerId, env.alpha);
+  const people = await call(env.origin, `/cloud/api/v1/organizations/${env.organizationId}/usage/people?days=7`, { token: owner });
+  assert.equal(people.status, 200);
+  assert.deepEqual(people.body.people.unavailable, []);
+  assert.equal(people.body.people.members.find((member: any) => member.userId === env.memberId).sessionsUploaded, 450);
+  // Page through the drill-down far enough to grow each read.
+  const base = `/cloud/api/v1/organizations/${env.organizationId}/usage/people/${env.memberId}/sessions?days=7`;
+  let cursor: string | null = null;
+  let seen = 0;
+  for (let page = 0; page < 12; page += 1) {
+    const result: Awaited<ReturnType<typeof call>> = await call(env.origin, cursor ? `${base}&cursor=${encodeURIComponent(cursor)}` : base, { token: owner });
+    assert.equal(result.status, 200);
+    seen += result.body.sessions.length;
+    cursor = result.body.nextCursor;
+    if (!cursor) break;
+  }
+  assert.equal(seen, 240);
+  const limits = env.history.requests.filter((entry) => entry.path === "/v1/sessions").map((entry) => Number(entry.query.limit));
+  assert.ok(limits.length > 0 && limits.every((limit) => limit >= 1 && limit <= 200), `limits ${limits}`);
 });

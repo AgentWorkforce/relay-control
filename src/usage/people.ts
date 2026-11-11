@@ -20,9 +20,14 @@ import { usageDates } from "./routes.js";
  */
 export const PEOPLE_AUDIT_ACTION = "usage.people.viewed";
 const DAY_MS = 86_400_000;
-/** Read API page size for the aggregate; at most this many pages per workspace. */
-const AGGREGATE_PAGE = 500;
-const AGGREGATE_PAGES = 10;
+/**
+ * Largest page the read API's directory list serves (DIRECTORY_LIST_MAX_LIMIT;
+ * more is 501 `limit`). Every /v1/sessions read here stays at or below it.
+ */
+export const READ_API_MAX_LIMIT = 200;
+/** The aggregate reads at most this many pages (5,000 sessions) per workspace. */
+const AGGREGATE_PAGE = READ_API_MAX_LIMIT;
+const AGGREGATE_PAGES = 25;
 const DRILL_PAGE = 20;
 const SUMMARY_CONCURRENCY = 5;
 const TOP_PROJECTS = 3;
