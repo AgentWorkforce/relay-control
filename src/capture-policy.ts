@@ -151,19 +151,21 @@ export async function writeCapturePolicy(database: Database, input: {
     }
     const revision = current.revision + 1;
     const userId = input.actor.kind === "user" ? input.actor.userId : null;
-    // sharing_mode_since: kept while sharing_mode stays `new`, now() when it
-    // becomes `new`, cleared otherwise.
+    // sharing_mode_since: kept while sharing_mode stays `new`, set when it
+    // becomes `new`, cleared otherwise. clock_timestamp(), not now(): now() is
+    // the transaction start, before the organization lock wait above, so it
+    // could predate the moment `new` takes effect and admit older sessions.
     const written = await tx.query<{ sharing_mode_since: Date | string | null }>(
       `INSERT INTO capture_policies (organization_id, revision, settings, set_by_user_id, updated_at, sharing_mode_since)
-       VALUES ($1, $2, $3::jsonb, $4, now(), CASE WHEN $3::jsonb->>'sharing_mode' = 'new' THEN now() END)
+       VALUES ($1, $2, $3::jsonb, $4, now(), CASE WHEN $3::jsonb->>'sharing_mode' = 'new' THEN clock_timestamp() END)
        ON CONFLICT (organization_id) DO UPDATE
          SET revision = EXCLUDED.revision, settings = EXCLUDED.settings,
              set_by_user_id = EXCLUDED.set_by_user_id, updated_at = now(),
              sharing_mode_since = CASE
                WHEN EXCLUDED.settings->>'sharing_mode' IS DISTINCT FROM 'new' THEN NULL
                WHEN capture_policies.settings->>'sharing_mode' = 'new'
-                 THEN COALESCE(capture_policies.sharing_mode_since, now())
-               ELSE now()
+                 THEN COALESCE(capture_policies.sharing_mode_since, clock_timestamp())
+               ELSE clock_timestamp()
              END
        RETURNING sharing_mode_since`,
       [input.organizationId, revision, JSON.stringify(input.settings), userId],
