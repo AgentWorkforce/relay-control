@@ -1410,3 +1410,163 @@ test("usage: any route that authenticates a token counts its user (not only the 
   const { rows } = await env.database.query<{ n: number }>("SELECT count(*)::int AS n FROM usage_daily_users");
   assert.equal(rows[0]!.n, 2);
 });
+
+// Usage People drill-down (docs/usage.md, "People"): owner-only, per member, audited.
+
+const PEOPLE_ON: SelectedFeatures = { ...NO_FEATURES, usage: true, usage_people: true };
+
+/** A read API /v1/sessions double that honours `user`, `cursor` and the lastTs bounds. */
+function peopleSessions(env: Awaited<ReturnType<typeof setup>>, rows: Array<{
+  sessionId: string; workspaceId: string; userIds: string[]; lastTs: string; title?: string; projectId?: string;
+}>) {
+  env.history.overrides.set("/v1/sessions", (_request, url) => {
+    const workspace = url.searchParams.get("workspace");
+    const user = url.searchParams.get("user");
+    const after = Date.parse(url.searchParams.get("lastTsAfter")!);
+    const before = Date.parse(url.searchParams.get("lastTsBefore")!);
+    const limit = Number(url.searchParams.get("limit"));
+    const offset = Number(url.searchParams.get("cursor") ?? "0");
+    const matching = rows
+      .filter((row) => row.workspaceId === workspace && (!user || row.userIds.includes(user)))
+      .filter((row) => Date.parse(row.lastTs) >= after && Date.parse(row.lastTs) <= before)
+      .sort((a, b) => Date.parse(b.lastTs) - Date.parse(a.lastTs));
+    const page = matching.slice(offset, offset + limit);
+    return {
+      body: {
+        sessions: page.map((row) => ({
+          sessionId: row.sessionId, source: "claude", userIds: row.userIds, projectId: row.projectId ?? null,
+          title: row.title ?? null, firstTs: row.lastTs, lastTs: row.lastTs, agentName: "reviewer",
+        })),
+        nextCursor: offset + limit < matching.length ? String(offset + limit) : null,
+      },
+    };
+  });
+}
+
+test("usage people: owner sees members with session counts, searches and last active", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  peopleSessions(env, [
+    { sessionId: "a1", workspaceId: env.alpha, userIds: [env.memberId], lastTs: "2026-11-02T10:00:00.000Z", projectId: "relay" },
+    { sessionId: "a2", workspaceId: env.alpha, userIds: [env.memberId], lastTs: "2026-11-01T10:00:00.000Z", projectId: "relay" },
+    { sessionId: "b1", workspaceId: env.beta, userIds: [env.ownerId, env.memberId], lastTs: "2026-10-30T10:00:00.000Z", projectId: "docs" },
+    // Outside the 7-day range.
+    { sessionId: "old", workspaceId: env.alpha, userIds: [env.memberId], lastTs: "2026-09-01T10:00:00.000Z" },
+  ]);
+  const owner = await env.login(env.ownerId, env.alpha);
+  const member = await env.login(env.memberId, env.alpha);
+  assert.equal((await call(env.origin, `/cloud/api/v1/workspaces/${env.alpha}/sessions/search?q=fix`, { token: member })).status, 200);
+  const path = `/cloud/api/v1/organizations/${env.organizationId}/usage/people?days=7`;
+  let result = await call(env.origin, path, { token: owner });
+  for (let i = 0; i < 50 && result.body.people?.members?.find((m: any) => m.userId === env.memberId)?.searches !== 1; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    result = await call(env.origin, path, { token: owner });
+  }
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.people.range, { days: 7, from: "2026-10-27", to: "2026-11-02" });
+  assert.equal(result.body.people.truncated, false);
+  const [first, second] = result.body.people.members;
+  assert.deepEqual(first, {
+    userId: env.memberId, name: "Member", email: "member@example.test", role: "member",
+    sessionsUploaded: 3, searches: 1, lastActiveAt: "2026-11-02T20:00:00.000Z", lastSessionAt: "2026-11-02T10:00:00.000Z",
+    topProjects: [{ name: "relay", sessions: 2 }, { name: "docs", sessions: 1 }],
+  });
+  assert.equal(second.userId, env.ownerId);
+  assert.equal(second.sessionsUploaded, 1);
+});
+
+test("usage people: drill-down lists a member's sessions with recorded summaries and writes an audit row", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  const rows = Array.from({ length: 25 }, (_, index) => ({
+    sessionId: `s${index}`, workspaceId: env.alpha, userIds: [env.memberId],
+    lastTs: new Date(Date.parse("2026-11-02T19:00:00.000Z") - index * 3_600_000).toISOString(),
+    title: `Task ${index}`, projectId: "relay",
+  }));
+  rows.push({ sessionId: "other", workspaceId: env.alpha, userIds: [env.ownerId], lastTs: "2026-11-02T18:30:00.000Z", title: "Owner work", projectId: "relay" });
+  peopleSessions(env, rows);
+  env.history.overrides.set("/v1/sessions/s0/summary", () => ({
+    body: { summary: { status: "ready", kind: "short", summary: "Fixed the login flow", model: "m", builtAt: "2026-11-02T19:05:00.000Z", state: null } },
+  }));
+  const owner = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/organizations/${env.organizationId}/usage/people/${env.memberId}/sessions?days=7`;
+  const first = await call(env.origin, base, { token: owner });
+  assert.equal(first.status, 200);
+  assert.deepEqual(first.body.person, { userId: env.memberId, name: "Member", email: "member@example.test", role: "member" });
+  assert.equal(first.body.sessions.length, 20);
+  assert.deepEqual(first.body.sessions[0], {
+    sessionId: "s0", source: "claude", workspaceId: env.alpha, title: "Task 0", project: "relay", agentName: "reviewer",
+    firstTs: rows[0]!.lastTs, lastTs: rows[0]!.lastTs, summary: "Fixed the login flow",
+  });
+  assert.equal(first.body.sessions[1].summary, null);
+  assert.ok(first.body.sessions.every((session: any) => session.sessionId !== "other"));
+  assert.deepEqual(first.body.rollup.projects, [{ name: "relay", sessions: 20 }]);
+  assert.equal(first.body.rollup.titles[0], "Task 0");
+  assert.ok(first.body.nextCursor);
+  const second = await call(env.origin, `${base}&cursor=${encodeURIComponent(first.body.nextCursor)}`, { token: owner });
+  assert.equal(second.status, 200);
+  // The 25 member sessions in alpha; beta has none.
+  assert.deepEqual(second.body.sessions.map((session: any) => session.sessionId), ["s20", "s21", "s22", "s23", "s24"]);
+  assert.equal(second.body.rollup, null);
+  assert.equal(second.body.nextCursor, null);
+  const reads = env.history.requests.filter((entry) => entry.path === "/v1/sessions");
+  assert.ok(reads.every((entry) => entry.query.user === env.memberId || entry.query.user === undefined));
+
+  // One audit row per drill-down (first page only), visible to owners.
+  const audit = await call(env.origin, `/cloud/api/v1/organizations/${env.organizationId}/usage/people/audit`, { token: owner });
+  assert.equal(audit.status, 200);
+  assert.equal(audit.body.events.length, 1);
+  assert.deepEqual({ ...audit.body.events[0], createdAt: undefined }, {
+    viewerUserId: env.ownerId, viewerName: "Owner", subjectUserId: env.memberId, subjectName: "Member", days: 7, createdAt: undefined,
+  });
+  const { rows: auditRows } = await env.database.query<{ action: string; workspace_id: string | null }>(
+    "SELECT action, workspace_id FROM admin_audit_events WHERE action = 'usage.people.viewed'");
+  // Organization-level: not listed by a workspace admin's audit view.
+  assert.deepEqual(auditRows, [{ action: "usage.people.viewed", workspace_id: null }]);
+});
+
+test("usage people: owner-only, its own flag, unknown members and bad input", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  peopleSessions(env, []);
+  const admin = await call(env.origin, `/api/v1/organizations/${env.organizationId}/memberships`, {
+    method: "POST", token: env.bootstrapToken, body: { email: "admin@example.test", name: "Admin", role: "admin" },
+  });
+  const base = `/cloud/api/v1/organizations/${env.organizationId}/usage/people`;
+  for (const token of [await env.login(admin.body.userId, env.alpha), await env.login(env.memberId, env.alpha), env.bootstrapToken]) {
+    for (const path of [base, `${base}/${env.ownerId}/sessions`, `${base}/audit`]) {
+      const refused = await call(env.origin, path, { token });
+      assert.equal(refused.status, 403, path);
+      assert.equal(refused.body.error, "forbidden");
+    }
+  }
+  const { rows } = await env.database.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM admin_audit_events WHERE action = 'usage.people.viewed'");
+  assert.equal(rows[0]!.n, 0);
+
+  const owner = await env.login(env.ownerId, env.alpha);
+  assert.equal((await call(env.origin, `${base}/00000000-0000-4000-8000-000000000001/sessions`, { token: owner })).status, 404);
+  for (const query of ["days=14", "days=7&days=30", "cursor=x", "foo=1"]) {
+    assert.equal((await call(env.origin, `${base}?${query}`, { token: owner })).status, 400, query);
+  }
+  assert.equal((await call(env.origin, `${base}/${env.memberId}/sessions?cursor=not-a-cursor`, { token: owner })).status, 400);
+  const empty = await call(env.origin, `${base}/${env.memberId}/sessions`, { token: owner });
+  assert.deepEqual([empty.status, empty.body.sessions, empty.body.nextCursor], [200, [], null]);
+
+  // usage alone does not serve People, and nothing is written for it.
+  const v1Only = await setup(t, undefined, { features: USAGE_ON });
+  const v1Owner = await v1Only.login(v1Only.ownerId, v1Only.alpha);
+  const refused = await call(v1Only.origin, `/cloud/api/v1/organizations/${v1Only.organizationId}/usage/people`, { token: v1Owner });
+  assert.deepEqual([refused.status, refused.body.error], [403, "feature_not_enabled"]);
+  await call(v1Only.origin, `/cloud/api/v1/workspaces/${v1Only.alpha}/sessions/search?q=x`, { token: v1Owner });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const { rows: written } = await v1Only.database.query<{ n: number }>("SELECT count(*)::int AS n FROM usage_people_daily");
+  assert.equal(written[0]!.n, 0);
+});
+
+test("usage people: an unreadable session backend is unavailable, never zero", async (t) => {
+  const env = await setup(t, undefined, { features: PEOPLE_ON });
+  env.history.overrides.set("/v1/sessions", () => ({ status: 503, body: { error: { code: "not_configured" } } }));
+  const owner = await env.login(env.ownerId, env.alpha);
+  const result = await call(env.origin, `/cloud/api/v1/organizations/${env.organizationId}/usage/people`, { token: owner });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.people.unavailable, ["sessionsUploaded"]);
+  assert.ok(result.body.people.members.every((member: any) => member.sessionsUploaded === null));
+});

@@ -148,7 +148,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_PERSONAL_ORG_ON_SIGNIN` | Multi mode only, default `true`: a first sign-in with no invite, membership or assigned domain creates a personal organization. The bootstrap bearer can override it at runtime via `PATCH /api/v1/installation/settings` |
 | `SELFHOST_SELF_SERVE_ORGANIZATIONS` | Multi mode only, default `true`: signed-in people may create organizations. Overridable the same way |
 | `SELFHOST_INVITE_TTL_HOURS` | Invite link lifetime, default 168 (7 days), 1-720 |
-| `SELFHOST_FEATURES` | Comma list of optional components to serve: `flows`, `relayfile`, `chief`, `usage`. Unset selects nothing; those routes answer 403 `feature_not_enabled`. See [docs/features.md](docs/features.md) |
+| `SELFHOST_FEATURES` | Comma list of optional components to serve: `flows`, `relayfile`, `chief`, `usage`, `launch`, `usage_people`. Unset selects `usage,usage_people`; `""` selects nothing. Unselected routes answer 403 `feature_not_enabled`. See [docs/features.md](docs/features.md) |
 | `SELFHOST_FACTORY_ENABLED` | Optional `true`/`false`, default `false`. Factory sessions: when off every Factory route is 404 and the worker does not start. See [docs/factory-sessions.md](docs/factory-sessions.md) |
 | `SELFHOST_FACTORY_API_URL` | Factory API origin, default `https://api.factory.ai`; absolute https only |
 | `SELFHOST_FACTORY_HISTORY_INTERVAL_MS` | Dormant Factory history loop cadence, default 300000, minimum 60000 |
