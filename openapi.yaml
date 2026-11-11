@@ -890,7 +890,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status, timestamp, version]
+                required: [status, timestamp, version, imageVersion]
                 properties:
                   status:
                     const: ok
@@ -899,6 +899,10 @@ paths:
                     format: date-time
                   version:
                     type: string
+                    description: The API version.
+                  imageVersion:
+                    type: [string, "null"]
+                    description: The running image tag (SELFHOST_IMAGE_VERSION); null when run from source.
   /login:
     get:
       security: []

@@ -217,6 +217,7 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
     internalServiceToken: null,
     oauthRedirectUrl: "https://control.internal.example/api/v1/integrations/oauth/callback",
     dashboardUrl: "https://control.internal.example/",
+    imageVersion: "0.5.12-test",
     port: 3000,
     host: "127.0.0.1",
   };
@@ -234,6 +235,7 @@ test("device flow, tenant isolation, token rotation, runtime, and History issuan
   assert.equal(cloudHealth.body.status, "ok");
   assert.equal(typeof cloudHealth.body.timestamp, "string");
   assert.equal(cloudHealth.body.version, "0.1.0");
+  assert.equal(cloudHealth.body.imageVersion, "0.5.12-test");
 
   const firstOrg = await jsonRequest(controlOrigin, "/api/v1/organizations", {
     method: "POST",
