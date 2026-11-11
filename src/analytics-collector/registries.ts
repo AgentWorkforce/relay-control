@@ -1,6 +1,7 @@
 // Closed collector vocabularies. These do not add client-gateway kinds: every
 // service still needs its own token bound to its component and deployment.
 import { EVENT_REGISTRY, type PropertySpec } from "../analytics/events.js";
+import { RELAYCAST_COLLECTOR_REGISTRY } from "./relaycast-registry.js";
 import type { CollectorRegistries } from "./validate.js";
 
 // Sessions producer contract: relayhistory-pipeline src/shared/analytics.ts at
@@ -14,6 +15,7 @@ const COUNT: PropertySpec = { type: "integer", min: 0, max: 1_000_000 };
 
 export const COLLECTOR_REGISTRIES: CollectorRegistries = {
   relaycontrol: EVENT_REGISTRY,
+  relaycast: RELAYCAST_COLLECTOR_REGISTRY,
   "session-ingest": {
     "session_ingest.batch_completed": {
       scope: "workspace",

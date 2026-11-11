@@ -11,6 +11,7 @@ import {
 } from "../analytics/events.js";
 import { ANALYTICS_BATCH_SCHEMA, type AnalyticsPropertyValue } from "../analytics/types.js";
 import type { Producer } from "./producers.js";
+import { isRelaycastWorkspaceId } from "./relaycast-registry.js";
 
 /** Event kinds per component. The CLI wires `relaycontrol` → EVENT_REGISTRY. */
 export type CollectorRegistries = Readonly<Record<string, Readonly<Record<string, EventSpec>>>>;
@@ -114,6 +115,9 @@ function registered(event: ShapedEvent, index: number, registry: Readonly<Record
     : spec.scope === "native_workspace" ? !tenant && workspace
     : false;
   if (!scopeOk) throw invalid(index);
+  if (event.component === "relaycast" && spec.scope === "native_workspace" && !isRelaycastWorkspaceId(event.workspace_id ?? "")) {
+    throw invalid(index);
+  }
   const properties: Record<string, AnalyticsPropertyValue> = {};
   for (const [key, value] of Object.entries(event.properties)) {
     if (RESERVED_FIELDS.has(key)) throw invalid(index);
