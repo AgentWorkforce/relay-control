@@ -86,7 +86,10 @@ export function allowedDownloadUrl(repo: string, value: unknown): string | null 
   }
   if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash) return null;
   if (url.hostname !== "github.com" && url.hostname !== "objects.githubusercontent.com") return null;
-  if (!url.pathname.startsWith(`/${repo}/releases/download/`)) return null;
+  // GitHub treats owner/repository case-insensitively; its URLs use the
+  // canonical spelling, which may differ from the configured one.
+  const prefix = `/${repo}/releases/download/`;
+  if (url.pathname.slice(0, prefix.length).toLowerCase() !== prefix.toLowerCase()) return null;
   return url.toString();
 }
 
@@ -94,7 +97,10 @@ class Deadline extends Error {}
 
 async function boundedText(response: Response, limit: number): Promise<string> {
   const declared = Number(response.headers.get("content-length") ?? "0");
-  if (declared > limit) throw new Error("too large");
+  if (declared > limit) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error("too large");
+  }
   const reader = response.body?.getReader();
   if (!reader) return "";
   const chunks: Uint8Array[] = [];
@@ -112,7 +118,10 @@ async function boundedText(response: Response, limit: number): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-type ApiAsset = { id: number; name: string; size: number; url: string; browser_download_url: string; digest?: string | null };
+type ApiAsset = {
+  id: number; name: string; size: number; url: string; browser_download_url: string;
+  digest?: string | null; updated_at?: string;
+};
 type ApiRelease = { tag_name: string; draft: boolean; prerelease: boolean; published_at: string | null; assets: ApiAsset[] };
 
 function isApiRelease(value: unknown): value is ApiRelease {
@@ -121,9 +130,21 @@ function isApiRelease(value: unknown): value is ApiRelease {
     typeof row.prerelease === "boolean" && Array.isArray(row.assets);
 }
 
+/** A sidecar could not be read (transport, status, size): the release is unavailable, not smaller. */
+class SidecarUnavailable extends Error {}
+
 export class GitHubDesktopReleases {
   #cache: { expiresAt: number; value: DesktopReleases } | null = null;
   #inflight: Promise<DesktopReleases> | null = null;
+  /** The last complete answer, served again when a refresh fails (stale beats empty). */
+  #lastGood: DesktopReleases | null = null;
+  /** The release list's ETag: a 304 reply does not count against GitHub's unauthenticated quota. */
+  #etag: string | null = null;
+  /**
+   * Verified sidecar digests by `<asset id>:<asset updated_at>`: a re-upload
+   * changes both, so an unchanged asset is never re-read. Bounded.
+   */
+  readonly #digests = new Map<string, string>();
 
   constructor(
     readonly repo: string,
@@ -149,8 +170,10 @@ export class GitHubDesktopReleases {
     let value: DesktopReleases;
     try {
       value = await this.read(controller.signal);
+      if (value.release) this.#lastGood = value;
     } catch {
-      value = this.empty();
+      // An outage (or the quota) serves the last complete answer, else null.
+      value = this.#lastGood ?? this.empty();
     } finally {
       clearTimeout(timer);
     }
@@ -159,22 +182,32 @@ export class GitHubDesktopReleases {
     return value;
   }
 
-  private async api(path: string, signal: AbortSignal, accept: string): Promise<Response> {
+  private async api(path: string, signal: AbortSignal, accept: string, etag?: string | null): Promise<Response> {
     const url = new URL(`${API}/repos/${this.repo}/releases${path}`);
     if (url.origin !== API || !url.pathname.startsWith(`/repos/${this.repo}/releases`)) throw new Error("bad path");
     return this.fetchImpl(url, {
       redirect: "manual",
       signal,
-      headers: { accept, "user-agent": "agent-relay-selfhost", "x-github-api-version": "2022-11-28" },
+      headers: {
+        accept,
+        "user-agent": "agent-relay-selfhost",
+        "x-github-api-version": "2022-11-28",
+        ...(etag ? { "if-none-match": etag } : {}),
+      },
     });
   }
 
   private async read(signal: AbortSignal): Promise<DesktopReleases> {
-    const list = await this.api("?per_page=10", signal, "application/vnd.github+json");
+    const list = await this.api("?per_page=10", signal, "application/vnd.github+json", this.#lastGood ? this.#etag : null);
+    if (list.status === 304 && this.#lastGood) {
+      await list.body?.cancel().catch(() => {});
+      return this.#lastGood;
+    }
     if (list.status !== 200) {
       await list.body?.cancel().catch(() => {});
       throw new Error(`list ${list.status}`);
     }
+    const etag = list.headers.get("etag");
     const releases: unknown = JSON.parse(await boundedText(list, MAX_LIST_BYTES));
     if (!Array.isArray(releases)) throw new Error("list shape");
     // Newest first; drafts are never public, but skip them defensively.
@@ -193,10 +226,17 @@ export class GitHubDesktopReleases {
     await Promise.all(Array.from({ length: Math.min(SIDECAR_CONCURRENCY, candidates.length) }, async () => {
       while (next < candidates.length) {
         const { asset, described, url, sidecar } = candidates[next++]!;
-        const sha256 = await this.sidecar(sidecar, asset.name, signal).catch((error: unknown) => {
-          if (error instanceof Deadline || signal.aborted) throw error;
-          return null;
-        });
+        const key = `${sidecar.id}:${sidecar.updated_at ?? ""}`;
+        let sha256 = this.#digests.get(key) ?? null;
+        if (!sha256) {
+          // Throws SidecarUnavailable on any read failure: the whole release is
+          // then unavailable rather than silently missing installers.
+          sha256 = await this.sidecar(sidecar, asset.name, signal);
+          if (sha256) {
+            if (this.#digests.size >= MAX_ASSETS * 4) this.#digests.clear();
+            this.#digests.set(key, sha256);
+          }
+        }
         if (!sha256) continue;
         // GitHub's own digest, when present, must agree with the sidecar.
         if (typeof asset.digest === "string" && asset.digest.startsWith("sha256:") && asset.digest.slice(7) !== sha256) continue;
@@ -204,6 +244,7 @@ export class GitHubDesktopReleases {
       }
     }));
     assets.sort((a, b) => a.name.localeCompare(b.name));
+    this.#etag = etag;
     return {
       source: this.empty().source,
       release: {
@@ -217,22 +258,33 @@ export class GitHubDesktopReleases {
   }
 
   /** The 64-hex digest from `<name>.sha256` (`<hex>  <name>` or just `<hex>`). */
+  /**
+   * The digest, or null when the sidecar's content does not verify this asset
+   * (that asset is dropped). Throws SidecarUnavailable when it cannot be read.
+   */
   private async sidecar(sidecar: ApiAsset, name: string, signal: AbortSignal): Promise<string | null> {
     if (!Number.isSafeInteger(sidecar.id) || sidecar.size > MAX_SIDECAR_BYTES) return null;
-    const first = await this.api(`/assets/${sidecar.id}`, signal, "application/octet-stream");
-    let response = first;
-    if (first.status === 301 || first.status === 302 || first.status === 307 || first.status === 308) {
-      await first.body?.cancel().catch(() => {});
-      const location = first.headers.get("location");
-      const target = location ? new URL(location, API) : null;
-      if (!target || target.protocol !== "https:" || !SIDECAR_HOST.test(target.hostname)) return null;
-      response = await this.fetchImpl(target, { redirect: "error", signal, headers: { "user-agent": "agent-relay-selfhost" } });
+    let text: string;
+    try {
+      const first = await this.api(`/assets/${sidecar.id}`, signal, "application/octet-stream");
+      let response = first;
+      if (first.status === 301 || first.status === 302 || first.status === 307 || first.status === 308) {
+        await first.body?.cancel().catch(() => {});
+        const location = first.headers.get("location");
+        const target = location ? new URL(location, API) : null;
+        // An off-host redirect is a refusal of this asset, not an outage.
+        if (!target || target.protocol !== "https:" || !SIDECAR_HOST.test(target.hostname)) return null;
+        response = await this.fetchImpl(target, { redirect: "error", signal, headers: { "user-agent": "agent-relay-selfhost" } });
+      }
+      if (response.status !== 200) {
+        await response.body?.cancel().catch(() => {});
+        throw new SidecarUnavailable(`sidecar ${response.status}`);
+      }
+      text = (await boundedText(response, MAX_SIDECAR_BYTES)).trim();
+    } catch (error) {
+      if (error instanceof SidecarUnavailable) throw error;
+      throw new SidecarUnavailable(error instanceof Error ? error.message : "sidecar");
     }
-    if (response.status !== 200) {
-      await response.body?.cancel().catch(() => {});
-      return null;
-    }
-    const text = (await boundedText(response, MAX_SIDECAR_BYTES)).trim();
     const [digest, file] = text.split(/\s+/);
     const hex = digest?.toLowerCase() ?? "";
     if (!SHA256.test(hex)) return null;

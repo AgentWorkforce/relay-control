@@ -62,7 +62,8 @@ function fakeGitHub(options: {
   redirectHost?: string;
   listStatus?: number;
   releases?: unknown[];
-} = {}): Fake {
+  etag?: string;
+} = {}): Fake & { options: typeof options } {
   const calls: string[] = [];
   const assets = (options.assets ?? []).map((asset, index) => ({
     id: index + 1,
@@ -70,17 +71,21 @@ function fakeGitHub(options: {
     size: asset.size ?? (asset.name.endsWith(".sha256") ? 120 : 1000),
     url: `https://api.github.com/repos/${REPO}/releases/assets/${index + 1}`,
     browser_download_url: asset.browser ?? `https://github.com/${REPO}/releases/download/${TAG}/${asset.name}`,
+    updated_at: "2026-11-11T19:21:31Z",
     ...(asset.digest ? { digest: asset.digest } : {}),
   }));
   const releases = options.releases ?? [
     { tag_name: "v9.9.9-draft", draft: true, prerelease: false, published_at: null, assets: [] },
     { tag_name: TAG, draft: false, prerelease: true, published_at: "2026-11-11T19:21:31Z", assets },
   ];
-  const fetchImpl = (async (input: string | URL) => {
+  const fetchImpl = (async (input: string | URL, init?: RequestInit) => {
     const url = new URL(String(input));
     calls.push(url.toString());
     if (url.origin === "https://api.github.com" && url.pathname === `/repos/${REPO}/releases`) {
-      return new Response(JSON.stringify(releases), { status: options.listStatus ?? 200 });
+      const sent = new Headers(init?.headers).get("if-none-match");
+      const etag = options.etag ?? '"e1"';
+      if (sent && sent === etag && !options.listStatus) return new Response(null, { status: 304 });
+      return new Response(JSON.stringify(releases), { status: options.listStatus ?? 200, headers: { etag } });
     }
     const asset = /\/assets\/(\d+)$/.exec(url.pathname);
     if (url.origin === "https://api.github.com" && asset) {
@@ -98,7 +103,7 @@ function fakeGitHub(options: {
     }
     return new Response("unexpected", { status: 500 });
   }) as typeof fetch;
-  return { calls, fetch: fetchImpl };
+  return { calls, fetch: fetchImpl, options };
 }
 
 const DMG = "Desktop-q7m2k9-2026.11.1-beta.6-macOS-arm64.dmg";
@@ -179,4 +184,57 @@ test("an upstream failure is release null (cached), never an error", async () =>
   assert.equal((await throwing.latest()).release, null);
   const empty = fakeGitHub({ releases: [] });
   assert.equal((await new GitHubDesktopReleases(REPO, empty.fetch).latest()).release, null);
+});
+
+test("configured repo casing may differ from GitHub's canonical download URLs", async () => {
+  const github = fakeGitHub({ assets: [{ name: DMG }, { name: `${DMG}.sha256` }], sidecars: { [`${DMG}.sha256`]: hex("a") } });
+  const lower = REPO.toLowerCase();
+  const fetchLower = (async (input: string | URL, init?: RequestInit) =>
+    github.fetch(String(input).replace(`/repos/${lower}/`, `/repos/${REPO}/`), init)) as typeof fetch;
+  const result = await new GitHubDesktopReleases(lower, fetchLower).latest();
+  assert.equal(result.release?.assets.length, 1);
+  assert.equal(result.release?.assets[0]!.url, `https://github.com/${REPO}/releases/download/${TAG}/${DMG}`);
+});
+
+test("a checksum outage makes the release unavailable, not smaller; the last good answer is kept", async () => {
+  const outage = fakeGitHub({ assets: [{ name: DMG }, { name: `${DMG}.sha256` }], sidecars: {} });
+  assert.equal((await new GitHubDesktopReleases(REPO, outage.fetch).latest()).release, null);
+
+  const github = fakeGitHub({ assets: [{ name: DMG }, { name: `${DMG}.sha256` }], sidecars: { [`${DMG}.sha256`]: hex("a") } });
+  let now = 0;
+  const releases = new GitHubDesktopReleases(REPO, github.fetch, () => now);
+  const good = await releases.latest();
+  assert.equal(good.release?.assets.length, 1);
+  github.options.listStatus = 403; // e.g. the unauthenticated quota
+  now += 5 * 60_000 + 1;
+  assert.deepEqual(await releases.latest(), good);
+});
+
+test("refreshes stay inside GitHub's unauthenticated quota: 304 lists and remembered checksums", async () => {
+  const names = [
+    "Linux-x64.deb", "Linux-arm64.deb", "Linux-x64.tar.gz", "Linux-arm64.tar.gz",
+    "macOS-arm64.dmg", "macOS-x64.dmg", "Windows-x64-Setup.exe", "Windows-arm64-Setup.exe",
+  ].map((rest) => `Desktop-q7m2k9-2026.11.1-beta.6-${rest}`);
+  const github = fakeGitHub({
+    assets: names.flatMap((name) => [{ name }, { name: `${name}.sha256` }]),
+    sidecars: Object.fromEntries(names.map((name, index) => [`${name}.sha256`, hex(String(index))])),
+  });
+  let now = 0;
+  const releases = new GitHubDesktopReleases(REPO, github.fetch, () => now);
+  assert.equal((await releases.latest()).release?.assets.length, 8);
+  const api = (from: number) => github.calls.slice(from).filter((call) => new URL(call).hostname === "api.github.com");
+  // A full hour of refreshes (12 cache misses): one conditional list each, answered 304.
+  let mark = github.calls.length;
+  for (let tick = 0; tick < 12; tick += 1) {
+    now += 5 * 60_000 + 1;
+    assert.equal((await releases.latest()).release?.assets.length, 8);
+  }
+  assert.equal(api(mark).length, 12);
+  assert.ok(api(mark).every((call) => new URL(call).pathname === `/repos/${REPO}/releases`));
+  // A changed list (new ETag) with the same assets re-reads only the list.
+  github.options.etag = '"e2"';
+  mark = github.calls.length;
+  now += 5 * 60_000 + 1;
+  assert.equal((await releases.latest()).release?.assets.length, 8);
+  assert.equal(github.calls.length - mark, 1);
 });
