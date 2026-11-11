@@ -1070,19 +1070,18 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     // desktop-auth lane, browser flow. Hosted Cloud's provider sign-in starts
     // (Google, Microsoft): the Desktop opens one with next=/api/v1/cli/login?...
     // Self-host sends Microsoft to its own Microsoft sign-in when configured
-    // (SELFHOST_MICROSOFT_*), and otherwise to the /login chooser, which lists
-    // every provider. Google goes to the OIDC provider when configured, else
-    // /login. The `next` stays on the /cloud mount, where the session cookie
-    // is scoped.
+    // (SELFHOST_MICROSOFT_*). Everything else, including Google, lands on the
+    // /login chooser, which lists every provider; a bounce never forces one
+    // provider. The `next` stays on the /cloud mount, where the session
+    // cookie is scoped.
     if (
       method === "GET" &&
       (publicPath === "/cloud/api/auth/google/start" || publicPath === "/cloud/api/auth/microsoft/start")
     ) {
       const next = cloudPathForNext(url.searchParams.get("next"));
-      const signIn = publicPath === "/cloud/api/auth/microsoft/start"
-        ? identity?.config.microsoft ? "/login/microsoft/start" : "/login"
-        // With an OIDC provider configured, go straight to it.
-        : identity?.config.oidc ? "/login/oidc/start" : "/login";
+      const signIn = publicPath === "/cloud/api/auth/microsoft/start" && identity?.config.microsoft
+        ? "/login/microsoft/start"
+        : "/login";
       response.writeHead(302, {
         location: `${signIn}?next=${encodeURIComponent(next)}`,
         "cache-control": "no-store",

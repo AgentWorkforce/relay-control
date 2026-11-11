@@ -1217,9 +1217,9 @@ paths:
         alias; a signed-out browser is redirected to /login and returned here.
         Hosted's provider starts, /cloud/api/auth/google/start and
         /cloud/api/auth/microsoft/start with next=/api/v1/cli/login?..., also
-        land on /login here with the inner parameters kept (the Microsoft
-        start goes to /login/microsoft/start when Microsoft sign-in is
-        configured). Unknown query
+        land on the /login chooser here with the inner parameters kept, never
+        on one provider (only the Microsoft start goes to
+        /login/microsoft/start, when Microsoft sign-in is configured). Unknown query
         parameters (workspace_selection) are ignored.
         With client=desktop and an S256 code_challenge, issues a 15-minute
         handoff access token bound to the challenge and redirects (307) to the

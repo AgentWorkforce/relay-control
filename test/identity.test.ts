@@ -514,10 +514,10 @@ test("oidc: the admin email signs in as owner through the full code + PKCE flow"
   assert.equal(me.body.currentOrganization.role, "owner");
   assert.equal(me.body.currentWorkspace.name, "Default");
 
-  // Desktop / CLI provider start goes straight to the IdP.
+  // Desktop / CLI provider start lands on the /login chooser, never on one provider.
   const google = await call(ctx.origin, "/cloud/api/auth/google/start?next=%2Fapi%2Fv1%2Fcli%2Flogin");
   assert.equal(google.status, 302);
-  assert.match(google.headers.get("location")!, /^\/login\/oidc\/start\?next=/);
+  assert.equal(google.headers.get("location"), `/login?next=${encodeURIComponent("/cloud/api/v1/cli/login")}`);
 });
 
 test("oidc: refuses strangers, other domains, unverified email, forged state and bad tokens", async (t) => {
@@ -934,7 +934,7 @@ test("microsoft beside generic OIDC: both buttons, both public configs, Desktop 
   assert.equal(microsoft.headers.get("set-cookie"), null);
   const google = await call(ctx.origin, `/cloud/api/auth/google/start?next=${next}`);
   assert.equal(google.status, 302);
-  assert.equal(google.headers.get("location"), `/login/oidc/start?next=${encodeURIComponent("/cloud/api/v1/cli/login")}`);
+  assert.equal(google.headers.get("location"), `/login?next=${encodeURIComponent("/cloud/api/v1/cli/login")}`);
 });
 
 test("microsoft not configured: no button, start answers 404, Desktop start lands on the /login chooser", async (t) => {
@@ -952,7 +952,7 @@ test("microsoft not configured: no button, start answers 404, Desktop start land
   assert.equal(microsoft.headers.get("location"), `/login?next=${encodeURIComponent("/cloud/api/v1/cli/login")}`);
   assert.equal(microsoft.headers.get("set-cookie"), null);
   const google = await call(ctx.origin, `/cloud/api/auth/google/start?next=${next}`);
-  assert.equal(google.headers.get("location"), `/login/oidc/start?next=${encodeURIComponent("/cloud/api/v1/cli/login")}`);
+  assert.equal(google.headers.get("location"), `/login?next=${encodeURIComponent("/cloud/api/v1/cli/login")}`);
 });
 
 // ---- invites ------------------------------------------------------------------------

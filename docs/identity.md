@@ -196,8 +196,9 @@ with <name>" for the generic provider first and "Continue with Microsoft"
 below it. `GET /api/v1/auth/login-config` and `GET /api/v1/auth/methods`
 publish `microsoft: { displayName }` (or `null`) beside `oidc`. When
 Microsoft is configured, Agent Relay Desktop's "Continue with Microsoft" opens
-`/login/microsoft/start`; otherwise it opens the `/login` chooser, which
-lists every configured provider, even when `SELFHOST_OIDC_*` is set.
+`/login/microsoft/start`; otherwise it, and Desktop's Google start, open the
+`/login` chooser, which lists every configured provider, even when
+`SELFHOST_OIDC_*` is set. A signed-out bounce never forces one provider.
 
 #### Invites
 

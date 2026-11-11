@@ -426,9 +426,10 @@ See `openapi.yaml` (also served at `/openapi.yaml`) for the exact contract.
 Desktop's GUI signs in with hosted Cloud's browser flow, not the device flow:
 it opens `$SELFHOST_PUBLIC_URL/cloud/api/v1/cli/login?redirect_uri=http://127.0.0.1:<port>/callback/<state>&state=<state>&client=desktop&workspace_selection=desktop&code_challenge=<S256>&code_challenge_method=S256[&desktop_host_name=<host>]`
 (or hosted's `/cloud/api/auth/google/start` and `/cloud/api/auth/microsoft/start`
-with `next=/api/v1/cli/login?...`, which here land on `/login` with the
-inner parameters kept; the Microsoft start goes to `/login/microsoft/start`
-when `SELFHOST_MICROSOFT_*` is configured). A signed-out browser goes through `/login` and
+with `next=/api/v1/cli/login?...`, which here land on the `/login` chooser
+with the inner parameters kept, never on one provider; only the Microsoft
+start goes to `/login/microsoft/start`, when `SELFHOST_MICROSOFT_*` is
+configured). A signed-out browser goes through `/login` and
 returns. With a session cookie the API issues a 15-minute handoff access
 token bound to the challenge and redirects to the loopback `redirect_uri`
 with `state`, `access_token`, `access_token_expires_at` and
