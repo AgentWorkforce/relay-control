@@ -1,3 +1,4 @@
+import { isCapyBindingIdentity } from "../capy/identity.js";
 import { createHash, randomUUID } from "node:crypto";
 import { decryptSecret, encryptSecret } from "../crypto.js";
 import type { SqlExecutor } from "../database.js";
@@ -35,8 +36,10 @@ import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } f
  * session acts as that identity unless `as` names a hosted participant, so
  * DMs and channel posts reach the Desktop natively; an unlinked session acts
  * as its hosted participant. OAuth grants act only as their approved agent
- * and never link. Person sends (`as_person`), events inboxes and Capy are not
- * part of self-host; launches (SELFHOST_FEATURES launch) go through
+ * and never link. An explicitly injected Capy resolver permits only native,
+ * unmanaged sends as an owned binding; it creates no participant alias.
+ * Person sends (`as_person`) and events inboxes are not part of self-host;
+ * launches (SELFHOST_FEATURES launch) go through
  * withSpawnActor and src/mcp/relay-spawn.ts.
  */
 
@@ -56,6 +59,7 @@ const AS_PERSON_UNAVAILABLE =
 export const RELAY_COORDINATION_GUIDANCE = "DM a specific agent by default. Use channels only to coordinate a larger swarm or broadcast to many agents, and subscribe only to channels you need. Reply to a channel post in that channel with post_relay_channel (thread_id for its thread), not by DM, unless the reply is private. At task start, check list_relay_agents and DM peers whose work your task affects, without waiting to be asked.";
 export const HOSTED_REPLY_GUIDANCE = "replies arrive in check_relay_inbox; poll it";
 export const FACTORY_REPLY_GUIDANCE = "Replies to this Factory agent are delivered into its Droid session by the Factory worker; check_relay_inbox does not serve Factory agents. Read the conversation with read_relay_conversation as=<this agent>.";
+export const CAPY_REPLY_GUIDANCE = "Replies are addressed to the bound Capy thread. This receipt does not confirm delivery or reading.";
 export const DESKTOP_REPLY_GUIDANCE = "replies will be injected into your session by Agent Relay Desktop";
 export const MANAGED_AS_REFUSED = "This managed chat can only act as its verified desktop identity.";
 export const MANAGED_JOIN_REFUSED = "This chat can only use its verified desktop identity.";
@@ -218,7 +222,7 @@ export function relayFailure(error: unknown, operation?: RelayToolOperation) {
 // The per-request relay service.
 
 /** `desktop` marks a synced Agent Relay Desktop identity; its deliveries are injected, not polled. */
-type Identity = { name: string; token: string; desktop?: boolean; factory?: boolean };
+type Identity = { name: string; token: string; desktop?: boolean; factory?: boolean; capy?: boolean };
 type DesktopActor = LinkedDesktopIdentity & { desktop: true };
 /**
  * `remotePresent` and the ownership checks come from the token or, when
@@ -347,7 +351,7 @@ function createRelayService(context: McpContext) {
   }
 
   function ownsRemote(remote: { metadata: Record<string, unknown> }): boolean {
-    return remote.metadata.source === HOSTED_SOURCE && remote.metadata.cloud_workspace_id === workspaceId
+    return !isCapyBindingIdentity(remote.metadata) && remote.metadata.source === HOSTED_SOURCE && remote.metadata.cloud_workspace_id === workspaceId
       && remote.metadata.owner_hash === owner;
   }
 
@@ -644,10 +648,27 @@ function createRelayService(context: McpContext) {
     return { name: found.name, token: found.token, factory: true };
   }
 
-  /** The linked Desktop identity, else the participant `as` names or this session's, auto-joining this session when it has none. Only send opts into the Factory hook. */
+  const capyFallback = (as: string | undefined): as is string => Boolean(
+    as?.startsWith("capy-") && !managed && !oauth && context.capy);
+
+  async function capyActor(as: string): Promise<Identity> {
+    const found = await context.capy!.agentFor(workspaceId, userId, as);
+    if (!found || found.name !== as || !found.token) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
+    // agentFor resolves current custody. The recipient was resolved using this
+    // request's admitted route: never mix it with a newly rebound workspace.
+    const route = (await database.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
+      "SELECT relaycast_workspace_id,relaycast_api_key_ciphertext FROM workspaces WHERE id=$1 AND organization_id=$2",
+      [workspaceId,organizationId])).rows[0];
+    if (!route || route.relaycast_workspace_id !== relayWorkspaceId ||
+        decryptSecret(route.relaycast_api_key_ciphertext,keyring) !== key) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
+    return { name: found.name, token: found.token, capy: true };
+  }
+
+  /** Native provider identities never become participant rows. Only send opts into Capy. */
   async function hostedActor<T>(as: string | undefined, fn: (identity: Identity) => Promise<T>,
-    options: { factory?: boolean } = {}): Promise<T> {
-    const viaFactory = options.factory === true && factoryFallback(as);
+    options: { factory?: boolean; capy?: boolean } = {}): Promise<T> {
+    const viaCapy = options.capy === true && capyFallback(as);
+    const viaFactory = !viaCapy && options.factory === true && factoryFallback(as);
     if (managed) {
       await managedActorOnly(as);
       return fn(await desktop());
@@ -656,7 +677,8 @@ function createRelayService(context: McpContext) {
       const linkedIdentity = await linkedDesktop();
       if (linkedIdentity) return fn(linkedIdentity);
     }
-    let hosted = await participant(as, { allowMissing: Boolean(oauth) || viaFactory });
+    let hosted = await participant(as, { allowMissing: Boolean(oauth) || viaFactory || viaCapy });
+    if (!hosted && viaCapy) return fn(await capyActor(as));
     if (!hosted && viaFactory) return fn(await factoryActor(as));
     if (!hosted) {
       await join({});
@@ -887,6 +909,12 @@ function createRelayService(context: McpContext) {
             return found!;
           })() : Promise.resolve(null),
         ]);
+        // Parent/address reads may cross a disconnect or key rotation. Resolve
+        // the same binding again immediately before the external write.
+        if (identity.capy) {
+          const current = await capyActor(identity.name);
+          if (current.token !== identity.token) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
+        }
         let sent;
         if (input.reply_to) {
           sent = await client.replyToMessage({ token: identity.token, parentId: input.reply_to, text: input.text, idempotencyKey });
@@ -902,9 +930,10 @@ function createRelayService(context: McpContext) {
           delivery: peer.online ? "queued_unconfirmed" : "queued_offline",
           note: "Accepted by Relaycast; delivery and reading are not confirmed.",
           ...(identity.desktop ? { reply_guidance: DESKTOP_REPLY_GUIDANCE }
+            : identity.capy ? { reply_guidance: CAPY_REPLY_GUIDANCE }
             : identity.factory ? { reply_guidance: FACTORY_REPLY_GUIDANCE }
             : { reply_guidance: HOSTED_REPLY_GUIDANCE, desktop_relay_guidance: DESKTOP_RELAY_GUIDANCE }) };
-      }, { factory: true });
+      }, { factory: true, capy: true });
     },
 
     async read(input: { agent: string; as?: string; before?: string; limit: number }) {

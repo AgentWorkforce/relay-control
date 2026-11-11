@@ -1,3 +1,4 @@
+import type { CapyBindings } from "../capy/bindings.js";
 import type { AmpDeps } from "../amp/service.js";
 import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import type { SelfhostConfig } from "../config.js";
@@ -62,6 +63,8 @@ export type McpContext = {
   launch?: boolean;
   /** Factory sessions (SELFHOST_FACTORY_ENABLED); absent when the feature is off. */
   factory?: FactoryMcpDeps;
+  /** Internal native send resolver; absent until a complete Capy module is mounted. */
+  capy?: Pick<CapyBindings, "agentFor">;
   /** Where shared-session read calls are audited (src/mcp/read-audit.ts); absent writes nothing. */
   readAudit?: {
     database: SqlExecutor;
