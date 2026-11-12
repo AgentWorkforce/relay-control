@@ -11,13 +11,13 @@ const annotations = { readOnlyHint: true, destructiveHint: false, idempotentHint
 const unsupported = "The selected backend does not support recorded session summaries (unsupported_by_backend).";
 
 // Read only recorded summaries, never the generic `summary` field (which can
-// be a task title). Required nullable fields distinguish unavailable contracts
-// from a recorded row with no generated summary yet.
+// be a task title). Omitted fields stay unknown, distinct from a recorded
+// row with no generated summary yet, without hiding the session metadata.
 const listPage = z.object({
   sessions: z.array(z.object({
     sessionId: id, source: id, userIds: z.array(id), projectId: z.string().nullable(),
-    lastTs: timestamp, shortSummary: z.string().max(1000).nullable(),
-    shortSummaryGeneratedAt: timestamp.nullable(),
+    lastTs: timestamp, shortSummary: z.string().max(1000).nullish(),
+    shortSummaryGeneratedAt: timestamp.nullish(),
     catalog: z.object({ repoUrl: z.string().nullable(), gitBranch: z.string().nullable() }).optional(),
   })).max(50),
   nextCursor: cursor.nullable(),
@@ -27,6 +27,7 @@ const session = z.object({
   session_id: z.string(), source: z.string(), owner: z.array(owner),
   project: z.string().nullable(), repo: z.string().nullable(), branch: z.string().nullable(),
   last_active: timestamp, short_summary: z.string().nullable(),
+  short_summary_status: z.enum(["available", "empty", "unsupported"]),
   short_summary_generated_at: timestamp.nullable(), citation_url: z.string().url(),
 });
 
@@ -77,8 +78,10 @@ export function registerSessionSummaries(server: McpServer, context: McpContext)
         session_id: row.sessionId, source: row.source,
         owner: row.userIds.map(userId => ({ user_id: userId, name: names.get(userId) ?? null })),
         project: row.projectId, repo: row.catalog?.repoUrl ?? null, branch: row.catalog?.gitBranch ?? null,
-        last_active: row.lastTs, short_summary: row.shortSummary,
-        short_summary_generated_at: row.shortSummaryGeneratedAt,
+        last_active: row.lastTs, short_summary: row.shortSummary ?? null,
+        short_summary_status: row.shortSummary === undefined || row.shortSummaryGeneratedAt === undefined ? "unsupported"
+          : row.shortSummary === null ? "empty" : "available",
+        short_summary_generated_at: row.shortSummaryGeneratedAt ?? null,
         citation_url: sessionCitation(context.origin, row.sessionId, row.source),
       })), next_cursor: page.nextCursor });
       noteResultOwners(result, selected.map(row => ({ sessionId: row.sessionId, source: row.source, userIds: row.userIds })));
@@ -97,8 +100,7 @@ export function registerSessionSummaries(server: McpServer, context: McpContext)
     try {
       if (input.kind === "long") throw new SharedSessionsToolError("Long session summaries are not available yet (unsupported_by_backend). Use get_shared_session for a bounded transcript page.");
       if (!input.source) throw new SharedSessionsToolError("Pass the session source from list_session_summaries (for example codex or claude). A summary source cannot be inferred.");
-      const params = new URLSearchParams({ kind: input.kind });
-      if (input.source) params.set("source", input.source);
+      const params = new URLSearchParams({ kind: input.kind, source: input.source });
       const body = await context.readHistory(`/v1/sessions/${encodeURIComponent(input.session_id)}/summary?${params}`);
       const summary = body !== null && typeof body === "object" && !Array.isArray(body)
         ? recordedSummary(body as Record<string, unknown>) : null;

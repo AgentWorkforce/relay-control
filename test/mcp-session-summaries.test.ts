@@ -5,7 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpContext } from "../src/mcp/context.js";
 import { registerSharedSessionReads } from "../src/mcp/shared-session-reads.js";
-import { resultSessionsOf, AUDITED_READ_TOOLS } from "../src/mcp/read-audit.js";
+import { resultSessionsOf, buildReadAuditRecord, AUDITED_READ_TOOLS } from "../src/mcp/read-audit.js";
 import { SHARED_SESSION_READ_TOOLS } from "../src/mcp/catalog.js";
 
 const ts = "2026-11-12T12:00:00.000Z";
@@ -53,7 +53,7 @@ test("list reads one bounded directory page and preserves recorded provenance, o
   assert.equal(f.paths.length, 1, "no per-session reads or transcript scan");
   assert.deepEqual(value.sessions[0], { session_id: "fake/session", source: "codex", owner: [{ user_id: "user-a", name: "Example User" }, { user_id: "former-user", name: null }],
     project: "fake-project", repo: "https://example.test/org/repo", branch: "feature/test", last_active: ts,
-    short_summary: row().shortSummary, short_summary_generated_at: ts,
+    short_summary: row().shortSummary, short_summary_status: "available", short_summary_generated_at: ts,
     citation_url: "https://relay.example.test/dashboard/sessions/fake%2Fsession?source=codex" });
   assert.equal(value.next_cursor, "b96l1:opaque-page");
   assert.deepEqual(resultSessionsOf("list_session_summaries", value), { count: 1, truncated: false,
@@ -64,8 +64,14 @@ test("list never substitutes a task title for an absent recorded summary", async
   const f = await fixture(t, { body: { sessions: [{ ...row(), shortSummary: null, shortSummaryGeneratedAt: null, summary: "Task title", taskTitle: "Not a summary" }], nextCursor: null } });
   const value = data(await call(f.client, "list_session_summaries"));
   assert.equal(value.sessions[0].short_summary, null); assert.equal(value.sessions[0].short_summary_generated_at, null);
-  const legacy = await fixture(t, { body: { sessions: [{ sessionId: "old", source: "codex", summary: "Task title" }], nextCursor: null } });
-  assert.match(JSON.stringify(await call(legacy.client, "list_session_summaries")), /unsupported_by_backend/);
+  assert.equal(value.sessions[0].short_summary_status, "empty");
+  const { shortSummary, shortSummaryGeneratedAt, ...metadata } = row();
+  const legacy = await fixture(t, { body: { sessions: [{ ...metadata, summary: "Task title" }], nextCursor: null } });
+  const unknown = data(await call(legacy.client, "list_session_summaries")).sessions[0];
+  assert.equal(unknown.session_id, row().sessionId);
+  assert.equal(unknown.short_summary, null); assert.equal(unknown.short_summary_generated_at, null);
+  assert.equal(unknown.short_summary_status, "unsupported");
+  assert.equal(legacy.paths.length, 1, "missing summary fields never trigger a fallback or detail scan");
 });
 
 test("repo filtering preserves pagination, including an empty filtered page", async t => {
@@ -124,4 +130,17 @@ test("unsupported long summaries never fetch or silently return a short summary 
   const result = await call(f.client, "get_session_summary", { session_id: "fake", kind: "long" });
   assert.equal(result.isError, true); assert.match(JSON.stringify(result), /unsupported_by_backend/);
   assert.deepEqual(f.paths, []);
+});
+
+test("summary audit retains recorded owner IDs without persisting a raw person lookup or summary text", async t => {
+  const f = await fixture(t);
+  const result = await call(f.client, "list_session_summaries", { person: "fake@example.test" });
+  const context = { ...f.context, principal: { userId: "caller" }, authMode: "cli_login", desktopCall: { required: false },
+    relay: { sessionId: undefined } } as unknown as McpContext;
+  const record = buildReadAuditRecord({ context, toolName: "list_session_summaries", args: { person: "fake@example.test", repo: "repo" },
+    result: result as any, startedAt: Date.now(), now: null });
+  assert.deepEqual(record.filters, { repo: "repo" });
+  assert.deepEqual(record.resultSessions[0]!.owner_user_ids, ["former-user", "user-a"]);
+  assert.ok(!JSON.stringify(record).includes("fake@example.test"));
+  assert.ok(!JSON.stringify(record).includes(row().shortSummary));
 });

@@ -8,8 +8,8 @@ assigned at release.
 - Added: plain MCP `list_session_summaries` and `get_session_summary` tools
   for recorded summaries, workspace-scoped citations and owners. List pages
   are bounded to 50; summaries are never synthesized from task titles or
-  transcripts. Reader contracts without recorded summary fields and long
-  summaries report unsupported. Both tools join the shared-session read audit.
+  transcripts. Missing list summary fields stay null with explicit unsupported
+  status; long summaries report unsupported. Both tools join the read audit.
 
 ## 0.5.20 (2026-11-12)
 

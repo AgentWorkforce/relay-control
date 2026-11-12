@@ -99,7 +99,7 @@ function identityOf(context: McpContext) {
 /** Request filters worth keeping for the ledger: never content, never the cursor value. */
 function filtersOf(input: Record<string, unknown>): Record<string, string | boolean> {
   const filters: Record<string, string | boolean> = {};
-  for (const key of ["source", "project", "repo", "since", "until", "user_id", "person", "kind", "focus_timestamp", "order"]) {
+  for (const key of ["source", "project", "repo", "since", "until", "user_id", "kind", "focus_timestamp", "order"]) {
     const value = bounded(input[key], MAX_FILTER_LENGTH);
     if (value !== null) filters[key] = value;
   }

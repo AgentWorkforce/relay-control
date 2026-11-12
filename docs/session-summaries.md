@@ -20,17 +20,19 @@ Keep filters unchanged when following that cursor.
 
 Each result has `session_id`, `source`, `owner` (an array, since sessions may
 have several recorded owners), `project`, `repo`, `branch`, `last_active`,
-`short_summary`, `short_summary_generated_at` and `citation_url`. Owner IDs
+`short_summary`, `short_summary_generated_at`, `short_summary_status` and `citation_url`. Owner IDs
 come from the session row; names are resolved from workspace membership and
 are null when unavailable. Missing repository metadata stays null.
 
-The reader must expose nullable `shortSummary` and
-`shortSummaryGeneratedAt` fields on list rows. Readers that omit those
-fields report `unsupported_by_backend`. The current reader omits them for
-compatibility with older clients; an upstream opt-in extension is required
-before this list can return recorded summaries. A null recorded summary remains
-null: task titles, the generic list `summary` field and transcript content
-are never substituted. The list tool makes no per-session detail calls.
+Readers can expose nullable `shortSummary` and `shortSummaryGeneratedAt`
+fields on list rows. When either field is omitted, its output is null and
+`short_summary_status` is `unsupported`; session metadata remains usable.
+When both fields are present, the status is `empty` for a null summary and
+`available` for recorded text. The current reader omits the fields for
+compatibility with older clients; an upstream opt-in extension is needed
+for recorded list summaries. Null stays null: task titles, the generic list
+`summary` field and transcript content are never substituted. The list tool
+makes no per-session detail calls.
 
 ## Read one summary
 
@@ -63,5 +65,6 @@ different backend after a reader refusal. `401`, `403`, `404`, `501`, transient
 errors and missing attestation preserve existing fail-closed behavior.
 
 Calls are recorded in `shared_session_read_audit`, including filters and
-returned session/owner IDs, never summary text. No migration or new feature
+returned session/owner IDs, never summary text or the raw person name/email
+lookup. No migration or new feature
 flag is required for these tools.
