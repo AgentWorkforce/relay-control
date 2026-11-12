@@ -562,6 +562,20 @@ key back to Relaycast one generation above the rotation, then restores every
 backed-up ciphertext that has not changed since the run; restored agent tokens
 work for as long as the legacy grace lasts.
 
+The backups hold old Relaycast credential ciphertexts, so delete them once
+the cutover is done and undo is no longer wanted:
+
+```sh
+agent-relay-selfhost-relaycast-rekey --purge <run-id>            # preview: counts only, deletes nothing
+agent-relay-selfhost-relaycast-rekey --purge <run-id> --confirm  # delete the run's backups
+```
+
+The preview reports, per run, how many backed-up rows still hold the run's
+new value (`live`: undo could still restore them), were rewritten since
+(`changed`), no longer exist (`gone`) or were already restored by `--undo`.
+Only `--confirm` deletes, and after it `--undo` for that run is impossible.
+Purge does not need `RELAYCAST_INTERNAL_SECRET` and logs counts only.
+
 ### Deleting a workspace
 
 `DELETE /api/v1/organizations/{organizationId}/workspaces/{workspaceId}`

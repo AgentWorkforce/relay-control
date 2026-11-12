@@ -6,6 +6,7 @@ import { migrate } from "../src/migrations.js";
 import {
   loadRekeyEnv,
   parseRekeyArgs,
+  purgeRelaycastRekey,
   rekeyRelaycastCredentials,
   TOKEN_SOURCES,
   undoRelaycastRekey,
@@ -437,6 +438,10 @@ test("CLI arguments carry no secret and environment errors name variables only",
   assert.throws(() => parseRekeyArgs(["--internal-secret", "x"]), /unknown argument --internal-secret/);
   assert.throws(() => parseRekeyArgs(["rk_live_pasted"]), (error: Error) => !error.message.includes("rk_live_pasted"));
   assert.throws(() => parseRekeyArgs(["--undo", "r", "--dry-run"]), /--undo takes no/);
+  assert.deepEqual(parseRekeyArgs(["--purge", "r"]), { mode: "purge", runId: "r", confirm: false });
+  assert.deepEqual(parseRekeyArgs(["--purge", "r", "--confirm"]), { mode: "purge", runId: "r", confirm: true });
+  assert.throws(() => parseRekeyArgs(["--purge", "r", "--undo", "r"]), /--purge takes only --confirm/);
+  assert.throws(() => parseRekeyArgs(["--confirm"]), /--confirm applies only to --purge/);
   assert.throws(() => parseRekeyArgs(["--grace-ms", "-1"]), /needs a value|non-negative/);
 
   const env = {
@@ -452,4 +457,45 @@ test("CLI arguments carry no secret and environment errors name variables only",
   assert.equal(loaded.internalSecret, INTERNAL_SECRET);
   assert.deepEqual(loaded.relaycastOrigins, [RELAYCAST_URL, PUBLIC_URL]);
   assert.equal(loadRekeyEnv(env, false).internalSecret, null);
+});
+
+test("purge without --confirm only reports; with it the run's backups are deleted", async (t) => {
+  const f = await fixture(t);
+  const run = await rekeyRelaycastCredentials(f.deps);
+  // One row rewritten since the run, one row gone.
+  await f.database.query("UPDATE amp_bindings SET token_ciphertext = $2 WHERE id = $1", [f.ids.amp, f.enc("ar_ag_later")]);
+  await f.database.query("DELETE FROM factory_bindings WHERE id = $1", [f.ids.factory]);
+  const count = async () => (await f.database.query<{ count: number }>(
+    "SELECT count(*)::int AS count FROM relaycast_rekey_backups WHERE run_id = $1", [run.runId],
+  )).rows[0]!.count;
+
+  const preview = await purgeRelaycastRekey(f.deps, run.runId!);
+  assert.deepEqual(preview, {
+    runId: run.runId, confirmed: false, backups: 11, live: 9, changed: 1, gone: 1, restored: 0, purged: 0,
+  });
+  assert.equal(await count(), 11);
+
+  const purged = await purgeRelaycastRekey(f.deps, run.runId!, { confirm: true });
+  assert.equal(purged.purged, 11);
+  assert.equal(await count(), 0);
+  await assert.rejects(undoRelaycastRekey(f.deps, run.runId!), /No relaycast rekey backups/);
+  await assert.rejects(purgeRelaycastRekey(f.deps, run.runId!, { confirm: true }), /No relaycast rekey backups/);
+  await assert.rejects(purgeRelaycastRekey(f.deps, "not-a-uuid"), /--purge must be a run id/);
+
+  // Counts only: the purge log carries no ciphertext or credential.
+  const purgeLines = f.logs.filter((line) => line.includes("relaycast_rekey.purge"));
+  assert.equal(purgeLines.length, 2);
+  for (const line of purgeLines) {
+    for (const value of [...f.secrets, ...f.relaycast.upgrades.values()]) assert.ok(!line.includes(value));
+    assert.ok(!/v2\.k1\./.test(line));
+  }
+});
+
+test("purge counts rows restored by undo", async (t) => {
+  const f = await fixture(t);
+  const run = await rekeyRelaycastCredentials(f.deps);
+  await undoRelaycastRekey(f.deps, run.runId!);
+  const report = await purgeRelaycastRekey(f.deps, run.runId!, { confirm: true });
+  assert.equal(report.restored, 11);
+  assert.equal(report.purged, 11);
 });

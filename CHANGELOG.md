@@ -43,6 +43,10 @@ assigned at release.
   ciphertexts are kept in `relaycast_rekey_backups` (migration 0048). See
   README, "Re-keying Relaycast credentials".
 
+- Added: `agent-relay-selfhost-relaycast-rekey --purge <run-id> [--confirm]`
+  deletes a run's `relaycast_rekey_backups` after the cutover. Without
+  `--confirm` it only reports counts (live, changed, gone, restored).
+
 ## 0.5.20 (2026-11-12)
 
 - Added: `SELFHOST_DESKTOP_RELEASES_REPO` (owner/repository, unset by default)

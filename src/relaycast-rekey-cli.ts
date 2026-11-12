@@ -6,6 +6,7 @@
 //
 //   relaycast-rekey [--workspace <id>] [--dry-run] [--grace-ms <n>]
 //   relaycast-rekey --undo <run-id> [--grace-ms <n>]
+//   relaycast-rekey --purge <run-id> [--confirm]
 //
 // Exit 0: done with no failures. 1: at least one credential failed (the
 // others were still processed). 2: usage or configuration error.
@@ -14,6 +15,7 @@ import { PostgresDatabase } from "./database.js";
 import {
   loadRekeyEnv,
   parseRekeyArgs,
+  purgeRelaycastRekey,
   rekeyRelaycastCredentials,
   REKEY_USAGE,
   undoRelaycastRekey,
@@ -46,7 +48,7 @@ async function main(argv: readonly string[], env: Env): Promise<number> {
       console.log(REKEY_USAGE);
       return 0;
     }
-    config = loadRekeyEnv(env, !(args.mode === "rekey" && args.dryRun));
+    config = loadRekeyEnv(env, args.mode === "undo" || (args.mode === "rekey" && !args.dryRun));
   } catch (error) {
     // Configuration and usage errors name variables and flags, never values.
     console.error(JSON.stringify({ event: "relaycast_rekey.usage_error", error: error instanceof Error ? error.message : "invalid" }));
@@ -58,6 +60,11 @@ async function main(argv: readonly string[], env: Env): Promise<number> {
   const database = new PostgresDatabase(databaseUrl);
   try {
     const deps: RekeyDeps = { ...rest, database, log };
+    if (args.mode === "purge") {
+      // Without --confirm this is a preview; the counts are already logged.
+      await purgeRelaycastRekey(deps, args.runId, { confirm: args.confirm });
+      return 0;
+    }
     const report = args.mode === "undo"
       ? await undoRelaycastRekey(deps, args.runId, args.graceMs === undefined ? {} : { workspaceKeyGraceMs: args.graceMs })
       : await rekeyRelaycastCredentials(deps, {

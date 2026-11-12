@@ -582,13 +582,87 @@ export async function undoRelaycastRekey(
   return report;
 }
 
+export type PurgeReport = {
+  runId: string;
+  confirmed: boolean;
+  /** Backups of the run, by state of the row they came from. */
+  backups: number;
+  /** The row still holds the run's new value: undo could still restore it. */
+  live: number;
+  /** The row was rewritten since the run; undo would refuse it anyway. */
+  changed: number;
+  /** The row no longer exists. */
+  gone: number;
+  /** Already put back by --undo. */
+  restored: number;
+  purged: number;
+};
+
+/**
+ * Deletes a run's backups once the cutover is done and they are no longer
+ * wanted: they hold old Relaycast credential ciphertexts, and after the purge
+ * `--undo` for that run is impossible. Without `confirm` it only reports what
+ * it would delete. Counts only; nothing secret is read into the log.
+ */
+export async function purgeRelaycastRekey(
+  deps: Pick<RekeyDeps, "database" | "log">,
+  runId: string,
+  options: { confirm?: boolean } = {},
+): Promise<PurgeReport> {
+  if (!UUID.test(runId)) throw new Error("--purge must be a run id (uuid)");
+  const confirmed = options.confirm === true;
+  return deps.database.transaction(async (tx) => {
+    const { rows } = await tx.query<BackupRow & { restored: boolean }>(
+      `SELECT id::text AS id, table_name, row_id, column_name, kind, new_ciphertext,
+              restored_at IS NOT NULL AS restored
+         FROM relaycast_rekey_backups
+        WHERE run_id = $1
+        FOR UPDATE`,
+      [runId],
+    );
+    if (rows.length === 0) throw new Error("No relaycast rekey backups for that run id");
+    const report: PurgeReport = { runId, confirmed, backups: rows.length, live: 0, changed: 0, gone: 0, restored: 0, purged: 0 };
+    for (const row of rows) {
+      if (row.restored) {
+        report.restored += 1;
+        continue;
+      }
+      if (!sourceFor(row.table_name, row.column_name)) throw new Error("Backup names an unknown table or column");
+      const current = await tx.query<{ value: string | null }>(
+        `SELECT ${row.column_name} AS value FROM ${row.table_name} WHERE id = $1::uuid`,
+        [row.row_id],
+      );
+      if (current.rows.length === 0) report.gone += 1;
+      else if (current.rows[0]!.value === row.new_ciphertext) report.live += 1;
+      else report.changed += 1;
+    }
+    if (confirmed) {
+      const deleted = await tx.query("DELETE FROM relaycast_rekey_backups WHERE run_id = $1 RETURNING id", [runId]);
+      report.purged = deleted.rows.length;
+    }
+    deps.log?.("relaycast_rekey.purge", {
+      run_id: runId,
+      confirmed,
+      backups: report.backups,
+      live: report.live,
+      changed: report.changed,
+      gone: report.gone,
+      restored: report.restored,
+      purged: report.purged,
+    });
+    return report;
+  });
+}
+
 export type RekeyArgs =
   | { mode: "rekey"; workspaceId?: string; dryRun: boolean; graceMs?: number }
   | { mode: "undo"; runId: string; graceMs?: number }
+  | { mode: "purge"; runId: string; confirm: boolean }
   | { mode: "help" };
 
 export const REKEY_USAGE = `usage: relaycast-rekey [--workspace <id>] [--dry-run] [--grace-ms <n>]
        relaycast-rekey --undo <run-id> [--grace-ms <n>]
+       relaycast-rekey --purge <run-id> [--confirm]
 
 Reads DATABASE_URL, RELAYCAST_URL, RELAYCAST_PUBLIC_URL (optional),
 RELAYCAST_INTERNAL_SECRET and SELFHOST_ENCRYPTION_KEY* (each secret also as
@@ -598,7 +672,9 @@ export function parseRekeyArgs(argv: readonly string[]): RekeyArgs {
   let workspaceId: string | undefined;
   let runId: string | undefined;
   let graceMs: number | undefined;
+  let purgeRunId: string | undefined;
   let dryRun = false;
+  let confirm = false;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
     const value = (): string => {
@@ -611,6 +687,8 @@ export function parseRekeyArgs(argv: readonly string[]): RekeyArgs {
     else if (arg === "--dry-run") dryRun = true;
     else if (arg === "--workspace") workspaceId = value();
     else if (arg === "--undo") runId = value();
+    else if (arg === "--purge") purgeRunId = value();
+    else if (arg === "--confirm") confirm = true;
     else if (arg === "--grace-ms") {
       const raw = value();
       if (!/^\d+$/.test(raw)) throw new Error("--grace-ms must be a non-negative integer");
@@ -620,6 +698,13 @@ export function parseRekeyArgs(argv: readonly string[]): RekeyArgs {
       throw new Error(/^--[a-z-]{1,32}$/.test(arg) ? `unknown argument ${arg}` : "unexpected positional argument");
     }
   }
+  if (purgeRunId !== undefined) {
+    if (runId !== undefined || workspaceId !== undefined || dryRun || graceMs !== undefined) {
+      throw new Error("--purge takes only --confirm");
+    }
+    return { mode: "purge", runId: purgeRunId, confirm };
+  }
+  if (confirm) throw new Error("--confirm applies only to --purge");
   if (runId !== undefined) {
     if (workspaceId !== undefined || dryRun) throw new Error("--undo takes no --workspace or --dry-run");
     return { mode: "undo", runId, ...(graceMs === undefined ? {} : { graceMs }) };
