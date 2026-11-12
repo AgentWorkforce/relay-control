@@ -34,6 +34,9 @@ function fakeRelaycast() {
   const failUpgrade = new Map<string, { status: number; code: string }>();
   const failRotation = new Map<string, { status: number; code: string }>();
   let beforeUpgrade: ((legacy: string) => Promise<void>) | undefined;
+  /** Relaycast workspaces whose next key push applies and then loses its answer. */
+  const dropAnswerAfterPush = new Set<string>();
+  let capabilitiesStatus = 200;
   const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
   const fetch = async (input: string, init: RequestInit): Promise<Response> => {
     const url = new URL(input);
@@ -41,6 +44,12 @@ function fakeRelaycast() {
     const bearer = String((init.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /, "");
     const body = JSON.parse(String(init.body ?? "{}")) as Record<string, unknown>;
     calls.push({ path: url.pathname, bearer, body });
+    if (url.pathname === "/internal/capabilities") {
+      if (bearer !== INTERNAL_SECRET || capabilitiesStatus !== 200) {
+        return json(capabilitiesStatus === 200 ? 401 : capabilitiesStatus, { ok: false, error: { code: capabilitiesStatus === 200 ? "unauthorized" : "unavailable", message: "no" } });
+      }
+      return json(200, { ok: true, data: { workspace_admin: { rotate: true } } });
+    }
     const rotate = /^\/internal\/workspaces\/([^/]+)\/api-key$/.exec(url.pathname);
     if (rotate) {
       if (bearer !== INTERNAL_SECRET) return json(401, { ok: false, error: { code: "unauthorized", message: "Invalid internal token" } });
@@ -54,11 +63,16 @@ function fakeRelaycast() {
         currentKeys.set(id, apiKey);
         return json(200, { ok: true, data: { workspace_id: id, api_key_generation: stored + 1, api_key: apiKey } });
       }
+      // Engine semantics: re-pushing the live key is an idempotent no-op.
+      if (currentKeys.get(id) === body.api_key) {
+        return json(200, { ok: true, data: { workspace_id: id, api_key_generation: stored } });
+      }
       if (typeof body.key_generation !== "number" || body.key_generation <= stored) {
         return json(409, { ok: false, error: { code: "stale_key_generation", message: "stale" } });
       }
       generations.set(id, body.key_generation);
       currentKeys.set(id, String(body.api_key));
+      if (dropAnswerAfterPush.delete(id)) throw new TypeError("fetch failed");
       return json(200, { ok: true, data: { workspace_id: id, api_key_generation: body.key_generation } });
     }
     if (url.pathname === "/v1/credentials/upgrade") {
@@ -76,7 +90,8 @@ function fakeRelaycast() {
     return json(404, { ok: false, error: { code: "not_found", message: "Route not found" } });
   };
   return {
-    fetch, calls, upgrades, currentKeys, generations, failUpgrade, failRotation,
+    fetch, calls, upgrades, currentKeys, generations, failUpgrade, failRotation, dropAnswerAfterPush,
+    setCapabilitiesStatus(status: number) { capabilitiesStatus = status; },
     setBeforeUpgrade(hook: (legacy: string) => Promise<void>) { beforeUpgrade = hook; },
   };
 }
@@ -374,7 +389,7 @@ test("undo restores every replaced ciphertext and pushes the old workspace key b
   assert.equal(undo.failed, 0);
   assert.equal(undo.items.filter((item) => item.outcome === "restored").length, 3 + 8);
   assert.deepEqual(await f.snapshot(), before);
-  const pushes = f.relaycast.calls.filter((call) => call.path.startsWith("/internal/"));
+  const pushes = f.relaycast.calls.filter((call) => call.path.startsWith("/internal/workspaces/"));
   assert.equal(pushes.length, 2);
   const primary = pushes.find((call) => call.path.includes(RC_WS + "/"))!;
   assert.deepEqual(primary.body, { api_key: f.legacyKey, key_generation: 2, grace_ms: 3_600_000 });
@@ -390,18 +405,118 @@ test("undo restores every replaced ciphertext and pushes the old workspace key b
   assert.equal(f.dec(await f.read("amp_bindings", "token_ciphertext", f.ids.amp!)), f.relaycast.upgrades.get(f.tokens.amp!));
 });
 
-test("undo leaves a row changed since the run and reports it", async (t) => {
+test("undo refuses the whole run when any row changed since, before touching Relaycast", async (t) => {
   const f = await fixture(t);
   const run = await rekeyRelaycastCredentials(f.deps);
-  const changed = f.enc("ar_ag_written_later");
-  await f.database.query("UPDATE amp_bindings SET token_ciphertext = $2 WHERE id = $1", [f.ids.amp, changed]);
+  const after = await f.snapshot();
+  // An operator replaced one workspace's key after the re-key.
+  const changed = f.enc("ar_ws_replaced_later");
+  await f.database.query("UPDATE workspaces SET relaycast_api_key_ciphertext = $2 WHERE id = $1", [f.otherWorkspace, changed]);
+  const generationBefore = new Map(f.relaycast.generations);
+  f.relaycast.calls.length = 0;
+
   const undo = await undoRelaycastRekey(f.deps, run.runId!);
-  assert.equal(undo.failed, 1);
-  assert.deepEqual(undo.items.find((item) => item.outcome === "failed"), {
-    table: "amp_bindings", column: "token_ciphertext", rowId: f.ids.amp, kind: "agent", outcome: "failed", code: "concurrent_change",
-  });
-  assert.equal(await f.read("amp_bindings", "token_ciphertext", f.ids.amp!), changed);
+  assert.equal(undo.failed, 11);
+  assert.equal(undo.items.find((item) => item.rowId === f.otherWorkspace)?.code, "concurrent_change");
+  assert.ok(undo.items.filter((item) => item.rowId !== f.otherWorkspace).every((item) => item.code === "undo_refused"));
+  // Nothing changed anywhere: no push, no restore.
+  assert.equal(f.relaycast.calls.length, 0);
+  assert.deepEqual(f.relaycast.generations, generationBefore);
+  assert.deepEqual(await f.snapshot(), { ...after, [`ws:${f.otherWorkspace}`]: changed });
   await assert.rejects(undoRelaycastRekey(f.deps, randomUUID()), /No relaycast rekey backups/);
+});
+
+test("undo validates --grace-ms before reading or changing anything", async (t) => {
+  const f = await fixture(t);
+  const run = await rekeyRelaycastCredentials(f.deps);
+  const after = await f.snapshot();
+  f.relaycast.calls.length = 0;
+  for (const grace of [3_600_001, -1, 1.5]) {
+    await assert.rejects(undoRelaycastRekey(f.deps, run.runId!, { workspaceKeyGraceMs: grace }), /--grace-ms must be an integer/);
+  }
+  assert.equal(f.relaycast.calls.length, 0);
+  assert.deepEqual(await f.snapshot(), after);
+});
+
+test("undo refuses an unreadable backup or an unreachable Relaycast without a partial restore", async (t) => {
+  const f = await fixture(t);
+  const run = await rekeyRelaycastCredentials(f.deps);
+  const after = await f.snapshot();
+
+  f.relaycast.setCapabilitiesStatus(503);
+  const unreachable = await undoRelaycastRekey(f.deps, run.runId!);
+  assert.equal(unreachable.failed, 11);
+  assert.equal(unreachable.items.filter((item) => item.kind === "workspace").every((item) => item.code === "unavailable"), true);
+  assert.deepEqual(await f.snapshot(), after);
+  f.relaycast.setCapabilitiesStatus(200);
+
+  // The keyring that wrote one old token is gone.
+  await f.database.query(
+    "UPDATE relaycast_rekey_backups SET old_ciphertext = $2 WHERE run_id = $1 AND table_name = 'person_identities' AND row_id = $3",
+    [run.runId, encryptSecret(f.tokens.person!, { id: "gone", key: Buffer.alloc(32, 1) }), f.ids.person],
+  );
+  const unreadable = await undoRelaycastRekey(f.deps, run.runId!);
+  assert.equal(unreadable.failed, 11);
+  assert.equal(unreadable.items.find((item) => item.rowId === f.ids.person)?.code, "ciphertext_unknown_key");
+  assert.deepEqual(await f.snapshot(), after);
+  assert.equal(f.relaycast.calls.filter((call) => call.path.startsWith("/internal/workspaces/") && "api_key" in call.body).length, 0);
+});
+
+test("undo whose key push landed but whose answer was lost restores nothing and succeeds on retry", async (t) => {
+  const f = await fixture(t);
+  const before = await f.snapshot();
+  const run = await rekeyRelaycastCredentials(f.deps);
+  const after = await f.snapshot();
+  // The second Relaycast workspace's push applies upstream, then the
+  // connection drops: the transaction rolls back every row.
+  f.relaycast.dropAnswerAfterPush.add(RC_WS_OTHER);
+  const first = await undoRelaycastRekey(f.deps, run.runId!);
+  assert.equal(first.failed, 11);
+  assert.ok(first.items.every((item) => item.code === "relaycast_unreachable"));
+  assert.deepEqual(await f.snapshot(), after);
+  assert.equal(f.relaycast.currentKeys.get(RC_WS_OTHER), f.otherKey);
+
+  // A retry re-pushes the same generation; Relaycast accepts its live key again.
+  const retry = await undoRelaycastRekey(f.deps, run.runId!);
+  assert.equal(retry.failed, 0);
+  assert.deepEqual(await f.snapshot(), before);
+  assert.equal(f.relaycast.currentKeys.get(RC_WS), f.legacyKey);
+  assert.equal(f.relaycast.currentKeys.get(RC_WS_OTHER), f.otherKey);
+});
+
+test("overlapping rekey runs rotate each Relaycast workspace once and store the key Relaycast holds", async (t) => {
+  const f = await fixture(t);
+  const [a, b] = await Promise.all([rekeyRelaycastCredentials(f.deps), rekeyRelaycastCredentials(f.deps)]);
+  assert.equal(a.failed + b.failed, 0);
+  const rotations = f.relaycast.calls.filter((call) => call.path.startsWith("/internal/workspaces/"));
+  assert.equal(rotations.length, 2);
+  for (const [id, relaycastId] of [[f.workspace, RC_WS], [f.sharedWorkspace, RC_WS], [f.otherWorkspace, RC_WS_OTHER]] as const) {
+    assert.equal(f.dec(await f.workspaceKey(id)), f.relaycast.currentKeys.get(relaycastId));
+  }
+  const { rows } = await f.database.query<{ relaycast_workspace_id: string; key_generation: string }>(
+    "SELECT relaycast_workspace_id, key_generation::text FROM relaycast_rekey_backups WHERE kind = 'workspace'",
+  );
+  assert.equal(rows.length, 3);
+  for (const row of rows) assert.equal(Number(row.key_generation), f.relaycast.generations.get(row.relaycast_workspace_id));
+  const outcomes = [...a.items, ...b.items].filter((item) => item.kind === "workspace").map((item) => item.outcome).sort();
+  assert.deepEqual(outcomes, ["already_ar", "already_ar", "already_ar", "upgraded", "upgraded", "upgraded"]);
+  // Tokens upgraded by the other run count as done, with the same ar_ credential.
+  for (const name of ["person", "amp", "wake"]) {
+    const [table, column] = agentTables(f)[name]!;
+    assert.equal(f.dec(await f.read(table, column, f.ids[name]!)), f.relaycast.upgrades.get(f.tokens[name]!));
+  }
+});
+
+test("deleting a workspace deletes its rekey backups", async (t) => {
+  const f = await fixture(t);
+  const run = await rekeyRelaycastCredentials(f.deps);
+  const count = async () => (await f.database.query<{ count: number }>(
+    "SELECT count(*)::int AS count FROM relaycast_rekey_backups WHERE run_id = $1", [run.runId],
+  )).rows[0]!.count;
+  assert.equal(await count(), 11);
+  await f.database.query("DELETE FROM workspaces WHERE id = $1", [f.otherWorkspace]);
+  // Its workspace key and its person identity's token.
+  assert.equal(await count(), 9);
 });
 
 test("nothing secret reaches the log or the report", async (t) => {

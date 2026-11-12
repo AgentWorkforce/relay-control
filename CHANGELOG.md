@@ -46,6 +46,9 @@ assigned at release.
 - Added: `agent-relay-selfhost-relaycast-rekey --purge <run-id> [--confirm]`
   deletes a run's `relaycast_rekey_backups` after the cutover. Without
   `--confirm` it only reports counts (live, changed, gone, restored).
+  Workspace key rotations hold a per-Relaycast-workspace advisory lock, undo
+  is checked up front and restores all or nothing, backups are deleted with
+  their workspace, and the image links every package command onto `PATH`.
 
 ## 0.5.20 (2026-11-12)
 

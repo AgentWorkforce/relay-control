@@ -22,7 +22,8 @@ export type RekeyOutcome =
   | "would_upgrade"
   | "foreign"
   | "failed"
-  | "restored";
+  | "restored"
+  | "gone";
 
 export type RekeyItem = {
   table: string;
@@ -249,6 +250,8 @@ async function insertBackup(
     column: string;
     rowId: string;
     kind: RekeyKind;
+    /** relay-control workspace the row belongs to; the backup cascades with it. */
+    workspaceId: string | null;
     relaycastWorkspaceId: string | null;
     oldCiphertext: string;
     newCiphertext: string;
@@ -257,11 +260,11 @@ async function insertBackup(
 ): Promise<void> {
   await tx.query(
     `INSERT INTO relaycast_rekey_backups
-       (id, run_id, table_name, row_id, column_name, kind, relaycast_workspace_id,
+       (id, run_id, table_name, row_id, column_name, kind, workspace_id, relaycast_workspace_id,
         old_ciphertext, new_ciphertext, key_generation)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
     [
-      randomUUID(), runId, row.table, row.rowId, row.column, row.kind, row.relaycastWorkspaceId,
+      randomUUID(), runId, row.table, row.rowId, row.column, row.kind, row.workspaceId, row.relaycastWorkspaceId,
       row.oldCiphertext, row.newCiphertext, row.keyGeneration,
     ],
   );
@@ -281,12 +284,15 @@ async function swapCiphertext(
   rowId: string,
   expected: string,
   next: string,
+  relaycastWorkspaceId?: string,
 ): Promise<void> {
+  // A workspace row also keeps its Relaycast binding: a key rotated for one
+  // Relaycast workspace is never stored under another.
   const result = await tx.query(
     `UPDATE ${table} SET ${column} = $3${hasUpdatedAt ? ", updated_at = now()" : ""}
-      WHERE id = $1::uuid AND ${column} = $2
+      WHERE id = $1::uuid AND ${column} = $2${relaycastWorkspaceId === undefined ? "" : " AND relaycast_workspace_id = $4"}
       RETURNING id`,
-    [rowId, expected, next],
+    relaycastWorkspaceId === undefined ? [rowId, expected, next] : [rowId, expected, next, relaycastWorkspaceId],
   );
   if (result.rows.length !== 1) throw new RekeyFailure("concurrent_change");
 }
@@ -294,6 +300,17 @@ async function swapCiphertext(
 function sourceFor(table: string, column: string): { hasUpdatedAt: boolean } | null {
   if (table === WORKSPACE_SOURCE.table && column === WORKSPACE_SOURCE.column) return { hasUpdatedAt: true };
   return TOKEN_SOURCES.find((source) => source.table === table && source.column === column) ?? null;
+}
+
+/** Advisory lock namespace for one Relaycast workspace's key ("RCK"). */
+const WORKSPACE_LOCK_NAMESPACE = 0x52434b;
+
+/**
+ * Serializes everything that reads, rotates or restores one Relaycast
+ * workspace's key (rekey and undo, across Jobs) until the transaction ends.
+ */
+async function lockRelaycastWorkspace(tx: SqlExecutor, relaycastWorkspaceId: string): Promise<void> {
+  await tx.query("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [WORKSPACE_LOCK_NAMESPACE, relaycastWorkspaceId]);
 }
 
 export type RekeyOptions = {
@@ -339,72 +356,92 @@ async function rekeyWorkspaceKeys(
   workspaceId: string | undefined,
   graceMs: number,
 ): Promise<void> {
-  // Every row bound to a selected Relaycast workspace, even in another
-  // organization: one rotation replaces the key they all hold.
-  const { rows } = await deps.database.query<{ id: string; relaycast_workspace_id: string; ciphertext: string }>(
-    `SELECT id::text AS id, relaycast_workspace_id, relaycast_api_key_ciphertext AS ciphertext
+  // Every Relaycast workspace bound to a selected row, so rows in other
+  // organizations bound to it too: one rotation replaces the key they all hold.
+  const { rows: bindings } = await deps.database.query<{ relaycast_workspace_id: string }>(
+    `SELECT DISTINCT relaycast_workspace_id
        FROM workspaces
-      ${workspaceId === undefined ? "" : "WHERE relaycast_workspace_id IN (SELECT relaycast_workspace_id FROM workspaces WHERE id = $1)"}
-      ORDER BY relaycast_workspace_id, id`,
+      ${workspaceId === undefined ? "" : "WHERE id = $1"}
+      ORDER BY relaycast_workspace_id`,
     workspaceId === undefined ? [] : [workspaceId],
   );
-  const groups = new Map<string, typeof rows>();
-  for (const row of rows) {
-    const group = groups.get(row.relaycast_workspace_id) ?? [];
-    group.push(row);
-    groups.set(row.relaycast_workspace_id, group);
-  }
 
-  for (const [relaycastWorkspaceId, group] of groups) {
+  type KeyRow = { id: string; ciphertext: string };
+  const readGroup = async (executor: SqlExecutor, relaycastWorkspaceId: string, lock: boolean) =>
+    (await executor.query<KeyRow>(
+      `SELECT id::text AS id, relaycast_api_key_ciphertext AS ciphertext
+         FROM workspaces
+        WHERE relaycast_workspace_id = $1
+        ORDER BY id${lock ? "\n        FOR UPDATE" : ""}`,
+      [relaycastWorkspaceId],
+    )).rows;
+
+  for (const { relaycast_workspace_id: relaycastWorkspaceId } of bindings) {
     const item = (rowId: string, outcome: RekeyOutcome, code?: string): void =>
       reporter.add({ ...WORKSPACE_SOURCE, rowId, kind: "workspace", outcome, ...(code ? { code } : {}) });
 
-    const keys: { row: (typeof rows)[number]; key: string }[] = [];
-    let unreadable: string | null = null;
-    for (const row of group) {
-      try {
-        keys.push({ row, key: decryptSecret(row.ciphertext, deps.keyring) });
-      } catch (error) {
-        unreadable ??= decryptCode(error);
+    // Decide from a read of the group: undecryptable, already ar_, or rotate.
+    const classify = (group: KeyRow[]): { failed: string } | { done: true } | { rotate: true } => {
+      const keys: string[] = [];
+      for (const row of group) {
+        try {
+          keys.push(decryptSecret(row.ciphertext, deps.keyring));
+        } catch (error) {
+          // Rotating would strand a row this keyring cannot read (for example
+          // one under a previous key that is no longer configured).
+          return { failed: decryptCode(error) };
+        }
       }
-    }
-    // Rotating would strand a row this keyring cannot read (for example one
-    // under a previous key that is no longer configured): leave the group.
-    if (unreadable) {
-      for (const row of group) item(row.id, "failed", unreadable);
-      continue;
-    }
-    if (keys.every(({ key }) => isArCredential(key))) {
-      for (const row of group) item(row.id, "already_ar");
-      continue;
-    }
+      return keys.every(isArCredential) ? { done: true } : { rotate: true };
+    };
+
     if (runId === null) {
+      const group = await readGroup(deps.database, relaycastWorkspaceId, false);
+      const decision = classify(group);
       // A rotation rewrites every row of the group, ar_ ones included.
-      for (const row of group) item(row.id, "would_upgrade");
+      for (const row of group) {
+        if ("failed" in decision) item(row.id, "failed", decision.failed);
+        else item(row.id, "done" in decision ? "already_ar" : "would_upgrade");
+      }
       continue;
     }
 
+    let group: KeyRow[] = [];
     try {
-      const rotation = await rotateWorkspaceKey(deps, relaycastWorkspaceId, graceMs);
-      const next = encryptSecret(rotation.apiKey, deps.keyring.active);
-      await deps.database.transaction(async (tx) => {
-        for (const { row } of keys) {
+      // Read, rotate and store under one lock per Relaycast workspace, with
+      // the rows locked: an overlapping Job waits and then finds the key
+      // already ar_, and a live key write waits for the swap. Relaycast is
+      // therefore never left on a generation whose key Control does not hold.
+      const outcome = await deps.database.transaction(async (tx) => {
+        await lockRelaycastWorkspace(tx, relaycastWorkspaceId);
+        group = await readGroup(tx, relaycastWorkspaceId, true);
+        const decision = classify(group);
+        if (!("rotate" in decision)) return decision;
+        const rotation = await rotateWorkspaceKey(deps, relaycastWorkspaceId, graceMs);
+        const next = encryptSecret(rotation.apiKey, deps.keyring.active);
+        for (const row of group) {
           await insertBackup(tx, runId, {
             ...WORKSPACE_SOURCE,
             rowId: row.id,
             kind: "workspace",
+            workspaceId: row.id,
             relaycastWorkspaceId,
             oldCiphertext: row.ciphertext,
             newCiphertext: next,
             keyGeneration: rotation.generation,
           });
-          await swapCiphertext(tx, WORKSPACE_SOURCE.table, WORKSPACE_SOURCE.column, true, row.id, row.ciphertext, next);
+          await swapCiphertext(tx, WORKSPACE_SOURCE.table, WORKSPACE_SOURCE.column, true, row.id, row.ciphertext, next, relaycastWorkspaceId);
         }
+        return { upgraded: true } as const;
       });
-      for (const row of group) item(row.id, "upgraded");
+      for (const row of group) {
+        if ("failed" in outcome) item(row.id, "failed", outcome.failed);
+        else item(row.id, "done" in outcome ? "already_ar" : "upgraded");
+      }
     } catch (error) {
-      // A rotation whose key could not be stored is recovered by rerunning:
-      // the internal secret rotates again regardless of the lost key.
+      // Nothing was stored. If Relaycast did rotate (the store failed after
+      // it answered), the old key still verifies for the grace and a rerun
+      // rotates again with the internal secret, so the lost key is harmless.
       const code = failureCode(error);
       for (const row of group) item(row.id, "failed", code);
     }
@@ -419,8 +456,8 @@ async function rekeyTokens(
   workspaceId: string | undefined,
 ): Promise<void> {
   const origin = source.originColumn ? `, ${source.originColumn} AS origin_url` : "";
-  const { rows } = await deps.database.query<{ id: string; ciphertext: string; origin_url?: string | null }>(
-    `SELECT id::text AS id, ${source.column} AS ciphertext${origin}
+  const { rows } = await deps.database.query<{ id: string; workspace_id: string | null; ciphertext: string; origin_url?: string | null }>(
+    `SELECT id::text AS id, workspace_id::text AS workspace_id, ${source.column} AS ciphertext${origin}
        FROM ${source.table}
       WHERE ${source.column} IS NOT NULL${workspaceId === undefined ? "" : " AND workspace_id = $1"}
       ORDER BY id`,
@@ -467,6 +504,7 @@ async function rekeyTokens(
           column: source.column,
           rowId: row.id,
           kind: source.kind,
+          workspaceId: row.workspace_id,
           relaycastWorkspaceId: null,
           oldCiphertext: row.ciphertext,
           newCiphertext: next,
@@ -476,8 +514,29 @@ async function rekeyTokens(
       });
       item("upgraded");
     } catch (error) {
-      item("failed", failureCode(error));
+      const code = failureCode(error);
+      // An overlapping run (or the holder itself) stored an ar_ credential
+      // first: the upgrade is idempotent per legacy token, so this is done.
+      if (code === "concurrent_change" && await nowAr(deps, source, row.id)) {
+        item("already_ar", "concurrent_upgrade");
+        continue;
+      }
+      item("failed", code);
     }
+  }
+}
+
+async function nowAr(deps: RekeyDeps, source: TokenSource, rowId: string): Promise<boolean> {
+  const { rows } = await deps.database.query<{ value: string | null }>(
+    `SELECT ${source.column} AS value FROM ${source.table} WHERE id = $1::uuid`,
+    [rowId],
+  );
+  const value = rows[0]?.value;
+  if (!value) return false;
+  try {
+    return isArCredential(decryptSecret(value, deps.keyring));
+  } catch {
+    return false;
   }
 }
 
@@ -494,11 +553,19 @@ type BackupRow = {
 };
 
 /**
- * Puts back every ciphertext a run replaced. An agent or webhook token goes
- * back as stored: its legacy credential keeps verifying for Relaycast's
- * legacy grace. A workspace key is first pushed back to Relaycast above the
- * generation the rotation produced, because the rotated-out key verified for
- * at most an hour. A row changed since the run is reported, not overwritten.
+ * Puts back every ciphertext a run replaced, all or nothing. An agent or
+ * webhook token goes back as stored: its legacy credential keeps verifying
+ * for Relaycast's legacy grace. A workspace key is first pushed back to
+ * Relaycast above the generation the rotation produced, because the
+ * rotated-out key verified for at most an hour.
+ *
+ * Every pending row is checked first (old ciphertext readable, row still
+ * holding the run's value, workspace backups complete, Relaycast reachable
+ * with the internal secret); any problem refuses the whole undo before
+ * anything changes. The restore then runs in one transaction holding each
+ * Relaycast workspace's lock and every row: if it fails, no row changes. A
+ * key push that landed before such a failure is harmless to retry, since
+ * Relaycast treats a re-push of its live key as a no-op.
  */
 export async function undoRelaycastRekey(
   deps: RekeyDeps,
@@ -507,6 +574,9 @@ export async function undoRelaycastRekey(
 ): Promise<RekeyReport> {
   if (!UUID.test(runId)) throw new Error("--undo must be a run id (uuid)");
   const graceMs = options.workspaceKeyGraceMs ?? WORKSPACE_KEY_MAX_GRACE_MS;
+  if (!Number.isSafeInteger(graceMs) || graceMs < 0 || graceMs > WORKSPACE_KEY_MAX_GRACE_MS) {
+    throw new Error(`--grace-ms must be an integer from 0 to ${WORKSPACE_KEY_MAX_GRACE_MS}`);
+  }
   const reporter = new Reporter(deps.log);
   deps.log?.("relaycast_rekey.undo_start", { run_id: runId });
 
@@ -519,67 +589,125 @@ export async function undoRelaycastRekey(
     [runId],
   );
   if (all.length === 0) throw new Error("No relaycast rekey backups for that run id");
-  const rows = all.filter((row) => !row.restored);
-
-  const restore = async (row: BackupRow): Promise<void> => {
-    const source = sourceFor(row.table_name, row.column_name);
-    if (!source) throw new RekeyFailure("unknown_source");
-    await deps.database.transaction(async (tx) => {
-      await swapCiphertext(tx, row.table_name, row.column_name, source.hasUpdatedAt, row.row_id, row.new_ciphertext, row.old_ciphertext);
-      await tx.query("UPDATE relaycast_rekey_backups SET restored_at = now() WHERE id = $1", [row.id]);
-    });
-  };
   const item = (row: BackupRow, outcome: RekeyOutcome, code?: string): void =>
     reporter.add({ table: row.table_name, column: row.column_name, rowId: row.row_id, kind: row.kind, outcome, ...(code ? { code } : {}) });
 
-  const workspaceGroups = new Map<string, BackupRow[]>();
-  for (const row of rows) {
-    if (row.kind !== "workspace") continue;
-    const key = row.relaycast_workspace_id ?? "";
-    workspaceGroups.set(key, [...(workspaceGroups.get(key) ?? []), row]);
-  }
-  for (const [relaycastWorkspaceId, group] of workspaceGroups) {
-    try {
-      const generation = Number(group[0]!.key_generation);
-      if (!relaycastWorkspaceId || !Number.isSafeInteger(generation)) throw new RekeyFailure("backup_incomplete");
-      const oldKeys = new Set<string>();
-      for (const row of group) {
-        try {
-          oldKeys.add(decryptSecret(row.old_ciphertext, deps.keyring));
-        } catch (error) {
-          throw new RekeyFailure(decryptCode(error));
-        }
-      }
-      // Rows that held different keys cannot all be made current again.
-      if (oldKeys.size !== 1) throw new RekeyFailure("ambiguous_old_key");
-      await pushWorkspaceKey(deps, relaycastWorkspaceId, [...oldKeys][0]!, generation + 1, graceMs);
-    } catch (error) {
-      for (const row of group) item(row, "failed", failureCode(error));
+  const current = async (executor: SqlExecutor, row: BackupRow, lock: boolean): Promise<string | null | undefined> => {
+    const result = await executor.query<{ value: string | null }>(
+      `SELECT ${row.column_name} AS value FROM ${row.table_name} WHERE id = $1::uuid${lock ? " FOR UPDATE" : ""}`,
+      [row.row_id],
+    );
+    return result.rows.length === 0 ? undefined : result.rows[0]!.value;
+  };
+
+  // 1. Preflight: read only.
+  const problems = new Map<string, string>();
+  const pending: BackupRow[] = [];
+  for (const row of all) {
+    if (row.restored) continue;
+    if (!sourceFor(row.table_name, row.column_name)) {
+      problems.set(row.id, "unknown_source");
+      pending.push(row);
       continue;
     }
-    for (const row of group) {
+    const value = await current(deps.database, row, false);
+    // A deleted row has nothing to restore into.
+    if (value === undefined) {
+      item(row, "gone");
+      continue;
+    }
+    pending.push(row);
+    if (value !== row.new_ciphertext) {
+      problems.set(row.id, "concurrent_change");
+      continue;
+    }
+    try {
+      decryptSecret(row.old_ciphertext, deps.keyring);
+    } catch (error) {
+      problems.set(row.id, decryptCode(error));
+    }
+  }
+  const groups = new Map<string, { generation: number; oldKey: string; rows: BackupRow[] }>();
+  const workspaceRows = pending.filter((row) => row.kind === "workspace");
+  const byBinding = new Map<string, BackupRow[]>();
+  for (const row of workspaceRows) {
+    const key = row.relaycast_workspace_id ?? "";
+    byBinding.set(key, [...(byBinding.get(key) ?? []), row]);
+  }
+  for (const [relaycastWorkspaceId, rows] of byBinding) {
+    const generation = Number(rows[0]!.key_generation);
+    const keys = new Set<string>();
+    for (const row of rows) {
       try {
-        await restore(row);
-        item(row, "restored");
-      } catch (error) {
-        item(row, "failed", failureCode(error));
+        keys.add(decryptSecret(row.old_ciphertext, deps.keyring));
+      } catch {
+        // Already recorded above.
       }
     }
-  }
-
-  for (const row of rows) {
-    if (row.kind === "workspace") continue;
-    try {
-      await restore(row);
-      item(row, "restored");
-    } catch (error) {
-      item(row, "failed", failureCode(error));
+    const code = !relaycastWorkspaceId || !Number.isSafeInteger(generation) || rows.some((row) => Number(row.key_generation) !== generation)
+      ? "backup_incomplete"
+      // Rows that held different keys cannot all be made current again.
+      : keys.size > 1 ? "ambiguous_old_key" : null;
+    if (code) {
+      for (const row of rows) if (!problems.has(row.id)) problems.set(row.id, code);
+      continue;
     }
+    if (keys.size === 1) groups.set(relaycastWorkspaceId, { generation, oldKey: [...keys][0]!, rows });
+  }
+  if (workspaceRows.length > 0 && problems.size === 0) {
+    const code = await relaycastReady(deps);
+    if (code) for (const row of workspaceRows) problems.set(row.id, code);
+  }
+  if (problems.size > 0) {
+    for (const row of pending) item(row, "failed", problems.get(row.id) ?? "undo_refused");
+    return finishUndo(deps, reporter, runId, all.length - pending.length);
   }
 
+  // 2. Restore everything in one transaction.
+  try {
+    await deps.database.transaction(async (tx) => {
+      for (const relaycastWorkspaceId of [...groups.keys()].sort()) await lockRelaycastWorkspace(tx, relaycastWorkspaceId);
+      for (const row of pending) {
+        if (await current(tx, row, true) !== row.new_ciphertext) throw new RekeyFailure("concurrent_change");
+      }
+      for (const [relaycastWorkspaceId, group] of groups) {
+        await pushWorkspaceKey(deps, relaycastWorkspaceId, group.oldKey, group.generation + 1, graceMs);
+      }
+      for (const row of pending) {
+        const source = sourceFor(row.table_name, row.column_name)!;
+        await swapCiphertext(tx, row.table_name, row.column_name, source.hasUpdatedAt, row.row_id, row.new_ciphertext, row.old_ciphertext);
+        await tx.query("UPDATE relaycast_rekey_backups SET restored_at = now() WHERE id = $1", [row.id]);
+      }
+    });
+    for (const row of pending) item(row, "restored");
+  } catch (error) {
+    // No row changed; rerun --undo once the cause is fixed.
+    const code = failureCode(error);
+    for (const row of pending) item(row, "failed", code);
+  }
+  return finishUndo(deps, reporter, runId, all.length - pending.length);
+}
+
+function finishUndo(deps: RekeyDeps, reporter: Reporter, runId: string, skipped: number): RekeyReport {
   const report = reporter.report(runId, "undo");
-  deps.log?.("relaycast_rekey.undo_done", { run_id: runId, failed: report.failed, already_restored: all.length - rows.length });
+  deps.log?.("relaycast_rekey.undo_done", { run_id: runId, failed: report.failed, not_pending: skipped });
   return report;
+}
+
+/** Relaycast answers its internal API with this secret (read-only probe), or a failure code. */
+async function relaycastReady(deps: RekeyDeps): Promise<string | null> {
+  if (!deps.internalSecret) return "internal_secret_missing";
+  const fetchImpl = deps.fetch ?? ((input, init) => globalThis.fetch(input, init));
+  try {
+    const response = await fetchImpl(`${deps.relaycastUrl.replace(/\/+$/, "")}/internal/capabilities`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${deps.internalSecret}`, accept: "application/json" },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    return response.ok ? null : await relaycastError(response);
+  } catch {
+    return "relaycast_unreachable";
+  }
 }
 
 export type PurgeReport = {

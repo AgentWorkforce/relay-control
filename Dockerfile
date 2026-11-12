@@ -33,6 +33,15 @@ COPY --from=build /app/package-lock.json node_modules/relay-control/package-lock
 RUN cd node_modules/relay-control \
  && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
  && chown -R node:node /app
+# npm ci inside the package does not link the package's own bins: put each
+# one (agent-relay-selfhost-migrate, agent-relay-selfhost-relaycast-rekey, ...)
+# on PATH so Jobs can run them by name.
+RUN node -e 'const bin = require("/app/node_modules/relay-control/package.json").bin; \
+      for (const [name, file] of Object.entries(bin)) { \
+        const target = require("path").resolve("/app/node_modules/relay-control", file); \
+        require("fs").chmodSync(target, 0o755); \
+        require("fs").symlinkSync(target, "/usr/local/bin/" + name); \
+      }'
 USER node
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \

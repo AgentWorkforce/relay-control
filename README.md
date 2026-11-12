@@ -517,8 +517,10 @@ Relaycast on durable actors routes only `ar_` credentials. Before a
 self-hosted Relaycast moves from `runtime.backend: postgres` to durable
 actors, and after it has been switched to `credentials.format: ar` with a
 keyring and a long legacy grace (legacy credentials keep verifying), run
-`agent-relay-selfhost-relaycast-rekey` (`npm run relaycast-rekey`) once as a
-Kubernetes Job with the API's image, environment and Secrets:
+`agent-relay-selfhost-relaycast-rekey` once as a Kubernetes Job with the
+API's image, environment and Secrets. The image puts every package command
+on `PATH` (`node node_modules/relay-control/dist/relaycast-rekey-cli.js` is
+the same thing; from a source checkout, `npm run relaycast-rekey --`):
 
 ```sh
 agent-relay-selfhost-relaycast-rekey --dry-run          # counts by table and kind, writes nothing
@@ -527,7 +529,7 @@ agent-relay-selfhost-relaycast-rekey --undo <run-id>    # put the run's old valu
 ```
 
 It reads `DATABASE_URL`, `RELAYCAST_URL`, `RELAYCAST_PUBLIC_URL` (optional),
-`RELAYCAST_INTERNAL_SECRET` (not needed for `--dry-run`) and the
+`RELAYCAST_INTERNAL_SECRET` (not needed for `--dry-run` or `--purge`) and the
 `SELFHOST_ENCRYPTION_*` keyring, each secret also as `<NAME>_FILE`; no secret
 is accepted on the command line. It replaces, for every row (or one
 workspace's rows):
@@ -544,7 +546,13 @@ workspace's rows):
 | `events_shims.wake_secret_ciphertext` | webhook | same, only for wake links on this Relaycast's origin |
 
 A credential that already starts with `ar_` (or that Relaycast answers `409
-credential_not_legacy`) is skipped, so reruns are safe. Each old ciphertext is
+credential_not_legacy`) is skipped, so reruns are safe. Each Relaycast
+workspace's key is read, rotated and stored in one transaction that holds an
+advisory lock for that Relaycast workspace and its rows, so overlapping Jobs
+rotate it once and Control always stores the key (and generation) Relaycast
+holds. The rotation and the store cannot be atomic: if the store fails after
+Relaycast answered, nothing is stored, the old key still verifies for the
+grace, and a rerun rotates again. Each old ciphertext is
 written to `relaycast_rekey_backups` (migration 0048) in the same transaction
 that swaps the new one in, and only while the row still holds the value read,
 so a concurrent writer is never overwritten. A failed credential (Relaycast
@@ -557,10 +565,23 @@ ciphertext.
 The rotated-out workspace key keeps working for `--grace-ms` (default and
 Relaycast's maximum: one hour). Desktops and CLIs that resolved the old key
 must resolve it again after that. Legacy agent tokens keep working for
-Relaycast's legacy grace. `--undo <run-id>` first pushes each old workspace
-key back to Relaycast one generation above the rotation, then restores every
-backed-up ciphertext that has not changed since the run; restored agent tokens
-work for as long as the legacy grace lasts.
+Relaycast's legacy grace.
+
+`--undo <run-id>` is all or nothing. It first checks every backup of the run
+without changing anything: the row still holds the run's value, the old
+ciphertext is readable with the current keyring, workspace backups are
+complete, `--grace-ms` is valid and Relaycast answers its internal API with
+the secret. Any problem refuses the whole undo (exit 1; the failing rows carry
+their code, the rest `undo_refused`). Then, in one transaction holding the
+same locks and rows, it pushes each old workspace key back to Relaycast one
+generation above the rotation and restores every ciphertext. If anything
+fails, no row changes; a key push that already landed is safe to repeat,
+since Relaycast treats a re-push of its live key as a no-op, so rerun
+`--undo`. Rows deleted since the run are reported as `gone`. Restored agent
+tokens work only while the legacy grace lasts, and restoring a workspace key
+needs Relaycast to accept the old key again: a Relaycast that accepts only
+`ar_` credentials refuses it, and then the undo fails without restoring
+anything. Undo is meant for before the cutover.
 
 The backups hold old Relaycast credential ciphertexts, so delete them once
 the cutover is done and undo is no longer wanted:
@@ -575,6 +596,7 @@ new value (`live`: undo could still restore them), were rewritten since
 (`changed`), no longer exist (`gone`) or were already restored by `--undo`.
 Only `--confirm` deletes, and after it `--undo` for that run is impossible.
 Purge does not need `RELAYCAST_INTERNAL_SECRET` and logs counts only.
+Deleting a workspace deletes its backups too.
 
 ### Deleting a workspace
 
