@@ -302,6 +302,38 @@ export class PostgresEventsShimStore implements EventsShimStore {
     return result.rows.map(eventFrom);
   }
 
+  async listStalledWakes(input: {
+    staleBefore: string;
+    receivedBefore: string;
+    activeSince: string;
+    limit: number;
+  }): Promise<ShimRecord[]> {
+    if (input.limit <= 0) return [];
+    // Live inboxes with a working wake link and a claimable post old enough
+    // that its own delivery pass is over, whose creator (like every lookup)
+    // is still in the workspace's organization. Random order, so inboxes whose
+    // relay keeps failing cannot hold every slot run after run.
+    const result = await this.database.query<ShimRow>(
+      `SELECT ${SHIM_COLUMNS} FROM events_shims s
+        WHERE s.wake_url IS NOT NULL AND s.wake_broken_at IS NULL
+          AND s.last_used_at >= $3
+          AND EXISTS (
+            SELECT 1 FROM events_shim_events e
+             WHERE e.shim_id = s.id
+               AND (e.delivery = 'pending' OR (e.delivery = 'sending' AND e.delivered_at < $1))
+               AND e.received_at < $2)
+          AND (s.user_id IS NULL OR EXISTS (
+            SELECT 1 FROM workspaces w
+              JOIN organization_memberships m
+                ON m.organization_id = w.organization_id AND m.user_id = s.user_id
+             WHERE w.id = s.workspace_id))
+        ORDER BY random()
+        LIMIT $4`,
+      [input.staleBefore, input.receivedBefore, input.activeSince, input.limit],
+    );
+    return result.rows.map((row) => this.record(row));
+  }
+
   async countPending(shimId: string, staleBefore: string): Promise<number> {
     const result = await this.database.query<{ n: number }>(
       `SELECT count(*)::int AS n FROM events_shim_events
@@ -321,8 +353,10 @@ export class PostgresEventsShimStore implements EventsShimStore {
     // One statement, the pick materialized once: rows another caller holds are
     // skipped and rows it already moved no longer match, so two callers never
     // get the same event. Claimable: pending, or sending with an expired lease.
-    // With linkedAt, nothing is claimed unless that link is still current and
-    // unbroken, checked in the same statement.
+    // With linkedAt (a wake send), nothing is claimed unless that link is still
+    // current and unbroken and the creator is still in the workspace's
+    // organization, checked in the same statement: a member removed after a
+    // pass or sweep picked the inbox gets nothing more forwarded.
     const result = await this.database.query<EventRow>(
       `WITH picked AS MATERIALIZED (
          SELECT id FROM events_shim_events
@@ -332,7 +366,12 @@ export class PostgresEventsShimStore implements EventsShimStore {
             AND ($7::timestamptz IS NULL OR EXISTS (
               SELECT 1 FROM events_shims s
                WHERE s.id = $1 AND s.wake_url IS NOT NULL
-                 AND s.wake_linked_at = $7::timestamptz AND s.wake_broken_at IS NULL))
+                 AND s.wake_linked_at = $7::timestamptz AND s.wake_broken_at IS NULL
+                 AND (s.user_id IS NULL OR EXISTS (
+                   SELECT 1 FROM workspaces w
+                     JOIN organization_memberships m
+                       ON m.organization_id = w.organization_id AND m.user_id = s.user_id
+                    WHERE w.id = s.workspace_id))))
           ORDER BY seq ASC
           LIMIT $4::int
           FOR UPDATE SKIP LOCKED)

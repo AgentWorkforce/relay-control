@@ -94,3 +94,11 @@ Migration 0047 adds `events_shims`, `events_shim_posts` and
   creates an inbox.
 - A post the agent has already read stays `read` when a late wake result
   arrives.
+
+## Recovering stalled wakes
+
+When Relaycast refuses a forward for a while (a 5xx or a timeout), the post
+stays pending. Every minute while `events_shim` is on, the server re-drains
+inboxes with a working wake link and a pending post older than 30 seconds
+(`recoverStalledWakes`), so the idle agent still gets it without a new post.
+A permanent refusal (the hook was revoked) marks the link broken instead.
