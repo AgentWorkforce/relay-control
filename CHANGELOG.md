@@ -5,7 +5,7 @@ assigned at release.
 
 ## Unreleased
 
-## 0.5.12 (2026-11-12)
+## 0.5.20 (2026-11-12)
 
 - Added: `SELFHOST_DESKTOP_RELEASES_REPO` (owner/repository, unset by default)
   and `GET /api/v1/desktop/releases`: the latest release of a public GitHub
