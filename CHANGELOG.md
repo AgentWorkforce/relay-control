@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `POST /api/v1/events-shim/t/<mcp token>/workspace`, each webhook
+  inbox's temporary Agent Relay workspace for `events-shim setup` to run its
+  own core on: created through Relaycast's internal admin API with a 7-day
+  deadline that posts, agent calls and asking for it move back; Relaycast
+  deletes it at the deadline. Needs `RELAYCAST_INTERNAL_SECRET` and a Relaycast
+  with `POST /internal/workspaces/:id/expiry`. Migration 0048.
+
 ## 0.5.20 (2026-11-12)
 
 - Added: `SELFHOST_DESKTOP_RELEASES_REPO` (owner/repository, unset by default)

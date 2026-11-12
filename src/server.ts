@@ -159,6 +159,7 @@ emitConfigLoaded(analytics, {
 const server = createServer(createApp({
   config,
   store,
+  relaycastInternalSecret: identityConfig.relaycastInternalSecret,
   flows,
   admin,
   telemetry,

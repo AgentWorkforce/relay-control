@@ -24,14 +24,46 @@ const SHIM = "/api/v1/events-shim";
 
 type RelayCall = { url: string; authorization: string | null; body: Record<string, any> };
 
-async function plane(t: TestContext, features: SelectedFeatures = { ...NO_FEATURES, events_shim: true }) {
+async function plane(
+  t: TestContext,
+  features: SelectedFeatures = { ...NO_FEATURES, events_shim: true },
+  options: { relaycastInternalSecret?: string | null } = {},
+) {
   const database = new PGliteDatabase();
   await migrate(database);
   const relayCalls: RelayCall[] = [];
   let relayStatus = 200;
+  /** Relaycast's internal admin API (temporary workspaces). */
+  const admin = {
+    calls: [] as { method: string; url: string; authorization: string | null; body: Record<string, any> | null }[],
+    created: 0,
+    expiryMissing: false,
+    unreachable: false,
+  };
   // The injected messaging fetch: Relaycast inbound hooks answer here.
   const messagingFetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
+    if (url.startsWith("http://relaycast.internal/internal/")) {
+      if (admin.unreachable) throw new TypeError("fetch failed");
+      const method = init?.method ?? "GET";
+      admin.calls.push({
+        method,
+        url,
+        authorization: new Headers(init?.headers).get("authorization"),
+        body: init?.body ? JSON.parse(String(init.body)) as Record<string, any> : null,
+      });
+      const json = (status: number, data: unknown) =>
+        new Response(JSON.stringify({ ok: status < 400, data }), { status, headers: { "content-type": "application/json" } });
+      if (method === "POST" && url === "http://relaycast.internal/internal/workspaces") {
+        admin.created += 1;
+        return json(201, { workspace_id: `24675426484659814${admin.created}`, api_key: `rk_live_${"k".repeat(31)}${admin.created}` });
+      }
+      if (method === "POST" && url.endsWith("/expiry")) {
+        if (admin.expiryMissing) return json(404, null);
+        return json(200, { expires_at: new Date(Date.now() + 7 * 86_400_000).toISOString() });
+      }
+      if (method === "DELETE") return new Response(null, { status: 204 });
+    }
     if (url.startsWith("https://cast.agentrelay.com/v1/hooks/")) {
       relayCalls.push({
         url,
@@ -61,7 +93,12 @@ async function plane(t: TestContext, features: SelectedFeatures = { ...NO_FEATUR
     host: "127.0.0.1",
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
-  server.on("request", createApp({ config, store, features, messagingFetch }));
+  server.on("request", createApp({
+    config, store, features, messagingFetch,
+    relaycastInternalSecret: options.relaycastInternalSecret === undefined
+      ? "relaycast-internal-secret-0123456789abcdef"
+      : options.relaycastInternalSecret,
+  }));
   t.after(async () => {
     await close(server);
     await database.close();
@@ -114,7 +151,7 @@ async function plane(t: TestContext, features: SelectedFeatures = { ...NO_FEATUR
   }
 
   return {
-    origin, database, ownerId, workspaceId, relayCalls, signIn, create, post, connect,
+    origin, database, ownerId, workspaceId, relayCalls, admin, signIn, create, post, connect,
     setRelayStatus: (status: number) => { relayStatus = status; },
   };
 }
@@ -612,4 +649,77 @@ test("SELFHOST_EVENTS_SHIM_RELAY_ORIGINS: https origins only", () => {
   for (const bad of ["http://relay.example.com", "https://relay.example.com/v1", "https://u:p@relay.example.com", "not a url"]) {
     assert.throws(() => loadEventsShimRelayOrigins({ SELFHOST_EVENTS_SHIM_RELAY_ORIGINS: bad }), /SELFHOST_EVENTS_SHIM_RELAY_ORIGINS/);
   }
+});
+
+test("each inbox gets one temporary Agent Relay workspace with a 7-day deadline, kept alive by posts", async (t) => {
+  const p = await plane(t);
+  const shim = await p.create(await p.signIn());
+  const token = shim.mcp_url.split("/t/")[1]!.split("/")[0]!;
+  const issue = () => request(p.origin, `${SHIM}/t/${token}/workspace`, { method: "POST" });
+
+  const first = await issue();
+  assert.equal(first.status, 200, first.raw);
+  assert.equal(first.body.temporary, true);
+  assert.match(first.body.workspace_key, /^rk_live_/);
+  assert.ok(Date.parse(first.body.workspace_expires_at) - Date.now() > 6.9 * 86_400_000);
+  assert.match(first.body.message, /sign this machine's Agent Relay in to http/);
+  // Made through the internal admin API, then given its deadline.
+  assert.deepEqual(p.admin.calls.map((call) => `${call.method} ${call.url.replace("http://relaycast.internal", "")}`), [
+    "POST /internal/workspaces",
+    `POST /internal/workspaces/${first.body.workspace_id}/expiry`,
+  ]);
+  assert.equal(p.admin.calls[0]!.authorization, "Bearer relaycast-internal-secret-0123456789abcdef");
+  assert.deepEqual(p.admin.calls[1]!.body, { expires_in_seconds: 604800 });
+  // The key is stored encrypted only.
+  const stored = await p.database.query("SELECT * FROM events_shims WHERE id = $1", [shim.shim_id]);
+  assert.ok(!JSON.stringify(stored.rows).includes(first.body.workspace_key));
+
+  // Asked again: the same workspace.
+  assert.deepEqual((await issue()).body, first.body);
+  assert.equal(p.admin.created, 1);
+
+  // A post with plenty of time left calls nothing; with two days left it moves the deadline back once.
+  const before = p.admin.calls.length;
+  assert.equal((await p.post(shim.webhook_url, { a: 1 })).status, 202);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(p.admin.calls.length, before);
+  await p.database.query("UPDATE events_shims SET relay_workspace_expires_at = now() + interval '2 days' WHERE id = $1", [shim.shim_id]);
+  assert.equal((await p.post(shim.webhook_url, { a: 2 })).status, 202);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(p.admin.calls.length, before + 1);
+  assert.match(p.admin.calls.at(-1)!.url, /\/expiry$/);
+  const moved = await p.database.query<{ at: Date }>("SELECT relay_workspace_expires_at AS at FROM events_shims WHERE id = $1", [shim.shim_id]);
+  assert.ok(new Date(moved.rows[0]!.at).getTime() - Date.now() > 6.9 * 86_400_000);
+
+  // Past its deadline: a new one is issued.
+  await p.database.query("UPDATE events_shims SET relay_workspace_expires_at = now() - interval '1 minute' WHERE id = $1", [shim.shim_id]);
+  const next = await issue();
+  assert.notEqual(next.body.workspace_id, first.body.workspace_id);
+});
+
+test("temporary workspaces: unknown inboxes, an old Relaycast, an unreachable one and no internal secret", async (t) => {
+  const p = await plane(t);
+  const shim = await p.create(await p.signIn());
+  const token = shim.mcp_url.split("/t/")[1]!.split("/")[0]!;
+  assert.equal((await request(p.origin, `${SHIM}/t/esm_${"x".repeat(43)}/workspace`, { method: "POST" })).status, 404);
+  assert.equal(p.admin.calls.length, 0);
+
+  // A Relaycast without the expiry route: the permanent workspace it made is deleted, nothing is handed out.
+  p.admin.expiryMissing = true;
+  const old = await request(p.origin, `${SHIM}/t/${token}/workspace`, { method: "POST" });
+  assert.equal(old.status, 503);
+  assert.equal(old.headers.get("retry-after"), "60");
+  assert.ok(!old.raw.includes("rk_live_"));
+  assert.equal(p.admin.calls.at(-1)!.method, "DELETE");
+
+  p.admin.expiryMissing = false;
+  p.admin.unreachable = true;
+  assert.equal((await request(p.origin, `${SHIM}/t/${token}/workspace`, { method: "POST" })).status, 503);
+
+  const bare = await plane(t, { ...NO_FEATURES, events_shim: true }, { relaycastInternalSecret: null });
+  const other = await bare.create(await bare.signIn());
+  const otherToken = other.mcp_url.split("/t/")[1]!.split("/")[0]!;
+  const refused = await request(bare.origin, `${SHIM}/t/${otherToken}/workspace`, { method: "POST" });
+  assert.equal(refused.status, 503);
+  assert.equal(refused.body.error, "not_configured");
 });
