@@ -18,6 +18,8 @@ export class EventsShimWakeSweeper {
     fetchImpl?: typeof fetch;
     now?: () => Date;
     intervalMs?: number;
+    /** Longest stop() waits for a running sweep. */
+    stopGraceMs?: number;
     log?: (event: { code: "events_shim_wake_sweep_failed" }) => void;
   }) {}
 
@@ -46,10 +48,22 @@ export class EventsShimWakeSweeper {
     this.timer.unref();
   }
 
+  /**
+   * Stops the timer and waits at most `stopGraceMs` for a running sweep, so a
+   * slow relay cannot eat the server's shutdown budget. A send cut short
+   * leaves its post on an expiring `sending` lease, which the next sweep (on
+   * any replica) claims again.
+   */
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    await this.busy;
+    if (!this.busy) return;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      this.busy,
+      new Promise<void>((resolve) => { timeout = setTimeout(resolve, this.deps.stopGraceMs ?? 2_000); }),
+    ]);
+    clearTimeout(timeout);
   }
 }

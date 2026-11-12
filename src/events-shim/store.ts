@@ -353,8 +353,10 @@ export class PostgresEventsShimStore implements EventsShimStore {
     // One statement, the pick materialized once: rows another caller holds are
     // skipped and rows it already moved no longer match, so two callers never
     // get the same event. Claimable: pending, or sending with an expired lease.
-    // With linkedAt, nothing is claimed unless that link is still current and
-    // unbroken, checked in the same statement.
+    // With linkedAt (a wake send), nothing is claimed unless that link is still
+    // current and unbroken and the creator is still in the workspace's
+    // organization, checked in the same statement: a member removed after a
+    // pass or sweep picked the inbox gets nothing more forwarded.
     const result = await this.database.query<EventRow>(
       `WITH picked AS MATERIALIZED (
          SELECT id FROM events_shim_events
@@ -364,7 +366,12 @@ export class PostgresEventsShimStore implements EventsShimStore {
             AND ($7::timestamptz IS NULL OR EXISTS (
               SELECT 1 FROM events_shims s
                WHERE s.id = $1 AND s.wake_url IS NOT NULL
-                 AND s.wake_linked_at = $7::timestamptz AND s.wake_broken_at IS NULL))
+                 AND s.wake_linked_at = $7::timestamptz AND s.wake_broken_at IS NULL
+                 AND (s.user_id IS NULL OR EXISTS (
+                   SELECT 1 FROM workspaces w
+                     JOIN organization_memberships m
+                       ON m.organization_id = w.organization_id AND m.user_id = s.user_id
+                    WHERE w.id = s.workspace_id))))
           ORDER BY seq ASC
           LIMIT $4::int
           FOR UPDATE SKIP LOCKED)

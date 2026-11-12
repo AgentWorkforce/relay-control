@@ -530,6 +530,30 @@ test("listStalledWakes skips an inbox whose creator left the organization", asyn
   void shim;
 });
 
+test("a wake claim stops once the inbox creator leaves the organization", async (t) => {
+  const p = await plane(t);
+  await p.create(await p.signIn());
+  const store = new PostgresEventsShimStore(p.database, KEYRING);
+  const id = (await p.database.query<{ id: string }>("SELECT id FROM events_shims")).rows[0]!.id;
+  const linkedAt = new Date(Date.now() - 60_000).toISOString();
+  await store.setWakeTarget(id, { url: RELAY_HOOK, secret: RELAY_SECRET, linkedAt });
+  await store.appendEvent(id, { receivedAt: linkedAt, mode: "open", contentType: "application/json", body: "{}", headers: {} },
+    { feedSize: 50, dedupeSince: new Date(0).toISOString() });
+  await p.database.query("DELETE FROM organization_memberships WHERE user_id = $1", [p.ownerId]);
+  const now = new Date().toISOString();
+  assert.deepEqual(await store.claimPending(id, { limit: 10, staleBefore: NOT_STALE, linkedAt }, "sending", now), []);
+});
+
+test("stopping the sweeper does not wait out a slow sweep", async () => {
+  const slow = new Promise<never>(() => {});
+  const store = { listStalledWakes: () => slow } as unknown as PostgresEventsShimStore;
+  const sweeper = new EventsShimWakeSweeper({ store, stopGraceMs: 50 });
+  void sweeper.tick();
+  const started = Date.now();
+  await sweeper.stop();
+  assert.ok(Date.now() - started < 1_000, "stop returned within its grace period");
+});
+
 test("markWakeBroken ignores a stale link", async (t) => {
   const s = await bareStore(t);
   const oldLink = "2026-01-01T00:00:00.000Z";
