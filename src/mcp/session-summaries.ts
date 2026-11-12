@@ -16,7 +16,7 @@ const unsupported = "The selected backend does not support recorded session summ
 const listPage = z.object({
   sessions: z.array(z.object({
     sessionId: id, source: id, userIds: z.array(id), projectId: z.string().nullable(),
-    lastTs: timestamp, shortSummary: z.string().max(16_384).nullable(),
+    lastTs: timestamp, shortSummary: z.string().max(1000).nullable(),
     shortSummaryGeneratedAt: timestamp.nullable(),
     catalog: z.object({ repoUrl: z.string().nullable(), gitBranch: z.string().nullable() }).optional(),
   })).max(50),
@@ -90,11 +90,13 @@ export function registerSessionSummaries(server: McpServer, context: McpContext)
     title: "Get a recorded session summary",
     description: "Read the recorded short summary for one shared session, with model/time provenance and a citation. Long summaries are unsupported until the selected backend provides a recorded long-summary route. Does not generate a summary or read the transcript.",
     inputSchema: { session_id: id.refine(value => value !== "." && value !== "..", "Invalid session ID"),
-      source: id.optional(), kind: z.enum(["short", "long"]).default("short") },
+      source: id.optional().describe("Pass the source from a list result. The summary reader requires it; no source is inferred."),
+      kind: z.enum(["short", "long"]).default("short") },
     annotations,
   }, async input => {
     try {
       if (input.kind === "long") throw new SharedSessionsToolError("Long session summaries are not available yet (unsupported_by_backend). Use get_shared_session for a bounded transcript page.");
+      if (!input.source) throw new SharedSessionsToolError("Pass the session source from list_session_summaries (for example codex or claude). A summary source cannot be inferred.");
       const params = new URLSearchParams({ kind: input.kind });
       if (input.source) params.set("source", input.source);
       const body = await context.readHistory(`/v1/sessions/${encodeURIComponent(input.session_id)}/summary?${params}`);

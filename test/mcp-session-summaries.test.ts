@@ -105,11 +105,18 @@ test("short summary uses the exact session route and retains recorded model/time
 test("empty summaries stay empty; malformed provenance and unsupported responses are refused", async t => {
   for (const summary of [{ status: "ready", kind: "short", summary: "Recorded", builtAt: ts, state: null }, { status: "unsupported" }]) {
     const f = await fixture(t, { body: { summary } });
-    assert.equal((await call(f.client, "get_session_summary", { session_id: "fake" })).isError, true);
+    assert.equal((await call(f.client, "get_session_summary", { session_id: "fake", source: "codex" })).isError, true);
   }
   const summary = { status: "empty", kind: "short", state: null };
   const f = await fixture(t, { body: { summary } });
-  assert.deepEqual(data(await call(f.client, "get_session_summary", { session_id: "fake" })).summary, summary);
+  assert.deepEqual(data(await call(f.client, "get_session_summary", { session_id: "fake", source: "codex" })).summary, summary);
+});
+
+test("missing summary source gives actionable guidance without inferring a harness or calling the reader", async t => {
+  const f = await fixture(t);
+  const result = await call(f.client, "get_session_summary", { session_id: "fake" });
+  assert.equal(result.isError, true); assert.match(JSON.stringify(result), /Pass the session source/);
+  assert.deepEqual(f.paths, []);
 });
 
 test("unsupported long summaries never fetch or silently return a short summary or transcript", async t => {

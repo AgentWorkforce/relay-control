@@ -26,7 +26,9 @@ are null when unavailable. Missing repository metadata stays null.
 
 The reader must expose nullable `shortSummary` and
 `shortSummaryGeneratedAt` fields on list rows. Readers that omit those
-fields report `unsupported_by_backend`. A null recorded summary remains
+fields report `unsupported_by_backend`. The current reader omits them for
+compatibility with older clients; an upstream opt-in extension is required
+before this list can return recorded summaries. A null recorded summary remains
 null: task titles, the generic list `summary` field and transcript content
 are never substituted. The list tool makes no per-session detail calls.
 
@@ -34,8 +36,9 @@ are never substituted. The list tool makes no per-session detail calls.
 
 `get_session_summary { session_id, source?, kind?: "short" | "long" }`
 reads `GET /v1/sessions/:id/summary?kind=short&source=...`. Pass the source
-returned by the list to disambiguate session IDs; readers that require a
-source refuse requests without one. A ready result retains its recorded
+returned by the list to disambiguate session IDs. The summary reader requires
+that source; omitted source is refused locally with guidance to pass it,
+without guessing a harness. A ready result retains its recorded
 model, build timestamp and state classification. An empty recorded result
 stays empty. Malformed or missing provenance is refused.
 
@@ -43,6 +46,11 @@ Only recorded short summaries are currently supported. `kind: "long"`
 returns an explicit unsupported result without fetching a short summary or
 transcript as a substitute. Use `get_shared_session` for a bounded transcript
 page until the reader provides a long-summary contract.
+
+Hosted readers that have no summary dependency configured return 501; the
+consumer does not enable reader wiring or summary producers. An installed
+reader may return `status: "empty"` when no summary has been produced. These
+are distinct from a ready recorded summary and from consumer test success.
 
 ## Authority and failures
 
