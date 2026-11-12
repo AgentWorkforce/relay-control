@@ -238,7 +238,7 @@ function required(env: Env, name: string, secret = false): string {
   return value;
 }
 
-function serviceUrl(env: Env, name: string): string {
+export function serviceUrl(env: Env, name: string): string {
   const value = required(env, name);
   let url: URL;
   try {
@@ -339,7 +339,7 @@ function encryptionKeyId(value: string, name: string): string {
   return value;
 }
 
-function loadEncryptionKeyring(env: Env): EncryptionKeyring {
+export function loadEncryptionKeyring(env: Env = process.env): EncryptionKeyring {
   const active: EncryptionKey = {
     id: encryptionKeyId(required(env, "SELFHOST_ENCRYPTION_KEY_ID"), "SELFHOST_ENCRYPTION_KEY_ID"),
     key: encryptionKey(required(env, "SELFHOST_ENCRYPTION_KEY", true), "SELFHOST_ENCRYPTION_KEY"),

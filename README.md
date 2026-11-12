@@ -511,6 +511,57 @@ organization owner/admin) replaces the stored, encrypted key, for a Relaycast
 that was reset and re-minted. The workspace id, and so Desktop sign-ins bound
 to it, stay the same.
 
+### Re-keying Relaycast credentials
+
+Relaycast on durable actors routes only `ar_` credentials. Before a
+self-hosted Relaycast moves from `runtime.backend: postgres` to durable
+actors, and after it has been switched to `credentials.format: ar` with a
+keyring and a long legacy grace (legacy credentials keep verifying), run
+`agent-relay-selfhost-relaycast-rekey` (`npm run relaycast-rekey`) once as a
+Kubernetes Job with the API's image, environment and Secrets:
+
+```sh
+agent-relay-selfhost-relaycast-rekey --dry-run          # counts by table and kind, writes nothing
+agent-relay-selfhost-relaycast-rekey [--workspace <id>] # re-key; prints a run id
+agent-relay-selfhost-relaycast-rekey --undo <run-id>    # put the run's old values back
+```
+
+It reads `DATABASE_URL`, `RELAYCAST_URL`, `RELAYCAST_PUBLIC_URL` (optional),
+`RELAYCAST_INTERNAL_SECRET` (not needed for `--dry-run`) and the
+`SELFHOST_ENCRYPTION_*` keyring, each secret also as `<NAME>_FILE`; no secret
+is accepted on the command line. It replaces, for every row (or one
+workspace's rows):
+
+| Column | Kind | How |
+| --- | --- | --- |
+| `workspaces.relaycast_api_key_ciphertext` | workspace key | `POST /internal/workspaces/{id}/api-key` with only `grace_ms`: Relaycast mints an `ar_ws_` key one generation up. One rotation per Relaycast workspace, stored in every row bound to it |
+| `person_identities.token_ciphertext` | agent | `POST /v1/credentials/upgrade` with the stored token |
+| `hosted_relay_participants.token_ciphertext` | agent | same |
+| `desktop_relay_identities.token_ciphertext` | agent | same (Desktop's own upgrade of the token returns the same `ar_` credential) |
+| `amp_bindings.token_ciphertext` | agent | same |
+| `factory_bindings.hosted_token_envelope` | agent | same |
+| `capy_bindings.token_ciphertext` | agent | same |
+| `events_shims.wake_secret_ciphertext` | webhook | same, only for wake links on this Relaycast's origin |
+
+A credential that already starts with `ar_` (or that Relaycast answers `409
+credential_not_legacy`) is skipped, so reruns are safe. Each old ciphertext is
+written to `relaycast_rekey_backups` (migration 0048) in the same transaction
+that swaps the new one in, and only while the row still holds the value read,
+so a concurrent writer is never overwritten. A failed credential (Relaycast
+error, unreadable ciphertext, concurrent change) is reported by its error code
+and the others continue; the exit code is then 1 (2 for a usage or
+configuration error). Output is one JSON line per credential with table,
+column, row id, kind and outcome, then a summary; never a credential or
+ciphertext.
+
+The rotated-out workspace key keeps working for `--grace-ms` (default and
+Relaycast's maximum: one hour). Desktops and CLIs that resolved the old key
+must resolve it again after that. Legacy agent tokens keep working for
+Relaycast's legacy grace. `--undo <run-id>` first pushes each old workspace
+key back to Relaycast one generation above the rotation, then restores every
+backed-up ciphertext that has not changed since the run; restored agent tokens
+work for as long as the legacy grace lasts.
+
 ### Deleting a workspace
 
 `DELETE /api/v1/organizations/{organizationId}/workspaces/{workspaceId}`
