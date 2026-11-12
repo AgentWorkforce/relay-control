@@ -104,6 +104,11 @@ test("session hard delete stays 501 until the pipeline erase is configured", asy
   const app = await startControlPlane();
   t.after(() => app.stop());
   const tenant = await seedTenant(app.api);
+  for (const endpoint of ["/api/v1/capabilities", "/cloud/api/v1/capabilities", "/readyz"]) {
+    const read = await app.api(endpoint, { token: tenant.ownerToken });
+    assert.equal(read.status, 200);
+    assert.equal(read.body.capabilities.session_delete, false, endpoint);
+  }
   const path = `/api/v1/organizations/${tenant.organizationId}/sessions/${SESSION}`;
   for (const [route, method] of [[path, "DELETE"], [`${path}/erasure`, "GET"]] as const) {
     const result = await app.api(route, { method, token: tenant.ownerToken });
@@ -112,6 +117,44 @@ test("session hard delete stays 501 until the pipeline erase is configured", asy
   }
   const rows = await app.database.query(`SELECT 1 FROM admin_audit_events WHERE action LIKE 'session.hard_%'`);
   assert.equal(rows.rows.length, 0);
+});
+
+test("session_delete advertises configuration and the write gate, without probing or erasing", async (t) => {
+  const previous = process.env.SELFHOST_OPERATOR_CONTROLS;
+  process.env.SELFHOST_OPERATOR_CONTROLS = "always";
+  t.after(() => {
+    if (previous === undefined) delete process.env.SELFHOST_OPERATOR_CONTROLS;
+    else process.env.SELFHOST_OPERATOR_CONTROLS = previous;
+  });
+  const { app, tenant, pipeline, audits } = await setup(t);
+  // The pipeline defaults to 503: discovery reports wiring, not health,
+  // and never contacts the upstream or creates an erase/audit record.
+  for (const token of [tenant.ownerToken, tenant.memberToken]) {
+    for (const endpoint of ["/api/v1/capabilities", "/readyz"]) {
+      const read = await app.api(endpoint, { token });
+      assert.equal(read.status, 200);
+      assert.equal(read.body.capabilities.session_delete, true, endpoint);
+      assert.equal(JSON.stringify(read.body).includes(SECRET), false);
+      assert.equal(JSON.stringify(read.body.capabilities).includes(pipeline.url), false);
+    }
+  }
+  const cookie = await app.api("/cloud/api/v1/capabilities", {
+    headers: { cookie: `agent_relay_session=${tenant.ownerToken}` },
+  });
+  assert.equal(cookie.status, 200);
+  assert.equal(cookie.body.capabilities.session_delete, true);
+  assert.equal(cookie.headers.get("cache-control"), "no-store");
+  assert.equal((await app.api("/api/v1/capabilities")).status, 401);
+
+  for (const mode of ["off", "invalid"]) {
+    process.env.SELFHOST_OPERATOR_CONTROLS = mode;
+    for (const endpoint of ["/api/v1/capabilities", "/readyz"]) {
+      const read = await app.api(endpoint, { token: tenant.ownerToken });
+      assert.equal(read.body.capabilities.session_delete, false, mode);
+    }
+  }
+  assert.equal(pipeline.calls.length, 0);
+  assert.equal((await audits()).length, 0);
 });
 
 test("session hard delete: owner erases, audits once, repeat is idempotent, membership kept", async (t) => {

@@ -18,8 +18,16 @@ else is core and always on.
 ## Reading it
 
 - `GET /api/v1/capabilities` (also `/cloud/api/v1/capabilities`): any signed-in
-  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool, "usage": bool, "launch": bool, "usage_people": bool, "events_shim": bool } }`.
+  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool, "usage": bool, "launch": bool, "usage_people": bool, "events_shim": bool, "session_delete": bool } }`.
 - `/readyz` includes the same `capabilities` object.
+
+`session_delete` is derived from configuration, not selected by `SELFHOST_FEATURES`:
+it is true only when `SESSION_ERASE_API_URL` and its dedicated secret are configured
+and `SELFHOST_OPERATOR_CONTROLS` permits writes. It tells the dashboard whether to
+offer hard delete; it does not grant authorization, probe upstream health, or
+promise that a particular session's storage can be erased. The owner/admin,
+CSRF, operator-gate and pipeline checks still apply. Older servers omit this key;
+clients must treat absence as false. See [session-erasure.md](session-erasure.md).
 
 ## Refusals
 
