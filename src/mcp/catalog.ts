@@ -50,7 +50,7 @@ const REPLICAS_TOOLS = ["list_replicas_environments", "spawn_replica", "get_repl
 const CAPY_BINDING_TOOLS = ["bind_capy_thread", "unbind_capy_thread"] as const;
 const CAPY_SPAWN_TOOLS = ["list_capy_projects", "spawn_capy_thread", "get_capy_thread_spawn"] as const;
 export const SHARED_SESSION_READ_TOOLS = ["open_shared_sessions", "search_shared_sessions", "get_shared_session",
-  "get_shared_session_context", "list_session_timings"] as const;
+  "get_shared_session_context", "list_session_timings", "list_session_summaries", "get_session_summary"] as const;
 const SCREEN_TOOLS = ["show_ui", "show_ui_guide"] as const;
 const EVENT_TOOLS = ["get_event", "get_recent_events", "connect_grok_bot_routine", "disconnect_grok_bot_routine",
   "connect_muse_polling", "disconnect_muse_polling",

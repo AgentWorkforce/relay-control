@@ -5,6 +5,12 @@ assigned at release.
 
 ## Unreleased
 
+- Added: plain MCP `list_session_summaries` and `get_session_summary` tools
+  for recorded summaries, workspace-scoped citations and owners. List pages
+  are bounded to 50; summaries are never synthesized from task titles or
+  transcripts. Reader contracts without recorded summary fields and long
+  summaries report unsupported. Both tools join the shared-session read audit.
+
 ## 0.5.20 (2026-11-12)
 
 - Added: `SELFHOST_DESKTOP_RELEASES_REPO` (owner/repository, unset by default)

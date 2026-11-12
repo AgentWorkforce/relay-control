@@ -13,7 +13,8 @@ Always on; there is no setting. Nothing leaves the installation.
 ## Audited tools
 
 `open_shared_sessions`, `search_shared_sessions`, `get_shared_session`,
-`get_shared_session_context` and `list_session_timings`. Successful and failed
+`get_shared_session_context`, `list_session_timings`, `list_session_summaries`
+and `get_session_summary`. Successful and failed
 calls alike (a refused workspace, an unknown session, a History outage, a
 timeout, arguments refused by the input schema: recorded as `Input validation
 error.` without the validation detail). Other MCP tools are not recorded here.

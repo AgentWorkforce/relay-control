@@ -201,6 +201,27 @@ test("every selected-reader501 stays unsupported with zero History calls regardl
   }
 });
 
+test("summary reads use the per-user reader and never fall back after refusal or missing attestation", async t => {
+  const path="/v1/sessions/fake-session/summary?source=codex&kind=short&workspace=other";
+  for(const status of [200,401,403,404,501,503]) {
+    const seen=fake(t,{readStatus:()=>status}),cfg=config();
+    const read=historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a");
+    if(status===200) assert.deepEqual(await read(path),{from:"read-api"});
+    else await assert.rejects(read(path));
+    assert.ok(seen.reads.length>0);
+    for(const request of seen.reads) {
+      assert.equal(request.url.origin,PUBLIC);
+      assert.equal(request.url.pathname,"/v1/sessions/fake-session/summary");
+      assert.equal(request.url.searchParams.get("workspace"),"ws-a");
+      assert.match(request.bearer!,/^Bearer rth_at_read_/);
+    }
+    assert.equal(seen.history.length,0);assert.equal(seen.handoffs.length,0);
+  }
+  const seen=fake(t,{attest:()=>null}),cfg=config();
+  await assert.rejects(historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")(path));
+  assert.equal(seen.history.length,0);
+});
+
 test("a read API cursor is never restarted on History", async (t) => {
   const seen = fake(t, { readStatus: () => 503 });
   const cfg = config();
