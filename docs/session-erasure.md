@@ -16,6 +16,14 @@ Set both on relay-control:
 While unset, both routes answer 501 `not_implemented`. `SELFHOST_OPERATOR_CONTROLS` (`always`, `off`) gates
 `DELETE` exactly as it gates capture-policy writes (403 `operator_controls_not_entitled`); the read is never gated.
 
+`GET /api/v1/capabilities` (including the `/cloud` alias) and `/readyz` report
+`capabilities.session_delete`: true only when the erase URL/secret pair is
+configured and the operator-controls gate permits writes. This is deployment
+configuration discovery, not a per-user grant, upstream health check or
+per-session storage verdict. No erase request or audit is created by discovery.
+The dashboard hides the delete control while this capability is false or absent;
+the DELETE route retains all authorization and pipeline checks.
+
 ## Delete a session
 
 `DELETE /api/v1/organizations/{org}/sessions/{sessionId}` (also under `/cloud/api/v1/...` with the session cookie;

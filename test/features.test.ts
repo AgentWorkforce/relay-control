@@ -44,6 +44,7 @@ test("SELFHOST_FEATURES: parsing, empty selects nothing, unknown names stop star
   assert.deepEqual(loadSelectedFeatures({ SELFHOST_FEATURES: "" }), NO_FEATURES);
   assert.deepEqual(loadSelectedFeatures({ SELFHOST_FEATURES: " Flows , ,chief," }), { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false, events_shim: false });
   assert.throws(() => loadSelectedFeatures({ SELFHOST_FEATURES: "flows,teleport" }), /unknown feature "teleport"/);
+  assert.throws(() => loadSelectedFeatures({ SELFHOST_FEATURES: "session_delete" }), /unknown feature "session_delete"/);
 });
 
 test("GET /api/v1/capabilities: exact shape, any member, cookie alias, 401 without a user token", async (t) => {
@@ -55,7 +56,7 @@ test("GET /api/v1/capabilities: exact shape, any member, cookie alias, 401 witho
   const read = await cp.api("/api/v1/capabilities", { token: cp.tenant.memberToken });
   assert.equal(read.status, 200);
   assert.equal(read.headers.get("cache-control"), "no-store");
-  assert.deepEqual(read.body, { capabilities: { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false, events_shim: false } });
+  assert.deepEqual(read.body, { capabilities: { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false, events_shim: false, session_delete: false } });
 
   const cookie = await cp.api("/cloud/api/v1/capabilities", {
     headers: { cookie: `agent_relay_session=${cp.tenant.ownerToken}` },
@@ -184,7 +185,7 @@ test("/readyz reports capabilities and no licence field", async (t) => {
   const ready = await cp.api("/readyz");
   assert.equal(ready.status, 200);
   assert.equal("license" in ready.body, false);
-  assert.deepEqual(ready.body.capabilities, { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false, events_shim: false });
+  assert.deepEqual(ready.body.capabilities, { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false, events_shim: false, session_delete: false });
 });
 
 

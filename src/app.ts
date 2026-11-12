@@ -428,6 +428,12 @@ export function createApp(input: {
 }): (request: IncomingMessage, response: ServerResponse) => void {
   const { config, store, admin, telemetry, identity } = input;
   const features = input.features ?? NO_FEATURES;
+  // Installation wiring, not an opt-in SELFHOST_FEATURES name or a grant to
+  // the caller. DELETE still checks organization role and the operator gate.
+  const capabilities = () => ({
+    ...features,
+    session_delete: Boolean(config.sessionErasureApi) && operatorControlsEntitled(),
+  });
   // Usage page counters: written only while the `usage` feature is selected.
   const usage = new UsageStore(store.database, () => input.now?.() ?? new Date());
   const desktopReleases = config.desktopReleasesRepo
@@ -1058,8 +1064,8 @@ export function createApp(input: {
         outageHoldMs: config.introspectOutageHoldMs ?? 0,
       };
       json(response, readiness.ready ? 200 : 503, readiness.ready
-        ? { status: "ready", introspection, capabilities: features }
-        : { status: "not_ready", reason: readiness.reason, message: readiness.message, introspection, capabilities: features });
+        ? { status: "ready", introspection, capabilities: capabilities() }
+        : { status: "not_ready", reason: readiness.reason, message: readiness.message, introspection, capabilities: capabilities() });
       return;
     }
     if (method === "GET" && path === "/openapi.yaml") {
@@ -1837,11 +1843,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
-    // Which optional features this installation serves, for any signed-in member.
+    // Which features and configured operator capabilities this installation serves.
     if (method === "GET" && path === "/api/v1/capabilities") {
       const auth = await authenticate(request);
       if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
-      json(response, 200, { capabilities: features }, true);
+      json(response, 200, { capabilities: capabilities() }, true);
       return;
     }
 
