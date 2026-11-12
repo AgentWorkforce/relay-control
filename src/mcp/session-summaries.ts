@@ -16,7 +16,7 @@ const unsupported = "The selected backend does not support recorded session summ
 const listPage = z.object({
   sessions: z.array(z.object({
     sessionId: id, source: id, userIds: z.array(id), projectId: z.string().nullable(),
-    lastTs: timestamp, shortSummary: z.string().max(1000).nullish(),
+    lastTs: timestamp, shortSummary: z.string().max(2000).refine(value => Array.from(value).length <= 1000).nullish(),
     shortSummaryGeneratedAt: timestamp.nullish(),
     catalog: z.object({ repoUrl: z.string().nullable(), gitBranch: z.string().nullable() }).optional(),
   })).max(50),
@@ -58,7 +58,7 @@ export function registerSessionSummaries(server: McpServer, context: McpContext)
         return [];
       });
       const names = new Map(members.map(member => [member.userId, member.name ?? member.email]));
-      const params = new URLSearchParams({ limit: String(input.limit) });
+      const params = new URLSearchParams({ limit: String(input.limit), includeShortSummary: "recorded" });
       if (input.since) params.set("lastTsAfter", input.since);
       if (input.project) params.set("projectContains", input.project);
       if (input.cursor) params.set("cursor", input.cursor);

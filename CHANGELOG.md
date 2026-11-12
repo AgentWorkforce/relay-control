@@ -9,7 +9,9 @@ assigned at release.
   for recorded summaries, workspace-scoped citations and owners. List pages
   are bounded to 50; summaries are never synthesized from task titles or
   transcripts. Missing list summary fields stay null with explicit unsupported
-  status; long summaries report unsupported. Both tools join the read audit.
+  status; list requests opt in with `includeShortSummary=recorded`. Readers
+  with that extension disabled and long summaries report unsupported. Both
+  tools join the read audit.
 
 ## 0.5.20 (2026-11-12)
 

@@ -222,6 +222,16 @@ test("summary reads use the per-user reader and never fall back after refusal or
   assert.equal(seen.history.length,0);
 });
 
+test("a disabled recorded-summary opt-in never retries without the parameter or on History", async t => {
+  const seen=fake(t,{readStatus:()=>501,errorReason:"param_includeShortSummary"}),cfg=config();
+  await assert.rejects(historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")(
+    "/v1/sessions?includeShortSummary=recorded&limit=50"),/unsupported_by_backend/);
+  assert.equal(seen.reads.length,1);
+  assert.equal(seen.reads[0]!.url.searchParams.get("includeShortSummary"),"recorded");
+  assert.equal(seen.reads[0]!.url.searchParams.get("workspace"),"ws-a");
+  assert.equal(seen.history.length,0);assert.equal(seen.handoffs.length,0);
+});
+
 test("a read API cursor is never restarted on History", async (t) => {
   const seen = fake(t, { readStatus: () => 503 });
   const cfg = config();

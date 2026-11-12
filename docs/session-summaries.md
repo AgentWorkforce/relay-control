@@ -9,7 +9,8 @@ that an agent is currently running; use the existing presence tools for that.
 ## List
 
 `list_session_summaries { since?, project?, repo?, person?, limit?, cursor? }`
-reads one `GET /v1/sessions` page. `limit` defaults to 20 and cannot exceed 50.
+reads one `GET /v1/sessions?includeShortSummary=recorded` page. `limit`
+defaults to 20 and cannot exceed 50.
 `since` is an ISO timestamp mapped to `lastTsAfter`; `project` maps to the
 directory's `projectContains` substring filter. `person` resolves an exact
 workspace member ID, email or unambiguous name and sends that recorded user
@@ -29,8 +30,11 @@ fields on list rows. When either field is omitted, its output is null and
 `short_summary_status` is `unsupported`; session metadata remains usable.
 When both fields are present, the status is `empty` for a null summary and
 `available` for recorded text. The current reader omits the fields for
-compatibility with older clients; an upstream opt-in extension is needed
-for recorded list summaries. Null stays null: task titles, the generic list
+compatibility with older clients; this tool requests the explicit
+`includeShortSummary=recorded` extension. Readers with that extension disabled
+answer 501, which remains unsupported: the tool never retries without the
+parameter or switches backends. Recorded text is bounded to 1000 Unicode
+code points. Null stays null: task titles, the generic list
 `summary` field and transcript content are never substituted. The list tool
 makes no per-session detail calls.
 

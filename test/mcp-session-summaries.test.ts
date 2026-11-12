@@ -49,7 +49,7 @@ test("list reads one bounded directory page and preserves recorded provenance, o
   const value = data(await call(f.client, "list_session_summaries", { since: ts, project: "repo", person: "FAKE@example.test", limit: 50, cursor: "b96l1:before" }));
   const url = new URL(f.paths[0]!, "https://reader.test");
   assert.equal(url.pathname, "/v1/sessions");
-  assert.deepEqual(Object.fromEntries(url.searchParams), { limit: "50", lastTsAfter: ts, projectContains: "repo", cursor: "b96l1:before", user: "user-a" });
+  assert.deepEqual(Object.fromEntries(url.searchParams), { limit: "50", includeShortSummary: "recorded", lastTsAfter: ts, projectContains: "repo", cursor: "b96l1:before", user: "user-a" });
   assert.equal(f.paths.length, 1, "no per-session reads or transcript scan");
   assert.deepEqual(value.sessions[0], { session_id: "fake/session", source: "codex", owner: [{ user_id: "user-a", name: "Example User" }, { user_id: "former-user", name: null }],
     project: "fake-project", repo: "https://example.test/org/repo", branch: "feature/test", last_active: ts,
@@ -79,6 +79,15 @@ test("repo filtering preserves pagination, including an empty filtered page", as
   const value = data(await call(f.client, "list_session_summaries", { repo: "unmatched" }));
   assert.deepEqual(value.sessions, []); assert.equal(value.next_cursor, "b96l1:opaque-page"); assert.equal(f.paths.length, 1);
   assert.equal(data(await call(f.client, "list_session_summaries", { repo: "ORG/REPO" })).sessions.length, 1);
+});
+
+test("recorded list summaries use the reader bound of 1000 Unicode code points", async t => {
+  for (const count of [1000, 1001]) {
+    const f = await fixture(t, { body: { sessions: [{ ...row(), shortSummary: "😀".repeat(count) }], nextCursor: null } });
+    const result = await call(f.client, "list_session_summaries");
+    if (count === 1000) assert.equal(data(result).sessions[0].short_summary, "😀".repeat(count));
+    else assert.equal(result.isError, true);
+  }
 });
 
 test("ambiguous or unknown person filters refuse without broadening to all workspace sessions", async t => {
