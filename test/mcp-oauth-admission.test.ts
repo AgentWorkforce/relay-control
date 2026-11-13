@@ -121,7 +121,7 @@ async function relayFixture(t:test.TestContext) {
     members:async()=>[{userId:f.owner.userId,email:"fake@example.test",name:"Fake User"}],
     providers:async()=>[],
     relaycast:{listAgents:status=>client.listAgents("rk_fake",status),listPresence:()=>client.listPresence("rk_fake")},
-    relay:{database:f.database,keyring,client,sessionId:"fake-chat-session"},oauth:f.connection,
+    relay:{database:f.database,keyring,client,sessionId:"fake-chat-session",relaycastPublicUrl:"https://cast.example.test"},oauth:f.connection,
   };
   const service=relayService(context);
   const oauth=new McpOAuthStore(f.database,{protocol:f.sessions.options.protocol,tenancyMode:"multi",isGrokRoutine:()=>false});

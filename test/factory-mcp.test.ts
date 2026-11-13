@@ -219,7 +219,8 @@ for (const retired of [false,true]) test(`generic join refuses ${retired?"retire
   const base=mcpContext(env,env.ownerId);
   const context=mcpContext(env,env.ownerId,{principal:{...base.principal,name:"Owner",email:"owner@acme.test"},
     relay:{database:env.database,keyring:env.config.encryptionKeyring,
-      client:createRelaycastClient({internalOrigin:env.config.relaycastUrl}),sessionId:undefined}});
+      client:createRelaycastClient({internalOrigin:env.config.relaycastUrl}),sessionId:undefined,
+      relaycastPublicUrl:env.config.relaycastPublicUrl}});
   await assert.rejects(relayService(context).join({name}),/name is already taken/);
   assert.deepEqual({registered:env.relay.registered,recovered:env.relay.recovered},before);
   assert.equal(env.relay.agents.get(name)!.token,originalToken,"generic recovery cannot rotate the provider token");

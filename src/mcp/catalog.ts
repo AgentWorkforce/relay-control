@@ -39,7 +39,7 @@ export function ensureToolTitles(server: McpServer): void {
   }) as McpServer["registerTool"];
 }
 
-export const RELAY_TOOLS = ["list_relay_agents", "send_relay_message", "read_relay_conversation", "join_relay", "leave_relay",
+export const RELAY_TOOLS = ["list_relay_agents", "get_relay_agent_card", "set_relay_agent_card", "send_relay_message", "read_relay_conversation", "join_relay", "leave_relay",
   "relay_status", "check_relay_inbox", "list_relay_channels", "subscribe_relay_channel", "unsubscribe_relay_channel",
   "post_relay_channel", "read_relay_channel"] as const;
 const RELAY_SPAWN_TOOLS = ["list_relay_spawn_targets", "spawn_relay_agent", "get_relay_spawn_status", "release_relay_agent"] as const;
