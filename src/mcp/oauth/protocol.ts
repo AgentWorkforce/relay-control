@@ -46,7 +46,9 @@ const CODE_VERIFIER_PATTERN = /^[A-Za-z0-9._~-]{43,128}$/u;
 const MAX_REDIRECT_URIS = 10;
 const MAX_URL_LENGTH = 2048;
 const MAX_CLIENT_NAME_LENGTH = 100;
-const MAX_STATE_LENGTH = 1024;
+// Limit the encoded callback field, not just JS string length, so escaped
+// Unicode cannot expand an otherwise accepted state beyond the URL budget.
+const MAX_STATE_LENGTH = 4 * 1024;
 const MAX_NONCE_LENGTH = 1024;
 // WHATWG URL keeps IPv6 brackets in `hostname`; the bare form is accepted defensively.
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
@@ -505,8 +507,9 @@ export function createMcpOAuthProtocol(config: McpOAuthProtocolConfig) {
     const state = params.state ?? null;
     // A callback without the client's state masks this error as "missing
     // state". Show the validation error here instead of dropping correlation.
-    if (state !== null && state.length > MAX_STATE_LENGTH) {
-      return { ok: false, redirect: false, error: { error: "invalid_request", error_description: "state must be at most 1024 characters." } };
+    if (state !== null && (state.length > MAX_STATE_LENGTH
+      || new URLSearchParams({ state }).toString().length - "state=".length > MAX_STATE_LENGTH)) {
+      return { ok: false, redirect: false, error: { error: "invalid_request", error_description: `state must be at most ${MAX_STATE_LENGTH} URL-encoded characters.` } };
     }
     const fail = (error: string, description: string) => ({
       ok: false as const,

@@ -39,8 +39,10 @@ against the configured origin and handle malformed URLs without throwing.
 `/cloud/mcp` is not the canonical `/mcp` resource; transport rewrites must supply
 the public path. Empty state is echoed, and nonce is evaluated only for granted
 OIDC. OAuth response fields replace any stale callback values while unrelated
-callback query parameters are preserved. State is accepted up to 1024
-characters and echoed exactly on successful and failed callbacks. A longer
+callback query parameters are preserved. State is accepted up to 4096
+URL-encoded characters and echoed exactly on successful and failed callbacks.
+This permits opaque MCP-client state beyond the previous 1024-character limit
+while bounding the encoded callback field, including Unicode expansion. A longer
 state produces a local `invalid_request` instead of redirecting without state;
 an uncorrelatable callback would hide this cause behind the client's
 "missing state" error. Resource

@@ -71,14 +71,14 @@ const pagePath="/cloud/oauth/authorize?"+new URLSearchParams(params);
 
 test("oversized state returns a local error from both consent endpoints without issuing a code", async () => {
   const {module,calls}=harness({resources:[SHARED]});
-  const oversized={...params,state:"x".repeat(1025)};
+  const oversized={...params,state:"x".repeat(4097)};
   const page=(await module.handle(web("/cloud/oauth/authorize?"+new URLSearchParams(oversized))))!;
   const decision=(await module.handle(web(API+"/authorize",{params:oversized,decision:"approve",
     workspace_id:principal.workspaceId,agent_name:"fake-agent"})))!;
   for(const response of [page,decision]) {
     assert.equal(response.status,400);
     assert.equal(response.headers.get("location"),null);
-    assert.deepEqual(await response.json(),{error:"invalid_request",error_description:"state must be at most 1024 characters."});
+    assert.deepEqual(await response.json(),{error:"invalid_request",error_description:"state must be at most 4096 URL-encoded characters."});
   }
   assert.equal(calls.includes("code"),false);
 });
