@@ -7,6 +7,7 @@ import { emailDomain, type IdentityConfig } from "./config.js";
 import { inviteEmail, signInEmail, type Mailer } from "./mailer.js";
 import { OidcClient, OidcError, pkcePair, randomState } from "./oidc.js";
 import { cloudPathForNext } from "../auth/desktop-login.js";
+import { attemptClearCookies, attemptSetCookies, readAttemptCookie } from "./attempt-cookie.js";
 import { choosePasswordPage, confirmEmailPage, loginPage, messagePage, PAGE_CSP, passwordLinkPage, type InviteBanner } from "./pages.js";
 import { IdentityError, IdentityStore, type Role } from "./store.js";
 import type { Database } from "../database.js";
@@ -315,14 +316,14 @@ export function createIdentityModule(input: {
   }
 
   function signInErrorPage(response: ServerResponse, error: unknown, back: string, provider: Provider = providers[0]!): void {
-    const clear = clearCookie(provider.cookie, `/login/${provider.slug}`);
+    const clear = attemptClearCookies(provider.cookie, `/login/${provider.slug}`);
     if (error instanceof IdentityError) {
-      sendHtml(response, error.status, messagePage({ title: error.code === "not_ready" ? "Almost ready" : "Unable to sign in", message: error.message, back }), [clear]);
+      sendHtml(response, error.status, messagePage({ title: error.code === "not_ready" ? "Almost ready" : "Unable to sign in", message: error.message, back }), clear);
       return;
     }
     if (error instanceof OidcError) {
       log(`${provider.slug} sign-in failed`, { code: error.code, error: error.message });
-      sendHtml(response, 502, messagePage({ title: "Unable to sign in", message: error.message, back }), [clear]);
+      sendHtml(response, 502, messagePage({ title: "Unable to sign in", message: error.message, back }), clear);
       return;
     }
     throw error;
@@ -424,22 +425,26 @@ export function createIdentityModule(input: {
       signInErrorPage(response, error, `/login?next=${encodeURIComponent(next)}`, provider);
       return;
     }
-    redirect(response, 302, location, [
-      setCookie(provider.cookie, encryptSecret(JSON.stringify(attempt), keyring.active), `/login/${provider.slug}`, OIDC_ATTEMPT_TTL_MS / 1_000),
-    ]);
+    // A long `next` is split across chunk cookies; over the budget is refused.
+    const cookies = attemptSetCookies(encryptSecret(JSON.stringify(attempt), keyring.active), provider.cookie, `/login/${provider.slug}`, OIDC_ATTEMPT_TTL_MS / 1_000);
+    if (!cookies) {
+      signInErrorPage(response, new IdentityError(400, "invalid_request", "The sign-in return target is too large."), "/login", provider);
+      return;
+    }
+    redirect(response, 302, location, cookies);
   }
 
   /** GET /login/<slug>/callback: checks the attempt, exchanges the code and signs in. */
   async function providerCallback(request: IncomingMessage, response: ServerResponse, url: URL, provider: Provider): Promise<void> {
     const client = provider.client!;
-    const clear = clearCookie(provider.cookie, `/login/${provider.slug}`);
+    const clear = attemptClearCookies(provider.cookie, `/login/${provider.slug}`);
     if (limited(`${provider.slug}-callback:${limiterKey(clientIp(request))}`, RATE.callback)) {
       sendHtml(response, 429, messagePage({ title: "Too many attempts", message: "Too many sign-in attempts. Try again in a few minutes." }));
       return;
     }
     let attempt: { p: string; state: string; nonce: string; verifier: string; next: string; invite: string | null; redirectUri: string; exp: number } | null = null;
     try {
-      const raw = cookie(request, provider.cookie);
+      const raw = readAttemptCookie((name) => cookie(request, name), provider.cookie);
       attempt = raw ? JSON.parse(decryptSecret(raw, keyring)) : null;
     } catch {
       attempt = null;
@@ -447,7 +452,7 @@ export function createIdentityModule(input: {
     const back = `/login?next=${encodeURIComponent(attempt?.next ?? "/")}${attempt?.invite ? `&invite=${encodeURIComponent(attempt.invite)}` : ""}`;
     const state = url.searchParams.get("state") ?? "";
     if (!attempt || attempt.p !== `${provider.slug}-attempt` || attempt.exp < now() || !state || !secureEqual(state, attempt.state)) {
-      sendHtml(response, 400, messagePage({ title: "Sign-in expired", message: "This sign-in attempt expired or was started in another browser. Start again." , back }), [clear]);
+      sendHtml(response, 400, messagePage({ title: "Sign-in expired", message: "This sign-in attempt expired or was started in another browser. Start again." , back }), clear);
       return;
     }
     const idpError = url.searchParams.get("error");
@@ -457,12 +462,12 @@ export function createIdentityModule(input: {
         title: cancelled ? "Sign-in cancelled" : "Unable to sign in",
         message: cancelled ? "You cancelled the sign-in." : `The identity provider returned an error (${idpError.slice(0, 64).replace(/[^\w.-]/g, "")}).`,
         back,
-      }), [clear]);
+      }), clear);
       return;
     }
     const code = url.searchParams.get("code");
     if (!code) {
-      sendHtml(response, 400, messagePage({ title: "Unable to sign in", message: "The identity provider returned no authorization code.", back }), [clear]);
+      sendHtml(response, 400, messagePage({ title: "Unable to sign in", message: "The identity provider returned no authorization code.", back }), clear);
       return;
     }
     try {
@@ -484,7 +489,7 @@ export function createIdentityModule(input: {
         },
       });
       if (result.joined) log("member joined", { via: result.joined.via, role: result.joined.role, domain: emailDomain(result.email) });
-      redirect(response, 303, attempt.next, [sessionCookie(result.tokens), clear]);
+      redirect(response, 303, attempt.next, [sessionCookie(result.tokens), ...clear]);
     } catch (error) {
       signInErrorPage(response, error, back, provider);
     }

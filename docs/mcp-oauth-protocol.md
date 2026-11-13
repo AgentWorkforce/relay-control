@@ -49,6 +49,10 @@ an uncorrelatable callback would hide this cause behind the client's
 with the whole authorization request as its `next` return target; that target
 allows up to 8 KiB and keeps the same-origin, path-only and control-character
 checks, so a maximum-length state survives sign-in instead of being dropped.
+Provider (OIDC) sign-in keeps the encrypted attempt in up to five
+2800-character cookie chunks with a digest-checked manifest, so the return
+target also survives the provider round trip within browser cookie limits;
+short attempts keep the single cookie.
 Resource canonicalization uses the same parser as consent so URL normalization cannot
 turn a rejected hint/resource into an accepted token audience.
 
