@@ -41,7 +41,10 @@ Included:
   and presence plus RelayHistory; no running flows), relay messaging (DMs,
   inbox and channels as a hosted Relaycast participant per MCP session or
   `join_relay` name, kept in `hosted_relay_participants`), and
-  capability discovery tool groups. `join_relay desktop_address` (the direct
+  capability discovery tool groups. `ask_customer_support` provides private
+  support for all current members through the configured support service,
+  independently of Cloud; see [the support contract](docs/customer-support-mcp.md).
+  `join_relay desktop_address` (the direct
   `name@machine` address Desktop syncs, as shown by `GET /whoami` on the local
   relay socket or an injected `[reply: ...]` hint; an alias address is refused
   with the direct one named) links the MCP session to a synced Agent Relay Desktop identity, kept in
@@ -101,6 +104,8 @@ is explicit. History is served only by the sessions pipeline: see
 | `DATABASE_MIGRATIONS_URL` | Migration-owner Postgres connection; migrate CLI only |
 | `SELFHOST_RUNTIME_DATABASE_ROLE` | Runtime Postgres role granted CRUD on application tables, but not migration metadata or schema creation |
 | `SELFHOST_PUBLIC_URL` | Public origin of this API |
+| `SELFHOST_CUSTOMER_SUPPORT_URL` | Optional support service origin. Configure with the dedicated token below; all current members can use the tool without staff enrollment. |
+| `SELFHOST_CUSTOMER_SUPPORT_TOKEN` | Dedicated support service credential, at least 32 bytes (`_FILE` supported). Paired with relay-agent's `SUPPORT_CONTROL_TOKEN` and exact `SUPPORT_CONTROL_ORIGIN`; never returned to clients. |
 | `RELAYCAST_URL` | Internal Relaycast origin for server-to-server traffic |
 | `RELAYCAST_PUBLIC_URL` | Public Relaycast origin returned to clients; bare HTTPS public DNS origin |
 | `SESSION_READ_API_URL` | Internal HTTP(S) origin of the sessions pipeline read API; the credential handoff and every History read go here ([docs/sessions-read-api.md](docs/sessions-read-api.md)) |

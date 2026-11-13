@@ -3,8 +3,24 @@ import type { Server } from "node:http";
 import { PGlite } from "@electric-sql/pglite";
 import type { Database, SqlExecutor, SqlResult } from "../../src/database.js";
 
+/**
+ * A PGlite-backed Database for tests. close() also drops the PGlite reference:
+ * node:test keeps every finished test's t.after() closure (and so this
+ * wrapper) alive until the file ends, and each PGlite pins ~100 MB of WASM
+ * memory, so a file with dozens of databases otherwise grows to several GB.
+ */
 export class PGliteDatabase implements Database {
-  constructor(readonly client = new PGlite()) {}
+  // A plain (not #private) field: tests wrap databases with Object.create().
+  private open: PGlite | null;
+
+  constructor(client = new PGlite()) {
+    this.open = client;
+  }
+
+  get client(): PGlite {
+    if (!this.open) throw new Error("PGliteDatabase is closed");
+    return this.open;
+  }
 
   async query<T extends Record<string, unknown>>(
     sql: string,
@@ -31,7 +47,10 @@ export class PGliteDatabase implements Database {
   }
 
   async close(): Promise<void> {
-    await this.client.close();
+    const client = this.open;
+    if (!client) return;
+    this.open = null;
+    await client.close();
   }
 
   async exec(sql: string): Promise<void> {

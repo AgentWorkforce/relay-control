@@ -10,36 +10,17 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
 import { PGlite } from "@electric-sql/pglite";
-import type { Database, SqlExecutor, SqlResult } from "../src/database.js";
 import { migrate } from "../src/migrations.js";
 import { loadTelemetryConfig } from "../src/telemetry/config.js";
 import { createTelemetryModule } from "../src/telemetry/module.js";
 import { exportEnvelope } from "../src/telemetry/sign.js";
+import { PGliteDatabase } from "./support/harness.js";
 
 const endpoint = process.env.TELEMETRY_INGEST_URL;
 const installId = process.env.TELEMETRY_INSTALL_ID;
 const installKey = process.env.TELEMETRY_INSTALL_KEY;
 const enabled = Boolean(endpoint && installId && installKey);
 const INTERNAL = "e2e-internal-token-".padEnd(48, "x");
-
-class PGliteDatabase implements Database {
-  constructor(readonly client = new PGlite()) {}
-  async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<SqlResult<T>> {
-    const result = params.length > 0 ? await this.client.query<T>(sql, params) : await this.client.query<T>(sql);
-    return { rows: result.rows };
-  }
-  async transaction<T>(run: (transaction: SqlExecutor) => Promise<T>): Promise<T> {
-    return this.client.transaction(async (transaction) => run({
-      query: async <R extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
-        const result = params.length > 0 ? await transaction.query<R>(sql, params) : await transaction.query<R>(sql);
-        return { rows: result.rows };
-      },
-      exec: async (sql: string) => { await transaction.exec(sql); },
-    }));
-  }
-  async close(): Promise<void> { await this.client.close(); }
-  async exec(sql: string): Promise<void> { await this.client.exec(sql); }
-}
 
 test("relaycontrol -> hosted ingest: digest, error burst, issue report, and an air-gapped export", { skip: !enabled }, async () => {
   const database = new PGliteDatabase();

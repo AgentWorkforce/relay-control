@@ -28,6 +28,8 @@ export type SelfhostConfig = {
   relayfileControlBrokerSecret?: string | null;
   /** RELAYCHIEF_CONTROL_RELAY_SECRET: chief agent registration route. Unset: it 404s. */
   chiefRelaySecret?: string | null;
+  /** Dedicated relay-agent support HTTP connection; no customer allowlist. */
+  customerSupport?: { url: string; token: string } | null;
   /** Independent read service; owns issuance, rotation and verification of its tokens. Required. */
   sessionReadApi: { url: string; publicUrl: string; secret: string };
   /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
@@ -398,6 +400,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     sessionReadApi,
     relayfileControlBrokerSecret: loadBrokerSecret(env),
     chiefRelaySecret: loadChiefRelaySecret(env),
+    customerSupport: loadCustomerSupportConfig(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
     sessionSearchAgentTokens: loadSessionSearchAgentTokens(env),
@@ -415,6 +418,22 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
   };
+}
+
+function loadCustomerSupportConfig(env: Env): SelfhostConfig["customerSupport"] {
+  const url = env.SELFHOST_CUSTOMER_SUPPORT_URL?.trim();
+  const token = readSecret(env, "SELFHOST_CUSTOMER_SUPPORT_TOKEN");
+  if (!url && !token) return null;
+  if (!url || !token) throw new Error("SELFHOST_CUSTOMER_SUPPORT_URL and SELFHOST_CUSTOMER_SUPPORT_TOKEN are required together");
+  if (Buffer.byteLength(token) < 32) throw new Error("SELFHOST_CUSTOMER_SUPPORT_TOKEN must be at least 32 bytes");
+  if (["SELFHOST_BOOTSTRAP_TOKEN", "SELFHOST_INTERNAL_TOKEN", "RELAYCONTROL_INTROSPECT_SECRET", "RELAYFILE_CONTROL_BROKER_SECRET"]
+    .some(name => readSecret(env, name) === token)) throw new Error("SELFHOST_CUSTOMER_SUPPORT_TOKEN must be a dedicated credential");
+  const origin = serviceUrl(env, "SELFHOST_CUSTOMER_SUPPORT_URL");
+  const parsed = new URL(origin);
+  if (parsed.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) {
+    throw new Error("SELFHOST_CUSTOMER_SUPPORT_URL must use HTTPS except on loopback");
+  }
+  return { url: origin, token };
 }
 
 function loadSessionSearchAgentTokens(env: Env): boolean {
