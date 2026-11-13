@@ -430,13 +430,13 @@ test("undo refuses the whole run when any row changed since, before touching Rel
   await assert.rejects(undoRelaycastRekey(f.deps, randomUUID()), /No relaycast rekey backups/);
 });
 
-test("undo validates --grace-ms before reading or changing anything", async (t) => {
+test("undo requires the full recovery grace before reading or changing anything", async (t) => {
   const f = await fixture(t);
   const run = await rekeyRelaycastCredentials(f.deps);
   const after = await f.snapshot();
   f.relaycast.calls.length = 0;
-  for (const grace of [3_600_001, -1, 1.5]) {
-    await assert.rejects(undoRelaycastRekey(f.deps, run.runId!, { workspaceKeyGraceMs: grace }), /--grace-ms must be an integer/);
+  for (const grace of [3_600_001, 0, 1, -1, 1.5]) {
+    await assert.rejects(undoRelaycastRekey(f.deps, run.runId!, { workspaceKeyGraceMs: grace }), /--undo --grace-ms must be 3600000/);
   }
   assert.equal(f.relaycast.calls.length, 0);
   assert.deepEqual(await f.snapshot(), after);

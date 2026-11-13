@@ -568,8 +568,12 @@ export async function undoRelaycastRekey(
 ): Promise<RekeyReport> {
   if (!UUID.test(runId)) throw new Error("--undo must be a run id (uuid)");
   const graceMs = options.workspaceKeyGraceMs ?? WORKSPACE_KEY_MAX_GRACE_MS;
-  if (!Number.isSafeInteger(graceMs) || graceMs < 0 || graceMs > WORKSPACE_KEY_MAX_GRACE_MS) {
-    throw new Error(`--grace-ms must be an integer from 0 to ${WORKSPACE_KEY_MAX_GRACE_MS}`);
+  // Relaycast and PostgreSQL cannot commit atomically. Keep Control's current
+  // (new) key valid for Relaycast's full recovery window if a remote push
+  // lands but the database transaction later rolls back. The operator can
+  // then rerun undo; Relaycast accepts the same live key/generation again.
+  if (graceMs !== WORKSPACE_KEY_MAX_GRACE_MS) {
+    throw new Error(`--undo --grace-ms must be ${WORKSPACE_KEY_MAX_GRACE_MS}`);
   }
   const reporter = new Reporter(deps.log);
   deps.log?.("relaycast_rekey.undo_start", { run_id: runId });

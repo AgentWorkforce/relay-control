@@ -570,14 +570,16 @@ Relaycast's legacy grace.
 `--undo <run-id>` is all or nothing. It first checks every backup of the run
 without changing anything: the row still holds the run's value, the old
 ciphertext is readable with the current keyring, workspace backups are
-complete, `--grace-ms` is valid and Relaycast answers its internal API with
+complete, `--grace-ms` is the full one-hour recovery window and Relaycast answers its internal API with
 the secret. Any problem refuses the whole undo (exit 1; the failing rows carry
 their code, the rest `undo_refused`). Then, in one transaction holding the
 same locks and rows, it pushes each old workspace key back to Relaycast one
 generation above the rotation and restores every ciphertext. If anything
-fails, no row changes; a key push that already landed is safe to repeat,
-since Relaycast treats a re-push of its live key as a no-op, so rerun
-`--undo`. Rows deleted since the run are reported as `gone`. Restored agent
+fails, no row changes; Control's still-stored current key remains valid for
+the full hour, and a key push that already landed is safe to repeat since
+Relaycast treats a re-push of its live key as a no-op. Fix the cause and rerun
+`--undo` inside that recovery window. A shorter (including zero) undo grace is
+refused before any read or write. Rows deleted since the run are reported as `gone`. Restored agent
 tokens work only while the legacy grace lasts, and restoring a workspace key
 needs Relaycast to accept the old key again: a Relaycast that accepts only
 `ar_` credentials refuses it, and then the undo fails without restoring
