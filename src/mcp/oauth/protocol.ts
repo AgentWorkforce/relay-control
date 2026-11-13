@@ -503,14 +503,18 @@ export function createMcpOAuthProtocol(config: McpOAuthProtocolConfig) {
       return { ok: false, redirect: false, error: { error: "invalid_request", error_description: "redirect_uri does not match a registered redirect URI." } };
     }
     const state = params.state ?? null;
+    // A callback without the client's state masks this error as "missing
+    // state". Show the validation error here instead of dropping correlation.
+    if (state !== null && state.length > MAX_STATE_LENGTH) {
+      return { ok: false, redirect: false, error: { error: "invalid_request", error_description: "state must be at most 1024 characters." } };
+    }
     const fail = (error: string, description: string) => ({
       ok: false as const,
       redirect: true as const,
       redirectUri,
-      state: state !== null && state.length <= MAX_STATE_LENGTH ? state : null,
+      state,
       error: { error, error_description: description },
     });
-    if (state !== null && state.length > MAX_STATE_LENGTH) return fail("invalid_request", "state is too long.");
     if (params.response_type !== "code") return fail("unsupported_response_type", "response_type must be code.");
     if (params.code_challenge_method !== "S256" || !params.code_challenge || !isValidCodeChallenge(params.code_challenge)) {
       return fail("invalid_request", "PKCE with code_challenge_method=S256 is required.");

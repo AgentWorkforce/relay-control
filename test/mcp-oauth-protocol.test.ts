@@ -112,17 +112,23 @@ test("authorization failures redirect only after exact registered client/redirec
     assert.ok(!result.ok && !result.redirect);
   }
   for (const overrides of [{ response_type: "token" }, { code_challenge_method: "plain" }, { code_challenge: "bad" },
-    { resource: `${ORIGIN}/api/admin` }, { state: "x".repeat(1025) }]) {
+    { resource: `${ORIGIN}/api/admin` }]) {
     const result = protocol.validateAuthorizationRequest(params(overrides), client);
     assert.ok(!result.ok && result.redirect);
     assert.equal(result.redirectUri, REDIRECT);
-    if (overrides.state) assert.equal(result.state, null);
   }
   const multiple = { ...client, redirectUris: [REDIRECT, "http://localhost:5000/cb"] };
   const ambiguous = protocol.validateAuthorizationRequest(params({ redirect_uri: undefined }), multiple);
   assert.ok(!ambiguous.ok && !ambiguous.redirect);
   assert.ok(protocol.validateAuthorizationRequest(params(), multiple).ok);
   assert.equal(protocol.validateAuthorizationRequest(params({ scope: "openid relay:mcp" }), multiple).ok, false);
+});
+
+test("oversized state fails locally rather than redirecting without the client's correlation value", () => {
+  assert.deepEqual(protocol.validateAuthorizationRequest(params({ state: "x".repeat(1025) }), client), {
+    ok: false, redirect: false,
+    error: { error: "invalid_request", error_description: "state must be at most 1024 characters." },
+  });
 });
 
 test("authorization scopes stay resource-bound; OIDC is opt-in and iss accompanies success and denial", () => {

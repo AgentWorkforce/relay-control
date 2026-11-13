@@ -39,7 +39,11 @@ against the configured origin and handle malformed URLs without throwing.
 `/cloud/mcp` is not the canonical `/mcp` resource; transport rewrites must supply
 the public path. Empty state is echoed, and nonce is evaluated only for granted
 OIDC. OAuth response fields replace any stale callback values while unrelated
-callback query parameters are preserved. Resource
+callback query parameters are preserved. State is accepted up to 1024
+characters and echoed exactly on successful and failed callbacks. A longer
+state produces a local `invalid_request` instead of redirecting without state;
+an uncorrelatable callback would hide this cause behind the client's
+"missing state" error. Resource
 canonicalization uses the same parser as consent so URL normalization cannot
 turn a rejected hint/resource into an accepted token audience.
 
