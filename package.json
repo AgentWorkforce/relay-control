@@ -8,7 +8,8 @@
   "bin": {
     "agent-relay-selfhost-api": "./dist/server.js",
     "agent-relay-selfhost-migrate": "./dist/migrate-cli.js",
-    "agent-relay-analytics-collector": "./dist/collector-cli.js"
+    "agent-relay-analytics-collector": "./dist/collector-cli.js",
+    "agent-relay-selfhost-relaycast-rekey": "./dist/relaycast-rekey-cli.js"
   },
   "files": [
     "dist",
@@ -23,7 +24,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test --test-concurrency=2 test/*.test.ts",
     "start": "node dist/server.js",
-    "migrate": "node dist/migrate-cli.js"
+    "migrate": "node dist/migrate-cli.js",
+    "relaycast-rekey": "node dist/relaycast-rekey-cli.js"
   },
   "dependencies": {
     "@agent-relay/events-shim": "18.3.0",

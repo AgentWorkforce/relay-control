@@ -36,6 +36,20 @@ assigned at release.
   deletes it at the deadline. Needs `RELAYCAST_INTERNAL_SECRET` and a Relaycast
   with `POST /internal/workspaces/:id/expiry`. Migration 0048.
 
+- Added: `agent-relay-selfhost-relaycast-rekey` (`--dry-run`, `--workspace`,
+  `--undo <run-id>`), a one-shot Job that replaces every legacy Relaycast
+  credential Control stores (workspace keys, agent tokens, events-shim wake
+  tokens) with an `ar_` one before Relaycast moves to durable actors. Old
+  ciphertexts are kept in `relaycast_rekey_backups` (migration 0049). See
+  README, "Re-keying Relaycast credentials".
+
+- Added: `agent-relay-selfhost-relaycast-rekey --purge <run-id> [--confirm]`
+  deletes a run's `relaycast_rekey_backups` after the cutover. Without
+  `--confirm` it only reports counts (live, changed, gone, restored).
+  Workspace key rotations hold a per-Relaycast-workspace advisory lock, undo
+  is checked up front and restores all or nothing, backups are deleted with
+  their workspace, and the image links every package command onto `PATH`.
+
 ## 0.5.20 (2026-11-12)
 
 - Added: `SELFHOST_DESKTOP_RELEASES_REPO` (owner/repository, unset by default)
