@@ -33,6 +33,8 @@ test("customer support uses an optional complete dedicated service connection, n
   assert.throws(() => loadConfig({ ...completeEnv, ...support, SELFHOST_CUSTOMER_SUPPORT_TOKEN: "short" }), /at least 32/);
   assert.throws(() => loadConfig({ ...completeEnv, ...support, SELFHOST_CUSTOMER_SUPPORT_TOKEN: completeEnv.SELFHOST_BOOTSTRAP_TOKEN }), /dedicated/);
   assert.throws(() => loadConfig({ ...completeEnv, ...support, SELFHOST_CUSTOMER_SUPPORT_URL: "https://user:secret@support.test/path" }), /origin/);
+  assert.throws(() => loadConfig({ ...completeEnv, ...support, SELFHOST_CUSTOMER_SUPPORT_URL: "http://support.remote.test" }), /HTTPS/);
+  assert.equal(loadConfig({ ...completeEnv, ...support, SELFHOST_CUSTOMER_SUPPORT_URL: "http://127.0.0.1:3000" }).customerSupport?.url, "http://127.0.0.1:3000");
 });
 
 test("the image version is read from SELFHOST_IMAGE_VERSION and null from source", () => {

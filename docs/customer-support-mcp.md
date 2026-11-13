@@ -24,7 +24,8 @@ the shared-session read audit. A user's own MCP client may retain its transcript
 
 Configure `SELFHOST_CUSTOMER_SUPPORT_URL` as the support service origin and
 `SELFHOST_CUSTOMER_SUPPORT_TOKEN` (or `SELFHOST_CUSTOMER_SUPPORT_TOKEN_FILE`) as a dedicated secret of at
-least 32 bytes. Both are required together. Without a connection the tool stays
+least 32 bytes. Both are required together. Remote support service origins must use HTTPS; HTTP
+is accepted only for loopback development origins. Without a connection the tool stays
 discoverable and reports unavailable; `describe_capabilities` explains the
 missing service configuration. No hosted origin is selected implicitly.
 
@@ -74,6 +75,10 @@ configuration stay in the support service. Legacy enrolled routes are indexed
 lazily from service-owned Durable Object configuration, without Cloud DB access.
 New staff configurations update that index. Conflicting aliases fail closed.
 Disabled and removed configurations are not overwritten by initialization.
+Enrollment/removal publishes the immutable workspace binding before releasing its
+reservation. Before cutover, replay authenticated support DELETE for revoked aliases
+recorded by older builds that deleted their directory names, so their surviving
+owner tombstones are indexed too.
 
 HTTP success is the same strict `kind` union as the Cloud RPC: `reply` with up to
 100 strings, `pending` with bounded text, or `unauthorized`, `unavailable`,

@@ -428,7 +428,12 @@ function loadCustomerSupportConfig(env: Env): SelfhostConfig["customerSupport"] 
   if (Buffer.byteLength(token) < 32) throw new Error("SELFHOST_CUSTOMER_SUPPORT_TOKEN must be at least 32 bytes");
   if (["SELFHOST_BOOTSTRAP_TOKEN", "SELFHOST_INTERNAL_TOKEN", "RELAYCONTROL_INTROSPECT_SECRET", "RELAYFILE_CONTROL_BROKER_SECRET"]
     .some(name => readSecret(env, name) === token)) throw new Error("SELFHOST_CUSTOMER_SUPPORT_TOKEN must be a dedicated credential");
-  return { url: serviceUrl(env, "SELFHOST_CUSTOMER_SUPPORT_URL"), token };
+  const origin = serviceUrl(env, "SELFHOST_CUSTOMER_SUPPORT_URL");
+  const parsed = new URL(origin);
+  if (parsed.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) {
+    throw new Error("SELFHOST_CUSTOMER_SUPPORT_URL must use HTTPS except on loopback");
+  }
+  return { url: origin, token };
 }
 
 function loadSessionSearchAgentTokens(env: Env): boolean {
