@@ -1,3 +1,4 @@
+import { page } from "./identity/pages.js";
 import { revokeOrganizationMcpOAuthGrants } from "./mcp/oauth/revocations.js";
 import { createMcpOAuthHttpModule } from "./mcp/oauth/routes.js";
 import { McpOAuthStore } from "./mcp/oauth/store.js";
@@ -1193,22 +1194,16 @@ export function createApp(input: {
         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
       );
       response.setHeader("referrer-policy", "no-referrer");
-      text(response, 200, `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Sign in to Agent Relay</title>
-<style>body{font:16px system-ui;max-width:34rem;margin:10vh auto;padding:1.5rem;color:#171717}code{font-size:2rem;letter-spacing:.12em}#status{color:#555}</style>
-</head><body><main><h1>Sign in to Agent Relay</h1>
-<p>Approve this device code from an authenticated Agent Relay client or administrator:</p>
+      text(response, 200, page("Sign in to Agent Relay", `<h1>Sign in to Agent Relay</h1>
+<p class="muted">Approve this device code from an authenticated Agent Relay client or administrator:</p>
 <p><code>${html(started.userCode)}</code></p>
-<p id="status">Waiting for approval…</p></main>
-<script>
-const status=document.getElementById("status");
+<p class="muted" id="status">Waiting for approval…</p>`, `const status=document.getElementById("status");
 const next=${JSON.stringify(next).replaceAll("<", "\\u003c")};
 async function poll(){try{const r=await fetch("/login/poll",{method:"POST",credentials:"same-origin",headers:{accept:"application/json"}});
 if(r.status===202){const p=await r.json();setTimeout(poll,Math.max(1,Number(p.interval)||5)*1000);return}
 if(r.ok){location.replace(next);return}status.textContent="Sign-in failed. Reload to start again."}catch{setTimeout(poll,5000)}}
 setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
-</script></body></html>`, "text/html");
+`), "text/html");
       return;
     }
 
@@ -1332,12 +1327,16 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
             const value = params.get(field);
             if (value !== null && field !== "workspace") pickerParams.set(field, value);
           }
+          // The picker is a GET form, and a sign-in without consent answers it
+          // with a redirect to the validated loopback listener, which Chromium
+          // checks against form-action too (see the consent page below).
+          const pickerLoopback = new URL(login.redirectUri).origin;
           response.writeHead(200, {
             "content-type": "text/html; charset=utf-8",
             "cache-control": "no-store",
             "referrer-policy": "no-referrer",
             "content-security-policy":
-              `default-src 'none'; style-src 'unsafe-inline'; form-action ${formActionSources.join(" ")}; base-uri 'none'; frame-ancestors 'none'`,
+              `default-src 'none'; style-src 'unsafe-inline'; form-action ${[...formActionSources, pickerLoopback].join(" ")}; base-uri 'none'; frame-ancestors 'none'`,
           });
           response.end(desktopWorkspacePickerPage({
             action: publicPath,

@@ -35,11 +35,26 @@ details{margin-top:18px;font-size:.9rem}summary{cursor:pointer;color:var(--muted
 export const PAGE_CSP =
   "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
-export function page(title: string, body: string, script = "", header = ""): string {
+// Pieces the other server pages (Desktop sign-in, app connection, OAuth
+// callbacks) need on top of the sign-in styles.
+const EXTRA_STYLE = `.actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px}
+.choices{list-style:none;padding:0;margin:0;display:grid;gap:8px}.choice{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;color:var(--fg)}a.choice:visited{color:var(--fg)}a.choice:hover{background:var(--secondary-hover);text-decoration:none}
+ul.list{margin:0 0 14px;padding-left:20px}ul.list li{margin:2px 0}
+label{display:block;font-size:.9rem;color:var(--muted);margin:0 0 4px}label:has(input[type=checkbox]){display:flex;align-items:center;gap:8px;color:var(--fg)}
+input:not([type]){width:100%;padding:10px 14px;border-radius:6px;border:1px solid var(--field);background:var(--field-bg);color:var(--fg);font:inherit;font-size:.92rem;margin:4px 0 0;outline:none}input:not([type]):focus{border-color:var(--focus)}
+select{width:100%;padding:9px 12px;border-radius:6px;border:1px solid var(--field);background:var(--field-bg);color:var(--fg);font:inherit;font-size:.92rem;margin:4px 0 10px}
+.btn:disabled{opacity:.5;cursor:not-allowed}.alert{color:var(--danger);font-size:.92rem;margin:12px 0 0}.alert:empty{display:none}`;
+
+/**
+ * One page: the Agent Relay lockup above a card. `nonce` marks the inline
+ * style and script for pages whose CSP allows only nonced ones.
+ */
+export function page(title: string, body: string, script = "", header = "", nonce = ""): string {
+  const marked = nonce ? ` nonce="${escapeHtml(nonce)}"` : "";
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${escapeHtml(title)}</title><style>${STYLE}</style></head>
-<body><main>${header}<div class="card">${body}</div></main>${script ? `<script>${script}</script>` : ""}</body></html>`;
+<title>${escapeHtml(title)}</title><style${marked}>${STYLE}${EXTRA_STYLE}</style></head>
+<body><main>${header || brandHeader(null)}<div class="card">${body}</div></main>${script ? `<script${marked}>${script}</script>` : ""}</body></html>`;
 }
 
 export type InviteBanner =

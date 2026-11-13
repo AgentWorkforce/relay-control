@@ -344,6 +344,8 @@ test("an unavailable module answers every OAuth path with 501 naming only the re
 test("consent page names where the code goes, labels the client name as self-reported and suggests no shared name",async()=>{
   const remote=await (await harness({resources:[SHARED]}).module.handle(web(pagePath)))!.text();
   assert.match(remote,/<h1>Connect an app calling itself &quot;Fake client&quot;<\/h1>/);
+  assert.match(remote,/<header class="brand">/);
+  assert.match(remote,/<style nonce="[^"]+">/);
   assert.match(remote,/Returns to: <strong>client\.example\.test<\/strong>/);
   assert.match(remote,/id="caution"><strong>Caution:<\/strong> the app chose its own name/);
   assert.ok(remote.indexOf("Returns to:")<remote.indexOf("This connection may:"));

@@ -1,6 +1,7 @@
 // admin lane HTTP routes: workspace environment variables, provider
 // connections (BYO OAuth), workspace API tokens, org settings, audit, and the
 // /internal/v1 runtime read contract. Mounted from src/app.ts.
+import { page } from "../identity/pages.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { SelfhostConfig } from "../config.js";
 import type { EncryptionKeyring } from "../crypto.js";
@@ -269,14 +270,13 @@ export function createAdminModule(input: {
       "content-security-policy":
         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
     });
-    response.end(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>${html(outcome.title)}</title>
-<style>body{font:16px system-ui;max-width:34rem;margin:10vh auto;padding:1.5rem;color:#171717}</style>
-</head><body><main><h1>${html(outcome.title)}</h1><p>${html(outcome.detail)}</p>
-<p><a href="${html(dashboard)}">${outcome.returnTo ? "Return to where you were" : "Return to the dashboard"}</a></p></main>
-<script>${outcome.ok ? "if(window.opener){setTimeout(function(){window.close()},1200)}" : ""}</script>
-</body></html>`);
+    response.end(page(
+      outcome.title,
+      `<h1>${html(outcome.title)}</h1>
+<p class="muted">${html(outcome.detail)}</p>
+<a class="btn secondary" href="${html(dashboard)}">${outcome.returnTo ? "Return to where you were" : "Return to the dashboard"}</a>`,
+      outcome.ok ? "if(window.opener){setTimeout(function(){window.close()},1200)}" : "",
+    ));
   }
 
   async function handle(

@@ -253,7 +253,7 @@ test("a sign-in naming its host needs the person's approval on a same-origin con
     `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${origin} http://127.0.0.1:5123; base-uri 'none'; frame-ancestors 'none'`,
   );
   const html = await page.text();
-  assert.match(html, /Agent Relay Desktop on <strong>sf-mini<\/strong>/);
+  assert.match(html, /<h1>Agent Relay Desktop on sf-mini<\/h1>/);
   assert.match(html, /<strong>Primary<\/strong>/);
   const consentToken = html.match(/name="consent_token" value="([^"]+)"/)?.[1];
   assert(consentToken);
@@ -299,7 +299,7 @@ test("a sign-in naming its host needs the person's approval on a same-origin con
   const token3 = (await third.text()).match(/name="consent_token" value="([^"]+)"/)?.[1];
   const denied = await post({ consent_token: token3!, decision: "deny" });
   assert.equal(denied.status, 200);
-  assert.match(await denied.text(), /Sign-in denied/);
+  assert.match(await denied.text(), /Device denied/);
 });
 
 test("the picker and consent pages keep a path-only form action and allow both browser origins", async (t) => {
@@ -336,7 +336,8 @@ test("the picker and consent pages keep a path-only form action and allow both b
   assert.equal(picker.status, 200);
   assert.equal(
     picker.headers.get("content-security-policy"),
-    `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${origin} ${dashboard}; base-uri 'none'; frame-ancestors 'none'`,
+    // The picker's GET form can be answered with a redirect to the loopback listener.
+    `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${origin} ${dashboard} http://127.0.0.1:5123; base-uri 'none'; frame-ancestors 'none'`,
   );
   assert.doesNotMatch(await picker.text(), /href="https?:\/\/[^"]*\/cloud\/api\/v1\/cli\/login/);
 });
