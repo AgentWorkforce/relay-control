@@ -1,45 +1,16 @@
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import test from "node:test";
-import { PGlite } from "@electric-sql/pglite";
 import { ApiTokenStore } from "../src/admin/api-tokens.js";
 import { createApp } from "../src/app.js";
 import { hashSecret } from "../src/crypto.js";
 import type { SelfhostConfig } from "../src/config.js";
-import type { Database, SqlExecutor, SqlResult } from "../src/database.js";
+import type { Database, SqlExecutor } from "../src/database.js";
 import { SendAbandoned } from "../src/messaging/http.js";
 import { createRelaycastClient, RelaycastCallError } from "../src/messaging/relaycast.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
-
-class PGliteDatabase implements Database {
-  constructor(readonly client = new PGlite()) {}
-
-  async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<SqlResult<T>> {
-    const result = params.length > 0 ? await this.client.query<T>(sql, params) : await this.client.query<T>(sql);
-    return { rows: result.rows };
-  }
-
-  async transaction<T>(run: (transaction: SqlExecutor) => Promise<T>): Promise<T> {
-    return this.client.transaction(async (transaction) => run({
-      query: async <R extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
-        const result = params.length > 0 ? await transaction.query<R>(sql, params) : await transaction.query<R>(sql);
-        return { rows: result.rows };
-      },
-      exec: async (sql: string) => {
-        await transaction.exec(sql);
-      },
-    }));
-  }
-
-  async close(): Promise<void> {
-    await this.client.close();
-  }
-
-  async exec(sql: string): Promise<void> {
-    await this.client.exec(sql);
-  }
-}
+import { PGliteDatabase } from "./support/harness.js";
 
 type AgentRecord = {
   id: string;
