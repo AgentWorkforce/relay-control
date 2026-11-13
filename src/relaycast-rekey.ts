@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 import { decryptSecret, EncryptedSecretError, encryptSecret, type EncryptionKeyring } from "./crypto.js";
 import type { Database, SqlExecutor } from "./database.js";
 import { loadDatabaseUrl, loadEncryptionKeyring, readSecret, serviceUrl, type Env } from "./config.js";
+import { lockRelaycastWorkspace } from "./relaycast-workspace-lock.js";
 
 export type RekeyKind = "workspace" | "agent" | "webhook";
 export type RekeyOutcome =
@@ -302,17 +303,6 @@ function sourceFor(table: string, column: string): { hasUpdatedAt: boolean } | n
   return TOKEN_SOURCES.find((source) => source.table === table && source.column === column) ?? null;
 }
 
-/** Advisory lock namespace for one Relaycast workspace's key ("RCK"). */
-const WORKSPACE_LOCK_NAMESPACE = 0x52434b;
-
-/**
- * Serializes everything that reads, rotates or restores one Relaycast
- * workspace's key (rekey and undo, across Jobs) until the transaction ends.
- */
-async function lockRelaycastWorkspace(tx: SqlExecutor, relaycastWorkspaceId: string): Promise<void> {
-  await tx.query("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [WORKSPACE_LOCK_NAMESPACE, relaycastWorkspaceId]);
-}
-
 export type RekeyOptions = {
   /** relay-control workspace id (workspaces.id); all workspaces when absent. */
   workspaceId?: string;
@@ -439,6 +429,10 @@ async function rekeyWorkspaceKeys(
         else item(row.id, "done" in outcome ? "already_ar" : "upgraded");
       }
     } catch (error) {
+      // A lock/read failure happened before any binding row was available to
+      // report. Do not let the CLI claim success merely because `group` is
+      // empty; abort the run so its exit status is non-zero.
+      if (group.length === 0) throw error;
       // Nothing was stored. If Relaycast did rotate (the store failed after
       // it answered), the old key still verifies for the grace and a rerun
       // rotates again with the internal secret, so the lost key is harmless.

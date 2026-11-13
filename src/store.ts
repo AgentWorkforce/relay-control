@@ -5,6 +5,7 @@ import { capturePolicyFromRow, type CapturePolicy } from "./capture-policy.js";
 import { consentAttemptKey, type ConsentAttempt } from "./auth/desktop-login.js";
 import type { Database, SqlExecutor } from "./database.js";
 import { revokeMcpOAuthGrantRows } from "./mcp/oauth/store.js";
+import { lockRelaycastWorkspace } from "./relaycast-workspace-lock.js";
 import { DASHBOARD_DEVICE_CLIENT, isDeviceReservedClientName } from "./reserved-client-names.js";
 import {
   lockIdentity,
@@ -329,6 +330,26 @@ export class ControlPlaneStore {
     if (!apiKey) throw new Error("relaycastApiKey is required");
     await this.database.transaction(async (tx) => {
       await this.requireOrganization(tx, input.organizationId);
+      // Rekey rotates every Control workspace bound to one Relaycast
+      // workspace as a group. Join the same advisory-lock domain before
+      // inserting a new binding, then require the caller's key to match the
+      // group after the lock: a create that began with the legacy key while a
+      // rotation was in flight waits and fails instead of stranding that row.
+      await lockRelaycastWorkspace(tx, relaycastWorkspaceId);
+      const existing = await tx.query<{ ciphertext: string }>(
+        `SELECT relaycast_api_key_ciphertext AS ciphertext
+           FROM workspaces
+          WHERE relaycast_workspace_id = $1
+          ORDER BY id
+          FOR UPDATE`,
+        [relaycastWorkspaceId],
+      );
+      for (const row of existing.rows) {
+        const current = decryptSecret(row.ciphertext, this.encryptionKeyring);
+        if (!secureEqual(current, apiKey)) {
+          throw new Error("relaycastApiKey does not match the existing Relaycast workspace binding");
+        }
+      }
       await tx.query(
         `INSERT INTO workspaces
           (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)

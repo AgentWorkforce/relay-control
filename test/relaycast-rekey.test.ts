@@ -13,6 +13,7 @@ import {
   type RekeyDeps,
 } from "../src/relaycast-rekey.js";
 import { PGliteDatabase } from "./support/harness.js";
+import { ControlPlaneStore } from "../src/store.js";
 
 const RELAYCAST_URL = "http://relaycast.internal:8080";
 const PUBLIC_URL = "https://cast.example.test";
@@ -34,6 +35,7 @@ function fakeRelaycast() {
   const failUpgrade = new Map<string, { status: number; code: string }>();
   const failRotation = new Map<string, { status: number; code: string }>();
   let beforeUpgrade: ((legacy: string) => Promise<void>) | undefined;
+  let beforeRotation: ((workspaceId: string) => Promise<void>) | undefined;
   /** Relaycast workspaces whose next key push applies and then loses its answer. */
   const dropAnswerAfterPush = new Set<string>();
   let capabilitiesStatus = 200;
@@ -54,6 +56,7 @@ function fakeRelaycast() {
     if (rotate) {
       if (bearer !== INTERNAL_SECRET) return json(401, { ok: false, error: { code: "unauthorized", message: "Invalid internal token" } });
       const id = decodeURIComponent(rotate[1]!);
+      await beforeRotation?.(id);
       const failure = failRotation.get(id);
       if (failure) return json(failure.status, { ok: false, error: { code: failure.code, message: `secret detail ${INTERNAL_SECRET}` } });
       const stored = generations.get(id) ?? 0;
@@ -93,6 +96,7 @@ function fakeRelaycast() {
     fetch, calls, upgrades, currentKeys, generations, failUpgrade, failRotation, dropAnswerAfterPush,
     setCapabilitiesStatus(status: number) { capabilitiesStatus = status; },
     setBeforeUpgrade(hook: (legacy: string) => Promise<void>) { beforeUpgrade = hook; },
+    setBeforeRotation(hook: (workspaceId: string) => Promise<void>) { beforeRotation = hook; },
   };
 }
 
@@ -196,7 +200,7 @@ async function fixture(t: TestContext) {
   };
   return {
     database, keyring, enc, dec, relaycast, deps, logs, secrets, tokens, ids, read, workspaceKey, snapshot,
-    workspace, sharedWorkspace, otherWorkspace, legacyKey, otherKey,
+    org, otherOrg, workspace, sharedWorkspace, otherWorkspace, legacyKey, otherKey,
   };
 }
 
@@ -505,6 +509,60 @@ test("overlapping rekey runs rotate each Relaycast workspace once and store the 
     const [table, column] = agentTables(f)[name]!;
     assert.equal(f.dec(await f.read(table, column, f.ids[name]!)), f.relaycast.upgrades.get(f.tokens[name]!));
   }
+});
+
+test("a workspace create cannot add the legacy key while its Relaycast workspace rotates", async (t) => {
+  const f = await fixture(t);
+  let entered!: () => void;
+  let release!: () => void;
+  const rotating = new Promise<void>((resolve) => { entered = resolve; });
+  const resume = new Promise<void>((resolve) => { release = resolve; });
+  f.relaycast.setBeforeRotation(async (workspaceId) => {
+    if (workspaceId === RC_WS) {
+      entered();
+      await resume;
+    }
+  });
+
+  const rekey = rekeyRelaycastCredentials(f.deps, { workspaceId: f.workspace });
+  await rotating;
+  const store = new ControlPlaneStore(f.database, f.keyring, 0, { tenancy: "multi" });
+  let createSettled = false;
+  const create = store.createWorkspace({
+    organizationId: f.org,
+    name: "Concurrent binding",
+    relaycastWorkspaceId: RC_WS,
+    relaycastApiKey: f.legacyKey,
+  }).finally(() => { createSettled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(createSettled, false, "create must wait for the workspace rotation lock");
+
+  release();
+  assert.equal((await rekey).failed, 0);
+  await assert.rejects(create, /does not match the existing Relaycast workspace binding/);
+
+  const current = f.relaycast.currentKeys.get(RC_WS)!;
+  const thirdOrg = randomUUID();
+  await f.database.query("INSERT INTO organizations(id,name) VALUES ($1,'Third Org')", [thirdOrg]);
+  const created = await store.createWorkspace({
+    organizationId: thirdOrg,
+    name: "Current binding",
+    relaycastWorkspaceId: RC_WS,
+    relaycastApiKey: current,
+  });
+  assert.equal(f.dec(await f.workspaceKey(created.id)), current);
+});
+
+test("a workspace lock/read failure aborts rekey instead of reporting success", async (t) => {
+  const f = await fixture(t);
+  const database = Object.create(f.database) as typeof f.database;
+  database.transaction = async () => {
+    throw Object.assign(new Error("database unavailable"), { code: "57P01" });
+  };
+  await assert.rejects(
+    rekeyRelaycastCredentials({ ...f.deps, database }),
+    (error: Error & { code?: string }) => error.code === "57P01",
+  );
 });
 
 test("deleting a workspace deletes its rekey backups", async (t) => {
