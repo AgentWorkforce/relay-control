@@ -357,6 +357,21 @@ test("/login returns to a safe same-origin next path after sign-in", async (t) =
     const html = await (await fetch(`${origin}/login?next=${encodeURIComponent(unsafe)}`)).text();
     assert(html.includes('const next="/";'), unsafe);
   }
+  const authorizeNext = "/cloud/oauth/authorize?" + new URLSearchParams({
+    client_id: "c".repeat(32),
+    response_type: "code",
+    redirect_uri: "https://client.example.test/cb",
+    code_challenge: "v".repeat(43),
+    code_challenge_method: "S256",
+    resource: "https://control.example.test/mcp",
+    state: "x".repeat(4096),
+  });
+  const authorizePage = await (await fetch(`${origin}/login?next=${encodeURIComponent(authorizeNext)}`)).text();
+  assert(authorizePage.includes(`const next=${JSON.stringify(authorizeNext)};`), "MCP authorize handoff kept");
+  for (const dropped of ["/x?s=" + "a".repeat(8188), "//evil.example/" + "a".repeat(4000)]) {
+    const html = await (await fetch(`${origin}/login?next=${encodeURIComponent(dropped)}`)).text();
+    assert(html.includes('const next="/";'), dropped.slice(0, 24));
+  }
   const escaped = await (await fetch(`${origin}/login?next=${encodeURIComponent("/</script><script>x")}`)).text();
   assert.doesNotMatch(escaped, /<\/script><script>x/);
 });
@@ -417,6 +432,18 @@ test("device approval helpers", () => {
   assert.equal(safeNextPath(null), "/");
   assert.equal(safeNextPath("relative"), "/");
   assert.equal(safeNextPath("/a\u0000b"), "/");
+  const long = "/x?s=" + "a".repeat(8192 - 5);
+  assert.equal(long.length, 8192);
+  assert.equal(safeNextPath(long), long);
+  assert.equal(safeNextPath(long + "a"), "/");
+  for (const hostile of [
+    "//evil.example/" + "a".repeat(4000),
+    "/\\evil.example/" + "a".repeat(4000),
+    "/ok?" + "a".repeat(4000) + "\u0000",
+    "https://evil.example/" + "a".repeat(4000),
+  ]) {
+    assert.equal(safeNextPath(hostile), "/", hostile.slice(0, 24));
+  }
   assert.equal(sanitizeDesktopHostName("  mini\tbox "), "mini box");
   assert.equal(sanitizeDesktopHostName("x".repeat(81)), null);
   assert.equal(sanitizeDesktopHostName(42), null);
