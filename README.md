@@ -553,7 +553,7 @@ rotate it once and Control always stores the key (and generation) Relaycast
 holds. The rotation and the store cannot be atomic: if the store fails after
 Relaycast answered, nothing is stored, the old key still verifies for the
 grace, and a rerun rotates again. Each old ciphertext is
-written to `relaycast_rekey_backups` (migration 0048) in the same transaction
+written to `relaycast_rekey_backups` (migration 0049) in the same transaction
 that swaps the new one in, and only while the row still holds the value read,
 so a concurrent writer is never overwritten. A failed credential (Relaycast
 error, unreadable ciphertext, concurrent change) is reported by its error code

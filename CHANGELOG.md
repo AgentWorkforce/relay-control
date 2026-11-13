@@ -40,7 +40,7 @@ assigned at release.
   `--undo <run-id>`), a one-shot Job that replaces every legacy Relaycast
   credential Control stores (workspace keys, agent tokens, events-shim wake
   tokens) with an `ar_` one before Relaycast moves to durable actors. Old
-  ciphertexts are kept in `relaycast_rekey_backups` (migration 0048). See
+  ciphertexts are kept in `relaycast_rekey_backups` (migration 0049). See
   README, "Re-keying Relaycast credentials".
 
 - Added: `agent-relay-selfhost-relaycast-rekey --purge <run-id> [--confirm]`
