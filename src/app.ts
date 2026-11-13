@@ -72,6 +72,7 @@ import { isBindingOwnedIdentity } from "./messaging/binding-identities.js";
 import type { McpContext } from "./mcp/context.js";
 import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./factory/routes.js";
 import { createMcpHandler } from "./mcp/routes.js";
+import { createCustomerSupportNoticeHandler } from "./mcp/customer-support-notice.js";
 import type { AmpModule } from "./amp/module.js";
 import { isAmpPath } from "./amp/routes.js";
 import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
@@ -488,6 +489,7 @@ export function createApp(input: {
     internalServiceToken: config.internalServiceToken,
     browserOrigins,
   });
+  const customerSupportNotice = createCustomerSupportNoticeHandler(config, store, messagingDeps);
   const factory = input.factory ?? createFactoryModule({
     config,
     database: store.database,
@@ -1130,6 +1132,7 @@ export function createApp(input: {
       return;
     }
 
+    if (await customerSupportNotice(request, response, publicPath, method)) return;
     // Dormant acquisition assertion issuer (docs/acquisition-issuer.md): every
     // /api/v1/acquisition path is 404 until SELFHOST_ACQUISITION_ISSUER_ENABLED.
     if (await handleAcquisitionRoutes({

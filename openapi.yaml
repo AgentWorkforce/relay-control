@@ -109,6 +109,41 @@ tags:
         ED25519_SHA_512, 4096-byte message cap), one key per profile,
         addressed by alias. A private key stored in Postgres is not a fallback.
 paths:
+  /internal/v1/customer-support/reply-notice:
+    post:
+      operationId: customerSupportReplyNotice
+      summary: Wake a member's verified Desktop when a private support reply is ready
+      security: [{ customerSupportService: [] }]
+      description: |
+        Authenticated service callback from relay-agent; never carries reply text.
+        Verifies current organization/workspace membership, the exact synced Desktop
+        address and its current Relaycast ownership. Sends an idempotent DM as the
+        member. No Cloud service is required. See docs/customer-support-mcp.md.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [version, organizationId, workspaceId, userId, desktopAddress, conversationId, revision, replyId]
+              properties:
+                version: { const: 1 }
+                organizationId: { type: string, format: uuid }
+                workspaceId: { type: string, format: uuid }
+                userId: { type: string, format: uuid }
+                desktopAddress: { type: string, maxLength: 512 }
+                conversationId: { type: string, pattern: '^[0-9a-f]{32}$' }
+                revision: { type: integer, minimum: 0 }
+                replyId: { type: integer }
+      responses:
+        "200": { description: Sent, not_authorized or no_desktop; revoked or stale targets are acknowledged without a DM }
+        "400": { description: Invalid notice }
+        "401": { description: Dedicated support service credential required }
+        "404": { description: Support service not configured }
+        "405": { description: POST required }
+        "413": { description: Body exceeds 2048 bytes }
+        "503": { description: Delivery unavailable; retry the same notice }
   /mcp:
     post:
       operationId: mcpOAuthRoot
@@ -7660,6 +7695,10 @@ paths:
           description: "`unavailable` (Relaycast refused or unreachable; retry-after 60) or `not_configured` (no RELAYCAST_INTERNAL_SECRET)."
 components:
   securitySchemes:
+    customerSupportService:
+      type: http
+      scheme: bearer
+      description: Dedicated SELFHOST_CUSTOMER_SUPPORT_TOKEN; no user session, workspace or general service credential is accepted.
     eventsShimManageBearer:
       type: http
       scheme: bearer

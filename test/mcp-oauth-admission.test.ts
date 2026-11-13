@@ -44,6 +44,33 @@ const INITIALIZE={jsonrpc:"2.0",id:1,method:"initialize",params:{
   protocolVersion:"2025-06-18",capabilities:{},clientInfo:{name:"fake-client",version:"1"},
 }};
 
+test("OAuth support checks its exact live grant again before returning a private answer", async t => {
+  const f = await fixture(t);
+  let revoke = false;
+  const support = createServer(async (request, response) => {
+    assert.equal(request.headers.authorization, "Bearer " + "support-credential-".repeat(2));
+    if (revoke) await f.database.query("UPDATE mcp_oauth_grants SET revoked_at = now() WHERE id = $1", [f.owner.grantId]);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ kind: "reply", replies: ["PRIVATE_OAUTH_SUPPORT"] }));
+  });
+  const supportUrl = await listen(support); t.after(() => close(support));
+  const config = appConfig();
+  config.customerSupport = { url: supportUrl, token: "support-credential-".repeat(2) };
+  const store = new ControlPlaneStore(f.database, KEYRING, 0, { tenancy: "multi" });
+  const server = createServer(createApp({ config, store }));
+  const base = await listen(server); t.after(() => close(server));
+  const client = new Client({ name: "support-oauth-test", version: "1" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(base + SHARED), {
+    requestInit: { headers: { authorization: "Bearer " + f.pair.accessToken } },
+  }));
+  t.after(() => client.close());
+  const args = { message: "Help with setup", request_id: "oauth-support-001" };
+  assert.equal(((await client.callTool({ name: "ask_customer_support", arguments: args })).structuredContent as any).status, "reply");
+  revoke = true;
+  assert.deepEqual((await client.callTool({ name: "ask_customer_support", arguments: { ...args, request_id: "oauth-support-002" } })).structuredContent,
+    { status: "not_authorized" });
+});
+
 async function fixture(t:test.TestContext) {
   const database=new PGliteDatabase();t.after(()=>database.close());await migrate(database);
   const userId=randomUUID(),organizationId=randomUUID(),workspaceId=randomUUID();

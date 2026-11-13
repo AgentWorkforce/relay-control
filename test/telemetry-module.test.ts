@@ -7,31 +7,12 @@ import test from "node:test";
 import { PGlite } from "@electric-sql/pglite";
 import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
-import type { Database, SqlExecutor, SqlResult } from "../src/database.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { loadTelemetryConfig } from "../src/telemetry/config.js";
 import { createTelemetryModule, type TelemetryModule } from "../src/telemetry/module.js";
 import { INSTALL_HEADER, SIGNATURE_HEADER, verifySignature } from "../src/telemetry/sign.js";
-
-class PGliteDatabase implements Database {
-  constructor(readonly client = new PGlite()) {}
-  async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<SqlResult<T>> {
-    const result = params.length > 0 ? await this.client.query<T>(sql, params) : await this.client.query<T>(sql);
-    return { rows: result.rows };
-  }
-  async transaction<T>(run: (transaction: SqlExecutor) => Promise<T>): Promise<T> {
-    return this.client.transaction(async (transaction) => run({
-      query: async <R extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
-        const result = params.length > 0 ? await transaction.query<R>(sql, params) : await transaction.query<R>(sql);
-        return { rows: result.rows };
-      },
-      exec: async (sql: string) => { await transaction.exec(sql); },
-    }));
-  }
-  async close(): Promise<void> { await this.client.close(); }
-  async exec(sql: string): Promise<void> { await this.client.exec(sql); }
-}
+import { PGliteDatabase } from "./support/harness.js";
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

@@ -96,7 +96,7 @@ export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
 export function planToolGroups(options: { amp?: boolean; factory?: boolean; launch?: boolean; capyPermits?: boolean } = {}): ToolPlanEntry[] {
-  const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relay_messaging"];
+  const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relay_messaging", "customer_support"];
   // Launch tools exist only when SELFHOST_FEATURES selects launch; role and
   // connection kind are checked on every call.
   if (options.launch) groups.push("hosted_launch");
@@ -140,6 +140,7 @@ export type CapabilityGroup = {
   tools: string[];
   reason?: string;
   how_to_enable?: string;
+  call_requirements?: string;
 };
 
 export type CapabilityReport = {
@@ -169,6 +170,7 @@ export function describeCapabilities(input: {
   factory?: boolean;
   launch?: boolean;
   capyPermits?: boolean;
+  customerSupport?: boolean;
   providers: ProviderStatus[];
 }): CapabilityReport {
   const launchRole = input.role === "owner" || input.role === "admin";
@@ -180,6 +182,9 @@ export function describeCapabilities(input: {
     const definition = TOOL_GROUPS[id];
     const base = { id, title: definition.title };
     const item = planned.get(id);
+    if (id === "customer_support" && !input.customerSupport) return { ...base, status: "unavailable", tools: [...definition.tools],
+      reason: "The customer support backend is not configured on this installation.",
+      how_to_enable: "Configure SELFHOST_CUSTOMER_SUPPORT_URL and SELFHOST_CUSTOMER_SUPPORT_TOKEN for the support service." };
     if (item && id === "shared_session_reads" && input.authMode === "oauth") {
       return { ...base, status: "restricted", tools: [...item.tools],
         reason: "This OAuth connection does not grant transcript-history access.",
@@ -190,7 +195,8 @@ export function describeCapabilities(input: {
         reason: LAUNCH_ROLE_REFUSAL,
         how_to_enable: "Ask a workspace owner to make you an owner or admin." };
     }
-    if (item) return { ...base, status: "available", tools: [...item.tools] };
+    if (item) return { ...base, status: "available", tools: [...item.tools], ...(id === "customer_support"
+      ? { call_requirements: "Available to all signed-in customers. Current credentials and workspace membership are checked before sending and before returning an answer." } : {}) };
     if (id === "hosted_launch" && input.launch && input.authMode === "oauth") {
       return { ...base, status: "unavailable", tools: [...definition.tools],
         reason: "Agent launches are not available through an OAuth MCP connection on this self-hosted site.",

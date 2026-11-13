@@ -12,6 +12,8 @@ import {
   type RemoteAgent,
 } from "./relaycast.js";
 
+type PersonUser = Pick<Principal, "userId" | "name" | "email">;
+
 const MAX_NAME = 48;
 const STALE_CLAIM_MS = 15_000;
 
@@ -73,7 +75,7 @@ export function candidateNames(user: { userId: string; email: string; name: stri
   return [...new Set(names.map((name) => name.slice(0, MAX_NAME)))];
 }
 
-function ownerOf(workspaceId: string, user: Principal): PersonOwner {
+function ownerOf(workspaceId: string, user: PersonUser): PersonOwner {
   return {
     cloudWorkspaceId: workspaceId,
     cloudUserId: user.userId,
@@ -158,7 +160,7 @@ export async function findPersonIdentity(
 async function createIdentity(
   deps: MessagingDeps,
   relaycast: Relaycast,
-  access: { workspaceId: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; user: Principal },
+  access: { workspaceId: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; user: PersonUser },
   executor: SqlExecutor,
 ): Promise<PersonIdentity> {
   const owner = ownerOf(access.workspaceId, access.user);
@@ -200,7 +202,7 @@ async function createIdentity(
 async function persistRecovery(
   deps: MessagingDeps,
   relaycast: Relaycast,
-  access: { workspaceId: string; relaycastWorkspaceId: string; relaycastApiKey: string; user: Principal },
+  access: { workspaceId: string; relaycastWorkspaceId: string; relaycastApiKey: string; user: PersonUser },
   remote: RemoteAgent,
   executor: SqlExecutor,
 ): Promise<PersonIdentity> {
@@ -228,7 +230,7 @@ async function persistRecovery(
 
 export async function ensurePersonIdentity(
   deps: MessagingDeps,
-  access: { workspaceId: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; user: Principal },
+  access: { workspaceId: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; user: PersonUser },
 ): Promise<PersonIdentity> {
   const relaycast = client(deps);
   const outcome = await withLock(deps.database, `${access.workspaceId}:${access.user.userId}`, async (tx) => {
@@ -270,7 +272,7 @@ export function isRefusedToken(error: unknown): boolean {
 
 export async function recoverPersonIdentity(
   deps: MessagingDeps,
-  access: { workspaceId: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; user: Principal },
+  access: { workspaceId: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; user: PersonUser },
   refused: PersonIdentity,
 ): Promise<PersonIdentity> {
   const relaycast = client(deps);
@@ -289,7 +291,7 @@ export async function recoverPersonIdentity(
 
 export async function withPersonToken<T>(
   deps: MessagingDeps,
-  access: { workspaceId: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; user: Principal },
+  access: { workspaceId: string; organizationId: string; relaycastWorkspaceId: string; relaycastApiKey: string; user: PersonUser },
   fn: (identity: PersonIdentity) => Promise<T>,
 ): Promise<T> {
   const identity = await ensurePersonIdentity(deps, access);
