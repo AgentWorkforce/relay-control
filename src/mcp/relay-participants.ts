@@ -848,8 +848,13 @@ function createRelayService(context: McpContext) {
       const current = await client.getRosterAgent(key, own.name);
       if (!current || current.id !== own.agentId || current.status === "released") throw new RelayToolError(CARD_IDENTITY_CHANGED);
       // Only these keys are sent; Relaycast merges them, keeping every other key.
+      // Bound to the checked id: a name re-registered since is never written.
       const updated = await client.mergeAgentMetadata(key, own.name, {
-        ...cardMetadata(input, current.metadata, new Date()), kind: own.kind, ...(ownerName ? { owner_name: ownerName } : {}) });
+        ...cardMetadata(input, current.metadata, new Date()), kind: own.kind, ...(ownerName ? { owner_name: ownerName } : {}) }, own.agentId)
+        .catch((error: unknown) => {
+          if (error instanceof RelaycastCallError && error.status === 409) throw new RelayToolError(CARD_IDENTITY_CHANGED);
+          throw error;
+        });
       if (updated.id !== own.agentId) throw new RelayToolError(CARD_IDENTITY_CHANGED);
       return { updated: true, linked: own.linked, name: updated.name,
         card: buildAgentCard(updated, cardOptions) };

@@ -197,6 +197,8 @@ export function createRelaycastWorld(roster: unknown[]) {
       // body.metadata into the stored metadata; keys not sent are kept.
       const agent = agents.get(decodeURIComponent(match[1]!));
       if (!agent) return fail(404, "agent_not_found");
+      // expected_agent_id (relaycast#666): 409 when the name now names another agent.
+      if (body?.expected_agent_id !== undefined && body.expected_agent_id !== agent.id) return fail(409, "agent_identity_changed");
       if (body?.metadata !== undefined) agent.metadata = { ...agent.metadata, ...body.metadata };
       syncRoster();
       return ok(rosterEntry(agent));

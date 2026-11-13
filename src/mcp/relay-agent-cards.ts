@@ -96,21 +96,25 @@ export function skillIdFromName(name: string): string {
 
 /**
  * The agent's declared skills, read as Relaycast's readDeclaredSkills does
- * (malformed entries skipped; a missing id derived from the name; a repeated
- * id suffixed -2, -3, ...), then bounded to the section-1 limits.
+ * (malformed entries skipped; explicit ids reserved first; a missing id derived
+ * from the name; a repeated or colliding id suffixed -2, -3, ...), then bounded to the section-1 limits.
  */
 export function storedSkills(metadata: Record<string, unknown>): CardSkill[] {
   if (!Array.isArray(metadata.skills)) return [];
-  const used = new Set<string>();
-  const skills: CardSkill[] = [];
-  for (const item of metadata.skills) {
-    if (skills.length >= CARD_LIMITS.skills) break;
+  const entries = metadata.skills.flatMap(item => {
     const raw = record(item);
     const name = bounded(raw?.name, CARD_LIMITS.skillName);
-    if (!raw || !name) continue;
-    const base = bounded(raw.id, CARD_LIMITS.skillId) ?? skillIdFromName(name);
+    return raw && name ? [{ raw, name, explicit: bounded(raw.id, CARD_LIMITS.skillId) }] : [];
+  });
+  // Explicit ids are reserved first, so a declared id is published unchanged.
+  const reserved = new Set(entries.flatMap(entry => entry.explicit ? [entry.explicit] : []));
+  const used = new Set<string>();
+  const skills: CardSkill[] = [];
+  for (const { raw, name, explicit } of entries) {
+    if (skills.length >= CARD_LIMITS.skills) break;
+    const base = explicit ?? skillIdFromName(name);
     let id = base;
-    for (let n = 2; used.has(id); n += 1) id = `${base}-${n}`;
+    for (let n = 2; used.has(id) || (id !== explicit && reserved.has(id)); n += 1) id = `${base}-${n}`;
     used.add(id);
     const examples = strings(raw.examples, CARD_LIMITS.examples, CARD_LIMITS.example);
     skills.push({ id, name, description: typeof raw.description === "string" ? raw.description.slice(0, CARD_LIMITS.skillDescription) : "",

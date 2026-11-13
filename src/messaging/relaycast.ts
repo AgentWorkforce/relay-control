@@ -446,11 +446,13 @@ export function createRelaycastClient(input: {
      * Sets top-level metadata keys on one agent. Relaycast's
      * `PATCH /v1/agents/:name` merges `metadata` into the stored metadata
      * (`{ ...existing, ...body.metadata }`), so keys not sent are preserved;
-     * a key sent replaces that key's value. Returns the updated record.
+     * a key sent replaces that key's value. With `expectedAgentId`, Relaycast
+     * 409s if the name now belongs to another agent. Returns the updated record.
      */
-    async mergeAgentMetadata(workspaceKey: string, name: string, metadata: Record<string, unknown>): Promise<RosterAgent> {
+    async mergeAgentMetadata(workspaceKey: string, name: string, metadata: Record<string, unknown>, expectedAgentId?: string): Promise<RosterAgent> {
       const data = await labeled("update_agent", () =>
-        call("PATCH", `/v1/agents/${encodeURIComponent(name)}`, workspaceKey, { metadata }));
+        call("PATCH", `/v1/agents/${encodeURIComponent(name)}`, workspaceKey,
+          expectedAgentId ? { metadata, expected_agent_id: expectedAgentId } : { metadata }));
       const agent = rosterFrom(data);
       if (!agent) throw new RelaycastCallError(502, "", true);
       return agent;

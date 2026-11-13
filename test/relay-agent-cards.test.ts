@@ -14,9 +14,9 @@ test("stored skills are bounded, get derived ids and unique ids as Relaycast rea
     ...Array.from({ length: 30 }, (_, index) => ({ id: `s-${index}`, name: `Skill ${index}` })),
   ] });
   assert.equal(skills.length, 20);
-  assert.deepEqual(skills[0], { id: "review-prs", name: "Review PRs", description: "x".repeat(500), tags: ["a"],
+  assert.deepEqual(skills[0], { id: "review-prs-2", name: "Review PRs", description: "x".repeat(500), tags: ["a"],
     examples: ["one", "two", "three", "four", "five"] });
-  assert.deepEqual(skills.slice(1, 3).map(skill => [skill.id, skill.name]), [["review-prs-2", "Duplicate id"], ["Bad Id", "Ship Releases"]]);
+  assert.deepEqual(skills.slice(1, 3).map(skill => [skill.id, skill.name]), [["review-prs", "Duplicate id"], ["Bad Id", "Ship Releases"]]);
   assert.deepEqual(skills[2], { id: "Bad Id", name: "Ship Releases", description: "", tags: [] });
   assert.deepEqual(storedSkills({ skills: "nope" }), []);
 });

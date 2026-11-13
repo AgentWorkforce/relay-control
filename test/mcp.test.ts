@@ -714,7 +714,8 @@ test("set_relay_agent_card writes only the joined participant's card and preserv
   // Exactly one merge-PATCH of only skills and card, with the workspace key.
   const patches = env.relay.world.bodies.filter(call => call.method === "PATCH");
   assert.deepEqual(patches.map(call => [call.path, Object.keys(call.body!), Object.keys(call.body!.metadata).sort()]),
-    [["/v1/agents/owner-reviewer", ["metadata"], ["card", "kind", "owner_name", "skills"]]]);
+    [["/v1/agents/owner-reviewer", ["metadata", "expected_agent_id"], ["card", "kind", "owner_name", "skills"]]]);
+  assert.equal(patches[0]!.body!.expected_agent_id, remote.id);
   assert.ok(env.relay.calls.some(call => call.path === "/v1/agents/owner-reviewer" && call.authorization === "Bearer rk_live_first"));
   const { card, skills, ...rest } = remote.metadata as Record<string, any>;
   const { skills: _old, ...ownership } = before;
