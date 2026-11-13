@@ -1922,7 +1922,7 @@ paths:
               required: [workspaceId, nodeToken]
               properties:
                 workspaceId: { type: string, description: Must be the token's workspace }
-                nodeToken: { type: string, pattern: "^nt_live_[A-Za-z0-9_-]{8,256}$" }
+                nodeToken: { type: string, pattern: "^(?:nt_live_[A-Za-z0-9_-]{8,256}|ar_nd_[0-9A-Za-z]{11}_[a-z][0-9A-Za-z]{10}_[0-9A-Za-z]{49})$" }
       responses:
         "200":
           description: Claim result

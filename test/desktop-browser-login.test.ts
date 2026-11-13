@@ -435,6 +435,19 @@ test("the Desktop claims its spawn node with a proven node token, idempotently, 
   assert.equal(unknown.status, 403);
   assert.equal(unknown.body.error, "node_claim_refused");
 
+  // Self-hosted Relaycast issues the `ar_` family: ar_nd_<wsid 11>_<tag 11>_<secret 43 + crc 6>.
+  // Other ar_ kinds and malformed shapes are refused before Relaycast is asked.
+  const arToken = (kind: string, tail = "0".repeat(49)) => `ar_${kind}_00000000001_a0000000001_${tail}`;
+  for (const nodeToken of [arToken("ws"), arToken("ag"), arToken("nd", "0".repeat(48)), arToken("nd", `${"0".repeat(48)}-`),
+    `ar_nd_00000000001_A0000000001_${"0".repeat(49)}`]) {
+    assert.equal((await claim({ workspaceId, nodeToken })).status, 400, nodeToken.slice(0, 12));
+  }
+  relaycastState.nodes[arToken("nd")] = { id: "node_ar", name: "ar-mini" };
+  const arClaim = await claim({ workspaceId, nodeToken: arToken("nd") });
+  assert.equal(arClaim.status, 200);
+  assert.deepEqual(arClaim.body, { nodeId: "node_ar", claimed: true, owner: "you" });
+  assert.ok(!JSON.stringify(arClaim.body).includes(arToken("nd")));
+
   const first = await claim({ workspaceId, nodeToken: "nt_live_desktop_token_abc" });
   assert.equal(first.status, 200);
   assert.deepEqual(first.body, { nodeId: "node_desk", claimed: true, owner: "you" });
