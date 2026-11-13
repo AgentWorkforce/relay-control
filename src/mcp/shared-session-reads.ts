@@ -5,6 +5,7 @@ import { SHARED_SESSION_READ_TOOLS } from "./catalog.js";
 import { type McpContext, SharedSessionsToolError, sessionCitation, toolError } from "./context.js";
 import { noteResultOwners, withReadAudit } from "./read-audit.js";
 import { registerSessionTimings } from "./session-timings.js";
+import { registerSessionSummaries } from "./session-summaries.js";
 import { agentPrefixTooShort, AGENT_VALUE, MAX_AGENT_LENGTH, selectAgent } from "../sessions/agent-query.js";
 
 /**
@@ -300,6 +301,7 @@ export function registerSharedSessionReads(mcpServer: McpServer, context: McpCon
   // Every read below writes one shared_session_read_audit row (docs/shared-session-read-audit.md).
   const server = withReadAudit(mcpServer, context);
   const origin = context.origin;
+  registerSessionSummaries(server, context);
 
   server.registerTool(SHARED_SESSION_READ_TOOLS[0], {
     title: "Shared agent sessions",

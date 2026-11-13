@@ -299,7 +299,7 @@ function structured(result: Awaited<ReturnType<Client["callTool"]>>): Record<str
   return result.structuredContent as Record<string, any>;
 }
 
-test("initialize advertises the self-host server and the nineteen tools on both paths", async (t) => {
+test("initialize advertises the self-host server and the twenty-one tools on both paths", async (t) => {
   const env = await setup(t);
   for (const path of [MCP_PATH, CLOUD_MCP_PATH]) {
     const raw = await rpc(env.origin, path, { headers: { authorization: `Bearer ${env.accessToken}` } });
@@ -321,12 +321,14 @@ test("initialize advertises the self-host server and the nineteen tools on both 
     assert.deepEqual(tools.map((tool) => tool.name).sort(), [
       "check_relay_inbox",
       "describe_capabilities",
+      "get_session_summary",
       "get_shared_session",
       "get_shared_session_context",
       "join_relay",
       "leave_relay",
       "list_relay_agents",
       "list_relay_channels",
+      "list_session_summaries",
       "list_session_timings",
       "list_team_activity",
       "open_shared_sessions",

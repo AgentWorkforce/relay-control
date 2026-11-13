@@ -513,7 +513,8 @@ paths:
         Serves the `agent-relay-selfhost` MCP server ("Agent Relay Sessions",
         version 0.1.0). Tool groups served: shared session reads
         (`open_shared_sessions`, `search_shared_sessions`, `get_shared_session`,
-        `get_shared_session_context`, `list_session_timings`), team activity
+        `get_shared_session_context`, `list_session_timings`,
+        `list_session_summaries`, `get_session_summary`), team activity
         (`list_team_activity`, from the Relaycast roster and presence plus
         RelayHistory; running flows are not listed), relay messaging
         (`list_relay_agents`, `send_relay_message`, `read_relay_conversation`,

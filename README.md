@@ -657,6 +657,15 @@ API on PGlite at `http://127.0.0.1:8787` with fixed development secrets.
 
 ## Shared-session read audit
 
+`list_session_summaries` is a plain MCP tool for discovering recent sessions
+before opening transcripts. It returns at most 50 rows with recorded short
+summaries, owners, project/repository metadata, timestamps and citation links.
+`get_session_summary` reads one recorded short summary; long summaries are
+explicitly unsupported until the reader supplies that contract. Both use the
+existing per-user workspace reader and appear in the read audit. See
+[docs/session-summaries.md](docs/session-summaries.md) for filters and backend
+requirements.
+
 Every MCP shared-session read (search, session and context reads, timings,
 open) writes an append-only `shared_session_read_audit` row: who asked, from
 which calling chat (and whether a signed proof verified it), the bounded

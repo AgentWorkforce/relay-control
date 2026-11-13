@@ -5,6 +5,14 @@ assigned at release.
 
 ## Unreleased
 
+- Added: plain MCP `list_session_summaries` and `get_session_summary` tools
+  for recorded summaries, workspace-scoped citations and owners. List pages
+  are bounded to 50; summaries are never synthesized from task titles or
+  transcripts. Missing list summary fields stay null with explicit unsupported
+  status; list requests opt in with `includeShortSummary=recorded`. Readers
+  with that extension disabled and long summaries report unsupported. Both
+  tools join the read audit.
+
 - Added: `POST /api/v1/events-shim/t/<mcp token>/workspace`, each webhook
   inbox's temporary Agent Relay workspace for `events-shim setup` to run its
   own core on: created through Relaycast's internal admin API with a 7-day

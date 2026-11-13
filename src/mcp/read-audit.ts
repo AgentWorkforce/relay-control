@@ -18,6 +18,8 @@ export const AUDITED_READ_TOOLS = [
   "get_shared_session",
   "get_shared_session_context",
   "list_session_timings",
+  "list_session_summaries",
+  "get_session_summary",
 ] as const;
 
 export const MAX_AUDIT_QUERY_LENGTH = 500;
@@ -97,7 +99,7 @@ function identityOf(context: McpContext) {
 /** Request filters worth keeping for the ledger: never content, never the cursor value. */
 function filtersOf(input: Record<string, unknown>): Record<string, string | boolean> {
   const filters: Record<string, string | boolean> = {};
-  for (const key of ["source", "project", "since", "until", "user_id", "focus_timestamp", "order"]) {
+  for (const key of ["source", "project", "repo", "since", "until", "user_id", "kind", "focus_timestamp", "order"]) {
     const value = bounded(input[key], MAX_FILTER_LENGTH);
     if (value !== null) filters[key] = value;
   }
@@ -153,6 +155,13 @@ export function resultSessionsOf(toolName: string, structured: Record<string, un
     // Each event names its own source: a read without `source` can span several.
     for (const event of events) add(event.session_id, event.source, [event.user_id]);
     if (events.length === 0) add(structured.session_id, structured.source, []);
+  } else if (toolName === "list_session_summaries") {
+    const sessions = list(structured.sessions);
+    count = sessions.length;
+    for (const session of sessions) add(session.session_id, session.source, list(session.owner).map(member => member.user_id));
+  } else if (toolName === "get_session_summary") {
+    count = 1;
+    add(structured.session_id, structured.source, []);
   } else if (toolName === "list_session_timings") {
     const sessions = list(structured.sessions);
     count = sessions.length;

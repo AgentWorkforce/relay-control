@@ -10,7 +10,7 @@ type ReaderConfig = Pick<SelfhostConfig,"publicBaseUrl"|"sessionReadMcpReads"> &
 };
 
 /** Per-user reader client. Only Control sees the reader's internal issuer secret. */
-const READ_ROUTES = /^\/v1\/(?:events|sessions(?:\/activity|\/[^/]+\/(?:turns|metadata|events))?)$/;
+const READ_ROUTES = /^\/v1\/(?:events|sessions(?:\/activity|\/[^/]+\/(?:turns|metadata|events|summary))?)$/;
 const READ_API_CURSOR = /^b96[a-z][0-9]+:/;
 const EXPIRY_MARGIN_MS = 30_000;
 const CACHE_LIMIT = 1_000;
