@@ -336,7 +336,8 @@ test("the picker and consent pages keep a path-only form action and allow both b
   assert.equal(picker.status, 200);
   assert.equal(
     picker.headers.get("content-security-policy"),
-    `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${origin} ${dashboard}; base-uri 'none'; frame-ancestors 'none'`,
+    // The picker's GET form can be answered with a redirect to the loopback listener.
+    `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${origin} ${dashboard} http://127.0.0.1:5123; base-uri 'none'; frame-ancestors 'none'`,
   );
   assert.doesNotMatch(await picker.text(), /href="https?:\/\/[^"]*\/cloud\/api\/v1\/cli\/login/);
 });

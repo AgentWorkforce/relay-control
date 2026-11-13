@@ -1327,12 +1327,16 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
             const value = params.get(field);
             if (value !== null && field !== "workspace") pickerParams.set(field, value);
           }
+          // The picker is a GET form, and a sign-in without consent answers it
+          // with a redirect to the validated loopback listener, which Chromium
+          // checks against form-action too (see the consent page below).
+          const pickerLoopback = new URL(login.redirectUri).origin;
           response.writeHead(200, {
             "content-type": "text/html; charset=utf-8",
             "cache-control": "no-store",
             "referrer-policy": "no-referrer",
             "content-security-policy":
-              `default-src 'none'; style-src 'unsafe-inline'; form-action ${formActionSources.join(" ")}; base-uri 'none'; frame-ancestors 'none'`,
+              `default-src 'none'; style-src 'unsafe-inline'; form-action ${[...formActionSources, pickerLoopback].join(" ")}; base-uri 'none'; frame-ancestors 'none'`,
           });
           response.end(desktopWorkspacePickerPage({
             action: publicPath,

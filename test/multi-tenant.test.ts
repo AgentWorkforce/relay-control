@@ -376,6 +376,7 @@ test("DG-001: the Desktop picker, desktop:workspaces list and mint, and device a
   for (const name of ["a1", "a2", "b1", "Org A", "Org B"]) assert(page.includes(name), name);
   assert(page.includes(`<option value="${env.b1}">`));
   assert.match(page, /<select id="workspace" name="workspace" required>/);
+  assert.match(picker.headers.get("content-security-policy") ?? "", /form-action [^;]*http:\/\/127\.0\.0\.1:\d+/);
   assert.equal((await fetch(`${env.origin}${loginPath({ workspace: FOREIGN_WORKSPACE })}`, {
     redirect: "manual", headers: { cookie },
   })).status, 403);
