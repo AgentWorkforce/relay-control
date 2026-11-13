@@ -58,6 +58,8 @@ const ACCOUNT_SCOPES = [...BROWSER_SESSION_SCOPES, ACCOUNT_SCOPE];
 const DESKTOP_SCOPES = [...DEVICE_SCOPES, DESKTOP_WORKSPACES_SCOPE];
 /** desktop-auth lane, browser flow: hosted Cloud's 15-minute loopback handoff. */
 const DESKTOP_HANDOFF_TTL_MS = 15 * 60 * 1_000;
+
+class RelaycastBindingMoved extends Error {}
 /** The Desktop consent screen's single-use token lives as long as the screen. */
 const DESKTOP_CONSENT_TOKEN_TTL_MS = 10 * 60 * 1_000;
 const DESKTOP_SESSION_LABEL = "Agent Relay Desktop";
@@ -383,33 +385,89 @@ export class ControlPlaneStore {
     const apiKey = input.relaycastApiKey?.trim() || null;
     if (input.relaycastApiKey !== undefined && !apiKey) throw new Error("relaycastApiKey is required");
     if (name === null && relaycastWorkspaceId === null && apiKey === null) throw new Error("nothing to update");
-    return this.database.transaction(async (tx) => {
-      await this.requireOrganization(tx, input.organizationId);
-      const result = await tx.query<{ id: string; name: string; relaycast_workspace_id: string }>(
-        `UPDATE workspaces
-            SET name = COALESCE($3, name),
-                relaycast_workspace_id = COALESCE($4, relaycast_workspace_id),
-                relaycast_api_key_ciphertext = COALESCE($5, relaycast_api_key_ciphertext),
-                updated_at = now()
-          WHERE id = $1 AND organization_id = $2
-          RETURNING id, name, relaycast_workspace_id`,
-        [
-          input.workspaceId,
-          input.organizationId,
-          name,
-          relaycastWorkspaceId,
-          apiKey === null ? null : encryptSecret(apiKey, this.encryptionKeyring.active),
-        ],
-      );
-      const row = result.rows[0];
-      if (!row) return null;
-      return {
-        id: row.id,
-        organizationId: input.organizationId,
-        name: row.name,
-        relaycastWorkspaceId: row.relaycast_workspace_id,
-      };
-    });
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.database.transaction(async (tx) => {
+          await this.requireOrganization(tx, input.organizationId);
+          // Read before locking so we can take both advisory locks in sorted
+          // order, matching other binding writers. Re-read under the locks;
+          // if another update moved the row meanwhile, retry from scratch.
+          const beforeResult = await tx.query<{ relaycast_workspace_id: string; ciphertext: string }>(
+            `SELECT relaycast_workspace_id, relaycast_api_key_ciphertext AS ciphertext
+               FROM workspaces
+              WHERE id = $1 AND organization_id = $2`,
+            [input.workspaceId, input.organizationId],
+          );
+          const before = beforeResult.rows[0];
+          if (!before) return null;
+          const targetRelaycastWorkspaceId = relaycastWorkspaceId ?? before.relaycast_workspace_id;
+          for (const id of [...new Set([before.relaycast_workspace_id, targetRelaycastWorkspaceId])].sort()) {
+            await lockRelaycastWorkspace(tx, id);
+          }
+          const lockedResult = await tx.query<{ relaycast_workspace_id: string; ciphertext: string }>(
+            `SELECT relaycast_workspace_id, relaycast_api_key_ciphertext AS ciphertext
+               FROM workspaces
+              WHERE id = $1 AND organization_id = $2
+              FOR UPDATE`,
+            [input.workspaceId, input.organizationId],
+          );
+          const locked = lockedResult.rows[0];
+          if (!locked) return null;
+          if (locked.relaycast_workspace_id !== before.relaycast_workspace_id) throw new RelaycastBindingMoved();
+
+          const effectiveKey = apiKey ?? decryptSecret(locked.ciphertext, this.encryptionKeyring);
+          // A same-binding key replacement that waited behind rekey must not
+          // put its stale input back after rotation. A deliberate reset made
+          // without a concurrent ciphertext change remains supported.
+          if (apiKey !== null && targetRelaycastWorkspaceId === locked.relaycast_workspace_id
+            && locked.ciphertext !== before.ciphertext
+            && !secureEqual(effectiveKey, decryptSecret(locked.ciphertext, this.encryptionKeyring))) {
+            throw new Error("relaycastApiKey does not match the current Relaycast workspace binding");
+          }
+          const existing = await tx.query<{ ciphertext: string }>(
+            `SELECT relaycast_api_key_ciphertext AS ciphertext
+               FROM workspaces
+              WHERE relaycast_workspace_id = $1 AND id <> $2
+              ORDER BY id
+              FOR UPDATE`,
+            [targetRelaycastWorkspaceId, input.workspaceId],
+          );
+          for (const row of existing.rows) {
+            if (!secureEqual(decryptSecret(row.ciphertext, this.encryptionKeyring), effectiveKey)) {
+              throw new Error("relaycastApiKey does not match the existing Relaycast workspace binding");
+            }
+          }
+
+          const result = await tx.query<{ id: string; name: string; relaycast_workspace_id: string }>(
+            `UPDATE workspaces
+                SET name = COALESCE($3, name),
+                    relaycast_workspace_id = COALESCE($4, relaycast_workspace_id),
+                    relaycast_api_key_ciphertext = COALESCE($5, relaycast_api_key_ciphertext),
+                    updated_at = now()
+              WHERE id = $1 AND organization_id = $2
+              RETURNING id, name, relaycast_workspace_id`,
+            [
+              input.workspaceId,
+              input.organizationId,
+              name,
+              relaycastWorkspaceId,
+              apiKey === null ? null : encryptSecret(apiKey, this.encryptionKeyring.active),
+            ],
+          );
+          const row = result.rows[0];
+          if (!row) return null;
+          return {
+            id: row.id,
+            organizationId: input.organizationId,
+            name: row.name,
+            relaycastWorkspaceId: row.relaycast_workspace_id,
+          };
+        });
+      } catch (error) {
+        if (error instanceof RelaycastBindingMoved && attempt < 2) continue;
+        throw error;
+      }
+    }
   }
 
   /**

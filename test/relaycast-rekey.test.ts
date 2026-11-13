@@ -553,6 +553,56 @@ test("a workspace create cannot add the legacy key while its Relaycast workspace
   assert.equal(f.dec(await f.workspaceKey(created.id)), current);
 });
 
+test("a workspace rebind cannot enter a rotating group with its legacy key", async (t) => {
+  const f = await fixture(t);
+  const thirdOrg = randomUUID();
+  await f.database.query("INSERT INTO organizations(id,name) VALUES ($1,'Third Org')", [thirdOrg]);
+  const store = new ControlPlaneStore(f.database, f.keyring, 0, { tenancy: "multi" });
+  const candidate = await store.createWorkspace({
+    organizationId: thirdOrg,
+    name: "Rebind candidate",
+    relaycastWorkspaceId: RC_WS_OTHER,
+    relaycastApiKey: f.otherKey,
+  });
+
+  let entered!: () => void;
+  let release!: () => void;
+  const rotating = new Promise<void>((resolve) => { entered = resolve; });
+  const resume = new Promise<void>((resolve) => { release = resolve; });
+  f.relaycast.setBeforeRotation(async (workspaceId) => {
+    if (workspaceId === RC_WS) {
+      entered();
+      await resume;
+    }
+  });
+
+  const rekey = rekeyRelaycastCredentials(f.deps, { workspaceId: f.workspace });
+  await rotating;
+  let updateSettled = false;
+  const update = store.updateWorkspace({
+    organizationId: thirdOrg,
+    workspaceId: candidate.id,
+    relaycastWorkspaceId: RC_WS,
+    relaycastApiKey: f.legacyKey,
+  }).finally(() => { updateSettled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(updateSettled, false, "rebind must wait for the target workspace rotation lock");
+
+  release();
+  assert.equal((await rekey).failed, 0);
+  await assert.rejects(update, /does not match the existing Relaycast workspace binding/);
+
+  const current = f.relaycast.currentKeys.get(RC_WS)!;
+  const rebound = await store.updateWorkspace({
+    organizationId: thirdOrg,
+    workspaceId: candidate.id,
+    relaycastWorkspaceId: RC_WS,
+    relaycastApiKey: current,
+  });
+  assert.equal(rebound?.relaycastWorkspaceId, RC_WS);
+  assert.equal(f.dec(await f.workspaceKey(candidate.id)), current);
+});
+
 test("a workspace lock/read failure aborts rekey instead of reporting success", async (t) => {
   const f = await fixture(t);
   const database = Object.create(f.database) as typeof f.database;
