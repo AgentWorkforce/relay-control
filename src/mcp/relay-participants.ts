@@ -12,6 +12,7 @@ import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
 import { buildAgentCard, cardMetadata, cardSummary, type SetCardInput } from "./relay-agent-cards.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
+import { connectorKind } from "./oauth/connector-kind.js";
 import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } from "./oauth/retirement.js";
 
 /**
@@ -54,6 +55,9 @@ export class RelayToolError extends Error {
 export const ownerHash = (id: string) => createHash("sha256").update(id).digest("hex");
 
 export const HOSTED_SOURCE = "cloud-hosted-mcp";
+/** Card kinds (metadata.kind), as Cloud's hosted MCP writes them. */
+export const HOSTED_KIND = "hosted";
+export const DESKTOP_KIND = "relay-desktop";
 const AS_PERSON_UNAVAILABLE =
   "as_person is not available on this self-hosted site. Omit it to act as this MCP session's hosted participant.";
 
@@ -490,7 +494,7 @@ function createRelayService(context: McpContext) {
       : await client.registerHosted(key, name, {
         source: HOSTED_SOURCE, cloud_workspace_id: workspaceId, owner_hash: owner, objective,
         // Agent card fields (x-agent-relay kind and owner).
-        kind: "session", ...(ownerName ? { owner_name: ownerName } : {}),
+        kind: HOSTED_KIND, ...(ownerName ? { owner_name: ownerName } : {}),
         ...(oauth ? { created_by: "mcp-oauth" } : {}),
       });
     try {
@@ -753,17 +757,31 @@ function createRelayService(context: McpContext) {
 
   const cardOptions = { organization: context.workspace.name, relaycastUrl: context.relay.relaycastPublicUrl };
 
+  type CardIdentity = { name: string; agentId: string; linked: "desktop" | "hosted"; kind: string };
+
   /** The identity set_relay_agent_card writes: the caller's own, chosen as relay_status reports it. */
-  async function ownCardIdentity(): Promise<{ name: string; agentId: string; linked: "desktop" | "hosted" }> {
+  async function ownCardIdentity(): Promise<CardIdentity> {
     if (managed) {
       const identity = await desktop();
-      return { name: identity.name, agentId: identity.agentId, linked: "desktop" };
+      return { name: identity.name, agentId: identity.agentId, linked: "desktop", kind: DESKTOP_KIND };
     }
     const linkedIdentity = await linkedDesktop();
-    if (linkedIdentity) return { name: linkedIdentity.name, agentId: linkedIdentity.agentId, linked: "desktop" };
+    if (linkedIdentity) return { name: linkedIdentity.name, agentId: linkedIdentity.agentId, linked: "desktop", kind: DESKTOP_KIND };
     const hosted = await participant();
     if (!hosted) throw new RelayToolError(CARD_NEEDS_IDENTITY);
-    return { name: hosted.name, agentId: hosted.row.agentRemoteId, linked: "hosted" };
+    return { name: hosted.name, agentId: hosted.row.agentRemoteId, linked: "hosted", kind: await hostedKind() };
+  }
+
+  /**
+   * A hosted participant's card kind: an OAuth grant's connector kind
+   * (grok-bot, chatgpt, muse) from its registered redirect URIs, else "hosted".
+   */
+  async function hostedKind(): Promise<string> {
+    if (!oauth) return HOSTED_KIND;
+    const client = (await executor.query<{ client_name: string | null; redirect_uris: string[] }>(
+      "SELECT client_name, redirect_uris FROM mcp_oauth_clients WHERE client_id = $1", [oauth.access.clientId])).rows[0];
+    const kind = client ? connectorKind({ clientName: client.client_name, redirectUris: client.redirect_uris ?? [] }) : "mcp";
+    return kind === "mcp" ? HOSTED_KIND : kind;
   }
 
   /**
@@ -821,14 +839,17 @@ function createRelayService(context: McpContext) {
      * names. A managed chat's verified desktop identity, else this session's
      * desktop link, else its joined hosted participant (an OAuth grant's
      * approved agent). Nothing is created: a session with no identity is told
-     * to join first. Only `skills` and `card` are sent; Relaycast merges them
-     * into the stored metadata, so every other key is preserved.
+     * to join first. Only `skills`, `card`, `kind` and `owner_name` are sent;
+     * Relaycast merges them into the stored metadata, so every other key is
+     * preserved.
      */
     async setCard(input: SetCardInput) {
       const own = await ownCardIdentity();
       const current = await client.getRosterAgent(key, own.name);
       if (!current || current.id !== own.agentId || current.status === "released") throw new RelayToolError(CARD_IDENTITY_CHANGED);
-      const updated = await client.mergeAgentMetadata(key, own.name, cardMetadata(input, current.metadata, new Date()));
+      // Only these keys are sent; Relaycast merges them, keeping every other key.
+      const updated = await client.mergeAgentMetadata(key, own.name, {
+        ...cardMetadata(input, current.metadata, new Date()), kind: own.kind, ...(ownerName ? { owner_name: ownerName } : {}) });
       if (updated.id !== own.agentId) throw new RelayToolError(CARD_IDENTITY_CHANGED);
       return { updated: true, linked: own.linked, name: updated.name,
         card: buildAgentCard(updated, cardOptions) };

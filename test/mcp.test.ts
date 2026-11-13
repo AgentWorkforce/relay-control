@@ -583,7 +583,7 @@ test("join_relay by name registers a hosted participant with Cloud's metadata", 
   assert.equal(remote.type, "agent");
   assert.deepEqual(remote.metadata, {
     source: "cloud-hosted-mcp", cloud_workspace_id: env.workspaceId, owner_hash: sha256(env.ownerId), objective: "Reviews R2b",
-    kind: "session", owner_name: "Owner",
+    kind: "hosted", owner_name: "Owner",
   });
   const register = env.relay.world.bodies.find(call => call.method === "POST" && call.path === "/v1/agents")!;
   assert.equal(register.body!.auto_join_general, false);
@@ -699,6 +699,10 @@ test("set_relay_agent_card writes only the joined participant's card and preserv
   structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-reviewer", description: "Reviews R2b" } }));
   const remote = env.relay.world.agents.get("owner-reviewer")!;
   remote.metadata.skills = [{ id: "old", name: "Old skill" }];
+  // A participant registered before kind/owner_name existed gets them from set.
+  delete remote.metadata.kind;
+  delete remote.metadata.owner_name;
+  remote.metadata.extra_key = "kept";
   const before = { ...remote.metadata };
   const set = await client.callTool({ name: "set_relay_agent_card", arguments: CARD_INPUT });
   assertNoTokens(env, set);
@@ -710,13 +714,13 @@ test("set_relay_agent_card writes only the joined participant's card and preserv
   // Exactly one merge-PATCH of only skills and card, with the workspace key.
   const patches = env.relay.world.bodies.filter(call => call.method === "PATCH");
   assert.deepEqual(patches.map(call => [call.path, Object.keys(call.body!), Object.keys(call.body!.metadata).sort()]),
-    [["/v1/agents/owner-reviewer", ["metadata"], ["card", "skills"]]]);
+    [["/v1/agents/owner-reviewer", ["metadata"], ["card", "kind", "owner_name", "skills"]]]);
   assert.ok(env.relay.calls.some(call => call.path === "/v1/agents/owner-reviewer" && call.authorization === "Bearer rk_live_first"));
   const { card, skills, ...rest } = remote.metadata as Record<string, any>;
   const { skills: _old, ...ownership } = before;
-  assert.deepEqual(rest, ownership);
+  assert.deepEqual(rest, { ...ownership, kind: "hosted", owner_name: "Owner" });
   assert.deepEqual(rest, { source: "cloud-hosted-mcp", cloud_workspace_id: env.workspaceId, owner_hash: sha256(env.ownerId), objective: "Reviews R2b",
-    kind: "session", owner_name: "Owner" });
+    extra_key: "kept", kind: "hosted", owner_name: "Owner" });
   assert.deepEqual(skills, CARD_INPUT.skills);
   assert.match(card.updated_at, /^\d{4}-\d{2}-\d{2}T/);
   assert.deepEqual({ ...card, updated_at: "x" }, {
@@ -732,6 +736,7 @@ test("set_relay_agent_card writes only the joined participant's card and preserv
   assert.deepEqual(read["x-agent-relay"].tags, ["code-review"]);
   assert.equal(read["x-agent-relay"].hasCard, true);
   assert.equal(read["x-agent-relay"].owner, "Owner");
+  assert.equal(read["x-agent-relay"].kind, "hosted");
   assert.equal(read["x-agent-relay"].cardUpdatedAt, card.updated_at);
   const listed = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
   assert.deepEqual(listed.agents.map((agent: any) => [agent.name, agent.skills, agent.has_card]),
@@ -763,6 +768,7 @@ test("set_relay_agent_card validates the card limits and has no target parameter
     { ...CARD_INPUT, skills: [{ ...skill, examples: ["e".repeat(201)] }] },
     { ...CARD_INPUT, tags: Array.from({ length: 11 }, (_, index) => `t${index}`) },
     { ...CARD_INPUT, documentation_url: "http://docs.example.test" },
+    { ...CARD_INPUT, version: "v".repeat(33) },
   ];
   for (const args of invalid) {
     const result = await client.callTool({ name: "set_relay_agent_card", arguments: args });

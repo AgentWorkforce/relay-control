@@ -1111,3 +1111,19 @@ test("OAuth consent and live actor admission never adopt provider binding identi
   f.world.addAgent("capy-support",metadata);
   assert.equal(await check("capy-support"),"yours","name prefix alone does not reserve provider custody");
 });
+
+test("set_relay_agent_card on an OAuth grant writes its approved agent with the connector kind",async t=>{
+  const f=await relayFixture(t);
+  await f.service.join({});
+  const card={description:"Answers in ChatGPT.",skills:[]};
+  const set=await f.service.setCard(card) as Record<string,any>;
+  assert.equal(set.name,"approved-agent");
+  assert.equal(f.world.agents.get("approved-agent")!.metadata.kind,"hosted");
+  await f.database.query("UPDATE mcp_oauth_clients SET redirect_uris=$2 WHERE client_id=$1",[f.clientId,["https://chatgpt.com/connector/oauth/cb"]]);
+  await f.service.setCard(card);
+  const metadata=f.world.agents.get("approved-agent")!.metadata;
+  assert.equal(metadata.kind,"chatgpt");
+  assert.equal(metadata.owner_name,"Fake User");
+  assert.equal(metadata.source,HOSTED_SOURCE);
+  assert.equal(metadata.owner_hash,ownerHash(f.owner.userId));
+});

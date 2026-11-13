@@ -11,13 +11,15 @@ assigned at release.
   `metadata.skills`), or a minimal `hasCard: false` card. Set writes only the
   caller's own identity (a managed chat's or linked Desktop identity, else the
   session's joined hosted participant; no target parameter) with a
-  `PATCH /v1/agents/:name` that sends only `skills` and `card`, which Relaycast
-  merges, so other metadata is kept. `list_relay_agents` entries gain `skills`
+  `PATCH /v1/agents/:name` that sends only `skills`, `card`, `kind`
+  (`relay-desktop`, `hosted`, or an OAuth connector kind such as `chatgpt` or
+  `grok-bot`) and `owner_name`, which Relaycast merges, so other metadata is
+  kept. `list_relay_agents` entries gain `skills`
   (names, at most 10) and `has_card`; the coordination guidance asks agents to
   read cards before delegating and keep their own current. Card fields match
   Relaycast's `GET /v1/agents/:name/card` (kind from `metadata.kind`, owner
   from `metadata.owner_name`, where from `metadata.where`). Hosted
-  participants are now registered with `kind: "session"` and `owner_name`.
+  participants are now registered with `kind: "hosted"` and `owner_name`.
 
 - Added: plain MCP `list_session_summaries` and `get_session_summary` tools
   for recorded summaries, workspace-scoped citations and owners. List pages

@@ -24,7 +24,7 @@ export const CARD_LIMITS = {
   tags: 10,
   tag: 50,
   skillId: 64,
-  version: 40,
+  version: 32,
   documentationUrl: 2048,
   /** Skill names list_relay_agents reports per agent. */
   listedSkills: 10,
