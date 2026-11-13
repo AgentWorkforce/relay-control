@@ -23,6 +23,8 @@ import { buildMcpServer } from "./server.js";
 import { admitMcpOAuthBearer, type McpOAuthConnection } from "./oauth/admission.js";
 import type { McpOAuthSessions } from "./oauth/sessions.js";
 import { MCP_RELAY_SCOPE, type McpOAuthResourcePath } from "./oauth/protocol.js";
+import { sendCustomerSupport } from "./customer-support.js";
+import { customerSupportDesktop } from "./customer-support-notice.js";
 
 /**
  * `POST /api/v1/mcp/shared-sessions` (also `/cloud/api/v1/...`, the path
@@ -336,6 +338,23 @@ export function createMcpHandler(input: {
       ...(oauth && input.capyPermits ? { capyPermits: input.capyPermits } : {}),
       ...(!oauth && input.launch ? { launch: true } : {}),
       readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
+    };
+    if (config.customerSupport) context.customerSupport = {
+      origin: new URL(config.publicBaseUrl).origin,
+      send: request => sendCustomerSupport(config.customerSupport!, request),
+      notifyTarget: () => customerSupportDesktop(context),
+      authorize: async () => {
+        const current = oauth && oauthSessions
+          ? (await admitMcpOAuthBearer({ sessions: oauthSessions, token, resourcePath: resourceFor(rawPath)! }))
+          : null;
+        const person = oauth ? (current?.ok ? current.connection.access.principal : null)
+          : provider ? (await desktopCredentials.resolve(token))?.principal : await store.authenticateAccessToken(token);
+        if (!person || person.userId !== principal.userId || person.workspaceId !== workspace.id || person.organizationId !== workspace.organizationId
+          || person.pendingHandoff || person.handoff) return false;
+        if (!oauth && !provider && !person.scopes.includes("cli:auth")) return false;
+        const member = await store.workspaceForUser(workspace.id, principal.userId);
+        return member?.organizationId === workspace.organizationId;
+      },
     };
 
     const server = buildMcpServer(context);

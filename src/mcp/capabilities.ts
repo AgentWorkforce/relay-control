@@ -25,6 +25,7 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       factory: Boolean(context.factory),
       launch: Boolean(context.launch),
       capyPermits: Boolean(context.oauth && context.capyPermits),
+      customerSupport: Boolean(context.customerSupport),
       providers: await context.providers(),
     });
     return {

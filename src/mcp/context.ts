@@ -13,6 +13,7 @@ import type { Principal } from "../store.js";
 import type { McpAuthMode, WorkspaceRole } from "./catalog.js";
 import type { DesktopCallContext } from "./desktop-call.js";
 import type { McpOAuthConnection } from "./oauth/admission.js";
+import type { CustomerSupportConnection } from "./customer-support.js";
 
 export type McpWorkspace = {
   id: string;
@@ -38,6 +39,7 @@ export type McpContext = {
   desktopCall: DesktopCallContext;
   /** Present only after the MCP-only OAuth resolver admits its exact resource. */
   oauth?: McpOAuthConnection;
+  customerSupport?: CustomerSupportConnection;
   /** GET a workspace-scoped RelayHistory path (with its query); throws SharedSessionsToolError. */
   readHistory: (path: string, options?: { timeoutMessage?: string }) => Promise<unknown>;
   /** Read `@name` tokens in search text as agent filters. */

@@ -25,6 +25,16 @@ const completeEnv = {
   SELFHOST_ENCRYPTION_KEY: "00".repeat(32),
 };
 
+test("customer support uses an optional complete dedicated service connection, never a customer allowlist", () => {
+  assert.equal(loadConfig(completeEnv).customerSupport, null);
+  const support = { SELFHOST_CUSTOMER_SUPPORT_URL: "https://support.example.test/", SELFHOST_CUSTOMER_SUPPORT_TOKEN: "s".repeat(32) };
+  assert.deepEqual(loadConfig({ ...completeEnv, ...support }).customerSupport, { url: "https://support.example.test", token: "s".repeat(32) });
+  assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_CUSTOMER_SUPPORT_URL: support.SELFHOST_CUSTOMER_SUPPORT_URL }), /required together/);
+  assert.throws(() => loadConfig({ ...completeEnv, ...support, SELFHOST_CUSTOMER_SUPPORT_TOKEN: "short" }), /at least 32/);
+  assert.throws(() => loadConfig({ ...completeEnv, ...support, SELFHOST_CUSTOMER_SUPPORT_TOKEN: completeEnv.SELFHOST_BOOTSTRAP_TOKEN }), /dedicated/);
+  assert.throws(() => loadConfig({ ...completeEnv, ...support, SELFHOST_CUSTOMER_SUPPORT_URL: "https://user:secret@support.test/path" }), /origin/);
+});
+
 test("the image version is read from SELFHOST_IMAGE_VERSION and null from source", () => {
   assert.equal(loadConfig(completeEnv).imageVersion, null);
   assert.equal(loadConfig({ ...completeEnv, SELFHOST_IMAGE_VERSION: "  " }).imageVersion, null);
