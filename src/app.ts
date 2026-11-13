@@ -499,7 +499,11 @@ export function createApp(input: {
   });
   // desktop-auth lane: hosted Cloud's device-route limits and CSRF origins.
   const limiter = new RateLimiter(() => (input.now?.() ?? new Date()).getTime());
-  const NODE_TOKEN = /^nt_live_[A-Za-z0-9_-]{8,256}$/;
+  // Relaycast issues node tokens in two credential families and every deployment
+  // accepts both (@relaycast/types credentials.ts): legacy `nt_live_…` and
+  // `ar_nd_<workspace 11>_<tag 11>_<secret 43><crc 6>`, which self-hosted relays
+  // issue. Shape only; Relaycast decides validity (verifyNodeToken).
+  const NODE_TOKEN = /^(?:nt_live_[A-Za-z0-9_-]{8,256}|ar_nd_[0-9A-Za-z]{11}_[a-z][0-9A-Za-z]{10}_[0-9A-Za-z]{49})$/;
   const NODE_ID = NODE_ID_PATTERN;
   // The site a client signed in through: the public API origin or the
   // dashboard origin (both serve /cloud/api). Agent Relay Desktop requires
@@ -1501,7 +1505,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       );
       const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken.trim() : "";
       if (!NODE_TOKEN.test(nodeToken)) {
-        throw new HttpError(400, "invalid_request", "Send workspaceId and the node's token (nt_live_...).");
+        throw new HttpError(400, "invalid_request", "Send workspaceId and the node's token (nt_live_... or ar_nd_...).");
       }
       const proven = await verifyNodeToken(config.relaycastUrl, workspace.relaycastApiKey, nodeToken);
       const result = await store.claimNode({
