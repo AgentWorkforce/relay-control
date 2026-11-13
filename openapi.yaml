@@ -7632,6 +7632,32 @@ paths:
           description: Only POST.
         "413":
           description: Request over 64 KiB.
+  /api/v1/events-shim/t/{mcpToken}/workspace:
+    post:
+      operationId: eventsShimTempWorkspace
+      tags: [events-shim]
+      summary: The inbox's temporary Agent Relay workspace, made on first call through Relaycast's internal admin API with a 7-day deadline that activity on the inbox moves back. The token in the path is the capability.
+      security: []
+      parameters:
+        - { name: mcpToken, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The workspace.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [workspace_id, workspace_key, workspace_expires_at, temporary, message]
+                properties:
+                  workspace_id: { type: string }
+                  workspace_key: { type: string }
+                  workspace_expires_at: { type: string, format: date-time }
+                  temporary: { type: boolean, enum: [true] }
+                  message: { type: string }
+        "404":
+          description: Unknown or expired MCP URL.
+        "503":
+          description: "`unavailable` (Relaycast refused or unreachable; retry-after 60) or `not_configured` (no RELAYCAST_INTERNAL_SECRET)."
 components:
   securitySchemes:
     eventsShimManageBearer:

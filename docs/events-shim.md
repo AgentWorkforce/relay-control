@@ -52,6 +52,7 @@ All under `/api/v1/events-shim` (also `/cloud/api/v1/events-shim`).
 | `PUT /shims/current/secrets/{github,stripe,linear,bearer}` | Manage token: sets (`{"secret": "..."}`) or clears (`null`) a verification secret; `bearer` with no secret generates one, shown once |
 | `POST /h/<hook token>[/<mode>]` | The token in the URL. `open` is unverified; the other modes check the sender's signature or bearer against the stored secret |
 | `POST /t/<mcp token>/mcp` | The token in the URL. Stateless Streamable HTTP MCP |
+| `POST /t/<mcp token>/workspace` | The token in the URL. The inbox's temporary Agent Relay workspace (`workspace_id`, `workspace_key`, `workspace_expires_at`), made on first call; see below |
 
 `POST /shims` answers `{shim_id, mcp_url, webhook_url, webhook_urls, manage_token, limits}`.
 The three tokens are shown once; an unknown or expired token answers 404.
@@ -69,6 +70,26 @@ before it is stored. Only `/v1/hooks/<id>` URLs on an allowed origin are
 accepted, so holding an MCP URL cannot make this server post anywhere else.
 A wake answered 401, 403, 404 or 410 marks the link broken; posts then wait
 for `get_webhook_events` or `wait_for_webhook` until the agent relinks.
+
+## Temporary Agent Relay workspace
+
+`events-shim setup --codex` (and the other CLIs it wakes through an Agent Relay
+core) asks `POST /t/<mcp token>/workspace` for a workspace to run its own
+headless core on when the machine's Agent Relay is not signed in here. The
+first call creates one through Relaycast's internal admin API
+(`POST /internal/workspaces`, with `RELAYCAST_INTERNAL_SECRET`) and gives it a
+7-day deadline (`POST /internal/workspaces/:id/expiry`), the inbox's own idle
+expiry; Relaycast deletes it then. Activity on the inbox (a post, an agent's
+MCP call, asking for the workspace) moves the deadline back to 7 days once it is
+under 6 days away. A workspace past its deadline is replaced on the next call.
+The key is stored encrypted with the keyring.
+
+The response says when it is deleted and that signing the machine's Agent Relay
+in to this control plane uses the person's own workspace instead: the inbox
+already belongs to a signed-in person, so there is nothing to claim. Without
+`RELAYCAST_INTERNAL_SECRET` the route answers `503 not_configured`; a Relaycast
+without the expiry route (older than relaycast#660) answers `503` and the
+workspace it made is deleted rather than left permanent.
 
 ## Limits
 

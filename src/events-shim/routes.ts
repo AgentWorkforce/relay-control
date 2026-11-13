@@ -2,12 +2,14 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   EVENTS_SHIM_LIMITS,
   handleEventsShimRequest,
+  sha256Hex,
   type EventsShimHttpOptions,
   type ShimUrls,
 } from "@agent-relay/events-shim";
 import type { EncryptionKeyring } from "../crypto.js";
 import type { Database } from "../database.js";
 import { PostgresEventsShimStore, type EventsShimCreator } from "./store.js";
+import { inboxTempWorkspace, keepTempWorkspaceAlive, TempWorkspaceError, type TempWorkspaceDeps } from "./temp-workspace.js";
 
 /** Every events-shim route lives under this normalized (/cloud-stripped) prefix. */
 export const EVENTS_SHIM_PREFIX = "/api/v1/events-shim";
@@ -25,6 +27,8 @@ export type EventsShimRoutesInput = {
   publicBaseUrl: string;
   /** Relaycast origins a wake link may name. */
   relayOrigins: readonly string[];
+  /** Relaycast's internal origin and admin secret, for each inbox's temporary workspace. */
+  relaycast?: { url: string; internalSecret: string | null };
   fetchImpl?: typeof fetch;
   now?: () => Date;
   /**
@@ -60,6 +64,27 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
   ): Promise<boolean> {
     if (!isEventsShimPath(path)) return false;
     const relative = path.slice(EVENTS_SHIM_PREFIX.length) || "/";
+    const temp: TempWorkspaceDeps | null = input.relaycast
+      ? {
+        database: input.database,
+        keyring: input.keyring,
+        relaycastUrl: input.relaycast.url,
+        internalSecret: input.relaycast.internalSecret,
+        ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
+        now: clock,
+      }
+      : null;
+    const parts = relative.split("/").filter(Boolean);
+    // POST /t/<mcp token>/workspace: the inbox's temporary Agent Relay workspace.
+    if (method === "POST" && parts.length === 3 && parts[0] === "t" && parts[2] === "workspace") {
+      await send(response, await tempWorkspaceResponse(temp, parts[1]!, input.publicBaseUrl));
+      return true;
+    }
+    // Activity keeps that workspace alive: posts (/h/<token>…) and agent calls (/t/<token>/mcp).
+    if (temp && (parts[0] === "h" || parts[0] === "t") && parts[1]) {
+      const hash = await sha256Hex(parts[1]);
+      void keepTempWorkspaceAlive(temp, parts[0] === "h" ? { hookTokenHash: hash } : { mcpTokenHash: hash });
+    }
 
     const declared = Number(request.headers["content-length"] ?? "0");
     if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
@@ -115,6 +140,34 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
     }));
     return true;
   };
+}
+
+const NO_STORE = { "content-type": "application/json", "cache-control": "no-store" };
+
+async function tempWorkspaceResponse(temp: TempWorkspaceDeps | null, mcpToken: string, publicBaseUrl: string): Promise<Response> {
+  if (!temp) {
+    return new Response(JSON.stringify({ error: "not_found", message: "This control plane issues no temporary workspaces." }), { status: 404, headers: NO_STORE });
+  }
+  try {
+    const workspace = await inboxTempWorkspace(temp, mcpToken);
+    if (!workspace) {
+      return new Response(JSON.stringify({ error: "not_found", message: "No webhook inbox has that MCP URL." }), { status: 404, headers: NO_STORE });
+    }
+    return new Response(JSON.stringify({
+      workspace_id: workspace.workspaceId,
+      workspace_key: workspace.workspaceKey,
+      workspace_expires_at: workspace.expiresAt,
+      temporary: true,
+      message: `A temporary Agent Relay workspace for this inbox. It is deleted ${workspace.expiresAt.slice(0, 10)} unless the inbox is used. To use your own workspace, sign this machine's Agent Relay in to ${publicBaseUrl}.`,
+    }), { status: 200, headers: NO_STORE });
+  } catch (error) {
+    if (error instanceof TempWorkspaceError) {
+      return error.configured
+        ? new Response(JSON.stringify({ error: "unavailable", message: "Try again in a minute." }), { status: 503, headers: { ...NO_STORE, "retry-after": "60" } })
+        : new Response(JSON.stringify({ error: "not_configured", message: "Temporary workspaces need RELAYCAST_INTERNAL_SECRET on this control plane." }), { status: 503, headers: NO_STORE });
+    }
+    throw error;
+  }
 }
 
 function tooLarge(): Response {
