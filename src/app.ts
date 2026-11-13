@@ -400,6 +400,8 @@ export function createApp(input: {
   };
   /** Person messaging. Tests pass fetchImpl; the server uses global fetch. */
   messagingFetch?: typeof fetch;
+  /** RELAYCAST_INTERNAL_SECRET: lets webhook inboxes issue temporary Agent Relay workspaces. */
+  relaycastInternalSecret?: string | null;
   /** Factory sessions (dormant unless SELFHOST_FACTORY_ENABLED). The server passes its module so it can run the worker. */
   factory?: FactoryModule;
   /** Internal dormant Capy send resolver; server wiring requires a complete runtime. */
@@ -576,6 +578,7 @@ export function createApp(input: {
     keyring: config.encryptionKeyring,
     publicBaseUrl: config.publicBaseUrl,
     relayOrigins: config.eventsShimRelayOrigins ?? [new URL(config.relaycastPublicUrl).origin],
+    relaycast: { url: config.relaycastUrl, internalSecret: input.relaycastInternalSecret ?? null },
     fetchImpl: input.messagingFetch,
     now: input.now,
     authorizeCreate: async (request, response) => {
