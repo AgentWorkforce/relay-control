@@ -1,3 +1,4 @@
+import { page as renderPage } from "../../identity/pages.js";
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage,ServerResponse } from "node:http";
 import type { SelfhostConfig } from "../../config.js";
@@ -161,21 +162,19 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
     const connectionSelect=existing.length?`<label>Existing connection <select id="connection"><option value="">New connection</option>${existing.map(row=>`<option value="${escaped(row.id)}">${escaped(row.agentName)}</option>`).join("")}</select></label>`:"";
     const heading=client!.clientName?`Connect an app calling itself &quot;${escaped(client!.clientName)}&quot;`:"Connect an unnamed app";
     const caution=destination.loopback?"":`<p id="caution"><strong>Caution:</strong> the app chose its own name, and nobody has verified it. Connect only if you trust ${escaped(destination.label)}.</p>`;
-    const body=`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect Agent Relay</title>
-<body><main><h1>${heading}</h1><p id="returns-to">Returns to: <strong>${escaped(destination.label)}</strong></p>${caution}<p>Workspace: <strong>${escaped(workspace)}</strong></p>
-<p>This connection may:</p><ul>${requestValue.scopes.map(scope=>`<li>${escaped(labels[scope]??scope)}</li>`).join("")}</ul>
+    const body=renderPage("Connect Agent Relay",`<h1>${heading}</h1><p id="returns-to" class="muted">Returns to: <strong>${escaped(destination.label)}</strong></p>${caution}<p>Workspace: <strong>${escaped(workspace)}</strong></p>
+<p>This connection may:</p><ul class="list">${requestValue.scopes.map(scope=>`<li>${escaped(labels[scope]??scope)}</li>`).join("")}</ul>
 <form id="consent">${connectionSelect}<p><label>Approved agent name <input id="agent" maxlength="128" required value="${escaped(suggested)}"></label></p>
 <p id="attach-row" hidden><label><input type="checkbox" id="attach"> Attach to my existing agent</label></p>
-<button type="submit">Connect</button> <button type="button" id="deny">Cancel</button></form><p id="error" role="alert"></p></main>
-<script nonce="${nonce}">const data=${payload};const form=document.getElementById('consent'),agent=document.getElementById('agent'),connection=document.getElementById('connection'),attachRow=document.getElementById('attach-row'),attach=document.getElementById('attach');
+<div class="actions"><button class="btn" type="submit">Connect</button><button class="btn secondary" type="button" id="deny">Cancel</button></div></form><p id="error" class="alert" role="alert"></p>`,`const data=${payload};const form=document.getElementById('consent'),agent=document.getElementById('agent'),connection=document.getElementById('connection'),attachRow=document.getElementById('attach-row'),attach=document.getElementById('attach');
 function showAttach(show){attachRow.hidden=!show;if(!show)attach.checked=false;}
 let checking=0;async function check(){const name=agent.value.trim(),ticket=++checking;showAttach(false);if(!name)return;try{const response=await fetch('${API}/authorize/agent-name?'+new URLSearchParams({workspace_id:data.workspaceId,name}));const value=await response.json();if(ticket===checking)showAttach(response.ok&&value.status==='yours');}catch{}}
 agent.addEventListener('change',check);if(agent.value)check();
 if(connection)connection.addEventListener('change',()=>{const chosen=data.connections.find(row=>row.id===connection.value);if(chosen){agent.value=chosen.agentName;showAttach(false);}});
 async function decide(decision){const buttons=form.querySelectorAll('button');buttons.forEach(button=>button.disabled=true);try{const response=await fetch('${API}/authorize',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({params:data.params,workspace_id:data.workspaceId,agent_name:agent.value,decision,...(!attachRow.hidden&&attach.checked?{attach_existing:true}:{}),...(connection&&connection.value?{continue_grant_id:connection.value}:{})})});const value=await response.json();if(response.ok&&typeof value.redirect_to==='string'){location.assign(value.redirect_to);return;}if(value.error==='agent_name_in_use')showAttach(true);document.getElementById('error').textContent=value.error_description||'Connection could not be completed.';}catch{document.getElementById('error').textContent='Connection could not be completed. Try again.';}buttons.forEach(button=>button.disabled=false);}
-form.addEventListener('submit',event=>{event.preventDefault();decide('approve');});document.getElementById('deny').addEventListener('click',()=>decide('deny'));</script></body></html>`;
+form.addEventListener('submit',event=>{event.preventDefault();decide('approve');});document.getElementById('deny').addEventListener('click',()=>decide('deny'));`,"",nonce);
     return new Response(body,{headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store","referrer-policy":"no-referrer",
-      "content-security-policy":`default-src 'none'; script-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
+      "content-security-policy":`default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
       "x-content-type-options":"nosniff"}});
   }
 

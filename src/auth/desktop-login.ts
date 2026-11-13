@@ -1,3 +1,4 @@
+import { page } from "../identity/pages.js";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { safeNextPath } from "./device-approval.js";
 
@@ -159,11 +160,6 @@ function escape(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
-const PAGE_CSS =
-  "body{font:16px system-ui;max-width:34rem;margin:10vh auto;padding:1.5rem;color:#171717}" +
-  "button{font:inherit;padding:.6rem 1.2rem;margin-right:.75rem;border-radius:.4rem;border:1px solid #888;background:#fff;cursor:pointer}" +
-  "button.primary{background:#171717;color:#fff;border-color:#171717}p.muted{color:#555}";
-
 /**
  * The consent screen for a desktop sign-in that names its host. Approve posts
  * the same parameters back with the consent token; nothing is issued by
@@ -184,27 +180,21 @@ export function desktopConsentPage(input: {
   const where = input.workspaceName
     ? `<p>It will use the workspace <strong>${escape(input.workspaceName)}</strong>.</p>`
     : "";
-  return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Approve Agent Relay Desktop</title><style>${PAGE_CSS}</style></head>
-<body><main><h1>Sign in Agent Relay Desktop?</h1>
+  return page("Approve Agent Relay Desktop", `<h1>Sign in Agent Relay Desktop?</h1>
 <p>Agent Relay Desktop on <strong>${escape(input.hostName)}</strong> is asking to sign in as you.</p>
 ${where}
 <p class="muted">Only approve a sign-in you started on that computer.</p>
 <form method="post" action="${escape(input.action)}">
 ${hidden}
 <input type="hidden" name="consent_token" value="${escape(input.consentToken)}">
-<button class="primary" type="submit" name="decision" value="approve">Approve</button>
-<button type="submit" name="decision" value="deny">Deny</button>
-</form></main></body></html>`;
+<div class="actions"><button class="btn" type="submit" name="decision" value="approve">Approve</button>
+<button class="btn secondary" type="submit" name="decision" value="deny">Deny</button></div>
+</form>`);
 }
 
 export function desktopConsentDeniedPage(): string {
-  return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Sign-in denied</title><style>${PAGE_CSS}</style></head>
-<body><main><h1>Sign-in denied</h1>
-<p>Agent Relay Desktop was not signed in. You can close this tab.</p></main></body></html>`;
+  return page("Sign-in denied", `<h1>Sign-in denied</h1>
+<p class="muted">Agent Relay Desktop was not signed in. You can close this tab.</p>`);
 }
 
 /** Where the browser is sent with the handoff (hosted Cloud's issueHandoff). */
@@ -249,14 +239,11 @@ export function desktopWorkspacePickerPage(input: {
   const items = input.workspaces.map((workspace) => {
     const params = new URLSearchParams(input.params);
     params.set("workspace", workspace.id);
-    return `<li><a href="${escape(`${input.action}?${params.toString()}`)}">${escape(workspace.name)}</a> <span class="muted">${escape(workspace.organizationName)}</span></li>`;
+    return `<li><a class="choice" href="${escape(`${input.action}?${params.toString()}`)}">${escape(workspace.name)} <span class="muted">${escape(workspace.organizationName)}</span></a></li>`;
   }).join("\n");
-  return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Choose a workspace</title><style>${PAGE_CSS}li{margin:.5rem 0}span.muted{color:#555}</style></head>
-<body><main><h1>Choose a workspace</h1>
-<p>Pick the workspace Agent Relay Desktop should use.</p>
-<ul>
+  return page("Choose a workspace", `<h1>Choose a workspace</h1>
+<p class="muted">Pick the workspace Agent Relay Desktop should use.</p>
+<ul class="choices">
 ${items}
-</ul></main></body></html>`;
+</ul>`);
 }
