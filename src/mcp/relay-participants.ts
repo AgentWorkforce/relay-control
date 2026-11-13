@@ -10,7 +10,9 @@ import {
 } from "../messaging/desktop-identities.js";
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
+import { buildAgentCard, cardMetadata, cardSummary, type SetCardInput } from "./relay-agent-cards.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
+import { connectorKind } from "./oauth/connector-kind.js";
 import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } from "./oauth/retirement.js";
 
 /**
@@ -53,10 +55,16 @@ export class RelayToolError extends Error {
 export const ownerHash = (id: string) => createHash("sha256").update(id).digest("hex");
 
 export const HOSTED_SOURCE = "cloud-hosted-mcp";
+/** Card kinds (metadata.kind), as Cloud's hosted MCP writes them. */
+export const HOSTED_KIND = "hosted";
+export const DESKTOP_KIND = "relay-desktop";
 const AS_PERSON_UNAVAILABLE =
   "as_person is not available on this self-hosted site. Omit it to act as this MCP session's hosted participant.";
 
-export const RELAY_COORDINATION_GUIDANCE = "DM a specific agent by default. Use channels only to coordinate a larger swarm or broadcast to many agents, and subscribe only to channels you need. Reply to a channel post in that channel with post_relay_channel (thread_id for its thread), not by DM, unless the reply is private. At task start, check list_relay_agents and DM peers whose work your task affects, without waiting to be asked.";
+/** Contract section 4, verbatim (shared with Cloud's hosted MCP). */
+export const RELAY_AGENT_CARD_GUIDANCE = "Before delegating to a peer, read its card with get_relay_agent_card to see what it does and what to send it. Keep your own card current with set_relay_agent_card: a description of your purpose and one skill per kind of work you take on, with example requests.";
+export const RELAY_COORDINATION_GUIDANCE = "DM a specific agent by default. Use channels only to coordinate a larger swarm or broadcast to many agents, and subscribe only to channels you need. Reply to a channel post in that channel with post_relay_channel (thread_id for its thread), not by DM, unless the reply is private. At task start, check list_relay_agents and DM peers whose work your task affects, without waiting to be asked. "
+  + RELAY_AGENT_CARD_GUIDANCE;
 export const HOSTED_REPLY_GUIDANCE = "replies arrive in check_relay_inbox; poll it";
 export const FACTORY_REPLY_GUIDANCE = "Replies to this Factory agent are delivered into its Droid session by the Factory worker; check_relay_inbox does not serve Factory agents. Read the conversation with read_relay_conversation as=<this agent>.";
 export const CAPY_REPLY_GUIDANCE = "Replies are addressed to the bound Capy thread. This receipt does not confirm delivery or reading.";
@@ -257,6 +265,9 @@ async function hasActiveLaunches(executor: SqlExecutor, workspaceId: string, act
   return result.rows.length > 0;
 }
 
+const UNKNOWN_CARD_AGENT = "Unknown agent name or stale machine address in this workspace. Use list_relay_agents.";
+const CARD_NEEDS_IDENTITY = "This MCP session has no relay identity to publish a card for. Call join_relay with desktop_address (from GET /whoami on the relay socket) to publish your Agent Relay Desktop identity's card, or join_relay to use a hosted participant, then retry.";
+const CARD_IDENTITY_CHANGED = "Your relay identity is no longer available or changed. Call relay_status, join_relay again if needed, then retry.";
 const NO_PARTICIPANT_MESSAGE = "No hosted participant with that name is owned by you in this workspace.";
 const rejectedToken = (name: string) => new RelayToolError(
   `The relay token for participant ${name} was rejected by Relaycast. Call join_relay with name=${name} to recover it, or leave_relay to remove it.`);
@@ -273,6 +284,7 @@ function createRelayService(context: McpContext) {
   const relayWorkspaceId = context.workspace.relaycastWorkspaceId;
   const sessionHash = !oauth && sessionId ? ownerHash(sessionId) : null;
   const owner = ownerHash(userId);
+  const ownerName = (typeof context.principal.name === "string" ? context.principal.name.trim().slice(0, 200) : "") || null;
   const desktopCall = context.desktopCall;
   /**
    * A desktop-managed call (a Desktop-provider credential, or the app bearer
@@ -432,7 +444,7 @@ function createRelayService(context: McpContext) {
 
   async function roster(status: "live" | "all" | "offline", people: readonly McpMember[], includeStale = false) {
     return (await listedAgents(status === "live" ? "active" : "all", includeStale))
-      .map(agent => rosterAgent(agent, people, userId, workspaceId))
+      .map(agent => ({ ...rosterAgent(agent, people, userId, workspaceId), ...cardSummary(agent.metadata) }))
       .filter(agent => status === "all" || (status === "live" ? agent.online : !agent.online));
   }
 
@@ -481,6 +493,8 @@ function createRelayService(context: McpContext) {
       ? await client.recoverHosted(key, name, remote.id, userId)
       : await client.registerHosted(key, name, {
         source: HOSTED_SOURCE, cloud_workspace_id: workspaceId, owner_hash: owner, objective,
+        // Agent card fields (x-agent-relay kind and owner).
+        kind: HOSTED_KIND, ...(ownerName ? { owner_name: ownerName } : {}),
         ...(oauth ? { created_by: "mcp-oauth" } : {}),
       });
     try {
@@ -741,6 +755,35 @@ function createRelayService(context: McpContext) {
     throw new RelayToolError(`You are not subscribed to #${channel}. Call subscribe_relay_channel first.`);
   }
 
+  const cardOptions = { organization: context.workspace.name, relaycastUrl: context.relay.relaycastPublicUrl };
+
+  type CardIdentity = { name: string; agentId: string; linked: "desktop" | "hosted"; kind: string };
+
+  /** The identity set_relay_agent_card writes: the caller's own, chosen as relay_status reports it. */
+  async function ownCardIdentity(): Promise<CardIdentity> {
+    if (managed) {
+      const identity = await desktop();
+      return { name: identity.name, agentId: identity.agentId, linked: "desktop", kind: DESKTOP_KIND };
+    }
+    const linkedIdentity = await linkedDesktop();
+    if (linkedIdentity) return { name: linkedIdentity.name, agentId: linkedIdentity.agentId, linked: "desktop", kind: DESKTOP_KIND };
+    const hosted = await participant();
+    if (!hosted) throw new RelayToolError(CARD_NEEDS_IDENTITY);
+    return { name: hosted.name, agentId: hosted.row.agentRemoteId, linked: "hosted", kind: await hostedKind() };
+  }
+
+  /**
+   * A hosted participant's card kind: an OAuth grant's connector kind
+   * (grok-bot, chatgpt, muse) from its registered redirect URIs, else "hosted".
+   */
+  async function hostedKind(): Promise<string> {
+    if (!oauth) return HOSTED_KIND;
+    const client = (await executor.query<{ client_name: string | null; redirect_uris: string[] }>(
+      "SELECT client_name, redirect_uris FROM mcp_oauth_clients WHERE client_id = $1", [oauth.access.clientId])).rows[0];
+    const kind = client ? connectorKind({ clientName: client.client_name, redirectUris: client.redirect_uris ?? [] }) : "mcp";
+    return kind === "mcp" ? HOSTED_KIND : kind;
+  }
+
   /**
    * The owner's launcher participant, created on first use. Every launch is
    * sent as it, never as a person, a Desktop identity or another session's
@@ -783,6 +826,39 @@ function createRelayService(context: McpContext) {
     },
 
     join,
+
+    /** get_relay_agent_card: any listed agent in this workspace, by name or exact machine address. Read-only. */
+    async getCard(input: { agent: string }) {
+      const agent = await explicitAgent(input.agent.trim());
+      if (!agent || agent.status === "released" || !isListedRelayAgent(agent)) throw new RelayToolError(UNKNOWN_CARD_AGENT);
+      return buildAgentCard(agent, cardOptions);
+    },
+
+    /**
+     * set_relay_agent_card: the caller's own identity only, never a target it
+     * names. A managed chat's verified desktop identity, else this session's
+     * desktop link, else its joined hosted participant (an OAuth grant's
+     * approved agent). Nothing is created: a session with no identity is told
+     * to join first. Only `skills`, `card`, `kind` and `owner_name` are sent;
+     * Relaycast merges them into the stored metadata, so every other key is
+     * preserved.
+     */
+    async setCard(input: SetCardInput) {
+      const own = await ownCardIdentity();
+      const current = await client.getRosterAgent(key, own.name);
+      if (!current || current.id !== own.agentId || current.status === "released") throw new RelayToolError(CARD_IDENTITY_CHANGED);
+      // Only these keys are sent; Relaycast merges them, keeping every other key.
+      // Bound to the checked id: a name re-registered since is never written.
+      const updated = await client.mergeAgentMetadata(key, own.name, {
+        ...cardMetadata(input, current.metadata, new Date()), kind: own.kind, ...(ownerName ? { owner_name: ownerName } : {}) }, own.agentId)
+        .catch((error: unknown) => {
+          if (error instanceof RelaycastCallError && error.status === 409) throw new RelayToolError(CARD_IDENTITY_CHANGED);
+          throw error;
+        });
+      if (updated.id !== own.agentId) throw new RelayToolError(CARD_IDENTITY_CHANGED);
+      return { updated: true, linked: own.linked, name: updated.name,
+        card: buildAgentCard(updated, cardOptions) };
+    },
 
     async leave(as?: string) {
       if (managed) {

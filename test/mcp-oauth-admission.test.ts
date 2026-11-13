@@ -121,7 +121,7 @@ async function relayFixture(t:test.TestContext) {
     members:async()=>[{userId:f.owner.userId,email:"fake@example.test",name:"Fake User"}],
     providers:async()=>[],
     relaycast:{listAgents:status=>client.listAgents("rk_fake",status),listPresence:()=>client.listPresence("rk_fake")},
-    relay:{database:f.database,keyring,client,sessionId:"fake-chat-session"},oauth:f.connection,
+    relay:{database:f.database,keyring,client,sessionId:"fake-chat-session",relaycastPublicUrl:"https://cast.example.test"},oauth:f.connection,
   };
   const service=relayService(context);
   const oauth=new McpOAuthStore(f.database,{protocol:f.sessions.options.protocol,tenancyMode:"multi",isGrokRoutine:()=>false});
@@ -1110,4 +1110,20 @@ test("OAuth consent and live actor admission never adopt provider binding identi
   assert.equal(f.world.bodies.some(call=>call.path.includes("takeover")),false);
   f.world.addAgent("capy-support",metadata);
   assert.equal(await check("capy-support"),"yours","name prefix alone does not reserve provider custody");
+});
+
+test("set_relay_agent_card on an OAuth grant writes its approved agent with the connector kind",async t=>{
+  const f=await relayFixture(t);
+  await f.service.join({});
+  const card={description:"Answers in ChatGPT.",skills:[]};
+  const set=await f.service.setCard(card) as Record<string,any>;
+  assert.equal(set.name,"approved-agent");
+  assert.equal(f.world.agents.get("approved-agent")!.metadata.kind,"hosted");
+  await f.database.query("UPDATE mcp_oauth_clients SET redirect_uris=$2 WHERE client_id=$1",[f.clientId,["https://chatgpt.com/connector/oauth/cb"]]);
+  await f.service.setCard(card);
+  const metadata=f.world.agents.get("approved-agent")!.metadata;
+  assert.equal(metadata.kind,"chatgpt");
+  assert.equal(metadata.owner_name,"Fake User");
+  assert.equal(metadata.source,HOSTED_SOURCE);
+  assert.equal(metadata.owner_hash,ownerHash(f.owner.userId));
 });

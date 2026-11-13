@@ -552,7 +552,8 @@ paths:
         `list_session_summaries`, `get_session_summary`), team activity
         (`list_team_activity`, from the Relaycast roster and presence plus
         RelayHistory; running flows are not listed), relay messaging
-        (`list_relay_agents`, `send_relay_message`, `read_relay_conversation`,
+        (`list_relay_agents`, `get_relay_agent_card`, `set_relay_agent_card`,
+        `send_relay_message`, `read_relay_conversation`,
         `join_relay`, `leave_relay`, `relay_status`, `check_relay_inbox`,
         `list_relay_channels`, `subscribe_relay_channel`,
         `unsubscribe_relay_channel`, `post_relay_channel`, `read_relay_channel`;
@@ -561,7 +562,10 @@ paths:
         `providers`: the same `ProviderStatus` array as
         `GET /api/v1/workspaces/{workspaceId}/providers`). Relay tools act as a hosted Relaycast
         participant owned by the caller, bound to the `Mcp-Session-Id` or chosen
-        with `as`; replies arrive in `check_relay_inbox`. Launches,
+        with `as`; replies arrive in `check_relay_inbox`. Agent cards are A2A
+        0.3.0 cards built from the Relaycast agent record's `metadata.card` and
+        `metadata.skills`; `set_relay_agent_card` writes only the caller's own
+        identity and preserves its other metadata. Launches,
         `as_person` and desktop-linked identity (`join_relay desktop_address`)
         are not yet available. Initialize advertises the experimental
         capabilities `com.agentrelay/native-session-identity`,

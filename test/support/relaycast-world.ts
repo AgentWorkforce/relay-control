@@ -192,6 +192,17 @@ export function createRelaycastWorld(roster: unknown[]) {
       const agent = agents.get(decodeURIComponent(match[1]!));
       return agent ? ok(rosterEntry(agent)) : fail(404, "agent_not_found");
     }
+    if ((match = /^\/v1\/agents\/([^/]+)$/.exec(path)) && method === "PATCH" && workspace) {
+      // Relaycast's PATCH /v1/agents/:name (routes/agent.ts) shallow-merges
+      // body.metadata into the stored metadata; keys not sent are kept.
+      const agent = agents.get(decodeURIComponent(match[1]!));
+      if (!agent) return fail(404, "agent_not_found");
+      // expected_agent_id (relaycast#666): 409 when the name now names another agent.
+      if (body?.expected_agent_id !== undefined && body.expected_agent_id !== agent.id) return fail(409, "agent_identity_changed");
+      if (body?.metadata !== undefined) agent.metadata = { ...agent.metadata, ...body.metadata };
+      syncRoster();
+      return ok(rosterEntry(agent));
+    }
     if (method === "GET" && path === "/v1/agent" && caller) {
       return ok({ ...rosterEntry(caller), channels: [...channels.values()]
         .filter(channel => channel.members.has(caller.name)).map(channel => ({ id: channel.id, name: channel.name })) });
