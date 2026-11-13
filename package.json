@@ -2,7 +2,7 @@
   "name": "relay-control",
   "version": "0.5.20",
   "private": true,
-  "license": "Apache-2.0",
+  "license": "FSL-1.1-ALv2",
   "type": "module",
   "description": "Minimal self-hosted Agent Relay sessions control plane",
   "bin": {

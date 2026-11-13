@@ -22,7 +22,7 @@ ENV NODE_ENV=production PORT=3000 HOST=0.0.0.0 SELFHOST_IMAGE_VERSION=${IMAGE_VE
 LABEL org.opencontainers.image.source="https://github.com/AgentWorkforce/relay-control" \
       org.opencontainers.image.revision="${IMAGE_REVISION}" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="FSL-1.1-ALv2"
 COPY --from=build /tmp/relay-control-*.tgz /tmp/package.tgz
 # Keep the installed application and command paths, but resolve dependencies
 # with the exact source lock instead of a second packed-package npm install.
