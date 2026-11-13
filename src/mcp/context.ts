@@ -58,6 +58,8 @@ export type McpContext = {
     client: RelaycastClient;
     /** The Mcp-Session-Id header, when the client sent one. */
     sessionId: string | undefined;
+    /** Relaycast's public base URL; agent cards name `<it>/a2a/rpc` as their A2A endpoint. */
+    relaycastPublicUrl: string;
   };
   /** Amp control (SELFHOST_AMP_ENABLED); absent when the feature is off. */
   amp?: AmpDeps;

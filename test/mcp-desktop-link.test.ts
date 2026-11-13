@@ -255,3 +255,35 @@ test("an OAuth connection cannot link a desktop identity", async (t) => {
     /cannot link a desktop identity/);
   assert.equal((await f.bindings()).length, 0);
 });
+
+test("set_relay_agent_card on a linked session writes the Desktop identity's card and keeps its metadata", async (t) => {
+  const f = await linkedDesktop(t);
+  const card = { description: "Desk chat that triages relay bugs.",
+    skills: [{ id: "triage-bugs", name: "Triage bugs", description: "Reproduce and label a bug report.", examples: ["Triage issue 7"] }] };
+  // A hosted participant of the same session is replaced by the link, so the card goes to the Desktop identity.
+  structured(await f.client.callTool({ name: "join_relay", arguments: { desktop_address: f.address } }));
+  f.chat.metadata.session_id = "codex-thread-1";
+  f.chat.metadata.renamed_from = "older-name";
+  const before = { ...f.chat.metadata };
+  const set = structured(await f.client.callTool({ name: "set_relay_agent_card", arguments: card }));
+  assert.equal(set.linked, "desktop");
+  assert.equal(set.name, "desk-chat");
+  assert.equal(JSON.stringify(set).includes(f.chat.token), false);
+  const { card: stored, skills, kind, owner_name: ownerName, ...rest } = f.chat.metadata as Record<string, any>;
+  assert.deepEqual(rest, before);
+  assert.equal(kind, "relay-desktop");
+  assert.equal(ownerName, "Owner");
+  assert.deepEqual(skills, [{ ...card.skills[0], tags: [] }]);
+  assert.equal(stored.description, card.description);
+  // The peer is untouched, and the card reads back for any workspace member.
+  assert.equal(f.peer.metadata.card, undefined);
+  const read = structured(await f.client.callTool({ name: "get_relay_agent_card", arguments: { agent: f.address } }));
+  assert.equal(read.description, card.description);
+  assert.equal(read["x-agent-relay"].hasCard, true);
+  assert.equal(read["x-agent-relay"].kind, "relay-desktop");
+  assert.equal(read.url, "https://relaycast.selfhosted.test/a2a/rpc");
+
+  // After leaving the link, the session has no identity to write.
+  structured(await f.client.callTool({ name: "leave_relay", arguments: {} }));
+  assert.match(toolError(await f.client.callTool({ name: "set_relay_agent_card", arguments: card })), /no relay identity/);
+});
