@@ -1,4 +1,3 @@
-import { page } from "../identity/pages.js";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { safeNextPath } from "./device-approval.js";
 
@@ -160,6 +159,17 @@ function escape(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+// Hosted Cloud's Desktop sign-in pages (packages/web/app/api/v1/cli/login/
+// desktop-consent.ts and workspace-picker.ts): same markup and styles.
+const CLOUD_STYLE = "body{margin:0;background:#10171d;color:#edf3f7;font:16px system-ui,sans-serif;display:grid;min-height:100vh;place-items:center}main{max-width:460px;padding:40px}h1{font-size:28px;letter-spacing:-.5px}p{color:#b6c6d0;line-height:1.6}strong{color:#edf3f7;overflow-wrap:anywhere}.actions{display:flex;gap:12px;margin-top:28px}button{box-sizing:border-box;flex:1;font:inherit;border-radius:8px;padding:12px;cursor:pointer}button[value=approve]{background:#78bce0;color:#10171d;border:0;font-weight:600}button[value=deny]{background:transparent;color:#edf3f7;border:1px solid #526470}";
+const CLOUD_PICKER_STYLE = "body{margin:0;background:#10171d;color:#edf3f7;font:16px system-ui,sans-serif;display:grid;min-height:100vh;place-items:center}main{max-width:420px;padding:40px}h1{font-size:28px;letter-spacing:-.5px}p{color:#b6c6d0;line-height:1.6}label{display:block;margin-top:28px}select,button{box-sizing:border-box;width:100%;font:inherit;border-radius:8px;padding:12px;margin-top:10px}select{background:#1b2832;color:#edf3f7;border:1px solid #526470}button{background:#78bce0;color:#10171d;border:0;font-weight:600;cursor:pointer}small{display:block;color:#b6c6d0;line-height:1.6;margin-top:20px}";
+
+function cloudPage(title: string, body: string, style = CLOUD_STYLE): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>${escape(title)} · Agent Relay</title>
+<style>${style}</style></head><body><main>${body}</main></body></html>`;
+}
+
 /**
  * The consent screen for a desktop sign-in that names its host. Approve posts
  * the same parameters back with the consent token; nothing is issued by
@@ -177,24 +187,21 @@ export function desktopConsentPage(input: {
     .map((field) =>
       `<input type="hidden" name="${field}" value="${escape(input.params.get(field)!)}">`)
     .join("\n");
-  const where = input.workspaceName
-    ? `<p>It will use the workspace <strong>${escape(input.workspaceName)}</strong>.</p>`
-    : "";
-  return page("Approve Agent Relay Desktop", `<h1>Sign in Agent Relay Desktop?</h1>
-<p>Agent Relay Desktop on <strong>${escape(input.hostName)}</strong> is asking to sign in as you.</p>
-${where}
-<p class="muted">Only approve a sign-in you started on that computer.</p>
+  const name = `Agent Relay Desktop on ${input.hostName}`;
+  const workspace = input.workspaceName ? ` <strong>${escape(input.workspaceName)}</strong>` : "";
+  return cloudPage("Authorize a device", `<p>Requesting app or device</p><h1>${escape(name)}</h1>
+<p>Approving authorizes ${escape(name)} to access your workspace${workspace}. Check that this is the computer where you started sign-in; otherwise, deny it.</p>
 <form method="post" action="${escape(input.action)}">
 ${hidden}
 <input type="hidden" name="consent_token" value="${escape(input.consentToken)}">
-<div class="actions"><button class="btn" type="submit" name="decision" value="approve">Approve</button>
-<button class="btn secondary" type="submit" name="decision" value="deny">Deny</button></div>
-</form>`);
+<div class="actions">
+<button type="submit" name="decision" value="approve">Approve</button>
+<button type="submit" name="decision" value="deny">Deny</button></div></form>`);
 }
 
 export function desktopConsentDeniedPage(): string {
-  return page("Sign-in denied", `<h1>Sign-in denied</h1>
-<p class="muted">Agent Relay Desktop was not signed in. You can close this tab.</p>`);
+  return cloudPage("Device denied", `<p>Agent Relay</p><h1>Device denied</h1>
+<p>No credentials were issued. You can close this tab.</p>`);
 }
 
 /** Where the browser is sent with the handoff (hosted Cloud's issueHandoff). */
@@ -227,23 +234,26 @@ export function cloudPathForNext(value: string | null): string {
 }
 
 /**
- * Multi-workspace desktop sign-in (Cloud cli/login picker): each choice
- * re-opens the same sign-in with ?workspace=<id>. Choosing issues nothing by
- * itself; the GET that follows runs the usual consent or handoff.
+ * Multi-workspace desktop sign-in (Cloud's cli/login picker): choosing re-opens
+ * the same sign-in with ?workspace=<id>. Choosing issues nothing by itself;
+ * the GET that follows runs the usual consent or handoff.
  */
 export function desktopWorkspacePickerPage(input: {
   action: string;
   params: URLSearchParams;
   workspaces: ReadonlyArray<{ id: string; name: string; organizationName: string }>;
 }): string {
-  const items = input.workspaces.map((workspace) => {
-    const params = new URLSearchParams(input.params);
-    params.set("workspace", workspace.id);
-    return `<li><a class="choice" href="${escape(`${input.action}?${params.toString()}`)}">${escape(workspace.name)} <span class="muted">${escape(workspace.organizationName)}</span></a></li>`;
-  }).join("\n");
-  return page("Choose a workspace", `<h1>Choose a workspace</h1>
-<p class="muted">Pick the workspace Agent Relay Desktop should use.</p>
-<ul class="choices">
-${items}
-</ul>`);
+  const hidden = [...input.params]
+    .filter(([key]) => key !== "workspace")
+    .map(([key, value]) => `<input type="hidden" name="${escape(key)}" value="${escape(value)}">`)
+    .join("");
+  const options = input.workspaces.map((workspace) => {
+    const label = workspace.organizationName && workspace.organizationName !== workspace.name
+      ? `${workspace.organizationName} / ${workspace.name}` : workspace.name;
+    return `<option value="${escape(workspace.id)}">${escape(label)}</option>`;
+  }).join("");
+  return cloudPage("Choose your workspace", `<p>Agent Relay</p><h1>Choose your workspace</h1><p>This computer will connect to the workspace you choose.</p>
+<form method="get" action="${escape(input.action)}">${hidden}<label for="workspace">Workspace</label>
+<select id="workspace" name="workspace" required>${options}</select><button type="submit">Continue to Agent Relay</button></form>
+<small>Sign out of the desktop app to switch workspaces.</small>`, CLOUD_PICKER_STYLE);
 }
