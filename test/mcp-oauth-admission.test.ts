@@ -897,6 +897,54 @@ test("native pending and exchanged handoff artifacts cannot gain MCP capability"
   assert.equal((await initialize(exchanged.accessToken)).status,200);
 });
 
+test("mounted signed-in consent rejects oversized state locally while accepting the boundary",async t=>{
+  const f=await fixture(t);
+  const store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
+  const account=await f.database.transaction(tx=>store.issueBrowserSession(tx,{...f.owner,label:"fake-browser"}));
+  const server=createServer(createApp({config:appConfig(),store}));
+  const base=await listen(server);t.after(()=>close(server));
+  const params={client_id:f.clientId,response_type:"code",redirect_uri:"https://client.example.test/cb",
+    code_challenge:pkceS256("v".repeat(43)),code_challenge_method:"S256",resource:RESOURCE,state:"x".repeat(4096)};
+  const headers={cookie:"agent_relay_session="+account.accessToken};
+  const accepted=await fetch(base+"/cloud/oauth/authorize?"+new URLSearchParams(params),{headers,redirect:"manual"});
+  assert.equal(accepted.status,200);
+  await accepted.text();
+  const rejected=await fetch(base+"/cloud/oauth/authorize?"+new URLSearchParams({...params,state:params.state+"x"}),{headers,redirect:"manual"});
+  assert.equal(rejected.status,400);
+  assert.equal(rejected.headers.get("location"),null);
+  assert.deepEqual(await rejected.json(),{error:"invalid_request",error_description:"state must be at most 4096 URL-encoded characters."});
+  assert.equal((await f.database.query("SELECT code_hash FROM mcp_oauth_authorization_codes")).rows.length,0);
+});
+
+test("anonymous authorize keeps a 4096-character state in the /login return target",async t=>{
+  const f=await fixture(t);
+  const store=new ControlPlaneStore(f.database,KEYRING,0,{tenancy:"multi"});
+  const server=createServer(createApp({config:appConfig(),store}));
+  const base=await listen(server);t.after(()=>close(server));
+  const params={client_id:f.clientId,response_type:"code",redirect_uri:"https://client.example.test/cb",
+    code_challenge:pkceS256("v".repeat(43)),code_challenge_method:"S256",resource:RESOURCE,state:"x".repeat(4096)};
+  const authorizePath="/cloud/oauth/authorize?"+new URLSearchParams(params);
+  const anonymous=await fetch(base+authorizePath,{redirect:"manual"});
+  assert.equal(anonymous.status,302);
+  await anonymous.text();
+  const location=anonymous.headers.get("location")!;
+  assert.ok(location.startsWith("/login?"),location.slice(0,40));
+  const next=new URL(location,base).searchParams.get("next")!;
+  assert.equal(next,authorizePath);
+  assert.equal(new URL(next,base).searchParams.get("state"),params.state);
+  const login=await fetch(base+location);
+  assert.equal(login.status,200);
+  assert.ok((await login.text()).includes(`const next=${JSON.stringify(next)};`),"whole authorize request kept as next");
+  const oversized=await fetch(base+"/login?"+new URLSearchParams({
+    next:"/cloud/oauth/authorize?"+new URLSearchParams({...params,state:"x".repeat(8192)}),
+  }));
+  assert.equal(oversized.status,200);
+  assert.ok((await oversized.text()).includes('const next="/";'),"oversized next is dropped, not truncated");
+  const offOrigin=await fetch(base+"/login?"+new URLSearchParams({next:"//client.example.test/"+params.state}));
+  assert.ok((await offOrigin.text()).includes('const next="/";'),"protocol-relative next is dropped");
+  assert.equal((await f.database.query("SELECT code_hash FROM mcp_oauth_authorization_codes")).rows.length,0);
+});
+
 for(const endpoint of ["/mcp","/cloud/mcp","/cloud"+SHARED]) test("mounted app OAuth round trip is MCP-only and chat-independent at "+endpoint,async t=>{
   const f=await relayFixture(t);
   f.world.addAgent("peer");
@@ -918,8 +966,9 @@ for(const endpoint of ["/mcp","/cloud/mcp","/cloud"+SHARED]) test("mounted app O
     client_name:"Fake connector",redirect_uris:["https://client.example.test/cb"],
   })).json();
   const verifier="v".repeat(43),resource=ORIGIN+(endpoint==="/cloud/mcp"?"/mcp":endpoint);
+  const opaqueState="x".repeat(2048);
   const params={client_id:registered.client_id,response_type:"code",redirect_uri:"https://client.example.test/cb",
-    code_challenge:pkceS256(verifier),code_challenge_method:"S256",resource,state:""};
+    code_challenge:pkceS256(verifier),code_challenge_method:"S256",resource,state:opaqueState};
   const cookie="agent_relay_session="+account.accessToken;
   const page=await fetch(base+"/cloud/oauth/authorize?"+new URLSearchParams(params),{headers:{cookie},redirect:"manual"});
   assert.equal(page.status,200);
@@ -928,7 +977,7 @@ for(const endpoint of ["/mcp","/cloud/mcp","/cloud"+SHARED]) test("mounted app O
     workspace_id:f.owner.workspaceId,agent_name:"connected-agent"},{cookie,origin:ORIGIN});
   assert.equal(approved.status,200);
   const redirect=new URL((await approved.json()).redirect_to);
-  assert.equal(redirect.searchParams.get("state"),"");
+  assert.equal(redirect.searchParams.get("state"),opaqueState);
   const exchanged=await call("/cloud/api/oauth/token",{grant_type:"authorization_code",
     client_id:registered.client_id,code:redirect.searchParams.get("code"),code_verifier:verifier,
     redirect_uri:params.redirect_uri,resource});

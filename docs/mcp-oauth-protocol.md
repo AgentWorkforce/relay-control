@@ -39,8 +39,21 @@ against the configured origin and handle malformed URLs without throwing.
 `/cloud/mcp` is not the canonical `/mcp` resource; transport rewrites must supply
 the public path. Empty state is echoed, and nonce is evaluated only for granted
 OIDC. OAuth response fields replace any stale callback values while unrelated
-callback query parameters are preserved. Resource
-canonicalization uses the same parser as consent so URL normalization cannot
+callback query parameters are preserved. State is accepted up to 4096
+URL-encoded characters and echoed exactly on successful and failed callbacks.
+This permits opaque MCP-client state beyond the previous 1024-character limit
+while bounding the encoded callback field, including Unicode expansion. A longer
+state produces a local `invalid_request` instead of redirecting without state;
+an uncorrelatable callback would hide this cause behind the client's
+"missing state" error. A browser that is not signed in is sent to `/login`
+with the whole authorization request as its `next` return target; that target
+allows up to 8 KiB and keeps the same-origin, path-only and control-character
+checks, so a maximum-length state survives sign-in instead of being dropped.
+Provider (OIDC) sign-in keeps the encrypted attempt in up to five
+2800-character cookie chunks with a digest-checked manifest, so the return
+target also survives the provider round trip within browser cookie limits;
+short attempts keep the single cookie.
+Resource canonicalization uses the same parser as consent so URL normalization cannot
 turn a rejected hint/resource into an accepted token audience.
 
 The module issues no tokens and does not authorize a user or tenant. OAuth

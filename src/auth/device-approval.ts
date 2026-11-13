@@ -169,12 +169,18 @@ export function deviceApprovalPageUrl(dashboardUrl: string, rawUserCode: string 
   return url.toString();
 }
 
+/** Length budget for a /login return target (see safeNextPath). */
+const MAX_NEXT_PATH_LENGTH = 8 * 1024;
+
 /**
  * Where /login may send the browser after sign-in: a same-origin absolute path
- * only (no scheme, no `//host`, no backslash tricks, no control characters).
+ * only (no scheme, no `//host`, no backslash tricks, no control characters),
+ * at most MAX_NEXT_PATH_LENGTH characters so the MCP authorize request
+ * handoff (4096-character URL-encoded state plus the other authorization
+ * parameters) survives sign-in while staying bounded.
  */
 export function safeNextPath(value: string | null): string {
-  if (!value || value.length > 2_048) return "/";
+  if (!value || value.length > MAX_NEXT_PATH_LENGTH) return "/";
   if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/";
   if (/[\p{C}]/u.test(value)) return "/";
   try {

@@ -13,6 +13,7 @@ import { createIdentityModule } from "../src/identity/routes.js";
 import { bootstrapOnce, relaycastProvisioner, startBootstrap, type RelaycastProvisioner } from "../src/identity/bootstrap.js";
 import type { Mailer, OutgoingEmail } from "../src/identity/mailer.js";
 import { close, listen, PGliteDatabase } from "./support/harness.js";
+import { encryptSecret } from "../src/crypto.js";
 
 const BOOTSTRAP = "bootstrap-token-that-is-at-least-32-bytes";
 const KEYRING = { active: { id: "test-key", key: Buffer.alloc(32, 7) } };
@@ -558,6 +559,140 @@ test("oidc: refuses strangers, other domains, unverified email, forged state and
     cookie: `agent_relay_oidc=${encodeURIComponent(start.cookies.agent_relay_oidc!)}`,
   });
   assert.match(cancelled.text, /cancelled/);
+});
+
+// ---- OIDC: chunked sign-in attempt cookie ---------------------------------------
+
+const OIDC_ATTEMPT_COOKIES = ["agent_relay_oidc", ...[0, 1, 2, 3, 4].map((index) => `agent_relay_oidc.${index}`)];
+
+/** A browser's view: drops cookies over 4096 bytes, deletes on Max-Age=0, keeps the latest per name. */
+function browserCookieHeader(setCookies: string[]): { header: string; kept: Map<string, string> } {
+  const kept = new Map<string, string>();
+  for (const line of setCookies) {
+    const [pair] = line.split(";");
+    if (Buffer.byteLength(pair!) > 4096) continue;
+    const index = pair!.indexOf("=");
+    const name = pair!.slice(0, index);
+    if (/;\s*Max-Age=0(;|$)/.test(line)) kept.delete(name);
+    else kept.set(name, pair!.slice(index + 1));
+  }
+  return { header: [...kept].map(([name, value]) => `${name}=${value}`).join("; "), kept };
+}
+
+function mcpAuthorizeNext(): string {
+  return `/cloud/oauth/authorize?${new URLSearchParams({
+    client_id: "c".repeat(32),
+    response_type: "code",
+    redirect_uri: "https://client.example.test/cb",
+    code_challenge: "v".repeat(43),
+    code_challenge_method: "S256",
+    resource: "https://control.example.test/mcp",
+    state: "x".repeat(4096),
+  })}`;
+}
+
+function assertClearsAttempt(response: Res): void {
+  const lines = response.headers.getSetCookie();
+  for (const name of OIDC_ATTEMPT_COOKIES) {
+    assert(lines.some((line) => line.startsWith(`${name}=;`) && /Path=\/login\/oidc; Max-Age=0;/.test(line)), `clears ${name}`);
+  }
+}
+
+test("oidc: a 4096-character MCP state survives provider start and callback within browser cookie limits", async (t) => {
+  const ctx = await setup(t);
+  for (const next of [mcpAuthorizeNext(), `/x?s=${"a".repeat(8187)}`]) {
+    const start = await call(ctx.origin, `/login/oidc/start?next=${encodeURIComponent(next)}`);
+    assert.equal(start.status, 302, start.text);
+    const setCookies = start.headers.getSetCookie();
+    for (const line of setCookies) assert(Buffer.byteLength(line) <= 4096, `Set-Cookie of ${Buffer.byteLength(line)} bytes`);
+    const browser = browserCookieHeader(setCookies);
+    assert(browser.kept.size > 1, "manifest plus chunks");
+    assert.match(browser.kept.get("agent_relay_oidc")!, /^chunked\.\d\./);
+
+    const approved = ctx.idp.approve(start.headers.get("location")!, { email: "admin@acme.test" });
+    const callback = await call(ctx.origin, `/login/oidc/callback?code=${approved.code}&state=${approved.state}`, { cookie: browser.header });
+    assert.equal(callback.status, 303, callback.text);
+    assert.equal(callback.headers.get("location"), next);
+    assert(callback.cookies.agent_relay_session, "session cookie");
+    assertClearsAttempt(callback);
+  }
+});
+
+test("oidc: a tampered or incomplete chunked attempt is refused", async (t) => {
+  const ctx = await setup(t);
+  const begin = async () => {
+    const start = await call(ctx.origin, `/login/oidc/start?next=${encodeURIComponent(mcpAuthorizeNext())}`);
+    assert.equal(start.status, 302, start.text);
+    const { kept } = browserCookieHeader(start.headers.getSetCookie());
+    const approved = ctx.idp.approve(start.headers.get("location")!, { email: "admin@acme.test" });
+    return { kept, approved };
+  };
+  const expectExpired = async (approved: { code: string; state: string }, kept: Map<string, string>) => {
+    const header = [...kept].map(([name, value]) => `${name}=${value}`).join("; ");
+    const callback = await call(ctx.origin, `/login/oidc/callback?code=${approved.code}&state=${approved.state}`, { cookie: header });
+    assert.equal(callback.status, 400, callback.text);
+    assert.match(callback.text, /Sign-in expired/);
+    assert.equal(callback.cookies.agent_relay_session, undefined);
+    assertClearsAttempt(callback);
+  };
+
+  // (a) one character flipped inside a chunk.
+  let { kept, approved } = await begin();
+  const chunk = kept.get("agent_relay_oidc.1")!;
+  kept.set("agent_relay_oidc.1", `${chunk.slice(0, 10)}${chunk[10] === "A" ? "B" : "A"}${chunk.slice(11)}`);
+  await expectExpired(approved, kept);
+
+  // (b) the last chunk missing.
+  ({ kept, approved } = await begin());
+  const count = Number(kept.get("agent_relay_oidc")!.split(".")[1]);
+  kept.delete(`agent_relay_oidc.${count - 1}`);
+  await expectExpired(approved, kept);
+
+  // (c) a manifest claiming six chunks, or zero.
+  ({ kept, approved } = await begin());
+  const digest = kept.get("agent_relay_oidc")!.split(".")[2];
+  kept.set("agent_relay_oidc", `chunked.6.${digest}`);
+  kept.set("agent_relay_oidc.5", "x");
+  await expectExpired(approved, kept);
+  ({ kept, approved } = await begin());
+  kept.set("agent_relay_oidc", "chunked.0.x");
+  await expectExpired(approved, kept);
+
+  // A short next keeps the single legacy cookie.
+  const short = await call(ctx.origin, "/login/oidc/start?next=%2Fsettings");
+  const shortJar = browserCookieHeader(short.headers.getSetCookie()).kept;
+  assert.deepEqual([...shortJar.keys()], ["agent_relay_oidc"]);
+  assert(!shortJar.get("agent_relay_oidc")!.startsWith("chunked."));
+
+  // A single cookie written before chunking existed is still accepted.
+  const verifier = "legacy-verifier-".padEnd(64, "v");
+  const attempt = {
+    p: "oidc-attempt",
+    state: "legacy-state",
+    nonce: "legacy-nonce",
+    verifier,
+    next: "/settings",
+    invite: null,
+    redirectUri: `${ctx.origin}/login/oidc/callback`,
+    exp: Date.now() + 60_000,
+  };
+  const authorize = new URL(`${ctx.idp.state.issuer}/authorize`);
+  authorize.search = new URLSearchParams({
+    client_id: CLIENT_ID,
+    response_type: "code",
+    code_challenge_method: "S256",
+    code_challenge: createHash("sha256").update(verifier).digest("base64url"),
+    nonce: attempt.nonce,
+    redirect_uri: attempt.redirectUri,
+    state: attempt.state,
+  }).toString();
+  const legacy = ctx.idp.approve(authorize.toString(), { email: "admin@acme.test" });
+  const callback = await call(ctx.origin, `/login/oidc/callback?code=${legacy.code}&state=${legacy.state}`, {
+    cookie: `agent_relay_oidc=${encodeURIComponent(encryptSecret(JSON.stringify(attempt), KEYRING.active))}`,
+  });
+  assert.equal(callback.status, 303, callback.text);
+  assert.equal(callback.headers.get("location"), "/settings");
+  assert(callback.cookies.agent_relay_session, "session cookie");
 });
 
 // ---- Microsoft Entra ID: an id_token without email_verified ----------------------
