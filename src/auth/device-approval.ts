@@ -20,9 +20,10 @@ export const DEVICE_RATE_LIMITS = {
 export const ENROLLMENT_RATE_LIMITS = {
   /**
    * Per client IP: POST /api/v1/auth/enrollment/token is unauthenticated
-   * apart from the key; same window as a device start.
+   * apart from the key; the same window as a device start with room for a
+   * fleet enrolling behind one address.
    */
-  exchange: { limit: 10, windowMs: 5 * 60_000 },
+  exchange: { limit: 30, windowMs: 5 * 60_000 },
 } as const;
 
 type Hits = { timestamps: number[]; expiresAt: number };

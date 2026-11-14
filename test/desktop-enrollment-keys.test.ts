@@ -306,10 +306,10 @@ test("exchange: spent, expired, revoked and unknown keys get one identical inval
   }
 });
 
-test("exchange: 10 per client address per 5 minutes, then 429 slow_down", async (t) => {
+test("exchange: 30 per client address per 5 minutes, then 429 slow_down", async (t) => {
   const env = await setup(t);
   const unknown = `sh_ek_${"1".repeat(43)}`;
-  for (let attempt = 0; attempt < 10; attempt += 1) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
     assert.equal((await env.exchange(unknown)).status, 400);
   }
   const limited = await env.exchange(unknown);

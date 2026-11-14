@@ -1259,7 +1259,7 @@ paths:
                   error_description: { type: string }
                   message: { type: string }
         "429":
-          description: slow_down, per-client-address limit (10 per 5 minutes); see Retry-After
+          description: slow_down, per-client-address limit (30 per 5 minutes); see Retry-After
   /api/v1/me/enrollment-keys:
     get:
       operationId: listMyEnrollmentKeys

@@ -1018,7 +1018,7 @@ names refused); `desktop_host_name` is required (1 to 80 characters). The
 device scopes, is labelled with `client_name` and stores the host name. A
 missing, expired, revoked or already exchanged key gets one answer,
 `400 {"error": "invalid_grant", "error_description": "..."}`, whatever the
-reason. The route allows 10 exchanges per client address per 5 minutes and
+reason. The route allows 30 exchanges per client address per 5 minutes and
 then answers `429 slow_down`.
 
 Consent: a key minted with `mcpConsent: "admin"` yields a Desktop-verified
