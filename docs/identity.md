@@ -312,7 +312,7 @@ its routes. That covers `/api/v1/auth/password/*` and `/login/password` for
 | Variable | Meaning |
 |---|---|
 | `SELFHOST_SIGNIN_METHODS` | `email_link`, `password`, or both. The default is `email_link` when `SELFHOST_EMAIL_LOGIN=true`, otherwise none |
-| `SELFHOST_LOGIN_LOGO_URL` | Optional customer logo for the sign-in pages, shown under the Agent Relay lockup. Must be an absolute `https` URL without credentials. It is drawn 22px tall through an `<img>`, so script inside an SVG does not run |
+| `SELFHOST_LOGIN_LOGO_URL` | Optional customer logo for the sign-in pages, shown in a "for <logo> <name>" line under the Agent Relay lockup (Agent Relay stays the product). Must be an absolute `https` URL without credentials. It is drawn 16px tall through an `<img>`, so script inside an SVG does not run |
 | `SELFHOST_LOGIN_ORG_NAME` | Optional name shown beside that logo. The default is `SELFHOST_BOOTSTRAP_ORG_NAME`. Public through `login-config`, and only while a logo is set |
 | `SELFHOST_PASSWORD_PEPPER_FILE` | Optional file of versioned peppers, one `v<version>:<secret>` per line (for example `v1:...`, `v2:...`). Each secret is at least 32 bytes. The highest version hashes new passwords. See [Pepper file](#pepper-file) for the required permissions |
 | `SELFHOST_PASSWORD_ARGON2_MEMORY_KIB` / `_TIME_COST` / `_PARALLELISM` | Optional. These can only raise argon2id above the baseline of 19456 KiB, 2 passes and 1 lane. A lower value refuses to start |

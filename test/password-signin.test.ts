@@ -202,9 +202,10 @@ test("/login: co-brands under the Agent Relay lockup and allows only the logo's 
   const html = await response.text();
   assert.match(response.headers.get("content-security-policy") ?? "", /; img-src https:\/\/cdn\.example\.test$/);
   assert.match(html, /class="mark"/);
-  assert.match(html, /class="wordmark"[\s\S]*<hr><div class="cobrand"><img src="https:\/\/cdn\.example\.test\/logo\.svg" alt="" referrerpolicy="no-referrer"><strong>Example &lt;Corp&gt;<\/strong>/);
-  // Option A, stacked: the Agent Relay lockup, the rule and the customer lockup share one flush-left column.
-  assert.match(html, /<header class="brand"><span class="lockup"><svg[^>]*class="mark"[\s\S]*class="wordmark"[\s\S]*<\/span><hr><div class="cobrand">/);
+  assert.match(html, /class="wordmark"[\s\S]*<div class="cobrand"><span>for<\/span><img src="https:\/\/cdn\.example\.test\/logo\.svg" alt="" referrerpolicy="no-referrer"><strong>Example &lt;Corp&gt;<\/strong>/);
+  // Option B, the "for" line: the Agent Relay lockup, then one line naming the customer, in one flush-left column, with no rule.
+  assert.match(html, /<header class="brand"><span class="lockup"><svg[^>]*class="mark"[\s\S]*class="wordmark"[\s\S]*<\/span><div class="cobrand"><span>for<\/span>/);
+  assert.doesNotMatch(html, /<hr>/);
   assert.match(html, /\.brand\{display:flex;flex-direction:column;align-items:flex-start/);
   assert.doesNotMatch(html, /grid-column/);
 });

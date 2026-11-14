@@ -29,7 +29,7 @@ input[type=email]:focus,input[type=password]:focus,input[type=text]:focus{border
 .notice{border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin:0 0 16px;font-size:.92rem}.notice.error{border-color:var(--danger);background:var(--danger-soft);color:var(--danger)}.notice.ok{background:var(--ok-soft)}
 dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0 0 16px;font-size:.92rem}dt{color:var(--muted)}dd{margin:0;word-break:break-all}
 .brand{display:flex;flex-direction:column;align-items:flex-start;margin:0 0 24px}.brand .lockup{display:inline-flex;align-items:center;gap:10px}.brand .mark{height:24px;width:auto;color:var(--mark)}.brand .wordmark{height:20px;width:auto;color:var(--fg)}
-.brand hr{align-self:flex-start;width:150px;max-width:100%;margin:14px 0;border:0;border-top:1px solid var(--border)}.cobrand{display:flex;align-items:center;gap:10px;min-width:0;max-width:100%}.cobrand img{height:22px;width:auto;max-width:160px;object-fit:contain;object-position:left;flex:none}.cobrand strong{font-size:16px;font-weight:700;letter-spacing:-.01em;min-width:0;overflow-wrap:anywhere}
+.cobrand{display:flex;align-items:center;gap:8px;min-width:0;max-width:100%;margin:10px 0 0;color:var(--muted);font-size:13px}.cobrand img{height:16px;width:auto;max-width:120px;object-fit:contain;object-position:left;flex:none}.cobrand strong{font-size:13px;font-weight:600;color:var(--fg);min-width:0;overflow-wrap:anywhere}
 details{margin-top:18px;font-size:.9rem}summary{cursor:pointer;color:var(--muted)}code{font-size:1.6rem;letter-spacing:.12em}`;
 
 export const PAGE_CSP =
@@ -69,14 +69,15 @@ function roleText(role: string): string {
 export type CoBrand = { logoUrl: string; orgName: string | null };
 
 /**
- * The lockup above the card: the Agent Relay lockup, a rule and the customer
- * lockup stacked flush left in one column (co-brand option A, stacked). An
+ * The lockup above the card: the Agent Relay lockup, then one quiet line
+ * naming the customer, "for <logo> <name>", flush left (co-brand option B, the
+ * "for" line: Agent Relay stays the product). An
  * `<img>` never runs script inside an SVG, and the CSS caps how large the logo
  * can draw.
  */
 function brandHeader(coBrand: CoBrand | null): string {
   const customer = coBrand
-    ? `<hr><div class="cobrand"><img src="${escapeHtml(coBrand.logoUrl)}" alt="${coBrand.orgName ? "" : "Organization logo"}" referrerpolicy="no-referrer">${coBrand.orgName ? `<strong>${escapeHtml(coBrand.orgName)}</strong>` : ""}</div>`
+    ? `<div class="cobrand"><span>for</span><img src="${escapeHtml(coBrand.logoUrl)}" alt="${coBrand.orgName ? "" : "Organization logo"}" referrerpolicy="no-referrer">${coBrand.orgName ? `<strong>${escapeHtml(coBrand.orgName)}</strong>` : ""}</div>`
     : "";
   return `<header class="brand"><span class="lockup">${AGENT_RELAY_MARK}${AGENT_RELAY_WORDMARK}</span>${customer}</header>`;
 }
