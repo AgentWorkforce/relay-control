@@ -985,7 +985,12 @@ only):
   - `email` and `mcpConsent` are refused with `400` for every other purpose.
 - `GET /api/v1/workspaces/{id}/deployment-api-tokens` lists the keys with
   `userId`, `userEmail`, `mcpConsent`, `exchangedAt` and
-  `exchangedHostName` (these are `null` on other purposes).
+  `exchangedHostName` (these are `null` on other purposes). The list is the
+  newest 100 tokens of the workspace; add `?purpose=desktop-enrollment` (or
+  any other purpose) to list one purpose only, so many keys never hide the
+  other tokens. An unknown purpose is `400 invalid_request`.
+- A key's `status` is `revoked`, else `exchanged` once it has been spent,
+  else `expired` past its expiry, else `active`.
 - `DELETE /api/v1/workspaces/{id}/deployment-api-tokens/{tokenId}` revokes
   the key and, if it was exchanged, every session it provisioned (including
   refreshed sessions and their MCP child sessions), with revoked reason
@@ -998,8 +1003,10 @@ The employee can see and revoke their own keys with a signed-in user token
 
 - `GET /api/v1/me/enrollment-keys` answers
   `{keys: [{id, label, status, mcpConsent, createdAt, expiresAt, exchangedAt,
-  exchangedHostName, mintedBy}]}`.
-- `DELETE /api/v1/me/enrollment-keys/{id}` answers `204` with the same
+  exchangedHostName, mintedBy}]}`, `status` as above.
+- `DELETE /api/v1/me/enrollment-keys/{id}` (a bearer token, or the `/cloud`
+  session cookie from a same-origin page; otherwise `403 csrf_rejected`)
+  answers `204` with the same
   cascade as the admin revoke, or `404 token_not_found` for a key that is
   not theirs.
 
@@ -1037,9 +1044,10 @@ issued by an enrollment key:
 and `provisioning: null` for every other session. A refresh keeps the link.
 
 Removing a member (`DELETE /api/v1/organizations/{id}/memberships/{userId}`)
-revokes that user's unexchanged enrollment keys in the organization, one
-`api_token.revoke` audit row per key with `reason=member_removed`. Sessions
-from exchanged keys already end with the membership.
+revokes that user's enrollment keys in the organization and the sessions
+they provisioned, exchanged keys included, one `api_token.revoke` audit row
+per key with `reason=member_removed`. Re-adding the person does not revive
+those sessions; mint a new key.
 
 Discovery: `GET /api/v1/capabilities` answers `enrollment_keys: true` and
 `GET /api/v1/auth/login-config` answers `enrollment_keys: true`; an installer
@@ -1052,7 +1060,7 @@ introspection answers `wrong-kind`. Only the exchange route accepts it.
 Audit actions (all in the minting workspace's audit log, `GET /api/v1/workspaces/{id}/admin/audit`):
 - `api_token.create`: target `<keyId> (desktop-enrollment: user <userId>[ mcpConsent=admin])`
 - `membership.provision`: actor the minting admin, target `<userId> <email> role member`
-- `enrollment_key.exchange`: actor the employee, target `<keyId> ip=<client address> host=<host name|->`; never the key
+- `enrollment_key.exchange`: actor the employee, target `<keyId> ip=<client address> host=<host name>`; never the key
 - `api_token.revoke`: target `<keyId> (desktop-enrollment: user <userId>) sessions=<n>`, with ` reason=member_removed` when a membership removal revoked it
 
 ## Who may sign in

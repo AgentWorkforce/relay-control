@@ -15,7 +15,8 @@ assigned at release.
   host). With admin consent the session is Desktop-verified. Whoami shows
   `provisioning`; the employee can list and revoke their keys at
   `/api/v1/me/enrollment-keys`; revoking a key ends its sessions; removing a
-  member revokes their unexchanged keys. Discovery: `enrollment_keys: true` in
+  member revokes their keys and the sessions those provisioned. Spent keys
+  list as `exchanged`; the token list takes `?purpose=`. Discovery: `enrollment_keys: true` in
   capabilities and login-config. The key is refused by every other gate.
 
 - Added: MCP `get_relay_agent_card` and `set_relay_agent_card` (A2A agent

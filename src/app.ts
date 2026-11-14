@@ -639,13 +639,20 @@ export function createApp(input: {
     return { kind: "user", principal, token };
   }
 
-  /** /api/v1/me/enrollment-keys: a person's own session with cli:auth or account. */
+  /**
+   * /api/v1/me/enrollment-keys: a person's own session with cli:auth or
+   * account. A mutating request carried only by the /cloud session cookie
+   * must pass the same-origin check, like every other cookie-capable write.
+   */
   async function enrollmentKeyOwner(request: IncomingMessage): Promise<Principal> {
     const auth = await authenticate(request);
     if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
     const { principal } = auth;
     if (principal.pendingHandoff) {
       throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+    }
+    if (request.method !== "GET" && !bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+      throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
     }
     if (!principal.scopes.includes("cli:auth") && !principal.scopes.includes(ACCOUNT_SCOPE)) {
       throw new HttpError(403, "insufficient_scope", "Requires a cli:auth or account session");
@@ -2288,8 +2295,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           await purgeMemberAmp(tx, member);
           await factory.purgeMemberInTx(tx, organizationId, userId);
           await revokeOrganizationMcpOAuthGrants(tx, member, input.now?.() ?? new Date());
-          // Unexchanged desktop enrollment keys stop being spendable with
-          // the membership (one api_token.revoke audit row per key).
+          // The member's desktop enrollment keys, exchanged ones included,
+          // are revoked with the membership together with the sessions they
+          // provisioned (one api_token.revoke audit row per key).
           await apiTokens.revokeEnrollmentKeysForMemberIn(tx, {
             organizationId,
             userId,

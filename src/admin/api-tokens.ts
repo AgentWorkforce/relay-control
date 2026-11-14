@@ -83,7 +83,8 @@ export type ApiTokenRecord = {
   accessTokenExpiresAt: string | null;
   lastUsedAt: string | null;
   revokedAt: string | null;
-  status: "active" | "expired" | "revoked";
+  /** `exchanged`: a spent desktop-enrollment key (revoked wins over it, it wins over expired). */
+  status: "active" | "expired" | "revoked" | "exchanged";
   /**
    * relayfile-agent: the agent the token speaks for; relay-node: the node
    * name (same value as nodeName); else null.
@@ -170,7 +171,11 @@ function toRecord(row: Row): ApiTokenRecord {
     accessTokenExpiresAt: row.expires_at ? iso(row.expires_at) : null,
     lastUsedAt: row.last_used_at ? iso(row.last_used_at) : null,
     revokedAt: row.revoked_at ? iso(row.revoked_at) : null,
-    status: row.revoked_at ? "revoked" : expired ? "expired" : "active",
+    status: row.revoked_at
+      ? "revoked"
+      : row.purpose === DESKTOP_ENROLLMENT_PURPOSE && row.exchanged_at
+        ? "exchanged"
+        : expired ? "expired" : "active",
     agent_name: row.agent_name,
     nodeName: row.purpose === RELAY_NODE_PURPOSE ? row.agent_name : null,
     aud: row.aud,
@@ -249,10 +254,15 @@ export class ApiTokenStore {
     private readonly audiences: () => string[] = () => [],
   ) {}
 
-  async list(workspaceId: string): Promise<ApiTokenRecord[]> {
+  /**
+   * The newest 100 tokens of a workspace, optionally of one purpose (so
+   * mass-minted enrollment keys cannot push other tokens off the list).
+   */
+  async list(workspaceId: string, purpose?: ApiTokenPurpose): Promise<ApiTokenRecord[]> {
     const result = await this.database.query<Row>(
-      `${SELECT} WHERE t.workspace_id = $1 ORDER BY t.created_at DESC LIMIT 100`,
-      [workspaceId],
+      `${SELECT} WHERE t.workspace_id = $1 AND ($2::text IS NULL OR t.purpose = $2)
+        ORDER BY t.created_at DESC LIMIT 100`,
+      [workspaceId, purpose ?? null],
     );
     return result.rows.map(toRecord);
   }
@@ -620,10 +630,12 @@ export class ApiTokenStore {
   }
 
   /**
-   * Membership removal: revokes the departing person's live, unexchanged
-   * desktop-enrollment keys in the organization, one `api_token.revoke` audit
-   * row each (target suffix `reason=member_removed`). Runs inside the
-   * removal transaction. An exchanged key's session goes with the membership.
+   * Membership removal: revokes every live desktop-enrollment key of the
+   * departing person in the organization, exchanged ones included, so the
+   * sessions they provisioned (Desktop-verified ones too) are revoked with
+   * the membership instead of lying dormant until the person is re-added.
+   * One `api_token.revoke` audit row each (target suffix
+   * `reason=member_removed`). Runs inside the removal transaction.
    */
   async revokeEnrollmentKeysForMemberIn(
     tx: SqlExecutor,
@@ -634,7 +646,7 @@ export class ApiTokenStore {
          FROM workspace_api_tokens t
          JOIN workspaces w ON w.id = t.workspace_id
         WHERE t.user_id = $1 AND t.purpose = 'desktop-enrollment' AND w.organization_id = $2
-          AND t.revoked_at IS NULL AND t.exchanged_at IS NULL
+          AND t.revoked_at IS NULL
         ORDER BY t.id`,
       [input.userId, input.organizationId],
     );

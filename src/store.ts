@@ -1452,7 +1452,7 @@ export class ControlPlaneStore {
         workspaceId: row.workspace_id,
         actor: { kind: "user", userId: row.user_id },
         action: "enrollment_key.exchange",
-        target: `${row.id} ip=${input.clientIp} host=${input.desktopHostName || "-"}`,
+        target: `${row.id} ip=${input.clientIp} host=${input.desktopHostName}`,
       });
       return { ok: true as const, keyId: row.id, tokens };
     });

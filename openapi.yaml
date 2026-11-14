@@ -5443,7 +5443,13 @@ paths:
       - $ref: "#/components/parameters/WorkspaceId"
     get:
       operationId: listWorkspaceApiTokens
-      description: Owner/admin.
+      description: Owner/admin. The newest 100 tokens, optionally of one purpose.
+      parameters:
+        - name: purpose
+          in: query
+          required: false
+          description: Only tokens of this purpose (400 invalid_request for an unknown purpose).
+          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment] }
       responses:
         "200":
           description: Tokens (never the token value)
@@ -9432,7 +9438,7 @@ components:
         accessTokenExpiresAt: { type: [string, "null"], format: date-time }
         lastUsedAt: { type: [string, "null"], format: date-time }
         revokedAt: { type: [string, "null"], format: date-time }
-        status: { enum: [active, expired, revoked] }
+        status: { enum: [active, expired, revoked, exchanged], description: "exchanged: a spent desktop-enrollment key (revoked wins over it, it wins over expired)" }
         userId: { type: [string, "null"], description: desktop-enrollment only; the bound employee }
         userEmail: { type: [string, "null"], description: desktop-enrollment only }
         mcpConsent: { enum: [admin, null], description: desktop-enrollment only }
@@ -9444,7 +9450,7 @@ components:
       properties:
         id: { type: string, format: uuid }
         label: { type: string }
-        status: { enum: [active, expired, revoked] }
+        status: { enum: [active, expired, revoked, exchanged], description: "exchanged: a spent desktop-enrollment key (revoked wins over it, it wins over expired)" }
         mcpConsent: { enum: [admin, null] }
         createdAt: { type: string, format: date-time }
         expiresAt: { type: [string, "null"], format: date-time }
