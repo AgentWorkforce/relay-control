@@ -247,6 +247,7 @@ test("exchange: device/token shape and scopes; consent decides Desktop verificat
   const keyRow = (await request(env.origin, env.base, { token: env.owner })).body.tokens
     .find((token: Record<string, any>) => token.id === plain.id);
   assert.ok(keyRow.exchangedAt);
+  assert.equal(keyRow.status, "exchanged");
   assert.equal(keyRow.exchangedHostName, "build-01");
   assert.ok(keyRow.lastUsedAt);
 
@@ -399,6 +400,7 @@ test("/api/v1/me/enrollment-keys: the employee lists and revokes only their own 
   assert.equal(summary.id, mine.id);
   assert.equal(summary.mcpConsent, "admin");
   assert.equal(summary.exchangedHostName, "build-01");
+  assert.equal(summary.status, "exchanged");
   assert.equal(summary.mintedBy.id, env.ownerId);
   assert.equal(JSON.stringify(listed.body).includes(mine.accessToken), false);
 
@@ -421,7 +423,47 @@ test("/api/v1/me/enrollment-keys: the employee lists and revokes only their own 
   assert.equal((await request(env.origin, `/api/v1/me/enrollment-keys/${theirs.id}`, { method: "DELETE", token: otherToken })).status, 204);
 });
 
-test("membership removal revokes the member's unexchanged keys", async (t) => {
+test("/cloud DELETE /me/enrollment-keys: a session cookie needs a same-origin request, a bearer does not", async (t) => {
+  const env = await setup(t);
+  await env.addMember("member@acme.test");
+  const first = await env.mintKey("member@acme.test");
+  const second = await env.mintKey("member@acme.test");
+  const employee = (await env.exchange(first.accessToken)).body.access_token as string;
+  const path = `/cloud/api/v1/me/enrollment-keys/${second.id}`;
+
+  const crossSite = await request(env.origin, path, {
+    method: "DELETE",
+    headers: { cookie: `agent_relay_session=${employee}`, origin: "https://evil.example" },
+  });
+  assert.equal(crossSite.status, 403);
+  assert.equal(crossSite.body.error, "csrf_rejected");
+  const still = (await request(env.origin, "/api/v1/me/enrollment-keys", { token: employee })).body.keys
+    .find((key: { id: string }) => key.id === second.id);
+  assert.equal(still.status, "active", "the refused request revoked nothing");
+
+  assert.equal((await request(env.origin, path, { method: "DELETE", token: employee })).status, 204);
+});
+
+test("admin list: ?purpose= filters one purpose, an unknown purpose is 400", async (t) => {
+  const env = await setup(t);
+  await env.addMember("member@acme.test");
+  const key = await env.mintKey("member@acme.test");
+  const deployment = await env.mint({ label: "ci", purpose: "deployment" });
+  assert.equal(deployment.status, 201);
+  const ids = async (query: string) => {
+    const answer = await request(env.origin, `${env.base}?purpose=${query}`, { token: env.owner });
+    assert.equal(answer.status, 200, query);
+    return answer.body.tokens.map((token: { id: string }) => token.id);
+  };
+  assert.deepEqual(await ids("desktop-enrollment"), [key.id]);
+  assert.deepEqual(await ids("deployment"), [deployment.body.id]);
+  assert.deepEqual(await ids("workflow"), []);
+  const bogus = await request(env.origin, `${env.base}?purpose=bogus`, { token: env.owner });
+  assert.equal(bogus.status, 400);
+  assert.equal(bogus.body.error, "invalid_request");
+});
+
+test("membership removal revokes all the member's keys and the sessions exchanged keys provisioned", async (t) => {
   const env = await setup(t);
   const memberId = await env.addMember("member@acme.test");
   const unexchanged = await env.mintKey("member@acme.test");
@@ -435,10 +477,21 @@ test("membership removal revokes the member's unexchanged keys", async (t) => {
   assert.ok(removed.status === 200 || removed.status === 204, `remove: ${removed.status}`);
   const tokens = (await request(env.origin, env.base, { token: env.owner })).body.tokens as Array<Record<string, any>>;
   assert.equal(tokens.find((token) => token.id === unexchanged.id)!.status, "revoked");
+  assert.equal(tokens.find((token) => token.id === exchanged.id)!.status, "revoked");
   assert.equal((await env.exchange(unexchanged.accessToken)).status, 400);
-  assert.equal((await request(env.origin, "/api/v1/auth/whoami", { token: issued.body.access_token })).status, 401);
+  const access = issued.body.access_token as string;
+  assert.equal((await request(env.origin, "/api/v1/auth/whoami", { token: access })).status, 401);
+  // The membership cascade deletes the session row; were it kept, it must be revoked.
+  const row = await env.session(access);
+  assert.ok(!row || row.revoked_at, "the provisioned session is gone or revoked");
   const revokes = (await env.audit()).filter((event) => event.action === "api_token.revoke");
-  assert.ok(revokes.some((event) => event.target?.startsWith(unexchanged.id) && event.target.endsWith(" reason=member_removed")));
+  for (const id of [unexchanged.id, exchanged.id]) {
+    assert.ok(revokes.some((event) => event.target?.startsWith(id) && event.target.endsWith(" reason=member_removed")), id);
+  }
+
+  // Re-adding the person does not revive the old session.
+  await env.addMember("member@acme.test");
+  assert.equal((await request(env.origin, "/api/v1/auth/whoami", { token: access })).status, 401);
 });
 
 test("the key is never a bearer: workspace token gates, introspection and admin routes refuse it", async (t) => {
