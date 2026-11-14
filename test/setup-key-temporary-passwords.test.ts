@@ -89,6 +89,7 @@ test("setup key: offered on /login and in login-config only before the admin's f
   const config = await call(ctx.origin, "/api/v1/auth/login-config");
   assert.equal(config.body.setup_key, true);
   assert.equal(config.body.password_self_service, false);
+  assert.equal(config.body.enrollment_keys, true, "desktop enrollment keys are always served");
   assert.deepEqual(config.body.methods, ["password"]);
 
   // Register and reset need email.
