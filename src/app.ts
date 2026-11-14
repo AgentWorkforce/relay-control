@@ -16,7 +16,7 @@ import { dirname, resolve } from "node:path";
 import { SELFHOST_API_VERSION, type SelfhostConfig } from "./config.js";
 import { secureEqual } from "./crypto.js";
 import { adminErrorResponse, type AdminModule } from "./admin/routes.js";
-import { ApiTokenStore } from "./admin/api-tokens.js";
+import { ApiTokenStore, ENROLLMENT_KEY_PREFIX } from "./admin/api-tokens.js";
 import { recordAudit } from "./admin/audit.js";
 import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
 import { handleChiefRelay } from "./chief-relay.js";
@@ -132,6 +132,7 @@ import {
   cookieRequestAllowed,
   DEVICE_RATE_LIMITS,
   deviceApprovalPageUrl,
+  ENROLLMENT_RATE_LIMITS,
   limiterKey,
   RateLimiter,
   safeNextPath,
@@ -437,6 +438,8 @@ export function createApp(input: {
   const capabilities = () => ({
     ...features,
     session_delete: Boolean(config.sessionErasureApi) && operatorControlsEntitled(),
+    // Desktop enrollment keys (docs/identity.md): always served.
+    enrollment_keys: true,
   });
   // Usage page counters: written only while the `usage` feature is selected.
   const usage = new UsageStore(store.database, () => input.now?.() ?? new Date());
@@ -634,6 +637,20 @@ export function createApp(input: {
     const principal = await store.authenticateAccessToken(token);
     if (!principal) throw new HttpError(401, "unauthorized", "Invalid or expired token");
     return { kind: "user", principal, token };
+  }
+
+  /** /api/v1/me/enrollment-keys: a person's own session with cli:auth or account. */
+  async function enrollmentKeyOwner(request: IncomingMessage): Promise<Principal> {
+    const auth = await authenticate(request);
+    if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+    const { principal } = auth;
+    if (principal.pendingHandoff) {
+      throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+    }
+    if (!principal.scopes.includes("cli:auth") && !principal.scopes.includes(ACCOUNT_SCOPE)) {
+      throw new HttpError(403, "insufficient_scope", "Requires a cli:auth or account session");
+    }
+    return principal;
   }
 
   // analytics lane: the client gateway. Authority comes only from the
@@ -1799,6 +1816,61 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    // Desktop enrollment keys (docs/identity.md, "Desktop enrollment keys"):
+    // an installer spends a single-use sh_ek_ key once for a device session.
+    // Unauthenticated apart from the key; one generic refusal for any key
+    // problem, so an anonymous caller learns nothing about a key's state.
+    if (method === "POST" && path === "/api/v1/auth/enrollment/token") {
+      const ip = clientIp(request);
+      rateLimit(
+        response,
+        `enrollment-token:${limiterKey(ip)}`,
+        ENROLLMENT_RATE_LIMITS.exchange,
+        "slow_down",
+        "Too many enrollment key exchanges",
+      );
+      const body = await requestObject(request);
+      const key = body.enrollment_key;
+      if (typeof key !== "string" || !key.startsWith(ENROLLMENT_KEY_PREFIX) || key.length > 256) {
+        throw new HttpError(400, "invalid_request", "enrollment_key must be an sh_ek_ enrollment key");
+      }
+      const rawClientName = stringField(body, "client_name")!;
+      const clientName = rawClientName.replace(/[\p{C}]/gu, " ").trim();
+      if (!clientName || clientName.length > 120) {
+        throw new HttpError(400, "invalid_request", "client_name must be 1-120 characters");
+      }
+      if (isDeviceReservedClientName(clientName)) {
+        throw new HttpError(400, "invalid_request", "client_name is reserved");
+      }
+      const desktopHostName = sanitizeDesktopHostName(body.desktop_host_name);
+      if (desktopHostName === null) {
+        throw new HttpError(400, "invalid_request", "desktop_host_name must be 1-80 characters");
+      }
+      const result = await store.exchangeEnrollmentKey({ key, clientName, desktopHostName, clientIp: ip });
+      // One line, key id only (never the key; null for an unknown key).
+      console.info("[selfhost-api] enrollment key exchange", {
+        keyId: result.keyId,
+        outcome: result.ok ? "exchanged" : "refused",
+      });
+      if (!result.ok) {
+        json(response, 400, {
+          error: "invalid_grant",
+          error_description: "Enrollment key is invalid, expired, revoked or already used",
+        }, true);
+        return;
+      }
+      json(response, 200, {
+        access_token: result.tokens.accessToken,
+        refresh_token: result.tokens.refreshToken,
+        token_type: "Bearer",
+        access_token_expires_at: result.tokens.accessTokenExpiresAt,
+        refresh_token_expires_at: result.tokens.refreshTokenExpiresAt,
+        scope: result.tokens.scopes.join(" "),
+        api_url: `${siteBaseUrl(request)}/cloud`,
+      }, true);
+      return;
+    }
+
     if (method === "POST" && path === "/api/v1/auth/token/refresh") {
       const body = await requestObject(request);
       const refreshToken = stringField(body, "refreshToken")!;
@@ -1848,7 +1920,34 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         // The workspaces this person belongs to (Desktop reads this when
         // present); the token itself stays bound to currentWorkspace.
         workspaceCount: await store.memberWorkspaceCount(principal.userId),
+        // An admin-provisioned sign-in (desktop enrollment key); else null.
+        provisioning: principal.provisionedByTokenId
+          ? await apiTokens.enrollmentProvisioning(principal.provisionedByTokenId)
+          : null,
       }, true);
+      return;
+    }
+
+    // The caller's own desktop enrollment keys (docs/identity.md, "Desktop
+    // enrollment keys"): list, and revoke one with the sessions it provisioned.
+    if (path === "/api/v1/me/enrollment-keys" && method === "GET") {
+      const principal = await enrollmentKeyOwner(request);
+      json(response, 200, {
+        keys: await apiTokens.listForUser({ organizationId: principal.organizationId, userId: principal.userId }),
+      }, true);
+      return;
+    }
+    const ownEnrollmentKey = routeMatch(path, /^\/api\/v1\/me\/enrollment-keys\/([^/]+)$/);
+    if (ownEnrollmentKey && method === "DELETE") {
+      const principal = await enrollmentKeyOwner(request);
+      const revoked = await apiTokens.revokeForUser({
+        organizationId: principal.organizationId,
+        userId: principal.userId,
+        tokenId: ownEnrollmentKey[0]!,
+      });
+      if (!revoked) throw new HttpError(404, "token_not_found", "Enrollment key not found");
+      response.writeHead(204, { "cache-control": "no-store" });
+      response.end();
       return;
     }
 
@@ -2189,6 +2288,13 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           await purgeMemberAmp(tx, member);
           await factory.purgeMemberInTx(tx, organizationId, userId);
           await revokeOrganizationMcpOAuthGrants(tx, member, input.now?.() ?? new Date());
+          // Unexchanged desktop enrollment keys stop being spendable with
+          // the membership (one api_token.revoke audit row per key).
+          await apiTokens.revokeEnrollmentKeysForMemberIn(tx, {
+            organizationId,
+            userId,
+            actor: auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" },
+          });
         },
       );
       if (!deleted) {

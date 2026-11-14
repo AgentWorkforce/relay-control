@@ -716,6 +716,8 @@ export function createAdminModule(input: {
           aud: body.aud,
           scope: body.scope,
           scopes: body.scopes,
+          email: body.email,
+          mcpConsent: body.mcpConsent,
           actor: userActor(access),
         });
         json(response, 201, token);
