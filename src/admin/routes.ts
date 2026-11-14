@@ -8,7 +8,7 @@ import type { EncryptionKeyring } from "../crypto.js";
 import { secureEqual } from "../crypto.js";
 import type { Database } from "../database.js";
 import type { Principal } from "../store.js";
-import { ApiTokenError, ApiTokenStore } from "./api-tokens.js";
+import { API_TOKEN_PURPOSE_SCOPES, ApiTokenError, ApiTokenStore, type ApiTokenPurpose } from "./api-tokens.js";
 import { acceptedAudiences } from "../auth/introspect.js";
 import { listAudit, recordAudit, type AuditActor } from "./audit.js";
 import { ConnectionError, ConnectionStore, type FetchLike } from "./connections.js";
@@ -697,7 +697,15 @@ export function createAdminModule(input: {
     if (rest === "deployment-api-tokens") {
       if (method === "GET") {
         const access = await helpers.workspaceAccess(request, workspaceId, true);
-        json(response, 200, { tokens: await apiTokens.list(access.workspace.id) });
+        // Optional ?purpose= filter: the list is the newest 100, so a purpose
+        // with many tokens (desktop-enrollment) must not hide the others.
+        const purpose = url.searchParams.get("purpose");
+        if (purpose !== null && !Object.hasOwn(API_TOKEN_PURPOSE_SCOPES, purpose)) {
+          throw new ApiTokenError(400, "invalid_request", "purpose is not a workspace API token purpose");
+        }
+        json(response, 200, {
+          tokens: await apiTokens.list(access.workspace.id, (purpose ?? undefined) as ApiTokenPurpose | undefined),
+        });
         return true;
       }
       if (method === "POST") {
@@ -716,6 +724,8 @@ export function createAdminModule(input: {
           aud: body.aud,
           scope: body.scope,
           scopes: body.scopes,
+          email: body.email,
+          mcpConsent: body.mcpConsent,
           actor: userActor(access),
         });
         json(response, 201, token);

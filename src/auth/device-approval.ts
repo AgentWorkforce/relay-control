@@ -17,6 +17,15 @@ export const DEVICE_RATE_LIMITS = {
   approve: { limit: 30, windowMs: 5 * 60_000 },
 } as const;
 
+export const ENROLLMENT_RATE_LIMITS = {
+  /**
+   * Per client IP: POST /api/v1/auth/enrollment/token is unauthenticated
+   * apart from the key; the same window as a device start with room for a
+   * fleet enrolling behind one address.
+   */
+  exchange: { limit: 30, windowMs: 5 * 60_000 },
+} as const;
+
 type Hits = { timestamps: number[]; expiresAt: number };
 
 /** Sliding-window limiter. Per process, like hosted Cloud's. */

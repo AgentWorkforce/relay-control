@@ -88,6 +88,11 @@ export type Principal = {
    * gains capability-route authority from that exchange.
    */
   handoff?: boolean;
+  /**
+   * The desktop-enrollment key this session was exchanged from (whoami's
+   * `provisioning`); absent for every other session.
+   */
+  provisionedByTokenId?: string;
 };
 
 export type IssuedTokens = {
@@ -171,6 +176,7 @@ type TokenContextRow = {
   scopes: string[];
   pending_handoff: boolean;
   handoff: boolean;
+  provisioned_by_token_id: string | null;
 };
 
 function cleanName(value: string, field: string): string {
@@ -1096,7 +1102,8 @@ export class ControlPlaneStore {
               u.name AS user_name, s.organization_id, o.name AS organization_name,
               s.workspace_id, w.name AS workspace_name, m.role, s.scopes,
               (s.desktop_exchange_challenge IS NOT NULL AND s.desktop_exchanged_at IS NULL) AS pending_handoff,
-              (s.desktop_exchange_challenge IS NOT NULL) AS handoff
+              (s.desktop_exchange_challenge IS NOT NULL) AS handoff,
+              s.provisioned_by_token_id
          FROM token_sessions s
          JOIN users u ON u.id = s.user_id
          JOIN organizations o ON o.id = s.organization_id
@@ -1127,6 +1134,7 @@ export class ControlPlaneStore {
       scopes: row.scopes,
       pendingHandoff: row.pending_handoff === true,
       handoff: row.handoff === true,
+      ...(row.provisioned_by_token_id ? { provisionedByTokenId: row.provisioned_by_token_id } : {}),
     };
   }
 
@@ -1374,6 +1382,79 @@ export class ControlPlaneStore {
         // Proven: consented host on the handoff plus the S256 verifier now.
         ...(row.desktop_host_name ? { desktopHostName: row.desktop_host_name, desktopVerified: true } : {}),
       });
+    });
+  }
+
+  /**
+   * POST /api/v1/auth/enrollment/token (docs/identity.md, "Desktop enrollment
+   * keys"): spends a desktop-enrollment key once for a device session of its
+   * bound member. The key row is locked first, so two exchanges of one key
+   * serialize and the second finds it spent. Every refusal (unknown, revoked,
+   * expired, spent, or the member left: issueTokens re-checks membership) is
+   * the same `{ ok: false }`; `keyId` is only for the caller's log line.
+   * The session carries the device scopes, label = client name and the host
+   * name; it is Desktop-verified only when the minting admin granted MCP
+   * consent (`mcp_consent = 'admin'`). Audited `enrollment_key.exchange` as
+   * the bound member, with the client IP and host, never the key.
+   */
+  async exchangeEnrollmentKey(input: {
+    key: string;
+    clientName: string;
+    desktopHostName: string;
+    clientIp: string;
+  }): Promise<{ ok: true; keyId: string; tokens: IssuedTokens } | { ok: false; keyId: string | null }> {
+    return this.database.transaction(async (tx) => {
+      const found = await tx.query<{
+        id: string;
+        workspace_id: string;
+        organization_id: string;
+        user_id: string | null;
+        mcp_consent: string | null;
+        usable: boolean;
+      }>(
+        `SELECT t.id, t.workspace_id, w.organization_id, t.user_id, t.mcp_consent,
+                (t.revoked_at IS NULL AND t.exchanged_at IS NULL
+                  AND t.expires_at IS NOT NULL AND t.expires_at > now()) AS usable
+           FROM workspace_api_tokens t
+           JOIN workspaces w ON w.id = t.workspace_id
+          WHERE t.token_hash = $1 AND t.purpose = 'desktop-enrollment'
+          FOR UPDATE OF t`,
+        [hashSecret(input.key)],
+      );
+      const row = found.rows[0];
+      if (!row || !row.usable || !row.user_id) return { ok: false as const, keyId: row?.id ?? null };
+      let tokens: IssuedTokens;
+      try {
+        tokens = await this.issueTokens(tx, {
+          userId: row.user_id,
+          organizationId: row.organization_id,
+          workspaceId: row.workspace_id,
+          label: cleanName(input.clientName, "clientName"),
+        }, {
+          scopes: DEVICE_SCOPES,
+          desktopHostName: input.desktopHostName,
+          desktopVerified: row.mcp_consent === "admin",
+          provisionedByTokenId: row.id,
+        });
+      } catch (error) {
+        if (error instanceof OrganizationBoundaryError) return { ok: false as const, keyId: row.id };
+        throw error;
+      }
+      await tx.query(
+        `UPDATE workspace_api_tokens
+            SET exchanged_at = now(), exchanged_session_id = $2, exchanged_host_name = $3,
+                last_used_at = now()
+          WHERE id = $1`,
+        [row.id, tokens.sessionId, input.desktopHostName],
+      );
+      await recordAudit(tx, {
+        organizationId: row.organization_id,
+        workspaceId: row.workspace_id,
+        actor: { kind: "user", userId: row.user_id },
+        action: "enrollment_key.exchange",
+        target: `${row.id} ip=${input.clientIp} host=${input.desktopHostName}`,
+      });
+      return { ok: true as const, keyId: row.id, tokens };
     });
   }
 
@@ -1698,6 +1779,8 @@ export class ControlPlaneStore {
       desktopExchangeChallenge?: string;
       desktopHostName?: string;
       desktopVerified?: boolean;
+      /** A desktop-enrollment key's id (token_sessions.provisioned_by_token_id). */
+      provisionedByTokenId?: string;
     },
   ): Promise<IssuedTokens> {
     const context = await tx.query<{ valid: boolean }>(
@@ -1724,9 +1807,10 @@ export class ControlPlaneStore {
       `INSERT INTO token_sessions
         (id, token_family_id, user_id, organization_id, workspace_id, label, scopes,
          access_token_hash, refresh_token_hash, access_token_expires_at, refresh_token_expires_at,
-         desktop_exchange_challenge, desktop_host_name, desktop_verified_at)
+         desktop_exchange_challenge, desktop_host_name, desktop_verified_at,
+         provisioned_by_token_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-               CASE WHEN $14::boolean THEN now() ELSE NULL END)`,
+               CASE WHEN $14::boolean THEN now() ELSE NULL END, $15)`,
       [
         sessionId,
         options.tokenFamilyId ?? randomUUID(),
@@ -1742,6 +1826,7 @@ export class ControlPlaneStore {
         options.desktopExchangeChallenge ?? null,
         options.desktopHostName ?? null,
         options.desktopVerified === true,
+        options.provisionedByTokenId ?? null,
       ],
     );
     return {

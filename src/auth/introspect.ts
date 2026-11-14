@@ -360,7 +360,9 @@ export async function introspect(
     return introspectFlowRunCredential(config, flowRunCredentials, request);
   }
   // Refresh, internal, bootstrap, worker, run and enrollment tokens are
-  // never looked up as user tokens.
+  // never looked up as user tokens. That includes sh_ek_ desktop enrollment
+  // keys: they are exchanged once at POST /api/v1/auth/enrollment/token and
+  // are never a bearer for any other route.
   if (!request.token.startsWith(USER_ACCESS_TOKEN_PREFIX)) {
     return { active: false, reason: "wrong-kind" };
   }

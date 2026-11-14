@@ -1216,6 +1216,83 @@ paths:
                     type: integer
         "429":
           description: Per-client-address limit (120 per minute); see Retry-After
+  /api/v1/auth/enrollment/token:
+    post:
+      security: []
+      operationId: exchangeEnrollmentKey
+      description: |
+        Exchanges a one-time desktop enrollment key (sh_ek_, minted by an owner or
+        admin as a desktop-enrollment workspace API token) for a device session of
+        the bound employee: device scopes, labelled client_name, desktop host name
+        stored, Desktop-verified only when the key carries mcpConsent admin. Also
+        served at /cloud/api/v1/auth/enrollment/token. Audited
+        enrollment_key.exchange with the client address and host.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enrollment_key, client_name, desktop_host_name]
+              properties:
+                enrollment_key: { type: string, pattern: "^sh_ek_", maxLength: 256 }
+                client_name: { type: string, minLength: 1, maxLength: 120 }
+                desktop_host_name: { type: string, minLength: 1, maxLength: 80 }
+      responses:
+        "200":
+          description: Renewable token pair issued; the key is spent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthTokenPair"
+        "400":
+          description: |
+            invalid_request for a malformed body; invalid_grant (one body for every
+            reason) when the key is unknown, expired, revoked or already exchanged.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: { enum: [invalid_request, invalid_grant] }
+                  error_description: { type: string }
+                  message: { type: string }
+        "429":
+          description: slow_down, per-client-address limit (30 per 5 minutes); see Retry-After
+  /api/v1/me/enrollment-keys:
+    get:
+      operationId: listMyEnrollmentKeys
+      description: |
+        The caller's desktop enrollment keys in the token's organization (user token
+        with cli:auth or account scope). Never the key itself.
+      responses:
+        "200":
+          description: Keys bound to the caller, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { $ref: "#/components/schemas/EnrollmentKeySummary" }
+        "401": { description: No user token }
+        "403": { description: "insufficient_scope or handoff_not_exchanged" }
+  /api/v1/me/enrollment-keys/{keyId}:
+    parameters:
+      - { name: keyId, in: path, required: true, schema: { type: string, format: uuid } }
+    delete:
+      operationId: revokeMyEnrollmentKey
+      description: |
+        Revokes one of the caller's own desktop enrollment keys and every session it
+        provisioned (the caller is the audited actor).
+      responses:
+        "204": { description: Revoked }
+        "401": { description: No user token }
+        "403": { description: "insufficient_scope or handoff_not_exchanged" }
+        "404": { description: "token_not_found: no such key bound to the caller in this organization" }
   /api/v1/auth/token/refresh:
     post:
       security: []
@@ -5366,7 +5443,13 @@ paths:
       - $ref: "#/components/parameters/WorkspaceId"
     get:
       operationId: listWorkspaceApiTokens
-      description: Owner/admin.
+      description: Owner/admin. The newest 100 tokens, optionally of one purpose.
+      parameters:
+        - name: purpose
+          in: query
+          required: false
+          description: Only tokens of this purpose (400 invalid_request for an unknown purpose).
+          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment] }
       responses:
         "200":
           description: Tokens (never the token value)
@@ -5408,6 +5491,13 @@ paths:
         scopes a 400 for every purpose (scopes are fixed by purpose).
         neverExpires is a 400 for agent-runtime, deployment and relay-node. expiryDays
         1-365, default 90. accessToken (sh_wk_...) is returned only here.
+        desktop-enrollment grants no scopes and returns an sh_ek_ key: a one-time
+        Desktop enrollment key for the employee named by email (required; email
+        and mcpConsent are a 400 for every other purpose), exchanged once at
+        POST /api/v1/auth/enrollment/token and never a bearer anywhere else.
+        expiryDays 1-30, default 7; neverExpires is a 400. Revoking it also
+        revokes the sessions it provisioned. See docs/identity.md "Desktop
+        enrollment keys".
       requestBody:
         required: true
         content:
@@ -5417,8 +5507,22 @@ paths:
               required: [label]
               properties:
                 label: { type: string, maxLength: 128 }
-                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node] }
-                expiryDays: { type: integer, minimum: 1, maximum: 365 }
+                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment] }
+                expiryDays: { type: integer, minimum: 1, maximum: 365, description: "desktop-enrollment: 1-30, default 7" }
+                email:
+                  type: string
+                  format: email
+                  description: >-
+                    desktop-enrollment only, required. The employee the key signs in.
+                    An existing member is bound; an address with no account gets a
+                    user and a member membership (audit membership.provision); an
+                    account that belongs only to other organizations is a 409
+                    invitation_required.
+                mcpConsent:
+                  enum: [admin]
+                  description: >-
+                    desktop-enrollment only. The admin consents to Desktop MCP access
+                    for the employee: the exchanged session is Desktop-verified.
                 neverExpires:
                   type: boolean
                   description: >-
@@ -5458,8 +5562,8 @@ paths:
                   - type: object
                     properties:
                       accessToken: { type: string }
-        "400": { description: "invalid_request: bad label, purpose, expiry, agent_name or aud, or a scope/scopes field (scopes are fixed by purpose)" }
-        "409": { description: "agent_name_conflict: a non-revoked relayfile-agent token already uses this agent_name" }
+        "400": { description: "invalid_request: bad label, purpose, expiry, agent_name, aud, email or mcpConsent, or a scope/scopes field (scopes are fixed by purpose)" }
+        "409": { description: "agent_name_conflict: a non-revoked relayfile-agent token already uses this agent_name; invitation_required: the desktop-enrollment email belongs to an account outside this organization" }
   /api/v1/workspaces/{workspaceId}/deployment-api-tokens/{tokenId}:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -7952,7 +8056,7 @@ components:
         created_at: {type: string, format: date-time}
     LoginConfig:
       type: object
-      required: [methods, oidc, microsoft, logo_url, org_name, allowed_domain_hint, password_policy, password_self_service, setup_key]
+      required: [methods, oidc, microsoft, logo_url, org_name, allowed_domain_hint, password_policy, password_self_service, setup_key, enrollment_keys]
       properties:
         methods:
           type: array
@@ -7982,6 +8086,9 @@ components:
           description: |
             Show "First-time setup: enter setup key" (POST /api/v1/auth/password/setup-key): a
             setup key is live and the bootstrap admin has never signed in and has no password.
+        enrollment_keys:
+          type: boolean
+          description: Always true. An installer can exchange a desktop enrollment key at POST /api/v1/auth/enrollment/token; it falls back to the device flow when absent.
     TemporaryPasswordRequest:
       type: object
       additionalProperties: false
@@ -8440,7 +8547,7 @@ components:
               description: SELFHOST_INTROSPECT_OUTAGE_HOLD_MS in effect (0 = off); how long a Desktop token's last active verdict may answer during a database outage.
     FeatureCapabilities:
       type: object
-      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, session_delete]
+      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, session_delete, enrollment_keys]
       additionalProperties: false
       description: Optional features selected by SELFHOST_FEATURES, plus configured operator capabilities. session_delete is derived from erase wiring and the operator-controls gate, not SELFHOST_FEATURES.
       properties:
@@ -8454,6 +8561,9 @@ components:
         session_delete:
           type: boolean
           description: True when the erase API URL and dedicated secret are configured and operator controls permit writes. Configuration availability only, not an upstream health or per-session storage verdict; owner/admin authorization is still required for DELETE.
+        enrollment_keys:
+          type: boolean
+          description: Always true. POST /api/v1/auth/enrollment/token exchanges desktop enrollment keys.
     UsageCounts:
       type: object
       required: [activeUsers, sessionsUploaded, searches, summaries]
@@ -8617,6 +8727,22 @@ components:
           type: object
         currentWorkspace:
           type: object
+        provisioning:
+          type: [object, "null"]
+          description: Set when the session (or the session it was refreshed from) was issued by a desktop enrollment key; null otherwise.
+          required: [kind, keyId, label, mcpConsent, mintedBy, mintedAt, exchangedAt]
+          properties:
+            kind: { const: enrollment_key }
+            keyId: { type: string, format: uuid }
+            label: { type: string }
+            mcpConsent: { enum: [admin, null] }
+            mintedBy:
+              type: [object, "null"]
+              properties:
+                id: { type: string }
+                name: { type: [string, "null"] }
+            mintedAt: { type: string, format: date-time }
+            exchangedAt: { type: [string, "null"], format: date-time }
     WorkspaceResolution:
       type: object
       required:
@@ -9294,7 +9420,7 @@ components:
       properties:
         id: { type: string }
         label: { type: string }
-        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node] }
+        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment] }
         agent_name: { type: [string, "null"], description: "relayfile-agent: the agent name; relay-node: the node name (same as nodeName); null for other purposes" }
         nodeName: { type: [string, "null"], description: relay-node only; null for other purposes }
         aud: { type: [string, "null"], description: "relayfile-agent and acquisition-operator: the normalized audience origin; null for other purposes" }
@@ -9312,7 +9438,29 @@ components:
         accessTokenExpiresAt: { type: [string, "null"], format: date-time }
         lastUsedAt: { type: [string, "null"], format: date-time }
         revokedAt: { type: [string, "null"], format: date-time }
-        status: { enum: [active, expired, revoked] }
+        status: { enum: [active, expired, revoked, exchanged], description: "exchanged: a spent desktop-enrollment key (revoked wins over it, it wins over expired)" }
+        userId: { type: [string, "null"], description: desktop-enrollment only; the bound employee }
+        userEmail: { type: [string, "null"], description: desktop-enrollment only }
+        mcpConsent: { enum: [admin, null], description: desktop-enrollment only }
+        exchangedAt: { type: [string, "null"], format: date-time, description: desktop-enrollment only; null until exchanged }
+        exchangedHostName: { type: [string, "null"], description: desktop-enrollment only }
+    EnrollmentKeySummary:
+      type: object
+      required: [id, label, status, mcpConsent, createdAt, expiresAt, exchangedAt, exchangedHostName, mintedBy]
+      properties:
+        id: { type: string, format: uuid }
+        label: { type: string }
+        status: { enum: [active, expired, revoked, exchanged], description: "exchanged: a spent desktop-enrollment key (revoked wins over it, it wins over expired)" }
+        mcpConsent: { enum: [admin, null] }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: [string, "null"], format: date-time }
+        exchangedAt: { type: [string, "null"], format: date-time }
+        exchangedHostName: { type: [string, "null"] }
+        mintedBy:
+          type: [object, "null"]
+          properties:
+            id: { type: string }
+            name: { type: [string, "null"] }
     RuntimeIntegrationToken:
       type: object
       properties:

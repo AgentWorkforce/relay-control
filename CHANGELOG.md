@@ -5,6 +5,20 @@ assigned at release.
 
 ## Unreleased
 
+- Added: desktop enrollment keys (migration 0050). An owner or admin mints a
+  one-time `sh_ek_` key for an employee by email through the workspace API
+  token routes (`purpose: "desktop-enrollment"`, 1-30 days, default 7,
+  optional `mcpConsent: "admin"`); a new address gets a user and `member`
+  membership (`membership.provision`). The installer exchanges the key once
+  at `POST /api/v1/auth/enrollment/token` for a device session (rate limited
+  per client address, audited `enrollment_key.exchange` with the address and
+  host). With admin consent the session is Desktop-verified. Whoami shows
+  `provisioning`; the employee can list and revoke their keys at
+  `/api/v1/me/enrollment-keys`; revoking a key ends its sessions; removing a
+  member revokes their keys and the sessions those provisioned. Spent keys
+  list as `exchanged`; the token list takes `?purpose=`. Discovery: `enrollment_keys: true` in
+  capabilities and login-config. The key is refused by every other gate.
+
 - Added: MCP `get_relay_agent_card` and `set_relay_agent_card` (A2A agent
   cards, matching Cloud). Get returns any listed workspace agent's A2A 0.3.0
   card, built from its Relaycast agent record (`metadata.card`,

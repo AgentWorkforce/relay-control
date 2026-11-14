@@ -863,6 +863,10 @@ export function createIdentityModule(input: {
         // /api/v1/auth/password/setup-key): a key is live and the bootstrap
         // admin has never signed in.
         setup_key: passwordRoutes ? await passwordRoutes.setupKeyOffered() : false,
+        // POST /api/v1/auth/enrollment/token is served (docs/identity.md,
+        // "Desktop enrollment keys"); an installer falls back to the device
+        // flow when this is absent.
+        enrollment_keys: true,
       });
       return true;
     }
