@@ -24,6 +24,10 @@ Included:
 - Cloud-compatible `/cloud/api` aliases and fixed RelayHistory session reads
 - Secure HttpOnly same-origin browser device login at `/login`
 - Agent Relay Desktop browser sign-in (`/cli/login` handoff, `/auth/desktop/session`) and fleet node claims
+- Desktop enrollment keys: an owner or admin mints a one-time `sh_ek_` key for
+  an employee and the installer exchanges it for a device session
+  (`/auth/enrollment/token`); see
+  [docs/identity.md](docs/identity.md#desktop-enrollment-keys)
 - opaque per-workspace runtime configuration
 - liveness/readiness and an OpenAPI contract
 - opt-in, aggregate-only telemetry with a "what we send" preview, an
@@ -482,6 +486,16 @@ hosted: 30 per minute per client address on both routes.
 Self-host has no Desktop-authority grant: approving a named host records
 nothing beyond the session itself. A session is bound to one workspace, so a
 `workspace` parameter naming another is refused (403).
+
+### Desktop enrollment keys (no browser)
+
+For managed rollouts an organization owner or admin mints a one-time key per
+employee with `POST /api/v1/workspaces/{id}/deployment-api-tokens`
+`{label, purpose: "desktop-enrollment", email, mcpConsent?, expiryDays?}`
+(1-30 days, default 7). The installer exchanges it once at
+`POST /cloud/api/v1/auth/enrollment/token` for the device/token response.
+The key is never a bearer anywhere else. Contract, consent, revocation and
+audit: [docs/identity.md](docs/identity.md#desktop-enrollment-keys).
 
 ### Fleet node claims
 

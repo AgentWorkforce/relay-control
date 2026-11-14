@@ -957,6 +957,104 @@ refresh keeps the session's scopes, so a session issued before `rth:acquire`
 existed gains it only at the next sign-in. Introspection returns the scopes
 verbatim.
 
+#### Desktop enrollment keys
+
+An organization owner or admin can sign an employee's Desktop in without a
+browser: mint a one-time enrollment key for the employee, hand it to the
+installer, and the installer exchanges it for a normal device session bound
+to that employee. The API is the only surface; there is no dashboard page.
+
+Mint, list and revoke use the workspace API token routes (owner or admin
+only):
+
+- `POST /api/v1/workspaces/{id}/deployment-api-tokens` with
+  `{label, purpose: "desktop-enrollment", email, mcpConsent?, expiryDays?}`.
+  The answer carries the key (`sh_ek_...`) once, like every other workspace
+  API token.
+  - `email` names the employee. An existing member of the organization is
+    bound as is. A new address gets a user (no password, no verified-email
+    claim) and a `member` membership of this organization, in the same
+    transaction and lock order as every other membership writer, audited as
+    `membership.provision`. An address that already belongs to another
+    organization but not this one is refused with `409 invitation_required`:
+    invite that person instead.
+  - `mcpConsent` is `"admin"` or absent. With `"admin"` the admin consents
+    to Desktop MCP access on the employee's behalf (below).
+  - `expiryDays` is 1 to 30, default 7. Keys always expire;
+    `neverExpires: true` is refused with `400`.
+  - `email` and `mcpConsent` are refused with `400` for every other purpose.
+- `GET /api/v1/workspaces/{id}/deployment-api-tokens` lists the keys with
+  `userId`, `userEmail`, `mcpConsent`, `exchangedAt` and
+  `exchangedHostName` (these are `null` on other purposes).
+- `DELETE /api/v1/workspaces/{id}/deployment-api-tokens/{tokenId}` revokes
+  the key and, if it was exchanged, every session it provisioned (including
+  refreshed sessions and their MCP child sessions), with revoked reason
+  `enrollment_key_revoked`. Desktop relay identities are keyed by source,
+  not by session, so they are not deleted; they cannot be used without a
+  live session.
+
+The employee can see and revoke their own keys with a signed-in user token
+(`cli:auth` or `account` scope) in the token's organization:
+
+- `GET /api/v1/me/enrollment-keys` answers
+  `{keys: [{id, label, status, mcpConsent, createdAt, expiresAt, exchangedAt,
+  exchangedHostName, mintedBy}]}`.
+- `DELETE /api/v1/me/enrollment-keys/{id}` answers `204` with the same
+  cascade as the admin revoke, or `404 token_not_found` for a key that is
+  not theirs.
+
+The installer exchanges the key once at
+`POST /api/v1/auth/enrollment/token` (also under `/cloud`):
+
+```json
+{ "enrollment_key": "sh_ek_...", "client_name": "Agent Relay Desktop", "desktop_host_name": "build-01" }
+```
+
+`client_name` follows the device flow rules (1 to 120 characters, reserved
+names refused); `desktop_host_name` is required (1 to 80 characters). The
+`200` body is the `POST /api/v1/auth/device/token` body: `access_token`,
+`refresh_token`, `token_type`, `access_token_expires_at`,
+`refresh_token_expires_at`, `scope` and `api_url`. The session carries the
+device scopes, is labelled with `client_name` and stores the host name. A
+missing, expired, revoked or already exchanged key gets one answer,
+`400 {"error": "invalid_grant", "error_description": "..."}`, whatever the
+reason. The route allows 10 exchanges per client address per 5 minutes and
+then answers `429 slow_down`.
+
+Consent: a key minted with `mcpConsent: "admin"` yields a Desktop-verified
+session, exactly like a Desktop browser-consent handoff, so the Desktop can
+mint its MCP credential at once. Without it the session is unverified like
+a device-code session, and Desktop MCP waits for the employee's own browser
+consent. The consent is visible to the employee in their key list and in
+`GET /api/v1/auth/whoami`, which answers `provisioning` for a session
+issued by an enrollment key:
+
+```json
+{ "kind": "enrollment_key", "keyId": "...", "label": "...", "mcpConsent": "admin",
+  "mintedBy": { "id": "...", "name": "..." }, "mintedAt": "...", "exchangedAt": "..." }
+```
+
+and `provisioning: null` for every other session. A refresh keeps the link.
+
+Removing a member (`DELETE /api/v1/organizations/{id}/memberships/{userId}`)
+revokes that user's unexchanged enrollment keys in the organization, one
+`api_token.revoke` audit row per key with `reason=member_removed`. Sessions
+from exchanged keys already end with the membership.
+
+Discovery: `GET /api/v1/capabilities` answers `enrollment_keys: true` and
+`GET /api/v1/auth/login-config` answers `enrollment_keys: true`; an installer
+falls back to the device flow when the field is absent.
+
+The key is not a bearer. Every workspace API token gate, the relay node
+broker and the admin routes treat `sh_ek_` as no credential (`401`), and
+introspection answers `wrong-kind`. Only the exchange route accepts it.
+
+Audit actions (all in the minting workspace's audit log, `GET /api/v1/workspaces/{id}/admin/audit`):
+- `api_token.create`: target `<keyId> (desktop-enrollment: user <userId>[ mcpConsent=admin])`
+- `membership.provision`: actor the minting admin, target `<userId> <email> role member`
+- `enrollment_key.exchange`: actor the employee, target `<keyId> ip=<client address> host=<host name|->`; never the key
+- `api_token.revoke`: target `<keyId> (desktop-enrollment: user <userId>) sessions=<n>`, with ` reason=member_removed` when a membership removal revoked it
+
 ## Who may sign in
 
 **Single mode (the default).** An email the provider did not mark unverified
@@ -1030,6 +1128,7 @@ Audit actions:
 - `invitation.revoke`
 - `invitation.accept`
 - `membership.auto_join`
+- `membership.provision` (a desktop enrollment key minted for a new member; see "Desktop enrollment keys")
 - `membership.update`
 - `membership.remove`
 
@@ -1147,6 +1246,7 @@ adds one.
 | Browser session (cookie under `/cloud`) | `/login/oidc/callback`, `/login/email/verify`, `POST /login/poll` for a `/login` device code, `POST /cloud/api/auth/workspace` | `cli:auth rth:read rth:sync account` |
 | Desktop session | `/api/v1/cli/login` handoff exchanged at `/api/v1/auth/desktop/session`, `POST /api/v1/auth/desktop/workspaces` | `cli:auth rth:read rth:sync rth:acquire desktop:workspaces` |
 | Device / CLI token | `POST /api/v1/auth/device/token` | `cli:auth rth:read rth:sync rth:acquire` |
+| Enrollment key session | `POST /api/v1/auth/enrollment/token` (one exchange of an `sh_ek_` key) | `cli:auth rth:read rth:sync rth:acquire` |
 | Refreshed token | `POST /api/v1/auth/token/refresh` | Unchanged from the session it refreshes |
 | MCP, workspace API, worker and service tokens | Their own routes | Never `account` or `desktop:workspaces` |
 
