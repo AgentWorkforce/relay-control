@@ -41,8 +41,24 @@ async function fixture(t: test.TestContext, resourcePath: typeof SHARED | "/mcp"
   const sessions = new McpOAuthSessions(database, { protocol, tenancyMode: "multi", now: () => now });
   const pair = await database.transaction(tx => sessions.issue(tx, { ...owner, scopes: ["relay:mcp"] }));
   const world = createRelaycastWorld([]);
+  const stall = { path: null as string | null, phase: "headers" as "headers" | "body", signal: undefined as AbortSignal | undefined,
+    entered: () => {} };
   const relayFetch: typeof fetch = async (input, init) => {
     const url = new globalThis.URL(input instanceof Request ? input.url : String(input)), headers = new Headers(init?.headers);
+    if (url.pathname === stall.path) {
+      stall.signal = init?.signal ?? undefined;
+      stall.entered();
+      if (!stall.signal) throw new Error("Worker did not supply a cancellation signal");
+      const signal = stall.signal;
+      if (stall.phase === "headers") return new Promise<Response>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      return new Response(new ReadableStream({ start(controller) {
+        if (signal.aborted) controller.error(signal.reason);
+        else signal.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+      } }));
+    }
     if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") return Response.json({ ok: true,
       data: [...world.agents.values()].map(agent => ({ ...agent, address: `${agent.name}@cloud-${agent.id}`, last_seen: new Date().toISOString() })) });
     const result = await world.handle(init?.method ?? "GET", url.pathname, url.searchParams,
@@ -83,7 +99,7 @@ async function fixture(t: test.TestContext, resourcePath: typeof SHARED | "/mcp"
     const sender = world.agents.get("sender") ?? world.addAgent("sender");
     await cast.sendDirectMessage({ token: sender.token, to: "fake-grok", text: "PRIVATE_MESSAGE_BODY", idempotencyKey: randomUUID() });
   };
-  return { database, owner, clientId, pair, routines, world, calls, tool, setup, save, message, base,
+  return { database, owner, clientId, pair, routines, world, calls, tool, setup, save, message, base, stall,
     advance: () => { now = new Date(now.getTime() + 301_000); }, fail: (status: number) => { webhookStatus = status; } };
 }
 
@@ -107,6 +123,56 @@ test("self-hosted Grok OAuth discovers wake-ups, creates its pinned participant 
   const page = await f.setup(); assert.equal(page.status, 200);
   assert.match(page.headers.get("content-security-policy")!, /script-src 'nonce-/);
   assert.ok(!(await page.text()).includes(KEY));
+});
+
+test("the routine keeps reading its pinned inbox after the bot is renamed", async t => {
+  const f = await fixture(t);
+  const connected = (await f.tool("connect_grok_bot_routine")).structuredContent as any;
+  assert.match(connected.routine_prompt, /check_relay_inbox without as/);
+  await f.save();
+  const agent = f.world.agents.get("fake-grok")!;
+  f.world.agents.delete(agent.name); agent.name = "renamed-grok"; f.world.agents.set(agent.name, agent);
+  f.world.addAgent("sender"); f.world.sendAs("sender", agent.name, "Message after rename");
+  await f.routines.tick(); assert.equal(f.calls[0]!.body.agent, agent.name);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const inbox = (await f.tool("check_relay_inbox")).structuredContent as any;
+    assert.equal(inbox.name, agent.name); assert.equal(inbox.messages[0].text, "Message after rename");
+  }
+  const grant = (await f.database.query("SELECT agent_name,agent_remote_id FROM mcp_oauth_grants WHERE id=$1", [f.owner.grantId])).rows[0]!;
+  assert.equal(grant.agent_name, agent.name); assert.equal(grant.agent_remote_id, agent.id);
+});
+
+test("Relaycast header and body stalls reach a deadline and release the transaction for revocation", async t => {
+  for (const path of ["/v1/agent", "/v1/deliveries"]) for (const phase of ["headers", "body"] as const) {
+    await t.test(`${path} ${phase}`, { timeout: 5_000 }, async t => {
+      const f = await fixture(t); await f.tool("connect_grok_bot_routine"); await f.save();
+      f.stall.path = path; f.stall.phase = phase;
+      const entered = new Promise<void>(resolve => { f.stall.entered = resolve; });
+      const worker = new GrokRoutines({ ...f.routines.options, requestTimeoutMs: 30 });
+      const running = worker.tick(); await entered;
+      const revocation = f.database.transaction(tx => revokeMcpOAuthGrantRows(tx, f.owner.grantId, "test", new Date()));
+      await running; await revocation;
+      assert.equal(f.stall.signal?.aborted, true);
+      assert.equal(f.calls.length, 0);
+      assert.equal((await f.database.query("SELECT * FROM grok_bot_routines")).rows.length, 0);
+    });
+  }
+});
+
+test("worker shutdown aborts either Relaycast read without waiting for its deadline", async t => {
+  for (const path of ["/v1/agent", "/v1/deliveries"]) {
+    await t.test(path, { timeout: 5_000 }, async t => {
+      const f = await fixture(t); await f.tool("connect_grok_bot_routine"); await f.save();
+      f.stall.path = path;
+      const entered = new Promise<void>(resolve => { f.stall.entered = resolve; });
+      const worker = new GrokRoutines({ ...f.routines.options, requestTimeoutMs: 60_000 });
+      t.after(() => worker.stop()); worker.start(); await entered; await worker.stop();
+      assert.equal(f.stall.signal?.aborted, true);
+      assert.equal(f.calls.length, 0);
+      const row = (await f.database.query("SELECT failures,last_error FROM grok_bot_routines")).rows[0]!;
+      assert.equal(row.failures, 1); assert.equal(row.last_error, "delivery_unavailable");
+    });
+  }
 });
 
 test("worker wakes pending inbox once across restarts, includes no message text and leaves acknowledgement to the bot", async t => {

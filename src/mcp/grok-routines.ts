@@ -24,7 +24,7 @@ const escape = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<",
 /** One encrypted routine per grant. User -> organization -> grant locks fence every delivery against revocation. */
 export class GrokRoutines {
   constructor(readonly options: { database: Database; keyring: EncryptionKeyring; client: RelaycastClient;
-    publicOrigin: string; tenancyMode: TenancyMode; fetchImpl?: typeof fetch; now?: () => Date }) {}
+    publicOrigin: string; tenancyMode: TenancyMode; fetchImpl?: typeof fetch; now?: () => Date; requestTimeoutMs?: number }) {}
 
   private now() { return this.options.now?.() ?? new Date(); }
 
@@ -138,6 +138,10 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
           [grant.id, this.now()])).rows[0];
         if (!routine) return;
         try {
+          // One budget bounds all remote reads, response bodies and the wake
+          // while the revocation fence is held. stop() aborts the same requests.
+          const deadline = AbortSignal.timeout(this.options.requestTimeoutMs ?? 5_000);
+          const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
           const participant = (await tx.query<{ token_ciphertext: string; relaycast_workspace_id: string }>(`SELECT p.token_ciphertext,p.relaycast_workspace_id
             FROM hosted_relay_participants p JOIN workspaces w ON w.id=p.workspace_id AND w.organization_id=$4
             WHERE p.workspace_id=$1 AND p.user_id=$2 AND p.agent_remote_id=$3
@@ -145,12 +149,12 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
           [candidate.workspace_id, candidate.user_id, grant.agent_remote_id, candidate.organization_id])).rows[0];
           if (!participant) throw new Error("identity_unavailable");
           const token = decryptSecret(participant.token_ciphertext, this.options.keyring);
-          const remote = await this.options.client.authenticatedAgent(token);
+          const remote = await this.options.client.authenticatedAgent(token, requestSignal);
           if (remote.id !== grant.agent_remote_id || remote.workspaceId !== participant.relaycast_workspace_id || remote.status === "released" ||
               isBindingOwnedIdentity(remote.metadata) ||
               remote.metadata.source !== HOSTED_SOURCE || remote.metadata.owner_hash !== ownerHash(candidate.user_id) ||
               remote.metadata.cloud_workspace_id !== candidate.workspace_id) throw new Error("identity_unavailable");
-          const inbox = (await this.options.client.readHostedInbox(token)).slice(0, 100).filter(message => message.sender_id !== remote.id);
+          const inbox = (await this.options.client.readHostedInbox(token, requestSignal)).slice(0, 100).filter(message => message.sender_id !== remote.id);
           const ids = inbox.map(message => message.delivery_id).sort();
           const fresh = ids.filter(id => !routine.notified_delivery_ids.includes(id));
           if (fresh.length) {
@@ -158,7 +162,7 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
             const credentials = parseGrokRoutineCredentials(saved.url, saved.key);
             const eventId = hashSecret(JSON.stringify([grant.id, fresh]));
             const response = await (this.options.fetchImpl ?? fetch)(credentials.url, { method: "POST", redirect: "error",
-              signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5_000)]) : AbortSignal.timeout(5_000),
+              signal: requestSignal,
               headers: { "content-type": "application/json", Authorization: `Bearer ${credentials.key}`, "webhook-id": eventId },
               body: JSON.stringify({ eventId, name: "relay.inbox", agent: remote.name, pending_count: ids.length }) });
             await response.body?.cancel();

@@ -61,6 +61,10 @@ Failures retry with exponential backoff capped at five minutes. The worker
 never acknowledges messages. A crash after Grok accepts a trigger but before
 the database commits can cause a duplicate; `webhook-id` remains stable for a
 retry of the same batch. The routine must deduplicate by `delivery_id`.
+Both Relaycast reads (including response bodies) and the Grok POST share a
+five-second request budget while the revocation fence is held. Shutdown aborts
+those requests immediately. The prompt reads the approved inbox without an
+explicit `as` name, so renaming the pinned bot does not break its routine.
 
 Only the exact HTTPS routine endpoint is accepted; alternate hosts, ports,
 URL credentials, queries and fragments are refused, and redirects are disabled.
