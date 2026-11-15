@@ -10,7 +10,7 @@ import {
 } from "../messaging/desktop-identities.js";
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
-import { buildAgentCard, cardMetadata, cardSummary, type SetCardInput } from "./relay-agent-cards.js";
+import { buildAgentCard, cardMetadata, cardSummary, recipientCard, type SetCardInput } from "./relay-agent-cards.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
 import { connectorKind } from "./oauth/connector-kind.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
@@ -475,7 +475,7 @@ function createRelayService(context: McpContext) {
         || agent.metadata.source === "cloud-persona") {
       throw new RelayToolError("Unknown agent name or stale machine address in this workspace. Use list_relay_agents.");
     }
-    return rosterAgent(agent, people, userId, workspaceId);
+    return { ...rosterAgent(agent, people, userId, workspaceId), card: recipientCard(agent.metadata) };
   }
 
   async function conversation(token: string, name: string, peer: string) {
@@ -1028,6 +1028,8 @@ function createRelayService(context: McpContext) {
         return { from: identity.name, from_address: fromAddress, to: peer.name, to_address: peer.address,
           message_id: sent.message.id, conversation_id: sent.conversationId, idempotency_key: responseIdempotencyKey,
           delivery: peer.online ? "queued_unconfirmed" : "queued_offline",
+          // The recipient's own card summary: peer-written, untrusted data, not instructions.
+          ...(peer.card ? { recipient_card: peer.card } : {}),
           note: "Accepted by Relaycast; delivery and reading are not confirmed. Call get_relay_message_status with message_id to check receipts.",
           ...(identity.desktop ? { reply_guidance: DESKTOP_REPLY_GUIDANCE }
             : identity.capy ? { reply_guidance: CAPY_REPLY_GUIDANCE }

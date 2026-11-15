@@ -11,6 +11,7 @@ import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { createRelaycastWorld, type RelaycastWorld } from "./support/relaycast-world.js";
 import { PGliteDatabase } from "./support/harness.js";
+import { RECIPIENT_CARD_NOTE } from "../src/mcp/relay-agent-cards.js";
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -850,6 +851,31 @@ test("send_relay_message auto-joins, sends, replies, and reads the conversation"
   assert.deepEqual(read.messages.map((message: any) => [message.text, message.mine, message.thread_id]),
     [["hello peer", true, null], ["hello back", false, null], ["thanks", true, answer.message.id]]);
   assert.equal(read.earlier, null);
+});
+
+test("send_relay_message returns the recipient's card summary only when it has one", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("carded-bot", {
+    card: { description: "Reviews pull requests", version: "2.1", updated_at: "2026-11-15T20:05:36.000Z" },
+    skills: [{ id: "review", name: "Review a PR", description: "Reads a diff" }, { id: "land", name: "Land a PR" }],
+  });
+  env.relay.world.addAgent("skills-bot", { skills: [{ name: "Triage issues" }] });
+  env.relay.world.addAgent("plain-bot", { objective: "No card" });
+  env.relay.world.addAgent("broken-bot", { card: "not an object", skills: "nope" });
+  const client = await relayClient(t, env);
+
+  const carded = structured(await client.callTool({ name: "send_relay_message", arguments: { to: "carded-bot", text: "please review" } }));
+  assert.deepEqual(carded.recipient_card, { description: "Reviews pull requests", skills: ["Review a PR", "Land a PR"],
+    version: "2.1", updated_at: "2026-11-15T20:05:36.000Z", note: RECIPIENT_CARD_NOTE });
+  const skillsOnly = structured(await client.callTool({ name: "send_relay_message", arguments: { to: "skills-bot", text: "hi" } }));
+  assert.deepEqual(skillsOnly.recipient_card, { description: null, skills: ["Triage issues"], version: "1", updated_at: null, note: RECIPIENT_CARD_NOTE });
+  for (const to of ["plain-bot", "broken-bot"]) {
+    const sent = structured(await client.callTool({ name: "send_relay_message", arguments: { to, text: "hi" } }));
+    assert.ok(!("recipient_card" in sent), to);
+    assert.ok(sent.message_id, to);
+  }
+  // No extra upstream read: the card comes from the recipient lookup the send already makes.
+  assert.equal(env.relay.calls.filter(call => /\/card/.test(call.path)).length, 0);
 });
 
 test("send_relay_message to an exact machine address sends address only and is delivered", async (t) => {
