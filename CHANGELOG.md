@@ -5,6 +5,14 @@ assigned at release.
 
 ## Unreleased
 
+- Added: workspace deletes reach relayfile-control (migration 0052). With
+  `RELAYFILE_CONTROL_URL` and a dedicated `RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET`,
+  deleting a workspace queues `DELETE /internal/v1/flows/workspaces/{id}` in
+  the same transaction; a worker sends it and retries with backoff (30 s
+  doubling to 1 h) until relayfile-control answers 200 or 404. Refusals and
+  outages keep the row. Unset, nothing is queued; the legacy local Flows rows
+  still cascade as before.
+
 - Added: a persistent mounted-secret Ed25519 Desktop feed signer (`file`),
   reporting and enforcing a 65,536-byte canonical manifest limit so a full
   platform asset set can include macOS headless bundles and its installer.

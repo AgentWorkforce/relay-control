@@ -28,6 +28,12 @@ export type SelfhostConfig = {
   relayfileControlBrokerSecret?: string | null;
   /** RELAYCHIEF_CONTROL_RELAY_SECRET: chief agent registration route. Unset: it 404s. */
   chiefRelaySecret?: string | null;
+  /**
+   * RELAYFILE_CONTROL_URL + RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: deleting
+   * a workspace queues the same delete for relayfile-control's Flows data.
+   * Unset: nothing is queued (the legacy local Flows rows still cascade).
+   */
+  flowsWorkspaceDelete?: { url: string; secret: string } | null;
   /** Dedicated relay-agent support HTTP connection; no customer allowlist. */
   customerSupport?: { url: string; token: string } | null;
   /** Independent read service; owns issuance, rotation and verification of its tokens. Required. */
@@ -401,6 +407,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     sessionReadApi,
     relayfileControlBrokerSecret: loadBrokerSecret(env),
     chiefRelaySecret: loadChiefRelaySecret(env),
+    flowsWorkspaceDelete: loadFlowsWorkspaceDelete(env),
     customerSupport: loadCustomerSupportConfig(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
@@ -471,6 +478,22 @@ function loadChiefRelaySecret(env: Env): string | null {
     throw new Error("RELAYCHIEF_CONTROL_RELAY_SECRET must differ from RELAYFILE_CONTROL_BROKER_SECRET");
   }
   return secret;
+}
+
+function loadFlowsWorkspaceDelete(env: Env): SelfhostConfig["flowsWorkspaceDelete"] {
+  const secret = readSecret(env, "RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET");
+  if (!secret && !env.RELAYFILE_CONTROL_URL?.trim()) return null;
+  if (!secret) throw new Error("RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET (or _FILE) is required with RELAYFILE_CONTROL_URL");
+  if (Buffer.byteLength(secret) < 32) {
+    throw new Error("RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET (or _FILE) must be at least 32 bytes");
+  }
+  // relayfile-control holds the broker secret too: sharing it would let either side act in both directions.
+  const others = ["SELFHOST_BOOTSTRAP_TOKEN", "SELFHOST_INTERNAL_TOKEN", "RELAYCONTROL_INTROSPECT_SECRET",
+    "RELAYFILE_CONTROL_BROKER_SECRET", "RELAYCHIEF_CONTROL_RELAY_SECRET", "SESSION_ERASE_API_SECRET"];
+  if (others.some((name) => readSecret(env, name) === secret)) {
+    throw new Error("RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET must be a dedicated credential");
+  }
+  return { url: serviceUrl(env, "RELAYFILE_CONTROL_URL"), secret };
 }
 
 function loadBrokerSecret(env: Env): string | null {
@@ -1114,6 +1137,7 @@ export function configFingerprint(config: SelfhostConfig): string {
       config.sessionReadApi.url,
       config.sessionReadApi.publicUrl,
       ...(config.sessionErasureApi ? [config.sessionErasureApi.url] : []),
+      ...(config.flowsWorkspaceDelete ? [config.flowsWorkspaceDelete.url] : []),
     ].join("\n"))
     .digest("hex")
     .slice(0, 12);

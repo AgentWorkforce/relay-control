@@ -2201,6 +2201,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           workspaceId,
           allowLast: auth.kind === "bootstrap",
           actor: auth.kind === "bootstrap" ? { kind: "bootstrap" } : { kind: "user", userId: auth.principal.userId },
+          queueFlowsDelete: Boolean(config.flowsWorkspaceDelete),
         })
         : "not_found";
       if (outcome === "not_found") throw new HttpError(404, "workspace_not_found", "Workspace not found");
