@@ -64,9 +64,14 @@ before broker, then free capacity and measured load.
    `failed` or `unknown`.
 4. `release_relay_agent` stops exactly that worker by its immutable id.
 
-Clients must retain `Mcp-Session-Id`: a launch belongs to the MCP session that
-started it, and another session (even the same person's) cannot read or
-release it.
+Native clients must retain `Mcp-Session-Id`: their launches belong to that
+session. OAuth launches belong to the exact grant and remain accessible after
+MCP reconnects within that grant. A new consent grant cannot recover them.
+Release workers before disconnecting. Revocation ends tool access immediately;
+cleanup retains the launcher credentials while its journal has active or
+unconfirmed launches. An operator must drain those workers and reconcile their
+journal rows before the deferred cleanup can finish; it never marks a live
+worker released merely because the grant was revoked.
 
 ## Journal and failure handling
 

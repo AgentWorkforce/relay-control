@@ -20,7 +20,7 @@ test("sender receipts use only the acting token and preserve acceptance, acknowl
 test("unsupported and invisible receipts remain unconfirmed; authorization and outages stay errors", async () => {
   for (const status of [404, 501, 401, 403, 503]) {
     const client = createRelaycastClient({ internalOrigin: "https://cast.example.test", fetchImpl: async () =>
-      Response.json({ ok: false, error: { code: "not_found" } }, { status }) });
+      Response.json({ ok: false, error: { code: "not_found", message: "Route not found" } }, { status }) });
     if ([404, 501].includes(status)) assert.equal(await client.getMessageDeliveries("actor", "123"), null);
     else await assert.rejects(client.getMessageDeliveries("actor", "123"), RelaycastCallError);
   }
@@ -31,4 +31,12 @@ test("malformed or mismatched receipt data cannot produce a confirmation", async
     const client = createRelaycastClient({ internalOrigin: "https://cast.example.test", fetchImpl: async () => Response.json({ ok: true, data }) });
     await assert.rejects(client.getMessageDeliveries("actor", "123"), RelaycastCallError);
   }
+});
+
+test("receipt errors never echo provider credentials or private URLs", async () => {
+  const client = createRelaycastClient({ internalOrigin: "https://cast.example.test", fetchImpl: async () => Response.json({ ok: true,
+    data: { message_id: "123", deliveries: [{ id: "1", agent_id: "2", status: "failed", state: "failed", error: "Bearer secret-token https://private.example.test/path" }] } }) });
+  const data = await client.getMessageDeliveries("actor", "123");
+  assert.equal(JSON.stringify(data).includes("secret-token"), false);
+  assert.equal(JSON.stringify(data).includes("private.example.test"), false);
 });

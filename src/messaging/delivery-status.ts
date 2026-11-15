@@ -19,6 +19,6 @@ export function parseMessageDeliveries(value: unknown, messageId: string): Messa
     return { id: row.id, agent_id: row.agent_id, agent_name: nullable(row.agent_name), status: row.status, state: row.state as DeliveryState,
       created_at: nullable(row.created_at), delivered_at: nullable(row.delivered_at), accepted_at: nullable(row.accepted_at),
       acked_at: nullable(row.acked_at), replied_at: nullable(row.replied_at), reply_message_id: nullable(row.reply_message_id),
-      dead_lettered_at: nullable(row.dead_lettered_at), error: nullable(row.error), read_at: nullable(row.read_at) };
+      dead_lettered_at: nullable(row.dead_lettered_at), error: typeof row.error === "string" ? "Delivery failed; upstream details withheld." : null, read_at: nullable(row.read_at) };
   });
 }

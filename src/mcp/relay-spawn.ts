@@ -228,10 +228,10 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
     if (role !== "owner" && role !== "admin") throw new RelayToolError(LAUNCH_ROLE_REFUSAL);
   }
   function owner(actor: SpawnActor): SpawnOwner {
-    if (!sessionId) throw new RelayToolError("Initialize MCP and retain Mcp-Session-Id before starting agents.");
+    if (!context.oauth && !sessionId) throw new RelayToolError("Initialize MCP and retain Mcp-Session-Id before starting agents.");
     return { workspaceId: context.workspace.id, userId, relaycastWorkspaceId: actor.relaycastWorkspaceId, actorId: actor.id,
       authorityHash: ownerHash(JSON.stringify(context.oauth
-        ? [context.authMode, sessionId, context.oauth.access.grantId]
+        ? [context.authMode, context.oauth.access.grantId]
         : [context.authMode, sessionId])) };
   }
   const run = <T>(fn: (actor: SpawnActor, owned: SpawnOwner) => Promise<T>): Promise<T> => {

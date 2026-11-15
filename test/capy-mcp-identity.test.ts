@@ -12,6 +12,20 @@ import { copilotDesktopSetup, MCP_PATH } from "./support/copilot-desktop.js";
 import { seedTenant, startControlPlane } from "./flows-helpers.js";
 
 const MISSING = "No hosted participant with that name is owned by you in this workspace.";
+test("receipt lookup uses an existing owned Capy sender without joining a hosted participant", async t => {
+  const e = await setup(t), context = e.context(), name = e.binding.agent;
+  let lookups = 0;
+  context.relay.client.getMessageDeliveries = async (token, messageId) => {
+    lookups++;
+    assert.equal(token, e.agents.get(name)!.token);
+    assert.equal(messageId, "12");
+    return [];
+  };
+  assert.equal((await relayService(context).messageStatus({ as: name, message_id: "12" })).confirmation, "available");
+  assert.equal(await e.participantCount(), 0);
+  await assert.rejects(relayService(e.context({ capy: undefined })).messageStatus({ as: name, message_id: "12" }), { message: MISSING });
+  assert.equal(lookups, 1);
+});
 async function setup(t: TestContext) {
   const c = await startControlPlane(); t.after(() => c.stop());
   const tenant = await seedTenant(c.api);

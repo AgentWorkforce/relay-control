@@ -10,6 +10,16 @@ assigned at release.
   platform asset set can include macOS headless bundles and its installer.
   Existing KMS signing and its 4,096-byte limit remain unchanged.
 
+- Added: `get_relay_message_status` for sender-scoped software acceptance,
+  acknowledgement, correlated replies and protocol read markers. Older
+  engines return confirmation unavailable rather than inferring delivery.
+- Changed: with `SELFHOST_FEATURES=launch`, an OAuth MCP connection consented
+  by a current owner/admin can launch as its exact grant's approved agent.
+  Launches survive MCP reconnects within that grant; other grants cannot
+  inspect or release them. The `relay:mcp` consent label, "Use available MCP
+  tools in this workspace", is unchanged. Disconnect revokes access at once
+  and defers launcher cleanup while active or unconfirmed launches remain.
+
 - Added: desktop enrollment keys (migration 0050). An owner or admin mints a
   one-time `sh_ek_` key for an employee by email through the workspace API
   token routes (`purpose: "desktop-enrollment"`, 1-30 days, default 7,

@@ -258,7 +258,7 @@ export const launcherName = (userId: string) => `launcher-${ownerHash(userId).sl
 const ACTIVE_LAUNCHES = "This participant still owns agent launches that have not been released. Release them with release_relay_agent first.";
 
 /** Whether a hosted actor still owns a launch that is not terminal; its token is needed to release it. */
-async function hasActiveLaunches(executor: SqlExecutor, workspaceId: string, actorId: string): Promise<boolean> {
+export async function hasActiveLaunches(executor: SqlExecutor, workspaceId: string, actorId: string): Promise<boolean> {
   const result = await executor.query(
     `SELECT 1 FROM relay_spawns WHERE workspace_id = $1 AND actor_id = $2 AND state NOT IN ('failed', 'released') LIMIT 1`,
     [workspaceId, actorId],
@@ -1036,9 +1036,20 @@ function createRelayService(context: McpContext) {
       }, { factory: true, capy: true });
     },
 
-    async messageStatus(input: { message_id: string; as?: string }) {
-      await managedActorOnly(input.as);
-      const identity = managed ? await desktop() : (input.as ? null : await linkedDesktop()) ?? await participant(input.as);
+    async messageStatus(input: { message_id: string; as?: string; as_person?: boolean }) {
+      if (input.as_person && input.as) throw new RelayToolError("Choose either as_person or as, not both.");
+      await managedActorOnly(input.as, Boolean(input.as_person));
+      if (input.as_person) throw new RelayToolError(AS_PERSON_UNAVAILABLE);
+      let permitted: Identity | null = null;
+      if (input.as?.startsWith("capy-") && oauth && context.capyPermits && input.as !== oauth.access.agentName) {
+        permitted = await capyActor(input.as, true);
+      }
+      const viaCapy = capyFallback(input.as);
+      const viaFactory = !viaCapy && factoryFallback(input.as);
+      const identity = permitted ?? (managed ? await desktop()
+        : (input.as ? null : await linkedDesktop())
+          ?? await participant(input.as, { allowMissing: viaCapy || viaFactory })
+          ?? (viaCapy ? await capyActor(input.as!) : viaFactory ? await factoryActor(input.as!) : null));
       if (!identity) throw new RelayToolError("Call join_relay first, or select your own sending participant with as.");
       const deliveries = await client.getMessageDeliveries(identity.token, input.message_id);
       return { message_id: input.message_id, you: identity.name, confirmation: deliveries === null ? "unavailable" : "available",

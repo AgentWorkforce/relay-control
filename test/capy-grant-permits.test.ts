@@ -49,6 +49,7 @@ async function fixture(t:TestContext) {
     releaseHosted:async()=>undefined,
     listAgents:async()=>{await onAddress?.();return [roster({id:"ag_peer",name:"peer",metadata:{}}),...[...agents.values()].map(roster)];},
     heartbeat:async()=>undefined,
+    getMessageDeliveries:async(token:string,id:string)=>{assert.ok([...agents.values()].some(a=>a.token===token));assert.equal(id,"12");return [];},
     sendDirectMessage:async(input:any)=>{writes.push(input);return {message:{id:"12"},conversationId:"dm"};},
     replyToMessage:async(input:any)=>{writes.push(input);return {message:{id:"13"},conversationId:"dm"};},
     listConversations:async()=>[{id:"dm",participants:[binding.agent,"peer"]}],
@@ -111,6 +112,8 @@ test("Capy explicit grant permits preserve binding custody and the OAuth persona
     assert.equal(JSON.stringify(result).includes(e.agents.get(name).token),false);
     await relayService(e.context(g.connection)).send({to:"peer",text:"reply",as:name,reply_to:"10"});
     const service=relayService(e.context(g.connection));
+    assert.equal((await service.messageStatus({message_id:"12",as:name})).confirmation,"available");
+    await assert.rejects(relayService(e.context(second.connection)).messageStatus({message_id:"12",as:name}),/approved/);
     await assert.rejects(service.read({agent:"peer",as:name,limit:10}),/approved/);
     await assert.rejects(service.inbox(name,[]),/approved/);
     await assert.rejects(service.subscribeChannel({channel:"ops",as:name}),/approved/);
