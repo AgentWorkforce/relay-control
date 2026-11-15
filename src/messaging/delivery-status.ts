@@ -15,7 +15,7 @@ export function parseMessageDeliveries(value: unknown, messageId: string): Messa
     if (!value || typeof value !== "object") throw new Error("Invalid delivery receipt");
     const row = value as Record<string, unknown>;
     if (typeof row.id !== "string" || typeof row.agent_id !== "string" || typeof row.status !== "string"
-      || !["queued", "delivered", "consumed", "replied", "failed"].includes(String(row.state))) throw new Error("Invalid delivery receipt");
+      || typeof row.state !== "string" || !["queued", "delivered", "consumed", "replied", "failed"].includes(row.state)) throw new Error("Invalid delivery receipt");
     return { id: row.id, agent_id: row.agent_id, agent_name: nullable(row.agent_name), status: row.status, state: row.state as DeliveryState,
       created_at: nullable(row.created_at), delivered_at: nullable(row.delivered_at), accepted_at: nullable(row.accepted_at),
       acked_at: nullable(row.acked_at), replied_at: nullable(row.replied_at), reply_message_id: nullable(row.reply_message_id),

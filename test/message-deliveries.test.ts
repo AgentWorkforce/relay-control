@@ -38,7 +38,8 @@ test("unsupported and invisible receipts remain unconfirmed; authorization and o
 });
 
 test("malformed or mismatched receipt data cannot produce a confirmation", async () => {
-  for (const data of [{ message_id: "other", deliveries: [] }, { message_id: "123", deliveries: [{ id: "1", agent_id: "2", status: "acked", state: "read" }] }]) {
+  for (const data of [{ message_id: "other", deliveries: [] }, { message_id: "123", deliveries: [{ id: "1", agent_id: "2", status: "acked", state: "read" }] },
+    { message_id: "123", deliveries: [{ id: "1", agent_id: "2", status: "delivered", state: ["delivered"] }] }]) {
     const client = createRelaycastClient({ internalOrigin: "https://cast.example.test", fetchImpl: async () => Response.json({ ok: true, data }) });
     await assert.rejects(client.getMessageDeliveries("actor", "123"), RelaycastCallError);
   }

@@ -302,7 +302,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
       }
       const input: SpawnInput = parsed.data;
       return run(async (actor, owned) => {
-        const key = input.idempotency_key ?? ownerHash(JSON.stringify([sessionId ?? null, requestId]));
+        const key = input.idempotency_key ?? (sessionId ? ownerHash(JSON.stringify([sessionId, requestId])) : randomUUID());
         const launch = { name: input.name, cli: input.cli, task: input.task, target_node: input.target_node,
           ...(input.worker_cwd ? { worker_cwd: input.worker_cwd } : {}) };
         const idempotencyHash = ownerHash(JSON.stringify(["selfhost-spawn:v1", owned, key]));

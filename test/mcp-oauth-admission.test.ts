@@ -25,8 +25,7 @@ import { MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS,McpOAuthTeardown,mcpOAuthTeardo
 import { lockOrganization,lockUser } from "../src/tenancy.js";
 import type { RelaycastClient } from "../src/messaging/relaycast.js";
 import { relaySpawnService, relaySpawnDeps, spawnStore, type SpawnOwner } from "../src/mcp/relay-spawn.js";
-import { buildMcpServer } from "../src/mcp/server.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { NO_FEATURES } from "../src/features.js";
 
 test("OAuth launches use only the approved immutable actor and recheck role and revocation", async t => {
   const f = await relayFixture(t);
@@ -110,19 +109,34 @@ test("OAuth revocation during target discovery prevents journaling or dispatch",
 
 test("OAuth capabilities register launch tools when enabled and follow the consenting person's role", async t => {
   const f = await relayFixture(t);
+  const store = new ControlPlaneStore(f.database, KEYRING, 0, { tenancy: "multi" });
+  const server = createServer(createApp({ config: appConfig(), store, messagingFetch: f.fetchImpl, features: { ...NO_FEATURES, launch: true } }));
+  const base = await listen(server); t.after(() => close(server));
+  const client = new Client({ name: "oauth-capabilities", version: "1" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(base + SHARED), {
+    requestInit: { headers: { authorization: "Bearer " + f.pair.accessToken } },
+  }));
+  t.after(() => client.close());
   for (const role of ["admin", "member"] as const) {
-    const server = buildMcpServer({ ...f.context, launch: true, role });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    const client = new Client({ name: "oauth-capabilities", version: "1" });
-    await client.connect(clientTransport);
-    try {
-      assert.ok((await client.listTools()).tools.some(tool => tool.name === "spawn_relay_agent"));
-      const report = (await client.callTool({ name: "describe_capabilities", arguments: {} })).structuredContent as any;
-      assert.equal(report.workspace.can_launch, role === "admin");
-      assert.equal(report.groups.find((group: any) => group.id === "hosted_launch").status, role === "admin" ? "available" : "restricted");
-    } finally { await client.close(); await server.close(); }
+    await f.database.query("UPDATE organization_memberships SET role=$1 WHERE user_id=$2", [role, f.owner.userId]);
+    assert.ok((await client.listTools()).tools.some(tool => tool.name === "spawn_relay_agent"));
+    const report = (await client.callTool({ name: "describe_capabilities", arguments: {} })).structuredContent as any;
+    assert.equal(report.workspace.can_launch, role === "admin");
+    assert.equal(report.groups.find((group: any) => group.id === "hosted_launch").status, role === "admin" ? "available" : "restricted");
   }
+});
+
+test("sessionless OAuth launches do not deduplicate distinct requests by recycled request id", async t => {
+  const f = await relayFixture(t);
+  await f.database.query("UPDATE organization_memberships SET role='admin' WHERE user_id=$1", [f.owner.userId]);
+  f.world.nodes.set("rk_fake", [{ id: "broker", name: "broker", live: true, handlers_live: true, max_agents: 0, active_agents: 0,
+    reserved_agents: 0, capabilities: [{ name: "spawn:codex", metadata: { configured: { node_kind: "broker" } } }] }]);
+  const context = { ...f.context, relay: { ...f.context.relay, sessionId: undefined } };
+  const service = relaySpawnService(context, relaySpawnDeps(context));
+  const first = await service.spawn({ name: "worker-1", cli: "codex", target_node: "broker", task: "first" }, 1);
+  const second = await service.spawn({ name: "worker-2", cli: "codex", target_node: "broker", task: "second" }, 1);
+  assert.notEqual(first.spawn_id, second.spawn_id);
+  assert.equal((await f.database.query("SELECT 1 FROM relay_spawns")).rows.length, 2);
 });
 
 const ORIGIN="https://relay.example.test",SHARED="/api/v1/mcp/shared-sessions";
