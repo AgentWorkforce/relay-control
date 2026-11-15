@@ -2981,9 +2981,15 @@ paths:
         `workspace.relaycast_key.resolved` audit event (no secret recorded).
         Returns 404, not 403, when the bearer belongs to another tenant or
         is no longer a member.
+
+        Gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set): the answer
+        adds `urls.relaygateUrl` and omits `relaycastApiKey`; the device
+        enrols at relaygate with its Control token instead. The call is
+        audited as `workspace.relaycast_key.withheld`. Clients that require the
+        key must treat its absence as "no key" and fail closed.
       responses:
         "200":
-          description: Relaycast endpoint and decrypted workspace credential
+          description: Relaycast endpoint and decrypted workspace credential (no credential on a gate-only install)
           content:
             application/json:
               schema:
@@ -8838,7 +8844,6 @@ components:
         - relaycastWorkspaceId
         - organizationId
         - name
-        - relaycastApiKey
         - urls
         - provisioned
       properties:
@@ -8857,6 +8862,9 @@ components:
           type: string
         relaycastApiKey:
           type: string
+          description: >-
+            The workspace-wide Relaycast key. Always present unless
+            `SELFHOST_RELAYGATE_PUBLIC_URL` is set, when it is omitted.
         urls:
           type: object
           required: [relaycastUrl]
@@ -8864,6 +8872,14 @@ components:
             relaycastUrl:
               type: string
               format: uri
+            relaygateUrl:
+              type: string
+              format: uri
+              description: >-
+                Present only on a gate-only install: relaygate's public https
+                origin (`SELFHOST_RELAYGATE_PUBLIC_URL`), the only public way
+                into Relaycast there. Its presence means `relaycastApiKey` is
+                withheld.
         provisioned:
           const: false
     DashboardAccount:

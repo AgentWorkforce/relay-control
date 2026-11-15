@@ -5,6 +5,20 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `SELFHOST_RELAYGATE_PUBLIC_URL` (unset by default) for gate-only
+  installs, where relaygate is the only public way into Relaycast. When set,
+  `GET /api/v1/workspaces/{id}/resolve` answers `urls.relaygateUrl` (the
+  configured origin) next to `urls.relaycastUrl`, and omits
+  `relaycastApiKey`: the workspace-wide key would bypass the gate's policy,
+  so no device receives it, and no `workspace.relaycast_key.resolved` audit
+  row is written; the call is audited as `workspace.relaycast_key.withheld`.
+  Desktop and iPad builds that require the key fail closed and report that the
+  workspace shared no key. The CLI reads only `cloudWorkspaceId` from resolve
+  and is unaffected. The events-shim temporary workspace
+  (`POST /t/<mcp token>/workspace`) is also withheld (`404 not_found`), so
+  `events-shim setup` on a machine not signed in here cannot start its own
+  core. Unset, both are byte-for-byte as before. See docs/identity.md
+  ("Gate-only installs").
 - Added: `send_relay_message` results include `recipient_card` when the
   recipient has an agent card (`has_card`): `{ description, skills, version, updated_at, note }`, where `description` is null
   without card text and `skills` lists skill names. The field name and shape

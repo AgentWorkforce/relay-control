@@ -91,6 +91,16 @@ already belongs to a signed-in person, so there is nothing to claim. Without
 without the expiry route (older than relaycast#660) answers `503` and the
 workspace it made is deleted rather than left permanent.
 
+On a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set, see
+[identity.md](identity.md#gate-only-installs-relaygate)) the route mints and hands
+out nothing: it answers `404 not_found` with a message saying the control
+plane is gate-only and the machine's Agent Relay should sign in here. Any
+Relaycast workspace key on a laptop talks to Relaycast directly, around
+relaygate, so this is withheld too. As a result, `events-shim setup` on a
+machine that is not signed in cannot start its own headless core. Inboxes,
+webhook posts, MCP calls and wakes through a signed-in Agent Relay are
+unaffected.
+
 ## Limits
 
 Set by the package: 64 KiB per body (larger bodies are refused before they
