@@ -293,6 +293,7 @@ test("initialize advertises the self-host server and its tools on both paths", a
       "check_relay_inbox",
       "describe_capabilities",
       "get_relay_agent_card",
+      "get_relay_message_status",
       "get_session_summary",
       "get_shared_session",
       "get_shared_session_context",
@@ -436,7 +437,7 @@ test("describe_capabilities reports the served groups and the bound workspace", 
   assert.deepEqual(available.sort(), ["capability_discovery", "relay_messaging", "shared_session_reads", "team_activity"]);
   const messaging = data.groups.find((group: any) => group.id === "relay_messaging");
   assert.equal(messaging.status, "available");
-  assert.equal(messaging.tools.length, 14);
+  assert.equal(messaging.tools.length, 15);
   assert.deepEqual(messaging.tools.slice(0, 3), ["list_relay_agents", "get_relay_agent_card", "set_relay_agent_card"]);
   assert.equal(messaging.reason, undefined);
 });

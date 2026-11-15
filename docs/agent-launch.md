@@ -18,14 +18,17 @@ setting that enables it.
   dashboard session, or an Agent Relay Desktop provider credential. A
   managed Desktop chat, or a session linked with `join_relay desktop_address`,
   must still prove its Desktop identity or it launches nothing.
-- **Not** over an OAuth MCP connection: the tools are not registered there and
-  `describe_capabilities` says why. Workspace API tokens and service tokens are
-  refused at admission as before.
+- An **OAuth MCP connection** may launch as the agent approved for its exact
+  workspace grant, when the consenting person is currently an owner or admin.
+  Grant revocation, credential expiry and demotion are checked on every call.
+  Workspace API tokens and service tokens remain refused at admission.
 
-Every launch is sent as the owner's **launcher** participant, a hosted relay
+Native launches are sent as the owner's **launcher** participant, a hosted relay
 agent named `launcher-<hash of the user id>`. It is never a person, a Desktop
 identity or another chat's participant, so relinking or leaving a chat does
-not strand a launch. `leave_relay` refuses to remove a participant that still
+not strand a launch. OAuth launches use the grant's immutable approved agent
+instead; a different grant cannot inspect or release the old grant's launches.
+`leave_relay` refuses to remove a participant that still
 owns a launch that is not failed or released.
 
 ## Where a launch can go

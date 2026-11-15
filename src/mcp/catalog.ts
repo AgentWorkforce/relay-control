@@ -40,7 +40,7 @@ export function ensureToolTitles(server: McpServer): void {
   }) as McpServer["registerTool"];
 }
 
-export const RELAY_TOOLS = ["list_relay_agents", "get_relay_agent_card", "set_relay_agent_card", "send_relay_message", "read_relay_conversation", "join_relay", "leave_relay",
+export const RELAY_TOOLS = ["list_relay_agents", "get_relay_agent_card", "set_relay_agent_card", "send_relay_message", "get_relay_message_status", "read_relay_conversation", "join_relay", "leave_relay",
   "relay_status", "check_relay_inbox", "list_relay_channels", "subscribe_relay_channel", "unsubscribe_relay_channel",
   "post_relay_channel", "read_relay_channel"] as const;
 const RELAY_SPAWN_TOOLS = ["list_relay_spawn_targets", "spawn_relay_agent", "get_relay_spawn_status", "release_relay_agent"] as const;
@@ -160,7 +160,7 @@ export type CapabilityReport = {
  * from the same plan the server registered. Cloud's report also names its
  * relay-events endpoint (`other_endpoint`); self-host does not serve one, so
  * the field is omitted. `can_launch` is true only when the launch feature is
- * selected, this is a person connection (not OAuth) and the role read at
+ * selected and the consenting person's role read at
  * admission is owner or admin; each launch call checks again.
  */
 export function describeCapabilities(input: {
@@ -178,8 +178,8 @@ export function describeCapabilities(input: {
   providers: ProviderStatus[];
 }): CapabilityReport {
   const launchRole = input.role === "owner" || input.role === "admin";
-  const canLaunch = Boolean(input.launch) && input.authMode !== "oauth" && launchRole;
-  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, launch: input.launch && input.authMode !== "oauth",
+  const canLaunch = Boolean(input.launch) && launchRole;
+  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, launch: input.launch,
     capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines })
     .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
@@ -207,11 +207,6 @@ export function describeCapabilities(input: {
     if (id === "events") return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "The MCP Events endpoint is not available here. Self-hosted Grok Bot webhook wake-ups use the grok_routines group on this connection.",
       how_to_enable: "Use connect_grok_bot_routine from a Grok Bot OAuth connection to this server's /cloud/api/v1/mcp/shared-sessions endpoint." };
-    if (id === "hosted_launch" && input.launch && input.authMode === "oauth") {
-      return { ...base, status: "unavailable", tools: [...definition.tools],
-        reason: "Agent launches are not available through an OAuth MCP connection on this self-hosted site.",
-        how_to_enable: "Connect with an Agent Relay CLI login or Agent Relay Desktop." };
-    }
     if (id === "hosted_launch") {
       return { ...base, status: "unavailable", tools: [...definition.tools],
         reason: "Agent launches are not enabled on this self-hosted installation.",

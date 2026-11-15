@@ -20,8 +20,8 @@ import {
  * Relaycast workspace: targets are read with this workspace's key and owners
  * from fleet_node_owners rows for this workspace and Relaycast workspace, so
  * a node from another workspace or another installation is never listed or
- * reachable. Every call rechecks the owner/admin role read at admission and
- * refuses OAuth connections. A launch is journaled (relay_spawns) before it
+ * reachable. Every call rechecks the owner's current role and OAuth grant
+ * when present. A launch is journaled (relay_spawns) before it
  * is sent and is sent at most once per journal row; status and release only
  * reach rows owned by the same workspace, user, MCP authority, Relaycast
  * workspace and launcher actor.
@@ -223,19 +223,20 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
   const sessionId = context.relay.sessionId;
 
   function authorize(): void {
-    if (context.oauth || context.authMode === "oauth") {
-      throw new RelayToolError("Agent launches are not available through an OAuth MCP connection on this self-hosted site. Connect with an Agent Relay CLI login or Agent Relay Desktop.");
-    }
-    if (context.role !== "owner" && context.role !== "admin") throw new RelayToolError(LAUNCH_ROLE_REFUSAL);
+    const role = context.oauth ? context.oauth.access.principal.role : context.role;
+    if (context.authMode === "oauth" && !context.oauth) throw new RelayToolError(LAUNCH_ROLE_REFUSAL);
+    if (role !== "owner" && role !== "admin") throw new RelayToolError(LAUNCH_ROLE_REFUSAL);
   }
   function owner(actor: SpawnActor): SpawnOwner {
     if (!sessionId) throw new RelayToolError("Initialize MCP and retain Mcp-Session-Id before starting agents.");
     return { workspaceId: context.workspace.id, userId, relaycastWorkspaceId: actor.relaycastWorkspaceId, actorId: actor.id,
-      authorityHash: ownerHash(JSON.stringify([context.authMode, sessionId])) };
+      authorityHash: ownerHash(JSON.stringify(context.oauth
+        ? [context.authMode, sessionId, context.oauth.access.grantId]
+        : [context.authMode, sessionId])) };
   }
   const run = <T>(fn: (actor: SpawnActor, owned: SpawnOwner) => Promise<T>): Promise<T> => {
-    authorize();
-    return deps.withActor(actor => fn(actor, owner(actor)));
+    if (!context.oauth) authorize();
+    return deps.withActor(actor => { authorize(); return fn(actor, owner(actor)); });
   };
   async function lookup(owned: SpawnOwner, id: string): Promise<SpawnRow> {
     if (!z.string().uuid().safeParse(id).success) throw new RelayToolError("Use a spawn_id returned by this connection.");
@@ -279,6 +280,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
 
   return {
     async targets() {
+      if (context.oauth) await context.relay.database.transaction(tx => context.oauth!.lock(tx));
       authorize();
       const targets = (await deps.client.listSpawnTargets(deps.workspaceKey)).filter(eligible);
       return {
