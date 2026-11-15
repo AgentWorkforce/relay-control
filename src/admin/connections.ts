@@ -51,6 +51,7 @@ export type OAuthAppRecord = {
 /** Public connection record; never carries tokens or API keys. */
 export type ConnectionRecord = {
   connectionId: string;
+  version: string;
   provider: string;
   providerConfigKey: string;
   displayName: string;
@@ -186,6 +187,13 @@ async function readTokenResponse(response: Response): Promise<Record<string, unk
     `Provider token endpoint returned an unreadable response (HTTP ${response.status})`,
     response.status,
   );
+}
+
+/** Opaque edit token: reconnects retain the row id but replace encrypted credentials. */
+function connectionVersion(row: ConnectionRow): string {
+  return createHash("sha256").update(JSON.stringify([
+    row.id, row.credentials_ciphertext, metadataObject(row.metadata), iso(row.updated_at),
+  ])).digest("hex");
 }
 
 export class ConnectionStore {
@@ -726,6 +734,7 @@ export class ConnectionStore {
     }
     return {
       connectionId: row.id,
+      version: connectionVersion(row),
       provider: row.provider,
       providerConfigKey: provider?.configKey ?? row.provider,
       displayName: provider?.displayName ?? row.provider,
@@ -772,12 +781,13 @@ export class ConnectionStore {
 
   async updateDisplayName(input: {
     workspaceId: string; organizationId: string; provider: string;
-    connectionId: unknown; displayName: unknown; actor: AuditActor;
+    connectionId: unknown; displayName: unknown; version?: unknown; actor: AuditActor;
   }): Promise<{ connectionId: string; displayName: string }> {
     const provider = this.provider(input.provider);
     const connectionId = cleanText(input.connectionId, "connectionId", 200);
     const displayName = cleanText(input.displayName, "displayName", 80);
     return this.database.transaction(async (tx) => {
+      await this.assertCurrentVersion(tx, input.workspaceId, provider.id, input.version);
       const updated = await tx.query<{ id: string }>(
         `UPDATE integration_connections SET metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{displayName}', to_jsonb($4::text), true),
           updated_by_user_id = $5, updated_at = now()
@@ -790,15 +800,29 @@ export class ConnectionStore {
     });
   }
 
+  private async assertCurrentVersion(tx: SqlExecutor, workspaceId: string, provider: string, version: unknown): Promise<void> {
+    if (version === undefined) return; // Existing API consumers retain their contract.
+    if (typeof version !== "string" || !/^[a-f0-9]{64}$/.test(version))
+      throw new ConnectionError(400, "invalid_request", "Invalid connection version");
+    const current = await tx.query<ConnectionRow>(
+      `SELECT ${CONNECTION_COLUMNS} FROM integration_connections WHERE workspace_id = $1 AND provider = $2 FOR UPDATE`,
+      [workspaceId, provider],
+    );
+    if (!current.rows[0] || connectionVersion(current.rows[0]) !== version)
+      throw new ConnectionError(409, "connection_changed", "This connection has changed. Refresh before updating it.");
+  }
+
   async disconnect(input: {
     workspaceId: string;
     organizationId: string;
     provider: string;
     actor: AuditActor;
     connectionId?: string;
+    version?: unknown;
   }): Promise<boolean> {
     const provider = this.provider(input.provider);
     return this.database.transaction(async (tx) => {
+      await this.assertCurrentVersion(tx, input.workspaceId, provider.id, input.version);
       const deleted = await tx.query(
         `DELETE FROM integration_connections
           WHERE workspace_id = $1 AND provider = $2 AND ($3::text IS NULL OR id::text = $3) RETURNING id`,

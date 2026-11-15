@@ -624,8 +624,8 @@ export function createAdminModule(input: {
       requireJsonWrite(request, helpers);
       const access = await helpers.workspaceAccess(request, workspaceId, true);
       const body = await helpers.requestObject(request);
-      if (Object.keys(body).some((key) => !["connectionId", "displayName"].includes(key))) throw new AdminHttpError(400, "invalid_request", "Only the connection display name can be edited here");
-      const updated = await connections.updateDisplayName({ workspaceId: access.workspace.id, organizationId: access.workspace.organizationId, provider: integrationSettings[0]!, connectionId: body.connectionId, displayName: body.displayName, actor: userActor(access) });
+      if (Object.keys(body).some((key) => !["connectionId", "displayName", "version"].includes(key))) throw new AdminHttpError(400, "invalid_request", "Only the connection display name can be edited here");
+      const updated = await connections.updateDisplayName({ workspaceId: access.workspace.id, organizationId: access.workspace.organizationId, provider: integrationSettings[0]!, connectionId: body.connectionId, displayName: body.displayName, version: body.version, actor: userActor(access) });
       json(response, 200, updated);
       return true;
     }
@@ -672,6 +672,7 @@ export function createAdminModule(input: {
           provider: providerId,
           actor: userActor(access),
           ...(url.searchParams.get("connectionId") ? { connectionId: url.searchParams.get("connectionId")! } : {}),
+          ...(url.searchParams.has("version") ? { version: url.searchParams.get("version") } : {}),
         });
         json(response, 200, {
           success: true,
