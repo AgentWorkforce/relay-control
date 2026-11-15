@@ -93,7 +93,8 @@ function assertSpawnPatch(row: SpawnRow, patch: SpawnPatch): void {
   }
 }
 
-export function spawnStore(database: { query: SqlExecutor["query"]; transaction<T>(run: (tx: SqlExecutor) => Promise<T>): Promise<T> }) {
+export function spawnStore(database: { query: SqlExecutor["query"]; transaction<T>(run: (tx: SqlExecutor) => Promise<T>): Promise<T> },
+  options: { beforeReserve?: (tx: SqlExecutor) => Promise<void> } = {}) {
   async function find(owner: SpawnOwner, id: string): Promise<SpawnRow | null> {
     const result = await database.query(`SELECT ${COLUMNS} FROM relay_spawns WHERE ${OWNED} AND id = $6`, [...ownedParams(owner), id]);
     return result.rows[0] ? rowFrom(result.rows[0]) : null;
@@ -108,6 +109,10 @@ export function spawnStore(database: { query: SqlExecutor["query"]; transaction<
     /** One transaction per reservation, never held over a network call. */
     reserve(row: Omit<SpawnRow, "updatedAt">): Promise<{ row: SpawnRow; created: boolean }> {
       return database.transaction(async (tx) => {
+        // Commit the active-launch fence atomically with live OAuth admission.
+        // Revocation either sees this row or prevents its reservation; teardown
+        // cannot delete an actor between the last grant check and journaling.
+        await options.beforeReserve?.(tx);
         await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`relay-spawn:${row.workspaceId}`]);
         const existing = await tx.query(`SELECT ${COLUMNS} FROM relay_spawns WHERE idempotency_hash = $1`, [row.idempotencyHash]);
         if (existing.rows[0]) {
@@ -425,7 +430,10 @@ export function relaySpawnDeps(context: McpContext): RelaySpawnDeps {
   return {
     client,
     workspaceKey: context.workspace.relaycastApiKey,
-    store: spawnStore(database),
+    store: spawnStore(database, context.oauth ? { beforeReserve: async tx => {
+      await context.oauth!.lock(tx);
+      if (!["owner", "admin"].includes(context.oauth!.access.principal.role ?? "")) throw new RelayToolError(LAUNCH_ROLE_REFUSAL);
+    } } : {}),
     async owners(nodeIds) {
       if (nodeIds.length === 0) return new Map();
       // Only this workspace's claims on this workspace's relay; the membership FK drops a departed owner's claim.

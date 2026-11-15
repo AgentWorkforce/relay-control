@@ -17,7 +17,7 @@ not that the message arrived. Inspect each delivery's `state`:
 | delivered | Recipient software durably accepted the message |
 | consumed | Recipient acknowledged the delivery |
 | replied | An explicitly correlated reply exists; see `reply_message_id` |
-| failed | Delivery failed; inspect the receipt error |
+| failed | Delivery failed; arbitrary upstream error details are withheld |
 
 `read_at` records an explicit read receipt only. Acknowledgement does not
 mean a person read the message or a model understood it. An empty list does

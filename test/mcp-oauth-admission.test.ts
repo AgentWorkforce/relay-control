@@ -24,7 +24,7 @@ import { McpOAuthStore } from "../src/mcp/oauth/store.js";
 import { MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS,McpOAuthTeardown,mcpOAuthTeardownBackoffMs,mcpOAuthTeardownFetch } from "../src/mcp/oauth/teardown.js";
 import { lockOrganization,lockUser } from "../src/tenancy.js";
 import type { RelaycastClient } from "../src/messaging/relaycast.js";
-import { relaySpawnService, spawnStore, type SpawnOwner } from "../src/mcp/relay-spawn.js";
+import { relaySpawnService, relaySpawnDeps, spawnStore, type SpawnOwner } from "../src/mcp/relay-spawn.js";
 import { buildMcpServer } from "../src/mcp/server.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
@@ -89,6 +89,23 @@ test("OAuth disconnect retains the launcher until its active launch journal is d
   f.advance();
   assert.equal((await f.teardown.drain()).completed, 1);
   assert.equal((await f.database.query("SELECT 1 FROM hosted_relay_participants WHERE agent_remote_id=$1", [actor])).rows.length, 0);
+});
+
+test("OAuth revocation during target discovery prevents journaling or dispatch", async t => {
+  const f = await relayFixture(t);
+  await f.database.query("UPDATE organization_memberships SET role='admin' WHERE user_id=$1", [f.owner.userId]);
+  const deps = relaySpawnDeps(f.context);
+  let dispatched = false;
+  deps.client.listSpawnTargets = async () => {
+    await f.oauth.revokeMcpOAuthGrant(f.owner.grantId, "revoke-during-discovery");
+    return [{ id: "broker", name: "broker", live: true, handlersLive: true, stale: false, activeAgents: 0, reservedAgents: 0,
+      maxAgents: 0, capabilities: ["spawn:codex"], raw: { capabilities: [{ name: "spawn:codex", metadata: { configured: { node_kind: "broker" } } }] } }];
+  };
+  deps.client.spawnRelayAgent = async () => { dispatched = true; assert.fail("revoked grant dispatched"); };
+  const service = relaySpawnService(f.context, deps);
+  await assert.rejects(service.spawn({ name: "worker", cli: "codex", target_node: "broker", task: "test", idempotency_key: "test-launch-key" }, 1), /no longer has access/);
+  assert.equal(dispatched, false);
+  assert.equal((await f.database.query("SELECT 1 FROM relay_spawns")).rows.length, 0);
 });
 
 test("OAuth capabilities register launch tools when enabled and follow the consenting person's role", async t => {
