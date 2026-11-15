@@ -303,10 +303,11 @@ export class GcsDesktopFeedStorage implements DesktopFeedStorage {
     });
     // pipeline destroys `counted` when the source fails, which fails the upload.
     pipeline(body, counted).catch(() => undefined);
-    const response = await this.send("PUT", staging, { body: counted, size });
-    response.resume();
-    if (response.statusCode !== 200) throw new StorageError(`GCS upload failed: ${response.statusCode}`, response.statusCode);
     try {
+      // Inside the try: GCS may have stored the object even when the response is lost.
+      const response = await this.send("PUT", staging, { body: counted, size });
+      response.resume();
+      if (response.statusCode !== 200) throw new StorageError(`GCS upload failed: ${response.statusCode}`, response.statusCode);
       if (received !== size || hash.digest("hex") !== sha256) {
         throw new StorageError("object bytes do not match the declared size and sha256");
       }

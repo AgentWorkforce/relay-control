@@ -107,6 +107,12 @@ test("GCS storage: streamed PUT, ranged GET, DELETE through the XML API with a B
 
   putStatus = 403;
   await assert.rejects(storage.put(key, Readable.from([bytes]), bytes.length, sha), StorageError);
+  // A failed staging PUT is still cleaned up, and the key is never copied over.
+  const [failedPut, cleanup] = gcs.seen.slice(-2);
+  assert.equal(failedPut!.method, "PUT");
+  assert.match(failedPut!.path, /\.upload-[0-9a-f]{24}$/);
+  assert.equal(cleanup!.method, "DELETE");
+  assert.equal(cleanup!.path, failedPut!.path);
 });
 
 test("GCS storage: an upload whose sha256 differs never touches the key", async (t) => {

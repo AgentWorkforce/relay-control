@@ -79,6 +79,12 @@ account needs:
   (`GOOG4-RSA-SHA256`, `host` signed, five minutes) through `signBlob`;
   without the permission it fails while `GET /assets/{assetId}` streaming
   keeps working.
+- On GKE, a Kubernetes ServiceAccount linked to that Google service account
+  (`iam.gke.io/gcp-service-account` annotation plus
+  `roles/iam.workloadIdentityUser` for the KSA on the Google service account).
+  `signBlob` needs a Google service account: a KSA granted bucket access
+  directly as a Workload Identity Federation principal can upload and stream,
+  but `download-url` fails.
 
 Enable uniform bucket-level access and enforce public access prevention on
 the bucket; downloads are always either streamed through this service or a
