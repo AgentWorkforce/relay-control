@@ -111,7 +111,8 @@ export class FlowsWorkspaceDeletions {
       await this.deps.database.query(
         "UPDATE flows_workspace_deletions SET attempts = $2, next_attempt_at = $3, last_error = $4 WHERE workspace_id = $1",
         [workspaceId, failures, new Date(this.now().getTime() + flowsDeleteBackoffMs(failures)),
-          status ? `http_${status}` : "unreachable"],
+          // A 200 or 404 that proved nothing is marked apart from an ordinary status.
+          !status ? "unreachable" : status === 200 || status === 404 ? `http_${status}_unconfirmed` : `http_${status}`],
       );
       this.deps.log?.({
         code: refused ? "flows_workspace_delete_refused" : "flows_workspace_delete_deferred",

@@ -113,7 +113,7 @@ test("the worker completes only on a confirmed delete and keeps every other answ
   const left = (await c.database.query<{ workspace_id: string; attempts: number; last_error: string; next_attempt_at: Date }>(
     "SELECT workspace_id, attempts, last_error, next_attempt_at FROM flows_workspace_deletions ORDER BY workspace_id")).rows;
   assert.deepEqual(left.map((row) => [row.workspace_id, row.attempts, row.last_error]),
-    [[ids[2], 1, "http_401"], [ids[3], 1, "http_503"], [ids[4], 1, "unreachable"], [ids[5], 1, "http_404"], [ids[6], 1, "http_200"]]);
+    [[ids[2], 1, "http_401"], [ids[3], 1, "http_503"], [ids[4], 1, "unreachable"], [ids[5], 1, "http_404_unconfirmed"], [ids[6], 1, "http_200_unconfirmed"]]);
   for (const row of left) assert.equal(new Date(row.next_attempt_at).getTime(), now.getTime() + flowsDeleteBackoffMs(1));
   // UPDATE ... RETURNING has no order, so compare by workspace.
   const byWorkspace = [...logs].sort((a, b) => a.workspaceId!.localeCompare(b.workspaceId!));

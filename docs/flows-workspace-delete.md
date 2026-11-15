@@ -33,9 +33,13 @@ queued and startup logs `flowsWorkspaceDelete: false`.
    relayfile-control sends only after the secret checks out and only when
    Flows is off there (it holds nothing). A bare `404` is what the route
    answers while relayfile-control's secret is unset; it deleted nothing, so
-   it is retried like a refusal.
+   it is retried like a refusal. Such a row records `last_error`
+   `http_404_unconfirmed` (`http_200_unconfirmed` for a 200 about another
+   workspace). A relayfile-control build without the `flows_not_enabled`
+   answer, with Flows off, also answers a bare 404, so its rows retry until
+   the backoff reaches its one-hour cap and stay there until it is upgraded.
 4. Any other answer, a network failure or a timeout keeps the row, records
-   `last_error` (`http_<status>` or `unreachable`) and backs off: 30 s,
+   `last_error` (`http_<status>`, `http_<status>_unconfirmed` or `unreachable`) and backs off: 30 s,
    doubling to one hour. A `4xx` logs `flows_workspace_delete_refused`
    (usually a secret mismatch); the rest log
    `flows_workspace_delete_deferred`. Neither log carries the secret or the
