@@ -28,8 +28,12 @@ queued and startup logs `flowsWorkspaceDelete: false`.
    `DELETE {RELAYFILE_CONTROL_URL}/internal/v1/flows/workspaces/{id}` with
    the secret as bearer and a 10 s timeout. The remote delete is idempotent,
    so a lease that expires mid-call is harmless.
-3. `200` completes the row. `404` also completes it: relayfile-control
-   answers 404 when Flows is off there, so it holds no data for the workspace.
+3. Two answers complete the row: a `200` whose body names the same
+   `workspaceId`, and a `404` with `{"error": "flows_not_enabled"}`, which
+   relayfile-control sends only after the secret checks out and only when
+   Flows is off there (it holds nothing). A bare `404` is what the route
+   answers while relayfile-control's secret is unset; it deleted nothing, so
+   it is retried like a refusal.
 4. Any other answer, a network failure or a timeout keeps the row, records
    `last_error` (`http_<status>` or `unreachable`) and backs off: 30 s,
    doubling to one hour. A `4xx` logs `flows_workspace_delete_refused`

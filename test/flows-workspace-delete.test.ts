@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { loadConfig } from "../src/config.js";
-import { flowsDeleteBackoffMs, FlowsWorkspaceDeletions, type FlowsDeleteEvent } from "../src/flows-workspace-delete.js";
+import { FLOWS_NOT_ENABLED, flowsDeleteBackoffMs, FlowsWorkspaceDeletions, type FlowsDeleteEvent } from "../src/flows-workspace-delete.js";
 import { BOOTSTRAP, seedTenant, startControlPlane } from "./flows-helpers.js";
 
 const secret = "flows-workspace-delete-secret-32-bytes-plus";
@@ -37,7 +37,7 @@ test("the hand-off is optional, needs both values, and its own secret", () => {
 
 async function deleteWorkspace(api: Awaited<ReturnType<typeof startControlPlane>>["api"], organizationId: string, workspaceId: string) {
   const answer = await api(`/api/v1/organizations/${organizationId}/workspaces/${workspaceId}`, { method: "DELETE", token: BOOTSTRAP });
-  assert.equal(answer.status, 204, answer.raw);
+  assert.equal(answer.status, 204, answer.text);
 }
 
 test("a workspace delete queues the relayfile-control delete only when configured", async (t) => {
@@ -62,12 +62,24 @@ test("a workspace delete queues the relayfile-control delete only when configure
   assert.equal((await on.database.query("SELECT * FROM flows_workspace_deletions")).rows.length, 1);
 });
 
-test("the worker completes on 200 or 404 and keeps every other answer with backoff", async (t) => {
+test("the worker completes only on a confirmed delete and keeps every other answer with backoff", async (t) => {
   const c = await startControlPlane({}, undefined, { flowsWorkspaceDelete: endpoint });
   t.after(() => c.stop());
   const ids = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222",
-    "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"];
-  const answers = new Map<string, number | "throw">([[ids[0]!, 200], [ids[1]!, 404], [ids[2]!, 401], [ids[3]!, 503], [ids[4]!, "throw"]]);
+    "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555",
+    "66666666-6666-4666-8666-666666666666", "77777777-7777-4777-8777-777777777777"];
+  type Answer = { status: number; body?: unknown } | "throw";
+  const answers = new Map<string, Answer>([
+    [ids[0]!, { status: 200, body: { workspaceId: ids[0], deleted: { runs: 3 } } }],
+    [ids[1]!, { status: 404, body: { error: FLOWS_NOT_ENABLED } }],
+    [ids[2]!, { status: 401, body: { error: "unauthorized" } }],
+    [ids[3]!, { status: 503 }],
+    [ids[4]!, "throw"],
+    // The route is hidden while relayfile-control's secret is unset: deleted nothing, proves nothing.
+    [ids[5]!, { status: 404, body: { error: "not_found" } }],
+    // A 200 about another workspace is not this delete.
+    [ids[6]!, { status: 200, body: { workspaceId: ids[0] } }],
+  ]);
   const org = "99999999-9999-4999-8999-999999999999";
   let now = new Date(Date.now() + 60_000);
   for (const id of ids) {
@@ -86,13 +98,13 @@ test("the worker completes on 200 or 404 and keeps every other answer with backo
       calls.push({ url, method: init?.method ?? "GET", authorization: new Headers(init?.headers).get("authorization") });
       const answer = answers.get(decodeURIComponent(url.split("/").pop()!))!;
       if (answer === "throw") throw new Error("connect ECONNREFUSED private-detail");
-      return new Response(JSON.stringify({ error: "x" }), { status: answer });
+      return new Response(answer.body === undefined ? "upstream private-detail" : JSON.stringify(answer.body), { status: answer.status });
     },
   });
   t.after(() => worker.stop());
 
   await worker.tick();
-  assert.equal(calls.length, 5);
+  assert.equal(calls.length, 7);
   for (const call of calls) {
     assert.equal(call.method, "DELETE");
     assert.equal(call.authorization, `Bearer ${secret}`);
@@ -101,27 +113,28 @@ test("the worker completes on 200 or 404 and keeps every other answer with backo
   const left = (await c.database.query<{ workspace_id: string; attempts: number; last_error: string; next_attempt_at: Date }>(
     "SELECT workspace_id, attempts, last_error, next_attempt_at FROM flows_workspace_deletions ORDER BY workspace_id")).rows;
   assert.deepEqual(left.map((row) => [row.workspace_id, row.attempts, row.last_error]),
-    [[ids[2], 1, "http_401"], [ids[3], 1, "http_503"], [ids[4], 1, "unreachable"]]);
+    [[ids[2], 1, "http_401"], [ids[3], 1, "http_503"], [ids[4], 1, "unreachable"], [ids[5], 1, "http_404"], [ids[6], 1, "http_200"]]);
   for (const row of left) assert.equal(new Date(row.next_attempt_at).getTime(), now.getTime() + flowsDeleteBackoffMs(1));
   // UPDATE ... RETURNING has no order, so compare by workspace.
   const byWorkspace = [...logs].sort((a, b) => a.workspaceId!.localeCompare(b.workspaceId!));
   assert.deepEqual(byWorkspace.map((event) => [event.code, event.status]), [
     ["flows_workspace_delete_refused", 401], ["flows_workspace_delete_deferred", 503], ["flows_workspace_delete_deferred", undefined],
+    ["flows_workspace_delete_refused", 404], ["flows_workspace_delete_deferred", 200],
   ]);
   assert.equal(JSON.stringify(logs).includes(secret), false);
   assert.equal(JSON.stringify(logs).includes("private-detail"), false);
 
   // Not due yet: nothing is sent.
   await worker.tick();
-  assert.equal(calls.length, 5);
+  assert.equal(calls.length, 7);
   // Due again: a recovered relayfile-control completes the row.
-  answers.set(ids[3]!, 200);
+  answers.set(ids[3]!, { status: 200, body: { workspaceId: ids[3] } });
   now = new Date(now.getTime() + flowsDeleteBackoffMs(1));
   await worker.tick();
-  assert.equal(calls.length, 8);
+  assert.equal(calls.length, 12);
   const after = (await c.database.query<{ workspace_id: string; attempts: number }>(
     "SELECT workspace_id, attempts FROM flows_workspace_deletions ORDER BY workspace_id")).rows;
-  assert.deepEqual(after.map((row) => [row.workspace_id, row.attempts]), [[ids[2], 2], [ids[4], 2]]);
+  assert.deepEqual(after.map((row) => [row.workspace_id, row.attempts]), [[ids[2], 2], [ids[4], 2], [ids[5], 2], [ids[6], 2]]);
 });
 
 test("backoff doubles from 30 s and stops at an hour", () => {

@@ -8,6 +8,11 @@ const MAX_BACKOFF_MS = 60 * 60_000;
 // A claimed row is invisible to other replicas for this long; the remote delete is idempotent.
 const LEASE_MS = 2 * 60_000;
 const TIMEOUT_MS = 10_000;
+/**
+ * relayfile-control's authenticated answer when Flows is off there: it holds
+ * nothing. A bare 404 (route unconfigured, secret unset) proves nothing and is retried.
+ */
+export const FLOWS_NOT_ENABLED = "flows_not_enabled";
 
 type Endpoint = NonNullable<SelfhostConfig["flowsWorkspaceDelete"]>;
 
@@ -25,9 +30,10 @@ export function flowsDeleteBackoffMs(attempts: number): number {
 
 /**
  * Sends queued workspace deletes to relayfile-control's
- * DELETE /internal/v1/flows/workspaces/{id}. 200 and 404 (Flows off there,
- * nothing held) complete the row. Every other answer keeps it and backs off:
- * a refusal is a configuration fault, never a reason to drop deleted data.
+ * DELETE /internal/v1/flows/workspaces/{id}. Only a 200 naming this workspace,
+ * or a 404 `flows_not_enabled` (authenticated: Flows off there, nothing held),
+ * completes the row. Every other answer keeps it and backs off: a refusal is
+ * a configuration fault, never a reason to drop deleted data.
  */
 export class FlowsWorkspaceDeletions {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -77,6 +83,7 @@ export class FlowsWorkspaceDeletions {
 
   private async deliver(workspaceId: string, attempts: number): Promise<void> {
     let status = 0;
+    let confirmed = false;
     try {
       const url = new URL(`/internal/v1/flows/workspaces/${encodeURIComponent(workspaceId)}`, this.deps.endpoint.url);
       const response = await this.fetchImpl(url, {
@@ -85,12 +92,17 @@ export class FlowsWorkspaceDeletions {
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
       status = response.status;
-      await response.body?.cancel().catch(() => undefined);
+      if (status === 200 || status === 404) {
+        const body = await response.json().catch(() => null) as { workspaceId?: unknown; error?: unknown } | null;
+        confirmed = status === 200 ? body?.workspaceId === workspaceId : body?.error === FLOWS_NOT_ENABLED;
+      } else {
+        await response.body?.cancel().catch(() => undefined);
+      }
     } catch {
-      // Network failure or timeout: status stays 0.
+      // Network failure, timeout or an unreadable body: unconfirmed.
     }
     try {
-      if (status === 200 || status === 404) {
+      if (confirmed) {
         await this.deps.database.query("DELETE FROM flows_workspace_deletions WHERE workspace_id = $1", [workspaceId]);
         return;
       }

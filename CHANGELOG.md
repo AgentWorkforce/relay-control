@@ -9,8 +9,9 @@ assigned at release.
   `RELAYFILE_CONTROL_URL` and a dedicated `RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET`,
   deleting a workspace queues `DELETE /internal/v1/flows/workspaces/{id}` in
   the same transaction; a worker sends it and retries with backoff (30 s
-  doubling to 1 h) until relayfile-control answers 200 or 404. Refusals and
-  outages keep the row. Unset, nothing is queued; the legacy local Flows rows
+  doubling to 1 h) until relayfile-control confirms (a 200 naming the
+  workspace, or an authenticated 404 `flows_not_enabled`). Refusals, a bare
+  404 and outages keep the row. Unset, nothing is queued; the legacy local Flows rows
   still cascade as before.
 
 - Added: a persistent mounted-secret Ed25519 Desktop feed signer (`file`),
