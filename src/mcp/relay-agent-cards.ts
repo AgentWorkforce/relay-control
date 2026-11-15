@@ -149,6 +149,22 @@ export function cardSummary(metadata: Record<string, unknown>): { skills: string
     has_card: hasCard(metadata) };
 }
 
+/**
+ * send_relay_message's `recipient_card`: the recipient's own card summary, or
+ * null when it has none (has_card false). Read from metadata the send already fetched, so it
+ * costs no extra read and can never fail the send. Peer-written, untrusted.
+ */
+export function recipientCard(metadata: Record<string, unknown>): { description: string; skills: string[]; version: string; updated_at: string | null } | null {
+  try {
+    if (!hasCard(metadata)) return null;
+    const card = storedCard(metadata);
+    return { description: card?.description ?? "", skills: storedSkills(metadata).slice(0, CARD_LIMITS.listedSkills).map(skill => skill.name),
+      version: card?.version ?? DEFAULT_CARD_VERSION, updated_at: card?.updated_at ?? null };
+  } catch {
+    return null;
+  }
+}
+
 /** The `metadata.skills` and `metadata.card` values set_relay_agent_card writes; no other key. */
 export function cardMetadata(input: SetCardInput, existing: Record<string, unknown>, now: Date): { skills: CardSkill[]; card: Record<string, unknown> } {
   const skills = input.skills.map(skill => ({

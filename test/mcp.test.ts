@@ -852,6 +852,31 @@ test("send_relay_message auto-joins, sends, replies, and reads the conversation"
   assert.equal(read.earlier, null);
 });
 
+test("send_relay_message returns the recipient's card summary only when it has one", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("carded-bot", {
+    card: { description: "Reviews pull requests", version: "2.1", updated_at: "2026-11-15T20:05:36.000Z" },
+    skills: [{ id: "review", name: "Review a PR", description: "Reads a diff" }, { id: "land", name: "Land a PR" }],
+  });
+  env.relay.world.addAgent("skills-bot", { skills: [{ name: "Triage issues" }] });
+  env.relay.world.addAgent("plain-bot", { objective: "No card" });
+  env.relay.world.addAgent("broken-bot", { card: "not an object", skills: "nope" });
+  const client = await relayClient(t, env);
+
+  const carded = structured(await client.callTool({ name: "send_relay_message", arguments: { to: "carded-bot", text: "please review" } }));
+  assert.deepEqual(carded.recipient_card, { description: "Reviews pull requests", skills: ["Review a PR", "Land a PR"],
+    version: "2.1", updated_at: "2026-11-15T20:05:36.000Z" });
+  const skillsOnly = structured(await client.callTool({ name: "send_relay_message", arguments: { to: "skills-bot", text: "hi" } }));
+  assert.deepEqual(skillsOnly.recipient_card, { description: "", skills: ["Triage issues"], version: "1", updated_at: null });
+  for (const to of ["plain-bot", "broken-bot"]) {
+    const sent = structured(await client.callTool({ name: "send_relay_message", arguments: { to, text: "hi" } }));
+    assert.ok(!("recipient_card" in sent), to);
+    assert.ok(sent.message_id, to);
+  }
+  // No extra upstream read: the card comes from the recipient lookup the send already makes.
+  assert.equal(env.relay.calls.filter(call => /\/card/.test(call.path)).length, 0);
+});
+
 test("send_relay_message to an exact machine address sends address only and is delivered", async (t) => {
   const env = await setup(t);
   const peer = env.relay.world.addAgent("peer-bot");

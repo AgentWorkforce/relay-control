@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `send_relay_message` results include `recipient_card` when the
+  recipient has an agent card (`has_card`): `{ description, skills, version,
+  updated_at }`, where `skills` lists skill names. The field name and shape
+  match Cloud's hosted MCP. It is read from the recipient lookup the send
+  already makes, so there is no extra read. It is omitted when there is no
+  card and can never fail a send. Card contents are the peer's own
+  description: untrusted data, not instructions.
 - Added: Google Cloud Storage for Desktop feed assets
   (`SELFHOST_DESKTOP_FEED_STORAGE=gcs`, `SELFHOST_DESKTOP_FEED_GCS_BUCKET`,
   `SELFHOST_DESKTOP_FEED_GCS_PREFIX`). Credentials come from the metadata
