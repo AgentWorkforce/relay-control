@@ -25,7 +25,7 @@ import {
   SignerUnavailableError,
   type DesktopFeedSigner,
 } from "../src/desktop-feed/signer.js";
-import { MemoryDesktopFeedStorage, type ByteRange, type DesktopFeedStorage } from "../src/desktop-feed/storage.js";
+import { GcsDesktopFeedStorage, MemoryDesktopFeedStorage, type ByteRange, type DesktopFeedStorage } from "../src/desktop-feed/storage.js";
 import { StaticAwsCredentialProvider } from "../src/aws/sigv4.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
@@ -129,6 +129,7 @@ async function setup(
     feed?: boolean;
     limits?: Partial<DesktopFeedLimits>;
     signer?: DesktopFeedSigner;
+    storage?: DesktopFeedStorage;
     publisherTokenHashes?: Record<string, string[]>;
   } = {},
 ) {
@@ -160,7 +161,7 @@ async function setup(
   const logs: Array<{ message: string; fields: Record<string, unknown> }> = [];
   const server = createServer(createApp({
     config, store, now: () => clock, desktopFeed: {
-      signer: options.signer ?? signer, storage, limits: options.limits, log: (message, fields) => logs.push({ message, fields }),
+      signer: options.signer ?? signer, storage: options.storage ?? storage, limits: options.limits, log: (message, fields) => logs.push({ message, fields }),
     },
   }));
   const origin = await listen(server);
@@ -1078,6 +1079,106 @@ test("storage: uploads land in drafts/, publish moves them to releases/ and mirr
   const betaPublished = await world.call(`${FEED}/releases/2026.11.1-beta.1/publish`, { token: publisher, profile: "acme", body: {} });
   assert.equal(betaPublished.status, 200, betaPublished.text);
   assert.equal(objects.get("profiles/acme/manifests/beta.json")!.toString("utf8"), betaPublished.text);
+});
+
+test("gcs storage: publish, stream and a signed download URL against a fake GCS XML API", async (t) => {
+  // A tiny private bucket: PUT (upload or x-goog-copy-source), ranged GET, DELETE.
+  const bucket = new Map<string, Buffer>();
+  const gcs = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const path = decodeURIComponent(new URL(request.url!, "http://x").pathname);
+    if (request.headers.authorization !== "Bearer ya29.gcs-route-test" || !path.startsWith("/feed-bucket/desktop-feed/profiles/")) {
+      response.writeHead(403).end("<Error><Code>AccessDenied</Code></Error>");
+      return;
+    }
+    const copySource = request.headers["x-goog-copy-source"];
+    if (request.method === "PUT" && typeof copySource === "string") {
+      const source = bucket.get(decodeURIComponent(copySource));
+      if (!source) return void response.writeHead(404).end("<Error><Code>NoSuchKey</Code></Error>");
+      bucket.set(path, source);
+      return void response.writeHead(200).end("<CopyObjectResult></CopyObjectResult>");
+    }
+    if (request.method === "PUT") {
+      bucket.set(path, Buffer.concat(chunks));
+      return void response.writeHead(200).end();
+    }
+    if (request.method === "DELETE") return void response.writeHead(bucket.delete(path) ? 204 : 404).end();
+    const object = bucket.get(path);
+    if (!object) return void response.writeHead(404).end();
+    const range = /^bytes=(\d+)-(\d+)$/.exec(String(request.headers.range ?? ""));
+    if (range) return void response.writeHead(206).end(object.subarray(Number(range[1]), Number(range[2]) + 1));
+    response.writeHead(200).end(object);
+  });
+  const origin = await listen(gcs);
+  t.after(() => close(gcs));
+  const storage = new GcsDesktopFeedStorage({
+    bucket: "feed-bucket",
+    prefix: "desktop-feed",
+    endpoint: origin,
+    credentials: {
+      accessToken: async () => "ya29.gcs-route-test",
+      serviceAccountEmail: async () => "relay-control@feed-test-project.iam.gserviceaccount.com",
+      signBlob: async (payload) => {
+        if (signBlobDenied) throw new Error("IAM Credentials signBlob failed: 403 PERMISSION_DENIED");
+        return createHash("sha256").update(payload).digest();
+      },
+    },
+  });
+  let signBlobDenied = false;
+  const world = await setup(t, { storage });
+  const { publisher } = await provision(world, "acme", "Acme", world.w1);
+  const version = "2026.11.0";
+  const body = draftBody("Acme", version);
+  await uploaded(world, "acme", publisher, body, BYTES_BY_INDEX);
+  const name = body.expected_assets[0]!.name;
+  assert.ok(bucket.has(`/feed-bucket/desktop-feed/profiles/acme/drafts/${version}/${name}`));
+
+  const published = await world.call(`${FEED}/releases/${version}/publish`, { token: publisher, profile: "acme", body: { latest: true } });
+  assert.equal(published.status, 200, published.text);
+  assert.deepEqual(published.json.manifest.download_hosts, ["storage.googleapis.com"]);
+  assert.deepEqual(bucket.get(`/feed-bucket/desktop-feed/profiles/acme/releases/${version}/${name}`), BYTES.dmg);
+  assert.ok(![...bucket.keys()].some((key) => key.includes("/drafts/")), "drafts are removed after the commit");
+  assert.equal(bucket.get("/feed-bucket/desktop-feed/profiles/acme/manifests/stable.json")!.toString("utf8"), published.text);
+
+  const read = { token: await world.session(world.ownerId, world.w1), profile: "acme" };
+  const asset = published.json.manifest.assets[0];
+  const streamed = await world.call(`${FEED}/assets/${asset.id}`, read);
+  assert.equal(streamed.status, 200);
+  assert.equal(streamed.text, BYTES.dmg.toString("utf8"));
+  const part = await world.call(`${FEED}/assets/${asset.id}`, { ...read, headers: { range: "bytes=1-3" } });
+  assert.equal(part.status, 206);
+  assert.equal(part.text, BYTES.dmg.subarray(1, 4).toString("utf8"));
+
+  const url = await world.call(`${FEED}/assets/${asset.id}/download-url`, { ...read, method: "POST" });
+  assert.equal(url.status, 200, url.text);
+  conforms("DesktopFeedDownloadUrl", url.json);
+  const signed = new URL(url.json.url);
+  assert.equal(signed.host, "storage.googleapis.com");
+  assert.equal(signed.pathname, `/feed-bucket/desktop-feed/profiles/acme/releases/${version}/${encodeURIComponent(name)}`);
+  assert.equal(signed.searchParams.get("X-Goog-Algorithm"), "GOOG4-RSA-SHA256");
+  assert.equal(signed.searchParams.get("X-Goog-Expires"), "300");
+  assert.equal(url.json.expires_at, "2026-11-07T10:05:00.000Z");
+
+  // Without signBlob, download-url fails and is logged; streaming still works.
+  signBlobDenied = true;
+  world.logs.length = 0;
+  const denied = await world.call(`${FEED}/assets/${asset.id}/download-url`, { ...read, method: "POST" });
+  assert.ok(denied.status >= 500, denied.text);
+  assert.ok(world.logs.some((entry) => entry.fields.operation === "presign" && entry.fields.storage === "gcs"), JSON.stringify(world.logs));
+  assert.equal((await world.call(`${FEED}/assets/${asset.id}`, read)).status, 200);
+  signBlobDenied = false;
+
+  // A tampered upload is rejected and leaves nothing behind.
+  const next = draftBody("Acme", "2026.11.1");
+  assert.equal((await world.call(`${FEED}/releases`, { token: publisher, profile: "acme", body: next })).status, 201);
+  const entry = next.expected_assets[0]!;
+  const tampered = await world.call(`${FEED}/releases/2026.11.1/assets/${entry.name}`, {
+    method: "PUT", token: publisher, profile: "acme", raw: Buffer.from(BYTES_BY_INDEX[0]!.map((byte) => byte ^ 1)),
+    headers: { "x-content-sha256": entry.sha256 },
+  });
+  assert.ok(tampered.status >= 400 && tampered.status < 500, tampered.text);
+  assert.ok(![...bucket.keys()].some((key) => key.includes("/drafts/2026.11.1/")), "a mismatched upload is not kept");
 });
 
 test("publish: a failed copy leaves a draft that a rerun completes", async (t) => {

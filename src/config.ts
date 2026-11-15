@@ -148,7 +148,8 @@ export type DesktopFeedSignerConfig =
 
 export type DesktopFeedStorageConfig =
   | { kind: "memory" }
-  | { kind: "s3"; bucket: string; region: string; prefix: string };
+  | { kind: "s3"; bucket: string; region: string; prefix: string }
+  | { kind: "gcs"; bucket: string; prefix: string };
 
 export type DesktopFeedConfig = {
   signer: DesktopFeedSignerConfig;
@@ -840,8 +841,22 @@ function feedProfileMap(env: Env, name: string): Record<string, unknown> {
 }
 
 /**
+ * The object key prefix. Unset, empty or only slashes: the default. Segments
+ * use only characters that encodeURIComponent and the SigV4/V4 canonical
+ * encodings agree on.
+ */
+function feedStoragePrefix(env: Env, name: string): string {
+  const prefix = (env[name] ?? "").trim().replace(/^\/+|\/+$/g, "") || "desktop-feed";
+  if (!/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(prefix)
+    || prefix.split("/").some((segment) => segment === "." || segment === "..")) {
+    throw new Error(`${name} must be [A-Za-z0-9._-] segments separated by /`);
+  }
+  return prefix;
+}
+
+/**
  * SELFHOST_DESKTOP_FEED_SIGNER (awskms | file | memory) and
- * SELFHOST_DESKTOP_FEED_STORAGE (s3 | memory) together turn the feed on;
+ * SELFHOST_DESKTOP_FEED_STORAGE (s3 | gcs | memory) together turn the feed on;
  * with neither set it is off. Setting only one is a configuration error, so a
  * half-configured feed never starts silently disabled.
  */
@@ -897,18 +912,18 @@ export function loadDesktopFeedConfig(env: Env = process.env): DesktopFeedConfig
     if (!region || !/^[a-z0-9-]+$/.test(region)) {
       throw new Error("SELFHOST_DESKTOP_FEED_S3_REGION (or AWS_REGION) is required for s3 feed storage");
     }
-    // Unset, empty or only slashes: the default. Segments use only characters
-    // that encodeURIComponent and SigV4 canonical encoding agree on.
-    const prefix = (env.SELFHOST_DESKTOP_FEED_S3_PREFIX ?? "").trim().replace(/^\/+|\/+$/g, "") || "desktop-feed";
-    if (!/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(prefix)
-      || prefix.split("/").some((segment) => segment === "." || segment === "..")) {
-      throw new Error("SELFHOST_DESKTOP_FEED_S3_PREFIX must be [A-Za-z0-9._-] segments separated by /");
+    storage = { kind: "s3", bucket, region, prefix: feedStoragePrefix(env, "SELFHOST_DESKTOP_FEED_S3_PREFIX") };
+  } else if (storageKind === "gcs") {
+    const bucket = required(env, "SELFHOST_DESKTOP_FEED_GCS_BUCKET");
+    // Requests and signed URLs are path-style on storage.googleapis.com, so dots are fine.
+    if (!/^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/.test(bucket) || bucket.includes("..")) {
+      throw new Error("SELFHOST_DESKTOP_FEED_GCS_BUCKET must be a GCS bucket name");
     }
-    storage = { kind: "s3", bucket, region, prefix };
+    storage = { kind: "gcs", bucket, prefix: feedStoragePrefix(env, "SELFHOST_DESKTOP_FEED_GCS_PREFIX") };
   } else if (storageKind === "memory") {
     storage = { kind: "memory" };
   } else {
-    throw new Error("SELFHOST_DESKTOP_FEED_STORAGE must be s3 or memory");
+    throw new Error("SELFHOST_DESKTOP_FEED_STORAGE must be s3, gcs or memory");
   }
   const publisherTokenHashes: Record<string, string[]> = {};
   if (env.SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES?.trim()) {

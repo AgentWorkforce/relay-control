@@ -1,4 +1,5 @@
-// Desktop feed object storage: one private bucket (SSE-S3 on every write), with
+// Desktop feed object storage: one private bucket (S3 with SSE-S3 on every
+// write, or GCS with its default encryption at rest), with
 // per-profile prefixes under <prefix>/profiles/<profile>/:
 //   drafts/<version>/<name>     uploads of a release not yet published
 //   releases/<version>/<name>   published assets, what downloads read
@@ -9,9 +10,10 @@
 import { createHash } from "node:crypto";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { DefaultAwsCredentialProvider, presignV4, signV4, type AwsCredentialProvider } from "../aws/sigv4.js";
+import { DefaultAwsCredentialProvider, encodeRfc3986, presignV4, sha256Hex, signV4, type AwsCredentialProvider } from "../aws/sigv4.js";
+import { MetadataGcpCredentialProvider, type GcpCredentialProvider } from "../gcp/credentials.js";
 
 export type ByteRange = { start: number; end: number };
 
@@ -23,7 +25,7 @@ export class StorageError extends Error {
 }
 
 export interface DesktopFeedStorage {
-  readonly kind: "memory" | "s3";
+  readonly kind: "memory" | "s3" | "gcs";
   /**
    * Store exactly `size` bytes whose sha256 is `sha256`. Rejects (and keeps
    * nothing) when the received bytes differ; the caller also checks.
@@ -204,5 +206,151 @@ export class S3DesktopFeedStorage implements DesktopFeedStorage {
       now,
       expiresSeconds,
     });
+  }
+}
+
+/** GCS bucket names: 3-63 of [a-z0-9._-], starting and ending alphanumeric (path-style, so dots are fine). */
+const GCS_BUCKET = /^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/;
+const GCS_HOST = "storage.googleapis.com";
+
+/**
+ * Google Cloud Storage through its XML API with a Bearer token from
+ * Application Default Credentials (src/gcp/credentials.ts: the metadata
+ * server, i.e. GKE Workload Identity). Uploads stream straight through; GCS
+ * cannot check a sha256 itself, so the bytes are hashed in flight and an
+ * object whose size or sha256 differs is deleted before put rejects. Objects
+ * are never public: downloads are streamed through this service or served by
+ * V4 signed URLs (GOOG4-RSA-SHA256) signed with IAM Credentials signBlob.
+ */
+export class GcsDesktopFeedStorage implements DesktopFeedStorage {
+  readonly kind = "gcs" as const;
+  constructor(
+    private readonly options: {
+      bucket: string;
+      prefix: string;
+      credentials?: GcpCredentialProvider;
+      /** Override for tests (requests go to this origin instead of https://storage.googleapis.com). */
+      endpoint?: string;
+    },
+  ) {
+    if (!GCS_BUCKET.test(options.bucket)) throw new Error("SELFHOST_DESKTOP_FEED_GCS_BUCKET is not a valid bucket name");
+  }
+  #credentials: GcpCredentialProvider | null = null;
+  private get credentials(): GcpCredentialProvider {
+    this.#credentials ??= this.options.credentials ?? new MetadataGcpCredentialProvider();
+    return this.#credentials;
+  }
+  /** /<bucket>/<prefix>/<key>, each segment RFC 3986 encoded (the V4 canonical form). */
+  private path(key: string): string {
+    const prefix = this.options.prefix.replace(/^\/+|\/+$/g, "");
+    const object = prefix ? `${prefix}/${key}` : key;
+    return `/${this.options.bucket}/${object.split("/").map(encodeRfc3986).join("/")}`;
+  }
+  url(key: string): URL {
+    const origin = this.options.endpoint?.replace(/\/+$/, "") ?? `https://${GCS_HOST}`;
+    return new URL(`${origin}${this.path(key)}`);
+  }
+  downloadHost(): string {
+    return GCS_HOST;
+  }
+  private async send(
+    method: "GET" | "PUT" | "DELETE",
+    key: string,
+    options: { body?: Readable; size?: number; range?: ByteRange; copySource?: string } = {},
+  ): Promise<IncomingMessage> {
+    const url = this.url(key);
+    const headers: Record<string, string> = { authorization: `Bearer ${await this.credentials.accessToken()}` };
+    if (options.size !== undefined) {
+      headers["content-length"] = String(options.size);
+      headers["content-type"] = "application/octet-stream";
+    } else if (method === "PUT") {
+      headers["content-length"] = "0";
+    }
+    if (options.copySource) headers["x-goog-copy-source"] = options.copySource;
+    if (options.range) headers.range = `bytes=${options.range.start}-${options.range.end}`;
+    const send = url.protocol === "https:" ? httpsRequest : httpRequest;
+    return new Promise<IncomingMessage>((resolve, reject) => {
+      const outgoing = send(url, { method, headers }, resolve);
+      outgoing.setTimeout(120_000, () => outgoing.destroy(new StorageError("GCS request timed out")));
+      outgoing.on("error", (error) => reject(error instanceof StorageError ? error : new StorageError("GCS request failed")));
+      if (options.body) {
+        pipeline(options.body, outgoing).catch((error) => {
+          outgoing.destroy();
+          reject(error instanceof StorageError ? error : new StorageError("upload stream failed"));
+        });
+      } else {
+        outgoing.end();
+      }
+    });
+  }
+  async put(key: string, body: Readable, size: number, sha256: string): Promise<void> {
+    const hash = createHash("sha256");
+    let received = 0;
+    const counted = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        received += chunk.length;
+        if (received > size) return callback(new StorageError("object is larger than its declared size"));
+        hash.update(chunk);
+        callback(null, chunk);
+      },
+    });
+    // pipeline destroys `counted` when the source fails, which fails the upload.
+    pipeline(body, counted).catch(() => undefined);
+    const response = await this.send("PUT", key, { body: counted, size });
+    response.resume();
+    if (response.statusCode !== 200) throw new StorageError(`GCS upload failed: ${response.statusCode}`, response.statusCode);
+    if (received !== size || hash.digest("hex") !== sha256) {
+      await this.delete(key).catch(() => undefined);
+      throw new StorageError("object bytes do not match the declared size and sha256");
+    }
+  }
+  async copy(sourceKey: string, destinationKey: string): Promise<void> {
+    const response = await this.send("PUT", destinationKey, { copySource: this.path(sourceKey) });
+    // Like S3, a copy can answer 200 and carry its error in the body.
+    const chunks: Buffer[] = [];
+    for await (const chunk of response) chunks.push(Buffer.from(chunk as Buffer));
+    if (response.statusCode !== 200 || Buffer.concat(chunks).includes("<Error>")) {
+      throw new StorageError(`GCS copy failed: ${response.statusCode}`, response.statusCode);
+    }
+  }
+  async get(key: string, range?: ByteRange): Promise<Readable | null> {
+    const response = await this.send("GET", key, { range });
+    if (response.statusCode === 404) {
+      response.resume();
+      return null;
+    }
+    if (response.statusCode !== 200 && response.statusCode !== 206) {
+      response.resume();
+      throw new StorageError(`GCS download failed: ${response.statusCode}`, response.statusCode);
+    }
+    return response;
+  }
+  async delete(key: string): Promise<void> {
+    const response = await this.send("DELETE", key);
+    response.resume();
+    if (response.statusCode !== 204 && response.statusCode !== 200 && response.statusCode !== 404) {
+      throw new StorageError(`GCS delete failed: ${response.statusCode}`, response.statusCode);
+    }
+  }
+  /** A V4 signed GET on https://storage.googleapis.com, signed by the service account through signBlob. */
+  async presignGet(key: string, expiresSeconds: number, now: Date): Promise<URL> {
+    const email = await this.credentials.serviceAccountEmail();
+    const datetime = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
+    const scope = `${datetime.slice(0, 8)}/auto/storage/goog4_request`;
+    const path = this.path(key);
+    const query = [
+      ["X-Goog-Algorithm", "GOOG4-RSA-SHA256"],
+      ["X-Goog-Credential", `${email}/${scope}`],
+      ["X-Goog-Date", datetime],
+      ["X-Goog-Expires", String(expiresSeconds)],
+      ["X-Goog-SignedHeaders", "host"],
+    ]
+      .map(([name, value]) => `${encodeRfc3986(name!)}=${encodeRfc3986(value!)}`)
+      .sort()
+      .join("&");
+    const canonicalRequest = ["GET", path, query, `host:${GCS_HOST}`, "", "host", "UNSIGNED-PAYLOAD"].join("\n");
+    const stringToSign = ["GOOG4-RSA-SHA256", datetime, scope, sha256Hex(canonicalRequest)].join("\n");
+    const signature = (await this.credentials.signBlob(Buffer.from(stringToSign))).toString("hex");
+    return new URL(`https://${GCS_HOST}${path}?${query}&X-Goog-Signature=${signature}`);
   }
 }
