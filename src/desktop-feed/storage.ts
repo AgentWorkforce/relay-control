@@ -7,7 +7,7 @@
 // There is deliberately no listing operation. Postgres is the source of truth
 // for envelopes (desktop_feed_releases.envelope, served byte-for-byte);
 // the manifests/ objects are a copy written after each publish commits.
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { Readable, Transform } from "node:stream";
@@ -216,9 +216,8 @@ const GCS_HOST = "storage.googleapis.com";
 /**
  * Google Cloud Storage through its XML API with a Bearer token from
  * Application Default Credentials (src/gcp/credentials.ts: the metadata
- * server, i.e. GKE Workload Identity). Uploads stream straight through; GCS
- * cannot check a sha256 itself, so the bytes are hashed in flight and an
- * object whose size or sha256 differs is deleted before put rejects. Objects
+ * server, i.e. GKE Workload Identity). Uploads stream to a staging object,
+ * hashed in flight, and only verified bytes are copied to the key. Objects
  * are never public: downloads are streamed through this service or served by
  * V4 signed URLs (GOOG4-RSA-SHA256) signed with IAM Credentials signBlob.
  */
@@ -283,7 +282,15 @@ export class GcsDesktopFeedStorage implements DesktopFeedStorage {
       }
     });
   }
+  /**
+   * GCS cannot check a sha256 before it stores the bytes, so an upload is
+   * staged at its own temporary object beside the key, verified, and only then
+   * copied over the key and the staging object deleted. A concurrent upload
+   * with other bytes therefore never overwrites or deletes a good object, as
+   * with S3, which refuses mismatched bytes itself.
+   */
   async put(key: string, body: Readable, size: number, sha256: string): Promise<void> {
+    const staging = `${key}.upload-${randomBytes(12).toString("hex")}`;
     const hash = createHash("sha256");
     let received = 0;
     const counted = new Transform({
@@ -296,12 +303,16 @@ export class GcsDesktopFeedStorage implements DesktopFeedStorage {
     });
     // pipeline destroys `counted` when the source fails, which fails the upload.
     pipeline(body, counted).catch(() => undefined);
-    const response = await this.send("PUT", key, { body: counted, size });
+    const response = await this.send("PUT", staging, { body: counted, size });
     response.resume();
     if (response.statusCode !== 200) throw new StorageError(`GCS upload failed: ${response.statusCode}`, response.statusCode);
-    if (received !== size || hash.digest("hex") !== sha256) {
-      await this.delete(key).catch(() => undefined);
-      throw new StorageError("object bytes do not match the declared size and sha256");
+    try {
+      if (received !== size || hash.digest("hex") !== sha256) {
+        throw new StorageError("object bytes do not match the declared size and sha256");
+      }
+      await this.copy(staging, key);
+    } finally {
+      await this.delete(staging).catch(() => undefined);
     }
   }
   async copy(sourceKey: string, destinationKey: string): Promise<void> {

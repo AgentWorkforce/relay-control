@@ -1179,6 +1179,7 @@ test("gcs storage: publish, stream and a signed download URL against a fake GCS 
   });
   assert.ok(tampered.status >= 400 && tampered.status < 500, tampered.text);
   assert.ok(![...bucket.keys()].some((key) => key.includes("/drafts/2026.11.1/")), "a mismatched upload is not kept");
+  assert.ok(![...bucket.keys()].some((key) => key.includes(".upload-")), "no staging object is left behind");
 });
 
 test("publish: a failed copy leaves a draft that a rerun completes", async (t) => {

@@ -73,9 +73,15 @@ test("GCS storage: streamed PUT, ranged GET, DELETE through the XML API with a B
   const key = "profiles/acme/releases/2026.11.0/Acme-2026.11.0-arm64.dmg";
 
   await storage.put(key, Readable.from([bytes.subarray(0, 5), bytes.subarray(5)]), bytes.length, sha);
+  // Staged, verified, copied over the key, staging deleted.
+  assert.deepEqual(gcs.seen.map((seen) => seen.method), ["PUT", "PUT", "DELETE"]);
   const put = gcs.seen[0]!;
   assert.equal(put.method, "PUT");
-  assert.equal(put.path, `/feed-bucket/desktop-feed/${key}`);
+  const staging = put.path;
+  assert.match(staging, new RegExp(`^/feed-bucket/desktop-feed/${key.replace(/\./g, "\\.")}\\.upload-[0-9a-f]{24}$`));
+  assert.equal(gcs.seen[1]!.path, `/feed-bucket/desktop-feed/${key}`);
+  assert.equal(gcs.seen[1]!.headers["x-goog-copy-source"], staging);
+  assert.equal(gcs.seen[2]!.path, staging);
   assert.deepEqual(put.body, bytes);
   assert.equal(put.headers["content-length"], String(bytes.length));
   assert.equal(put.headers["content-type"], "application/octet-stream");
@@ -88,7 +94,7 @@ test("GCS storage: streamed PUT, ranged GET, DELETE through the XML API with a B
   const chunks: Buffer[] = [];
   for await (const chunk of ranged) chunks.push(Buffer.from(chunk));
   assert.deepEqual(Buffer.concat(chunks), bytes.subarray(2, 6));
-  const get = gcs.seen[1]!;
+  const get = gcs.seen[3]!;
   assert.equal(get.method, "GET");
   assert.equal(get.headers.range, "bytes=2-5");
   assert.equal(get.headers.authorization, "Bearer ya29.feed-test-token");
@@ -103,7 +109,7 @@ test("GCS storage: streamed PUT, ranged GET, DELETE through the XML API with a B
   await assert.rejects(storage.put(key, Readable.from([bytes]), bytes.length, sha), StorageError);
 });
 
-test("GCS storage: an upload whose sha256 differs is deleted and rejected", async (t) => {
+test("GCS storage: an upload whose sha256 differs never touches the key", async (t) => {
   const gcs = await fakeServer(t, (seen) => ({ status: seen.method === "DELETE" ? 204 : 200 }));
   const storage = new GcsDesktopFeedStorage({
     bucket: "feed-bucket", prefix: "desktop-feed", credentials: FAKE_CREDENTIALS, endpoint: gcs.origin,
@@ -111,8 +117,12 @@ test("GCS storage: an upload whose sha256 differs is deleted and rejected", asyn
   const bytes = Buffer.from("tampered bytes");
   const key = "profiles/acme/drafts/2026.11.0/a.dmg";
   await assert.rejects(storage.put(key, Readable.from([bytes]), bytes.length, "0".repeat(64)), /sha256/);
+  // Only the staging object is written and deleted; the key is neither replaced nor removed.
   assert.deepEqual(gcs.seen.map((seen) => seen.method), ["PUT", "DELETE"]);
-  assert.equal(gcs.seen[1]!.path, `/feed-bucket/desktop-feed/${key}`);
+  assert.match(gcs.seen[0]!.path, /\.upload-[0-9a-f]{24}$/);
+  assert.equal(gcs.seen[1]!.path, gcs.seen[0]!.path);
+  assert.ok(gcs.seen.every((seen) => seen.path !== `/feed-bucket/desktop-feed/${key}`));
+  assert.equal(gcs.seen[0]!.headers["x-goog-copy-source"], undefined);
 });
 
 test("GCS storage: copy is server-side and sees an error inside a 200", async (t) => {

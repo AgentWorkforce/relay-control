@@ -58,9 +58,12 @@ or Cloud Run. Static service-account keys are not supported:
 are cached until a minute before expiry. Requests use the XML API
 (`https://storage.googleapis.com/<bucket>/<object>`) with a Bearer token:
 streamed `PUT`, server-side copy (`x-goog-copy-source`), ranged `GET` and
-`DELETE`; there is no listing. GCS cannot verify a sha256 on upload, so the
-service hashes the bytes in flight and deletes an object whose size or
-sha256 differs before the upload fails. Objects are encrypted at rest by GCS
+`DELETE`; there is no listing. GCS cannot verify a sha256 on upload, so each
+upload streams to its own staging object (`<key>.upload-<random>`, beside the
+draft key), hashed in flight; only verified bytes are copied to the draft key,
+and the staging object is deleted either way. A concurrent upload with other
+bytes therefore never replaces or removes a good draft object. A process that
+dies mid-upload can leave a staging object under `drafts/`. Objects are encrypted at rest by GCS
 (Google-managed keys, or the bucket's default CMEK). The Google service
 account needs:
 
