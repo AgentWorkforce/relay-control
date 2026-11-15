@@ -122,7 +122,7 @@ export class FileDesktopFeedSigner implements DesktopFeedSigner {
       let bytes: Buffer | undefined;
       try {
         // Resolve projected Secret symlinks, then forbid a symlink swap at open.
-        fd = openSync(realpathSync(path), constants.O_RDONLY | constants.O_NOFOLLOW);
+        fd = openSync(realpathSync(path), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         const stat = fstatSync(fd);
         if (!stat.isFile() || stat.size > 16384 || (stat.mode & 0o077) !== 0
           || (stat.uid !== process.getuid?.() && stat.uid !== 0)) throw new Error("unsafe key file");
