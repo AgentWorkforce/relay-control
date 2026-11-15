@@ -2,7 +2,9 @@
 
 After `send_relay_message`, call `get_relay_message_status` with its
 `message_id`. Both self-hosted and Cloud MCP expose the same arguments:
-`message_id` and optional `as` for your own sending participant. OAuth uses
+`message_id`, optional `as` for your own sending participant, and optional
+`as_person` for an explicit Cloud person send (refused on self-hosted sites).
+OAuth uses
 only its approved agent. A receipt lookup never uses a workspace key.
 
 The response includes `message_id`, `you`, `confirmation`, `deliveries` and
