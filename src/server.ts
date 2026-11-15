@@ -31,6 +31,7 @@ import { buildProviderProbes } from "./providers/probes.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
 import { mcpOAuthActiveNotice } from "./mcp/oauth/routes.js";
+import { GrokRoutines } from "./mcp/grok-routines.js";
 import { createRelaycastClient } from "./messaging/relaycast.js";
 import { loadAnalyticsConfig } from "./analytics/config.js";
 import {
@@ -135,6 +136,11 @@ const mcpOAuthTeardown = new McpOAuthTeardown({
   database,keyring:config.encryptionKeyring,
   client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch()}),
 });
+const grokRoutines = new GrokRoutines({
+  database, keyring:config.encryptionKeyring,
+  client:createRelaycastClient({internalOrigin:config.relaycastUrl}),
+  publicOrigin:new URL(config.publicBaseUrl).origin,tenancyMode:store.tenancy,
+});
 // Factory sessions: routes 404 and the worker stays off unless SELFHOST_FACTORY_ENABLED.
 const factory = createFactoryModule({
   config,
@@ -170,6 +176,7 @@ const server = createServer(createApp({
   providerProbes: buildProviderProbes({ factory, amp, config }),
   analytics: { port: analytics, config: analyticsConfig },
   mcpOAuthTeardown,
+  grokRoutines,
 }));
 const bootstrapAbort = new AbortController();
 // Worker queue streams are long-lived SSE responses.
@@ -185,6 +192,7 @@ async function start(): Promise<void> {
   if(mcpOAuthActive(config)) {
     console.log("[selfhost-api] hosted MCP OAuth active", mcpOAuthActiveNotice());
     mcpOAuthTeardown.start();
+    grokRoutines.start();
   }
   else if(config.mcpOAuth?.unavailable) console.warn("[selfhost-api] hosted MCP OAuth unavailable", { reason: config.mcpOAuth.unavailable.reason, detail: config.mcpOAuth.unavailable.detail });
   factory.start();
@@ -248,6 +256,7 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   await capyCleanup.stop();
   await eventsShimSweeper?.stop();
   await mcpOAuthTeardown.stop();
+  await grokRoutines.stop();
   await factory.stop();
   identity.stop();
   await emitStopping(analytics, signal, analyticsConfig.shutdownDeadlineMs);

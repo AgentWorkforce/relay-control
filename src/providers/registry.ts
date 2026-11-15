@@ -117,16 +117,16 @@ export const PROVIDERS: readonly Readonly<ProviderDescriptor>[] = Object.freeze(
     id: "grok-bot",
     product: "Grok Bot",
     family: "assistant_connector",
-    transport: "grok-bot routine webhook and polling through the events group",
+    transport: "Grok Bot routine webhook wake-ups through the self-hosted messaging MCP",
     setup: "oauth_grant",
     history: {
-      kind: "redacted_mcp_activity",
-      source: "grok-bot",
-      coverage: "continuous",
-      notes: "plus a separate passive bounded local transcript-tail parser owned by RelayHistory",
+      kind: "none",
+      source: null,
+      coverage: "n_a",
+      notes: "Webhook wake-ups do not synchronize Grok transcripts or Cloud's redacted MCP activity history.",
     },
     outbound: "relay:mcp",
-    mcpGroups: ["events"],
+    mcpGroups: ["grok_routines"],
   }),
 ]);
 

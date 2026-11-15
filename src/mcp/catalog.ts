@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ProviderStatus } from "../providers/registry.js";
+import { GROK_ROUTINE_TOOLS } from "./grok-routine.js";
 
 /**
  * The shared-sessions MCP tool catalog, ported from Cloud's
@@ -52,7 +53,7 @@ const CAPY_SPAWN_TOOLS = ["list_capy_projects", "spawn_capy_thread", "get_capy_t
 export const SHARED_SESSION_READ_TOOLS = ["open_shared_sessions", "search_shared_sessions", "get_shared_session",
   "get_shared_session_context", "list_session_timings", "list_session_summaries", "get_session_summary"] as const;
 const SCREEN_TOOLS = ["show_ui", "show_ui_guide"] as const;
-const EVENT_TOOLS = ["get_event", "get_recent_events", "connect_grok_bot_routine", "disconnect_grok_bot_routine",
+const EVENT_TOOLS = ["get_event", "get_recent_events",
   "connect_muse_polling", "disconnect_muse_polling",
   "answer_reply_question", "relay_events_status", "use_relay_identity"] as const;
 const INBOX_APP_TOOLS = ["relay_inbox", "relay_inbox_tab", "relay_inbox_refresh", "relay_inbox_conversation"] as const;
@@ -63,7 +64,7 @@ export const CAPABILITY_DISCOVERY_TOOL = "describe_capabilities";
 
 export type ToolGroupId =
   | "shared_session_reads" | "team_activity" | "relay_messaging" | "hosted_launch" | "replicas" | "amp" | "factory" | "capy_binding"
-  | "customer_support" | "capy_launch" | "connect" | "events" | "relay_inbox_app" | "screens" | "events_settings" | "capability_discovery";
+  | "customer_support" | "capy_launch" | "connect" | "events" | "grok_routines" | "relay_inbox_app" | "screens" | "events_settings" | "capability_discovery";
 
 type GroupDefinition = {
   title: string;
@@ -85,7 +86,8 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
   capy_binding: { title: "Capy thread binding", tools: CAPY_BINDING_TOOLS },
   capy_launch: { title: "Capy thread launches", tools: CAPY_SPAWN_TOOLS },
   connect: { title: "Relay Connect rooms", tools: CONNECT_TOOLS },
-  events: { title: "Agent Relay events and Grok Bot routines", tools: EVENT_TOOLS, relayEventsOnly: true },
+  events: { title: "Agent Relay events", tools: EVENT_TOOLS, relayEventsOnly: true },
+  grok_routines: { title: "Self-hosted Grok Bot webhook wake-ups", tools: GROK_ROUTINE_TOOLS },
   relay_inbox_app: { title: "Relay inbox app", tools: INBOX_APP_TOOLS, relayEventsOnly: true },
   screens: { title: "Live screens (show_ui)", tools: SCREEN_TOOLS },
   events_settings: { title: "Event handling settings", tools: EVENTS_SETTINGS_TOOLS, relayEventsOnly: true },
@@ -95,7 +97,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; launch?: boolean; capyPermits?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean } = {}): ToolPlanEntry[] {
   const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relay_messaging", "customer_support"];
   // Launch tools exist only when SELFHOST_FEATURES selects launch; role and
   // connection kind are checked on every call.
@@ -105,6 +107,7 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; laun
   // Factory tools exist only when SELFHOST_FACTORY_ENABLED is on.
   if (options.factory) groups.push("factory");
   if (options.capyPermits) groups.push("capy_binding");
+  if (options.grokRoutines) groups.push("grok_routines");
   groups.push("capability_discovery");
   return groups.map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
 }
@@ -171,12 +174,13 @@ export function describeCapabilities(input: {
   launch?: boolean;
   capyPermits?: boolean;
   customerSupport?: boolean;
+  grokRoutines?: boolean;
   providers: ProviderStatus[];
 }): CapabilityReport {
   const launchRole = input.role === "owner" || input.role === "admin";
   const canLaunch = Boolean(input.launch) && input.authMode !== "oauth" && launchRole;
   const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, launch: input.launch && input.authMode !== "oauth",
-    capyPermits: input.capyPermits && input.authMode === "oauth" })
+    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines })
     .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
     const definition = TOOL_GROUPS[id];
@@ -197,6 +201,12 @@ export function describeCapabilities(input: {
     }
     if (item) return { ...base, status: "available", tools: [...item.tools], ...(id === "customer_support"
       ? { call_requirements: "Available to all signed-in customers. Current credentials and workspace membership are checked before sending and before returning an answer." } : {}) };
+    if (id === "grok_routines") return { ...base, status: "unavailable", tools: [...definition.tools],
+      reason: "Webhook wake-ups require a Grok Bot OAuth connection on this self-hosted server.",
+      how_to_enable: "Connect Grok Bot to this server's /cloud/api/v1/mcp/shared-sessions endpoint, then call connect_grok_bot_routine." };
+    if (id === "events") return { ...base, status: "unavailable", tools: [...definition.tools],
+      reason: "The MCP Events endpoint is not available here. Self-hosted Grok Bot webhook wake-ups use the grok_routines group on this connection.",
+      how_to_enable: "Use connect_grok_bot_routine from a Grok Bot OAuth connection to this server's /cloud/api/v1/mcp/shared-sessions endpoint." };
     if (id === "hosted_launch" && input.launch && input.authMode === "oauth") {
       return { ...base, status: "unavailable", tools: [...definition.tools],
         reason: "Agent launches are not available through an OAuth MCP connection on this self-hosted site.",

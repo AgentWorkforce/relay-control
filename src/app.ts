@@ -6,6 +6,7 @@ import { connectorKind } from "./mcp/oauth/connector-kind.js";
 import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
+import { GrokRoutines } from "./mcp/grok-routines.js";
 import { retiringIdentity } from "./mcp/oauth/retirement.js";
 import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -382,6 +383,7 @@ export function createApp(input: {
   amp?: AmpModule;
   /** Server-owned worker; absent tests use the same on-demand cleanup without a timer. */
   mcpOAuthTeardown?: McpOAuthTeardown;
+  grokRoutines?: GrokRoutines;
   /**
    * Runtime probes for the provider modules this build contains. Unset (the
    * default) means no provider module: each reports implemented, configured
@@ -531,7 +533,12 @@ export function createApp(input: {
     database:store.database,keyring:config.encryptionKeyring,
     client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch(input.messagingFetch)}),now:input.now,
   }) : null;
+  const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines({
+      database:store.database,keyring:config.encryptionKeyring,client:oauthRelay,
+      publicOrigin:new URL(config.publicBaseUrl).origin,tenancyMode:store.tenancy,now:input.now,
+    }) : undefined;
   const mcpOAuth = createMcpOAuthHttpModule({
+    grokRoutines,
     config,mountedResources:["/mcp","/api/v1/mcp/shared-sessions"],
     clientAddress:request=>limiterKey(clientIp(request)),
     createStore:({protocol,issuer})=>new McpOAuthStore(store.database,{
@@ -576,6 +583,7 @@ export function createApp(input: {
     ...(input.capy ? { capy: input.capy } : {}),
     ...(features.launch ? { launch: true } : {}),
     ...(mcpOAuth.store ? {oauthSessions:mcpOAuth.store.sessions} : {}),
+    grokRoutines,
     ...(input.now ? { now: input.now } : {}),
   });
   const desktopMcpCredentials = new DesktopMcpCredentials(store.database);

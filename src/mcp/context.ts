@@ -14,6 +14,7 @@ import type { McpAuthMode, WorkspaceRole } from "./catalog.js";
 import type { DesktopCallContext } from "./desktop-call.js";
 import type { McpOAuthConnection } from "./oauth/admission.js";
 import type { CustomerSupportConnection } from "./customer-support.js";
+import type { GrokRoutines } from "./grok-routines.js";
 
 export type McpWorkspace = {
   id: string;
@@ -39,6 +40,7 @@ export type McpContext = {
   desktopCall: DesktopCallContext;
   /** Present only after the MCP-only OAuth resolver admits its exact resource. */
   oauth?: McpOAuthConnection;
+  grokRoutines?: GrokRoutines;
   customerSupport?: CustomerSupportConnection;
   /** GET a workspace-scoped RelayHistory path (with its query); throws SharedSessionsToolError. */
   readHistory: (path: string, options?: { timeoutMessage?: string }) => Promise<unknown>;
