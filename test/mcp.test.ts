@@ -293,6 +293,7 @@ test("initialize advertises the self-host server and its tools on both paths", a
       "check_relay_inbox",
       "describe_capabilities",
       "get_relay_agent_card",
+      "get_relay_message_status",
       "get_session_summary",
       "get_shared_session",
       "get_shared_session_context",
@@ -436,7 +437,7 @@ test("describe_capabilities reports the served groups and the bound workspace", 
   assert.deepEqual(available.sort(), ["capability_discovery", "relay_messaging", "shared_session_reads", "team_activity"]);
   const messaging = data.groups.find((group: any) => group.id === "relay_messaging");
   assert.equal(messaging.status, "available");
-  assert.equal(messaging.tools.length, 14);
+  assert.equal(messaging.tools.length, 15);
   assert.deepEqual(messaging.tools.slice(0, 3), ["list_relay_agents", "get_relay_agent_card", "set_relay_agent_card"]);
   assert.equal(messaging.reason, undefined);
 });
@@ -824,6 +825,9 @@ test("send_relay_message auto-joins, sends, replies, and reads the conversation"
   assert.match(data.from, /^owner-mcp-[0-9a-f]{8}$/);
   assert.equal(data.to, "peer-bot");
   assert.equal(data.delivery, "queued_unconfirmed");
+  const receipt = structured(await client.callTool({ name: "get_relay_message_status", arguments: { message_id: data.message_id } }));
+  assert.equal(receipt.confirmation, "unavailable");
+  assert.deepEqual(receipt.deliveries, []);
   assert.match(data.idempotency_key, /^[0-9a-f]{32}$/);
   const peerInbox = env.relay.world.deliveries.filter(row => row.agent === "peer-bot");
   assert.deepEqual(peerInbox.map(row => row.message.text), ["hello peer"]);

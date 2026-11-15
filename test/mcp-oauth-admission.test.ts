@@ -24,6 +24,120 @@ import { McpOAuthStore } from "../src/mcp/oauth/store.js";
 import { MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS,McpOAuthTeardown,mcpOAuthTeardownBackoffMs,mcpOAuthTeardownFetch } from "../src/mcp/oauth/teardown.js";
 import { lockOrganization,lockUser } from "../src/tenancy.js";
 import type { RelaycastClient } from "../src/messaging/relaycast.js";
+import { relaySpawnService, relaySpawnDeps, spawnStore, type SpawnOwner } from "../src/mcp/relay-spawn.js";
+import { NO_FEATURES } from "../src/features.js";
+
+test("OAuth launches use only the approved immutable actor and recheck role and revocation", async t => {
+  const f = await relayFixture(t);
+  await assert.rejects(f.service.withSpawnActor(async () => assert.fail("member launched")), /owners and admins/);
+  await f.database.query("UPDATE organization_memberships SET role='admin' WHERE user_id=$1", [f.owner.userId]);
+  const actor = await f.service.withSpawnActor(async actor => actor);
+  assert.equal(actor.name, "approved-agent");
+  assert.equal(f.connection.access.agentRemoteId, actor.id);
+  assert.equal([...f.world.agents.values()].some(agent => agent.name.startsWith("launcher-")), false);
+  await f.database.query("UPDATE organization_memberships SET role='member' WHERE user_id=$1", [f.owner.userId]);
+  await assert.rejects(f.service.withSpawnActor(async () => assert.fail("demoted launched")), /owners and admins/);
+  await f.database.query("UPDATE mcp_oauth_grants SET revoked_at=now() WHERE id=$1", [f.owner.grantId]);
+  await assert.rejects(f.service.withSpawnActor(async () => assert.fail("revoked launched")), /no longer has access/);
+});
+
+test("OAuth launch journals cannot be recovered through a different grant", async t => {
+  const f = await relayFixture(t);
+  await f.database.query("UPDATE organization_memberships SET role='admin' WHERE user_id=$1", [f.owner.userId]);
+  const authorities: string[] = [];
+  const actor = await f.service.withSpawnActor(async actor => actor);
+  const store = spawnStore(f.database);
+  let owned: SpawnOwner | undefined;
+  const find = store.find;
+  store.find = async owner => { owned = owner; authorities.push(owner.authorityHash); return null; };
+  const service = relaySpawnService(f.context, { client: f.context.relay.client, workspaceKey: "rk_fake", store,
+    owners: async () => new Map(), withActor: fn => f.service.withSpawnActor(fn) });
+  await assert.rejects(service.status(randomUUID()), /not owned by this connection/);
+  store.find = find;
+  const id = randomUUID();
+  await store.reserve({ ...owned!, id, idempotencyHash: "a".repeat(64), requestHash: "b".repeat(64), agentName: "worker",
+    cli: "codex", nodeId: "broker", state: "failed", invocationId: null, workerId: null, workerAddress: null,
+    releaseInvocationId: null, taskUnconfirmed: false, revision: 0, audit: [] });
+  const reconnected = relaySpawnService({ ...f.context, relay: { ...f.context.relay, sessionId: undefined } }, {
+    client: f.context.relay.client, workspaceKey: "rk_fake", store, owners: async () => new Map(), withActor: fn => f.service.withSpawnActor(fn) });
+  assert.equal((await reconnected.status(id)).status, "failed");
+  assert.equal((await reconnected.release(id)).status, "failed");
+  // Same person, session and actor: a newly consented grant still has a distinct authority.
+  const first = f.connection.access.grantId;
+  f.connection.access.grantId = randomUUID();
+  const second = relaySpawnService(f.context, { client: f.context.relay.client, workspaceKey: "rk_fake", store,
+    owners: async () => new Map(), withActor: async fn => fn(actor) });
+  await assert.rejects(second.status(id), /not owned by this connection/);
+  f.connection.access.grantId = first;
+});
+
+test("OAuth disconnect retains the launcher until its active launch journal is drained", async t => {
+  const f = await relayFixture(t);
+  await f.service.join({});
+  const actor = f.connection.access.agentRemoteId!;
+  await f.database.query(`INSERT INTO relay_spawns
+    (id,workspace_id,user_id,authority_hash,relaycast_workspace_id,actor_id,idempotency_hash,request_hash,agent_name,cli,node_id,state,audit)
+    VALUES($1,$2,$3,'authority','fake-workspace',$4,'key','request','worker','codex','broker','accepted','[]'::jsonb)`,
+    [randomUUID(), f.owner.workspaceId, f.owner.userId, actor]);
+  await f.oauth.revokeMcpOAuthGrant(f.owner.grantId, "test-disconnect");
+  assert.equal((await f.teardown.drain()).pending, 1);
+  assert.equal((await f.database.query("SELECT 1 FROM hosted_relay_participants WHERE agent_remote_id=$1", [actor])).rows.length, 1);
+  assert.ok([...f.world.agents.values()].some(agent => agent.id === actor));
+  await assert.rejects(f.service.withSpawnActor(async () => assert.fail("revoked launch")), /no longer has access/);
+  await f.database.query("UPDATE relay_spawns SET state='released' WHERE actor_id=$1", [actor]);
+  f.advance();
+  assert.equal((await f.teardown.drain()).completed, 1);
+  assert.equal((await f.database.query("SELECT 1 FROM hosted_relay_participants WHERE agent_remote_id=$1", [actor])).rows.length, 0);
+});
+
+test("OAuth revocation during target discovery prevents journaling or dispatch", async t => {
+  const f = await relayFixture(t);
+  await f.database.query("UPDATE organization_memberships SET role='admin' WHERE user_id=$1", [f.owner.userId]);
+  const deps = relaySpawnDeps(f.context);
+  let dispatched = false;
+  deps.client.listSpawnTargets = async () => {
+    await f.oauth.revokeMcpOAuthGrant(f.owner.grantId, "revoke-during-discovery");
+    return [{ id: "broker", name: "broker", live: true, handlersLive: true, stale: false, activeAgents: 0, reservedAgents: 0,
+      maxAgents: 0, capabilities: ["spawn:codex"], raw: { capabilities: [{ name: "spawn:codex", metadata: { configured: { node_kind: "broker" } } }] } }];
+  };
+  deps.client.spawnRelayAgent = async () => { dispatched = true; assert.fail("revoked grant dispatched"); };
+  const service = relaySpawnService(f.context, deps);
+  await assert.rejects(service.spawn({ name: "worker", cli: "codex", target_node: "broker", task: "test", idempotency_key: "test-launch-key" }, 1), /no longer has access/);
+  assert.equal(dispatched, false);
+  assert.equal((await f.database.query("SELECT 1 FROM relay_spawns")).rows.length, 0);
+});
+
+test("OAuth capabilities register launch tools when enabled and follow the consenting person's role", async t => {
+  const f = await relayFixture(t);
+  const store = new ControlPlaneStore(f.database, KEYRING, 0, { tenancy: "multi" });
+  const server = createServer(createApp({ config: appConfig(), store, messagingFetch: f.fetchImpl, features: { ...NO_FEATURES, launch: true } }));
+  const base = await listen(server); t.after(() => close(server));
+  const client = new Client({ name: "oauth-capabilities", version: "1" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(base + SHARED), {
+    requestInit: { headers: { authorization: "Bearer " + f.pair.accessToken } },
+  }));
+  t.after(() => client.close());
+  for (const role of ["admin", "member"] as const) {
+    await f.database.query("UPDATE organization_memberships SET role=$1 WHERE user_id=$2", [role, f.owner.userId]);
+    assert.ok((await client.listTools()).tools.some(tool => tool.name === "spawn_relay_agent"));
+    const report = (await client.callTool({ name: "describe_capabilities", arguments: {} })).structuredContent as any;
+    assert.equal(report.workspace.can_launch, role === "admin");
+    assert.equal(report.groups.find((group: any) => group.id === "hosted_launch").status, role === "admin" ? "available" : "restricted");
+  }
+});
+
+test("sessionless OAuth launches do not deduplicate distinct requests by recycled request id", async t => {
+  const f = await relayFixture(t);
+  await f.database.query("UPDATE organization_memberships SET role='admin' WHERE user_id=$1", [f.owner.userId]);
+  f.world.nodes.set("rk_fake", [{ id: "broker", name: "broker", live: true, handlers_live: true, max_agents: 0, active_agents: 0,
+    reserved_agents: 0, capabilities: [{ name: "spawn:codex", metadata: { configured: { node_kind: "broker" } } }] }]);
+  const context = { ...f.context, relay: { ...f.context.relay, sessionId: undefined } };
+  const service = relaySpawnService(context, relaySpawnDeps(context));
+  const first = await service.spawn({ name: "worker-1", cli: "codex", target_node: "broker", task: "first" }, 1);
+  const second = await service.spawn({ name: "worker-2", cli: "codex", target_node: "broker", task: "second" }, 1);
+  assert.notEqual(first.spawn_id, second.spawn_id);
+  assert.equal((await f.database.query("SELECT 1 FROM relay_spawns")).rows.length, 2);
+});
 
 const ORIGIN="https://relay.example.test",SHARED="/api/v1/mcp/shared-sessions";
 const RESOURCE=ORIGIN+"/cloud"+SHARED;

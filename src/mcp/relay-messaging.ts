@@ -84,6 +84,11 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
   }, (input, extra) => run(service => service.send({ ...input, idempotency_key: normalizeIdempotencyKey(input.idempotency_key) },
     directMessageKey(sessionId, extra.requestId)), "send"));
 
+  server.registerTool("get_relay_message_status", {
+    description: "Look up delivery receipts and read markers for a message sent by your acting relay identity, using the message_id returned when sending. Only your own outgoing messages. delivered means software accepted it; consumed is acknowledged, not human reading. Older engines may return confirmation unavailable; never resend just for that.",
+    inputSchema: { message_id: z.string().regex(/^[0-9]{1,30}$/), as, as_person: z.boolean().default(false).describe("Select your person identity for a message sent as_person. Not available on this self-hosted site; omit it.") }, annotations,
+  }, input => run(service => service.messageStatus(input)));
+
   server.registerTool("read_relay_conversation", {
     description: "Read recent messages and thread IDs in your hosted participant's DM with a workspace agent. Cannot read other people's conversations.",
     inputSchema: { agent: z.string().trim().min(1).max(512), as, before: z.string().regex(/^[0-9]{1,30}$/).optional(), limit: z.number().int().min(1).max(30).default(20) },

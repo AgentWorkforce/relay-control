@@ -1,3 +1,5 @@
+import { parseMessageDeliveries, type MessageDelivery } from "./delivery-status.js";
+
 export class RelaycastCallError extends Error {
   readonly code: string | null;
   /** True when the request may have been accepted and the outcome was not confirmed. */
@@ -604,6 +606,18 @@ export function createRelaycastClient(input: {
       if (!data) return null;
       if (text(data.id) !== messageId) throw new RelaycastCallError(200, "", true);
       return { id: messageId, agentName: text(data.agent_name), threadId: text(data.thread_id), channelId: text(data.channel_id) };
+    },
+
+    /** Agent token only: Relaycast authorizes the immutable message sender. */
+    async getMessageDeliveries(token: string, messageId: string): Promise<MessageDelivery[] | null> {
+      try {
+        const data = await labeled("message_deliveries", () => call("GET", `/v1/messages/${encodeURIComponent(messageId)}/deliveries`, token));
+        try { return parseMessageDeliveries(data, messageId); }
+        catch { throw new RelaycastCallError(200, "", true); }
+      } catch (error) {
+        if (error instanceof RelaycastCallError && [404, 501].includes(error.status)) return null;
+        throw error;
+      }
     },
 
     async getMessageThreadId(token: string, messageId: string): Promise<string | null> {

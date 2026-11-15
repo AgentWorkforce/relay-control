@@ -341,7 +341,7 @@ export function createMcpHandler(input: {
       ...(!oauth && input.factory ? { factory: input.factory } : {}),
       ...(!oauth && !desktopCall.required && desktopCall.provider === undefined && input.capy ? { capy: input.capy } : {}),
       ...(oauth && input.capyPermits ? { capyPermits: input.capyPermits } : {}),
-      ...(!oauth && input.launch ? { launch: true } : {}),
+      ...(input.launch ? { launch: true } : {}),
       readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
     };
     if (oauth && input.grokRoutines) {

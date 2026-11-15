@@ -20,8 +20,8 @@ import {
  * Relaycast workspace: targets are read with this workspace's key and owners
  * from fleet_node_owners rows for this workspace and Relaycast workspace, so
  * a node from another workspace or another installation is never listed or
- * reachable. Every call rechecks the owner/admin role read at admission and
- * refuses OAuth connections. A launch is journaled (relay_spawns) before it
+ * reachable. Every call rechecks the owner's current role and OAuth grant
+ * when present. A launch is journaled (relay_spawns) before it
  * is sent and is sent at most once per journal row; status and release only
  * reach rows owned by the same workspace, user, MCP authority, Relaycast
  * workspace and launcher actor.
@@ -93,7 +93,8 @@ function assertSpawnPatch(row: SpawnRow, patch: SpawnPatch): void {
   }
 }
 
-export function spawnStore(database: { query: SqlExecutor["query"]; transaction<T>(run: (tx: SqlExecutor) => Promise<T>): Promise<T> }) {
+export function spawnStore(database: { query: SqlExecutor["query"]; transaction<T>(run: (tx: SqlExecutor) => Promise<T>): Promise<T> },
+  options: { beforeReserve?: (tx: SqlExecutor) => Promise<void> } = {}) {
   async function find(owner: SpawnOwner, id: string): Promise<SpawnRow | null> {
     const result = await database.query(`SELECT ${COLUMNS} FROM relay_spawns WHERE ${OWNED} AND id = $6`, [...ownedParams(owner), id]);
     return result.rows[0] ? rowFrom(result.rows[0]) : null;
@@ -108,6 +109,10 @@ export function spawnStore(database: { query: SqlExecutor["query"]; transaction<
     /** One transaction per reservation, never held over a network call. */
     reserve(row: Omit<SpawnRow, "updatedAt">): Promise<{ row: SpawnRow; created: boolean }> {
       return database.transaction(async (tx) => {
+        // Commit the active-launch fence atomically with live OAuth admission.
+        // Revocation either sees this row or prevents its reservation; teardown
+        // cannot delete an actor between the last grant check and journaling.
+        await options.beforeReserve?.(tx);
         await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`relay-spawn:${row.workspaceId}`]);
         const existing = await tx.query(`SELECT ${COLUMNS} FROM relay_spawns WHERE idempotency_hash = $1`, [row.idempotencyHash]);
         if (existing.rows[0]) {
@@ -223,19 +228,20 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
   const sessionId = context.relay.sessionId;
 
   function authorize(): void {
-    if (context.oauth || context.authMode === "oauth") {
-      throw new RelayToolError("Agent launches are not available through an OAuth MCP connection on this self-hosted site. Connect with an Agent Relay CLI login or Agent Relay Desktop.");
-    }
-    if (context.role !== "owner" && context.role !== "admin") throw new RelayToolError(LAUNCH_ROLE_REFUSAL);
+    const role = context.oauth ? context.oauth.access.principal.role : context.role;
+    if (context.authMode === "oauth" && !context.oauth) throw new RelayToolError(LAUNCH_ROLE_REFUSAL);
+    if (role !== "owner" && role !== "admin") throw new RelayToolError(LAUNCH_ROLE_REFUSAL);
   }
   function owner(actor: SpawnActor): SpawnOwner {
-    if (!sessionId) throw new RelayToolError("Initialize MCP and retain Mcp-Session-Id before starting agents.");
+    if (!context.oauth && !sessionId) throw new RelayToolError("Initialize MCP and retain Mcp-Session-Id before starting agents.");
     return { workspaceId: context.workspace.id, userId, relaycastWorkspaceId: actor.relaycastWorkspaceId, actorId: actor.id,
-      authorityHash: ownerHash(JSON.stringify([context.authMode, sessionId])) };
+      authorityHash: ownerHash(JSON.stringify(context.oauth
+        ? [context.authMode, context.oauth.access.grantId]
+        : [context.authMode, sessionId])) };
   }
   const run = <T>(fn: (actor: SpawnActor, owned: SpawnOwner) => Promise<T>): Promise<T> => {
-    authorize();
-    return deps.withActor(actor => fn(actor, owner(actor)));
+    if (!context.oauth) authorize();
+    return deps.withActor(actor => { authorize(); return fn(actor, owner(actor)); });
   };
   async function lookup(owned: SpawnOwner, id: string): Promise<SpawnRow> {
     if (!z.string().uuid().safeParse(id).success) throw new RelayToolError("Use a spawn_id returned by this connection.");
@@ -279,6 +285,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
 
   return {
     async targets() {
+      if (context.oauth) await context.relay.database.transaction(tx => context.oauth!.lock(tx));
       authorize();
       const targets = (await deps.client.listSpawnTargets(deps.workspaceKey)).filter(eligible);
       return {
@@ -295,7 +302,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
       }
       const input: SpawnInput = parsed.data;
       return run(async (actor, owned) => {
-        const key = input.idempotency_key ?? ownerHash(JSON.stringify([sessionId ?? null, requestId]));
+        const key = input.idempotency_key ?? (sessionId ? ownerHash(JSON.stringify([sessionId, requestId])) : randomUUID());
         const launch = { name: input.name, cli: input.cli, task: input.task, target_node: input.target_node,
           ...(input.worker_cwd ? { worker_cwd: input.worker_cwd } : {}) };
         const idempotencyHash = ownerHash(JSON.stringify(["selfhost-spawn:v1", owned, key]));
@@ -423,7 +430,10 @@ export function relaySpawnDeps(context: McpContext): RelaySpawnDeps {
   return {
     client,
     workspaceKey: context.workspace.relaycastApiKey,
-    store: spawnStore(database),
+    store: spawnStore(database, context.oauth ? { beforeReserve: async tx => {
+      await context.oauth!.lock(tx);
+      if (!["owner", "admin"].includes(context.oauth!.access.principal.role ?? "")) throw new RelayToolError(LAUNCH_ROLE_REFUSAL);
+    } } : {}),
     async owners(nodeIds) {
       if (nodeIds.length === 0) return new Map();
       // Only this workspace's claims on this workspace's relay; the membership FK drops a departed owner's claim.
