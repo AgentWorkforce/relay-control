@@ -622,7 +622,10 @@ export class ConnectionStore {
            refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
            account_id = EXCLUDED.account_id,
            account_label = EXCLUDED.account_label,
-           metadata = EXCLUDED.metadata,
+           metadata = EXCLUDED.metadata || CASE
+             WHEN integration_connections.metadata ? 'displayName'
+             THEN jsonb_build_object('displayName', integration_connections.metadata->'displayName')
+             ELSE '{}'::jsonb END,
            last_error = NULL,
            last_refreshed_at = NULL,
            updated_by_user_id = EXCLUDED.updated_by_user_id,

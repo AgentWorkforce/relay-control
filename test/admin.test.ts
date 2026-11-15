@@ -646,6 +646,8 @@ test("provider connections: BYO OAuth round trip, encrypted tokens, refresh, dis
     method: "POST", token: ctx.owner, body: { credentials: { apiKey: "replacement-test-key", host: "https://eu.posthog.com" } },
   });
   assert.equal(replacement.status, 201);
+  assert.equal(replacement.body.metadata.displayName, "Production analytics", "credential rotation preserves the saved presentation name");
+  assert.equal(replacement.body.metadata.config.host, "https://eu.posthog.com");
   assert.equal(replacement.body.connectionId, posthog.body.connectionId, "native reconnect retains the row id");
   assert.notEqual(replacement.body.version, named.body.version);
   assert.equal((await request(ctx.origin, settingsPath, { method: "PATCH", token: ctx.owner, body: { ...label, version: named.body.version } })).status, 409);
