@@ -112,7 +112,8 @@ export class MetadataGcpCredentialProvider implements GcpCredentialProvider {
       const email = (await (await this.metadata("email")).text()).trim();
       if (!SERVICE_ACCOUNT_EMAIL.test(email)) throw new GcpCredentialError(
         "GCP metadata server returned no Google service account email; signed URLs need the Kubernetes ServiceAccount "
-          + "linked to a Google service account (iam.gke.io/gcp-service-account)",
+          + "linked to a Google service account (iam.gke.io/gcp-service-account) and annotated "
+          + "iam.gke.io/return-principal-id-as-email=\"true\"",
       );
       return email;
     })().catch((error) => {

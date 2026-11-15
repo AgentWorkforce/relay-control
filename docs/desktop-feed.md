@@ -81,7 +81,11 @@ account needs:
   keeps working.
 - On GKE, a Kubernetes ServiceAccount linked to that Google service account
   (`iam.gke.io/gcp-service-account` annotation plus
-  `roles/iam.workloadIdentityUser` for the KSA on the Google service account).
+  `roles/iam.workloadIdentityUser` for the KSA on the Google service account),
+  and also annotated `iam.gke.io/return-principal-id-as-email: "true"`. A linked KSA can otherwise
+  get `<ksa>.svc.id.goog` instead of the Google service account email from the
+  metadata server ([GKE troubleshooting](https://cloud.google.com/kubernetes-engine/docs/troubleshooting/authentication)),
+  which this service refuses as a signing identity.
   `signBlob` needs a Google service account: a KSA granted bucket access
   directly as a Workload Identity Federation principal can upload and stream,
   but `download-url` fails.

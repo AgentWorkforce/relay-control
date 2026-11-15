@@ -253,6 +253,10 @@ test("metadata credentials: an unreachable or non-Google metadata server is a cl
   });
   await assert.rejects(unreachable.accessToken(), /Workload Identity/);
   assert.throws(() => new MetadataGcpCredentialProvider({ env: { GCE_METADATA_HOST: "http://evil/" } }), /GCE_METADATA_HOST/);
+  // A Workload Identity identifier is not a signing identity; the error names the KSA annotations.
+  const principal = await fakeServer(t, () => ({ status: 200, headers: { "metadata-flavor": "Google" }, body: "relay-control.svc.id.goog" }));
+  const unlinked = new MetadataGcpCredentialProvider({ env: { GCE_METADATA_HOST: new URL(principal.origin).host } });
+  await assert.rejects(unlinked.serviceAccountEmail(), /iam\.gke\.io\/gcp-service-account.*return-principal-id-as-email/);
 });
 
 test("feed config: gcs storage with bucket and prefix", () => {
