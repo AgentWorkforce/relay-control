@@ -597,6 +597,7 @@ export function createApp(input: {
     publicBaseUrl: config.publicBaseUrl,
     relayOrigins: config.eventsShimRelayOrigins ?? [new URL(config.relaycastPublicUrl).origin],
     relaycast: { url: config.relaycastUrl, internalSecret: input.relaycastInternalSecret ?? null },
+    gateOnly: Boolean(config.relaygatePublicUrl),
     fetchImpl: input.messagingFetch,
     now: input.now,
     authorizeCreate: async (request, response) => {
@@ -2453,6 +2454,33 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (!principal.scopes.includes("cli:auth")) {
         throw new HttpError(403, "forbidden", "Relaycast key requires a browser session or cli:auth");
       }
+      const identity = {
+        workspaceId: workspace.id,
+        cloudWorkspaceId: workspace.id,
+        relaycastWorkspaceId: workspace.relaycastWorkspaceId,
+        organizationId: workspace.organizationId,
+        name: workspace.name,
+      };
+      // Gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): relaygate is the
+      // only public way into Relaycast, so the workspace-wide key, which
+      // would bypass its policy, never leaves. The device enrols at the gate
+      // with its Control token instead. Clients that require the key fail
+      // closed on its absence. The resolve is still audited, as withheld.
+      if (config.relaygatePublicUrl) {
+        await recordAudit(store.database, {
+          organizationId: workspace.organizationId,
+          workspaceId: workspace.id,
+          actor: { kind: "user", userId: principal.userId },
+          action: "workspace.relaycast_key.withheld",
+          target: `session:${principal.sessionId}`,
+        });
+        json(response, 200, {
+          ...identity,
+          urls: { relaycastUrl: config.relaycastPublicUrl, relaygateUrl: config.relaygatePublicUrl },
+          provisioned: false,
+        }, true);
+        return;
+      }
       // Written before the key leaves; the target is the non-secret session id.
       await recordAudit(store.database, {
         organizationId: workspace.organizationId,
@@ -2462,11 +2490,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         target: `session:${principal.sessionId}`,
       });
       json(response, 200, {
-        workspaceId: workspace.id,
-        cloudWorkspaceId: workspace.id,
-        relaycastWorkspaceId: workspace.relaycastWorkspaceId,
-        organizationId: workspace.organizationId,
-        name: workspace.name,
+        ...identity,
         relaycastApiKey: workspace.relaycastApiKey,
         urls: { relaycastUrl: config.relaycastPublicUrl },
         provisioned: false,

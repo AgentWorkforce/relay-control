@@ -37,6 +37,17 @@ test("customer support uses an optional complete dedicated service connection, n
   assert.equal(loadConfig({ ...completeEnv, ...support, SELFHOST_CUSTOMER_SUPPORT_URL: "http://127.0.0.1:3000" }).customerSupport?.url, "http://127.0.0.1:3000");
 });
 
+test("SELFHOST_RELAYGATE_PUBLIC_URL is optional and must be a public https origin", () => {
+  assert.equal(loadConfig(completeEnv).relaygatePublicUrl, null);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: "  " }).relaygatePublicUrl, null);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: " https://cast.selfhosted.company/ " }).relaygatePublicUrl,
+    "https://cast.selfhosted.company");
+  for (const bad of ["http://cast.selfhosted.company", "https://cast.selfhosted.company/v1", "https://u:p@cast.selfhosted.company",
+    "https://localhost", "https://10.0.0.1", "not a url"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: bad }), /SELFHOST_RELAYGATE_PUBLIC_URL/, bad);
+  }
+});
+
 test("the image version is read from SELFHOST_IMAGE_VERSION and null from source", () => {
   assert.equal(loadConfig(completeEnv).imageVersion, null);
   assert.equal(loadConfig({ ...completeEnv, SELFHOST_IMAGE_VERSION: "  " }).imageVersion, null);

@@ -107,6 +107,15 @@ export type SelfhostConfig = {
    */
   eventsShimRelayOrigins?: string[] | null;
   /**
+   * SELFHOST_RELAYGATE_PUBLIC_URL: the public https origin of relaygate, the
+   * governance gateway that is the only public way into Relaycast on a
+   * gate-only install. Set: GET /api/v1/workspaces/{id}/resolve answers
+   * `urls.relaygateUrl` and never the workspace-wide Relaycast key
+   * (`relaycastApiKey` is omitted), so a device enrols through the gate
+   * instead. Null or absent: resolve hands out the key as before.
+   */
+  relaygatePublicUrl?: string | null;
+  /**
    * SELFHOST_IMAGE_VERSION: the image tag, set by the image (Dockerfile).
    * Null when run from source. Shown by GET /cloud/api/health and telemetry.
    */
@@ -416,6 +425,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     historyUpload: loadHistoryUploadConfig(env),
     capturePolicyUploads: loadCapturePolicyUploads(env),
     eventsShimRelayOrigins: loadEventsShimRelayOrigins(env),
+    relaygatePublicUrl: loadRelaygatePublicUrl(env),
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
@@ -982,6 +992,15 @@ function uploadEndpoint(env: Env, name: string): string | null {
  * SELFHOST_EVENTS_SHIM_RELAY_ORIGINS: comma list of https origins (no path,
  * query or credentials). Unset or empty: null (use RELAYCAST_PUBLIC_URL).
  */
+/**
+ * SELFHOST_RELAYGATE_PUBLIC_URL: optional; when set, a public https origin
+ * (validated like RELAYCAST_PUBLIC_URL). Unset or blank: null.
+ */
+export function loadRelaygatePublicUrl(env: Env = process.env): string | null {
+  if (!env.SELFHOST_RELAYGATE_PUBLIC_URL?.trim()) return null;
+  return publicServiceUrl(env, "SELFHOST_RELAYGATE_PUBLIC_URL");
+}
+
 export function loadEventsShimRelayOrigins(env: Env = process.env): string[] | null {
   const raw = env.SELFHOST_EVENTS_SHIM_RELAY_ORIGINS?.trim();
   if (!raw) return null;

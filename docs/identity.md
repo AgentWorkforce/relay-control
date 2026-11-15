@@ -1242,6 +1242,33 @@ capability scope:
 Membership is checked live on every request and mint, so removing a person
 from an organization takes effect on their next request.
 
+### Gate-only installs (relaygate)
+
+On a gate-only install, relaygate is the only public way into Relaycast and
+Sessions. Set `SELFHOST_RELAYGATE_PUBLIC_URL` to relaygate's public https
+origin (a bare origin, validated like `RELAYCAST_PUBLIC_URL`), e.g.
+`https://cast.example.com` when that host routes to relaygate. Control then
+hands no Relaycast workspace key to anything outside the cluster:
+
+- `GET /api/v1/workspaces/{id}/resolve` keeps its identity fields and
+  `urls.relaycastUrl`, adds `urls.relaygateUrl` (the configured origin) and
+  omits `relaycastApiKey`. Each call is audited as
+  `workspace.relaycast_key.withheld` in place of
+  `workspace.relaycast_key.resolved`. A desktop enrols at relaygate with its
+  Control device token. Older desktop and iPad builds that need the key fail
+  closed and say the workspace shared no key. The CLI reads only
+  `cloudWorkspaceId` from resolve.
+- The events-shim temporary workspace (`POST /t/<mcp token>/workspace`) is not
+  issued ([events-shim.md](events-shim.md#temporary-agent-relay-workspace)).
+
+Per-identity credentials are unchanged, because relaygate can apply policy to
+each one: the person credential
+(`POST /api/v1/workspaces/{id}/messaging/identity/credential`, the caller's
+own agent token), the relay-node broker's enrol answer (that node's own
+token), and MCP join and spawn, which deal in per-agent participant tokens and
+never the workspace key.
+Unset, nothing changes.
+
 ### Scope mint matrix
 
 Scopes are fixed when a credential is issued and stored on its session row.

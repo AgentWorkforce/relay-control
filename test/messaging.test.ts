@@ -359,7 +359,10 @@ type Hooks = {
   beforeMembershipRecheck?: (tx: SqlExecutor) => Promise<void> | void;
 };
 
-async function harness(t: { after: (fn: () => Promise<void>) => void }, options?: { claimLeaseMs?: number }) {
+async function harness(
+  t: { after: (fn: () => Promise<void>) => void },
+  options?: { claimLeaseMs?: number; config?: Partial<SelfhostConfig> },
+) {
   const state = relayState();
   const hooks: Hooks = {};
   const relaycast = createRelay(state);
@@ -387,6 +390,7 @@ async function harness(t: { after: (fn: () => Promise<void>) => void }, options?
     dashboardUrl: "https://control.internal.example/",
     port: 3000,
     host: "127.0.0.1",
+    ...options?.config,
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
   control = createServer(createApp({
@@ -1312,4 +1316,64 @@ test("resolve: a refusal writes no audit row", async (t) => {
   }
   assert.equal((await jsonRequest(fx.origin, resolvePath(fx.otherWorkspaceId), { token: fx.accessToken })).status, 404);
   assert.equal((await resolveAudits(fx.database)).length, 0);
+});
+
+test("resolve: without SELFHOST_RELAYGATE_PUBLIC_URL the answer names no gate", async (t) => {
+  const fx = await harness(t);
+  const resolved = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.accessToken });
+  assert.equal(resolved.status, 200);
+  assert.equal(resolved.body.relaycastApiKey, "rk_live_first");
+  assert.deepEqual(resolved.body.urls, { relaycastUrl: "https://cast.selfhosted.example" });
+});
+
+test("resolve: gate-only answers urls.relaygateUrl and never the workspace key", async (t) => {
+  const fx = await harness(t, { config: { relaygatePublicUrl: "https://gate.selfhosted.example" } });
+  for (const [cloud, auth] of [
+    [false, { token: fx.accessToken }],
+    [true, { cookie: `agent_relay_session=${fx.accessToken}` }],
+  ] as const) {
+    const resolved = await jsonRequest(fx.origin, resolvePath(fx.workspaceId, cloud), auth);
+    assert.equal(resolved.status, 200);
+    assert.deepEqual(Object.keys(resolved.body).sort(), [
+      "cloudWorkspaceId", "name", "organizationId", "provisioned",
+      "relaycastWorkspaceId", "urls", "workspaceId",
+    ]);
+    assert.equal("relaycastApiKey" in resolved.body, false);
+    assert.deepEqual(resolved.body.urls, {
+      relaycastUrl: "https://cast.selfhosted.example",
+      relaygateUrl: "https://gate.selfhosted.example",
+    });
+    assert.equal(resolved.body.workspaceId, fx.workspaceId);
+    assert.equal(resolved.body.relaycastWorkspaceId, "rc-first");
+    assert.equal(JSON.stringify(resolved.body).includes("rk_live_"), false);
+  }
+  // A plain member, and a token bound to the other workspace, get no key either.
+  const member = await addMember(fx, "gate-member@example.test");
+  const asMember = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: member.token });
+  assert.equal(asMember.status, 200);
+  assert.equal("relaycastApiKey" in asMember.body, false);
+  const boundToOther = await fx.signIn(fx.userId, fx.otherWorkspaceId);
+  const other = await jsonRequest(fx.origin, resolvePath(fx.otherWorkspaceId), { token: boundToOther });
+  assert.equal(other.status, 200);
+  assert.equal(JSON.stringify(other.body).includes("rk_live_"), false);
+  // No key left, so no disclosure was audited; each resolve is audited as withheld.
+  assert.equal((await resolveAudits(fx.database)).length, 0);
+  const withheld = (await fx.database.query<Record<string, unknown>>(
+    "SELECT * FROM admin_audit_events WHERE action = 'workspace.relaycast_key.withheld' ORDER BY created_at",
+  )).rows;
+  assert.equal(withheld.length, 4);
+  assert.equal(withheld[0]!.actor_id, fx.userId);
+  assert.equal(withheld[0]!.workspace_id, fx.workspaceId);
+  assert.match(String(withheld[0]!.target), /^session:[0-9a-f-]{36}$/);
+  assert.equal(JSON.stringify(withheld).includes("rk_live_"), false);
+});
+
+test("resolve: gate-only keeps every refusal", async (t) => {
+  const fx = await harness(t, { config: { relaygatePublicUrl: "https://gate.selfhosted.example" } });
+  const lowScope = await fx.signIn(fx.userId);
+  await dropCliAuth(fx.database, lowScope);
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: lowScope })).status, 403);
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.config.internalServiceToken! })).status, 403);
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.config.bootstrapToken })).status, 401);
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.otherWorkspaceId), { token: fx.accessToken })).status, 404);
 });
