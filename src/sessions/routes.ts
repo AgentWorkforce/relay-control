@@ -25,7 +25,7 @@ type WorkspaceAccess = (
   workspaceId: string,
 ) => Promise<{
   principal: Principal;
-  workspace: { id: string; organizationId: string };
+  workspace: { id: string; organizationId: string; role: Principal["role"] };
   /** The caller's raw access token; a credential, used only to key the read token cache. */
   token: string;
 }>;
@@ -185,6 +185,7 @@ function identityOf(access: Awaited<ReturnType<WorkspaceAccess>>): HistoryIdenti
     userId: access.principal.userId,
     organizationId: access.workspace.organizationId,
     workspaceId: access.workspace.id,
+    role: access.workspace.role,
     callerToken: access.token,
   };
 }

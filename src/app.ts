@@ -954,8 +954,8 @@ export function createApp(input: {
       rateLimit(response, `session-read:${principal.userId}:${workspace.id}`,
         { limit: 30, windowMs: 60_000 }, "rate_limited", "Too many session read credential requests");
       const session = await requestReadSession(api, {
-        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
-      }, parsed.data);
+        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id, role: workspace.role,
+      }, parsed.data, { includeRole: config.sessionReadMintIncludeRole });
       const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
       return browser ? accessOnly : session;
     }
@@ -2534,8 +2534,8 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       rateLimit(response, `session-read:${principal.userId}:${workspace.id}`,
         { limit: 30, windowMs: 60_000 }, "rate_limited", "Too many session read credential requests");
       const session = await requestReadSession(config.sessionReadApi, {
-        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
-      }, parsed.data);
+        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id, role: workspace.role,
+      }, parsed.data, { includeRole: config.sessionReadMintIncludeRole });
       // Page scripts get a short-lived access token only. Renew by requesting
       // a new session through the cookie path, which rechecks live membership.
       const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;

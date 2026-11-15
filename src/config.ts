@@ -36,6 +36,11 @@ export type SelfhostConfig = {
   sessionErasureApi?: { url: string; secret: string } | null;
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
   sessionReadMcpReads?: boolean;
+  /**
+   * SESSION_READ_MINT_INCLUDE_ROLE: send the member's org role in the read API
+   * mint/refresh bodies. Default off; enable only after the read API accepts it.
+   */
+  sessionReadMintIncludeRole?: boolean;
   /** SESSION_SEARCH_AGENT_TOKENS: read `@name` tokens in search text as agent filters. Default off. */
   sessionSearchAgentTokens?: boolean;
   /** The read API's public origin (equal to sessionReadApi.publicUrl). */
@@ -406,6 +411,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
     sessionSearchAgentTokens: loadSessionSearchAgentTokens(env),
+    sessionReadMintIncludeRole: loadSessionReadMintIncludeRole(env),
     ...introspection,
     acquisitionIssuer: loadAcquisitionIssuerConfig(env, introspection),
     bootstrapToken,
@@ -442,6 +448,13 @@ function loadSessionSearchAgentTokens(env: Env): boolean {
   const value = env.SESSION_SEARCH_AGENT_TOKENS?.trim();
   if (!value || value === "false") return false;
   if (value !== "true") throw new Error("SESSION_SEARCH_AGENT_TOKENS must be true or false");
+  return true;
+}
+
+function loadSessionReadMintIncludeRole(env: Env): boolean {
+  const value = env.SESSION_READ_MINT_INCLUDE_ROLE?.trim();
+  if (!value || value === "false") return false;
+  if (value !== "true") throw new Error("SESSION_READ_MINT_INCLUDE_ROLE must be true or false");
   return true;
 }
 

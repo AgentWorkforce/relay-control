@@ -110,6 +110,7 @@ export function historyReader(
     userId: principal.userId,
     organizationId: workspace.organizationId,
     workspaceId: workspace.id,
+    role: workspace.role,
     callerToken,
   };
   return async (path: string, options: { timeoutMessage?: string } = {}): Promise<unknown> => {

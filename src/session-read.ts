@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { SelfhostConfig } from "./config.js";
+import type { Principal } from "./store.js";
 
 const opaqueToken = (prefix: string) => z.string().max(4096).regex(new RegExp(`^${prefix}[A-Za-z0-9_-]{43,}$`));
 export const readSessionRequest = z.object({
@@ -28,13 +29,33 @@ export class SessionReadError extends Error {
   }
 }
 
-export type ReadIdentity = { userId: string; orgId: string; workspaceId: string };
+/**
+ * `role` is the member's live organization role, the one Control authorized
+ * this request with (the membership row `workspaceForUser` reads).
+ */
+export type ReadIdentity = { userId: string; orgId: string; workspaceId: string; role: Principal["role"] };
+
+/**
+ * The internal mint/refresh body. `role` is sent only when
+ * SESSION_READ_MINT_INCLUDE_ROLE is on: read APIs that predate it refuse
+ * unknown fields, so turn it on only after the read API accepts `role`.
+ */
+export function readSessionBody(
+  config: NonNullable<SelfhostConfig["sessionReadApi"]>,
+  identity: ReadIdentity,
+  input: { label?: string } | { refreshToken: string },
+  options: { includeRole?: boolean } = {},
+): Record<string, unknown> {
+  const { role, ...ids } = identity;
+  return { ...ids, ...(options.includeRole ? { role } : {}), audience: config.publicUrl, scopes: ["rth:read"], ...input };
+}
 
 /** The read API is the issuer. Control authorizes a single identity and validates its reply. */
 export async function requestReadSession(
   config: NonNullable<SelfhostConfig["sessionReadApi"]>,
   identity: ReadIdentity,
   input: { label?: string } | { refreshToken: string },
+  options: { includeRole?: boolean } = {},
 ) {
   const refreshing = "refreshToken" in input;
   const path = refreshing ? "/internal/v1/session-read/sessions/refresh" : "/internal/v1/session-read/sessions";
@@ -46,7 +67,7 @@ export async function requestReadSession(
       redirect: "error",
       signal: AbortSignal.timeout(10_000),
       headers: { authorization: `Bearer ${config.secret}`, "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({ ...identity, audience: config.publicUrl, scopes: ["rth:read"], ...input }),
+      body: JSON.stringify(readSessionBody(config, identity, input, options)),
     });
     if (!response.ok) {
       await response.body?.cancel();
