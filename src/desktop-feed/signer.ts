@@ -11,13 +11,15 @@
 // - memory: a node:crypto key pair per profile, generated in process. Tests
 //   and local development only; config refuses nothing else, but the key
 //   dies with the process so nothing it signs survives a restart.
-import { createPublicKey, generateKeyPairSync, sign as edSign, verify as edVerify, type KeyObject } from "node:crypto";
+import { createPrivateKey, createPublicKey, generateKeyPairSync, sign as edSign, verify as edVerify, type KeyObject } from "node:crypto";
+import { openSync, fstatSync, readFileSync, closeSync, constants, realpathSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { DefaultAwsCredentialProvider, signV4, type AwsCredentialProvider } from "../aws/sigv4.js";
 
 export type DesktopFeedSignature = { signature: string; keyId: string };
 
 export interface DesktopFeedSigner {
-  readonly kind: "memory" | "awskms";
+  readonly kind: "memory" | "awskms" | "file";
   /** `fk_<profile>_<label>`. */
   keyId(profile: string): string;
   /** Ed25519 over `bytes`, base64url without padding (86 characters). */
@@ -100,6 +102,57 @@ export class MemoryDesktopFeedSigner implements DesktopFeedSigner {
   }
   hasProfile(): boolean {
     return true;
+  }
+}
+
+/** A persistent mounted secret, suitable for full multi-platform manifests.
+ * Key files are private PKCS8 Ed25519 PEMs, loaded once at startup; keys never
+ * enter config responses, logs or the database. Mount the same files on each
+ * replica and after restarts. KMS remains available with its original cap.
+ */
+export class FileDesktopFeedSigner implements DesktopFeedSigner {
+  readonly kind = "file" as const;
+  readonly #keys = new Map<string, KeyObject>();
+  constructor(private readonly options: { label: string; keyFiles: Record<string, string> }) {
+    if (!KEY_LABEL_PATTERN.test(options.label)) throw new Error("file signer key label is invalid");
+    if (!Object.keys(options.keyFiles).length) throw new Error("file signer needs at least one profile key");
+    for (const [profile, path] of Object.entries(options.keyFiles)) {
+      if (!/^[a-z0-9]{1,32}$/.test(profile) || !isAbsolute(path)) throw new Error("file signer profile or absolute key path is invalid");
+      let fd: number | undefined;
+      let bytes: Buffer | undefined;
+      try {
+        // Resolve projected Secret symlinks, then forbid a symlink swap at open.
+        fd = openSync(realpathSync(path), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        const stat = fstatSync(fd);
+        if (!stat.isFile() || stat.size > 16384 || (stat.mode & 0o027) !== 0
+          || (stat.uid !== process.getuid?.() && stat.uid !== 0)) throw new Error("unsafe key file");
+        bytes = readFileSync(fd);
+        const key = createPrivateKey(bytes);
+        if (key.asymmetricKeyType !== "ed25519") throw new Error("wrong key type");
+        this.#keys.set(profile, key);
+      } catch {
+        // Parsing failures must never echo key material or the secret path.
+        throw new Error("Cannot load a private Ed25519 desktop feed key; check the mounted secret and file permissions");
+      } finally {
+        bytes?.fill(0);
+        if (fd !== undefined) closeSync(fd);
+      }
+    }
+  }
+  keyId(profile: string): string { return `fk_${profile}_${this.options.label}`; }
+  maxCanonicalBytes(): number { return 65536; }
+  hasProfile(profile: string): boolean { return this.#keys.has(profile); }
+  private key(profile: string): KeyObject {
+    const key = this.#keys.get(profile);
+    if (!key) throw new SignerUnavailableError("profile has no signing key");
+    return key;
+  }
+  async sign(profile: string, bytes: Buffer): Promise<DesktopFeedSignature> {
+    if (bytes.length > this.maxCanonicalBytes()) throw new SignerUnavailableError("message exceeds the signer limit");
+    return { signature: edSign(null, bytes, this.key(profile)).toString("base64url"), keyId: this.keyId(profile) };
+  }
+  async publicKey(profile: string): Promise<string> {
+    return rawPublicKeyFromSpki(createPublicKey(this.key(profile)).export({ format: "der", type: "spki" }));
   }
 }
 
