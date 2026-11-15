@@ -8,8 +8,13 @@
 # ghcr.io/agentworkforce/relay-control tagged fast-<sha> only. It never moves
 # or claims a release tag: no :latest, :main, semver or sha-<sha> (the release
 # workflow refuses to overwrite sha-<sha>, so the fast path leaves it free).
-# It does not notify infra of a release candidate. Pin the digest printed in
-# the run summary.
+# It refuses to overwrite an existing fast-<sha> (the release workflow accepts
+# fast-* as a release tag) and does not notify infra of a release candidate.
+# Pin the digest printed in the run summary.
+#
+# No signed GitHub attestation is pushed: attest-build-provenance records the
+# dispatch commit, not the `ref` actually built. BuildKit's SBOM and max-mode
+# provenance (which read the checkout) are attached to the image.
 name: fast-path
 run-name: fast-path ${{ inputs.ref }} (${{ inputs.reason }})
 on:
@@ -60,8 +65,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,6 +77,23 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse an existing fast tag
+        env:
+          SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The release workflow accepts any unreserved tag, fast-* included, so
+          # never overwrite an existing tag: pin the digest it already names.
+          out="$RUNNER_TEMP/imagetools-fast.txt"
+          if docker buildx imagetools inspect "$IMAGE:fast-$SHA" >"$out" 2>&1; then
+            echo "::error::$IMAGE:fast-$SHA already exists; pin its digest instead of republishing."
+            exit 1
+          fi
+          if ! grep -Eqi 'manifest unknown|name unknown|not found' "$out"; then
+            cat "$out" >&2
+            echo "::error::Could not prove $IMAGE:fast-$SHA is absent; failing closed."
+            exit 1
+          fi
       - id: build
         uses: docker/build-push-action@v6
         with:
@@ -92,11 +112,6 @@ jobs:
             org.opencontainers.image.version=fast-${{ needs.verify.outputs.sha }}
           provenance: mode=max
           sbom: true
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
       - name: Summary
         env:
           REF: ${{ inputs.ref }}
