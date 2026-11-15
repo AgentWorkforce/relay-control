@@ -540,6 +540,59 @@ paths:
         "404":
           description: Module disabled, workspace inaccessible or no owned grant
         "501": {$ref: "#/components/responses/McpOAuthUnavailable"}
+  /cloud/api/v1/grok-bot/routine:
+    parameters:
+      - {name: grant, in: query, required: true, schema: {type: string, format: uuid}}
+    get:
+      operationId: grokRoutineSetup
+      tags: [MCP OAuth]
+      summary: Configure webhook wake-ups for an owned Grok Bot connection.
+      description: Requires the grant owner's browser account in its issued workspace. The page never returns stored routine credentials. OAuth must be active.
+      security:
+        - cookieAuth: []
+      responses:
+        "200": {description: HTML setup page with non-secret instructions and delivery status}
+        "302": {description: Sign in through this server first}
+        "400": {description: Grant missing, expired, revoked, owned by another account or not a Grok connection}
+        "403": {description: Browser account capability or handoff refused}
+        "404": {description: Module disabled, invalid grant ID or workspace inaccessible}
+    post:
+      operationId: grokRoutineSave
+      tags: [MCP OAuth]
+      summary: Encrypt and save the approved bot's routine endpoint and key.
+      description: Requires the exact configured public Origin and grant owner's workspace-bound browser account. Only the fixed HTTPS Grok routine host/path is accepted. Saving is not proof of delivery.
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [webhook_url, authorization]
+              properties:
+                webhook_url: {type: string, maxLength: 512, writeOnly: true}
+                authorization: {type: string, writeOnly: true, description: The routine crsr_ key or Authorization Bearer header}
+      responses:
+        "200": {description: Configuration saved without echoing secrets}
+        "400": {description: Invalid credentials or unavailable/unowned/unpinned Grok grant}
+        "401": {description: Browser sign-in required; MCP bearers are refused}
+        "403": {description: Invalid Origin or browser account capability}
+        "404": {description: Module disabled, invalid grant ID or workspace inaccessible}
+        "413": {description: Body exceeds 64 KiB}
+    delete:
+      operationId: grokRoutineDisconnect
+      tags: [MCP OAuth]
+      summary: Delete the saved routine credential without revoking MCP messaging.
+      description: Requires the exact configured public Origin and grant owner's workspace-bound browser account.
+      security:
+        - cookieAuth: []
+      responses:
+        "200": {description: Number of removed routine configurations}
+        "400": {description: Connection unavailable or not owned}
+        "401": {description: Browser account sign-in required}
+        "403": {description: Invalid Origin or browser account capability}
+        "404": {description: Module disabled, invalid grant ID or workspace inaccessible}
   /api/v1/mcp/shared-sessions:
     post:
       operationId: hostedMcpSharedSessions

@@ -79,6 +79,9 @@ Included:
   session (without Desktop the agent long-polls `wait_for_webhook`). Served by
   `@agent-relay/events-shim`; see [docs/events-shim.md](docs/events-shim.md).
   Not the separate `SELFHOST_MCP_EVENTS` module
+- Grok Bot webhook wake-ups: an existing Grok OAuth MCP connection can return
+  a browser setup link for its routine URL and key. Control delivers inbox
+  wake-ups with retries, without Cloud or Desktop. See [docs/grok-bot.md](docs/grok-bot.md).
 
 Explicitly absent: billing, fleet, and Relayfile.
 

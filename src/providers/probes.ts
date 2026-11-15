@@ -2,6 +2,7 @@ import type { AmpModule } from "../amp/module.js";
 import type { SelfhostConfig } from "../config.js";
 import type { FactoryModule } from "../factory/routes.js";
 import type { ProviderProbes } from "./registry.js";
+import { mcpOAuthActive } from "../mcp/oauth/config.js";
 
 /**
  * Runtime probes for the provider modules mounted in this build. Synchronous
@@ -15,6 +16,11 @@ export function buildProviderProbes(input: {
   config: SelfhostConfig;
 }): ProviderProbes {
   return {
+    "grok-bot": {
+      implemented: true,
+      configured: () => mcpOAuthActive(input.config),
+      enabled: () => mcpOAuthActive(input.config),
+    },
     factory: {
       implemented: true,
       configured: () => Boolean(input.config.factory),

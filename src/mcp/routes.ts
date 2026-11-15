@@ -1,5 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import type { GrokRoutines } from "./grok-routines.js";
+import { connectorKind } from "./oauth/connector-kind.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { ApiTokenStore } from "../admin/api-tokens.js";
@@ -129,6 +131,7 @@ export function createMcpHandler(input: {
   launch?: boolean;
   /** Own credential resolver, used only at these MCP routes when the module is enabled. */
   oauthSessions?: McpOAuthSessions;
+  grokRoutines?: GrokRoutines;
   /** Clock for shared-session read audit records; tests inject it. */
   now?: () => Date;
 }) {
@@ -321,7 +324,8 @@ export function createMcpHandler(input: {
         email: String(row.email),
         name: typeof row.name === "string" && row.name.trim() ? row.name : null,
       })),
-      providers: () => providerStatuses(input.providerProbes),
+      providers: async () => (await providerStatuses(input.providerProbes)).map(provider => provider.id === "grok-bot"
+        ? { ...provider, mcpGroupsRegistered: Boolean(context.grokRoutines) } : provider),
       relaycast: {
         listAgents: (status) => relaycast.listAgents(workspace.relaycastApiKey, status),
         listPresence: () => relaycast.listPresence(workspace.relaycastApiKey),
@@ -340,6 +344,13 @@ export function createMcpHandler(input: {
       ...(!oauth && input.launch ? { launch: true } : {}),
       readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
     };
+    if (oauth && input.grokRoutines) {
+      const client = (await store.database.query<{ client_name: string | null; redirect_uris: string[] }>(
+        "SELECT client_name,redirect_uris FROM mcp_oauth_clients WHERE client_id=$1", [oauth.access.clientId])).rows[0];
+      if (client && connectorKind({ clientName: client.client_name, redirectUris: client.redirect_uris }) === "grok-bot") {
+        context.grokRoutines = input.grokRoutines;
+      }
+    }
     if (config.customerSupport) context.customerSupport = {
       origin: new URL(config.publicBaseUrl).origin,
       send: request => sendCustomerSupport(config.customerSupport!, request),

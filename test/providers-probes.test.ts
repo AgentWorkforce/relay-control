@@ -46,10 +46,16 @@ test("copilot is reported as unconditionally mounted", async () => {
   assert.deepEqual([status.implemented, status.configured, status.enabled], [true, true, true]);
 });
 
-test("providers without a module are absent and report all false", async () => {
+test("Grok webhook module follows OAuth availability; providers without a module report all false", async () => {
   const probes = buildProviderProbes({ factory: factoryModule(true), amp: ampModule(true, {}), config: config({}) });
-  assert.deepEqual(Object.keys(probes).sort(), ["amp", "copilot", "factory"]);
-  for (const id of ["capy", "replicas", "dot", "grok-bot"]) {
+  assert.deepEqual(Object.keys(probes).sort(), ["amp", "copilot", "factory", "grok-bot"]);
+  const grok = await statusOf(probes, "grok-bot");
+  assert.deepEqual([grok.implemented, grok.configured, grok.enabled], [true, false, false]);
+  const active = buildProviderProbes({ factory: factoryModule(false), amp: ampModule(false, null),
+    config: { mcpOAuth: { enabled: true, unavailable: null } } as unknown as SelfhostConfig });
+  const enabled = await statusOf(active, "grok-bot");
+  assert.deepEqual([enabled.implemented, enabled.configured, enabled.enabled], [true, true, true]);
+  for (const id of ["capy", "replicas", "dot"]) {
     const status = await statusOf(probes, id);
     assert.deepEqual([status.implemented, status.configured, status.enabled], [false, false, false]);
   }

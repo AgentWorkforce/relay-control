@@ -32,6 +32,10 @@ The existing native MCP endpoint continues to use native credentials.
 OAuth connections receive `mcp_at_` access tokens and `mcp_rt_` refresh
 tokens. These credentials work only at their granted MCP resource.
 
+Grok Bot connections also support [webhook routine wake-ups](grok-bot.md)
+through their existing `relay:mcp` grant. The `grok_routines` tools return a
+setup page on this server; no Cloud MCP Events endpoint or Desktop is needed.
+
 ## URLs
 
 For a site whose public origin is `https://relay.example.com`:

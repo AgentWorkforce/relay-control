@@ -196,6 +196,7 @@ export function createRelaycastClient(input: {
     body?: Record<string, unknown>,
     idempotencyKey?: string,
     allowNotFound = false,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     let response: Response;
     try {
@@ -208,6 +209,7 @@ export function createRelaycastClient(input: {
           ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
         },
         ...(body ? { body: JSON.stringify(body) } : {}),
+        ...(signal ? { signal } : {}),
       });
     } catch {
       throw new RelaycastCallError(0, "", true);
@@ -537,8 +539,8 @@ export function createRelaycastClient(input: {
     },
 
     /** The agent a token controls, with its channel memberships. */
-    async authenticatedAgent(token: string): Promise<RosterAgent & { channels: Array<{ id: string; name: string }>; workspaceId: string | null }> {
-      const data = await labeled("authenticated_agent", () => call("GET", "/v1/agent", token));
+    async authenticatedAgent(token: string, signal?: AbortSignal): Promise<RosterAgent & { channels: Array<{ id: string; name: string }>; workspaceId: string | null }> {
+      const data = await labeled("authenticated_agent", () => call("GET", "/v1/agent", token, undefined, undefined, false, signal));
       const agent = rosterFrom(data);
       if (!agent) throw new RelaycastCallError(502, "", true);
       const channels = (Array.isArray(record(data)?.channels) ? record(data)!.channels as unknown[] : []).flatMap((item) => {
@@ -555,8 +557,8 @@ export function createRelaycastClient(input: {
     },
 
     /** Up to 100 unacknowledged deliveries for an agent token. */
-    async readHostedInbox(token: string): Promise<HostedDelivery[]> {
-      const data = await labeled("read_inbox", () => call("GET", "/v1/deliveries?limit=100", token));
+    async readHostedInbox(token: string, signal?: AbortSignal): Promise<HostedDelivery[]> {
+      const data = await labeled("read_inbox", () => call("GET", "/v1/deliveries?limit=100", token, undefined, undefined, false, signal));
       if (!Array.isArray(data)) throw new RelaycastCallError(200, "", true);
       return data.flatMap((item) => {
         const delivery = record(item);
