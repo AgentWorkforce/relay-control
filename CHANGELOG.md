@@ -5,6 +5,15 @@ assigned at release.
 
 ## Unreleased
 
+- Added: Google Cloud Storage for Desktop feed assets
+  (`SELFHOST_DESKTOP_FEED_STORAGE=gcs`, `SELFHOST_DESKTOP_FEED_GCS_BUCKET`,
+  `SELFHOST_DESKTOP_FEED_GCS_PREFIX`). Credentials come from the metadata
+  server only (GKE Workload Identity); no static keys are read. Objects stay
+  private: downloads stream through the service or use V4 signed URLs signed
+  with IAM Credentials `signBlob`, which needs
+  `roles/iam.serviceAccountTokenCreator` on the service account itself.
+  Signers, the canonical-size limits and S3 storage are unchanged.
+
 - Added: a persistent mounted-secret Ed25519 Desktop feed signer (`file`),
   reporting and enforcing a 65,536-byte canonical manifest limit so a full
   platform asset set can include macOS headless bundles and its installer.

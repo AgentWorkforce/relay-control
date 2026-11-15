@@ -1004,7 +1004,14 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
     const noStorage = () => new FeedError(501, "no_object_storage", "This deployment streams assets; use GET /assets/{assetId}");
     if (!host || !signedHosts.includes(host)) throw noStorage();
     const issued = now();
-    const url = await storage.presignGet(found.storageKey!, DOWNLOAD_URL_SECONDS, issued);
+    let url: URL | null;
+    try {
+      url = await storage.presignGet(found.storageKey!, DOWNLOAD_URL_SECONDS, issued);
+    } catch (error) {
+      // For gcs this is IAM signBlob: a missing roles/iam.serviceAccountTokenCreator shows up here.
+      storageFailed("presign", found.storageKey!, error);
+      throw error;
+    }
     if (!url) throw noStorage();
     return {
       status: 200,

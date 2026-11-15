@@ -32,7 +32,7 @@ into:
 |---|---|
 | `SELFHOST_DESKTOP_FEED_SIGNER` | `awskms`, `file` (persistent mounted secret), or `memory` (tests and development: a throwaway key per process, refused when `NODE_ENV=production`). Must be set together with `_STORAGE`; setting only one is a startup error |
 | `SELFHOST_DESKTOP_FEED_KEY_FILES` | `file`: JSON object mapping profile ids to absolute paths of private PKCS8 Ed25519 PEM files. Mount durable secret files with mode `0400`, `0600` or `0440` (dedicated service group); group-write and all other-user permissions are refused. Projected Secret symlinks are supported. Key bytes are never stored in configuration or the database |
-| `SELFHOST_DESKTOP_FEED_STORAGE` | `s3` (deployed sites) or `memory` (tests and development, refused when `NODE_ENV=production`) |
+| `SELFHOST_DESKTOP_FEED_STORAGE` | `s3` (deployed sites on AWS), `gcs` (deployed sites on Google Cloud) or `memory` (tests and development, refused when `NODE_ENV=production`) |
 | `SELFHOST_DESKTOP_FEED_KMS_REGION` | `awskms`: region of the keys; default `AWS_REGION` |
 | `SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES` | `awskms`: JSON object of profile id to KMS alias, one key per profile, for example `{"x7k2q":"alias/desktop-feed-x7k2q"}`. Each key has spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`. Calls are `Sign` with `MessageType=RAW`, `SigningAlgorithm=ED25519_SHA_512`, and `GetPublicKey` (cached) |
 | `SELFHOST_DESKTOP_FEED_KEY_LABEL` | The `<label>` in `key_id` `fk_<profile>_<label>`. Defaults: `k1` for `awskms`, `f1` for `file`, `dev` for `memory`. A changed key must use a new label |
@@ -40,12 +40,59 @@ into:
 | `SELFHOST_DESKTOP_FEED_S3_BUCKET` | `s3`: private bucket name, without dots (TLS on the virtual-hosted host). Its virtual-hosted host `<bucket>.s3.<region>.amazonaws.com` is signed into `download_hosts` |
 | `SELFHOST_DESKTOP_FEED_S3_REGION` | `s3`: bucket region; default `AWS_REGION`, then `SELFHOST_DESKTOP_FEED_KMS_REGION` |
 | `SELFHOST_DESKTOP_FEED_S3_PREFIX` | `s3`: key prefix, default `desktop-feed` (also when set empty or to `/`). Segments of `[A-Za-z0-9._-]` separated by `/`; `.` and `..` segments and any other character are a startup error |
+| `SELFHOST_DESKTOP_FEED_GCS_BUCKET` | `gcs`: private bucket name (3-63 of `[a-z0-9._-]`). Requests and signed URLs are path-style, so `storage.googleapis.com` is signed into `download_hosts` |
+| `SELFHOST_DESKTOP_FEED_GCS_PREFIX` | `gcs`: object name prefix, same default and rules as `SELFHOST_DESKTOP_FEED_S3_PREFIX` |
+| `GCE_METADATA_HOST` | `gcs`: optional metadata server `host[:port]` override (the standard ADC variable); default `metadata.google.internal` |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | Optional static credentials. Unset: container credentials (`AWS_CONTAINER_CREDENTIALS_FULL_URI` + `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` for EKS Pod Identity, `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` for ECS), then web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, IRSA), then the EC2 instance role through IMDSv2; temporary credentials are cached until five minutes before expiry |
 
 The AWS role needs `kms:Sign` and `kms:GetPublicKey` on each profile's key, and
 `s3:PutObject`, `s3:GetObject` and `s3:DeleteObject` on
 `<prefix>/profiles/*`. Requests are SigV4 (`src/aws/sigv4.ts`). Every S3 write
 asks for SSE-S3 (`AES256`); block public access on the bucket.
+
+With `gcs`, credentials are Application Default Credentials from the metadata
+server only: GKE Workload Identity (the pod's Kubernetes service account
+bound to a Google service account), or the attached service account on GCE
+or Cloud Run. Static service-account keys are not supported:
+`GOOGLE_APPLICATION_CREDENTIALS` and inline JSON keys are never read. Tokens
+are cached until a minute before expiry. Requests use the XML API
+(`https://storage.googleapis.com/<bucket>/<object>`) with a Bearer token:
+streamed `PUT`, server-side copy (`x-goog-copy-source`), ranged `GET` and
+`DELETE`; there is no listing. GCS cannot verify a sha256 on upload, so each
+upload streams to its own staging object (`<key>.upload-<random>`, beside the
+draft key), hashed in flight; only verified bytes are copied to the draft key,
+and the staging object is deleted either way. A concurrent upload with other
+bytes therefore never replaces or removes a good draft object. A process that
+dies mid-upload can leave a staging object under `drafts/`. Objects are encrypted at rest by GCS
+(Google-managed keys, or the bucket's default CMEK). The Google service
+account needs:
+
+- `storage.objects.get`, `storage.objects.create` and `storage.objects.delete`
+  on objects named `<prefix>/profiles/*` (`create` plus `delete` is what an
+  overwrite needs; no `list`). Use a custom role with exactly these three, or
+  `roles/storage.objectUser` narrowed by an IAM condition such as
+  `resource.name.startsWith("projects/_/buckets/<bucket>/objects/<prefix>/profiles/")`.
+- `iam.serviceAccounts.signBlob` on itself, i.e.
+  `roles/iam.serviceAccountTokenCreator` granted to the service account on
+  its own resource, with the IAM Service Account Credentials API
+  (`iamcredentials.googleapis.com`) enabled. `download-url` signs V4 URLs
+  (`GOOG4-RSA-SHA256`, `host` signed, five minutes) through `signBlob`;
+  without the permission it fails while `GET /assets/{assetId}` streaming
+  keeps working.
+- On GKE, a Kubernetes ServiceAccount linked to that Google service account
+  (`iam.gke.io/gcp-service-account` annotation plus
+  `roles/iam.workloadIdentityUser` for the KSA on the Google service account),
+  and also annotated `iam.gke.io/return-principal-id-as-email: "true"`. A linked KSA can otherwise
+  get `<ksa>.svc.id.goog` instead of the Google service account email from the
+  metadata server ([GKE troubleshooting](https://cloud.google.com/kubernetes-engine/docs/troubleshooting/authentication)),
+  which this service refuses as a signing identity.
+  `signBlob` needs a Google service account: a KSA granted bucket access
+  directly as a Workload Identity Federation principal can upload and stream,
+  but `download-url` fails.
+
+Enable uniform bucket-level access and enforce public access prevention on
+the bucket; downloads are always either streamed through this service or a
+short-lived signed URL, never a public object.
 
 Objects live under `<prefix>/profiles/<profile>/`: `drafts/<version>/<name>`
 until publish, `releases/<version>/<name>` once published, and
@@ -89,7 +136,8 @@ one.
 | `src/desktop-feed/routes.ts` | Feed and admin routes, credential resolution, precedence, rate limits, audit |
 | `src/desktop-feed/store.ts` | Postgres access (profiles, bindings, tokens, releases, assets, audit) |
 | `src/desktop-feed/signer.ts` | `AwsKmsDesktopFeedSigner`, `MemoryDesktopFeedSigner` |
-| `src/desktop-feed/storage.ts` | `S3DesktopFeedStorage` (streamed PUT, ranged GET, presigned GET), `MemoryDesktopFeedStorage` |
+| `src/desktop-feed/storage.ts` | `S3DesktopFeedStorage` and `GcsDesktopFeedStorage` (streamed PUT, ranged GET, presigned GET), `MemoryDesktopFeedStorage` |
+| `src/gcp/credentials.ts` | Metadata-server (Workload Identity) access tokens and IAM Credentials `signBlob` for `gcs` |
 | `src/desktop-feed/schemas.ts` | The manifest, envelope and draft-create schemas, kept equal to `docs/specs/` and `openapi.yaml` by `test/desktop-feed.test.ts` |
 | `src/desktop-feed/canonical.ts`, `strict-json.ts` | RFC 8785 and strict I-JSON |
 | `migrations/0013_desktop_feed.sql` | `desktop_feed_*` tables |
@@ -708,8 +756,8 @@ concrete starting point. The signer below is decided; everything else here is
   in `src/flows/objects.ts` is 8 MiB; installers are hundreds of MiB.
 - **Backend selected by `SELFHOST_DESKTOP_FEED_STORAGE`:** `s3` (SigV4 against
   an S3-compatible bucket with the instance or pod role; the non-production
-  default on the AWS box), `gcs` (the hosted default; reuse the existing GCS
-  JSON-API client), `postgres-lo` (PostgreSQL large objects, streamed in
+  default on the AWS box), `gcs` (the XML API with Workload Identity tokens and
+  `signBlob` V4 signed URLs; see Configuration), `postgres-lo` (PostgreSQL large objects, streamed in
   chunks; for self-host deployments with no object store, which then answer
   501 `no_object_storage` on `download-url` and serve the stream route).
 - **Keys.** `desktop-feed/<profile>/<version>/<asset name>`, written once; a

@@ -39,7 +39,7 @@ import { IntrospectionHold } from "./auth/introspection-hold.js";
 import { handleAcquisitionRoutes } from "./acquisition/routes.js";
 import { createDesktopFeedHandler, type DesktopFeedLimits } from "./desktop-feed/routes.js";
 import { AwsKmsDesktopFeedSigner, FileDesktopFeedSigner, MemoryDesktopFeedSigner, type DesktopFeedSigner } from "./desktop-feed/signer.js";
-import { MemoryDesktopFeedStorage, S3DesktopFeedStorage, type DesktopFeedStorage } from "./desktop-feed/storage.js";
+import { GcsDesktopFeedStorage, MemoryDesktopFeedStorage, S3DesktopFeedStorage, type DesktopFeedStorage } from "./desktop-feed/storage.js";
 import { DesktopFeedStore } from "./desktop-feed/store.js";
 import { DefaultAwsCredentialProvider, StaticAwsCredentialProvider, type AwsCredentialProvider } from "./aws/sigv4.js";
 import { AwsStsClient, type StsClient } from "./aws/sts.js";
@@ -848,6 +848,8 @@ export function createApp(input: {
         ? new S3DesktopFeedStorage({
           bucket: feedConfig.storage.bucket, region: feedConfig.storage.region, prefix: feedConfig.storage.prefix,
         })
+        : feedConfig.storage.kind === "gcs"
+        ? new GcsDesktopFeedStorage({ bucket: feedConfig.storage.bucket, prefix: feedConfig.storage.prefix })
         : new MemoryDesktopFeedStorage()),
       browserOrigins,
       publisherTokenHashes: feedConfig.publisherTokenHashes,
