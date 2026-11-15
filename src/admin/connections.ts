@@ -770,20 +770,44 @@ export class ConnectionStore {
     return result.rows[0] ? this.toRecord(result.rows[0]) : null;
   }
 
+  async updateDisplayName(input: {
+    workspaceId: string; organizationId: string; provider: string;
+    connectionId: unknown; displayName: unknown; actor: AuditActor;
+  }): Promise<{ connectionId: string; displayName: string }> {
+    const provider = this.provider(input.provider);
+    const connectionId = cleanText(input.connectionId, "connectionId", 200);
+    const displayName = cleanText(input.displayName, "displayName", 80);
+    return this.database.transaction(async (tx) => {
+      const updated = await tx.query<{ id: string }>(
+        `UPDATE integration_connections SET metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{displayName}', to_jsonb($4::text), true),
+          updated_by_user_id = $5, updated_at = now()
+          WHERE workspace_id = $1 AND provider = $2 AND id::text = $3 RETURNING id`,
+        [input.workspaceId, provider.id, connectionId, displayName, input.actor.kind === "user" ? input.actor.userId : null],
+      );
+      if (updated.rows.length === 0) throw new ConnectionError(409, "connection_changed", "This connection has changed. Refresh before editing.");
+      await recordAudit(tx, { organizationId: input.organizationId, workspaceId: input.workspaceId, actor: input.actor, action: "integration.rename", target: provider.id });
+      return { connectionId, displayName };
+    });
+  }
+
   async disconnect(input: {
     workspaceId: string;
     organizationId: string;
     provider: string;
     actor: AuditActor;
+    connectionId?: string;
   }): Promise<boolean> {
     const provider = this.provider(input.provider);
     return this.database.transaction(async (tx) => {
       const deleted = await tx.query(
         `DELETE FROM integration_connections
-          WHERE workspace_id = $1 AND provider = $2 RETURNING id`,
-        [input.workspaceId, provider.id],
+          WHERE workspace_id = $1 AND provider = $2 AND ($3::text IS NULL OR id::text = $3) RETURNING id`,
+        [input.workspaceId, provider.id, input.connectionId ?? null],
       );
-      if (deleted.rows.length === 0) return false;
+      if (deleted.rows.length === 0) {
+        if (input.connectionId) throw new ConnectionError(409, "connection_changed", "This connection has changed. Refresh before disconnecting.");
+        return false;
+      }
       await recordAudit(tx, {
         organizationId: input.organizationId,
         workspaceId: input.workspaceId,

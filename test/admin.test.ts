@@ -629,6 +629,17 @@ test("provider connections: BYO OAuth round trip, encrypted tokens, refresh, dis
   assert.equal(posthog.body.authMode, "api_key");
   assert.deepEqual(posthog.body.metadata, { config: { host: "https://eu.posthog.com" } });
   assert(!posthog.raw.includes(apiKey));
+  const settingsPath = `${ws}/integrations/posthog/settings`;
+  const label = { connectionId: posthog.body.connectionId, displayName: "Production analytics" };
+  assert.equal((await request(ctx.origin, settingsPath, { method: "PATCH", token: ctx.member, body: label })).status, 403);
+  assert.equal((await request(ctx.origin, settingsPath, { method: "PATCH", token: ctx.owner, body: { ...label, credentials: { apiKey: "must-not-overwrite" } } })).status, 400);
+  assert.equal((await request(ctx.origin, settingsPath, { method: "PATCH", token: ctx.owner, body: { ...label, connectionId: "stale" } })).status, 409);
+  const renamed = await request(ctx.origin, settingsPath, { method: "PATCH", token: ctx.owner, body: label });
+  assert.equal(renamed.status, 200); assert.deepEqual(renamed.body, label); assert(!renamed.raw.includes(apiKey));
+  const named = await request(ctx.origin, `${ws}/integrations/posthog`, { token: ctx.owner });
+  assert.equal(named.body.metadata.displayName, "Production analytics");
+  assert.equal(named.body.metadata.config.host, "https://eu.posthog.com");
+  assert.equal((await request(ctx.origin, `${ws}/integrations/posthog?connectionId=stale`, { method: "DELETE", token: ctx.owner })).status, 409);
   assert.equal((await request(ctx.origin, `${ws}/integrations/github`, {
     method: "POST",
     token: ctx.owner,
@@ -823,6 +834,7 @@ test("every admin operation is documented in openapi.yaml", async () => {
     "/api/v1/workspaces/{workspaceId}/integrations/{provider}/oauth-app:",
     "/api/v1/workspaces/{workspaceId}/integrations/{provider}:",
     "/api/v1/workspaces/{workspaceId}/integrations/{provider}/status:",
+    "/api/v1/workspaces/{workspaceId}/integrations/{provider}/settings:",
     "/api/v1/workspaces/{workspaceId}/deployment-api-tokens:",
     "/api/v1/workspaces/{workspaceId}/deployment-api-tokens/{tokenId}:",
     "/api/v1/workspaces/{workspaceId}/admin/audit:",

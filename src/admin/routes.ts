@@ -619,6 +619,17 @@ export function createAdminModule(input: {
       }
     }
 
+    const integrationSettings = match(rest, /^integrations\/([^/]+)\/settings$/);
+    if (integrationSettings && method === "PATCH") {
+      requireJsonWrite(request, helpers);
+      const access = await helpers.workspaceAccess(request, workspaceId, true);
+      const body = await helpers.requestObject(request);
+      if (Object.keys(body).some((key) => !["connectionId", "displayName"].includes(key))) throw new AdminHttpError(400, "invalid_request", "Only the connection display name can be edited here");
+      const updated = await connections.updateDisplayName({ workspaceId: access.workspace.id, organizationId: access.workspace.organizationId, provider: integrationSettings[0]!, connectionId: body.connectionId, displayName: body.displayName, actor: userActor(access) });
+      json(response, 200, updated);
+      return true;
+    }
+
     const integrationStatus = match(rest, /^integrations\/([^/]+)\/status$/);
     const integrationItem = match(rest, /^integrations\/([^/]+)$/);
     const providerId = integrationStatus?.[0] ?? integrationItem?.[0];
@@ -660,6 +671,7 @@ export function createAdminModule(input: {
           organizationId: access.workspace.organizationId,
           provider: providerId,
           actor: userActor(access),
+          ...(url.searchParams.get("connectionId") ? { connectionId: url.searchParams.get("connectionId")! } : {}),
         });
         json(response, 200, {
           success: true,

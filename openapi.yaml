@@ -5418,6 +5418,30 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DisconnectResult" }
+  /api/v1/workspaces/{workspaceId}/integrations/{provider}/settings:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/Provider"
+    patch:
+      operationId: updateIntegrationDisplayName
+      description: Owner/admin. Updates only a presentation name, preserving credentials and provider metadata. The connectionId guards against stale edits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [connectionId, displayName]
+              properties:
+                connectionId: { type: string, minLength: 1 }
+                displayName: { type: string, minLength: 1, maxLength: 80 }
+      responses:
+        "200": { description: Updated presentation name and connectionId; no credentials }
+        "400": { description: invalid_request }
+        "401": { description: Unauthorized }
+        "403": { description: Forbidden }
+        "409": { description: connection_changed }
   /api/v1/workspaces/{workspaceId}/integrations/{provider}/status:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
