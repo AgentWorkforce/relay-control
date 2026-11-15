@@ -124,7 +124,7 @@ export class FileDesktopFeedSigner implements DesktopFeedSigner {
         // Resolve projected Secret symlinks, then forbid a symlink swap at open.
         fd = openSync(realpathSync(path), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         const stat = fstatSync(fd);
-        if (!stat.isFile() || stat.size > 16384 || (stat.mode & 0o077) !== 0
+        if (!stat.isFile() || stat.size > 16384 || (stat.mode & 0o027) !== 0
           || (stat.uid !== process.getuid?.() && stat.uid !== 0)) throw new Error("unsafe key file");
         bytes = readFileSync(fd);
         const key = createPrivateKey(bytes);

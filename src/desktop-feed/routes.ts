@@ -58,8 +58,9 @@ const ASSET_ID_CHARS = 8;
 const PLACEHOLDER_PUBLISHED_AT = "2000-01-01T00:00:00Z";
 
 /**
- * Short on purpose: ids are signed into the manifest under the KMS 4096-byte
- * cap, and are not secrets (every lookup is scoped to an entitled profile).
+ * Short on purpose: ids are signed into a manifest bounded by its signer
+ * (4096 bytes for KMS, 65536 for file). They are not secrets; every lookup
+ * is scoped to an entitled profile.
  */
 function newAssetId(): string {
   return `a_${Array.from({ length: ASSET_ID_CHARS }, () => BASE62[randomInt(BASE62.length)]).join("")}`;

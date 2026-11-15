@@ -21,6 +21,8 @@ test("persistent feed signer signs full multi-platform manifests across restarts
   const projected = join(dir, "projected-secret"); symlinkSync(path, projected);
   const options = { label: "k1", keyFiles: { profile1: projected } };
   const first = new FileDesktopFeedSigner(options), restarted = new FileDesktopFeedSigner(options);
+  chmodSync(path, 0o440);
+  assert.equal(await new FileDesktopFeedSigner(options).publicKey("profile1"), await first.publicKey("profile1"));
   const bytes = Buffer.alloc(5000, 32); // More than the 4096-byte KMS limit.
   const signed = await first.sign("profile1", bytes);
   assert.equal(signed.keyId, "fk_profile1_k1");
@@ -50,7 +52,7 @@ test("persistent feed signer refuses readable, malformed and wrong-type secrets 
 test("file signer config validates a profile-to-absolute-file map without accepting key contents", () => {
   const base = { SELFHOST_DESKTOP_FEED_SIGNER: "file", SELFHOST_DESKTOP_FEED_STORAGE: "memory" };
   assert.deepEqual(loadDesktopFeedConfig({ ...base, SELFHOST_DESKTOP_FEED_KEY_FILES: '{"profile1":"/run/secrets/feed.pem"}' })?.signer,
-    { kind: "file", label: "k1", keyFiles: { profile1: "/run/secrets/feed.pem" } });
+    { kind: "file", label: "f1", keyFiles: { profile1: "/run/secrets/feed.pem" } });
   for (const map of ['{}', '{"profile1":"relative.pem"}', '{"profile1":true}', '{"bad/profile":"/secret"}']) {
     assert.throws(() => loadDesktopFeedConfig({ ...base, SELFHOST_DESKTOP_FEED_KEY_FILES: map }), /SELFHOST_DESKTOP_FEED_KEY_FILES/);
   }

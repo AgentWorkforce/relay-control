@@ -31,11 +31,11 @@ into:
 | Variable | Meaning |
 |---|---|
 | `SELFHOST_DESKTOP_FEED_SIGNER` | `awskms`, `file` (persistent mounted secret), or `memory` (tests and development: a throwaway key per process, refused when `NODE_ENV=production`). Must be set together with `_STORAGE`; setting only one is a startup error |
-| `SELFHOST_DESKTOP_FEED_KEY_FILES` | `file`: JSON object mapping profile ids to absolute paths of private PKCS8 Ed25519 PEM files. Mount durable secret files readable only by the process owner (mode `0400` or `0600`); projected Secret symlinks are supported. Key bytes are never stored in configuration or the database |
+| `SELFHOST_DESKTOP_FEED_KEY_FILES` | `file`: JSON object mapping profile ids to absolute paths of private PKCS8 Ed25519 PEM files. Mount durable secret files with mode `0400`, `0600` or `0440` (dedicated service group); group-write and all other-user permissions are refused. Projected Secret symlinks are supported. Key bytes are never stored in configuration or the database |
 | `SELFHOST_DESKTOP_FEED_STORAGE` | `s3` (deployed sites) or `memory` (tests and development, refused when `NODE_ENV=production`) |
 | `SELFHOST_DESKTOP_FEED_KMS_REGION` | `awskms`: region of the keys; default `AWS_REGION` |
 | `SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES` | `awskms`: JSON object of profile id to KMS alias, one key per profile, for example `{"x7k2q":"alias/desktop-feed-x7k2q"}`. Each key has spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`. Calls are `Sign` with `MessageType=RAW`, `SigningAlgorithm=ED25519_SHA_512`, and `GetPublicKey` (cached) |
-| `SELFHOST_DESKTOP_FEED_KEY_LABEL` | The `<label>` in `key_id` `fk_<profile>_<label>`. Default `k1` for `awskms` and `dev` for `memory` |
+| `SELFHOST_DESKTOP_FEED_KEY_LABEL` | The `<label>` in `key_id` `fk_<profile>_<label>`. Defaults: `k1` for `awskms`, `f1` for `file`, `dev` for `memory`. A changed key must use a new label |
 | `SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES` | Optional JSON object of profile id to an array of token sha256 hex digests, for CI tokens (`sh_dfp_...`) provisioned outside the admin routes. Only the hash is configured; removing an entry and restarting revokes the token |
 | `SELFHOST_DESKTOP_FEED_S3_BUCKET` | `s3`: private bucket name, without dots (TLS on the virtual-hosted host). Its virtual-hosted host `<bucket>.s3.<region>.amazonaws.com` is signed into `download_hosts` |
 | `SELFHOST_DESKTOP_FEED_S3_REGION` | `s3`: bucket region; default `AWS_REGION`, then `SELFHOST_DESKTOP_FEED_KMS_REGION` |
@@ -57,7 +57,7 @@ The `file` signer supports complete multi-platform feeds, including macOS
 headless bundles and their installer, by reporting and enforcing
 `limits.max_canonical_bytes: 65536`. It signs the same pure Ed25519 bytes;
 clients retain their profile, signature, checksum and size checks. Supply
-durable private keys from a mounted secret, readable by the service uid only;
+durable private keys from a mounted secret, readable by the service uid or its dedicated group;
 the service loads them at startup. All replicas and restarts must receive the
 same key files. Back up and rotate these secrets through the operator's secret
 store. Register each public key for its profile and compile it into that

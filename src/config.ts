@@ -856,7 +856,7 @@ export function loadDesktopFeedConfig(env: Env = process.env): DesktopFeedConfig
   if (env.NODE_ENV === "production" && (signerKind === "memory" || storageKind === "memory")) {
     throw new Error("The memory desktop feed signer and storage are for tests and development, not NODE_ENV=production");
   }
-  const label = env.SELFHOST_DESKTOP_FEED_KEY_LABEL?.trim() || (signerKind === "memory" ? "dev" : "k1");
+  const label = env.SELFHOST_DESKTOP_FEED_KEY_LABEL?.trim() || (signerKind === "memory" ? "dev" : signerKind === "file" ? "f1" : "k1");
   if (!/^[a-z0-9]{1,16}$/.test(label)) throw new Error("SELFHOST_DESKTOP_FEED_KEY_LABEL must match ^[a-z0-9]{1,16}$");
   let signer: DesktopFeedSignerConfig;
   if (signerKind === "awskms") {
