@@ -11,6 +11,7 @@ import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { createRelaycastWorld, type RelaycastWorld } from "./support/relaycast-world.js";
 import { PGliteDatabase } from "./support/harness.js";
+import { RECIPIENT_CARD_NOTE } from "../src/mcp/relay-agent-cards.js";
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -865,9 +866,9 @@ test("send_relay_message returns the recipient's card summary only when it has o
 
   const carded = structured(await client.callTool({ name: "send_relay_message", arguments: { to: "carded-bot", text: "please review" } }));
   assert.deepEqual(carded.recipient_card, { description: "Reviews pull requests", skills: ["Review a PR", "Land a PR"],
-    version: "2.1", updated_at: "2026-11-15T20:05:36.000Z" });
+    version: "2.1", updated_at: "2026-11-15T20:05:36.000Z", note: RECIPIENT_CARD_NOTE });
   const skillsOnly = structured(await client.callTool({ name: "send_relay_message", arguments: { to: "skills-bot", text: "hi" } }));
-  assert.deepEqual(skillsOnly.recipient_card, { description: "", skills: ["Triage issues"], version: "1", updated_at: null });
+  assert.deepEqual(skillsOnly.recipient_card, { description: null, skills: ["Triage issues"], version: "1", updated_at: null, note: RECIPIENT_CARD_NOTE });
   for (const to of ["plain-bot", "broken-bot"]) {
     const sent = structured(await client.callTool({ name: "send_relay_message", arguments: { to, text: "hi" } }));
     assert.ok(!("recipient_card" in sent), to);
