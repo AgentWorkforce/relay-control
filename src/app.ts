@@ -38,7 +38,7 @@ import { acceptedAudiences, handleIntrospection, introspect, INTROSPECT_PATH } f
 import { IntrospectionHold } from "./auth/introspection-hold.js";
 import { handleAcquisitionRoutes } from "./acquisition/routes.js";
 import { createDesktopFeedHandler, type DesktopFeedLimits } from "./desktop-feed/routes.js";
-import { AwsKmsDesktopFeedSigner, MemoryDesktopFeedSigner, type DesktopFeedSigner } from "./desktop-feed/signer.js";
+import { AwsKmsDesktopFeedSigner, FileDesktopFeedSigner, MemoryDesktopFeedSigner, type DesktopFeedSigner } from "./desktop-feed/signer.js";
 import { MemoryDesktopFeedStorage, S3DesktopFeedStorage, type DesktopFeedStorage } from "./desktop-feed/storage.js";
 import { DesktopFeedStore } from "./desktop-feed/store.js";
 import { DefaultAwsCredentialProvider, StaticAwsCredentialProvider, type AwsCredentialProvider } from "./aws/sigv4.js";
@@ -841,6 +841,8 @@ export function createApp(input: {
         ? new AwsKmsDesktopFeedSigner({
           region: feedConfig.signer.region, label: feedConfig.signer.label, keyAliases: feedConfig.signer.keyAliases,
         })
+        : feedConfig.signer.kind === "file"
+        ? new FileDesktopFeedSigner({ label: feedConfig.signer.label, keyFiles: feedConfig.signer.keyFiles })
         : new MemoryDesktopFeedSigner({ label: feedConfig.signer.label })),
       storage: input.desktopFeed?.storage ?? (feedConfig.storage.kind === "s3"
         ? new S3DesktopFeedStorage({

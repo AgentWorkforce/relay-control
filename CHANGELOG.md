@@ -5,6 +5,11 @@ assigned at release.
 
 ## Unreleased
 
+- Added: a persistent mounted-secret Ed25519 Desktop feed signer (`file`),
+  reporting and enforcing a 65,536-byte canonical manifest limit so a full
+  platform asset set can include macOS headless bundles and its installer.
+  Existing KMS signing and its 4,096-byte limit remain unchanged.
+
 - Added: desktop enrollment keys (migration 0050). An owner or admin mints a
   one-time `sh_ek_` key for an employee by email through the workspace API
   token routes (`purpose: "desktop-enrollment"`, 1-30 days, default 7,

@@ -264,7 +264,7 @@ test("feed config: off unless both signer and storage are set", () => {
   assert.throws(() => loadDesktopFeedConfig({
     ...kmsEnv, SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES: ALIASES_JSON, SELFHOST_DESKTOP_FEED_STORAGE: "s3", SELFHOST_DESKTOP_FEED_S3_BUCKET: "dotted.bucket",
   }), /without dots/);
-  assert.throws(() => loadDesktopFeedConfig({ SELFHOST_DESKTOP_FEED_SIGNER: "local", SELFHOST_DESKTOP_FEED_STORAGE: "memory" }), /awskms or memory/);
+  assert.throws(() => loadDesktopFeedConfig({ SELFHOST_DESKTOP_FEED_SIGNER: "local", SELFHOST_DESKTOP_FEED_STORAGE: "memory" }), /awskms, file or memory/);
 });
 
 test("S3 storage: copy is server-side, encrypted, and sees an error inside a 200", async (t) => {

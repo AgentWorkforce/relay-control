@@ -143,6 +143,7 @@ export interface HistoryUploadConfig {
 
 export type DesktopFeedSignerConfig =
   | { kind: "memory"; label: string }
+  | { kind: "file"; label: string; keyFiles: Record<string, string> }
   | { kind: "awskms"; region: string; label: string; keyAliases: Record<string, string> };
 
 export type DesktopFeedStorageConfig =
@@ -839,7 +840,7 @@ function feedProfileMap(env: Env, name: string): Record<string, unknown> {
 }
 
 /**
- * SELFHOST_DESKTOP_FEED_SIGNER (awskms | memory) and
+ * SELFHOST_DESKTOP_FEED_SIGNER (awskms | file | memory) and
  * SELFHOST_DESKTOP_FEED_STORAGE (s3 | memory) together turn the feed on;
  * with neither set it is off. Setting only one is a configuration error, so a
  * half-configured feed never starts silently disabled.
@@ -855,7 +856,7 @@ export function loadDesktopFeedConfig(env: Env = process.env): DesktopFeedConfig
   if (env.NODE_ENV === "production" && (signerKind === "memory" || storageKind === "memory")) {
     throw new Error("The memory desktop feed signer and storage are for tests and development, not NODE_ENV=production");
   }
-  const label = env.SELFHOST_DESKTOP_FEED_KEY_LABEL?.trim() || (signerKind === "awskms" ? "k1" : "dev");
+  const label = env.SELFHOST_DESKTOP_FEED_KEY_LABEL?.trim() || (signerKind === "memory" ? "dev" : "k1");
   if (!/^[a-z0-9]{1,16}$/.test(label)) throw new Error("SELFHOST_DESKTOP_FEED_KEY_LABEL must match ^[a-z0-9]{1,16}$");
   let signer: DesktopFeedSignerConfig;
   if (signerKind === "awskms") {
@@ -873,10 +874,16 @@ export function loadDesktopFeedConfig(env: Env = process.env): DesktopFeedConfig
       }
     }
     signer = { kind: "awskms", region, label, keyAliases: aliases as Record<string, string> };
+  } else if (signerKind === "file") {
+    const files = feedProfileMap(env, "SELFHOST_DESKTOP_FEED_KEY_FILES");
+    if (!Object.keys(files).length || Object.values(files).some(path => typeof path !== "string" || !path.startsWith("/"))) {
+      throw new Error("SELFHOST_DESKTOP_FEED_KEY_FILES must map at least one profile to an absolute secret file path");
+    }
+    signer = { kind: "file", label, keyFiles: files as Record<string, string> };
   } else if (signerKind === "memory") {
     signer = { kind: "memory", label };
   } else {
-    throw new Error("SELFHOST_DESKTOP_FEED_SIGNER must be awskms or memory");
+    throw new Error("SELFHOST_DESKTOP_FEED_SIGNER must be awskms, file or memory");
   }
   let storage: DesktopFeedStorageConfig;
   if (storageKind === "s3") {
