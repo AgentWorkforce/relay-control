@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import { createRelaycastClient, RelaycastCallError } from "../src/messaging/relaycast.js";
+
+const captured = JSON.parse(readFileSync(new URL("./fixtures/message-deliveries.json", import.meta.url), "utf8"));
+test("captured old-engine and sender-scoped #625 receipts match the MCP client contract", async () => {
+  for (const sample of ["old_engine", "non_sender", "delivered", "replied"]) {
+    const body = captured[sample];
+    const client = createRelaycastClient({ internalOrigin: "https://cast.example.test", fetchImpl: async () => Response.json(body, { status: body.ok ? 200 : 404 }) });
+    const receipts = await client.getMessageDeliveries("sender", "123");
+    assert.deepEqual(receipts, body.ok ? body.data.deliveries : null);
+  }
+});
 
 test("sender receipts use only the acting token and preserve acceptance, acknowledgement and explicit reads", async () => {
   for (const state of ["queued", "delivered", "consumed", "replied", "failed"]) {

@@ -1,0 +1,16 @@
+{
+  "source": "Relaycast #625, b6cc6e1a; captured on a temporary test workspace, identifiers normalized",
+  "old_engine": {"ok": false, "error": {"code": "not_found", "message": "Route not found"}},
+  "non_sender": {"ok": false, "error": {"code": "message_not_found", "message": "Message not found"}},
+  "delivered": {"ok": true, "data": {"message_id": "123", "deliveries": [{
+    "id": "del_456", "agent_id": "789", "agent_name": "bob", "status": "delivered", "state": "delivered",
+    "created_at": "2026-11-15T02:59:31.000Z", "delivered_at": "2026-11-15T02:59:31.000Z", "accepted_at": "2026-11-15T02:59:31.000Z",
+    "acked_at": null, "replied_at": null, "reply_message_id": null, "dead_lettered_at": null, "error": null, "read_at": null
+  }]}},
+  "replied": {"ok": true, "data": {"message_id": "123", "deliveries": [{
+    "id": "del_456", "agent_id": "789", "agent_name": "bob", "status": "acked", "state": "replied",
+    "created_at": "2026-11-15T02:59:31.000Z", "delivered_at": "2026-11-15T02:59:31.000Z", "accepted_at": "2026-11-15T02:59:31.000Z",
+    "acked_at": "2026-11-15T02:59:31.000Z", "replied_at": "2026-11-15T02:59:31.000Z", "reply_message_id": "124",
+    "dead_lettered_at": null, "error": null, "read_at": "2026-11-15T02:59:31.000Z"
+  }]}}
+}

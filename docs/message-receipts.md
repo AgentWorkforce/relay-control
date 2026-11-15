@@ -19,8 +19,8 @@ not that the message arrived. Inspect each delivery's `state`:
 | replied | An explicitly correlated reply exists; see `reply_message_id` |
 | failed | Delivery failed; arbitrary upstream error details are withheld |
 
-`read_at` records an explicit read receipt only. Acknowledgement does not
-mean a person read the message or a model understood it. An empty list does
+`read_at` is a protocol read marker and may be written when a delivery is
+acknowledged. It does not mean a person read the message or a model understood it. An empty list does
 not confirm delivery.
 
 The engine must include Relaycast #625's delivery-confirmation API and its
