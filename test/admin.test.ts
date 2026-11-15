@@ -629,6 +629,31 @@ test("provider connections: BYO OAuth round trip, encrypted tokens, refresh, dis
   assert.equal(posthog.body.authMode, "api_key");
   assert.deepEqual(posthog.body.metadata, { config: { host: "https://eu.posthog.com" } });
   assert(!posthog.raw.includes(apiKey));
+  const settingsPath = `${ws}/integrations/posthog/settings`;
+  const label = { connectionId: posthog.body.connectionId, displayName: "Production analytics" };
+  assert.equal((await request(ctx.origin, settingsPath, { method: "PATCH", token: ctx.member, body: label })).status, 403);
+  assert.equal((await request(ctx.origin, settingsPath, { method: "PATCH", token: ctx.owner, body: { ...label, credentials: { apiKey: "must-not-overwrite" } } })).status, 400);
+  assert.equal((await request(ctx.origin, settingsPath, { method: "PATCH", token: ctx.owner, body: { ...label, connectionId: "stale" } })).status, 409);
+  const renamed = await request(ctx.origin, settingsPath, { method: "PATCH", token: ctx.owner, body: label });
+  assert.equal(renamed.status, 200); assert.deepEqual(renamed.body, label); assert(!renamed.raw.includes(apiKey));
+  const named = await request(ctx.origin, `${ws}/integrations/posthog`, { token: ctx.owner });
+  assert.equal(named.body.metadata.displayName, "Production analytics");
+  assert.equal(named.body.metadata.config.host, "https://eu.posthog.com");
+  assert.equal((await request(ctx.origin, `${ws}/integrations/posthog?connectionId=stale`, { method: "DELETE", token: ctx.owner })).status, 409);
+  assert.match(named.body.version, /^[a-f0-9]{64}$/);
+  assert.notEqual(named.body.version, posthog.body.version, "renaming changes the edit token");
+  const replacement = await request(ctx.origin, `${ws}/integrations/posthog`, {
+    method: "POST", token: ctx.owner, body: { credentials: { apiKey: "replacement-test-key", host: "https://eu.posthog.com" } },
+  });
+  assert.equal(replacement.status, 201);
+  assert.equal(replacement.body.metadata.displayName, "Production analytics", "credential rotation preserves the saved presentation name");
+  assert.equal(replacement.body.metadata.config.host, "https://eu.posthog.com");
+  assert.equal(replacement.body.connectionId, posthog.body.connectionId, "native reconnect retains the row id");
+  assert.notEqual(replacement.body.version, named.body.version);
+  assert.equal((await request(ctx.origin, settingsPath, { method: "PATCH", token: ctx.owner, body: { ...label, version: named.body.version } })).status, 409);
+  assert.equal((await request(ctx.origin, `${ws}/integrations/posthog?connectionId=${label.connectionId}&version=${named.body.version}`, { method: "DELETE", token: ctx.owner })).status, 409);
+  assert.equal((await request(ctx.origin, `${ws}/integrations/posthog`, { token: ctx.owner })).body.version, replacement.body.version, "stale edits leave the replacement intact");
+  assert.equal((await request(ctx.origin, settingsPath, { method: "PATCH", token: ctx.owner, body: { ...label, version: replacement.body.version } })).status, 200);
   assert.equal((await request(ctx.origin, `${ws}/integrations/github`, {
     method: "POST",
     token: ctx.owner,
@@ -641,7 +666,7 @@ test("provider connections: BYO OAuth round trip, encrypted tokens, refresh, dis
     { token: SERVICE },
   );
   assert.equal(env.status, 200);
-  assert.equal(env.body.env.WORKFORCE_INTEGRATION_POSTHOG_TOKEN, apiKey);
+  assert.equal(env.body.env.WORKFORCE_INTEGRATION_POSTHOG_TOKEN, "replacement-test-key");
   assert.equal(env.body.env.WORKFORCE_INTEGRATION_POSTHOG_HOST, "https://eu.posthog.com");
   assert.equal(env.body.env.WORKFORCE_INTEGRATION_MOCKHUB_TOKEN, "at-4-secret-access");
 
@@ -649,7 +674,7 @@ test("provider connections: BYO OAuth round trip, encrypted tokens, refresh, dis
     token: SERVICE,
   });
   assert.equal(internalList.body.integrations.length, 2);
-  assert(!internalList.raw.includes(apiKey) && !internalList.raw.includes("secret-access"));
+  assert(!internalList.raw.includes(apiKey) && !internalList.raw.includes("replacement-test-key") && !internalList.raw.includes("secret-access"));
 
   // Disconnect: admin-only, idempotent, then token fetch 404.
   assert.equal((await request(ctx.origin, `${ws}/integrations/mockhub`, { method: "DELETE", token: ctx.member })).status, 403);
@@ -823,6 +848,7 @@ test("every admin operation is documented in openapi.yaml", async () => {
     "/api/v1/workspaces/{workspaceId}/integrations/{provider}/oauth-app:",
     "/api/v1/workspaces/{workspaceId}/integrations/{provider}:",
     "/api/v1/workspaces/{workspaceId}/integrations/{provider}/status:",
+    "/api/v1/workspaces/{workspaceId}/integrations/{provider}/settings:",
     "/api/v1/workspaces/{workspaceId}/deployment-api-tokens:",
     "/api/v1/workspaces/{workspaceId}/deployment-api-tokens/{tokenId}:",
     "/api/v1/workspaces/{workspaceId}/admin/audit:",

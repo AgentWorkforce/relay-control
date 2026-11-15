@@ -5463,6 +5463,15 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/IntegrationConnection" }
     delete:
+      parameters:
+        - in: query
+          name: connectionId
+          schema: { type: string }
+          description: Selected connection id; a stale id answers 409.
+        - in: query
+          name: version
+          schema: { type: string, pattern: "^[a-f0-9]{64}$" }
+          description: Opaque edit token from the connection record; detects replacements retaining the id.
       operationId: disconnectIntegration
       description: Owner/admin. Idempotent. Deletes stored tokens; revoke the grant in the provider if required.
       responses:
@@ -5471,6 +5480,31 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DisconnectResult" }
+  /api/v1/workspaces/{workspaceId}/integrations/{provider}/settings:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/Provider"
+    patch:
+      operationId: updateIntegrationDisplayName
+      description: Owner/admin. Updates only a presentation name, preserving credentials and provider metadata. The connectionId and optional opaque version guard against stale edits, including reconnects that retain the row id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [connectionId, displayName]
+              properties:
+                connectionId: { type: string, minLength: 1 }
+                version: { type: string, pattern: "^[a-f0-9]{64}$", description: Opaque edit token from the connection record; detects reconnects that retain the row id. }
+                displayName: { type: string, minLength: 1, maxLength: 80 }
+      responses:
+        "200": { description: Updated presentation name and connectionId; no credentials }
+        "400": { description: invalid_request }
+        "401": { description: Unauthorized }
+        "403": { description: Forbidden }
+        "409": { description: connection_changed }
   /api/v1/workspaces/{workspaceId}/integrations/{provider}/status:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -9437,6 +9471,7 @@ components:
       type: object
       properties:
         connectionId: { type: string }
+        version: { type: string, description: Opaque connection edit token }
         provider: { type: string }
         providerConfigKey: { type: string }
         displayName: { type: string }
