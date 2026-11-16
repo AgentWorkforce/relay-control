@@ -13,6 +13,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { CodingAgentStore } from "../src/admin/coding-agents.js";
+import { CredentialBlobStore,PostgresObjectBackend } from "../src/admin/credential-blobs.js";
+import { SubscriptionLoginStore } from "../src/admin/subscription-logins.js";
+import { copyCodingAgentCredentials } from "../scripts/cloud-import/credentials.js";
+import { mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
 
 const port = Number(process.env.CLOUD_VERIFY_FIXTURE_PORT);
 const enabled = Boolean(port) && process.env.CLOUD_VERIFY_FIXTURE_CLUSTER === "synthetic-only";
@@ -37,6 +43,31 @@ const sourceDb = database(source);
 const targetDb = database(target);
 const scope = {orgIds:null};
 const apply = (selected=scope) => runImport({source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply");
+async function copiedFixture() {
+  await source.query("DELETE FROM provider_credentials WHERE id=$1",[id(0x807)]);
+  // Cloud object keys retain the pre-merge user id, while Control uses the survivor.
+  await source.query("UPDATE provider_credentials SET user_id=$1 WHERE id=$2",[id(5),id(0x803)]);
+  const ledger = await apply();
+  assert.equal(ledger.ok,true,JSON.stringify(ledger.orgs));
+  const jwt = (value:Record<string,unknown>) => `e30.${Buffer.from(JSON.stringify(value)).toString("base64url")}.sig`;
+  const auth = JSON.stringify({auth_mode:"chatgpt",tokens:{
+    access_token:jwt({exp:1893456000}),id_token:jwt({email:"alice@example.test"}),
+    refresh_token:"rt-synthetic-only",account_id:"acct-synthetic-1"}});
+  const objects = new Map<string,string>([
+    [`${id(5)}/${id(0x803)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-synthetic-openai-key-0000000000"}),cloudKeyHex))],
+    [`${id(2)}/anthropic/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({token:"sk-ant-oat01-synthetic-token-00000000"}),cloudKeyHex))],
+    [`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(auth,cloudKeyHex))],
+    [`${id(2)}/${id(0x808)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-synthetic-second-key-00000000000"}),cloudKeyHex))],
+  ]);
+  const reader = {get:async (key:string) => objects.get(key) ?? null};
+  const blobs = new CredentialBlobStore(new PostgresObjectBackend(targetDb),fixtureKeyring);
+  const deps = {source:sourceDb,reader,cloudKeyHex,keyring:fixtureKeyring,
+    codingAgents:new CodingAgentStore(targetDb,fixtureKeyring,undefined,blobs),
+    logins:new SubscriptionLoginStore(targetDb,fixtureKeyring,blobs)};
+  const copy = await copyCodingAgentCredentials(deps,scope,"apply");
+  assert.equal(copy.ok,true,JSON.stringify(copy));
+  return {ledger,copy,deps,objects,blobs,reader};
+}
 before(async () => {
   if (!enabled) return;
   await admin.connect();
@@ -55,7 +86,7 @@ beforeEach(async () => {
     UPDATE workspaces SET relay_workspace_id='rw_0000b202' WHERE relay_workspace_id='rw_legacy-01'`);
   await migrate(targetDb);
   // Run actual checked-in migrations first. Model the published optional
-  // 0053/0056/0057/0058 shapes until those separate schema PRs land.
+  // 0053/0054/0056/0057/0058 shapes until those separate schema PRs land.
   await target.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS cloud_relay_workspace_id text UNIQUE;
     ALTER TABLE organizations ADD COLUMN IF NOT EXISTS slug text;
     ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS slug text;
@@ -63,6 +94,19 @@ beforeEach(async () => {
     ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS relaycast_api_key_generation integer;
     ALTER TABLE desktop_relay_identities ALTER COLUMN source_id TYPE text USING source_id::text;
     ALTER TABLE fleet_node_owners ALTER COLUMN node_name DROP NOT NULL;
+    CREATE TABLE github_app_installations (
+      installation_id text PRIMARY KEY CHECK(installation_id ~ '^[1-9][0-9]{0,19}$'),
+      organization_id uuid NOT NULL REFERENCES organizations(id),UNIQUE(installation_id,organization_id));
+    ALTER TABLE integration_connections ADD COLUMN installation_id text,
+      ADD COLUMN github_app_organization_id uuid,ADD COLUMN github_app_refresh_id uuid,
+      ADD COLUMN github_app_refresh_until timestamptz;
+    ALTER TABLE integration_connections DROP CONSTRAINT IF EXISTS selfhost_connection_auth_mode,
+      DROP CONSTRAINT IF EXISTS connection_auth_mode,
+      ADD CONSTRAINT connection_auth_mode CHECK(auth_mode IN ('oauth2','api_key','github_app')),
+      ADD CONSTRAINT connection_github_installation_owner FOREIGN KEY(installation_id,github_app_organization_id)
+        REFERENCES github_app_installations(installation_id,organization_id),
+      ADD CONSTRAINT connection_github_workspace_owner FOREIGN KEY(workspace_id,github_app_organization_id)
+        REFERENCES workspaces(id,organization_id);
     ALTER TABLE coding_agent_credentials
       ALTER COLUMN secret_preview DROP NOT NULL,ALTER COLUMN key_fingerprint DROP NOT NULL,
       DROP CONSTRAINT IF EXISTS selfhost_coding_agent_auth_type,
@@ -85,7 +129,7 @@ fixtureTest("actual importer rollback, apply and rerun reconcile all mapped tabl
   const one = await verifyImport(source,target,scope,first,fixtureKeyring,cloudKeyHex);
   assert.equal(one.ok,true,JSON.stringify(one.findings.filter((f) => !f.ok)));
   assert.equal(one.findings.filter((f) => f.kind === "table").length,SOURCE_TABLES.length);
-  assert.equal(one.findings.filter((f) => f.kind === "decrypt").length,4);
+  assert.equal(one.findings.filter((f) => f.kind === "decrypt").length,encryptedSamples(20,scope).length);
   const hashes = (await target.query("SELECT id,token_hash FROM organization_invitations ORDER BY id")).rows;
   const second = await apply();
   const two = await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex);
@@ -100,10 +144,88 @@ fixtureTest("actual importer rollback, apply and rerun reconcile all mapped tabl
   for (const table of ["token_sessions","device_authorizations","workspace_api_tokens","mcp_oauth_grants","desktop_relay_session_bindings","desktop_attestation_keys"]) {
     assert.equal((await target.query(`SELECT count(*)::int AS n FROM public.${table}`)).rows[0].n,0,`${table} remains empty`);
   }
-  if (process.env.CLOUD_VERIFY_IMPORT_REPORT_PATH) {
-    await writeFile(process.env.CLOUD_VERIFY_IMPORT_REPORT_PATH,
-      `${JSON.stringify({...two,evidenceKind:"synthetic-local-postgres"},null,2)}\n`,{mode:0o600});
-  }
+});
+
+fixtureTest("copied credential natural keys verify reminted IDs, encrypted blobs, reruns and local CLI",async () => {
+  const fixture = await copiedFixture();
+  const evidence = {report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs};
+  const first = await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,{credentialCopy:evidence});
+  assert.equal(first.ok,true,JSON.stringify(first.findings.filter((f) => !f.ok)));
+  assert.equal(first.credentialCopy,"verified");
+  const copiedRows = (await target.query("SELECT id FROM coding_agent_credentials WHERE auth_type <> 'relay_managed'")).rows;
+  assert.equal(copiedRows.length,4);
+  assert.ok(copiedRows.every((row) => ![id(0x803),id(0x805),id(0x806),id(0x808)].includes(row.id)));
+  await target.query("UPDATE coding_agent_credentials SET id=$1 WHERE auth_type='byo_api_key' AND workspace_id=$2",[id(0xdeadbeef),id(0x201)]);
+  assert.equal((await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,{credentialCopy:evidence})).ok,true);
+  const again = await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  const report = await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{...evidence,report:again}});
+  assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
+  assert.deepEqual(report.findings.find((f) => f.kind === "credential_natural_keys"),first.findings.find((f) => f.kind === "credential_natural_keys"));
+  if (process.env.CLOUD_VERIFY_IMPORT_REPORT_PATH) await writeFile(process.env.CLOUD_VERIFY_IMPORT_REPORT_PATH,
+    `${JSON.stringify({...report,evidenceKind:"synthetic-local-postgres",credentialCopyVerified:true},null,2)}\n`,{mode:0o600});
+
+  const directory = await mkdtemp(join(tmpdir(),"copy-verifier-cli-"));
+  try {
+    const objectRoot = join(directory,"objects");await mkdir(objectRoot,{mode:0o700});
+    for (const [key,body] of fixture.objects) {
+      const path = join(objectRoot,key);await mkdir(dirname(path),{recursive:true,mode:0o700});
+      await writeFile(path,body,{mode:0o600});
+    }
+    const ledgerPath=join(directory,"ledger.json"),copyPath=join(directory,"copy.json");
+    await writeFile(ledgerPath,JSON.stringify(fixture.ledger),{mode:0o600});
+    await writeFile(copyPath,JSON.stringify(again),{mode:0o600});
+    const url = new URL("postgresql:/");url.hostname=config.host;url.port=String(port);url.username=config.user;
+    url.pathname="/cloud_import_source_fixture";const sourceUrl=url.toString();url.pathname="/cloud_import_target_fixture";
+    const inherited=Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(SELFHOST_|CLOUD_IMPORT_|CLOUD_VERIFY_|CLOUD_CREDENTIAL_)/.test(name)));
+    const child=spawnSync(process.execPath,["--import","tsx",fileURLToPath(new URL("../scripts/cloud-import-verify/import-cli.ts",import.meta.url)),
+      ledgerPath,"--all-organizations","--credential-copy-report",copyPath],{encoding:"utf8",timeout:20000,env:{...inherited,
+      CLOUD_VERIFY_SOURCE_URL:sourceUrl,CLOUD_VERIFY_TARGET_URL:url.toString(),CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR:objectRoot,
+      CLOUD_CREDENTIAL_ENCRYPTION_KEY:cloudKeyHex,SELFHOST_ENCRYPTION_KEY_ID:fixtureKeyring.active.id,
+      SELFHOST_ENCRYPTION_KEY:fixtureKeyring.active.key.toString("base64")}});
+    assert.equal(child.status,0,child.stderr);
+    assert.equal(JSON.parse(child.stdout).ok,true);
+  } finally {await rm(directory,{recursive:true,force:true});}
+});
+
+fixtureTest("zero active credentials fails exact model/harness selection cardinality",async () => {
+  const fixture=await copiedFixture();
+  await target.query("UPDATE coding_agent_credentials SET is_active=false WHERE model_provider='openai'");
+  const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(report.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
+  assert.ok(report.findings.some((f) => f.kind === "credential_selection" && !f.ok));
+  assert.equal(report.ok,false);
+});
+
+fixtureTest("equal-count credential fingerprint or blob corruption fails natural-key/content checks",async () => {
+  const fixture=await copiedFixture();
+  await target.query("UPDATE coding_agent_credentials SET blob_backend='s3' WHERE auth_type='provider_oauth'");
+  const backendMismatch=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(backendMismatch.credentialCopy,"failed");
+  await target.query("UPDATE coding_agent_credentials SET blob_backend='postgres' WHERE auth_type='provider_oauth'");
+  await target.query("UPDATE coding_agent_credentials SET key_fingerprint=repeat('0',64) WHERE auth_type='byo_api_key' AND workspace_id=$1",[id(0x201)]);
+  await target.query("UPDATE coding_agent_credential_blobs SET envelope='{}'");
+  const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(report.ok,false);
+  assert.equal(report.credentialCopy,"failed");
+  assert.equal(report.findings.find((f) => f.kind === "credential_natural_keys")!.ok,false);
+  assert.ok(!JSON.stringify(report).includes("rt-synthetic-only"));
+  assert.ok(!JSON.stringify(report).includes("sk-synthetic"));
+});
+
+fixtureTest("missing Cloud credential objects and a plan report cannot qualify copied secrets",async () => {
+  const fixture=await copiedFixture();
+  fixture.objects.delete(`${id(2)}/${id(0x808)}/credentials.json.enc`);
+  const copy=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(report.ok,false);
+  copy.mode="plan";
+  assert.equal((await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs}})).findings.find((f) => f.kind === "credential_copy_ledger")!.ok,false);
 });
 
 fixtureTest("tampered importer ledger cannot authorize dropped rows or invented skips",async () => {
@@ -194,6 +316,15 @@ fixtureTest("missing rw_ target column and a rollback-mode ledger cannot qualify
   assert.equal(report.findings.find((f) => f.name === "rw_column_present")!.ok,false);
   ledger.mode="dry-run";
   assert.equal((await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex)).findings.find((f) => f.name === "run")!.ok,false);
+});
+
+fixtureTest("missing GitHub installation storage reconciles decimal keys and blocks qualification",async () => {
+  await target.query("DROP TABLE github_app_installations CASCADE");
+  const ledger=await apply();
+  assert.deepEqual(ledger.tables.github_app_installations.importerSkips.target_lacks_github_app,["12345"]);
+  const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.findings.find((f) => f.kind === "ledger" && f.name === "github_app_installations")!.ok,true);
+  assert.equal(report.ok,false);
 });
 
 fixtureTest("legacy rw_ values normalized away by mapping still block continuity qualification",async () => {

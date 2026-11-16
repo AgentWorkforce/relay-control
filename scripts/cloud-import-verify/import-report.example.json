@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "mappingRevision": "cloud-identity-2026-11-15.2",
+  "mappingRevision": "cloud-identity-2026-11-15.3",
   "ok": true,
   "findings": [
     {
@@ -8,8 +8,8 @@
       "name": "run",
       "ok": true,
       "detail": {
-        "expectedRevision": "cloud-identity-2026-11-15.2",
-        "actualRevision": "cloud-identity-2026-11-15.2",
+        "expectedRevision": "cloud-identity-2026-11-15.3",
+        "actualRevision": "cloud-identity-2026-11-15.3",
         "mode": "apply",
         "ok": true
       }
@@ -285,20 +285,66 @@
       "ok": true,
       "detail": {
         "observed": {
-          "candidates": 4,
+          "candidates": 7,
           "imported": 2,
           "skipped": {
-            "secret_in_cloud_credential_store": 1,
+            "secret_in_cloud_credential_store": 4,
             "workspace_not_imported": 1
           },
           "importerSkips": {}
         },
         "reported": {
-          "candidates": 4,
+          "candidates": 7,
           "imported": 2,
           "skipped": {
-            "secret_in_cloud_credential_store": 1,
+            "secret_in_cloud_credential_store": 4,
             "workspace_not_imported": 1
+          },
+          "importerSkips": {}
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "github_app_installations",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 1,
+          "imported": 1,
+          "skipped": {},
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 1,
+          "imported": 1,
+          "skipped": {},
+          "importerSkips": {}
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "github_app_connections",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 4,
+          "imported": 1,
+          "skipped": {
+            "named_connection_needs_policy": 1,
+            "installation_claimed_by_other_org": 1,
+            "invalid_installation_id": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 4,
+          "imported": 1,
+          "skipped": {
+            "named_connection_needs_policy": 1,
+            "installation_claimed_by_other_org": 1,
+            "invalid_installation_id": 1
           },
           "importerSkips": {}
         }
@@ -328,7 +374,9 @@
           "person_identities": 1,
           "desktop_relay_identities": 2,
           "fleet_node_owners": 1,
-          "coding_agent_credentials": 2
+          "coding_agent_credentials": 2,
+          "github_app_installations": 1,
+          "github_app_connections": 1
         },
         "reported": {
           "status": "ok",
@@ -341,7 +389,9 @@
             "hosted_relay_participants": 0,
             "desktop_relay_identities": 2,
             "fleet_node_owners": 1,
-            "coding_agent_credentials": 2
+            "coding_agent_credentials": 2,
+            "github_app_installations": 1,
+            "github_app_connections": 1
           }
         }
       }
@@ -370,9 +420,91 @@
             "hosted_relay_participants": 1,
             "desktop_relay_identities": 0,
             "fleet_node_owners": 0,
-            "coding_agent_credentials": 0
+            "coding_agent_credentials": 0,
+            "github_app_installations": 0,
+            "github_app_connections": 0
           }
         }
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000201:anthropic",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000201",
+        "model_provider": "anthropic",
+        "model_eligible": 2,
+        "harness_eligible": 0,
+        "model_active": 1,
+        "harness_active": 0
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000201:openai",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000201",
+        "model_provider": "openai",
+        "model_eligible": 1,
+        "harness_eligible": 1,
+        "model_active": 1,
+        "harness_active": 1
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000205:anthropic",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000205",
+        "model_provider": "anthropic",
+        "model_eligible": 1,
+        "harness_eligible": 1,
+        "model_active": 1,
+        "harness_active": 1
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000205:openai",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000205",
+        "model_provider": "openai",
+        "model_eligible": 1,
+        "harness_eligible": 0,
+        "model_active": 1,
+        "harness_active": 0
+      }
+    },
+    {
+      "kind": "credential_copy_ledger",
+      "name": "run",
+      "ok": true,
+      "detail": {
+        "candidates": 4,
+        "sourceFailures": 0,
+        "unresolvedSourceSkips": 0,
+        "reportedCandidates": 4
+      }
+    },
+    {
+      "kind": "credential_natural_keys",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "expected": 4,
+        "target": 4,
+        "missing": 0,
+        "extra": 0,
+        "duplicateKeys": 0,
+        "contentFailures": 0,
+        "sourceFailures": 0,
+        "unresolvedSourceSkips": 0,
+        "sourceChecksum": "efa7243bb3d97220f5d50363b5bb443fae7e9f609a8b6867f452dc653954de47",
+        "targetChecksum": "efa7243bb3d97220f5d50363b5bb443fae7e9f609a8b6867f452dc653954de47"
       }
     },
     {
@@ -1089,6 +1221,124 @@
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 2,
               "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "github_app_installations",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "installation_id",
+            "organization_id"
+          ],
+          "count": 1,
+          "checksum": "acb084f7e3af0cc2b2d78fa3e586feda1db7e51ff57b46cc18e6d7f212ae7af4",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "acb084f7e3af0cc2b2d78fa3e586feda1db7e51ff57b46cc18e6d7f212ae7af4"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "installation_id",
+            "organization_id"
+          ],
+          "count": 1,
+          "checksum": "acb084f7e3af0cc2b2d78fa3e586feda1db7e51ff57b46cc18e6d7f212ae7af4",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "acb084f7e3af0cc2b2d78fa3e586feda1db7e51ff57b46cc18e6d7f212ae7af4"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "github_app_connections",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "auth_mode",
+            "created_at",
+            "created_by_user_id",
+            "github_app_organization_id",
+            "id",
+            "installation_id",
+            "provider",
+            "status",
+            "token_type",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "auth_mode",
+            "created_at",
+            "created_by_user_id",
+            "github_app_organization_id",
+            "id",
+            "installation_id",
+            "provider",
+            "status",
+            "token_type",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a"
             }
           },
           "invalidWorkspaceBindings": 0
@@ -1865,6 +2115,128 @@
       "detail": "not_applicable"
     },
     {
+      "kind": "constraint_validation",
+      "name": "public.github_app_installations",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.github_app_installations.github_app_installations_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.github_app_installations.github_app_installations_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.github_app_installations.github_app_installations_installation_id_organization_id_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.github_app_installations",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.integration_connections",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.integration_connections.connection_github_installation_owner",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.integration_connections.connection_github_workspace_owner",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.integration_connections.integration_connections_created_by_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.integration_connections.integration_connections_updated_by_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.integration_connections.integration_connections_workspace_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.integration_connections.integration_connections_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.integration_connections.integration_connections_workspace_id_provider_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.integration_connections",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
       "kind": "standalone_sequence",
       "name": "desktop_feed_publish_seq",
       "ok": true,
@@ -1938,6 +2310,16 @@
         "minimum": 1,
         "failures": 0
       }
+    },
+    {
+      "kind": "decrypt",
+      "name": "github_app_connections.credentials_ciphertext",
+      "ok": true,
+      "detail": {
+        "sampled": 1,
+        "minimum": 1,
+        "failures": 0
+      }
     }
   ],
   "smoke": [
@@ -1966,5 +2348,7 @@
       "status": "pending"
     }
   ],
-  "evidenceKind": "synthetic-local-postgres"
+  "credentialCopy": "verified",
+  "evidenceKind": "synthetic-local-postgres",
+  "credentialCopyVerified": true
 }

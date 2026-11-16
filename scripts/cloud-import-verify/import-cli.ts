@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { readFile,realpath,stat } from "node:fs/promises";
+import { resolve,sep } from "node:path";
 import { Client } from "pg";
 import { loadEncryptionKeyring,readSecret } from "../../src/config.js";
 import { parsePepperFile,readPepperFile } from "../../src/identity/config.js";
@@ -6,11 +7,20 @@ import type { ImportReport } from "../cloud-import/importer.js";
 import { assertScope,type ImportScope } from "../cloud-import/mapping.js";
 import { localDatabaseUrl } from "./local.js";
 import { verifyImport } from "./import-contract.js";
+import { readOnlyPostgresBlobs,type CredentialEvidence } from "./credential-copy.js";
+import type { CredentialCopyReport } from "../cloud-import/credentials.js";
 
 let source:Client|undefined;
 let target:Client|undefined;
 try {
   const args = process.argv.slice(2);
+  const copyAt = args.indexOf("--credential-copy-report");
+  let copyPath:string|undefined;
+  if (copyAt >= 0) {
+    copyPath=args[copyAt+1];
+    if (!copyPath || copyPath.startsWith("--")) throw new Error("copy_report_path_required");
+    args.splice(copyAt,2);
+  }
   const path = args[0];
   let scope:ImportScope;
   if (args.length === 2 && args[1] === "--all-organizations") scope = {orgIds:null};
@@ -25,7 +35,26 @@ try {
   source = new Client({connectionString:localDatabaseUrl(readSecret(process.env,"CLOUD_VERIFY_SOURCE_URL"))});
   target = new Client({connectionString:localDatabaseUrl(readSecret(process.env,"CLOUD_VERIFY_TARGET_URL"))});
   await source.connect();await target.connect();
-  const report = await verifyImport(source,target,scope,ledger,keyring,cloudKeyHex,{pepperVersions});
+  let credentialCopy:CredentialEvidence|undefined;
+  if (copyPath) {
+    if (!process.env.CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR) throw new Error("local_object_directory_required");
+    const root = await realpath(process.env.CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR);
+    credentialCopy = {
+      report:JSON.parse(await readFile(copyPath,"utf8")) as CredentialCopyReport,
+      targetBlobs:readOnlyPostgresBlobs(target,keyring),
+      reader:{get:async (key) => {
+        try {
+          const path = await realpath(resolve(root,key));
+          if (!path.startsWith(root+sep)) throw new Error("object_path_outside_directory");
+          const info = await stat(path);
+          if (!info.isFile() || (info.mode & 0o077) !== 0
+            || (process.getuid && info.uid !== process.getuid())) throw new Error("private_object_file_required");
+          return await readFile(path,"utf8");
+        } catch (error) {if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;throw error;}
+      }},
+    };
+  }
+  const report = await verifyImport(source,target,scope,ledger,keyring,cloudKeyHex,{pepperVersions,credentialCopy});
   process.stdout.write(`${JSON.stringify(report,null,2)}\n`);
   process.exitCode = report.ok ? 0 : 1;
 } catch {

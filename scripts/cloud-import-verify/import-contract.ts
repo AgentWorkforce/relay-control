@@ -4,6 +4,7 @@ import { decryptCloudEnvelope, type ImportReport } from "../cloud-import/importe
 import { MAPPING_REVISION, ORG_TABLES, SOURCE_TABLES, TARGETS, TARGET_RELATIONS,
   assertScope, encryptedSamples, sourceQuery, verifierComparisons, type ImportScope, type ImportTable } from "../cloud-import/mapping.js";
 import { verify, type Comparison, type Contract, type Finding } from "./verify.js";
+import { credentialCopyFindings,credentialSelections,type CredentialEvidence } from "./credential-copy.js";
 
 const literal = (s:string) => `'${s.replaceAll("'","''")}'`;
 const sorted = (values:Record<string,number>) => JSON.stringify(Object.entries(values).filter(([,n]) => n !== 0).sort(([a],[b]) => a.localeCompare(b)));
@@ -12,8 +13,9 @@ const sortedKeys = (values:Record<string,string[]>) => JSON.stringify(Object.ent
 const equalScope = (a:ImportScope,b:ImportScope) => JSON.stringify(a.orgIds?.map((s) => s.toLowerCase()).sort() ?? null)
   === JSON.stringify(b.orgIds?.map((s) => s.toLowerCase()).sort() ?? null);
 
-function comparisons(scope:ImportScope,columns:ReadonlySet<string>): Comparison[] {
-  return verifierComparisons(scope,columns);
+function comparisons(scope:ImportScope,columns:ReadonlySet<string>,gated:ReadonlySet<ImportTable>|null = null): Comparison[] {
+  return verifierComparisons(scope,columns,gated).map((item) => item.name === "coding_agent_credentials"
+    ? {...item,targetSql:`SELECT p.* FROM (${item.targetSql}) p WHERE auth_type='relay_managed'`} : item);
 }
 
 function contractFor(scope:ImportScope,columns:ReadonlySet<string>,tables=comparisons(scope,columns)):Contract {
@@ -41,17 +43,22 @@ function contractFor(scope:ImportScope,columns:ReadonlySet<string>,tables=compar
  * Source/target reads, skip reconciliation and checksums share the snapshots.
  */
 export async function verifyImport(source:Client,target:Client,scope:ImportScope,ledger:ImportReport,
-  keyring:EncryptionKeyring,cloudKeyHex:string,options:{pepperVersions?:readonly number[]} = {}) {
+  keyring:EncryptionKeyring,cloudKeyHex:string,options:{pepperVersions?:readonly number[];credentialCopy?:CredentialEvidence} = {}) {
   assertScope(scope);
   if (!/^[0-9a-f]{64}$/i.test(cloudKeyHex)) throw new Error("Cloud key must be 32 bytes of hex");
   const base = contractFor(scope,new Set());
-  return verify(source,target,base,keyring,{...options,prepare:async (s,t) => {
+  const checked = await verify(source,target,base,keyring,{...options,prepare:async (s,t) => {
     const findings:Finding[] = [];
     findings.push({kind:"ledger",name:"run",ok:ledger.version === 1 && ledger.mappingRevision === MAPPING_REVISION
       && ledger.mode === "apply" && ledger.ok === true && !ledger.refused && equalScope(scope,ledger.scope),
       detail:{expectedRevision:MAPPING_REVISION,actualRevision:ledger.mappingRevision,mode:ledger.mode,ok:ledger.ok}});
     const metadata = await t.query(`SELECT table_name,column_name,udt_name FROM information_schema.columns WHERE table_schema='public'`);
     const columns = new Set<string>(metadata.rows.map((r) => `${r.table_name}.${r.column_name}`));
+    const gatedPresent = new Set<ImportTable>(SOURCE_TABLES.filter((table) => {
+      const spec = TARGETS[table];
+      return !spec.gate || [...spec.columns,...(spec.secret ? [spec.secret.target] : [])]
+        .every((column) => columns.has(`${spec.table}.${column}`));
+    }));
     const desktopUuid = metadata.rows.some((r) => r.table_name === "desktop_relay_identities" && r.column_name === "source_id" && r.udt_name === "uuid");
     const relayManaged = (await t.query(`SELECT EXISTS (SELECT 1 FROM pg_constraint c
       WHERE c.conrelid='public.coding_agent_credentials'::regclass AND c.contype='c'
@@ -96,6 +103,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
           catch { reason = "cloud_decrypt_failed"; }
         }
         if (reason === null && table === "desktop_relay_identities" && desktopUuid && !row.source_id_is_uuid) reason = "source_id_not_uuid";
+        if (reason === null && spec.gate && !gatedPresent.has(table)) reason = spec.gate;
         if (reason === null && table === "coding_agent_credentials" && !relayManaged) reason = "target_lacks_relay_managed";
         if (reason !== null) {
           skipped[reason] = (skipped[reason] ?? 0)+1;
@@ -123,10 +131,11 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
       if (dynamicKeys.length) findings.push({kind:"importer_skip_policy",name:table,ok:false,
         detail:{unresolvedDynamicSkips:dynamicKeys.length}});
       const reported = ledger.tables?.[table];
-      const keyFormat = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$/i;
+      const keyFormat = table === "github_app_installations" ? /^[1-9][0-9]{0,19}$/
+        : /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$/i;
       for (const keys of Object.values(reported?.importerSkips ?? {})) {
         if (!Array.isArray(keys) || keys.some((key) => typeof key !== "string" || !keyFormat.test(key))) {
-          throw new Error("Importer skip keys must be UUIDs or org:user UUID pairs");
+          throw new Error("Importer skip keys do not match the table key type");
         }
       }
       findings.push({kind:"ledger",name:table,ok:reported?.candidates === candidates && reported.imported === imported
@@ -140,11 +149,12 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
       findings.push({kind:"ledger_org",name:org,ok:actual?.status === "ok" && ORG_TABLES.every((table) =>
         (expected[table] ?? 0) === (actual.imported[table] ?? 0)),detail:{expected,reported:actual}});
     }
-    const tables = comparisons(scope,columns).map((item) => {
+    const tables = comparisons(scope,columns,gatedPresent).map((item) => {
       const keys = exclusions.get(item.name)!;
       return keys.length ? {...item,sourceSql:`SELECT p.* FROM (${item.sourceSql}) p WHERE __key::text <> ALL(ARRAY[${keys.map(literal).join(",")}]::text[])`} : item;
     });
     const contract = contractFor(scope,columns,tables);
+    contract.targetRelations = SOURCE_TABLES.filter((table) => gatedPresent.has(table)).map((table) => `public.${TARGETS[table].table}`);
     contract.encryptedSamples = encryptedSamples(20,scope).flatMap((sample) => {
       const table = sample.name.split(".")[0] as ImportTable;
       if (counts.get(table) === 0) {
@@ -155,6 +165,11 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     // Preserve fail-closed sampling if the entire cohort lacks an importable
     // workspace: an empty cohort cannot qualify the credential migration.
     if (!contract.encryptedSamples.length) contract.encryptedSamples = base.encryptedSamples;
+    findings.push(...await credentialSelections(t,scope));
+    if (options.credentialCopy) findings.push(...await credentialCopyFindings(s,t,scope,options.credentialCopy,keyring,cloudKeyHex));
     return {contract,findings};
   }});
+  return {...checked,credentialCopy:options.credentialCopy
+    ? checked.findings.filter((f) => f.kind.startsWith("credential_")).every((f) => f.ok) ? "verified" : "failed"
+    : "not_requested"};
 }

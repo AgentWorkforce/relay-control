@@ -10,13 +10,15 @@ sample definitions. PR #148 is stacked on the importer branch.
 
 The harness executes the actual importer against its synthetic Cloud fixture
 and separate source/target databases. It checks rollback mode, committed apply
-and a second apply, reconciles all ten mapped tables and per-org ledgers, preserves
+and a second apply, reconciles all twelve mapped tables and per-org ledgers, preserves
 invite hashes and proves sessions/reconnect state stay empty. The checked-in
-`import-report.example.json` is that synthetic receipt; application smokes are
+It then runs the opt-in credential copier against in-memory encrypted Cloud
+objects and local encrypted Postgres blobs, including a repeat copy.
+`import-report.example.json` is that full synthetic receipt; application smokes are
 pending and no real-data import has run.
 
 The target uses all checked-in Control migrations (through 0051 at the initial
-integration) plus test-only models of the optional 0053/0056/0057/0058 shapes
+integration) plus test-only models of the optional 0053/0054/0056/0057/0058 shapes
 from separate schema PRs. These models exercise the new columns/types; they
 do not prove those pending migration files themselves. The shared Cloud fixture
 now includes the generation column, so there is no verifier-owned source guard.
@@ -74,6 +76,9 @@ For an actual importer ledger against local synthetic databases:
 node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --all-organizations
 # Or use an explicit UUID cohort:
 node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --org-ids UUID,UUID
+# After the opt-in secret copy, also verify its ledger and local object snapshot:
+node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --all-organizations \
+  --credential-copy-report /path/to/credential-copy-ledger.json
 ```
 
 Supply `CLOUD_VERIFY_SOURCE_URL`, `CLOUD_VERIFY_TARGET_URL`,
@@ -81,6 +86,14 @@ Supply `CLOUD_VERIFY_SOURCE_URL`, `CLOUD_VERIFY_TARGET_URL`,
 usual keyring variables through the environment or their `_FILE` variants.
 Pepper coverage uses `SELFHOST_PASSWORD_PEPPER_FILE`. The explicit scope must
 match the ledger; a plan or rollback-mode ledger cannot qualify committed data.
+
+For `--credential-copy-report`, set `CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR` to a
+local encrypted object snapshot using the Cloud-relative object keys. Files
+must be owned by the process user and private (mode 600); resolved paths must
+stay inside that directory. The CLI only reads local source files and target
+Postgres blobs. It never creates a Cloud R2/S3 client, refreshes a token or
+loads cloud-provider credentials. Remote object/backend evidence requires a
+separately authorized caller supplying read-only readers to the library.
 
 The adapter discovers optional target columns instead of trusting the ledger.
 It independently reconstructs source-query skips, decrypt failures and legacy
@@ -102,10 +115,29 @@ source/import counts.
 The shared mapping supplies workspace projections and scoped encrypted samples
 directly. Coding-agent `relay_managed` rows are also checked; a target lacking
 0058 support accounts for their excluded keys and blocks qualification. No
-external coding-agent credential-store secrets are read or copied.
+external coding-agent credential store is accessed by the local harness.
+
+`credential-copy.ts` verifies the store-copied rows by workspace, provider,
+auth type and keyed fingerprint/account identity, never Cloud row id. It
+derives expected keys from independently decrypted objects, reconciles the
+copy ledger, checks scope/organization and compares decrypted inline secrets
+or raw auth-file contents. Only counts and checksums enter reports. Copies
+that deduplicate/reassign row ids are valid; missing/extra natural keys,
+wrong fingerprints, unreadable blobs and unresolved input failures are not.
+SQL-imported `relay_managed` rows retain their Cloud ids and are compared
+separately so the copier's additional rows cannot spoil those counts.
+
+Selection checks require exactly one model-active row when a group has an
+API key, setup token or relay-managed credential, and exactly one harness-active
+row when it has a setup token or provider login. A provider-login-only group
+has zero model-active rows by Control's store contract. Both selectors are
+checked per workspace/provider; zero active rows fail even when uniqueness holds.
 
 The library entry point is `verifyImport(source, target, scope, ledger, keyring,
-cloudKeyHex, {pepperVersions})`. For standalone comparisons without an importer
+cloudKeyHex, {pepperVersions, credentialCopy: {report, reader, targetBlobs}})`.
+The copy option is optional: output explicitly marks this phase as
+`not_requested`, `verified` or `failed`. Identity-only verification does not
+qualify copied secrets. For standalone comparisons without an importer
 ledger, the lower-level API remains available:
 
 `verify.ts` exports `Contract` and `verify(sourceClient, targetClient, contract,
