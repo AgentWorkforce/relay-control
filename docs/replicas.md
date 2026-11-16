@@ -168,11 +168,22 @@ Each call is admitted in this order:
 5. The first admitted call enrols the replica: one `replica_spawns` row with
    source `environment_identity`, `replica_id` = the Replicas workspace id and
    a Relay identity named `replicas-<16 hex>`. Later calls reuse it. A replica
-   already bound through a per-launch spawn, or through another Control
-   workspace, answers 409 `replica_already_bound`. A Relay agent left behind
+   with a live binding in another Control workspace answers 409
+   `replica_already_bound`. A Relay agent left behind
    by this replica's own released binding (its cleanup failed after a
    disable, principal or mapping change) is not a conflict: enrolment retries
    its cleanup first and answers a retryable 503 while that keeps failing.
+
+   A replica already launched or bound through the API in this workspace (a
+   live `spawn` or `bind` record for the same replica id) is not enrolled:
+   once steps 1-4 pass, the environment MCP acts as that binding and its
+   owner, with the binding's Relay name, task, state and deliveries unchanged,
+   and answers a retryable 503 until the launch is bound (a rejected launch
+   stays 409 until it is recovered or released). The mapped creator
+   or principal of step 4 does not replace the owner. When the owner is no
+   longer a member of the organization, calls are refused with 403
+   `replica_creator_not_allowed`; nothing falls back to the principal.
+   Releasing that binding tombstones the replica as any per-launch release.
 
 The server offers the same three tools as the per-launch server:
 `list_relay_agents`, `check_relay_inbox` and `send_relay_message`. Messages are

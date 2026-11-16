@@ -8,7 +8,8 @@ import { migrate } from "../src/migrations.js";
 import { createReplicasModule } from "../src/replicas/module.js";
 import { ReplicasRuntimeError, type ReplicasRuntime } from "../src/replicas/runtime.js";
 import { loadReplicasConfig } from "../src/replicas/config.js";
-import { releaseReplica, recoverReplica } from "../src/replicas/service.js";
+import { admitIdentity, IdentityRefusal } from "../src/replicas/environments.js";
+import { encrypt, releaseReplica, recoverReplica } from "../src/replicas/service.js";
 import { ReplicasSyncSweep } from "../src/replicas/sync-sweep.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { apiClient, BOOTSTRAP, close, listen, PGliteDatabase, type Api } from "./flows-helpers.js";
@@ -408,6 +409,83 @@ test("sync sweep: every all-environments connection, service actor, no overlap, 
   off.start();
   await off.stop();
   assert.equal(provider.registered.length, 3);
+});
+
+/** A bound API launch of WORKSPACE_1 owned by the member (not the principal, not a mapped creator). */
+async function reuseSetup(t: TestContext) {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, ownerId, memberId, organizationId, database } = env;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  const principal = await api(`/api/v1/workspaces/${workspaceId}/replicas/environment-principal`, { method: "PUT", token: ownerToken, body: { userId: ownerId } });
+  assert.equal(principal.status, 200, principal.text);
+  const id = randomUUID();
+  const input = { environment_id: ENV_A, name: "worker", task: "Fix the build", coding_agent: "claude" };
+  await database.query(
+    `INSERT INTO replica_spawns (id, workspace_id, organization_id, user_id, client_request_id, source, input, replica_id, chat_id, state,
+       relay_workspace_id, agent_name, agent_remote_id, token_ciphertext)
+     VALUES ($1, $2, $3, $4, $5, 'spawn', $6::jsonb, $7, $8, 'bound', 'rc-primary', 'worker-agent', 'remote-1', $9)`,
+    [id, workspaceId, organizationId, memberId, `request-${id}`, JSON.stringify(input), WORKSPACE_1, randomUUID(),
+      encrypt(env.replicas.deps, "launch-token")],
+  );
+  const relayCalls: string[] = [];
+  const relaycast = env.replicas.deps.relaycast;
+  const register = relaycast.registerHosted.bind(relaycast);
+  const recover = relaycast.recoverHosted.bind(relaycast);
+  relaycast.registerHosted = (...args) => { relayCalls.push("registerHosted"); return register(...args); };
+  relaycast.recoverHosted = (...args) => { relayCalls.push("recoverHosted"); return recover(...args); };
+  const claims = { issuer: ISSUER, organizationId: PROVIDER_ORG, environmentId: ENV_A, workspaceId: WORKSPACE_1,
+    creatorId: null, creatorEmail: null, jti: randomUUID() };
+  return { env, id, input, relayCalls, claims };
+}
+
+test("an environment identity reuses the live API binding of the same VM", async (t) => {
+  const { env, id, input, relayCalls, claims } = await reuseSetup(t);
+  const row = await admitIdentity(env.replicas.deps, claims);
+  assert.equal(row.id, id);
+  assert.equal(row.user_id, env.memberId);
+  assert.equal(row.source, "spawn");
+  assert.equal(row.state, "bound");
+  assert.equal(row.agent_name, "worker-agent");
+  assert.deepEqual(row.input, input);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns"), 1);
+  assert.deepEqual(relayCalls, []);
+  assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.identity.enrolled'"), 0);
+  // The tools act as the launch binding.
+  const listed = await rpc(env.api, token({ workspace_id: WORKSPACE_1, creator_id: null }), "tools/call", { name: "list_relay_agents", arguments: {} });
+  assert.equal(listed.status, 200, listed.text);
+  assert.equal(listed.body.result.structuredContent.agent, "worker-agent");
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns"), 1);
+
+  // A launch still preparing is a retryable 503, not a refusal or an enrolment.
+  await env.database.query("UPDATE replica_spawns SET state = 'binding' WHERE id = $1", [id]);
+  await assert.rejects(admitIdentity(env.replicas.deps, claims), (error: unknown) =>
+    !(error instanceof IdentityRefusal) && (error as { status?: number }).status === 503);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns"), 1);
+  assert.deepEqual(relayCalls, []);
+  await env.database.query("UPDATE replica_spawns SET state = 'bound' WHERE id = $1", [id]);
+
+  // A live launch of the same replica in another workspace is still replica_already_bound.
+  const other = await env.api(`/api/v1/organizations/${env.organizationId}/workspaces`, {
+    method: "POST", token: BOOTSTRAP, body: { name: "secondary", relaycastWorkspaceId: "rc-secondary", relaycastApiKey: "rk_live_secondary" },
+  });
+  assert.equal(other.status, 201, other.text);
+  await env.database.query("UPDATE replica_spawns SET workspace_id = $2 WHERE id = $1", [id, other.body.id]);
+  await assert.rejects(admitIdentity(env.replicas.deps, claims), (error: unknown) =>
+    error instanceof IdentityRefusal && error.code === "replica_already_bound" && error.status === 409);
+});
+
+test("no fallback to the workspace principal after the binding owner leaves", async (t) => {
+  const { env, relayCalls, claims } = await reuseSetup(t);
+  await env.database.query("DELETE FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [env.organizationId, env.memberId]);
+  await assert.rejects(admitIdentity(env.replicas.deps, claims), (error: unknown) =>
+    error instanceof IdentityRefusal && error.code === "replica_creator_not_allowed" && error.status === 403);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns"), 1);
+  assert.equal((await tombstones(env)).length, 0);
+  assert.deepEqual(relayCalls, []);
+  assert.equal(await count(env,
+    "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.identity.refused' AND target = 'replica_creator_not_allowed' AND workspace_id = $1",
+    [env.workspaceId]), 1);
 });
 
 test("connect reports provisioning_error when environment setup failed and keeps the connection", async (t) => {

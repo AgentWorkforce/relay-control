@@ -21,7 +21,12 @@ assigned at release.
   for every connection whose all-environments default is on. The Replicas
   connect response adds `provisioning_error` (`replica_environment_setup_failed`,
   stage `environment_setup`, `retryable`, `environments`) when environment
-  setup failed; the status stays 200 and the connection is kept.
+  setup failed; the status stays 200 and the connection is kept. The
+  environment MCP of a replica already launched or bound through the API in
+  the same workspace now acts as that binding and its owner instead of
+  answering 409 `replica_already_bound`; when the owner leaves the
+  organization it is refused with `replica_creator_not_allowed`, never moved
+  to the principal.
 - Added: environment-level Replicas MCP. `POST /api/v1/replicas/mcp` accepts
   only a Replicas `workspace_identity` token (RS256, issuer
   `SELFHOST_REPLICAS_IDENTITY_ISSUER`, default `https://api.replicas.dev`) and

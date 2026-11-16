@@ -170,6 +170,15 @@ async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admis
   );
   const row = live.rows[0];
   if (!row) return null;
+  // A launch or bind of the same replica in this workspace is reused as is: the identity acts as
+  // that binding and its owner (never the principal or a creator mapping) while the owner is a member.
+  // A rejected launch binds nothing by itself, so it stays a conflict until recovered or released.
+  if (row.source !== ENVIRONMENT_IDENTITY && row.workspace_id === admission.policy.workspace_id && row.state !== "rejected") {
+    const owner = await tx.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
+      [admission.organizationId, row.user_id]);
+    if (!owner.rows.length) throw new IdentityRefusal("replica_creator_not_allowed", 403, scopeOf(admission));
+    return row;
+  }
   // A live binding in another workspace (for example under an earlier policy) is a bound replica, not a creator problem.
   if (row.source !== ENVIRONMENT_IDENTITY || row.workspace_id !== admission.policy.workspace_id) {
     throw new IdentityRefusal("replica_already_bound", 409, scopeOf(admission));
@@ -266,6 +275,8 @@ async function underAdmission<T>(deps: ReplicasDeps, claims: ReplicaIdentityClai
  * first use. Nothing is written until every check passed. Enrolment commits
  * the binding row (with its deterministic agent name) before the Relay
  * registration, so a lost registration is recovered, never duplicated.
+ * A live launch or bind of the same replica in the admitted workspace is
+ * returned as is, acting as its owner.
  */
 export async function admitIdentity(deps: ReplicasDeps, claims: ReplicaIdentityClaims): Promise<SpawnRow> {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -277,6 +288,8 @@ export async function admitIdentity(deps: ReplicasDeps, claims: ReplicaIdentityC
 
 async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIdentityClaims, admission: Admission): Promise<SpawnRow> {
   let row = await liveBinding(tx, claims, admission);
+  // A reused launch or bind is never enrolled: its own lifecycle binds it (admitIdentity 503s until then).
+  if (row && row.source !== ENVIRONMENT_IDENTITY) return row;
   const hint = emailHint(claims.creatorEmail);
   if (hint) {
     await tx.query("UPDATE replica_environment_creators SET creator_email_hint = $3 WHERE policy_id = $1 AND creator_id = $2 AND creator_email_hint IS DISTINCT FROM $3",
