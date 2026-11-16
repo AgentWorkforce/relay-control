@@ -21,14 +21,15 @@
 // Exit 0: done, every organization ok. 1: refused, or an organization failed.
 // 2: usage or configuration error. Output is JSON lines without values.
 import { randomBytes } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { loadEncryptionKeyring, readSecret, type Env } from "../../src/config.js";
-import { PostgresDatabase } from "../../src/database.js";
+import { PostgresDatabase, type Database } from "../../src/database.js";
 import { CodingAgentStore } from "../../src/admin/coding-agents.js";
 import { CredentialBlobStore, credentialBackendFromEnv, S3ObjectBackend } from "../../src/admin/credential-blobs.js";
 import { SubscriptionLoginStore } from "../../src/admin/subscription-logins.js";
 import type { EncryptionKeyring } from "../../src/crypto.js";
-import { copyCodingAgentCredentials, type CloudObjectReader } from "./credentials.js";
+import { copyCodingAgentCredentials, type CloudObjectReader, type CredentialCopyReport } from "./credentials.js";
+import { computeCredentialCheckpoint, validateCredentialCheckpoint, type CredentialConvergenceReceipt } from "../cloud-import-verify/convergence.js";
 import { runImport, type ImportMode } from "./importer.js";
 import { encryptedSamples, IMPORT_LEDGER_DDL, MAPPING_REVISION, TARGET_RELATIONS, verifierComparisons } from "./mapping.js";
 
@@ -40,9 +41,11 @@ export type CliArgs = {
   copyCredentials: boolean;
   credentialsReport?: string;
   initLedger: boolean;
+  /** A validated before-checkpoint the run must start from (convergence reruns). */
+  convergenceCheckpoint?: string;
 };
 
-export const USAGE = "usage: cloud-import --mode plan|dry-run|apply [--org <uuid>]... [--report <path>] [--verifier-contract <path>] [--init-ledger] [--copy-credentials [--credentials-report <path>]]";
+export const USAGE = "usage: cloud-import --mode plan|dry-run|apply [--org <uuid>]... [--report <path>] [--verifier-contract <path>] [--init-ledger] [--copy-credentials [--credentials-report <path>] [--convergence-checkpoint <path>]]";
 
 export function parseArgs(argv: readonly string[]): CliArgs {
   let mode: ImportMode | undefined;
@@ -52,6 +55,7 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   let copyCredentials = false;
   let credentialsReport: string | undefined;
   let initLedger = false;
+  let convergenceCheckpoint: string | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--copy-credentials") {
@@ -72,10 +76,14 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     else if (flag === "--report") report = value;
     else if (flag === "--verifier-contract") verifierContract = value;
     else if (flag === "--credentials-report") credentialsReport = value;
+    else if (flag === "--convergence-checkpoint") convergenceCheckpoint = value;
     else throw new Error(`unknown flag ${flag}`);
   }
   if (!mode) throw new Error("--mode is required");
   if (copyCredentials && mode === "dry-run") throw new Error("--copy-credentials runs with plan or apply only (its stores commit)");
+  if (convergenceCheckpoint && (mode !== "apply" || !copyCredentials || orgs.length)) {
+    throw new Error("--convergence-checkpoint needs --mode apply --copy-credentials over all organizations (no --org)");
+  }
   return {
     mode,
     orgIds: orgs.length ? orgs : null,
@@ -84,7 +92,77 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     ...(report ? { report } : {}),
     ...(verifierContract ? { verifierContract } : {}),
     ...(credentialsReport ? { credentialsReport } : {}),
+    ...(convergenceCheckpoint ? { convergenceCheckpoint } : {}),
   };
+}
+
+export class ConvergenceRefused extends Error {}
+
+/**
+ * The convergence receipt (scripts/cloud-import-verify/CONVERGENCE_CONTRACT.md).
+ * Validates the operator's before-checkpoint, then recomputes the target's
+ * credential state itself, in its own repeatable-read read-only transaction,
+ * and refuses unless the digests match. Runs before any write; the receipt
+ * carries the digest this run computed, never one copied from the file.
+ */
+export async function bindConvergence(target: Database, checkpoint: unknown): Promise<CredentialConvergenceReceipt> {
+  const scope = { orgIds: null };
+  let expected: ReturnType<typeof validateCredentialCheckpoint>;
+  try {
+    expected = validateCredentialCheckpoint(checkpoint, scope);
+  } catch {
+    throw new ConvergenceRefused("convergence_checkpoint_invalid");
+  }
+  const current = await target.transaction(async (tx) => {
+    await tx.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+    return computeCredentialCheckpoint(tx, scope);
+  });
+  if (current.digest !== expected.digest) throw new ConvergenceRefused("convergence_checkpoint_mismatch");
+  return { beforeDigest: current.digest, nonce: expected.nonce };
+}
+
+export type ProducerIo = {
+  source: Database;
+  target?: Database;
+  keyring: EncryptionKeyring;
+  cloudKey?: string;
+  /** The parsed --convergence-checkpoint file, read before anything else. */
+  checkpoint?: unknown;
+  copy: () => Promise<CredentialCopyReport>;
+  write: (path: string, value: unknown) => void;
+  log?: (event: string, fields: Record<string, unknown>) => void;
+};
+
+/**
+ * One producer run: convergence binding (if asked), then the identity
+ * import, then the credential copy. Nothing writes before the binding holds.
+ */
+export async function runProducer(args: CliArgs, io: ProducerIo): Promise<number> {
+  const scope = { orgIds: args.orgIds };
+  let convergence: CredentialConvergenceReceipt | undefined;
+  if (args.convergenceCheckpoint) {
+    if (!io.target) throw new ConvergenceRefused("convergence_needs_target");
+    convergence = await bindConvergence(io.target, io.checkpoint);
+  }
+  if (args.initLedger && io.target && args.mode !== "plan") {
+    // Until the ledger ships as a Control migration: an explicit operator
+    // step that creates only this table, idempotently.
+    await io.target.exec(IMPORT_LEDGER_DDL);
+  }
+  const report = await runImport({
+    source: io.source,
+    ...(io.target ? { target: io.target } : {}),
+    keyring: io.keyring,
+    ...(io.cloudKey ? { cloudKeyHex: io.cloudKey } : {}),
+    ...(io.log ? { log: io.log } : {}),
+  }, scope, args.mode);
+  if (args.report) io.write(args.report, report);
+  if (!args.copyCredentials) return report.ok ? 0 : 1;
+  if (args.mode === "apply" && !report.ok) return 1;
+  const copy = await io.copy();
+  if (convergence) copy.convergence = convergence;
+  if (args.credentialsReport) io.write(args.credentialsReport, copy);
+  return report.ok && copy.ok ? 0 : 1;
 }
 
 const COPY_APPLY_ENV = [
@@ -153,29 +231,30 @@ async function main(argv: readonly string[], env: Env): Promise<number> {
     }, null, 2), { mode: 0o600 });
   }
 
+  let checkpoint: unknown;
+  if (args.convergenceCheckpoint) {
+    try {
+      checkpoint = JSON.parse(readFileSync(args.convergenceCheckpoint, "utf8"));
+    } catch {
+      console.error(JSON.stringify({ event: "cloud_import.usage_error", error: "convergence_checkpoint_unreadable" }));
+      return 2;
+    }
+  }
   const source = new PostgresDatabase(config.sourceUrl);
   const target = config.targetUrl ? new PostgresDatabase(config.targetUrl) : undefined;
   try {
-    if (args.initLedger && target && args.mode !== "plan") {
-      // Until the ledger ships as a Control migration: an explicit operator
-      // step that creates only this table, idempotently.
-      await target.exec(IMPORT_LEDGER_DDL);
-    }
-    const report = await runImport({
+    return await runProducer(args, {
       source,
       ...(target ? { target } : {}),
       keyring: config.keyring,
-      ...(config.cloudKey ? { cloudKeyHex: config.cloudKey } : {}),
+      ...(config.cloudKey ? { cloudKey: config.cloudKey } : {}),
+      ...(args.convergenceCheckpoint ? { checkpoint } : {}),
+      copy: () => copyCredentials(args, env, source, target, config.keyring, config.cloudKey),
+      write: (path, value) => writeFileSync(path, JSON.stringify(value, null, 2), { mode: 0o600 }),
       log: (event, fields) => console.log(JSON.stringify({ event, ...fields })),
-    }, scope, args.mode);
-    if (args.report) writeFileSync(args.report, JSON.stringify(report, null, 2), { mode: 0o600 });
-    if (!args.copyCredentials) return report.ok ? 0 : 1;
-    if (args.mode === "apply" && !report.ok) return 1;
-    const copy = await copyCredentials(args, env, source, target, config.keyring, config.cloudKey);
-    if (args.credentialsReport) writeFileSync(args.credentialsReport, JSON.stringify(copy, null, 2), { mode: 0o600 });
-    return report.ok && copy.ok ? 0 : 1;
+    });
   } catch (error) {
-    if (error instanceof CopyRefused) {
+    if (error instanceof CopyRefused || error instanceof ConvergenceRefused) {
       console.error(JSON.stringify({ event: "cloud_import.usage_error", error: error.message }));
       return 2;
     }

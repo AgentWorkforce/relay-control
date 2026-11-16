@@ -65,6 +65,13 @@ async function copiedFixture() {
     [`${id(5)}/${id(0x803)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-synthetic-openai-key-0000000000"}),cloudKeyHex))],
     [`${id(2)}/anthropic/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({token:"sk-ant-oat01-synthetic-token-00000000"}),cloudKeyHex))],
     [`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(auth,cloudKeyHex))],
+    // Rows the cloud-import stack's fixture adds: an account-less legacy
+    // ChatGPT login (0x810) and the claude/gemini alias keys (0x814, 0x817).
+    [`${id(1)}/openai/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({auth_mode:"chatgpt",tokens:{
+      access_token:jwt({exp:1893456000}),id_token:jwt({email:"alice.legacy@example.test"}),
+      refresh_token:"rt-synthetic-legacy",account_id:"acct-synthetic-legacy"}}),cloudKeyHex))],
+    [`${id(2)}/${id(0x814)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-ant-api03-synthetic-alias-0000000"}),cloudKeyHex))],
+    [`${id(2)}/${id(0x817)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"AIza-synthetic-gemini-alias-key-000000"}),cloudKeyHex))],
     [`${id(2)}/${id(0x80b)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-ant-api03-unselected-synthetic-00000"}),cloudKeyHex))],
     [`${id(1)}/${id(0x80d)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-ant-api03-selected-synthetic-0000000"}),cloudKeyHex))],
     [`${id(1)}/${id(0x80e)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"AIza-synthetic-google-key-000000000000"}),cloudKeyHex))],
