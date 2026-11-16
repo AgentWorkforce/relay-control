@@ -64,6 +64,7 @@ CREATE TABLE provider_credentials (
   harness text NOT NULL, model_provider text NOT NULL DEFAULT '', auth_type text NOT NULL DEFAULT 'provider_oauth',
   label text, key_fingerprint text, display_name text NOT NULL, account_email text, provider_account_id text,
   is_active boolean NOT NULL DEFAULT false, harness_active boolean NOT NULL DEFAULT false, status text NOT NULL,
+  refresh_exhausted boolean NOT NULL DEFAULT false,
   last_authenticated_at timestamptz, last_used_at timestamptz, last_error text,
   created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
 );
@@ -72,6 +73,11 @@ CREATE TABLE workspace_integrations (
   name text, created_by_user_id uuid, connection_id text, provider_config_key text, installation_id text,
   metadata_json text NOT NULL DEFAULT '{}',
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE staff_read_grants (
+  id uuid PRIMARY KEY, workspace_id uuid NOT NULL, organization_id uuid NOT NULL, staff_user_id uuid NOT NULL,
+  reason text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz NOT NULL,
+  revoked_at timestamptz, revoked_by uuid
 );
 CREATE TABLE fleet_node_owners (
   id uuid PRIMARY KEY, workspace_id uuid NOT NULL, relay_workspace_id text NOT NULL, node_id text NOT NULL,
@@ -164,15 +170,34 @@ INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, ha
   ('${id(0x805)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'claude', 'anthropic', 'oauth_token', 'Bob token', true, true, 'connected', ${t}, ${t}),
   ('${id(0x806)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT', false, true, 'connected', ${t}, ${t}),
   ('${id(0x807)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'claude', 'anthropic', 'provider_oauth', 'Claude login', false, true, 'connected', ${t}, ${t}),
-  ('${id(0x808)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'codex', 'openai', 'byo_api_key', 'Lost key', false, false, 'connected', ${t}, ${t});
+  ('${id(0x808)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'codex', 'openai', 'byo_api_key', 'Lost key', true, false, 'connected', ${t}, ${t}),
+  -- C1: a suspended member's key, an errored key, an unselected key.
+  ('${id(0x809)}', '${ORG_A}', '${id(0x201)}', '${id(6)}', 'codex', 'openai', 'byo_api_key', 'Dave key', true, false, 'connected', ${t}, ${t}),
+  ('${id(0x80a)}', '${ORG_A}', '${id(0x201)}', '${id(2)}', 'codex', 'openai', 'byo_api_key', 'Errored', true, false, 'error', ${t}, ${t}),
+  ('${id(0x80b)}', '${ORG_A}', '${id(0x201)}', '${id(2)}', 'claude', 'anthropic', 'byo_api_key', 'Unselected', false, false, 'connected', ${t}, ${t}),
+  -- C2: Alice's second ChatGPT login (org B) shares her legacy openai object.
+  ('${id(0x80c)}', '${ORG_B}', '${id(0x205)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT 2', false, true, 'connected', ${t}, ${t}),
+  -- Review: Cloud's selected Anthropic key has the HIGHER id than the
+  -- unselected 0x80b in the same workspace; Control must activate this one.
+  ('${id(0x80d)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'claude', 'anthropic', 'byo_api_key', 'Selected', true, false, 'connected', ${t}, ${t}),
+  -- S1: an unselected Google key where Control already has a native active
+  -- one, and an unselected OpenRouter key with nothing else in its group.
+  ('${id(0x80e)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'gemini', 'google', 'byo_api_key', 'Cloud Google', false, false, 'connected', ${t}, ${t}),
+  ('${id(0x80f)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'opencode', 'openrouter', 'byo_api_key', 'Cloud OpenRouter', false, false, 'connected', ${t}, ${t});
 UPDATE provider_credentials SET label = 'Bob token', account_email = 'bob@example.test' WHERE id = '${id(0x805)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-1' WHERE id = '${id(0x806)}';
+UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-2' WHERE id = '${id(0x80c)}';
 INSERT INTO workspace_integrations (id, workspace_id, provider, name, created_by_user_id, connection_id, installation_id, created_at, updated_at) VALUES
   ('${id(0x901)}', 'rw_0000a201', 'github', NULL, '${id(5)}', 'nango-1', '12345', ${t}, ${t}),
   ('${id(0x902)}', 'rw_0000a201', 'github', 'second', '${id(1)}', 'nango-2', '12345', ${t}, ${t}),
   ('${id(0x903)}', 'rw_0000b201', 'github', NULL, '${id(2)}', 'nango-3', '12345', '2026-02-01T00:00:00Z', ${t}),
   ('${id(0x904)}', '${id(0x206)}', 'github', NULL, '${id(2)}', 'nango-4', 'abc', ${t}, ${t}),
-  ('${id(0x905)}', 'rw_0000a201', 'slack', NULL, '${id(1)}', 'nango-5', NULL, ${t}, ${t});
+  ('${id(0x905)}', 'rw_0000a201', 'slack', NULL, '${id(1)}', 'nango-5', NULL, ${t}, ${t}),
+  -- An older default for the same workspace, keyed by the app workspace UUID.
+  ('${id(0x906)}', '${id(0x201)}', 'github', NULL, '${id(1)}', 'nango-6', '12345', '2025-06-01T00:00:00Z', '2026-03-01T00:00:00Z');
+INSERT INTO staff_read_grants (id, workspace_id, organization_id, staff_user_id, reason, created_at, expires_at) VALUES
+  ('${id(0xa01)}', '${id(0x201)}', '${ORG_A}', '${id(5)}', '  Investigating a support ticket  ', ${t}, '2026-09-01T00:00:00Z'),
+  ('${id(0xa02)}', '${id(0x203)}', '${ORG_A}', '${id(1)}', 'Unbound workspace', ${t}, '2026-02-01T00:00:00Z');
 INSERT INTO fleet_node_owners (id, workspace_id, relay_workspace_id, node_id, user_id, source, created_at) VALUES
   ('${id(0x701)}', '${id(0x201)}', 'rw_0000a201', 'node-1', '${id(3)}', 'claim', ${t}),
   ('${id(0x702)}', '${id(0x203)}', 'rw_0000a203', 'node-2', '${id(1)}', 'claim', ${t});
@@ -205,8 +230,10 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
   // Pre-0058 target: the two relay_managed rows are refused by the importer.
   coding_agent_credentials: {
     imported: 0,
-    skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 5, target_lacks_relay_managed: 2 },
+    skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 12, target_lacks_relay_managed: 2 },
   },
+  // Pre-0061 target: grants wait for the migration.
+  staff_read_grants: { imported: 0, skipped: { workspace_not_imported: 1, target_lacks_staff_read_grants: 1 } },
   // Pre-0054 target: the GitHub App rows wait for the migration.
   github_app_installations: { imported: 0, skipped: { target_lacks_github_app: 1 } },
   github_app_connections: {
@@ -215,6 +242,7 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
       named_connection_needs_policy: 1,
       installation_claimed_by_other_org: 1,
       invalid_installation_id: 1,
+      duplicate_default_connection: 1,
       target_lacks_github_app: 1,
     },
   },

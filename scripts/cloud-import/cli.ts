@@ -87,6 +87,24 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   };
 }
 
+const COPY_APPLY_ENV = [
+  "CLOUD_IMPORT_TARGET_URL",
+  "CLOUD_CREDENTIAL_ENCRYPTION_KEY",
+  "CLOUD_CREDENTIAL_R2_ENDPOINT",
+  "CLOUD_CREDENTIAL_R2_BUCKET",
+  "CLOUD_CREDENTIAL_R2_ACCESS_KEY_ID",
+  "CLOUD_CREDENTIAL_R2_SECRET_ACCESS_KEY",
+] as const;
+
+/**
+ * `--mode apply --copy-credentials` refuses up front, before the identity
+ * import writes anything, when any setting it needs is missing. Names only.
+ */
+export function copyApplyPreflight(args: Pick<CliArgs, "mode" | "copyCredentials">, env: Env): string[] {
+  if (!args.copyCredentials || args.mode !== "apply") return [];
+  return COPY_APPLY_ENV.filter((name) => !readSecret(env, name));
+}
+
 function required(env: Env, name: string): string {
   const value = readSecret(env, name);
   if (!value) throw new Error(`${name} (or ${name}_FILE) is required`);
@@ -98,6 +116,8 @@ async function main(argv: readonly string[], env: Env): Promise<number> {
   let config: { sourceUrl: string; targetUrl?: string; cloudKey?: string; keyring: ReturnType<typeof loadEncryptionKeyring> };
   try {
     args = parseArgs(argv);
+    const missing = copyApplyPreflight(args, env);
+    if (missing.length) throw new Error(`--copy-credentials with --mode apply needs ${missing.join(", ")} (or *_FILE)`);
     // Plan mode may run without the Cloud key (agent tokens are then not
     // test-decrypted); dry-run and apply need it.
     const cloudKey = args.mode === "plan"
@@ -155,6 +175,10 @@ async function main(argv: readonly string[], env: Env): Promise<number> {
     if (args.credentialsReport) writeFileSync(args.credentialsReport, JSON.stringify(copy, null, 2), { mode: 0o600 });
     return report.ok && copy.ok ? 0 : 1;
   } catch (error) {
+    if (error instanceof CopyRefused) {
+      console.error(JSON.stringify({ event: "cloud_import.usage_error", error: error.message }));
+      return 2;
+    }
     const code = (error as { code?: unknown } | null)?.code;
     console.error(JSON.stringify({
       event: "cloud_import.error",
@@ -183,6 +207,8 @@ function cloudReader(env: Env): CloudObjectReader {
   return { get: (key) => backend.get(key) };
 }
 
+class CopyRefused extends Error {}
+
 async function copyCredentials(
   args: CliArgs,
   env: Env,
@@ -192,14 +218,19 @@ async function copyCredentials(
   cloudKey: string | undefined,
 ) {
   const scope = { orgIds: args.orgIds };
-  if (args.mode === "plan" || !target || !cloudKey) {
+  if (args.mode === "plan") {
     // Plan: candidates and skip reasons only; the object store is not touched.
     const stub = undefined as unknown as never;
-    return copyCodingAgentCredentials({ source, reader: { get: async () => null }, cloudKeyHex: "", keyring, codingAgents: stub, logins: stub }, scope, "plan");
+    return copyCodingAgentCredentials({ source, target: stub, reader: { get: async () => null }, cloudKeyHex: "", keyring, codingAgents: stub, logins: stub }, scope, "plan");
+  }
+  if (!target || !cloudKey) {
+    // Never fall back to a silent plan when an apply was asked for.
+    throw new CopyRefused("--copy-credentials with --mode apply needs CLOUD_IMPORT_TARGET_URL and CLOUD_CREDENTIAL_ENCRYPTION_KEY");
   }
   const blobs = new CredentialBlobStore(credentialBackendFromEnv(env, target), keyring);
   return copyCodingAgentCredentials({
     source,
+    target,
     reader: cloudReader(env),
     cloudKeyHex: cloudKey,
     keyring,

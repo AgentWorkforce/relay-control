@@ -10,7 +10,8 @@
 //   keys, emails and SQL error messages are never logged or reported.
 // - Idempotent: every write is an upsert on the target primary key. Ids are
 //   the Cloud ids. A re-run converges; invite token hashes are insert-only.
-import { createDecipheriv } from "node:crypto";
+import { createDecipheriv, randomBytes } from "node:crypto";
+import { recordAudit } from "../../src/admin/audit.js";
 import { encryptSecret, hashSecret, opaqueToken, type EncryptionKeyring } from "../../src/crypto.js";
 import type { Database, SqlExecutor } from "../../src/database.js";
 import {
@@ -200,6 +201,7 @@ function writeColumns(table: ImportTable, columns: TargetColumns): string[] | nu
   const list = [...spec.columns, ...(spec.optional ?? []).filter((column) => present.has(column))];
   if (spec.secret) list.push(spec.secret.target);
   if (spec.inviteTokenHash) list.push(spec.inviteTokenHash);
+  if (spec.freshTokenHash) list.push(spec.freshTokenHash);
   const missing = list.filter((column) => !present.has(column));
   if (missing.length) {
     if (spec.gate) return null;
@@ -210,7 +212,7 @@ function writeColumns(table: ImportTable, columns: TargetColumns): string[] | nu
 
 function upsertSql(table: ImportTable, columns: string[], fill = "'{}'::jsonb"): string {
   const spec = TARGETS[table];
-  const secretColumn = spec.secret?.target ?? spec.inviteTokenHash;
+  const secretColumn = spec.secret?.target ?? spec.inviteTokenHash ?? spec.freshTokenHash;
   const relation = `public.${quote(spec.table)}`;
   const updates = columns
     .filter((column) => !spec.primaryKey.includes(column) && !(spec.insertOnly ?? []).includes(column))
@@ -223,6 +225,16 @@ SELECT ${columns.map((column) => `p.${quote(column)}`).join(", ")}
    u.r::jsonb || COALESCE(u.o::jsonb, '{}'::jsonb) || ${fill} || ${secretColumn ? `CASE WHEN u.s IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('${secretColumn}', u.s) END` : "'{}'::jsonb"}
  ) AS p
 ON CONFLICT (${spec.primaryKey.map(quote).join(", ")}) DO ${updates.length ? `UPDATE SET ${updates.join(", ")}` : "NOTHING"}`;
+}
+
+/** Keys of `rows` not yet present on the target (first import). */
+async function newKeys(tx: SqlExecutor, table: ImportTable, rows: PreparedRow[]): Promise<Set<string>> {
+  const existing = await tx.query<{ id: string }>(
+    `SELECT id::text AS id FROM public.${quote(TARGETS[table].table)} WHERE id::text = ANY($1::text[])`,
+    [rows.map((row) => row.key)],
+  );
+  const present = new Set(existing.rows.map((row) => row.id));
+  return new Set(rows.map((row) => row.key).filter((key) => !present.has(key)));
 }
 
 const USERS_LAST_SQL = `
@@ -336,6 +348,19 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
   await deps.source.transaction(async (tx) => {
     await tx.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
     for (const table of SOURCE_TABLES) {
+      const relation = TARGETS[table].sourceRelation;
+      if (relation) {
+        const present = await tx.query<{ present: boolean }>(
+          "SELECT to_regclass(format('public.%I', $1::text)) IS NOT NULL AS present",
+          [relation],
+        );
+        if (present.rows[0]?.present !== true) {
+          // An older Cloud branch: nothing to import, said out loud.
+          warn(`source_lacks_${relation}`);
+          prepared[table] = [];
+          continue;
+        }
+      }
       const rows = await readSource(tx, table, scope);
       report.tables[table].candidates = rows.length;
       const kept: PreparedRow[] = [];
@@ -356,6 +381,9 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
           } else if (spec.secret?.source === "secret_envelope") {
             const plaintext = decryptCloudEnvelope(JSON.parse(row.secret ?? "null") as EncryptedEnvelope, deps.cloudKeyHex!);
             secret = encryptSecret(plaintext, deps.keyring.active);
+          } else if (spec.freshTokenHash) {
+            // A random value nobody holds: imported grants never authenticate.
+            secret = hashSecret(randomBytes(32).toString("base64url"));
           } else if (spec.inviteTokenHash) {
             // Same mint as IdentityStore.createInvitation: an sh_inv_ opaque
             // token stored as its sha256. The token itself is discarded; an
@@ -466,6 +494,21 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     }
     // Before 0057 node_name is NOT NULL: the node id stands in.
     const fills: Partial<Record<ImportTable, string>> = {};
+    // staff_read_grants.staff_organization_id is the target's operator org.
+    if (prepared.staff_read_grants.length > 0) {
+      const operator = await target.query<{ organization_id: string }>(
+        "SELECT organization_id::text AS organization_id FROM public.installation_bootstrap WHERE organization_id IS NOT NULL LIMIT 1",
+      );
+      const operatorOrg = operator.rows[0]?.organization_id;
+      if (operatorOrg && UUID_KEY.test(operatorOrg)) {
+        fills.staff_read_grants = `jsonb_build_object('staff_organization_id', '${operatorOrg}'::text)`;
+      } else {
+        prepared.staff_read_grants = prepared.staff_read_grants.filter((row) => {
+          skip("staff_read_grants", "no_operator_organization", row.key);
+          return false;
+        });
+      }
+    }
     if (columns.get("fleet_node_owners")?.get("node_name")?.nullable === false) {
       fills.fleet_node_owners = "jsonb_build_object('node_name', u.r::jsonb ->> 'node_id')";
       warn("fleet_node_name_filled_with_node_id");
@@ -543,8 +586,23 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       }
       for (const table of ORG_TABLES) {
         const rows = prepared[table].filter((row) => row.org === org);
+        const fresh = table === "staff_read_grants" && rows.length > 0
+          ? await newKeys(tx, table, rows)
+          : null;
         await writeRows(tx, table, rows);
         report.orgs[org]!.imported[table] = rows.length;
+        // 0061: one audit row per grant, on its first import only.
+        for (const row of rows) {
+          if (!fresh?.has(row.key)) continue;
+          const { workspace_id: workspaceId } = JSON.parse(row.row) as { workspace_id: string };
+          await recordAudit(tx, {
+            organizationId: org,
+            workspaceId,
+            actor: { kind: "service", subject: "cloud-import" },
+            action: "staff_read_grant.imported",
+            target: `${row.key} workspace ${workspaceId}`,
+          });
+        }
       }
       const tables = ORG_TABLES.flatMap((table) => (keys[table] ?? []).map(() => table));
       const rowKeys = ORG_TABLES.flatMap((table) => keys[table] ?? []);
