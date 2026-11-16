@@ -1,7 +1,7 @@
 // Subscription logins for coding agents: hosted's provider_oauth credentials,
 // ported to self-host.
 //
-//   device login (start/status)  ->  auth file JSON  ->  envelope-encrypted
+//   device login or import  ->  auth file JSON  ->  envelope-encrypted
 //   object (CredentialBlobStore)  ->  run-scoped reference in the assignment
 //   payload  ->  worker reads it, writes the CLI's auth file 0600 into the
 //   run's private dir, and writes refreshed tokens back after the run.
@@ -29,7 +29,8 @@ import {
   XaiDeviceAuthError,
 } from "./xai-device-auth.js";
 
-export type SubscriptionProvider = "openai" | "xai";
+export type SubscriptionProvider = "anthropic" | "openai" | "xai";
+export type DeviceSubscriptionProvider = Exclude<SubscriptionProvider, "anthropic">;
 
 type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
@@ -41,6 +42,7 @@ export const SUBSCRIPTION_CLI_FILES: Record<SubscriptionProvider, {
   file: string;
   displayName: string;
 }> = {
+  anthropic: { cli: "claude", homeEnv: "HOME", directory: ".claude", file: ".credentials.json", displayName: "Claude login" },
   openai: { cli: "codex", homeEnv: "CODEX_HOME", directory: ".codex", file: "auth.json", displayName: "Codex login" },
   xai: { cli: "grok", homeEnv: "GROK_HOME", directory: ".grok", file: "auth.json", displayName: "Grok login" },
 };
@@ -55,9 +57,12 @@ const MAX_FAILED_REFRESHES = 3;
 const MAX_AUTH_FILE_BYTES = 64 * 1024;
 
 const OPENAI_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token";
+const ANTHROPIC_TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token";
 const XAI_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token";
+const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const DEFAULT_ANTHROPIC_EXPIRES_IN_SECONDS = 8 * 60 * 60;
 
-export const DEVICE_BINDING_COOKIES: Record<SubscriptionProvider, string> = {
+export const DEVICE_BINDING_COOKIES: Record<DeviceSubscriptionProvider, string> = {
   openai: "agent_relay_openai_device_session",
   xai: "agent_relay_xai_device_session",
 };
@@ -115,6 +120,30 @@ type GrokEntry = {
   [key: string]: unknown;
 };
 
+type AnthropicOauth = {
+  accessToken?: string;
+  refreshToken?: string;
+  expiresAt?: number | string;
+  emailAddress?: string;
+  email?: string;
+  [key: string]: unknown;
+};
+
+function anthropicExpiry(value: unknown): Date | null {
+  if (typeof value === "number") {
+    const date = new Date(value > 1e12 ? value : value * 1_000);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    const date = Number.isFinite(numeric)
+      ? new Date(numeric > 1e12 ? numeric : numeric * 1_000)
+      : new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  return null;
+}
+
 /** Identity, expiry and fingerprint input of a stored auth file. */
 export function describeAuthFile(provider: SubscriptionProvider, content: string): {
   accountId: string;
@@ -130,6 +159,27 @@ export function describeAuthFile(provider: SubscriptionProvider, content: string
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new CodingAgentError(422, "invalid_auth_file", "Auth file is not an object");
+  }
+  if (provider === "anthropic") {
+    const oauth = (parsed as { claudeAiOauth?: AnthropicOauth }).claudeAiOauth;
+    if (!oauth?.accessToken || !oauth.refreshToken) {
+      throw new CodingAgentError(422, "invalid_auth_file", "Not a Claude subscription login");
+    }
+    const email = typeof oauth.emailAddress === "string"
+      ? oauth.emailAddress
+      : typeof oauth.email === "string"
+        ? oauth.email
+        : null;
+    const normalizedEmail = email?.trim().toLowerCase() || null;
+    if (!normalizedEmail) {
+      throw new CodingAgentError(422, "invalid_auth_file", "Claude subscription login has no account email");
+    }
+    return {
+      accountId: normalizedEmail,
+      email: email!.trim(),
+      expiresAt: anthropicExpiry(oauth.expiresAt),
+      refreshToken: oauth.refreshToken,
+    };
   }
   if (provider === "openai") {
     const codex = parsed as Partial<CodexAuthJson>;
@@ -166,6 +216,32 @@ export async function refreshAuthFile(
   now = new Date(),
 ): Promise<string> {
   const parsed = JSON.parse(content) as Record<string, unknown>;
+  if (provider === "anthropic") {
+    const oauth = (parsed as { claudeAiOauth?: AnthropicOauth }).claudeAiOauth;
+    if (!oauth?.refreshToken) throw new RefreshFailed(provider, 422);
+    const response = await fetchImpl(ANTHROPIC_TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: oauth.refreshToken,
+        client_id: ANTHROPIC_CLIENT_ID,
+      }).toString(),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) throw new RefreshFailed(provider, response.status);
+    const tokens = await response.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
+    if (!tokens.access_token || !tokens.refresh_token) throw new RefreshFailed(provider, 502);
+    return JSON.stringify({
+      ...parsed,
+      claudeAiOauth: {
+        ...oauth,
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        expiresAt: now.getTime() + (tokens.expires_in ?? DEFAULT_ANTHROPIC_EXPIRES_IN_SECONDS) * 1_000,
+      },
+    });
+  }
   if (provider === "openai") {
     const codex = parsed as unknown as CodexAuthJson;
     const response = await fetchImpl(OPENAI_TOKEN_ENDPOINT, {
@@ -269,7 +345,7 @@ export class SubscriptionLoginStore {
   // --------------------------------------------------------- device login
 
   async startDevice(input: {
-    provider: SubscriptionProvider;
+    provider: DeviceSubscriptionProvider;
     workspaceId: string;
     organizationId: string;
     userId: string;
@@ -354,7 +430,7 @@ export class SubscriptionLoginStore {
   }
 
   async pollDevice(input: {
-    provider: SubscriptionProvider;
+    provider: DeviceSubscriptionProvider;
     transactionId: unknown;
     workspaceId: string;
     organizationId: string;

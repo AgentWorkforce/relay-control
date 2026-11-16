@@ -863,8 +863,9 @@ the runtime environment read below:
 A selected credential wins over a workspace variable of the same name; a run's
 own `envSecrets` win over both.
 
-**Subscription logins** (hosted `provider_oauth`). Codex (ChatGPT) and Grok
-(xAI) sign in from the dashboard's Connect agent dialog with the providers'
+**Subscription logins** (hosted `provider_oauth`). Imported Claude Pro/Max
+logins, Codex (ChatGPT), and Grok (xAI) use the CLI's refreshable login file.
+Codex and Grok sign in from the dashboard's Connect agent dialog with the providers'
 device flows (`POST provider-credentials/{openai,xai}-device/start|status`):
 the operator approves a one-time code on the provider's site and relaycontrol
 exchanges it, with no hosted callback. The resulting auth file is stored as an
@@ -887,11 +888,14 @@ worker presents it with its worker token at
 `GET /api/v1/workers/:w/assignments/:run/cli-credentials` and gets each auth
 file, refreshed first (under a per-credential advisory lock, so concurrent
 runs spend one single-use refresh token) when it expires within 45 minutes. It
-writes them 0600 under the run's private directory as `$CODEX_HOME/auth.json`
-/ `$GROK_HOME/auth.json`, and after the run `PUT`s back a file the CLI
+writes them 0600 under the run's private directory as
+`$HOME/.claude/.credentials.json`, `$CODEX_HOME/auth.json`, or
+`$GROK_HOME/auth.json`, and after the run `PUT`s back a file the CLI
 refreshed (same account only, never over a newer login). A login that is
 expired and cannot refresh becomes `refresh_failed` and is skipped.
-Claude has no browser login on hosted either; it uses the setup token above.
+Claude still has no Control browser login; an imported
+`provider_oauth` file keeps existing Cloud users signed in, while new logins
+can use the setup token above.
 
 **Workspace API tokens** (`/deployment-api-tokens`, hosted shapes). Owner/admin
 only, shown once, stored as SHA-256. Purposes: `agent-runtime` (runtime env and
