@@ -5,6 +5,17 @@ assigned at release.
 
 ## Unreleased
 
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), every
+  agent launch through `spawn_relay_agent` mints a one-time `sh_lt_` launch
+  credential (10 minutes, bound to the workspace, node, agent name and
+  launching user; migration 0060 `relay_launch_credentials`). relaygate
+  introspects it at `POST /internal/v1/auth/introspect`, which answers
+  principal_type `relay_launch` with `node_name` and `scopes`
+  `["relay:agent:enrol"]` and burns it on the first active answer. It is
+  stored sealed and never sent to Relaycast; delivery to the node is a later
+  change. Audited as `relay_launch.credential.issued` and
+  `relay_launch.credential.redeemed`. Unset, nothing changes. See
+  docs/identity.md.
 - Added: GitHub App installation credentials with `SELFHOST_GITHUB_APP_ID`
   and `SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`. Imported connections retain
   their installation IDs and mint replacement tokens without reconnecting.
@@ -15,7 +26,6 @@ assigned at release.
   See [GitHub App credentials](docs/github-app-connections.md).
 - Changed: connection edit versions include auth mode and installation ID;
   existing clients must refresh their opaque connection version once after upgrading.
-
 - Added: `SELFHOST_RELAYGATE_PUBLIC_URL` (unset by default) for gate-only
   installs, where relaygate is the only public way into Relaycast. When set,
   `GET /api/v1/workspaces/{id}/resolve` answers `urls.relaygateUrl` (the

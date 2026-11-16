@@ -1284,6 +1284,40 @@ per-identity handouts stop too:
 
 Unset, nothing changes.
 
+#### Relay launch credentials
+
+On a gate-only install, every agent launch through the MCP launch tool
+(`spawn_relay_agent`) also gets a one-time launch credential, which the
+launched agent presents to relaygate's `POST /v1/register`:
+
+- An opaque `sh_lt_` token, valid for 10 minutes and redeemable once, bound to
+  the launch's workspace, organization, target node name, agent name and
+  launching user (table `relay_launch_credentials`, migration 0060, one row
+  per `relay_spawns` launch). Control stores its sha256 hash and a copy sealed
+  under the active encryption key, and never returns it to the MCP caller.
+- It is minted after the launch is journaled and before it is sent. It is not
+  part of the spawn invocation sent to Relaycast, so Relaycast never sees it.
+  The Control node-socket bridge, a separate change, attaches it to the spawn
+  frame it forwards to the node. A launch Relaycast rejects outright deletes
+  its credential.
+- relaygate introspects it at `POST /internal/v1/auth/introspect` with
+  `{token, aud}`, `aud` being its configured audience (one of
+  `SELFHOST_INTROSPECT_AUDIENCES`). Inactive reasons: `unknown`, `expired`,
+  `revoked` (already redeemed), `audience`, `workspace` (when the request
+  names another workspace) and `machine_not_owned` (any `machine`). Only
+  when every check passes is it burned (redeemed, sealed copy cleared); a
+  concurrent second presentation answers inactive. The active answer is
+  `{active: true, sub: <launching user id>, email: null, principal_type:
+  "relay_launch", agent_name, node_name, machine_id: null, org, workspace,
+  scopes: ["relay:agent:enrol"], aud, iat, exp, token_id: <credential id>}`.
+- Audit events `relay_launch.credential.issued` and
+  `relay_launch.credential.redeemed` (actor: the launching user; target: the
+  credential id, spawn id, node name and agent name, plus the expiry on
+  issue). The token and its hash are never logged or audited.
+
+Unset `SELFHOST_RELAYGATE_PUBLIC_URL`: no credential is minted and every
+`sh_lt_` introspects as `unknown`.
+
 ### Scope mint matrix
 
 Scopes are fixed when a credential is issued and stored on its session row.
