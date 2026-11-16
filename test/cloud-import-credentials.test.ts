@@ -78,6 +78,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     [`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(codexAuth, CLOUD_KEY))],
     [`${id(1)}/${id(0x80d)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "anthropic", key: "sk-ant-api03-synthetic-selected-0000" }), CLOUD_KEY))],
     [`${id(1)}/${id(0x80e)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "google", key: "AIza-synthetic-cloud-google-key-000000" }), CLOUD_KEY))],
+    [`${id(2)}/${id(0x817)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "gemini", key: "AIza-synthetic-gemini-alias-key-000000" }), CLOUD_KEY))],
     [`${id(2)}/${id(0x814)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "claude", key: "sk-ant-api03-synthetic-alias-0000000" }), CLOUD_KEY))],
     [`${id(2)}/${id(0x80f)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "openrouter", key: "sk-or-v1-synthetic-cloud-openrouter-0" }), CLOUD_KEY))],
     // 0x810 has no provider_account_id: Cloud reads Alice's legacy openai object.
@@ -108,9 +109,14 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.equal(native.record.isActive, true);
   const plan = await copyCodingAgentCredentials(deps, { orgIds: null }, "plan");
   assert.equal(reads.length, 0, "plan never reads the object store");
-  assert.equal(plan.candidates, 17);
+  assert.equal(plan.candidates, 18);
 
   const report = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  // A dropped login is classified in SQL before any object is read: none of
+  // the keys Cloud would read for it is fetched.
+  const droppedKeys = cloudObjectKeys({ id: id(0x813), cloud_user_id: id(1), auth_type: "provider_oauth", model_provider: "openrouter", provider_account_id: null });
+  assert.ok(droppedKeys.length > 0);
+  for (const key of droppedKeys) assert.ok(!reads.includes(key), `no object-store read for a dropped login (${key})`);
   assert.deepEqual(report.rows, {
     [id(0x803)]: "copied",
     [id(0x805)]: "copied",
@@ -136,18 +142,18 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     [id(0x813)]: "skipped:unsupported_dropped",
     // Stored as " Claude ": Cloud serves it as anthropic, and so does Control.
     [id(0x814)]: "copied",
+    // Stored as "Gemini": Cloud serves it as google.
+    [id(0x817)]: "copied",
   });
-  // A dropped login is classified in SQL before any object is read.
-  assert.ok(!reads.some((key) => key.includes(id(0x813))), "no object-store read for a dropped login");
   // Control receives only what Cloud's runtime reads for each row.
   assert.ok(!reads.includes(`${id(1)}/accounts/${id(0x810)}/credentials.json.enc`), "no account read for an account-less login");
   assert.equal(reads.filter((key) => key === `${id(1)}/openai/credentials.json.enc`).length, 1, "legacy read only for 0x810");
   assert.equal(report.ok, false, "a missing object is not a clean copy");
   // Rollback handle: every written Cloud row maps to its Control row.
-  assert.equal(Object.keys(report.controlIds).length, 9); // 0x808 object missing
+  assert.equal(Object.keys(report.controlIds).length, 10); // 0x808 object missing
   const mapped = (await target.query<{ n: number }>(
     "SELECT count(*)::int AS n FROM coding_agent_credentials WHERE id::text = ANY($1::text[])", [Object.values(report.controlIds)])).rows[0]!.n;
-  assert.equal(mapped, 9);
+  assert.equal(mapped, 10);
   assert.doesNotMatch(JSON.stringify(report), /sk-|rt-synthetic|example\.test/);
 
   const rows = (await target.query<{ auth_type: string; model_provider: string; secret_ciphertext: string | null; blob_location: string | null; workspace_id: string }>(
@@ -158,6 +164,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     `byo_api_key anthropic ${id(0x205)}`,
     `byo_api_key google ${id(0x201)}`,
     `byo_api_key google ${id(0x201)}`,
+    `byo_api_key google ${id(0x205)}`,
     `byo_api_key openai ${id(0x201)}`,
     `byo_api_key openrouter ${id(0x205)}`,
     `oauth_token anthropic ${id(0x205)}`,
@@ -201,7 +208,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   // active (never zero) and is reported as a conflict.
   const openrouter = flags.filter((row) => row.model_provider === "openrouter");
   assert.deepEqual(openrouter.map((row) => row.is_active), [true]);
-  assert.deepEqual(report.selection, { groups: 5, active: 3, harness: 2, activeDemoted: 1, harnessDemoted: 0, selectionConflicts: 1 });
+  assert.deepEqual(report.selection, { groups: 6, active: 4, harness: 2, activeDemoted: 1, harnessDemoted: 0, selectionConflicts: 1 });
   assert.equal(await deps.logins.freshAuthFile(id(0x201), (await target.query<{ id: string }>(
     "SELECT id FROM coding_agent_credentials WHERE auth_type = 'provider_oauth'")).rows[0]!.id), codexAuth);
 
@@ -220,7 +227,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.equal(again.rows[id(0x805)], "already_present");
   assert.equal(again.rows[id(0x80b)], "already_present");
   const count = (await target.query<{ n: number }>("SELECT count(*)::int AS n FROM coding_agent_credentials WHERE auth_type <> 'relay_managed'")).rows[0]!.n;
-  assert.equal(count, 11);
+  assert.equal(count, 12);
   // The re-run re-applies the same selection.
   const activeAfter = (await target.query<{ secret_ciphertext: string }>(
     "SELECT secret_ciphertext FROM coding_agent_credentials WHERE workspace_id = $1 AND model_provider = 'anthropic' AND is_active", [id(0x201)])).rows;

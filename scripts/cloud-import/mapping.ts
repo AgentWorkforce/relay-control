@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.15";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.16";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -48,14 +48,15 @@ const ROLE_RANK = (expression: string) =>
   `(CASE ${expression} WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END)`;
 const RW_FORMAT = "'^rw_[0-9a-f]{8}$'";
 /**
- * Cloud's canonicalConnectionProvider
- * (packages/web/lib/billing/connection-provider.ts), in SQL: Cloud stores
- * aliases (claude, codex, grok, cursor-agent, agent) and serves them as the
- * canonical provider, so the import does the same.
+ * Cloud's provider normalisation, in SQL: canonicalConnectionProvider
+ * (packages/web/lib/billing/connection-provider.ts) plus gemini -> google
+ * from the serving path's normalizeModelProvider
+ * (packages/web/lib/billing/house-keys.ts). Cloud stores these aliases and
+ * serves them as the canonical provider, so the import does the same.
  */
 export const PROVIDER = (expression: string) =>
   `(CASE lower(btrim(${expression})) WHEN 'claude' THEN 'anthropic' WHEN 'codex' THEN 'openai' WHEN 'grok' THEN 'xai'` +
-  ` WHEN 'cursor-agent' THEN 'cursor' WHEN 'agent' THEN 'cursor' ELSE lower(btrim(${expression})) END)`;
+  ` WHEN 'cursor-agent' THEN 'cursor' WHEN 'agent' THEN 'cursor' WHEN 'gemini' THEN 'google' ELSE lower(btrim(${expression})) END)`;
 // A Cloud workspace with no usable Relaycast binding (rw and rw alias the
 // workspace and its relay_workspaces row in workspace_rows).
 const UNBOUND = "(w.relay_workspace_id IS NULL OR rw.id IS NULL OR COALESCE(rw.relaycast_workspace_id, '') = '' OR COALESCE(rw.relaycast_api_key, '') = '')";

@@ -119,7 +119,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   // Plan has no target, so the pre-0064 unbound-workspace gate cannot apply:
   // unbound workspaces (a2 no key, a3 no rw_) count as importable.
   expectedPlan.workspaces = { imported: 5, skipped: { workspace_being_deleted: 1 } };
-  expectedPlan.coding_agent_credentials = { imported: 4, skipped: { secret_in_cloud_credential_store: 17 } };
+  expectedPlan.coding_agent_credentials = { imported: 4, skipped: { secret_in_cloud_credential_store: 18 } };
   expectedPlan.github_app_installations = { imported: 1, skipped: {} };
   expectedPlan.staff_read_grants = { imported: 2, skipped: {} };
   expectedPlan.github_app_connections = {

@@ -190,9 +190,10 @@ type Candidate = {
 };
 
 // Cloud's cli-credentials.ts aliases: claude -> anthropic, codex -> openai, grok -> xai.
-// Cloud's canonicalConnectionProvider (packages/web/lib/billing/connection-provider.ts).
+// Cloud's canonicalConnectionProvider (packages/web/lib/billing/connection-provider.ts)
+// plus gemini -> google from normalizeModelProvider (packages/web/lib/billing/house-keys.ts).
 const CANONICAL: Record<string, string> = {
-  claude: "anthropic", codex: "openai", grok: "xai", "cursor-agent": "cursor", agent: "cursor",
+  claude: "anthropic", codex: "openai", grok: "xai", "cursor-agent": "cursor", agent: "cursor", gemini: "google",
 };
 export const canonicalProvider = (value: string) => {
   const normalized = value.trim().toLowerCase();
