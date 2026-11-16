@@ -559,6 +559,33 @@ test("cloud import: secrets imported before markers are adopted when they still 
   assert.equal((await target.query<{ key: string }>("SELECT relaycast_api_key_ciphertext AS key FROM workspaces WHERE id = $1", [id(0x201)])).rows[0]!.key, controlKey);
 });
 
+test("cloud import: a secret Control re-encrypted unchanged (keyring rotation) is re-adopted, not kept forever", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  const deps = { source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY };
+  assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
+  const key = async () => (await target.query<{ key: string }>("SELECT relaycast_api_key_ciphertext AS key FROM workspaces WHERE id = $1", [id(0x201)])).rows[0]!.key;
+  // Control re-encrypts a1's key: same plaintext, new ciphertext; the marker names the old one.
+  const reencrypted = encryptSecret(decryptSecret(await key(), KEYRING), KEYRING.active);
+  await target.query("UPDATE workspaces SET relaycast_api_key_ciphertext = $2 WHERE id = $1", [id(0x201), reencrypted]);
+  const again = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(again.ok, true, JSON.stringify(again.orgs));
+  assert.equal(again.warnings.workspaces_secret_adopted, 1, "re-adopted");
+  assert.equal(again.warnings.workspaces_secret_kept ?? 0, 0, "not reported as a Control rotation");
+  assert.equal(await key(), reencrypted, "adopted without a write");
+  const third = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(third.warnings.workspaces_secret_adopted ?? 0, 0, "the marker now names it; nothing more to adopt");
+  assert.equal(third.warnings.workspaces_secret_kept ?? 0, 0);
+  // And Cloud's rotations flow again.
+  await source.exec("UPDATE relay_workspaces SET relaycast_api_key = 'rk_cloud_after_readopt' WHERE id = 'rw_0000a201'");
+  assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
+  assert.equal(decryptSecret(await key(), KEYRING), "rk_cloud_after_readopt");
+});
+
 test("cloud import: an existing Control user with an imported email under another id refuses the run", async (t) => {
   const source = await cloudSource();
   const target = await controlTarget("0051");
