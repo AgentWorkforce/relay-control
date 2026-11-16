@@ -74,6 +74,7 @@ test("an active sh_fr_ credential introspects as the run's agent with its path s
     machine_id: null,
     org: env.org.id,
     workspace: env.alpha.id,
+    cloud_relay_workspace_id: null,
     scopes: [
       `relayfile:fs:read:/workflows/runs/${runId}`,
       `relayfile:fs:read:/workflows/runs/${runId}/*`,

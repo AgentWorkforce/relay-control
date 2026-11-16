@@ -795,7 +795,7 @@ paths:
         - cookieAuth: []
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
-        - { name: source_id, in: query, required: true, schema: { type: string, format: uuid } }
+        - { name: source_id, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 200 } }
       responses:
         "200":
           description: Identities and capabilities
@@ -3688,11 +3688,10 @@ paths:
         issued, RelayHistory is not called, and it does not count against
         anything the session issue/renew path does, so Agent Relay Desktop
         can use it for site-push admission and cold-process delete/revoke
-        lookups. `origin` and `audience` are both the configured
-        public History origin (SESSION_READ_API_PUBLIC_URL), the exact string
-        sessions are bound to (read token audience, default introspection
-        audience, returned `baseUrl`); it is installation-wide, not per
-        workspace.
+        lookups. `origin` and `audience` are both the workspace's imported
+        customer-hosted History origin when set, otherwise the configured
+        public History origin (SESSION_READ_API_PUBLIC_URL). It is the exact
+        introspection audience and sync-session `baseUrl`.
       responses:
         "200":
           description: The workspace's RelayHistory origin and session audience
@@ -3758,9 +3757,10 @@ paths:
         renew through this route), and both expiries are the token's own
         expiry capped at 15 minutes.
 
-        In every mode `baseUrl` is the public History origin
-        (SESSION_READ_API_PUBLIC_URL). Caller-supplied service URLs or tenant
-        IDs are rejected because they are not request fields. See
+        In sync mode `baseUrl` is the workspace's imported customer-hosted
+        origin when set, otherwise SESSION_READ_API_PUBLIC_URL. Read mode uses
+        the configured read API. Caller-supplied service URLs or tenant IDs
+        are rejected because they are not request fields. See
         docs/sessions-read-api.md.
       requestBody:
         required: false
@@ -5990,7 +5990,7 @@ paths:
                 oneOf:
                   - type: object
                     additionalProperties: false
-                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, role, scopes, aud, iat, exp, token_id, capture_policy]
+                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, cloud_relay_workspace_id, role, scopes, aud, iat, exp, token_id, capture_policy]
                     properties:
                       active: { const: true }
                       sub: { type: string, description: relaycontrol user id }
@@ -6002,6 +6002,10 @@ paths:
                         description: The verified machine id when `machine` was supplied; null when it was absent
                       org: { type: string, description: Organization id from the token session }
                       workspace: { type: string, description: "Workspace id from the token session; authoritative for the caller when the request omitted `workspace`" }
+                      cloud_relay_workspace_id:
+                        type: [string, "null"]
+                        pattern: "^rw_[0-9a-f]{8}$"
+                        description: The imported Cloud relay-workspace identity used by Relayfile and provider integrations; null for a workspace created in Control.
                       scopes:
                         type: array
                         items: { type: string }
@@ -6026,7 +6030,7 @@ paths:
                         description: Present and true only when the answer was served from Control's last authoritative verification during a database outage; `exp` is then clamped to the end of the hold.
                   - type: object
                     additionalProperties: false
-                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, scopes, aud, iat, exp, token_id]
+                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, cloud_relay_workspace_id, scopes, aud, iat, exp, token_id]
                     description: A relayfile-agent workspace API token.
                     properties:
                       active: { const: true }
@@ -6037,6 +6041,9 @@ paths:
                       machine_id: { type: "null" }
                       org: { type: string }
                       workspace: { type: string, description: "The token's workspace; authoritative when the request omitted `workspace`" }
+                      cloud_relay_workspace_id:
+                        type: [string, "null"]
+                        pattern: "^rw_[0-9a-f]{8}$"
                       scopes:
                         type: array
                         items: { enum: ["fs:read", "fs:write", "sync:read", "sync:trigger"] }
@@ -6046,7 +6053,7 @@ paths:
                       token_id: { type: string, format: uuid }
                   - type: object
                     additionalProperties: false
-                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, scopes, aud, iat, exp, token_id]
+                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, cloud_relay_workspace_id, scopes, aud, iat, exp, token_id]
                     description: An acquisition-operator workspace API token (an operator service).
                     properties:
                       active: { const: true }
@@ -6057,6 +6064,9 @@ paths:
                       machine_id: { type: "null" }
                       org: { type: string }
                       workspace: { type: string, description: "The token's workspace; authoritative when the request omitted `workspace`" }
+                      cloud_relay_workspace_id:
+                        type: [string, "null"]
+                        pattern: "^rw_[0-9a-f]{8}$"
                       scopes:
                         type: array
                         items: { const: "acquisition:operate" }
@@ -8233,7 +8243,7 @@ components:
         caller's own access token; the edge introspects it on every upload.
       required: [baseUrl, accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType, scopes, orgId, workspaceId]
       properties:
-        baseUrl: { type: string, format: uri, description: The public History origin (SESSION_READ_API_PUBLIC_URL). }
+        baseUrl: { type: string, format: uri, description: The workspace's customer-hosted History origin when set, otherwise SESSION_READ_API_PUBLIC_URL. }
         accessToken: { type: string, pattern: '^sh_at_' }
         accessTokenExpiresAt: { type: string, format: date-time }
         refreshToken:
@@ -8841,6 +8851,7 @@ components:
       required:
         - workspaceId
         - cloudWorkspaceId
+        - cloudRelayWorkspaceId
         - relaycastWorkspaceId
         - organizationId
         - name
@@ -8853,6 +8864,10 @@ components:
         cloudWorkspaceId:
           type: string
           format: uuid
+        cloudRelayWorkspaceId:
+          type: [string, "null"]
+          pattern: "^rw_[0-9a-f]{8}$"
+          description: The imported Cloud relay-workspace identity used by Relayfile and provider integrations; null for a workspace created in Control.
         relaycastWorkspaceId:
           type: string
         organizationId:
@@ -9449,7 +9464,13 @@ components:
         configKey: { type: string }
         vfsRoot: { type: string }
         backend: { const: selfhost }
-        authMode: { enum: [OAUTH2, API_KEY] }
+        authMode: { enum: [OAUTH2, API_KEY, APP] }
+        supportedAuthModes:
+          type: array
+          items: { enum: [OAUTH2, APP] }
+          description: GitHub supports OAuth connections and imported App installations concurrently.
+        githubAppConfigured: { type: boolean, description: Whether the GitHub App signing key is configured; independent of OAuth setup. }
+        githubAppSetup: { const: import, description: GitHub App installation bindings use the trusted import seam. }
         categories:
           type: array
           items: { type: string }
@@ -9491,7 +9512,8 @@ components:
         provider: { type: string }
         providerConfigKey: { type: string }
         displayName: { type: string }
-        authMode: { enum: [oauth2, api_key] }
+        authMode: { enum: [oauth2, api_key, github_app] }
+        installationId: { type: [string, "null"], description: GitHub App installation routing imported from Cloud }
         status: { enum: [ready, error] }
         ready: { type: boolean }
         scopes:
@@ -9570,7 +9592,8 @@ components:
       properties:
         connectionId: { type: string }
         provider: { type: string }
-        authMode: { enum: [oauth2, api_key] }
+        authMode: { enum: [oauth2, api_key, github_app] }
+        installationId: { type: [string, "null"] }
         accessToken: { type: string }
         tokenType: { type: string }
         expiresAt: { type: [string, "null"], format: date-time }
@@ -9655,7 +9678,7 @@ components:
       additionalProperties: false
       required: [source_id, identities]
       properties:
-        source_id: { type: string, format: uuid }
+        source_id: { type: string, minLength: 1, maxLength: 200 }
         identities:
           type: array
           maxItems: 200

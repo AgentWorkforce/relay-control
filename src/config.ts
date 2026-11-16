@@ -11,8 +11,10 @@ import {
 } from "./acquisition/assertion.js";
 
 import { loadDesktopReleasesRepo } from "./desktop-releases.js";
+import type { GithubAppConfig } from "./admin/github-app.js";
 
 export type SelfhostConfig = {
+  githubApp?: GithubAppConfig | null;
   databaseUrl: string;
   publicBaseUrl: string;
   relaycastUrl: string;
@@ -203,6 +205,23 @@ export type FactoryConfig = {
 };
 
 export type OperatorOAuthApp = { clientId: string; clientSecret: string; scopes: string[] | null };
+
+/** The same App registration as Cloud/Nango; never resolve or copy Cloud secrets here. */
+export function loadGithubAppConfig(env: Env): GithubAppConfig | null {
+  const appId = env.SELFHOST_GITHUB_APP_ID?.trim();
+  const pem = readSecret(env, "SELFHOST_GITHUB_APP_PRIVATE_KEY");
+  if (!appId && !pem) return null;
+  if (!appId || !/^[1-9][0-9]*$/.test(appId) || !pem) {
+    throw new Error("SELFHOST_GITHUB_APP_ID and SELFHOST_GITHUB_APP_PRIVATE_KEY (or _FILE) are required together");
+  }
+  try {
+    const privateKey = createPrivateKey(pem);
+    if (privateKey.asymmetricKeyType !== "rsa" || (privateKey.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) throw new Error();
+    return { appId, privateKey };
+  } catch {
+    throw new Error("SELFHOST_GITHUB_APP_PRIVATE_KEY must be an RSA private key of at least 2048 bits");
+  }
+}
 
 /**
  * SELFHOST_OAUTH_GITHUB_CLIENT_ID + SELFHOST_OAUTH_GITHUB_CLIENT_SECRET (or
@@ -802,6 +821,7 @@ function absoluteHttpUrl(env: Env, name: string, fallback: string): string {
 }
 
 function loadAdminConfig(env: Env, publicBaseUrl: string): {
+  githubApp: GithubAppConfig | null;
   internalServiceToken: string | null;
   oauthRedirectUrl: string;
   dashboardUrl: string;
@@ -823,6 +843,7 @@ function loadAdminConfig(env: Env, publicBaseUrl: string): {
   }
   return {
     internalServiceToken,
+    githubApp: loadGithubAppConfig(env),
     oauthRedirectUrl,
     dashboardUrl: absoluteHttpUrl(env, "SELFHOST_DASHBOARD_URL", `${publicBaseUrl}/`),
     operatorOAuthApps: loadOperatorOAuthApps(env),

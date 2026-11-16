@@ -1,4 +1,5 @@
 import { webcrypto } from "node:crypto";
+import { normalizeDesktopSourceId } from "../desktop-source-id.js";
 import {
   ATTESTATION_ARGUMENT, ATTESTATION_TYPE, attestationKeyId, decodeBase64Url, type AttestationStore,
 } from "./copilot-attestation.js";
@@ -39,7 +40,6 @@ export class ClaudeAttestationError extends Error {
 export type ClaudeAttestation = { nativeSession: { kind: "claude"; id: string }; sourceId: string };
 
 const UUID_LOWER = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const KID = /^[A-Za-z0-9_-]{22}$/;
 const TOOL_USE_ID = /^[A-Za-z0-9_-]{1,200}$/;
 const TOOL_NAME = /^[A-Za-z0-9_.-]{1,128}$/;
@@ -92,15 +92,14 @@ export async function verifyClaudeAttestation(input: {
   if (!hasExactKeys(payload, ["v", "kind", "sid", "src", "tuid", "tool", "iat", "exp"]) ||
       payload.v !== 1 || payload.kind !== "claude" ||
       typeof payload.sid !== "string" || !UUID_LOWER.test(payload.sid) ||
-      typeof payload.src !== "string" || !UUID.test(payload.src) ||
+      typeof payload.src !== "string" || payload.src.length < 1 || payload.src.length > 200 ||
       typeof payload.tuid !== "string" || !TOOL_USE_ID.test(payload.tuid) ||
       typeof payload.tool !== "string" || !TOOL_NAME.test(payload.tool) ||
       !Number.isSafeInteger(payload.iat) || !Number.isSafeInteger(payload.exp)) {
     return fail("unexpected payload");
   }
   const { sid, tuid, tool } = payload as { sid: string; tuid: string; tool: string };
-  // Identity sync stores source ids lowercase.
-  const src = (payload.src as string).toLowerCase();
+  const src = normalizeDesktopSourceId(payload.src as string);
   const iat = payload.iat as number;
   const exp = payload.exp as number;
 

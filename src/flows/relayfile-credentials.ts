@@ -63,6 +63,7 @@ export type FlowRelayfileCredentialIssuer = {
 export type FlowRunCredentialIntrospection = {
   credentialId: string;
   workspaceId: string;
+  cloudRelayWorkspaceId: string | null;
   organizationId: string;
   runId: string;
   scopes: string[];
@@ -272,6 +273,7 @@ export class FlowRunRelayfileCredentials implements FlowRelayfileCredentialIssue
     const result = await this.database.query<{
       id: string;
       workspace_id: string;
+      cloud_relay_workspace_id: string | null;
       organization_id: string;
       run_id: string;
       scopes: string[];
@@ -280,7 +282,8 @@ export class FlowRunRelayfileCredentials implements FlowRelayfileCredentialIssue
       expires_at: Date | string;
       revoked_at: Date | string | null;
     }>(
-      `SELECT c.id, c.workspace_id, w.organization_id, c.run_id, c.scopes, c.aud,
+      `SELECT c.id, c.workspace_id, w.cloud_relay_workspace_id, w.organization_id,
+              c.run_id, c.scopes, c.aud,
               c.created_at, c.expires_at, c.revoked_at
          FROM flow_run_relayfile_credentials c
          JOIN workspaces w ON w.id = c.workspace_id
@@ -293,6 +296,7 @@ export class FlowRunRelayfileCredentials implements FlowRelayfileCredentialIssue
     return {
       credentialId: row.id,
       workspaceId: row.workspace_id,
+      cloudRelayWorkspaceId: row.cloud_relay_workspace_id,
       organizationId: row.organization_id,
       runId: row.run_id,
       scopes: row.scopes,
