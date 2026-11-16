@@ -3,11 +3,11 @@ import { before,after,beforeEach,test,type TestFn } from "node:test";
 import { Client } from "pg";
 import type { Database,SqlExecutor } from "../src/database.js";
 import { migrate } from "../src/migrations.js";
-import { runImport } from "../scripts/cloud-import/importer.js";
+import { runImport,type ImportReport } from "../scripts/cloud-import/importer.js";
 import { CLOUD_FIXTURE_DDL,cloudFixtureSeed,cloudEnvelope,id,ORG_A,ORG_B } from "../scripts/cloud-import/cloud-fixture.js";
 import { fixtureKeyring } from "../scripts/cloud-import-verify/fixtures.js";
 import { verifyImport } from "../scripts/cloud-import-verify/import-contract.js";
-import { SOURCE_TABLES,MAPPING_REVISION,TARGET_RELATIONS,verifierComparisons,encryptedSamples } from "../scripts/cloud-import/mapping.js";
+import { SOURCE_TABLES,MAPPING_REVISION,TARGET_RELATIONS,verifierComparisons,encryptedSamples,type ImportScope } from "../scripts/cloud-import/mapping.js";
 import { writeFile,mkdtemp,rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,7 +42,8 @@ function database(client:Client):Database {
 const sourceDb = database(source);
 const targetDb = database(target);
 const scope = {orgIds:null};
-const apply = (selected=scope) => runImport({source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply");
+const apply = (previous?:ImportReport,selected:ImportScope=scope) => runImport(
+  {source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply",{previous});
 async function copiedFixture() {
   await source.query("DELETE FROM provider_credentials WHERE id=$1",[id(0x807)]);
   // Cloud object keys retain the pre-merge user id, while Control uses the survivor.
@@ -85,29 +86,9 @@ beforeEach(async () => {
   await source.query(`UPDATE relay_workspaces SET id='rw_0000b202' WHERE id='rw_legacy-01';
     UPDATE workspaces SET relay_workspace_id='rw_0000b202' WHERE relay_workspace_id='rw_legacy-01'`);
   await migrate(targetDb);
-  // Run actual checked-in migrations first. Model the published optional
-  // 0053/0054/0056/0057/0058 shapes until those separate schema PRs land.
-  await target.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS cloud_relay_workspace_id text UNIQUE;
-    ALTER TABLE organizations ADD COLUMN IF NOT EXISTS slug text;
-    ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS slug text;
-    ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS relayhistory_origin text;
-    ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS relaycast_api_key_generation integer;
-    ALTER TABLE desktop_relay_identities ALTER COLUMN source_id TYPE text USING source_id::text;
-    ALTER TABLE fleet_node_owners ALTER COLUMN node_name DROP NOT NULL;
-    CREATE TABLE github_app_installations (
-      installation_id text PRIMARY KEY CHECK(installation_id ~ '^[1-9][0-9]{0,19}$'),
-      organization_id uuid NOT NULL REFERENCES organizations(id),UNIQUE(installation_id,organization_id));
-    ALTER TABLE integration_connections ADD COLUMN installation_id text,
-      ADD COLUMN github_app_organization_id uuid,ADD COLUMN github_app_refresh_id uuid,
-      ADD COLUMN github_app_refresh_until timestamptz;
-    ALTER TABLE integration_connections DROP CONSTRAINT IF EXISTS selfhost_connection_auth_mode,
-      DROP CONSTRAINT IF EXISTS connection_auth_mode,
-      ADD CONSTRAINT connection_auth_mode CHECK(auth_mode IN ('oauth2','api_key','github_app')),
-      ADD CONSTRAINT connection_github_installation_owner FOREIGN KEY(installation_id,github_app_organization_id)
-        REFERENCES github_app_installations(installation_id,organization_id),
-      ADD CONSTRAINT connection_github_workspace_owner FOREIGN KEY(workspace_id,github_app_organization_id)
-        REFERENCES workspaces(id,organization_id);
-    ALTER TABLE coding_agent_credentials
+  // All checked-in migrations, including 0053/0054/0056/0057, ran above.
+  // Only the separate 0058 credential shape is still modeled.
+  await target.query(`    ALTER TABLE coding_agent_credentials
       ALTER COLUMN secret_preview DROP NOT NULL,ALTER COLUMN key_fingerprint DROP NOT NULL,
       DROP CONSTRAINT IF EXISTS selfhost_coding_agent_auth_type,
       DROP CONSTRAINT IF EXISTS coding_agent_auth_type,
@@ -131,8 +112,8 @@ fixtureTest("actual importer rollback, apply and rerun reconcile all mapped tabl
   assert.equal(one.findings.filter((f) => f.kind === "table").length,SOURCE_TABLES.length);
   assert.equal(one.findings.filter((f) => f.kind === "decrypt").length,encryptedSamples(20,scope).length);
   const hashes = (await target.query("SELECT id,token_hash FROM organization_invitations ORDER BY id")).rows;
-  const second = await apply();
-  const two = await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex);
+  const second = await apply(first);
+  const two = await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex,{previousReport:first});
   assert.equal(two.ok,true,JSON.stringify(two.findings.filter((f) => !f.ok)));
   assert.deepEqual(one.findings.filter((f) => f.kind === "table"),two.findings.filter((f) => f.kind === "table"));
   const afterHashes = (await target.query("SELECT id,token_hash FROM organization_invitations ORDER BY id")).rows;
@@ -144,6 +125,66 @@ fixtureTest("actual importer rollback, apply and rerun reconcile all mapped tabl
   for (const table of ["token_sessions","device_authorizations","workspace_api_tokens","mcp_oauth_grants","desktop_relay_session_bindings","desktop_attestation_keys"]) {
     assert.equal((await target.query(`SELECT count(*)::int AS n FROM public.${table}`)).rows[0].n,0,`${table} remains empty`);
   }
+});
+
+fixtureTest("delta reconciles removed identities and replaced invites against previous owned keys",async () => {
+  const first=await apply();assert.equal(first.ok,true);
+  await source.query("DELETE FROM workspace_person_identities WHERE id=$1",[id(0x401)]);
+  await source.query("UPDATE organization_invites SET canceled_at=now() WHERE id=$1",[id(0x302)]);
+  const second=await apply(first);
+  assert.equal(second.ok,true,JSON.stringify(second.orgs));
+  assert.equal(second.tables.person_identities.deleted,1);
+  assert.equal(second.tables.organization_invitations.deleted,1);
+  const report=await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex,{previousReport:first});
+  assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
+  assert.equal((await target.query("SELECT count(*)::int AS n FROM person_identities WHERE id=$1",[id(0x401)])).rows[0].n,0);
+  assert.equal((await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex)).ok,false,"deletes require a previous ledger");
+  const bad=structuredClone(second);bad.tables.person_identities.deleted=0;
+  const tampered=await verifyImport(source,target,scope,bad,fixtureKeyring,cloudKeyHex,{previousReport:first});
+  assert.equal(tampered.findings.find((f) => f.kind === "deleted_total" && f.name === "person_identities")!.ok,false);
+});
+
+fixtureTest("cascade removals must be included in logical deleted counts",async () => {
+  const first=await apply();assert.equal(first.ok,true);
+  await source.query("UPDATE organization_memberships SET status='suspended' WHERE organization_id=$1 AND user_id=$2",[ORG_A,id(2)]);
+  const second=await apply(first);assert.equal(second.ok,true,JSON.stringify(second.orgs));
+  process.stdout.write(`# Synthetic cascade audit: expected Desktop removals=1, importer deleted=${second.tables.desktop_relay_identities.deleted}\n`);
+  assert.equal((await target.query("SELECT count(*)::int AS n FROM desktop_relay_identities WHERE id=$1",[id(0x602)])).rows[0].n,0);
+  const undercount=structuredClone(second);
+  undercount.orgs[ORG_A]!.deleted.desktop_relay_identities=0;undercount.tables.desktop_relay_identities.deleted=0;
+  const rejected=await verifyImport(source,target,scope,undercount,fixtureKeyring,cloudKeyHex,{previousReport:first});
+  assert.equal(rejected.findings.find((f) => f.kind === "deletions" && f.name === `${ORG_A}:desktop_relay_identities`)!.ok,false);
+  const accounted=structuredClone(second);
+  accounted.orgs[ORG_A]!.deleted.desktop_relay_identities=1;accounted.tables.desktop_relay_identities.deleted=1;
+  assert.equal((await verifyImport(source,target,scope,accounted,fixtureKeyring,cloudKeyHex,{previousReport:first})).ok,true);
+});
+
+fixtureTest("current manifests cannot substitute invented keys with matching row counts",async () => {
+  const ledger=await apply();
+  ledger.orgs[ORG_A]!.keys.desktop_relay_identities![0]=id(0x9999);
+  const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "desktop_relay_identities")!.ok,true);
+  assert.equal(report.findings.find((f) => f.kind === "ledger_keys" && f.name === `${ORG_A}:desktop_relay_identities`)!.ok,false);
+  assert.equal(report.ok,false);
+});
+
+fixtureTest("unrecognized ledger annotations never enter a verification report",async () => {
+  const ledger=await apply();
+  const marker="private-ledger-annotation-must-stay-local";
+  Object.assign(ledger.tables.users,{annotation:marker});Object.assign(ledger.orgs[ORG_A]!,{annotation:marker});
+  const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.ok,true);
+  assert.ok(!JSON.stringify(report).includes(marker));
+});
+
+fixtureTest("new person/hosted membership and Desktop control-character skips reconcile",async () => {
+  await source.query("UPDATE desktop_relay_identities SET source_id=$1 WHERE id=$2",["opaque\ncontrol",id(0x602)]);
+  const ledger=await apply();
+  assert.equal(ledger.tables.person_identities.skipped.not_a_member,1);
+  assert.equal(ledger.tables.hosted_relay_participants.skipped.not_a_member,1);
+  assert.equal(ledger.tables.desktop_relay_identities.skipped.source_id_control_character,1);
+  const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
 });
 
 fixtureTest("copied credential natural keys verify reminted IDs, encrypted blobs, reruns and local CLI",async () => {
@@ -299,11 +340,11 @@ fixtureTest("pre-0057 non-UUID Desktop source IDs remain visible as unresolved i
 });
 
 fixtureTest("cohort scope counts and encrypted samples exclude another org's corrupt key",async () => {
-  assert.equal((await apply()).ok,true);
+  const first=await apply();assert.equal(first.ok,true);
   await target.query("UPDATE workspaces SET relaycast_api_key_ciphertext='synthetic-corrupt' WHERE organization_id=$1",[ORG_B]);
   const selected = {orgIds:[ORG_A]};
-  const ledger = await runImport({source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply");
-  const report = await verifyImport(source,target,selected,ledger,fixtureKeyring,cloudKeyHex);
+  const ledger = await runImport({source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply",{previous:first});
+  const report = await verifyImport(source,target,selected,ledger,fixtureKeyring,cloudKeyHex,{previousReport:first});
   assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
   assert.ok(report.findings.some((f) => f.kind === "decrypt" && f.detail === "not_applicable_no_imported_rows"));
 });

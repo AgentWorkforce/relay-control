@@ -121,7 +121,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
       && report.candidates === candidates && reportedIds.length === sourceIds.size
       && reportedIds.every((id) => sourceIds.has(id)) && rowOutcomesMatch
       && totals(report.outcomes) === totals(expectedOutcomes),
-    detail:{candidates,sourceFailures,unresolvedSourceSkips,reportedCandidates:report.candidates}}];
+    detail:{candidates,sourceFailures,unresolvedSourceSkips,reportedCandidates:Number.isSafeInteger(report.candidates) ? report.candidates : null}}];
   const seen = new Set<string>();
   let duplicateKeys = 0;
   let contentFailures = 0;

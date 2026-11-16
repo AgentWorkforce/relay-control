@@ -1,12 +1,14 @@
 import type { Client } from "pg";
 import type { EncryptionKeyring } from "../../src/crypto.js";
 import { decryptCloudEnvelope, type ImportReport } from "../cloud-import/importer.js";
-import { MAPPING_REVISION, ORG_TABLES, SOURCE_TABLES, TARGETS, TARGET_RELATIONS,
+import { MAPPING_REVISION, ORG_TABLES, SOURCE_TABLES, TARGETS, TARGET_RELATIONS,IMPORTER_SKIP_REASONS,
   assertScope, encryptedSamples, sourceQuery, verifierComparisons, type ImportScope, type ImportTable } from "../cloud-import/mapping.js";
 import { verify, type Comparison, type Contract, type Finding } from "./verify.js";
 import { credentialCopyFindings,credentialSelections,type CredentialEvidence } from "./credential-copy.js";
+import { reconciliationFindings,validImportKey,type OrgKeys } from "./reconciliation.js";
 
 const literal = (s:string) => `'${s.replaceAll("'","''")}'`;
+const safeCount = (value:unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 const sorted = (values:Record<string,number>) => JSON.stringify(Object.entries(values).filter(([,n]) => n !== 0).sort(([a],[b]) => a.localeCompare(b)));
 const sortedKeys = (values:Record<string,string[]>) => JSON.stringify(Object.entries(values).filter(([,keys]) => keys.length)
   .sort(([a],[b]) => a.localeCompare(b)).map(([reason,keys]) => [reason,[...keys].sort()]));
@@ -43,7 +45,7 @@ function contractFor(scope:ImportScope,columns:ReadonlySet<string>,tables=compar
  * Source/target reads, skip reconciliation and checksums share the snapshots.
  */
 export async function verifyImport(source:Client,target:Client,scope:ImportScope,ledger:ImportReport,
-  keyring:EncryptionKeyring,cloudKeyHex:string,options:{pepperVersions?:readonly number[];credentialCopy?:CredentialEvidence} = {}) {
+  keyring:EncryptionKeyring,cloudKeyHex:string,options:{pepperVersions?:readonly number[];credentialCopy?:CredentialEvidence;previousReport?:ImportReport} = {}) {
   assertScope(scope);
   if (!/^[0-9a-f]{64}$/i.test(cloudKeyHex)) throw new Error("Cloud key must be 32 bytes of hex");
   const base = contractFor(scope,new Set());
@@ -51,7 +53,8 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     const findings:Finding[] = [];
     findings.push({kind:"ledger",name:"run",ok:ledger.version === 1 && ledger.mappingRevision === MAPPING_REVISION
       && ledger.mode === "apply" && ledger.ok === true && !ledger.refused && equalScope(scope,ledger.scope),
-      detail:{expectedRevision:MAPPING_REVISION,actualRevision:ledger.mappingRevision,mode:ledger.mode,ok:ledger.ok}});
+      detail:{expectedRevision:MAPPING_REVISION,revisionMatches:ledger.mappingRevision === MAPPING_REVISION,
+        mode:["plan","dry-run","apply"].includes(ledger.mode) ? ledger.mode : "invalid",ok:ledger.ok === true}});
     const metadata = await t.query(`SELECT table_name,column_name,udt_name FROM information_schema.columns WHERE table_schema='public'`);
     const columns = new Set<string>(metadata.rows.map((r) => `${r.table_name}.${r.column_name}`));
     const gatedPresent = new Set<ImportTable>(SOURCE_TABLES.filter((table) => {
@@ -68,8 +71,9 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     const actualOptional = SOURCE_TABLES.flatMap((table) => (TARGETS[table].optional ?? [])
       .filter((c) => columns.has(`${table}.${c}`)).map((c) => `${table}.${c}`)).sort();
     findings.push({kind:"ledger",name:"optional_columns",ok:JSON.stringify(actualOptional) === JSON.stringify([...(ledger.optionalColumns ?? [])].sort()),
-      detail:{expected:actualOptional,reported:ledger.optionalColumns}});
+      detail:{expected:actualOptional,reportedCount:Array.isArray(ledger.optionalColumns) ? ledger.optionalColumns.length : null}});
     const perOrg = new Map<string,Partial<Record<ImportTable,number>>>();
+    const perOrgKeys:OrgKeys = new Map();
     const exclusions = new Map<string,string[]>();
     const counts = new Map<ImportTable,number>();
     for (const table of SOURCE_TABLES) {
@@ -121,6 +125,8 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
           if (row.org) {
             const group = perOrg.get(row.org) ?? {};
             group[table] = (group[table] ?? 0)+1; perOrg.set(row.org,group);
+            const keys = perOrgKeys.get(row.org) ?? {};
+            (keys[table] ??= []).push(row.key);perOrgKeys.set(row.org,keys);
           }
         }
       }}} finally {await s.query("CLOSE import_ledger_cursor");}
@@ -131,24 +137,30 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
       if (dynamicKeys.length) findings.push({kind:"importer_skip_policy",name:table,ok:false,
         detail:{unresolvedDynamicSkips:dynamicKeys.length}});
       const reported = ledger.tables?.[table];
-      const keyFormat = table === "github_app_installations" ? /^[1-9][0-9]{0,19}$/
-        : /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$/i;
       for (const keys of Object.values(reported?.importerSkips ?? {})) {
-        if (!Array.isArray(keys) || keys.some((key) => typeof key !== "string" || !keyFormat.test(key))) {
+        if (!Array.isArray(keys) || keys.some((key) => !validImportKey(table,key))) {
           throw new Error("Importer skip keys do not match the table key type");
         }
       }
       findings.push({kind:"ledger",name:table,ok:reported?.candidates === candidates && reported.imported === imported
         && sorted(reported.skipped) === sorted(skipped) && sortedKeys(reported.importerSkips) === sortedKeys(dynamicReasons),
-        detail:{observed:{candidates,imported,skipped,importerSkips:dynamicReasons},reported}});
+        detail:{observed:{candidates,imported,skipped,importerSkips:dynamicReasons},reported:{
+          candidates:safeCount(reported?.candidates),imported:safeCount(reported?.imported),deleted:safeCount(reported?.deleted),
+          skipped:Object.fromEntries([...new Set([...Object.keys(skipped),...IMPORTER_SKIP_REASONS])]
+            .filter((reason) => reported?.skipped?.[reason] !== undefined).map((reason) => [reason,safeCount(reported.skipped[reason])])),
+        }}});
     }
     const expectedOrgs = [...perOrg.keys()].sort();
     findings.push({kind:"ledger",name:"organization_set",ok:JSON.stringify(expectedOrgs) === JSON.stringify(Object.keys(ledger.orgs ?? {}).sort()),detail:{expected:expectedOrgs}});
     for (const [org,expected] of perOrg) {
       const actual = ledger.orgs?.[org];
       findings.push({kind:"ledger_org",name:org,ok:actual?.status === "ok" && ORG_TABLES.every((table) =>
-        (expected[table] ?? 0) === (actual.imported[table] ?? 0)),detail:{expected,reported:actual}});
+        (expected[table] ?? 0) === (actual.imported[table] ?? 0)),detail:{expected,reported:{
+          status:actual && ["ok","failed","planned"].includes(actual.status) ? actual.status : "invalid",
+          imported:Object.fromEntries(ORG_TABLES.map((table) => [table,safeCount(actual?.imported?.[table] ?? 0)])),
+        }}});
     }
+    findings.push(...await reconciliationFindings(t,ledger,perOrgKeys,gatedPresent,options.previousReport));
     const tables = comparisons(scope,columns,gatedPresent).map((item) => {
       const keys = exclusions.get(item.name)!;
       return keys.length ? {...item,sourceSql:`SELECT p.* FROM (${item.sourceSql}) p WHERE __key::text <> ALL(ARRAY[${keys.map(literal).join(",")}]::text[])`} : item;

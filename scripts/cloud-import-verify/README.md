@@ -17,10 +17,10 @@ objects and local encrypted Postgres blobs, including a repeat copy.
 `import-report.example.json` is that full synthetic receipt; application smokes are
 pending and no real-data import has run.
 
-The target uses all checked-in Control migrations (through 0051 at the initial
-integration) plus test-only models of the optional 0053/0054/0056/0057/0058 shapes
-from separate schema PRs. These models exercise the new columns/types; they
-do not prove those pending migration files themselves. The shared Cloud fixture
+The target runs all checked-in Control migrations, including the actual
+0053/0054/0056/0057 files merged into the importer branch. Only the separate
+0058 relay-managed credential shape still uses a test-only model; that model
+does not prove the pending migration file. The shared Cloud fixture
 now includes the generation column, so there is no verifier-owned source guard.
 The smaller fixtures in `fixtures.ts` independently
 stress the engine and are explicitly labeled as reference shapes.
@@ -76,6 +76,9 @@ For an actual importer ledger against local synthetic databases:
 node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --all-organizations
 # Or use an explicit UUID cohort:
 node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --org-ids UUID,UUID
+# A delta with removals also needs the previous apply ledger:
+node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/current-ledger.json --all-organizations \
+  --previous-report /path/to/previous-ledger.json
 # After the opt-in secret copy, also verify its ledger and local object snapshot:
 node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --all-organizations \
   --credential-copy-report /path/to/credential-copy-ledger.json
@@ -86,6 +89,16 @@ Supply `CLOUD_VERIFY_SOURCE_URL`, `CLOUD_VERIFY_TARGET_URL`,
 usual keyring variables through the environment or their `_FILE` variants.
 Pepper coverage uses `SELFHOST_PASSWORD_PEPPER_FILE`. The explicit scope must
 match the ledger; a plan or rollback-mode ledger cannot qualify committed data.
+
+For `.4` deltas, `reconciliation.ts` independently checks `OrgLedger.keys`
+against the final imported source-key sets, then compares previous-owned keys
+with the current set for each `RECONCILED_TABLES` relation. It proves removed
+keys are absent from the target, reconciles per-org and global `deleted`
+totals, and validates previous manifest counts. Positive deletion claims need
+a previous apply report with key manifests; earlier reports without ownership
+keys cannot establish the required baseline. Logical removals include cascade
+deletes, even when a later explicit DELETE affects zero rows. Tables outside
+the reconciliation set must report zero deletions.
 
 For `--credential-copy-report`, set `CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR` to a
 local encrypted object snapshot using the Cloud-relative object keys. Files
@@ -108,9 +121,10 @@ Dropped History route fields or populated origin/generation metadata omitted
 by an older target schema also block qualification; normalization to NULL must
 not silently redirect a workspace to the default History service.
 Source metadata streams in batches of 250, with a 10,000-key exclusion cap that
-refuses excessive unresolved skips. Encrypted samples stay within the cohort;
-empty mapped secret tables are explicitly not applicable based on observed
-source/import counts.
+refuses excessive unresolved skips. Ownership manifests retain imported IDs
+for comparison with the supplied current/previous JSON ledgers; choose a bounded
+cohort when memory is limited. Encrypted samples stay within the cohort; empty
+mapped secret tables are explicitly not applicable based on observed counts.
 
 The shared mapping supplies workspace projections and scoped encrypted samples
 directly. Coding-agent `relay_managed` rows are also checked; a target lacking
@@ -134,7 +148,7 @@ has zero model-active rows by Control's store contract. Both selectors are
 checked per workspace/provider; zero active rows fail even when uniqueness holds.
 
 The library entry point is `verifyImport(source, target, scope, ledger, keyring,
-cloudKeyHex, {pepperVersions, credentialCopy: {report, reader, targetBlobs}})`.
+cloudKeyHex, {pepperVersions, previousReport, credentialCopy: {report, reader, targetBlobs}})`.
 The copy option is optional: output explicitly marks this phase as
 `not_requested`, `verified` or `failed`. Identity-only verification does not
 qualify copied secrets. For standalone comparisons without an importer
@@ -244,7 +258,7 @@ Before a cohort can be marked ready:
 2. Run the actual-importer synthetic harness and repeat against the intended
    target's finalized migrations before a cohort run. It already exercises
    rollback/apply/rerun, open invite deduplication and agent identity uniqueness;
-   pending optional migration files still need their own schema proof.
+   the remaining 0058 migration still needs its own schema proof.
 3. Check transformed identity tables: users' deferred `last_*` references,
    refreshed invite hashes, re-encrypted person/Desktop/hosted-participant
    tokens, Desktop `source_id` text-to-UUID handling and derived fleet fields.

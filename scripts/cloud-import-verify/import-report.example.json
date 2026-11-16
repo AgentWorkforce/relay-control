@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "mappingRevision": "cloud-identity-2026-11-15.3",
+  "mappingRevision": "cloud-identity-2026-11-16.4",
   "ok": true,
   "findings": [
     {
@@ -8,8 +8,8 @@
       "name": "run",
       "ok": true,
       "detail": {
-        "expectedRevision": "cloud-identity-2026-11-15.3",
-        "actualRevision": "cloud-identity-2026-11-15.3",
+        "expectedRevision": "cloud-identity-2026-11-16.4",
+        "revisionMatches": true,
         "mode": "apply",
         "ok": true
       }
@@ -32,13 +32,7 @@
           "workspaces.relayhistory_origin",
           "workspaces.slug"
         ],
-        "reported": [
-          "organizations.slug",
-          "workspaces.cloud_relay_workspace_id",
-          "workspaces.slug",
-          "workspaces.relayhistory_origin",
-          "workspaces.relaycast_api_key_generation"
-        ]
+        "reportedCount": 5
       }
     },
     {
@@ -58,11 +52,11 @@
         "reported": {
           "candidates": 6,
           "imported": 4,
+          "deleted": 0,
           "skipped": {
             "merged_into_survivor": 1,
             "no_valid_email": 1
-          },
-          "importerSkips": {}
+          }
         }
       }
     },
@@ -80,8 +74,8 @@
         "reported": {
           "candidates": 2,
           "imported": 2,
-          "skipped": {},
-          "importerSkips": {}
+          "deleted": 0,
+          "skipped": {}
         }
       }
     },
@@ -104,13 +98,13 @@
         "reported": {
           "candidates": 9,
           "imported": 5,
+          "deleted": 0,
           "skipped": {
             "inactive_membership": 1,
             "user_not_imported": 1,
             "merged_duplicate_membership": 1,
             "unsupported_role": 1
-          },
-          "importerSkips": {}
+          }
         }
       }
     },
@@ -149,12 +143,12 @@
         "reported": {
           "candidates": 6,
           "imported": 3,
+          "deleted": 0,
           "skipped": {
             "workspace_being_deleted": 1,
             "no_relaycast_key": 1,
             "no_relay_workspace": 1
-          },
-          "importerSkips": {}
+          }
         }
       }
     },
@@ -176,12 +170,12 @@
         "reported": {
           "candidates": 5,
           "imported": 2,
+          "deleted": 0,
           "skipped": {
             "already_member": 1,
             "canceled": 1,
             "superseded_open_invite": 1
-          },
-          "importerSkips": {}
+          }
         }
       }
     },
@@ -191,20 +185,22 @@
       "ok": true,
       "detail": {
         "observed": {
-          "candidates": 3,
+          "candidates": 4,
           "imported": 2,
           "skipped": {
+            "not_a_member": 1,
             "workspace_not_imported": 1
           },
           "importerSkips": {}
         },
         "reported": {
-          "candidates": 3,
+          "candidates": 4,
           "imported": 2,
+          "deleted": 0,
           "skipped": {
+            "not_a_member": 1,
             "workspace_not_imported": 1
-          },
-          "importerSkips": {}
+          }
         }
       }
     },
@@ -214,22 +210,24 @@
       "ok": true,
       "detail": {
         "observed": {
-          "candidates": 3,
+          "candidates": 4,
           "imported": 1,
           "skipped": {
             "stale_relay_workspace": 1,
+            "not_a_member": 1,
             "duplicate_after_merge": 1
           },
           "importerSkips": {}
         },
         "reported": {
-          "candidates": 3,
+          "candidates": 4,
           "imported": 1,
+          "deleted": 0,
           "skipped": {
             "stale_relay_workspace": 1,
+            "not_a_member": 1,
             "duplicate_after_merge": 1
-          },
-          "importerSkips": {}
+          }
         }
       }
     },
@@ -249,10 +247,10 @@
         "reported": {
           "candidates": 3,
           "imported": 2,
+          "deleted": 0,
           "skipped": {
             "not_a_member": 1
-          },
-          "importerSkips": {}
+          }
         }
       }
     },
@@ -272,10 +270,10 @@
         "reported": {
           "candidates": 2,
           "imported": 1,
+          "deleted": 0,
           "skipped": {
             "workspace_not_imported": 1
-          },
-          "importerSkips": {}
+          }
         }
       }
     },
@@ -296,11 +294,11 @@
         "reported": {
           "candidates": 7,
           "imported": 2,
+          "deleted": 0,
           "skipped": {
             "secret_in_cloud_credential_store": 4,
             "workspace_not_imported": 1
-          },
-          "importerSkips": {}
+          }
         }
       }
     },
@@ -318,8 +316,8 @@
         "reported": {
           "candidates": 1,
           "imported": 1,
-          "skipped": {},
-          "importerSkips": {}
+          "deleted": 0,
+          "skipped": {}
         }
       }
     },
@@ -341,12 +339,12 @@
         "reported": {
           "candidates": 4,
           "imported": 1,
+          "deleted": 0,
           "skipped": {
             "named_connection_needs_policy": 1,
             "installation_claimed_by_other_org": 1,
             "invalid_installation_id": 1
-          },
-          "importerSkips": {}
+          }
         }
       }
     },
@@ -425,6 +423,566 @@
             "github_app_connections": 0
           }
         }
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:organizations",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:organizations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:organization_memberships",
+      "ok": true,
+      "detail": {
+        "observed": 3,
+        "reported": 3
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:organization_memberships",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:workspaces",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:workspaces",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:organization_invitations",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:organization_invitations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:person_identities",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:person_identities",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "observed": 2,
+        "reported": 2
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "observed": 2,
+        "reported": 2
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:github_app_installations",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:github_app_installations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:github_app_connections",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:github_app_connections",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:organizations",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:organizations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:organization_memberships",
+      "ok": true,
+      "detail": {
+        "observed": 2,
+        "reported": 2
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:organization_memberships",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:workspaces",
+      "ok": true,
+      "detail": {
+        "observed": 2,
+        "reported": 2
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:workspaces",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:organization_invitations",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:organization_invitations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:person_identities",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:person_identities",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:github_app_installations",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:github_app_installations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:github_app_connections",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:github_app_connections",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "users",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "organizations",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "organization_memberships",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "workspaces",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "organization_invitations",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "person_identities",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "github_app_installations",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "github_app_connections",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
       }
     },
     {
@@ -1565,6 +2123,16 @@
       }
     },
     {
+      "kind": "unique",
+      "name": "public.organizations.organizations_slug_unique",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
       "kind": "sequence",
       "name": "public.organizations",
       "ok": true,
@@ -1661,7 +2229,17 @@
     },
     {
       "kind": "unique",
-      "name": "public.workspaces.workspaces_cloud_relay_workspace_id_key",
+      "name": "public.workspaces.workspaces_cloud_relay_workspace_id_unique",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.workspaces.workspaces_org_slug_unique",
       "ok": true,
       "detail": {
         "valid": true,

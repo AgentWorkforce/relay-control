@@ -21,6 +21,13 @@ try {
     if (!copyPath || copyPath.startsWith("--")) throw new Error("copy_report_path_required");
     args.splice(copyAt,2);
   }
+  const previousAt=args.indexOf("--previous-report");
+  let previousPath:string|undefined;
+  if (previousAt >= 0) {
+    previousPath=args[previousAt+1];
+    if (!previousPath || previousPath.startsWith("--")) throw new Error("previous_report_path_required");
+    args.splice(previousAt,2);
+  }
   const path = args[0];
   let scope:ImportScope;
   if (args.length === 2 && args[1] === "--all-organizations") scope = {orgIds:null};
@@ -28,6 +35,7 @@ try {
   else throw new Error("explicit_scope_required");
   assertScope(scope);
   const ledger = JSON.parse(await readFile(path!,"utf8")) as ImportReport;
+  const previousReport = previousPath ? JSON.parse(await readFile(previousPath,"utf8")) as ImportReport : undefined;
   const keyring = loadEncryptionKeyring();
   const cloudKeyHex = readSecret(process.env,"CLOUD_CREDENTIAL_ENCRYPTION_KEY") ?? "";
   const pepperPath = process.env.SELFHOST_PASSWORD_PEPPER_FILE?.trim();
@@ -54,7 +62,7 @@ try {
       }},
     };
   }
-  const report = await verifyImport(source,target,scope,ledger,keyring,cloudKeyHex,{pepperVersions,credentialCopy});
+  const report = await verifyImport(source,target,scope,ledger,keyring,cloudKeyHex,{pepperVersions,credentialCopy,previousReport});
   process.stdout.write(`${JSON.stringify(report,null,2)}\n`);
   process.exitCode = report.ok ? 0 : 1;
 } catch {
