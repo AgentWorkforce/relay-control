@@ -424,14 +424,17 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   refuseRemovedHistoryVariables(env);
   // One History origin, the read API's. Nothing may name a second one.
   const sessionReadApi = loadSessionReadApiConfig(env);
-  const introspection = loadIntrospectionConfig(env);
+  const loadedIntrospection = loadIntrospectionConfig(env);
   const relayhistoryAudiences = loadRelayhistoryAudiences(env, sessionReadApi.publicUrl);
-  const overlap = introspection.introspectAudiences.find((audience) =>
-    relayhistoryAudiences.includes(new URL(audience).origin)
+  const introspectAudiences = loadedIntrospection.introspectAudiences.filter((audience) =>
+    !relayhistoryAudiences.includes(new URL(audience).origin)
   );
-  if (overlap !== undefined) {
-    throw new Error("SELFHOST_INTROSPECT_AUDIENCES and SELFHOST_RELAYHISTORY_AUDIENCES must not overlap");
+  if (introspectAudiences.length !== loadedIntrospection.introspectAudiences.length) {
+    console.warn(
+      "[selfhost-api] ignoring History origins in SELFHOST_INTROSPECT_AUDIENCES; configure them only in SELFHOST_RELAYHISTORY_AUDIENCES",
+    );
   }
+  const introspection = { ...loadedIntrospection, introspectAudiences };
   assertHistoryIntrospection(introspection, relayhistoryAudiences, sessionReadApi.publicUrl);
   return {
     databaseUrl: loadDatabaseUrl(env),

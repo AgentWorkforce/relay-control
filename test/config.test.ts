@@ -238,7 +238,7 @@ test("startup refuses the removed RelayHistory and RelayAuth variables by name",
   assert.doesNotThrow(() => loadConfig({ ...completeEnv, RELAYAUTH_URL: "", RELAYAUTH_API_KEY: " ", RELAYHISTORY_READ_API_URL: "" }));
 });
 
-test("token introspection is required and validates its secret and audiences", () => {
+test("token introspection is required and validates its secret and audiences", (t) => {
   const config = loadConfig(completeEnv);
   assert.equal(config.introspectSecret, completeEnv.RELAYCONTROL_INTROSPECT_SECRET);
   assert.deepEqual(config.introspectAudiences, []);
@@ -261,13 +261,17 @@ test("token introspection is required and validates its secret and audiences", (
   assert.deepEqual(enabled.introspectAudiences, [
     "http://relayfile.files.svc:8080",
   ]);
-  assert.throws(
-    () => loadConfig({
-      ...completeEnv,
-      SELFHOST_INTROSPECT_AUDIENCES: completeEnv.SESSION_READ_API_PUBLIC_URL,
-    }),
-    /must not overlap/,
-  );
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+  const compatibleOverlap = loadConfig({
+    ...completeEnv,
+    SELFHOST_INTROSPECT_AUDIENCES:
+      `${completeEnv.SESSION_READ_API_PUBLIC_URL},http://relayfile.files.svc:8080`,
+  });
+  assert.deepEqual(compatibleOverlap.introspectAudiences, ["http://relayfile.files.svc:8080"]);
+  assert.equal(warnings.length, 1);
+  assert.match(String(warnings[0]![0]), /SELFHOST_INTROSPECT_AUDIENCES/);
+  assert.match(String(warnings[0]![0]), /SELFHOST_RELAYHISTORY_AUDIENCES/);
   const importedHistory = loadConfig({
     ...completeEnv,
     SELFHOST_RELAYHISTORY_AUDIENCES:

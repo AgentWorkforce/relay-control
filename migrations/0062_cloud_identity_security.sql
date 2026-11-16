@@ -52,7 +52,7 @@ BEGIN
       -- IPv4. Refuse it here unless the whole host took the canonical inet
       -- branch above, so 0x7f.1 cannot coexist with 127.0.0.1.
       IF split_part(hostname, '.', array_length(string_to_array(hostname, '.'), 1))
-        ~ '^([0-9]+|0x[0-9a-f]+)$' THEN
+        ~ '^([0-9]+|0x[0-9a-f]*)$' THEN
         RETURN false;
       END IF;
       FOREACH label IN ARRAY string_to_array(hostname, '.') LOOP
