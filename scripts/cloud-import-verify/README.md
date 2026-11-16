@@ -34,6 +34,25 @@ Control login deactivated between copies; full qualification of `.25` requires
 the matching reviewed producer stack. Workspace binding-conflict and
 generation-kept warnings do not waive workspace comparison drift.
 
+From revision `.21`, duplicate subscription logins are resolved from decrypted
+source account identities: freshest `updated_at`, then lowest source UUID.
+Only the independent winner supplies expected target content and a Control-ID
+link; its Cloud selection flags are the union of the group's flags. Every
+other usable source row must report `duplicate_login`, with no Control-ID
+entry or inserted/updated write credit. Wrong labels and stale target content
+remain fatal. API keys and setup tokens are not collapsed by this rule.
+
+The exact `workspace_unbound` ledger namespace is separate from identity
+ownership. Each marker must reference the correct live workspace/org and its
+current workspace ownership entry, with the current mapping revision. Its
+complete set must equal imported source workspaces with a NULL provider
+binding; marker labels cannot hide drift on bound source rows. Incoming
+foreign-org markers that affect an in-scope workspace are checked too. A
+legitimately unbound workspace may never have had an `rw_` id; existing Cloud
+bindings still must be preserved. Later Control binding is permitted by the
+mapping projection, only when this independent marker proof passes. Other
+ledger namespaces remain strict. Diagnostics retain fixed counts only.
+
 The target runs all checked-in Control migrations, including the actual
 0053/0054/0056/0057/0058/0061/0062 files and the owner-only 0063 ledger migration. The
 staff-grant table comes from the checked-in 0061 migration. The shared Cloud fixture

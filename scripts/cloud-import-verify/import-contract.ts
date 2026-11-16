@@ -1,6 +1,7 @@
 import { validateCredentialCheckpoint } from "./convergence.js";
 import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
 import { readCopierMarkers } from "./copier-markers.js";
+import { unboundWorkspaceMarkers } from "./unbound-markers.js";
 import type { Client } from "pg";
 import { schemaFindings } from "./schema.js";
 import { normalizedScope,organizationCensus } from "./organization-scope.js";
@@ -96,6 +97,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     const perOrgKeys:OrgKeys = new Map();
     const canonicalOrigin=options.canonicalOrigin ?? canonicalRelayhistoryOrigin;
     const origins=new Map<string,string|null>();
+    const unboundWorkspaces=new Map<string,string>();
     const exclusions = new Map<string,string[]>();
     const counts = new Map<ImportTable,number>();
     for (const table of SOURCE_TABLES) {
@@ -117,6 +119,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
         ${table === "workspaces" ? "q.has_dashboard_url" : "false"} AS loses_history_route,
         ${table === "workspaces" ? "q.relayhistory_origin_raw" : "NULL::text"} AS history_origin_raw,
         ${table === "workspaces" ? "q.relaycast_api_key_generation IS NOT NULL" : "false"} AS has_generation,
+        ${table === "workspaces" ? "q.relaycast_workspace_id IS NULL" : "false"} AS source_unbound,
         ${table === "coding_agent_credentials" ? "q.model_provider" : "NULL::text"} AS credential_provider,
         ${table === "coding_agent_credentials" ? "q.auth_type" : "NULL::text"} AS credential_auth_type
         FROM (${sourceQuery(table,scope)}) q`);
@@ -154,9 +157,12 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
           }
         } else {
           imported++;
-          if (!row.preserves_rw) missingRw++;
+          // A legitimately unbound Cloud workspace may never have had an rw_
+          // value. Bound source rows must still preserve their Cloud binding.
+          if (!row.preserves_rw && !row.source_unbound) missingRw++;
           const origin=table === "workspaces" && row.history_origin_raw !== null ? canonicalOrigin(row.history_origin_raw) : null;
           if (table === "workspaces") origins.set(row.key,origin);
+          if (table === "workspaces" && row.source_unbound) unboundWorkspaces.set(row.key,row.org);
           if (row.loses_history_route || (table === "workspaces" && row.history_origin_raw !== null && origin === null)) historyLoss++;
           if ((origin !== null && !columns.has("workspaces.relayhistory_origin"))
             || (row.has_generation && !columns.has("workspaces.relaycast_api_key_generation"))) metadataLoss++;
@@ -201,6 +207,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
         }}});
     }
     findings.push(...await reconciliationFindings(t,ledger,perOrgKeys,gatedPresent,scope,options.previousReport,options.previousOwnership));
+    findings.push(await unboundWorkspaceMarkers(t,scope,unboundWorkspaces));
     const distinctOrigins=[...new Set([...origins.values()].filter((origin):origin is string => origin !== null))].sort();
     const originRows=columns.has("workspaces.relayhistory_origin")
       ? (await t.query("SELECT id::text,relayhistory_origin FROM public.workspaces WHERE id::text=ANY($1::text[])",[[...origins.keys()]])).rows : [];

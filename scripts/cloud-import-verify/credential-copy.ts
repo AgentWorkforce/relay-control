@@ -1,6 +1,7 @@
 import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
 
 import { credentialCloudSelection,type SourceSelection } from "./credential-selection.js";
+import { credentialLoginCohort,deduplicatesLogins } from "./credential-cohort.js";
 
 import { readCopierMarkers } from "./copier-markers.js";
 import { credentialConvergenceCohort,credentialWriteCounts,readCredentialConvergence,compareCredentialConvergence,type CredentialConvergenceSnapshot } from "./convergence.js";
@@ -118,6 +119,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
   const sourceIds = new Set<string>();
   const expectedBySourceId=new Map<string,string>();
   const selections:SourceSelection[]=[];
+  const usable:{selection:SourceSelection;authType:string;expected:Expected}[]=[];
   const expectedOutcomes:Record<string,number> = {};
   const {report} = evidence;
   const baseline=priorCredentials(evidence.previousTarget,scope);
@@ -174,21 +176,29 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
           identity = row.auth_type === "oauth_token" && row.account_email?.trim()
             ? `account:${row.account_email.trim().toLowerCase()}` : `fingerprint:${fp}`;
         }
-        // Last source row wins when Control replaces a setup token or login
-        // for the same account. Only hashes, never plaintext, are retained.
+        // Derive account identity/content before trusting duplicate labels.
+        // Only hashes, never plaintext, survive source-row processing.
         const key=naturalKey(row.workspace_id,provider,row.auth_type,identity);
-        expectedBySourceId.set(row.id,key);
-        selections.push({id:row.id,key,group:`${row.workspace_id}:${provider}`,active:row.is_active,
-          harness:row.harness_active && ["oauth_token","provider_oauth"].includes(row.auth_type),updated:new Date(row.updated_at).getTime()});
-        expected.set(key,{
+        const selection={id:row.id,key,group:`${row.workspace_id}:${provider}`,active:row.is_active,
+          harness:row.harness_active && ["oauth_token","provider_oauth"].includes(row.auth_type),updated:new Date(row.updated_at).getTime()};
+        if (!Number.isFinite(selection.updated)) throw new Error("invalid_source_timestamp");
+        usable.push({selection,authType:row.auth_type,expected:{
           org:row.organization_id,workspace:row.workspace_id,provider,authType:row.auth_type,identity,
           fingerprint:fp,contentHash:hash(content),
-        });
-        rowOutcomesMatch &&= outcome === "copied" || outcome === "already_present"
-          || (outcome === "updated" && Boolean(credentialWriteCounts(report)?.updated));
+        }});
       } catch {sourceFailures++;rowOutcomesMatch = false;}
     }
   }} finally {await source.query("CLOSE credential_copy_cursor");}
+  const cohort=credentialLoginCohort(usable,deduplicatesLogins(report.mappingRevision));
+  for (const sourceId of cohort.duplicates) rowOutcomesMatch &&= String(report.rows?.[sourceId]) === "duplicate_login";
+  for (const row of cohort.selected) {
+    const outcome:unknown=report.rows?.[row.selection.id];
+    expectedBySourceId.set(row.selection.id,row.selection.key);
+    selections.push(row.selection);
+    expected.set(row.selection.key,row.expected);
+    rowOutcomesMatch &&= outcome === "copied" || outcome === "already_present"
+      || (outcome === "updated" && Boolean(credentialWriteCounts(report)?.updated));
+  }
   const reportedIds = Object.keys(report.rows ?? {});
   const totals = (values:Record<string,number>) => JSON.stringify(Object.entries(values).sort(([a],[b]) => a.localeCompare(b)));
   const findings:Finding[] = [{kind:"credential_copy_ledger",name:"run",
@@ -196,7 +206,9 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
       && report.candidates === candidates && reportedIds.length === sourceIds.size
       && reportedIds.every((id) => sourceIds.has(id)) && rowOutcomesMatch
       && totals(report.outcomes) === totals(expectedOutcomes),
-    detail:{candidates,sourceFailures,unresolvedSourceSkips,reportedCandidates:Number.isSafeInteger(report.candidates) ? report.candidates : null}},
+    detail:{candidates,sourceFailures,unresolvedSourceSkips,duplicateLogins:cohort.duplicates.size,
+      outcomesMatch:rowOutcomesMatch,
+      reportedCandidates:Number.isSafeInteger(report.candidates) ? report.candidates : null}},
     {kind:"credential_exclusions",name:"credential_copy",ok:!unresolvedSourceSkips,
       detail:{classes:deliberateExclusions,unresolvedSourceSkips}}];
   const seen = new Set<string>();

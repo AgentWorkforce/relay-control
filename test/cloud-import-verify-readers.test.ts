@@ -1,5 +1,6 @@
 import { accountCredentialExclusion,exclusionAccounting } from "../scripts/cloud-import-verify/exclusions.js";
 import { credentialCloudSelection,writtenOnlySelection,type SourceSelection,type TargetSelection } from "../scripts/cloud-import-verify/credential-selection.js";
+import { credentialLoginCohort,deduplicatesLogins } from "../scripts/cloud-import-verify/credential-cohort.js";
 
 import { credentialConvergenceCohort,credentialWriteCounts,compareCredentialConvergence,credentialCheckpointDigest,validateCredentialCheckpoint,type CredentialConvergenceSnapshot } from "../scripts/cloud-import-verify/convergence.js";
 import { MAPPING_REVISION } from "../scripts/cloud-import/mapping.js";
@@ -14,6 +15,23 @@ import { readOnlyCloudCredentials } from "../scripts/cloud-import-verify/credent
 
 const inputs={CLOUD_CREDENTIAL_R2_ENDPOINT:"https://objects.example.test",CLOUD_CREDENTIAL_R2_BUCKET:"synthetic-fixtures",
   CLOUD_CREDENTIAL_R2_ACCESS_KEY_ID:"SYNTHETIC_ACCESS",CLOUD_CREDENTIAL_R2_SECRET_ACCESS_KEY:"synthetic-secret-only"};
+
+test("duplicate login winner is independently freshest then lowest id and inherits all Cloud choices",() => {
+  const make=(id:string,updated:number,active:boolean,harness:boolean) => ({authType:"provider_oauth",content:id,
+    selection:{id,key:"decrypted-account-key",group:"workspace:provider",updated,active,harness}});
+  const old=make("001",1,true,false),fresh=make("003",2,false,false),tie=make("002",2,false,true);
+  const cohort=credentialLoginCohort([old,fresh,tie],true);
+  assert.equal(cohort.selected.length,1);assert.equal(cohort.selected[0]!.content,"002");
+  assert.deepEqual([...cohort.duplicates].sort(),["001","003"]);
+  assert.equal(cohort.selected[0]!.selection.active,true);assert.equal(cohort.selected[0]!.selection.harness,true);
+  assert.equal(tie.selection.active,false,"source values are not mutated");
+  const separate={...old,selection:{...old.selection,id:"004",key:"different-decrypted-account"}};
+  const api={...fresh,authType:"byo_api_key",selection:{...fresh.selection,id:"005"}};
+  assert.equal(credentialLoginCohort([old,fresh,tie,separate,api],true).selected.length,3);
+  assert.equal(credentialLoginCohort([old,fresh,tie],false).selected.length,3);
+  assert.equal(deduplicatesLogins("cloud-identity-2026-11-16.11"),false);
+  assert.equal(deduplicatesLogins("cloud-identity-2026-11-16.21"),true);
+});
 
 test("written-only selection preserves Control choices and rejects missing or changed prior evidence",() => {
   const entry:SourceSelection={id:"source",key:"existing",group:"workspace:provider",active:true,harness:true,updated:1};
