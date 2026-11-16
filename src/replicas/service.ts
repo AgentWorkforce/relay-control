@@ -754,6 +754,10 @@ export async function bindReplica(deps: ReplicasDeps, actor: ReplicasActor, raw:
     const { replica } = await deps.replicas.get(key, input.data.replica_id);
     const chat = replica.chats?.find((item) => item.id === input.data.chat_id);
     if (!chat) throw new ReplicasError("The key cannot see that chat in that replica.", 404);
+    // The API's provider values are canonical. Refuse unsupported harnesses
+    // before saving a binding or registering an identity; never guess aliases.
+    const codingAgent = z.enum(["claude", "codex"]).safeParse(chat.provider);
+    if (!codingAgent.success) throw new ReplicasError("Native Relay MCP binding currently supports only Claude Code and Codex chats.", 422);
     const older = await tx.query<SpawnRow>(`SELECT ${COLUMNS} FROM replica_spawns WHERE replica_id = $1 FOR UPDATE`, [replica.id]);
     if (older.rows.some((row) => row.state === "gone" && !row.input.cleanup_complete)) {
       throw new ReplicasError("Finish the previous binding cleanup before reconnecting this replica.", 409);
@@ -771,7 +775,7 @@ export async function bindReplica(deps: ReplicasDeps, actor: ReplicasActor, raw:
       [randomUUID(), actor.workspaceId, actor.organizationId, actor.userId,
         `bind:${replica.id}:${chat.id}:${randomBytes(8).toString("hex")}`,
         JSON.stringify({ origin: "existing", environment_id: "", task: "Connection check only: confirm your Relay identity, then wait for Relay messages.",
-          coding_agent: chat.provider, name: replica.name }),
+          coding_agent: codingAgent.data, name: replica.name }),
         replica.id, chat.id],
     )).rows[0]!;
     await audit(tx, inserted, actor, "replicas.spawn.created");

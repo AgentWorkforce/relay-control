@@ -498,3 +498,19 @@ test("Replicas bridge: unpinned relay, live delivery while MCP setup is retried,
     assert.equal(listed.status, 200, listed.text);
   });
 });
+
+test("Replicas bind refuses a chat whose harness is not Claude Code or Codex before saving anything", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, organizationId, ownerId, ownerToken, provider, database } = env;
+  assert.equal((await api(`/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`, {
+    method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } })).status, 200);
+  const replicaId = randomUUID();
+  const chatId = randomUUID();
+  provider.replicas.set(replicaId, { status: "active", chatId, harness: "gemini" });
+  const actor = { workspaceId, userId: ownerId, organizationId };
+  await assert.rejects(bindReplica(env.replicas.deps, actor, { replica_id: replicaId, chat_id: chatId }),
+    { status: 422, message: "Native Relay MCP binding currently supports only Claude Code and Codex chats." });
+  const rows = await database.query<{ count: number }>("SELECT count(*)::int AS count FROM replica_spawns");
+  assert.equal(rows.rows[0]!.count, 0);
+  assert.equal(provider.execs.length, 0, "no helper or MCP install ran");
+});
