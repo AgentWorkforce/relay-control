@@ -5,6 +5,16 @@ assigned at release.
 
 ## Unreleased
 
+- Added: on gate-only installs a member's signed-in Agent Relay Desktop can
+  mint, list and revoke its own relay-node token at
+  `/api/v1/workspaces/{id}/relay-node/self-tokens` (also under
+  `/cloud/api/v1`). Only a redeemed Desktop session may call it
+  (`403 desktop_session_required`); `SELFHOST_RELAY_NODE_SELF_MINT=false`
+  turns it off (`403 self_mint_disabled`, default on). A node name belongs to
+  one person (`409 node_name_taken`), at most 3 live tokens per person
+  (`409 too_many_tokens`), 10 mints per hour (`429 rate_limited`), expiry at
+  most 90 days. Audited `relay_node.token.self_minted` and
+  `relay_node.token.self_revoked` with the Desktop host name. No migration.
 - Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), Agent
   Relay Desktop claims its relay node at `POST /api/v1/fleet/nodes/claim` with
   `{workspaceId, nodeName}`: the proof is the node's enrolment through this
