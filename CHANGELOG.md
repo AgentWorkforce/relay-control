@@ -5,6 +5,12 @@ assigned at release.
 
 ## Unreleased
 
+- Changed: credential-refresh transactions (subscription-login auth files and
+  integration-connection OAuth tokens) now set
+  `SET LOCAL idle_in_transaction_session_timeout = '60s'` and
+  `SET LOCAL lock_timeout = '30s'`, so a provider token exchange is not killed
+  mid-refresh by a shorter server default and a concurrent refresher waits at
+  most 30 s for the per-credential lock.
 - Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), Agent
   Relay Desktop claims its relay node at `POST /api/v1/fleet/nodes/claim` with
   `{workspaceId, nodeName}`: the proof is the node's enrolment through this
