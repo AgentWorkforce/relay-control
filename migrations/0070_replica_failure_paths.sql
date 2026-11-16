@@ -3,9 +3,11 @@
 -- replica_environment_policies.create_unconfirmed: set (and committed) before
 -- Control asks the provider to create an environment MCP entry, cleared once
 -- the entry is found by name or the provider definitely rejected the create.
--- While set, automatic runs (startup, sweep) only relist and never create
--- again; a person-driven sync or enable may create again only when a complete
--- listing shows no entry.
+-- While set, every sync (startup, sweep, person-driven sync or enable) only
+-- relists and never creates again; the only path that may create again is an
+-- explicit operator recovery (PUT .../environments/{id} with
+-- retry_registration), and it does so only when a complete listing shows no
+-- entry.
 --
 -- replica_environment_policies.create_attempt: generation of the create
 -- intent, incremented each time the intent is set. A run clears the intent
