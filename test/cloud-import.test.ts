@@ -236,6 +236,7 @@ test("cloud import: current target (every checked-in migration) keeps rw_, slugs
   assert.equal((await target.query<{ token_hash: string }>("SELECT token_hash FROM staff_read_grants WHERE id = $1", [id(0xa01)])).rows[0]!.token_hash, grant.token_hash);
   assert.deepEqual(report.optionalColumns.sort(), [
     "organizations.slug",
+    "users.signup_source",
     "workspaces.cloud_relay_workspace_id",
     "workspaces.relaycast_api_key_generation",
     "workspaces.relayhistory_origin",
@@ -323,6 +324,39 @@ test("cloud import: org scope imports one organization and its members only", as
   assert.equal(report.tables.users.skipped.outside_org_scope, 2);
   assert.equal(report.tables.workspaces.imported, 2);
   assert.throws(() => verifierComparisons({ orgIds: ["not-a-uuid"] }), /UUID/);
+});
+
+test("cloud import: signup_source is carried normalised, unknown values as NULL, set on insert only (0068)", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  // 0068 (users.signup_source, #177) is a checked-in migration.
+  // Cloud's column has no CHECK: case, padding and unknown values all occur.
+  await source.exec(`
+    UPDATE users SET signup_source = ' Teams ' WHERE id = '${id(1)}';
+    UPDATE users SET signup_source = 'desktop' WHERE id = '${id(5)}';
+    UPDATE users SET signup_source = 'bogus' WHERE id = '${id(2)}';
+    UPDATE users SET signup_source = 'MCP' WHERE id = '${id(6)}';`);
+  const sources = async () => Object.fromEntries((await target.query<{ id: string; signup_source: string | null }>(
+    "SELECT id::text AS id, signup_source FROM users ORDER BY id")).rows.map((row) => [row.id, row.signup_source]));
+  const report = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(report.ok, true, JSON.stringify(report.orgs));
+  assert.ok(report.optionalColumns.includes("users.signup_source"));
+  assert.deepEqual(await sources(), {
+    [id(1)]: "teams", // the survivor keeps its own value, not the merged duplicate's
+    [id(2)]: null, // unknown Cloud value
+    [id(3)]: null, // never set in Cloud
+    [id(6)]: "mcp",
+  });
+  // A re-run never overwrites what the target holds, whatever Cloud says now.
+  await target.query("UPDATE users SET signup_source = 'flows' WHERE id = $1", [id(1)]);
+  await source.exec(`UPDATE users SET signup_source = 'desktop' WHERE id IN ('${id(1)}', '${id(2)}');`);
+  const again = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(again.ok, true);
+  assert.deepEqual(await sources(), { [id(1)]: "flows", [id(2)]: null, [id(3)]: null, [id(6)]: "mcp" });
 });
 
 test("cloud import: a re-run keeps a binding Control made lazily on an unbound import (0064)", async (t) => {
@@ -450,6 +484,11 @@ test("cloud import: ledger guards: no ledger table refuses; a Control-native org
   // Org B already exists in Control without a ledger entry: it was not
   // imported, so it is refused (never merged into); org A still imports.
   await target.query("INSERT INTO organizations (id, name) VALUES ($1, 'Native B')", [ORG_B]);
+  // A credential-copier marker must not make a native org look imported.
+  await target.query(
+    "INSERT INTO cloud_import_ledger (organization_id, table_name, row_key, mapping_revision) VALUES ($1, 'copier_login', 'x:1', 'test')",
+    [ORG_B],
+  );
   await target.query("INSERT INTO users (id, email, name) VALUES ($1, 'native@example.test', 'Native')", [id(0xeee)]);
   await target.query("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')", [ORG_B, id(0xeee)]);
   const report = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");

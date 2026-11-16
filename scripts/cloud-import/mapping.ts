@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.18";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.23";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -96,7 +96,11 @@ cloud_users AS (
          COALESCE(
            CASE WHEN ${validEmail(normEmail("u.primary_email"))} THEN ${normEmail("u.primary_email")} END,
            ie.email
-         ) AS email
+         ) AS email,
+         -- Cloud's column has no CHECK: keep only values Control's 0068
+         -- accepts, normalised; anything else imports as NULL.
+         CASE WHEN lower(btrim(u.signup_source)) IN ('teams', 'flows', 'desktop', 'mcp')
+              THEN lower(btrim(u.signup_source)) END AS signup_source
     FROM public.users u
     LEFT JOIN ident_email ie ON ie.user_id = u.id
 ),
@@ -176,7 +180,7 @@ imported_workspaces AS (
 user_rows AS (
   SELECT cu.id, cu.email,
          COALESCE(NULLIF(btrim(cu.name), ''), cu.email) AS name,
-         cu.created_at, cu.updated_at,
+         cu.created_at, cu.updated_at, cu.signup_source,
          CASE WHEN EXISTS (
            SELECT 1 FROM imported_members im
             WHERE im.user_id = cu.id AND im.organization_id = cu.last_organization_id
@@ -299,7 +303,7 @@ function selects(): Record<ImportTable, string> {
   return {
     users: `
 SELECT id, email, name, created_at, updated_at, last_organization_id, last_workspace_id,
-       NULL::uuid AS organization_id, skip_reason
+       signup_source, NULL::uuid AS organization_id, skip_reason
   FROM user_rows`,
     organizations: `
 SELECT o.id, o.id AS organization_id, o.name, o.slug, o.created_at, o.updated_at, NULL::text AS skip_reason
@@ -516,6 +520,11 @@ export function credentialCopyQuery(scope: ImportScope): string {
 SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS cloud_user_id,
        ${PROVIDER("p.model_provider")} AS model_provider, p.harness, p.auth_type, p.label, p.account_email, p.provider_account_id,
        p.is_active, p.harness_active,
+       -- Preserved on the Control row the copier writes (status and history
+       -- are Cloud's, not the store seam's defaults). Timestamps as text so
+       -- microseconds survive (the source session is UTC).
+       p.status, p.last_error, p.refresh_attempts,
+       p.last_authenticated_at::text AS last_authenticated_at, p.last_used_at::text AS last_used_at,
        -- Saved but neither the LLM-call nor the sandbox selection: carried
        -- over, then left inactive in Control.
        (p.is_active OR p.harness_active) AS selected,
@@ -529,7 +538,9 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS 
          ) THEN 'not_a_member'
          -- A login whose refresh is exhausted is already dead in Cloud: its
          -- user must sign in again there too, so it is dropped on purpose.
-         WHEN p.refresh_exhausted OR (p.auth_type IN ('oauth_token', 'provider_oauth') AND p.status = 'refresh_failed')
+         -- OAuth only: an API key has no refresh, so an exhausted flag on one
+         -- does not make it a dead login (it falls to the status check).
+         WHEN p.auth_type IN ('oauth_token', 'provider_oauth') AND (p.refresh_exhausted OR p.status = 'refresh_failed')
            THEN 'dead_login'
          WHEN p.status <> 'connected' THEN 'credential_not_usable'
          WHEN p.auth_type <> 'provider_oauth' AND ${PROVIDER("p.model_provider")} NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
@@ -639,6 +650,10 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
     primaryKey: ["id"],
     // last_* are written after every organisation is in (FKs), see importer.
     columns: ["id", "email", "name", "created_at", "updated_at"],
+    // 0068. Set when the import creates the user; a re-run, or a user
+    // Control already has, keeps the target's value.
+    optional: ["signup_source"],
+    insertOnly: ["signup_source"],
   },
   organizations: {
     table: "organizations",
