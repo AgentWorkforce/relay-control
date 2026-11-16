@@ -100,6 +100,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     keyring: KEYRING,
     codingAgents: new CodingAgentStore(target, KEYRING, undefined, blobs),
     logins: new SubscriptionLoginStore(target, KEYRING, blobs),
+    blobs,
   };
 
   // S1 probe: Control already has a native, active Google key in workspace A.
@@ -212,15 +213,40 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   // active (never zero) and is reported as a conflict.
   const openrouter = flags.filter((row) => row.model_provider === "openrouter");
   assert.deepEqual(openrouter.map((row) => row.is_active), [true]);
-  assert.deepEqual(report.selection, { groups: 7, active: 5, harness: 2, activeDemoted: 1, harnessDemoted: 0, selectionConflicts: 1 });
+  assert.deepEqual(report.selection, { groups: 7, active: 5, harness: 2, activeDemoted: 1, harnessDemoted: 0, selectionConflicts: 1, writes: report.selection!.writes });
   assert.equal(await deps.logins.freshAuthFile(id(0x201), (await target.query<{ id: string }>(
     "SELECT id FROM coding_agent_credentials WHERE auth_type = 'provider_oauth'")).rows[0]!.id), codexAuth);
 
+  // Cloud's status and history survive on the rows the copier wrote.
+  const history = async (cloudId: string) => (await target.query<{ status: string; last_error: string | null; refresh_attempts: number; la: string | null; lu: string | null }>(
+    `SELECT status, last_error, refresh_attempts,
+            to_char(last_authenticated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') AS la,
+            to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') AS lu
+       FROM coding_agent_credentials WHERE id = $1`, [report.controlIds[cloudId]])).rows[0]!;
+  assert.deepEqual(await history(id(0x806)), { status: "connected", last_error: "transient refresh error", refresh_attempts: 2, la: "2026-01-05T10:00:00.123456", lu: "2026-01-06T11:00:00.654321" });
+  assert.deepEqual(await history(id(0x803)), { status: "connected", last_error: null, refresh_attempts: 0, la: "2026-01-07T09:00:00.000001", lu: "2026-01-08T09:30:00.500000" });
+
+  // A re-run writes nothing to rows Control already holds: no blob version,
+  // no updated_at, no status moves (storeLogin would rewrite every login).
+  const snapshot = async () => (await target.query<{ id: string; v: number | null; u: string; status: string }>(
+    "SELECT id::text AS id, blob_version AS v, updated_at::text AS u, status FROM coding_agent_credentials WHERE auth_type <> 'relay_managed' ORDER BY id")).rows;
+  const before = await snapshot();
   // Re-run converges on Control's own dedupe keys. The lost key is found
   // this time, so the only remaining problem is the selection conflict.
   objects.set(`${id(2)}/${id(0x808)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "openai", key: "sk-synthetic-openai-found-0000000000" }), CLOUD_KEY)));
   const again = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
   assert.equal(again.rows[id(0x808)], "copied");
+  // Unchanged logins are already_present, never a blanket "copied".
+  assert.equal(again.rows[id(0x806)], "already_present");
+  assert.equal(again.rows[id(0x810)], "already_present");
+  assert.ok(!Object.values(again.rows).includes("updated"));
+  const after = new Map((await snapshot()).map((row) => [row.id, row]));
+  for (const row of before) assert.deepEqual(after.get(row.id), row, `row ${row.id} unchanged by the re-run`);
+  // The report proves it: only the newly found 0x808 key was written.
+  assert.deepEqual(again.writes, { inserted: 1, updated: 0, blobWrites: 0, metadataWrites: 1, selectionWrites: again.writes.selectionWrites });
+  // A third run with nothing new writes nothing at all.
+  const third = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.deepEqual(third.writes, { inserted: 0, updated: 0, blobWrites: 0, metadataWrites: 0, selectionWrites: 0 });
   assert.equal(again.selection?.selectionConflicts, 1);
   assert.equal(again.ok, false, "a selection conflict is never a clean run");
   // Org A alone has no conflict (its Google group has a native active key).
@@ -236,6 +262,93 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   const activeAfter = (await target.query<{ secret_ciphertext: string }>(
     "SELECT secret_ciphertext FROM coding_agent_credentials WHERE workspace_id = $1 AND model_provider = 'anthropic' AND is_active", [id(0x201)])).rows;
   assert.deepEqual(activeAfter.map((row) => decryptSecret(row.secret_ciphertext, KEYRING)), ["sk-ant-api03-synthetic-selected-0000"]);
+  // Re-import must never clobber Control-owned state. Control rotates
+  // 0x806's login (a refresh), and Cloud's copy also changed: Control wins.
+  const loginId = report.controlIds[id(0x806)]!;
+  const version = async (controlId: string) => (await target.query<{ v: number }>(
+    "SELECT blob_version AS v FROM coding_agent_credentials WHERE id = $1", [controlId])).rows[0]!.v;
+  const rotated = JSON.stringify({ ...JSON.parse(codexAuth), tokens: { ...JSON.parse(codexAuth).tokens, refresh_token: "rt-rotated-by-control" } });
+  await deps.logins.storeLogin({ provider: "openai", workspaceId: id(0x201), organizationId: ORG_A, actor: { kind: "user", userId: id(1) }, authFile: rotated });
+  const rotatedVersion = await version(loginId);
+  const cloudChanged = JSON.stringify({ ...JSON.parse(codexAuth), tokens: { ...JSON.parse(codexAuth).tokens, refresh_token: "rt-cloud-changed" } });
+  objects.set(`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(cloudChanged, CLOUD_KEY)));
+  const afterRotation = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.equal(afterRotation.rows[id(0x806)], "control_newer");
+  assert.equal(await version(loginId), rotatedVersion, "no write over Control's rotated login");
+  assert.equal(await deps.logins.freshAuthFile(id(0x201), loginId), rotated, "Control's rotated token survives");
+  assert.equal(afterRotation.writes.blobWrites, 0);
+
+  // Cloud changed and Control did not: the import updates it and moves its marker.
+  const legacyId = report.controlIds[id(0x810)]!;
+  const legacyBefore = await version(legacyId);
+  const legacyChanged = JSON.stringify({ ...JSON.parse(legacyCodexAuth), tokens: { ...JSON.parse(legacyCodexAuth).tokens, refresh_token: "rt-legacy-cloud-v2" } });
+  objects.set(`${id(1)}/openai/credentials.json.enc`, JSON.stringify(cloudEnvelope(legacyChanged, CLOUD_KEY)));
+  const cloudNewer = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.equal(cloudNewer.rows[id(0x810)], "updated");
+  assert.equal(await version(legacyId), legacyBefore + 1);
+  assert.equal(await deps.logins.freshAuthFile(id(0x201), legacyId), legacyChanged);
+  assert.equal(cloudNewer.writes.updated, 1);
+  assert.equal(cloudNewer.writes.blobWrites, 1);
+  // ...and the next run sees it unchanged.
+  assert.equal((await copyCodingAgentCredentials(deps, { orgIds: null }, "apply")).rows[id(0x810)], "already_present");
+
+  // An unreadable Control blob is a row error, never an overwrite.
+  await target.query("UPDATE coding_agent_credentials SET blob_location = 'missing/blob' WHERE id = $1", [loginId]);
+  const unreadable = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.equal(unreadable.rows[id(0x806)], "blob_read_failed");
+  assert.equal(await version(loginId), rotatedVersion);
+  assert.equal(unreadable.ok, false);
+
+  // storeLogin reports, inside its own transaction, exactly the version it wrote.
+  let seen: { id: string; version: number } | null = null;
+  const storedId = await deps.logins.storeLogin({
+    provider: "openai", workspaceId: id(0x201), organizationId: ORG_A, actor: { kind: "user", userId: id(1) },
+    authFile: codexAuth, onStored: async (_tx, stored) => { seen = stored; },
+  });
+  const seenVersion = (seen as { id: string; version: number } | null)!;
+  assert.equal(seenVersion.id, storedId);
+  assert.equal(seenVersion.version, await version(storedId));
+});
+
+test("credential copier: a marker only ever names the import's own write, even racing a Control rotation", async (t) => {
+  const source = new PGliteDatabase();
+  const target = new PGliteDatabase();
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  await source.exec(CLOUD_FIXTURE_DDL);
+  await source.exec(cloudFixtureSeed(CLOUD_KEY));
+  await migrate(target);
+  assert.equal((await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply")).ok, true);
+  const auth = (refresh: string) => JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: { access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), id_token: jwt({ email: "alice@example.test" }), refresh_token: refresh, account_id: "acct-synthetic-1" },
+  });
+  const objects = new Map([[`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(auth("rt-cloud"), CLOUD_KEY))]]);
+  const blobs = new CredentialBlobStore(new PostgresObjectBackend(target), KEYRING);
+  const deps = {
+    source, target, reader: { get: async (key: string) => objects.get(key) ?? null }, cloudKeyHex: CLOUD_KEY, keyring: KEYRING,
+    codingAgents: new CodingAgentStore(target, KEYRING, undefined, blobs),
+    logins: new SubscriptionLoginStore(target, KEYRING, blobs), blobs,
+  };
+  for (let round = 0; round < 4; round += 1) {
+    objects.set(`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(auth(`rt-cloud-${round}`), CLOUD_KEY)));
+    await Promise.all([
+      copyCodingAgentCredentials(deps, { orgIds: null }, "apply"),
+      deps.logins.storeLogin({ provider: "openai", workspaceId: id(0x201), organizationId: ORG_A, actor: { kind: "user", userId: id(1) }, authFile: auth(`rt-control-${round}`) }),
+    ]);
+    const markers = (await target.query<{ row_key: string }>(
+      "SELECT row_key FROM cloud_import_ledger WHERE table_name = 'copier_login'")).rows;
+    for (const { row_key } of markers) {
+      const [controlId, markedVersion] = row_key.split(":") as [string, string];
+      const row = (await target.query<{ blob_location: string }>("SELECT blob_location FROM coding_agent_credentials WHERE id = $1", [controlId])).rows[0];
+      if (!row) continue;
+      // Whatever interleaving happened, a marker names a version the import wrote.
+      const atMarker = await blobs.read(`workspaces/${id(0x201)}/accounts/${controlId}/v${markedVersion}.json.enc`, controlId, Number(markedVersion)).catch(() => null);
+      if (atMarker !== null) assert.match(atMarker, /rt-cloud-/, `marker ${row_key} names the import's own write`);
+    }
+  }
 });
 
 test("credential copier: a workspace the target does not have is skipped without reading Cloud", async (t) => {
@@ -255,7 +368,7 @@ test("credential copier: a workspace the target does not have is skipped without
   const blobs = new CredentialBlobStore(new PostgresObjectBackend(target), KEYRING);
   const report = await copyCodingAgentCredentials({
     source, target, reader: { get: async (key: string) => { reads.push(key); return null; } }, cloudKeyHex: CLOUD_KEY, keyring: KEYRING,
-    codingAgents: new CodingAgentStore(target, KEYRING, undefined, blobs), logins: new SubscriptionLoginStore(target, KEYRING, blobs),
+    codingAgents: new CodingAgentStore(target, KEYRING, undefined, blobs), logins: new SubscriptionLoginStore(target, KEYRING, blobs), blobs,
   }, { orgIds: null }, "apply");
   assert.equal(report.rows[id(0x812)], "skipped:workspace_not_on_target");
   assert.ok(!reads.some((key) => key.includes(id(0x812))), "no Cloud read for a row that cannot land");

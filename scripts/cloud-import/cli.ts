@@ -221,7 +221,7 @@ async function copyCredentials(
   if (args.mode === "plan") {
     // Plan: candidates and skip reasons only; the object store is not touched.
     const stub = undefined as unknown as never;
-    return copyCodingAgentCredentials({ source, target: stub, reader: { get: async () => null }, cloudKeyHex: "", keyring, codingAgents: stub, logins: stub }, scope, "plan");
+    return copyCodingAgentCredentials({ source, target: stub, reader: { get: async () => null }, cloudKeyHex: "", keyring, codingAgents: stub, logins: stub, blobs: stub }, scope, "plan");
   }
   if (!target || !cloudKey) {
     // Never fall back to a silent plan when an apply was asked for.
@@ -236,6 +236,7 @@ async function copyCredentials(
     keyring,
     codingAgents: new CodingAgentStore(target, keyring, undefined, blobs),
     logins: new SubscriptionLoginStore(target, keyring, blobs),
+    blobs,
     log: (event, fields) => console.log(JSON.stringify({ event, ...fields })),
   }, scope, "apply");
 }
