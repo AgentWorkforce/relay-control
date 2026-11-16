@@ -3102,11 +3102,11 @@ paths:
                   description: Required for Devin (Cognition organization ID).
       responses:
         "200":
-          description: "{connection, environmentDiscovery?, environmentSetup?}: the validated connection hint and timestamp, never the key. For replicas (when SELFHOST_REPLICAS_ENABLED is on), every environment of the connected organization gets Relay by default, including ones discovered later on sync. A fresh connect (none before it, or after a disconnect) turns the default on and enables and registers every environment; a re-connect over an existing connection (key rotation) keeps the default and every opt-out and runs the sync semantics (environmentSetup.allEnvironments is the current default). environmentDiscovery is the discovery report ({status: ok|partial|failed, environments: [{environmentId, name, status: discovered|known}]}) and environmentSetup is {allEnvironments, environments: [per-environment enable and registration result, as POST .../replicas/environment-mcp]}. Setup failures are reported there and never fail the connect; the connection is saved. When the provider organization is connected in another workspace nothing is enabled and each result is organization_shared. Admins opt out per environment."
+          description: "{connection, environmentDiscovery?, environmentSetup?}: the validated connection hint and timestamp, never the key. For replicas (when SELFHOST_REPLICAS_ENABLED is on), every environment of the connected organization gets Relay by default, including ones discovered later on sync. A fresh connect (none before it, or after a disconnect) turns the default on and enables and registers every environment; a re-connect over an existing connection (key rotation) keeps the default and every opt-out and runs the sync semantics (environmentSetup.allEnvironments is the current default). environmentDiscovery is the discovery report ({status: ok|partial|failed, environments: [{environmentId, name, status: discovered|known}]}) and environmentSetup is {allEnvironments, environments: [per-environment enable and registration result, as POST .../replicas/environment-mcp]}. A connect whose provider organization is already connected in another workspace is refused with 403 organization_shared and saves nothing; concurrent first connects of one organization are serialized per organization, so exactly one wins. Other setup failures are reported there and never fail the connect; the connection is saved. A connection saved before that rule whose organization is connected elsewhere admits no token and enables nothing (a re-connect over it is refused with 403 organization_shared). Admins opt out per environment."
         "400":
           description: Invalid key, organization or field
         "403":
-          description: Owner/admin person required or cross-origin write refused
+          description: Owner/admin person required or cross-origin write refused, or organization_shared (replicas; the provider organization is connected in another workspace, nothing is saved)
         "404":
           description: Workspace or provider not found
         "409":
@@ -3141,11 +3141,11 @@ paths:
         "404":
           description: Workspace or provider not found
         "409":
-          description: Replicas cleanup refused (replicas_cleanup_failed), for example an unknown launch create to recover first; the connection stays
+          description: Replicas cleanup refused (replicas_cleanup_failed), for example an unknown launch create to recover first; answered after the fence and before any environment entry is touched; the connection stays
         "415":
           description: A non-empty body that is not application/json
         "503":
-          description: Replicas cleanup could not confirm or remove an environment entry (replicas_cleanup_failed, retryable); the connection stays
+          description: Replicas cleanup could not confirm or remove an environment entry (replicas_cleanup_failed, retryable). A Replicas disconnect retires compute and Relay identities first, then confirms and removes the environment entries, then deletes the connection, so retirement is already done; the connection stays
   /api/v1/workspaces/{workspaceId}/providers:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -8139,7 +8139,7 @@ paths:
     post:
       operationId: replicasEnvironmentMcp
       tags: [replicas]
-      summary: "Environment-level Agent Relay MCP for Replicas workspaces. Stateless streamable HTTP (JSON-RPC), pull-only, not an OAuth resource. Admission order: valid workspace_identity token with an expiry at most one hour ahead (else 401 replica_identity_invalid); not released (else 403 replica_released); the token's organization connected in no other workspace (else 403 organization_shared) and its environment enabled (else 403 replica_environment_not_enabled); a creator mapped to a current member acts as that member, otherwise (null or unmapped creator) the workspace's explicit VM principal when set and a current member, re-read on every call (else 403 replica_creator_not_allowed); then the replica's Relay identity is resolved or enrolled once. Tools: list_relay_agents, check_relay_inbox, send_relay_message. Future wake-up delivery will answer 409 replica_chat_selection_required when no chat is selected. 404 before auth when SELFHOST_REPLICAS_ENABLED is off. Rate limited per source IP (120 per minute). Only refusals that name a Control workspace are audited."
+      summary: "Environment-level Agent Relay MCP for Replicas workspaces. Stateless streamable HTTP (JSON-RPC), pull-only, not an OAuth resource. Admission order: valid workspace_identity token with an expiry at most one hour ahead (else 401 replica_identity_invalid); not released (else 403 replica_released); the token's organization connected in no other workspace (else 403 organization_shared) and its environment enabled (else 403 replica_environment_not_enabled); a creator mapped to a current member acts as that member, otherwise (null or unmapped creator) the workspace's explicit VM principal when set and a current member, re-read on every call (else 403 replica_creator_not_allowed); then the replica's Relay identity is resolved or enrolled once. Tools: list_relay_agents, check_relay_inbox, send_relay_message. Future wake-up delivery will answer 409 replica_chat_selection_required when no chat is selected. 404 before auth when SELFHOST_REPLICAS_ENABLED is off. Rate limited by a coarse per-source-IP guard (10000 per minute, before the token is checked) and per verified identity (120 per minute per organization and Replicas workspace, after the token is verified and before the body is read). Only refusals that name a Control workspace are audited."
       security: [{ replicasWorkspaceIdentity: [] }]
       requestBody:
         required: true

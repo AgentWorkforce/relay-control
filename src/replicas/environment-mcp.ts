@@ -104,19 +104,33 @@ function buildServer(deps: ReplicasDeps, claims: ReplicaIdentityClaims): McpServ
   return server;
 }
 
+type RateLimitResult = { allowed: boolean; retryAfterSeconds: number };
+export type EnvironmentMcpRateLimit = {
+  /** Coarse per source IP guard, before any token work. */
+  ip?: () => RateLimitResult;
+  /** The request quota per verified identity (organization and Replicas workspace), before the body or admission. */
+  identity?: (claims: ReplicaIdentityClaims) => RateLimitResult;
+};
+
+const rateLimited = (response: ServerResponse, limited: RateLimitResult | undefined): boolean => {
+  if (!limited || limited.allowed) return false;
+  rpcError(response, 429, -32000, "rate_limited", null, { "retry-after": String(limited.retryAfterSeconds) });
+  return true;
+};
+
 /**
  * Answers one environment-level MCP request. The caller has already answered
- * 404 when Replicas is off. `rateLimit` (per source IP) runs before any token
- * work, so an unauthenticated flood never reaches the issuer or the database.
+ * 404 when Replicas is off. `rateLimit.ip` (per source IP, coarse: every VM of
+ * an organization shares the provider's egress IP) runs before any token work,
+ * so an unauthenticated flood never reaches the issuer or the database.
+ * `rateLimit.identity` is the per-replica quota, consumed right after the
+ * token verified and before the body is read or admission runs.
  */
 export async function handleEnvironmentMcp(deps: ReplicasDeps, request: IncomingMessage, response: ServerResponse,
-  method: string, rateLimit?: () => { allowed: boolean; retryAfterSeconds: number }): Promise<void> {
+  method: string, rateLimit: EnvironmentMcpRateLimit = {}): Promise<void> {
   if (!deps.identity) return rpcError(response, 404, -32004, "Not found");
   if (method !== "POST") return rpcError(response, 405, -32000, "Use POST.", null, { allow: "POST" });
-  const limited = rateLimit?.();
-  if (limited && !limited.allowed) {
-    return rpcError(response, 429, -32000, "rate_limited", null, { "retry-after": String(limited.retryAfterSeconds) });
-  }
+  if (rateLimited(response, rateLimit.ip?.())) return;
   const header = request.headers.authorization ?? "";
   // RFC 7235: the scheme is case-insensitive and followed by any whitespace.
   const match = header.length <= MAX_BEARER ? /^Bearer\s+([A-Za-z0-9._-]+)$/i.exec(header) : null;
@@ -130,6 +144,7 @@ export async function handleEnvironmentMcp(deps: ReplicasDeps, request: Incoming
     if (error instanceof ReplicaIdentityError) return rpcError(response, 401, -32001, "replica_identity_invalid", null, INVALID);
     return rpcError(response, 503, -32000, "replica_identity_unavailable");
   }
+  if (rateLimited(response, rateLimit.identity?.(claims))) return;
   let body: unknown;
   try {
     const raw = await boundedBody(request, BODY_MAX_BYTES);

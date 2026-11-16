@@ -1072,6 +1072,8 @@ test("disconnect reads back an unconfirmed create: no entry fails retryably and 
   const connection = `/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`;
   const connected = () => count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'", [workspaceId]);
   assert.equal((await connect(env)).status, 200);
+  const launchedReplica = randomUUID();
+  const launched = await launchRow(env, "spawn", launchedReplica);
   provider.environments.push({ id: ENV_C, name: "gamma" });
   provider.mode.register = "fail";
   await syncEnvironments(env.replicas.deps, serviceActor(env));
@@ -1084,6 +1086,11 @@ test("disconnect reads back an unconfirmed create: no entry fails retryably and 
   assert.equal(failed.status, 503, failed.text);
   assert.equal(failed.body.error, "replicas_cleanup_failed");
   assert.equal(await connected(), 1, "the connection and its key stay for the retry");
+  // Retirement runs before any entry is touched: the launch is retired and its compute stopped although the entry cleanup failed.
+  const retired = await spawnRow(env, launched);
+  assert.equal(retired.state, "gone");
+  assert.equal(retired.input.cleanup_complete, true);
+  assert.deepEqual(provider.slept, [launchedReplica]);
   assert.equal((await policyRow(env, ENV_C)).create_unconfirmed, true, "the intent stays");
   assert.deepEqual(creates, [], "disconnect never sends a create");
 

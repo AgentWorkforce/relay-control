@@ -26,6 +26,8 @@ export function createReplicasModule(input: {
   /** workspace_identity discovery/JWKS fetch (tests inject a fake issuer). */
   identityFetch?: typeof fetch;
   now?: () => Date;
+  /** Test hook: environment MCP limits (ip guard, per-identity quota). Production leaves this unset. */
+  rateLimits?: Parameters<typeof createReplicasHandler>[0]["rateLimits"];
 }): ReplicasModule {
   const issuer = input.replicas.identityIssuer ?? DEFAULT_REPLICAS_IDENTITY_ISSUER;
   const mcpUrl = environmentMcpUrl(input.config.publicBaseUrl);
@@ -48,6 +50,7 @@ export function createReplicasModule(input: {
     database: input.database,
     internalServiceToken: input.config.internalServiceToken,
     browserOrigins: [...new Set([new URL(input.config.publicBaseUrl).origin, new URL(input.config.dashboardUrl).origin])],
+    ...(input.rateLimits ? { rateLimits: input.rateLimits } : {}),
   });
   return { config: input.replicas, deps, handle };
 }

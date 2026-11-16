@@ -130,9 +130,13 @@ the replica: no helper, credentials file or exec call.
 The endpoint is stateless streamable HTTP and pull-only. It answers 404 before
 authentication while `SELFHOST_REPLICAS_ENABLED` is off, is not an OAuth
 resource, and accepts only a Bearer `workspace_identity` token. Person
-credentials and capabilities are refused. It is rate limited per source IP
-(120 requests per minute): over the limit it answers 429 with JSON-RPC error
--32000 `rate_limited` and `Retry-After`.
+credentials and capabilities are refused. It is rate limited twice: a coarse
+guard per source IP (10000 requests per minute, checked before the token)
+and a quota per verified identity (120 requests per minute per provider
+organization and Replicas workspace, checked right after the token is
+verified and before the body is read or admission runs), so replicas behind
+one egress IP do not share a budget. Over either limit it answers 429 with
+JSON-RPC error -32000 `rate_limited` and `Retry-After`.
 
 Each call is admitted in this order:
 
@@ -154,7 +158,9 @@ Each call is admitted in this order:
    enabled candidate workspace is known (step 3), before its connection
    and creator checks.
 3. The token's provider organization must not be connected in more than one
-   Control workspace, otherwise 403 `organization_shared` (as Cloud). The
+   Control workspace, otherwise 403 `organization_shared` (as Cloud). A
+   connect cannot create that state (see "Policies and registration"); it
+   covers connections saved before that rule. The
    token's environment must be enabled in exactly one Control workspace whose
    Replicas connection belongs to the token's organization, otherwise 403
    `replica_environment_not_enabled`. The same refusal applies while that
@@ -225,7 +231,10 @@ rotation) keeps the default and every opt-out as they are and runs the sync
 semantics below. The connect response reports `environmentDiscovery`
 (the discovery report per environment) and `environmentSetup:
 {allEnvironments, environments}` (the enable and registration status per
-environment). Setup failures are reported there and never fail the connect:
+environment). A connect for a provider organization that is already
+connected in another Control workspace is refused with 403
+`organization_shared` and saves nothing (see below). Other setup failures
+are reported there and never fail the connect:
 the connection is saved and a sync, a re-connect or an enable retries them
 (a failed or refused default enable is not an opt-out). When discovery failed
 or any environment ends in `registration_failed`, `registration_unconfirmed`,
@@ -305,11 +314,18 @@ or the workspace owner.
 The policy view also returns `principal` (`{userId, member}` or `null`;
 `member: false` means the principal left the organization and admits nobody)
 and `organizationShared`: true when the same Replicas organization is
-connected in another Control workspace. A shared organization admits no
-token, and enabling refuses: `PUT .../environments/{id}` with `enabled: true`
-answers 409 "This Replicas organization is connected in another workspace.",
-and `POST .../environment-mcp`, sync and the connect setup report
-`organization_shared` and enable nothing. The connection is still saved.
+connected in another Control workspace. One Replicas organization belongs to
+one Control workspace: a connect (or a re-connect) for an organization that
+is connected in another workspace is refused with 403 `organization_shared`
+before anything is saved, so no connection row is written and nothing is
+registered at the provider. The check runs under a per-organization lock, so
+of two concurrent first connects in different workspaces exactly one wins.
+Connections saved before this rule can still share an organization: such a
+shared organization admits no token, and enabling refuses: `PUT
+.../environments/{id}` with `enabled: true` answers 409 "This Replicas
+organization is connected in another workspace.", and `POST
+.../environment-mcp`, sync and a re-connect report `organization_shared` and
+enable nothing. Once the other workspace disconnects, a connect succeeds.
 
 Changing or clearing the principal releases every live binding that acts as
 the principal (no tombstone): those replicas enrol again under the new
@@ -397,11 +413,18 @@ environment-mcp`, or disconnect) commits the disable first, then removes the
 provider entry, and releases the environment's enrolled bindings in this
 workspace: their Relay identities are retired, no tombstone is written, and
 each replica enrols again on its next call once the environment is enabled
-again. On disconnect an unconfirmed create is read back first (see above),
-and an entry that cannot be confirmed or removed fails the disconnect with a
-retryable 503 `replicas_cleanup_failed` before the connection is deleted; the
-released bindings are retired either way. Disable keeps reporting
-`removal_failed` per environment instead.
+again. Disable keeps reporting `removal_failed` per environment.
+
+Disconnect runs in this order: the disable and the disconnect fence are
+committed (every policy disabled, the all-environments default off, the
+bindings released); then every launch, bind and environment-identity binding
+of the workspace is retired (compute stopped, Relay identity released); only
+then is each unconfirmed create read back (see above) and each provider entry
+removed; the connection is deleted last. An unknown launch create stops the
+retirement with 409 `replicas_cleanup_failed` before any entry is touched. An
+entry that cannot be confirmed or removed fails the disconnect with a
+retryable 503 `replicas_cleanup_failed` before the connection is deleted, so
+an entry that cannot be removed never keeps compute running.
 
 The removal lists the environment's entries first and deletes the recorded
 entry only when it is still exactly this edition's: same name, transport
@@ -425,10 +448,10 @@ completes the disconnect explicitly with `DELETE
    disconnect: every policy is disabled, the all-environments default is off
    and the bindings are released, so neither the sync sweep nor an identity
    call can register or admit anything while the disconnect is half done;
-2. no entry is confirmed or removed and no create or remove is sent;
-   compute and Relay retirement then run as on every disconnect (an unknown
+2. compute and Relay retirement run as on every disconnect (an unknown
    launch create still answers 409 `replicas_cleanup_failed`; nothing is
-   bypassed);
+   bypassed); then no entry is confirmed or removed and no create or remove
+   is sent;
 3. only when that retirement succeeded, every recorded entry id and
    unconfirmed create is cleared, audited as
    `replicas.environment.cleanup_abandoned` (one per environment), in the
@@ -468,7 +491,7 @@ A newer row whose release an admin revived counts the same way (the revive
 stamps `revived_at` on it), so releasing an older row cannot undo the revive;
 the replica is fenced again by releasing the row its next admitted call enrols.
 Disconnecting Replicas disables every policy and releases its bindings first,
-then removes the registered entries best effort (or, on an explicit abandon,
+retires them, then removes the registered entries (or, on an explicit abandon,
 leaves them at the provider; see above).
 
 Policies, pending creators and the principal (migration 0067) are deleted

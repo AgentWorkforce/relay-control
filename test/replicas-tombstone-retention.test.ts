@@ -541,19 +541,18 @@ test("connect reports provisioning_error when environment setup failed and keeps
       code: "replica_environment_setup_failed", stage: "environment_setup", retryable: true, environments: [ENV_A, ENV_B],
     });
   });
-  await t.test("organization shared: not retryable", async (t) => {
+  await t.test("organization shared: refused before the save, no provisioning_error and no connection", async (t) => {
     const env = await start(t);
     const other = await env.api(`/api/v1/organizations/${env.organizationId}/workspaces`, {
       method: "POST", token: BOOTSTRAP, body: { name: "other", relaycastWorkspaceId: "rc-other", relaycastApiKey: "rk_live_other" },
     });
     await env.database.query(`INSERT INTO remote_agent_connections (workspace_id, provider, key_ciphertext, key_hint, provider_account)
       VALUES ($1, 'replicas', 'x', 'x', $2)`, [other.body.id, PROVIDER_ORG]);
-    const saved = await connect(env);
-    assert.equal(saved.status, 200, saved.text);
-    assert.deepEqual(saved.body.provisioning_error, {
-      code: "replica_environment_setup_failed", stage: "environment_setup", retryable: false, environments: [ENV_A, ENV_B],
-    });
-    assert.equal(await count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1", [env.workspaceId]), 1);
+    const refused = await connect(env);
+    assert.equal(refused.status, 403, refused.text);
+    assert.equal(refused.body.error, "organization_shared");
+    assert.equal("provisioning_error" in refused.body, false);
+    assert.equal(await count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1", [env.workspaceId]), 0);
   });
   await t.test("success: no provisioning_error", async (t) => {
     const env = await start(t);

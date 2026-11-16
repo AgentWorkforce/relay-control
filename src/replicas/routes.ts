@@ -46,8 +46,14 @@ const WORKSPACE = /^\/api\/v1\/workspaces\/([^/]+)\/replicas(\/.*)?$/;
 const CAPABILITY = /^\/api\/v1\/replicas\/agents\/([^/]+)\/messages$/;
 const RELAY_EVENTS = /^\/api\/v1\/replicas\/relay-events\/([^/]+)$/;
 const MCP = /^\/api\/v1\/replicas\/mcp$/;
-/** Per source IP on the environment-level MCP, which any caller can reach without a session. */
-export const REPLICAS_MCP_RATE_LIMIT = { limit: 120, windowMs: 60_000 };
+/**
+ * Coarse per source IP guard on the environment-level MCP, which any caller can reach without a
+ * session. Every VM of an organization shares the provider's egress IP, so it is set high.
+ */
+export const REPLICAS_MCP_IP_RATE_LIMIT = { limit: 10_000, windowMs: 60_000 };
+/** The request quota per verified identity (provider organization and Replicas workspace). Process-local. */
+export const REPLICAS_MCP_IDENTITY_RATE_LIMIT = { limit: 120, windowMs: 60_000 };
+type RateLimitRule = { limit: number; windowMs: number };
 
 /** Every route this module owns, on the normalized (/cloud-stripped) path. */
 export function isReplicasPath(path: string): boolean {
@@ -102,10 +108,14 @@ export function createReplicasHandler(input: {
   database: Database;
   internalServiceToken: string | null;
   browserOrigins: string[];
+  /** Test hook: environment MCP limits. Production leaves this unset (REPLICAS_MCP_*_RATE_LIMIT). */
+  rateLimits?: { ip?: RateLimitRule; identity?: RateLimitRule };
 }) {
   const apiTokens = new ApiTokenStore(input.database);
   const { deps } = input;
   const mcpLimiter = new RateLimiter(() => deps.now().getTime());
+  const ipLimit = input.rateLimits?.ip ?? REPLICAS_MCP_IP_RATE_LIMIT;
+  const identityLimit = input.rateLimits?.identity ?? REPLICAS_MCP_IDENTITY_RATE_LIMIT;
 
   async function personActor(request: IncomingMessage, workspaceId: string, method: string, helpers: ReplicasHelpers): Promise<ReplicasActor> {
     // Agent, CI and service credentials never act as a person here.
@@ -176,8 +186,12 @@ export function createReplicasHandler(input: {
     if (!input.enabled) return send(404, { error: "Not found" }), true;
     if (MCP.test(path)) {
       // Not an OAuth resource: only a Replicas workspace_identity bearer is accepted.
-      await handleEnvironmentMcp(deps, request, response, method, () => mcpLimiter.consume(
-        `replicas-mcp:${limiterKey(clientIp(request))}`, REPLICAS_MCP_RATE_LIMIT.limit, REPLICAS_MCP_RATE_LIMIT.windowMs));
+      await handleEnvironmentMcp(deps, request, response, method, {
+        ip: () => mcpLimiter.consume(`replicas-mcp:${limiterKey(clientIp(request))}`, ipLimit.limit, ipLimit.windowMs),
+        identity: (claims) => mcpLimiter.consume(
+          `replicas-mcp-identity:${claims.organizationId.toLowerCase()}:${claims.workspaceId.toLowerCase()}`,
+          identityLimit.limit, identityLimit.windowMs),
+      });
       return true;
     }
     const events = RELAY_EVENTS.exec(path);

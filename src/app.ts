@@ -582,10 +582,11 @@ export function createApp(input: {
     ...(replicas ? { replicasCleanup: async (actor: { userId: string; workspaceId: string; organizationId: string },
       options: { abandonEnvironmentCleanup?: boolean }) => {
       try {
-        // Stop environment-level admission and remove provider MCP entries first (or skip that removal
-        // on an abandon request), then retire bindings: the compute check and Relay retirement always run.
-        await disconnectEnvironments(replicas.deps, actor, options);
-        await disconnectReplicas(replicas.deps, actor);
+        // Stop environment-level admission (the fence), then retire bindings (the compute check and
+        // Relay retirement always run, also on an abandon request), and only then confirm and remove
+        // provider MCP entries (skipped on an abandon request): an entry that cannot be removed never
+        // keeps compute running.
+        await disconnectEnvironments(replicas.deps, actor, { ...options, afterFence: () => disconnectReplicas(replicas.deps, actor) });
       } catch (error) {
         if (error instanceof ReplicasError) throw new RemoteAgentError(error.status, "replicas_cleanup_failed", error.message);
         throw new RemoteAgentError(502, "replicas_cleanup_failed", "Replicas cleanup could not finish. Retry the disconnect.");

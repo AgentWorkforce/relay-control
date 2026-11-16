@@ -242,6 +242,18 @@ export class RemoteAgentConnections {
       ])).digest("hex");
     }
     return this.authorized(actor, async tx => {
+      if (provider === "replicas") {
+        // One workspace per provider organization. Lock order: workspace lock
+        // (authorized) then organization lock, so concurrent first claims in
+        // two workspaces serialize here and exactly one saves.
+        const organization = account!.toLowerCase();
+        await tx.query("SELECT pg_advisory_xact_lock(hashtext('replicas-organization'), hashtext($1))", [organization]);
+        const claimed = await tx.query(
+          "SELECT 1 FROM remote_agent_connections WHERE provider = 'replicas' AND lower(provider_account) = $1 AND workspace_id <> $2 LIMIT 1",
+          [organization, actor.workspaceId],
+        );
+        if (claimed.rows.length) throw new RemoteAgentError(403, "organization_shared", "This Replicas organization is connected in another workspace.");
+      }
       const existing = await tx.query<{ provider_account: string | null; key_ciphertext: string }>(
         "SELECT provider_account,key_ciphertext FROM remote_agent_connections WHERE workspace_id=$1 AND provider=$2 FOR UPDATE",
         [actor.workspaceId, provider],

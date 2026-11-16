@@ -1277,8 +1277,10 @@ async function enableDefaults(deps: ReplicasDeps, actor: ReplicasActor, selectio
  * organization's environments, then enables and registers every one that is
  * not already enabled and registered. A re-connect (a key rotation over an
  * existing connection) changes no flag and no opt-out: it runs the sync
- * semantics under the current flag. Under an organization connected in
- * another workspace nothing is enabled and each result is organization_shared.
+ * semantics under the current flag. A connect for an organization already
+ * connected in another workspace is refused before it saves; under a
+ * duplicate saved before that rule nothing is enabled and each result is
+ * organization_shared.
  * Provider and registration failures are per-environment statuses or a
  * discovery status "failed", never a throw.
  */
@@ -1367,12 +1369,16 @@ async function confirmCreate(deps: ReplicasDeps, actor: ReplicasActor, policy: P
 
 /**
  * Disconnect: stop admission for every environment and revoke its bindings
- * (committed), then, while the key still exists, read back each unconfirmed
- * create (confirmCreate) and remove every registered provider entry, then
- * retire the released Relay identities (also when cleanup fails). An entry
+ * (committed), then run afterFence (compute and Relay retirement of the
+ * workspace's bindings), then, while the key still exists, read back each
+ * unconfirmed create (confirmCreate) and remove every registered provider
+ * entry, then retire the released Relay identities (also when cleanup
+ * fails). A failing afterFence (for example a launch create with an unknown
+ * outcome, 409) stops the disconnect before any entry is touched. An entry
  * that cannot be confirmed or removed fails the disconnect with a retryable
- * 503, so the connection and its key stay for the retry instead of leaving an
- * orphaned provider entry. Called before the provider connection is deleted.
+ * 503, so the connection and its key stay for the retry instead of leaving
+ * an orphaned provider entry; compute is already retired by then. Called
+ * before the provider connection is deleted.
  *
  * The first step is also the disconnect fence: every policy is disabled and
  * the all-environments flag is off (committed), so neither the sync sweep
@@ -1381,15 +1387,15 @@ async function confirmCreate(deps: ReplicasDeps, actor: ReplicasActor, policy: P
  *
  * abandonEnvironmentCleanup (owners and admins, checked under the lock like
  * every step) is the explicit way out when that cleanup can never succeed,
- * for example after the provider key was revoked: the first step is the
- * same, then no entry is confirmed or removed and no provider call is made.
- * Nothing is cleared here: the recorded entry ids and unconfirmed creates
- * stay until compute and Relay retirement succeeded, and are then forgotten
- * by abandonEnvironmentCleanup in the transaction that deletes the
- * connection.
+ * for example after the provider key was revoked: the fence and afterFence
+ * are the same, then no entry is confirmed or removed and no provider entry
+ * call is made. Nothing is cleared here: the recorded entry ids and
+ * unconfirmed creates stay until compute and Relay retirement succeeded, and
+ * are then forgotten by abandonEnvironmentCleanup in the transaction that
+ * deletes the connection.
  */
 export async function disconnectEnvironments(deps: ReplicasDeps, actor: ReplicasActor,
-  options: { abandonEnvironmentCleanup?: boolean } = {}): Promise<void> {
+  options: { abandonEnvironmentCleanup?: boolean; afterFence?: () => Promise<void> } = {}): Promise<void> {
   const released: string[] = [];
   try {
     const pending = await withReplicasLock(deps, actor, async (tx) => {
@@ -1402,6 +1408,8 @@ export async function disconnectEnvironments(deps: ReplicasDeps, actor: Replicas
       for (const policy of policies) disabled.push(await disablePolicy(tx, actor, policy, released));
       return disabled.filter((policy) => policy.registered_mcp_id || policy.create_unconfirmed);
     });
+    // Retirement before any entry is touched: an unremovable entry never keeps compute running.
+    await options.afterFence?.();
     if (options.abandonEnvironmentCleanup) return;
     for (const policy of pending) {
       const registered = policy.registered_mcp_id ? policy : await confirmCreate(deps, actor, policy);
