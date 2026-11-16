@@ -44,6 +44,41 @@ async function preserveCloudState(target: Database, id: string, row: Candidate):
   return result.rows.length;
 }
 
+/**
+ * The import's own record of the login it last wrote: a cloud_import_ledger
+ * row (owner-only, 0063) under table_name copier_login, row_key
+ * "<controlId>:<blob_version>". The identity importer's reconcile reads only
+ * its own table names, so these never reach it.
+ */
+const LOGIN_MARKER = "copier_login";
+
+async function loginMarker(target: Database, organizationId: string, controlId: string): Promise<number | null> {
+  const rows = (await target.query<{ row_key: string }>(
+    "SELECT row_key FROM cloud_import_ledger WHERE organization_id = $1 AND table_name = $2 AND row_key LIKE $3",
+    [organizationId, LOGIN_MARKER, `${controlId}:%`],
+  )).rows;
+  if (rows.length !== 1) return null;
+  const version = Number(rows[0]!.row_key.slice(controlId.length + 1));
+  return Number.isInteger(version) ? version : null;
+}
+
+async function recordLoginMarker(target: Database, organizationId: string, controlId: string): Promise<void> {
+  const current = (await target.query<{ blob_version: number }>(
+    "SELECT blob_version FROM coding_agent_credentials WHERE id = $1", [controlId])).rows[0];
+  if (!current) return;
+  await target.transaction(async (tx) => {
+    await tx.query(
+      "DELETE FROM cloud_import_ledger WHERE organization_id = $1 AND table_name = $2 AND row_key LIKE $3",
+      [organizationId, LOGIN_MARKER, `${controlId}:%`],
+    );
+    await tx.query(
+      `INSERT INTO cloud_import_ledger (organization_id, table_name, row_key, mapping_revision)
+       VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+      [organizationId, LOGIN_MARKER, `${controlId}:${current.blob_version}`, MAPPING_REVISION],
+    );
+  });
+}
+
 /** Reads one Cloud credential object; null when it does not exist. */
 export interface CloudObjectReader {
   get(key: string): Promise<string | null>;
@@ -67,6 +102,8 @@ export type CredentialOutcome =
   | "copied"
   | "updated"
   | "already_present"
+  | "control_newer"
+  | "blob_read_failed"
   | "object_missing"
   | "decrypt_failed"
   | "payload_invalid"
@@ -364,23 +401,45 @@ export async function copyCodingAgentCredentials(
         // reset), so it runs only when Control does not already hold this
         // exact login: a re-run writes nothing and bumps no version.
         const provider = canonicalProvider(row.model_provider) as SubscriptionProvider;
-        const accountId = describeAuthFile(provider, plaintext, row.account_email).accountId;
+        const cloudFile = describeAuthFile(provider, plaintext, row.account_email);
+        const accountId = cloudFile.accountId;
         const existing = (await deps.target.query<{ id: string; blob_location: string | null; blob_version: number | null }>(
           `SELECT id::text AS id, blob_location, blob_version FROM coding_agent_credentials
             WHERE workspace_id = $1 AND model_provider = $2 AND auth_type = 'provider_oauth' AND provider_account_id = $3`,
           [row.workspace_id, provider, accountId],
         )).rows[0];
-        if (existing?.blob_location && existing.blob_version !== null) {
-          const stored = await deps.blobs.read(existing.blob_location, existing.id, existing.blob_version).catch(() => null);
+        if (existing) {
+          // Never overwrite on doubt: an unreadable Control blob is an error
+          // for this row, not a reason to replace it.
+          let stored: string;
+          try {
+            if (!existing.blob_location || existing.blob_version === null) throw new Error("no blob");
+            stored = await deps.blobs.read(existing.blob_location, existing.id, existing.blob_version);
+          } catch {
+            record(row.id, "blob_read_failed");
+            continue;
+          }
+          report.controlIds[row.id] = existing.id;
           if (stored === plaintext) {
             copied.push({ row, controlId: existing.id });
-            report.controlIds[row.id] = existing.id;
             record(row.id, "already_present");
+            continue;
+          }
+          // Different content. Overwrite only if Cloud changed AND Control did
+          // not: the import's marker must name the row's current blob_version
+          // (every Control refresh or rotation bumps it; the selection pass
+          // never does). A moved version, or no marker at all (a row Control
+          // created), means Control owns newer state: never clobber it.
+          const marker = await loginMarker(deps.target, row.organization_id!, existing.id);
+          if (marker === null || marker !== existing.blob_version) {
+            copied.push({ row, controlId: existing.id });
+            record(row.id, "control_newer");
             continue;
           }
         }
         const id = await deps.logins.storeLogin(login);
         report.writes.blobWrites += 1;
+        await recordLoginMarker(deps.target, row.organization_id!, id);
         if (existing) report.writes.updated += 1;
         else report.writes.inserted += 1;
         report.writes.metadataWrites += await preserveCloudState(deps.target, id, row);
@@ -426,7 +485,8 @@ export async function copyCodingAgentCredentials(
   // A selection conflict needs a human choice per (workspace, provider)
   // before cutover sign-off, so it is never a clean run.
   report.ok = Object.keys(report.outcomes).every((outcome) =>
-    outcome === "copied" || outcome === "updated" || outcome === "already_present" || outcome.startsWith("skipped:"))
+    outcome === "copied" || outcome === "updated" || outcome === "already_present" || outcome === "control_newer"
+    || outcome.startsWith("skipped:"))
     && (report.selection?.selectionConflicts ?? 0) === 0;
   deps.log?.("cloud_import.credentials", { mode, ok: report.ok, candidates: report.candidates, outcomes: report.outcomes });
   return report;

@@ -258,6 +258,42 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   const activeAfter = (await target.query<{ secret_ciphertext: string }>(
     "SELECT secret_ciphertext FROM coding_agent_credentials WHERE workspace_id = $1 AND model_provider = 'anthropic' AND is_active", [id(0x201)])).rows;
   assert.deepEqual(activeAfter.map((row) => decryptSecret(row.secret_ciphertext, KEYRING)), ["sk-ant-api03-synthetic-selected-0000"]);
+  // Re-import must never clobber Control-owned state. Control rotates
+  // 0x806's login (a refresh), and Cloud's copy also changed: Control wins.
+  const loginId = report.controlIds[id(0x806)]!;
+  const version = async (controlId: string) => (await target.query<{ v: number }>(
+    "SELECT blob_version AS v FROM coding_agent_credentials WHERE id = $1", [controlId])).rows[0]!.v;
+  const rotated = JSON.stringify({ ...JSON.parse(codexAuth), tokens: { ...JSON.parse(codexAuth).tokens, refresh_token: "rt-rotated-by-control" } });
+  await deps.logins.storeLogin({ provider: "openai", workspaceId: id(0x201), organizationId: ORG_A, actor: { kind: "user", userId: id(1) }, authFile: rotated });
+  const rotatedVersion = await version(loginId);
+  const cloudChanged = JSON.stringify({ ...JSON.parse(codexAuth), tokens: { ...JSON.parse(codexAuth).tokens, refresh_token: "rt-cloud-changed" } });
+  objects.set(`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(cloudChanged, CLOUD_KEY)));
+  const afterRotation = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.equal(afterRotation.rows[id(0x806)], "control_newer");
+  assert.equal(await version(loginId), rotatedVersion, "no write over Control's rotated login");
+  assert.equal(await deps.logins.freshAuthFile(id(0x201), loginId), rotated, "Control's rotated token survives");
+  assert.equal(afterRotation.writes.blobWrites, 0);
+
+  // Cloud changed and Control did not: the import updates it and moves its marker.
+  const legacyId = report.controlIds[id(0x810)]!;
+  const legacyBefore = await version(legacyId);
+  const legacyChanged = JSON.stringify({ ...JSON.parse(legacyCodexAuth), tokens: { ...JSON.parse(legacyCodexAuth).tokens, refresh_token: "rt-legacy-cloud-v2" } });
+  objects.set(`${id(1)}/openai/credentials.json.enc`, JSON.stringify(cloudEnvelope(legacyChanged, CLOUD_KEY)));
+  const cloudNewer = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.equal(cloudNewer.rows[id(0x810)], "updated");
+  assert.equal(await version(legacyId), legacyBefore + 1);
+  assert.equal(await deps.logins.freshAuthFile(id(0x201), legacyId), legacyChanged);
+  assert.equal(cloudNewer.writes.updated, 1);
+  assert.equal(cloudNewer.writes.blobWrites, 1);
+  // ...and the next run sees it unchanged.
+  assert.equal((await copyCodingAgentCredentials(deps, { orgIds: null }, "apply")).rows[id(0x810)], "already_present");
+
+  // An unreadable Control blob is a row error, never an overwrite.
+  await target.query("UPDATE coding_agent_credentials SET blob_location = 'missing/blob' WHERE id = $1", [loginId]);
+  const unreadable = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.equal(unreadable.rows[id(0x806)], "blob_read_failed");
+  assert.equal(await version(loginId), rotatedVersion);
+  assert.equal(unreadable.ok, false);
 });
 
 test("credential copier CLI: apply refuses up front when copy settings are missing", async () => {
