@@ -247,8 +247,8 @@ test("native config: requires the handoff and introspection and refuses a second
   assert.throws(noisy({ ...nativeEnv, RELAYHISTORY_URL: "http://other:8080" }), {
     message: "RELAYHISTORY_URL must equal SESSION_READ_API_URL (or be unset)",
   });
-  assert.throws(noisy({ ...nativeEnv, SELFHOST_INTROSPECT_AUDIENCES: "https://other.selfhosted.company" }), {
-    message: "SELFHOST_INTROSPECT_AUDIENCES must include SESSION_READ_API_PUBLIC_URL",
+  assert.throws(noisy({ ...nativeEnv, SELFHOST_RELAYHISTORY_AUDIENCES: "https://other.selfhosted.company" }), {
+    message: "SELFHOST_RELAYHISTORY_AUDIENCES must include SESSION_READ_API_PUBLIC_URL",
   });
 });
 
@@ -258,7 +258,8 @@ test("native config: resolves the History origin to the read API with the backen
     assert.equal(config.relayhistoryUrl, "http://read-api.svc.cluster.local");
     assert.equal(config.relayhistoryPublicUrl, ORIGIN);
     assert.deepEqual(config.sessionReadApi, { url: "http://read-api.svc.cluster.local", publicUrl: ORIGIN, secret: READ_SECRET, mintReaderKind: false });
-    assert.deepEqual(config.introspectAudiences, [ORIGIN]);
+    assert.deepEqual(config.introspectAudiences, []);
+    assert.deepEqual(config.relayhistoryAudiences, [ORIGIN]);
   }
 });
 
