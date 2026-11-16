@@ -47,4 +47,40 @@ test("Cloud identity preservation columns match the import contract", async (t) 
      ORDER BY indexname
   `);
   assert.deepEqual(indexes.rows.map((row) => row.indexname), ["organizations_slug_unique", "workspaces_org_slug_unique"]);
+
+  const organizationId = "00000000-0000-4000-8000-000000000056";
+  const workspaceId = "00000000-0000-4000-8000-000000000057";
+  await database.query("INSERT INTO organizations (id, name) VALUES ($1, 'Imported org')", [organizationId]);
+  await database.query(
+    `INSERT INTO workspaces
+       (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
+     VALUES ($1, $2, 'Imported workspace', 'relay-ws-0056', 'ciphertext')`,
+    [workspaceId, organizationId],
+  );
+  for (const origin of [
+    "https://history.customer.example",
+    "http://localhost:3000",
+    "https://[2001:db8::1]:8443",
+  ]) {
+    await database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [workspaceId, origin]);
+    const stored = await database.query<{ relayhistory_origin: string }>(
+      "SELECT relayhistory_origin FROM workspaces WHERE id = $1",
+      [workspaceId],
+    );
+    assert.equal(stored.rows[0]!.relayhistory_origin, origin);
+  }
+  for (const invalid of [
+    "history.customer.example",
+    "ftp://history.customer.example",
+    "https://history.customer.example/",
+    "https://history.customer.example/path",
+    "https://history.customer.example?tenant=1",
+    "https://user@history.customer.example",
+  ]) {
+    await assert.rejects(
+      database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [workspaceId, invalid]),
+      /workspaces_relayhistory_origin_format/,
+      invalid,
+    );
+  }
 });

@@ -11,6 +11,11 @@ ALTER TABLE workspaces
   ADD COLUMN slug text,
   ADD COLUMN relayhistory_origin text,
   ADD COLUMN relaycast_api_key_generation integer NOT NULL DEFAULT 1,
+  ADD CONSTRAINT workspaces_relayhistory_origin_format
+    CHECK (
+      relayhistory_origin IS NULL
+      OR relayhistory_origin ~ '^https?://([[:alnum:].-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$'
+    ),
   ADD CONSTRAINT workspaces_relaycast_api_key_generation_positive
     CHECK (relaycast_api_key_generation >= 1);
 
