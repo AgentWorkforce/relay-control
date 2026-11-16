@@ -12,6 +12,7 @@
 //   the Cloud ids. A re-run converges; invite token hashes are insert-only.
 import { createDecipheriv, randomBytes } from "node:crypto";
 import { recordAudit } from "../../src/admin/audit.js";
+import { canonicalRelayhistoryOrigin } from "../../src/relayhistory-origin.js";
 import { encryptSecret, hashSecret, opaqueToken, type EncryptionKeyring } from "../../src/crypto.js";
 import type { Database, SqlExecutor } from "../../src/database.js";
 import {
@@ -49,15 +50,15 @@ export type ImportDeps = {
   batchSize?: number;
   /**
    * Canonical relayhistory_origin for a Cloud value, or null when it cannot
-   * be one. Control's canonicalRelayhistoryOrigin (#163) once merged.
+   * be one. Defaults to Control's canonicalRelayhistoryOrigin (#163), the
+   * same contract 0062's CHECK enforces.
    */
   canonicalOrigin?: (raw: string) => string | null;
 };
 
 /**
- * Interim stand-in until #163 merges: accepts only what 0056's CHECK accepts
- * after lowercasing and stripping one trailing slash. Stricter than #163, so
- * it can drop (flag) a value #163 would keep, never the reverse.
+ * The pre-#163 stand-in, kept for callers that pinned it (the verifier's
+ * older default). The importer uses canonicalRelayhistoryOrigin.
  */
 export function interimCanonicalOrigin(raw: string): string | null {
   const value = raw.trim().toLowerCase().replace(/\/$/, "");
@@ -341,7 +342,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     report.warnings[name] = (report.warnings[name] ?? 0) + 1;
   };
 
-  const canonicalOrigin = deps.canonicalOrigin ?? interimCanonicalOrigin;
+  const canonicalOrigin = deps.canonicalOrigin ?? canonicalRelayhistoryOrigin;
   const origins = new Set<string>();
   // 1. Read and transform. Nothing is written before every row is prepared.
   const prepared = {} as Record<ImportTable, PreparedRow[]>;
