@@ -142,7 +142,9 @@ function listEntry(
     provider: connection.provider,
     providerConfigKey: provider?.configKey ?? connection.provider,
     status: connection.status,
-    upstreamConnected: connection.upstreamConnected ?? null,
+    upstreamConnected: connection.authorizationStatus === undefined
+      ? connection.status === "ready" // Existing internal runtime readiness contract.
+      : connection.upstreamConnected ?? null,
     authorizationStatus: connection.authorizationStatus ?? "unknown",
     authorizationReason: connection.authorizationReason ?? "not_checked",
     authorizationCheckedAt: connection.authorizationCheckedAt,

@@ -79,6 +79,8 @@ export type ConnectionRecord = Partial<AuthorizationHealth> & {
 
 export type RuntimeToken = {
   connectionId: string;
+  /** Exact encrypted credential snapshot returned atomically with this token. */
+  credentialVersion: string;
   provider: string;
   authMode: "oauth2" | "api_key" | "github_app";
   installationId: string | null;
@@ -851,7 +853,7 @@ export class ConnectionStore {
           try {
             const token = await this.runtimeToken({workspaceId, provider:record.provider, actor});
             if (token.connectionId !== record.connectionId) throw new Error("connection_changed");
-            const checked = await this.get(workspaceId, record.provider);
+            checkedVersion = token.credentialVersion;
             const verified = await verifyProviderAuthorization({
               provider:record.provider,
               authMode:record.authMode === "github_app" ? "APP" : record.authMode,
@@ -859,18 +861,29 @@ export class ConnectionStore {
                 fetch:(url,init)=>this.fetchImpl(String(url),init ?? {})}),
             });
             const current = await this.get(workspaceId, record.provider);
-            if (!checked || !current || current.connectionId !== record.connectionId || current.version !== checked.version) throw new Error("connection_changed");
+            if (!current || current.connectionId !== record.connectionId || current.version !== token.credentialVersion) throw new Error("connection_changed");
             checkedVersion = current.version;
+            // Presence at the native credential authority is separate from authorization.
             return {...verified,upstreamConnected:true};
           } catch (error) {
-            const inactive = error instanceof ConnectionError && ["token_expired","invalid_grant"].includes(error.code);
+            const failed = await this.get(workspaceId, record.provider).catch(() => null);
+            const sameBinding = failed?.connectionId === record.connectionId;
+            const expired = failed?.authMode === "oauth2" && !failed.refreshable &&
+              failed.accessTokenExpiresAt !== null && Date.parse(failed.accessTokenExpiresAt) <= Date.now();
+            const inactive = error instanceof ConnectionError && sameBinding && (
+              (error.code === "token_expired" && expired) ||
+              (error.code === "refresh_failed" && failed?.lastError === "refresh_failed: invalid_grant")
+            );
+            // runtimeToken commits its own error marker. That marker changes the
+            // edit version, but it must not erase a definitive authorization failure.
+            if (inactive && failed) checkedVersion = failed.version;
             return {authorizationStatus:inactive ? "inactive" as const : "unknown" as const,
               authorizationReason:inactive ? "credentials_rejected" : "credentials_unavailable",
-              authorizationCheckedAt:new Date().toISOString(),upstreamConnected:null};
+              authorizationCheckedAt:new Date().toISOString(),upstreamConnected:inactive ? true : null};
           }
         },
       );
-      const current = await this.get(workspaceId, record.provider);
+      const current = await this.get(workspaceId, record.provider).catch(() => null);
       if (!current || current.connectionId !== record.connectionId || current.version !== checkedVersion) {
         return {...(current ?? record),authorizationStatus:"unknown" as const,
           authorizationReason:"connection_changed",authorizationCheckedAt:new Date().toISOString(),upstreamConnected:null};
@@ -1180,6 +1193,7 @@ export class ConnectionStore {
     delete metadata.config;
     return {
       connectionId: row.id,
+      credentialVersion: connectionVersion(row),
       provider: row.provider,
       authMode: row.auth_mode,
       installationId: row.installation_id,
