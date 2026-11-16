@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { PostgresDatabase } from "../src/database.js";
 import { migrate } from "../src/migrations.js";
-import { ControlPlaneStore, OrganizationConflictError } from "../src/store.js";
+import { ControlPlaneStore, OrganizationConflictError, RelaycastBindingUnavailableError } from "../src/store.js";
 import { loadIdentityConfig } from "../src/identity/config.js";
 import { IdentityError, IdentityStore } from "../src/identity/store.js";
 import { loadTenancyConfig } from "../src/tenancy.js";
@@ -154,23 +154,34 @@ test("lazy Relaycast binding: a two-connection first-use race provisions once", 
   );
 
   let creates = 0;
+  let enteredCreate!: () => void;
+  let releaseCreate!: () => void;
+  const entered = new Promise<void>((resolve) => { enteredCreate = resolve; });
+  const release = new Promise<void>((resolve) => { releaseCreate = resolve; });
   const provisioner: RelaycastProvisioner = {
     async create() {
       creates += 1;
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      enteredCreate();
+      await release;
       return { id: "rw_postgres_race", apiKey: "rk_postgres_race" };
     },
     async remove() {},
   };
   const a = new ControlPlaneStore(first, KEYRING, 0, { relaycastProvisioner: provisioner });
   const b = new ControlPlaneStore(second, KEYRING, 0, { relaycastProvisioner: provisioner });
-  const [left, right] = await Promise.all([
-    a.relaycastBinding(workspaceId),
-    b.relaycastBinding(workspaceId),
-  ]);
+  const creator = a.relaycastBinding(workspaceId);
+  await entered;
+  const keyShareStarted = Date.now();
+  await second.query("SELECT id FROM workspaces WHERE id = $1 FOR KEY SHARE", [workspaceId]);
+  assert(Date.now() - keyShareStarted < 500, "remote create must not hold a conflicting workspace row lock");
+  await assert.rejects(b.relaycastBinding(workspaceId), RelaycastBindingUnavailableError);
+  releaseCreate();
+  const created = await creator;
 
   assert.equal(creates, 1);
-  assert.equal(left!.relaycastWorkspaceId, "rw_postgres_race");
-  assert.equal(right!.relaycastWorkspaceId, "rw_postgres_race");
-  assert.equal(Number(left!.provisioned) + Number(right!.provisioned), 1);
+  assert.equal(created!.relaycastWorkspaceId, "rw_postgres_race");
+  assert.equal(created!.provisioned, true);
+  const retry = await b.relaycastBinding(workspaceId);
+  assert.equal(retry!.relaycastWorkspaceId, "rw_postgres_race");
+  assert.equal(retry!.provisioned, false);
 });

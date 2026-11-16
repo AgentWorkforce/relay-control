@@ -581,10 +581,10 @@ export function createApp(input: {
     },
     workspaceAccess:async principal=>{
       if(!(await store.readiness()).ready) return false;
-      const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
+      const workspace=await store.workspaceMembershipForUser(principal.workspaceId,principal.userId);
       return workspace?.organizationId===principal.organizationId;
     },
-    workspaceLabel:async principal=>(await store.workspaceForUser(principal.workspaceId,principal.userId))?.name??principal.workspaceId,
+    workspaceLabel:async principal=>(await store.workspaceMembershipForUser(principal.workspaceId,principal.userId))?.name??principal.workspaceId,
     checkAgentNameAvailability:async(principal,name)=>{
       const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
       if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
@@ -2910,6 +2910,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         return;
       }
       if (error instanceof RelaycastBindingUnavailableError) {
+        response.setHeader("retry-after", String(error.retryAfterSeconds));
         json(response, error.status, { error: error.code, message: error.message }, true);
         return;
       }

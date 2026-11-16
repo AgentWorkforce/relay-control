@@ -8903,7 +8903,11 @@ components:
                 into Relaycast there. Its presence means `relaycastApiKey` is
                 withheld.
         provisioned:
-          const: false
+          type: boolean
+          description: >-
+            True only when this resolve request won the durable provisioning
+            claim and installed the Relaycast binding. False for an existing
+            binding, including one installed by a concurrent request.
     DashboardAccount:
       type: object
       required: [authenticated, user, currentWorkspace]

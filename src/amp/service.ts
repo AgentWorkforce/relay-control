@@ -127,7 +127,7 @@ export type WorkspaceRelay = { relaycastWorkspaceId: string; key: string };
 
 /** Current owner/admin of this workspace's organization, read under the caller's lock. */
 export async function requireAdmin(deps: AmpDeps, tx: SqlExecutor, actor: AmpActor): Promise<WorkspaceRelay> {
-  const result = await tx.query<{ role: string; relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
+  const result = await tx.query<{ role: string; relaycast_workspace_id: string | null; relaycast_api_key_ciphertext: string | null }>(
     `SELECT m.role, w.relaycast_workspace_id, w.relaycast_api_key_ciphertext
        FROM workspaces w
        JOIN organization_memberships m
@@ -140,16 +140,21 @@ export async function requireAdmin(deps: AmpDeps, tx: SqlExecutor, actor: AmpAct
   if (!row || (row.role !== "owner" && row.role !== "admin")) {
     throw new AmpError(403, "forbidden", "Only current owners and admins can manage Amp.");
   }
+  if (row.relaycast_workspace_id === null || row.relaycast_api_key_ciphertext === null) {
+    throw new AmpError(503, "relaycast_not_ready", "Agent Relay is provisioning this workspace.");
+  }
   return { relaycastWorkspaceId: row.relaycast_workspace_id, key: decrypt(deps, row.relaycast_api_key_ciphertext) };
 }
 
 export async function workspaceRelay(deps: AmpDeps, executor: SqlExecutor, workspaceId: string): Promise<WorkspaceRelay | null> {
-  const result = await executor.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
+  const result = await executor.query<{ relaycast_workspace_id: string | null; relaycast_api_key_ciphertext: string | null }>(
     "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM workspaces WHERE id = $1",
     [workspaceId],
   );
   const row = result.rows[0];
-  return row ? { relaycastWorkspaceId: row.relaycast_workspace_id, key: decrypt(deps, row.relaycast_api_key_ciphertext) } : null;
+  return row?.relaycast_workspace_id && row.relaycast_api_key_ciphertext
+    ? { relaycastWorkspaceId: row.relaycast_workspace_id, key: decrypt(deps, row.relaycast_api_key_ciphertext) }
+    : null;
 }
 
 type ConnectionRow = { user_id: string; key_ciphertext: string; key_hint: string; validated_at: Date | string };

@@ -340,7 +340,8 @@ export async function revokeRemovedMember(deps: MessagingDeps, organizationId: s
             identity.agent_remote_id, workspace.relaycast_api_key_ciphertext
        FROM person_identities identity
        JOIN workspaces workspace ON workspace.id = identity.workspace_id
-      WHERE workspace.organization_id = $1 AND identity.user_id = $2`,
+      WHERE workspace.organization_id = $1 AND identity.user_id = $2
+        AND workspace.relaycast_api_key_ciphertext IS NOT NULL`,
     [organizationId, userId],
   );
   for (const row of rows.rows) {
@@ -371,7 +372,8 @@ export async function sweepRevocations(deps: MessagingDeps, organizationId?: str
             revocation.user_id, workspace.relaycast_api_key_ciphertext
        FROM person_revocations revocation
        JOIN workspaces workspace ON workspace.id = revocation.workspace_id
-      WHERE ($1::uuid IS NULL OR workspace.organization_id = $1)
+      WHERE workspace.relaycast_api_key_ciphertext IS NOT NULL
+        AND ($1::uuid IS NULL OR workspace.organization_id = $1)
         AND ($2::uuid IS NULL OR revocation.user_id = $2)`,
     [organizationId ?? null, userId ?? null],
   );
