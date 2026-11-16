@@ -149,23 +149,43 @@ export const rejectedByProvider = (error: unknown, statuses = REJECTED) => error
  * unreadable answer proves nothing and changes nothing; "granted" (a 2xx
  * environments list) clears it, as does a successful re-connect. While it is
  * set, admission refuses every token of the workspace. The stored text is
- * Control-authored, never a provider body.
+ * Control-authored, never a provider body. Both directions are keyed to the
+ * ciphertext the call was made with: a reconnect stores a new ciphertext, so
+ * a late answer about the replaced key neither latches nor clears the new one.
  */
 export const accessRevoked = (error: unknown): error is ReplicasRuntimeError => error instanceof ReplicasRuntimeError
   && (error.status === 401 || error.status === 403) && error.code === `replicas_http_${error.status}`;
-export async function recordProviderAccess(executor: SqlExecutor, workspaceId: string, outcome: "granted" | unknown): Promise<void> {
+export async function recordProviderAccess(executor: SqlExecutor, workspaceId: string, outcome: "granted" | unknown, ciphertext: string): Promise<void> {
   if (outcome === "granted") {
     await executor.query(
       `UPDATE remote_agent_connections SET access_revoked_at = NULL, access_error = NULL
-        WHERE workspace_id = $1 AND provider = 'replicas' AND access_revoked_at IS NOT NULL`, [workspaceId]);
+        WHERE workspace_id = $1 AND provider = 'replicas' AND access_revoked_at IS NOT NULL AND key_ciphertext = $2`, [workspaceId, ciphertext]);
   } else if (accessRevoked(outcome)) {
     await executor.query(
       `UPDATE remote_agent_connections SET access_revoked_at = COALESCE(access_revoked_at, now()),
               access_error = COALESCE(access_error, $2)
-        WHERE workspace_id = $1 AND provider = 'replicas'`,
-      [workspaceId, `Replicas refused the stored key (HTTP ${outcome.status}). Reconnect Replicas with a working key.`]);
+        WHERE workspace_id = $1 AND provider = 'replicas' AND key_ciphertext = $3`,
+      [workspaceId, `Replicas refused the stored key (HTTP ${outcome.status}). Reconnect Replicas with a working key.`, ciphertext]);
   }
 }
+
+/** The stored key ciphertext a provider refusal was made with; set by `underKey`. */
+const REFUSED_KEY = Symbol("replicas.refused_key");
+/**
+ * Runs provider calls made with one stored key. A 401/403 they raise carries
+ * that key's ciphertext, so the latch withReplicasLock records after a
+ * rollback compares it with the stored key. The innermost key wins.
+ */
+export async function underKey<T>(ciphertext: string, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (accessRevoked(error) && !(REFUSED_KEY in error)) Object.defineProperty(error, REFUSED_KEY, { value: ciphertext });
+    throw error;
+  }
+}
+const refusedKey = (error: unknown): string | undefined => accessRevoked(error)
+  ? (error as ReplicasRuntimeError & { [REFUSED_KEY]?: string })[REFUSED_KEY] : undefined;
 
 /** Stored and returned failure text: only Control-authored messages, never a provider or Relay body. */
 const safeFailure = (error: unknown) => error instanceof ReplicasError ? error.message
@@ -196,8 +216,11 @@ export function withReplicasLock<T>(
   }).catch(async (error: unknown) => {
     // A provider 401/403 that rolled the transaction back still latches the
     // connection, after the rollback (catch sites that commit record it in
-    // their own transaction). Best effort: the original error is what the caller sees.
-    if (accessRevoked(error)) await recordProviderAccess(deps.database, scope.workspaceId, error).catch(() => undefined);
+    // their own transaction), but only when it carries the ciphertext it was
+    // made with (underKey) and that key is still the stored one. Unmarked
+    // refusals are skipped. Best effort: the original error is what the caller sees.
+    const ciphertext = refusedKey(error);
+    if (ciphertext) await recordProviderAccess(deps.database, scope.workspaceId, error, ciphertext).catch(() => undefined);
     throw error;
   });
 }
@@ -269,8 +292,12 @@ export async function cleanupRelay(deps: ReplicasDeps, tx: SqlExecutor, row: Spa
   return { relaycastWorkspaceId: relay.relaycast_workspace_id, key: decrypt(deps, relay.relaycast_api_key_ciphertext) };
 }
 
-/** The sealed Replicas key from remote-agent-connections; it is never copied into a replica. */
-export async function keyFor(deps: ReplicasDeps, executor: SqlExecutor, workspaceId: string): Promise<string> {
+/**
+ * The sealed Replicas key from remote-agent-connections and the ciphertext it
+ * was read from; it is never copied into a replica. Sites that record
+ * provider access pass the ciphertext so the latch compares keys.
+ */
+export async function connectionKey(deps: ReplicasDeps, executor: SqlExecutor, workspaceId: string): Promise<{ key: string; ciphertext: string }> {
   const result = await executor.query<{ key_ciphertext: string }>(
     "SELECT key_ciphertext FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'",
     [workspaceId],
@@ -279,8 +306,10 @@ export async function keyFor(deps: ReplicasDeps, executor: SqlExecutor, workspac
   if (!row) {
     throw new ReplicasError("Replicas is not connected. An owner or admin connects it in Settings → Connections → Replicas.", 409);
   }
-  return decrypt(deps, row.key_ciphertext);
+  return { key: decrypt(deps, row.key_ciphertext), ciphertext: row.key_ciphertext };
 }
+export const keyFor = async (deps: ReplicasDeps, executor: SqlExecutor, workspaceId: string): Promise<string> =>
+  (await connectionKey(deps, executor, workspaceId)).key;
 
 export async function byId(executor: SqlExecutor, id: string, lock = false): Promise<SpawnRow | null> {
   if (!isUuid(id)) return null;
@@ -288,7 +317,7 @@ export async function byId(executor: SqlExecutor, id: string, lock = false): Pro
   return result.rows[0] ?? null;
 }
 
-const PATCHABLE = new Set(["input", "replica_id", "chat_id", "state", "relay_workspace_id", "agent_name", "agent_remote_id",
+const PATCHABLE = new Set(["input", "environment_id", "replica_id", "chat_id", "state", "relay_workspace_id", "agent_name", "agent_remote_id",
   "token_ciphertext", "helper_ciphertext", "helper_hash", "hook_ciphertext", "subscription_id", "mention_subscription_id",
   "task_message_id", "last_error"]);
 export async function patch(tx: SqlExecutor, id: string, values: Partial<SpawnRow>): Promise<SpawnRow> {
@@ -347,18 +376,18 @@ export function spawnView(row: SpawnRow) {
 }
 
 export async function listEnvironments(deps: ReplicasDeps, actor: ReplicasActor) {
-  const key = await withReplicasLock(deps, actor, async (tx) => {
+  const { key, ciphertext } = await withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
-    return keyFor(deps, tx, actor.workspaceId);
+    return connectionKey(deps, tx, actor.workspaceId);
   });
   let result: Awaited<ReturnType<ReplicasDeps["replicas"]["environments"]>>;
   try {
     result = await deps.replicas.environments(key);
   } catch (error) {
-    await recordProviderAccess(deps.database, actor.workspaceId, error).catch(() => undefined);
+    await recordProviderAccess(deps.database, actor.workspaceId, error, ciphertext).catch(() => undefined);
     throw error;
   }
-  await recordProviderAccess(deps.database, actor.workspaceId, "granted").catch(() => undefined);
+  await recordProviderAccess(deps.database, actor.workspaceId, "granted", ciphertext).catch(() => undefined);
   return { environments: result.environments.map(({ id, name }) => ({ id, name })) };
 }
 
@@ -386,10 +415,10 @@ export async function spawnReplica(deps: ReplicasDeps, actor: ReplicasActor, raw
       if (!same) throw new ReplicasError("This request id already belongs to different launch options.", 409);
       if (existing.state !== "rejected") return { advance: existing };
     }
-    const key = await keyFor(deps, tx, actor.workspaceId);
+    const { key, ciphertext } = await connectionKey(deps, tx, actor.workspaceId);
     await relayFor(deps, tx, actor);
-    const environments = await deps.replicas.environments(key);
-    await recordProviderAccess(tx, actor.workspaceId, "granted");
+    const environments = await underKey(ciphertext, () => deps.replicas.environments(key));
+    await recordProviderAccess(tx, actor.workspaceId, "granted", ciphertext);
     if (!environments.environments.some((env) => env.id === input.environment_id)) {
       throw new ReplicasError("This key cannot use that environment.", 403);
     }
@@ -408,7 +437,7 @@ export async function spawnReplica(deps: ReplicasDeps, actor: ReplicasActor, raw
     await requireAdmin(tx, actor);
     let row = await owned(tx, actor, prepared.create.id);
     if (row.state !== "creating" || row.replica_id) return spawnView(row);
-    const key = await keyFor(deps, tx, actor.workspaceId);
+    const { key, ciphertext } = await connectionKey(deps, tx, actor.workspaceId);
     try {
       const created = await deps.replicas.create(key, {
         name: input.name, environment_id: input.environment_id, coding_agent: input.coding_agent,
@@ -420,7 +449,7 @@ export async function spawnReplica(deps: ReplicasDeps, actor: ReplicasActor, raw
       return spawnView(row);
     } catch (error) {
       // A definite rejection can retry this same durable operation. An ambiguous create cannot.
-      await recordProviderAccess(tx, row.workspace_id, error);
+      await recordProviderAccess(tx, row.workspace_id, error, ciphertext);
       row = await patch(tx, row.id, { state: rejectedByProvider(error) ? "rejected" : "creating", last_error: safeFailure(error) });
       return spawnView(row);
     }
@@ -486,8 +515,12 @@ async function advanceStep(deps: ReplicasDeps, tx: SqlExecutor, id: string, acto
   if (!row) throw new ReplicasError("Replica launch no longer exists.", 404);
   if (row.source === ENVIRONMENT_IDENTITY || ["creating", "dispatching", "gone", "rejected"].includes(row.state) || !row.replica_id
     || (row.state === "bound" && row.input.relay_mcp_version === 1)) return { row, next: "done" };
+  // Empty until the key is read: a refusal is only recorded against the key it was made with.
+  let ciphertext = "";
   try {
-    const key = await keyFor(deps, tx, row.workspace_id);
+    const stored = await connectionKey(deps, tx, row.workspace_id);
+    const key = stored.key;
+    ciphertext = stored.ciphertext;
     const { replica } = await deps.replicas.get(key, row.replica_id);
     if (replica.status === "sleeping") {
       await deps.replicas.wake(key, row.replica_id);
@@ -588,7 +621,7 @@ async function advanceStep(deps: ReplicasDeps, tx: SqlExecutor, id: string, acto
     row = await patch(tx, row.id, { state: "dispatching", last_error: null });
     return { row, next: "dispatch" };
   } catch (error) {
-    await recordProviderAccess(tx, row.workspace_id, error);
+    await recordProviderAccess(tx, row.workspace_id, error, ciphertext);
     row = await patch(tx, row.id, { last_error: safeFailure(error) });
     return { row, next: "done" };
   }
@@ -600,8 +633,11 @@ async function dispatchStep(deps: ReplicasDeps, tx: SqlExecutor, id: string, act
   let row = await byId(tx, id, true);
   if (!row) throw new ReplicasError("Replica launch no longer exists.", 404);
   if (row.state !== "dispatching") return row;
+  let ciphertext = "";
   try {
-    const key = await keyFor(deps, tx, row.workspace_id);
+    const stored = await connectionKey(deps, tx, row.workspace_id);
+    const key = stored.key;
+    ciphertext = stored.ciphertext;
     const message = await deps.replicas.message(key, row.replica_id!, row.chat_id!, `You are on Agent Relay as ${row.agent_name}. `
       + "Agent Relay MCP is installed with list_relay_agents, check_relay_inbox and send_relay_message. Use those tools for Relay messages. "
       + "The terminal fallback is python3 ~/.local/share/agent-relay-replicas/message.py send --to '<agent>' --text '<reply>'. "
@@ -612,7 +648,7 @@ async function dispatchStep(deps: ReplicasDeps, tx: SqlExecutor, id: string, act
     await audit(tx, row, actor, "replicas.spawn.bound");
     return row;
   } catch (error) {
-    await recordProviderAccess(tx, row.workspace_id, error);
+    await recordProviderAccess(tx, row.workspace_id, error, ciphertext);
     return patch(tx, row.id, { ...(rejectedByProvider(error) ? { state: "binding" as const } : {}), last_error: safeFailure(error) });
   }
 }
@@ -665,7 +701,8 @@ export async function retireRemote(deps: ReplicasDeps, tx: SqlExecutor, start: S
   // An environment-identity replica's compute belongs to its creator; only its Relay identity is retired.
   if (row.replica_id && row.source !== ENVIRONMENT_IDENTITY) {
     try {
-      await deps.replicas.sleep(await keyFor(deps, tx, row.workspace_id), row.replica_id);
+      const { key, ciphertext } = await connectionKey(deps, tx, row.workspace_id);
+      await underKey(ciphertext, () => deps.replicas.sleep(key, row.replica_id!));
     } catch (error) {
       if (!(error instanceof ReplicasRuntimeError) || ![404, 410].includes(error.status)) throw error;
     }
@@ -832,32 +869,34 @@ const launchMarker = (marker: string, events: Array<{ type: string; payload?: Re
 async function prepareCleanup(deps: ReplicasDeps, tx: SqlExecutor, rows: SpawnRow[]): Promise<SpawnRow[]> {
   const unknown = rows.filter((row) => row.state === "creating" && !row.replica_id);
   if (!unknown.length) return rows;
-  const key = await keyFor(deps, tx, unknown[0]!.workspace_id);
+  const { key, ciphertext } = await connectionKey(deps, tx, unknown[0]!.workspace_id);
   const matches = new Map<string, { replica_id: string; chat_id: string }>();
   const seen = new Set<string>();
-  for (let page = 1; ; page++) {
-    if (page > 20) throw new ReplicasError("Replica discovery exceeded its limit. Recover the unknown create before disconnecting.", 409);
-    const result = await deps.replicas.list(key, page);
-    for (const candidate of result.replicas) {
-      if (seen.has(candidate.id)) continue;
-      seen.add(candidate.id);
-      const candidates = unknown.filter((row) => row.input.name === candidate.name);
-      if (!candidates.length) continue;
-      const { replica } = await deps.replicas.get(key, candidate.id);
-      for (const row of candidates) {
-        const chats = replica.chats?.filter((chat) => chat.provider === row.input.coding_agent) ?? [];
-        if (chats.length !== 1) continue;
-        const chatId = chats[0]!.id;
-        const history = await deps.replicas.history(key, replica.id, chatId);
-        if (!launchMarker(`Agent Relay launch operation ${row.id}.`, history.events, true)) continue;
-        if (matches.has(row.id)) {
-          throw new ReplicasError("Multiple replicas match the launch marker. Inspect the unknown create before disconnecting.", 409);
+  await underKey(ciphertext, async () => {
+    for (let page = 1; ; page++) {
+      if (page > 20) throw new ReplicasError("Replica discovery exceeded its limit. Recover the unknown create before disconnecting.", 409);
+      const result = await deps.replicas.list(key, page);
+      for (const candidate of result.replicas) {
+        if (seen.has(candidate.id)) continue;
+        seen.add(candidate.id);
+        const candidates = unknown.filter((row) => row.input.name === candidate.name);
+        if (!candidates.length) continue;
+        const { replica } = await deps.replicas.get(key, candidate.id);
+        for (const row of candidates) {
+          const chats = replica.chats?.filter((chat) => chat.provider === row.input.coding_agent) ?? [];
+          if (chats.length !== 1) continue;
+          const chatId = chats[0]!.id;
+          const history = await deps.replicas.history(key, replica.id, chatId);
+          if (!launchMarker(`Agent Relay launch operation ${row.id}.`, history.events, true)) continue;
+          if (matches.has(row.id)) {
+            throw new ReplicasError("Multiple replicas match the launch marker. Inspect the unknown create before disconnecting.", 409);
+          }
+          matches.set(row.id, { replica_id: replica.id, chat_id: chatId });
         }
-        matches.set(row.id, { replica_id: replica.id, chat_id: chatId });
       }
+      if (page >= result.total_pages) break;
     }
-    if (page >= result.total_pages) break;
-  }
+  });
   if (matches.size !== unknown.length) {
     throw new ReplicasError("Recover the unknown create before disconnecting. No unique launch marker was found. Retry after provider creation finishes.", 409);
   }
@@ -1000,11 +1039,11 @@ export async function recoverReplica(deps: ReplicasDeps, actor: ReplicasActor, i
     }
     if (!["creating", "dispatching"].includes(row.state)) return { row, advance: false };
     if (row.replica_id && row.replica_id !== replicaId) throw new ReplicasError("This launch belongs to another replica.", 409);
-    const key = await keyFor(deps, tx, actor.workspaceId);
-    const { replica } = await deps.replicas.get(key, replicaId);
+    const { key, ciphertext } = await connectionKey(deps, tx, actor.workspaceId);
+    const { replica } = await underKey(ciphertext, () => deps.replicas.get(key, replicaId));
     const chats = replica.chats?.filter((chat) => chat.provider === row.input.coding_agent) ?? [];
     if (chats.length !== 1) throw new ReplicasError("The original chat cannot be identified.", 409);
-    const history = await deps.replicas.history(key, replicaId, chats[0]!.id);
+    const history = await underKey(ciphertext, () => deps.replicas.history(key, replicaId, chats[0]!.id));
     const marker = row.state === "creating" ? `Agent Relay launch operation ${row.id}.` : `[Agent Relay task ${row.id}]`;
     const found = launchMarker(marker, history.events, false);
     if (!found) throw new ReplicasError("No matching launch/task marker was found. Nothing was replayed.", 409);
@@ -1058,8 +1097,8 @@ export async function bindReplica(deps: ReplicasDeps, actor: ReplicasActor, raw:
   if (!input.success) throw new ReplicasError("Use the existing replica and chat UUIDs.");
   const row = await withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
-    const key = await keyFor(deps, tx, actor.workspaceId);
-    const { replica } = await deps.replicas.get(key, input.data.replica_id);
+    const { key, ciphertext } = await connectionKey(deps, tx, actor.workspaceId);
+    const { replica } = await underKey(ciphertext, () => deps.replicas.get(key, input.data.replica_id));
     const chat = replica.chats?.find((item) => item.id === input.data.chat_id);
     if (!chat) throw new ReplicasError("The key cannot see that chat in that replica.", 404);
     // The API's provider values are canonical. Refuse unsupported harnesses
