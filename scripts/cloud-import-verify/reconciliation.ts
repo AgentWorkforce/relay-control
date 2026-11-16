@@ -30,7 +30,7 @@ async function readOwnership(target:Client,scope:ImportScope):Promise<OwnershipS
   const rows:OwnershipSnapshot["rows"] = [];
   await target.query(`DECLARE ownership_cursor NO SCROLL CURSOR FOR SELECT organization_id::text,
     table_name,row_key,mapping_revision FROM public.${IMPORT_LEDGER_TABLE}
-    WHERE table_name <> 'copier_login' AND ($1::uuid[] IS NULL OR organization_id=ANY($1::uuid[]))
+    WHERE table_name NOT IN ('copier_login','workspace_unbound') AND ($1::uuid[] IS NULL OR organization_id=ANY($1::uuid[]))
     ORDER BY organization_id,table_name,row_key`,[scope.orgIds]);
   try {for (;;) {
     const batch=await target.query("FETCH FORWARD 250 FROM ownership_cursor");

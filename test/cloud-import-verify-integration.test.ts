@@ -1,11 +1,14 @@
 import { credentialConvergenceCohort,captureCredentialConvergence,compareCredentialConvergence,computeCredentialCheckpoint,validateCredentialCheckpoint } from "../scripts/cloud-import-verify/convergence.js";
+import { credentialCloudSelection,type SourceSelection,type TargetSelection } from "../scripts/cloud-import-verify/credential-selection.js";
+import { unboundWorkspaceMarkers } from "../scripts/cloud-import-verify/unbound-markers.js";
+import { beginReadOnlySnapshot } from "../scripts/cloud-import-verify/read-only.js";
 import assert from "node:assert/strict";
 import { before,after,beforeEach,test,type TestFn } from "node:test";
 import { Client } from "pg";
 import type { Database,SqlExecutor } from "../src/database.js";
 import { migrate,grantRuntimeDatabaseRole } from "../src/migrations.js";
 import { canonicalRelayhistoryOrigin } from "../src/relayhistory-origin.js";
-import { runImport,type ImportReport } from "../scripts/cloud-import/importer.js";
+import { runImport,decryptCloudEnvelope,type ImportReport } from "../scripts/cloud-import/importer.js";
 import { CLOUD_FIXTURE_DDL,cloudFixtureSeed,cloudEnvelope,id,ORG_A,ORG_B } from "../scripts/cloud-import/cloud-fixture.js";
 import { fixtureKeyring } from "../scripts/cloud-import-verify/fixtures.js";
 import { verifyImport } from "../scripts/cloud-import-verify/import-contract.js";
@@ -21,7 +24,7 @@ import { SubscriptionLoginStore } from "../src/admin/subscription-logins.js";
 import { copyCodingAgentCredentials } from "../scripts/cloud-import/credentials.js";
 import { normalizedScope,cutoverScopeFinding,requireAllSourceScope } from "../scripts/cloud-import-verify/organization-scope.js";
 import { schemaCatalog,migrationFiles,sealManifest,manifestJson,type SchemaEntry } from "../scripts/cloud-import-verify/schema.js";
-import { captureCredentialTarget } from "../scripts/cloud-import-verify/credential-copy.js";
+import { captureCredentialTarget,credentialCopyFindings } from "../scripts/cloud-import-verify/credential-copy.js";
 import { captureOwnership } from "../scripts/cloud-import-verify/reconciliation.js";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -80,7 +83,7 @@ async function copiedFixture() {
   ]);
   const reader = {get:async (key:string) => objects.get(key) ?? null};
   const blobs = new CredentialBlobStore(new PostgresObjectBackend(targetDb),fixtureKeyring);
-  const deps = {source:sourceDb,target:targetDb,reader,cloudKeyHex,keyring:fixtureKeyring,
+  const deps = {source:sourceDb,target:targetDb,reader,cloudKeyHex,keyring:fixtureKeyring,blobs,
     codingAgents:new CodingAgentStore(targetDb,fixtureKeyring,undefined,blobs),
     logins:new SubscriptionLoginStore(targetDb,fixtureKeyring,blobs),blobs};
   const copy = await copyCodingAgentCredentials(deps,scope,"apply");
@@ -393,6 +396,40 @@ fixtureTest("wrong Cloud credential selection fails even with unchanged cardinal
   assert.ok(report.findings.filter((f) => f.kind === "credential_selection").every((f) => f.ok));
   assert.equal(report.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
   assert.equal(report.findings.find((f) => f.kind === "credential_cloud_selection")!.ok,false);
+});
+
+fixtureTest("written-only consumer preserves a real Control-deactivated login on an untouched rerun",async () => {
+  const fixture=await copiedFixture();
+  const login=fixture.copy.controlIds[id(0x806)]!;
+  await target.query("UPDATE coding_agent_credentials SET harness_active=false WHERE id=$1",[login]);
+  const flags=async () => new Map((await target.query("SELECT id,workspace_id,model_provider,is_active,harness_active FROM coding_agent_credentials")).rows
+    .map((row) => [row.id,{group:`${row.workspace_id}:${row.model_provider}`,active:row.is_active,harness:row.harness_active}] as [string,TargetSelection]));
+  const baseline=await flags();
+  const sourceRows=new Map((await source.query("SELECT * FROM provider_credentials")).rows.map((row) => [row.id,row]));
+  const entries:SourceSelection[]=Object.entries(fixture.copy.controlIds).map(([sourceId,controlId]) => {
+    const row=sourceRows.get(sourceId)!;
+    return {id:sourceId,key:controlId,group:baseline.get(controlId)!.group,active:row.is_active,
+      harness:row.harness_active && ["oauth_token","provider_oauth"].includes(row.auth_type),updated:new Date(row.updated_at).getTime()};
+  });
+  const check=async () => {
+    const current=await flags();
+    return credentialCloudSelection({revision:"cloud-identity-2026-11-16.25",entries,
+      outcomes:Object.fromEntries(entries.map((row) => [row.id,"already_present"])),flags:current,
+      nativeFlags:new Map(),baseline,allFlags:[...current.values()],unchangedKeys:new Set(),reported:undefined});
+  };
+  assert.equal((await check()).ok,true);
+  await target.query("UPDATE coding_agent_credentials SET harness_active=true WHERE id=$1",[login]);
+  assert.equal((await check()).ok,false,"re-activating an untouched login fails independently of the producer's empty selection summary");
+});
+
+fixtureTest("retained workspace binding warnings do not waive visible comparison drift",async () => {
+  const ledger=await apply();
+  ledger.warnings.workspaces_binding_conflict=1;
+  ledger.warnings.workspaces_generation_kept=1;
+  await target.query("UPDATE workspaces SET relaycast_workspace_id='synthetic-retained-provider-binding' WHERE id=$1",[id(0x201)]);
+  const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.ok,false);
+  assert.equal(report.findings.find((finding) => finding.kind === "table" && finding.name === "workspaces")!.ok,false);
 });
 
 fixtureTest("unselected copied credentials preserve native selections and report fallback conflicts",async () => {
@@ -1017,4 +1054,72 @@ fixtureTest("historical marker revisions cannot prove a current updated login",a
   await target.query("UPDATE cloud_import_ledger SET mapping_revision=$1 WHERE table_name='copier_login'",[MAPPING_REVISION]);
   const current=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
   assert.equal(current.credentialCopy,'verified',JSON.stringify(current.findings.filter((f) => !f.ok)));
+});
+
+fixtureTest("unbound namespace validates source set and live org/ownership links before hiding a later binding",async () => {
+  const ledger=await apply();
+  const key=id(0x201),expected=new Map([[key,ORG_A]]);
+  const inspect=async (set=expected,selectedScope:ImportScope=scope) => {
+    await beginReadOnlySnapshot(target);
+    try {return await unboundWorkspaceMarkers(target,selectedScope,set);} finally {await target.query("ROLLBACK");}
+  };
+  assert.equal((await inspect()).ok,false,"an expected marker cannot be omitted");
+  await target.query("INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision) VALUES($1,'workspace_unbound',$2,$3)",[ORG_A,key,MAPPING_REVISION]);
+  assert.equal((await inspect()).ok,true,"a later live Control binding is allowed by the namespace contract");
+  const ownership=await captureOwnership(target,scope);
+  assert.ok(ownership.rows.every((row) => String(row.table_name) !== "workspace_unbound"));
+  const forged=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(forged.ok,false,"the actual source is bound, so this marker cannot authorize projection masking");
+  assert.equal((forged.findings.find((row) => row.kind === "workspace_unbound_markers")!.detail as {unexpected:number}).unexpected,1);
+  await target.query("UPDATE cloud_import_ledger SET mapping_revision='cloud-identity-2000-01-01.0' WHERE table_name='workspace_unbound'");
+  assert.equal((await inspect()).ok,false);
+  await target.query("UPDATE cloud_import_ledger SET mapping_revision=$1 WHERE table_name='workspace_unbound'",[MAPPING_REVISION]);
+  await target.query("DELETE FROM cloud_import_ledger WHERE table_name='workspaces' AND row_key=$1",[key]);
+  assert.equal((await inspect()).ok,false,"a marker cannot claim a workspace outside the identity ownership ledger");
+  await target.query("INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision) VALUES($1,'workspaces',$2,$3)",[ORG_A,key,MAPPING_REVISION]);
+  await target.query("UPDATE cloud_import_ledger SET organization_id=$1 WHERE table_name='workspace_unbound'",[ORG_B]);
+  assert.equal((await inspect()).ok,false,"org links must match both the workspace and its ownership");
+  assert.equal((await inspect(expected,{orgIds:[ORG_A]})).ok,false,"a foreign-org marker affecting an in-scope projection is still checked");
+  await target.query("UPDATE cloud_import_ledger SET organization_id=$1,row_key='synthetic-private-invalid-unbound-marker' WHERE table_name='workspace_unbound'",[ORG_A]);
+  const invalid=await inspect();assert.equal(invalid.ok,false);
+  assert.ok(!JSON.stringify(invalid).includes("synthetic-private-invalid-unbound-marker"));
+});
+
+fixtureTest("duplicate-login consumer derives content from the newest decrypted source and rejects false duplicate labels",async () => {
+  const fixture=await copiedFixture(),older=id(0x806),fresh=id(0x810);
+  await source.query(`INSERT INTO provider_credentials(id,organization_id,workspace_id,user_id,harness,model_provider,auth_type,display_name,label,account_email,
+    provider_account_id,is_active,harness_active,status,created_at,updated_at)
+    SELECT $1,organization_id,workspace_id,user_id,harness,model_provider,auth_type,display_name,label,account_email,provider_account_id,
+      false,false,status,created_at,updated_at+interval '1 day' FROM provider_credentials WHERE id=$2`,[fresh,older]);
+  const oldKey=`${id(1)}/accounts/${older}/credentials.json.enc`;
+  const auth=JSON.parse(decryptCloudEnvelope(JSON.parse(fixture.objects.get(oldKey)!),cloudKeyHex));
+  auth.tokens.refresh_token="synthetic-newest-refresh-only";
+  fixture.objects.set(`${id(1)}/accounts/${fresh}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify(auth),cloudKeyHex)));
+  // Use the current main writer to construct real encrypted target content.
+  // This is a future-contract consumer probe, never a relabelled qualification.
+  const actual=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  const rows={...actual.rows,[older]:"duplicate_login"};
+  const report={...actual,mappingRevision:"cloud-identity-2026-11-16.25",rows,
+    outcomes:{...actual.outcomes,copied:actual.outcomes.copied!-1,duplicate_login:1},controlIds:{...actual.controlIds}};
+  delete report.controlIds[older];
+  const inspect=async () => {
+    await beginReadOnlySnapshot(source);await beginReadOnlySnapshot(target);
+    try {return await credentialCopyFindings(source,target,scope,
+      {report:report as unknown as typeof actual,reader:fixture.reader,targetBlobs:fixture.blobs},fixtureKeyring,cloudKeyHex);
+    } finally {await source.query("ROLLBACK");await target.query("ROLLBACK");}
+  };
+  const findings=await inspect();
+  const ledger=findings.find((row) => row.kind === "credential_copy_ledger")!;
+  assert.equal(ledger.ok,false,"the .25 consumer probe must not qualify against the .11 producer revision");
+  assert.equal((ledger.detail as {outcomesMatch:boolean}).outcomesMatch,true);
+  assert.equal((ledger.detail as {duplicateLogins:number}).duplicateLogins,1);
+  assert.equal(findings.find((row) => row.kind === "credential_natural_keys")!.ok,true);
+  assert.equal(findings.find((row) => row.kind === "credential_control_ids")!.ok,true);
+  report.rows[older]="copied";
+  const wrong=await inspect();
+  assert.equal((wrong.find((row) => row.kind === "credential_copy_ledger")!.detail as {outcomesMatch:boolean}).outcomesMatch,false);
+  report.rows[older]="duplicate_login";
+  await source.query("UPDATE provider_credentials SET updated_at=updated_at+interval '2 days' WHERE id=$1",[older]);
+  const staleContent=await inspect();
+  assert.equal(staleContent.find((row) => row.kind === "credential_natural_keys")!.ok,false,"a newer source login cannot be waived by labelling it duplicate");
 });
