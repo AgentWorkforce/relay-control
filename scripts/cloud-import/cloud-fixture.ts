@@ -172,7 +172,9 @@ INSERT INTO workspace_integrations (id, workspace_id, provider, name, created_by
   ('${id(0x902)}', 'rw_0000a201', 'github', 'second', '${id(1)}', 'nango-2', '12345', ${t}, ${t}),
   ('${id(0x903)}', 'rw_0000b201', 'github', NULL, '${id(2)}', 'nango-3', '12345', '2026-02-01T00:00:00Z', ${t}),
   ('${id(0x904)}', '${id(0x206)}', 'github', NULL, '${id(2)}', 'nango-4', 'abc', ${t}, ${t}),
-  ('${id(0x905)}', 'rw_0000a201', 'slack', NULL, '${id(1)}', 'nango-5', NULL, ${t}, ${t});
+  ('${id(0x905)}', 'rw_0000a201', 'slack', NULL, '${id(1)}', 'nango-5', NULL, ${t}, ${t}),
+  -- An older default for the same workspace, keyed by the app workspace UUID.
+  ('${id(0x906)}', '${id(0x201)}', 'github', NULL, '${id(1)}', 'nango-6', '12345', '2025-06-01T00:00:00Z', '2026-03-01T00:00:00Z');
 INSERT INTO fleet_node_owners (id, workspace_id, relay_workspace_id, node_id, user_id, source, created_at) VALUES
   ('${id(0x701)}', '${id(0x201)}', 'rw_0000a201', 'node-1', '${id(3)}', 'claim', ${t}),
   ('${id(0x702)}', '${id(0x203)}', 'rw_0000a203', 'node-2', '${id(1)}', 'claim', ${t});
@@ -215,6 +217,7 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
       named_connection_needs_policy: 1,
       installation_claimed_by_other_org: 1,
       invalid_installation_id: 1,
+      duplicate_default_connection: 1,
       target_lacks_github_app: 1,
     },
   },

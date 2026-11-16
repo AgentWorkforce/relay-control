@@ -107,7 +107,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   expectedPlan.github_app_installations = { imported: 1, skipped: {} };
   expectedPlan.github_app_connections = {
     imported: 1,
-    skipped: { named_connection_needs_policy: 1, installation_claimed_by_other_org: 1, invalid_installation_id: 1 },
+    skipped: { named_connection_needs_policy: 1, installation_claimed_by_other_org: 1, invalid_installation_id: 1, duplicate_default_connection: 1 },
   };
   expectedPlan.desktop_relay_identities = { imported: 2, skipped: { not_a_member: 1 } };
   assert.deepEqual(ledger(plan), expectedPlan);

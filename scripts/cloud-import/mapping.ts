@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.6";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.7";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -182,6 +182,14 @@ github_rows AS (
            WHEN iw.id IS NULL THEN 'workspace_not_imported'
            WHEN wi.name IS NOT NULL THEN 'named_connection_needs_policy'
            WHEN wi.installation_id IS NULL OR wi.installation_id !~ '^[1-9][0-9]{0,19}$' THEN 'invalid_installation_id'
+           -- Control holds one connection per (workspace, provider). Cloud can
+           -- hold a default keyed by rw_ and an older one keyed by the app
+           -- workspace UUID for the same workspace: keep the rw_-keyed one,
+           -- then the newest.
+           WHEN row_number() OVER (
+             PARTITION BY iw.id, (wi.name IS NULL), (wi.installation_id ~ '^[1-9][0-9]{0,19}$')
+             ORDER BY (wi.workspace_id = w.relay_workspace_id) DESC, wi.updated_at DESC, wi.id
+           ) > 1 THEN 'duplicate_default_connection'
            WHEN first_value(iw.organization_id) OVER (
              PARTITION BY wi.installation_id, (wi.name IS NULL), (iw.id IS NOT NULL)
              ORDER BY wi.created_at, wi.id
