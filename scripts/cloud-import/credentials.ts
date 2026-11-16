@@ -31,7 +31,7 @@ import { assertScope, credentialCopyQuery, MAPPING_REVISION, type ImportScope } 
  * reset them: status connected, last_authenticated_at now, no error).
  * Control's status CHECK allows connected|error|refresh_failed.
  */
-async function preserveCloudState(target: Database, id: string, row: Candidate): Promise<number> {
+async function preserveCloudState(target: SqlExecutor, id: string, row: Candidate): Promise<number> {
   const status = row.status === "connected" || row.status === "error" || row.status === "refresh_failed" ? row.status : "error";
   const result = await target.query<{ id: string }>(
     `UPDATE coding_agent_credentials
@@ -104,6 +104,8 @@ export type CredentialOutcome =
   | "updated"
   | "already_present"
   | "control_newer"
+  /** Another Cloud row for the same Control login (workspace, provider, account) won. */
+  | "duplicate_login"
   | "blob_read_failed"
   | "object_missing"
   | "decrypt_failed"
@@ -300,6 +302,15 @@ export const canonicalProvider = (value: string) => {
  *   (lib/auth/credential-store-backend.ts hasAccountScopedSubscriptionCredential)
  *   is true whenever such a row exists, so provider_account_id decides.
  */
+/** Winner order for Cloud rows naming one Control login: selected, newest, lowest id. */
+function compareLoginRows(a: Candidate, b: Candidate): number {
+  if (a.selected !== b.selected) return a.selected ? -1 : 1;
+  const at = new Date(a.updated_at).getTime();
+  const bt = new Date(b.updated_at).getTime();
+  if (at !== bt) return bt - at;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
 export function cloudObjectKeys(row: Pick<Candidate, "id" | "cloud_user_id" | "auth_type" | "model_provider" | "provider_account_id">): string[] {
   const account = `${row.cloud_user_id}/accounts/${row.id}/credentials.json.enc`;
   const legacy = `${row.cloud_user_id}/${canonicalProvider(row.model_provider)}/credentials.json.enc`;
@@ -349,6 +360,7 @@ export async function copyCodingAgentCredentials(
   report.candidates = candidates.length;
 
   const copied: Array<{ row: Candidate; controlId: string }> = [];
+  const ready: Array<{ row: Candidate; plaintext: string }> = [];
   for (const row of candidates) {
     if (row.skip_reason) {
       record(row.id, `skipped:${row.skip_reason}`);
@@ -385,20 +397,43 @@ export async function copyCodingAgentCredentials(
       record(row.id, "object_missing");
       continue;
     }
+    ready.push({ row, plaintext });
+  }
 
+  // Several Cloud rows can name one Control login (workspace, provider,
+  // provider account): writing each would overwrite the others on every run
+  // and never converge. One deterministic winner per login: Cloud's
+  // selected row, then the most recently updated, then the lowest id.
+  const loginKey = (row: Candidate, plaintext: string): string | null => {
+    if (row.auth_type !== "provider_oauth") return null;
+    try {
+      const provider = canonicalProvider(row.model_provider) as SubscriptionProvider;
+      JSON.parse(plaintext);
+      return `${row.workspace_id}|${provider}|${describeAuthFile(provider, plaintext, row.account_email).accountId}`;
+    } catch {
+      return null; // the write below reports it (payload_invalid / store_rejected)
+    }
+  };
+  const winners = new Map<string, Candidate>();
+  for (const { row, plaintext } of ready) {
+    const key = loginKey(row, plaintext);
+    if (key === null) continue;
+    const best = winners.get(key);
+    if (!best || compareLoginRows(row, best) < 0) winners.set(key, row);
+  }
+
+  for (const { row, plaintext } of ready) {
+    const key = loginKey(row, plaintext);
+    if (key !== null && winners.get(key) !== row) {
+      record(row.id, "duplicate_login");
+      continue;
+    }
     const actor = { kind: "user" as const, userId: row.user_id! };
     const base = { workspaceId: row.workspace_id, organizationId: row.organization_id!, actor };
     try {
       if (row.auth_type === "provider_oauth") {
         // The raw CLI auth file, unmodified (#150: email is passed beside it).
         JSON.parse(plaintext);
-        const login: Parameters<SubscriptionLoginStore["storeLogin"]>[0] & { accountEmail?: string | null } = {
-          ...base,
-          provider: canonicalProvider(row.model_provider) as SubscriptionProvider,
-          authFile: plaintext,
-          accountEmail: row.account_email,
-          onStored: (tx, stored) => writeLoginMarker(tx, row.organization_id!, stored),
-        };
         // storeLogin always rewrites in place (new blob, version + 1, status
         // reset), so it runs only when Control does not already hold this
         // exact login: a re-run writes nothing and bumps no version.
@@ -439,11 +474,36 @@ export async function copyCodingAgentCredentials(
             continue;
           }
         }
-        const id = await deps.logins.storeLogin(login);
+        // The decision above was made without locks: storeLogin re-checks the
+        // version under the per-credential lock (expectedVersion), and the
+        // marker and Cloud's state are written in its transaction, so a
+        // Control refresh or first login landing in between is never replaced.
+        let metadataWrites = 0;
+        let id: string;
+        try {
+          id = await deps.logins.storeLogin({
+            ...base,
+            provider,
+            authFile: plaintext,
+            accountEmail: row.account_email,
+            expectedVersion: existing ? existing.blob_version : null,
+            onStored: async (tx, stored) => {
+              await writeLoginMarker(tx, row.organization_id!, stored);
+              metadataWrites = await preserveCloudState(tx, stored.id, row);
+            },
+          });
+        } catch (error) {
+          if (error instanceof CodingAgentError && error.code === "login_version_conflict") {
+            if (existing) copied.push({ row, controlId: existing.id });
+            record(row.id, "control_newer");
+            continue;
+          }
+          throw error;
+        }
         report.writes.blobWrites += 1;
         if (existing) report.writes.updated += 1;
         else report.writes.inserted += 1;
-        report.writes.metadataWrites += await preserveCloudState(deps.target, id, row);
+        report.writes.metadataWrites += metadataWrites;
         copied.push({ row, controlId: id });
         report.controlIds[row.id] = id;
         record(row.id, existing ? "updated" : "copied");
@@ -487,6 +547,7 @@ export async function copyCodingAgentCredentials(
   // before cutover sign-off, so it is never a clean run.
   report.ok = Object.keys(report.outcomes).every((outcome) =>
     outcome === "copied" || outcome === "updated" || outcome === "already_present" || outcome === "control_newer"
+    || outcome === "duplicate_login"
     || outcome.startsWith("skipped:"))
     && (report.selection?.selectionConflicts ?? 0) === 0;
   deps.log?.("cloud_import.credentials", { mode, ok: report.ok, candidates: report.candidates, outcomes: report.outcomes });

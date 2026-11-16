@@ -589,6 +589,14 @@ export class SubscriptionLoginStore {
      * so its marker can never name a version a concurrent refresh wrote).
      */
     onStored?: (tx: SqlExecutor, stored: { id: string; version: number }) => Promise<void>;
+    /**
+     * Compare-and-swap for operator imports: the blob_version the caller
+     * decided on (null = no login for this account yet). Re-checked under
+     * the per-credential lock; a mismatch writes nothing and throws 409
+     * login_version_conflict, so a concurrent refresh or first login is
+     * never replaced by a caller's stale copy. Omitted = no check.
+     */
+    expectedVersion?: number | null;
   }): Promise<string> {
     if (Buffer.byteLength(input.authFile) > MAX_AUTH_FILE_BYTES) {
       throw new CodingAgentError(422, "invalid_auth_file", "Auth file is too large");
@@ -597,7 +605,11 @@ export class SubscriptionLoginStore {
     const files = SUBSCRIPTION_CLI_FILES[input.provider];
     const fingerprint = this.keyFingerprint(input.provider, described.refreshToken);
     let previousLocation: string | null = null;
-    const id = await this.database.transaction(async (tx) => {
+    // A first login created by someone else between the unlocked lookup and
+    // the row lock was locked without the advisory lock: start over, so the
+    // lookup finds it and the advisory lock is taken first.
+    const lockOrderRetry = Symbol("lock-order-retry");
+    const attempt = () => this.database.transaction(async (tx) => {
       // Bounded lock waits, as the refresh transactions do (#175,
       // REFRESH_TX_LOCK_TIMEOUT), scoped to this transaction only.
       await tx.exec("SET LOCAL lock_timeout = '30s'");
@@ -625,6 +637,10 @@ export class SubscriptionLoginStore {
         [input.workspaceId, input.provider, described.accountId],
       );
       const current = existing.rows[0];
+      if (current && current.id !== prior.rows[0]?.id) throw lockOrderRetry;
+      if (input.expectedVersion !== undefined && (current?.blob_version ?? null) !== input.expectedVersion) {
+        throw new CodingAgentError(409, "login_version_conflict", "The login changed since it was read");
+      }
       const credentialId = current?.id ?? randomUUID();
       const version = (current?.blob_version ?? 0) + 1;
       const location = await this.blobs.write(input.workspaceId, credentialId, version, input.authFile, tx);
@@ -684,6 +700,15 @@ export class SubscriptionLoginStore {
       if (input.onStored) await input.onStored(tx, { id: credentialId, version });
       return credentialId;
     });
+    let id: string | undefined;
+    for (let tries = 0; id === undefined; tries += 1) {
+      try {
+        id = await attempt();
+      } catch (error) {
+        if (error !== lockOrderRetry) throw error;
+        if (tries >= 2) throw new CodingAgentError(409, "login_busy", "The login is being created concurrently");
+      }
+    }
     if (previousLocation) await this.blobs.remove(previousLocation).catch(() => undefined);
     return id;
   }
