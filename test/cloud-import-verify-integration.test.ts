@@ -75,7 +75,7 @@ async function copiedFixture() {
   const blobs = new CredentialBlobStore(new PostgresObjectBackend(targetDb),fixtureKeyring);
   const deps = {source:sourceDb,target:targetDb,reader,cloudKeyHex,keyring:fixtureKeyring,
     codingAgents:new CodingAgentStore(targetDb,fixtureKeyring,undefined,blobs),
-    logins:new SubscriptionLoginStore(targetDb,fixtureKeyring,blobs)};
+    logins:new SubscriptionLoginStore(targetDb,fixtureKeyring,blobs),blobs};
   const copy = await copyCodingAgentCredentials(deps,scope,"apply");
   assert.equal(copy.ok,true,JSON.stringify(copy));
   return {ledger,copy,deps,objects,blobs,reader};
