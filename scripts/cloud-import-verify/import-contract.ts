@@ -1,11 +1,11 @@
 import type { Client } from "pg";
 import type { EncryptionKeyring } from "../../src/crypto.js";
-import { decryptCloudEnvelope, type ImportReport } from "../cloud-import/importer.js";
+import { decryptCloudEnvelope,interimCanonicalOrigin,type ImportReport } from "../cloud-import/importer.js";
 import { MAPPING_REVISION, ORG_TABLES, SOURCE_TABLES, TARGETS, TARGET_RELATIONS,IMPORTER_SKIP_REASONS,
   assertScope, encryptedSamples, sourceQuery, verifierComparisons, type ImportScope, type ImportTable } from "../cloud-import/mapping.js";
 import { verify, type Comparison, type Contract, type Finding } from "./verify.js";
 import { credentialCopyFindings,credentialSelections,type CredentialEvidence } from "./credential-copy.js";
-import { reconciliationFindings,validImportKey,type OrgKeys } from "./reconciliation.js";
+import { reconciliationFindings,validImportKey,type OrgKeys,type OwnershipSnapshot } from "./reconciliation.js";
 
 const literal = (s:string) => `'${s.replaceAll("'","''")}'`;
 const safeCount = (value:unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -45,7 +45,8 @@ function contractFor(scope:ImportScope,columns:ReadonlySet<string>,tables=compar
  * Source/target reads, skip reconciliation and checksums share the snapshots.
  */
 export async function verifyImport(source:Client,target:Client,scope:ImportScope,ledger:ImportReport,
-  keyring:EncryptionKeyring,cloudKeyHex:string,options:{pepperVersions?:readonly number[];credentialCopy?:CredentialEvidence;previousReport?:ImportReport} = {}) {
+  keyring:EncryptionKeyring,cloudKeyHex:string,options:{pepperVersions?:readonly number[];credentialCopy?:CredentialEvidence;previousReport?:ImportReport;
+    previousOwnership?:OwnershipSnapshot;canonicalOrigin?:(raw:string) => string|null} = {}) {
   assertScope(scope);
   if (!/^[0-9a-f]{64}$/i.test(cloudKeyHex)) throw new Error("Cloud key must be 32 bytes of hex");
   const base = contractFor(scope,new Set());
@@ -74,6 +75,8 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
       detail:{expected:actualOptional,reportedCount:Array.isArray(ledger.optionalColumns) ? ledger.optionalColumns.length : null}});
     const perOrg = new Map<string,Partial<Record<ImportTable,number>>>();
     const perOrgKeys:OrgKeys = new Map();
+    const canonicalOrigin=options.canonicalOrigin ?? interimCanonicalOrigin;
+    const origins=new Map<string,string|null>();
     const exclusions = new Map<string,string[]>();
     const counts = new Map<ImportTable,number>();
     for (const table of SOURCE_TABLES) {
@@ -84,8 +87,8 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
         ${spec.secret?.source === "secret_envelope" ? "q.secret_envelope::text" : "NULL::text"} AS envelope,
         ${table === "desktop_relay_identities" ? "q.source_id_is_uuid" : "true"} AS source_id_is_uuid,
         ${table === "workspaces" ? "q.cloud_relay_workspace_id IS NOT NULL" : "true"} AS preserves_rw,
-        ${table === "workspaces" ? "q.origin_invalid OR q.has_dashboard_url" : "false"} AS loses_history_route,
-        ${table === "workspaces" ? "q.relayhistory_origin IS NOT NULL" : "false"} AS has_history_origin,
+        ${table === "workspaces" ? "q.has_dashboard_url" : "false"} AS loses_history_route,
+        ${table === "workspaces" ? "q.relayhistory_origin_raw" : "NULL::text"} AS history_origin_raw,
         ${table === "workspaces" ? "q.relaycast_api_key_generation IS NOT NULL" : "false"} AS has_generation
         FROM (${sourceQuery(table,scope)}) q`);
       const skipped:Record<string,number> = {};
@@ -119,8 +122,10 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
         } else {
           imported++;
           if (!row.preserves_rw) missingRw++;
-          if (row.loses_history_route) historyLoss++;
-          if ((row.has_history_origin && !columns.has("workspaces.relayhistory_origin"))
+          const origin=table === "workspaces" && row.history_origin_raw !== null ? canonicalOrigin(row.history_origin_raw) : null;
+          if (table === "workspaces") origins.set(row.key,origin);
+          if (row.loses_history_route || (table === "workspaces" && row.history_origin_raw !== null && origin === null)) historyLoss++;
+          if ((origin !== null && !columns.has("workspaces.relayhistory_origin"))
             || (row.has_generation && !columns.has("workspaces.relaycast_api_key_generation"))) metadataLoss++;
           if (row.org) {
             const group = perOrg.get(row.org) ?? {};
@@ -160,13 +165,24 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
           imported:Object.fromEntries(ORG_TABLES.map((table) => [table,safeCount(actual?.imported?.[table] ?? 0)])),
         }}});
     }
-    findings.push(...await reconciliationFindings(t,ledger,perOrgKeys,gatedPresent,options.previousReport));
+    findings.push(...await reconciliationFindings(t,ledger,perOrgKeys,gatedPresent,scope,options.previousReport,options.previousOwnership));
+    const distinctOrigins=[...new Set([...origins.values()].filter((origin):origin is string => origin !== null))].sort();
+    const originRows=columns.has("workspaces.relayhistory_origin")
+      ? (await t.query("SELECT id::text,relayhistory_origin FROM public.workspaces WHERE id::text=ANY($1::text[])",[[...origins.keys()]])).rows : [];
+    const storedOrigins=new Map(originRows.map((row) => [row.id,row.relayhistory_origin]));
+    const originMismatches=[...origins].filter(([id,origin]) => !storedOrigins.has(id) || storedOrigins.get(id) !== origin).length;
+    findings.push({kind:"canonical_history_origins",name:"workspaces",
+      ok:originMismatches === 0 && Array.isArray(ledger.relayhistoryOrigins)
+        && JSON.stringify(distinctOrigins) === JSON.stringify([...ledger.relayhistoryOrigins].sort()),
+      detail:{workspaces:origins.size,distinctOrigins:distinctOrigins.length,mismatches:originMismatches,
+        reportedDistinctCount:Array.isArray(ledger.relayhistoryOrigins) ? ledger.relayhistoryOrigins.length : null}});
     const tables = comparisons(scope,columns,gatedPresent).map((item) => {
       const keys = exclusions.get(item.name)!;
       return keys.length ? {...item,sourceSql:`SELECT p.* FROM (${item.sourceSql}) p WHERE __key::text <> ALL(ARRAY[${keys.map(literal).join(",")}]::text[])`} : item;
     });
     const contract = contractFor(scope,columns,tables);
     contract.targetRelations = SOURCE_TABLES.filter((table) => gatedPresent.has(table)).map((table) => `public.${TARGETS[table].table}`);
+    contract.targetRelations.push("public.cloud_import_ledger");
     contract.encryptedSamples = encryptedSamples(20,scope).flatMap((sample) => {
       const table = sample.name.split(".")[0] as ImportTable;
       if (counts.get(table) === 0) {

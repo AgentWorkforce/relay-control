@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { before,after,beforeEach,test,type TestFn } from "node:test";
 import { Client } from "pg";
 import type { Database,SqlExecutor } from "../src/database.js";
-import { migrate } from "../src/migrations.js";
+import { migrate,grantRuntimeDatabaseRole } from "../src/migrations.js";
 import { runImport,type ImportReport } from "../scripts/cloud-import/importer.js";
 import { CLOUD_FIXTURE_DDL,cloudFixtureSeed,cloudEnvelope,id,ORG_A,ORG_B } from "../scripts/cloud-import/cloud-fixture.js";
 import { fixtureKeyring } from "../scripts/cloud-import-verify/fixtures.js";
 import { verifyImport } from "../scripts/cloud-import-verify/import-contract.js";
 import { SOURCE_TABLES,MAPPING_REVISION,TARGET_RELATIONS,verifierComparisons,encryptedSamples,type ImportScope } from "../scripts/cloud-import/mapping.js";
-import { writeFile,mkdtemp,rm } from "node:fs/promises";
+import { writeFile,mkdtemp,rm,readFile,stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +17,7 @@ import { CodingAgentStore } from "../src/admin/coding-agents.js";
 import { CredentialBlobStore,PostgresObjectBackend } from "../src/admin/credential-blobs.js";
 import { SubscriptionLoginStore } from "../src/admin/subscription-logins.js";
 import { copyCodingAgentCredentials } from "../scripts/cloud-import/credentials.js";
+import { captureOwnership } from "../scripts/cloud-import-verify/reconciliation.js";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -42,8 +43,8 @@ function database(client:Client):Database {
 const sourceDb = database(source);
 const targetDb = database(target);
 const scope = {orgIds:null};
-const apply = (previous?:ImportReport,selected:ImportScope=scope) => runImport(
-  {source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply",{previous});
+const apply = (selected:ImportScope=scope) => runImport(
+  {source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply");
 async function copiedFixture() {
   await source.query("DELETE FROM provider_credentials WHERE id=$1",[id(0x807)]);
   // Cloud object keys retain the pre-merge user id, while Control uses the survivor.
@@ -74,6 +75,7 @@ before(async () => {
   await admin.connect();
   await admin.query("CREATE DATABASE cloud_import_source_fixture");
   await admin.query("CREATE DATABASE cloud_import_target_fixture");
+  await admin.query("CREATE ROLE cloud_verify_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT");
   await source.connect();await target.connect();
 });
 after(async () => {if (enabled) {await source.end();await target.end();await admin.end();}});
@@ -112,8 +114,9 @@ fixtureTest("actual importer rollback, apply and rerun reconcile all mapped tabl
   assert.equal(one.findings.filter((f) => f.kind === "table").length,SOURCE_TABLES.length);
   assert.equal(one.findings.filter((f) => f.kind === "decrypt").length,encryptedSamples(20,scope).length);
   const hashes = (await target.query("SELECT id,token_hash FROM organization_invitations ORDER BY id")).rows;
-  const second = await apply(first);
-  const two = await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex,{previousReport:first});
+  const ownership=await captureOwnership(target,scope);
+  const second = await apply();
+  const two = await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex,{previousReport:first,previousOwnership:ownership});
   assert.equal(two.ok,true,JSON.stringify(two.findings.filter((f) => !f.ok)));
   assert.deepEqual(one.findings.filter((f) => f.kind === "table"),two.findings.filter((f) => f.kind === "table"));
   const afterHashes = (await target.query("SELECT id,token_hash FROM organization_invitations ORDER BY id")).rows;
@@ -129,34 +132,38 @@ fixtureTest("actual importer rollback, apply and rerun reconcile all mapped tabl
 
 fixtureTest("delta reconciles removed identities and replaced invites against previous owned keys",async () => {
   const first=await apply();assert.equal(first.ok,true);
+  const ownership=await captureOwnership(target,scope);
   await source.query("DELETE FROM workspace_person_identities WHERE id=$1",[id(0x401)]);
   await source.query("UPDATE organization_invites SET canceled_at=now() WHERE id=$1",[id(0x302)]);
-  const second=await apply(first);
+  const second=await apply();
   assert.equal(second.ok,true,JSON.stringify(second.orgs));
   assert.equal(second.tables.person_identities.deleted,1);
   assert.equal(second.tables.organization_invitations.deleted,1);
-  const report=await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex,{previousReport:first});
+  const report=await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex,{previousReport:first,previousOwnership:ownership});
   assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
   assert.equal((await target.query("SELECT count(*)::int AS n FROM person_identities WHERE id=$1",[id(0x401)])).rows[0].n,0);
   assert.equal((await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex)).ok,false,"deletes require a previous ledger");
   const bad=structuredClone(second);bad.tables.person_identities.deleted=0;
-  const tampered=await verifyImport(source,target,scope,bad,fixtureKeyring,cloudKeyHex,{previousReport:first});
+  const tampered=await verifyImport(source,target,scope,bad,fixtureKeyring,cloudKeyHex,{previousReport:first,previousOwnership:ownership});
   assert.equal(tampered.findings.find((f) => f.kind === "deleted_total" && f.name === "person_identities")!.ok,false);
 });
 
 fixtureTest("cascade removals must be included in logical deleted counts",async () => {
   const first=await apply();assert.equal(first.ok,true);
+  const ownership=await captureOwnership(target,scope);
   await source.query("UPDATE organization_memberships SET status='suspended' WHERE organization_id=$1 AND user_id=$2",[ORG_A,id(2)]);
-  const second=await apply(first);assert.equal(second.ok,true,JSON.stringify(second.orgs));
-  process.stdout.write(`# Synthetic cascade audit: expected Desktop removals=1, importer deleted=${second.tables.desktop_relay_identities.deleted}\n`);
+  const second=await apply();assert.equal(second.ok,true,JSON.stringify(second.orgs));
+  assert.equal(second.tables.desktop_relay_identities.deleted,1,"actual importer accounts for cascade removals");
+  assert.equal((await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex,
+    {previousReport:first,previousOwnership:ownership})).ok,true);
   assert.equal((await target.query("SELECT count(*)::int AS n FROM desktop_relay_identities WHERE id=$1",[id(0x602)])).rows[0].n,0);
   const undercount=structuredClone(second);
   undercount.orgs[ORG_A]!.deleted.desktop_relay_identities=0;undercount.tables.desktop_relay_identities.deleted=0;
-  const rejected=await verifyImport(source,target,scope,undercount,fixtureKeyring,cloudKeyHex,{previousReport:first});
+  const rejected=await verifyImport(source,target,scope,undercount,fixtureKeyring,cloudKeyHex,{previousReport:first,previousOwnership:ownership});
   assert.equal(rejected.findings.find((f) => f.kind === "deletions" && f.name === `${ORG_A}:desktop_relay_identities`)!.ok,false);
   const accounted=structuredClone(second);
   accounted.orgs[ORG_A]!.deleted.desktop_relay_identities=1;accounted.tables.desktop_relay_identities.deleted=1;
-  assert.equal((await verifyImport(source,target,scope,accounted,fixtureKeyring,cloudKeyHex,{previousReport:first})).ok,true);
+  assert.equal((await verifyImport(source,target,scope,accounted,fixtureKeyring,cloudKeyHex,{previousReport:first,previousOwnership:ownership})).ok,true);
 });
 
 fixtureTest("current manifests cannot substitute invented keys with matching row counts",async () => {
@@ -166,6 +173,53 @@ fixtureTest("current manifests cannot substitute invented keys with matching row
   assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "desktop_relay_identities")!.ok,true);
   assert.equal(report.findings.find((f) => f.kind === "ledger_keys" && f.name === `${ORG_A}:desktop_relay_identities`)!.ok,false);
   assert.equal(report.ok,false);
+});
+
+fixtureTest("0063 ownership ledger is readable by owner and denied to runtime",async () => {
+  const ledger=await apply();assert.equal(ledger.ok,true);
+  assert.ok((await captureOwnership(target,scope)).rows.length > 0);
+  await grantRuntimeDatabaseRole(targetDb,"cloud_verify_runtime");
+  await target.query("SET ROLE cloud_verify_runtime");
+  try {
+    assert.ok((await target.query("SELECT count(*)::int AS n FROM users")).rows[0].n > 0);
+    await assert.rejects(target.query("SELECT * FROM cloud_import_ledger"),{code:"42501"});
+    await assert.rejects(target.query("DELETE FROM cloud_import_ledger WHERE false"),{code:"42501"});
+  } finally {await target.query("RESET ROLE");}
+});
+
+fixtureTest("persisted ownership revisions and keys must match the imported data",async () => {
+  const ledger=await apply();
+  await target.query("UPDATE cloud_import_ledger SET mapping_revision='cloud-identity-2000-01-01.0' WHERE table_name='desktop_relay_identities' AND row_key=$1",[id(0x601)]);
+  const stale=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(stale.findings.find((f) => f.kind === "ownership_ledger")!.ok,false);
+  await target.query("UPDATE cloud_import_ledger SET mapping_revision=$1",[MAPPING_REVISION]);
+  await target.query("DELETE FROM cloud_import_ledger WHERE table_name='desktop_relay_identities' AND row_key=$1",[id(0x601)]);
+  const missing=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(missing.findings.find((f) => f.kind === "table" && f.name === "desktop_relay_identities")!.ok,true);
+  assert.equal(missing.findings.find((f) => f.kind === "ownership_ledger")!.ok,false);
+});
+
+fixtureTest("rerun never deletes or claims a Control row absent from the ownership ledger",async () => {
+  const first=await apply();const ownership=await captureOwnership(target,scope);
+  await target.query(`INSERT INTO organization_invitations(id,organization_id,email,role,token_hash,expires_at)
+    VALUES($1,$2,'control-only@example.test','member',repeat('f',64),'2030-01-01T00:00:00Z')`,[id(0xc0ffee),ORG_A]);
+  const second=await apply();assert.equal(second.ok,true);
+  assert.equal((await target.query("SELECT count(*)::int AS n FROM organization_invitations WHERE id=$1",[id(0xc0ffee)])).rows[0].n,1);
+  assert.equal((await target.query("SELECT count(*)::int AS n FROM cloud_import_ledger WHERE row_key=$1",[id(0xc0ffee)])).rows[0].n,0);
+  const report=await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex,{previousReport:first,previousOwnership:ownership});
+  assert.equal(report.findings.find((f) => f.kind === "ownership_ledger")!.ok,true);
+  assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "organization_invitations")!.ok,false);
+});
+
+fixtureTest("dedicated canonical-origin checks detect drift without printing private hosts",async () => {
+  const ledger=await apply();
+  const marker="tampered-private-origin.example.test";
+  await target.query("UPDATE workspaces SET relayhistory_origin=$1 WHERE id=$2",[`https://${marker}`,id(0x201)]);
+  ledger.relayhistoryOrigins=[`https://${marker}`];
+  const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "workspaces")!.ok,true);
+  assert.equal(report.findings.find((f) => f.kind === "canonical_history_origins")!.ok,false);
+  assert.ok(!JSON.stringify(report).includes(marker));
 });
 
 fixtureTest("unrecognized ledger annotations never enter a verification report",async () => {
@@ -306,6 +360,8 @@ fixtureTest("target without relay_managed support accounts for coding credential
   assert.equal(ledger.tables.coding_agent_credentials.importerSkips.target_lacks_relay_managed!.length,2);
   const report = await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
   assert.equal(report.findings.find((f) => f.kind === "ledger" && f.name === "coding_agent_credentials")!.ok,true);
+  assert.ok(report.findings.filter((f) => f.kind === "ledger_keys").every((f) => f.ok));
+  assert.equal(report.findings.find((f) => f.kind === "ownership_ledger")!.ok,true);
   assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "coding_agent_credentials")!.ok,true);
   assert.equal(report.ok,false);
 });
@@ -336,15 +392,17 @@ fixtureTest("pre-0057 non-UUID Desktop source IDs remain visible as unresolved i
   assert.equal(ledger.tables.desktop_relay_identities.skipped.source_id_not_uuid,1);
   const report = await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
   assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "desktop_relay_identities")!.ok,true);
+  assert.ok(report.findings.filter((f) => f.kind === "ledger_keys").every((f) => f.ok));
   assert.equal(report.ok,false);
 });
 
 fixtureTest("cohort scope counts and encrypted samples exclude another org's corrupt key",async () => {
   const first=await apply();assert.equal(first.ok,true);
+  const ownership=await captureOwnership(target,scope);
   await target.query("UPDATE workspaces SET relaycast_api_key_ciphertext='synthetic-corrupt' WHERE organization_id=$1",[ORG_B]);
   const selected = {orgIds:[ORG_A]};
-  const ledger = await runImport({source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply",{previous:first});
-  const report = await verifyImport(source,target,selected,ledger,fixtureKeyring,cloudKeyHex,{previousReport:first});
+  const ledger = await runImport({source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply");
+  const report = await verifyImport(source,target,selected,ledger,fixtureKeyring,cloudKeyHex,{previousReport:first,previousOwnership:ownership});
   assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
   assert.ok(report.findings.some((f) => f.kind === "decrypt" && f.detail === "not_applicable_no_imported_rows"));
 });
@@ -394,14 +452,25 @@ fixtureTest("import-ledger CLI requires explicit scope and emits a complete actu
       CLOUD_CREDENTIAL_ENCRYPTION_KEY:cloudKeyHex,
       SELFHOST_ENCRYPTION_KEY_ID:fixtureKeyring.active.id,SELFHOST_ENCRYPTION_KEY:fixtureKeyring.active.key.toString("base64"),
       SELFHOST_ENCRYPTION_PREVIOUS_KEY_ID:"",SELFHOST_ENCRYPTION_PREVIOUS_KEY:"",SELFHOST_PASSWORD_PEPPER_FILE:""};
-    const run = (args:string[]) => spawnSync(process.execPath,["--import","tsx",
-      fileURLToPath(new URL("../scripts/cloud-import-verify/import-cli.ts",import.meta.url)),path,...args],
+    const run = (args:string[],ledgerPath=path) => spawnSync(process.execPath,["--import","tsx",
+      fileURLToPath(new URL("../scripts/cloud-import-verify/import-cli.ts",import.meta.url)),ledgerPath,...args],
       {env,encoding:"utf8",timeout:20000});
     const passed = run(["--all-organizations"]);
     assert.equal(passed.status,0,passed.stderr);
     assert.equal(JSON.parse(passed.stdout).mappingRevision,ledger.mappingRevision);
     assert.equal(run([]).status,2);
     assert.equal(run(["--org-ids",ORG_A]).status,1);
+    const ownershipPath=join(directory,"ownership.json");await writeFile(ownershipPath,"{}",{mode:0o644});
+    const capture=spawnSync(process.execPath,["--import","tsx",
+      fileURLToPath(new URL("../scripts/cloud-import-verify/ownership-cli.ts",import.meta.url)),ownershipPath,"--all-organizations"],
+      {env,encoding:"utf8",timeout:20000});
+    assert.equal(capture.status,0,capture.stderr);
+    assert.equal((await stat(ownershipPath)).mode & 0o077,0);
+    assert.ok(JSON.parse(await readFile(ownershipPath,"utf8")).rows.length > 0);
+    await source.query("DELETE FROM workspace_person_identities WHERE id=$1",[id(0x401)]);
+    const next=await apply();const nextPath=join(directory,"next.json");await writeFile(nextPath,JSON.stringify(next),{mode:0o600});
+    assert.equal(run(["--all-organizations"],nextPath).status,1);
+    assert.equal(run(["--all-organizations","--previous-ownership",ownershipPath,"--previous-report",path],nextPath).status,0);
     const contractPath = join(directory,"contract.json");
     await writeFile(contractPath,JSON.stringify({version:1,mappingRevision:MAPPING_REVISION,
       tables:verifierComparisons(scope,new Set(ledger.optionalColumns)),identities:[],

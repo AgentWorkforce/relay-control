@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "mappingRevision": "cloud-identity-2026-11-16.4",
+  "mappingRevision": "cloud-identity-2026-11-16.6",
   "ok": true,
   "findings": [
     {
@@ -8,7 +8,7 @@
       "name": "run",
       "ok": true,
       "detail": {
-        "expectedRevision": "cloud-identity-2026-11-16.4",
+        "expectedRevision": "cloud-identity-2026-11-16.6",
         "revisionMatches": true,
         "mode": "apply",
         "ok": true
@@ -423,6 +423,17 @@
             "github_app_connections": 0
           }
         }
+      }
+    },
+    {
+      "kind": "ownership_ledger",
+      "name": "cloud_import_ledger",
+      "ok": true,
+      "detail": {
+        "entries": 22,
+        "keyMismatches": 0,
+        "revisionMismatches": 0,
+        "extraOrgs": 0
       }
     },
     {
@@ -986,6 +997,17 @@
       }
     },
     {
+      "kind": "canonical_history_origins",
+      "name": "workspaces",
+      "ok": true,
+      "detail": {
+        "workspaces": 3,
+        "distinctOrigins": 1,
+        "mismatches": 0,
+        "reportedDistinctCount": 1
+      }
+    },
+    {
       "kind": "credential_selection",
       "name": "00000000-0000-4000-8000-000000000201:anthropic",
       "ok": true,
@@ -1255,36 +1277,35 @@
             "organization_id",
             "relaycast_api_key_generation",
             "relaycast_workspace_id",
-            "relayhistory_origin",
             "runtime_config",
             "slug",
             "updated_at"
           ],
           "count": 3,
-          "checksum": "4780ca920b9d73567db7a4c934eae864acd09fcdf14e8109f3ef5014a28d9f44",
+          "checksum": "e99f3155c67db8a1e45b2a8c3d30f02e23d1fd915ad8cd08399a7a6e55b79ce5",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
               "count": 1,
-              "checksum": "18649e69a96da7a67563b54c60c06269a35022607fa063be6ee535339e26c22f"
+              "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
             },
             "\"00000000-0000-4000-8000-0000000000b1\"": {
               "count": 2,
-              "checksum": "a3e2a747c0407dc0fc36ba0a0d9922e34756f14bbf985ffe8c6811a787c1aeea"
+              "checksum": "b3d6cf7f0198d4a1ecad94ef078a7bd1c7c4dbaa31f9e2cc9def150fc8a9a20e"
             }
           },
           "workspaces": {
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 1,
-              "checksum": "18649e69a96da7a67563b54c60c06269a35022607fa063be6ee535339e26c22f"
+              "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
             },
             "\"00000000-0000-4000-8000-000000000205\"": {
               "count": 1,
-              "checksum": "fe7caeec34a97df42ed1a92954c05267cf3f5ed4d85962c351ff71344467b838"
+              "checksum": "1ec95f32594b82933359dc14c5a1956aaa0d7667cb126eacf07d4775f8ec9399"
             },
             "\"00000000-0000-4000-8000-000000000206\"": {
               "count": 1,
-              "checksum": "3e819c4bc6b2deabe61510d198b3469056edede83461f3522bbc7e9669146a99"
+              "checksum": "bd089553e17509dc303ff9359f1b0b06d006b04534fcd408c28e6350d3325381"
             }
           },
           "invalidWorkspaceBindings": 0
@@ -1301,36 +1322,35 @@
             "organization_id",
             "relaycast_api_key_generation",
             "relaycast_workspace_id",
-            "relayhistory_origin",
             "runtime_config",
             "slug",
             "updated_at"
           ],
           "count": 3,
-          "checksum": "4780ca920b9d73567db7a4c934eae864acd09fcdf14e8109f3ef5014a28d9f44",
+          "checksum": "e99f3155c67db8a1e45b2a8c3d30f02e23d1fd915ad8cd08399a7a6e55b79ce5",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
               "count": 1,
-              "checksum": "18649e69a96da7a67563b54c60c06269a35022607fa063be6ee535339e26c22f"
+              "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
             },
             "\"00000000-0000-4000-8000-0000000000b1\"": {
               "count": 2,
-              "checksum": "a3e2a747c0407dc0fc36ba0a0d9922e34756f14bbf985ffe8c6811a787c1aeea"
+              "checksum": "b3d6cf7f0198d4a1ecad94ef078a7bd1c7c4dbaa31f9e2cc9def150fc8a9a20e"
             }
           },
           "workspaces": {
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 1,
-              "checksum": "18649e69a96da7a67563b54c60c06269a35022607fa063be6ee535339e26c22f"
+              "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
             },
             "\"00000000-0000-4000-8000-000000000205\"": {
               "count": 1,
-              "checksum": "fe7caeec34a97df42ed1a92954c05267cf3f5ed4d85962c351ff71344467b838"
+              "checksum": "1ec95f32594b82933359dc14c5a1956aaa0d7667cb126eacf07d4775f8ec9399"
             },
             "\"00000000-0000-4000-8000-000000000206\"": {
               "count": 1,
-              "checksum": "3e819c4bc6b2deabe61510d198b3469056edede83461f3522bbc7e9669146a99"
+              "checksum": "bd089553e17509dc303ff9359f1b0b06d006b04534fcd408c28e6350d3325381"
             }
           },
           "invalidWorkspaceBindings": 0
@@ -2811,6 +2831,39 @@
     {
       "kind": "sequence",
       "name": "public.integration_connections",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.cloud_import_ledger",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.cloud_import_ledger.cloud_import_ledger_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.cloud_import_ledger.cloud_import_ledger_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.cloud_import_ledger",
       "ok": true,
       "detail": "not_applicable"
     },

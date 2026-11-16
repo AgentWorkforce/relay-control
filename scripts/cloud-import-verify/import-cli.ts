@@ -9,6 +9,7 @@ import { localDatabaseUrl } from "./local.js";
 import { verifyImport } from "./import-contract.js";
 import { readOnlyPostgresBlobs,type CredentialEvidence } from "./credential-copy.js";
 import type { CredentialCopyReport } from "../cloud-import/credentials.js";
+import type { OwnershipSnapshot } from "./reconciliation.js";
 
 let source:Client|undefined;
 let target:Client|undefined;
@@ -28,6 +29,12 @@ try {
     if (!previousPath || previousPath.startsWith("--")) throw new Error("previous_report_path_required");
     args.splice(previousAt,2);
   }
+  const ownershipAt=args.indexOf("--previous-ownership");let ownershipPath:string|undefined;
+  if (ownershipAt >= 0) {
+    ownershipPath=args[ownershipAt+1];
+    if (!ownershipPath || ownershipPath.startsWith("--")) throw new Error("ownership_snapshot_path_required");
+    args.splice(ownershipAt,2);
+  }
   const path = args[0];
   let scope:ImportScope;
   if (args.length === 2 && args[1] === "--all-organizations") scope = {orgIds:null};
@@ -36,6 +43,7 @@ try {
   assertScope(scope);
   const ledger = JSON.parse(await readFile(path!,"utf8")) as ImportReport;
   const previousReport = previousPath ? JSON.parse(await readFile(previousPath,"utf8")) as ImportReport : undefined;
+  const previousOwnership=ownershipPath ? JSON.parse(await readFile(ownershipPath,"utf8")) as OwnershipSnapshot : undefined;
   const keyring = loadEncryptionKeyring();
   const cloudKeyHex = readSecret(process.env,"CLOUD_CREDENTIAL_ENCRYPTION_KEY") ?? "";
   const pepperPath = process.env.SELFHOST_PASSWORD_PEPPER_FILE?.trim();
@@ -62,7 +70,7 @@ try {
       }},
     };
   }
-  const report = await verifyImport(source,target,scope,ledger,keyring,cloudKeyHex,{pepperVersions,credentialCopy,previousReport});
+  const report = await verifyImport(source,target,scope,ledger,keyring,cloudKeyHex,{pepperVersions,credentialCopy,previousReport,previousOwnership});
   process.stdout.write(`${JSON.stringify(report,null,2)}\n`);
   process.exitCode = report.ok ? 0 : 1;
 } catch {

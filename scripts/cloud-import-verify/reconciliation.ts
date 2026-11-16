@@ -1,9 +1,15 @@
 import type { Client } from "pg";
 import type { ImportReport } from "../cloud-import/importer.js";
-import { ORG_TABLES,RECONCILED_TABLES,SOURCE_TABLES,TARGETS,type ImportTable } from "../cloud-import/mapping.js";
+import { ORG_TABLES,RECONCILED_TABLES,SOURCE_TABLES,TARGETS,IMPORT_LEDGER_TABLE,MAPPING_REVISION,assertScope,type ImportTable,type ImportScope } from "../cloud-import/mapping.js";
 import type { Finding } from "./verify.js";
 
 export type OrgKeys = Map<string,Partial<Record<ImportTable,string[]>>>;
+export interface OwnershipSnapshot {
+  version:1;
+  table:typeof IMPORT_LEDGER_TABLE;
+  scope:ImportScope;
+  rows:{organization_id:string;table_name:ImportTable;row_key:string;mapping_revision:string}[];
+}
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function validImportKey(table:ImportTable,key:unknown):key is string {
   if (typeof key !== "string") return false;
@@ -15,10 +21,84 @@ const sameKeys = (left:readonly string[],right:readonly string[]) => new Set(rig
   && JSON.stringify([...left].sort()) === JSON.stringify([...right].sort());
 const safeCount = (value:unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 
+/** Caller holds a read-only transaction. Snapshot files contain ownership IDs,
+ * never credentials or customer History hosts. */
+async function readOwnership(target:Client,scope:ImportScope):Promise<OwnershipSnapshot> {
+  assertScope(scope);
+  const rows:OwnershipSnapshot["rows"] = [];
+  await target.query(`DECLARE ownership_cursor NO SCROLL CURSOR FOR SELECT organization_id::text,
+    table_name,row_key,mapping_revision FROM public.${IMPORT_LEDGER_TABLE}
+    WHERE $1::uuid[] IS NULL OR organization_id=ANY($1::uuid[])
+    ORDER BY organization_id,table_name,row_key`,[scope.orgIds]);
+  try {for (;;) {
+    const batch=await target.query("FETCH FORWARD 250 FROM ownership_cursor");
+    if (!batch.rows.length) break;
+    for (const row of batch.rows) {
+      if (rows.length >= 100000) throw new Error("Ownership snapshot requires a smaller cohort");
+      rows.push(row);
+    }
+  }} finally {await target.query("CLOSE ownership_cursor");}
+  const snapshot:OwnershipSnapshot={version:1,table:IMPORT_LEDGER_TABLE,
+    scope:{orgIds:scope.orgIds === null ? null : [...scope.orgIds]},rows};
+  snapshotKeys(snapshot);
+  return snapshot;
+}
+
+function snapshotKeys(snapshot:OwnershipSnapshot):OrgKeys {
+  if (snapshot.version !== 1 || snapshot.table !== IMPORT_LEDGER_TABLE || !Array.isArray(snapshot.rows)) throw new Error("Invalid ownership snapshot");
+  assertScope(snapshot.scope);
+  const orgs:OrgKeys=new Map();
+  const seen=new Set<string>();
+  for (const row of snapshot.rows) {
+    if (!uuid.test(row.organization_id) || !ORG_TABLES.includes(row.table_name)
+      || !validImportKey(row.table_name,row.row_key)
+      || !/^cloud-identity-\d{4}-\d{2}-\d{2}\.\d+$/.test(row.mapping_revision)
+      || (snapshot.scope.orgIds !== null && !snapshot.scope.orgIds.some((id) => id.toLowerCase() === row.organization_id))) {
+      throw new Error("Invalid ownership entry");
+    }
+    const identity=`${row.organization_id}:${row.table_name}:${row.row_key}`;
+    if (seen.has(identity)) throw new Error("Duplicate ownership entry");seen.add(identity);
+    const keys=orgs.get(row.organization_id) ?? {};
+    (keys[row.table_name] ??= []).push(row.row_key);orgs.set(row.organization_id,keys);
+  }
+  return orgs;
+}
+
+/** Capture immediately before the importer runs; it never authorizes writes.
+ * The importer trusts only its own transactional database ledger. */
+export async function captureOwnership(target:Client,scope:ImportScope):Promise<OwnershipSnapshot> {
+  await target.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  try {
+    await target.query("SET LOCAL statement_timeout='60s'");await target.query("SET LOCAL row_security=off");
+    return await readOwnership(target,scope);
+  } finally {await target.query("ROLLBACK");}
+}
+
 export async function reconciliationFindings(target:Client,current:ImportReport,observed:OrgKeys,
-  present:ReadonlySet<ImportTable>,previous?:ImportReport):Promise<Finding[]> {
+  present:ReadonlySet<ImportTable>,scope:ImportScope,previous?:ImportReport,previousOwnership?:OwnershipSnapshot):Promise<Finding[]> {
   const findings:Finding[] = [];
   const totals = new Map<ImportTable,number>();
+  const persisted=await readOwnership(target,scope);
+  const persistedKeys=snapshotKeys(persisted);
+  const priorKeys=previousOwnership ? snapshotKeys(previousOwnership) : new Map();
+  const covered=previousOwnership && (previousOwnership.scope.orgIds === null
+    || (scope.orgIds !== null && scope.orgIds.every((id) =>
+      previousOwnership.scope.orgIds!.some((before) => before.toLowerCase() === id.toLowerCase()))));
+  if (previousOwnership) findings.push({kind:"previous_ownership",name:"scope",ok:Boolean(covered),detail:{coversCurrentScope:Boolean(covered)}});
+  let ledgerKeyMismatches=0;
+  let ledgerRevisionMismatches=0;
+  const currentIdentities=new Set<string>();
+  for (const [org,expected] of observed) for (const table of ORG_TABLES) {
+    const actual=persistedKeys.get(org)?.[table] ?? [];
+    if (!sameKeys(expected[table] ?? [],actual)) ledgerKeyMismatches++;
+    for (const key of expected[table] ?? []) currentIdentities.add(`${org}:${table}:${key}`);
+  }
+  ledgerRevisionMismatches=persisted.rows.filter((row) => currentIdentities.has(`${row.organization_id}:${row.table_name}:${row.row_key}`)
+    && row.mapping_revision !== MAPPING_REVISION).length;
+  const extraOrgs=[...persistedKeys.keys()].filter((org) => !observed.has(org)).length;
+  findings.push({kind:"ownership_ledger",name:IMPORT_LEDGER_TABLE,
+    ok:!ledgerKeyMismatches && !ledgerRevisionMismatches && !extraOrgs,
+    detail:{entries:persisted.rows.length,keyMismatches:ledgerKeyMismatches,revisionMismatches:ledgerRevisionMismatches,extraOrgs}});
   if (previous) findings.push({kind:"previous_ledger",name:"run",
     ok:previous.version === 1 && previous.mode === "apply" && previous.ok === true,
     detail:{revisionPresent:typeof previous.mappingRevision === "string",mode:previous.mode === "apply" ? "apply" : "invalid",ok:previous.ok === true}});
@@ -33,11 +113,12 @@ export async function reconciliationFindings(target:Client,current:ImportReport,
       findings.push({kind:"ledger_keys",name:`${org}:${table}`,
         ok:Array.isArray(keys) && sameKeys(expected[table] ?? [],keys),
         detail:{observed:(expected[table] ?? []).length,reported:keys?.length ?? null}});
-      const before = prior?.keys?.[table] ?? [];
+      const before = priorKeys.get(org)?.[table] ?? [];
       const priorCount = prior?.imported?.[table] ?? 0;
       if (!Array.isArray(before) || before.some((key) => !validImportKey(table,key))) throw new Error("Invalid previous imported-key manifest");
       if (prior) findings.push({kind:"previous_manifest",name:`${org}:${table}`,
-        ok:prior.status === "ok" && priorCount === before.length && new Set(before).size === before.length,
+        ok:prior.status === "ok" && (!previousOwnership || (priorCount === before.length
+          && sameKeys(before,prior.keys?.[table] ?? []))),
         detail:{imported:safeCount(priorCount),keys:before.length}});
       const reconciled = RECONCILED_TABLES.includes(table);
       const now = new Set(expected[table] ?? []);
@@ -60,15 +141,15 @@ export async function reconciliationFindings(target:Client,current:ImportReport,
       findings.push({kind:"deletions",name:`${org}:${table}`,
         ok:Number.isSafeInteger(deleted) && deleted >= 0 && deleted === gone.length
           && remaining === 0 && (!gone.length || present.has(table)),
-        detail:{expected:gone.length,reported:safeCount(deleted),remaining,previousSupplied:Boolean(previous)}});
+        detail:{expected:gone.length,reported:safeCount(deleted),remaining,previousSupplied:Boolean(previousOwnership)}});
     }
   }
   for (const table of SOURCE_TABLES) {
     const reported = current.tables?.[table]?.deleted;
     const expected = totals.get(table) ?? 0;
     findings.push({kind:"deleted_total",name:table,
-      ok:Number.isSafeInteger(reported) && reported === expected && (Boolean(previous) || reported === 0),
-      detail:{orgTotal:safeCount(expected),reported:safeCount(reported),previousSupplied:Boolean(previous)}});
+      ok:Number.isSafeInteger(reported) && reported === expected && (Boolean(previousOwnership) || reported === 0),
+      detail:{orgTotal:safeCount(expected),reported:safeCount(reported),previousSupplied:Boolean(previousOwnership)}});
   }
   return findings;
 }

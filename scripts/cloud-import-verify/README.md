@@ -11,14 +11,15 @@ sample definitions. PR #148 is stacked on the importer branch.
 The harness executes the actual importer against its synthetic Cloud fixture
 and separate source/target databases. It checks rollback mode, committed apply
 and a second apply, reconciles all twelve mapped tables and per-org ledgers, preserves
-invite hashes and proves sessions/reconnect state stay empty. The checked-in
+invite hashes and proves sessions/reconnect state stay empty.
 It then runs the opt-in credential copier against in-memory encrypted Cloud
 objects and local encrypted Postgres blobs, including a repeat copy.
 `import-report.example.json` is that full synthetic receipt; application smokes are
 pending and no real-data import has run.
 
 The target runs all checked-in Control migrations, including the actual
-0053/0054/0056/0057 files merged into the importer branch. Only the separate
+0053/0054/0056/0057 files and the owner-only 0063 ledger migration from the
+importer branch. Only the separate
 0058 relay-managed credential shape still uses a test-only model; that model
 does not prove the pending migration file. The shared Cloud fixture
 now includes the generation column, so there is no verifier-owned source guard.
@@ -76,9 +77,11 @@ For an actual importer ledger against local synthetic databases:
 node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --all-organizations
 # Or use an explicit UUID cohort:
 node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --org-ids UUID,UUID
-# A delta with removals also needs the previous apply ledger:
+# Capture ownership before the next local import:
+node --import tsx scripts/cloud-import-verify/ownership-cli.ts /path/to/before.json --all-organizations
+# After the importer commits, verify removals against that database snapshot:
 node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/current-ledger.json --all-organizations \
-  --previous-report /path/to/previous-ledger.json
+  --previous-ownership /path/to/before.json
 # After the opt-in secret copy, also verify its ledger and local object snapshot:
 node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --all-organizations \
   --credential-copy-report /path/to/credential-copy-ledger.json
@@ -90,15 +93,21 @@ usual keyring variables through the environment or their `_FILE` variants.
 Pepper coverage uses `SELFHOST_PASSWORD_PEPPER_FILE`. The explicit scope must
 match the ledger; a plan or rollback-mode ledger cannot qualify committed data.
 
-For `.4` deltas, `reconciliation.ts` independently checks `OrgLedger.keys`
-against the final imported source-key sets, then compares previous-owned keys
-with the current set for each `RECONCILED_TABLES` relation. It proves removed
-keys are absent from the target, reconciles per-org and global `deleted`
-totals, and validates previous manifest counts. Positive deletion claims need
-a previous apply report with key manifests; earlier reports without ownership
-keys cannot establish the required baseline. Logical removals include cascade
-deletes, even when a later explicit DELETE affects zero rows. Tables outside
-the reconciliation set must report zero deletions.
+The importer reconciles exclusively from its transactional target
+`cloud_import_ledger`; report files never authorize deletion. The verifier
+checks the actual post-import ledger's keys/revisions against independently
+derived source import keys and `OrgLedger.keys`. Before each delta,
+`ownership-cli.ts` takes a scoped read-only database snapshot, written to
+mode 600 without customer hosts or secrets. The harness captures the same
+snapshot through `captureOwnership(target, scope)`.
+
+With `--previous-ownership`, the verifier computes removed owned keys for
+`RECONCILED_TABLES`, proves their target absence and reconciles per-org/global
+logical `deleted` totals, including cascades. Positive deletion claims without
+the pre-import database snapshot fail. An optional `--previous-report` adds an
+old-report cross-check; it is not ownership authority. Other tables must report
+zero deletions. Tests prove runtime SELECT/DELETE are denied on the ledger and
+that reruns preserve unowned Control rows instead of claiming or deleting them.
 
 For `--credential-copy-report`, set `CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR` to a
 local encrypted object snapshot using the Cloud-relative object keys. Files
@@ -122,7 +131,7 @@ by an older target schema also block qualification; normalization to NULL must
 not silently redirect a workspace to the default History service.
 Source metadata streams in batches of 250, with a 10,000-key exclusion cap that
 refuses excessive unresolved skips. Ownership manifests retain imported IDs
-for comparison with the supplied current/previous JSON ledgers; choose a bounded
+for comparison with the current report and captured database ownership; choose a bounded
 cohort when memory is limited. Encrypted samples stay within the cohort; empty
 mapped secret tables are explicitly not applicable based on observed counts.
 
@@ -148,11 +157,18 @@ has zero model-active rows by Control's store contract. Both selectors are
 checked per workspace/provider; zero active rows fail even when uniqueness holds.
 
 The library entry point is `verifyImport(source, target, scope, ledger, keyring,
-cloudKeyHex, {pepperVersions, previousReport, credentialCopy: {report, reader, targetBlobs}})`.
+cloudKeyHex, {pepperVersions, previousOwnership, previousReport, canonicalOrigin,
+credentialCopy: {report, reader, targetBlobs}})`.
 The copy option is optional: output explicitly marks this phase as
 `not_requested`, `verified` or `failed`. Identity-only verification does not
 qualify copied secrets. For standalone comparisons without an importer
-ledger, the lower-level API remains available:
+ledger, the lower-level API remains available.
+
+Revision `.6` deliberately excludes History origins from the shared SQL checksum
+shape. A separate check uses the importer's `canonicalOrigin` callback (currently
+its interim default until Control's normalizer is available), compares stored
+values and the private origin inventory, and reports only counts/mismatches.
+Customer hosts are never echoed, including a tampered input report's origin list.
 
 `verify.ts` exports `Contract` and `verify(sourceClient, targetClient, contract,
 keyring, {pepperVersions})`. The final options argument is optional.
