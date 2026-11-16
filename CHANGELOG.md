@@ -15,19 +15,29 @@ assigned at release.
   derived from an email or the owner. A provider organization connected in
   more than one workspace is refused and cannot be enabled
   (`organizationShared`, `organization_shared`). The first call enrols one
-  Relay identity per replica; tools are pull-only. Connecting discovers every
-  environment of the organization disabled; owners and admins see policies,
-  the principal and pending (unmapped) creators at
-  `/replicas/environment-policies`, enable selected environments (or opt in
-  with `{all: true}`) and register the MCP entry through
-  `/replicas/environments/{id}` and `/replicas/environment-mcp`, from the
-  dashboard or the CLI. Registration reads existing entries first, reuses a
+  Relay identity per replica; tools are pull-only. A fresh connect (also
+  after a disconnect) discovers, enables and registers every environment of
+  the organization by default; a re-connect over an existing connection (key
+  rotation) keeps the default and every opt-out and runs the sync semantics
+  (the connect response adds `environmentSetup`; a partial failure is a
+  per-environment status, never a failed connect), and
+  `POST /replicas/environments/sync` enables environments discovered later.
+  Owners and admins see policies, the principal and pending (unmapped)
+  creators at `/replicas/environment-policies` and opt out per environment
+  (`PUT /replicas/environments/{id}` with `enabled: false`, or `DELETE
+  /replicas/environment-mcp` with `environmentIds`); sync never re-enables an
+  opted-out environment. `DELETE /replicas/environment-mcp` with `{all: true}`
+  turns the default off and `POST` with `{all: true}` turns it back on, from
+  the dashboard or the CLI. A ship created by the provider with no creator is
+  admitted only as the explicit VM principal, re-checked on every admission
+  and call. Registration reads existing entries first, reuses a
   matching one, never overwrites a conflicting one, and reads the entry back
   after a create (`registration_failed`, `registration_unconfirmed`). Changing
   the principal or mapping a creator releases the affected bindings, and
   disabling releases the environment's bindings, all without a tombstone. Release writes a tombstone; `recover_replica_spawn` with
   `revive: true` lifts it. The endpoint is rate limited per IP and answers 503
-  when the issuer cannot be read. Migration 0067. See
+  when the issuer cannot be read. Migration 0067 (`all_environments`
+  defaults to true). See
   [Replicas](docs/replicas.md).
 - Added: Replicas agent bridge behind `SELFHOST_REPLICAS_ENABLED` (default
   off). Owners and admins spawn, recover, bind and release Replicas agents

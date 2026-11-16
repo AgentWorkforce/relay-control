@@ -90,7 +90,7 @@ import { createCustomerSupportNoticeHandler } from "./mcp/customer-support-notic
 import type { AmpModule } from "./amp/module.js";
 import type { ReplicasModule } from "./replicas/module.js";
 import { isReplicasPath } from "./replicas/routes.js";
-import { discoverEnvironments, disconnectEnvironments } from "./replicas/environments.js";
+import { disconnectEnvironments, setupEnvironments } from "./replicas/environments.js";
 import { disconnectReplicas, purgeMemberReplicas, releaseMemberReplicas, ReplicasError } from "./replicas/service.js";
 import { isAmpPath } from "./amp/routes.js";
 import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
@@ -580,7 +580,8 @@ export function createApp(input: {
         throw new RemoteAgentError(502, "replicas_cleanup_failed", "Replicas cleanup could not finish. Retry the disconnect.");
       }
     },
-    replicasDiscover: (actor: { userId: string; workspaceId: string; organizationId: string }) => discoverEnvironments(replicas.deps, actor) } : {}),
+    replicasSetup: (actor: { userId: string; workspaceId: string; organizationId: string }, options: { reconnect: boolean }) =>
+      setupEnvironments(replicas.deps, actor, options) } : {}),
   }));
   const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
   const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({

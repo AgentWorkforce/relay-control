@@ -51,9 +51,12 @@ export function remoteAgentRoutes(connections: RemoteAgentConnections) {
         if (Object.keys(body).some(key => key !== "key" && !(provider === "devin" && key === "orgId"))) {
           throw new RemoteAgentError(400, "invalid_request", "Unsupported connection field.");
         }
-        const connection = await connections.connect(actor, provider, { key: body.key, ...(provider === "devin" ? { orgId: body.orgId } : {}) });
-        const environmentDiscovery = provider === "replicas" ? await connections.replicasDiscovery(actor) : undefined;
-        send(200, { connection, ...(environmentDiscovery === undefined ? {} : { environmentDiscovery }) });
+        const { connection, replaced } = await connections.connectReporting(actor, provider,
+          { key: body.key, ...(provider === "devin" ? { orgId: body.orgId } : {}) });
+        // Replicas: environment discovery and the default enable (sync semantics on a re-connect);
+        // partial failures are statuses, never a failed connect.
+        const environments = provider === "replicas" ? await connections.replicasSetup(actor, { reconnect: replaced }) : undefined;
+        send(200, { connection, ...(environments ?? {}) });
       }
     } catch (error) {
       if (!(error instanceof RemoteAgentError)) throw error;

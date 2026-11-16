@@ -208,7 +208,7 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
   const base = `/api/v1/workspaces/${workspaceId}/replicas`;
   const connections = `/api/v1/workspaces/${workspaceId}/remote-agent-connections`;
 
-  await t.test("connect discovers environments disabled and reports each", async () => {
+  await t.test("connect discovers, enables and registers every environment and reports each", async () => {
     const saved = await api(`${connections}/replicas`, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
     assert.equal(saved.status, 200, saved.text);
     assert.equal(saved.body.connection.providerAccount, PROVIDER_ORG);
@@ -219,7 +219,19 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
         { environmentId: ENV_B, name: "beta", status: "discovered" },
       ],
     });
-    assert.equal(provider.registered.length, 0, "connect registers nothing");
+    assert.deepEqual(saved.body.environmentSetup, {
+      allEnvironments: true,
+      environments: [{ environmentId: ENV_A, status: "registered" }, { environmentId: ENV_B, status: "registered" }],
+    });
+    assert.deepEqual(provider.registered.map((item) => [item.environmentId, item.id]), [[ENV_A, "mcp_1"], [ENV_B, "mcp_2"]]);
+    const defaults = await api(`${base}/environment-policies`, { token: ownerToken });
+    assert.equal(defaults.body.allEnvironments, true);
+    assert.deepEqual(defaults.body.environments.map((item: any) => [item.environmentId, item.status, item.enabled]),
+      [[ENV_A, "registered", true], [ENV_B, "registered", true]]);
+    // Turning the default off disables and unregisters everything (the precondition for the subtests below).
+    const off = await api(`${base}/environment-mcp`, { method: "DELETE", token: ownerToken, body: { all: true } });
+    assert.equal(off.status, 200, off.text);
+    assert.deepEqual(provider.removed, ["mcp_1", "mcp_2"]);
     const listed = await api(`${base}/environment-policies`, { token: ownerToken });
     assert.equal(listed.status, 200, listed.text);
     assert.equal(listed.body.mcpUrl, MCP_URL);
@@ -436,7 +448,7 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     });
     // Repeat registers nothing new.
     await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { environmentIds: [ENV_A] } });
-    assert.equal(provider.registered.length, 2);
+    assert.equal(provider.registered.length, 4);
     provider.environments.push({ id: ENV_C, name: "gamma" });
     provider.mode.register = "fail";
     const synced = await api(`${base}/environments/sync`, { method: "POST", token: ownerToken });
@@ -453,7 +465,7 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     const removed = await api(`${base}/environment-mcp`, { method: "DELETE", token: ownerToken, body: { environmentIds: [ENV_B] } });
     assert.equal(removed.status, 200, removed.text);
     assert.deepEqual(removed.body.environments, [{ environmentId: ENV_B, status: "disabled" }]);
-    assert.deepEqual(provider.removed, ["mcp_2"]);
+    assert.deepEqual(provider.removed, ["mcp_1", "mcp_2", "mcp_4"]);
     const listed = await api(`${base}/environment-policies`, { token: ownerToken });
     assert.deepEqual(listed.body.environments.map((item: any) => [item.environmentId, item.status]),
       [[ENV_A, "registered"], [ENV_B, "disabled"], [ENV_C, "registered"]]);
@@ -462,7 +474,7 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
   await t.test("disconnect disables every policy, releases bindings, removes entries and refuses tokens", async () => {
     const disconnected = await api(`${connections}/replicas`, { method: "DELETE", token: ownerToken });
     assert.equal(disconnected.status, 200, disconnected.text);
-    assert.equal(provider.removed.length, 3);
+    assert.equal(provider.removed.length, 5);
     assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE enabled"), 0);
     assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE registered_mcp_id IS NOT NULL"), 0);
     assert.equal(await spawns(env), 0);
@@ -491,6 +503,9 @@ test("a concurrent enable in another workspace is enabled_elsewhere, not a 500",
   const { api, workspaceId, ownerToken, database, provider } = env;
   const saved = await api(`/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
   assert.equal(saved.status, 200, saved.text);
+  // Start from disabled policies: turn the connect default off.
+  assert.equal((await api(`/api/v1/workspaces/${workspaceId}/replicas/environment-mcp`, { method: "DELETE", token: ownerToken, body: { all: true } })).status, 200);
+  provider.registered.length = 0;
   const other = await api(`/api/v1/organizations/${env.organizationId}/workspaces`, {
     method: "POST", token: BOOTSTRAP, body: { name: "secondary", relaycastWorkspaceId: "rc-secondary", relaycastApiKey: "rk_live_secondary" },
   });
@@ -531,6 +546,9 @@ async function connectAndEnable(env: Awaited<ReturnType<typeof start>>) {
   const { api, workspaceId, ownerToken } = env;
   const saved = await api(`/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
   assert.equal(saved.status, 200, saved.text);
+  // The connect enables every environment; opt ENV_B out so only ENV_A is enabled.
+  const optedOut = await api(`/api/v1/workspaces/${workspaceId}/replicas/environment-mcp`, { method: "DELETE", token: ownerToken, body: { environmentIds: [ENV_B] } });
+  assert.equal(optedOut.status, 200, optedOut.text);
   const enabled = await api(`/api/v1/workspaces/${workspaceId}/replicas/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { enabled: true } });
   assert.equal(enabled.status, 200, enabled.text);
 }
@@ -694,8 +712,13 @@ test("registration reads entries first, reuses a match, never overwrites a confl
   const path = `/api/v1/workspaces/${workspaceId}/replicas/environment-mcp`;
   const saved = await api(`/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
   assert.equal(saved.status, 200, saved.text);
+  // Start from disabled, unregistered policies: turn the connect default off; sync then enables nothing.
+  assert.equal((await api(path, { method: "DELETE", token: ownerToken, body: { all: true } })).status, 200);
   provider.environments.push({ id: ENV_C, name: "gamma" });
-  await api(`/api/v1/workspaces/${workspaceId}/replicas/environments/sync`, { method: "POST", token: ownerToken });
+  const synced = await api(`/api/v1/workspaces/${workspaceId}/replicas/environments/sync`, { method: "POST", token: ownerToken });
+  assert.deepEqual(synced.body.environments, []);
+  provider.registered.length = 0;
+  provider.removed.length = 0;
   const entry = (environmentId: string, id: string, config: Record<string, unknown> = {}) => ({
     id, organization_id: PROVIDER_ORG, environment_id: environmentId, name: "agent-relay-replica", transport: "http",
     config: { url: MCP_URL, headers: {}, auth: { type: "workspace_identity", audience: MCP_URL }, ...config },
@@ -741,4 +764,125 @@ test("registration reads entries first, reuses a match, never overwrites a confl
   result = await api(path, { method: "POST", token: ownerToken, body: { environmentIds: [ENV_C] } });
   assert.deepEqual(result.body.environments, [{ environmentId: ENV_C, status: "registered" }]);
   assert.equal(await stored(ENV_C), "raced_c");
+});
+
+test("all environments by default: sync enables new ones, opt-outs stick, the default can be turned off and on, reconnect restores it", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider, database } = env;
+  const base = `/api/v1/workspaces/${workspaceId}/replicas`;
+  const connection = `/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`;
+  const states = async () => (await api(`${base}/environment-policies`, { token: ownerToken })).body.environments
+    .map((item: any) => [item.environmentId, item.status]);
+  const saved = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.equal(saved.status, 200, saved.text);
+  assert.deepEqual(saved.body.environmentSetup.environments.map((item: any) => item.status), ["registered", "registered"]);
+
+  // An environment opted out with PUT stays disabled on sync; a newly discovered one is enabled.
+  const optOut = await api(`${base}/environments/${ENV_B}`, { method: "PUT", token: ownerToken, body: { enabled: false } });
+  assert.equal(optOut.status, 200, optOut.text);
+  provider.environments.push({ id: ENV_C, name: "gamma" });
+  let synced = await api(`${base}/environments/sync`, { method: "POST", token: ownerToken });
+  assert.equal(synced.status, 200, synced.text);
+  assert.equal(synced.body.allEnvironments, true);
+  assert.deepEqual(synced.body.environments, [{ environmentId: ENV_C, status: "registered" }]);
+  assert.deepEqual(await states(), [[ENV_A, "registered"], [ENV_B, "disabled"], [ENV_C, "registered"]]);
+
+  // Sync re-registers an enabled policy whose entry is missing, never a disabled one.
+  await database.query("UPDATE replica_environment_policies SET registered_mcp_id = NULL WHERE environment_id = $1", [ENV_A]);
+  provider.entriesOf(ENV_A).length = 0;
+  synced = await api(`${base}/environments/sync`, { method: "POST", token: ownerToken });
+  assert.deepEqual(synced.body.environments, [{ environmentId: ENV_A, status: "registered" }]);
+  assert.deepEqual(await states(), [[ENV_A, "registered"], [ENV_B, "disabled"], [ENV_C, "registered"]]);
+
+  // With the default off, sync enables nothing new.
+  assert.equal((await api(`${base}/environment-mcp`, { method: "DELETE", token: ownerToken, body: { all: true } })).status, 200);
+  provider.environments.push({ id: "env-delta", name: "delta" });
+  synced = await api(`${base}/environments/sync`, { method: "POST", token: ownerToken });
+  assert.equal(synced.status, 200, synced.text);
+  assert.equal(synced.body.allEnvironments, false);
+  assert.deepEqual(synced.body.environments, []);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE enabled"), 0);
+
+  // Turning it back on re-enables everything, including the opted-out environment.
+  const all = await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { all: true } });
+  assert.equal(all.status, 200, all.text);
+  assert.deepEqual((await states()).sort(), [[ENV_A, "registered"], [ENV_B, "registered"], [ENV_C, "registered"], ["env-delta", "registered"]].sort());
+
+  // Disconnect then reconnect: the flag is true again and every environment is enabled again.
+  assert.equal((await api(connection, { method: "DELETE", token: ownerToken })).status, 200);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE enabled"), 0);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_settings WHERE NOT all_environments"), 1);
+  const again = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.equal(again.status, 200, again.text);
+  assert.equal(again.body.environmentSetup.allEnvironments, true);
+  assert.ok(again.body.environmentSetup.environments.every((item: any) => item.status === "registered"));
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE enabled AND registered_mcp_id IS NOT NULL"), 4);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_settings WHERE all_environments"), 1);
+});
+
+test("connect with the organization already connected in another workspace enables nothing and still saves the connection", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider, database } = env;
+  const other = await api(`/api/v1/organizations/${env.organizationId}/workspaces`, {
+    method: "POST", token: BOOTSTRAP, body: { name: "secondary", relaycastWorkspaceId: "rc-secondary", relaycastApiKey: "rk_live_secondary" },
+  });
+  assert.equal(other.status, 201, other.text);
+  await database.query(`INSERT INTO remote_agent_connections (workspace_id, provider, key_ciphertext, key_hint, provider_account)
+    VALUES ($1, 'replicas', 'x', 'x', $2)`, [other.body.id, PROVIDER_ORG]);
+  const saved = await api(`/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.equal(saved.status, 200, saved.text);
+  assert.equal(saved.body.connection.providerAccount, PROVIDER_ORG);
+  assert.deepEqual(saved.body.environmentSetup.environments, [
+    { environmentId: ENV_A, status: "organization_shared", retryable: false },
+    { environmentId: ENV_B, status: "organization_shared", retryable: false },
+  ]);
+  assert.equal(provider.registered.length, 0);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE enabled"), 0);
+  assert.equal(await count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'", [workspaceId]), 1);
+});
+
+test("a re-connect (key rotation) keeps per-environment opt-outs and a default turned off", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider } = env;
+  const base = `/api/v1/workspaces/${workspaceId}/replicas`;
+  const connection = `/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`;
+  const states = async () => (await api(`${base}/environment-policies`, { token: ownerToken })).body.environments
+    .map((item: any) => [item.environmentId, item.status]).sort();
+  assert.equal((await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } })).status, 200);
+  assert.equal((await api(`${base}/environments/${ENV_B}`, { method: "PUT", token: ownerToken, body: { enabled: false } })).status, 200);
+
+  // The rotation runs the sync semantics: the opt-out stays, a new environment is enabled under the default.
+  provider.environments.push({ id: ENV_C, name: "gamma" });
+  let rotated = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.equal(rotated.status, 200, rotated.text);
+  assert.deepEqual(rotated.body.environmentSetup, { allEnvironments: true, environments: [{ environmentId: ENV_C, status: "registered" }] });
+  assert.deepEqual(await states(), [[ENV_A, "registered"], [ENV_B, "disabled"], [ENV_C, "registered"]].sort());
+  assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.environment.all_enabled'"), 1);
+
+  // With the default off, a rotation turns nothing back on.
+  assert.equal((await api(`${base}/environment-mcp`, { method: "DELETE", token: ownerToken, body: { all: true } })).status, 200);
+  const registered = provider.registered.length;
+  rotated = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.equal(rotated.status, 200, rotated.text);
+  assert.deepEqual(rotated.body.environmentSetup, { allEnvironments: false, environments: [] });
+  assert.equal((await api(`${base}/environment-policies`, { token: ownerToken })).body.allEnvironments, false);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE enabled"), 0);
+  assert.equal(provider.registered.length, registered);
+});
+
+test("disconnect then connect enables every environment again, including opted-out ones", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken } = env;
+  const base = `/api/v1/workspaces/${workspaceId}/replicas`;
+  const connection = `/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`;
+  assert.equal((await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } })).status, 200);
+  assert.equal((await api(`${base}/environment-mcp`, { method: "DELETE", token: ownerToken, body: { environmentIds: [ENV_B] } })).status, 200);
+  assert.equal((await api(connection, { method: "DELETE", token: ownerToken })).status, 200);
+  const again = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.equal(again.status, 200, again.text);
+  assert.deepEqual(again.body.environmentSetup, {
+    allEnvironments: true,
+    environments: [{ environmentId: ENV_A, status: "registered" }, { environmentId: ENV_B, status: "registered" }],
+  });
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE enabled AND registered_mcp_id IS NOT NULL"), 2);
 });

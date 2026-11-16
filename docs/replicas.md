@@ -182,40 +182,65 @@ environment cannot fill the audit log), `replicas.identity.revived`,
 
 ### Policies and registration
 
-Connecting Replicas discovers the key's environments and stores each one
-disabled; the connect response reports `environmentDiscovery` per
-environment. A discovery failure never fails the connect. Connecting enables
-nothing.
+When an owner or admin connects Replicas, every environment of the connected
+organization gets Relay by default, including environments discovered later
+on sync. A fresh connect (no Replicas connection before it, including a
+connect after a disconnect) discovers the environments, enables each one and
+registers its MCP entry. A re-connect over an existing connection (a key
+rotation) keeps the default and every opt-out as they are and runs the sync
+semantics below. The connect response reports `environmentDiscovery`
+(the discovery report per environment) and `environmentSetup:
+{allEnvironments, environments}` (the enable and registration status per
+environment). Setup failures are reported there and never fail the connect:
+the connection is saved and a sync or enable retries them. Admins opt out
+per environment. Enabling an environment never admits a replica on its own:
+each call still needs a mapped creator or the VM principal (see the
+admission order above).
 
 | Route | Purpose |
 | --- | --- |
 | `GET /api/v1/workspaces/{ws}/replicas/environment-policies` | Policies: enabled, registration status, creator mapping with masked email hints, pending creators, binding counts |
 | `PUT /api/v1/workspaces/{ws}/replicas/environments/{id}` | `{enabled?, creators?: [{creatorId, userId}]}`; creators replace the list and must be current members |
 | `PUT /api/v1/workspaces/{ws}/replicas/environment-principal` | `{userId: <member id> \| null}`: set or clear the VM principal; answers the policy view |
-| `POST /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}` or `{all: true}`, optionally with `principalUserId`: set the principal, then enable and register the entry |
-| `DELETE /api/v1/workspaces/{ws}/replicas/environment-mcp` | Same body: disable, then remove the entry |
-| `POST /api/v1/workspaces/{ws}/replicas/environments/sync` | Rediscover; with `all` set, newly found environments are enabled and registered |
+| `POST /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}` (re-enable those) or `{all: true}` (turn the default back on and re-enable every environment, including opted-out ones), optionally with `principalUserId`: set the principal, then enable and register the entry |
+| `DELETE /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}`: opt those environments out; `{all: true}`: turn the default off for the workspace and disable every environment. Disables, then removes the entry |
+| `POST /api/v1/workspaces/{ws}/replicas/environments/sync` | Rediscover; while the default is on, newly found environments are enabled and registered and enabled ones without an entry are registered again. Opted-out environments stay disabled |
 
 `GET .../environments` stays the live list of environments the key can use
 (`{environments: [{id, name}]}`). Discovery lists every environment of the
-organization (`scope=all`), not only the key holder's. Only selected
-environments are enabled by default; `{all: true}` is an explicit opt-in and
-covers environments discovered later only on the next sync (`POST
-.../environments/sync`); nothing runs automatically.
+organization (`scope=all`), not only the key holder's. Environments that
+appear later are picked up by the next sync (`POST .../environments/sync`);
+nothing polls the provider automatically.
+
+An admin opts one environment out with `PUT .../environments/{id}` and
+`enabled: false`, or `DELETE .../environment-mcp` with `{environmentIds}`. An
+opted-out environment stays disabled across syncs until an admin enables it
+again. `DELETE .../environment-mcp` with `{all: true}` turns the default off
+for the workspace: every environment is disabled and sync enables nothing
+new. `POST .../environment-mcp` with `{all: true}` turns it back on and
+re-enables every environment. The policy view reports the default as
+`allEnvironments`. A key rotation (re-connect) changes neither the default nor
+any opt-out. Disconnecting Replicas turns the default off; connecting again
+after the disconnect turns it back on and enables every environment again.
 
 The dashboard's Settings → Connections → Replicas one-click setup and the CLI
 use the same routes with the person's own credential (a cookie session or a
-`cli:auth` bearer token): connect, then `POST .../environment-mcp` with the
-selected environments and `principalUserId`. From then on every replica of
-those environments is admitted, including ones started without a creator.
+`cli:auth` bearer token): connect, then set the VM principal (`PUT
+.../environment-principal`, or `principalUserId` on `POST
+.../environment-mcp`). From then on every replica of the enabled
+environments is admitted, including ones started without a creator. A
+replica without a creator is admitted only as that explicit principal,
+re-checked on every admission and every call, never through an email match
+or the workspace owner.
 
 The policy view also returns `principal` (`{userId, member}` or `null`;
 `member: false` means the principal left the organization and admits nobody)
 and `organizationShared`: true when the same Replicas organization is
 connected in another Control workspace. A shared organization admits no
 token, and enabling refuses: `PUT .../environments/{id}` with `enabled: true`
-answers 409 "This Replicas organization is connected in another workspace."
-and `POST .../environment-mcp` reports `organization_shared`.
+answers 409 "This Replicas organization is connected in another workspace.",
+and `POST .../environment-mcp`, sync and the connect setup report
+`organization_shared` and enable nothing. The connection is still saved.
 
 Changing or clearing the principal releases every live binding that acts as
 the principal (no tombstone): those replicas enrol again under the new

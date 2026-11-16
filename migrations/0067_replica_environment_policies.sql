@@ -3,8 +3,10 @@
 -- workspace_identity token; these tables decide whether that identity is
 -- admitted and which tenant workspace and person it acts for.
 --
--- Policies are discovered (disabled) when an owner/admin connects Replicas
--- and are only enabled by an explicit admin action. No token, email address
+-- Policies are discovered and enabled when an owner/admin connects Replicas,
+-- and environments discovered later are enabled on sync; admins opt out per
+-- environment. A token is still admitted only as a mapped creator or the
+-- explicit VM principal (replica_environment_settings). No token, email address
 -- or provider key is stored here; creator_email_hint is a masked hint
 -- (first character and domain) shown to admins.
 
@@ -53,14 +55,15 @@ CREATE TABLE IF NOT EXISTS replica_environment_creator_requests (
   PRIMARY KEY (policy_id, creator_id)
 );
 
--- Workspace-level settings. all_environments is the grant "every
--- environment of the connected organization, including ones discovered
--- later". principal_user_id is the explicit principal that VMs without a
+-- Workspace-level settings. all_environments ("every environment of the
+-- connected organization, including ones discovered later") is on by
+-- default; false means an admin turned the default off for this workspace
+-- (DELETE /replicas/environment-mcp {all: true}). principal_user_id is the explicit principal that VMs without a
 -- mapped creator (including tokens without a creator) act for; unset = such
 -- VMs are refused. Never derived from an email or the workspace owner.
 CREATE TABLE IF NOT EXISTS replica_environment_settings (
   workspace_id uuid PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
-  all_environments boolean NOT NULL DEFAULT false,
+  all_environments boolean NOT NULL DEFAULT true,
   principal_user_id uuid NULL REFERENCES users(id) ON DELETE SET NULL,
   updated_at timestamptz NOT NULL DEFAULT now()
 );

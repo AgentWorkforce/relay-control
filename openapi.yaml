@@ -3102,7 +3102,7 @@ paths:
                   description: Required for Devin (Cognition organization ID).
       responses:
         "200":
-          description: Validated connection hint and timestamp, never the key
+          description: "{connection, environmentDiscovery?, environmentSetup?}: the validated connection hint and timestamp, never the key. For replicas (when SELFHOST_REPLICAS_ENABLED is on), every environment of the connected organization gets Relay by default, including ones discovered later on sync. A fresh connect (none before it, or after a disconnect) turns the default on and enables and registers every environment; a re-connect over an existing connection (key rotation) keeps the default and every opt-out and runs the sync semantics (environmentSetup.allEnvironments is the current default). environmentDiscovery is the discovery report ({status: ok|partial|failed, environments: [{environmentId, name, status: discovered|known}]}) and environmentSetup is {allEnvironments, environments: [per-environment enable and registration result, as POST .../replicas/environment-mcp]}. Setup failures are reported there and never fail the connect; the connection is saved. When the provider organization is connected in another workspace nothing is enabled and each result is organization_shared. Admins opt out per environment."
         "400":
           description: Invalid key, organization or field
         "403":
@@ -7828,7 +7828,7 @@ paths:
     post:
       operationId: syncReplicasEnvironments
       tags: [replicas]
-      summary: Rediscover the key's environments (stored disabled). When all-environments mode is on, newly discovered environments are enabled and registered here; nothing runs automatically. Owner/admin person only.
+      summary: "Rediscover the key's environments. While the all-environments default is on (it is on after connect; DELETE .../environment-mcp {all: true} turns it off), newly discovered environments are enabled and registered, and enabled environments without a registered entry are registered again. Environments an admin opted out stay disabled. Nothing polls the provider automatically. Owner/admin person only."
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
@@ -7905,7 +7905,7 @@ paths:
     post:
       operationId: registerReplicasEnvironmentMcp
       tags: [replicas]
-      summary: "Enable the selected environments and register the agent-relay-replica HTTP MCP entry ({name, transport: http, config: {url, headers: {}, auth: {type: workspace_identity, audience: url}}}) in each. Selected environments are the default; {all: true} is an explicit opt-in that also enables environments discovered later, on the next sync (POST .../environments/sync). An optional principalUserId sets the VM principal in the same transaction before enabling. Registration reads the environment's entries first and reuses a matching one, never overwrites a duplicated or different same-name entry, and reads the entry back after a create. Owner/admin person only."
+      summary: "Enable the selected environments and register the agent-relay-replica HTTP MCP entry ({name, transport: http, config: {url, headers: {}, auth: {type: workspace_identity, audience: url}}}) in each. Every environment gets Relay by default once Replicas is connected; {environmentIds} re-enables the chosen ones, and {all: true} turns the all-environments default back on and re-enables every environment, including opted-out ones (environments discovered later are enabled on sync). An optional principalUserId sets the VM principal in the same transaction before enabling. Registration reads the environment's entries first and reuses a matching one, never overwrites a duplicated or different same-name entry, and reads the entry back after a create. Owner/admin person only."
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       requestBody:
         required: true
@@ -7925,7 +7925,7 @@ paths:
     delete:
       operationId: removeReplicasEnvironmentMcp
       tags: [replicas]
-      summary: Disable the selected environments, then remove the registered entry from each (best effort; a missing entry counts as removed). The environments' enrolled bindings in this workspace are released without a tombstone and enrol again once the environment is enabled. Owner/admin person only.
+      summary: "Opt out: {environmentIds} disables those environments and they stay disabled across syncs until re-enabled; {all: true} turns the all-environments default off for the workspace and disables every environment. Then removes the registered entry from each (best effort; a missing entry counts as removed). The environments' enrolled bindings in this workspace are released without a tombstone and enrol again once the environment is enabled. Owner/admin person only."
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       requestBody:
         required: true
