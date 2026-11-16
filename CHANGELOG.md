@@ -34,6 +34,14 @@ assigned at release.
   first call stamps its issuer and organization on the row), and a repeat
   launch with the same request id after a release and revive, or after that
   stamp, returns the original operation instead of a 409 or a new create.
+- Changed: storing a subscription login (device-login completion and
+  operator imports) takes the per-credential refresh lock before the
+  workspace lock, so it no longer deadlocks with a concurrent write-back.
+  If a login for the same account is created concurrently it retries, and
+  after three attempts answers `409 login_busy` (retry the sign-in).
+  Operator imports pass the version they read and get `409
+  login_version_conflict`, with nothing written, if the login changed.
+
 - Added: Replicas tombstone retention, periodic sync and setup errors.
   Releasing a per-launch replica (`release_replica`, `DELETE
   .../replicas/spawns/{id}`) now writes a tombstone in the revoke
