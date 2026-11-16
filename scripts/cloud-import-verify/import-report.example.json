@@ -15,7 +15,7 @@
     }
   },
   "version": 1,
-  "mappingRevision": "cloud-identity-2026-11-16.27",
+  "mappingRevision": "cloud-identity-2026-11-16.28",
   "ok": true,
   "findings": [
     {
@@ -77,11 +77,28 @@
       }
     },
     {
+      "kind": "secret_markers",
+      "name": "secret_written",
+      "ok": true,
+      "detail": {
+        "observed": 9,
+        "invalidKeys": 0,
+        "invalidRevisions": 0,
+        "duplicates": 0,
+        "invalidReferences": 0,
+        "historicalRevisions": 0,
+        "orphanMarkers": 0,
+        "matched": 9,
+        "changedSinceImport": 0,
+        "cleared": 0
+      }
+    },
+    {
       "kind": "ledger",
       "name": "run",
       "ok": true,
       "detail": {
-        "expectedRevision": "cloud-identity-2026-11-16.27",
+        "expectedRevision": "cloud-identity-2026-11-16.28",
         "revisionMatches": true,
         "mode": "apply",
         "ok": true
@@ -1458,11 +1475,11 @@
         "cohort": {
           "expectedValid": true,
           "expectedCount": 12,
-          "expectedSha256": "0bc64f5817e98c3794390237e9e971f9568466b8ea2a610a2ba12df6f05e9536",
+          "expectedSha256": "3ae7aa8e6a0c07c8a829e2365698d8358243a84579bc11bebc8fc10c331a9694",
           "beforeCount": 12,
-          "beforeSha256": "0bc64f5817e98c3794390237e9e971f9568466b8ea2a610a2ba12df6f05e9536",
+          "beforeSha256": "3ae7aa8e6a0c07c8a829e2365698d8358243a84579bc11bebc8fc10c331a9694",
           "afterCount": 12,
-          "afterSha256": "0bc64f5817e98c3794390237e9e971f9568466b8ea2a610a2ba12df6f05e9536"
+          "afterSha256": "3ae7aa8e6a0c07c8a829e2365698d8358243a84579bc11bebc8fc10c331a9694"
         },
         "binding": {
           "receiptValid": true,
@@ -3579,7 +3596,7 @@
   "credentialCopy": "verified",
   "credentialCopyVerified": true,
   "syntheticProducerReceipt": {
-    "mappingRevision": "cloud-identity-2026-11-16.27",
+    "mappingRevision": "cloud-identity-2026-11-16.28",
     "writes": {
       "inserted": 0,
       "updated": 0,
@@ -3588,8 +3605,8 @@
       "selectionWrites": 0
     },
     "convergence": {
-      "beforeDigest": "33653b1600d398547793535f38a1fa918ffcb1742930a72eca6ce0cd7d53d5ef",
-      "nonce": "d22586ad38c5c5cd1cf59fd437f325c0a2e4cfe71218cf4787c66889c0cddece"
+      "beforeDigest": "4e6c0887b9d2418524241f17dcc5079177244424ed6944d2e53e6fa89fcbb955",
+      "nonce": "50cc9c3a1913fe8de0bfb31f7fa0abeccd1f97d0164f45cfe92b5d5ade5a407c"
     }
   }
 }

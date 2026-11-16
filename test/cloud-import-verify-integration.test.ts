@@ -1,6 +1,7 @@
 import { credentialConvergenceCohort,captureCredentialConvergence,compareCredentialConvergence,computeCredentialCheckpoint,validateCredentialCheckpoint,credentialCheckpointDigest } from "../scripts/cloud-import-verify/convergence.js";
 import { credentialCloudSelection,type SourceSelection,type TargetSelection } from "../scripts/cloud-import-verify/credential-selection.js";
 import { unboundWorkspaceMarkers } from "../scripts/cloud-import-verify/unbound-markers.js";
+import { secretMarkerFinding } from "../scripts/cloud-import-verify/secret-markers.js";
 import { beginReadOnlySnapshot } from "../scripts/cloud-import-verify/read-only.js";
 import assert from "node:assert/strict";
 import { before,after,beforeEach,test,type TestFn } from "node:test";
@@ -11,7 +12,7 @@ import { canonicalRelayhistoryOrigin } from "../src/relayhistory-origin.js";
 import { runImport,decryptCloudEnvelope,type ImportReport } from "../scripts/cloud-import/importer.js";
 import { CLOUD_FIXTURE_DDL,cloudFixtureSeed,cloudEnvelope,id,ORG_A,ORG_B } from "../scripts/cloud-import/cloud-fixture.js";
 import { fixtureKeyring } from "../scripts/cloud-import-verify/fixtures.js";
-import { encryptSecret } from "../src/crypto.js";
+import { encryptSecret,decryptSecret } from "../src/crypto.js";
 import { verifyImport } from "../scripts/cloud-import-verify/import-contract.js";
 import { SOURCE_TABLES,MAPPING_REVISION,TARGET_RELATIONS,verifierComparisons,encryptedSamples,sourceQuery,type ImportScope } from "../scripts/cloud-import/mapping.js";
 import { writeFile,mkdtemp,rm,readFile,stat } from "node:fs/promises";
@@ -469,6 +470,73 @@ fixtureTest("a source-unbound workspace can bind later in Control while bound ke
   const corrupt=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
   assert.equal(corrupt.ok,false);assert.equal(corrupt.findings.find((finding) => finding.kind === "decrypt"
     && finding.name === "workspaces.relaycast_api_key_ciphertext")!.ok,false);
+});
+
+fixtureTest("Control-rotated integration and hosted secrets survive reruns byte-for-byte and never revert to Cloud",async () => {
+  await apply();
+  const cases=[
+    {logical:"github_app_connections",relation:"integration_connections",column:"credentials_ciphertext",
+      where:"auth_mode='github_app'",control:JSON.stringify({access_token:"synthetic-control-access",refresh_token:"synthetic-control-refresh"})},
+    {logical:"hosted_relay_participants",relation:"hosted_relay_participants",column:"token_ciphertext",
+      where:"true",control:"tok_synthetic_control_hosted_rotation"},
+  ] as const;
+  const controlRows:{id:string;cipher:string;cloud:string;spec:typeof cases[number]}[]=[];
+  for (const spec of cases) {
+    const row=(await target.query(`SELECT id::text,${spec.column} AS value FROM ${spec.relation} WHERE ${spec.where} ORDER BY id LIMIT 1`)).rows[0]!;
+    assert.ok(row);
+    const cloud=decryptSecret(row.value,fixtureKeyring),cipher=encryptSecret(spec.control,fixtureKeyring.active);
+    assert.notEqual(spec.control,cloud);
+    await target.query(`UPDATE ${spec.relation} SET ${spec.column}=$2 WHERE id=$1`,[row.id,cipher]);
+    controlRows.push({id:row.id,cipher,cloud,spec});
+  }
+  const markers=async () => (await target.query("SELECT row_key,mapping_revision,xmin::text,ctid::text FROM cloud_import_ledger WHERE table_name='secret_written' ORDER BY organization_id,row_key")).rows;
+  const before=await markers();assert.ok(before.length > 0);
+  for (let run=0;run<2;run++) {
+    const ledger=await apply();assert.equal(ledger.ok,true,JSON.stringify(ledger.orgs));
+    for (const {id,cipher,cloud,spec} of controlRows) {
+      const value=(await target.query(`SELECT ${spec.column} AS value FROM ${spec.relation} WHERE id=$1`,[id])).rows[0].value;
+      assert.equal(value,cipher,`${spec.relation}: exact Control ciphertext survives`);
+      assert.equal(decryptSecret(value,fixtureKeyring),spec.control);
+      assert.notEqual(decryptSecret(value,fixtureKeyring),cloud);
+      assert.equal(ledger.warnings[`${spec.logical}_secret_kept`],1);
+    }
+    assert.deepEqual(await markers(),before,"preserving Control's value never adopts it as an import write");
+    const checked=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+    assert.equal(checked.ok,true,JSON.stringify(checked.findings.filter((row) => !row.ok)));
+    const finding=checked.findings.find((row) => row.kind === "secret_markers")!;
+    assert.equal(finding.ok,true);assert.equal((finding.detail as {changedSinceImport:number}).changedSinceImport,2);
+    assert.ok(!JSON.stringify(checked).includes("synthetic-control-access"));
+    assert.ok(!JSON.stringify(checked).includes("tok_synthetic_control_hosted_rotation"));
+  }
+});
+
+fixtureTest("secret write markers validate exact namespaces, unique links, tenants and ownership without leaking values",async () => {
+  await apply();
+  const inspect=async (selected:ImportScope=scope) => {
+    await beginReadOnlySnapshot(target);
+    try {return await secretMarkerFinding(target,selected);} finally {await target.query("ROLLBACK");}
+  };
+  assert.equal((await inspect()).ok,true);
+  const marker=(await target.query("SELECT organization_id::text AS org,row_key FROM cloud_import_ledger WHERE table_name='secret_written' AND starts_with(row_key,$1) LIMIT 1",[`workspaces:${id(0x201)}:`])).rows[0]!;
+  assert.ok(marker);
+  const forged=marker.row_key.slice(0,-1)+(marker.row_key.endsWith("a") ? "b" : "a");
+  await target.query("INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision) VALUES($1,'secret_written',$2,$3)",[marker.org,forged,MAPPING_REVISION]);
+  const duplicate=await inspect();assert.equal(duplicate.ok,false);assert.equal((duplicate.detail as {duplicates:number}).duplicates,1);
+  await target.query("DELETE FROM cloud_import_ledger WHERE table_name='secret_written' AND row_key=$1",[forged]);
+  await target.query("UPDATE cloud_import_ledger SET organization_id=$1 WHERE table_name='secret_written' AND row_key=$2",[ORG_B,marker.row_key]);
+  assert.equal((await inspect({orgIds:[ORG_A]})).ok,false,"foreign-tenant pointers into the scoped target still fail");
+  await target.query("UPDATE cloud_import_ledger SET organization_id=$1 WHERE table_name='secret_written' AND row_key=$2",[ORG_A,marker.row_key]);
+  await target.query("DELETE FROM cloud_import_ledger WHERE table_name='workspaces' AND row_key=$1",[id(0x201)]);
+  assert.equal((await inspect()).ok,false,"live marker rows need identity ownership");
+  await target.query("INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision) VALUES($1,'workspaces',$2,$3)",[ORG_A,id(0x201),MAPPING_REVISION]);
+  const invalidKey=`synthetic_private_secret_table:${id(0x201)}:${"0".repeat(64)}`;
+  await target.query("INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision) VALUES($1,'secret_written',$2,$3)",[ORG_A,invalidKey,MAPPING_REVISION]);
+  const invalid=await inspect();assert.equal(invalid.ok,false);assert.ok(!JSON.stringify(invalid).includes("synthetic_private_secret_table"));
+  await target.query("DELETE FROM cloud_import_ledger WHERE table_name='secret_written' AND row_key=$1",[invalidKey]);
+  await target.query("UPDATE cloud_import_ledger SET mapping_revision='cloud-identity-2000-01-01.0' WHERE table_name='secret_written' AND row_key=$1",[marker.row_key]);
+  assert.equal((await inspect()).ok,true,"unchanged historical write markers do not claim a current write");
+  const ownership=await captureOwnership(target,scope);
+  assert.ok(ownership.rows.every((row) => String(row.table_name) !== "secret_written"));
 });
 
 fixtureTest("new relay-managed rows keep Control's active key and report selection divergence without generic drift",async () => {

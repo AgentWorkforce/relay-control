@@ -3,6 +3,7 @@ import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js"
 import { readCopierMarkers } from "./copier-markers.js";
 import { unboundWorkspaceMarkers } from "./unbound-markers.js";
 import { selectionDivergence } from "./selection-divergence.js";
+import { secretMarkerFinding } from "./secret-markers.js";
 import type { Client } from "pg";
 import { schemaFindings } from "./schema.js";
 import { normalizedScope,organizationCensus } from "./organization-scope.js";
@@ -68,6 +69,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     const schema=await schemaFindings(t);targetSchema=schema.summary;findings.push(schema.finding);
     if (schema.halt) return {contract:base,findings,halt:true};
     findings.push((await readCopierMarkers(t,scope)).finding);
+    findings.push(await secretMarkerFinding(t,scope));
     findings.push({kind:"ledger",name:"run",ok:ledger.version === 1 && ledger.mappingRevision === MAPPING_REVISION
       && ledger.mode === "apply" && ledger.ok === true && !ledger.refused && equalScope(scope,ledger.scope),
       detail:{expectedRevision:MAPPING_REVISION,revisionMatches:ledger.mappingRevision === MAPPING_REVISION,

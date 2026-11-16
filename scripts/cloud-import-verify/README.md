@@ -28,7 +28,7 @@ an empty producer selection summary cannot waive a changed Control choice.
 The independent content/outcome gates still apply, so `control_newer` is not
 made acceptable by excluding it from selection expectations.
 
-The paired harness uses the producer's actual revision `.27` reports and
+The paired harness uses the producer's actual revision `.28` reports and
 `runProducer` path, including its fresh before-write checkpoint validation.
 It exercises a real local Control login deactivated between copies and rejects
 a relabelled after-checkpoint against the actual run receipt. Workspace
@@ -63,6 +63,19 @@ legitimately unbound workspace may never have had an `rw_` id; existing Cloud
 bindings still must be preserved. Later Control binding is permitted by the
 mapping projection, only when this independent marker proof passes. Other
 ledger namespaces remain strict. Diagnostics retain fixed counts only.
+
+The exact `secret_written` namespace records immutable import-write provenance
+as `<target_relation>:<row_uuid>:<ciphertext_sha256>`. The verifier checks the
+five mapped secret relations, live tenant and workspace links, identity
+ownership, unique relation/row links and marker syntax. Historical revisions
+and markers left by reconciled deletions are informational: they cannot assert
+a current write. A changed ciphertext digest is reported separately as
+`changedSinceImport`; the independent decrypt and data checks still apply.
+Reports contain counts only, with no marker keys, hashes or secret values.
+The actual importer integration test independently rotates an integration and
+a hosted-participant secret, reruns the import twice, and requires byte-for-byte
+preservation and decryption to Control's value rather than Cloud's. It also
+requires the original provenance markers to remain unchanged.
 
 The target runs all checked-in Control migrations, including the actual
 0053/0054/0056/0057/0058/0061/0062/0064 files and the owner-only 0063 ledger migration. The
