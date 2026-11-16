@@ -62,6 +62,21 @@
       }
     },
     {
+      "kind": "credential_copy_markers",
+      "name": "copier_login",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "invalidKeys": 0,
+        "invalidRevisions": 0,
+        "duplicateCredentials": 0,
+        "invalidReferences": 0,
+        "orphanMarkers": 0,
+        "olderVersions": 0,
+        "historicalRevisions": 0
+      }
+    },
+    {
       "kind": "ledger",
       "name": "run",
       "ok": true,
@@ -333,6 +348,30 @@
             "workspace_not_imported": 1
           }
         }
+      }
+    },
+    {
+      "kind": "credential_exclusions",
+      "name": "identity_metadata",
+      "ok": true,
+      "detail": {
+        "classes": [
+          {
+            "reason": "unsupported_dropped",
+            "accounted": 0,
+            "unresolved": 0
+          },
+          {
+            "reason": "dead_login",
+            "accounted": 0,
+            "unresolved": 0
+          },
+          {
+            "reason": "unsupported_model_provider",
+            "accounted": 0,
+            "unresolved": 0
+          }
+        ]
       }
     },
     {
@@ -1242,6 +1281,31 @@
       }
     },
     {
+      "kind": "credential_exclusions",
+      "name": "credential_copy",
+      "ok": true,
+      "detail": {
+        "classes": [
+          {
+            "reason": "unsupported_dropped",
+            "accounted": 0,
+            "unresolved": 0
+          },
+          {
+            "reason": "dead_login",
+            "accounted": 0,
+            "unresolved": 0
+          },
+          {
+            "reason": "unsupported_model_provider",
+            "accounted": 0,
+            "unresolved": 0
+          }
+        ],
+        "unresolvedSourceSkips": 0
+      }
+    },
+    {
       "kind": "credential_natural_keys",
       "name": "coding_agent_credentials",
       "ok": true,
@@ -1253,6 +1317,14 @@
         "unexplainedTarget": 0,
         "duplicateKeys": 0,
         "contentFailures": 0,
+        "contentFailureReasons": {
+          "organizationMismatch": 0,
+          "statusNotConnected": 0,
+          "fingerprintMismatch": 0,
+          "contentMismatch": 0,
+          "blobBackendMismatch": 0,
+          "targetReadOrDecryptFailed": 0
+        },
         "sourceFailures": 0,
         "unresolvedSourceSkips": 0,
         "sourceChecksum": "79915a2c7412f90863412007ca2e643f6dde08f670673169d062a92f220db210",
@@ -1268,6 +1340,18 @@
         "reported": 8,
         "idMismatches": 0,
         "extraIds": 0
+      }
+    },
+    {
+      "kind": "credential_marker_links",
+      "name": "written_logins",
+      "ok": true,
+      "detail": {
+        "receiptStatus": "legacy_without_write_receipt",
+        "expected": 0,
+        "missing": 0,
+        "mismatches": 0,
+        "revisionMismatches": 0
       }
     },
     {
@@ -3314,6 +3398,7 @@
     "migrationsMatch": true,
     "ok": true
   },
+  "credentialConvergence": "not_requested",
   "credentialCopy": "verified",
   "credentialCopyVerified": true
 }

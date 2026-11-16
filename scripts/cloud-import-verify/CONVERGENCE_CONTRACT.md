@@ -68,3 +68,13 @@ cannot replace the independently computed before digest after tuple changes.
 A fabricated all-zero report with an empty checkpoint also fails. None of these
 checks treats a manually edited producer receipt as an authenticated signature;
 operator-held actual-run artifacts and provenance are still required.
+
+Convergence also requires a nonempty independently expected source cohort.
+The qualified verifier derives natural keys from decrypted source credentials,
+validates each report Control-ID link against actual target natural keys, then
+forms a deduplicated hashed-ID count/digest. Both before and after checkpoints
+must contain that complete expected cohort; checkpoint rows never define the
+expectation. Missing, empty or incomplete expected cohorts fail, and unrelated
+native credentials cannot substitute. Current copied/updated login links also
+require marker.mapping_revision to equal both the actual report revision and
+MAPPING_REVISION. Historical unrelated markers remain observable/nonfatal.

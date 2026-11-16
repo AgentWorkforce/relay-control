@@ -1,4 +1,4 @@
-import { captureCredentialConvergence,compareCredentialConvergence,computeCredentialCheckpoint,validateCredentialCheckpoint } from "../scripts/cloud-import-verify/convergence.js";
+import { credentialConvergenceCohort,captureCredentialConvergence,compareCredentialConvergence,computeCredentialCheckpoint,validateCredentialCheckpoint } from "../scripts/cloud-import-verify/convergence.js";
 import assert from "node:assert/strict";
 import { before,after,beforeEach,test,type TestFn } from "node:test";
 import { Client } from "pg";
@@ -825,15 +825,16 @@ fixtureTest("convergence snapshots detect in-place OAuth rewrites and same-value
   const fixture=await copiedFixture();
   const before=await captureCredentialConvergence(target);
   const unchanged=await captureCredentialConvergence(target,"after");
+  const cohort=credentialConvergenceCohort(Object.values(fixture.copy.controlIds));
   const zeroReport={version:1,mappingRevision:MAPPING_REVISION,mode:"apply",ok:true,outcomes:{},
     writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0},
     convergence:{beforeDigest:before.digest,nonce:before.nonce}};
-  assert.equal(compareCredentialConvergence(before,unchanged,zeroReport).ok,true);
-  assert.equal(compareCredentialConvergence(before,unchanged,undefined).ok,false,"missing counters never mean zero");
+  assert.equal(compareCredentialConvergence(before,unchanged,zeroReport,cohort).ok,true);
+  assert.equal(compareCredentialConvergence(before,unchanged,undefined,cohort).ok,false,"missing counters never mean zero");
   const sameId=fixture.copy.controlIds[id(0x803)]!;
   await target.query("UPDATE coding_agent_credentials SET status=status WHERE id=$1",[sameId]);
   const sameValue=await captureCredentialConvergence(target,"after");
-  const changed=compareCredentialConvergence(before,sameValue,zeroReport);
+  const changed=compareCredentialConvergence(before,sameValue,zeroReport,cohort);
   assert.equal(changed.ok,false,"same-value DML is independently detected despite a false zero-write claim");
   assert.equal((changed.detail as {credentialChanges:{changed:number}}).credentialChanges.changed,1);
   const beforeCopy=await captureCredentialConvergence(target);
@@ -841,7 +842,7 @@ fixtureTest("convergence snapshots detect in-place OAuth rewrites and same-value
   const rerun=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
   assert.equal(rerun.ok,true);
   const afterCopy=await captureCredentialConvergence(target,"after");
-  const nonConverged=compareCredentialConvergence(beforeCopy,afterCopy,zeroReport);
+  const nonConverged=compareCredentialConvergence(beforeCopy,afterCopy,zeroReport,cohort);
   assert.equal(nonConverged.ok,false);
   assert.ok((nonConverged.detail as {blobVersionChanges:number}).blobVersionChanges > 0);
   assert.ok(!JSON.stringify(before).includes(sameId));
@@ -946,7 +947,7 @@ fixtureTest("copier marker writes fail convergence independently of credential a
   const report={version:1,mappingRevision:MAPPING_REVISION,mode:'apply',ok:true,outcomes:{},
     writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0},
     convergence:{beforeDigest:before.digest,nonce:before.nonce}};
-  const finding=compareCredentialConvergence(before,after,report);
+  const finding=compareCredentialConvergence(before,after,report,credentialConvergenceCohort(Object.values(fixture.copy.controlIds)));
   assert.equal(finding.ok,false);
   const detail=finding.detail as {credentialChanges:{changed:number};blobChanges:{changed:number};markerChanges:{inserted:number}};
   assert.equal(detail.credentialChanges.changed,0);assert.equal(detail.blobChanges.changed,0);assert.equal(detail.markerChanges.inserted,1);
@@ -986,4 +987,27 @@ fixtureTest("producer transaction computes the checkpoint digest freshly before 
     writes++;
   }),/checkpoint_mismatch/);
   assert.equal(writes,0);
+});
+
+fixtureTest("historical marker revisions cannot prove a current updated login",async () => {
+  const fixture=await copiedFixture();const row=id(0x806),controlId=fixture.copy.controlIds[row]!;
+  await target.query(`INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision)
+    SELECT organization_id,'copier_login',id::text||':'||blob_version::text,'cloud-identity-2000-01-01.0'
+    FROM coding_agent_credentials WHERE id=$1`,[controlId]);
+  const report={...fixture.copy,rows:{...fixture.copy.rows,[row]:'updated'},
+    outcomes:{...fixture.copy.outcomes,copied:fixture.copy.outcomes.copied!-1,updated:1},
+    writes:{inserted:fixture.copy.outcomes.copied!-1,updated:1,blobWrites:1,metadataWrites:0,selectionWrites:0},
+    selection:fixture.copy.selection ? {...fixture.copy.selection,writes:0} : undefined};
+  const options={credentialCopy:{report:report as unknown as typeof fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}};
+  const stale=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
+  assert.equal(stale.credentialCopy,'failed');
+  assert.equal(stale.findings.find((f) => f.kind === 'credential_copy_markers')!.ok,true,'historical marker is well-formed');
+  assert.equal(stale.findings.find((f) => f.kind === 'credential_natural_keys')!.ok,true);
+  assert.equal(stale.findings.find((f) => f.kind === 'credential_copy_ledger')!.ok,true);
+  const links=stale.findings.find((f) => f.kind === 'credential_marker_links')!;
+  assert.equal(links.ok,false);
+  assert.deepEqual(links.detail,{receiptStatus:'valid',expected:1,missing:0,mismatches:0,revisionMismatches:1});
+  await target.query("UPDATE cloud_import_ledger SET mapping_revision=$1 WHERE table_name='copier_login'",[MAPPING_REVISION]);
+  const current=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
+  assert.equal(current.credentialCopy,'verified',JSON.stringify(current.findings.filter((f) => !f.ok)));
 });

@@ -126,3 +126,13 @@ and checkpoint nonce in the actual `report.convergence` receipt. See
 API. Empty state and missing or mismatched receipt bindings do not qualify;
 post-rerun relabelling cannot replace the genuine before artifact. The older
 operator-ordering-only contract is superseded.
+
+Convergence also requires a nonempty independently expected source cohort.
+The qualified verifier derives natural keys from decrypted source credentials,
+validates each report Control-ID link against actual target natural keys, then
+forms a deduplicated hashed-ID count/digest. Both before and after checkpoints
+must contain that complete expected cohort; checkpoint rows never define the
+expectation. Missing, empty or incomplete expected cohorts fail, and unrelated
+native credentials cannot substitute. Current copied/updated login links also
+require marker.mapping_revision to equal both the actual report revision and
+MAPPING_REVISION. Historical unrelated markers remain observable/nonfatal.
