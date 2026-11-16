@@ -23,6 +23,8 @@ export type RemoteConnection = {
   keyHint: string;
   providerAccount: string | null;
   validatedAt: string;
+  /** Replicas only: the provider refused the stored key (401/403); cleared by a 2xx environments list or a re-connect. */
+  accessRevoked?: { since: string; error: string | null };
 };
 export class RemoteAgentError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -34,11 +36,14 @@ type ConnectionRow = {
   key_hint: string;
   provider_account: string | null;
   validated_at: Date | string;
+  access_revoked_at?: Date | string | null;
+  access_error?: string | null;
 };
 const view = (row: ConnectionRow): RemoteConnection => ({
   keyHint: row.key_hint,
   providerAccount: row.provider_account,
   validatedAt: new Date(row.validated_at).toISOString(),
+  ...(row.access_revoked_at ? { accessRevoked: { since: new Date(row.access_revoked_at).toISOString(), error: row.access_error ?? null } } : {}),
 });
 
 const MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024;
@@ -109,7 +114,7 @@ export class RemoteAgentConnections {
 
   async list(workspaceId: string) {
     const { rows } = await this.database.query<ConnectionRow>(
-      "SELECT provider, key_hint, provider_account, validated_at FROM remote_agent_connections WHERE workspace_id = $1",
+      "SELECT provider, key_hint, provider_account, validated_at, access_revoked_at, access_error FROM remote_agent_connections WHERE workspace_id = $1",
       [workspaceId],
     );
     return REMOTE_AGENT_PROVIDERS.map(provider => ({
@@ -244,7 +249,8 @@ export class RemoteAgentConnections {
           VALUES($1,$2,$3,$4,$5,$6)
           ON CONFLICT(workspace_id,provider) DO UPDATE SET key_ciphertext=EXCLUDED.key_ciphertext,
             key_hint=EXCLUDED.key_hint,provider_account=EXCLUDED.provider_account,
-            created_by_user_id=EXCLUDED.created_by_user_id,validated_at=now()
+            created_by_user_id=EXCLUDED.created_by_user_id,validated_at=now(),
+            access_revoked_at=NULL,access_error=NULL
           RETURNING provider,key_hint,provider_account,validated_at`,
         [actor.workspaceId, provider, encryptSecret(raw, this.keyring.active), `…${raw.slice(-4)}`, account, actor.userId],
       );
@@ -305,7 +311,7 @@ export type ReplicasProvisioningError = {
 };
 
 /** Environment-setup statuses that mean an environment was not provisioned. */
-const FAILED_SETUP = new Set(["registration_failed", "registration_unconfirmed", "enabled_elsewhere", "organization_shared", "stale_connection"]);
+const FAILED_SETUP = new Set(["registration_failed", "registration_unconfirmed", "enabled_elsewhere", "organization_shared", "stale_connection", "access_revoked"]);
 
 /**
  * The connect response's provisioning_error: set when discovery failed or any

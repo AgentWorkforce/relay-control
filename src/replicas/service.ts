@@ -139,6 +139,30 @@ const REJECTED = [400, 401, 402, 403, 404, 422, 429];
 export const rejectedByProvider = (error: unknown, statuses = REJECTED) => error instanceof ReplicasRuntimeError
   && (statuses.includes(error.status) || (error.outcome === "rejected" && error.code === "replicas_invalid_input"));
 
+/**
+ * Access-revoked latch on the workspace's Replicas connection. A 401 or 403
+ * from the provider sets it (the first timestamp is kept); a 5xx, timeout or
+ * unreadable answer proves nothing and changes nothing; "granted" (a 2xx
+ * environments list) clears it, as does a successful re-connect. While it is
+ * set, admission refuses every token of the workspace. The stored text is
+ * Control-authored, never a provider body.
+ */
+export const accessRevoked = (error: unknown): error is ReplicasRuntimeError => error instanceof ReplicasRuntimeError
+  && (error.status === 401 || error.status === 403) && error.code === `replicas_http_${error.status}`;
+export async function recordProviderAccess(executor: SqlExecutor, workspaceId: string, outcome: "granted" | unknown): Promise<void> {
+  if (outcome === "granted") {
+    await executor.query(
+      `UPDATE remote_agent_connections SET access_revoked_at = NULL, access_error = NULL
+        WHERE workspace_id = $1 AND provider = 'replicas' AND access_revoked_at IS NOT NULL`, [workspaceId]);
+  } else if (accessRevoked(outcome)) {
+    await executor.query(
+      `UPDATE remote_agent_connections SET access_revoked_at = COALESCE(access_revoked_at, now()),
+              access_error = COALESCE(access_error, $2)
+        WHERE workspace_id = $1 AND provider = 'replicas'`,
+      [workspaceId, `Replicas refused the stored key (HTTP ${outcome.status}). Reconnect Replicas with a working key.`]);
+  }
+}
+
 /** Stored and returned failure text: only Control-authored messages, never a provider or Relay body. */
 const safeFailure = (error: unknown) => error instanceof ReplicasError ? error.message
   : error instanceof ReplicasRuntimeError ? "Replicas request failed"
@@ -165,6 +189,12 @@ export function withReplicasLock<T>(
     await tx.query("SELECT id FROM organizations WHERE id = $1 FOR SHARE", [scope.organizationId]);
     await tx.query("SELECT pg_advisory_xact_lock(hashtext('selfhost-replicas'), hashtext($1))", [scope.workspaceId]);
     return run(tx);
+  }).catch(async (error: unknown) => {
+    // A provider 401/403 that rolled the transaction back still latches the
+    // connection, after the rollback (catch sites that commit record it in
+    // their own transaction). Best effort: the original error is what the caller sees.
+    if (accessRevoked(error)) await recordProviderAccess(deps.database, scope.workspaceId, error).catch(() => undefined);
+    throw error;
   });
 }
 
@@ -317,7 +347,14 @@ export async function listEnvironments(deps: ReplicasDeps, actor: ReplicasActor)
     await requireAdmin(tx, actor);
     return keyFor(deps, tx, actor.workspaceId);
   });
-  const result = await deps.replicas.environments(key);
+  let result: Awaited<ReturnType<ReplicasDeps["replicas"]["environments"]>>;
+  try {
+    result = await deps.replicas.environments(key);
+  } catch (error) {
+    await recordProviderAccess(deps.database, actor.workspaceId, error).catch(() => undefined);
+    throw error;
+  }
+  await recordProviderAccess(deps.database, actor.workspaceId, "granted").catch(() => undefined);
   return { environments: result.environments.map(({ id, name }) => ({ id, name })) };
 }
 
@@ -347,6 +384,7 @@ export async function spawnReplica(deps: ReplicasDeps, actor: ReplicasActor, raw
     const key = await keyFor(deps, tx, actor.workspaceId);
     await relayFor(deps, tx, actor);
     const environments = await deps.replicas.environments(key);
+    await recordProviderAccess(tx, actor.workspaceId, "granted");
     if (!environments.environments.some((env) => env.id === input.environment_id)) {
       throw new ReplicasError("This key cannot use that environment.", 403);
     }
@@ -377,6 +415,7 @@ export async function spawnReplica(deps: ReplicasDeps, actor: ReplicasActor, raw
       return spawnView(row);
     } catch (error) {
       // A definite rejection can retry this same durable operation. An ambiguous create cannot.
+      await recordProviderAccess(tx, row.workspace_id, error);
       row = await patch(tx, row.id, { state: rejectedByProvider(error) ? "rejected" : "creating", last_error: safeFailure(error) });
       return spawnView(row);
     }
@@ -544,6 +583,7 @@ async function advanceStep(deps: ReplicasDeps, tx: SqlExecutor, id: string, acto
     row = await patch(tx, row.id, { state: "dispatching", last_error: null });
     return { row, next: "dispatch" };
   } catch (error) {
+    await recordProviderAccess(tx, row.workspace_id, error);
     row = await patch(tx, row.id, { last_error: safeFailure(error) });
     return { row, next: "done" };
   }
@@ -567,6 +607,7 @@ async function dispatchStep(deps: ReplicasDeps, tx: SqlExecutor, id: string, act
     await audit(tx, row, actor, "replicas.spawn.bound");
     return row;
   } catch (error) {
+    await recordProviderAccess(tx, row.workspace_id, error);
     return patch(tx, row.id, { ...(rejectedByProvider(error) ? { state: "binding" as const } : {}), last_error: safeFailure(error) });
   }
 }

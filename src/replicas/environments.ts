@@ -14,6 +14,8 @@ import {
   isUuid,
   keyFor,
   patch,
+  accessRevoked,
+  recordProviderAccess,
   rejectedByProvider,
   relayFor,
   ReplicasError,
@@ -124,9 +126,10 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
     throw new IdentityRefusal("replica_released", 403, released.workspace_id && released.organization_id
       ? { workspaceId: released.workspace_id, organizationId: released.organization_id } : null);
   }
-  const policies = await tx.query<PolicyRow & { organization_id: string; provider_account: string | null; principal_member: string | null }>(
+  const policies = await tx.query<PolicyRow & { organization_id: string; provider_account: string | null;
+    access_revoked_at: Date | string | null; principal_member: string | null }>(
     `SELECT ${POLICY.split(", ").map((column) => `p.${column}`).join(", ")}, w.organization_id, c.provider_account,
-            pm.user_id AS principal_member
+            c.access_revoked_at, pm.user_id AS principal_member
        FROM replica_environment_policies p
        JOIN workspaces w ON w.id = p.workspace_id
        LEFT JOIN remote_agent_connections c ON c.workspace_id = p.workspace_id AND c.provider = 'replicas'
@@ -141,11 +144,13 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
     throw new IdentityRefusal("organization_shared", 403,
       candidate ? { workspaceId: candidate.workspace_id, organizationId: candidate.organization_id } : null);
   }
-  // The workspace must still hold a connection to the same provider organization.
-  if (!candidate || candidate.provider_account?.toLowerCase() !== claims.organizationId) {
+  // The workspace must still hold a connection to the same provider
+  // organization, one the provider has not refused (the access-revoked latch).
+  if (!candidate || candidate.provider_account?.toLowerCase() !== claims.organizationId || candidate.access_revoked_at) {
     throw new IdentityRefusal("replica_environment_not_enabled", 403);
   }
-  const { organization_id: organizationId, provider_account: _account, principal_member: principal, ...policy } = candidate;
+  const { organization_id: organizationId, provider_account: _account, access_revoked_at: _revoked,
+    principal_member: principal, ...policy } = candidate;
   const scope = { workspaceId: policy.workspace_id, organizationId };
   if (claims.creatorId !== null) {
     const mapping = await tx.query<{ user_id: string; member: string | null }>(
@@ -488,9 +493,11 @@ export async function discoverEnvironments(deps: ReplicasDeps, actor: ReplicasAc
   let listed: Awaited<ReturnType<ReplicasDeps["replicas"]["allEnvironments"]>>;
   try {
     listed = await deps.replicas.allEnvironments(key);
-  } catch {
+  } catch (error) {
+    await recordProviderAccess(deps.database, actor.workspaceId, error);
     return { status: "failed", environments: [] };
   }
+  await recordProviderAccess(deps.database, actor.workspaceId, "granted");
   return withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
     const organization = await connectedOrganization(tx, actor.workspaceId);
@@ -524,8 +531,8 @@ export async function listEnvironmentPolicies(deps: ReplicasDeps, actor: Replica
   const { mcpUrl } = identityConfig(deps);
   return withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
-    const connection = (await tx.query<{ provider_account: string | null }>(
-      "SELECT provider_account FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'",
+    const connection = (await tx.query<{ provider_account: string | null; access_revoked_at: Date | string | null; access_error: string | null }>(
+      "SELECT provider_account, access_revoked_at, access_error FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'",
       [actor.workspaceId])).rows[0];
     const policies = (await tx.query<PolicyRow>(
       `SELECT ${POLICY} FROM replica_environment_policies WHERE workspace_id = $1 ORDER BY environment_name, environment_id`,
@@ -552,6 +559,9 @@ export async function listEnvironmentPolicies(deps: ReplicasDeps, actor: Replica
     return {
       mcpUrl,
       organizationId: connection?.provider_account ?? null,
+      // The provider refused the stored key (401/403): nothing is admitted until a 2xx environments list or a re-connect.
+      accessRevoked: connection?.access_revoked_at
+        ? { since: new Date(connection.access_revoked_at).toISOString(), error: connection.access_error } : null,
       allEnvironments: await allEnvironmentsFlag(tx, actor.workspaceId),
       // The VM principal; member false means it left the organization and admits nobody.
       principal: principal?.principal_user_id ? { userId: principal.principal_user_id, member: Boolean(principal.member) } : null,
@@ -561,7 +571,7 @@ export async function listEnvironmentPolicies(deps: ReplicasDeps, actor: Replica
         environmentId: policy.environment_id,
         name: policy.environment_name,
         enabled: policy.enabled,
-        status: policyStatus(policy),
+        status: policy.enabled && connection?.access_revoked_at ? "access_revoked" : policyStatus(policy),
         // An admin opt-out: sync and re-connect leave it disabled; a disabled policy without it is retried.
         optedOut: policy.opted_out,
         // A policy recorded for an earlier connection never admits a token.
@@ -759,7 +769,7 @@ type EnableSelection = z.infer<typeof enableInput>;
 export type EnvironmentMcpResult = {
   environmentId: string;
   status: "registered" | "registration_failed" | "registration_unconfirmed" | "not_found" | "enabled_elsewhere"
-    | "organization_shared" | "stale_connection" | "disabled" | "removal_failed";
+    | "organization_shared" | "stale_connection" | "access_revoked" | "disabled" | "removal_failed";
   retryable?: boolean;
 };
 
@@ -942,6 +952,8 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
   config: IdentityMcpConfig, automatic: boolean): Promise<EnvironmentMcpResult> {
   const failed = (retryable: boolean): EnvironmentMcpResult => ({ environmentId, status: "registration_failed", retryable });
   const unconfirmed: EnvironmentMcpResult = { environmentId, status: "registration_unconfirmed", retryable: true };
+  // The provider refused the key itself: retrying with it cannot succeed, a re-connect can.
+  const revoked: EnvironmentMcpResult = { environmentId, status: "access_revoked", retryable: false };
   const list = (target: RegistrationTarget) => deps.replicas.listEnvironmentMcps(target.key, target.current.environment_id)
     .then((entries) => matchEntry(entries, target.current, config));
   const intent = await withReplicasLock(deps, actor, async (tx): Promise<EnvironmentMcpResult | { previous: boolean }> => {
@@ -950,8 +962,9 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
     let found: EntryMatch;
     try {
       found = await list(target);
-    } catch {
-      return target.current.create_unconfirmed ? unconfirmed : failed(true);
+    } catch (error) {
+      await recordProviderAccess(tx, actor.workspaceId, error);
+      return target.current.create_unconfirmed ? unconfirmed : accessRevoked(error) ? revoked : failed(true);
     }
     if (found.kind === "conflict") return failed(false);
     if (found.kind === "match") return markRegistered(tx, actor, target.current, found.id);
@@ -971,10 +984,11 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
       let found: EntryMatch;
       try {
         found = await list(target);
-      } catch {
+      } catch (error) {
+        await recordProviderAccess(tx, actor.workspaceId, error);
         // Nothing was sent in this attempt: restore the intent it found.
         if (!intent.previous) await setCreateIntent(tx, target.current.id, false);
-        return intent.previous ? unconfirmed : failed(true);
+        return intent.previous ? unconfirmed : accessRevoked(error) ? revoked : failed(true);
       }
       if (found.kind === "conflict") return failed(false);
       if (found.kind === "match") return markRegistered(tx, actor, target.current, found.id);
@@ -985,15 +999,17 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
           { name: IDENTITY_SERVER_NAME, transport: "http", config })).id;
       } catch (error) {
         // A 409 or a lost answer may still have created the entry: read it back below.
+        await recordProviderAccess(tx, actor.workspaceId, error);
         if (rejectedByProvider(error)) {
           asked = false;
           await setCreateIntent(tx, target.current.id, false);
-          return failed(true);
+          return accessRevoked(error) ? revoked : failed(true);
         }
       }
       try {
         found = await list(target);
-      } catch {
+      } catch (error) {
+        await recordProviderAccess(tx, actor.workspaceId, error);
         return unconfirmed;
       }
       if (found.kind === "conflict") return failed(false);
@@ -1062,7 +1078,8 @@ async function removeEntry(deps: ReplicasDeps, actor: ReplicasActor, policy: Pol
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
         actor: auditActor(actor), action: "replicas.environment.mcp_removed", target: current.id });
       return { environmentId: current.environment_id, status: "disabled" };
-    } catch {
+    } catch (error) {
+      await recordProviderAccess(tx, actor.workspaceId, error);
       return { environmentId: current.environment_id, status: "removal_failed", retryable: true };
     }
   });

@@ -56,14 +56,18 @@ function createProvider() {
   const entries = new Map<string, Array<Record<string, unknown>>>();
   const entriesOf = (environmentId: string) => entries.get(environmentId) ?? (entries.set(environmentId, []), entries.get(environmentId)!);
   // fail: a timeout with nothing created; lost: created, then the answer is lost; conflict: 409 (the entry may exist).
-  const mode = { register: "ok" as "ok" | "fail" | "reject" | "lost" | "conflict", discover: "ok" as "ok" | "fail" };
+  // discover: revoked = 401, unavailable = 503, partial = an incomplete listing (more pages than the bound).
+  const mode = { register: "ok" as "ok" | "fail" | "reject" | "lost" | "conflict",
+    discover: "ok" as "ok" | "fail" | "revoked" | "unavailable" | "partial" };
   const runtime = {
     identity: async () => ({ organization: { id: PROVIDER_ORG, name: "Org" } }),
     environments: async () => ({ environments }),
     allEnvironments: async (key: string) => {
       assert.equal(key, REPLICAS_KEY);
       if (mode.discover === "fail") throw new ReplicasRuntimeError("unknown", "replicas_timeout");
-      return { environments: [...environments], complete: true };
+      if (mode.discover === "revoked") throw new ReplicasRuntimeError("rejected", "replicas_http_401", 401);
+      if (mode.discover === "unavailable") throw new ReplicasRuntimeError("rejected", "replicas_http_503", 503);
+      return { environments: [...environments], complete: mode.discover !== "partial" };
     },
     listEnvironmentMcps: async (key: string, environmentId: string) => {
       assert.equal(key, REPLICAS_KEY);
@@ -384,4 +388,70 @@ test("sweep cleanup retry: an incomplete Relay release is retried with backoff",
   assert.equal(row.input.cleanup_complete, true);
   assert.equal(row.input.cleanup_attempts, 2);
   assert.equal(world.agents.get(AGENT), undefined);
+});
+
+test("access-revoked latch: a provider 401 refuses every token until a 2xx environments list or a re-connect", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider, database } = env;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const sweep = new ReplicasSyncSweep({ replicas: env.replicas.deps, intervalSeconds: 30 });
+  t.after(() => sweep.stop());
+  const latch = async () => (await database.query<{ access_revoked_at: Date | null; access_error: string | null }>(
+    "SELECT access_revoked_at, access_error FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'",
+    [workspaceId])).rows[0]!;
+  const refusedNow = async () => {
+    const refused = await rpc(api, token(), "tools/list");
+    assert.equal(refused.status, 403, refused.text);
+    assert.equal(refused.body.error.message, "replica_environment_not_enabled");
+  };
+
+  // A 401 on an automatic sync latches the connection: the token is refused.
+  provider.mode.discover = "revoked";
+  await sweep.tick();
+  const first = await latch();
+  assert.ok(first.access_revoked_at);
+  assert.match(first.access_error!, /HTTP 401/);
+  await refusedNow();
+  const listed = await api(`/api/v1/workspaces/${workspaceId}/remote-agent-connections`, { token: ownerToken });
+  const replicas = listed.body.providers.find((item: any) => item.id === "replicas");
+  assert.equal(replicas.connection.accessRevoked.since, new Date(first.access_revoked_at!).toISOString());
+  const policies = await api(`/api/v1/workspaces/${workspaceId}/replicas/environment-policies`, { token: ownerToken });
+  assert.equal(policies.body.accessRevoked.since, new Date(first.access_revoked_at!).toISOString());
+  assert.deepEqual(policies.body.environments.map((item: any) => [item.environmentId, item.status]),
+    [[ENV_A, "access_revoked"], [ENV_B, "access_revoked"]]);
+
+  // A following 503 proves nothing: still refused, the first timestamp kept.
+  provider.mode.discover = "unavailable";
+  await sweep.tick();
+  assert.equal((await latch()).access_revoked_at!.getTime(), first.access_revoked_at!.getTime());
+  await refusedNow();
+  // Another 401 keeps the first timestamp too.
+  provider.mode.discover = "revoked";
+  await sweep.tick();
+  assert.equal((await latch()).access_revoked_at!.getTime(), first.access_revoked_at!.getTime());
+
+  // A 2xx environments list clears it: admitted again.
+  provider.mode.discover = "ok";
+  await sweep.tick();
+  assert.equal((await latch()).access_revoked_at, null);
+  assert.equal((await latch()).access_error, null);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+
+  // A 401 inside a locked step that rolls back still latches (recover reads the replica).
+  const spawnId = await launchRow(env, "spawn", randomUUID(), "creating");
+  await database.query("UPDATE replica_spawns SET replica_id = NULL WHERE id = $1", [spawnId]);
+  const runtime = env.replicas.deps.replicas as unknown as Record<string, unknown>;
+  runtime.get = async () => { throw new ReplicasRuntimeError("rejected", "replicas_http_403", 403); };
+  await assert.rejects(recoverReplica(env.replicas.deps, { userId: env.ownerId, workspaceId, organizationId: env.organizationId },
+    spawnId, randomUUID()));
+  assert.match((await latch()).access_error!, /HTTP 403/);
+  await refusedNow();
+
+  // A successful re-connect clears it, even when its own discovery is unavailable.
+  provider.mode.discover = "unavailable";
+  assert.equal((await connect(env)).status, 200);
+  assert.equal((await latch()).access_revoked_at, null);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
 });
