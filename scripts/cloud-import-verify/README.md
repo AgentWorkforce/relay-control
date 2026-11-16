@@ -6,7 +6,7 @@ The importer and authoritative mapping belong in `../cloud-import/`.
 `import-contract.ts` binds the verifier to the published
 `scripts/cloud-import/mapping.ts` from importer PR #155. It uses
 `MAPPING_REVISION`, shared comparisons, target specs/relations and encrypted
-sample definitions. PR #148 is stacked on the importer branch.
+sample definitions. PR #155 has merged; PR #148 now targets main.
 
 The harness executes the actual importer against its synthetic Cloud fixture
 and separate source/target databases. It checks rollback mode, committed apply
@@ -18,8 +18,7 @@ objects and local encrypted Postgres blobs, including a repeat copy.
 pending and no real-data import has run.
 
 The target runs all checked-in Control migrations, including the actual
-0053/0054/0056/0057/0058 files and the owner-only 0063 ledger migration from the
-importer branch. Only the pending 0061 staff-grant schema uses a test-only
+0053/0054/0056/0057/0058/0062 files and the owner-only 0063 ledger migration. Only the pending 0061 staff-grant schema uses a test-only
 model; it does not prove that pending migration file. The shared Cloud fixture
 now includes the generation column, so there is no verifier-owned source guard.
 The smaller fixtures in `fixtures.ts` independently
@@ -205,8 +204,9 @@ qualify copied secrets. For standalone comparisons without an importer
 ledger, the lower-level API remains available.
 
 Revision `.6` deliberately excludes History origins from the shared SQL checksum
-shape. A separate check uses the importer's `canonicalOrigin` callback (currently
-its interim default until Control's normalizer is available), compares stored
+shape. A separate check defaults to Control's `canonicalRelayhistoryOrigin` from
+`src/relayhistory-origin.ts` and accepts the same `canonicalOrigin` callback as
+the importer. It compares stored
 values and the private origin inventory, and reports only counts/mismatches.
 Customer hosts are never echoed, including a tampered input report's origin list.
 

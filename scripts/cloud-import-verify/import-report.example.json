@@ -2423,6 +2423,16 @@
     },
     {
       "kind": "unique",
+      "name": "public.workspaces.workspaces_relayhistory_origin_unique",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
       "name": "public.workspaces.workspaces_org_slug_unique",
       "ok": true,
       "detail": {

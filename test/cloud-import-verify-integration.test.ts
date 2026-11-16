@@ -3,6 +3,7 @@ import { before,after,beforeEach,test,type TestFn } from "node:test";
 import { Client } from "pg";
 import type { Database,SqlExecutor } from "../src/database.js";
 import { migrate,grantRuntimeDatabaseRole } from "../src/migrations.js";
+import { canonicalRelayhistoryOrigin } from "../src/relayhistory-origin.js";
 import { runImport,type ImportReport } from "../scripts/cloud-import/importer.js";
 import { CLOUD_FIXTURE_DDL,cloudFixtureSeed,cloudEnvelope,id,ORG_A,ORG_B } from "../scripts/cloud-import/cloud-fixture.js";
 import { fixtureKeyring } from "../scripts/cloud-import-verify/fixtures.js";
@@ -45,7 +46,7 @@ const sourceDb = database(source);
 const targetDb = database(target);
 const scope = {orgIds:null};
 const apply = (selected:ImportScope=scope) => runImport(
-  {source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply");
+  {source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,canonicalOrigin:canonicalRelayhistoryOrigin,batchSize:2},selected,"apply");
 async function copiedFixture() {
   await source.query("DELETE FROM provider_credentials WHERE id=ANY($1::uuid[])",[[id(0x807),id(0x80c)]]);
   await source.query("UPDATE provider_credentials SET is_active=true WHERE id=ANY($1::uuid[])",[[id(0x80e),id(0x80f)]]);
@@ -113,7 +114,7 @@ beforeEach(async () => {
 });
 
 fixtureTest("actual importer rollback, apply and rerun reconcile all mapped tables and keep invite hashes",async () => {
-  const dry = await runImport({source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},scope,"dry-run");
+  const dry = await runImport({source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,canonicalOrigin:canonicalRelayhistoryOrigin,batchSize:2},scope,"dry-run");
   assert.equal(dry.ok,true,JSON.stringify(dry));
   assert.equal((await target.query("SELECT count(*)::int AS n FROM users")).rows[0].n,0);
   const first = await apply();
@@ -230,6 +231,15 @@ fixtureTest("dedicated canonical-origin checks detect drift without printing pri
   assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "workspaces")!.ok,true);
   assert.equal(report.findings.find((f) => f.kind === "canonical_history_origins")!.ok,false);
   assert.ok(!JSON.stringify(report).includes(marker));
+});
+
+fixtureTest("actual 0062 origins use Control canonicalization before import and verification",async () => {
+  await source.query("UPDATE workspaces SET relayhistory_origin=$1 WHERE id=$2",["https://HISTORY.Example.test.:443/",id(0x201)]);
+  const ledger=await apply();assert.equal(ledger.ok,true);
+  assert.equal((await target.query("SELECT relayhistory_origin FROM workspaces WHERE id=$1",[id(0x201)])).rows[0].relayhistory_origin,"https://history.example.test");
+  const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
+  assert.equal(report.findings.find((f) => f.kind === "canonical_history_origins")!.ok,true);
 });
 
 fixtureTest("staff grants are revoked history with a stable fresh hash and one import audit",async () => {
@@ -535,7 +545,7 @@ fixtureTest("cohort scope counts and encrypted samples exclude another org's cor
   const ownership=await captureOwnership(target,scope);
   await target.query("UPDATE workspaces SET relaycast_api_key_ciphertext='synthetic-corrupt' WHERE organization_id=$1",[ORG_B]);
   const selected = {orgIds:[ORG_A]};
-  const ledger = await runImport({source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply");
+  const ledger = await runImport({source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,canonicalOrigin:canonicalRelayhistoryOrigin,batchSize:2},selected,"apply");
   const report = await verifyImport(source,target,selected,ledger,fixtureKeyring,cloudKeyHex,{previousReport:first,previousOwnership:ownership});
   assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
   assert.ok(report.findings.some((f) => f.kind === "decrypt" && f.detail === "not_applicable_no_imported_rows"));

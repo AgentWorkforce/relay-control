@@ -1,6 +1,7 @@
 import type { Client } from "pg";
+import { canonicalRelayhistoryOrigin } from "../../src/relayhistory-origin.js";
 import type { EncryptionKeyring } from "../../src/crypto.js";
-import { decryptCloudEnvelope,interimCanonicalOrigin,type ImportReport } from "../cloud-import/importer.js";
+import { decryptCloudEnvelope,type ImportReport } from "../cloud-import/importer.js";
 import { MAPPING_REVISION, ORG_TABLES, SOURCE_TABLES, TARGETS, TARGET_RELATIONS,IMPORTER_SKIP_REASONS,
   assertScope, encryptedSamples, sourceQuery, verifierComparisons, type ImportScope, type ImportTable } from "../cloud-import/mapping.js";
 import { verify, type Comparison, type Contract, type Finding } from "./verify.js";
@@ -77,7 +78,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     const absentSources=new Set<ImportTable>();
     const perOrg = new Map<string,Partial<Record<ImportTable,number>>>();
     const perOrgKeys:OrgKeys = new Map();
-    const canonicalOrigin=options.canonicalOrigin ?? interimCanonicalOrigin;
+    const canonicalOrigin=options.canonicalOrigin ?? canonicalRelayhistoryOrigin;
     const origins=new Map<string,string|null>();
     const exclusions = new Map<string,string[]>();
     const counts = new Map<ImportTable,number>();
