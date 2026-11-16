@@ -105,9 +105,11 @@ async function setup(t: TestContext, options: { tenancy?: "single" | "multi" } =
   const admin = createAdminModule({ config, database, keyring: config.encryptionKeyring });
   const control = createServer(createApp({ config, store, admin }));
   const origin = await listen(control);
-  // Same database, RelayHistory left unconfigured.
+  // Same database, installation History backend left unconfigured. Keeping a
+  // public fallback exercises that the default branch still requires the
+  // backend, while an imported workspace origin remains independently usable.
   const unconfigured = createServer(createApp({
-    config: { ...config, relayhistoryUrl: "", relayhistoryPublicUrl: "" },
+    config: { ...config, relayhistoryUrl: "", relayhistoryPublicUrl: historyOrigin },
     store,
   }));
   const unconfiguredOrigin = await listen(unconfigured);

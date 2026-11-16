@@ -2601,10 +2601,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (!workspace) throw new HttpError(404, "workspace_not_found", "Workspace not found");
       // An imported customer-hosted origin wins for this workspace. NULL uses
       // the installation default. Both are exact introspection audiences.
-      const origin = workspace.relayhistoryOrigin ?? config.relayhistoryPublicUrl;
-      if (!origin) {
+      const importedOrigin = workspace.relayhistoryOrigin;
+      if (!importedOrigin && (!config.relayhistoryUrl || !config.relayhistoryPublicUrl)) {
         throw new HttpError(404, "relayhistory_not_configured", "RelayHistory is not configured");
       }
+      const origin = importedOrigin ?? config.relayhistoryPublicUrl;
       json(response, 200, {
         workspace: workspace.id,
         origin,
