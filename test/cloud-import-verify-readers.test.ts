@@ -1,6 +1,6 @@
 import { accountCredentialExclusion,exclusionAccounting } from "../scripts/cloud-import-verify/exclusions.js";
 
-import { credentialWriteCounts,compareCredentialConvergence,credentialCheckpointDigest,validateCredentialCheckpoint,type CredentialConvergenceSnapshot } from "../scripts/cloud-import-verify/convergence.js";
+import { credentialConvergenceCohort,credentialWriteCounts,compareCredentialConvergence,credentialCheckpointDigest,validateCredentialCheckpoint,type CredentialConvergenceSnapshot } from "../scripts/cloud-import-verify/convergence.js";
 import { MAPPING_REVISION } from "../scripts/cloud-import/mapping.js";
 import { migrationFiles,sealManifest,type SchemaManifest } from "../scripts/cloud-import-verify/schema.js";
 import assert from "node:assert/strict";
@@ -118,9 +118,10 @@ test("exhausted API key cannot be accounted as a dead OAuth login",() => {
 
 const convergenceReport=() => ({version:1,mappingRevision:MAPPING_REVISION,mode:"apply",ok:true,outcomes:{} as Record<string,number>,
   writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0}});
+const independentCohort=credentialConvergenceCohort(["00000000-0000-4000-8000-000000000001"]);
 const checkpoint=(phase:"before"|"after",empty=false):CredentialConvergenceSnapshot => {
   const state={version:2 as const,mappingRevision:MAPPING_REVISION,scope:{orgIds:null},
-    credentials:empty ? [] : [{key:"a".repeat(64),stateSha256:"b".repeat(64),blobVersion:null}],blobs:[],markers:[]};
+    credentials:empty ? [] : [{key:independentCohort.keys[0]!,stateSha256:"b".repeat(64),blobVersion:null}],blobs:[],markers:[]};
   return {...state,kind:"credential-convergence",phase,nonce:(phase === "before" ? "c" : "d").repeat(64),
     digest:credentialCheckpointDigest(state),sessionSafety:{transactionReadOnly:"on",isolation:"repeatable read",statementTimeout:"1min",lockTimeout:"5s"}};
 };
@@ -146,23 +147,23 @@ test("convergence requires all five explicit valid write counters and bound repo
 
 test("nonzero counters fail convergence even when all independent target state is unchanged",() => {
   const before=checkpoint("before"),after=checkpoint("after");
-  assert.equal(compareCredentialConvergence(before,after,receiptReport(before)).ok,true);
-  assert.equal(compareCredentialConvergence(before,after,{}).ok,false);
+  assert.equal(compareCredentialConvergence(before,after,receiptReport(before),independentCohort).ok,true);
+  assert.equal(compareCredentialConvergence(before,after,{},independentCohort).ok,false);
   for (const key of Object.keys(convergenceReport().writes) as (keyof ReturnType<typeof convergenceReport>["writes"])[]) {
     const report=receiptReport(before);report.writes[key]=1;
     if (key === "inserted") report.outcomes.copied=1;
     if (key === "updated") report.outcomes.updated=1;
     const complete=key === "selectionWrites" ? {...report,selection:{writes:1}} : report;
     assert.notEqual(credentialWriteCounts(complete),null);
-    assert.equal(compareCredentialConvergence(before,after,complete).ok,false,key);
+    assert.equal(compareCredentialConvergence(before,after,complete,independentCohort).ok,false,key);
   }
-  assert.throws(() => compareCredentialConvergence(after,after,convergenceReport()),/baseline/);
+  assert.throws(() => compareCredentialConvergence(after,after,convergenceReport(),independentCohort),/baseline/);
 });
 
 test("empty state cannot qualify convergence even with zero counters and a matching receipt",() => {
   const before=checkpoint('before',true),after=checkpoint('after',true);
   assert.throws(() => validateCredentialCheckpoint(before,{orgIds:null}),/empty/);
-  const finding=compareCredentialConvergence(before,after,receiptReport(before));
+  const finding=compareCredentialConvergence(before,after,receiptReport(before),independentCohort);
   assert.equal(finding.ok,false);
   assert.equal((finding.detail as {nonemptyBefore:boolean}).nonemptyBefore,false);
   assert.deepEqual((finding.detail as {binding:unknown}).binding,{receiptValid:true,digestMatches:true,nonceMatches:true});
@@ -173,14 +174,26 @@ test("post-rerun relabelled checkpoints fail receipt nonce or fresh-before diges
   const report=receiptReport(before);
   const relabelled={...after,phase:'before' as const};
   assert.doesNotThrow(() => validateCredentialCheckpoint(relabelled,{orgIds:null}));
-  const wrongNonce=compareCredentialConvergence(relabelled,after,report);
+  const wrongNonce=compareCredentialConvergence(relabelled,after,report,independentCohort);
   assert.equal(wrongNonce.ok,false);
   assert.deepEqual((wrongNonce.detail as {binding:unknown}).binding,{receiptValid:true,digestMatches:true,nonceMatches:false});
   const changed={...after,credentials:[{...after.credentials[0]!,stateSha256:'e'.repeat(64)}]};
   changed.digest=credentialCheckpointDigest(changed);
   const replayedNonce={...changed,phase:'before' as const,nonce:before.nonce};
-  const wrongDigest=compareCredentialConvergence(replayedNonce,changed,report);
+  const wrongDigest=compareCredentialConvergence(replayedNonce,changed,report,independentCohort);
   assert.equal(wrongDigest.ok,false);
   assert.deepEqual((wrongDigest.detail as {binding:unknown}).binding,{receiptValid:true,digestMatches:false,nonceMatches:true});
   assert.deepEqual((wrongDigest.detail as {credentialChanges:unknown}).credentialChanges,{inserted:0,removed:0,changed:0});
+});
+
+test("nonempty unrelated state cannot substitute for the independent source cohort",() => {
+  const before=checkpoint('before'),after=checkpoint('after'),report=receiptReport(before);
+  assert.equal(compareCredentialConvergence(before,after,report).ok,false,'missing source cohort fails');
+  assert.equal(compareCredentialConvergence(before,after,report,credentialConvergenceCohort([])).ok,false,'empty source cohort fails even with nonempty target');
+  const unrelated=credentialConvergenceCohort(['00000000-0000-4000-8000-000000000002']);
+  const finding=compareCredentialConvergence(before,after,report,unrelated);
+  assert.equal(finding.ok,false);
+  assert.equal((finding.detail as {nonemptyBefore:boolean}).nonemptyBefore,true);
+  const cohort=(finding.detail as {cohort:{expectedCount:number;beforeCount:number;afterCount:number}}).cohort;
+  assert.equal(cohort.expectedCount,1);assert.equal(cohort.beforeCount,0);assert.equal(cohort.afterCount,0);
 });

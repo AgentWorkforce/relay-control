@@ -1,7 +1,7 @@
 import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
 
 import { readCopierMarkers } from "./copier-markers.js";
-import { credentialWriteCounts,readCredentialConvergence,compareCredentialConvergence,type CredentialConvergenceSnapshot } from "./convergence.js";
+import { credentialConvergenceCohort,credentialWriteCounts,readCredentialConvergence,compareCredentialConvergence,type CredentialConvergenceSnapshot } from "./convergence.js";
 import { beginReadOnlySnapshot,type ReadOnlySettings } from "./read-only.js";
 import { createHash,createHmac } from "node:crypto";
 import type { Client } from "pg";
@@ -323,7 +323,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
   const markerState=await readCopierMarkers(target,scope);
   const receipt=credentialWriteCounts(report);
   const hasReceipt=Object.hasOwn(report,"writes");
-  let markerExpected=0,markerMissing=0,markerMismatches=0;
+  let markerExpected=0,markerMissing=0,markerMismatches=0,markerRevisionMismatches=0;
   if (receipt) for (const [sourceId,key] of expectedBySourceId) {
     const outcome:unknown=report.rows[sourceId];
     const expectedRow=expected.get(key)!;
@@ -331,19 +331,32 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
     markerExpected++;
     const controlId=report.controlIds?.[sourceId];const marker=markerState.markers.get(controlId!);
     if (!marker) markerMissing++;
-    else if (marker.org !== expectedRow.org || marker.version !== targetVersions.get(controlId!)) markerMismatches++;
+    else {
+      if (marker.org !== expectedRow.org || marker.version !== targetVersions.get(controlId!)) markerMismatches++;
+      if (marker.revision !== report.mappingRevision || marker.revision !== MAPPING_REVISION) markerRevisionMismatches++;
+    }
   }
   findings.push({kind:"credential_marker_links",name:"written_logins",
-    ok:(!hasReceipt || receipt !== null) && !markerMissing && !markerMismatches,
+    ok:(!hasReceipt || receipt !== null) && !markerMissing && !markerMismatches && !markerRevisionMismatches,
     detail:{receiptStatus:hasReceipt ? receipt ? "valid" : "invalid" : "legacy_without_write_receipt",
-      expected:markerExpected,missing:markerMissing,mismatches:markerMismatches}});
+      expected:markerExpected,missing:markerMissing,mismatches:markerMismatches,revisionMismatches:markerRevisionMismatches}});
   const reported=report.selection;
   const matches=reported === undefined ? selectionGroups.size === 0 : Object.entries(summary).every(([key,value]) =>
     reported[key as keyof typeof summary] === value);
   findings.push({kind:"credential_cloud_selection",name:"coding_agent_credentials",
     ok:matches && !selectionMismatches && !summary.selectionConflicts,
     detail:{...summary,selectionMismatches,reportMatches:matches}});
-  if (evidence.convergenceBefore) findings.push(compareCredentialConvergence(evidence.convergenceBefore,
-    await readCredentialConvergence(target,"after"),report));
+  if (evidence.convergenceBefore) {
+    const controlIds=[...expectedBySourceId].flatMap(([sourceId,key]) => {
+      const controlId=report.controlIds?.[sourceId];
+      return typeof controlId === "string" && targetKeysById.get(controlId) === key ? [controlId] : [];
+    });
+    const cohort=credentialConvergenceCohort(controlIds);
+    // Every independently derived natural key must have its exact target ID.
+    // An incomplete link map may not silently shrink the expected cohort.
+    cohort.count=expected.size;
+    findings.push(compareCredentialConvergence(evidence.convergenceBefore,
+      await readCredentialConvergence(target,"after"),report,cohort));
+  }
   return findings;
 }

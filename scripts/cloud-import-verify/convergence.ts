@@ -113,10 +113,21 @@ export function validateCredentialCheckpoint(value:unknown,scope:ImportScope):Cr
   return snapshot;
 }
 
+export type CredentialConvergenceCohort={count:number;sha256:string;keys:readonly string[]};
+/** IDs come from independently source-derived expected natural keys and their
+ * validated actual target ID links, never from a before checkpoint roster. */
+export function credentialConvergenceCohort(controlIds:Iterable<string>):CredentialConvergenceCohort {
+  const keys=[...new Set([...controlIds].map((id) => {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error("Invalid expected cohort ID");
+    return hash(id.toLowerCase());
+  }))].sort();
+  return {count:keys.length,sha256:hash(JSON.stringify(keys)),keys};
+}
+
 /** Report write counts and independently computed before digest/nonce must
  * agree with the genuine before artifact. Same-value UPDATEs remain visible. */
 export function compareCredentialConvergence(before:CredentialConvergenceSnapshot,after:CredentialConvergenceSnapshot,
-  report:unknown):Finding {
+  report:unknown,expected?:CredentialConvergenceCohort):Finding {
   validateSnapshot(before,"before");validateSnapshot(after,"after");
   const nonemptyBefore=before.credentials.length > 0;
   const raw=report && typeof report === "object" ? (report as Record<string,unknown>).convergence : undefined;
@@ -129,6 +140,17 @@ export function compareCredentialConvergence(before:CredentialConvergenceSnapsho
   const previous=rowsByKey(before.credentials,10000),current=rowsByKey(after.credentials,10000);
   const previousBlobs=rowsByKey(before.blobs,50000),currentBlobs=rowsByKey(after.blobs,50000);
   const previousMarkers=rowsByKey(before.markers,10000),currentMarkers=rowsByKey(after.markers,10000);
+  const expectedKeys=Array.isArray(expected?.keys) ? [...expected.keys].sort() : [];
+  const expectedValid=Boolean(expected && Number.isSafeInteger(expected.count) && expected.count >= 0 && expected.count <= 10000
+    && expectedKeys.length === expected.count && new Set(expectedKeys).size === expectedKeys.length
+    && expectedKeys.every((key) => typeof key === "string" && /^[0-9a-f]{64}$/.test(key))
+    && expected.sha256 === hash(JSON.stringify(expectedKeys)));
+  const beforeKeys=expectedKeys.filter((key) => previous.has(key));
+  const afterKeys=expectedKeys.filter((key) => current.has(key));
+  const cohort={expectedValid,expectedCount:expectedValid ? expected!.count : null,expectedSha256:expectedValid ? expected!.sha256 : null,
+    beforeCount:beforeKeys.length,beforeSha256:hash(JSON.stringify(beforeKeys)),afterCount:afterKeys.length,afterSha256:hash(JSON.stringify(afterKeys))};
+  const cohortMatches=expectedValid && expected!.count > 0 && beforeKeys.length === expected!.count && afterKeys.length === expected!.count
+    && cohort.beforeSha256 === expected!.sha256 && cohort.afterSha256 === expected!.sha256;
   const differences=(a:Map<string,StateRow>,b:Map<string,StateRow>) => ({
     inserted:[...b.keys()].filter((key) => !a.has(key)).length,removed:[...a.keys()].filter((key) => !b.has(key)).length,
     changed:[...a].filter(([key,row]) => b.has(key) && row.stateSha256 !== b.get(key)!.stateSha256).length});
@@ -140,8 +162,8 @@ export function compareCredentialConvergence(before:CredentialConvergenceSnapsho
   const reportedBlobWriteCount=writes?.blobWrites ?? null;
   const noStateChanges=[...Object.values(credentialChanges),...Object.values(blobChanges),...Object.values(markerChanges),blobVersionChanges].every((n) => n === 0);
   return {kind:"credential_convergence",name:"no_writes_or_blob_version_changes",
-    ok:nonemptyBefore && binding.digestMatches && binding.nonceMatches && noStateChanges && reportedWriteCount === 0 && reportedBlobWriteCount === 0,
-    detail:{nonemptyBefore,binding,credentialChanges,blobChanges,markerChanges,blobVersionChanges,reportedWrites:writes,reportedWriteCount,reportedBlobWriteCount,
+    ok:nonemptyBefore && cohortMatches && binding.digestMatches && binding.nonceMatches && noStateChanges && reportedWriteCount === 0 && reportedBlobWriteCount === 0,
+    detail:{nonemptyBefore,cohort,binding,credentialChanges,blobChanges,markerChanges,blobVersionChanges,reportedWrites:writes,reportedWriteCount,reportedBlobWriteCount,
       evidenceScope:"all_target_credentials_postgres_blobs_and_copier_markers",physicalTupleIdentityIncluded:true}};
 }
 

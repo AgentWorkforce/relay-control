@@ -1,5 +1,5 @@
 import type { Client } from "pg";
-import type { ImportScope } from "../cloud-import/mapping.js";
+import { MAPPING_REVISION,type ImportScope } from "../cloud-import/mapping.js";
 import type { Finding } from "./verify.js";
 
 export const COPIER_LOGIN_MARKER="copier_login";
@@ -8,8 +8,8 @@ const KEY=/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):([1-9
  * can outlive a deleted credential; report orphan pointers without treating
  * them as current write authority. Unknown namespaces are never exempted. */
 export async function readCopierMarkers(target:Client,scope:ImportScope) {
-  const markers=new Map<string,{org:string;version:number}>();
-  let observed=0,invalidKeys=0,invalidRevisions=0,duplicateCredentials=0,invalidReferences=0,orphanMarkers=0,olderVersions=0;
+  const markers=new Map<string,{org:string;version:number;revision:string}>();
+  let observed=0,invalidKeys=0,invalidRevisions=0,duplicateCredentials=0,invalidReferences=0,orphanMarkers=0,olderVersions=0,historicalRevisions=0;
   await target.query(`DECLARE copier_marker_cursor NO SCROLL CURSOR FOR
     SELECT l.organization_id::text AS org,l.row_key,l.mapping_revision,c.id::text AS credential_id,
       c.organization_id::text AS credential_org,c.auth_type,c.blob_version
@@ -25,7 +25,8 @@ export async function readCopierMarkers(target:Client,scope:ImportScope) {
       if (!match || !Number.isSafeInteger(version) || version > 2147483647) {invalidKeys++;continue;}
       const id=match[1]!.toLowerCase();
       if (markers.has(id)) duplicateCredentials++;
-      markers.set(id,{org:row.org,version});
+      markers.set(id,{org:row.org,version,revision:row.mapping_revision});
+      if (row.mapping_revision !== MAPPING_REVISION) historicalRevisions++;
       if (!/^cloud-identity-\d{4}-\d{2}-\d{2}\.\d+$/.test(row.mapping_revision)) invalidRevisions++;
       if (!row.credential_id) {orphanMarkers++;continue;}
       if (row.credential_org !== row.org || row.auth_type !== "provider_oauth"
@@ -35,6 +36,6 @@ export async function readCopierMarkers(target:Client,scope:ImportScope) {
   }} finally {await target.query("CLOSE copier_marker_cursor");}
   const finding:Finding={kind:"credential_copy_markers",name:COPIER_LOGIN_MARKER,
     ok:!invalidKeys && !invalidRevisions && !duplicateCredentials && !invalidReferences,
-    detail:{observed,invalidKeys,invalidRevisions,duplicateCredentials,invalidReferences,orphanMarkers,olderVersions}};
+    detail:{observed,invalidKeys,invalidRevisions,duplicateCredentials,invalidReferences,orphanMarkers,olderVersions,historicalRevisions}};
   return {finding,markers};
 }
