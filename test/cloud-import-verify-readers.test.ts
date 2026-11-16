@@ -1,4 +1,6 @@
 import { accountCredentialExclusion,exclusionAccounting } from "../scripts/cloud-import-verify/exclusions.js";
+import { credentialCloudSelection,writtenOnlySelection,type SourceSelection,type TargetSelection } from "../scripts/cloud-import-verify/credential-selection.js";
+import { credentialLoginCohort,deduplicatesLogins } from "../scripts/cloud-import-verify/credential-cohort.js";
 
 import { credentialConvergenceCohort,credentialWriteCounts,compareCredentialConvergence,credentialCheckpointDigest,validateCredentialCheckpoint,type CredentialConvergenceSnapshot } from "../scripts/cloud-import-verify/convergence.js";
 import { MAPPING_REVISION } from "../scripts/cloud-import/mapping.js";
@@ -13,6 +15,64 @@ import { readOnlyCloudCredentials } from "../scripts/cloud-import-verify/credent
 
 const inputs={CLOUD_CREDENTIAL_R2_ENDPOINT:"https://objects.example.test",CLOUD_CREDENTIAL_R2_BUCKET:"synthetic-fixtures",
   CLOUD_CREDENTIAL_R2_ACCESS_KEY_ID:"SYNTHETIC_ACCESS",CLOUD_CREDENTIAL_R2_SECRET_ACCESS_KEY:"synthetic-secret-only"};
+
+test("duplicate login winner is independently freshest then lowest id and inherits all Cloud choices",() => {
+  const make=(id:string,updated:number,active:boolean,harness:boolean) => ({authType:"provider_oauth",content:id,
+    selection:{id,key:"decrypted-account-key",group:"workspace:provider",updated,active,harness}});
+  const old=make("001",1,true,false),fresh=make("003",2,false,false),tie=make("002",2,false,true);
+  const cohort=credentialLoginCohort([old,fresh,tie],true);
+  assert.equal(cohort.selected.length,1);assert.equal(cohort.selected[0]!.content,"002");
+  assert.deepEqual([...cohort.duplicates].sort(),["001","003"]);
+  assert.equal(cohort.selected[0]!.selection.active,true);assert.equal(cohort.selected[0]!.selection.harness,true);
+  assert.equal(tie.selection.active,false,"source values are not mutated");
+  const separate={...old,selection:{...old.selection,id:"004",key:"different-decrypted-account"}};
+  const api={...fresh,authType:"byo_api_key",selection:{...fresh.selection,id:"005"}};
+  assert.equal(credentialLoginCohort([old,fresh,tie,separate,api],true).selected.length,3);
+  assert.equal(credentialLoginCohort([old,fresh,tie],false).selected.length,3);
+  assert.equal(deduplicatesLogins("cloud-identity-2026-11-16.11"),false);
+  assert.equal(deduplicatesLogins("cloud-identity-2026-11-16.21"),true);
+});
+
+test("written-only selection preserves Control choices and rejects missing or changed prior evidence",() => {
+  const entry:SourceSelection={id:"source",key:"existing",group:"workspace:provider",active:true,harness:true,updated:1};
+  const prior:TargetSelection={group:entry.group,active:false,harness:false};
+  const input={revision:"cloud-identity-2026-11-16.25",entries:[entry],outcomes:{source:"already_present"},
+    flags:new Map([[entry.key,prior]]),nativeFlags:new Map<string,TargetSelection>(),baseline:new Map([[entry.key,prior]]),
+    allFlags:[prior],unchangedKeys:new Set<string>(),reported:undefined};
+  const finding=credentialCloudSelection(input);
+  assert.equal(finding.ok,true);assert.equal((finding.detail as {untouchedKeys:number}).untouchedKeys,1);
+  assert.equal(credentialCloudSelection({...input,outcomes:{source:"control_newer"}}).ok,true);
+  assert.equal(credentialCloudSelection({...input,revision:"cloud-identity-2026-11-16.24"}).ok,false);
+  assert.equal(credentialCloudSelection({...input,baseline:new Map()}).ok,false);
+  assert.equal(credentialCloudSelection({...input,baseline:new Map(),unchangedKeys:new Set([entry.key])}).ok,true);
+  assert.equal(credentialCloudSelection({...input,baseline:new Map([[entry.key,{...prior,active:true}]]),
+    unchangedKeys:new Set([entry.key])}).ok,true,"the genuine pre-rerun tuple supersedes pre-first-copy flags");
+  assert.equal(credentialCloudSelection({...input,flags:new Map([[entry.key,{...prior,harness:true}]])}).ok,false);
+  assert.equal(credentialCloudSelection({...input,reported:{groups:1,active:1,harness:1,activeDemoted:0,harnessDemoted:0,selectionConflicts:0}}).ok,false);
+  assert.equal(writtenOnlySelection("cloud-identity-2026-11-16.11"),false);
+  assert.equal(writtenOnlySelection("cloud-identity-2026-11-16.26"),true);
+});
+
+test("written selection cohorts exclude untouched source winners without weakening written winner checks",() => {
+  const entries:SourceSelection[]=[
+    {id:"new",key:"written",group:"workspace:provider",active:false,harness:false,updated:1},
+    {id:"old",key:"existing",group:"workspace:provider",active:true,harness:true,updated:2},
+  ];
+  const prior:TargetSelection={group:entries[0]!.group,active:true,harness:true};
+  const written={...prior,active:false,harness:false};
+  const input={revision:"cloud-identity-2026-11-16.25",entries,outcomes:{new:"copied",old:"already_present"},
+    flags:new Map([["written",written],["existing",prior]]),nativeFlags:new Map<string,TargetSelection>(),
+    baseline:new Map([["existing",prior]]),allFlags:[written,prior],unchangedKeys:new Set<string>(),
+    reported:{groups:1,active:0,harness:0,activeDemoted:0,harnessDemoted:0,selectionConflicts:0}};
+  assert.equal(credentialCloudSelection(input).ok,true);
+  assert.equal(credentialCloudSelection({...input,flags:new Map([["written",prior],["existing",written]])}).ok,false);
+  const selected={...input,entries:entries.map((entry) => ({...entry,active:true,harness:true})),
+    outcomes:{new:"updated",old:"already_present"},flags:new Map([["written",prior],["existing",written]]),
+    allFlags:[prior,written],reported:{...input.reported,active:1,harness:1}};
+  assert.equal(credentialCloudSelection(selected).ok,true);
+  assert.equal(credentialCloudSelection({...selected,flags:input.flags}).ok,false);
+  assert.equal(credentialCloudSelection({...selected,reported:{...selected.reported,activeDemoted:1}}).ok,false);
+});
 
 test("Cloud credential reader exposes signed GET only with no redirects",async () => {
   const calls:{url:string;init:RequestInit}[]=[];

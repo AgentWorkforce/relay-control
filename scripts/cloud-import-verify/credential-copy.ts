@@ -1,5 +1,8 @@
 import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
 
+import { credentialCloudSelection,type SourceSelection } from "./credential-selection.js";
+import { credentialLoginCohort,deduplicatesLogins } from "./credential-cohort.js";
+
 import { readCopierMarkers } from "./copier-markers.js";
 import { credentialConvergenceCohort,credentialWriteCounts,readCredentialConvergence,compareCredentialConvergence,type CredentialConvergenceSnapshot } from "./convergence.js";
 import { beginReadOnlySnapshot,type ReadOnlySettings } from "./read-only.js";
@@ -115,7 +118,8 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
   const expected = new Map<string,Expected>();
   const sourceIds = new Set<string>();
   const expectedBySourceId=new Map<string,string>();
-  const selections:{id:string;key:string;group:string;active:boolean;harness:boolean;updated:number}[]=[];
+  const selections:SourceSelection[]=[];
+  const usable:{selection:SourceSelection;authType:string;expected:Expected}[]=[];
   const expectedOutcomes:Record<string,number> = {};
   const {report} = evidence;
   const baseline=priorCredentials(evidence.previousTarget,scope);
@@ -172,21 +176,29 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
           identity = row.auth_type === "oauth_token" && row.account_email?.trim()
             ? `account:${row.account_email.trim().toLowerCase()}` : `fingerprint:${fp}`;
         }
-        // Last source row wins when Control replaces a setup token or login
-        // for the same account. Only hashes, never plaintext, are retained.
+        // Derive account identity/content before trusting duplicate labels.
+        // Only hashes, never plaintext, survive source-row processing.
         const key=naturalKey(row.workspace_id,provider,row.auth_type,identity);
-        expectedBySourceId.set(row.id,key);
-        selections.push({id:row.id,key,group:`${row.workspace_id}:${provider}`,active:row.is_active,
-          harness:row.harness_active && ["oauth_token","provider_oauth"].includes(row.auth_type),updated:new Date(row.updated_at).getTime()});
-        expected.set(key,{
+        const selection={id:row.id,key,group:`${row.workspace_id}:${provider}`,active:row.is_active,
+          harness:row.harness_active && ["oauth_token","provider_oauth"].includes(row.auth_type),updated:new Date(row.updated_at).getTime()};
+        if (!Number.isFinite(selection.updated)) throw new Error("invalid_source_timestamp");
+        usable.push({selection,authType:row.auth_type,expected:{
           org:row.organization_id,workspace:row.workspace_id,provider,authType:row.auth_type,identity,
           fingerprint:fp,contentHash:hash(content),
-        });
-        rowOutcomesMatch &&= outcome === "copied" || outcome === "already_present"
-          || (outcome === "updated" && Boolean(credentialWriteCounts(report)?.updated));
+        }});
       } catch {sourceFailures++;rowOutcomesMatch = false;}
     }
   }} finally {await source.query("CLOSE credential_copy_cursor");}
+  const cohort=credentialLoginCohort(usable,deduplicatesLogins(report.mappingRevision));
+  for (const sourceId of cohort.duplicates) rowOutcomesMatch &&= String(report.rows?.[sourceId]) === "duplicate_login";
+  for (const row of cohort.selected) {
+    const outcome:unknown=report.rows?.[row.selection.id];
+    expectedBySourceId.set(row.selection.id,row.selection.key);
+    selections.push(row.selection);
+    expected.set(row.selection.key,row.expected);
+    rowOutcomesMatch &&= outcome === "copied" || outcome === "already_present"
+      || (outcome === "updated" && Boolean(credentialWriteCounts(report)?.updated));
+  }
   const reportedIds = Object.keys(report.rows ?? {});
   const totals = (values:Record<string,number>) => JSON.stringify(Object.entries(values).sort(([a],[b]) => a.localeCompare(b)));
   const findings:Finding[] = [{kind:"credential_copy_ledger",name:"run",
@@ -194,7 +206,9 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
       && report.candidates === candidates && reportedIds.length === sourceIds.size
       && reportedIds.every((id) => sourceIds.has(id)) && rowOutcomesMatch
       && totals(report.outcomes) === totals(expectedOutcomes),
-    detail:{candidates,sourceFailures,unresolvedSourceSkips,reportedCandidates:Number.isSafeInteger(report.candidates) ? report.candidates : null}},
+    detail:{candidates,sourceFailures,unresolvedSourceSkips,duplicateLogins:cohort.duplicates.size,
+      outcomesMatch:rowOutcomesMatch,
+      reportedCandidates:Number.isSafeInteger(report.candidates) ? report.candidates : null}},
     {kind:"credential_exclusions",name:"credential_copy",ok:!unresolvedSourceSkips,
       detail:{classes:deliberateExclusions,unresolvedSourceSkips}}];
   const seen = new Set<string>();
@@ -272,54 +286,21 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
   findings.push({kind:"credential_control_ids",name:"coding_agent_credentials",
     ok:validMap && mapEntries.length === expectedBySourceId.size && !idMismatches && !extraIds,
     detail:{expected:expectedBySourceId.size,reported:validMap ? mapEntries.length : null,idMismatches,extraIds}});
-  const summary={groups:0,active:0,harness:0,activeDemoted:0,harnessDemoted:0,selectionConflicts:0};
-  let selectionMismatches=0;
   const allFlags=(await target.query(`SELECT workspace_id::text,model_provider,is_active,harness_active FROM public.coding_agent_credentials c
     JOIN public.workspaces w ON w.id=c.workspace_id WHERE $1::uuid[] IS NULL OR w.organization_id=ANY($1::uuid[])`,[scope.orgIds])).rows;
-  const selectionGroups=new Map<string,typeof selections>();
-  for (const entry of selections) {
-    const group=selectionGroups.get(entry.group) ?? [];group.push(entry);selectionGroups.set(entry.group,group);
+  const after=evidence.convergenceBefore ? await readCredentialConvergence(target,"after") : undefined;
+  const priorState=new Map(evidence.convergenceBefore?.credentials.map((row) => [row.key,row.stateSha256]));
+  const currentState=new Map(after?.credentials.map((row) => [row.key,row.stateSha256]));
+  const unchangedKeys=new Set<string>();
+  for (const [controlId,key] of targetKeysById) {
+    const before=priorState.get(hash(controlId));
+    if (before !== undefined && before === currentState.get(hash(controlId))) unchangedKeys.add(key);
   }
-  const flagGroups=new Map<string,[string,{group:string;active:boolean;harness:boolean}][]>();
-  for (const entry of flags) {
-    const group=flagGroups.get(entry[1].group) ?? [];group.push(entry);flagGroups.set(entry[1].group,group);
-  }
-  const groupCounts=new Map<string,{active:number;harness:number}>();
-  for (const row of allFlags) {
-    const key=`${row.workspace_id}:${row.model_provider}`;
-    const count=groupCounts.get(key) ?? {active:0,harness:0};
-    count.active+=Number(row.is_active);count.harness+=Number(row.harness_active);groupCounts.set(key,count);
-  }
-  for (const [group,entries] of selectionGroups) {
-    summary.groups++;
-    const copiedKeys=new Set(entries.map((entry) => entry.key));
-    const groupFlags=flagGroups.get(group) ?? [];
-    for (const column of ["active","harness"] as const) {
-      const candidates=entries.filter((entry) => entry[column]);
-      const chosen=[...candidates].sort((a,b) => b.updated-a.updated || a.id.localeCompare(b.id))[0];
-      const selectedCopies=groupFlags.filter(([,entry]) => entry[column]);
-      if (chosen) {
-        summary[column]++;
-        const demoted=Math.max(0,new Set(candidates.map((entry) => entry.key)).size-1);
-        if (column === "active") summary.activeDemoted+=demoted;else summary.harnessDemoted+=demoted;
-        const total=groupCounts.get(group)?.[column] ?? 0;
-        if (selectedCopies.length !== 1 || selectedCopies[0]![0] !== chosen.key || total !== 1) selectionMismatches++;
-      } else if (selectedCopies.length) {
-        if (column === "active") summary.selectionConflicts++;else selectionMismatches++;
-      }
-    }
-    if (groupFlags.length !== copiedKeys.size) selectionMismatches++;
-  }
-  for (const [key,prior] of baseline) {
-    if (expected.has(key) || (scope.orgIds !== null && !scope.orgIds.some((id) => id.toLowerCase() === prior.org.toLowerCase()))) continue;
-    const native=nativeFlags.get(key);
-    if (!native) {selectionMismatches++;continue;}
-    const entries=selectionGroups.get(prior.group) ?? [];
-    for (const column of ["active","harness"] as const) {
-      const chosen=entries.some((entry) => entry[column]);
-      if (native[column] !== (chosen ? false : prior[column])) selectionMismatches++;
-    }
-  }
+  const scopedBaseline=new Map([...baseline].filter(([,prior]) => scope.orgIds === null
+    || scope.orgIds.some((id) => id.toLowerCase() === prior.org.toLowerCase())));
+  findings.push(credentialCloudSelection({revision:report.mappingRevision,entries:selections,outcomes:report.rows,
+    flags,nativeFlags,baseline:scopedBaseline,unchangedKeys,reported:report.selection,
+    allFlags:allFlags.map((row) => ({group:`${row.workspace_id}:${row.model_provider}`,active:row.is_active,harness:row.harness_active}))}));
   const markerState=await readCopierMarkers(target,scope);
   const receipt=credentialWriteCounts(report);
   const hasReceipt=Object.hasOwn(report,"writes");
@@ -340,12 +321,6 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
     ok:(!hasReceipt || receipt !== null) && !markerMissing && !markerMismatches && !markerRevisionMismatches,
     detail:{receiptStatus:hasReceipt ? receipt ? "valid" : "invalid" : "legacy_without_write_receipt",
       expected:markerExpected,missing:markerMissing,mismatches:markerMismatches,revisionMismatches:markerRevisionMismatches}});
-  const reported=report.selection;
-  const matches=reported === undefined ? selectionGroups.size === 0 : Object.entries(summary).every(([key,value]) =>
-    reported[key as keyof typeof summary] === value);
-  findings.push({kind:"credential_cloud_selection",name:"coding_agent_credentials",
-    ok:matches && !selectionMismatches && !summary.selectionConflicts,
-    detail:{...summary,selectionMismatches,reportMatches:matches}});
   if (evidence.convergenceBefore) {
     const controlIds=[...expectedBySourceId].flatMap(([sourceId,key]) => {
       const controlId=report.controlIds?.[sourceId];
@@ -356,7 +331,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
     // An incomplete link map may not silently shrink the expected cohort.
     cohort.count=expected.size;
     findings.push(compareCredentialConvergence(evidence.convergenceBefore,
-      await readCredentialConvergence(target,"after"),report,cohort));
+      after!,report,cohort));
   }
   return findings;
 }
