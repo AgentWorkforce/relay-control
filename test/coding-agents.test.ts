@@ -445,12 +445,15 @@ test("coding agents: imported relay-managed rows remain metadata-only and fail c
   for (const name of blockedProbeNames) {
     assert.equal(runtime.body.env[name], undefined, `${name} cannot bypass a managed selection`);
     assert(!runtime.body.secretEnvNames.includes(name), `${name} is not advertised to the run`);
-  }
-  for (const provider of CODING_AGENT_PROVIDERS) {
     assert(runtime.body.skipped.some((entry: { name: string; reason: string }) =>
-      entry.name === provider.apiKeyEnv && entry.reason === "relay_managed_unavailable"
-    ), `${provider.id} reports the unavailable managed binding`);
+      entry.name === name && entry.reason === "relay_managed_blocked"
+    ), `${name} is named in the run warning`);
   }
+  assert.equal(
+    new Set(runtime.body.skipped.map((entry: { name: string }) => entry.name)).size,
+    runtime.body.skipped.length,
+    "warning names are deduplicated",
+  );
 
   const probesBefore = ctx.probes.length;
   const checked = await request(ctx.origin, `${base}/cloud-agents/${managedId}/check`, {

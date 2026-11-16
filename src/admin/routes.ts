@@ -250,17 +250,28 @@ export function createAdminModule(input: {
     // over both.
     const blocked = new Set(agentEnvironment.blockedNames);
     const blockedPrefixes = agentEnvironment.blockedPrefixes;
-    const workspaceEnv = Object.fromEntries(
-      Object.entries(environment.env).filter(([name]) =>
-        !blocked.has(name) && !blockedPrefixes.some((prefix) => name.startsWith(prefix))
-      ),
-    );
+    const blockedWorkspaceNames: string[] = [];
+    const workspaceEnv: Record<string, string> = {};
+    for (const [name, value] of Object.entries(environment.env)) {
+      if (blocked.has(name) || blockedPrefixes.some((prefix) => name.startsWith(prefix))) {
+        blockedWorkspaceNames.push(name);
+      } else {
+        workspaceEnv[name] = value;
+      }
+    }
+    const skipped = new Map<string, { name: string; reason: string }>();
+    for (const name of blockedWorkspaceNames) {
+      skipped.set(name, { name, reason: "relay_managed_blocked" });
+    }
+    for (const entry of [...environment.skipped, ...agentEnvironment.skipped]) {
+      if (!skipped.has(entry.name)) skipped.set(entry.name, entry);
+    }
     const env = { ...workspaceEnv, ...agentEnvironment.env, ...integrationEnv };
     return {
       workspaceId,
       env,
       secretEnvNames: Object.keys(env).sort(),
-      skipped: [...environment.skipped, ...agentEnvironment.skipped],
+      skipped: [...skipped.values()],
       integrationErrors: failed,
     };
   }
