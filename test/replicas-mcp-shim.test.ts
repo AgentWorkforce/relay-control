@@ -11,13 +11,14 @@ import { helperInstall } from "../src/replicas/service.js";
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
 // The replica-side MCP server and its installer are vendored byte for byte
-// from the hosted control plane (Cloud 26235d9d4cf2, mcp.ts sha256 7f386084).
+// from the hosted control plane (Cloud 34fd4016e, mcp.ts sha256 d5721532).
 // A change here must be a deliberate re-vendor: update the hosted copy and
 // these pins together.
 test("vendored replica MCP shim matches the pinned hosted source", () => {
-  assert.equal(sha256(replicaMcpSource), "ea66bfa7f279a4250aeba4deef07d1cc5b53081ccbbea1052081507cbef413e7");
-  assert.equal(sha256(mcpInstall("claude")), "53a4068c8ae84e23ad8c86080180b5e2733a2468dae02febdda95f05efceb259");
-  assert.equal(sha256(mcpInstall("codex")), "5aee7f4f88d3bd52271f9f5eeb892dd9a4ebc0b0700022b9186ad91b857b7d8f");
+  assert.equal(sha256(replicaMcpSource), "1624e788afb02435b2e0bd9b18d84eda474ae318bba74ca218a4f5dd720913a8");
+  assert.equal(sha256(mcpInstall("claude")), "cea60a8fc222870d3396177375e2fab54fb5c8312f82a9e1dac74d8f25ff8c5c");
+  assert.equal(sha256(mcpInstall("codex")), "f469b9ce5d87b291ad487a8671e6ea17cb251c428666442a130bd2da08c58ab5");
+  assert.ok(replicaMcpSource.includes("stop retrying until binding access is restored"));
   assert.equal(REPLICA_MCP_READY, "agent-relay-mcp-ready-v1");
   assert.match(REPLICA_MCP_FAILURE, /^Agent Relay MCP provisioning failed\./);
 });
