@@ -595,8 +595,12 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     const runOrg = async (tx: SqlExecutor, org: string) => {
       // The target ledger is the only record of what earlier runs wrote.
       const ledger = await tx.query<{ table_name: string; row_key: string }>(
-        `SELECT table_name, row_key FROM public.${IMPORT_LEDGER_TABLE} WHERE organization_id = $1 FOR UPDATE`,
-        [org],
+        // Only the importer's own tables: the credential copier keeps its
+        // markers here too (copier_login), and they must not make an org
+        // look imported.
+        `SELECT table_name, row_key FROM public.${IMPORT_LEDGER_TABLE}
+          WHERE organization_id = $1 AND table_name = ANY($2::text[]) FOR UPDATE`,
+        [org, [...ORG_TABLES]],
       );
       if (ledger.rows.length === 0) {
         // Never imported. An existing org with this id is Control's own:

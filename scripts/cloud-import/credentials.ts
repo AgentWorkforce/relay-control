@@ -19,7 +19,7 @@
 //   provider_oauth  {user}/accounts/{rowId}/... when provider_account_id is
 //                   set, then {user}/{provider}/credentials.json.enc
 import type { EncryptionKeyring } from "../../src/crypto.js";
-import type { Database } from "../../src/database.js";
+import type { Database, SqlExecutor } from "../../src/database.js";
 import { CodingAgentError, type CodingAgentStore } from "../../src/admin/coding-agents.js";
 import { describeAuthFile, type SubscriptionLoginStore, type SubscriptionProvider } from "../../src/admin/subscription-logins.js";
 import type { CredentialBlobStore } from "../../src/admin/credential-blobs.js";
@@ -62,21 +62,22 @@ async function loginMarker(target: Database, organizationId: string, controlId: 
   return Number.isInteger(version) ? version : null;
 }
 
-async function recordLoginMarker(target: Database, organizationId: string, controlId: string): Promise<void> {
-  const current = (await target.query<{ blob_version: number }>(
-    "SELECT blob_version FROM coding_agent_credentials WHERE id = $1", [controlId])).rows[0];
-  if (!current) return;
-  await target.transaction(async (tx) => {
-    await tx.query(
-      "DELETE FROM cloud_import_ledger WHERE organization_id = $1 AND table_name = $2 AND row_key LIKE $3",
-      [organizationId, LOGIN_MARKER, `${controlId}:%`],
-    );
-    await tx.query(
-      `INSERT INTO cloud_import_ledger (organization_id, table_name, row_key, mapping_revision)
-       VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
-      [organizationId, LOGIN_MARKER, `${controlId}:${current.blob_version}`, MAPPING_REVISION],
-    );
-  });
+/**
+ * Records, inside storeLogin's own transaction, the version it just wrote:
+ * the marker can only ever name the import's own write, never a version a
+ * concurrent Control refresh produced (storeLogin and refresh share the
+ * per-credential advisory lock).
+ */
+async function writeLoginMarker(tx: SqlExecutor, organizationId: string, stored: { id: string; version: number }): Promise<void> {
+  await tx.query(
+    "DELETE FROM cloud_import_ledger WHERE organization_id = $1 AND table_name = $2 AND row_key LIKE $3",
+    [organizationId, LOGIN_MARKER, `${stored.id}:%`],
+  );
+  await tx.query(
+    `INSERT INTO cloud_import_ledger (organization_id, table_name, row_key, mapping_revision)
+     VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+    [organizationId, LOGIN_MARKER, `${stored.id}:${stored.version}`, MAPPING_REVISION],
+  );
 }
 
 /** Reads one Cloud credential object; null when it does not exist. */
@@ -396,6 +397,7 @@ export async function copyCodingAgentCredentials(
           provider: canonicalProvider(row.model_provider) as SubscriptionProvider,
           authFile: plaintext,
           accountEmail: row.account_email,
+          onStored: (tx, stored) => writeLoginMarker(tx, row.organization_id!, stored),
         };
         // storeLogin always rewrites in place (new blob, version + 1, status
         // reset), so it runs only when Control does not already hold this
@@ -439,7 +441,6 @@ export async function copyCodingAgentCredentials(
         }
         const id = await deps.logins.storeLogin(login);
         report.writes.blobWrites += 1;
-        await recordLoginMarker(deps.target, row.organization_id!, id);
         if (existing) report.writes.updated += 1;
         else report.writes.inserted += 1;
         report.writes.metadataWrites += await preserveCloudState(deps.target, id, row);

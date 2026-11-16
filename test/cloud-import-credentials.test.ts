@@ -294,6 +294,57 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.equal(unreadable.rows[id(0x806)], "blob_read_failed");
   assert.equal(await version(loginId), rotatedVersion);
   assert.equal(unreadable.ok, false);
+
+  // storeLogin reports, inside its own transaction, exactly the version it wrote.
+  let seen: { id: string; version: number } | null = null;
+  const storedId = await deps.logins.storeLogin({
+    provider: "openai", workspaceId: id(0x201), organizationId: ORG_A, actor: { kind: "user", userId: id(1) },
+    authFile: codexAuth, onStored: async (_tx, stored) => { seen = stored; },
+  });
+  const seenVersion = (seen as { id: string; version: number } | null)!;
+  assert.equal(seenVersion.id, storedId);
+  assert.equal(seenVersion.version, await version(storedId));
+});
+
+test("credential copier: a marker only ever names the import's own write, even racing a Control rotation", async (t) => {
+  const source = new PGliteDatabase();
+  const target = new PGliteDatabase();
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  await source.exec(CLOUD_FIXTURE_DDL);
+  await source.exec(cloudFixtureSeed(CLOUD_KEY));
+  await migrate(target);
+  assert.equal((await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply")).ok, true);
+  const auth = (refresh: string) => JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: { access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), id_token: jwt({ email: "alice@example.test" }), refresh_token: refresh, account_id: "acct-synthetic-1" },
+  });
+  const objects = new Map([[`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(auth("rt-cloud"), CLOUD_KEY))]]);
+  const blobs = new CredentialBlobStore(new PostgresObjectBackend(target), KEYRING);
+  const deps = {
+    source, target, reader: { get: async (key: string) => objects.get(key) ?? null }, cloudKeyHex: CLOUD_KEY, keyring: KEYRING,
+    codingAgents: new CodingAgentStore(target, KEYRING, undefined, blobs),
+    logins: new SubscriptionLoginStore(target, KEYRING, blobs), blobs,
+  };
+  for (let round = 0; round < 4; round += 1) {
+    objects.set(`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(auth(`rt-cloud-${round}`), CLOUD_KEY)));
+    await Promise.all([
+      copyCodingAgentCredentials(deps, { orgIds: null }, "apply"),
+      deps.logins.storeLogin({ provider: "openai", workspaceId: id(0x201), organizationId: ORG_A, actor: { kind: "user", userId: id(1) }, authFile: auth(`rt-control-${round}`) }),
+    ]);
+    const markers = (await target.query<{ row_key: string }>(
+      "SELECT row_key FROM cloud_import_ledger WHERE table_name = 'copier_login'")).rows;
+    for (const { row_key } of markers) {
+      const [controlId, markedVersion] = row_key.split(":") as [string, string];
+      const row = (await target.query<{ blob_location: string }>("SELECT blob_location FROM coding_agent_credentials WHERE id = $1", [controlId])).rows[0];
+      if (!row) continue;
+      // Whatever interleaving happened, a marker names a version the import wrote.
+      const atMarker = await blobs.read(`workspaces/${id(0x201)}/accounts/${controlId}/v${markedVersion}.json.enc`, controlId, Number(markedVersion)).catch(() => null);
+      if (atMarker !== null) assert.match(atMarker, /rt-cloud-/, `marker ${row_key} names the import's own write`);
+    }
+  }
 });
 
 test("credential copier CLI: apply refuses up front when copy settings are missing", async () => {

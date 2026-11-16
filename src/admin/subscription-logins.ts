@@ -583,6 +583,12 @@ export class SubscriptionLoginStore {
     authFile: string;
     /** Cloud stores Claude account identity beside the auth file, not inside it. */
     accountEmail?: string | null;
+    /**
+     * Runs inside the store's transaction, after the row and blob are
+     * written, with the version written (the Cloud importer records it there
+     * so its marker can never name a version a concurrent refresh wrote).
+     */
+    onStored?: (tx: SqlExecutor, stored: { id: string; version: number }) => Promise<void>;
   }): Promise<string> {
     if (Buffer.byteLength(input.authFile) > MAX_AUTH_FILE_BYTES) {
       throw new CodingAgentError(422, "invalid_auth_file", "Auth file is too large");
@@ -593,6 +599,18 @@ export class SubscriptionLoginStore {
     let previousLocation: string | null = null;
     const id = await this.database.transaction(async (tx) => {
       await tx.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [input.workspaceId]);
+      // A replaced login takes the same per-credential advisory lock as
+      // refresh and write-back (before its row lock, in the same order), so a
+      // concurrent refresh cannot also write blob version N + 1.
+      const prior = await tx.query<{ id: string }>(
+        `SELECT id FROM coding_agent_credentials
+          WHERE workspace_id = $1 AND model_provider = $2 AND auth_type = 'provider_oauth'
+            AND provider_account_id = $3`,
+        [input.workspaceId, input.provider, described.accountId],
+      );
+      if (prior.rows[0]) {
+        await tx.query("SELECT pg_advisory_xact_lock(hashtext('selfhost-cli-credential-refresh'), hashtext($1))", [prior.rows[0].id]);
+      }
       const existing = await tx.query<{ id: string; blob_version: number; blob_location: string }>(
         `SELECT id, blob_version, blob_location FROM coding_agent_credentials
           WHERE workspace_id = $1 AND model_provider = $2 AND auth_type = 'provider_oauth'
@@ -657,6 +675,7 @@ export class SubscriptionLoginStore {
         action: current ? "coding_agent.login_replace" : "coding_agent.login_create",
         target: `${input.provider}:${credentialId}`,
       });
+      if (input.onStored) await input.onStored(tx, { id: credentialId, version });
       return credentialId;
     });
     if (previousLocation) await this.blobs.remove(previousLocation).catch(() => undefined);

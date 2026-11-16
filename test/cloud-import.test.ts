@@ -415,6 +415,11 @@ test("cloud import: ledger guards: no ledger table refuses; a Control-native org
   // Org B already exists in Control without a ledger entry: it was not
   // imported, so it is refused (never merged into); org A still imports.
   await target.query("INSERT INTO organizations (id, name) VALUES ($1, 'Native B')", [ORG_B]);
+  // A credential-copier marker must not make a native org look imported.
+  await target.query(
+    "INSERT INTO cloud_import_ledger (organization_id, table_name, row_key, mapping_revision) VALUES ($1, 'copier_login', 'x:1', 'test')",
+    [ORG_B],
+  );
   await target.query("INSERT INTO users (id, email, name) VALUES ($1, 'native@example.test', 'Native')", [id(0xeee)]);
   await target.query("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')", [ORG_B, id(0xeee)]);
   const report = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
