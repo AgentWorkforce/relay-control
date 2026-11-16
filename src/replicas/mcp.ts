@@ -90,7 +90,7 @@ try:
   command=[config['harness'],'mcp','get',name]+(['--json'] if config['harness']=='codex' else [])
   entry=subprocess.run(command,capture_output=True,timeout=timeout)
   if entry.returncode:
-   if b'No MCP server named' in entry.stdout+entry.stderr: return None
+   if any(message in entry.stdout+entry.stderr for message in (b'No MCP server named',b'No MCP server found with name:')): return None
    raise ValueError()
   if config['harness']=='codex':
    registration=json.loads(entry.stdout)
