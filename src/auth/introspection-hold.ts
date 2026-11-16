@@ -9,10 +9,12 @@ export const INTROSPECTION_HOLD_MAX_ENTRIES = 10_000;
  */
 export const HOLD_TAIL_MS = 1_000;
 
-type HeldEntry = { session: IntrospectedToken; checkedAt: number };
+type HeldEntry = { session: IntrospectedToken; checkedAt: number; audience: string };
 
 export type HeldVerdict = {
   session: IntrospectedToken;
+  /** The audience on the last authoritative active answer. */
+  audience: string;
   /** When the database last confirmed the token active (ms since epoch). */
   checkedAt: number;
   /** min(token expiry, checkedAt + holdMs), in ms since epoch. */
@@ -55,24 +57,28 @@ export class IntrospectionHold {
   }
 
   /**
-   * Record one authoritative SQL answer. Active: remember it (as the newest
-   * entry). Unknown (null, with the hash), revoked or expired: forget it.
+   * Record one authoritative answer. Active: remember its audience (as the
+   * newest entry). Unknown (null, with the hash), revoked or expired: forget it.
    */
-  observe(session: IntrospectedToken | null, hash?: string): void {
+  observe(
+    session: IntrospectedToken | null,
+    options: { hash?: string; audience?: string } = {},
+  ): void {
     if (!session) {
-      if (hash !== undefined) this.forget(hash);
+      if (options.hash !== undefined) this.forget(options.hash);
       return;
     }
     const key = session.accessTokenHash;
     if (session.revoked || session.expired) {
       this.forget(key);
-      if (hash !== undefined && hash !== key) this.forget(hash);
+      if (options.hash !== undefined && options.hash !== key) this.forget(options.hash);
       return;
     }
+    if (!options.audience) throw new Error("IntrospectionHold requires an audience for an active verdict");
     const now = this.#now();
     this.#entries.delete(key);
     if (this.#entries.size >= this.#maxEntries) this.#makeRoom(now);
-    this.#entries.set(key, { session, checkedAt: now });
+    this.#entries.set(key, { session, checkedAt: now, audience: options.audience });
   }
 
   forget(hash: string): void {
@@ -98,6 +104,7 @@ export class IntrospectionHold {
     this.#entries.set(hash, entry);
     return {
       session: entry.session,
+      audience: entry.audience,
       checkedAt: entry.checkedAt,
       validUntil: this.#validUntil(entry),
     };

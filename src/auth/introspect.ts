@@ -76,8 +76,9 @@ import type { IntrospectionHold } from "./introspection-hold.js";
  *   The one exception is the opt-in database outage hold
  *   (SELFHOST_INTROSPECT_OUTAGE_HOLD_MS, docs/identity.md): only when the
  *   `sh_at_` lookup fails with a connection-class database error, the last
- *   ACTIVE verdict the database gave for that token within the hold answers
- *   instead, marked `held: true` with `exp` clamped to the end of the hold.
+ *   ACTIVE verdict the database gave for that token and audience within the
+ *   hold answers instead, marked `held: true` with `exp` clamped to the end
+ *   of the hold.
  *   Machine claims are never held.
  * - The token, its hash, the secret and the body are never logged.
  */
@@ -396,7 +397,7 @@ export async function introspect(
   }
   const hold = options?.hold;
   let session: IntrospectedToken | null;
-  let held: { checkedAt: number; validUntil: number; cause: string } | null = null;
+  let held: { audience: string; checkedAt: number; validUntil: number; cause: string } | null = null;
   let outage: unknown;
   try {
     session = await store.introspectAccessToken(request.token);
@@ -405,14 +406,25 @@ export async function introspect(
     const entry = hold.lookup(hashSecret(request.token));
     if (!entry) throw error;
     session = entry.session;
-    held = { checkedAt: entry.checkedAt, validUntil: entry.validUntil, cause: databaseErrorCause(error) };
+    held = {
+      audience: entry.audience,
+      checkedAt: entry.checkedAt,
+      validUntil: entry.validUntil,
+      cause: databaseErrorCause(error),
+    };
     outage = error;
   }
-  if (!held) hold?.observe(session, session ? undefined : hashSecret(request.token));
-  if (!session) return { active: false, reason: "unknown" };
-  if (session.revoked) return { active: false, reason: "revoked" };
+  if (!session) {
+    if (!held) hold?.observe(null, { hash: hashSecret(request.token) });
+    return { active: false, reason: "unknown" };
+  }
+  if (session.revoked) {
+    if (!held) hold?.observe(session);
+    return { active: false, reason: "revoked" };
+  }
   // A held verdict's flag was computed when it was checked: recompute it.
   if (held ? session.expiresAt.getTime() <= Date.now() : session.expired) {
+    if (!held) hold?.observe(session);
     return { active: false, reason: "expired" };
   }
   let aud = matchingIntrospectionAudience(config, request.aud);
@@ -430,12 +442,13 @@ export async function introspect(
     // general list. The unique origin index makes this lookup unambiguous;
     // refuse the general-list match for every workspace, including tenants
     // other than the owner, until the operator moves it to the dedicated list.
-    // A held verdict is served only while the database is unavailable. Boot
-    // config already removes overlaps with the dedicated History list, so do
-    // not turn a configured general audience into a second outage-time query.
     if (await store.workspaceIdForRelayhistoryOrigin(requestedHistoryOrigin) !== null) aud = undefined;
   }
   if (!aud) return { active: false, reason: "audience" };
+  // The hold re-serves one authoritative verdict, not merely a token session.
+  // This keeps the DB-backed legacy History-origin fence in force without a
+  // second database query during the outage.
+  if (held && held.audience !== aud) return { active: false, reason: "audience" };
   if (request.workspace !== undefined && session.workspaceId !== request.workspace) {
     return { active: false, reason: "workspace" };
   }
@@ -452,6 +465,7 @@ export async function introspect(
     if (here.userId !== session.userId) return { active: false, reason: "machine_not_owned" };
     machineId = request.machine;
   }
+  if (!held) hold?.observe(session, { audience: aud });
   const tokenId = tokenIdFor(session.accessTokenHash);
   if (held) {
     options?.log?.("[selfhost-api] token introspection held", {

@@ -213,6 +213,27 @@ test("hold on: a general audience does not require a History-origin lookup durin
   assert.equal(held.body.aud, GENERAL_AUDIENCE);
 });
 
+test("hold on: a held token cannot switch to an unconfirmed general-list History origin", async (t) => {
+  const importedOrigin = "https://history.beta-customer.test";
+  const env = await setup(t, {
+    holdMs: 60_000,
+    introspectAudiences: [GENERAL_AUDIENCE, importedOrigin],
+  });
+  await env.database.query(
+    "UPDATE workspaces SET relayhistory_origin = $1 WHERE id = $2",
+    [importedOrigin, env.beta],
+  );
+  const token = await env.login(env.alpha);
+  assert.equal((await env.introspect({ token, aud: GENERAL_AUDIENCE })).body.active, true);
+
+  env.database.outage = true;
+  assert.deepEqual(
+    (await env.introspect({ token, aud: importedOrigin })).body,
+    { active: false, reason: "audience" },
+  );
+  assert.equal((await env.introspect({ token, aud: GENERAL_AUDIENCE })).body.held, true);
+});
+
 test("hold on: only verified tokens are held; request checks still run; machine claims never held", async (t) => {
   const env = await setup(t, { holdMs: 60_000 });
   const token = await env.login();
@@ -296,10 +317,11 @@ function token(hash: string, overrides: Partial<IntrospectedToken> = {}): Intros
 test("IntrospectionHold serves an entry only within holdMs and before token expiry", () => {
   let now = 10_000;
   const hold = new IntrospectionHold(5_000, { now: () => now });
-  hold.observe(token("a"));
+  hold.observe(token("a"), { audience: "https://history.a.test" });
   now = 14_000;
   const entry = hold.lookup("a");
   assert.ok(entry, "exactly 1000 ms left: returned");
+  assert.equal(entry.audience, "https://history.a.test");
   assert.equal(entry.checkedAt, 10_000);
   assert.equal(entry.validUntil, 15_000);
   now = 14_001;
@@ -307,7 +329,7 @@ test("IntrospectionHold serves an entry only within holdMs and before token expi
   assert.equal(hold.size, 0, "stale entries are deleted on lookup");
 
   now = 0;
-  hold.observe(token("b", { expiresAt: new Date(3_000) }));
+  hold.observe(token("b", { expiresAt: new Date(3_000) }), { audience: "https://history.b.test" });
   now = 1_000;
   assert.equal(hold.lookup("b")?.validUntil, 3_000, "validUntil = min(expiry, checkedAt + holdMs)");
   now = 2_000;
@@ -318,10 +340,10 @@ test("IntrospectionHold serves an entry only within holdMs and before token expi
 
 test("IntrospectionHold forgets on unknown, revoked or expired verdicts", () => {
   const hold = new IntrospectionHold(60_000, { now: () => 0 });
-  hold.observe(token("a"));
-  hold.observe(token("b"));
-  hold.observe(token("c"));
-  hold.observe(null, "a");
+  hold.observe(token("a"), { audience: "https://history.a.test" });
+  hold.observe(token("b"), { audience: "https://history.b.test" });
+  hold.observe(token("c"), { audience: "https://history.c.test" });
+  hold.observe(null, { hash: "a" });
   hold.observe(token("b", { revoked: true }));
   hold.observe(token("c", { expired: true }));
   assert.equal(hold.lookup("a"), null);
@@ -335,10 +357,10 @@ test("IntrospectionHold forgets on unknown, revoked or expired verdicts", () => 
 test("IntrospectionHold is a bounded LRU", () => {
   let now = 0;
   const hold = new IntrospectionHold(60_000, { maxEntries: 2, now: () => now });
-  hold.observe(token("a"));
-  hold.observe(token("b"));
+  hold.observe(token("a"), { audience: "https://history.a.test" });
+  hold.observe(token("b"), { audience: "https://history.b.test" });
   assert.ok(hold.lookup("a"), "touch a: b is now the oldest");
-  hold.observe(token("c"));
+  hold.observe(token("c"), { audience: "https://history.c.test" });
   assert.equal(hold.size, 2);
   assert.equal(hold.lookup("b"), null);
   assert.ok(hold.lookup("a"));
@@ -346,10 +368,10 @@ test("IntrospectionHold is a bounded LRU", () => {
 
   // At capacity, stale entries are pruned before a live one is evicted.
   now = 1;
-  hold.observe(token("d", { expiresAt: new Date(2) }));
+  hold.observe(token("d", { expiresAt: new Date(2) }), { audience: "https://history.d.test" });
   assert.equal(hold.lookup("a"), null, "a was the least recently used");
   now = 5;
-  hold.observe(token("e"));
+  hold.observe(token("e"), { audience: "https://history.e.test" });
   assert.ok(hold.lookup("c"), "the expired d made room, not c");
   assert.ok(hold.lookup("e"));
   assert.equal(hold.size, 2);

@@ -854,12 +854,12 @@ startup. `GET /readyz` shows the value in effect as
 
 While the database answers nothing changes: every introspection runs the
 query, and the hold is never consulted. Each active answer for an `sh_at_`
-token is remembered in memory, keyed by the token hash (never the token),
-with the time of the check; an `unknown`, `revoked` or `expired` answer
-removes it. At most 10000 tokens are remembered per process, least recently
-used first out. When the query then fails with a connection-class database
-error (connection refused, reset or timed out, DNS failure, pool connect
-timeout, connection terminated, SQLSTATE class `08`, `57P01`-`57P03`,
+token and audience is remembered in memory, keyed by the token hash (never
+the token), with the time of the check; an `unknown`, `revoked` or `expired`
+answer removes it. At most 10000 tokens are remembered per process, least
+recently used first out. When the query then fails with a connection-class
+database error (connection refused, reset or timed out, DNS failure, pool
+connect timeout, connection terminated, SQLSTATE class `08`, `57P01`-`57P03`,
 `53300`), and only then, the remembered answer for that token is served if it
 is at most the hold old and the token has not expired. Held answers stop one
 second before the hold or the token would run out, so a verifier never reads
@@ -870,9 +870,10 @@ replica remembers only the tokens it verified itself.
 
 The verifier sees the normal active answer plus `held: true`, with `exp`
 clamped to the earlier of the token's expiry and the end of the hold. The
-audience and `workspace` checks still run against the request. A request that
-sends `machine` is never held: machine ownership needs the node-claims query,
-so it still fails with 500. `sh_wk_` and `sh_fr_` tokens are never held.
+audience must equal the one on the last authoritative active answer, and the
+`workspace` check still runs against the request. A request that sends
+`machine` is never held: machine ownership needs the node-claims query, so it
+still fails with 500. `sh_wk_` and `sh_fr_` tokens are never held.
 
 The bound this accepts: a revocation, membership removal or workspace removal
 that happened after the token's last successful introspection and before the
