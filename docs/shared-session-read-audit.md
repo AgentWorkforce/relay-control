@@ -28,7 +28,7 @@ error.` without the validation detail). Other MCP tools are not recorded here.
 | `organization_id`, `workspace_id` | The credential's organization and workspace |
 | `caller_user_id` | The person the credential belongs to |
 | `identity_kind` | `desktop` (an Agent Relay Desktop call: a Desktop provider credential or the Desktop marker), `oauth` (a hosted MCP OAuth connector), or `hosted` (a CLI-login bearer or the dashboard session) |
-| `auth_mode` | `cli_login`, `session` or `oauth` |
+| `auth_mode` | `cli_login`, `session`, `oauth`, or `staff_read_grant` (a [staff read grant](staff-read-grants.md); `caller_user_id` is the staff person) |
 | `desktop_provider` | The Desktop provider bound to a provider credential (`claude`, `copilot`, `codex`, ...), else null |
 | `oauth_client_id`, `oauth_grant_id` | The OAuth connector's client and grant, else null |
 | `mcp_session_id` | The `Mcp-Session-Id` header, when sent |

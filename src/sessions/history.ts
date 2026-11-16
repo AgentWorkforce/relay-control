@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { SelfhostConfig } from "../config.js";
+import type { Principal } from "../store.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
-import { requestReadSession, SessionReadError } from "../session-read.js";
+import { requestReadSession, SessionReadError, type ReaderKind } from "../session-read.js";
 
 /**
  * Workspace-scoped History reads for the dashboard sessions views, served by
@@ -23,12 +24,16 @@ export type HistoryIdentity = {
   userId: string;
   organizationId: string;
   workspaceId: string;
+  /** The caller's live organization role, as authorized on this request. */
+  role: Principal["role"];
   /**
    * The caller's raw relaycontrol access token. It is a credential and is only
    * ever used as a cache key through its SHA-256, so a read token is kept per
    * caller token session.
    */
   callerToken: string;
+  /** How the caller authenticated; named on every read-token mint (see ReaderKind). */
+  readerKind: ReaderKind;
 };
 
 type CachedToken = { accessToken: string; expiresAt: number; refreshToken?: string; refreshExpiresAt?: number };
@@ -49,9 +54,10 @@ function cacheFor(config: SelfhostConfig): Map<string, CachedToken> {
 
 function cacheKey(identity: HistoryIdentity): string {
   // Keyed per token session too, so a History token minted for one access
-  // token is never reused for another (revoked, rotated, or other session).
+  // token is never reused for another (revoked, rotated, or other session),
+  // nor a pair minted for one reader kind for another.
   const tokenHash = createHash("sha256").update(identity.callerToken).digest("hex");
-  return JSON.stringify([identity.userId, identity.organizationId, identity.workspaceId, tokenHash]);
+  return JSON.stringify([identity.userId, identity.organizationId, identity.workspaceId, identity.role, tokenHash, identity.readerKind]);
 }
 
 /**
@@ -68,17 +74,21 @@ async function nativeReadToken(
   previous: CachedToken | undefined,
 ): Promise<string> {
   const api = config.sessionReadApi;
-  const readIdentity = { userId: identity.userId, orgId: identity.organizationId, workspaceId: identity.workspaceId };
+  const readIdentity = {
+    userId: identity.userId, orgId: identity.organizationId, workspaceId: identity.workspaceId,
+    role: identity.role, readerKind: identity.readerKind,
+  };
+  const options = { includeRole: config.sessionReadMintIncludeRole };
   let session;
   try {
     session = previous?.refreshToken && (previous.refreshExpiresAt ?? 0) > now + TOKEN_EXPIRY_MARGIN_MS
-      ? await requestReadSession(api, readIdentity, { refreshToken: previous.refreshToken })
+      ? await requestReadSession(api, readIdentity, { refreshToken: previous.refreshToken }, options)
         .catch((error: unknown) => {
           if (error instanceof SessionReadError && error.status === 401) return null;
           throw error;
         })
       : null;
-    session ??= await requestReadSession(api, readIdentity, { label: "relay-dashboard" });
+    session ??= await requestReadSession(api, readIdentity, { label: "relay-dashboard" }, options);
   } catch (error) {
     if (error instanceof SessionReadError) throw new UpstreamError("exchange", error.status, undefined, error.status === 503);
     throw error;

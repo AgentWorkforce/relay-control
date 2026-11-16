@@ -2,9 +2,16 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
+import { MCP_READER_HEADER } from "../session-read.js";
 import { isRecord, WORKSPACE_ATTESTATION_HEADER, UNSUPPORTED_BY_BACKEND, type HistoryIdentity, type HistoryRead } from "../sessions/history.js";
 
-/** Client configuration deliberately excludes the issuer URL and internal secret. */
+/**
+ * Client configuration deliberately excludes the issuer URL and internal secret.
+ * The caller passes the precomputed MCP reader marker (derived from the secret,
+ * not the secret; see mcpReaderMarker in ../session-read.ts). It tells Control's
+ * public session-read route that this hop is the MCP reader, so the mint names
+ * reader kind `mcp`. It is never logged.
+ */
 type ReaderConfig = Pick<SelfhostConfig,"publicBaseUrl"|"sessionReadMcpReads"> & {
   sessionReadApi?: Pick<NonNullable<SelfhostConfig["sessionReadApi"]>,"publicUrl"> | null;
 };
@@ -32,7 +39,7 @@ function cacheFor(config:ReaderConfig) {
 }
 function cacheKey(identity:HistoryIdentity) {
   const hash=createHash("sha256").update(identity.callerToken).digest("hex");
-  return JSON.stringify([identity.userId,identity.organizationId,identity.workspaceId,hash]);
+  return JSON.stringify([identity.userId,identity.organizationId,identity.workspaceId,identity.role,hash]);
 }
 export function forgetSessionReadTokens(config:ReaderConfig):void { caches.delete(config); }
 function refused(error:unknown):boolean {
@@ -54,7 +61,7 @@ async function handoffJson(response:Response):Promise<unknown> {
   } finally { await reader.cancel().catch(()=>{}); }
 }
 
-async function issue(config:ReaderConfig,identity:HistoryIdentity,previous:Held|null):Promise<Held> {
+async function issue(config:ReaderConfig,identity:HistoryIdentity,previous:Held|null,marker:string):Promise<Held> {
   const api=config.sessionReadApi!;
   // Caller authority goes only to the configured Control origin. The read
   // client never sends user/org/scopes overrides or an internal/service secret.
@@ -63,7 +70,8 @@ async function issue(config:ReaderConfig,identity:HistoryIdentity,previous:Held|
   try {
     response=await globalThis.fetch(new URL(path,config.publicBaseUrl),{
       method:"POST",redirect:"error",signal:AbortSignal.timeout(10_000),
-      headers:{accept:"application/json","content-type":"application/json",authorization:`Bearer ${identity.callerToken}`},
+      headers:{accept:"application/json","content-type":"application/json",authorization:`Bearer ${identity.callerToken}`,
+        [MCP_READER_HEADER]:marker},
       body:JSON.stringify(previous?{refreshToken:previous.refreshToken}:{label:"mcp"}),
     });
   } catch { throw new UpstreamError("exchange"); }
@@ -85,14 +93,14 @@ async function issue(config:ReaderConfig,identity:HistoryIdentity,previous:Held|
   return {sessionId:pair.sessionId,baseUrl:pair.baseUrl,accessToken:pair.accessToken,accessExpiresAt,refreshToken:pair.refreshToken,refreshExpiresAt};
 }
 
-async function heldSession(config:ReaderConfig,identity:HistoryIdentity,rejectedAccess?:string):Promise<Held> {
+async function heldSession(config:ReaderConfig,identity:HistoryIdentity,marker:string,rejectedAccess?:string):Promise<Held> {
   const cache=cacheFor(config),key=cacheKey(identity),existing=cache.get(key);
   const current=existing?await existing.catch(error=>{if(refused(error)) throw error;return null;}):null;
   if(current && current.accessToken!==rejectedAccess && current.accessExpiresAt-EXPIRY_MARGIN_MS>Date.now()) return current;
   const latest=cache.get(key);
   if(latest && latest!==existing) return latest;
   const previous=current && current.refreshExpiresAt-EXPIRY_MARGIN_MS>Date.now()?current:null;
-  const pending=issue(config,identity,previous);
+  const pending=issue(config,identity,previous,marker);
   if(!cache.has(key) && cache.size>=CACHE_LIMIT) cache.delete(cache.keys().next().value!);
   cache.set(key,pending);
   // Keep a refused session refused for this caller cache entry; do not turn a
@@ -108,7 +116,7 @@ async function heldSession(config:ReaderConfig,identity:HistoryIdentity,rejected
   return pending;
 }
 
-export async function readViaSessionRead(config:ReaderConfig,identity:HistoryIdentity,path:string,params:URLSearchParams):Promise<HistoryRead|null> {
+export async function readViaSessionRead(config:ReaderConfig,identity:HistoryIdentity,path:string,params:URLSearchParams,marker:string):Promise<HistoryRead|null> {
   const cursor=params.get("cursor");
   const selected=Boolean(config.sessionReadMcpReads && config.sessionReadApi && READ_ROUTES.test(path));
   // Every History reader is the read API, so its cursors stay valid either way.
@@ -118,7 +126,7 @@ export async function readViaSessionRead(config:ReaderConfig,identity:HistoryIde
   const query=new URLSearchParams(params);query.delete("workspace");query.set("workspace",identity.workspaceId);
   let rejectedAccess:string|undefined;
   for(let attempt=0;attempt<2;attempt++) {
-    const held=await heldSession(config,identity,rejectedAccess);
+    const held=await heldSession(config,identity,marker,rejectedAccess);
     const url=new URL(`${path}?${query}`,held.baseUrl);
     if(url.origin!==new URL(held.baseUrl).origin) throw new UpstreamError("read");
     let response:Response;
