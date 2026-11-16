@@ -40,7 +40,7 @@ async function deviceToken(origin: string, userId: string, workspaceId: string):
   return issued.body.access_token as string;
 }
 
-async function setup(t: TestContext) {
+async function setup(t: TestContext, options: { relaygatePublicUrl?: string } = {}) {
   // Fake Relaycast: records every call; `reply` picks the answer per call.
   const calls: RelaycastCall[] = [];
   let reply: (call: RelaycastCall) => Reply = () => ({ status: 200, body: { ok: true, data: {} } });
@@ -83,6 +83,7 @@ async function setup(t: TestContext) {
     dashboardUrl: `${origin}/dashboard/`,
     port: 0,
     host: "127.0.0.1",
+    ...(options.relaygatePublicUrl ? { relaygatePublicUrl: options.relaygatePublicUrl } : {}),
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
   const admin = createAdminModule({ config, database, keyring: KEYRING });
@@ -378,6 +379,40 @@ test("broker POST nodes enrolls only the token's own node and forwards node head
   const before = ctx.calls.length;
   assert.equal((await ctx.broker("/relay-node/v1/nodes", node.accessToken, { method: "POST", body: "{" })).status, 400);
   assert.equal(ctx.calls.length, before);
+});
+
+test("broker on a gate-only install refuses node enrolment before Relaycast; reads unchanged", async (t) => {
+  const ctx = await setup(t, { relaygatePublicUrl: "https://gate.selfhosted.test" });
+  const node = await ctx.mintNode("node-a");
+  ctx.setReply((call) => call.url === "/v1/workspace"
+    ? { status: 200, body: { ok: true, data: { id: "rw-1", name: "Relay WS" } } }
+    : { status: 201, body: { ok: true, data: { id: "n-1", name: "node-a", token: "nt_live_secret" } } });
+
+  // node_mismatch still answers first.
+  const mismatch = await ctx.broker("/relay-node/v1/nodes", node.accessToken, {
+    method: "POST",
+    body: JSON.stringify({ name: "node-b" }),
+    headers: { "content-type": "application/json" },
+  });
+  assert.equal(mismatch.status, 403);
+  assert.equal(mismatch.body.error.code, "node_mismatch");
+
+  const enrol = await ctx.broker("/relay-node/v1/nodes", node.accessToken, {
+    method: "POST",
+    body: JSON.stringify({ name: "node-a" }),
+    headers: { "content-type": "application/json" },
+  });
+  assert.equal(enrol.status, 403);
+  assert.equal(enrol.body.ok, false);
+  assert.equal(enrol.body.error.code, "gate_only");
+  assert.equal(enrol.headers.get("cache-control"), "no-store");
+  assert(!enrol.raw.includes("nt_live_"));
+  assert.equal(ctx.calls.length, 0);
+
+  const workspace = await ctx.broker("/relay-node/v1/workspace", node.accessToken);
+  assert.equal(workspace.status, 200);
+  assert.deepEqual(workspace.body, { ok: true, data: { id: "rw-1", name: "Relay WS" } });
+  assert.deepEqual(ctx.calls.map((call) => `${call.method} ${call.url}`), ["GET /v1/workspace"]);
 });
 
 test("broker refuses everything outside the allowlist with 403 scope_denied", async (t) => {

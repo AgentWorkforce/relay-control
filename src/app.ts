@@ -24,6 +24,7 @@ import { handleChiefRelay } from "./chief-relay.js";
 import { handleRelayNode } from "./relay-node/broker.js";
 import { handleFlowsBroker } from "./flows-broker.js";
 import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
+import { relayLaunchCredentials } from "./mcp/relay-launch-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { UsageRangeError, usageDays, usageReport } from "./usage/routes.js";
 import { UsageStore } from "./usage/store.js";
@@ -509,6 +510,7 @@ export function createApp(input: {
   const messaging = createMessagingHandler({
     ...messagingDeps,
     relaycastPublicUrl: config.relaycastPublicUrl,
+    relaygatePublicUrl: config.relaygatePublicUrl,
     internalServiceToken: config.internalServiceToken,
     browserOrigins,
   });
@@ -800,6 +802,9 @@ export function createApp(input: {
   }
 
   const apiTokens = new ApiTokenStore(store.database);
+  // Gate-only installs only: relaygate introspects one-time `sh_lt_` launch credentials.
+  const relayLaunchCredentialStore = config.relaygatePublicUrl
+    ? relayLaunchCredentials(store.database, config.encryptionKeyring) : undefined;
   const flowRelayfileCredentials = input.flowRelayfileCredentials ?? new FlowRunRelayfileCredentials(
     store.database,
     () => input.now?.() ?? new Date(),
@@ -1144,7 +1149,7 @@ export function createApp(input: {
     // Internal only: never reachable through the /cloud alias.
     if (method === "POST" && publicPath === INTROSPECT_PATH) {
       const outcome = await handleIntrospection(
-        config, store, request, undefined, admin?.apiTokens, flowRelayfileCredentials, introspectionHold,
+        config, store, request, undefined, admin?.apiTokens, flowRelayfileCredentials, relayLaunchCredentialStore, introspectionHold,
       );
       if (outcome.status === 200) json(response, 200, outcome.body, true);
       else json(response, outcome.status, { error: outcome.error, message: outcome.message }, true);
@@ -1184,6 +1189,7 @@ export function createApp(input: {
       apiTokens,
       relaycastUrl: config.relaycastUrl,
       relaycastBinding: (id) => store.relaycastBinding(id),
+      relaygatePublicUrl: config.relaygatePublicUrl,
       bearer,
       rateLimit: (res, key, rule) =>
         rateLimit(res, key, rule, "rate_limited", "Too many relay-node requests; retry later"),

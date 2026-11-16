@@ -61,6 +61,12 @@ export type CredentialCopyReport = {
   outcomes: Record<string, number>;
   /** Cloud provider_credentials id -> outcome. Ids only. */
   rows: Record<string, CredentialOutcome>;
+  /**
+   * Cloud id -> the Control coding_agent_credentials id it was written to
+   * (copied or already present). Copier rows are not in the import ledger,
+   * so this is what a rollback deletes by.
+   */
+  controlIds: Record<string, string>;
   /** How Cloud's selection was applied (see applyCloudSelection). */
   /**
    * selectionConflicts: groups where Cloud selected no copied row, no other
@@ -222,6 +228,7 @@ export async function copyCodingAgentCredentials(
     candidates: 0,
     outcomes: {},
     rows: {},
+    controlIds: {},
   };
   const record = (id: string, outcome: CredentialOutcome) => {
     report.rows[id] = outcome;
@@ -230,6 +237,7 @@ export async function copyCodingAgentCredentials(
 
   const candidates = await deps.source.transaction(async (tx) => {
     await tx.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+    await tx.exec("SET LOCAL TIME ZONE 'UTC'");
     return (await tx.query<Candidate>(credentialCopyQuery(scope))).rows;
   });
   report.candidates = candidates.length;
@@ -278,6 +286,7 @@ export async function copyCodingAgentCredentials(
         };
         const id = await deps.logins.storeLogin(login);
         copied.push({ row, controlId: id });
+        report.controlIds[row.id] = id;
         record(row.id, "copied");
         continue;
       }
@@ -294,6 +303,7 @@ export async function copyCodingAgentCredentials(
         continue;
       }
       copied.push({ row, controlId: result.record.id });
+      report.controlIds[row.id] = result.record.id;
       record(row.id, result.created ? "copied" : "already_present");
     } catch (error) {
       if (error instanceof SyntaxError) {
@@ -307,8 +317,11 @@ export async function copyCodingAgentCredentials(
   if (mode === "apply" && copied.length > 0) {
     report.selection = await applyCloudSelection(deps.target, copied);
   }
+  // A selection conflict needs a human choice per (workspace, provider)
+  // before cutover sign-off, so it is never a clean run.
   report.ok = Object.keys(report.outcomes).every((outcome) =>
-    outcome === "copied" || outcome === "already_present" || outcome.startsWith("skipped:"));
+    outcome === "copied" || outcome === "already_present" || outcome.startsWith("skipped:"))
+    && (report.selection?.selectionConflicts ?? 0) === 0;
   deps.log?.("cloud_import.credentials", { mode, ok: report.ok, candidates: report.candidates, outcomes: report.outcomes });
   return report;
 }

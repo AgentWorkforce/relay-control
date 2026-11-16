@@ -33,6 +33,8 @@ export type RelayNodeDeps = {
   apiTokens: Pick<ApiTokenStore, "authenticateRelayNode">;
   relaycastUrl: string;
   relaycastBinding(workspaceId: string): Promise<{ relaycastApiKey: string } | null>;
+  /** Set on gate-only installs: node enrolment (which mints a node token) is refused. */
+  relaygatePublicUrl?: string | null;
   bearer(request: IncomingMessage): string | null;
   /** Throws (429) when `key` is over `rule`. */
   rateLimit(response: ServerResponse, key: string, rule: { limit: number; windowMs: number }): void;
@@ -128,6 +130,13 @@ export async function handleRelayNode(
       : undefined;
     if (typeof name !== "string" || name !== principal.nodeName) {
       fail(403, "node_mismatch", "This token may only enroll its own node");
+      return true;
+    }
+    // Gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): Relaycast's enrol
+    // answer carries the node token, which would bypass relaygate, so it is
+    // never requested.
+    if (deps.relaygatePublicUrl) {
+      fail(403, "gate_only", "This install is gate-only: Control issues no Relaycast node token. Node enrolment goes through relaygate.");
       return true;
     }
     forwardBody = raw;

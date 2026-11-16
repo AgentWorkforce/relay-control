@@ -10,6 +10,17 @@ assigned at release.
   `mcp`) from how the caller authenticated, so relaygate can tell a person's
   own reads from agent reads on their behalf. Other installs send the same
   mint body as before. See [Sessions read API](docs/sessions-read-api.md).
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), every
+  agent launch through `spawn_relay_agent` mints a one-time `sh_lt_` launch
+  credential (10 minutes, bound to the workspace, node, agent name and
+  launching user; migration 0060 `relay_launch_credentials`). relaygate
+  introspects it at `POST /internal/v1/auth/introspect`, which answers
+  principal_type `relay_launch` with `node_name` and `scopes`
+  `["relay:agent:enrol"]` and burns it on the first active answer. It is
+  stored sealed and never sent to Relaycast; delivery to the node is a later
+  change. Audited as `relay_launch.credential.issued` and
+  `relay_launch.credential.redeemed`. Unset, nothing changes. See
+  docs/identity.md.
 - Added: GitHub App installation credentials with `SELFHOST_GITHUB_APP_ID`
   and `SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`. Imported connections retain
   their installation IDs and mint replacement tokens without reconnecting.
@@ -20,7 +31,6 @@ assigned at release.
   See [GitHub App credentials](docs/github-app-connections.md).
 - Changed: connection edit versions include auth mode and installation ID;
   existing clients must refresh their opaque connection version once after upgrading.
-
 - Added: `SELFHOST_RELAYGATE_PUBLIC_URL` (unset by default) for gate-only
   installs, where relaygate is the only public way into Relaycast. When set,
   `GET /api/v1/workspaces/{id}/resolve` answers `urls.relaygateUrl` (the
@@ -33,7 +43,15 @@ assigned at release.
   and is unaffected. The events-shim temporary workspace
   (`POST /t/<mcp token>/workspace`) is also withheld (`404 not_found`), so
   `events-shim setup` on a machine not signed in here cannot start its own
-  core. Unset, both are byte-for-byte as before. See docs/identity.md
+  core. The person credential
+  (`POST /api/v1/workspaces/{id}/messaging/identity/credential`) answers
+  `403 gate_only` with both urls, registers no person identity on Relaycast
+  (the desktop enrols its own name at relaygate `/v1/register` with its device
+  token) and is audited as `workspace.person_credential.withheld`; the
+  relay-node broker's enrol (`POST /relay-node/v1/nodes`) answers
+  `403 gate_only` before any Relaycast call, so no node token leaves. MCP join
+  and spawn are unchanged (their participant tokens stay server-side). Unset,
+  all of these are byte-for-byte as before. See docs/identity.md
   ("Gate-only installs").
 - Added: `send_relay_message` results include `recipient_card` when the
   recipient has an agent card (`has_card`): `{ description, skills, version, updated_at, note }`, where `description` is null

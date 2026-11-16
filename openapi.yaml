@@ -881,7 +881,12 @@ paths:
                       token: { type: string }
                       relaycastUrl: { type: string, format: uri }
         "403":
-          description: Agent, CI, or service credential, or cookie request failed the origin check
+          description: >-
+            Agent, CI, or service credential, or cookie request failed the origin check;
+            or `gate_only` on a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): no
+            identity is registered and no token is issued, the body carries
+            `urls.relaycastUrl` and `urls.relaygateUrl`, and the call is audited as
+            `workspace.person_credential.withheld`
         "409":
           description: register_human admission is full, or the name is held by someone else
   /api/v1/workspaces/{workspaceId}/messaging/conversations/{agentName}:
@@ -5736,7 +5741,7 @@ paths:
         "400": { description: "invalid_request: the body is not JSON; Relaycast's own 400 also passes through" }
         "401": { $ref: "#/components/responses/RelayNodeTokenInvalid" }
         "403":
-          description: "node_mismatch: body.name is not the token's nodeName (nothing is forwarded); or scope_denied"
+          description: "node_mismatch: body.name is not the token's nodeName (nothing is forwarded); or scope_denied; or gate_only on a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): nothing is forwarded and no node token is issued"
           content:
             application/json:
               schema: { $ref: "#/components/schemas/RelayNodeError" }
@@ -5963,6 +5968,19 @@ paths:
         token passes the same checks and answers the same way except
         principal_type `service`, `agent_name` null and `scopes`
         `["acquisition:operate"]`.
+
+        Relay launch credentials (gate-only installs only, when
+        SELFHOST_RELAYGATE_PUBLIC_URL is set; otherwise every `sh_lt_` is
+        `unknown`): a one-time `sh_lt_` token minted for one agent launch and
+        presented by relaygate. Inactive reasons `unknown`, `expired`,
+        `revoked` (already redeemed), `audience` (`aud` must normalize to an
+        accepted audience), `workspace`, and `machine_not_owned` for any
+        `machine`. Only when every check passes is the credential burned: the
+        first active answer is the only one. The active answer has
+        principal_type `relay_launch`, `sub` the launching user, `agent_name`
+        and `node_name` of the launch, `scopes` `["relay:agent:enrol"]`,
+        `token_id` the credential id, `iat` the mint time and `exp` its expiry
+        (10 minutes later).
       requestBody:
         required: true
         content:
@@ -6081,6 +6099,27 @@ paths:
                       iat: { type: integer, description: Mint time }
                       exp: { type: integer, description: "The token's expiry, or now + 3600 (recomputed per call) when it has none" }
                       token_id: { type: string, format: uuid }
+                  - type: object
+                    additionalProperties: false
+                    required: [active, sub, email, principal_type, agent_name, node_name, machine_id, org, workspace, scopes, aud, iat, exp, token_id]
+                    description: A one-time relay launch credential (`sh_lt_`, gate-only installs), burned by this answer.
+                    properties:
+                      active: { const: true }
+                      sub: { type: string, format: uuid, description: The launching user's id }
+                      email: { type: "null" }
+                      principal_type: { const: relay_launch }
+                      agent_name: { type: string, description: The launched agent's name }
+                      node_name: { type: string, description: The name of the node the agent was launched on }
+                      machine_id: { type: "null" }
+                      org: { type: string }
+                      workspace: { type: string, description: "The launch's workspace; authoritative when the request omitted `workspace`" }
+                      scopes:
+                        type: array
+                        items: { const: "relay:agent:enrol" }
+                      aud: { type: string, description: The normalized request audience }
+                      iat: { type: integer, description: Mint time }
+                      exp: { type: integer, description: Expiry, 10 minutes after mint }
+                      token_id: { type: string, format: uuid, description: The credential id }
                   - type: object
                     additionalProperties: false
                     required: [active, reason]
