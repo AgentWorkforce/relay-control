@@ -43,6 +43,11 @@ assigned at release.
   when the issuer cannot be read. Migration 0067 (`all_environments`
   defaults to true; `opted_out` per policy). See
   [Replicas](docs/replicas.md).
+- Fixed: staff read grants (`sh_sr_`) introspect active only through the
+  History audience fence (the workspace's own History origin, else the
+  configured History URL); every other introspection audience, including
+  `SELFHOST_INTROSPECT_AUDIENCES`, answers inactive `audience`. A device-code
+  login started by Agent Relay Desktop can no longer mint or list grants.
 - Added: `users.signup_source` (migration 0068), where an account was
   created: `teams`, `flows` or `desktop` (hosted Cloud's values; the
   identity import's carry lands in a follow-up) or `mcp`. Control records `mcp` when a new person

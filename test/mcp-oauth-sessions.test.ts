@@ -10,6 +10,7 @@ import { hashSecret } from "../src/crypto.js";
 import { createMcpOAuthProtocol } from "../src/mcp/oauth/protocol.js";
 import { McpOAuthSessions } from "../src/mcp/oauth/sessions.js";
 import { PGliteDatabase } from "./support/harness.js";
+import { isolatedPostgresPool } from "./support/postgres.js";
 
 const ORIGIN = "https://relay.example.test";
 const SHARED = "/api/v1/mcp/shared-sessions";
@@ -176,13 +177,15 @@ test("real Postgres: concurrent OAuth refresh has one winner across independent 
   const admin=new pg.Pool({ connectionString:postgresUrl,max:1 });
   const schema=`mcp_oauth_${randomUUID().replaceAll("-","")}`;
   await admin.query(`CREATE SCHEMA "${schema}"`);
-  const pool=new pg.Pool({ connectionString:postgresUrl,max:4,options:`-c search_path=${schema},public` });
-  const database=new PostgresDatabase(pool);
+  let cleanupDatabase:PostgresDatabase|null=null;
   t.after(async()=>{
-    try { await database.close(); } finally {
+    try { await cleanupDatabase?.close(); } finally {
       try { await admin.query(`DROP SCHEMA "${schema}" CASCADE`); } finally { await admin.end(); }
     }
   });
+  const pool=await isolatedPostgresPool(postgresUrl!,schema,4);
+  const database=new PostgresDatabase(pool);
+  cleanupDatabase=database;
   const owner=await seed(database);
   const protocol=createMcpOAuthProtocol({ publicOrigin:ORIGIN,enabledResources:[SHARED] });
   const sessions=new McpOAuthSessions(database,{ protocol,tenancyMode:"multi" });

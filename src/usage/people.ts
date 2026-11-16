@@ -119,7 +119,7 @@ async function ownerIdentities(store: ControlPlaneStore, organizationId: string,
   const identities: HistoryIdentity[] = [];
   for (const workspace of await store.listWorkspaces(organizationId)) {
     const workspaceId = String(workspace.id);
-    const membership = await store.workspaceForUser(workspaceId, owner.userId);
+    const membership = await store.workspaceMembershipForUser(workspaceId, owner.userId);
     if (!membership) continue;
     identities.push({ userId: owner.userId, organizationId, workspaceId, role: membership.role, callerToken: owner.token,
       readerKind: owner.readerKind });
