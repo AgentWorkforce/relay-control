@@ -176,7 +176,10 @@ INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, ha
   ('${id(0x80a)}', '${ORG_A}', '${id(0x201)}', '${id(2)}', 'codex', 'openai', 'byo_api_key', 'Errored', true, false, 'error', ${t}, ${t}),
   ('${id(0x80b)}', '${ORG_A}', '${id(0x201)}', '${id(2)}', 'claude', 'anthropic', 'byo_api_key', 'Unselected', false, false, 'connected', ${t}, ${t}),
   -- C2: Alice's second ChatGPT login (org B) shares her legacy openai object.
-  ('${id(0x80c)}', '${ORG_B}', '${id(0x205)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT 2', false, true, 'connected', ${t}, ${t});
+  ('${id(0x80c)}', '${ORG_B}', '${id(0x205)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT 2', false, true, 'connected', ${t}, ${t}),
+  -- Review: Cloud's selected Anthropic key has the HIGHER id than the
+  -- unselected 0x80b in the same workspace; Control must activate this one.
+  ('${id(0x80d)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'claude', 'anthropic', 'byo_api_key', 'Selected', true, false, 'connected', ${t}, ${t});
 UPDATE provider_credentials SET label = 'Bob token', account_email = 'bob@example.test' WHERE id = '${id(0x805)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-1' WHERE id = '${id(0x806)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-2' WHERE id = '${id(0x80c)}';
@@ -223,7 +226,7 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
   // Pre-0058 target: the two relay_managed rows are refused by the importer.
   coding_agent_credentials: {
     imported: 0,
-    skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 9, target_lacks_relay_managed: 2 },
+    skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 10, target_lacks_relay_managed: 2 },
   },
   // Pre-0061 target: grants wait for the migration.
   staff_read_grants: { imported: 0, skipped: { workspace_not_imported: 1, target_lacks_staff_read_grants: 1 } },

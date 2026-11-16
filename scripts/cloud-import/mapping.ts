@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.9";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.11";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -494,6 +494,10 @@ legacy_rows AS (
 SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS cloud_user_id,
        p.model_provider, p.harness, p.auth_type, p.label, p.account_email, p.provider_account_id,
        p.is_active, p.harness_active,
+       -- Saved but neither the LLM-call nor the sandbox selection: carried
+       -- over, then left inactive in Control.
+       (p.is_active OR p.harness_active) AS selected,
+       p.updated_at,
        COALESCE(lr.sharing = 1, false) AS legacy_allowed,
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
@@ -504,8 +508,6 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS 
          ) THEN 'not_a_member'
          -- Only usable credentials: connected and not refresh-exhausted.
          WHEN p.status <> 'connected' OR p.refresh_exhausted THEN 'credential_not_usable'
-         -- Neither the LLM-call nor the sandbox selection: not carried over.
-         WHEN NOT p.is_active AND NOT p.harness_active THEN 'credential_not_selected'
          WHEN p.model_provider NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
          WHEN p.auth_type = 'oauth_token' AND p.model_provider <> 'anthropic' THEN 'unsupported_model_provider'
          WHEN p.auth_type = 'provider_oauth' AND p.model_provider NOT IN ('anthropic', 'openai', 'xai') THEN 'unsupported_model_provider'
@@ -521,6 +523,8 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS 
   LEFT JOIN imported_users iu ON iu.id = um.user_id
   LEFT JOIN legacy_rows lr ON lr.id = p.id
  WHERE p.auth_type IN ('byo_api_key', 'oauth_token', 'provider_oauth')
+ -- Order is irrelevant to selection: the copier sets is_active/harness_active
+ -- explicitly afterwards (credentials.ts applyCloudSelection).
  ORDER BY p.id`;
 }
 

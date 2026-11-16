@@ -32,6 +32,8 @@ export interface CloudObjectReader {
 
 export type CredentialCopyDeps = {
   source: Database;
+  /** Control's database, to leave a first-time copy of an unselected row inactive. */
+  target: Database;
   reader: CloudObjectReader;
   cloudKeyHex: string;
   codingAgents: CodingAgentStore;
@@ -59,7 +61,66 @@ export type CredentialCopyReport = {
   outcomes: Record<string, number>;
   /** Cloud provider_credentials id -> outcome. Ids only. */
   rows: Record<string, CredentialOutcome>;
+  /** How Cloud's selection was applied (see applyCloudSelection). */
+  selection?: { groups: number; active: number; harness: number; activeDemoted: number; harnessDemoted: number };
 };
+
+/**
+ * The store seams auto-activate the first credential per provider, so the
+ * copier sets the selection explicitly afterwards, in one transaction: per
+ * (workspace, provider) every row is cleared, then is_active goes to the
+ * row Cloud selected for LLM calls and harness_active to the row Cloud
+ * selected for the sandbox (subscription logins and setup tokens only,
+ * Control's CHECK). Cloud selects per user, Control per workspace: when
+ * several Cloud users selected one, the most recently updated wins and the
+ * others are counted as demoted. Unselected Cloud keys stay inactive.
+ */
+export async function applyCloudSelection(
+  target: Database,
+  copied: Array<{ row: Candidate; controlId: string }>,
+): Promise<NonNullable<CredentialCopyReport["selection"]>> {
+  const summary = { groups: 0, active: 0, harness: 0, activeDemoted: 0, harnessDemoted: 0 };
+  await target.transaction(async (tx) => {
+    const ids = [...new Set(copied.map((entry) => entry.controlId))];
+    const control = new Map((await tx.query<{ id: string; workspace_id: string; model_provider: string; auth_type: string }>(
+      `SELECT id::text AS id, workspace_id::text AS workspace_id, model_provider, auth_type
+         FROM coding_agent_credentials WHERE id::text = ANY($1::text[]) FOR UPDATE`,
+      [ids],
+    )).rows.map((row) => [row.id, row]));
+    const groups = new Map<string, Array<{ row: Candidate; controlId: string; authType: string }>>();
+    for (const entry of copied) {
+      const target = control.get(entry.controlId);
+      if (!target) continue;
+      const key = `${target.workspace_id}\0${target.model_provider}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push({ ...entry, authType: target.auth_type });
+    }
+    const newest = <T extends { row: Candidate }>(entries: T[]) =>
+      [...entries].sort((a, b) => new Date(b.row.updated_at).getTime() - new Date(a.row.updated_at).getTime() || a.row.id.localeCompare(b.row.id))[0];
+    for (const [key, entries] of groups) {
+      const [workspaceId, provider] = key.split("\0") as [string, string];
+      const llm = entries.filter((entry) => entry.row.is_active);
+      const sandbox = entries.filter((entry) =>
+        entry.row.harness_active && (entry.authType === "oauth_token" || entry.authType === "provider_oauth"));
+      const active = newest(llm);
+      const harness = newest(sandbox);
+      // Clear first, then set: the partial unique indexes never see two.
+      await tx.query(
+        `UPDATE coding_agent_credentials SET is_active = false, harness_active = false, updated_at = now()
+          WHERE workspace_id = $1 AND model_provider = $2`,
+        [workspaceId, provider],
+      );
+      if (active) await tx.query("UPDATE coding_agent_credentials SET is_active = true WHERE id = $1", [active.controlId]);
+      if (harness) await tx.query("UPDATE coding_agent_credentials SET harness_active = true WHERE id = $1", [harness.controlId]);
+      summary.groups += 1;
+      summary.active += active ? 1 : 0;
+      summary.harness += harness ? 1 : 0;
+      summary.activeDemoted += Math.max(0, new Set(llm.map((entry) => entry.controlId)).size - 1);
+      summary.harnessDemoted += Math.max(0, new Set(sandbox.map((entry) => entry.controlId)).size - 1);
+    }
+  });
+  return summary;
+}
 
 type Candidate = {
   id: string;
@@ -74,6 +135,11 @@ type Candidate = {
   provider_account_id: string | null;
   /** The per-user legacy object may stand in for this row (see mapping). */
   legacy_allowed: boolean;
+  /** Cloud selected it for LLM calls or the sandbox. */
+  selected: boolean;
+  is_active: boolean;
+  harness_active: boolean;
+  updated_at: Date;
   skip_reason: string | null;
 };
 
@@ -125,6 +191,7 @@ export async function copyCodingAgentCredentials(
   });
   report.candidates = candidates.length;
 
+  const copied: Array<{ row: Candidate; controlId: string }> = [];
   for (const row of candidates) {
     if (row.skip_reason) {
       record(row.id, `skipped:${row.skip_reason}`);
@@ -166,7 +233,8 @@ export async function copyCodingAgentCredentials(
           authFile: plaintext,
           accountEmail: row.account_email,
         };
-        await deps.logins.storeLogin(login);
+        const id = await deps.logins.storeLogin(login);
+        copied.push({ row, controlId: id });
         record(row.id, "copied");
         continue;
       }
@@ -182,6 +250,7 @@ export async function copyCodingAgentCredentials(
         record(row.id, "payload_invalid");
         continue;
       }
+      copied.push({ row, controlId: result.record.id });
       record(row.id, result.created ? "copied" : "already_present");
     } catch (error) {
       if (error instanceof SyntaxError) {
@@ -191,6 +260,9 @@ export async function copyCodingAgentCredentials(
         record(row.id, `store_rejected:${typeof code === "string" ? code : "unexpected"}`);
       }
     }
+  }
+  if (mode === "apply" && copied.length > 0) {
+    report.selection = await applyCloudSelection(deps.target, copied);
   }
   report.ok = Object.keys(report.outcomes).every((outcome) =>
     outcome === "copied" || outcome === "already_present" || outcome.startsWith("skipped:"));

@@ -62,12 +62,16 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     // oauth_token: no account object, so the legacy provider key is used.
     [`${id(2)}/anthropic/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "oauth_token", modelProvider: "anthropic", token: "sk-ant-oat01-synthetic-token-00000000000" }), CLOUD_KEY))],
     [`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(codexAuth, CLOUD_KEY))],
+    [`${id(1)}/${id(0x80d)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "anthropic", key: "sk-ant-api03-synthetic-selected-0000" }), CLOUD_KEY))],
+    // Saved but unselected in Cloud: copied, left inactive.
+    [`${id(2)}/${id(0x80b)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "anthropic", key: "sk-ant-api03-synthetic-unselected-000" }), CLOUD_KEY))],
   ]);
   const reads: string[] = [];
   const reader = { get: async (key: string) => { reads.push(key); return objects.get(key) ?? null; } };
   const blobs = new CredentialBlobStore(new PostgresObjectBackend(target), KEYRING);
   const deps = {
     source,
+    target,
     reader,
     cloudKeyHex: CLOUD_KEY,
     keyring: KEYRING,
@@ -77,7 +81,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
 
   const plan = await copyCodingAgentCredentials(deps, { orgIds: null }, "plan");
   assert.equal(reads.length, 0, "plan never reads the object store");
-  assert.equal(plan.candidates, 9);
+  assert.equal(plan.candidates, 10);
 
   const report = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
   assert.deepEqual(report.rows, {
@@ -89,7 +93,8 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     // C1
     [id(0x809)]: "skipped:not_a_member",
     [id(0x80a)]: "skipped:credential_not_usable",
-    [id(0x80b)]: "skipped:credential_not_selected",
+    [id(0x80b)]: "copied",
+    [id(0x80d)]: "copied",
     // C2: Alice has two openai logins, so her legacy openai object is ambiguous.
     [id(0x80c)]: "skipped:legacy_key_ambiguous",
   });
@@ -100,14 +105,38 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
 
   const rows = (await target.query<{ auth_type: string; model_provider: string; secret_ciphertext: string | null; blob_location: string | null; workspace_id: string }>(
     "SELECT auth_type, model_provider, secret_ciphertext, blob_location, workspace_id FROM coding_agent_credentials ORDER BY auth_type")).rows;
-  assert.deepEqual(rows.map((row) => [row.auth_type, row.model_provider, row.workspace_id]), [
-    ["byo_api_key", "openai", id(0x201)],
-    ["oauth_token", "anthropic", id(0x205)],
-    ["provider_oauth", "openai", id(0x201)],
+  assert.deepEqual(rows.map((row) => `${row.auth_type} ${row.model_provider} ${row.workspace_id}`).sort(), [
+    `byo_api_key anthropic ${id(0x201)}`,
+    `byo_api_key anthropic ${id(0x201)}`,
+    `byo_api_key openai ${id(0x201)}`,
+    `oauth_token anthropic ${id(0x205)}`,
+    `provider_oauth openai ${id(0x201)}`,
   ]);
-  assert.equal(decryptSecret(rows[0]!.secret_ciphertext!, KEYRING), "sk-synthetic-openai-key-0000000000");
-  assert.equal(decryptSecret(rows[1]!.secret_ciphertext!, KEYRING), "sk-ant-oat01-synthetic-token-00000000000");
-  assert.ok(rows[2]!.blob_location);
+  const byProvider = (auth: string, provider: string) => rows.find((row) => row.auth_type === auth && row.model_provider === provider)!;
+  assert.equal(decryptSecret(byProvider("byo_api_key", "openai").secret_ciphertext!, KEYRING), "sk-synthetic-openai-key-0000000000");
+  assert.equal(decryptSecret(byProvider("oauth_token", "anthropic").secret_ciphertext!, KEYRING), "sk-ant-oat01-synthetic-token-00000000000");
+  assert.ok(byProvider("provider_oauth", "openai").blob_location);
+  // Explicit selection contract: per (workspace, provider) Control's active
+  // and sandbox rows are exactly Cloud's, whatever the seams auto-activated.
+  const flags = (await target.query<{ workspace_id: string; model_provider: string; auth_type: string; is_active: boolean; harness_active: boolean; secret_ciphertext: string | null }>(
+    "SELECT workspace_id::text AS workspace_id, model_provider, auth_type, is_active, harness_active, secret_ciphertext FROM coding_agent_credentials")).rows;
+  const plain = (row: { secret_ciphertext: string | null }) => row.secret_ciphertext ? decryptSecret(row.secret_ciphertext, KEYRING) : null;
+  const anthropicA = flags.filter((row) => row.workspace_id === id(0x201) && row.model_provider === "anthropic");
+  assert.deepEqual(anthropicA.filter((row) => row.is_active).map(plain), ["sk-ant-api03-synthetic-selected-0000"],
+    "Cloud's selected key is active although the unselected key has the lower id");
+  assert.ok(anthropicA.every((row) => !row.harness_active));
+  const openaiA = flags.filter((row) => row.workspace_id === id(0x201) && row.model_provider === "openai");
+  assert.deepEqual(openaiA.filter((row) => row.is_active).map((row) => row.auth_type), ["byo_api_key"]);
+  assert.deepEqual(openaiA.filter((row) => row.harness_active).map((row) => row.auth_type), ["provider_oauth"]);
+  const anthropicB = flags.filter((row) => row.workspace_id === id(0x205) && row.model_provider === "anthropic");
+  assert.deepEqual(anthropicB.map((row) => [row.is_active, row.harness_active]), [[true, true]]);
+  // Invariant: at most one active and one sandbox row per (workspace, provider).
+  for (const group of new Set(flags.map((row) => `${row.workspace_id} ${row.model_provider}`))) {
+    const rowsInGroup = flags.filter((row) => `${row.workspace_id} ${row.model_provider}` === group);
+    assert.ok(rowsInGroup.filter((row) => row.is_active).length <= 1, group);
+    assert.ok(rowsInGroup.filter((row) => row.harness_active).length <= 1, group);
+  }
+  assert.deepEqual(report.selection, { groups: 3, active: 3, harness: 2, activeDemoted: 0, harnessDemoted: 0 });
   assert.equal(await deps.logins.freshAuthFile(id(0x201), (await target.query<{ id: string }>(
     "SELECT id FROM coding_agent_credentials WHERE auth_type = 'provider_oauth'")).rows[0]!.id), codexAuth);
 
@@ -115,8 +144,13 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   const again = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
   assert.equal(again.rows[id(0x803)], "already_present");
   assert.equal(again.rows[id(0x805)], "already_present");
+  assert.equal(again.rows[id(0x80b)], "already_present");
   const count = (await target.query<{ n: number }>("SELECT count(*)::int AS n FROM coding_agent_credentials")).rows[0]!.n;
-  assert.equal(count, 3);
+  assert.equal(count, 5);
+  // The re-run re-applies the same selection.
+  const activeAfter = (await target.query<{ secret_ciphertext: string }>(
+    "SELECT secret_ciphertext FROM coding_agent_credentials WHERE workspace_id = $1 AND model_provider = 'anthropic' AND is_active", [id(0x201)])).rows;
+  assert.deepEqual(activeAfter.map((row) => decryptSecret(row.secret_ciphertext, KEYRING)), ["sk-ant-api03-synthetic-selected-0000"]);
 });
 
 test("credential copier CLI: apply refuses up front when copy settings are missing", async () => {
