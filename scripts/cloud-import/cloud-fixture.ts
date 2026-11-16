@@ -7,7 +7,7 @@ import { createCipheriv, randomBytes } from "node:crypto";
 export const CLOUD_FIXTURE_DDL = `
 CREATE TABLE users (
   id uuid PRIMARY KEY, primary_email text, name text, avatar_url text,
-  last_organization_id uuid, last_workspace_id uuid,
+  last_organization_id uuid, last_workspace_id uuid, signup_source text,
   created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
 );
 CREATE TABLE auth_identities (
