@@ -56,6 +56,14 @@ export { DASHBOARD_DEVICE_CLIENT };
 const ACCOUNT_SCOPES = [...BROWSER_SESSION_SCOPES, ACCOUNT_SCOPE];
 /** Desktop sessions: device scopes (with rth:acquire) plus "desktop:workspaces". */
 const DESKTOP_SCOPES = [...DEVICE_SCOPES, DESKTOP_WORKSPACES_SCOPE];
+/**
+ * Control's own short-lived token for relaygate's POST /v1/check on a gate-only
+ * launch: no scopes at all (relaygate's check needs none, so the token is
+ * useless for /v1/register, uploads or reads even while a cached introspection
+ * outlives the revoke).
+ */
+const LAUNCH_CHECK_SCOPES: string[] = [];
+const LAUNCH_CHECK_TTL_MS = 60 * 1_000;
 /** desktop-auth lane, browser flow: hosted Cloud's 15-minute loopback handoff. */
 const DESKTOP_HANDOFF_TTL_MS = 15 * 60 * 1_000;
 
@@ -93,6 +101,14 @@ export type Principal = {
    * `provisioning`); absent for every other session.
    */
   provisionedByTokenId?: string;
+  /**
+   * The Desktop host name on the session row: set for an Agent Relay Desktop
+   * sign-in with host consent (PKCE handoff and its redeemed pair) and for a
+   * desktop-enrollment key exchange; absent for device-code and browser
+   * sessions. A pending or original handoff also carries it, so callers that
+   * want a redeemed Desktop session check `handoff` too.
+   */
+  desktopHostName?: string;
 };
 
 export type IssuedTokens = {
@@ -147,6 +163,10 @@ export type IntrospectedToken = {
   email: string;
   organizationId: string;
   workspaceId: string;
+  /** Hosted Cloud's stable rw_<8hex> identity, when this workspace was imported. */
+  cloudRelayWorkspaceId: string | null;
+  /** Imported customer-hosted History audience for this workspace, if any. */
+  relayhistoryOrigin: string | null;
   role: Principal["role"];
   scopes: string[];
   /** SHA-256 of the access token as stored; never returned to callers. */
@@ -177,6 +197,7 @@ type TokenContextRow = {
   pending_handoff: boolean;
   handoff: boolean;
   provisioned_by_token_id: string | null;
+  desktop_host_name: string | null;
 };
 
 function cleanName(value: string, field: string): string {
@@ -825,7 +846,9 @@ export class ControlPlaneStore {
     organizationId: string;
     name: string;
     relaycastWorkspaceId: string;
+    cloudRelayWorkspaceId: string | null;
     relaycastApiKey: string;
+    relayhistoryOrigin: string | null;
     runtime: unknown;
     role: Principal["role"];
   } | null> {
@@ -834,12 +857,15 @@ export class ControlPlaneStore {
       organization_id: string;
       name: string;
       relaycast_workspace_id: string;
+      cloud_relay_workspace_id: string | null;
       relaycast_api_key_ciphertext: string;
+      relayhistory_origin: string | null;
       runtime_config: unknown;
       role: Principal["role"];
     }>(
       `SELECT w.id, w.organization_id, w.name, w.relaycast_workspace_id,
-              w.relaycast_api_key_ciphertext, w.runtime_config, m.role
+              w.cloud_relay_workspace_id,
+              w.relaycast_api_key_ciphertext, w.relayhistory_origin, w.runtime_config, m.role
          FROM workspaces w
          JOIN organization_memberships m
            ON m.organization_id = w.organization_id AND m.user_id = $2
@@ -853,10 +879,21 @@ export class ControlPlaneStore {
       organizationId: row.organization_id,
       name: row.name,
       relaycastWorkspaceId: row.relaycast_workspace_id,
+      cloudRelayWorkspaceId: row.cloud_relay_workspace_id,
       relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring),
+      relayhistoryOrigin: row.relayhistory_origin,
       runtime: row.runtime_config,
       role: row.role,
     };
+  }
+
+  /** Workspace owning one canonical imported History origin, if any. */
+  async workspaceIdForRelayhistoryOrigin(origin: string): Promise<string | null> {
+    const result = await this.database.query<{ id: string }>(
+      "SELECT id FROM workspaces WHERE relayhistory_origin = $1",
+      [origin],
+    );
+    return result.rows[0]?.id ?? null;
   }
 
   async setRuntime(workspaceId: string, runtime: unknown): Promise<boolean> {
@@ -1097,13 +1134,17 @@ export class ControlPlaneStore {
   }
 
   private async lookupAccessToken(token: string): Promise<Principal | null> {
+    // A staff read grant (sh_sr_) is a credential only on the shared-sessions
+    // MCP facade and at introspection; every person-session gate refuses it
+    // by shape (docs/staff-read-grants.md).
+    if (token.startsWith("sh_sr_")) return null;
     const result = await this.database.query<TokenContextRow>(
       `SELECT s.id AS session_id, s.token_family_id, s.user_id, u.email,
               u.name AS user_name, s.organization_id, o.name AS organization_name,
               s.workspace_id, w.name AS workspace_name, m.role, s.scopes,
               (s.desktop_exchange_challenge IS NOT NULL AND s.desktop_exchanged_at IS NULL) AS pending_handoff,
               (s.desktop_exchange_challenge IS NOT NULL) AS handoff,
-              s.provisioned_by_token_id
+              s.provisioned_by_token_id, s.desktop_host_name
          FROM token_sessions s
          JOIN users u ON u.id = s.user_id
          JOIN organizations o ON o.id = s.organization_id
@@ -1135,6 +1176,7 @@ export class ControlPlaneStore {
       pendingHandoff: row.pending_handoff === true,
       handoff: row.handoff === true,
       ...(row.provisioned_by_token_id ? { provisionedByTokenId: row.provisioned_by_token_id } : {}),
+      ...(row.desktop_host_name ? { desktopHostName: row.desktop_host_name } : {}),
     };
   }
 
@@ -1154,6 +1196,8 @@ export class ControlPlaneStore {
       email: string;
       organization_id: string;
       workspace_id: string;
+      cloud_relay_workspace_id: string | null;
+      relayhistory_origin: string | null;
       role: Principal["role"];
       scopes: string[];
       access_token_hash: string;
@@ -1165,7 +1209,8 @@ export class ControlPlaneStore {
       policy_settings: unknown;
       policy_sharing_mode_since: Date | string | null;
     }>(
-      `SELECT s.user_id, u.email, s.organization_id, s.workspace_id, m.role, s.scopes,
+      `SELECT s.user_id, u.email, s.organization_id, s.workspace_id,
+              w.cloud_relay_workspace_id, w.relayhistory_origin, m.role, s.scopes,
               s.access_token_hash,
               (s.revoked_at IS NOT NULL OR (
                 'mcp:desktop' = ANY(s.scopes) AND NOT EXISTS (
@@ -1208,6 +1253,8 @@ export class ControlPlaneStore {
       email: row.email,
       organizationId: row.organization_id,
       workspaceId: row.workspace_id,
+      cloudRelayWorkspaceId: row.cloud_relay_workspace_id,
+      relayhistoryOrigin: row.relayhistory_origin,
       role: row.role,
       scopes: row.scopes,
       accessTokenHash: row.access_token_hash,
@@ -1761,6 +1808,26 @@ export class ControlPlaneStore {
     input: { userId: string; organizationId: string; workspaceId: string; label: string },
   ): Promise<IssuedTokens> {
     return this.issueTokens(tx, input, { scopes: ACCOUNT_SCOPES });
+  }
+
+  /**
+   * A one-use, ~60 s access token with which Control itself asks relaygate to
+   * check a launch on the launching person's behalf (POST /v1/check). Revoked
+   * right after the check. Only the access token is returned.
+   */
+  async issueLaunchCheckSession(input: {
+    userId: string;
+    organizationId: string;
+    workspaceId: string;
+  }): Promise<{ accessToken: string }> {
+    const issued = await this.database.transaction((tx) =>
+      this.issueTokens(tx, { ...input, label: "relay-launch-check" }, {
+        scopes: LAUNCH_CHECK_SCOPES,
+        accessTtlMs: LAUNCH_CHECK_TTL_MS,
+        refreshTtlMs: LAUNCH_CHECK_TTL_MS,
+      }),
+    );
+    return { accessToken: issued.accessToken };
   }
 
   private async issueTokens(

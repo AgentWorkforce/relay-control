@@ -123,7 +123,8 @@ is explicit. History is served only by the sessions pipeline: see
 | `RELAYCONTROL_INTROSPECT_SECRET` | At least 32 bytes (`_FILE` supported). Bearer for `POST /internal/v1/auth/introspect`, shared only with the sessions pipeline ingest edge (and relayfile) |
 | `RELAYCHIEF_CONTROL_RELAY_SECRET` | Optional, at least 32 bytes, `_FILE` supported, must differ from the broker secret. Enables `POST /internal/v1/chief/workspaces/{id}/relay-agents`, which registers a chief as a Relaycast agent for relaychief-control. A repeat call rotates that chief's live token. Requires the `chief` feature. Unset, it answers 404. |
 | `RELAYFILE_CONTROL_BROKER_SECRET` | Optional, at least 32 bytes, `_FILE` supported. Enables the internal credential routes under `/internal/v1/flows/credentials/` for relayfile-control's Flows service. Unset, they answer 404. Its `relayfile` action mints the per-run path-scoped `sh_fr_` Relayfile credential a Flows worker uses; see [docs/flows-relayfile-credential.md](docs/flows-relayfile-credential.md). |
-| `SELFHOST_INTROSPECT_AUDIENCES` | Optional comma-separated http(s) origins a token may be introspected for, default `SESSION_READ_API_PUBLIC_URL`; must include it. Matched as normalized origins (scheme, lowercase host, port); `GET /readyz` lists them under `introspection.audiences` |
+| `SELFHOST_INTROSPECT_AUDIENCES` | Optional comma-separated general service origins a token may be introspected for, default empty. Acquisition and Relayfile origins belong here; customer History origins use the dedicated variable below. The two lists must not overlap. Matched as normalized origins; `GET /readyz` lists the union under `introspection.audiences` |
+| `SELFHOST_RELAYHISTORY_AUDIENCES` | Optional comma-separated History origins allowed to receive user bearers; default `SESSION_READ_API_PUBLIC_URL` and must include it. Add every imported workspace History origin. Values canonicalize to lowercase ASCII/punycode with no DNS trailing dot or default port; HTTPS is required except explicit loopback. A stored History origin is refused through the general list even for legacy configuration |
 | `SELFHOST_INTROSPECT_OUTAGE_HOLD_MS` | Optional, default `0` (off); otherwise an integer from 1000 to 3600000. During a database outage, introspection of a Desktop `sh_at_` token may answer from that token's last active verdict for up to this long, marked `held: true` with `exp` clamped. Connection errors only; machine claims and other token kinds are never held. `GET /readyz` shows it as `introspection.outageHoldMs`. See [docs/identity.md](docs/identity.md#database-outage-hold) |
 | `SELFHOST_ACQUISITION_ISSUER_ENABLED` | Optional, default off (`true`/`false`). Turns on the dormant cloud-class acquisition assertion issuer ([docs/acquisition-issuer.md](docs/acquisition-issuer.md)); off, no other issuer variable is read and `/api/v1/acquisition/*` answers 404 |
 | `SELFHOST_ACQUISITION_ORIGIN` | Required when the issuer is enabled. The pipeline's `ACQUISITION_ORIGIN`; must also be listed in `SELFHOST_INTROSPECT_AUDIENCES` |
@@ -171,6 +172,8 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_DESKTOP_RELEASES_REPO` | Optional `owner/repository` of a public GitHub releases repo the downloads card shows when the signed Desktop feed has nothing. Unset: `GET /api/v1/desktop/releases` is 404. See [docs/desktop-feed.md](docs/desktop-feed.md#github-releases-source) |
 | `SELFHOST_FEATURES` | Comma list of optional components to serve: `flows`, `relayfile`, `chief`, `usage`, `launch`, `usage_people`, `events_shim`. Unset selects `usage,usage_people`; `""` selects nothing. Unselected routes answer 403 `feature_not_enabled` (`events_shim` routes answer 404). See [docs/features.md](docs/features.md) |
 | `SELFHOST_EVENTS_SHIM_RELAY_ORIGINS` | Optional comma list of https origins (no path) an events-shim inbox may forward wake posts to (`link_relay_wake`). Default: the `RELAYCAST_PUBLIC_URL` origin. Set it, e.g. to `https://cast.agentrelay.com`, when your agents' Agent Relay uses another Relaycast. See [docs/events-shim.md](docs/events-shim.md) |
+| `SELFHOST_RELAYGATE_PUBLIC_URL` | Optional public https origin of relaygate on a gate-only install (relaygate is the only public way into Relaycast), e.g. `https://cast.example.com` when that host routes to relaygate. Set: `GET /api/v1/workspaces/{id}/resolve` answers `urls.relaygateUrl` and omits `relaycastApiKey`, so no device receives the workspace-wide Relaycast key; desktops enrol at the gate with their Control token. Clients that need the key fail closed with "no key". The events-shim temporary workspace is not issued either. It also withholds the person credential and relay-node enrol token (both `403 gate_only`; the person credential refusal is audited as `workspace.person_credential.withheld`). Unset: all are unchanged. See [docs/identity.md](docs/identity.md#gate-only-installs-relaygate) |
+| `SELFHOST_RELAY_NODE_SELF_MINT` | Gate-only installs only. Optional `true`/`false` (also `1`/`0`, `on`/`off`), default `true`: a member's signed-in Agent Relay Desktop may mint its own relay-node token at `POST /api/v1/workspaces/{id}/relay-node/self-tokens`. Off: those routes answer 403 `self_mint_disabled`; the admin mint is unchanged. Any other value refuses startup. See [docs/relay-node-credential.md](docs/relay-node-credential.md#member-self-mint) |
 | `SELFHOST_FACTORY_ENABLED` | Optional `true`/`false`, default `false`. Factory sessions: when off every Factory route is 404 and the worker does not start. See [docs/factory-sessions.md](docs/factory-sessions.md) |
 | `SELFHOST_FACTORY_API_URL` | Factory API origin, default `https://api.factory.ai`; absolute https only |
 | `SELFHOST_FACTORY_HISTORY_INTERVAL_MS` | Dormant Factory history loop cadence, default 300000, minimum 60000 |
@@ -233,10 +236,16 @@ and the pipeline-side configuration.
 Required: `SESSION_READ_API_URL` (internal HTTP(S) origin),
 `SESSION_READ_API_PUBLIC_URL` (bare public HTTPS origin), `SESSION_READ_API_SECRET`
 or its mutually exclusive `_FILE` form (at least 32 bytes), and
-`RELAYCONTROL_INTROSPECT_SECRET`. `SELFHOST_INTROSPECT_AUDIENCES` must include
-the public origin (it does by default). Use a dedicated Control-to-reader
-secret; it is never sent to clients. Control's History probe is
+`RELAYCONTROL_INTROSPECT_SECRET`. `SELFHOST_RELAYHISTORY_AUDIENCES` must
+include the public origin (it does by default). Use a dedicated
+Control-to-reader secret; it is never sent to clients. Control's History probe is
 `${SESSION_READ_API_URL}/healthz`.
+
+Before applying migration 0062 to a database that may contain imported Cloud
+metadata, run `scripts/preflight-0062-cloud-identity-security.sql` read-only.
+Every query must return zero rows; its remediation column names the required
+origin or slug cleanup. Migration 0062 repeats the checks and refuses with the
+offending row ids before it replaces any constraint or index.
 
 The session read API credential handoff:
 
@@ -523,6 +532,10 @@ workspace Relaycast key to a person credential with the `cli:auth` scope
 `403`; the bootstrap token gets `401`; another or departed tenant gets `404`.
 Each disclosure is audited as `workspace.relaycast_key.resolved` with the
 session id, never the key or token.
+On a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set) the key is never
+returned: the answer adds `urls.relaygateUrl`, omits `relaycastApiKey`, and is
+audited as `workspace.relaycast_key.withheld`. See
+[docs/identity.md](docs/identity.md#gate-only-installs-relaygate).
 
 ### Replacing a workspace's Relaycast key
 
@@ -766,7 +779,11 @@ API on PGlite at `http://127.0.0.1:8787` with fixed development secrets.
   History origin before they are returned or used.
 - Token introspection requires its own secret, compared in constant time;
   only `sh_at_` access tokens are looked up, and the token, its hash, the
-  secret and the request body are never logged.
+  secret and the request body are never logged. Imported workspace-specific
+  History origins are globally unique canonical origins, HTTPS except for
+  explicit loopback, and usable only when listed in
+  `SELFHOST_RELAYHISTORY_AUDIENCES`. A History audience must also equal the
+  token session workspace's own imported origin (or the installation default).
 - Browser access/refresh tokens are never returned in HTML or JSON; only the
   opaque access credential is carried in a Secure HttpOnly same-origin cookie.
 
@@ -828,6 +845,14 @@ OAuth apps are operator configuration, not a per-user action:
 | `SELFHOST_OAUTH_<PROVIDER>_CLIENT_SECRET_FILE` (or `_CLIENT_SECRET`) | the client secret, mounted from a Secret |
 | `SELFHOST_OAUTH_<PROVIDER>_SCOPES` | optional scope override |
 
+Existing Cloud GitHub App installations can use direct installation token
+minting with `SELFHOST_GITHUB_APP_ID` and
+`SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`, using the same App registration as
+Cloud. The trusted importer retains the installation ID; users do not need
+to reconnect. OAuth connect and callbacks continue to work; credential mode
+is selected per connection row. See [GitHub App credentials](docs/github-app-connections.md)
+for the import contract, encrypted token cache, and refresh behavior.
+
 Register this callback URL in every provider app:
 `$SELFHOST_PUBLIC_URL/api/v1/integrations/oauth/callback` (or
 `SELFHOST_OAUTH_REDIRECT_URL`). An operator app wins over a per-workspace app
@@ -865,8 +890,9 @@ the runtime environment read below:
 A selected credential wins over a workspace variable of the same name; a run's
 own `envSecrets` win over both.
 
-**Subscription logins** (hosted `provider_oauth`). Codex (ChatGPT) and Grok
-(xAI) sign in from the dashboard's Connect agent dialog with the providers'
+**Subscription logins** (hosted `provider_oauth`). Imported Claude Pro/Max
+logins, Codex (ChatGPT), and Grok (xAI) use the CLI's refreshable login file.
+Codex and Grok sign in from the dashboard's Connect agent dialog with the providers'
 device flows (`POST provider-credentials/{openai,xai}-device/start|status`):
 the operator approves a one-time code on the provider's site and relaycontrol
 exchanges it, with no hosted callback. The resulting auth file is stored as an
@@ -889,11 +915,14 @@ worker presents it with its worker token at
 `GET /api/v1/workers/:w/assignments/:run/cli-credentials` and gets each auth
 file, refreshed first (under a per-credential advisory lock, so concurrent
 runs spend one single-use refresh token) when it expires within 45 minutes. It
-writes them 0600 under the run's private directory as `$CODEX_HOME/auth.json`
-/ `$GROK_HOME/auth.json`, and after the run `PUT`s back a file the CLI
+writes them 0600 under the run's private directory as
+`$HOME/.claude/.credentials.json`, `$CODEX_HOME/auth.json`, or
+`$GROK_HOME/auth.json`, and after the run `PUT`s back a file the CLI
 refreshed (same account only, never over a newer login). A login that is
 expired and cannot refresh becomes `refresh_failed` and is skipped.
-Claude has no browser login on hosted either; it uses the setup token above.
+Claude still has no Control browser login; an imported
+`provider_oauth` file keeps existing Cloud users signed in, while new logins
+can use the setup token above.
 
 **Workspace API tokens** (`/deployment-api-tokens`, hosted shapes). Owner/admin
 only, shown once, stored as SHA-256. Purposes: `agent-runtime` (runtime env and

@@ -1,6 +1,7 @@
 import { createHash, webcrypto } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { SqlExecutor } from "../database.js";
+import { normalizeDesktopSourceId } from "../desktop-source-id.js";
 
 /**
  * Copilot tool-call attestation, ported verbatim from Cloud's
@@ -104,7 +105,8 @@ export async function copilotAttestationFor(body: unknown, auth: {
       typeof header.kid !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(header.kid)) return fail("unexpected header");
   if (!exact(claims, ["v", "kind", "sid", "src", "workspace", "user", "nonce", "tool", "args", "iat", "exp"]) ||
       claims.v !== 1 || claims.kind !== "copilot" ||
-      typeof claims.sid !== "string" || !UUID.test(claims.sid) || typeof claims.src !== "string" || !UUID.test(claims.src) ||
+      typeof claims.sid !== "string" || !UUID.test(claims.sid) || typeof claims.src !== "string" ||
+      claims.src.length < 1 || claims.src.length > 200 ||
       typeof claims.nonce !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(claims.nonce) ||
       typeof claims.tool !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(claims.tool) ||
       !object(claims.args) || !Number.isSafeInteger(claims.iat) || !Number.isSafeInteger(claims.exp)) return fail("unexpected payload");
@@ -112,11 +114,12 @@ export async function copilotAttestationFor(body: unknown, auth: {
   if (claims.tool !== body.params.name || !isDeepStrictEqual(claims.args, args)) return fail("call mismatch");
   const iat = claims.iat as number;
   const exp = claims.exp as number;
+  const sourceId = normalizeDesktopSourceId(claims.src as string);
   const now = Math.floor(nowMs / 1000);
   if (iat < 0 || exp < iat || exp - iat > 60 || now > exp || iat > now + 30) return fail("invalid lifetime");
   const signature = decodeBase64Url(sig);
   if (!signature || signature.byteLength !== 64) return fail("invalid signature");
-  const publicKey = await store.publicKey({ workspaceId: auth.workspaceId, userId: auth.userId, sourceId: claims.src, kid: header.kid });
+  const publicKey = await store.publicKey({ workspaceId: auth.workspaceId, userId: auth.userId, sourceId, kid: header.kid });
   const raw = publicKey === null ? null : decodeBase64Url(publicKey);
   if (!raw || raw.byteLength !== 32 || attestationKeyId(raw) !== header.kid) return fail("unknown key");
   const key = await webcrypto.subtle.importKey("raw", raw, { name: "Ed25519" }, false, ["verify"]);
@@ -126,10 +129,10 @@ export async function copilotAttestationFor(body: unknown, auth: {
   if (!await store.spend({
     workspaceId: auth.workspaceId,
     userId: auth.userId,
-    toolUseId: `copilot:${claims.src}:${claims.nonce}`,
+    toolUseId: `copilot:${sourceId}:${claims.nonce}`,
     expiresAt: new Date((exp + 120) * 1000),
   })) return fail("replayed proof");
-  return { nativeSession: { kind: "copilot", id: claims.sid }, sourceId: claims.src };
+  return { nativeSession: { kind: "copilot", id: claims.sid }, sourceId };
 }
 
 /**

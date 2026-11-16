@@ -37,6 +37,34 @@ test("customer support uses an optional complete dedicated service connection, n
   assert.equal(loadConfig({ ...completeEnv, ...support, SELFHOST_CUSTOMER_SUPPORT_URL: "http://127.0.0.1:3000" }).customerSupport?.url, "http://127.0.0.1:3000");
 });
 
+test("SELFHOST_RELAYGATE_PUBLIC_URL is optional and must be a public https origin", () => {
+  assert.equal(loadConfig(completeEnv).relaygatePublicUrl, null);
+  // reader_kind goes into the read-token mint body only behind relaygate.
+  assert.equal(loadConfig(completeEnv).sessionReadApi.mintReaderKind, false);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: "https://cast.selfhosted.company" })
+    .sessionReadApi.mintReaderKind, true);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: "  " }).relaygatePublicUrl, null);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: " https://cast.selfhosted.company/ " }).relaygatePublicUrl,
+    "https://cast.selfhosted.company");
+  for (const bad of ["http://cast.selfhosted.company", "https://cast.selfhosted.company/v1", "https://u:p@cast.selfhosted.company",
+    "https://localhost", "https://10.0.0.1", "not a url"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: bad }), /SELFHOST_RELAYGATE_PUBLIC_URL/, bad);
+  }
+});
+
+test("SELFHOST_RELAY_NODE_SELF_MINT defaults on and is strictly boolean", () => {
+  assert.equal(loadConfig(completeEnv).relayNodeSelfMint, true);
+  for (const on of ["", "  ", "true", "1", "on", "TRUE"]) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAY_NODE_SELF_MINT: on }).relayNodeSelfMint, true, on);
+  }
+  for (const off of ["false", "0", "off", " Off "]) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAY_NODE_SELF_MINT: off }).relayNodeSelfMint, false, off);
+  }
+  for (const bad of ["yes", "no", "disabled", "2"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_RELAY_NODE_SELF_MINT: bad }), /SELFHOST_RELAY_NODE_SELF_MINT/, bad);
+  }
+});
+
 test("the image version is read from SELFHOST_IMAGE_VERSION and null from source", () => {
   assert.equal(loadConfig(completeEnv).imageVersion, null);
   assert.equal(loadConfig({ ...completeEnv, SELFHOST_IMAGE_VERSION: "  " }).imageVersion, null);
@@ -82,6 +110,7 @@ test("the read API handoff is required and must be fully configured", () => {
     url: reader.SESSION_READ_API_URL,
     publicUrl: "https://history.selfhosted.company",
     secret: reader.SESSION_READ_API_SECRET,
+    mintReaderKind: false,
   });
   // History is the read API: its URLs are the History URLs.
   assert.equal(config.relayhistoryUrl, reader.SESSION_READ_API_URL);
@@ -234,29 +263,65 @@ test("startup refuses the removed RelayHistory and RelayAuth variables by name",
   assert.doesNotThrow(() => loadConfig({ ...completeEnv, RELAYAUTH_URL: "", RELAYAUTH_API_KEY: " ", RELAYHISTORY_READ_API_URL: "" }));
 });
 
-test("token introspection is required and validates its secret and audiences", () => {
+test("token introspection is required and validates its secret and audiences", (t) => {
   const config = loadConfig(completeEnv);
   assert.equal(config.introspectSecret, completeEnv.RELAYCONTROL_INTROSPECT_SECRET);
-  assert.deepEqual(config.introspectAudiences, [completeEnv.SESSION_READ_API_PUBLIC_URL]);
+  assert.deepEqual(config.introspectAudiences, []);
+  assert.deepEqual(config.relayhistoryAudiences, [completeEnv.SESSION_READ_API_PUBLIC_URL]);
   assert.throws(() => loadConfig({ ...completeEnv, RELAYCONTROL_INTROSPECT_SECRET: "" }), {
     message: "RELAYCONTROL_INTROSPECT_SECRET is required: the sessions pipeline verifies every History token through introspection",
   });
-  assert.throws(
-    () => loadConfig({ ...completeEnv, SELFHOST_INTROSPECT_AUDIENCES: "http://relayfile.files.svc:8080" }),
-    { message: "SELFHOST_INTROSPECT_AUDIENCES must include SESSION_READ_API_PUBLIC_URL" },
+  assert.deepEqual(
+    loadConfig({ ...completeEnv, SELFHOST_INTROSPECT_AUDIENCES: "http://relayfile.files.svc:8080" }).introspectAudiences,
+    ["http://relayfile.files.svc:8080"],
   );
 
   const secret = "j".repeat(32);
   const enabled = loadConfig({
     ...completeEnv,
     RELAYCONTROL_INTROSPECT_SECRET: secret,
-    SELFHOST_INTROSPECT_AUDIENCES: " https://history.selfhosted.company/ , http://relayfile.files.svc:8080 ",
+    SELFHOST_INTROSPECT_AUDIENCES: " http://relayfile.files.svc:8080 ",
   });
   assert.equal(enabled.introspectSecret, secret);
   assert.deepEqual(enabled.introspectAudiences, [
-    "https://history.selfhosted.company",
     "http://relayfile.files.svc:8080",
   ]);
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+  const compatibleOverlap = loadConfig({
+    ...completeEnv,
+    SELFHOST_RELAYHISTORY_AUDIENCES:
+      `${completeEnv.SESSION_READ_API_PUBLIC_URL},https://xn--bcher-kva.example`,
+    SELFHOST_INTROSPECT_AUDIENCES:
+      "https://HISTORY.SELFHOSTED.COMPANY.:0443,https://BÜCHER.example.:443,http://relayfile.files.svc:8080",
+  });
+  assert.deepEqual(compatibleOverlap.introspectAudiences, ["http://relayfile.files.svc:8080"]);
+  assert.equal(warnings.length, 1);
+  assert.match(String(warnings[0]![0]), /SELFHOST_INTROSPECT_AUDIENCES/);
+  assert.match(String(warnings[0]![0]), /SELFHOST_RELAYHISTORY_AUDIENCES/);
+  const importedHistory = loadConfig({
+    ...completeEnv,
+    SELFHOST_RELAYHISTORY_AUDIENCES:
+      " https://history.selfhosted.company/ , https://BÜCHER.example.:0443 ",
+  });
+  assert.deepEqual(importedHistory.relayhistoryAudiences, [
+    "https://history.selfhosted.company",
+    "https://xn--bcher-kva.example",
+  ]);
+  assert.throws(
+    () => loadConfig({
+      ...completeEnv,
+      SELFHOST_RELAYHISTORY_AUDIENCES: "https://history.customer.example",
+    }),
+    { message: "SELFHOST_RELAYHISTORY_AUDIENCES must include SESSION_READ_API_PUBLIC_URL" },
+  );
+  for (const invalid of ["http://history.customer.example", "ftp://history.example", "https://u:p@h.example"]) {
+    assert.throws(
+      () => loadConfig({ ...completeEnv, SELFHOST_RELAYHISTORY_AUDIENCES: invalid }),
+      /SELFHOST_RELAYHISTORY_AUDIENCES/,
+      invalid,
+    );
+  }
   assert.doesNotMatch(configFingerprint(enabled), new RegExp(secret));
 
   assert.throws(

@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { SelfhostConfig } from "../config.js";
 import { UpstreamError } from "../relayhistory.js";
+import { readerKindOf } from "../session-read.js";
 import { recordedSummary } from "./summary.js";
 import type { ControlPlaneStore, Principal } from "../store.js";
 import { AGENT_VALUE, agentPrefixTooShort, MAX_AGENT_LENGTH, selectAgent } from "./agent-query.js";
@@ -180,13 +181,16 @@ function sessionPathId(ctx: SessionRouteContext, raw: string): string {
   return sessionId;
 }
 
-function identityOf(access: Awaited<ReturnType<WorkspaceAccess>>): HistoryIdentity {
+function identityOf(access: Awaited<ReturnType<WorkspaceAccess>>, request: IncomingMessage): HistoryIdentity {
   return {
     userId: access.principal.userId,
     organizationId: access.workspace.organizationId,
     workspaceId: access.workspace.id,
     role: access.workspace.role,
     callerToken: access.token,
+    // Dashboard reads are browser (cookie) or device (bearer); MCP reads do
+    // not come through these routes, so no marker is consulted here.
+    readerKind: readerKindOf(request),
   };
 }
 
@@ -306,7 +310,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
     // The backend cannot combine these, and narrowing a page here would hide matches.
     if (agent && (text || input.ranking)) throw new UnsupportedView("agent_with_text");
     if (input.q && !input.cursor) ctx.onSearch?.(access.workspace.organizationId, access.principal.userId);
-    const read = await readWorkspaceHistory(ctx.config, identityOf(access), "/v1/sessions", params({
+    const read = await readWorkspaceHistory(ctx.config, identityOf(access, ctx.request), "/v1/sessions", params({
       limit: String(limit ?? 50),
       q: agent ? undefined : input.q,
       agent,
@@ -355,7 +359,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
     const access = await ctx.workspaceAccess(ctx.request, workspaceId);
     const days: Array<{ date: string; conversations: number; bySource: Record<string, number> }> = [];
     for (const window of windows(dates, now)) {
-      const read = await readWorkspaceHistory(ctx.config, identityOf(access), "/v1/sessions/activity",
+      const read = await readWorkspaceHistory(ctx.config, identityOf(access, ctx.request), "/v1/sessions/activity",
         params({ since: window.since, until: window.until, q: input.q }));
       const rows = read.status === "ok" && Array.isArray(read.body.days) ? read.body.days : null;
       if (!rows || rows.length !== window.dates.length) {
@@ -397,7 +401,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
       commitsWithoutLineCounts: 0,
     };
     for (const window of windows(dates, now)) {
-      const read = await readWorkspaceHistory(ctx.config, identityOf(access), "/v1/sessions/output",
+      const read = await readWorkspaceHistory(ctx.config, identityOf(access, ctx.request), "/v1/sessions/output",
         params({ since: window.since, until: window.until }), { allowNotFound: true });
       if (read.status === "not_found") {
         // Older RelayHistory builds do not serve output metrics.
@@ -439,7 +443,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
     const until = instant(ctx, input.until, "until");
     const access = await ctx.workspaceAccess(ctx.request, workspaceId);
     if (!input.cursor) ctx.onSearch?.(access.workspace.organizationId, access.principal.userId);
-    const read = await readWorkspaceHistory(ctx.config, identityOf(access), "/v1/events", params({
+    const read = await readWorkspaceHistory(ctx.config, identityOf(access, ctx.request), "/v1/events", params({
       q: input.q,
       limit: String(limit),
       order: "desc",
@@ -476,7 +480,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
       const access = await ctx.workspaceAccess(ctx.request, workspaceId);
       const read = await readWorkspaceHistory(
         ctx.config,
-        identityOf(access),
+        identityOf(access, ctx.request),
         `/v1/sessions/${encodeURIComponent(sessionId)}/summary`,
         params({ source: input.source, kind: input.kind ?? "short" }),
         { allowNotFound: true },
@@ -505,7 +509,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
       const access = await ctx.workspaceAccess(ctx.request, workspaceId);
       const read = await readWorkspaceHistory(
         ctx.config,
-        identityOf(access),
+        identityOf(access, ctx.request),
         `/v1/sessions/${encodeURIComponent(sessionId)}/events`,
         params({
           source: input.source,
@@ -536,7 +540,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
       const access = await ctx.workspaceAccess(ctx.request, workspaceId);
       const read = await readWorkspaceHistory(
         ctx.config,
-        identityOf(access),
+        identityOf(access, ctx.request),
         `/v1/sessions/${encodeURIComponent(sessionId)}/turns`,
         params({ source: input.source, cursor: input.cursor }),
       );
@@ -554,7 +558,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
       const access = await ctx.workspaceAccess(ctx.request, workspaceId);
       const read = await readWorkspaceHistory(
         ctx.config,
-        identityOf(access),
+        identityOf(access, ctx.request),
         `/v1/sessions/${encodeURIComponent(sessionId)}/timing`,
         params({ source: input.source }),
         { allowNotFound: true },
@@ -585,7 +589,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
       const access = await ctx.workspaceAccess(ctx.request, workspaceId);
       const read = await readWorkspaceHistory(
         ctx.config,
-        identityOf(access),
+        identityOf(access, ctx.request),
         `/v1/sessions/${encodeURIComponent(sessionId)}/catalog`,
         params({ source: input.source }),
         { allowNotFound: true },

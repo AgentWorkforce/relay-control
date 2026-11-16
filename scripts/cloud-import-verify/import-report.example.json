@@ -1,0 +1,3319 @@
+{
+  "evidenceKind": "synthetic-local-postgres",
+  "sessionSafety": {
+    "source": {
+      "transactionReadOnly": "on",
+      "isolation": "repeatable read",
+      "statementTimeout": "1min",
+      "lockTimeout": "5s"
+    },
+    "target": {
+      "transactionReadOnly": "on",
+      "isolation": "repeatable read",
+      "statementTimeout": "1min",
+      "lockTimeout": "5s"
+    }
+  },
+  "version": 1,
+  "mappingRevision": "cloud-identity-2026-11-16.11",
+  "ok": true,
+  "findings": [
+    {
+      "kind": "scope_coverage",
+      "name": "source_organizations",
+      "ok": true,
+      "detail": {
+        "scope": {
+          "orgIds": null
+        },
+        "sourceOrganizationCensus": {
+          "algorithm": "sha256-length-framed-uuid-c-order-v1",
+          "all": {
+            "count": 2,
+            "sha256": "8aaccf8cdc676f175e5ed3fad082a383407bc68a785f97e7ac459d78669b44ac"
+          },
+          "selected": {
+            "count": 2,
+            "sha256": "8aaccf8cdc676f175e5ed3fad082a383407bc68a785f97e7ac459d78669b44ac"
+          },
+          "requestedCount": null,
+          "unknownRequested": 0
+        }
+      }
+    },
+    {
+      "kind": "schema_manifest",
+      "name": "control-main-b79cb5f",
+      "ok": true,
+      "detail": {
+        "baseline": "control-main-b79cb5f",
+        "manifestSha256": "72b678444d73be19b4440d82d891e42ced7ba70df36216485a1ed6e2b29ecbda",
+        "expectedSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
+        "actualSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
+        "profile": "main",
+        "optionalRelations": [],
+        "expectedObjects": 1843,
+        "actualObjects": 1843,
+        "missing": [],
+        "changed": [],
+        "unexpectedCount": 0,
+        "migrationsMatch": true,
+        "ok": true
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "run",
+      "ok": true,
+      "detail": {
+        "expectedRevision": "cloud-identity-2026-11-16.11",
+        "revisionMatches": true,
+        "mode": "apply",
+        "ok": true
+      }
+    },
+    {
+      "kind": "identity",
+      "name": "rw_column_present",
+      "ok": true,
+      "detail": "present"
+    },
+    {
+      "kind": "ledger",
+      "name": "optional_columns",
+      "ok": true,
+      "detail": {
+        "expected": [
+          "organizations.slug",
+          "workspaces.cloud_relay_workspace_id",
+          "workspaces.relaycast_api_key_generation",
+          "workspaces.relayhistory_origin",
+          "workspaces.slug"
+        ],
+        "reportedCount": 5
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "users",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 6,
+          "imported": 4,
+          "skipped": {
+            "merged_into_survivor": 1,
+            "no_valid_email": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 6,
+          "imported": 4,
+          "deleted": 0,
+          "skipped": {
+            "merged_into_survivor": 1,
+            "no_valid_email": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "organizations",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 2,
+          "imported": 2,
+          "skipped": {},
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 2,
+          "imported": 2,
+          "deleted": 0,
+          "skipped": {}
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "organization_memberships",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 9,
+          "imported": 5,
+          "skipped": {
+            "inactive_membership": 1,
+            "user_not_imported": 1,
+            "merged_duplicate_membership": 1,
+            "unsupported_role": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 9,
+          "imported": 5,
+          "deleted": 0,
+          "skipped": {
+            "inactive_membership": 1,
+            "user_not_imported": 1,
+            "merged_duplicate_membership": 1,
+            "unsupported_role": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "identity",
+      "name": "all_rw_bindings_preserved",
+      "ok": true,
+      "detail": {
+        "missing": 0
+      }
+    },
+    {
+      "kind": "continuity",
+      "name": "workspace_metadata_preserved",
+      "ok": true,
+      "detail": {
+        "historyRoutesDropped": 0,
+        "optionalMetadataDropped": 0
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "workspaces",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 6,
+          "imported": 3,
+          "skipped": {
+            "workspace_being_deleted": 1,
+            "no_relaycast_key": 1,
+            "no_relay_workspace": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 6,
+          "imported": 3,
+          "deleted": 0,
+          "skipped": {
+            "workspace_being_deleted": 1,
+            "no_relaycast_key": 1,
+            "no_relay_workspace": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "organization_invitations",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 5,
+          "imported": 2,
+          "skipped": {
+            "already_member": 1,
+            "canceled": 1,
+            "superseded_open_invite": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 5,
+          "imported": 2,
+          "deleted": 0,
+          "skipped": {
+            "already_member": 1,
+            "canceled": 1,
+            "superseded_open_invite": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "person_identities",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 4,
+          "imported": 2,
+          "skipped": {
+            "not_a_member": 1,
+            "workspace_not_imported": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 4,
+          "imported": 2,
+          "deleted": 0,
+          "skipped": {
+            "not_a_member": 1,
+            "workspace_not_imported": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 4,
+          "imported": 1,
+          "skipped": {
+            "stale_relay_workspace": 1,
+            "not_a_member": 1,
+            "duplicate_after_merge": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 4,
+          "imported": 1,
+          "deleted": 0,
+          "skipped": {
+            "stale_relay_workspace": 1,
+            "not_a_member": 1,
+            "duplicate_after_merge": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 3,
+          "imported": 2,
+          "skipped": {
+            "not_a_member": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 3,
+          "imported": 2,
+          "deleted": 0,
+          "skipped": {
+            "not_a_member": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 2,
+          "imported": 1,
+          "skipped": {
+            "workspace_not_imported": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 2,
+          "imported": 1,
+          "deleted": 0,
+          "skipped": {
+            "workspace_not_imported": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 13,
+          "imported": 2,
+          "skipped": {
+            "secret_in_cloud_credential_store": 10,
+            "workspace_not_imported": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 13,
+          "imported": 2,
+          "deleted": 0,
+          "skipped": {
+            "secret_in_cloud_credential_store": 10,
+            "workspace_not_imported": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "github_app_installations",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 1,
+          "imported": 1,
+          "skipped": {},
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 1,
+          "imported": 1,
+          "deleted": 0,
+          "skipped": {}
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "github_app_connections",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 5,
+          "imported": 1,
+          "skipped": {
+            "named_connection_needs_policy": 1,
+            "duplicate_default_connection": 1,
+            "installation_claimed_by_other_org": 1,
+            "invalid_installation_id": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 5,
+          "imported": 1,
+          "deleted": 0,
+          "skipped": {
+            "named_connection_needs_policy": 1,
+            "duplicate_default_connection": 1,
+            "installation_claimed_by_other_org": 1,
+            "invalid_installation_id": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "staff_read_grants",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 2,
+          "imported": 1,
+          "skipped": {
+            "workspace_not_imported": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 2,
+          "imported": 1,
+          "deleted": 0,
+          "skipped": {
+            "workspace_not_imported": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "organization_set",
+      "ok": true,
+      "detail": {
+        "expected": [
+          "00000000-0000-4000-8000-0000000000a1",
+          "00000000-0000-4000-8000-0000000000b1"
+        ]
+      }
+    },
+    {
+      "kind": "ledger_org",
+      "name": "00000000-0000-4000-8000-0000000000a1",
+      "ok": true,
+      "detail": {
+        "expected": {
+          "organizations": 1,
+          "organization_memberships": 3,
+          "workspaces": 1,
+          "organization_invitations": 1,
+          "person_identities": 1,
+          "desktop_relay_identities": 2,
+          "fleet_node_owners": 1,
+          "coding_agent_credentials": 2,
+          "github_app_installations": 1,
+          "github_app_connections": 1,
+          "staff_read_grants": 1
+        },
+        "reported": {
+          "status": "ok",
+          "imported": {
+            "organizations": 1,
+            "organization_memberships": 3,
+            "workspaces": 1,
+            "organization_invitations": 1,
+            "person_identities": 1,
+            "hosted_relay_participants": 0,
+            "desktop_relay_identities": 2,
+            "fleet_node_owners": 1,
+            "coding_agent_credentials": 2,
+            "github_app_installations": 1,
+            "github_app_connections": 1,
+            "staff_read_grants": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger_org",
+      "name": "00000000-0000-4000-8000-0000000000b1",
+      "ok": true,
+      "detail": {
+        "expected": {
+          "organizations": 1,
+          "organization_memberships": 2,
+          "workspaces": 2,
+          "organization_invitations": 1,
+          "person_identities": 1,
+          "hosted_relay_participants": 1
+        },
+        "reported": {
+          "status": "ok",
+          "imported": {
+            "organizations": 1,
+            "organization_memberships": 2,
+            "workspaces": 2,
+            "organization_invitations": 1,
+            "person_identities": 1,
+            "hosted_relay_participants": 1,
+            "desktop_relay_identities": 0,
+            "fleet_node_owners": 0,
+            "coding_agent_credentials": 0,
+            "github_app_installations": 0,
+            "github_app_connections": 0,
+            "staff_read_grants": 0
+          }
+        }
+      }
+    },
+    {
+      "kind": "ownership_ledger",
+      "name": "cloud_import_ledger",
+      "ok": true,
+      "detail": {
+        "entries": 23,
+        "keyMismatches": 0,
+        "revisionMismatches": 0,
+        "extraOrgs": 0
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:organizations",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:organizations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:organization_memberships",
+      "ok": true,
+      "detail": {
+        "observed": 3,
+        "reported": 3
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:organization_memberships",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:workspaces",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:workspaces",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:organization_invitations",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:organization_invitations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:person_identities",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:person_identities",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "observed": 2,
+        "reported": 2
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "observed": 2,
+        "reported": 2
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:github_app_installations",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:github_app_installations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:github_app_connections",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:github_app_connections",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:staff_read_grants",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:staff_read_grants",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:organizations",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:organizations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:organization_memberships",
+      "ok": true,
+      "detail": {
+        "observed": 2,
+        "reported": 2
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:organization_memberships",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:workspaces",
+      "ok": true,
+      "detail": {
+        "observed": 2,
+        "reported": 2
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:workspaces",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:organization_invitations",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:organization_invitations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:person_identities",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:person_identities",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:github_app_installations",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:github_app_installations",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:github_app_connections",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:github_app_connections",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:staff_read_grants",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:staff_read_grants",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "users",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "organizations",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "organization_memberships",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "workspaces",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "organization_invitations",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "person_identities",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "github_app_installations",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "github_app_connections",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "deleted_total",
+      "name": "staff_read_grants",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "canonical_history_origins",
+      "name": "workspaces",
+      "ok": true,
+      "detail": {
+        "workspaces": 3,
+        "distinctOrigins": 1,
+        "mismatches": 0,
+        "reportedDistinctCount": 1
+      }
+    },
+    {
+      "kind": "staff_grant_history",
+      "name": "staff_read_grants",
+      "ok": true,
+      "detail": {
+        "imported": 1,
+        "invalid": 0
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000201:anthropic",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000201",
+        "model_provider": "anthropic",
+        "model_eligible": 4,
+        "harness_eligible": 0,
+        "model_active": 1,
+        "harness_active": 0
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000201:google",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000201",
+        "model_provider": "google",
+        "model_eligible": 1,
+        "harness_eligible": 0,
+        "model_active": 1,
+        "harness_active": 0
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000201:openai",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000201",
+        "model_provider": "openai",
+        "model_eligible": 1,
+        "harness_eligible": 1,
+        "model_active": 1,
+        "harness_active": 1
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000205:anthropic",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000205",
+        "model_provider": "anthropic",
+        "model_eligible": 1,
+        "harness_eligible": 1,
+        "model_active": 1,
+        "harness_active": 1
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000205:openai",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000205",
+        "model_provider": "openai",
+        "model_eligible": 1,
+        "harness_eligible": 0,
+        "model_active": 1,
+        "harness_active": 0
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000205:openrouter",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000205",
+        "model_provider": "openrouter",
+        "model_eligible": 1,
+        "harness_eligible": 0,
+        "model_active": 1,
+        "harness_active": 0
+      }
+    },
+    {
+      "kind": "credential_copy_ledger",
+      "name": "run",
+      "ok": true,
+      "detail": {
+        "candidates": 10,
+        "sourceFailures": 0,
+        "unresolvedSourceSkips": 0,
+        "reportedCandidates": 10
+      }
+    },
+    {
+      "kind": "credential_natural_keys",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "expected": 8,
+        "target": 8,
+        "missing": 0,
+        "unmatchedTarget": 0,
+        "unexplainedTarget": 0,
+        "duplicateKeys": 0,
+        "contentFailures": 0,
+        "sourceFailures": 0,
+        "unresolvedSourceSkips": 0,
+        "sourceChecksum": "79915a2c7412f90863412007ca2e643f6dde08f670673169d062a92f220db210",
+        "targetChecksum": "79915a2c7412f90863412007ca2e643f6dde08f670673169d062a92f220db210"
+      }
+    },
+    {
+      "kind": "credential_control_ids",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "expected": 8,
+        "reported": 8,
+        "idMismatches": 0,
+        "extraIds": 0
+      }
+    },
+    {
+      "kind": "credential_cloud_selection",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "groups": 6,
+        "active": 6,
+        "harness": 2,
+        "activeDemoted": 0,
+        "harnessDemoted": 0,
+        "selectionConflicts": 0,
+        "selectionMismatches": 0,
+        "reportMatches": true
+      }
+    },
+    {
+      "kind": "table",
+      "name": "users",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "created_at",
+            "email",
+            "id",
+            "last_organization_id",
+            "last_workspace_id",
+            "name",
+            "updated_at"
+          ],
+          "count": 4,
+          "checksum": "ccae45933a73392d8f45d15b931036f4f75d6bd378124eb333c0a9293e5127e2",
+          "invalidKeys": 0,
+          "orgs": {
+            "null": {
+              "count": 4,
+              "checksum": "ccae45933a73392d8f45d15b931036f4f75d6bd378124eb333c0a9293e5127e2"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "created_at",
+            "email",
+            "id",
+            "last_organization_id",
+            "last_workspace_id",
+            "name",
+            "updated_at"
+          ],
+          "count": 4,
+          "checksum": "ccae45933a73392d8f45d15b931036f4f75d6bd378124eb333c0a9293e5127e2",
+          "invalidKeys": 0,
+          "orgs": {
+            "null": {
+              "count": 4,
+              "checksum": "ccae45933a73392d8f45d15b931036f4f75d6bd378124eb333c0a9293e5127e2"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "organizations",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "created_at",
+            "id",
+            "name",
+            "slug",
+            "updated_at"
+          ],
+          "count": 2,
+          "checksum": "d981fe298f5b8f880987d2270a24b18b748d62c6711c8850fc50247023bea41a",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "e105e5b90ae97c77e4532768c3a492b9d0bf6db1ef12534b556238fc1f73cd29"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "75946f1e770ffdb9cdd2d1de607e29edcff502baa6cf0afea637e12b67fd53ef"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "created_at",
+            "id",
+            "name",
+            "slug",
+            "updated_at"
+          ],
+          "count": 2,
+          "checksum": "d981fe298f5b8f880987d2270a24b18b748d62c6711c8850fc50247023bea41a",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "e105e5b90ae97c77e4532768c3a492b9d0bf6db1ef12534b556238fc1f73cd29"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "75946f1e770ffdb9cdd2d1de607e29edcff502baa6cf0afea637e12b67fd53ef"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "organization_memberships",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "created_at",
+            "organization_id",
+            "role",
+            "updated_at",
+            "user_id"
+          ],
+          "count": 5,
+          "checksum": "e65614be3845d8980b427d2a5a762eb33e95b7ab1b2a72e0f9a37f6a1d49ff98",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 3,
+              "checksum": "7076b5b850aefe760b7fc10a43fbd072ad9ecac619c1efa628d14f0fa7a34731"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 2,
+              "checksum": "d0379329c96cea695961f257554762f5a50a847d2911fa8300361f02b2cbdfdf"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "created_at",
+            "organization_id",
+            "role",
+            "updated_at",
+            "user_id"
+          ],
+          "count": 5,
+          "checksum": "e65614be3845d8980b427d2a5a762eb33e95b7ab1b2a72e0f9a37f6a1d49ff98",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 3,
+              "checksum": "7076b5b850aefe760b7fc10a43fbd072ad9ecac619c1efa628d14f0fa7a34731"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 2,
+              "checksum": "d0379329c96cea695961f257554762f5a50a847d2911fa8300361f02b2cbdfdf"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "workspaces",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "cloud_relay_workspace_id",
+            "created_at",
+            "id",
+            "name",
+            "organization_id",
+            "relaycast_api_key_generation",
+            "relaycast_workspace_id",
+            "runtime_config",
+            "slug",
+            "updated_at"
+          ],
+          "count": 3,
+          "checksum": "e99f3155c67db8a1e45b2a8c3d30f02e23d1fd915ad8cd08399a7a6e55b79ce5",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 2,
+              "checksum": "b3d6cf7f0198d4a1ecad94ef078a7bd1c7c4dbaa31f9e2cc9def150fc8a9a20e"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
+            },
+            "\"00000000-0000-4000-8000-000000000205\"": {
+              "count": 1,
+              "checksum": "1ec95f32594b82933359dc14c5a1956aaa0d7667cb126eacf07d4775f8ec9399"
+            },
+            "\"00000000-0000-4000-8000-000000000206\"": {
+              "count": 1,
+              "checksum": "bd089553e17509dc303ff9359f1b0b06d006b04534fcd408c28e6350d3325381"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "cloud_relay_workspace_id",
+            "created_at",
+            "id",
+            "name",
+            "organization_id",
+            "relaycast_api_key_generation",
+            "relaycast_workspace_id",
+            "runtime_config",
+            "slug",
+            "updated_at"
+          ],
+          "count": 3,
+          "checksum": "e99f3155c67db8a1e45b2a8c3d30f02e23d1fd915ad8cd08399a7a6e55b79ce5",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 2,
+              "checksum": "b3d6cf7f0198d4a1ecad94ef078a7bd1c7c4dbaa31f9e2cc9def150fc8a9a20e"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
+            },
+            "\"00000000-0000-4000-8000-000000000205\"": {
+              "count": 1,
+              "checksum": "1ec95f32594b82933359dc14c5a1956aaa0d7667cb126eacf07d4775f8ec9399"
+            },
+            "\"00000000-0000-4000-8000-000000000206\"": {
+              "count": 1,
+              "checksum": "bd089553e17509dc303ff9359f1b0b06d006b04534fcd408c28e6350d3325381"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "organization_invitations",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "created_at",
+            "email",
+            "expires_at",
+            "id",
+            "invited_by_user_id",
+            "organization_id",
+            "role"
+          ],
+          "count": 2,
+          "checksum": "89f0dca884f265ffbd0f4be825525168627a112d0e2fed692eca84df9358c4f6",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "219957de64ba3c61895883a9c697ed26a07629a8c3b1e6ee11439ea83d4f24b8"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "accf00a738773a0cae197aa0dd04f6577564feec70b3eb5b1784ee6c2fcc9583"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "created_at",
+            "email",
+            "expires_at",
+            "id",
+            "invited_by_user_id",
+            "organization_id",
+            "role"
+          ],
+          "count": 2,
+          "checksum": "89f0dca884f265ffbd0f4be825525168627a112d0e2fed692eca84df9358c4f6",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "219957de64ba3c61895883a9c697ed26a07629a8c3b1e6ee11439ea83d4f24b8"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "accf00a738773a0cae197aa0dd04f6577564feec70b3eb5b1784ee6c2fcc9583"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "person_identities",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "agent_name",
+            "agent_remote_id",
+            "created_at",
+            "id",
+            "relaycast_workspace_id",
+            "user_id",
+            "workspace_id"
+          ],
+          "count": 2,
+          "checksum": "a2823b189067b1519165b74858f119c32f945f9f292395e46bd794595d4e3289",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "6a801752cf8264dd9fa1a4bdfc70448af7b1b58034f99d2b8f0ebf2c631ef932"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "434c5e5bcab59f8d25d6481a00006f84e97374536a0bc357fd233568c4592c22"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "6a801752cf8264dd9fa1a4bdfc70448af7b1b58034f99d2b8f0ebf2c631ef932"
+            },
+            "\"00000000-0000-4000-8000-000000000205\"": {
+              "count": 1,
+              "checksum": "434c5e5bcab59f8d25d6481a00006f84e97374536a0bc357fd233568c4592c22"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "agent_name",
+            "agent_remote_id",
+            "created_at",
+            "id",
+            "relaycast_workspace_id",
+            "user_id",
+            "workspace_id"
+          ],
+          "count": 2,
+          "checksum": "a2823b189067b1519165b74858f119c32f945f9f292395e46bd794595d4e3289",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "6a801752cf8264dd9fa1a4bdfc70448af7b1b58034f99d2b8f0ebf2c631ef932"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "434c5e5bcab59f8d25d6481a00006f84e97374536a0bc357fd233568c4592c22"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "6a801752cf8264dd9fa1a4bdfc70448af7b1b58034f99d2b8f0ebf2c631ef932"
+            },
+            "\"00000000-0000-4000-8000-000000000205\"": {
+              "count": 1,
+              "checksum": "434c5e5bcab59f8d25d6481a00006f84e97374536a0bc357fd233568c4592c22"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "agent_name",
+            "agent_remote_id",
+            "created_at",
+            "id",
+            "relaycast_workspace_id",
+            "session_hash",
+            "user_id",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "4943a65e4e51dd45fd569c068aa86ed62461eecd8aadf326f908c10e64ba183b",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "4943a65e4e51dd45fd569c068aa86ed62461eecd8aadf326f908c10e64ba183b"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000205\"": {
+              "count": 1,
+              "checksum": "4943a65e4e51dd45fd569c068aa86ed62461eecd8aadf326f908c10e64ba183b"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "agent_name",
+            "agent_remote_id",
+            "created_at",
+            "id",
+            "relaycast_workspace_id",
+            "session_hash",
+            "user_id",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "4943a65e4e51dd45fd569c068aa86ed62461eecd8aadf326f908c10e64ba183b",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "4943a65e4e51dd45fd569c068aa86ed62461eecd8aadf326f908c10e64ba183b"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000205\"": {
+              "count": 1,
+              "checksum": "4943a65e4e51dd45fd569c068aa86ed62461eecd8aadf326f908c10e64ba183b"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "address",
+            "agent_name",
+            "agent_remote_id",
+            "created_at",
+            "id",
+            "native_session_id",
+            "native_session_kind",
+            "organization_id",
+            "relaycast_workspace_id",
+            "source_id",
+            "user_id",
+            "workspace_id"
+          ],
+          "count": 2,
+          "checksum": "28973178cb75da6d476ef1aad134d28ab5ebb14cdbeb14bd8c62b8b4365d1263",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 2,
+              "checksum": "28973178cb75da6d476ef1aad134d28ab5ebb14cdbeb14bd8c62b8b4365d1263"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 2,
+              "checksum": "28973178cb75da6d476ef1aad134d28ab5ebb14cdbeb14bd8c62b8b4365d1263"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "address",
+            "agent_name",
+            "agent_remote_id",
+            "created_at",
+            "id",
+            "native_session_id",
+            "native_session_kind",
+            "organization_id",
+            "relaycast_workspace_id",
+            "source_id",
+            "user_id",
+            "workspace_id"
+          ],
+          "count": 2,
+          "checksum": "28973178cb75da6d476ef1aad134d28ab5ebb14cdbeb14bd8c62b8b4365d1263",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 2,
+              "checksum": "28973178cb75da6d476ef1aad134d28ab5ebb14cdbeb14bd8c62b8b4365d1263"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 2,
+              "checksum": "28973178cb75da6d476ef1aad134d28ab5ebb14cdbeb14bd8c62b8b4365d1263"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "created_at",
+            "id",
+            "node_id",
+            "node_name",
+            "organization_id",
+            "relaycast_workspace_id",
+            "user_id",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "480f6a4611de6ce2e210ca059f1f0105e1e21e3d4573ab08aa3d94e071c4e355",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "480f6a4611de6ce2e210ca059f1f0105e1e21e3d4573ab08aa3d94e071c4e355"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "480f6a4611de6ce2e210ca059f1f0105e1e21e3d4573ab08aa3d94e071c4e355"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "created_at",
+            "id",
+            "node_id",
+            "node_name",
+            "organization_id",
+            "relaycast_workspace_id",
+            "user_id",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "480f6a4611de6ce2e210ca059f1f0105e1e21e3d4573ab08aa3d94e071c4e355",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "480f6a4611de6ce2e210ca059f1f0105e1e21e3d4573ab08aa3d94e071c4e355"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "480f6a4611de6ce2e210ca059f1f0105e1e21e3d4573ab08aa3d94e071c4e355"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "payload"
+          ],
+          "count": 2,
+          "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 2,
+              "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 2,
+              "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "payload"
+          ],
+          "count": 2,
+          "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 2,
+              "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 2,
+              "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "github_app_installations",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "installation_id",
+            "organization_id"
+          ],
+          "count": 1,
+          "checksum": "acb084f7e3af0cc2b2d78fa3e586feda1db7e51ff57b46cc18e6d7f212ae7af4",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "acb084f7e3af0cc2b2d78fa3e586feda1db7e51ff57b46cc18e6d7f212ae7af4"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "installation_id",
+            "organization_id"
+          ],
+          "count": 1,
+          "checksum": "acb084f7e3af0cc2b2d78fa3e586feda1db7e51ff57b46cc18e6d7f212ae7af4",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "acb084f7e3af0cc2b2d78fa3e586feda1db7e51ff57b46cc18e6d7f212ae7af4"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "github_app_connections",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "auth_mode",
+            "created_at",
+            "created_by_user_id",
+            "github_app_organization_id",
+            "id",
+            "installation_id",
+            "provider",
+            "status",
+            "token_type",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "auth_mode",
+            "created_at",
+            "created_by_user_id",
+            "github_app_organization_id",
+            "id",
+            "installation_id",
+            "provider",
+            "status",
+            "token_type",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "staff_read_grants",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "created_at",
+            "expires_at",
+            "id",
+            "organization_id",
+            "reason",
+            "staff_user_id",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "created_at",
+            "expires_at",
+            "id",
+            "organization_id",
+            "reason",
+            "staff_user_id",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "identity",
+      "name": "users_identity",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "id"
+          ],
+          "count": 4,
+          "checksum": "b8379dc50501c89ec97519311c1087404e2c9bc1c2a57b75a5d55b5f301fceda",
+          "invalidKeys": 0,
+          "orgs": {
+            "null": {
+              "count": 4,
+              "checksum": "b8379dc50501c89ec97519311c1087404e2c9bc1c2a57b75a5d55b5f301fceda"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "id"
+          ],
+          "count": 4,
+          "checksum": "b8379dc50501c89ec97519311c1087404e2c9bc1c2a57b75a5d55b5f301fceda",
+          "invalidKeys": 0,
+          "orgs": {
+            "null": {
+              "count": 4,
+              "checksum": "b8379dc50501c89ec97519311c1087404e2c9bc1c2a57b75a5d55b5f301fceda"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "identity",
+      "name": "organizations_identity",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "id"
+          ],
+          "count": 2,
+          "checksum": "fecf02a613973ff7eee18bfef564aec34a0dfb8ec459043ad7553390a39025e3",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "9455b163581d10e196ab9a56722f7ad9106be30144a340398c2a710f2231cb0d"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "4471d763d4d2f1184763a4fa9739b10d815f9f67be3a548f71e8e2f726717007"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "id"
+          ],
+          "count": 2,
+          "checksum": "fecf02a613973ff7eee18bfef564aec34a0dfb8ec459043ad7553390a39025e3",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "9455b163581d10e196ab9a56722f7ad9106be30144a340398c2a710f2231cb0d"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "4471d763d4d2f1184763a4fa9739b10d815f9f67be3a548f71e8e2f726717007"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "identity",
+      "name": "workspaces_identity",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "cloud_relay_workspace_id",
+            "id",
+            "relaycast_workspace_id"
+          ],
+          "count": 3,
+          "checksum": "6bac7052434f6ab4f2fa5b4c65a9fba54c8bd4cc9d7b7c6ec4092f72d8400a1d",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "12d248486fe631ab0e002370d540110bdf47edecace180306e253c594e7ad0b4"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 2,
+              "checksum": "8cf0b3cc5d0e1a51cac3ae06d0b5fe5f6ee00a680201aaf379b3649455fbd979"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "cloud_relay_workspace_id",
+            "id",
+            "relaycast_workspace_id"
+          ],
+          "count": 3,
+          "checksum": "6bac7052434f6ab4f2fa5b4c65a9fba54c8bd4cc9d7b7c6ec4092f72d8400a1d",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "12d248486fe631ab0e002370d540110bdf47edecace180306e253c594e7ad0b4"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 2,
+              "checksum": "8cf0b3cc5d0e1a51cac3ae06d0b5fe5f6ee00a680201aaf379b3649455fbd979"
+            }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.users",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.users.users_last_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.users.users_last_workspace_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.users.users_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.users.users_email_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.users",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.organizations",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.organizations.organizations_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.organizations.organizations_slug_unique",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.organizations",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.organization_memberships",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.organization_memberships.organization_memberships_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.organization_memberships.organization_memberships_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.organization_memberships.organization_memberships_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.organization_memberships",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.workspaces",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.workspaces.workspaces_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.workspaces.workspaces_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.workspaces.workspaces_id_organization_id_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.workspaces.workspaces_organization_id_relaycast_workspace_id_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.workspaces.workspaces_cloud_relay_workspace_id_unique",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.workspaces.workspaces_relayhistory_origin_unique",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.workspaces.workspaces_org_slug_unique",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.workspaces",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.organization_invitations",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.organization_invitations.organization_invitations_accepted_by_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.organization_invitations.organization_invitations_invited_by_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.organization_invitations.organization_invitations_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.organization_invitations.organization_invitations_revoked_by_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.organization_invitations.organization_invitations_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.organization_invitations.organization_invitations_token_hash_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.organization_invitations.invitations_open_email_idx",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.organization_invitations",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.person_identities",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.person_identities.person_identities_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.person_identities.person_identities_workspace_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.person_identities.person_identities_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.person_identities.person_identities_workspace_id_user_id_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.person_identities.person_identities_workspace_id_agent_name_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.person_identities",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.hosted_relay_participants.hosted_relay_participants_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.hosted_relay_participants.hosted_relay_participants_workspace_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.hosted_relay_participants.hosted_relay_participants_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.hosted_relay_participants.hosted_relay_partici_workspace_id_user_id_agent_na_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.hosted_relay_participants.hosted_relay_partici_relaycast_workspace_id_agent__key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.hosted_relay_participants.hosted_relay_participants_session",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.hosted_relay_participants",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.desktop_relay_identities.desktop_relay_identi_workspace_id_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.desktop_relay_identities.desktop_relay_identities_organization_id_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.desktop_relay_identities.desktop_relay_identities_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.desktop_relay_identities.desktop_relay_identi_relaycast_workspace_id_agent__key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.desktop_relay_identities.desktop_relay_identities_owned_id_unique",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.desktop_relay_identities.desktop_relay_identi_workspace_id_user_id_source_i_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.desktop_relay_identities",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.fleet_node_owners.fleet_node_owners_organization_id_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.fleet_node_owners.fleet_node_owners_workspace_id_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.fleet_node_owners.fleet_node_owners_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.fleet_node_owners.fleet_node_owners_workspace_id_node_id_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.fleet_node_owners.fleet_node_owners_relaycast_workspace_id_node_id_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.fleet_node_owners",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.coding_agent_credentials.coding_agent_credentials_created_by_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.coding_agent_credentials.coding_agent_credentials_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.coding_agent_credentials.coding_agent_credentials_workspace_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.coding_agent_credentials.coding_agent_credentials_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.coding_agent_credentials.coding_agent_one_llm",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.coding_agent_credentials.coding_agent_one_sandbox",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.coding_agent_credentials.coding_agent_fingerprint",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.coding_agent_credentials.coding_agent_oauth_account",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.coding_agent_credentials",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.github_app_installations",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.github_app_installations.github_app_installations_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.github_app_installations.github_app_installations_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.github_app_installations.github_app_installations_installation_id_organization_id_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.github_app_installations",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.integration_connections",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.integration_connections.connection_github_installation_owner",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.integration_connections.connection_github_workspace_owner",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.integration_connections.integration_connections_created_by_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.integration_connections.integration_connections_updated_by_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.integration_connections.integration_connections_workspace_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.integration_connections.integration_connections_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.integration_connections.integration_connections_workspace_id_provider_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.integration_connections",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.staff_read_grants",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.staff_read_grants.staff_read_grant_workspace",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.staff_read_grants.staff_read_grants_staff_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.staff_read_grants.staff_read_grants_staff_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.staff_read_grants.staff_read_grants_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.staff_read_grants.staff_read_grants_token_hash_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.staff_read_grants",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.cloud_import_ledger",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.cloud_import_ledger.cloud_import_ledger_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.cloud_import_ledger.cloud_import_ledger_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.cloud_import_ledger",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "standalone_sequence",
+      "name": "desktop_feed_publish_seq",
+      "ok": true,
+      "detail": {
+        "next": "1",
+        "source": {
+          "min_value": null,
+          "max_value": null
+        },
+        "target": {
+          "min_value": null,
+          "max_value": null
+        },
+        "cycle": false
+      }
+    },
+    {
+      "kind": "pepper",
+      "name": "password_credentials",
+      "ok": true,
+      "detail": {
+        "versions": [],
+        "missing": []
+      }
+    },
+    {
+      "kind": "pepper",
+      "name": "temporary_passwords",
+      "ok": true,
+      "detail": {
+        "versions": [],
+        "missing": []
+      }
+    },
+    {
+      "kind": "decrypt",
+      "name": "workspaces.relaycast_api_key_ciphertext",
+      "ok": true,
+      "detail": {
+        "sampled": 3,
+        "minimum": 1,
+        "failures": 0
+      }
+    },
+    {
+      "kind": "decrypt",
+      "name": "person_identities.token_ciphertext",
+      "ok": true,
+      "detail": {
+        "sampled": 2,
+        "minimum": 1,
+        "failures": 0
+      }
+    },
+    {
+      "kind": "decrypt",
+      "name": "hosted_relay_participants.token_ciphertext",
+      "ok": true,
+      "detail": {
+        "sampled": 1,
+        "minimum": 1,
+        "failures": 0
+      }
+    },
+    {
+      "kind": "decrypt",
+      "name": "desktop_relay_identities.token_ciphertext",
+      "ok": true,
+      "detail": {
+        "sampled": 2,
+        "minimum": 1,
+        "failures": 0
+      }
+    },
+    {
+      "kind": "decrypt",
+      "name": "github_app_connections.credentials_ciphertext",
+      "ok": true,
+      "detail": {
+        "sampled": 1,
+        "minimum": 1,
+        "failures": 0
+      }
+    }
+  ],
+  "smoke": [
+    {
+      "name": "login",
+      "status": "pending"
+    },
+    {
+      "name": "workspace_list",
+      "status": "pending"
+    },
+    {
+      "name": "relaycast_key_resolve",
+      "status": "pending"
+    },
+    {
+      "name": "flows_run",
+      "status": "pending"
+    },
+    {
+      "name": "integration_token_refresh",
+      "status": "pending"
+    },
+    {
+      "name": "desktop_feed",
+      "status": "pending"
+    }
+  ],
+  "scope": {
+    "orgIds": null
+  },
+  "sourceOrganizationCensus": {
+    "algorithm": "sha256-length-framed-uuid-c-order-v1",
+    "all": {
+      "count": 2,
+      "sha256": "8aaccf8cdc676f175e5ed3fad082a383407bc68a785f97e7ac459d78669b44ac"
+    },
+    "selected": {
+      "count": 2,
+      "sha256": "8aaccf8cdc676f175e5ed3fad082a383407bc68a785f97e7ac459d78669b44ac"
+    },
+    "requestedCount": null,
+    "unknownRequested": 0
+  },
+  "targetSchema": {
+    "baseline": "control-main-b79cb5f",
+    "manifestSha256": "72b678444d73be19b4440d82d891e42ced7ba70df36216485a1ed6e2b29ecbda",
+    "expectedSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
+    "actualSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
+    "profile": "main",
+    "optionalRelations": [],
+    "expectedObjects": 1843,
+    "actualObjects": 1843,
+    "missing": [],
+    "changed": [],
+    "unexpectedCount": 0,
+    "migrationsMatch": true,
+    "ok": true
+  },
+  "credentialCopy": "verified",
+  "credentialCopyVerified": true
+}

@@ -72,7 +72,19 @@ live workspace membership and `rth:read`, then calls the internal handoff
 `Bearer <SESSION_READ_API_SECRET>`. The body is `{ userId, orgId,
 workspaceId, audience, scopes: ["rth:read"], label? }`, with `refreshToken`
 instead of `label` on refresh. The caller's own token never reaches the read
-API. Control validates the reply's identity, audience, read-only scope, token
+API.
+
+On gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set) the body also
+carries `reader_kind`, taken from how the caller authenticated and never from
+the request body: `browser` for a cookie session with no bearer, `device` for
+an `sh_at_` bearer (a request with both a cookie and a bearer is `device`),
+and `mcp` for every MCP read made on the person's behalf. Relaygate records it
+and strips it before proxying, because the read API's internal schema is
+strict; on other installs the body is exactly as above. MCP reads that hop
+over Control's public session-read route prove themselves with the
+`x-relaycontrol-session-reader` header, an HMAC of a fixed string keyed by
+`SESSION_READ_API_SECRET`; a cookie request ignores the header, and a bearer
+without a matching header is `device`. Control validates the reply's identity, audience, read-only scope, token
 format (`rth_at_read_`/`rth_rt_read_`) and expiry, and sets `baseUrl` from
 configuration. Keep the internal routes off public ingress.
 

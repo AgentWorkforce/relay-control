@@ -113,6 +113,9 @@ test("real MCP calls, private history exclusion and Desktop reply wakes work wit
   assert.equal(env.world.messages.size, messagesBefore + 1, "duplicate notices create only one Relaycast message");
   assert.equal(notices[0]!.body!.address, desktopAddress);
   assert(!JSON.stringify(notices).includes("PRIVATE_SUPPORT_REPLY"));
+  const person = await env.database.query<{ agent_name: string }>("SELECT agent_name FROM person_identities WHERE user_id = $1", [env.ownerId]);
+  assert.equal(person.rows.length, 1);
+  assert.equal(person.rows[0]!.agent_name.startsWith("control-"), false, "a default install registers the notice sender without the gate-only prefix");
 
   beforeReply = async () => { await env.database.query("DELETE FROM organization_memberships WHERE user_id = $1", [env.ownerId]); };
   const revoked = await client.callTool({ name: "ask_customer_support", arguments: { ...input, request_id: "revoke-during-call" } });

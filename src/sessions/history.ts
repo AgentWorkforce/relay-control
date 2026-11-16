@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { SelfhostConfig } from "../config.js";
 import type { Principal } from "../store.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
-import { requestReadSession, SessionReadError } from "../session-read.js";
+import { requestReadSession, SessionReadError, type ReaderKind } from "../session-read.js";
 
 /**
  * Workspace-scoped History reads for the dashboard sessions views, served by
@@ -32,6 +32,8 @@ export type HistoryIdentity = {
    * caller token session.
    */
   callerToken: string;
+  /** How the caller authenticated; named on every read-token mint (see ReaderKind). */
+  readerKind: ReaderKind;
 };
 
 type CachedToken = { accessToken: string; expiresAt: number; refreshToken?: string; refreshExpiresAt?: number };
@@ -52,9 +54,10 @@ function cacheFor(config: SelfhostConfig): Map<string, CachedToken> {
 
 function cacheKey(identity: HistoryIdentity): string {
   // Keyed per token session too, so a History token minted for one access
-  // token is never reused for another (revoked, rotated, or other session).
+  // token is never reused for another (revoked, rotated, or other session),
+  // nor a pair minted for one reader kind for another.
   const tokenHash = createHash("sha256").update(identity.callerToken).digest("hex");
-  return JSON.stringify([identity.userId, identity.organizationId, identity.workspaceId, identity.role, tokenHash]);
+  return JSON.stringify([identity.userId, identity.organizationId, identity.workspaceId, identity.role, tokenHash, identity.readerKind]);
 }
 
 /**
@@ -71,7 +74,10 @@ async function nativeReadToken(
   previous: CachedToken | undefined,
 ): Promise<string> {
   const api = config.sessionReadApi;
-  const readIdentity = { userId: identity.userId, orgId: identity.organizationId, workspaceId: identity.workspaceId, role: identity.role };
+  const readIdentity = {
+    userId: identity.userId, orgId: identity.organizationId, workspaceId: identity.workspaceId,
+    role: identity.role, readerKind: identity.readerKind,
+  };
   const options = { includeRole: config.sessionReadMintIncludeRole };
   let session;
   try {

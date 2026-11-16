@@ -1,6 +1,7 @@
 import type { SelfhostConfig } from "../config.js";
 import type { ControlPlaneStore } from "../store.js";
 import { isRecord, readWorkspaceHistory, type HistoryIdentity } from "../sessions/history.js";
+import type { ReaderKind } from "../session-read.js";
 import type { UsageStore } from "./store.js";
 
 /**
@@ -98,7 +99,7 @@ export async function usageReport(input: {
   store: ControlPlaneStore;
   usage: UsageStore;
   organizationId: string;
-  owner: { userId: string; token: string };
+  owner: { userId: string; token: string; readerKind: ReaderKind };
   days: number;
   now: Date;
 }): Promise<UsageReport> {
@@ -111,7 +112,8 @@ export async function usageReport(input: {
     const workspaceId = String(workspace.id);
     const membership = await store.workspaceForUser(workspaceId, owner.userId);
     if (!membership) continue;
-    identities.push({ userId: owner.userId, organizationId, workspaceId, role: membership.role, callerToken: owner.token });
+    identities.push({ userId: owner.userId, organizationId, workspaceId, role: membership.role, callerToken: owner.token,
+      readerKind: owner.readerKind });
   }
   const [counters, sessions, summaries] = await Promise.all([
     usage.read(organizationId, dates),

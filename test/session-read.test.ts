@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { createServer } from "node:http";
 import test, { type TestContext } from "node:test";
 import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { hashSecret } from "../src/crypto.js";
 import { migrate } from "../src/migrations.js";
-import { readSessionBody } from "../src/session-read.js";
+import { mcpReaderMarker, readSessionBody } from "../src/session-read.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { close, listen, PGliteDatabase, request } from "./support/harness.js";
 
@@ -80,11 +81,48 @@ test("Control hands off reader-issued credentials with the verified identity and
     path: "/internal/v1/session-read/sessions", bearer: `Bearer ${secret}`,
     body: { userId: env.org.owner.id, orgId: env.org.id, workspaceId: env.alpha.id,
       audience: publicUrl, scopes: ["rth:read"], label: "MCP" },
-  });
+  }, "without relaygate the mint body is unchanged (the read API schema is strict)");
   assert.equal(JSON.stringify(env.calls).includes(env.pair.accessToken), false, "Control token never reaches reader");
   assert.equal((await env.post("refresh", { refreshToken })).status, 200);
   assert.equal(env.calls[1]!.path, "/internal/v1/session-read/sessions/refresh");
   assert.equal(env.calls[1]!.body.refreshToken, refreshToken);
+  assert.equal("reader_kind" in env.calls[1]!.body, false);
+});
+
+test("behind relaygate the mint names the reader kind from how the caller authenticated, never from the body", async (t) => {
+  const env = await setup(t);
+  env.config.sessionReadApi.mintReaderKind = true;
+  const marker = mcpReaderMarker(env.config.sessionReadApi.secret);
+  // Derived from the shared secret, so every replica agrees; not the secret itself.
+  assert.equal(marker, createHmac("sha256", env.config.sessionReadApi.secret)
+    .update("relay-control session-read mcp reader").digest("hex"));
+  assert.match(marker, /^[0-9a-f]{64}$/);
+  const cookie = `agent_relay_session=${env.pair.accessToken}`;
+  const kinds = () => env.calls.map((call) => call.body.reader_kind);
+  const browser = (headers: Record<string, string> = {}) => request(env.origin, `/cloud${env.path}/session`, {
+    method: "POST", cookie, body: {}, headers: { origin: env.config.dashboardUrl, ...headers },
+  });
+  assert.equal((await browser()).status, 200);
+  assert.equal((await browser({ "x-relaycontrol-session-reader": marker })).status, 200);
+  const withMarker = (action: string, body: unknown, value: string) => request(env.origin, `${env.path}/${action}`, {
+    method: "POST", token: env.pair.accessToken, body, headers: { "x-relaycontrol-session-reader": value },
+  });
+  assert.equal((await withMarker("session", {}, marker)).status, 200);
+  assert.equal((await withMarker("refresh", { refreshToken }, marker)).status, 200);
+  assert.equal((await withMarker("session", {}, "m".repeat(63) + "x")).status, 200);
+  assert.equal((await withMarker("session", {}, "short")).status, 200);
+  assert.equal((await request(env.origin, `${env.path}/session`, {
+    method: "POST", token: env.pair.accessToken, cookie, body: {}, headers: { origin: env.config.dashboardUrl },
+  })).status, 200);
+  assert.deepEqual(kinds(), ["browser", "browser", "mcp", "mcp", "device", "device", "device"]);
+  assert.equal(env.calls[3]!.path, "/internal/v1/session-read/sessions/refresh");
+  assert.deepEqual(env.calls[2]!.body, { userId: env.org.owner.id, orgId: env.org.id, workspaceId: env.alpha.id,
+    reader_kind: "mcp", audience: publicUrl, scopes: ["rth:read"] }, "camelCase readerKind never reaches the body");
+  assert.equal(env.calls[3]!.body.refreshToken, refreshToken);
+  for (const field of ["reader_kind", "readerKind"]) {
+    assert.equal((await env.post("session", { [field]: "browser" })).status, 400, field);
+  }
+  assert.equal(env.calls.length, 7);
 });
 
 test("issue and refresh reject unauthenticated, pending, foreign-workspace and removed members before issuing", async (t) => {
@@ -215,7 +253,7 @@ test("SESSION_READ_MINT_INCLUDE_ROLE on: mint and refresh bodies carry the live 
 
 test("readSessionBody adds role only when asked", () => {
   const api = { url: "http://reader.internal", publicUrl, secret };
-  const identity = { userId: "u", orgId: "o", workspaceId: "w", role: "admin" as const };
+  const identity = { userId: "u", orgId: "o", workspaceId: "w", role: "admin" as const, readerKind: "device" as const };
   assert.deepEqual(readSessionBody(api, identity, { label: "x" }),
     { userId: "u", orgId: "o", workspaceId: "w", audience: publicUrl, scopes: ["rth:read"], label: "x" });
   assert.deepEqual(readSessionBody(api, identity, { refreshToken }, { includeRole: true }),

@@ -17,6 +17,10 @@ export const ENROLLMENT_KEY_PREFIX = "sh_ek_";
 export const MAX_API_TOKEN_EXPIRY_DAYS = 365;
 export const MAX_ENROLLMENT_KEY_EXPIRY_DAYS = 30;
 export const DEFAULT_ENROLLMENT_KEY_EXPIRY_DAYS = 7;
+/** Member self-mint (gate-only): longest and default relay-node token lifetime. */
+export const MAX_SELF_MINTED_RELAY_NODE_EXPIRY_DAYS = 90;
+/** Member self-mint: live relay-node tokens one person may hold in a workspace. */
+export const MAX_SELF_MINTED_RELAY_NODE_TOKENS = 3;
 
 /** Mirrors hosted lib/auth/api-token-types.ts, plus self-host runtime scopes. */
 export const API_TOKEN_PURPOSE_SCOPES = {
@@ -145,6 +149,7 @@ type Row = {
 export type ApiTokenIntrospection = {
   tokenId: string;
   workspaceId: string;
+  cloudRelayWorkspaceId: string | null;
   organizationId: string;
   purpose: ApiTokenPurpose;
   scopes: string[];
@@ -663,6 +668,152 @@ export class ApiTokenStore {
     return revoked;
   }
 
+  /**
+   * POST /api/v1/workspaces/{id}/relay-node/self-tokens (gate-only installs,
+   * docs/relay-node-credential.md "Member self-mint"): the caller's signed-in
+   * Desktop mints a relay-node token for its own node. One transaction under
+   * a workspace-scoped lock, so the checks below and the insert cannot
+   * interleave with another self-mint: 409 `node_name_taken` when another
+   * person holds a live relay-node token for this node name (the same caller
+   * may hold several, for rotation), 409 `too_many_tokens` when the caller
+   * already holds MAX_SELF_MINTED_RELAY_NODE_TOKENS live relay-node tokens.
+   * Audited `api_token.create` (by createIn) and `relay_node.token.self_minted`.
+   */
+  async createSelfMintedRelayNode(input: {
+    workspaceId: string;
+    organizationId: string;
+    nodeName: unknown;
+    label: unknown;
+    expiryDays: unknown;
+    neverExpires: unknown;
+    desktopHostName: string;
+    actor: AuditActor & { kind: "user" };
+  }): Promise<ApiTokenRecord & { accessToken: string }> {
+    if (typeof input.nodeName !== "string" || !NODE_ID_PATTERN.test(input.nodeName)) {
+      throw new ApiTokenError(
+        400,
+        "invalid_request",
+        "nodeName is required: 1-200 characters of letters, digits, '.', '_', ':' or '-'",
+      );
+    }
+    if (input.neverExpires !== undefined && input.neverExpires !== false) {
+      throw new ApiTokenError(400, "invalid_request", "Self-minted relay-node tokens always expire");
+    }
+    const days = input.expiryDays ?? MAX_SELF_MINTED_RELAY_NODE_EXPIRY_DAYS;
+    if (!Number.isInteger(days) || (days as number) < 1 || (days as number) > MAX_SELF_MINTED_RELAY_NODE_EXPIRY_DAYS) {
+      throw new ApiTokenError(
+        400,
+        "invalid_request",
+        `expiryDays must be an integer from 1 to ${MAX_SELF_MINTED_RELAY_NODE_EXPIRY_DAYS} for self-minted relay-node tokens`,
+      );
+    }
+    const nodeName = input.nodeName;
+    const label = input.label === undefined ? `desktop ${input.desktopHostName}` : input.label;
+    const userId = input.actor.userId;
+    return this.database.transaction(async (tx) => {
+      await tx.query(
+        `SELECT pg_advisory_xact_lock(hashtext('relay-node-self-mint:' || $1::text))`,
+        [input.workspaceId],
+      );
+      const live = `workspace_id = $1 AND purpose = '${RELAY_NODE_PURPOSE}' AND revoked_at IS NULL
+                AND (expires_at IS NULL OR expires_at > now())`;
+      const taken = await tx.query(
+        `SELECT 1 FROM workspace_api_tokens
+          WHERE ${live} AND agent_name = $2 AND created_by_user_id IS DISTINCT FROM $3
+          LIMIT 1`,
+        [input.workspaceId, nodeName, userId],
+      );
+      if (taken.rows.length > 0) {
+        throw new ApiTokenError(
+          409,
+          "node_name_taken",
+          "Another member holds a live relay-node token for this nodeName; pick another node name",
+        );
+      }
+      const held = await tx.query<{ count: number | string }>(
+        `SELECT count(*) AS count FROM workspace_api_tokens
+          WHERE ${live} AND created_by_user_id = $2`,
+        [input.workspaceId, userId],
+      );
+      if (Number(held.rows[0]?.count ?? 0) >= MAX_SELF_MINTED_RELAY_NODE_TOKENS) {
+        throw new ApiTokenError(
+          409,
+          "too_many_tokens",
+          `You already hold ${MAX_SELF_MINTED_RELAY_NODE_TOKENS} live relay-node tokens; revoke one first`,
+        );
+      }
+      const created = await this.createIn(tx, {
+        workspaceId: input.workspaceId,
+        organizationId: input.organizationId,
+        label,
+        purpose: RELAY_NODE_PURPOSE,
+        expiryDays: days,
+        neverExpires: undefined,
+        nodeName,
+        actor: input.actor,
+      });
+      await recordAudit(tx, {
+        organizationId: input.organizationId,
+        workspaceId: input.workspaceId,
+        actor: input.actor,
+        action: "relay_node.token.self_minted",
+        target: `${created.id} (relay-node: ${nodeName}) host=${input.desktopHostName}`,
+      });
+      return created;
+    });
+  }
+
+  /**
+   * GET .../relay-node/self-tokens: the caller's own live relay-node tokens
+   * (created by them, not revoked, not expired), newest first. Never a value.
+   */
+  async listSelfMintedRelayNode(input: { workspaceId: string; userId: string }): Promise<ApiTokenRecord[]> {
+    const result = await this.database.query<Row>(
+      `${SELECT}
+        WHERE t.workspace_id = $1 AND t.purpose = '${RELAY_NODE_PURPOSE}' AND t.created_by_user_id = $2
+          AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > now())
+        ORDER BY t.created_at DESC LIMIT 100`,
+      [input.workspaceId, input.userId],
+    );
+    return result.rows.map(toRecord);
+  }
+
+  /**
+   * DELETE .../relay-node/self-tokens/{tokenId}: revokes one of the caller's
+   * own live relay-node tokens (audited `api_token.revoke` by revokeIn and
+   * `relay_node.token.self_revoked`). False for any other token, so an
+   * admin-minted or another member's token reads as absent.
+   */
+  async revokeSelfMintedRelayNode(input: {
+    workspaceId: string;
+    organizationId: string;
+    tokenId: string;
+    desktopHostName: string;
+    actor: AuditActor & { kind: "user" };
+  }): Promise<boolean> {
+    if (!/^[0-9a-f-]{36}$/i.test(input.tokenId)) return false;
+    return this.database.transaction(async (tx) => {
+      const found = await tx.query<{ agent_name: string | null }>(
+        `SELECT agent_name FROM workspace_api_tokens
+          WHERE id = $1 AND workspace_id = $2 AND purpose = '${RELAY_NODE_PURPOSE}'
+            AND created_by_user_id = $3 AND revoked_at IS NULL
+          FOR UPDATE`,
+        [input.tokenId, input.workspaceId, input.actor.userId],
+      );
+      const row = found.rows[0];
+      if (!row) return false;
+      if (!(await this.revokeIn(tx, input))) return false;
+      await recordAudit(tx, {
+        organizationId: input.organizationId,
+        workspaceId: input.workspaceId,
+        actor: input.actor,
+        action: "relay_node.token.self_revoked",
+        target: `${input.tokenId} (relay-node: ${row.agent_name}) host=${input.desktopHostName}`,
+      });
+      return true;
+    });
+  }
+
   async revoke(input: {
     workspaceId: string;
     organizationId: string;
@@ -808,6 +959,7 @@ export class ApiTokenStore {
     const result = await this.database.query<{
       id: string;
       workspace_id: string;
+      cloud_relay_workspace_id: string | null;
       organization_id: string;
       purpose: ApiTokenPurpose;
       scopes: string[];
@@ -818,7 +970,8 @@ export class ApiTokenStore {
       revoked: boolean;
       expired: boolean;
     }>(
-      `SELECT t.id, t.workspace_id, w.organization_id, t.purpose, t.scopes, t.agent_name, t.aud,
+      `SELECT t.id, t.workspace_id, w.cloud_relay_workspace_id, w.organization_id,
+              t.purpose, t.scopes, t.agent_name, t.aud,
               t.created_at, t.expires_at,
               t.revoked_at IS NOT NULL AS revoked,
               (t.expires_at IS NOT NULL AND t.expires_at <= now()) AS expired
@@ -841,6 +994,7 @@ export class ApiTokenStore {
     return {
       tokenId: row.id,
       workspaceId: row.workspace_id,
+      cloudRelayWorkspaceId: row.cloud_relay_workspace_id,
       organizationId: row.organization_id,
       purpose: row.purpose,
       scopes: row.scopes,

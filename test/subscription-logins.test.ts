@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import { createAdminModule } from "../src/admin/routes.js";
+import { CODING_AGENT_PROVIDERS } from "../src/admin/coding-agents.js";
 import {
   CredentialBlobStore,
   GcsObjectBackend,
@@ -44,7 +45,18 @@ function codexAuth(accessExp: number, refresh = "rt-openai-secret-1") {
   });
 }
 
-/** Mock auth.openai.com (device flow + refresh) and auth.x.ai. */
+function claudeAuth(expiresAt: number, refresh = "rt-anthropic-secret-1") {
+  return JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "at-anthropic-secret-1",
+      refreshToken: refresh,
+      expiresAt,
+      scopes: ["user:inference"],
+    },
+  });
+}
+
+/** Mock the provider token endpoints and OpenAI's device flow. */
 function providerMock() {
   const calls: Array<{ url: string; body: string }> = [];
   let polls = 0;
@@ -80,6 +92,13 @@ function providerMock() {
       return json(200, {
         access_token: jwt({ ...OPENAI_CLAIMS, exp: Math.floor(Date.now() / 1000) + 86_400 }),
         refresh_token: "rt-openai-secret-2",
+      });
+    }
+    if (url === "https://platform.claude.com/v1/oauth/token") {
+      return json(200, {
+        access_token: "at-anthropic-secret-2",
+        refresh_token: "rt-anthropic-secret-2",
+        expires_in: 28_800,
       });
     }
     if (url === "https://auth.x.ai/oauth2/token") {
@@ -260,7 +279,16 @@ test("Codex device login: start, poll, store encrypted, sandbox access, no secre
   assert.equal(agent.isActive, false);
   assert.equal(agent.accountEmail, "dev@acme.test");
   const openai = listed.body.providers.find((item: { id: string }) => item.id === "openai");
-  assert.deepEqual(openai.authTypes, ["provider_oauth", "byo_api_key"]);
+  assert.deepEqual(openai.authTypes, ["provider_oauth", "relay_managed", "byo_api_key"]);
+  const anthropic = listed.body.providers.find((item: { id: string }) => item.id === "anthropic");
+  assert.deepEqual(
+    anthropic.authTypes,
+    ["oauth_token", "relay_managed", "byo_api_key"],
+    "imports do not advertise a missing device route",
+  );
+  const anthropicCapabilities = CODING_AGENT_PROVIDERS.find((provider) => provider.id === "anthropic")!;
+  assert.equal(anthropicCapabilities.providerOauth, true, "operator imports may store Claude login files");
+  assert.equal(anthropicCapabilities.deviceLogin, false, "Claude has no interactive Control device flow");
   for (const response of [started, pending, connected, listed]) {
     assert(!response.text.includes("rt-openai-secret"), "no refresh token in any response");
   }
@@ -289,6 +317,14 @@ test("materialise and refresh: run reference, refresh-if-stale, write-back, revo
   const base = `/api/v1/workspaces/${ctx.tenant.workspaceId}`;
   const owner = (await ctx.database.query<{ id: string }>("SELECT id FROM users WHERE email = 'owner@acme.test'")).rows[0]!.id;
   // Expires inside the refresh window, so the first read refreshes it.
+  const anthropicCredentialId = await ctx.admin.logins.storeLogin({
+    provider: "anthropic",
+    workspaceId: ctx.tenant.workspaceId,
+    organizationId: ctx.tenant.organizationId,
+    actor: { kind: "user", userId: owner },
+    authFile: claudeAuth(Date.now() + REFRESH_WINDOW_MS / 2),
+    accountEmail: "claude@acme.test",
+  });
   const credentialId = await ctx.admin.logins.storeLogin({
     provider: "openai",
     workspaceId: ctx.tenant.workspaceId,
@@ -320,7 +356,10 @@ test("materialise and refresh: run reference, refresh-if-stale, write-back, revo
   const assignment = await queue.next("assignment");
   const payload = JSON.parse(assignment.data.workflowRef.value);
   assert.equal(payload.cliCredentials.path, `/api/v1/workers/{workerId}/assignments/${runId}/cli-credentials`);
-  assert.deepEqual(payload.cliCredentials.credentials, [{ credentialId, provider: "openai", cli: "codex" }]);
+  assert.deepEqual(payload.cliCredentials.credentials, [
+    { credentialId: anthropicCredentialId, provider: "anthropic", cli: "claude" },
+    { credentialId, provider: "openai", cli: "codex" },
+  ]);
   assert.match(payload.cliCredentials.ref, /^sh_clicred_/);
   assert(!assignment.data.workflowRef.value.includes("rt-openai-secret"), "the payload carries no auth file");
   const ref = payload.cliCredentials.ref as string;
@@ -332,7 +371,17 @@ test("materialise and refresh: run reference, refresh-if-stale, write-back, revo
   const read = await ctx.api(path, { token: workerToken, headers: { "x-cli-credential-ref": ref } });
   assert.equal(read.status, 200);
   assert.equal(read.headers.get("cache-control"), "no-store");
-  const file = read.body.files[0];
+  const claudeFile = read.body.files.find((item: { provider: string }) => item.provider === "anthropic");
+  assert.deepEqual(
+    { cli: claudeFile.cli, homeEnv: claudeFile.homeEnv, directory: claudeFile.directory, file: claudeFile.file },
+    { cli: "claude", homeEnv: "HOME", directory: ".claude", file: ".credentials.json" },
+  );
+  assert.equal(JSON.parse(claudeFile.content).claudeAiOauth.refreshToken, "rt-anthropic-secret-2");
+  const anthropicRefreshCalls = ctx.mock.calls.filter((call) => call.url === "https://platform.claude.com/v1/oauth/token");
+  assert.equal(anthropicRefreshCalls.length, 1);
+  assert.equal(new URLSearchParams(anthropicRefreshCalls[0]!.body).get("client_id"), "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+
+  const file = read.body.files.find((item: { provider: string }) => item.provider === "openai");
   assert.deepEqual(
     { cli: file.cli, homeEnv: file.homeEnv, directory: file.directory, file: file.file },
     { cli: "codex", homeEnv: "CODEX_HOME", directory: ".codex", file: "auth.json" },
@@ -344,8 +393,10 @@ test("materialise and refresh: run reference, refresh-if-stale, write-back, revo
   assert.equal(new URLSearchParams(refreshCalls[0]!.body).get("grant_type"), "refresh_token");
 
   const second = await ctx.api(path, { token: workerToken, headers: { "x-cli-credential-ref": ref } });
-  assert.equal(JSON.parse(second.body.files[0].content).tokens.refresh_token, "rt-openai-secret-2");
+  const secondOpenai = second.body.files.find((item: { provider: string }) => item.provider === "openai");
+  assert.equal(JSON.parse(secondOpenai.content).tokens.refresh_token, "rt-openai-secret-2");
   assert.equal(ctx.mock.calls.filter((call) => call.url === "https://auth.openai.com/oauth/token").length, 1, "fresh logins are not refreshed again");
+  assert.equal(ctx.mock.calls.filter((call) => call.url === "https://platform.claude.com/v1/oauth/token").length, 1, "fresh Claude logins are not refreshed again");
 
   // The CLI refreshed during the run: the worker writes the file back.
   const rotated = { ...delivered, tokens: { ...delivered.tokens, refresh_token: "rt-openai-secret-3", access_token: jwt({ ...OPENAI_CLAIMS, exp: Math.floor(Date.now() / 1000) + 2 * 86_400 }) } };
@@ -365,11 +416,12 @@ test("materialise and refresh: run reference, refresh-if-stale, write-back, revo
     body: { content: JSON.stringify(otherAccount) },
   })).status, 409, "write-back cannot swap the account");
   const after = await ctx.api(path, { token: workerToken, headers: { "x-cli-credential-ref": ref } });
-  assert.equal(JSON.parse(after.body.files[0].content).tokens.refresh_token, "rt-openai-secret-3");
+  const afterOpenai = after.body.files.find((item: { provider: string }) => item.provider === "openai");
+  assert.equal(JSON.parse(afterOpenai.content).tokens.refresh_token, "rt-openai-secret-3");
   const versions = await ctx.database.query<{ blob_version: number }>("SELECT blob_version FROM coding_agent_credentials WHERE id = $1", [credentialId]);
   assert.equal(versions.rows[0]!.blob_version, 3);
   const objects = await ctx.database.query("SELECT object_key FROM coding_agent_credential_blobs");
-  assert.equal(objects.rows.length, 1, "superseded versions are removed");
+  assert.equal(objects.rows.length, 2, "superseded versions are removed");
 
   // Finishing the run revokes the reference.
   await ctx.api(`/api/v1/workers/${workerId}/assignments/${runId}/status`, {
@@ -386,6 +438,7 @@ test("materialise and refresh: run reference, refresh-if-stale, write-back, revo
 
   // Delete removes the stored object.
   await ctx.api(`${base}/cloud-agents/${credentialId}`, { method: "DELETE", token: ctx.tenant.ownerToken });
+  await ctx.api(`${base}/cloud-agents/${anthropicCredentialId}`, { method: "DELETE", token: ctx.tenant.ownerToken });
   assert.equal((await ctx.database.query("SELECT 1 FROM coding_agent_credential_blobs")).rows.length, 0);
 });
 
@@ -433,4 +486,57 @@ test("Grok auth file: identity, expiry and refresh rotate the single-use refresh
   assert.equal(entry.refresh_token, "xai-refresh-2");
   assert.equal(entry.email, "dev@acme.test");
   assert.equal(new URLSearchParams(mock.calls[0]!.body).get("client_id"), "b1a00492-073a-47ea-816f-4c329264a828");
+});
+
+test("Claude auth files require a stable account email", () => {
+  const authFile = JSON.stringify({
+    claudeAiOauth: { accessToken: "access", refreshToken: "refresh", expiresAt: Date.now() + 60_000 },
+  });
+  assert.throws(
+    () => describeAuthFile("anthropic", authFile),
+    /account email/,
+  );
+  assert.deepEqual(describeAuthFile("anthropic", authFile, "Claude@Acme.test"), {
+    accountId: "claude@acme.test",
+    email: "Claude@Acme.test",
+    expiresAt: new Date(JSON.parse(authFile).claudeAiOauth.expiresAt),
+    refreshToken: "refresh",
+  });
+  assert.throws(
+    () => describeAuthFile("anthropic", JSON.stringify({
+      claudeAiOauth: { accessToken: "access", refreshToken: "refresh", emailAddress: "one@acme.test" },
+    }), "two@acme.test"),
+    /does not match/,
+  );
+});
+
+test("refresh transactions set local idle and lock timeouts before taking the credential lock", async (t) => {
+  const ctx = await setup(t);
+  const owner = (await ctx.database.query<{ id: string }>("SELECT id FROM users WHERE email = 'owner@acme.test'")).rows[0]!.id;
+  const credentialId = await ctx.admin.logins.storeLogin({
+    provider: "openai",
+    workspaceId: ctx.tenant.workspaceId,
+    organizationId: ctx.tenant.organizationId,
+    actor: { kind: "user", userId: owner },
+    authFile: codexAuth(Math.floor(Date.now() / 1000) + 30 * 86_400),
+  });
+  const transactions: string[][] = [];
+  const original = ctx.database.transaction.bind(ctx.database);
+  ctx.database.transaction = ((run: Parameters<typeof original>[0]) => original(async (tx) => {
+    const events: string[] = [];
+    transactions.push(events);
+    const watched = Object.create(tx) as typeof tx;
+    watched.exec = (sql: string) => { events.push(`exec:${sql}`); return tx.exec(sql); };
+    watched.query = ((sql: string, params?: unknown[]) => { events.push(`query:${sql}`); return tx.query(sql, params); }) as typeof tx.query;
+    return run(watched);
+  })) as typeof ctx.database.transaction;
+  assert.notEqual(await ctx.admin.logins.freshAuthFile(ctx.tenant.workspaceId, credentialId), null);
+  assert.equal(transactions.length, 1);
+  const events = transactions[0]!;
+  assert.deepEqual(events.slice(0, 2), [
+    "exec:SET LOCAL idle_in_transaction_session_timeout = '60s'",
+    "exec:SET LOCAL lock_timeout = '30s'",
+  ]);
+  assert.match(events[2]!, /^query:SELECT pg_advisory_xact_lock/);
+  assert.equal(events.filter((event) => event.startsWith("exec:")).length, 2);
 });

@@ -3,6 +3,7 @@ import type { SelfhostConfig } from "../config.js";
 import type { ControlPlaneStore } from "../store.js";
 import { recordAudit } from "../admin/audit.js";
 import { isRecord, nonEmptyString, readWorkspaceHistory, type HistoryIdentity } from "../sessions/history.js";
+import type { ReaderKind } from "../session-read.js";
 import { recordedSummary } from "../sessions/summary.js";
 import { usageDates } from "./routes.js";
 
@@ -114,13 +115,14 @@ function sessionOf(value: unknown, workspaceId: string): Session | null {
   };
 }
 
-async function ownerIdentities(store: ControlPlaneStore, organizationId: string, owner: { userId: string; token: string }) {
+async function ownerIdentities(store: ControlPlaneStore, organizationId: string, owner: { userId: string; token: string; readerKind: ReaderKind }) {
   const identities: HistoryIdentity[] = [];
   for (const workspace of await store.listWorkspaces(organizationId)) {
     const workspaceId = String(workspace.id);
     const membership = await store.workspaceForUser(workspaceId, owner.userId);
     if (!membership) continue;
-    identities.push({ userId: owner.userId, organizationId, workspaceId, role: membership.role, callerToken: owner.token });
+    identities.push({ userId: owner.userId, organizationId, workspaceId, role: membership.role, callerToken: owner.token,
+      readerKind: owner.readerKind });
   }
   return identities;
 }
@@ -301,7 +303,7 @@ export async function peopleReport(input: {
   store: ControlPlaneStore;
   people: UsagePeopleStore;
   organizationId: string;
-  owner: { userId: string; token: string };
+  owner: { userId: string; token: string; readerKind: ReaderKind };
   days: number;
   now: Date;
 }) {
@@ -404,7 +406,7 @@ export async function personSessions(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
   organizationId: string;
-  owner: { userId: string; token: string };
+  owner: { userId: string; token: string; readerKind: ReaderKind };
   subjectUserId: string;
   days: number;
   cursor?: string;

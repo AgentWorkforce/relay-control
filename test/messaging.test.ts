@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import test from "node:test";
 import { ApiTokenStore } from "../src/admin/api-tokens.js";
 import { createApp } from "../src/app.js";
-import { hashSecret } from "../src/crypto.js";
+import { encryptSecret, hashSecret } from "../src/crypto.js";
 import type { SelfhostConfig } from "../src/config.js";
 import type { Database, SqlExecutor } from "../src/database.js";
 import { SendAbandoned } from "../src/messaging/http.js";
@@ -46,6 +47,8 @@ type RelayState = {
   readTokens: string[];
   dmTokens: string[];
   registerKeys: string[];
+  /** The name of every POST /v1/agents call, in order. */
+  registerNames: string[];
   admission: boolean;
   failRevoke: boolean;
   malformedNext: boolean;
@@ -79,6 +82,7 @@ function relayState(): RelayState {
     readTokens: [],
     dmTokens: [],
     registerKeys: [],
+    registerNames: [],
     admission: false,
     failRevoke: false,
     malformedNext: false,
@@ -124,6 +128,7 @@ function createRelay(state: RelayState) {
     if (request.method === "POST" && url.pathname === "/v1/agents") {
       state.registerCalls += 1;
       state.registerKeys.push(token);
+      state.registerNames.push(String(parsed.name));
       if (state.admission) {
         sendJson(response, 409, { error: { code: "admission", message: "register_human admission is full" } });
         return;
@@ -359,7 +364,10 @@ type Hooks = {
   beforeMembershipRecheck?: (tx: SqlExecutor) => Promise<void> | void;
 };
 
-async function harness(t: { after: (fn: () => Promise<void>) => void }, options?: { claimLeaseMs?: number }) {
+async function harness(
+  t: { after: (fn: () => Promise<void>) => void },
+  options?: { claimLeaseMs?: number; config?: Partial<SelfhostConfig> },
+) {
   const state = relayState();
   const hooks: Hooks = {};
   const relaycast = createRelay(state);
@@ -387,6 +395,7 @@ async function harness(t: { after: (fn: () => Promise<void>) => void }, options?
     dashboardUrl: "https://control.internal.example/",
     port: 3000,
     host: "127.0.0.1",
+    ...options?.config,
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
   control = createServer(createApp({
@@ -1155,12 +1164,17 @@ async function addMember(fx: Awaited<ReturnType<typeof harness>>, email: string)
 
 test("resolve: an owner cli:auth bearer receives the key", async (t) => {
   const fx = await harness(t);
+  await fx.database.query(
+    "UPDATE workspaces SET cloud_relay_workspace_id = 'rw_a1b2c3d4' WHERE id = $1",
+    [fx.workspaceId],
+  );
   const resolved = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.accessToken });
   assert.equal(resolved.status, 200);
   assert.deepEqual(Object.keys(resolved.body).sort(), [
-    "cloudWorkspaceId", "name", "organizationId", "provisioned", "relaycastApiKey",
+    "cloudRelayWorkspaceId", "cloudWorkspaceId", "name", "organizationId", "provisioned", "relaycastApiKey",
     "relaycastWorkspaceId", "urls", "workspaceId",
   ]);
+  assert.equal(resolved.body.cloudRelayWorkspaceId, "rw_a1b2c3d4");
   assert.equal(resolved.body.relaycastApiKey, "rk_live_first");
 });
 
@@ -1312,4 +1326,228 @@ test("resolve: a refusal writes no audit row", async (t) => {
   }
   assert.equal((await jsonRequest(fx.origin, resolvePath(fx.otherWorkspaceId), { token: fx.accessToken })).status, 404);
   assert.equal((await resolveAudits(fx.database)).length, 0);
+});
+
+test("resolve: without SELFHOST_RELAYGATE_PUBLIC_URL the answer names no gate", async (t) => {
+  const fx = await harness(t);
+  const resolved = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.accessToken });
+  assert.equal(resolved.status, 200);
+  assert.equal(resolved.body.relaycastApiKey, "rk_live_first");
+  assert.deepEqual(resolved.body.urls, { relaycastUrl: "https://cast.selfhosted.example" });
+});
+
+test("resolve: gate-only answers urls.relaygateUrl and never the workspace key", async (t) => {
+  const fx = await harness(t, { config: { relaygatePublicUrl: "https://gate.selfhosted.example" } });
+  for (const [cloud, auth] of [
+    [false, { token: fx.accessToken }],
+    [true, { cookie: `agent_relay_session=${fx.accessToken}` }],
+  ] as const) {
+    const resolved = await jsonRequest(fx.origin, resolvePath(fx.workspaceId, cloud), auth);
+    assert.equal(resolved.status, 200);
+    assert.deepEqual(Object.keys(resolved.body).sort(), [
+      "cloudRelayWorkspaceId", "cloudWorkspaceId", "name", "organizationId", "provisioned",
+      "relaycastWorkspaceId", "urls", "workspaceId",
+    ]);
+    assert.equal(resolved.body.cloudRelayWorkspaceId, null);
+    assert.equal("relaycastApiKey" in resolved.body, false);
+    assert.deepEqual(resolved.body.urls, {
+      relaycastUrl: "https://cast.selfhosted.example",
+      relaygateUrl: "https://gate.selfhosted.example",
+    });
+    assert.equal(resolved.body.workspaceId, fx.workspaceId);
+    assert.equal(resolved.body.relaycastWorkspaceId, "rc-first");
+    assert.equal(JSON.stringify(resolved.body).includes("rk_live_"), false);
+  }
+  // A plain member, and a token bound to the other workspace, get no key either.
+  const member = await addMember(fx, "gate-member@example.test");
+  const asMember = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: member.token });
+  assert.equal(asMember.status, 200);
+  assert.equal("relaycastApiKey" in asMember.body, false);
+  const boundToOther = await fx.signIn(fx.userId, fx.otherWorkspaceId);
+  const other = await jsonRequest(fx.origin, resolvePath(fx.otherWorkspaceId), { token: boundToOther });
+  assert.equal(other.status, 200);
+  assert.equal(JSON.stringify(other.body).includes("rk_live_"), false);
+  // No key left, so no disclosure was audited; each resolve is audited as withheld.
+  assert.equal((await resolveAudits(fx.database)).length, 0);
+  const withheld = (await fx.database.query<Record<string, unknown>>(
+    "SELECT * FROM admin_audit_events WHERE action = 'workspace.relaycast_key.withheld' ORDER BY created_at",
+  )).rows;
+  assert.equal(withheld.length, 4);
+  assert.equal(withheld[0]!.actor_id, fx.userId);
+  assert.equal(withheld[0]!.workspace_id, fx.workspaceId);
+  assert.match(String(withheld[0]!.target), /^session:[0-9a-f-]{36}$/);
+  assert.equal(JSON.stringify(withheld).includes("rk_live_"), false);
+});
+
+test("resolve: gate-only keeps every refusal", async (t) => {
+  const fx = await harness(t, { config: { relaygatePublicUrl: "https://gate.selfhosted.example" } });
+  const lowScope = await fx.signIn(fx.userId);
+  await dropCliAuth(fx.database, lowScope);
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: lowScope })).status, 403);
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.config.internalServiceToken! })).status, 403);
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.config.bootstrapToken })).status, 401);
+  assert.equal((await jsonRequest(fx.origin, resolvePath(fx.otherWorkspaceId), { token: fx.accessToken })).status, 404);
+});
+
+// ---- POST /messaging/identity/credential on gate-only installs ---------------
+
+async function credentialWithheldAudits(database: Database) {
+  return (await database.query<Record<string, unknown>>(
+    "SELECT * FROM admin_audit_events WHERE action = 'workspace.person_credential.withheld' ORDER BY created_at",
+  )).rows;
+}
+
+test("person credential: without SELFHOST_RELAYGATE_PUBLIC_URL the token is still issued", async (t) => {
+  const fx = await harness(t);
+  const credential = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: fx.accessToken });
+  assert.equal(credential.status, 200);
+  assert.equal(credential.body.identity.token, "ar_ag_1");
+  assert.equal(fx.state.registerCalls, 1);
+  assert.equal((await credentialWithheldAudits(fx.database)).length, 0);
+});
+
+test("person credential: gate-only issues no Relaycast token", async (t) => {
+  const fx = await harness(t, { config: { relaygatePublicUrl: "https://gate.selfhosted.example" } });
+  const cookie = `agent_relay_session=${fx.accessToken}`;
+  for (const [cloud, auth] of [
+    [false, { token: fx.accessToken }],
+    [true, { cookie }],
+  ] as const) {
+    const withheld = await jsonRequest(fx.origin, credentialPath(fx.workspaceId, cloud), { method: "POST", body: {}, ...auth });
+    assert.equal(withheld.status, 403);
+    assert.equal(withheld.body.error, "gate_only");
+    assert.equal(typeof withheld.body.message, "string");
+    assert.deepEqual(withheld.body.urls, {
+      relaycastUrl: "https://cast.selfhosted.example",
+      relaygateUrl: "https://gate.selfhosted.example",
+    });
+    assert.equal("identity" in withheld.body, false);
+    assert.equal(JSON.stringify(withheld.body).includes("ar_ag_"), false);
+  }
+  // No person identity was registered on Relaycast or stored here.
+  assert.equal(fx.state.registerCalls, 0);
+  assert.equal((await fx.database.query("SELECT id FROM person_identities")).rows.length, 0);
+  const audits = await credentialWithheldAudits(fx.database);
+  assert.equal(audits.length, 2);
+  for (const audit of audits) {
+    assert.equal(audit.actor_id, fx.userId);
+    assert.equal(audit.workspace_id, fx.workspaceId);
+    assert.match(String(audit.target), /^session:[0-9a-f-]{36}$/);
+  }
+  assert.equal(JSON.stringify(audits).includes("ar_ag_"), false);
+
+  // Every earlier refusal still answers first, and none of them is audited as withheld.
+  const agentToken = await new ApiTokenStore(fx.database).create({
+    workspaceId: fx.workspaceId,
+    organizationId: fx.orgId,
+    label: "agent",
+    purpose: "agent-runtime",
+    expiryDays: 1,
+    neverExpires: undefined,
+    actor: { kind: "user", userId: fx.userId },
+  });
+  const agent = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: agentToken.accessToken });
+  assert.equal(agent.status, 403);
+  assert.notEqual(agent.body.error, "gate_only");
+  const service = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: fx.config.internalServiceToken! });
+  assert.equal(service.status, 403);
+  assert.notEqual(service.body.error, "gate_only");
+  const lowScope = await fx.signIn(fx.userId);
+  await dropCliAuth(fx.database, lowScope);
+  const scoped = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: lowScope });
+  assert.equal(scoped.status, 403);
+  assert.equal(scoped.body.error, "forbidden");
+  const foreign = await jsonRequest(fx.origin, credentialPath(fx.otherWorkspaceId), { method: "POST", token: fx.accessToken });
+  assert.equal(foreign.status, 404);
+  const evil = await jsonRequest(fx.origin, credentialPath(fx.workspaceId, true), {
+    method: "POST",
+    cookie,
+    origin: "https://evil.internal.example",
+    contentType: "text/plain",
+    rawBody: "{}",
+  });
+  assert.equal(evil.status, 403);
+  assert.equal(evil.body.error, "csrf_rejected");
+  assert.equal((await credentialWithheldAudits(fx.database)).length, 2);
+  assert.equal(fx.state.registerCalls, 0);
+
+  // Reads are unchanged: the directory answers, and a thread has no identity yet.
+  const people = await jsonRequest(fx.origin, `/api/v1/workspaces/${fx.workspaceId}/messaging/people`, { token: fx.accessToken });
+  assert.equal(people.status, 200);
+  assert.deepEqual(people.body.people, []);
+  const thread = await jsonRequest(fx.origin, threadPath(fx.workspaceId, "helper"), { token: fx.accessToken });
+  assert.equal(thread.status, 200);
+  assert.equal(thread.body.you, null);
+  assert.deepEqual(thread.body.messages, []);
+  assert.equal(fx.state.registerCalls, 0);
+});
+
+// ---- server-side person identity names on gate-only installs -----------------
+
+async function storedPersonName(database: Database, userId: string): Promise<string | undefined> {
+  const rows = await database.query<{ agent_name: string }>(
+    "SELECT agent_name FROM person_identities WHERE user_id = $1",
+    [userId],
+  );
+  return rows.rows[0]?.agent_name;
+}
+
+test("person identity: a default install registers the unprefixed name", async (t) => {
+  const fx = await harness(t);
+  const send = await jsonRequest(fx.origin, threadPath(fx.workspaceId, "helper"), {
+    method: "POST",
+    token: fx.accessToken,
+    body: { text: "hello", clientMessageId: "default-name-1" },
+  });
+  assert.equal(send.status, 201);
+  assert.deepEqual(fx.state.registerNames, ["owner"]);
+  assert.equal(await storedPersonName(fx.database, fx.userId), "owner");
+  assert.equal(fx.state.messages.at(-1)?.sender, "owner");
+});
+
+test("person identity: gate-only registers a control- name for a conversation send", async (t) => {
+  const fx = await harness(t, { config: { relaygatePublicUrl: "https://gate.selfhosted.example" } });
+  const send = await jsonRequest(fx.origin, threadPath(fx.workspaceId, "helper"), {
+    method: "POST",
+    token: fx.accessToken,
+    body: { text: "hello", clientMessageId: "gate-name-1" },
+  });
+  assert.equal(send.status, 201);
+  assert.equal(fx.state.registerCalls, 1);
+  assert.deepEqual(fx.state.registerNames, ["control-owner"]);
+  assert.equal(await storedPersonName(fx.database, fx.userId), "control-owner");
+  assert.equal(fx.state.messages.at(-1)?.sender, "control-owner");
+  const thread = await jsonRequest(fx.origin, threadPath(fx.workspaceId, "helper"), { token: fx.accessToken });
+  assert.equal(thread.status, 200);
+  assert.equal(thread.body.you, "control-owner");
+});
+
+test("person identity: gate-only reuses an existing unprefixed identity as stored", async (t) => {
+  const fx = await harness(t, { config: { relaygatePublicUrl: "https://gate.selfhosted.example" } });
+  seed(fx.state, "owner", "ag_owner_existing", "at_owner_existing");
+  await fx.database.query(
+    `INSERT INTO person_identities
+       (id, workspace_id, user_id, agent_name, agent_remote_id, token_ciphertext, relaycast_workspace_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      randomUUID(),
+      fx.workspaceId,
+      fx.userId,
+      "owner",
+      "ag_owner_existing",
+      encryptSecret("at_owner_existing", fx.config.encryptionKeyring.active),
+      "rc-first",
+    ],
+  );
+  const send = await jsonRequest(fx.origin, threadPath(fx.workspaceId, "helper"), {
+    method: "POST",
+    token: fx.accessToken,
+    body: { text: "hello", clientMessageId: "gate-existing-1" },
+  });
+  assert.equal(send.status, 201);
+  assert.equal(fx.state.registerCalls, 0);
+  assert.deepEqual(fx.state.registerNames, []);
+  assert.equal(await storedPersonName(fx.database, fx.userId), "owner");
+  assert.equal(fx.state.messages.at(-1)?.sender, "owner");
+  assert.deepEqual(fx.state.dmTokens, ["at_owner_existing"]);
 });

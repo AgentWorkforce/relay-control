@@ -45,6 +45,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "flow_run_relayfile_credentials",
   "hosted_relay_participants",
   "grok_bot_routines",
+  "github_app_installations",
   "installation_bootstrap",
   "integration_connections",
   "integration_oauth_apps",
@@ -68,6 +69,8 @@ export const CONTROL_TABLES: readonly string[] = [
   "person_identities",
   "person_messages",
   "person_revocations",
+  "relay_launch_credentials",
+  "relay_node_credentials",
   "relay_spawns",
   "relaycast_rekey_backups",
   "remote_agent_connections",
@@ -77,6 +80,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "session_erasures",
   "setup_keys",
   "shared_session_read_audit",
+  "staff_read_grants",
   "telemetry_counters",
   "telemetry_error_index",
   "telemetry_errors",
@@ -101,4 +105,12 @@ export const CONTROL_TABLES: readonly string[] = [
 export const CONTROL_SEQUENCES: readonly string[] = [
   "desktop_feed_publish_seq",
   "desktop_feed_publisher_tokens_seq_seq",
+];
+
+// Tables a migration creates that the runtime role must NOT be granted:
+// owner-only state written by operator tools. grantRuntimeDatabaseRole grants
+// CONTROL_TABLES only, so these stay invisible to the runtime role.
+export const OWNER_ONLY_TABLES: readonly string[] = [
+  // scripts/cloud-import: the Cloud identity import ledger (0063).
+  "cloud_import_ledger",
 ];

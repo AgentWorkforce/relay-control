@@ -5,8 +5,9 @@
 // - Credentials belong to the workspace (created_by is recorded), not to one
 //   member. Owners/admins write; every member sees metadata. Hosted shows an
 //   owner every member's rows, so the owner view is the same.
-// - No Agent Relay house key ("Agent Relay API key", "OpenCode managed"):
-//   self-host has no Agent Relay-paid model access.
+// - Imported Agent Relay-managed rows are retained as credential metadata, but
+//   self-host has no hosted house-proxy issuer. They never contain or deliver
+//   an upstream secret; runs report the unavailable managed binding instead.
 // - Secrets are AES-256-GCM ciphertext under SELFHOST_ENCRYPTION_KEY in
 //   Postgres instead of hosted's R2 credential store. Plaintext only leaves
 //   relaycontrol through the internal runtime environment read.
@@ -21,8 +22,8 @@ import {
 import { iso, recordAudit, type AuditActor } from "./audit.js";
 import type { CredentialBlobStore } from "./credential-blobs.js";
 
-/** byo_api_key = API key; oauth_token = Claude setup token; provider_oauth = Codex/Grok device login. */
-export type CodingAgentAuthType = "byo_api_key" | "oauth_token" | "provider_oauth";
+/** byo_api_key = API key; oauth_token = Claude setup token; provider_oauth = a CLI login file. */
+export type CodingAgentAuthType = "byo_api_key" | "oauth_token" | "provider_oauth" | "relay_managed";
 
 export type CodingAgentProvider = {
   id: string;
@@ -30,9 +31,15 @@ export type CodingAgentProvider = {
   harness: string;
   /** Env var a flow run receives when this provider's LLM credential is selected. */
   apiKeyEnv: string;
+  /** Non-family credentials/config that must not bypass a selected managed row. */
+  managedBlockedEnv: readonly string[];
+  /** Credential/config families read by this provider's CLIs. */
+  managedBlockedPrefixes: readonly string[];
   /** Can hold a subscription login a sandbox CLI mounts ("Sandbox access"). */
   setupToken: boolean;
-  /** Has a browser device login (hosted provider_oauth) whose auth file a run's CLI mounts. */
+  /** Can store and mount an imported provider_oauth login file. */
+  providerOauth: boolean;
+  /** Can start an interactive provider device flow from the connect dialog. */
   deviceLogin: boolean;
   keyPlaceholder: string;
   docsUrl: string;
@@ -47,7 +54,10 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     displayName: "Anthropic",
     harness: "claude",
     apiKeyEnv: "ANTHROPIC_API_KEY",
+    managedBlockedEnv: ["CLAUDE_CONFIG_DIR", "AWS_BEARER_TOKEN_BEDROCK", "CLOUD_ML_REGION"],
+    managedBlockedPrefixes: ["ANTHROPIC_", "CLAUDE_CODE_"],
     setupToken: true,
+    providerOauth: true,
     deviceLogin: false,
     keyPlaceholder: "sk-ant-api03-…",
     docsUrl: "https://console.anthropic.com/settings/keys",
@@ -57,7 +67,10 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     displayName: "OpenAI",
     harness: "codex",
     apiKeyEnv: "OPENAI_API_KEY",
+    managedBlockedEnv: [],
+    managedBlockedPrefixes: ["OPENAI_", "CODEX_", "AZURE_OPENAI_"],
     setupToken: false,
+    providerOauth: true,
     deviceLogin: true,
     keyPlaceholder: "sk-…",
     docsUrl: "https://platform.openai.com/api-keys",
@@ -67,7 +80,10 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     displayName: "OpenRouter",
     harness: "openrouter",
     apiKeyEnv: "OPENROUTER_API_KEY",
+    managedBlockedEnv: [],
+    managedBlockedPrefixes: ["OPENROUTER_", "OPENAI_"],
     setupToken: false,
+    providerOauth: false,
     deviceLogin: false,
     keyPlaceholder: "sk-or-v1-…",
     docsUrl: "https://openrouter.ai/settings/keys",
@@ -77,7 +93,10 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     displayName: "xAI",
     harness: "grok",
     apiKeyEnv: "XAI_API_KEY",
+    managedBlockedEnv: [],
+    managedBlockedPrefixes: ["XAI_", "GROK_"],
     setupToken: false,
+    providerOauth: true,
     deviceLogin: true,
     keyPlaceholder: "xai-…",
     docsUrl: "https://console.x.ai",
@@ -87,7 +106,16 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     displayName: "Google",
     harness: "gemini",
     apiKeyEnv: "GEMINI_API_KEY",
+    managedBlockedEnv: [
+      "GOOGLE_API_KEY",
+      "GOOGLE_API_BASE",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "GOOGLE_CLOUD_PROJECT",
+      "GOOGLE_CLOUD_LOCATION",
+    ],
+    managedBlockedPrefixes: ["GEMINI_", "GOOGLE_GENAI_", "GOOGLE_GEMINI_"],
     setupToken: false,
+    providerOauth: false,
     deviceLogin: false,
     keyPlaceholder: "AIza…",
     docsUrl: "https://aistudio.google.com/apikey",
@@ -151,7 +179,7 @@ type Row = {
   display_name: string;
   label: string | null;
   account_email: string | null;
-  secret_preview: string;
+  secret_preview: string | null;
   is_active: boolean;
   harness_active: boolean;
   status: "connected" | "error" | "refresh_failed";
@@ -186,7 +214,7 @@ function toRecord(row: Row): CodingAgentRecord {
     authType: row.auth_type,
     label: row.label,
     accountEmail: row.account_email,
-    secretPreview: row.secret_preview,
+    secretPreview: row.secret_preview ?? "Managed by Agent Relay",
     isActive: row.is_active,
     harnessActive: row.harness_active,
     defaultModel: null,
@@ -249,7 +277,11 @@ function validateEmail(value: unknown): string | null {
 
 export type RuntimeCodingAgentEnvironment = {
   env: Record<string, string>;
-  skipped: Array<{ name: string; reason: "undecryptable" }>;
+  /** Workspace variables with these names must not impersonate a selected credential. */
+  blockedNames: string[];
+  /** Workspace variables in these provider families must not impersonate a selected credential. */
+  blockedPrefixes: string[];
+  skipped: Array<{ name: string; reason: "undecryptable" | "relay_managed_unavailable" }>;
 };
 
 export type ProbeResult = {
@@ -488,11 +520,11 @@ export class CodingAgentStore {
     if (existing.status !== "connected") {
       throw new CodingAgentError(409, "credential_not_connected", "Reconnect this credential before selecting it");
     }
-    if (selection === "harness" && existing.authType === "byo_api_key") {
+    if (selection === "harness" && existing.authType !== "oauth_token" && existing.authType !== "provider_oauth") {
       throw new CodingAgentError(409, "sandbox_not_supported", "Only a subscription login can be used for sandbox access");
     }
     if (selection === "model" && existing.authType === "provider_oauth") {
-      // A Codex/Grok login is mounted as the CLI's auth file; it is not an API
+      // A subscription login is mounted as the CLI's auth file; it is not an API
       // key a flow can call models with.
       throw new CodingAgentError(409, "llm_not_supported", "A subscription login is used for sandbox access only");
     }
@@ -608,6 +640,13 @@ export class CodingAgentStore {
         message: "Subscription logins refresh when a run starts. No provider request was made.",
       };
     }
+    if (existing.authType === "relay_managed") {
+      return {
+        status: "unsupported",
+        checkedAt,
+        message: "Managed credentials require the hosted Agent Relay model gateway. No provider request was made.",
+      };
+    }
     if (existing.authType === "oauth_token" || !probe) {
       result = {
         status: "unsupported",
@@ -656,7 +695,9 @@ export class CodingAgentStore {
    * Internal runtime read: the env a flow run receives for the workspace's
    * selected credentials. LLM-call credentials map to the provider's API-key
    * variable (a selected setup token maps to CLAUDE_CODE_OAUTH_TOKEN); the
-   * sandbox credential maps to CLAUDE_CODE_OAUTH_TOKEN.
+   * sandbox credential maps to CLAUDE_CODE_OAUTH_TOKEN. An imported
+   * relay_managed row has no stored value and no self-host issuer, so it blocks
+   * a same-named workspace variable and produces a run warning instead.
    */
   async readRuntimeEnvironment(
     workspaceId: string,
@@ -668,26 +709,35 @@ export class CodingAgentStore {
       auth_type: CodingAgentAuthType;
       is_active: boolean;
       harness_active: boolean;
-      secret_ciphertext: string;
+      secret_ciphertext: string | null;
     }>(
       `SELECT id, model_provider, auth_type, is_active, harness_active, secret_ciphertext
          FROM coding_agent_credentials
-        WHERE workspace_id = $1 AND status = 'connected' AND (is_active OR harness_active)
+        WHERE workspace_id = $1 AND (is_active OR harness_active)
+          AND (status = 'connected' OR auth_type = 'relay_managed')
           AND auth_type <> 'provider_oauth'
         ORDER BY harness_active DESC, model_provider, id`,
       [workspaceId],
     );
     const env: Record<string, string> = Object.create(null) as Record<string, string>;
+    const blockedNames = new Set<string>();
+    const blockedPrefixes = new Set<string>();
     const skipped: RuntimeCodingAgentEnvironment["skipped"] = [];
     const used: string[] = [];
     for (const row of result.rows) {
       const provider = PROVIDERS_BY_ID.get(row.model_provider);
       if (!provider) continue;
+      if (row.auth_type === "relay_managed") {
+        for (const name of provider.managedBlockedEnv) blockedNames.add(name);
+        for (const prefix of provider.managedBlockedPrefixes) blockedPrefixes.add(prefix);
+        skipped.push({ name: provider.apiKeyEnv, reason: "relay_managed_unavailable" });
+        continue;
+      }
       const name = row.auth_type === "oauth_token" ? SETUP_TOKEN_ENV : provider.apiKeyEnv;
       // The sandbox selection is read first, so it owns CLAUDE_CODE_OAUTH_TOKEN.
       if (name in env) continue;
       try {
-        env[name] = decryptSecret(row.secret_ciphertext, this.keyring);
+        env[name] = decryptSecret(row.secret_ciphertext!, this.keyring);
         used.push(row.id);
       } catch (error) {
         if (!(error instanceof EncryptedSecretError)) throw error;
@@ -711,6 +761,11 @@ export class CodingAgentStore {
         target: `${used.length} credentials`,
       });
     }
-    return { env: { ...env }, skipped };
+    return {
+      env: { ...env },
+      blockedNames: [...blockedNames],
+      blockedPrefixes: [...blockedPrefixes],
+      skipped,
+    };
   }
 }
