@@ -40,6 +40,13 @@ export type ReplicasDeps = {
    * and the verifier. Absent: that surface is unavailable.
    */
   identity?: { issuer: string; mcpUrl: string; verifier: ReplicaIdentityVerifier };
+  /**
+   * The canonical lazy Relay binding (the store's): provisions an unbound
+   * workspace once. Only the environment-level MCP enrolment calls it
+   * (./environments.ts); every other path stays lookup-only (relayFor).
+   * Absent: an unbound workspace cannot be provisioned from here.
+   */
+  relaycastBinding?: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null>;
 };
 
 /**
@@ -57,6 +64,23 @@ export class ReplicasError extends Error {
   constructor(message: string, readonly status = 400) {
     super(message);
     this.name = "ReplicasError";
+  }
+}
+
+export const REPLICA_PROVISIONING_FAILURE = "Agent Relay MCP provisioning failed. Retry the MCP call from the same replica.";
+/**
+ * The environment-level MCP enrolment could not provision the workspace's
+ * Relay binding (no provisioner, a failed attempt, or one that did not
+ * persist). The reserved binding row is kept; the replica retries the call.
+ */
+export class ReplicaProvisioningError extends ReplicasError {
+  readonly code = "relay_mcp_provisioning_failed";
+  readonly stage = "relay_mcp";
+  readonly retryable = true;
+  readonly retryAfterSeconds = 5;
+  constructor() {
+    super(REPLICA_PROVISIONING_FAILURE, 503);
+    this.name = "ReplicaProvisioningError";
   }
 }
 
@@ -261,7 +285,7 @@ export async function relayFor(
   scope: { workspaceId: string; userId: string },
   knownRelay?: string | null,
 ): Promise<WorkspaceRelay> {
-  const result = await executor.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
+  const result = await executor.query<{ relaycast_workspace_id: string | null; relaycast_api_key_ciphertext: string | null }>(
     `SELECT w.relaycast_workspace_id, w.relaycast_api_key_ciphertext
        FROM workspaces w
        JOIN organization_memberships m ON m.organization_id = w.organization_id AND m.user_id = $2
@@ -276,17 +300,21 @@ export async function relayFor(
   // bind; a persisted pin must still match it exactly.
   const pin = knownRelay ?? undefined;
   if (pin !== undefined && pin !== row.relaycast_workspace_id) throw new ReplicasError("The replica's relay is unavailable.", 409);
+  // An unbound workspace (no Relay binding yet, e.g. imported) is never provisioned here: lookup only.
+  if (!row.relaycast_workspace_id || !row.relaycast_api_key_ciphertext) throw new ReplicasError("The replica's relay is unavailable.", 409);
   return { relaycastWorkspaceId: row.relaycast_workspace_id, key: decrypt(deps, row.relaycast_api_key_ciphertext) };
 }
 
 /** The workspace's canonical relay without a person check: cleanup only. */
 export async function cleanupRelay(deps: ReplicasDeps, tx: SqlExecutor, row: SpawnRow): Promise<WorkspaceRelay> {
-  const result = await tx.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
+  const result = await tx.query<{ relaycast_workspace_id: string | null; relaycast_api_key_ciphertext: string | null }>(
     "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM workspaces WHERE id = $1",
     [row.workspace_id],
   );
   const relay = result.rows[0];
-  if (!relay || relay.relaycast_workspace_id !== row.relay_workspace_id) {
+  // An unbound workspace (null pair) never matches a pin and is never decrypted.
+  if (!relay || !relay.relaycast_workspace_id || !relay.relaycast_api_key_ciphertext
+    || relay.relaycast_workspace_id !== row.relay_workspace_id) {
     throw new ReplicasError("The replica's relay is unavailable; cleanup must be retried.", 409);
   }
   return { relaycastWorkspaceId: relay.relaycast_workspace_id, key: decrypt(deps, relay.relaycast_api_key_ciphertext) };

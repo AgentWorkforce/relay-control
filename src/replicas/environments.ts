@@ -7,6 +7,7 @@ import { emailHint, type ReplicaIdentityClaims } from "./identity.js";
 import { ReplicasRuntimeError, type EnvironmentMcp } from "./runtime.js";
 import {
   auditActor,
+  byId,
   COLUMNS,
   decrypt,
   encrypt,
@@ -19,6 +20,8 @@ import {
   recordProviderAccess,
   rejectedByProvider,
   relayFor,
+  REPLICA_PROVISIONING_FAILURE,
+  ReplicaProvisioningError,
   ReplicasError,
   requireAdmin,
   retireIdentityBindings,
@@ -355,22 +358,64 @@ async function underAdmission<T>(deps: ReplicasDeps, claims: ReplicaIdentityClai
 }
 
 /**
+ * enrolStep's answer when the admitted workspace has no Relay binding yet
+ * (an imported workspace binds lazily): the binding row is reserved
+ * (committed, no relay pinned) and the caller provisions the workspace's
+ * canonical binding outside the admission lock.
+ */
+type ProvisionNeeded = { provision: { workspaceId: string; organizationId: string; spawnId: string } };
+
+/**
+ * Records the failed provisioning on the reserved row (only while it is still
+ * live, unpinned and unbound) and answers the typed retryable failure. The
+ * row is kept for the next call. Marking is best effort.
+ */
+async function provisioningFailed(deps: ReplicasDeps, provision: ProvisionNeeded["provision"]): Promise<never> {
+  await withReplicasLock(deps, { workspaceId: provision.workspaceId, organizationId: provision.organizationId }, async (tx) => {
+    const row = await byId(tx, provision.spawnId, true);
+    if (row && row.state !== "gone" && row.relay_workspace_id === null && row.token_ciphertext === null) {
+      await patch(tx, row.id, { last_error: REPLICA_PROVISIONING_FAILURE });
+    }
+  }).catch(() => undefined);
+  throw new ReplicaProvisioningError();
+}
+
+/**
  * Admits a verified identity and returns its bound binding, enrolling it on
  * first use. Nothing is written until every check passed. Enrolment commits
  * the binding row (with its deterministic agent name) before the Relay
  * registration, so a lost registration is recovered, never duplicated.
  * A live launch or bind of the same replica in the admitted workspace is
  * returned as is, acting as its owner.
+ *
+ * A workspace without a Relay binding is provisioned at most once per call,
+ * through the canonical lazy binding (deps.relaycastBinding), outside the
+ * admission lock; the next pass re-runs the full admission before anything
+ * is registered or served. No provisioner, a failed attempt or one that left
+ * the workspace unbound answers ReplicaProvisioningError.
  */
 export async function admitIdentity(deps: ReplicasDeps, claims: ReplicaIdentityClaims): Promise<SpawnRow> {
-  for (let attempt = 0; attempt < 3; attempt++) {
+  let provisionAttempted = false;
+  // Passes: reserve, register (bound workspace); reserve, pin, register after the
+  // provisioning pass (unbound workspace). One spare pass covers a lost registration.
+  for (let attempt = 0; attempt < 4; attempt++) {
     const result = await underAdmission(deps, claims, (tx, admission) => enrolStep(deps, tx, claims, admission));
+    if ("provision" in result) {
+      if (!deps.relaycastBinding || provisionAttempted) return provisioningFailed(deps, result.provision);
+      provisionAttempted = true;
+      // Any failure (also a retryable "not ready" from a concurrent provisioner) answers the same typed error.
+      const binding = await deps.relaycastBinding(result.provision.workspaceId).catch(() => null);
+      if (!binding) return provisioningFailed(deps, result.provision);
+      // The next pass re-runs the full admission and finds the reserved row.
+      continue;
+    }
     if (result.state === "bound") return result;
   }
   throw new ReplicasError("Replicas enrolment could not finish. Retry the call.", 503);
 }
 
-async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIdentityClaims, admission: Admission): Promise<SpawnRow> {
+async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIdentityClaims,
+  admission: Admission): Promise<SpawnRow | ProvisionNeeded> {
   let row = await liveBinding(tx, claims, admission);
   // A reused launch or bind is never enrolled: its own lifecycle binds it (admitIdentity 503s until then).
   if (row && row.source !== ENVIRONMENT_IDENTITY) return row;
@@ -391,8 +436,41 @@ async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIde
       input: { ...row.input, environment_id: claims.environmentId, creator_id: claims.creatorId, acts_as: actsAs } });
   }
   if (row?.state === "bound" && row.token_ciphertext) return row;
-  const relay = await relayFor(deps, tx, { workspaceId: admission.policy.workspace_id, userId }, row?.relay_workspace_id);
   const name = identityAgentName(claims.workspaceId);
+  const input: SpawnInput = { environment_id: claims.environmentId, name, task: "", coding_agent: "replicas",
+    origin: ENVIRONMENT_IDENTITY, acts_as: actsAs, creator_id: claims.creatorId };
+  const reserve = async (relayWorkspaceId: string | null) => {
+    const id = randomUUID();
+    const inserted = await tx.query<SpawnRow>(
+      `INSERT INTO replica_spawns (id, workspace_id, organization_id, user_id, client_request_id, source, input, replica_id, state,
+         relay_workspace_id, agent_name, environment_id, provider_organization_id, issuer)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, 'binding', $9, $10, $11, $12, $13) RETURNING ${COLUMNS}`,
+      [id, admission.policy.workspace_id, admission.organizationId, userId, `environment-identity:${id}`, ENVIRONMENT_IDENTITY,
+        JSON.stringify(input), claims.workspaceId, relayWorkspaceId, name, claims.environmentId, claims.organizationId, claims.issuer],
+    );
+    return inserted.rows[0]!;
+  };
+  // A workspace without a Relay binding yet (an imported workspace binds lazily): reserve the binding
+  // row under this lock with no relay pinned, committed, and let admitIdentity provision outside it.
+  // A saved pin never provisions (relayFor answers 409 for it below).
+  if (!row?.relay_workspace_id) {
+    const workspace = await tx.query<{ relaycast_workspace_id: string | null; relaycast_api_key_ciphertext: string | null }>(
+      `SELECT w.relaycast_workspace_id, w.relaycast_api_key_ciphertext
+         FROM workspaces w
+         JOIN organization_memberships m ON m.organization_id = w.organization_id AND m.user_id = $2
+        WHERE w.id = $1
+        FOR SHARE OF m`,
+      [admission.policy.workspace_id, userId],
+    );
+    const bound = workspace.rows[0];
+    if (!bound) throw new ReplicasError("This person no longer has workspace access.", 403);
+    if (!bound.relaycast_workspace_id || !bound.relaycast_api_key_ciphertext) {
+      // No relay to list yet: the bridged-agent check and predecessor retirement run on the next pass.
+      const reserved = row ?? await reserve(null);
+      return { provision: { workspaceId: reserved.workspace_id, organizationId: reserved.organization_id, spawnId: reserved.id } };
+    }
+  }
+  const relay = await relayFor(deps, tx, { workspaceId: admission.policy.workspace_id, userId }, row?.relay_workspace_id);
   const ownId = row?.id;
   // A replica already bridged by another binding (a PR A spawn or bind) is never enrolled twice.
   const bridged = (await deps.relaycast.listAgents(relay.key, "all")).filter((agent) =>
@@ -412,20 +490,11 @@ async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIde
       throw new ReplicasError("Replicas enrolment could not finish. Retry the call.", 503);
     }
   }
-  if (!row) {
-    const id = randomUUID();
-    const input: SpawnInput = { environment_id: claims.environmentId, name, task: "", coding_agent: "replicas",
-      origin: ENVIRONMENT_IDENTITY, acts_as: actsAs, creator_id: claims.creatorId };
-    const inserted = await tx.query<SpawnRow>(
-      `INSERT INTO replica_spawns (id, workspace_id, organization_id, user_id, client_request_id, source, input, replica_id, state,
-         relay_workspace_id, agent_name, environment_id, provider_organization_id, issuer)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, 'binding', $9, $10, $11, $12, $13) RETURNING ${COLUMNS}`,
-      [id, admission.policy.workspace_id, admission.organizationId, userId, `environment-identity:${id}`, ENVIRONMENT_IDENTITY,
-        JSON.stringify(input), claims.workspaceId, relay.relaycastWorkspaceId, name, claims.environmentId, claims.organizationId, claims.issuer],
-    );
-    // Committed before registration: the name is the cleanup locator.
-    return inserted.rows[0]!;
-  }
+  // Committed before registration: the name and the relay pin are the cleanup locator.
+  if (!row) return reserve(relay.relaycastWorkspaceId);
+  // A row reserved while the workspace was unbound pins the now-provisioned relay first, also committed
+  // before registration (a release of an unpinned row skips Relay cleanup).
+  if (!row.relay_workspace_id) return patch(tx, row.id, { relay_workspace_id: relay.relaycastWorkspaceId });
   const remote = await deps.relaycast.getAgent(relay.key, name);
   if (remote && (remote.metadata.source !== HOSTED_SOURCE || remote.metadata.replicas_spawn_id !== row.id
     || remote.metadata.cloud_workspace_id !== row.workspace_id || remote.metadata.owner_hash !== ownerHash(row.user_id))) {

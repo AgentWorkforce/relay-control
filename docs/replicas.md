@@ -193,6 +193,22 @@ Each call is admitted in this order:
    disable, principal or mapping change) is not a conflict: enrolment retries
    its cleanup first and answers a retryable 503 while that keeps failing.
 
+   An authorized first call from a replica in a workspace that has no Relay
+   binding yet (an imported workspace binds lazily) reserves the binding row
+   under the admission lock with no relay pinned. Control then provisions the
+   workspace's canonical Relay binding through the same lazy binding every
+   other service uses, outside that lock, and re-runs the full admission
+   (steps 2-4) before it registers the replica or serves the call. One
+   provisioning attempt is made per request. A failed or unconfirmed attempt
+   (no provisioner configured, an error, or a binding that did not persist)
+   answers 503 JSON-RPC -32000 `relay_mcp_provisioning_failed` with
+   `Retry-After: 5` and keeps the reserved row for the next call; that call
+   refuses the replica only if policy, mapping or membership changed. A replica
+   refused in steps 1-4 never reserves or provisions anything. Saved relay
+   pins, lookups, the API launch and bind path and cleanup never provision:
+   there an unbound workspace answers 409 "The replica's relay is
+   unavailable.".
+
    A replica already launched or bound through the API in this workspace (a
    live `spawn` or `bind` record for the same replica id) is not enrolled:
    once steps 1-4 pass, the environment MCP acts as that binding and its
