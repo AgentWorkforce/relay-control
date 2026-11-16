@@ -19,6 +19,7 @@ const INTROSPECT_SECRET = "introspect-secret-that-is-at-least-32-bytes";
 const BOOTSTRAP = "bootstrap-token-that-is-at-least-32-bytes";
 const INTERNAL = "internal-service-token-at-least-32-bytes!";
 const HISTORY_PUBLIC = "https://history.selfhosted.test";
+const GENERAL_AUDIENCE = "https://acquisition.selfhosted.test";
 const NODE = "node_0123456789abcdef";
 
 function refused(): Error {
@@ -60,7 +61,7 @@ function quietLogs(t: TestContext): string[] {
   return logged;
 }
 
-async function setup(t: TestContext, options: { holdMs?: number } = {}) {
+async function setup(t: TestContext, options: { holdMs?: number; introspectAudiences?: string[] } = {}) {
   const logged = quietLogs(t);
   const database = new FailingDatabase(new PGliteDatabase());
   await migrate(database);
@@ -74,6 +75,7 @@ async function setup(t: TestContext, options: { holdMs?: number } = {}) {
     sessionReadApi: { url: "http://history.internal", publicUrl: HISTORY_PUBLIC, secret: "session-read-secret-".repeat(2) },
     introspectSecret: INTROSPECT_SECRET,
     ...(options.holdMs !== undefined ? { introspectOutageHoldMs: options.holdMs } : {}),
+    ...(options.introspectAudiences ? { introspectAudiences: options.introspectAudiences } : {}),
     bootstrapToken: BOOTSTRAP,
     encryptionKeyring: { active: { id: "test-key", key: Buffer.alloc(32, 7) } },
     internalServiceToken: INTERNAL,
@@ -193,6 +195,22 @@ test("hold on: an outage answers the last active verdict, marked held with a cla
   assert.equal(recovered.body.active, true);
   assert.equal("held" in recovered.body, false);
   assert.equal(recovered.body.exp, fresh.body.exp);
+});
+
+test("hold on: a general audience does not require a History-origin lookup during an outage", async (t) => {
+  const env = await setup(t, { holdMs: 60_000, introspectAudiences: [GENERAL_AUDIENCE] });
+  const token = await env.login();
+  const fresh = await env.introspect({ token, aud: GENERAL_AUDIENCE });
+  assert.equal(fresh.status, 200);
+  assert.equal(fresh.body.active, true);
+  assert.equal(fresh.body.aud, GENERAL_AUDIENCE);
+
+  env.database.outage = true;
+  const held = await env.introspect({ token, aud: GENERAL_AUDIENCE });
+  assert.equal(held.status, 200);
+  assert.equal(held.body.active, true);
+  assert.equal(held.body.held, true);
+  assert.equal(held.body.aud, GENERAL_AUDIENCE);
 });
 
 test("hold on: only verified tokens are held; request checks still run; machine claims never held", async (t) => {

@@ -425,11 +425,14 @@ export async function introspect(
     aud = expectedHistoryOrigin !== null && requestedHistoryOrigin === expectedHistoryOrigin
       ? historyAudience
       : undefined;
-  } else if (aud !== undefined && requestedHistoryOrigin !== null) {
+  } else if (!held && aud !== undefined && requestedHistoryOrigin !== null) {
     // Legacy configs may still name a customer History origin in the old
     // general list. The unique origin index makes this lookup unambiguous;
     // refuse the general-list match for every workspace, including tenants
     // other than the owner, until the operator moves it to the dedicated list.
+    // A held verdict is served only while the database is unavailable. Boot
+    // config already removes overlaps with the dedicated History list, so do
+    // not turn a configured general audience into a second outage-time query.
     if (await store.workspaceIdForRelayhistoryOrigin(requestedHistoryOrigin) !== null) aud = undefined;
   }
   if (!aud) return { active: false, reason: "audience" };
