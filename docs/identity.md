@@ -1273,7 +1273,7 @@ Unset, nothing changes.
 
 On a gate-only install, every agent launch through the MCP launch tool
 (`spawn_relay_agent`) also gets a one-time launch credential, which the
-launched agent presents to relaygate's `POST /v1/agent/register`:
+launched agent presents to relaygate's `POST /v1/register`:
 
 - An opaque `sh_lt_` token, valid for 10 minutes and redeemable once, bound to
   the launch's workspace, organization, target node name, agent name and

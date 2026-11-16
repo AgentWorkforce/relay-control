@@ -11,7 +11,7 @@ import type { Database } from "../database.js";
  * Every agent launch journaled in relay_spawns gets one opaque `sh_lt_`
  * credential, bound to its workspace, organization, target node name, agent
  * name and launching user, valid for RELAY_LAUNCH_CREDENTIAL_TTL_MS. The
- * launched agent presents it to relaygate's POST /v1/agent/register;
+ * launched agent presents it to relaygate's POST /v1/register;
  * relaygate introspects it at POST /internal/v1/auth/introspect, which answers
  * principal_type `relay_launch` and burns it on the first active answer
  * (peek for the checks, then the atomic redeem).
