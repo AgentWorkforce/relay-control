@@ -530,3 +530,61 @@ test("discovery-away fencing: a complete listing without an enabled environment 
   assert.equal(after.enabled, false);
   assert.deepEqual(creates, [ENV_B]);
 });
+
+test("launch create: an unknown create outcome stays creating; a same-id retry never creates again; recover needs a positive marker", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, ownerId, organizationId } = env;
+  assert.equal((await connect(env)).status, 200);
+  const runtime = env.replicas.deps.replicas as unknown as Record<string, unknown>;
+  const replicaId = randomUUID();
+  const chatId = randomUUID();
+  const creates: string[] = [];
+  const history: Array<{ type: string; payload: Record<string, unknown> }> = [];
+  let found = false;
+  runtime.create = async (_key: string, input: { message: string }) => {
+    creates.push(input.message);
+    throw new ReplicasRuntimeError("unknown", "replicas_http_503", 503);
+  };
+  runtime.get = async (_key: string, id: string) => {
+    if (!found) throw new ReplicasRuntimeError("rejected", "replicas_http_404", 404);
+    return { replica: { id, name: "worker", status: "active", chats: [{ id: chatId, provider: "claude" }] } };
+  };
+  runtime.history = async () => ({ events: history });
+  runtime.wake = async () => null;
+  runtime.exec = async () => ({ exit_code: 0, timed_out: false, output: "ready\n" });
+
+  // The provider answers 503: the row stays creating without a replica id.
+  const body = { client_request_id: "launch-1", environment_id: ENV_A, name: "worker", task: "Fix the flaky test" };
+  const spawned = await api(`/api/v1/workspaces/${workspaceId}/replicas/spawns`, { method: "POST", token: ownerToken, body });
+  assert.ok(spawned.status < 300, spawned.text);
+  const spawnId = spawned.body.spawn_id as string;
+  let row = await spawnRow(env, spawnId);
+  assert.equal(row.state, "creating");
+  assert.equal(row.replica_id, null);
+  assert.equal(creates.length, 1);
+  assert.equal(spawned.body.outcome_unknown, true);
+
+  // A retry under the same request id returns the same launch and never POSTs again.
+  const retried = await api(`/api/v1/workspaces/${workspaceId}/replicas/spawns`, { method: "POST", token: ownerToken, body });
+  assert.equal(retried.body.spawn_id, spawnId, retried.text);
+  assert.equal(creates.length, 1);
+  assert.equal((await spawnRow(env, spawnId)).state, "creating");
+
+  // Recover with a 404 from get throws and leaves the row creating.
+  const actor = { userId: ownerId, workspaceId, organizationId };
+  await assert.rejects(recoverReplica(env.replicas.deps, actor, spawnId, replicaId));
+  row = await spawnRow(env, spawnId);
+  assert.equal(row.state, "creating");
+  assert.equal(row.replica_id, null);
+
+  // The replica turns up with the launch marker in its original chat: recover advances the row.
+  found = true;
+  history.push({ type: "claude-user", payload: { message: { content: creates[0] } } });
+  const recovered = await recoverReplica(env.replicas.deps, actor, spawnId, replicaId);
+  assert.equal(recovered.spawn_id, spawnId);
+  row = await spawnRow(env, spawnId);
+  assert.notEqual(row.state, "creating");
+  assert.equal(row.replica_id, replicaId);
+  assert.equal(row.chat_id, chatId);
+  assert.equal(creates.length, 1);
+});
