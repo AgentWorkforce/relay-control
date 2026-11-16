@@ -764,7 +764,8 @@ API on PGlite at `http://127.0.0.1:8787` with fixed development secrets.
   History origin before they are returned or used.
 - Token introspection requires its own secret, compared in constant time;
   only `sh_at_` access tokens are looked up, and the token, its hash, the
-  secret and the request body are never logged.
+  secret and the request body are never logged. An imported workspace-specific
+  History origin is accepted only for a token bound to that workspace.
 - Browser access/refresh tokens are never returned in HTML or JSON; only the
   opaque access credential is carried in a Secure HttpOnly same-origin cookie.
 

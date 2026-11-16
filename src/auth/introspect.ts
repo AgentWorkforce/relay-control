@@ -395,7 +395,8 @@ export async function introspect(
   const requested = normalizedOrigin(request.aud);
   const aud = requested === null
     ? undefined
-    : (config.introspectAudiences ?? [config.relayhistoryPublicUrl])
+    : [...(config.introspectAudiences ?? [config.relayhistoryPublicUrl]), session.relayhistoryOrigin]
+      .filter((candidate): candidate is string => candidate !== null)
       .find((configured) => normalizedOrigin(configured) === requested);
   if (!aud) return { active: false, reason: "audience" };
   if (request.workspace !== undefined && session.workspaceId !== request.workspace) {
