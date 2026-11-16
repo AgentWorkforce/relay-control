@@ -25,6 +25,7 @@ import {
   disableEnvironmentMcp,
   enableEnvironmentMcp,
   listEnvironmentPolicies,
+  setEnvironmentPrincipal,
   syncEnvironments,
   updateEnvironmentPolicy,
 } from "./environments.js";
@@ -140,6 +141,7 @@ export function createReplicasHandler(input: {
       || (sync && method === "POST")
       || (!sync && environment && method === "PUT")
       || (rest === "/environment-mcp" && (method === "POST" || method === "DELETE"))
+      || (rest === "/environment-principal" && method === "PUT")
       || (rest === "/spawns" && method === "POST")
       || (spawn && (method === "GET" || method === "DELETE"));
     if (!known) throw new ReplicasError("Not found", 404);
@@ -149,6 +151,7 @@ export function createReplicasHandler(input: {
     if (rest === "/environments") return { status: 200, body: await listEnvironments(deps, actor) };
     if (rest === "/environment-policies") return { status: 200, body: await listEnvironmentPolicies(deps, actor) };
     if (sync) return { status: 200, body: await syncEnvironments(deps, actor) };
+    if (rest === "/environment-principal") return { status: 200, body: await setEnvironmentPrincipal(deps, actor, await readJson(request)) };
     if (environment) return { status: 200, body: await updateEnvironmentPolicy(deps, actor, decode(environment[1]!), await readJson(request)) };
     if (rest === "/environment-mcp") {
       const body = await readJson(request);

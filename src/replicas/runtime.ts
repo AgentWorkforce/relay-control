@@ -37,6 +37,10 @@ const environmentMcpInput=z.object({name:z.literal("agent-relay-replica"),transp
     auth:z.object({type:z.literal("workspace_identity"),audience:z.string().url()}).strict()}).strict()}).strict()
   .refine(value=>value.config.url===value.config.auth.audience);
 export type EnvironmentMcpInput=z.infer<typeof environmentMcpInput>;
+// List environment MCPs answers {environment_mcps}; create answers {environment_mcp}.
+const environmentMcp=z.object({id:identifier,organization_id:z.string().optional(),environment_id:z.string().optional(),
+  name:z.string().max(4096),transport:z.string().max(64),config:z.unknown()}).passthrough();
+export type EnvironmentMcp=z.infer<typeof environmentMcp>;
 export type Replica=z.infer<typeof replica>;
 export type ReplicaHistoryPage=z.infer<typeof historyPage>;
 export type ReplicasCreateInput=z.infer<typeof createInput>;
@@ -108,26 +112,35 @@ export function createReplicasRuntime(options:{fetchImpl?:typeof fetch;timeoutMs
     /**
      * Every environment, following `total_pages` when the provider pages the
      * list (an unpaged answer is one page). Bounded to ENVIRONMENT_PAGES.
+     * scope=all: the provider's default scope (org) omits personal
+     * environments, such as a mothership's.
      */
     allEnvironments:async(key:string)=>{
-      const first=await call(key,"/environments?page=1&limit=100",environmentPageOf(1));
+      const first=await call(key,"/environments?scope=all&page=1&limit=100",environmentPageOf(1));
       const all=[...first.environments];
       const pages=Math.min(first.total_pages??1,ENVIRONMENT_PAGES);
       for(let page=2;page<=pages;page++) {
-        const next=await call(key,`/environments?page=${page}&limit=100`,environmentPageOf(page));
+        const next=await call(key,`/environments?scope=all&page=${page}&limit=100`,environmentPageOf(page));
         all.push(...next.environments);
       }
       const seen=new Set<string>();
       return {environments:all.filter(env=>!seen.has(env.id.toLowerCase())&&seen.add(env.id.toLowerCase())),
         complete:(first.total_pages??1)<=ENVIRONMENT_PAGES};
     },
-    /** Adds an MCP entry to an environment's configuration. Not idempotent provider-side. */
+    /** The MCP entries in an environment's configuration. */
+    listEnvironmentMcps:async(key:string,environmentId:string)=>{
+      input(uuid,environmentId);
+      return (await call(key,`/environments/${environmentId}/mcps`,z.object({environment_mcps:z.array(environmentMcp).max(1000)}))).environment_mcps;
+    },
+    /**
+     * Adds an MCP entry to an environment's configuration. Not idempotent
+     * provider-side: callers read the entries back to confirm the result.
+     */
     registerEnvironmentMcp:async(key:string,environmentId:string,value:EnvironmentMcpInput)=>{
       input(uuid,environmentId);
       const entry=await call(key,`/environments/${environmentId}/mcps`,
-        z.object({id:identifier.optional(),mcp:z.object({id:identifier}).passthrough().optional()}).passthrough()
-          .refine(body=>Boolean(body.id??body.mcp?.id)),input(environmentMcpInput,value));
-      return {id:(entry.mcp?.id??entry.id)!};
+        z.object({environment_mcp:z.object({id:identifier}).passthrough()}).passthrough(),input(environmentMcpInput,value));
+      return {id:entry.environment_mcp.id};
     },
     removeEnvironmentMcp:async(key:string,environmentId:string,mcpId:string)=>{
       input(uuid,environmentId);input(z.string().regex(/^[A-Za-z0-9_.:-]{1,256}$/),mcpId);

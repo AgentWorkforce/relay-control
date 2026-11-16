@@ -86,7 +86,7 @@ test("response identity and pagination must match the requested object/page",asy
   await assert.rejects(()=>page.list(KEY,2),failure("replicas_invalid_response","rejected",200));
 });
 
-test("allEnvironments requests every page at limit 100, caps each page and checks the echoed page",async()=>{
+test("allEnvironments requests every page (scope=all) at limit 100, caps each page and checks the echoed page",async()=>{
   const ids=Array.from({length:230},(_,i)=>`${i.toString(16).padStart(8,"0")}-0000-4000-8000-000000000000`);
   const paths:string[]=[];
   const provider=(overrides:{pageSize?:number;echo?:(page:number)=>number}={})=>createReplicasRuntime({fetchImpl:async(url)=>{
@@ -98,9 +98,31 @@ test("allEnvironments requests every page at limit 100, caps each page and check
   }});
   const listed=await provider().allEnvironments(KEY);
   assert.equal(listed.environments.length,230);assert.equal(listed.complete,true);
-  assert.deepEqual(paths,["/v1/environments?page=1&limit=100","/v1/environments?page=2&limit=100","/v1/environments?page=3&limit=100"]);
+  assert.deepEqual(paths,["/v1/environments?scope=all&page=1&limit=100","/v1/environments?scope=all&page=2&limit=100",
+    "/v1/environments?scope=all&page=3&limit=100"]);
   await assert.rejects(()=>provider({pageSize:101}).allEnvironments(KEY),failure("replicas_invalid_response","rejected",200));
   await assert.rejects(()=>provider({echo:page=>page===2?1:page}).allEnvironments(KEY),failure("replicas_invalid_response","rejected",200));
+});
+
+test("environment MCP entries: list, create (environment_mcp reply) and remove use the provider entry contract",async()=>{
+  const calls:Array<{method:string;path:string;body:unknown}>=[];
+  const config={url:"https://control.example/api/v1/replicas/mcp",headers:{},auth:{type:"workspace_identity" as const,audience:"https://control.example/api/v1/replicas/mcp"}};
+  const entry={id:"mcp_1",organization_id:"org_1",environment_id:ENV,name:"agent-relay-replica",transport:"http",config};
+  const replies:unknown[]=[{environment_mcps:[entry]},{environment_mcp:entry},{success:true},{id:"mcp_2"}];
+  const runtime=createReplicasRuntime({fetchImpl:async(url,init)=>{
+    const target=new URL(String(url));calls.push({method:init!.method!,path:target.pathname+target.search,body:init!.body?JSON.parse(String(init!.body)):null});
+    return Response.json(replies.shift());
+  }});
+  assert.deepEqual(await runtime.listEnvironmentMcps(KEY,ENV),[entry]);
+  assert.deepEqual(await runtime.registerEnvironmentMcp(KEY,ENV,{name:"agent-relay-replica",transport:"http",config}),{id:"mcp_1"});
+  await runtime.removeEnvironmentMcp(KEY,ENV,"mcp_1");
+  // The create reply must be the environment_mcp object; any other acknowledgement leaves the write unknown.
+  await assert.rejects(()=>runtime.registerEnvironmentMcp(KEY,ENV,{name:"agent-relay-replica",transport:"http",config}),
+    (error:unknown)=>error instanceof ReplicasRuntimeError&&error.outcome==="unknown");
+  assert.deepEqual(calls.map(c=>[c.method,c.path]),[["GET",`/v1/environments/${ENV}/mcps`],["POST",`/v1/environments/${ENV}/mcps`],
+    ["DELETE",`/v1/environments/${ENV}/mcps/mcp_1`],["POST",`/v1/environments/${ENV}/mcps`]]);
+  assert.deepEqual(calls[1]!.body,{name:"agent-relay-replica",transport:"http",config});
+  await assert.rejects(()=>runtime.listEnvironmentMcps(KEY,"not-a-uuid"));
 });
 
 test("decoded bodies are bounded, including after successful write headers",async()=>{

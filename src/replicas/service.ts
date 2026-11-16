@@ -66,6 +66,10 @@ export type SpawnInput = {
   origin?: "existing" | "environment_identity";
   cleanup_complete?: boolean;
   relay_mcp_version?: number;
+  /** Environment-identity bindings: how the binding was admitted (a mapped creator or the workspace principal). */
+  acts_as?: "creator" | "principal";
+  /** Environment-identity bindings: the token's creator_id at enrolment (null when the token had none). */
+  creator_id?: string | null;
 };
 export type SpawnRow = {
   id: string;

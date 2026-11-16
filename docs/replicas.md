@@ -143,14 +143,22 @@ Each call is admitted in this order:
    `WWW-Authenticate`: the outage is not the token's fault.
 2. A released replica (tombstone) is refused with 403 `replica_released`.
 3. The token's environment must be enabled in exactly one Control workspace
-   whose Replicas connection belongs to the token's organization. Otherwise 403
-   `replica_environment_not_enabled`.
-4. The token's creator must be mapped to a Control person who is still a
-   current member of the organization. A token without a creator is refused.
-   Otherwise 403 `replica_creator_not_allowed`. Mapping and membership are
-   re-read on every call, so removing a member stops their replicas at once.
-   An unmapped creator of an enabled environment is recorded as a pending
-   creator (see below) so an admin can map it.
+   whose Replicas connection belongs to the token's organization, and that
+   provider organization must not be connected in any other Control
+   workspace. Otherwise 403 `replica_environment_not_enabled`.
+4. The replica acts as one Control person, who must still be a current member
+   of the organization:
+   - a creator mapped for the environment acts as the mapped person; a
+     mapping to a former member is refused, never moved to the principal;
+   - otherwise (no creator, or an unmapped one) it acts as the workspace's
+     VM principal, an explicit member chosen by an admin. Control never
+     derives it from an email or the workspace owner;
+   - with no principal set, the call is refused.
+
+   Refusals answer 403 `replica_creator_not_allowed`. Mapping, principal and
+   membership are re-read on every call, so removing a member stops their
+   replicas at once. An unmapped creator of an enabled environment is
+   recorded as a pending creator (see below) so an admin can map it.
 5. The first admitted call enrols the replica: one `replica_spawns` row with
    source `environment_identity`, `replica_id` = the Replicas workspace id and
    a Relay identity named `replicas-<16 hex>`. Later calls reuse it. A replica
@@ -168,7 +176,7 @@ Audit actions: `replicas.identity.enrolled` and `replicas.identity.refused`
 names a Control workspace, so tokens of an unknown organization or
 environment cannot fill the audit log), `replicas.identity.revived`,
 `replicas.environment.enabled`, `replicas.environment.disabled`,
-`replicas.environment.creators_updated`,
+`replicas.environment.creators_updated`, `replicas.environment.principal_updated`,
 `replicas.environment.mcp_registered`, `replicas.environment.mcp_removed`,
 `replicas.environment.all_enabled` and `replicas.environment.all_disabled`.
 
@@ -183,19 +191,45 @@ nothing.
 | --- | --- |
 | `GET /api/v1/workspaces/{ws}/replicas/environment-policies` | Policies: enabled, registration status, creator mapping with masked email hints, pending creators, binding counts |
 | `PUT /api/v1/workspaces/{ws}/replicas/environments/{id}` | `{enabled?, creators?: [{creatorId, userId}]}`; creators replace the list and must be current members |
-| `POST /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}` or `{all: true}`: enable and register the entry |
+| `PUT /api/v1/workspaces/{ws}/replicas/environment-principal` | `{userId: <member id> \| null}`: set or clear the VM principal; answers the policy view |
+| `POST /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}` or `{all: true}`, optionally with `principalUserId`: set the principal, then enable and register the entry |
 | `DELETE /api/v1/workspaces/{ws}/replicas/environment-mcp` | Same body: disable, then remove the entry |
 | `POST /api/v1/workspaces/{ws}/replicas/environments/sync` | Rediscover; with `all` set, newly found environments are enabled and registered |
 
 `GET .../environments` stays the live list of environments the key can use
-(`{environments: [{id, name}]}`). `{all: true}` covers environments discovered
-later only on the next sync (`POST .../environments/sync`); nothing runs
-automatically.
+(`{environments: [{id, name}]}`). Discovery lists every environment of the
+organization (`scope=all`), not only the key holder's. Only selected
+environments are enabled by default; `{all: true}` is an explicit opt-in and
+covers environments discovered later only on the next sync (`POST
+.../environments/sync`); nothing runs automatically.
+
+The dashboard's Settings → Connections → Replicas one-click setup and the CLI
+use the same routes with the person's own credential (a cookie session or a
+`cli:auth` bearer token): connect, then `POST .../environment-mcp` with the
+selected environments and `principalUserId`. From then on every replica of
+those environments is admitted, including ones started without a creator.
+
+The policy view also returns `principal` (`{userId, member}` or `null`;
+`member: false` means the principal left the organization and admits nobody)
+and `organizationShared`: true when the same Replicas organization is
+connected in another Control workspace. A shared organization admits no
+token, and enabling refuses: `PUT .../environments/{id}` with `enabled: true`
+answers 409 "This Replicas organization is connected in another workspace."
+and `POST .../environment-mcp` reports `organization_shared`.
+
+Changing or clearing the principal releases every live binding that acts as
+the principal (no tombstone): those replicas enrol again under the new
+principal on their next call, or are refused when it was cleared. Mapping a
+creator releases that creator's bindings that act as the principal or as a
+different person, so they enrol again as the mapped member. Removing a
+mapping releases nothing: a binding keeps acting for its person and its calls
+are refused unless the rules above still select that person.
 
 Each policy lists `pendingCreators`: `[{creatorId, emailHint, lastSeenAt,
-count}]`, newest first, the creators whose calls were refused because they
-are not mapped (the 50 most recent per environment; a token without a creator
-is not recorded). Mapping a creator with `PUT` removes its pending entry.
+count}]`, newest first: creators seen without a mapping (admitted as the
+principal when one is set, refused otherwise). The 50 most recent are kept per
+environment; a token without a creator is not recorded. Mapping a creator with
+`PUT` removes its pending entry.
 
 All are owner/admin only. The registered entry is:
 
@@ -207,14 +241,20 @@ All are owner/admin only. The registered entry is:
 
 Registration and removal report a status per environment (`registered`,
 `registration_failed`, `registration_unconfirmed`, `enabled_elsewhere`,
-`disabled`, `removal_failed`); failures are `retryable`.
-`registration_failed` means the provider rejected the entry (HTTP 400, 401,
-402, 403, 404, 422 or 429). `registration_unconfirmed` means the outcome is
-unknown (timeout, provider 5xx, unreadable response, or the result could not
-be stored): the provider may already hold an agent-relay-replica entry for
-that environment; check the environment's MCP entries in Replicas before
-retrying. An environment can be enabled in only one Control workspace; a
-concurrent enable elsewhere reports `enabled_elsewhere`.
+`organization_shared`, `disabled`, `removal_failed`) with `retryable` on
+failures. Registration first reads the environment's MCP entries: a single
+matching `agent-relay-replica` entry is reused; two or more entries with that
+name, or one with another transport or config, are never overwritten and
+report `registration_failed` with `retryable: false`. Otherwise the entry is
+created and read back. `registration_failed` with `retryable: true` means the
+entries could not be read or the provider rejected the create (HTTP 400, 401,
+402, 403, 404, 422 or 429). `registration_unconfirmed` (retryable) means the
+create was sent but the entry could not be confirmed by reading it back
+(timeout, provider 5xx, unreadable response, or the result could not be
+stored); a retry reads the entries again and reuses one that landed. A 409 on
+create is resolved by the read-back. An environment can be enabled in only
+one Control workspace; a concurrent enable elsewhere reports
+`enabled_elsewhere`.
 
 Disabling an environment (`PUT` with `enabled: false`, `DELETE
 environment-mcp`, or disconnect) commits the disable first, then removes the
@@ -228,8 +268,8 @@ writes a tombstone, so its tokens keep being refused. An owner or admin
 revives it with `recover_replica_spawn` and `revive: true`, which deletes the
 tombstone; the next call enrols again. Disconnecting Replicas disables every
 policy and releases its bindings first, then removes the registered entries
-best effort. Policies, pending creators and tombstones are stored in migration
-0067; they are deleted with their workspace.
+best effort. Policies, pending creators, the principal and tombstones are
+stored in migration 0067; they are deleted with their workspace.
 
 ## Not yet covered
 

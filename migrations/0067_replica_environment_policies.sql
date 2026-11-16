@@ -28,7 +28,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS replica_environment_policies_enabled
   ON replica_environment_policies (issuer, provider_organization_id, environment_id) WHERE enabled;
 
 -- Which provider creator acts as which person. A creator without a row (or a
--- token without a creator) is refused.
+-- token without a creator) acts as the workspace principal when one is set
+-- (replica_environment_settings) and is refused otherwise.
 CREATE TABLE IF NOT EXISTS replica_environment_creators (
   policy_id uuid NOT NULL REFERENCES replica_environment_policies(id) ON DELETE CASCADE,
   creator_id text NOT NULL,
@@ -38,8 +39,9 @@ CREATE TABLE IF NOT EXISTS replica_environment_creators (
   PRIMARY KEY (policy_id, creator_id)
 );
 
--- Unmapped creators seen on an enabled policy, so an admin can learn which
--- creator_id to map. Bounded to the 50 most recent per policy; mapping a
+-- Unmapped creators seen on an enabled policy (admitted as the principal when
+-- one is set, refused otherwise), so an admin can learn which creator_id to
+-- map. Bounded to the 50 most recent per policy; mapping a
 -- creator deletes its row.
 CREATE TABLE IF NOT EXISTS replica_environment_creator_requests (
   policy_id uuid NOT NULL REFERENCES replica_environment_policies(id) ON DELETE CASCADE,
@@ -51,11 +53,15 @@ CREATE TABLE IF NOT EXISTS replica_environment_creator_requests (
   PRIMARY KEY (policy_id, creator_id)
 );
 
--- The workspace-level grant "every environment of the connected
--- organization, including ones discovered later".
+-- Workspace-level settings. all_environments is the grant "every
+-- environment of the connected organization, including ones discovered
+-- later". principal_user_id is the explicit principal that VMs without a
+-- mapped creator (including tokens without a creator) act for; unset = such
+-- VMs are refused. Never derived from an email or the workspace owner.
 CREATE TABLE IF NOT EXISTS replica_environment_settings (
   workspace_id uuid PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
   all_environments boolean NOT NULL DEFAULT false,
+  principal_user_id uuid NULL REFERENCES users(id) ON DELETE SET NULL,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
