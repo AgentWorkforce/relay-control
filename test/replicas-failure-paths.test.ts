@@ -23,6 +23,8 @@ const PROVIDER_ORG = "0a0a0a0a-0a0a-4a0a-8a0a-0a0a0a0a0a0a";
 const ENV_A = "1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a";
 const ENV_B = "2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b";
 const ENV_C = "3c3c3c3c-3c3c-4c3c-8c3c-3c3c3c3c3c3c";
+const OTHER_ORG = "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b";
+const ENV_OTHER = "4d4d4d4d-4d4d-4d4d-8d4d-4d4d4d4d4d4d";
 const SERVICE_TOKEN = "service-token-that-is-at-least-32-bytes";
 const keys = generateKeyPairSync("rsa", { modulusLength: 2048 });
 
@@ -147,8 +149,11 @@ async function start(t: TestContext, enabled = true, issuerFetch: typeof fetch =
   const replicas = createReplicasModule({
     replicas: { enabled }, config, database, relaycastFetch: messagingFetch, runtime: provider.runtime, identityFetch: issuerFetch,
   });
+  let providerOrganization = PROVIDER_ORG;
+  provider.runtime.identity = async () => ({ organization: { id: providerOrganization, name: "Org" } });
+  const setProviderOrganization = (id: string) => { providerOrganization = id; };
   const remoteAgentFetch = (async (input: string | URL | Request) => {
-    if (String(input).endsWith("/whoami")) return Response.json({ organization: { id: PROVIDER_ORG, name: "Org" } });
+    if (String(input).endsWith("/whoami")) return Response.json({ organization: { id: providerOrganization, name: "Org" } });
     throw new Error("Unexpected provider request");
   }) as typeof fetch;
   const server = createServer(createApp({ config, store, replicas, messagingFetch, remoteAgentFetch }));
@@ -157,7 +162,7 @@ async function start(t: TestContext, enabled = true, issuerFetch: typeof fetch =
     await close(server);
     await database.close();
   });
-  return { database, world, roster, provider, replicas, api, store, ...await seed(api) };
+  return { database, world, roster, provider, replicas, api, store, setProviderOrganization, ...await seed(api) };
 }
 
 async function seed(api: Api) {
@@ -1381,4 +1386,44 @@ test("the access latch is keyed to the stored key: a late answer about a replace
   const refused = await rpc(api, token(), "tools/list");
   assert.equal(refused.status, 403, refused.text);
   assert.equal(refused.body.error.message, "replica_environment_not_enabled");
+});
+
+test("a listing for a replaced connection is discarded: a disconnect and connect to another organization during discovery records and fences nothing", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, provider, ownerToken } = env;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  const runtime = env.replicas.deps.replicas;
+  const original = runtime.allEnvironments.bind(runtime);
+  let armed = false;
+  runtime.allEnvironments = async (key) => {
+    if (!armed) return original(key);
+    armed = false;
+    // The stale candidate: a complete listing of the old organization's environments.
+    const stale = { environments: [...provider.environments, { id: ENV_C, name: "gamma" }], complete: true };
+    const disconnected = await api(`/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`, { method: "DELETE", token: ownerToken });
+    assert.equal(disconnected.status, 200, disconnected.text);
+    provider.environments.splice(0, provider.environments.length, { id: ENV_OTHER, name: "other" });
+    env.setProviderOrganization(OTHER_ORG);
+    // The reconnect's own discovery runs under the new organization.
+    assert.equal((await connect(env)).status, 200);
+    return stale;
+  };
+  armed = true;
+  const result = await syncEnvironments(env.replicas.deps, serviceActor(env));
+  assert.equal(result.discovery.status, "failed");
+  assert.equal(result.discovery.environments.length, 0);
+  assert.equal(await count(env,
+    "SELECT 1 FROM replica_environment_policies WHERE workspace_id = $1 AND (provider_organization_id = $2 OR environment_id = $3)",
+    [workspaceId, OTHER_ORG, ENV_C]), 1, "nothing from the old listing is recorded under the new organization");
+  const row = async () => (await env.database.query<{ enabled: boolean; discovery_missing_since: Date | null }>(
+    "SELECT enabled, discovery_missing_since FROM replica_environment_policies WHERE workspace_id = $1 AND provider_organization_id = $2 AND environment_id = $3",
+    [workspaceId, OTHER_ORG, ENV_OTHER])).rows;
+  assert.equal((await row()).length, 1);
+  // Enabled by the reconnect's default, so a stale complete listing would have fenced it.
+  assert.equal((await row())[0]!.enabled, true);
+  assert.equal((await row())[0]!.discovery_missing_since, null);
+  const again = await syncEnvironments(env.replicas.deps, serviceActor(env));
+  assert.equal(again.discovery.status, "ok");
+  assert.equal((await row())[0]!.discovery_missing_since, null);
 });
