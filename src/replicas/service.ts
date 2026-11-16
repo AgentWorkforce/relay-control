@@ -85,6 +85,8 @@ export type SpawnInput = {
   acts_as?: "creator" | "principal";
   /** Environment-identity bindings: the token's creator_id at enrolment (null when the token had none). */
   creator_id?: string | null;
+  /** API launches and binds: set once by the first verified environment admission that reused the row (tenant pin). */
+  identity_admitted?: { issuer: string; organization_id: string; at: string };
 };
 export type SpawnRow = {
   id: string;
@@ -376,8 +378,9 @@ export async function spawnReplica(deps: ReplicasDeps, actor: ReplicasActor, raw
     );
     const existing = found.rows[0];
     if (existing) {
-      // Cleanup and release bookkeeping is not part of the caller's immutable launch options.
-      const { cleanup_complete: _cleanup, relay_mcp_version: _mcp, released: _released, ...original } = existing.input;
+      // Cleanup, release, revive and tenant-pin bookkeeping is not part of the caller's immutable launch options.
+      const { cleanup_complete: _cleanup, relay_mcp_version: _mcp, released: _released, revived_at: _revived,
+        identity_admitted: _admitted, ...original } = existing.input;
       const same = Object.keys(input).every((k) => original[k as keyof typeof original] === input[k as keyof typeof input])
         && Object.keys(original).length === Object.keys(input).length;
       if (!same) throw new ReplicasError("This request id already belongs to different launch options.", 409);
@@ -775,8 +778,10 @@ async function launchTombstoneKey(deps: ReplicasDeps, tx: SqlExecutor, row: Spaw
  * workspace once its tenant record is gone; then its hosted Relay participant rows and the
  * environment-identity spawn rows themselves are removed. Those rows are
  * Relay participants registered by a customer environment, not compute, so
- * the deletion retires them. Launch and bind rows (sources spawn/bind) are
- * left alone and still restrict the deletion. The tombstones outlive the
+ * the deletion retires them. A launch or bind row pinned by a verified
+ * environment admission (input.identity_admitted) is tombstoned the same way
+ * under its stamped issuer and organization. Launch and bind rows (sources
+ * spawn/bind) are left alone and still restrict the deletion. The tombstones outlive the
  * workspace (workspace_id becomes NULL) and keep refusing those provider
  * workspaces. The Relay side is not touched.
  */
@@ -784,9 +789,13 @@ export async function retireWorkspaceIdentitiesInTx(tx: SqlExecutor, workspaceId
   await tx.query(
     `INSERT INTO replica_identity_tombstones (issuer, provider_organization_id, provider_workspace_id, workspace_id, reason)
      SELECT DISTINCT ON (issuer, provider_organization_id, replica_id) issuer, provider_organization_id, replica_id, workspace_id, 'workspace_deleted'
-       FROM replica_spawns
-      WHERE workspace_id = $1 AND source = $2
-        AND issuer IS NOT NULL AND provider_organization_id IS NOT NULL AND replica_id IS NOT NULL
+       FROM (SELECT issuer, provider_organization_id, replica_id, workspace_id FROM replica_spawns
+              WHERE workspace_id = $1 AND source = $2
+             UNION
+             -- API launches and binds pinned by a verified environment admission.
+             SELECT input->'identity_admitted'->>'issuer', lower(input->'identity_admitted'->>'organization_id'), lower(replica_id), workspace_id
+               FROM replica_spawns WHERE workspace_id = $1 AND source <> $2 AND input->'identity_admitted' IS NOT NULL) owned
+      WHERE issuer IS NOT NULL AND provider_organization_id IS NOT NULL AND replica_id IS NOT NULL
      ON CONFLICT (issuer, provider_organization_id, provider_workspace_id)
        DO UPDATE SET workspace_id = EXCLUDED.workspace_id, reason = EXCLUDED.reason, released_at = now()`,
     [workspaceId, ENVIRONMENT_IDENTITY],

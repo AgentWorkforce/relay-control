@@ -149,9 +149,12 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
   // No reassignment across workspaces: the first workspace that enrolled this replica owns it
   // for good, whatever state its row is in (live, retired or gone).
   if (candidate) {
+    // An API launch or bind pinned by its first environment admission (identity_admitted) counts the same.
     const elsewhere = await tx.query(
       `SELECT 1 FROM replica_spawns
-        WHERE source = $1 AND issuer = $2 AND provider_organization_id = $3 AND lower(replica_id) = $4 AND workspace_id <> $5
+        WHERE lower(replica_id) = $4 AND workspace_id <> $5
+          AND ((source = $1 AND issuer = $2 AND lower(provider_organization_id) = $3)
+            OR (input->'identity_admitted'->>'issuer' = $2 AND lower(input->'identity_admitted'->>'organization_id') = $3))
         LIMIT 1`,
       [ENVIRONMENT_IDENTITY, claims.issuer, claims.organizationId, claims.workspaceId, candidate.workspace_id],
     );
@@ -212,6 +215,18 @@ async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admis
     const owner = await tx.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
       [admission.organizationId, row.user_id]);
     if (!owner.rows.length) throw new IdentityRefusal("replica_creator_not_allowed", 403, scopeOf(admission));
+    // The first verified admission pins the reused row to this tenant. Written under the admission
+    // lock (withReplicasLock), before the call is served, and only while unset: the first verified
+    // issuer and organization stay immutable, and release or revive never clear them.
+    if (!row.input.identity_admitted) {
+      const stamped = await tx.query<SpawnRow>(
+        `UPDATE replica_spawns SET input = input || jsonb_build_object('identity_admitted',
+           jsonb_build_object('issuer', $2::text, 'organization_id', $3::text, 'at', now()))
+          WHERE id = $1 AND input->>'identity_admitted' IS NULL RETURNING ${COLUMNS}`,
+        [row.id, claims.issuer, claims.organizationId],
+      );
+      return stamped.rows[0] ?? row;
+    }
     return row;
   }
   // Without an owned launch or bind, a creator mapping or the principal is required.

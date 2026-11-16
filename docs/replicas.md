@@ -149,7 +149,8 @@ Each call is admitted in this order:
    Any tombstone for the token's issuer, organization and replica counts,
    including one whose workspace was deleted.
    A replica enrolled in another Control workspace (an environment-identity
-   record in any state) is refused with 403 `replica_owned_elsewhere` once the
+   record in any state, or a launch or bind there that a verified call
+   reused) is refused with 403 `replica_owned_elsewhere` once the
    enabled candidate workspace is known (step 3), before its connection
    and creator checks.
 3. The token's provider organization must not be connected in more than one
@@ -412,12 +413,17 @@ from migration 0069 a tombstone outlives its workspace with no workspace
 attached, so those replicas stay refused, also when the organization is
 connected in another workspace. A tombstone that outlived its workspace stays
 in force: there is no in-product revive for it, matching the hosted
-edition's tenant pin. A workspace with launch or bind records still answers
-409 `in_use` until those replicas are released. A replica is never reassigned
+edition's tenant pin. A workspace with launch or bind records, released or
+not, still answers 409 `in_use`. A replica is never reassigned
 across workspaces: while any environment-identity record of it (in any state,
 for example retired by a disconnect) exists in another workspace, admission
 refuses it with 403 `replica_owned_elsewhere`; the workspace that enrolled it
-first admits it again once it is re-connected.
+first admits it again once it is re-connected. An API launch or bind that a
+verified environment-MCP call reuses is pinned to its workspace the same way:
+the first such call stamps the row with the token's issuer and organization
+(never changed afterwards, kept through release and revive), so it counts as
+that workspace's record for `replica_owned_elsewhere` and for the
+`workspace_deleted` tombstone.
 
 ### Revoked provider access
 

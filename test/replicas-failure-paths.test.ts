@@ -8,7 +8,7 @@ import { migrate } from "../src/migrations.js";
 import { createReplicasModule } from "../src/replicas/module.js";
 import { ReplicasRuntimeError, type ReplicasRuntime } from "../src/replicas/runtime.js";
 import { syncEnvironments } from "../src/replicas/environments.js";
-import { encrypt, releaseReplica, recoverReplica } from "../src/replicas/service.js";
+import { encrypt, releaseReplica, recoverReplica, retireWorkspaceIdentitiesInTx } from "../src/replicas/service.js";
 import { REPLICAS_SYNC_SERVICE, ReplicasSyncSweep } from "../src/replicas/sync-sweep.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { apiClient, BOOTSTRAP, close, listen, PGliteDatabase, type Api } from "./flows-helpers.js";
@@ -641,6 +641,18 @@ test("launch create: an unknown create outcome stays creating; a same-id retry n
   assert.equal(row.replica_id, replicaId);
   assert.equal(row.chat_id, chatId);
   assert.equal(creates.length, 1);
+
+  // Release and revive are bookkeeping, not launch options: the same request id still
+  // returns the original operation and never creates again.
+  await releaseReplica(env.replicas.deps, actor, spawnId);
+  const revived = await recoverReplica(env.replicas.deps, actor, spawnId, replicaId, { revive: true });
+  assert.equal((revived as { revived?: boolean }).revived, true);
+  assert.ok((await spawnRow(env, spawnId)).input.revived_at);
+  const repeated = await api(`/api/v1/workspaces/${workspaceId}/replicas/spawns`, { method: "POST", token: ownerToken, body });
+  assert.ok(repeated.status < 300, repeated.text);
+  assert.equal(repeated.body.spawn_id, spawnId);
+  assert.equal(creates.length, 1, "no second create");
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE client_request_id = 'launch-1'"), 1);
 });
 
 // The unique live-row indexes on replica_spawns are exact-case, so an older and a newer live row of the
@@ -780,6 +792,7 @@ test("workspace deletion tombstones a retired environment identity: the replica 
 
   const next = await secondWorkspace(env);
   assert.equal(await store.deleteWorkspace({ organizationId: env.organizationId, workspaceId, allowLast: true, actor: { kind: "bootstrap" } }), "deleted");
+  assert.equal(await count(env, "SELECT 1 FROM workspaces WHERE id = $1", [workspaceId]), 0, "workspace A is gone");
   assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE id = $1", [binding.id]), 0);
   assert.deepEqual(await tombstones(env), [{
     issuer: ISSUER, provider_organization_id: PROVIDER_ORG, provider_workspace_id: WORKSPACE_1, workspace_id: null, reason: "workspace_deleted",
@@ -823,4 +836,58 @@ test("a disconnected workspace keeps its replica: another workspace is refused r
   const admitted = await rpc(api, token(), "tools/list");
   assert.equal(admitted.status, 200, admitted.text);
   assert.equal((await liveBinding(env))?.user_id, env.ownerId);
+});
+
+test("an API bind reused by a verified environment call pins the replica to its workspace", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, ownerId, store } = env;
+  const connection = (id: string) => `/api/v1/workspaces/${id}/remote-agent-connections/replicas`;
+  assert.equal((await connect(env)).status, 200);
+  const bound = await launchRow(env, "bind", WORKSPACE_1.toUpperCase());
+
+  // The first verified call reuses the bind row and stamps it once; no environment identity is enrolled.
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const stamp = (await spawnRow(env, bound)).input.identity_admitted;
+  assert.equal(stamp?.issuer, ISSUER);
+  assert.equal(stamp?.organization_id, PROVIDER_ORG);
+  assert.ok(stamp?.at);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE source = 'environment_identity'"), 0);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  assert.deepEqual((await spawnRow(env, bound)).input.identity_admitted, stamp, "the first stamp is immutable");
+
+  // Disconnect A, then connect and enable B: the same replica is owned elsewhere.
+  assert.equal((await api(connection(workspaceId), { method: "DELETE", token: ownerToken })).status, 200);
+  assert.deepEqual(await tombstones(env), []);
+  const next = await secondWorkspace(env);
+  assert.equal((await connect(env, next.workspaceId, next.ownerToken)).status, 200);
+  await mapOwner(env, next.workspaceId, next.ownerToken);
+  const refused = await rpc(api, token(), "tools/list");
+  assert.equal(refused.status, 403, refused.text);
+  assert.equal(refused.body.error.message, "replica_owned_elsewhere");
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE workspace_id = $1", [next.workspaceId]), 0);
+
+  // A released bind keeps its stamp (cleanup complete; no connection left, so no release tombstone).
+  await releaseReplica(env.replicas.deps, { userId: ownerId, workspaceId, organizationId: env.organizationId }, bound);
+  const released = await spawnRow(env, bound);
+  assert.equal(released.state, "gone");
+  assert.equal(released.input.cleanup_complete, true);
+  assert.deepEqual(released.input.identity_admitted, stamp);
+  assert.equal((await rpc(api, token(), "tools/list")).body.error.message, "replica_owned_elsewhere");
+
+  // Launch and bind rows restrict workspace deletion, so A cannot be deleted while the row exists.
+  assert.equal(await store.deleteWorkspace({ organizationId: env.organizationId, workspaceId, allowLast: true, actor: { kind: "bootstrap" } }), "in_use");
+  assert.equal(await count(env, "SELECT 1 FROM workspaces WHERE id = $1", [workspaceId]), 1);
+  assert.equal((await rpc(api, token(), "tools/list")).body.error.message, "replica_owned_elsewhere");
+  // The deletion's tombstone step covers the stamped row (checked inside a rolled-back transaction).
+  const rollback = new Error("rollback");
+  let written: Awaited<ReturnType<typeof tombstones>> = [];
+  await assert.rejects(env.database.transaction(async (tx) => {
+    await retireWorkspaceIdentitiesInTx(tx, workspaceId);
+    written = (await tx.query<any>("SELECT issuer, provider_organization_id, provider_workspace_id, workspace_id, reason FROM replica_identity_tombstones")).rows;
+    throw rollback;
+  }), (error) => error === rollback);
+  assert.deepEqual(written, [{
+    issuer: ISSUER, provider_organization_id: PROVIDER_ORG, provider_workspace_id: WORKSPACE_1, workspace_id: workspaceId, reason: "workspace_deleted",
+  }]);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE id = $1", [bound]), 1, "launch and bind rows are never deleted there");
 });

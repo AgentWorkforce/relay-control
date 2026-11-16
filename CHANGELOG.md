@@ -29,7 +29,11 @@ assigned at release.
   older row no longer fences a newer live operation of the same replica, or
   one whose release was revived; workspace deletion tombstones retired
   environment identities too, and an identity enrolled in another workspace
-  is refused `replica_owned_elsewhere`.
+  is refused `replica_owned_elsewhere`; an API launch or bind reused by a
+  verified environment-MCP call is pinned to its workspace the same way (the
+  first call stamps its issuer and organization on the row), and a repeat
+  launch with the same request id after a release and revive, or after that
+  stamp, returns the original operation instead of a 409 or a new create.
 - Added: Replicas tombstone retention, periodic sync and setup errors.
   Releasing a per-launch replica (`release_replica`, `DELETE
   .../replicas/spawns/{id}`) now writes a tombstone in the revoke
