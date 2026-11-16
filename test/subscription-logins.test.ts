@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import { createAdminModule } from "../src/admin/routes.js";
+import { CODING_AGENT_PROVIDERS } from "../src/admin/coding-agents.js";
 import {
   CredentialBlobStore,
   GcsObjectBackend,
@@ -281,7 +282,10 @@ test("Codex device login: start, poll, store encrypted, sandbox access, no secre
   const openai = listed.body.providers.find((item: { id: string }) => item.id === "openai");
   assert.deepEqual(openai.authTypes, ["provider_oauth", "byo_api_key"]);
   const anthropic = listed.body.providers.find((item: { id: string }) => item.id === "anthropic");
-  assert.deepEqual(anthropic.authTypes, ["oauth_token", "provider_oauth", "byo_api_key"]);
+  assert.deepEqual(anthropic.authTypes, ["oauth_token", "byo_api_key"], "imports do not advertise a missing device route");
+  const anthropicCapabilities = CODING_AGENT_PROVIDERS.find((provider) => provider.id === "anthropic")!;
+  assert.equal(anthropicCapabilities.providerOauth, true, "operator imports may store Claude login files");
+  assert.equal(anthropicCapabilities.deviceLogin, false, "Claude has no interactive Control device flow");
   for (const response of [started, pending, connected, listed]) {
     assert(!response.text.includes("rt-openai-secret"), "no refresh token in any response");
   }

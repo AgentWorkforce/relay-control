@@ -32,7 +32,9 @@ export type CodingAgentProvider = {
   apiKeyEnv: string;
   /** Can hold a subscription login a sandbox CLI mounts ("Sandbox access"). */
   setupToken: boolean;
-  /** Can hold a hosted provider_oauth login file that a run's CLI mounts. */
+  /** Can store and mount an imported provider_oauth login file. */
+  providerOauth: boolean;
+  /** Can start an interactive provider device flow from the connect dialog. */
   deviceLogin: boolean;
   keyPlaceholder: string;
   docsUrl: string;
@@ -48,7 +50,8 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     harness: "claude",
     apiKeyEnv: "ANTHROPIC_API_KEY",
     setupToken: true,
-    deviceLogin: true,
+    providerOauth: true,
+    deviceLogin: false,
     keyPlaceholder: "sk-ant-api03-…",
     docsUrl: "https://console.anthropic.com/settings/keys",
   },
@@ -58,6 +61,7 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     harness: "codex",
     apiKeyEnv: "OPENAI_API_KEY",
     setupToken: false,
+    providerOauth: true,
     deviceLogin: true,
     keyPlaceholder: "sk-…",
     docsUrl: "https://platform.openai.com/api-keys",
@@ -68,6 +72,7 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     harness: "openrouter",
     apiKeyEnv: "OPENROUTER_API_KEY",
     setupToken: false,
+    providerOauth: false,
     deviceLogin: false,
     keyPlaceholder: "sk-or-v1-…",
     docsUrl: "https://openrouter.ai/settings/keys",
@@ -78,6 +83,7 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     harness: "grok",
     apiKeyEnv: "XAI_API_KEY",
     setupToken: false,
+    providerOauth: true,
     deviceLogin: true,
     keyPlaceholder: "xai-…",
     docsUrl: "https://console.x.ai",
@@ -88,6 +94,7 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     harness: "gemini",
     apiKeyEnv: "GEMINI_API_KEY",
     setupToken: false,
+    providerOauth: false,
     deviceLogin: false,
     keyPlaceholder: "AIza…",
     docsUrl: "https://aistudio.google.com/apikey",
