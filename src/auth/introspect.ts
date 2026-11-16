@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { ApiTokenStore } from "../admin/api-tokens.js";
 import type { SelfhostConfig } from "../config.js";
+import { canonicalRelayhistoryOrigin } from "../relayhistory-origin.js";
 import type { CapturePolicy } from "../capture-policy.js";
 import { hashSecret } from "../crypto.js";
 import { databaseErrorCause, isDatabaseUnavailable } from "../database.js";
@@ -258,9 +259,31 @@ function epochSeconds(value: Date): number {
  */
 export function acceptedAudiences(config: SelfhostConfig): string[] {
   if (!config.introspectSecret) return [];
-  return (config.introspectAudiences ?? [config.relayhistoryPublicUrl])
+  return [...new Set([
+    ...(config.introspectAudiences ?? []),
+    ...(config.relayhistoryAudiences ?? [config.relayhistoryPublicUrl]),
+  ])]
     .map(normalizedOrigin)
     .filter((origin): origin is string => origin !== null);
+}
+
+/** The configured audience value whose normalized origin matches `value`. */
+export function matchingIntrospectionAudience(config: SelfhostConfig, value: string): string | undefined {
+  const requested = normalizedOrigin(value);
+  if (requested === null) return undefined;
+  return [
+    ...(config.introspectAudiences ?? []),
+    ...(config.relayhistoryAudiences ?? [config.relayhistoryPublicUrl]),
+  ]
+    .find((configured) => normalizedOrigin(configured) === requested);
+}
+
+/** A dedicated History audience match, distinct from acquisition/Relayfile. */
+export function matchingRelayhistoryAudience(config: SelfhostConfig, value: string): string | undefined {
+  const requested = canonicalRelayhistoryOrigin(value);
+  if (requested === null) return undefined;
+  return (config.relayhistoryAudiences ?? [config.relayhistoryPublicUrl])
+    .find((configured) => canonicalRelayhistoryOrigin(configured) === requested);
 }
 
 /** relayfile-agent (principal `agent`) and acquisition-operator (`service`) tokens. */
@@ -392,12 +415,23 @@ export async function introspect(
   if (held ? session.expiresAt.getTime() <= Date.now() : session.expired) {
     return { active: false, reason: "expired" };
   }
-  const requested = normalizedOrigin(request.aud);
-  const aud = requested === null
-    ? undefined
-    : [...(config.introspectAudiences ?? [config.relayhistoryPublicUrl]), session.relayhistoryOrigin]
-      .filter((candidate): candidate is string => candidate !== null)
-      .find((configured) => normalizedOrigin(configured) === requested);
+  let aud = matchingIntrospectionAudience(config, request.aud);
+  const historyAudience = matchingRelayhistoryAudience(config, request.aud);
+  const requestedHistoryOrigin = canonicalRelayhistoryOrigin(request.aud);
+  const expectedHistoryOrigin = canonicalRelayhistoryOrigin(
+    session.relayhistoryOrigin ?? config.relayhistoryPublicUrl,
+  );
+  if (historyAudience !== undefined) {
+    aud = expectedHistoryOrigin !== null && requestedHistoryOrigin === expectedHistoryOrigin
+      ? historyAudience
+      : undefined;
+  } else if (aud !== undefined && requestedHistoryOrigin !== null) {
+    // Legacy configs may still name a customer History origin in the old
+    // general list. The unique origin index makes this lookup unambiguous;
+    // refuse the general-list match for every workspace, including tenants
+    // other than the owner, until the operator moves it to the dedicated list.
+    if (await store.workspaceIdForRelayhistoryOrigin(requestedHistoryOrigin) !== null) aud = undefined;
+  }
   if (!aud) return { active: false, reason: "audience" };
   if (request.workspace !== undefined && session.workspaceId !== request.workspace) {
     return { active: false, reason: "workspace" };
