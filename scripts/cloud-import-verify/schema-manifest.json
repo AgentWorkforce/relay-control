@@ -55,6 +55,7 @@
     {"name":"0049_relaycast_rekey_backups.sql","sha256":"095c945a62b7862225a7e91189a57b5e8386d25132336526897eef9d11f57787"},
     {"name":"0050_desktop_enrollment_keys.sql","sha256":"138cbaa6b5fadd89b9ca53708158803918b189ec655342aed28cdf87b857644f"},
     {"name":"0051_grok_bot_routines.sql","sha256":"8a5bf23e2b4c8910544b6fb967f531c9f23c1827570fc05265bbfa30caf64124"},
+    {"name":"0052_flows_workspace_deletions.sql","sha256":"cb884a64d443a8c1eef81173c6fdd301f2b8c762922c9debc3e939ea7683d21a"},
     {"name":"0053_cloud_relay_workspace_id.sql","sha256":"7b5c6906ea393469e6d3c72d68766b1c354acf6f00233915c02df119e3337bd7"},
     {"name":"0054_github_app_connections.sql","sha256":"331054089ad984f4ba6db1446c3d6d13e03c27aae963f56a6cc357f415c6e420"},
     {"name":"0055_anthropic_subscription_logins.sql","sha256":"202103b1e73519020fdab1ea71d220befb2b4c4a049443978a8d706b0603ffe2"},
@@ -523,6 +524,12 @@
     {"kind":"column","name":"public.flow_run_relayfile_credentials.token_hash","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"text"}},
     {"kind":"column","name":"public.flow_run_relayfile_credentials.token_prefix","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"text"}},
     {"kind":"column","name":"public.flow_run_relayfile_credentials.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
+    {"kind":"column","name":"public.flows_workspace_deletions.attempts","definition":{"collation":null,"default":"0","generated":"","identity":"","not_null":true,"position":5,"type":"integer"}},
+    {"kind":"column","name":"public.flows_workspace_deletions.last_error","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":6,"type":"text"}},
+    {"kind":"column","name":"public.flows_workspace_deletions.next_attempt_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":4,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.flows_workspace_deletions.organization_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
+    {"kind":"column","name":"public.flows_workspace_deletions.queued_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":3,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.flows_workspace_deletions.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
     {"kind":"column","name":"public.github_app_installations.installation_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"text"}},
     {"kind":"column","name":"public.github_app_installations.organization_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
     {"kind":"column","name":"public.grok_bot_routines.credentials_ciphertext","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"text"}},
@@ -1373,6 +1380,7 @@
     {"kind":"constraint","name":"public.flow_run_relayfile_credentials.flow_run_relayfile_credentials_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.flow_run_relayfile_credentials.flow_run_relayfile_credentials_token_hash_key","definition":{"deferrable":false,"deferred":false,"definition":"UNIQUE (token_hash)","no_inherit":true,"triggers":[],"type":"u","validated":true}},
     {"kind":"constraint","name":"public.flow_run_relayfile_credentials.flow_run_relayfile_credentials_workspace_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.flow_run_relayfile_credentials","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.flow_run_relayfile_credentials","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_cascade_del","table":"public.workspaces","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.workspaces","type":17}],"type":"f","validated":true}},
+    {"kind":"constraint","name":"public.flows_workspace_deletions.flows_workspace_deletions_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (workspace_id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.github_app_installations.github_app_installations_installation_id_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((installation_id ~ '^[1-9][0-9]{0,19}$'::text))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.github_app_installations.github_app_installations_installation_id_organization_id_key","definition":{"deferrable":false,"deferred":false,"definition":"UNIQUE (installation_id, organization_id)","no_inherit":true,"triggers":[],"type":"u","validated":true}},
     {"kind":"constraint","name":"public.github_app_installations.github_app_installations_organization_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.github_app_installations","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.github_app_installations","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_cascade_del","table":"public.organizations","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.organizations","type":17}],"type":"f","validated":true}},
@@ -1772,6 +1780,8 @@
     {"kind":"index","name":"public.flow_run_relayfile_credentials.flow_run_relayfile_credentials_pkey","definition":{"definition":"CREATE UNIQUE INDEX flow_run_relayfile_credentials_pkey ON public.flow_run_relayfile_credentials USING btree (id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.flow_run_relayfile_credentials.flow_run_relayfile_credentials_run_idx","definition":{"definition":"CREATE INDEX flow_run_relayfile_credentials_run_idx ON public.flow_run_relayfile_credentials USING btree (run_id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.flow_run_relayfile_credentials.flow_run_relayfile_credentials_token_hash_key","definition":{"definition":"CREATE UNIQUE INDEX flow_run_relayfile_credentials_token_hash_key ON public.flow_run_relayfile_credentials USING btree (token_hash)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":true,"valid":true}},
+    {"kind":"index","name":"public.flows_workspace_deletions.flows_workspace_deletions_due","definition":{"definition":"CREATE INDEX flows_workspace_deletions_due ON public.flows_workspace_deletions USING btree (next_attempt_at)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
+    {"kind":"index","name":"public.flows_workspace_deletions.flows_workspace_deletions_pkey","definition":{"definition":"CREATE UNIQUE INDEX flows_workspace_deletions_pkey ON public.flows_workspace_deletions USING btree (workspace_id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.github_app_installations.github_app_installations_installation_id_organization_id_key","definition":{"definition":"CREATE UNIQUE INDEX github_app_installations_installation_id_organization_id_key ON public.github_app_installations USING btree (installation_id, organization_id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.github_app_installations.github_app_installations_pkey","definition":{"definition":"CREATE UNIQUE INDEX github_app_installations_pkey ON public.github_app_installations USING btree (installation_id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.grok_bot_routines.grok_bot_routines_due","definition":{"definition":"CREATE INDEX grok_bot_routines_due ON public.grok_bot_routines USING btree (next_attempt_at)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
@@ -1966,6 +1976,7 @@
     {"kind":"table","name":"public.fleet_node_owners","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.flow_definitions","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.flow_run_relayfile_credentials","definition":{"force_row_security":false,"kind":"r","row_security":false}},
+    {"kind":"table","name":"public.flows_workspace_deletions","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.github_app_installations","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.grok_bot_routines","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.hosted_relay_participants","definition":{"force_row_security":false,"kind":"r","row_security":false}},
@@ -2035,5 +2046,5 @@
   "optional":{
 
   },
-  "sha256":"c010e217f0e042e9370c93279b994b0f2f323d989973d912e0522ef9b0ea9eac"
+  "sha256":"439102f5d2c7b2de08ff6fb2c933eccad252aa5ec4fc500c96623e19f0356748"
 }
