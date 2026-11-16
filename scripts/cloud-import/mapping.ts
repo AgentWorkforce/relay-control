@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-15.3";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.4";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -222,6 +222,24 @@ export const SOURCE_TABLES = [
 ] as const;
 export type ImportTable = (typeof SOURCE_TABLES)[number];
 
+/**
+ * Tables whose rows a re-run deletes when they were imported by an earlier
+ * run (its ledger) but are no longer imported now: removed in Cloud, or now
+ * skipped. Users, organizations and workspaces are never deleted (their
+ * cascades are too wide); their disappearance is reported instead. GitHub
+ * installation claims are kept on purpose (#146).
+ */
+export const RECONCILED_TABLES: readonly ImportTable[] = [
+  "organization_memberships",
+  "organization_invitations",
+  "person_identities",
+  "hosted_relay_participants",
+  "desktop_relay_identities",
+  "fleet_node_owners",
+  "coding_agent_credentials",
+  "github_app_connections",
+];
+
 /** Organisation-scoped tables are imported in one target transaction per org. */
 export const ORG_TABLES: readonly ImportTable[] = SOURCE_TABLES.filter((t) => t !== "users");
 
@@ -269,9 +287,14 @@ SELECT p.id, p.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
          WHEN iu.id IS NULL THEN 'user_not_imported'
+         -- A removed or suspended member keeps no agent token in Control.
+         WHEN NOT EXISTS (
+           SELECT 1 FROM imported_members im WHERE im.organization_id = w.organization_id AND im.user_id = iu.id
+         ) THEN 'not_a_member'
          WHEN p.relay_workspace_id IS DISTINCT FROM w.relay_workspace_id THEN 'stale_relay_workspace'
          WHEN row_number() OVER (
-           PARTITION BY p.workspace_id, iu.id ORDER BY p.updated_at DESC, p.id
+           PARTITION BY p.workspace_id, iu.id
+           ORDER BY (p.relay_workspace_id IS DISTINCT FROM w.relay_workspace_id), p.updated_at DESC, p.id
          ) > 1 THEN 'duplicate_after_merge'
        END AS skip_reason
   FROM public.workspace_person_identities p
@@ -287,6 +310,9 @@ SELECT h.id, h.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
          WHEN iu.id IS NULL THEN 'user_not_imported'
+         WHEN NOT EXISTS (
+           SELECT 1 FROM imported_members im WHERE im.organization_id = w.organization_id AND im.user_id = iu.id
+         ) THEN 'not_a_member'
          WHEN h.relay_workspace_id IS DISTINCT FROM w.relay_workspace_id THEN 'stale_relay_workspace'
          WHEN row_number() OVER (
            PARTITION BY h.workspace_id, iu.id, h.agent_name ORDER BY h.created_at DESC, h.id
@@ -318,6 +344,9 @@ SELECT d.id, d.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
            SELECT 1 FROM imported_members im WHERE im.organization_id = w.organization_id AND im.user_id = iu.id
          ) THEN 'not_a_member'
          WHEN d.relay_workspace_id IS DISTINCT FROM w.relay_workspace_id THEN 'stale_relay_workspace'
+         -- #152 review: Postgres text cannot hold NUL; refuse any control
+         -- character instead of carrying it into a key Desktop must match.
+         WHEN d.source_id ~ '[[:cntrl:]]' THEN 'source_id_control_character'
          WHEN row_number() OVER (
            PARTITION BY d.workspace_id, iu.id,
              CASE WHEN d.source_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN lower(d.source_id) ELSE d.source_id END,

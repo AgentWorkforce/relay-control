@@ -36,6 +36,7 @@ import { readSessionRequest, readRefreshRequest, requestReadSession, SessionRead
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, introspect, INTROSPECT_PATH } from "./auth/introspect.js";
 import { IntrospectionHold } from "./auth/introspection-hold.js";
+import { controlSessionToken, SESSION_COOKIE } from "./auth/session-cookie.js";
 import { handleAcquisitionRoutes } from "./acquisition/routes.js";
 import { createDesktopFeedHandler, type DesktopFeedLimits } from "./desktop-feed/routes.js";
 import { AwsKmsDesktopFeedSigner, FileDesktopFeedSigner, MemoryDesktopFeedSigner, type DesktopFeedSigner } from "./desktop-feed/signer.js";
@@ -163,7 +164,6 @@ const ACCESS_TOKEN_PREFIX = "sh_at_";
 const NATIVE_UPLOAD_SESSION_MAX_MS = 15 * 60_000;
 /** Not a credential: the native ingest edge never reads it and refuses every refresh with 401. */
 const NATIVE_UPLOAD_NO_REFRESH = "native_ingest_no_refresh";
-const SESSION_COOKIE = "agent_relay_session";
 const DEVICE_COOKIE = "agent_relay_device";
 
 class HttpError extends Error {
@@ -550,10 +550,8 @@ export function createApp(input: {
     }),
     resolveSession:async request=>{
       if(request.headers.has("authorization")) return null;
-      const raw=(request.headers.get("cookie")??"").split(";").map(part=>part.trim())
-        .find(part=>part.startsWith(SESSION_COOKIE+"="))?.slice(SESSION_COOKIE.length+1);
-      if(!raw) return null;
-      let token:string;try {token=decodeURIComponent(raw);} catch {return null;}
+      const token=controlSessionToken(request.headers.get("cookie"));
+      if(!token) return null;
       const principal=await store.authenticateAccessToken(token);
       return principal?{transport:"cookie" as const,principal}:null;
     },
@@ -636,7 +634,7 @@ export function createApp(input: {
     const headerToken = bearer(request);
     const requestPath = new URL(request.url ?? "/", config.publicBaseUrl).pathname;
     const cookieToken = requestPath === "/cloud" || requestPath.startsWith("/cloud/")
-      ? cookie(request, SESSION_COOKIE)
+      ? controlSessionToken(request.headers.cookie)
       : null;
     const token = headerToken ?? cookieToken;
     if (!token) throw new HttpError(401, "unauthorized", "Authentication required");
@@ -914,7 +912,8 @@ export function createApp(input: {
       throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
     }
     if (!token.startsWith(ACCESS_TOKEN_PREFIX)) throw new HttpError(401, "unauthorized", "User token required");
-    const active = await introspect(config, store, { token, aud: config.sessionReadApi.publicUrl, workspace: workspace.id });
+    const historyOrigin = workspace.relayhistoryOrigin ?? config.sessionReadApi.publicUrl;
+    const active = await introspect(config, store, { token, aud: historyOrigin, workspace: workspace.id });
     if (!active.active || !active.scopes.includes("rth:sync")) {
       throw new HttpError(401, "unauthorized", "Token is not valid for uploads");
     }
@@ -963,7 +962,7 @@ export function createApp(input: {
     const active = await assertNativeUploadCaller(request, access);
     const expiresAt = new Date(Math.min(active.exp * 1_000, Date.now() + NATIVE_UPLOAD_SESSION_MAX_MS)).toISOString();
     return {
-      baseUrl: api.publicUrl,
+      baseUrl: workspace.relayhistoryOrigin ?? api.publicUrl,
       accessToken: token,
       accessTokenExpiresAt: expiresAt,
       refreshToken: NATIVE_UPLOAD_NO_REFRESH,
@@ -987,7 +986,7 @@ export function createApp(input: {
     if (bearer(request)) {
       throw new HttpError(401, "unauthorized", "This route takes the browser session cookie, not a bearer token");
     }
-    const token = publicPath === "/cloud" || publicPath.startsWith("/cloud/") ? cookie(request, SESSION_COOKIE) : null;
+    const token = publicPath === "/cloud" || publicPath.startsWith("/cloud/") ? controlSessionToken(request.headers.cookie) : null;
     const principal = token ? await store.authenticateAccessToken(token) : null;
     if (!principal) return null;
     if (!principal.scopes.includes(ACCOUNT_SCOPE) || principal.pendingHandoff || principal.handoff) {
@@ -1322,7 +1321,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       const login = validateDesktopLogin(params);
       if ("error" in login) throw new HttpError(400, "invalid_request", login.error);
 
-      const sessionToken = publicPath.startsWith("/cloud/") ? cookie(request, SESSION_COOKIE) : null;
+      const sessionToken = publicPath.startsWith("/cloud/") ? controlSessionToken(request.headers.cookie) : null;
       const principal = sessionToken ? await store.authenticateAccessToken(sessionToken) : null;
       if (!principal) {
         if (method === "POST") throw new HttpError(401, "unauthorized", "Sign in first");
@@ -2457,6 +2456,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       const identity = {
         workspaceId: workspace.id,
         cloudWorkspaceId: workspace.id,
+        cloudRelayWorkspaceId: workspace.cloudRelayWorkspaceId,
         relaycastWorkspaceId: workspace.relaycastWorkspaceId,
         organizationId: workspace.organizationId,
         name: workspace.name,
@@ -2599,17 +2599,17 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         throw new HttpError(404, "workspace_not_found", "Workspace not found");
       }
       if (!workspace) throw new HttpError(404, "workspace_not_found", "Workspace not found");
-      // Sessions are bound to relayhistoryPublicUrl, the read API's public
-      // origin (default introspection audience, returned baseUrl, ingest edge
-      // origin). One installation-wide value. loadConfig requires it to be a
-      // bare origin, and introspection compares the audience by exact string.
-      if (!config.relayhistoryUrl || !config.relayhistoryPublicUrl) {
+      // An imported customer-hosted origin wins for this workspace. NULL uses
+      // the installation default. Both are exact introspection audiences.
+      const importedOrigin = workspace.relayhistoryOrigin;
+      if (!importedOrigin && (!config.relayhistoryUrl || !config.relayhistoryPublicUrl)) {
         throw new HttpError(404, "relayhistory_not_configured", "RelayHistory is not configured");
       }
+      const origin = importedOrigin ?? config.relayhistoryPublicUrl;
       json(response, 200, {
         workspace: workspace.id,
-        origin: config.relayhistoryPublicUrl,
-        audience: config.relayhistoryPublicUrl,
+        origin,
+        audience: origin,
       }, true);
       return;
     }

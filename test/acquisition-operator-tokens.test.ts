@@ -315,6 +315,7 @@ test("introspection answers for an acquisition-operator token as a service princ
     machine_id: null,
     org: ctx.organizationId,
     workspace: ctx.workspaceId,
+    cloud_relay_workspace_id: null,
     scopes: ["acquisition:operate"],
     aud: HISTORY,
     iat: Math.floor(new Date(row.created_at).getTime() / 1_000),
