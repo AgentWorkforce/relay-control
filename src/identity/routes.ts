@@ -15,6 +15,7 @@ import { PasswordHasher } from "./password/hashing.js";
 import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, type HibpFetch } from "./password/policy.js";
 import { createPasswordRoutes, disabledMethod, isChangeRequired, PASSWORD_PATH_PREFIX, PasswordHttpError, type PasswordRoutes } from "./password/routes.js";
 import { PasswordStore, TEMPORARY_PASSWORD_MAX_TTL_MS, TEMPORARY_PASSWORD_TTL_MS } from "./password/store.js";
+import { signupSourceFromNext } from "./signup-source.js";
 
 type JsonObject = Record<string, unknown>;
 type Auth = { kind: "bootstrap" } | { kind: "user"; principal: Principal };
@@ -479,6 +480,7 @@ export function createIdentityModule(input: {
       const result = await store.signIn({
         email: identity.email,
         name: identity.name,
+        signupSource: signupSourceFromNext(attempt.next),
         inviteTokenHash: attempt.invite ? hashSecret(attempt.invite) : null,
         method: provider.method,
         emailVerified: identity.emailVerified,
@@ -828,6 +830,7 @@ export function createIdentityModule(input: {
         const result = await store.signIn({
           email: consumed.email,
           name: null,
+          signupSource: signupSourceFromNext(consumed.next),
           inviteTokenHash: consumed.inviteTokenHash,
           method: "email",
           emailVerified: true,
