@@ -10,9 +10,11 @@ License, Version 2.0. Contributions made under the Apache License, Version 2.0
 before this change keep that license and their authors' notices, and are
 included in this work as Apache-2.0 licensed material.
 
-Enterprise features (single sign-on, SCIM provisioning, audit logs, hard delete
-and retention controls) require an Agent Relay Enterprise agreement for
-production use. Contact founders@agentrelay.com.
+The enterprise features (single sign-on, SCIM provisioning, audit logs, hard
+delete and retention controls) are part of the Software and are licensed under
+the same terms as the rest of it; no separate license applies to them. Agent
+Workforce offers an Agent Relay Enterprise agreement for supported production
+deployments. Contact founders@agentrelay.com.
 
 This product includes software developed at AgentWorkforce
 (https://github.com/AgentWorkforce/relay-control).
