@@ -113,6 +113,7 @@ type StartOptions = {
   relaycastProvisioner?: RelaycastProvisioner;
   /** The Replicas module's lazy binding: "store" wires the store's, a function replaces it; unset leaves it absent. */
   relaycastBinding?: "store" | ReplicasDeps["relaycastBinding"];
+  log?: ReplicasDeps["log"];
 };
 
 async function start(t: TestContext, enabled = true, issuerFetch: typeof fetch = identityFetch(),
@@ -147,6 +148,7 @@ async function start(t: TestContext, enabled = true, issuerFetch: typeof fetch =
     replicas: { enabled }, config, database, relaycastFetch: messagingFetch, runtime: provider.runtime, identityFetch: issuerFetch,
     ...(rateLimits ? { rateLimits } : {}),
     ...(relaycastBinding ? { relaycastBinding } : {}),
+    ...(options.log ? { log: options.log } : {}),
   });
   const remoteAgentFetch = (async (input: string | URL | Request) => {
     if (String(input).endsWith("/whoami")) return Response.json({ organization: { id: PROVIDER_ORG, name: "Org" } });
@@ -1110,9 +1112,13 @@ test("unbound workspace: the first admitted call provisions the Relay binding on
 
 test("unbound workspace: a failed provisioning answers a retryable 503, keeps the reserved row and a later call reuses it", async (t) => {
   const stub = provisionerStub();
-  const env = await start(t, true, identityFetch(), undefined, { relaycastProvisioner: stub.provisioner, relaycastBinding: "store" });
+  const events: unknown[] = [];
+  const env = await start(t, true, identityFetch(), undefined, {
+    relaycastProvisioner: stub.provisioner, relaycastBinding: "store", log: (event) => events.push(event),
+  });
   await unboundWorkspace(env);
 
+  let reservedId: string | undefined;
   for (const [index, fail] of (["refused", "plain"] as const).entries()) {
     stub.state.fail = fail;
     const failed = await rpc(env.api, token(), "tools/list");
@@ -1124,10 +1130,15 @@ test("unbound workspace: a failed provisioning answers a retryable 503, keeps th
     assert.equal(stub.state.calls, index + 1);
     const rows = await identityRows(env);
     assert.equal(rows.length, 1, "the reserved row is kept, never duplicated");
+    reservedId = rows[0].id;
     assert.deepEqual([rows[0].state, rows[0].relay_workspace_id, rows[0].token_ciphertext, rows[0].last_error],
       ["binding", null, null, PROVISIONING_TEXT]);
     assert.equal((await workspacePair(env)).relaycast_workspace_id, null);
   }
+  assert.deepEqual(events, [
+    { code: "replicas_relay_provisioning_failed", workspaceId: env.workspaceId, spawnId: reservedId, reason: "threw" },
+    { code: "replicas_relay_provisioning_failed", workspaceId: env.workspaceId, spawnId: reservedId, reason: "threw" },
+  ]);
   const reserved = (await identityRows(env))[0];
 
   stub.state.fail = null;
@@ -1143,11 +1154,13 @@ test("unbound workspace: a failed provisioning answers a retryable 503, keeps th
 
 test("unbound workspace: a binding that does not persist is called once and answers a retryable 503", async (t) => {
   let calls = 0;
+  const events: unknown[] = [];
   const env = await start(t, true, identityFetch(), undefined, {
     relaycastBinding: async () => {
       calls += 1;
       return { relaycastWorkspaceId: "rw_ghost", relaycastApiKey: "rk_ghost" };
     },
+    log: (event) => events.push(event),
   });
   await unboundWorkspace(env);
   const failed = await rpc(env.api, token(), "tools/list");
@@ -1155,6 +1168,7 @@ test("unbound workspace: a binding that does not persist is called once and answ
   assert.equal(failed.body.error.message, PROVISIONING_FAILED);
   assert.equal(failed.headers.get("retry-after"), "5");
   assert.equal(calls, 1, "never a second create in the same request");
+  assert.deepEqual(events.map((event: any) => event.reason), ["repeated"]);
   const rows = await identityRows(env);
   assert.equal(rows.length, 1);
   assert.deepEqual([rows[0].state, rows[0].relay_workspace_id, rows[0].last_error], ["binding", null, PROVISIONING_TEXT]);
@@ -1175,7 +1189,8 @@ test("unbound workspace: a replica refused by policy reserves and provisions not
 });
 
 test("unbound workspace: without a configured binding the call answers a retryable 503 and keeps the reserved row", async (t) => {
-  const env = await start(t);
+  const events: unknown[] = [];
+  const env = await start(t, true, identityFetch(), undefined, { log: (event) => events.push(event) });
   await unboundWorkspace(env);
   for (let call = 0; call < 2; call++) {
     const failed = await rpc(env.api, token(), "tools/list");
@@ -1183,6 +1198,7 @@ test("unbound workspace: without a configured binding the call answers a retryab
     assert.equal(failed.body.error.message, PROVISIONING_FAILED);
     assert.equal(failed.headers.get("retry-after"), "5");
   }
+  assert.deepEqual(events.map((event: any) => event.reason), ["unavailable", "unavailable"]);
   const rows = await identityRows(env);
   assert.equal(rows.length, 1);
   assert.deepEqual([rows[0].state, rows[0].relay_workspace_id, rows[0].last_error], ["binding", null, PROVISIONING_TEXT]);

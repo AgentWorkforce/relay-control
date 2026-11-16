@@ -133,6 +133,7 @@ const replicas = createReplicasModule({
   database,
   // The store's lazy binding: only the environment-level MCP enrolment provisions an unbound workspace.
   relaycastBinding: (id) => store.relaycastBinding(id),
+  log: (event) => console.warn("[replicas] relay provisioning failed", event),
 });
 // Environment sync sweep: only with Replicas on and SELFHOST_REPLICAS_SYNC_INTERVAL_SECONDS > 0.
 const replicasSync = replicas.config.enabled && (replicas.config.syncIntervalSeconds ?? 0) > 0

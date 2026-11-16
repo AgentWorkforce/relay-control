@@ -47,6 +47,8 @@ export type ReplicasDeps = {
    * Absent: an unbound workspace cannot be provisioned from here.
    */
   relaycastBinding?: (workspaceId: string) => Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null>;
+  /** Safe diagnostics (no provider output, no secrets): currently Relay provisioning failures at enrolment. */
+  log?: (event: { code: "replicas_relay_provisioning_failed"; workspaceId: string; spawnId: string; reason: ProvisionFailureReason }) => void;
 };
 
 /**
@@ -68,6 +70,13 @@ export class ReplicasError extends Error {
 }
 
 export const REPLICA_PROVISIONING_FAILURE = "Agent Relay MCP provisioning failed. Retry the MCP call from the same replica.";
+
+/**
+ * Why a Relay provisioning at enrolment failed, enum only and safe to log:
+ * no binding configured, a second request for it in the same call (the first
+ * did not leave the workspace bound), the binding threw, or it returned null.
+ */
+export type ProvisionFailureReason = "unavailable" | "repeated" | "threw" | "returned_null";
 /**
  * The environment-level MCP enrolment could not provision the workspace's
  * Relay binding (no provisioner, a failed attempt, or one that did not

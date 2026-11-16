@@ -204,7 +204,10 @@ Each call is admitted in this order:
    answers 503 JSON-RPC -32000 `relay_mcp_provisioning_failed` with
    `Retry-After: 5` and keeps the reserved row for the next call; that call
    refuses the replica only if policy, mapping or membership changed. A replica
-   refused in steps 1-4 never reserves or provisions anything. Saved relay
+   refused in steps 1-4 never reserves or provisions anything. The server logs
+   a safe diagnostic (`replicas_relay_provisioning_failed` with the workspace
+   id, the reserved row id and an enum reason: unavailable, repeated, threw
+   or returned_null), never provider output or credentials. Saved relay
    pins, lookups, the API launch and bind path and cleanup never provision:
    there an unbound workspace answers 409 "The replica's relay is
    unavailable.".

@@ -22,6 +22,7 @@ import {
   relayFor,
   REPLICA_PROVISIONING_FAILURE,
   ReplicaProvisioningError,
+  type ProvisionFailureReason,
   ReplicasError,
   requireAdmin,
   retireIdentityBindings,
@@ -370,7 +371,9 @@ type ProvisionNeeded = { provision: { workspaceId: string; organizationId: strin
  * live, unpinned and unbound) and answers the typed retryable failure. The
  * row is kept for the next call. Marking is best effort.
  */
-async function provisioningFailed(deps: ReplicasDeps, provision: ProvisionNeeded["provision"]): Promise<never> {
+async function provisioningFailed(deps: ReplicasDeps, provision: ProvisionNeeded["provision"],
+  reason: ProvisionFailureReason): Promise<never> {
+  deps.log?.({ code: "replicas_relay_provisioning_failed", workspaceId: provision.workspaceId, spawnId: provision.spawnId, reason });
   await withReplicasLock(deps, { workspaceId: provision.workspaceId, organizationId: provision.organizationId }, async (tx) => {
     const row = await byId(tx, provision.spawnId, true);
     if (row && row.state !== "gone" && row.relay_workspace_id === null && row.token_ciphertext === null) {
@@ -401,11 +404,13 @@ export async function admitIdentity(deps: ReplicasDeps, claims: ReplicaIdentityC
   for (let attempt = 0; attempt < 4; attempt++) {
     const result = await underAdmission(deps, claims, (tx, admission) => enrolStep(deps, tx, claims, admission));
     if ("provision" in result) {
-      if (!deps.relaycastBinding || provisionAttempted) return provisioningFailed(deps, result.provision);
+      if (!deps.relaycastBinding) return provisioningFailed(deps, result.provision, "unavailable");
+      if (provisionAttempted) return provisioningFailed(deps, result.provision, "repeated");
       provisionAttempted = true;
       // Any failure (also a retryable "not ready" from a concurrent provisioner) answers the same typed error.
-      const binding = await deps.relaycastBinding(result.provision.workspaceId).catch(() => null);
-      if (!binding) return provisioningFailed(deps, result.provision);
+      let reason: ProvisionFailureReason | null = null;
+      const binding = await deps.relaycastBinding(result.provision.workspaceId).catch(() => { reason = "threw"; return null; });
+      if (!binding) return provisioningFailed(deps, result.provision, reason ?? "returned_null");
       // The next pass re-runs the full admission and finds the reserved row.
       continue;
     }
