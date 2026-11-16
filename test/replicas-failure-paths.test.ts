@@ -588,3 +588,67 @@ test("launch create: an unknown create outcome stays creating; a same-id retry n
   assert.equal(row.chat_id, chatId);
   assert.equal(creates.length, 1);
 });
+
+// The unique live-row indexes on replica_spawns are exact-case, so an older and a newer live row of the
+// same replica coexist in one workspace only under different replica_id casing (provider canonical vs claims).
+const backdate = (env: Env, id: string, before: string) => env.database.query(
+  "UPDATE replica_spawns SET created_at = (SELECT created_at FROM replica_spawns WHERE id = $2) - interval '1 minute' WHERE id = $1", [id, before]);
+
+test("releasing an older bind row keeps a newer environment-identity binding of the same replica live and unfenced", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerId } = env;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  const actor = { userId: ownerId, workspaceId, organizationId: env.organizationId };
+
+  // (a) An API bind row is older than the environment-identity binding the MCP call uses.
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const newer = await liveBinding(env);
+  assert.ok(newer);
+  const bound = await launchRow(env, "bind", WORKSPACE_1.toUpperCase());
+  await backdate(env, bound, newer.id);
+
+  await releaseReplica(env.replicas.deps, actor, bound);
+  assert.equal((await spawnRow(env, bound)).state, "gone");
+  assert.equal((await spawnRow(env, bound)).input.released, true);
+  assert.equal((await liveBinding(env))?.id, newer.id, "the newer binding stays live");
+  assert.deepEqual(await tombstones(env), [], "the older release writes no tombstone");
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200, "admission still succeeds");
+  assert.equal((await liveBinding(env))?.id, newer.id);
+
+  // Releasing the newer row does tombstone the replica.
+  await releaseReplica(env.replicas.deps, actor, newer.id);
+  assert.deepEqual(await tombstones(env), [{
+    issuer: ISSUER, provider_organization_id: PROVIDER_ORG, provider_workspace_id: WORKSPACE_1, workspace_id: workspaceId, reason: "released",
+  }]);
+  assert.equal((await rpc(api, token(), "tools/list")).body.error.message, "replica_released");
+});
+
+test("releasing an older environment-identity binding keeps a newer bind row of the same replica live and unfenced", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerId } = env;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  const actor = { userId: ownerId, workspaceId, organizationId: env.organizationId };
+
+  // (b) An environment-identity binding first, then a later bind of the same replica.
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const older = await liveBinding(env);
+  assert.ok(older);
+  const bound = await launchRow(env, "bind", WORKSPACE_1.toUpperCase());
+
+  await releaseReplica(env.replicas.deps, actor, older.id);
+  assert.equal((await spawnRow(env, older.id)).state, "gone");
+  assert.equal((await spawnRow(env, older.id)).input.released, true);
+  assert.equal((await spawnRow(env, bound)).state, "bound", "the newer bind row stays live");
+  assert.deepEqual(await tombstones(env), [], "the older release writes no tombstone");
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200, "admission still succeeds (it reuses the bind row)");
+  assert.equal((await spawnRow(env, bound)).state, "bound");
+
+  // Releasing the newer row does tombstone the replica.
+  await releaseReplica(env.replicas.deps, actor, bound);
+  assert.deepEqual(await tombstones(env), [{
+    issuer: ISSUER, provider_organization_id: PROVIDER_ORG, provider_workspace_id: WORKSPACE_1, workspace_id: workspaceId, reason: "released",
+  }]);
+  assert.equal((await rpc(api, token(), "tools/list")).body.error.message, "replica_released");
+});

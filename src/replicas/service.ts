@@ -684,9 +684,13 @@ export async function releaseReplica(deps: ReplicasDeps, actor: ReplicasActor, i
     // without a tombstone (disable, principal or mapping change, member
     // removal) is still tombstoned by its first explicit release.
     if (current.state === "gone" && current.input.released) return current;
-    // An explicit release is final for its provider workspace until an admin revives it.
-    if (current.source === ENVIRONMENT_IDENTITY) await tombstoneInTx(tx, current, "released");
-    else await launchTombstoneInTx(deps, tx, current, "released");
+    // An explicit release is final for its provider workspace until an admin
+    // revives it, unless a newer live row of the same replica (same tombstone
+    // key) still runs: releasing the older row must not fence that operation.
+    const key = await tombstoneKey(deps, tx, current);
+    if (key && !await newerLiveRow(deps, tx, current, key)) {
+      await writeTombstone(tx, key.issuer, key.organization, key.providerWorkspaceId, current.workspace_id, "released");
+    }
     return patch(tx, current.id, { state: "gone", helper_hash: null, input: { ...current.input, released: true } });
   });
   return withReplicasLock(deps, actor, async (tx) => {
@@ -695,13 +699,38 @@ export async function releaseReplica(deps: ReplicasDeps, actor: ReplicasActor, i
   });
 }
 
+type TombstoneKey = { issuer: string; organization: string; providerWorkspaceId: string };
+
 /**
- * A released environment-identity binding stays released: the provider
- * workspace is refused (403 replica_released) until an admin revives it.
+ * The tombstone key a release of this row writes. A released
+ * environment-identity binding stays released: the provider workspace is
+ * refused (403 replica_released) until an admin revives it.
  */
-async function tombstoneInTx(tx: SqlExecutor, row: SpawnRow, reason: string): Promise<void> {
-  if (!row.issuer || !row.provider_organization_id || !row.replica_id) return;
-  await writeTombstone(tx, row.issuer, row.provider_organization_id, row.replica_id, row.workspace_id, reason);
+async function tombstoneKey(deps: ReplicasDeps, tx: SqlExecutor, row: SpawnRow): Promise<TombstoneKey | null> {
+  if (row.source !== ENVIRONMENT_IDENTITY) return launchTombstoneKey(deps, tx, row);
+  if (!row.issuer || !row.provider_organization_id || !row.replica_id) return null;
+  return { issuer: row.issuer, organization: row.provider_organization_id, providerWorkspaceId: row.replica_id };
+}
+
+/**
+ * Whether a newer live row (any source) of the same workspace has the same
+ * tombstone key: environment-identity rows by their issuer, provider
+ * organization and replica id; launch rows by the configured issuer, the
+ * workspace's connected organization (lowercased) and their lowercased replica id.
+ */
+async function newerLiveRow(deps: ReplicasDeps, tx: SqlExecutor, row: SpawnRow, key: TombstoneKey): Promise<boolean> {
+  const result = await tx.query(
+    `SELECT 1 FROM replica_spawns s
+       LEFT JOIN remote_agent_connections c ON c.workspace_id = s.workspace_id AND c.provider = 'replicas'
+      WHERE s.workspace_id = $1 AND s.id <> $2 AND s.state <> 'gone'
+        AND s.created_at > (SELECT created_at FROM replica_spawns WHERE id = $2)
+        AND CASE WHEN s.source = '${ENVIRONMENT_IDENTITY}'
+                 THEN s.issuer = $3 AND s.provider_organization_id = $4 AND s.replica_id = $5
+                 ELSE $6::text = $3 AND lower(c.provider_account) = $4 AND lower(s.replica_id) = $5 END
+      LIMIT 1`,
+    [row.workspace_id, row.id, key.issuer, key.organization, key.providerWorkspaceId, deps.identity?.issuer ?? null],
+  );
+  return result.rows.length > 0;
 }
 
 async function writeTombstone(tx: SqlExecutor, issuer: string, organization: string, providerWorkspaceId: string,
@@ -721,16 +750,16 @@ async function writeTombstone(tx: SqlExecutor, issuer: string, organization: str
  * replica id as the provider workspace. Without a configured issuer or a
  * connected organization there is nothing the tombstone could match.
  */
-async function launchTombstoneInTx(deps: ReplicasDeps, tx: SqlExecutor, row: SpawnRow, reason: string): Promise<void> {
+async function launchTombstoneKey(deps: ReplicasDeps, tx: SqlExecutor, row: SpawnRow): Promise<TombstoneKey | null> {
   const issuer = deps.identity?.issuer;
-  if (!issuer || !row.replica_id) return;
+  if (!issuer || !row.replica_id) return null;
   const connection = await tx.query<{ provider_account: string | null }>(
     "SELECT provider_account FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'",
     [row.workspace_id],
   );
   const organization = connection.rows[0]?.provider_account?.toLowerCase();
-  if (!organization) return;
-  await writeTombstone(tx, issuer, organization, row.replica_id.toLowerCase(), row.workspace_id, reason);
+  if (!organization) return null;
+  return { issuer, organization, providerWorkspaceId: row.replica_id.toLowerCase() };
 }
 
 /**
