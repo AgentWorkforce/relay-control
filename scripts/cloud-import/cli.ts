@@ -218,14 +218,14 @@ async function copyCredentials(
   cloudKey: string | undefined,
 ) {
   const scope = { orgIds: args.orgIds };
-  if (args.mode !== "plan" && (!target || !cloudKey)) {
-    // Never fall back to a silent plan when an apply was asked for.
-    throw new CopyRefused("--copy-credentials with --mode apply needs CLOUD_IMPORT_TARGET_URL and CLOUD_CREDENTIAL_ENCRYPTION_KEY");
-  }
   if (args.mode === "plan") {
     // Plan: candidates and skip reasons only; the object store is not touched.
     const stub = undefined as unknown as never;
     return copyCodingAgentCredentials({ source, reader: { get: async () => null }, cloudKeyHex: "", keyring, codingAgents: stub, logins: stub }, scope, "plan");
+  }
+  if (!target || !cloudKey) {
+    // Never fall back to a silent plan when an apply was asked for.
+    throw new CopyRefused("--copy-credentials with --mode apply needs CLOUD_IMPORT_TARGET_URL and CLOUD_CREDENTIAL_ENCRYPTION_KEY");
   }
   const blobs = new CredentialBlobStore(credentialBackendFromEnv(env, target), keyring);
   return copyCodingAgentCredentials({
