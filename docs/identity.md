@@ -1281,6 +1281,11 @@ per-identity handouts stop too:
   The broker's read routes are unchanged.
 - MCP join and spawn keep their participant tokens server-side and return
   none to callers, so they are unchanged.
+- Person identities Control registers server-side (messaging conversation
+  sends, customer-support reply notices) get names starting `control-`.
+  relaygate reserves that prefix at `/v1/register`, so a desktop-enrolled name
+  never collides with one. Only new registrations get it: identities that
+  already exist keep their stored names and are not renamed.
 
 Unset, nothing changes.
 
