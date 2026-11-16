@@ -1,3 +1,4 @@
+import { accountCredentialExclusion,exclusionAccounting } from "../scripts/cloud-import-verify/exclusions.js";
 import { migrationFiles,sealManifest,type SchemaManifest } from "../scripts/cloud-import-verify/schema.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -77,4 +78,30 @@ test("committed verifier manifest tracks every checked-in migration in ordinary 
   assert.equal(sha256,sealManifest(content).sha256,"manifest seal must cover the complete inventory");
   assert.deepEqual(manifest.migrations,await migrationFiles(),
     "Migration drift requires a reviewed manifest generated from a fresh local migration database; never use the qualification target");
+});
+
+test("deliberate credential exclusions require exact source predicates and retain named counts",() => {
+  const summary=exclusionAccounting();
+  for (const provider of ["openrouter","daytona"]) assert.equal(accountCredentialExclusion(summary,
+    {reason:"unsupported_dropped",provider,authType:"provider_oauth",status:"connected",refreshExhausted:false}),true);
+  assert.equal(accountCredentialExclusion(summary,{reason:"dead_login",provider:"anthropic",authType:"provider_oauth",refreshExhausted:true}),true);
+  assert.equal(accountCredentialExclusion(summary,{reason:"dead_login",provider:"anthropic",authType:"oauth_token",status:"refresh_failed",refreshExhausted:false}),true);
+  assert.equal(accountCredentialExclusion(summary,{reason:"unsupported_model_provider",provider:"opencode",authType:"relay_managed"}),true);
+  assert.deepEqual(summary,[{reason:"unsupported_dropped",accounted:2,unresolved:0},{reason:"dead_login",accounted:2,unresolved:0},
+    {reason:"unsupported_model_provider",accounted:1,unresolved:0}]);
+});
+
+test("labels alone cannot waive unknown providers, live logins, API keys or ambiguous legacy objects",() => {
+  const summary=exclusionAccounting();
+  for (const provider of ["google","opencode","synthetic-private-provider-marker"]) assert.equal(accountCredentialExclusion(summary,
+    {reason:"unsupported_dropped",provider,authType:"provider_oauth",status:"connected",refreshExhausted:false}),false);
+  assert.equal(accountCredentialExclusion(summary,{reason:"unsupported_dropped",provider:"daytona",authType:"byo_api_key",status:"connected",refreshExhausted:false}),false);
+  assert.equal(accountCredentialExclusion(summary,{reason:"dead_login",provider:"openai",authType:"provider_oauth",status:"connected",refreshExhausted:false}),false);
+  assert.equal(accountCredentialExclusion(summary,{reason:"dead_login",provider:"openai",authType:"byo_api_key",status:"refresh_failed",refreshExhausted:false}),false);
+  assert.equal(accountCredentialExclusion(summary,{reason:"unsupported_model_provider",provider:"opencode",authType:"provider_oauth"}),false);
+  assert.equal(accountCredentialExclusion(summary,{reason:"unsupported_model_provider",provider:"unknown",authType:"relay_managed"}),false);
+  for (const reason of ["legacy_key_ambiguous","object_missing","unknown_skip"]) assert.equal(accountCredentialExclusion(summary,
+    {reason,provider:"opencode",authType:"relay_managed"}),null);
+  assert.ok(!JSON.stringify(summary).includes("synthetic-private-provider-marker"));
+  assert.equal(summary.reduce((total,item) => total+item.accounted,0),0);
 });

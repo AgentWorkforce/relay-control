@@ -824,3 +824,17 @@ fixtureTest("target content diagnostics distinguish copied-row failures from int
     contentMismatch:1,blobBackendMismatch:0,targetReadOrDecryptFailed:0});
   assert.ok(!JSON.stringify(after).includes(marker));assert.ok(!JSON.stringify(detail).includes(controlId));
 });
+
+for (const [provider,accounted] of [["opencode",true],["synthetic-unknown-provider",false]] as const) {
+  fixtureTest(`relay-managed exclusion ${provider} is explicitly ${accounted ? "accounted" : "unresolved"}`,async () => {
+    await source.query("UPDATE provider_credentials SET model_provider=$1 WHERE id=$2",[provider,id(0x801)]);
+    const ledger=await apply();
+    assert.equal(ledger.tables.coding_agent_credentials.skipped.unsupported_model_provider,1);
+    const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+    const finding=report.findings.find((f) => f.kind === "credential_exclusions" && f.name === "identity_metadata")!;
+    assert.equal(finding.ok,accounted);assert.equal(report.ok,accounted);
+    assert.deepEqual((finding.detail as {classes:unknown}).classes,[
+      {reason:"unsupported_dropped",accounted:0,unresolved:0},{reason:"dead_login",accounted:0,unresolved:0},
+      {reason:"unsupported_model_provider",accounted:Number(accounted),unresolved:Number(!accounted)}]);
+  });
+}
