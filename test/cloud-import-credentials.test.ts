@@ -446,6 +446,35 @@ test("credential copier: a workspace the target does not have is skipped without
   assert.ok(!reads.some((key) => key.includes(id(0x812))), "no Cloud read for a row that cannot land");
 });
 
+test("credential copier: selectionDiverged is {} while Control holds exactly Cloud's selection", async (t) => {
+  const source = new PGliteDatabase();
+  const target = new PGliteDatabase();
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  await source.exec(CLOUD_FIXTURE_DDL);
+  await source.exec(cloudFixtureSeed(CLOUD_KEY));
+  await migrate(target);
+  assert.equal((await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply")).ok, true);
+  // No Cloud objects: nothing is copied, so Control holds exactly the identity
+  // import's relay_managed selection, which is Cloud's.
+  const blobs = new CredentialBlobStore(new PostgresObjectBackend(target), KEYRING);
+  const deps = {
+    source, target, reader: { get: async () => null }, cloudKeyHex: CLOUD_KEY, keyring: KEYRING,
+    codingAgents: new CodingAgentStore(target, KEYRING, undefined, blobs), logins: new SubscriptionLoginStore(target, KEYRING, blobs), blobs,
+  };
+  for (const scope of [{ orgIds: null }, { orgIds: [ORG_A] }]) {
+    assert.deepEqual((await copyCodingAgentCredentials(deps, scope, "apply")).selectionDiverged, {}, `converged: ${JSON.stringify(scope)}`);
+  }
+  // Control deactivates Cloud's active relay_managed row: one difference, in its org only.
+  await target.query("UPDATE coding_agent_credentials SET is_active = false WHERE id = $1", [id(0x801)]);
+  assert.deepEqual((await copyCodingAgentCredentials(deps, { orgIds: null }, "apply")).selectionDiverged, { [ORG_A]: { active: 1, harness: 0 } });
+  // Back to Cloud's selection: converged again.
+  await target.query("UPDATE coding_agent_credentials SET is_active = true WHERE id = $1", [id(0x801)]);
+  assert.deepEqual((await copyCodingAgentCredentials(deps, { orgIds: null }, "apply")).selectionDiverged, {});
+});
+
 test("credential copier CLI: apply refuses up front when copy settings are missing", async () => {
   const { copyApplyPreflight } = await import("../scripts/cloud-import/cli.js");
   assert.deepEqual(copyApplyPreflight({ mode: "plan", copyCredentials: true }, {}), []);
