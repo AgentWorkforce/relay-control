@@ -8,7 +8,9 @@ assigned at release.
 - Added: Replicas tombstone retention, periodic sync and setup errors.
   Releasing a per-launch replica (`release_replica`, `DELETE
   .../replicas/spawns/{id}`) now writes a tombstone in the revoke
-  transaction, and `recover_replica_spawn` with `revive: true` revives it.
+  transaction, and `recover_replica_spawn` with `revive: true` revives it; a
+  release of an already released replica is a no-op, so a repeated release
+  does not undo a revive.
   Deleting a workspace tombstones its live environment-enrolled replicas
   (`workspace_deleted`) and removes their bindings in the same transaction
   (launch and bind records still answer 409 `in_use`); migration 0069 keeps tombstones after their workspace

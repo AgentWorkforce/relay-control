@@ -73,6 +73,8 @@ export type SpawnInput = {
   report_to?: string;
   origin?: "existing" | "environment_identity";
   cleanup_complete?: boolean;
+  /** Set by an explicit release (it wrote the tombstone); a repeat of that release is a no-op. */
+  released?: true;
   relay_mcp_version?: number;
   /** Environment-identity bindings: how the binding was admitted (a mapped creator or the workspace principal). */
   acts_as?: "creator" | "principal";
@@ -332,8 +334,8 @@ export async function spawnReplica(deps: ReplicasDeps, actor: ReplicasActor, raw
     );
     const existing = found.rows[0];
     if (existing) {
-      // Cleanup bookkeeping is not part of the caller's immutable launch options.
-      const { cleanup_complete: _cleanup, relay_mcp_version: _mcp, ...original } = existing.input;
+      // Cleanup and release bookkeeping is not part of the caller's immutable launch options.
+      const { cleanup_complete: _cleanup, relay_mcp_version: _mcp, released: _released, ...original } = existing.input;
       const same = Object.keys(input).every((k) => original[k as keyof typeof original] === input[k as keyof typeof input])
         && Object.keys(original).length === Object.keys(input).length;
       if (!same) throw new ReplicasError("This request id already belongs to different launch options.", 409);
@@ -633,11 +635,15 @@ export async function releaseReplica(deps: ReplicasDeps, actor: ReplicasActor, i
     if (current.state === "creating" && !current.replica_id) {
       throw new ReplicasError("Recover the unknown create before release, so its compute can be stopped safely.", 409);
     }
-    // Every release is final for its provider workspace until an admin revives it.
+    // A repeat of an explicit release is an idempotent no-op: it must not
+    // re-create a tombstone an admin removed with a revive. A row left gone
+    // without a tombstone (disable, principal or mapping change, member
+    // removal) is still tombstoned by its first explicit release.
+    if (current.state === "gone" && current.input.released) return current;
+    // An explicit release is final for its provider workspace until an admin revives it.
     if (current.source === ENVIRONMENT_IDENTITY) await tombstoneInTx(tx, current, "released");
     else await launchTombstoneInTx(deps, tx, current, "released");
-    if (current.state === "gone") return current;
-    return patch(tx, current.id, { state: "gone", helper_hash: null });
+    return patch(tx, current.id, { state: "gone", helper_hash: null, input: { ...current.input, released: true } });
   });
   return withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);

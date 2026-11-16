@@ -270,6 +270,63 @@ test("a per-launch release (REST and MCP) tombstones its replica; revive re-admi
   assert.equal(((await recoverReplica(env.replicas.deps, actor, spawned, WORKSPACE_1, { revive: true })) as any).revived, false);
 });
 
+test("a repeated release (REST and MCP) of a revived per-launch replica keeps it revived", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, ownerId } = env;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  const actor = { userId: ownerId, workspaceId, organizationId: env.organizationId };
+
+  const spawned = await launchRow(env, "spawn", WORKSPACE_1);
+  const route = `/api/v1/workspaces/${workspaceId}/replicas/spawns/${spawned}`;
+  assert.equal((await api(route, { method: "DELETE", token: ownerToken })).status, 200);
+  assert.equal((await tombstones(env)).length, 1);
+  const revived = await recoverReplica(env.replicas.deps, actor, spawned, WORKSPACE_1, { revive: true });
+  assert.equal((revived as any).revived, true);
+  assert.deepEqual(await tombstones(env), []);
+
+  // The released row stays gone; repeating its release is a no-op and writes no tombstone.
+  const again = await api(route, { method: "DELETE", token: ownerToken });
+  assert.equal(again.status, 200, again.text);
+  await releaseReplica(env.replicas.deps, actor, spawned);
+  assert.deepEqual(await tombstones(env), []);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE id = $1 AND state = 'gone'", [spawned]), 1);
+
+  // The revived replica is still admitted and enrols again.
+  assert.equal((await rpc(api, token({ workspace_id: WORKSPACE_1 }), "tools/list")).status, 200);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE source = 'environment_identity' AND replica_id = $1 AND state <> 'gone'", [WORKSPACE_1]), 1);
+});
+
+test("an explicit release tombstones a binding a disable left gone without one; a repeat is a no-op", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, database } = env;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  assert.equal((await rpc(api, token({ workspace_id: WORKSPACE_1 }), "tools/list")).status, 200);
+  const binding = (await database.query<{ id: string }>(
+    "SELECT id FROM replica_spawns WHERE workspace_id = $1 AND source = 'environment_identity' AND state <> 'gone'", [workspaceId])).rows[0]!;
+
+  // A disable releases the binding without a tombstone.
+  const disabled = await api(`/api/v1/workspaces/${workspaceId}/replicas/environments/${ENV_A}`, {
+    method: "PUT", token: ownerToken, body: { enabled: false },
+  });
+  assert.equal(disabled.status, 200, disabled.text);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE id = $1 AND state = 'gone'", [binding.id]), 1);
+  assert.deepEqual(await tombstones(env), []);
+
+  // The first explicit release still writes the tombstone.
+  const route = `/api/v1/workspaces/${workspaceId}/replicas/spawns/${binding.id}`;
+  const released = await api(route, { method: "DELETE", token: ownerToken });
+  assert.equal(released.status, 200, released.text);
+  assert.deepEqual(await tombstones(env), [{
+    issuer: ISSUER, provider_organization_id: PROVIDER_ORG, provider_workspace_id: WORKSPACE_1, workspace_id: workspaceId, reason: "released",
+  }]);
+  // A repeat is a no-op: still exactly one tombstone row.
+  const again = await api(route, { method: "DELETE", token: ownerToken });
+  assert.equal(again.status, 200, again.text);
+  assert.equal((await tombstones(env)).length, 1);
+});
+
 test("tombstones survive workspace deletion; only the org's connected workspace admin revives them", async (t) => {
   const env = await start(t);
   const { api, workspaceId, ownerId, memberId, database, store } = env;

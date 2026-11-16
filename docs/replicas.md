@@ -334,6 +334,10 @@ connection's provider organization and the replica id; skipped when no
 identity issuer is configured). An owner or admin revives it with
 `recover_replica_spawn` and `revive: true`, which deletes the tombstone and
 is audited as `replicas.identity.revived`; the next call enrols again.
+A release of an already released replica is a no-op, so a repeated release
+does not undo a revive. A binding left released without a tombstone (by a
+disable, a principal or creator mapping change, or a member removal) is still
+tombstoned by its first explicit release.
 Disconnecting Replicas disables every policy and releases its bindings first,
 then removes the registered entries best effort.
 
