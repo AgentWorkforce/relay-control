@@ -343,11 +343,17 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
   });
 
   const orgIds = [...new Set(prepared.organizations.map((row) => row.org!))].sort();
-  for (const org of orgIds) {
-    const keys: Partial<Record<ImportTable, string[]>> = {};
-    for (const table of ORG_TABLES) keys[table] = prepared[table].filter((row) => row.org === org).map((row) => row.key).sort();
-    report.orgs[org] = { status: "planned", imported: {}, keys, deleted: {} };
-  }
+  // Keys are (re)computed from `prepared` after every filter has run, so the
+  // ledger lists exactly the rows this run writes.
+  const recordKeys = () => {
+    for (const org of orgIds) {
+      const keys: Partial<Record<ImportTable, string[]>> = {};
+      for (const table of ORG_TABLES) keys[table] = prepared[table].filter((row) => row.org === org).map((row) => row.key).sort();
+      report.orgs[org]!.keys = keys;
+    }
+  };
+  for (const org of orgIds) report.orgs[org] = { status: "planned", imported: {}, keys: {}, deleted: {} };
+  recordKeys();
   const previous = options.previous;
   if (previous) {
     if (previous.version !== 1 || previous.mode !== "apply") throw new Error("previous report must be an apply report");
@@ -389,6 +395,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       prepared[table] = [];
     }
     const write = writable as Record<ImportTable, string[]>;
+    const finishFilters = () => recordKeys();
     // Before 0057 the target source_id is uuid: a Cloud text id cannot land.
     if (columns.get("desktop_relay_identities")?.get("source_id")?.udt === "uuid") {
       prepared.desktop_relay_identities = prepared.desktop_relay_identities.filter((row) => {
@@ -441,6 +448,8 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       report.tables.users.skipped.target_email_conflict = Number(conflicts.rows[0]!.n);
       throw new ImportRefused("target_email_conflict");
     }
+
+    finishFilters();
 
     // 3. Write. apply: users in batches, then one transaction per org.
     //    dry-run: the same units as savepoints inside one transaction that is

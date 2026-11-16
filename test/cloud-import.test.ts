@@ -123,6 +123,15 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   assert.equal(applied.warnings.fleet_node_name_filled_with_node_id, 1);
   assert.equal(applied.warnings.workspace_rw_id_not_rw_8hex, 1);
   assert.deepEqual(applied.optionalColumns, []);
+  // The ledger lists only rows actually written: target-side filters
+  // (pre-0057 source_id, pre-0058 relay_managed, pre-0054 GitHub) apply first.
+  assert.deepEqual(applied.orgs[ORG_A]!.keys.desktop_relay_identities, [id(0x601)]);
+  assert.deepEqual(applied.orgs[ORG_A]!.keys.coding_agent_credentials, []);
+  assert.deepEqual(applied.orgs[ORG_A]!.keys.github_app_connections, []);
+  for (const table of SOURCE_TABLES.filter((t) => t !== "users")) {
+    const keys = Object.values(applied.orgs).flatMap((org) => org.keys[table] ?? []);
+    assert.equal(keys.length, applied.tables[table].imported, `${table} ledger keys match imported`);
+  }
 
   // Emails are normalized, ids are the Cloud ids, last_* survive the FK pass.
   const alice = (await target.query<{ email: string; last_organization_id: string; last_workspace_id: string }>(
