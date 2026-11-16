@@ -92,10 +92,17 @@ function priorCredentials(snapshot:CredentialTargetSnapshot|undefined,scope:Impo
 
 /** Read-only selection cardinality: model and sandbox are distinct selectors.
  * Sandbox selection may be empty; copied Cloud choices are checked separately.
+ * Source-unbound relay-managed rows are inert metadata, even after a lazy
+ * Control binding. The exact unbound namespace is independently source-checked
+ * by verifyImport; API keys and bound-source model groups still require a pick.
  */
 export async function credentialSelections(target:Client,scope:ImportScope):Promise<Finding[]> {
   const groups = await target.query(`SELECT c.workspace_id::text,c.model_provider,
-    count(*) FILTER(WHERE c.auth_type <> 'provider_oauth')::int AS model_eligible,
+    count(*) FILTER(WHERE c.auth_type <> 'provider_oauth'
+      AND (c.auth_type <> 'relay_managed' OR (w.relaycast_workspace_id IS NOT NULL
+        AND NOT EXISTS(SELECT 1 FROM public.cloud_import_ledger unbound
+          WHERE unbound.table_name='workspace_unbound' AND unbound.organization_id=w.organization_id
+            AND unbound.row_key=w.id::text))))::int AS model_eligible,
     count(*) FILTER(WHERE c.auth_type IN ('oauth_token','provider_oauth'))::int AS harness_eligible,
     count(*) FILTER(WHERE c.is_active)::int AS model_active,
     count(*) FILTER(WHERE c.harness_active)::int AS harness_active
