@@ -34,6 +34,16 @@ assigned at release.
   first call stamps its issuer and organization on the row), and a repeat
   launch with the same request id after a release and revive, or after that
   stamp, returns the original operation instead of a 409 or a new create.
+  - A creator mapped to a former member no longer blocks a replica with an
+    owned launch or bind in the workspace: that launch or bind is reused as
+    its owner first; without one the call is still refused
+    `replica_creator_not_allowed` (never moved to the principal, never
+    recorded as a pending creator).
+  - The create intent carries a generation (`create_attempt`, migration
+    0070): a run clears only the intent it set itself, so a registration
+    whose relist fails after an operator recovery sent its own create in
+    between keeps that recovery's intent (`registration_unconfirmed`) and
+    never creates again.
 - Changed: storing a subscription login (device-login completion and
   operator imports) takes the per-credential refresh lock before the
   workspace lock, so it no longer deadlocks with a concurrent write-back.

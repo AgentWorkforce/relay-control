@@ -21,7 +21,8 @@ import { checkRelayInbox, listRelayAgents, sendRelayMessage } from "./tools.js";
  * organization_shared, and an enabled environment policy, else 403
  * replica_environment_not_enabled, (4) a creator mapping to a current member,
  * else (no or unmapped creator) the workspace's VM principal when it is set
- * and a current member, else 403 replica_creator_not_allowed unless (5)
+ * and a current member, else (also for a creator mapped to a former member,
+ * never moved to the principal) 403 replica_creator_not_allowed unless (5)
  * applies, (5) binding lookup (a live launch or bind of the same replica in
  * this workspace is reused while its owner is a member, before a mapping or
  * principal is required) or enrolment. Every tool call repeats 2-4 under the

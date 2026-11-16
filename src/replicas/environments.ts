@@ -82,17 +82,25 @@ type PolicyRow = {
   opted_out: boolean;
   /** A create was (or was about to be) sent with an unknown outcome: every run only relists until it clears (retry_registration excepted). */
   create_unconfirmed: boolean;
+  /** Generation of the create intent: bumped each time the intent is set, so a run clears only its own intent. */
+  create_attempt: string | number | bigint;
   /** Set when a complete discovery listing no longer showed this enabled environment; fences admission. */
   discovery_missing_since: Date | string | null;
 };
-const POLICY = "id, workspace_id, issuer, provider_organization_id, environment_id, environment_name, enabled, registered_mcp_id, opted_out, create_unconfirmed, discovery_missing_since";
+const POLICY = "id, workspace_id, issuer, provider_organization_id, environment_id, environment_name, enabled, registered_mcp_id, opted_out, create_unconfirmed, create_attempt, discovery_missing_since";
 
 /**
  * actsAs: "creator" for a mapped creator, "principal" for the workspace VM
- * principal, "none" when neither applies (userId null): only an owned launch
- * or bind of the same replica can then admit it (liveBinding).
+ * principal (both with the member's userId). With userId null nothing acts
+ * by itself and only an owned launch or bind of the same replica can admit it
+ * (liveBinding): "none" when there is no mapping and no principal, and
+ * "refused_creator" when the creator is mapped to a former member (never
+ * moved to the principal, never recorded as a pending creator).
  */
-type Admission = { policy: PolicyRow; organizationId: string; userId: string | null; actsAs: "creator" | "principal" | "none" };
+type ActingAdmission = { policy: PolicyRow; organizationId: string; userId: string; actsAs: "creator" | "principal" };
+type Admission = ActingAdmission | { policy: PolicyRow; organizationId: string; userId: null; actsAs: "none" | "refused_creator" };
+/** Whether the admission acts for a person by itself (a mapped creator or the principal). */
+const acting = (admission: Admission): admission is ActingAdmission => admission.actsAs === "creator" || admission.actsAs === "principal";
 const scopeOf = (admission: Admission) => ({ workspaceId: admission.policy.workspace_id, organizationId: admission.organizationId });
 
 function identityConfig(deps: ReplicasDeps) {
@@ -119,7 +127,11 @@ async function organizationShared(tx: SqlExecutor, organization: string | null):
  * Checks 2-4 of the admission order (1 = token verification, done by the
  * caller). Reads only; every refusal is a typed IdentityRefusal. A mapped
  * creator acts as its member; otherwise (no creator, or an unmapped one) the
- * workspace's VM principal is used when it is set and still a member.
+ * workspace's VM principal is used when it is set and still a member. A
+ * creator mapped to a former member is not refused here but returned as
+ * "refused_creator": an owned launch or bind of the same replica is still
+ * reused first (owner before creator mapping), and liveBinding refuses it
+ * replica_creator_not_allowed without one.
  */
 async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): Promise<Admission> {
   // Any matching tombstone refuses, also one whose workspace was deleted (workspace_id NULL).
@@ -174,7 +186,6 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
   }
   const { organization_id: organizationId, provider_account: _account, access_revoked_at: _revoked,
     principal_member: principal, ...policy } = candidate;
-  const scope = { workspaceId: policy.workspace_id, organizationId };
   if (claims.creatorId !== null) {
     const mapping = await tx.query<{ user_id: string; member: string | null }>(
       `SELECT c.user_id, m.user_id AS member FROM replica_environment_creators c
@@ -185,7 +196,8 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
     const mapped = mapping.rows[0];
     if (mapped) {
       // A mapping to a former member is the admin's own choice: refused, never moved to the principal.
-      if (!mapped.member) throw new IdentityRefusal("replica_creator_not_allowed", 403, scope);
+      // The refusal is left to liveBinding, so an owned launch or bind is still reused before it.
+      if (!mapped.member) return { policy, organizationId, userId: null, actsAs: "refused_creator" };
       return { policy, organizationId, userId: mapped.user_id, actsAs: "creator" };
     }
   }
@@ -194,9 +206,13 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
   return { policy, organizationId, userId: null, actsAs: "none" };
 }
 
-/** No mapped creator and no principal; only an unmapped creator becomes a pending request. */
+/**
+ * No mapped creator and no principal; only an unmapped creator becomes a
+ * pending request (a creator mapped to a former member is already mapped).
+ */
 const unadmitted = (claims: ReplicaIdentityClaims, admission: Admission) =>
-  new IdentityRefusal("replica_creator_not_allowed", 403, scopeOf(admission), claims.creatorId === null ? null : admission.policy.id);
+  new IdentityRefusal("replica_creator_not_allowed", 403, scopeOf(admission),
+    claims.creatorId !== null && admission.actsAs === "none" ? admission.policy.id : null);
 
 async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admission: Admission): Promise<SpawnRow | null> {
   const live = await tx.query<SpawnRow>(
@@ -205,11 +221,12 @@ async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admis
   );
   const row = live.rows[0];
   if (!row) {
-    if (admission.actsAs === "none") throw unadmitted(claims, admission);
+    if (!acting(admission)) throw unadmitted(claims, admission);
     return null;
   }
   // A launch or bind of the same replica in this workspace is reused as is: the identity acts as
-  // that binding and its owner (never the principal or a creator mapping) while the owner is a member.
+  // that binding and its owner (never the principal or a creator mapping, also one to a former
+  // member) while the owner is a member.
   // A rejected launch binds nothing by itself, so it stays a conflict until recovered or released.
   if (row.source !== ENVIRONMENT_IDENTITY && row.workspace_id === admission.policy.workspace_id && row.state !== "rejected") {
     const owner = await tx.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
@@ -229,8 +246,8 @@ async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admis
     }
     return row;
   }
-  // Without an owned launch or bind, a creator mapping or the principal is required.
-  if (admission.actsAs === "none") throw unadmitted(claims, admission);
+  // Without an owned launch or bind, a creator mapping to a current member or the principal is required.
+  if (!acting(admission)) throw unadmitted(claims, admission);
   // A live binding in another workspace (for example under an earlier policy) is a bound replica, not a creator problem.
   if (row.source !== ENVIRONMENT_IDENTITY || row.workspace_id !== admission.policy.workspace_id) {
     throw new IdentityRefusal("replica_already_bound", 409, scopeOf(admission));
@@ -312,7 +329,8 @@ async function underAdmission<T>(deps: ReplicasDeps, claims: ReplicaIdentityClai
   work: (tx: SqlExecutor, admission: Admission) => Promise<T>): Promise<T> {
   return audited(deps, claims, async () => {
     const first = await deps.database.transaction((tx) => admissionChecks(tx, claims));
-    // An unmapped creator admitted as the principal still shows up for mapping.
+    // An unmapped creator admitted as the principal still shows up for mapping (a creator mapped
+    // to a former member, "refused_creator", is already mapped and never recorded).
     if (first.actsAs === "principal" && claims.creatorId !== null) await recordCreatorRequest(deps, first.policy.id, claims);
     return withReplicasLock(deps, scopeOf(first), async (tx) => {
       const admission = await admissionChecks(tx, claims);
@@ -343,9 +361,8 @@ async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIde
   // A reused launch or bind is never enrolled: its own lifecycle binds it (admitIdentity 503s until then).
   if (row && row.source !== ENVIRONMENT_IDENTITY) return row;
   // An environment-identity binding always acts for a mapped creator or the principal.
-  const userId = admission.userId;
-  const actsAs = admission.actsAs;
-  if (userId === null || actsAs === "none") throw unadmitted(claims, admission);
+  if (!acting(admission)) throw unadmitted(claims, admission);
+  const { userId, actsAs } = admission;
   const hint = emailHint(claims.creatorEmail);
   if (hint) {
     await tx.query("UPDATE replica_environment_creators SET creator_email_hint = $3 WHERE policy_id = $1 AND creator_id = $2 AND creator_email_hint IS DISTINCT FROM $3",
@@ -999,8 +1016,24 @@ async function registrationTarget(deps: ReplicasDeps, tx: SqlExecutor, actor: Re
   }
 }
 
-async function setCreateIntent(tx: SqlExecutor, policyId: string, value: boolean): Promise<void> {
-  await tx.query("UPDATE replica_environment_policies SET create_unconfirmed = $2, updated_at = now() WHERE id = $1", [policyId, value]);
+/** Sets the create intent and starts a new generation of it; returns that generation. */
+async function setCreateIntent(tx: SqlExecutor, policyId: string): Promise<string> {
+  const result = await tx.query<{ create_attempt: string | number | bigint }>(
+    `UPDATE replica_environment_policies SET create_unconfirmed = true, create_attempt = create_attempt + 1, updated_at = now()
+      WHERE id = $1 RETURNING create_attempt`, [policyId]);
+  return String(result.rows[0]!.create_attempt);
+}
+
+/**
+ * Clears the create intent only while it is still the generation this run
+ * set: a newer intent (a recovery run that sent its own create in between)
+ * is kept. Returns whether it was cleared.
+ */
+async function clearCreateIntent(tx: SqlExecutor, policyId: string, attempt: string): Promise<boolean> {
+  const result = await tx.query(
+    "UPDATE replica_environment_policies SET create_unconfirmed = false, updated_at = now() WHERE id = $1 AND create_attempt = $2::bigint RETURNING id",
+    [policyId, attempt]);
+  return result.rows.length > 0;
 }
 
 async function markRegistered(tx: SqlExecutor, actor: ReplicasActor, policy: PolicyRow, mcpId: string): Promise<EnvironmentMcpResult> {
@@ -1028,6 +1061,9 @@ async function markRegistered(tx: SqlExecutor, actor: ReplicasActor, policy: Pol
  * of the earlier outcome, so a duplicate entry may still surface later. Step 2 relists (another
  * run may have created it meanwhile), then creates and reads the entry back.
  * A timeout, 5xx, unreadable answer or a failed listing leaves the intent set.
+ * Setting the intent bumps its generation (create_attempt), and step 2 clears
+ * it only while that generation is still the one step 1 set, so a run never
+ * forgets the unresolved create of a recovery run that ran between its steps.
  */
 async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environmentId: string,
   config: IdentityMcpConfig, recover = false): Promise<EnvironmentMcpResult> {
@@ -1037,7 +1073,7 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
   const revoked: EnvironmentMcpResult = { environmentId, status: "access_revoked", retryable: false };
   const list = (target: RegistrationTarget) => deps.replicas.listEnvironmentMcps(target.key, target.current.environment_id)
     .then((entries) => matchEntry(entries, target.current, config));
-  const intent = await withReplicasLock(deps, actor, async (tx): Promise<EnvironmentMcpResult | { previous: boolean }> => {
+  const intent = await withReplicasLock(deps, actor, async (tx): Promise<EnvironmentMcpResult | { previous: boolean; attempt: string }> => {
     const target = await registrationTarget(deps, tx, actor, environmentId);
     if (!("current" in target)) return target;
     let found: EntryMatch;
@@ -1050,8 +1086,7 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
     if (found.kind === "conflict") return failed(false);
     if (found.kind === "match") return markRegistered(tx, actor, target.current, found.id);
     if (target.current.create_unconfirmed && !recover) return unconfirmed;
-    await setCreateIntent(tx, target.current.id, true);
-    return { previous: target.current.create_unconfirmed };
+    return { previous: target.current.create_unconfirmed, attempt: await setCreateIntent(tx, target.current.id) };
   });
   if ("status" in intent) return intent;
   // Once a create was sent, only a definite rejection proves no entry was
@@ -1067,12 +1102,16 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
         found = await list(target);
       } catch (error) {
         await recordProviderAccess(tx, actor.workspaceId, error);
-        // Nothing was sent in this attempt: restore the intent it found.
-        if (!intent.previous) await setCreateIntent(tx, target.current.id, false);
-        return intent.previous ? unconfirmed : accessRevoked(error) ? revoked : failed(true);
+        // Nothing was sent in this attempt: restore the intent it found, unless a newer
+        // attempt set it since (then that attempt's create is unresolved: unconfirmed).
+        if (intent.previous || !await clearCreateIntent(tx, target.current.id, intent.attempt)) return unconfirmed;
+        return accessRevoked(error) ? revoked : failed(true);
       }
       if (found.kind === "conflict") return failed(false);
       if (found.kind === "match") return markRegistered(tx, actor, target.current, found.id);
+      // A newer attempt (a recovery run between the two steps) owns the intent and its create is
+      // unresolved: this run only relists, as any run does while an earlier intent is set.
+      if (String(target.current.create_attempt) !== intent.attempt) return unconfirmed;
       asked = true;
       if (recover) {
         await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
@@ -1087,7 +1126,8 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
         await recordProviderAccess(tx, actor.workspaceId, error);
         if (rejectedByProvider(error)) {
           asked = false;
-          await setCreateIntent(tx, target.current.id, false);
+          // Only this attempt's intent is cleared; a newer one stays unresolved.
+          if (!await clearCreateIntent(tx, target.current.id, intent.attempt)) return unconfirmed;
           return accessRevoked(error) ? revoked : failed(true);
         }
       }

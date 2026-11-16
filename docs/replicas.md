@@ -164,13 +164,15 @@ Each call is admitted in this order:
 4. The replica acts as one Control person, who must still be a current member
    of the organization:
    - a creator mapped for the environment acts as the mapped person; a
-     mapping to a former member is refused, never moved to the principal;
+     mapping to a former member is refused, never moved to the principal
+     and never recorded as a pending creator;
    - otherwise (no creator, or an unmapped one) it acts as the workspace's
      VM principal, an explicit member chosen by an admin. Control never
      derives it from an email or the workspace owner;
-   - with no principal set, the call is refused, unless the replica has a
-     live launch or bind in this workspace whose owner is still a member: that
-     owned launch or bind is reused (step 5) before a principal is required.
+   - with no principal set, or a creator mapped to a former member, the call
+     is refused, unless the replica has a live launch or bind in this
+     workspace whose owner is still a member: that owned launch or bind is
+     reused (step 5) before a creator mapping or principal is required.
 
    Refusals answer 403 `replica_creator_not_allowed`. Mapping, principal and
    membership are re-read on every call, so removing a member stops their
@@ -359,7 +361,11 @@ started them. The intent clears only when:
   registered; or
 - a create sent by the same run is definitely rejected by the provider.
 
-A failed listing leaves the intent as it was. An environment can be enabled
+A failed listing leaves the intent as it was. Each time the intent is set its
+generation (`create_attempt`) is incremented, and a run clears only the
+generation it set itself: when an operator recovery sent its own create
+between a run's two locked steps, that run neither clears the recovery's
+intent nor creates again, and reports `registration_unconfirmed`. An environment can be enabled
 in only one Control workspace; a concurrent enable elsewhere reports
 `enabled_elsewhere`.
 

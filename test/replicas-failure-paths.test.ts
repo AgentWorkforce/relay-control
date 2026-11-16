@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import test, { type TestContext } from "node:test";
 import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
+import type { SqlExecutor } from "../src/database.js";
 import { migrate } from "../src/migrations.js";
 import { createReplicasModule } from "../src/replicas/module.js";
 import { ReplicasRuntimeError, type ReplicasRuntime } from "../src/replicas/runtime.js";
@@ -327,6 +328,95 @@ test("persisted create intent: every sync is read-only while a create is unconfi
   assert.equal((await policyRow(env, ENV_E)).registered_mcp_id, null);
 });
 
+/**
+ * Wraps the provider's MCP listing for one environment: afterFirst runs after
+ * the first listing (step 1 of a registration) and failNext makes the next
+ * listing answer a provider 503 once.
+ */
+function listingHooks(env: Env, environmentId: string, afterFirst: (state: { calls: number; failNext: boolean }) => void) {
+  const state = { calls: 0, failNext: false };
+  const runtime = env.replicas.deps.replicas;
+  const list = runtime.listEnvironmentMcps.bind(runtime);
+  runtime.listEnvironmentMcps = async (key, id) => {
+    if (id !== environmentId) return list(key, id);
+    state.calls++;
+    if (state.failNext) {
+      state.failNext = false;
+      throw new ReplicasRuntimeError("rejected", "replicas_http_503", 503);
+    }
+    const entries = await list(key, id);
+    if (state.calls === 1) afterFirst(state);
+    return entries;
+  };
+  return state;
+}
+
+/** Runs hook once before the next database transaction that starts after arm(), outside any open transaction. */
+function beforeNextTransaction(env: Env, hook: () => Promise<void>) {
+  const database = env.replicas.deps.database;
+  const transaction = database.transaction.bind(database);
+  let armed = false;
+  database.transaction = async <T>(run: (tx: SqlExecutor) => Promise<T>): Promise<T> => {
+    if (armed) {
+      armed = false;
+      await hook();
+    }
+    return transaction(run);
+  };
+  return { arm: () => { armed = true; } };
+}
+
+test("create intent generation: a relist failure restores a fresh intent it set itself", async (t) => {
+  const env = await start(t);
+  const { provider } = env;
+  assert.equal((await connect(env)).status, 200);
+  const creates = countCreates(env);
+  provider.environments.push({ id: ENV_C, name: "gamma" });
+  // Step 1 lists normally and sets the intent; the step 2 relist answers 503.
+  const listing = listingHooks(env, ENV_C, (state) => { state.failNext = true; });
+  const result = await syncEnvironments(env.replicas.deps, serviceActor(env));
+  assert.deepEqual(result.environments, [{ environmentId: ENV_C, status: "registration_failed", retryable: true }]);
+  assert.equal(listing.calls, 2);
+  assert.deepEqual(creates, [], "nothing was sent");
+  const row = await policyRow(env, ENV_C);
+  assert.equal(row.create_unconfirmed, false, "the intent this run set is restored");
+  assert.equal(String(row.create_attempt), "1");
+});
+
+test("create intent generation: a recovery between the two steps keeps its unresolved create when the first run's relist fails", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider } = env;
+  assert.equal((await connect(env)).status, 200);
+  const creates = countCreates(env);
+  provider.environments.push({ id: ENV_C, name: "gamma" });
+  const seen: { recovery?: Awaited<ReturnType<Api>> } = {};
+  // After run A's step 1 committed its intent (generation 1) and before its step 2 starts, an
+  // operator recovery runs to completion: it sets generation 2 and sends a create whose outcome
+  // stays unknown. Then run A's step 2 relist answers 503.
+  const interleave = beforeNextTransaction(env, async () => {
+    provider.mode.register = "fail";
+    seen.recovery = await api(`/api/v1/workspaces/${workspaceId}/replicas/environments/${ENV_C}`, {
+      method: "PUT", token: ownerToken, body: { enabled: true, retry_registration: true } });
+    listing.failNext = true;
+  });
+  const listing = listingHooks(env, ENV_C, () => interleave.arm());
+  const result = await syncEnvironments(env.replicas.deps, serviceActor(env));
+  const recovery = seen.recovery;
+  assert.ok(recovery, "the recovery ran between the two steps");
+  assert.equal(recovery.status, 200, recovery.text);
+  assert.equal(recovery.body.environment.status, "registration_unconfirmed");
+  assert.deepEqual(creates, [ENV_C], "only the recovery sent a create");
+  assert.equal(listing.calls, 5, "A step 1, recovery step 1, recovery step 2 twice, A step 2");
+  // Run A's relist failed after a newer attempt set the intent: it does not clear it and reports
+  // registration_unconfirmed (retryable), not registration_failed.
+  assert.deepEqual(result.environments, [{ environmentId: ENV_C, status: "registration_unconfirmed", retryable: true }]);
+  const row = await policyRow(env, ENV_C);
+  assert.equal(row.create_unconfirmed, true, "the recovery's unresolved create is not forgotten");
+  assert.equal(String(row.create_attempt), "2");
+  assert.equal(row.registered_mcp_id, null);
+  assert.deepEqual(await views(env), [[ENV_A, "registered"], [ENV_B, "registered"], [ENV_C, "registration_unconfirmed"]]);
+});
+
 const AGENT = `replicas-${WORKSPACE_1.replaceAll("-", "").slice(0, 16)}`;
 const liveBinding = async (env: Env) => (await env.database.query<any>(
   "SELECT id, user_id, input FROM replica_spawns WHERE source = 'environment_identity' AND replica_id = $1 AND state <> 'gone'", [WORKSPACE_1])).rows[0];
@@ -353,6 +443,58 @@ test("an owned bind is reused before a principal is required; without one an unm
   assert.equal(unmapped.body.error.message, "replica_creator_not_allowed");
   assert.equal(await count(env, "SELECT 1 FROM replica_environment_creator_requests WHERE creator_id = 'creator-owner'"), 1);
   assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE source = 'environment_identity'"), 0);
+});
+
+/** Maps the default token's creator to a member, then removes that member from the organization. */
+async function staleMapping(env: Env) {
+  const mapped = await env.api(`/api/v1/workspaces/${env.workspaceId}/replicas/environments/${ENV_A}`, {
+    method: "PUT", token: env.ownerToken, body: { enabled: true, creators: [{ creatorId: "creator-owner", userId: env.memberId }] },
+  });
+  assert.equal(mapped.status, 200, mapped.text);
+  await env.database.query("DELETE FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [env.organizationId, env.memberId]);
+  return (await policyRow(env, ENV_A)).id as string;
+}
+
+test("a creator mapped to a former member: an owned launch is still reused as its owner", async (t) => {
+  const env = await start(t);
+  const { api, ownerId } = env;
+  assert.equal((await connect(env)).status, 200);
+  const policyId = await staleMapping(env);
+  const launched = await launchRow(env, "spawn", WORKSPACE_1);
+  const reused = await rpc(api, token(), "tools/list");
+  assert.equal(reused.status, 200, reused.text);
+  const row = await spawnRow(env, launched);
+  assert.equal(row.user_id, ownerId, "acts as the launch owner, not the mapped former member");
+  assert.equal(row.state, "bound");
+  assert.equal(row.input.identity_admitted?.issuer, ISSUER);
+  assert.equal(row.input.identity_admitted?.organization_id, PROVIDER_ORG);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE source = 'environment_identity'"), 0, "no environment identity is enrolled");
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_creator_requests WHERE policy_id = $1", [policyId]), 0);
+});
+
+test("a creator mapped to a former member without an owned launch is refused, not recorded, and never moved to the principal", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, ownerId } = env;
+  assert.equal((await connect(env)).status, 200);
+  const policyId = await staleMapping(env);
+  const requests = () => count(env, "SELECT 1 FROM replica_environment_creator_requests WHERE policy_id = $1 AND creator_id = 'creator-owner'", [policyId]);
+
+  const refused = await rpc(api, token(), "tools/list");
+  assert.equal(refused.status, 403, refused.text);
+  assert.equal(refused.body.error.message, "replica_creator_not_allowed");
+  assert.equal(await requests(), 0, "a mapped creator is never a pending request");
+  assert.equal(await count(env,
+    "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.identity.refused' AND target = 'replica_creator_not_allowed' AND workspace_id = $1",
+    [workspaceId]), 1, "refused in the workspace's scope");
+
+  // With the VM principal set (a current member) it is still refused.
+  assert.equal((await api(`/api/v1/workspaces/${workspaceId}/replicas/environment-principal`, {
+    method: "PUT", token: ownerToken, body: { userId: ownerId } })).status, 200);
+  const still = await rpc(api, token(), "tools/list");
+  assert.equal(still.status, 403, still.text);
+  assert.equal(still.body.error.message, "replica_creator_not_allowed");
+  assert.equal(await requests(), 0);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns"), 0, "nothing is enrolled as the principal");
 });
 
 test("removing a creator mapping releases its binding: it enrols as the principal, or is refused without one", async (t) => {
