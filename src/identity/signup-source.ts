@@ -17,7 +17,9 @@ export function signupSourceFromNext(next: string | null | undefined): SignupSou
     const origin = "https://control.invalid";
     const destination = new URL(next, origin);
     if (destination.origin !== origin) return null;
-    return destination.pathname === MCP_AUTHORIZE ? "mcp" : null;
+    // The MCP authorize route matches with trailing slashes stripped, so
+    // /cloud/oauth/authorize/ is the same consent page.
+    return destination.pathname.replace(/\/+$/, "") === MCP_AUTHORIZE ? "mcp" : null;
   } catch {
     return null;
   }

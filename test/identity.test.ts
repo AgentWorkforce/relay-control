@@ -2134,6 +2134,9 @@ test("oidc e2e (entra-shaped Keycloak), multi mode: domain auto-join needs the n
 test("signup source: only a same-origin return to MCP OAuth consent is attributed", () => {
   assert.equal(signupSourceFromNext("/cloud/oauth/authorize?client_id=c&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fcb"), "mcp");
   assert.equal(signupSourceFromNext("/cloud/oauth/authorize"), "mcp");
+  // The authorize route strips trailing slashes before matching.
+  assert.equal(signupSourceFromNext("/cloud/oauth/authorize/?client_id=c"), "mcp");
+  assert.equal(signupSourceFromNext("/cloud/oauth/authorize//"), "mcp");
   for (const next of [null, undefined, "", "/", "/cloud", "/cloud/oauth/authorize/other", "/oauth/authorize",
     "//evil.test/cloud/oauth/authorize", "/\\evil.test/cloud/oauth/authorize", "https://evil.test/cloud/oauth/authorize"]) {
     assert.equal(signupSourceFromNext(next), null, String(next));

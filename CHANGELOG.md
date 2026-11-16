@@ -5,6 +5,14 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `users.signup_source` (migration 0068), where an account was
+  created: `teams`, `flows` or `desktop` (carried over from hosted Cloud by
+  the identity import) or `mcp`. Control records `mcp` when a new person
+  signs in (OIDC or email link) on the way back to MCP OAuth consent
+  (`/cloud/oauth/authorize`, e.g. ChatGPT's Agent Relay app). Set once at
+  creation; a later sign-in never rewrites it. Password sign-ups have no
+  return path and stay unattributed. Nullable; existing accounts are NULL.
+
 - Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), Agent
   Relay Desktop claims its relay node at `POST /api/v1/fleet/nodes/claim` with
   `{workspaceId, nodeName}`: the proof is the node's enrolment through this
