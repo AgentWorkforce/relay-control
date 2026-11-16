@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { closeSync, openSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -7,8 +7,6 @@ import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "pg";
-import { fixtureContract, fixtureKeyring, seedFixtures } from "./fixtures.js";
-import { verify } from "./verify.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const directory = await mkdtemp(join(tmpdir(), "cloud-verify-"));
@@ -63,26 +61,20 @@ try {
     await delay(100);
   }
   if (!ready) throw new Error("postgres_not_ready");
-  testProcess = spawn(process.execPath,["--import","tsx","--test","--test-concurrency=1",join(here,"../../test/cloud-import-verify.test.ts")], {
+  testProcess = spawn(process.execPath,["--import","tsx","--test","--test-concurrency=1",
+    join(here,"../../test/cloud-import-verify.test.ts"),join(here,"../../test/cloud-import-verify-integration.test.ts")], {
     cwd:join(here,"../.."), stdio:"inherit",
-    env: { ...process.env, CLOUD_VERIFY_FIXTURE_CLUSTER:"synthetic-only", CLOUD_VERIFY_FIXTURE_PORT:String(port) },
+    env: { ...process.env, CLOUD_VERIFY_FIXTURE_CLUSTER:"synthetic-only", CLOUD_VERIFY_FIXTURE_PORT:String(port),
+      CLOUD_VERIFY_IMPORT_REPORT_PATH:process.argv[3] ?? "" },
   });
   process.exitCode = await new Promise<number>((resolve,reject) => {
     testProcess!.once("error",reject);
     testProcess!.once("exit",(code) => resolve(code ?? 1));
   });
   if (process.exitCode === 0 && process.argv[3]) {
-    const config = {host:"127.0.0.1",port,user:"cloud_verify_fixture",database:"postgres",password:""};
-    const source = new Client(config);
-    const target = new Client(config);
-    try {
-      await source.connect(); await target.connect();
-      await seedFixtures(source);
-      const report = await verify(source,target,fixtureContract(),fixtureKeyring);
-      if (!report.ok) throw new Error("synthetic_receipt_failed");
-      await writeFile(process.argv[3],`${JSON.stringify(report,null,2)}\n`,{mode:0o600});
-      process.stdout.write(`Synthetic reference receipt: ${process.argv[3]}\n`);
-    } finally { await Promise.allSettled([source.end(),target.end()]); }
+    const report = JSON.parse(await readFile(process.argv[3],"utf8"));
+    if (!report.ok) throw new Error("synthetic_receipt_failed");
+    process.stdout.write(`Actual importer synthetic receipt: ${process.argv[3]}\n`);
   }
 } catch (error) {
   // Only synthetic data is ever put into this cluster. Log stays local on failure.

@@ -208,7 +208,8 @@ fixtureTest("CLI emits JSON with useful exit codes and hides URL/SQL errors", as
     const url = new URL("postgresql:/");
     url.hostname = "127.0.0.1"; url.port = port!;
     url.username = config.user; url.pathname = "/postgres";
-    const env = {...process.env,CLOUD_VERIFY_SOURCE_URL:url.toString(),CLOUD_VERIFY_TARGET_URL:url.toString(),
+    const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(SELFHOST_|CLOUD_IMPORT_|CLOUD_VERIFY_)/.test(name)));
+    const env = {...inherited,CLOUD_VERIFY_SOURCE_URL:url.toString(),CLOUD_VERIFY_TARGET_URL:url.toString(),
       SELFHOST_PASSWORD_PEPPER_FILE:"",
       SELFHOST_ENCRYPTION_KEY_ID:fixtureKeyring.active.id,
       SELFHOST_ENCRYPTION_KEY:fixtureKeyring.active.key.toString("base64"),

@@ -234,10 +234,12 @@ export function validateContract(contract: Contract): void {
  * Freeze importer writes before taking these independent repeatable-read snapshots.
  */
 export async function verify(source: Client, target: Client, contract: Contract, keyring: EncryptionKeyring,
-  options: {pepperVersions?: readonly number[]} = {}): Promise<Report> {
+  options: {pepperVersions?: readonly number[];
+    prepare?: (source:Client,target:Client) => Promise<{contract:Contract;findings:Finding[]}>} = {}): Promise<Report> {
   if (source === target) throw new Error("Separate source and target clients required");
   validateContract(contract);
   const findings: Finding[] = [];
+  let active = contract;
   try {
     for (const client of [source, target]) {
       await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -247,17 +249,21 @@ export async function verify(source: Client, target: Client, contract: Contract,
       // A role that silently filters data must not produce a passing checksum.
       await client.query("SET LOCAL row_security=off");
     }
-    for (const item of contract.tables) findings.push(await compare(source, target, item, "table"));
-    for (const item of contract.identities) findings.push(await compare(source, target, item, "identity"));
-    for (const relation of contract.targetRelations) findings.push(...await relationChecks(target, relation));
-    for (const item of contract.standaloneSequences ?? []) findings.push(await standaloneSequence(source,target,item));
-    for (const item of contract.pepperChecks ?? []) {
+    if (options.prepare) {
+      const prepared = await options.prepare(source,target);
+      validateContract(prepared.contract); active = prepared.contract; findings.push(...prepared.findings);
+    }
+    for (const item of active.tables) findings.push(await compare(source, target, item, "table"));
+    for (const item of active.identities) findings.push(await compare(source, target, item, "identity"));
+    for (const relation of active.targetRelations) findings.push(...await relationChecks(target, relation));
+    for (const item of active.standaloneSequences ?? []) findings.push(await standaloneSequence(source,target,item));
+    for (const item of active.pepperChecks ?? []) {
       const rows = await target.query(`SELECT DISTINCT pepper_version FROM (${item.sql}) p WHERE pepper_version IS NOT NULL`);
       const versions = rows.rows.map((row) => Number(row.pepper_version)).sort((a,b) => a-b);
       const missing = versions.filter((v) => !Number.isSafeInteger(v) || v < 1 || !options.pepperVersions?.includes(v));
       findings.push({kind:"pepper",name:item.name,ok:missing.length === 0,detail:{versions,missing}});
     }
-    for (const sample of contract.encryptedSamples) {
+    for (const sample of active.encryptedSamples) {
       const rows = await target.query(`SELECT ciphertext FROM (${sample.sql}) sample LIMIT $1`, [sample.limit]);
       let failures = 0;
       for (const row of rows.rows) {
@@ -275,7 +281,7 @@ export async function verify(source: Client, target: Client, contract: Contract,
     // PostgreSQL error details can contain rows and credentials.
     await Promise.allSettled([source.query("ROLLBACK"), target.query("ROLLBACK")]);
   }
-  return { version: 1, mappingRevision: contract.mappingRevision,
+  return { version: 1, mappingRevision: active.mappingRevision,
     ok: findings.every((f) => f.ok), findings,
     smoke: ["login", "workspace_list", "relaycast_key_resolve", "flows_run", "integration_token_refresh", "desktop_feed"]
       .map((name) => ({ name, status: "pending" })) };

@@ -3,18 +3,7 @@ import { Client } from "pg";
 import { loadEncryptionKeyring } from "../../src/config.js";
 import { parsePepperFile, readPepperFile } from "../../src/identity/config.js";
 import { validateContract, verify, type Contract } from "./verify.js";
-
-// Synthetic/local use only until remote verification is separately authorized.
-function localUrl(value: string | undefined): string {
-  if (!value) throw new Error("missing_url");
-  const url = new URL(value);
-  if (!["postgres:", "postgresql:"].includes(url.protocol)
-    || !["127.0.0.1", "[::1]"].includes(url.hostname)
-    || [...url.searchParams.keys()].some((key) => !["sslmode"].includes(key))) {
-    throw new Error("local_database_required");
-  }
-  return value;
-}
+import { localDatabaseUrl } from "./local.js";
 
 let source: Client | undefined;
 let target: Client | undefined;
@@ -27,8 +16,8 @@ try {
   const pepperPath = process.env.SELFHOST_PASSWORD_PEPPER_FILE?.trim();
   const pepperVersions = contract.pepperChecks?.length && pepperPath
     ? parsePepperFile(readPepperFile(pepperPath)).map((pepper) => pepper.version) : [];
-  source = new Client({ connectionString: localUrl(process.env.CLOUD_VERIFY_SOURCE_URL) });
-  target = new Client({ connectionString: localUrl(process.env.CLOUD_VERIFY_TARGET_URL) });
+  source = new Client({ connectionString: localDatabaseUrl(process.env.CLOUD_VERIFY_SOURCE_URL) });
+  target = new Client({ connectionString: localDatabaseUrl(process.env.CLOUD_VERIFY_TARGET_URL) });
   await source.connect();
   await target.connect();
   const report = await verify(source, target, contract, keyring,{pepperVersions});

@@ -3,12 +3,26 @@
 This directory owns the independent verifier and synthetic dry-run harness.
 The importer and authoritative mapping belong in `../cloud-import/`.
 
-**Current scope:** the engine and its reference fixtures work independently of
-the importer. `synthetic-reference-v2-plan-part1-NOT-production-mapping` is an explicit
-placeholder revision. The importer has not yet published `mapping.ts`; the
-production table projections, skip rules and importer invocation must be wired
-and reviewed against that contract before this can qualify an import. Passing
-these tests proves the verifier's detection behavior, not an actual import.
+`import-contract.ts` binds the verifier to the published
+`scripts/cloud-import/mapping.ts` from importer PR #155. It uses
+`MAPPING_REVISION`, shared comparisons, target specs/relations and encrypted
+sample definitions. PR #148 is stacked on the importer branch.
+
+The harness executes the actual importer against its synthetic Cloud fixture
+and separate source/target databases. It checks rollback mode, committed apply
+and a second apply, reconciles all nine tables and per-org ledgers, preserves
+invite hashes and proves sessions/reconnect state stay empty. The checked-in
+`import-report.example.json` is that synthetic receipt; application smokes are
+pending and no real-data import has run.
+
+The target uses all checked-in Control migrations (through 0051 at the initial
+integration) plus test-only models of the optional 0053/0056/0057 column shapes
+from separate schema PRs. These models exercise the new columns/types; they
+do not prove those pending migration files themselves. The shared Cloud fixture
+at importer head `240e84d` also needs a test-only generation-column guard because
+its mapping reads a column omitted from that initial fixture. The importer
+owner has been notified. The smaller fixtures in `fixtures.ts` independently
+stress the engine and are explicitly labeled as reference shapes.
 
 ## Run focused checks
 
@@ -28,8 +42,8 @@ CLOUD_VERIFY_PG_BIN=/opt/homebrew/opt/postgresql@15/bin \
 ```
 
 Omit `CLOUD_VERIFY_PG_BIN` when `initdb` and `postgres` are available to Node
-through `PATH`. `--report` is optional. Only the synthetic fixtures are seeded;
-there is no Neon/Supabase connection and no production importer invocation.
+through `PATH`. `--report` is optional and writes the actual importer's synthetic
+verification receipt. There is no Neon/Supabase connection or production run.
 The fixtures follow the plan's identifier shapes: `workspaces.id` is a UUID,
 `workspaces.relay_workspace_id` references text `relay_workspaces.id` values
 such as `rw_000000a1`, and `relay_workspaces.relaycast_workspace_id` contains a
@@ -39,8 +53,9 @@ lowercase email/name fallback are represented. These are reduced synthetic
 shapes, not the final importer contract. JSON/precision stress payloads live in
 separate `payload_probe` tables and do not imply a production workspace column.
 
-The test file is `test/cloud-import-verify.test.ts`. Normal repository test
-runs skip its database cases with an explicit reason; only this harness starts
+The test files are `test/cloud-import-verify.test.ts` and
+`test/cloud-import-verify-integration.test.ts`. Normal repository test
+runs skip their database cases with an explicit reason; only this harness starts
 their isolated cluster. Code under `scripts/` and tests under `test/` are both
 covered by the root `npm run typecheck`.
 
@@ -53,6 +68,37 @@ keys, multiple cursor batches, exact large JSON numbers, timestamp/JSON
 normalization, read-only transactions, cleanup and CLI exit/redaction behavior.
 
 ## Contract and CLI
+
+For an actual importer ledger against local synthetic databases:
+
+```sh
+node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --all-organizations
+# Or use an explicit UUID cohort:
+node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --org-ids UUID,UUID
+```
+
+Supply `CLOUD_VERIFY_SOURCE_URL`, `CLOUD_VERIFY_TARGET_URL`,
+`CLOUD_IMPORT_CREDENTIAL_ENCRYPTION_KEY` (Cloud's 64-hex AES key) and Control's
+usual keyring variables through the environment or their `_FILE` variants.
+Pepper coverage uses `SELFHOST_PASSWORD_PEPPER_FILE`. The explicit scope must
+match the ledger; a plan or rollback-mode ledger cannot qualify committed data.
+
+The adapter discovers optional target columns instead of trusting the ledger.
+It independently reconstructs source-query skips, decrypt failures and legacy
+Desktop source-ID exclusions inside the same read-only snapshots as the
+checksums. It checks candidate/import/skip totals and every per-org import
+count. Ledger counts alone never authorize excluding a row. Dynamic exclusions
+use independently derived keys and still block qualification as unresolved
+data-loss cases. Missing `rw_` storage and legacy `rw_` values normalized away
+by the importer also block continuity qualification, even if checksums match.
+Source metadata streams in batches of 250, with a 10,000-key exclusion cap that
+refuses excessive unresolved skips. Encrypted samples stay within the cohort;
+empty mapped secret tables are explicitly not applicable based on observed
+source/import counts.
+
+The library entry point is `verifyImport(source, target, scope, ledger, keyring,
+cloudKeyHex, {pepperVersions})`. For standalone comparisons without an importer
+ledger, the lower-level API remains available:
 
 `verify.ts` exports `Contract` and `verify(sourceClient, targetClient, contract,
 keyring, {pepperVersions})`. The final options argument is optional.
@@ -141,7 +187,7 @@ the same PostgreSQL major version for byte-level JSON rendering comparisons.
 Review schema coverage as well: catalog scans cannot infer a dropped constraint
 that is absent from the reviewed target schema.
 
-## Qualification after the importer contract lands
+## Cohort qualification
 
 The source-verified plan requires a one-time, repeatable import per cohort.
 Before a cohort can be marked ready:
@@ -150,11 +196,10 @@ Before a cohort can be marked ready:
    raw source counts with imported rows and every skipped row/reason in its
    JSON ledger, including active-only memberships, unresolved users and unbound
    workspaces. A passing projection alone cannot prove skip accounting.
-2. Seed the importer's actual synthetic source shapes and apply Control's
-   migrations in the harness. Run the importer twice; compare both verification
-   receipts and the second ledger to prove PK-upsert idempotency. Include open
-   invite deduplication and agent identity uniqueness in this integration.
-   The current reference seed is not this importer test.
+2. Run the actual-importer synthetic harness and repeat against the intended
+   target's finalized migrations before a cohort run. It already exercises
+   rollback/apply/rerun, open invite deduplication and agent identity uniqueness;
+   pending optional migration files still need their own schema proof.
 3. Check transformed identity tables: users' deferred `last_*` references,
    refreshed invite hashes, re-encrypted person/Desktop/hosted-participant
    tokens, Desktop `source_id` text-to-UUID handling and derived fleet fields.
@@ -170,7 +215,8 @@ Before a cohort can be marked ready:
    destination. The local synthetic harness does not qualify a production
    project restore and never provisions or accesses Supabase.
 
-These contract-integration steps remain pending. Rollback keeps the source
+The synthetic importer integration is exercised locally. Real cohort execution,
+application smokes and restore proof remain pending. Rollback keeps the source
 intact; writes created in Control after cutover need separate reconciliation.
 
 ## Application smoke checklist
