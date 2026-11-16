@@ -1,12 +1,12 @@
 # Reviewed target schema and verification scope
 
-`schema-manifest.json` is a committed reference built from all 61 checked-in
-Control migrations at main `c13c294`, in a fresh disposable local PostgreSQL
+`schema-manifest.json` is a committed reference built from all 63 checked-in
+Control migrations at main `b79cb5f`, in a fresh disposable local PostgreSQL
 cluster. It is never generated from the target being qualified. Its seal covers
 all expected entries and migration file hashes; verification also checks the
 migration files in the verifier checkout still match those hashes.
 
-The mandatory inventory has 97 tables and 1,777 logical catalogue objects.
+The mandatory inventory has 99 tables and 1,820 logical catalogue objects.
 It covers tables/relation kind and RLS flags, column types/positions/nullability/
 defaults/identity/generated/collation, constraints and definitions/validation/
 deferral/FK-trigger state, indexes and definitions/predicates/validity/readiness/
@@ -27,7 +27,7 @@ an empty target.
 There is one separately identified optional inventory: the synthetic proposed
 0061 staff-grant model. If present, all of its expected objects must match and
 the report profile is `main-plus-proposed-0061`. The cutover guard rejects that
-profile. On the actual c13c294 target without 0061, the production profile is
+profile. On the actual b79cb5f target without 0061, the production profile is
 `main`; a source containing importable staff grants still fails its missing-
 target gate. The optional fixture is not evidence for the pending migration.
 
@@ -67,3 +67,10 @@ evidence, all-source scope, a matching nonempty all/selected census and the
 production `main` schema profile. The copier runner additionally requires
 `credentialCopy:verified`. Contract-only reports are labeled `contract-only`
 and cannot pass this guard. Application smoke checks remain separate/pending.
+
+The ordinary offline test suite compares every migration filename/hash against
+the committed manifest, so a newly merged or changed migration fails CI until
+its inventory update is reviewed. This check does not require PostgreSQL and
+cannot silently skip with the integration tests. Baseline b79cb5f adds only the
+43 catalogue objects from 0059 relay-node credentials and 0060 relay-launch
+credentials; the earlier 1,777 required definitions remain identical.
