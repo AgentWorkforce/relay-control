@@ -183,7 +183,15 @@ INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, ha
   -- S1: an unselected Google key where Control already has a native active
   -- one, and an unselected OpenRouter key with nothing else in its group.
   ('${id(0x80e)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'gemini', 'google', 'byo_api_key', 'Cloud Google', false, false, 'connected', ${t}, ${t}),
-  ('${id(0x80f)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'opencode', 'openrouter', 'byo_api_key', 'Cloud OpenRouter', false, false, 'connected', ${t}, ${t});
+  ('${id(0x80f)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'opencode', 'openrouter', 'byo_api_key', 'Cloud OpenRouter', false, false, 'connected', ${t}, ${t}),
+  -- Cloud-exact reads: a login WITHOUT provider_account_id reads only the
+  -- legacy object; a refresh-exhausted login is dead in Cloud.
+  ('${id(0x810)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT legacy', false, false, 'connected', ${t}, ${t}),
+  ('${id(0x811)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT dead', false, false, 'refresh_failed', ${t}, ${t});
+INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, harness, model_provider, auth_type, display_name, is_active, harness_active, status, created_at, updated_at) VALUES
+  -- On a2, which is unbound: a pre-0064 target never gets that workspace.
+  ('${id(0x812)}', '${ORG_A}', '${id(0x202)}', '${id(1)}', 'codex', 'openai', 'byo_api_key', 'On unbound a2', true, false, 'connected', '2026-01-01T00:00:00.123456Z', '2026-01-01T00:00:00.123456Z');
+UPDATE provider_credentials SET refresh_exhausted = true WHERE id = '${id(0x811)}';
 UPDATE provider_credentials SET label = 'Bob token', account_email = 'bob@example.test' WHERE id = '${id(0x805)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-1' WHERE id = '${id(0x806)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-2' WHERE id = '${id(0x80c)}';
@@ -223,17 +231,19 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
     imported: 2,
     skipped: { superseded_open_invite: 1, already_member: 1, canceled: 1 },
   },
-  person_identities: { imported: 1, skipped: { workspace_not_imported: 1, cloud_decrypt_failed: 1, not_a_member: 1 } },
+  // 0x402's workspace (a2) is unbound: Relaycast identities need a binding.
+  person_identities: { imported: 1, skipped: { workspace_unbound: 1, cloud_decrypt_failed: 1, not_a_member: 1 } },
   hosted_relay_participants: { imported: 1, skipped: { duplicate_after_merge: 1, stale_relay_workspace: 1, not_a_member: 1 } },
   desktop_relay_identities: { imported: 1, skipped: { source_id_not_uuid: 1, not_a_member: 1 } },
-  fleet_node_owners: { imported: 1, skipped: { workspace_not_imported: 1 } },
+  fleet_node_owners: { imported: 1, skipped: { workspace_unbound: 1 } },
   // Pre-0058 target: the two relay_managed rows are refused by the importer.
   coding_agent_credentials: {
     imported: 0,
-    skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 12, target_lacks_relay_managed: 2 },
+    // Pre-0064: 0x804's workspace (a2, unbound) is skipped, so 0x804 follows it.
+    skipped: { workspace_unbound_pre_0064: 1, secret_in_cloud_credential_store: 15, target_lacks_relay_managed: 2 },
   },
   // Pre-0061 target: grants wait for the migration.
-  staff_read_grants: { imported: 0, skipped: { workspace_not_imported: 1, target_lacks_staff_read_grants: 1 } },
+  staff_read_grants: { imported: 0, skipped: { target_lacks_staff_read_grants: 2 } },
   // Pre-0054 target: the GitHub App rows wait for the migration.
   github_app_installations: { imported: 0, skipped: { target_lacks_github_app: 1 } },
   github_app_connections: {

@@ -170,7 +170,9 @@ async function readSource(tx: SqlExecutor, table: ImportTable, scope: ImportScop
 
 const ROW_FLAGS: Partial<Record<ImportTable, string>> = {
   workspaces: `array_remove(ARRAY[
-      CASE WHEN q.cloud_relay_workspace_id IS NULL THEN 'workspace_rw_id_not_rw_8hex' END,
+      CASE WHEN q.cloud_relay_workspace_id IS NULL AND q.unbound_reason IS DISTINCT FROM 'no_relay_workspace'
+           THEN 'workspace_rw_id_not_rw_8hex' END,
+      CASE WHEN q.unbound_reason IS NOT NULL THEN 'unbound:' || q.unbound_reason END,
       CASE WHEN q.has_dashboard_url THEN 'relayhistory_dashboard_url_dropped' END,
       CASE WHEN q.relayhistory_origin_raw IS NOT NULL THEN 'relayhistory_origin_set' END
     ], NULL)`,
@@ -277,6 +279,17 @@ function chunks<T>(items: T[], size: number): T[][] {
   return out;
 }
 
+/** Tables whose rows carry workspace_id and follow their workspace's skip. */
+const WORKSPACE_DEPENDENT_TABLES: readonly ImportTable[] = [
+  "person_identities",
+  "hosted_relay_participants",
+  "desktop_relay_identities",
+  "fleet_node_owners",
+  "github_app_connections",
+  "coding_agent_credentials",
+  "staff_read_grants",
+];
+
 /** A per-organization refusal: recorded as that org's failure, others go on. */
 class OrgRefused extends Error {
   constructor(readonly code: string) {
@@ -379,7 +392,8 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
           if (spec.secretConstant !== undefined) {
             secret = encryptSecret(spec.secretConstant, deps.keyring.active);
           } else if (spec.secret?.source === "secret_plaintext") {
-            secret = encryptSecret(row.secret ?? "", deps.keyring.active);
+            // NULL for an unbound workspace: its Relaycast pair stays NULL (0064).
+            secret = row.secret === null ? null : encryptSecret(row.secret, deps.keyring.active);
           } else if (spec.secret?.source === "secret_envelope" && !deps.cloudKeyHex) {
             warn("secrets_not_checked");
           } else if (spec.secret?.source === "secret_envelope") {
@@ -399,7 +413,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
           skip(table, "cloud_decrypt_failed", row.key);
           continue;
         }
-        for (const flag of row.flags ?? []) if (flag !== "source_id_not_uuid") warn(flag);
+        for (const flag of row.flags ?? []) if (flag !== "source_id_not_uuid" && !flag.startsWith("unbound:")) warn(flag);
         let override: string | undefined;
         if (table === "workspaces") {
           const canonical = row.origin === null ? null : canonicalOrigin(row.origin);
@@ -481,6 +495,35 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
         skip("desktop_relay_identities", "source_id_not_uuid", row.key);
         return false;
       });
+    }
+    // Before 0064 a Control workspace needs a Relaycast binding: an unbound
+    // Cloud workspace is skipped under its unbound reason, and so is every
+    // row that would reference it. From 0064 it imports with the pair NULL.
+    const workspaceColumns = columns.get("workspaces");
+    const unboundAllowed = workspaceColumns?.get("relaycast_workspace_id")?.nullable === true
+      && workspaceColumns?.get("relaycast_api_key_ciphertext")?.nullable === true;
+    const unboundReason = (row: PreparedRow) => row.flags?.find((flag) => flag.startsWith("unbound:"))?.slice("unbound:".length);
+    if (!unboundAllowed) {
+      const dropped = new Set<string>();
+      prepared.workspaces = prepared.workspaces.filter((row) => {
+        const reason = unboundReason(row);
+        if (!reason) return true;
+        skip("workspaces", reason, row.key);
+        dropped.add(row.key);
+        return false;
+      });
+      if (dropped.size > 0) {
+        for (const table of WORKSPACE_DEPENDENT_TABLES) {
+          prepared[table] = prepared[table].filter((row) => {
+            const { workspace_id: workspaceId } = JSON.parse(row.row) as { workspace_id?: string };
+            if (!workspaceId || !dropped.has(workspaceId)) return true;
+            skip(table, "workspace_unbound_pre_0064", row.key);
+            return false;
+          });
+        }
+      }
+    } else {
+      for (const row of prepared.workspaces) if (unboundReason(row)) warn("workspace_imported_unbound");
     }
     // Before 0058 Control cannot hold a relay_managed credential.
     const relayManaged = await target.query<{ ok: boolean }>(

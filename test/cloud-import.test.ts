@@ -42,6 +42,15 @@ CREATE TABLE IF NOT EXISTS staff_read_grants (
     REFERENCES workspaces(id, organization_id) ON DELETE CASCADE,
   CONSTRAINT staff_read_grant_lifetime CHECK (expires_at > created_at AND expires_at <= created_at + interval '90 days')
 );
+-- 0064 (#169, lazy Relaycast binding), as proposed.
+ALTER TABLE workspaces
+  ALTER COLUMN relaycast_workspace_id DROP NOT NULL,
+  ALTER COLUMN relaycast_api_key_ciphertext DROP NOT NULL,
+  ADD CONSTRAINT workspaces_relaycast_binding_pair
+    CHECK (
+      (relaycast_workspace_id IS NULL AND relaycast_api_key_ciphertext IS NULL)
+      OR (relaycast_workspace_id IS NOT NULL AND relaycast_api_key_ciphertext IS NOT NULL)
+    );
 -- 0058 (relay_managed coding agents) is a real migration now.
 `;
 
@@ -107,9 +116,12 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   const plan = await runImport({ ...deps, target: undefined }, scope, "plan");
   assert.equal(plan.ok, true);
   const expectedPlan = structuredClone(EXPECTED_FULL);
-  expectedPlan.coding_agent_credentials = { imported: 2, skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 12 } };
+  // Plan has no target, so the pre-0064 unbound-workspace gate cannot apply:
+  // unbound workspaces (a2 no key, a3 no rw_) count as importable.
+  expectedPlan.workspaces = { imported: 5, skipped: { workspace_being_deleted: 1 } };
+  expectedPlan.coding_agent_credentials = { imported: 3, skipped: { secret_in_cloud_credential_store: 15 } };
   expectedPlan.github_app_installations = { imported: 1, skipped: {} };
-  expectedPlan.staff_read_grants = { imported: 1, skipped: { workspace_not_imported: 1 } };
+  expectedPlan.staff_read_grants = { imported: 2, skipped: {} };
   expectedPlan.github_app_connections = {
     imported: 1,
     skipped: { named_connection_needs_policy: 1, installation_claimed_by_other_org: 1, invalid_installation_id: 1, duplicate_default_connection: 1 },
@@ -271,8 +283,21 @@ test("cloud import: current target (main + proposed 0061) keeps rw_, slugs, Hist
   assert.equal(strict.warnings.relayhistory_origin_invalid_dropped, 1);
   assert.equal(report.warnings.fleet_node_name_filled_with_node_id, undefined);
 
+  // R4 (0064): unbound Cloud workspaces arrive with the Relaycast pair NULL.
+  const unbound = (await target.query<{ id: string; relaycast_workspace_id: string | null; relaycast_api_key_ciphertext: string | null; cloud_relay_workspace_id: string | null }>(
+    "SELECT id, relaycast_workspace_id, relaycast_api_key_ciphertext, cloud_relay_workspace_id FROM workspaces WHERE relaycast_workspace_id IS NULL ORDER BY id")).rows;
+  assert.deepEqual(unbound, [
+    // a2: a Cloud rw_ whose Relaycast key is empty keeps its hosted rw_ identity.
+    { id: id(0x202), relaycast_workspace_id: null, relaycast_api_key_ciphertext: null, cloud_relay_workspace_id: "rw_0000a202" },
+    // a3: never had a relay workspace.
+    { id: id(0x203), relaycast_workspace_id: null, relaycast_api_key_ciphertext: null, cloud_relay_workspace_id: null },
+  ]);
+  assert.equal(report.warnings.workspace_imported_unbound, 2);
+  assert.equal(report.tables.person_identities.skipped.workspace_unbound, 1);
+  assert.equal(report.tables.fleet_node_owners.skipped.workspace_unbound, 1);
+  assert.equal(report.tables.coding_agent_credentials.imported, 3, "relay_managed rows on unbound workspaces import");
   const workspaces = (await target.query<{ id: string; cloud_relay_workspace_id: string | null; slug: string; relayhistory_origin: string | null }>(
-    "SELECT id, cloud_relay_workspace_id, slug, relayhistory_origin FROM workspaces ORDER BY id")).rows;
+    "SELECT id, cloud_relay_workspace_id, slug, relayhistory_origin FROM workspaces WHERE relaycast_workspace_id IS NOT NULL ORDER BY id")).rows;
   assert.deepEqual(workspaces, [
     { id: id(0x201), cloud_relay_workspace_id: "rw_0000a201", slug: "a1", relayhistory_origin: "https://history.example.test" },
     { id: id(0x205), cloud_relay_workspace_id: "rw_0000b201", slug: "b1", relayhistory_origin: null },
@@ -289,6 +314,8 @@ test("cloud import: current target (main + proposed 0061) keeps rw_, slugs, Hist
   assert.deepEqual(agents, [
     { id: id(0x801), is_active: true, harness_active: false, secret_ciphertext: null },
     { id: id(0x802), is_active: false, harness_active: false, secret_ciphertext: null },
+    // On a2, which now imports unbound (0064); Cloud had it unselected.
+    { id: id(0x804), is_active: false, harness_active: false, secret_ciphertext: null },
   ]);
   assert.equal(report.warnings.coding_agent_active_demoted, 1);
   const github = (await target.query<{ id: string; installation_id: string; github_app_organization_id: string; credentials_ciphertext: string; created_by_user_id: string }>(
