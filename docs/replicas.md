@@ -167,7 +167,9 @@ Each call is admitted in this order:
    - otherwise (no creator, or an unmapped one) it acts as the workspace's
      VM principal, an explicit member chosen by an admin. Control never
      derives it from an email or the workspace owner;
-   - with no principal set, the call is refused.
+   - with no principal set, the call is refused, unless the replica has a
+     live launch or bind in this workspace whose owner is still a member: that
+     owned launch or bind is reused (step 5) before a principal is required.
 
    Refusals answer 403 `replica_creator_not_allowed`. Mapping, principal and
    membership are re-read on every call, so removing a member stops their
@@ -205,8 +207,8 @@ names a Control workspace, so tokens of an unknown organization or
 environment cannot fill the audit log), `replicas.identity.revived`,
 `replicas.environment.enabled`, `replicas.environment.disabled`,
 `replicas.environment.creators_updated`, `replicas.environment.principal_updated`,
-`replicas.environment.mcp_registered`, `replicas.environment.mcp_removed`,
-`replicas.environment.all_enabled` and `replicas.environment.all_disabled`.
+`replicas.environment.mcp_registered`, `replicas.environment.registration_retried`,
+`replicas.environment.mcp_removed`, `replicas.environment.all_enabled` and `replicas.environment.all_disabled`.
 
 ### Policies and registration
 
@@ -237,7 +239,7 @@ admission order above).
 | Route | Purpose |
 | --- | --- |
 | `GET /api/v1/workspaces/{ws}/replicas/environment-policies` | Policies: enabled, opted out, registration status, creator mapping with masked email hints, pending creators, binding counts |
-| `PUT /api/v1/workspaces/{ws}/replicas/environments/{id}` | `{enabled?, creators?: [{creatorId, userId}]}`; creators replace the list and must be current members |
+| `PUT /api/v1/workspaces/{ws}/replicas/environments/{id}` | `{enabled?, creators?: [{creatorId, userId}], retry_registration?: true}`; creators replace the list and must be current members; `retry_registration` recovers an unconfirmed registration (see below) |
 | `PUT /api/v1/workspaces/{ws}/replicas/environment-principal` | `{userId: <member id> \| null}`: set or clear the VM principal; answers the policy view |
 | `POST /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}` (re-enable those) or `{all: true}` (turn the default back on and clear every opt-out and re-enable every environment), optionally with `principalUserId`: set the principal, then enable and register the entry |
 | `DELETE /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}`: opt those environments out; `{all: true}`: turn the default off for the workspace and disable every environment. Disables, then removes the entry |
@@ -346,15 +348,33 @@ means the provider answered 401 or 403 to the listing or the create.
 
 The create intent is persisted (`create_unconfirmed` on the policy, migration
 0070) before a create is sent, and the policy view reports such a policy as
-`registration_unconfirmed`. A matching entry found by any later listing is
-recorded as registered and clears the intent; a definite provider rejection
-clears it too. While it is set, automatic runs (the startup run and the
-periodic sync) only list the entries again and never send another create. A
-person-driven run (`POST .../environments/sync`, `POST .../environment-mcp`
-or `PUT .../environments/{id}`) may create again, and only after a complete
-listing showed no entry. A failed listing leaves the intent as it was. An environment can be enabled in only
-one Control workspace; a concurrent enable elsewhere reports
+`registration_unconfirmed`. While it is set, every run is read-only: the
+startup run, the periodic sync, `POST .../environments/sync`, `POST
+.../environment-mcp` and a plain `PUT .../environments/{id}` with `enabled:
+true` only list the entries again and never send another create, whoever
+started them. The intent clears only when:
+
+- a later complete listing finds a matching entry, which is recorded as
+  registered; or
+- a create sent by the same run is definitely rejected by the provider.
+
+A failed listing leaves the intent as it was. An environment can be enabled
+in only one Control workspace; a concurrent enable elsewhere reports
 `enabled_elsewhere`.
+
+Recovering an unconfirmed registration is a separate, explicit operator
+action, not a sync: `PUT .../environments/{id}` with `retry_registration:
+true` (owner or admin only; the environment must be enabled or enabled in the
+same request, otherwise 400). It retries an unresolved write, a create whose
+outcome is unknown: after the enable it registers the entry once more and,
+while the intent is set, sends the create again. A complete listing and a
+second listing just before the create must both show no entry; that is the
+precondition for re-sending, not proof that the earlier create failed. Using
+the flag is an operator decision that accepts a possible duplicate entry,
+which the provider may surface later. Each create it sends is audited as
+`replicas.environment.registration_retried`. On an environment without an
+unconfirmed create it registers like an enable does (an existing entry is
+reused). The response is the usual `{environment}` view.
 
 Disabling an environment (`PUT` with `enabled: false`, `DELETE
 environment-mcp`, or disconnect) commits the disable first, then removes the

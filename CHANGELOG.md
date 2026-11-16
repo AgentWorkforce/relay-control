@@ -6,9 +6,18 @@ assigned at release.
 ## Unreleased
 
 - Added: Replicas failure paths (migration 0070). The environment MCP create
-  intent is persisted on the policy, so an unconfirmed create is never sent
-  again by the startup run or the periodic sync; a person-driven sync or
-  enable creates again only after a complete listing shows no entry. Removing
+  intent is persisted on the policy and, while it is set, every sync or
+  enable (startup run, periodic sync, the sync and enable routes, a plain
+  `PUT .../environments/{id}`) is read-only and never sends the create again;
+  it clears when a complete listing finds the entry or a create is definitely
+  rejected. Operator recovery is the explicit, admin-only `retry_registration:
+  true` flag on `PUT .../environments/{id}`: it retries the unresolved write
+  (a create whose outcome is unknown) once a complete listing shows no entry,
+  which is the precondition for re-sending, not proof that the earlier create
+  failed; the operator accepts a possible duplicate entry the provider may
+  surface later (audited `replicas.environment.registration_retried`). A replica with an owned
+  launch or bind in the workspace is reused before a creator mapping or VM
+  principal is required. Removing
   a creator mapping releases that creator's creator-acting bindings, and the
   periodic sync retries unfinished cleanup of released bindings with
   exponential backoff (1 minute to 1 hour). A 401 or 403 from Replicas on the

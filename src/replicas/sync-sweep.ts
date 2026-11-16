@@ -15,7 +15,7 @@ export type ReplicasSyncLog = (event: {
  * all-environments default is on (no settings row = on). Runs once at start,
  * then every interval; a run never overlaps the previous one. A failing
  * connection is logged and the sweep moves on. It acts as a service, never as
- * a person, and never sets or infers the VM principal. Being automatic, it
+ * a person, and never sets or infers the VM principal. Like every sync, it
  * never re-sends a create whose earlier outcome is unconfirmed. After the
  * sync it retries incomplete remote cleanup of gone bindings for every
  * Replicas connection (whatever its default), with per-row backoff.
@@ -87,7 +87,7 @@ export class ReplicasSyncSweep {
     for (const target of targets) {
       if (this.stopped) break;
       try {
-        await syncEnvironments(this.deps.replicas, this.actor(target), { automatic: true });
+        await syncEnvironments(this.deps.replicas, this.actor(target));
       } catch {
         this.deps.log?.({ code: "replicas_sync_failed", workspaceId: target.workspace_id });
       }

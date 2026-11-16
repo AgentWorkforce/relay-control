@@ -239,7 +239,7 @@ function countCreates(env: Env) {
 const views = async (env: Env) => (await env.api(`/api/v1/workspaces/${env.workspaceId}/replicas/environment-policies`, { token: env.ownerToken }))
   .body.environments.map((item: any) => [item.environmentId, item.status]);
 
-test("persisted create intent: automatic runs only relist while a create is unconfirmed; a person run may create again", async (t) => {
+test("persisted create intent: every sync is read-only while a create is unconfirmed; only retry_registration creates again", async (t) => {
   const env = await start(t);
   const { api, workspaceId, ownerToken, provider } = env;
   assert.equal((await connect(env)).status, 200);
@@ -270,8 +270,9 @@ test("persisted create intent: automatic runs only relist while a create is unco
   assert.equal(row.create_unconfirmed, false);
   assert.deepEqual(creates, [ENV_C]);
 
-  // A person sync after a complete, empty listing creates exactly once more.
+  // Person-driven syncs and enables are read-only too, even after a complete, empty listing.
   const ENV_D = "4e4e4e4e-4e4e-4e4e-8e4e-4e4e4e4e4e4e";
+  const base = `/api/v1/workspaces/${workspaceId}/replicas`;
   provider.environments.push({ id: ENV_D, name: "delta" });
   provider.mode.register = "fail";
   await sweep.tick();
@@ -279,13 +280,43 @@ test("persisted create intent: automatic runs only relist while a create is unco
   provider.mode.register = "ok";
   await sweep.tick();
   assert.deepEqual(creates, [ENV_C, ENV_D]);
-  const synced = await api(`/api/v1/workspaces/${workspaceId}/replicas/environments/sync`, { method: "POST", token: ownerToken });
+  const synced = await api(`${base}/environments/sync`, { method: "POST", token: ownerToken });
   assert.equal(synced.status, 200, synced.text);
-  assert.deepEqual(synced.body.environments, [{ environmentId: ENV_D, status: "registered" }]);
+  assert.deepEqual(synced.body.environments, [{ environmentId: ENV_D, status: "registration_unconfirmed", retryable: true }]);
+  const enabled = await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { environmentIds: [ENV_D] } });
+  assert.equal(enabled.status, 200, enabled.text);
+  assert.deepEqual(enabled.body.environments, [{ environmentId: ENV_D, status: "registration_unconfirmed", retryable: true }]);
+  const put = await api(`${base}/environments/${ENV_D}`, { method: "PUT", token: ownerToken, body: { enabled: true } });
+  assert.equal(put.status, 200, put.text);
+  assert.equal(put.body.environment.status, "registration_unconfirmed");
+  assert.deepEqual(creates, [ENV_C, ENV_D], "no sync or enable replays the create");
+  assert.equal((await policyRow(env, ENV_D)).create_unconfirmed, true);
+
+  // retry_registration: admin only, and only on an enabled environment.
+  const refused = await api(`${base}/environments/${ENV_D}`, {
+    method: "PUT", token: env.memberToken, body: { enabled: true, retry_registration: true } });
+  assert.equal(refused.status, 403, refused.text);
+  const disabling = await api(`${base}/environments/${ENV_D}`, {
+    method: "PUT", token: ownerToken, body: { enabled: false, retry_registration: true } });
+  assert.equal(disabling.status, 400, disabling.text);
+  assert.equal(disabling.body.error, "retry_registration needs an enabled environment.");
+  assert.equal((await api(`${base}/environments/${ENV_B}`, { method: "PUT", token: ownerToken, body: { enabled: false } })).status, 200);
+  const disabled = await api(`${base}/environments/${ENV_B}`, { method: "PUT", token: ownerToken, body: { retry_registration: true } });
+  assert.equal(disabled.status, 400, disabled.text);
+  assert.deepEqual(creates, [ENV_C, ENV_D]);
+  assert.equal((await policyRow(env, ENV_D)).create_unconfirmed, true);
+
+  // The owner's explicit recovery creates exactly once more after a complete, empty listing.
+  const retried = await api(`${base}/environments/${ENV_D}`, {
+    method: "PUT", token: ownerToken, body: { enabled: true, retry_registration: true } });
+  assert.equal(retried.status, 200, retried.text);
+  assert.equal(retried.body.environment.status, "registered");
   assert.deepEqual(creates, [ENV_C, ENV_D, ENV_D]);
   row = await policyRow(env, ENV_D);
   assert.ok(row.registered_mcp_id);
   assert.equal(row.create_unconfirmed, false);
+  assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.environment.registration_retried' AND target = $1",
+    [row.id]), 1);
 
   // A definite rejection clears the intent.
   const ENV_E = "5f5f5f5f-5f5f-4f5f-8f5f-5f5f5f5f5f5f";
@@ -300,6 +331,29 @@ const AGENT = `replicas-${WORKSPACE_1.replaceAll("-", "").slice(0, 16)}`;
 const liveBinding = async (env: Env) => (await env.database.query<any>(
   "SELECT id, user_id, input FROM replica_spawns WHERE source = 'environment_identity' AND replica_id = $1 AND state <> 'gone'", [WORKSPACE_1])).rows[0];
 const spawnRow = async (env: Env, id: string) => (await env.database.query<any>("SELECT * FROM replica_spawns WHERE id = $1", [id])).rows[0];
+
+test("an owned bind is reused before a principal is required; without one an unmapped creator is refused and recorded", async (t) => {
+  const env = await start(t);
+  const { api } = env;
+  assert.equal((await connect(env)).status, 200);
+  // No creator mapping and no VM principal.
+  const bound = await launchRow(env, "bind", WORKSPACE_1.toUpperCase());
+  const reused = await rpc(api, token(), "tools/list");
+  assert.equal(reused.status, 200, reused.text);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE source = 'environment_identity'"), 0, "no environment identity is enrolled");
+  assert.equal((await spawnRow(env, bound)).state, "bound");
+
+  // Without a launch or bind: refused, and only a token with a creator id records a pending creator.
+  const anonymous = await rpc(api, token({ workspace_id: WORKSPACE_2, creator_id: null }), "tools/list");
+  assert.equal(anonymous.status, 403, anonymous.text);
+  assert.equal(anonymous.body.error.message, "replica_creator_not_allowed");
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_creator_requests"), 0);
+  const unmapped = await rpc(api, token({ workspace_id: WORKSPACE_2 }), "tools/list");
+  assert.equal(unmapped.status, 403, unmapped.text);
+  assert.equal(unmapped.body.error.message, "replica_creator_not_allowed");
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_creator_requests WHERE creator_id = 'creator-owner'"), 1);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE source = 'environment_identity'"), 0);
+});
 
 test("removing a creator mapping releases its binding: it enrols as the principal, or is refused without one", async (t) => {
   const env = await start(t);

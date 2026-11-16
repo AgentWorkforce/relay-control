@@ -80,15 +80,19 @@ type PolicyRow = {
   enabled: boolean;
   registered_mcp_id: string | null;
   opted_out: boolean;
-  /** A create was (or was about to be) sent with an unknown outcome: automatic runs only relist. */
+  /** A create was (or was about to be) sent with an unknown outcome: every run only relists until it clears (retry_registration excepted). */
   create_unconfirmed: boolean;
   /** Set when a complete discovery listing no longer showed this enabled environment; fences admission. */
   discovery_missing_since: Date | string | null;
 };
 const POLICY = "id, workspace_id, issuer, provider_organization_id, environment_id, environment_name, enabled, registered_mcp_id, opted_out, create_unconfirmed, discovery_missing_since";
 
-/** actsAs: "creator" for a mapped creator, "principal" for the workspace VM principal. */
-type Admission = { policy: PolicyRow; organizationId: string; userId: string; actsAs: "creator" | "principal" };
+/**
+ * actsAs: "creator" for a mapped creator, "principal" for the workspace VM
+ * principal, "none" when neither applies (userId null): only an owned launch
+ * or bind of the same replica can then admit it (liveBinding).
+ */
+type Admission = { policy: PolicyRow; organizationId: string; userId: string | null; actsAs: "creator" | "principal" | "none" };
 const scopeOf = (admission: Admission) => ({ workspaceId: admission.policy.workspace_id, organizationId: admission.organizationId });
 
 function identityConfig(deps: ReplicasDeps) {
@@ -183,9 +187,13 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
     }
   }
   if (principal) return { policy, organizationId, userId: principal, actsAs: "principal" };
-  // Only an unmapped creator becomes a pending request.
-  throw new IdentityRefusal("replica_creator_not_allowed", 403, scope, claims.creatorId === null ? null : policy.id);
+  // No creator mapping and no principal: liveBinding refuses unless an owned launch or bind exists.
+  return { policy, organizationId, userId: null, actsAs: "none" };
 }
+
+/** No mapped creator and no principal; only an unmapped creator becomes a pending request. */
+const unadmitted = (claims: ReplicaIdentityClaims, admission: Admission) =>
+  new IdentityRefusal("replica_creator_not_allowed", 403, scopeOf(admission), claims.creatorId === null ? null : admission.policy.id);
 
 async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admission: Admission): Promise<SpawnRow | null> {
   const live = await tx.query<SpawnRow>(
@@ -193,7 +201,10 @@ async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admis
     [claims.workspaceId],
   );
   const row = live.rows[0];
-  if (!row) return null;
+  if (!row) {
+    if (admission.actsAs === "none") throw unadmitted(claims, admission);
+    return null;
+  }
   // A launch or bind of the same replica in this workspace is reused as is: the identity acts as
   // that binding and its owner (never the principal or a creator mapping) while the owner is a member.
   // A rejected launch binds nothing by itself, so it stays a conflict until recovered or released.
@@ -203,6 +214,8 @@ async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admis
     if (!owner.rows.length) throw new IdentityRefusal("replica_creator_not_allowed", 403, scopeOf(admission));
     return row;
   }
+  // Without an owned launch or bind, a creator mapping or the principal is required.
+  if (admission.actsAs === "none") throw unadmitted(claims, admission);
   // A live binding in another workspace (for example under an earlier policy) is a bound replica, not a creator problem.
   if (row.source !== ENVIRONMENT_IDENTITY || row.workspace_id !== admission.policy.workspace_id) {
     throw new IdentityRefusal("replica_already_bound", 409, scopeOf(admission));
@@ -314,13 +327,17 @@ async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIde
   let row = await liveBinding(tx, claims, admission);
   // A reused launch or bind is never enrolled: its own lifecycle binds it (admitIdentity 503s until then).
   if (row && row.source !== ENVIRONMENT_IDENTITY) return row;
+  // An environment-identity binding always acts for a mapped creator or the principal.
+  const userId = admission.userId;
+  const actsAs = admission.actsAs;
+  if (userId === null || actsAs === "none") throw unadmitted(claims, admission);
   const hint = emailHint(claims.creatorEmail);
   if (hint) {
     await tx.query("UPDATE replica_environment_creators SET creator_email_hint = $3 WHERE policy_id = $1 AND creator_id = $2 AND creator_email_hint IS DISTINCT FROM $3",
       [admission.policy.id, claims.creatorId, hint]);
   }
   if (row?.state === "bound" && row.token_ciphertext) return row;
-  const relay = await relayFor(deps, tx, { workspaceId: admission.policy.workspace_id, userId: admission.userId }, row?.relay_workspace_id);
+  const relay = await relayFor(deps, tx, { workspaceId: admission.policy.workspace_id, userId }, row?.relay_workspace_id);
   const name = identityAgentName(claims.workspaceId);
   const ownId = row?.id;
   // A replica already bridged by another binding (a PR A spawn or bind) is never enrolled twice.
@@ -344,12 +361,12 @@ async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIde
   if (!row) {
     const id = randomUUID();
     const input: SpawnInput = { environment_id: claims.environmentId, name, task: "", coding_agent: "replicas",
-      origin: ENVIRONMENT_IDENTITY, acts_as: admission.actsAs, creator_id: claims.creatorId };
+      origin: ENVIRONMENT_IDENTITY, acts_as: actsAs, creator_id: claims.creatorId };
     const inserted = await tx.query<SpawnRow>(
       `INSERT INTO replica_spawns (id, workspace_id, organization_id, user_id, client_request_id, source, input, replica_id, state,
          relay_workspace_id, agent_name, environment_id, provider_organization_id, issuer)
        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, 'binding', $9, $10, $11, $12, $13) RETURNING ${COLUMNS}`,
-      [id, admission.policy.workspace_id, admission.organizationId, admission.userId, `environment-identity:${id}`, ENVIRONMENT_IDENTITY,
+      [id, admission.policy.workspace_id, admission.organizationId, userId, `environment-identity:${id}`, ENVIRONMENT_IDENTITY,
         JSON.stringify(input), claims.workspaceId, relay.relaycastWorkspaceId, name, claims.environmentId, claims.organizationId, claims.issuer],
     );
     // Committed before registration: the name is the cleanup locator.
@@ -712,13 +729,23 @@ async function disablePolicy(tx: SqlExecutor, actor: ReplicasActor, policy: Poli
 const putInput = z.object({
   enabled: z.boolean().optional(),
   creators: z.array(z.object({ creatorId: z.string().min(1).max(256), userId: z.string().uuid() }).strict()).max(100).optional(),
+  retry_registration: z.literal(true).optional(),
 }).strict();
 
-/** Sets an environment's admission switch and/or replaces its creator mappings. */
+/**
+ * Sets an environment's admission switch and/or replaces its creator
+ * mappings. retry_registration (owner/admin, enabled environment only)
+ * retries an unresolved write: after the enable it registers the
+ * environment's provider MCP entry with recover set, so a create whose
+ * outcome is unknown is sent again. A complete listing with no entry is the
+ * precondition for re-sending, not proof that the earlier create failed: the
+ * flag is an operator decision that accepts a possible duplicate entry the
+ * provider may surface later. No sync does that.
+ */
 export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: ReplicasActor, environmentId: string, raw: unknown) {
   const parsed = putInput.safeParse(raw);
-  if (!parsed.success) throw new ReplicasError("Send enabled and/or creators [{creatorId, userId}].");
-  const { enabled, creators } = parsed.data;
+  if (!parsed.success) throw new ReplicasError("Send enabled and/or creators [{creatorId, userId}], optionally retry_registration: true.");
+  const { enabled, creators, retry_registration: retry } = parsed.data;
   if (creators && new Set(creators.map((item) => item.creatorId)).size !== creators.length) {
     throw new ReplicasError("Each creator is mapped once.");
   }
@@ -727,6 +754,9 @@ export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: Replica
     await requireAdmin(tx, actor);
     let policy = await policyFor(tx, actor.workspaceId, environmentId);
     if (!policy) throw new ReplicasError("Unknown environment. Sync environments first.", 404);
+    if (retry && (enabled === false || (enabled !== true && !policy.enabled))) {
+      throw new ReplicasError("retry_registration needs an enabled environment.");
+    }
     if (creators) {
       for (const { userId } of creators) {
         const member = await tx.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
@@ -779,6 +809,11 @@ export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: Replica
     if (enabled === false) policy = await disablePolicy(tx, actor, policy, released, true);
   });
   await retireIdentityBindings(deps, actor, released);
+  if (retry) {
+    const { mcpUrl } = identityConfig(deps);
+    await registerPolicy(deps, actor, environmentId.toLowerCase(),
+      { url: mcpUrl, headers: {}, auth: { type: "workspace_identity", audience: mcpUrl } }, true);
+  }
   const view = await listEnvironmentPolicies(deps, actor);
   return { environment: view.environments.find((item) => item.environmentId === environmentId.toLowerCase()) ?? null };
 }
@@ -877,13 +912,9 @@ async function defaultPolicies(tx: SqlExecutor, workspaceId: string, organizatio
       ORDER BY environment_id FOR UPDATE`, [workspaceId, organization])).rows;
 }
 
-/**
- * automatic: the run was not started by a person route (startup run, sweep);
- * it never sends a create while an earlier create's outcome is unconfirmed.
- * Defaults to whether the actor is a service.
- */
+/** Enables a selection and registers each enabled policy; never replays an unconfirmed create (registerPolicy). */
 async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
-  selection: Selection | EnableSelection | DefaultSelection, options: { automatic?: boolean } = {}): Promise<EnvironmentMcpResult[]> {
+  selection: Selection | EnableSelection | DefaultSelection): Promise<EnvironmentMcpResult[]> {
   const { mcpUrl } = identityConfig(deps);
   const results: EnvironmentMcpResult[] = [];
   const released: string[] = [];
@@ -931,7 +962,7 @@ async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
   await retireIdentityBindings(deps, actor, released);
   const config = { url: mcpUrl, headers: {}, auth: { type: "workspace_identity" as const, audience: mcpUrl } };
   for (const policy of toRegister) {
-    results.push(await registerPolicy(deps, actor, policy.environment_id, config, options.automatic ?? Boolean(actor.service)));
+    results.push(await registerPolicy(deps, actor, policy.environment_id, config));
   }
   return results;
 }
@@ -971,15 +1002,20 @@ async function markRegistered(tx: SqlExecutor, actor: ReplicasActor, policy: Pol
  * Step 1 lists the environment's entries: a matching entry is recorded as
  * registered (and the create intent cleared); otherwise the create intent
  * (create_unconfirmed) is committed before any create is sent. While the
- * intent is set from an earlier attempt, an automatic run (startup, sweep)
- * only relists and reports registration_unconfirmed; a person-driven run may
- * create again, and only after a complete listing showed no entry. Step 2
- * relists (another run may have created it meanwhile), then creates and reads
- * the entry back. Only a definite provider rejection clears the intent; a
- * timeout, 5xx, unreadable answer or a failed listing leaves it set.
+ * intent is set from an earlier attempt, every run (startup, sweep, the sync
+ * and enable routes, a plain enable) is read-only: it only relists and
+ * reports registration_unconfirmed. The intent clears only when a complete
+ * listing finds the entry or a create sent by this run is definitely
+ * rejected. recover (the admin-only retry_registration flag) is the one
+ * exception: an operator decision to retry the unresolved write. It creates
+ * again only after a complete listing in step 1 and the relisting in step 2
+ * both showed no entry; that is the precondition for re-sending, not proof
+ * of the earlier outcome, so a duplicate entry may still surface later. Step 2 relists (another
+ * run may have created it meanwhile), then creates and reads the entry back.
+ * A timeout, 5xx, unreadable answer or a failed listing leaves the intent set.
  */
 async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environmentId: string,
-  config: IdentityMcpConfig, automatic: boolean): Promise<EnvironmentMcpResult> {
+  config: IdentityMcpConfig, recover = false): Promise<EnvironmentMcpResult> {
   const failed = (retryable: boolean): EnvironmentMcpResult => ({ environmentId, status: "registration_failed", retryable });
   const unconfirmed: EnvironmentMcpResult = { environmentId, status: "registration_unconfirmed", retryable: true };
   // The provider refused the key itself: retrying with it cannot succeed, a re-connect can.
@@ -998,7 +1034,7 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
     }
     if (found.kind === "conflict") return failed(false);
     if (found.kind === "match") return markRegistered(tx, actor, target.current, found.id);
-    if (target.current.create_unconfirmed && automatic) return unconfirmed;
+    if (target.current.create_unconfirmed && !recover) return unconfirmed;
     await setCreateIntent(tx, target.current.id, true);
     return { previous: target.current.create_unconfirmed };
   });
@@ -1023,6 +1059,10 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
       if (found.kind === "conflict") return failed(false);
       if (found.kind === "match") return markRegistered(tx, actor, target.current, found.id);
       asked = true;
+      if (recover) {
+        await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
+          actor: auditActor(actor), action: "replicas.environment.registration_retried", target: target.current.id });
+      }
       let createdId: string | null = null;
       try {
         createdId = (await deps.replicas.registerEnvironmentMcp(target.key, target.current.environment_id,
@@ -1188,14 +1228,13 @@ export async function setupEnvironments(deps: ReplicasDeps, actor: ReplicasActor
  * that failed or was refused earlier) is enabled and registered and enabled
  * ones without a registration are retried; opted-out environments stay disabled.
  */
-export async function syncEnvironments(deps: ReplicasDeps, actor: ReplicasActor, options: { automatic?: boolean } = {}) {
-  const automatic = options.automatic ?? Boolean(actor.service);
+export async function syncEnvironments(deps: ReplicasDeps, actor: ReplicasActor) {
   const discovery = await discoverEnvironments(deps, actor);
   const all = await withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
     return allEnvironmentsFlag(tx, actor.workspaceId);
   });
-  const environments = all ? await enableSelected(deps, actor, { defaults: "sync" }, { automatic }) : [];
+  const environments = all ? await enableSelected(deps, actor, { defaults: "sync" }) : [];
   return { discovery, allEnvironments: all, environments };
 }
 

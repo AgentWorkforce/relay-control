@@ -455,10 +455,14 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     assert.equal(synced.status, 200, synced.text);
     // A timeout leaves the provider outcome unknown.
     assert.deepEqual(synced.body.environments, [{ environmentId: ENV_C, status: "registration_unconfirmed", retryable: true }]);
-    // A definite provider rejection created nothing.
+    // While the outcome is unknown every enable is read-only: nothing is sent again.
     provider.mode.register = "reject";
-    const rejected = await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { environmentIds: [ENV_C] } });
-    assert.deepEqual(rejected.body.environments, [{ environmentId: ENV_C, status: "registration_failed", retryable: true }]);
+    const readOnly = await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { environmentIds: [ENV_C] } });
+    assert.deepEqual(readOnly.body.environments, [{ environmentId: ENV_C, status: "registration_unconfirmed", retryable: true }]);
+    // The explicit retry sends it again; a definite provider rejection created nothing and clears the intent.
+    const rejected = await api(`${base}/environments/${ENV_C}`, { method: "PUT", token: ownerToken, body: { retry_registration: true } });
+    assert.equal(rejected.status, 200, rejected.text);
+    assert.equal(rejected.body.environment.status, "enabled");
     provider.mode.register = "ok";
     const retried = await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { environmentIds: [ENV_C] } });
     assert.deepEqual(retried.body.environments, [{ environmentId: ENV_C, status: "registered" }]);
