@@ -239,6 +239,20 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.deepEqual(await flagsOf(), flagsBefore, "the identity re-run keeps Control's selection");
   assert.equal((await target.query<{ x: string }>("SELECT string_agg(xmin::text, ',' ORDER BY id) AS x FROM coding_agent_credentials")).rows[0]!.x,
     xminBefore, "and writes no credential row");
+  // A relay_managed credential NEW to Control, active in Cloud, for a group
+  // where Control already has an active key: it enters inactive, counted,
+  // instead of failing the org on coding_agent_one_llm.
+  await source.exec(`INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, harness, model_provider, auth_type, display_name, is_active, harness_active, status, created_at, updated_at)
+    VALUES ('${id(0x8f1)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'claude', 'anthropic', 'relay_managed', 'Relay Claude (new)', true, false, 'connected', '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')`);
+  const newRelay = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(newRelay.ok, true, JSON.stringify(newRelay.orgs));
+  assert.equal(newRelay.warnings.coding_agent_credentials_control_active_kept, 1);
+  const anthropicActive = (await target.query<{ id: string }>(
+    "SELECT id::text AS id FROM coding_agent_credentials WHERE workspace_id = $1 AND model_provider = 'anthropic' AND is_active", [id(0x201)])).rows;
+  assert.equal(anthropicActive.length, 1);
+  assert.notEqual(anthropicActive[0]!.id, id(0x8f1), "Control's selected key stays the active one");
+  assert.equal((await target.query<{ a: boolean }>("SELECT is_active AS a FROM coding_agent_credentials WHERE id = $1", [id(0x8f1)])).rows[0]!.a, false);
+  await source.exec(`DELETE FROM provider_credentials WHERE id = '${id(0x8f1)}'`);
   const before = await snapshot();
   // Re-run converges on Control's own dedupe keys. The lost key is found
   // this time, so the only remaining problem is the selection conflict.
