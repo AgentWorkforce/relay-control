@@ -5,6 +5,14 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `users.signup_source` (migration 0068), where an account was
+  created: `teams`, `flows` or `desktop` (hosted Cloud's values; the
+  identity import's carry lands in a follow-up) or `mcp`. Control records `mcp` when a new person
+  signs in (OIDC or email link) on the way back to MCP OAuth consent
+  (`/cloud/oauth/authorize`, e.g. ChatGPT's Agent Relay app). Set once at
+  creation; a later sign-in never rewrites it. Password sign-ups have no
+  return path and stay unattributed. Nullable; existing accounts are NULL.
+
 - Added: Replicas agent bridge behind `SELFHOST_REPLICAS_ENABLED` (default
   off). Owners and admins spawn, recover, bind and release Replicas agents
   through six MCP tools or the `/api/v1/workspaces/{ws}/replicas` routes. Each
