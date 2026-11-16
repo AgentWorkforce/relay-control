@@ -67,7 +67,7 @@ test("cutover scope rejects subsets and unbound or incomplete global census",() 
   assert.equal(cutoverScopeFinding(record).ok,true);
   assert.equal(cutoverScopeFinding({...record,scope:{orgIds:[id]}}).ok,false);
   assert.equal(cutoverScopeFinding({...record,evidenceKind:"contract-only"}).ok,false);
-  assert.equal(cutoverScopeFinding({...record,targetSchema:{profile:"main-plus-proposed-0061",ok:true}}).ok,false);
+  assert.equal(cutoverScopeFinding({...record,targetSchema:{profile:"main-plus-optional",ok:true}}).ok,false);
   assert.equal(cutoverScopeFinding({...record,sourceOrganizationCensus:{...record.sourceOrganizationCensus,selected:{count:1,sha256:"other"}}}).ok,false);
 });
 

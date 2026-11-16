@@ -18,8 +18,8 @@ objects and local encrypted Postgres blobs, including a repeat copy.
 pending and no real-data import has run.
 
 The target runs all checked-in Control migrations, including the actual
-0053/0054/0056/0057/0058/0062 files and the owner-only 0063 ledger migration. Only the pending 0061 staff-grant schema uses a test-only
-model; it does not prove that pending migration file. The shared Cloud fixture
+0053/0054/0056/0057/0058/0061/0062 files and the owner-only 0063 ledger migration. The
+staff-grant table comes from the checked-in 0061 migration. The shared Cloud fixture
 now includes the generation column, so there is no verifier-owned source guard.
 The smaller fixtures in `fixtures.ts` independently
 stress the engine and are explicitly labeled as reference shapes.
@@ -378,7 +378,7 @@ TLS/read-only library connection, without source/R2/keyring inputs.
 Schema and scope requirements are documented in [SCHEMA_MANIFEST.md](SCHEMA_MANIFEST.md).
 Qualified results always include normalized scope and the all-source org census.
 Cutover runners require all-source scope and the reviewed production schema;
-subset results and the proposed 0061 fixture profile are diagnostic evidence only.
+subset results and any optional-inventory profile are diagnostic evidence only.
 
 Verification and pre-import snapshots establish their own in-session repeatable-
 read, read-only transactions. They set a 60-second statement timeout and a

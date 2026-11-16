@@ -66,7 +66,8 @@ export async function schemaCatalog(client:Client,relations:readonly string[]|nu
   entries.push(...triggers.rows.map((row) => ({kind:"trigger",name:`public.${row.relname}.${row.tgname}`,definition:row.definition})));
   // Functions/sequences are migration-owned public objects. Extension functions
   // differ by provider and are not part of the Control migration manifest.
-  if (relations === null || !relations.every((name) => name === "staff_read_grants")) {
+  // A relation-scoped (optional) inventory covers only its relations.
+  if (relations === null) {
     const functions=await client.query(`SELECT p.oid::regprocedure::text AS name,CASE WHEN p.prokind <> 'a' THEN to_jsonb(pg_get_functiondef(p.oid))
         ELSE jsonb_build_object('kind',p.prokind,'source',p.prosrc,'config',p.proconfig) END AS definition
       FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public'
@@ -119,7 +120,7 @@ export async function schemaFindings(client:Client) {
   const migrationsMatch=digest(await migrationFiles()) === digest(expected.migrations);
   const ok=!missing.length && !changed.length && !unexpected.length && migrationsMatch;
   const summary={baseline:expected.baseline,manifestSha256:sha256,expectedSchemaSha256:digest(wanted),actualSchemaSha256:digest(actual),
-    profile:presentOptional.length ? "main-plus-proposed-0061" : "main",optionalRelations:presentOptional,
+    profile:presentOptional.length ? "main-plus-optional" : "main",optionalRelations:presentOptional,
     expectedObjects:wanted.length,actualObjects:actual.length,missing,changed,unexpectedCount:unexpected.length,
     migrationsMatch,ok};
   const finding:Finding={kind:"schema_manifest",name:expected.baseline,ok,detail:summary};
