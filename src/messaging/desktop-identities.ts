@@ -45,6 +45,7 @@ export const DESKTOP_IDENTITY_CAPABILITIES = {
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const uuid = z.string().regex(UUID).transform(value => value.toLowerCase());
+const sourceId = z.string().min(1).max(200);
 
 const nativeSession = z.union([
   z.object({ kind: z.enum(["codex", "grok", "pi", "claude", "copilot"]), id: uuid }).strict(),
@@ -71,7 +72,7 @@ const attestationKey = z.object({
 }, { message: "attestation key does not match kid" });
 
 const syncBody = z.object({
-  source_id: uuid,
+  source_id: sourceId,
   identities: z.array(identity).max(200),
   attestation_key: attestationKey.optional(),
 }).strict();
@@ -245,7 +246,7 @@ async function desktopIdentityLinks(database: SqlExecutor, workspaceId: string, 
       WHERE b.workspace_id = $1 AND b.user_id = $2
         AND i.workspace_id = $1 AND i.user_id = $2 AND i.source_id = $3
       GROUP BY i.agent_remote_id`,
-    [workspaceId, userId, sourceId.toLowerCase()],
+    [workspaceId, userId, sourceId],
   );
   return new Map(rows.rows.map(row => [row.agent_remote_id, new Date(row.linked_at)] as const));
 }
@@ -293,18 +294,19 @@ export async function handleDesktopIdentityRoutes(
   }
 
   if (method === "GET") {
-    const sourceId = new URL(request.url ?? "/", "http://local").searchParams.get("source_id");
-    if (!sourceId || !UUID.test(sourceId)) {
-      throw new MessagingHttpError(400, "invalid_request", "source_id must be a UUID");
+    const parsedSourceId = sourceId.safeParse(new URL(request.url ?? "/", "http://local").searchParams.get("source_id"));
+    if (!parsedSourceId.success) {
+      throw new MessagingHttpError(400, "invalid_request", "source_id must be 1 to 200 characters");
     }
+    const source = parsedSourceId.data;
     try {
       const rows = await deps.database.query<{ agent_remote_id: string }>(
         `SELECT agent_remote_id FROM desktop_relay_identities
           WHERE workspace_id = $1 AND user_id = $2 AND source_id = $3 AND relaycast_workspace_id = $4
           ORDER BY created_at, agent_remote_id`,
-        [access.workspace.id, access.principal.userId, sourceId.toLowerCase(), access.workspace.relaycastWorkspaceId],
+        [access.workspace.id, access.principal.userId, source, access.workspace.relaycastWorkspaceId],
       );
-      const links = await desktopIdentityLinks(deps.database, access.workspace.id, access.principal.userId, sourceId);
+      const links = await desktopIdentityLinks(deps.database, access.workspace.id, access.principal.userId, source);
       deps.json(response, 200, {
         identities: reportLinks(rows.rows.map(row => row.agent_remote_id), links),
         capabilities: DESKTOP_IDENTITY_CAPABILITIES,

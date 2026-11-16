@@ -795,7 +795,7 @@ paths:
         - cookieAuth: []
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
-        - { name: source_id, in: query, required: true, schema: { type: string, format: uuid } }
+        - { name: source_id, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 200 } }
       responses:
         "200":
           description: Identities and capabilities
@@ -9655,7 +9655,7 @@ components:
       additionalProperties: false
       required: [source_id, identities]
       properties:
-        source_id: { type: string, format: uuid }
+        source_id: { type: string, minLength: 1, maxLength: 200 }
         identities:
           type: array
           maxItems: 200

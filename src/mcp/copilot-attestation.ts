@@ -104,7 +104,8 @@ export async function copilotAttestationFor(body: unknown, auth: {
       typeof header.kid !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(header.kid)) return fail("unexpected header");
   if (!exact(claims, ["v", "kind", "sid", "src", "workspace", "user", "nonce", "tool", "args", "iat", "exp"]) ||
       claims.v !== 1 || claims.kind !== "copilot" ||
-      typeof claims.sid !== "string" || !UUID.test(claims.sid) || typeof claims.src !== "string" || !UUID.test(claims.src) ||
+      typeof claims.sid !== "string" || !UUID.test(claims.sid) || typeof claims.src !== "string" ||
+      claims.src.length < 1 || claims.src.length > 200 ||
       typeof claims.nonce !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(claims.nonce) ||
       typeof claims.tool !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(claims.tool) ||
       !object(claims.args) || !Number.isSafeInteger(claims.iat) || !Number.isSafeInteger(claims.exp)) return fail("unexpected payload");
