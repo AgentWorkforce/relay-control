@@ -6,6 +6,7 @@ import { HOSTED_SOURCE, ownerHash } from "../mcp/relay-participants.js";
 import { emailHint, type ReplicaIdentityClaims } from "./identity.js";
 import { ReplicasRuntimeError, type EnvironmentMcp } from "./runtime.js";
 import {
+  auditActor,
   COLUMNS,
   decrypt,
   encrypt,
@@ -109,14 +110,16 @@ async function organizationShared(tx: SqlExecutor, organization: string | null):
  * workspace's VM principal is used when it is set and still a member.
  */
 async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): Promise<Admission> {
-  const tombstone = await tx.query<{ workspace_id: string; organization_id: string }>(
-    `SELECT t.workspace_id, w.organization_id FROM replica_identity_tombstones t JOIN workspaces w ON w.id = t.workspace_id
+  // Any matching tombstone refuses, also one whose workspace was deleted (workspace_id NULL).
+  const tombstone = await tx.query<{ workspace_id: string | null; organization_id: string | null }>(
+    `SELECT t.workspace_id, w.organization_id FROM replica_identity_tombstones t LEFT JOIN workspaces w ON w.id = t.workspace_id
       WHERE t.issuer = $1 AND t.provider_organization_id = $2 AND t.provider_workspace_id = $3`,
     [claims.issuer, claims.organizationId, claims.workspaceId],
   );
   const released = tombstone.rows[0];
   if (released) {
-    throw new IdentityRefusal("replica_released", 403, { workspaceId: released.workspace_id, organizationId: released.organization_id });
+    throw new IdentityRefusal("replica_released", 403, released.workspace_id && released.organization_id
+      ? { workspaceId: released.workspace_id, organizationId: released.organization_id } : null);
   }
   const policies = await tx.query<PolicyRow & { organization_id: string; provider_account: string | null; principal_member: string | null }>(
     `SELECT ${POLICY.split(", ").map((column) => `p.${column}`).join(", ")}, w.organization_id, c.provider_account,
@@ -427,7 +430,7 @@ async function setPrincipal(tx: SqlExecutor, actor: ReplicasActor, userId: strin
     released.push(...revoked.rows.map((row) => row.id));
   }
   await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-    actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.principal_updated", target: actor.workspaceId });
+    actor: auditActor(actor), action: "replicas.environment.principal_updated", target: actor.workspaceId });
 }
 
 const principalInput = z.object({ userId: z.string().uuid().nullable() }).strict();
@@ -617,7 +620,7 @@ async function enablePolicy(tx: SqlExecutor, actor: ReplicasActor, policy: Polic
     throw error;
   }
   await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-    actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.enabled", target: policy.id });
+    actor: auditActor(actor), action: "replicas.environment.enabled", target: policy.id });
   return result.rows[0]!;
 }
 
@@ -645,7 +648,7 @@ async function disablePolicy(tx: SqlExecutor, actor: ReplicasActor, policy: Poli
   const result = await tx.query<PolicyRow>(
     `UPDATE replica_environment_policies SET enabled = false, updated_at = now() WHERE id = $1 RETURNING ${POLICY}`, [policy.id]);
   await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-    actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.disabled", target: policy.id });
+    actor: auditActor(actor), action: "replicas.environment.disabled", target: policy.id });
   return result.rows[0]!;
 }
 
@@ -699,7 +702,7 @@ export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: Replica
       await tx.query("DELETE FROM replica_environment_creator_requests WHERE policy_id = $1 AND creator_id = ANY($2::text[])",
         [policy.id, creators.map((item) => item.creatorId)]);
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-        actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.creators_updated", target: policy.id });
+        actor: auditActor(actor), action: "replicas.environment.creators_updated", target: policy.id });
     }
     if (enabled === true) {
       await clearOptOut(tx, actor.workspaceId, [policy]);
@@ -825,7 +828,7 @@ async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
       await setAllEnvironments(tx, actor.workspaceId, true);
       await clearOptOut(tx, actor.workspaceId, "all");
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-        actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.all_enabled", target: actor.workspaceId });
+        actor: auditActor(actor), action: "replicas.environment.all_enabled", target: actor.workspaceId });
       policies = (await tx.query<PolicyRow>(
         `SELECT ${POLICY} FROM replica_environment_policies WHERE workspace_id = $1 AND provider_organization_id = $2
           ORDER BY environment_id FOR UPDATE`, [actor.workspaceId, organization])).rows;
@@ -904,7 +907,7 @@ async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
         const entry = { id: found.id };
         await tx.query("UPDATE replica_environment_policies SET registered_mcp_id = $2, updated_at = now() WHERE id = $1", [current.id, entry.id]);
         await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-          actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.mcp_registered", target: current.id });
+          actor: auditActor(actor), action: "replicas.environment.mcp_registered", target: current.id });
         return { environmentId: current.environment_id, status: "registered" };
       }));
     } catch (error) {
@@ -931,7 +934,7 @@ export async function disableEnvironmentMcp(deps: ReplicasDeps, actor: ReplicasA
     if ("all" in selection) {
       await setAllEnvironments(tx, actor.workspaceId, false);
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-        actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.all_disabled", target: actor.workspaceId });
+        actor: auditActor(actor), action: "replicas.environment.all_disabled", target: actor.workspaceId });
       policies = (await tx.query<PolicyRow>(
         `SELECT ${POLICY} FROM replica_environment_policies WHERE workspace_id = $1 AND (enabled OR registered_mcp_id IS NOT NULL)
           ORDER BY environment_id FOR UPDATE`, [actor.workspaceId])).rows;
@@ -969,7 +972,7 @@ async function removeEntry(deps: ReplicasDeps, actor: ReplicasActor, policy: Pol
       }
       await tx.query("UPDATE replica_environment_policies SET registered_mcp_id = NULL, updated_at = now() WHERE id = $1", [current.id]);
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-        actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.mcp_removed", target: current.id });
+        actor: auditActor(actor), action: "replicas.environment.mcp_removed", target: current.id });
       return { environmentId: current.environment_id, status: "disabled" };
     } catch {
       return { environmentId: current.environment_id, status: "removal_failed", retryable: true };
@@ -1031,7 +1034,7 @@ export async function setupEnvironments(deps: ReplicasDeps, actor: ReplicasActor
     // A fresh connect starts clean: earlier opt-outs do not survive a disconnect.
     await clearOptOut(tx, actor.workspaceId, "all");
     await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-      actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.all_enabled", target: actor.workspaceId });
+      actor: auditActor(actor), action: "replicas.environment.all_enabled", target: actor.workspaceId });
   });
   let discovery: DiscoveryResult;
   try {
@@ -1058,6 +1061,38 @@ export async function syncEnvironments(deps: ReplicasDeps, actor: ReplicasActor)
   });
   const environments = all ? await enableSelected(deps, actor, { defaults: "sync" }) : [];
   return { discovery, allEnvironments: all, environments };
+}
+
+/**
+ * Revives a tombstone whose workspace was deleted (workspace_id NULL). Only an
+ * owner/admin of a workspace that currently holds the tombstone's provider
+ * organization connection may remove it: 404 when the connected organization
+ * has no such orphaned tombstone. The revival is audited in the caller's workspace.
+ */
+export async function reviveOrphanedTombstone(deps: ReplicasDeps, actor: ReplicasActor, providerWorkspaceId: string) {
+  const { issuer } = identityConfig(deps);
+  const notFound = () => new ReplicasError("No released replica with this provider workspace id was found for the connected organization.", 404);
+  return withReplicasLock(deps, actor, async (tx) => {
+    await requireAdmin(tx, actor);
+    if (!isUuid(providerWorkspaceId)) throw notFound();
+    const connection = await tx.query<{ provider_account: string | null }>(
+      "SELECT provider_account FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'",
+      [actor.workspaceId],
+    );
+    const organization = connection.rows[0]?.provider_account?.toLowerCase();
+    if (!organization) throw notFound();
+    const removed = await tx.query<{ provider_workspace_id: string }>(
+      `DELETE FROM replica_identity_tombstones
+        WHERE issuer = $1 AND provider_organization_id = $2 AND provider_workspace_id = $3 AND workspace_id IS NULL
+        RETURNING provider_workspace_id`,
+      [issuer, organization, providerWorkspaceId.toLowerCase()],
+    );
+    const revived = removed.rows[0];
+    if (!revived) throw notFound();
+    await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
+      actor: auditActor(actor), action: "replicas.identity.revived", target: revived.provider_workspace_id });
+    return { providerWorkspaceId: revived.provider_workspace_id, revived: true };
+  });
 }
 
 /**

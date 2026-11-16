@@ -42,8 +42,16 @@ export type ReplicasDeps = {
   identity?: { issuer: string; mcpUrl: string; verifier: ReplicaIdentityVerifier };
 };
 
-/** A person acting through REST or MCP. Authority is re-read from Postgres on every call. */
-export type ReplicasActor = { userId: string; workspaceId: string; organizationId: string };
+/**
+ * A person acting through REST or MCP. Authority is re-read from Postgres on
+ * every call. `service` marks an in-process job (the sync sweep): it has no
+ * person, skips the owner/admin check (the workspace must still belong to the
+ * organization) and is audited as that service subject.
+ */
+export type ReplicasActor = { userId: string; workspaceId: string; organizationId: string; service?: string };
+
+export const auditActor = (actor: ReplicasActor): AuditActor =>
+  actor.service ? { kind: "service", subject: actor.service } : { kind: "user", userId: actor.userId };
 
 export class ReplicasError extends Error {
   constructor(message: string, readonly status = 400) {
@@ -157,12 +165,17 @@ export function withReplicasLock<T>(
 
 export const scopeOf = (row: SpawnRow) => ({ workspaceId: row.workspace_id, organizationId: row.organization_id });
 export const audit = (tx: SqlExecutor, row: SpawnRow, actor: ReplicasActor | null, action: string) => {
-  const who: AuditActor = actor ? { kind: "user", userId: actor.userId } : { kind: "service", subject: `replicas-binding:${row.id}` };
+  const who: AuditActor = actor ? auditActor(actor) : { kind: "service", subject: `replicas-binding:${row.id}` };
   return recordAudit(tx, { organizationId: row.organization_id, workspaceId: row.workspace_id, actor: who, action, target: row.id });
 };
 
 /** Current owner/admin of the workspace's organization, read under the caller's lock. */
 export async function requireAdmin(tx: SqlExecutor, actor: ReplicasActor): Promise<void> {
+  if (actor.service) {
+    const workspace = await tx.query("SELECT 1 FROM workspaces WHERE id = $1 AND organization_id = $2", [actor.workspaceId, actor.organizationId]);
+    if (!workspace.rows.length) throw new ReplicasError(OWNER_ADMIN_REFUSAL, 403);
+    return;
+  }
   const result = await tx.query<{ role: string }>(
     `SELECT m.role FROM workspaces w
        JOIN organization_memberships m ON m.organization_id = w.organization_id AND m.user_id = $3
@@ -620,7 +633,9 @@ export async function releaseReplica(deps: ReplicasDeps, actor: ReplicasActor, i
     if (current.state === "creating" && !current.replica_id) {
       throw new ReplicasError("Recover the unknown create before release, so its compute can be stopped safely.", 409);
     }
+    // Every release is final for its provider workspace until an admin revives it.
     if (current.source === ENVIRONMENT_IDENTITY) await tombstoneInTx(tx, current, "released");
+    else await launchTombstoneInTx(deps, tx, current, "released");
     if (current.state === "gone") return current;
     return patch(tx, current.id, { state: "gone", helper_hash: null });
   });
@@ -636,13 +651,71 @@ export async function releaseReplica(deps: ReplicasDeps, actor: ReplicasActor, i
  */
 async function tombstoneInTx(tx: SqlExecutor, row: SpawnRow, reason: string): Promise<void> {
   if (!row.issuer || !row.provider_organization_id || !row.replica_id) return;
+  await writeTombstone(tx, row.issuer, row.provider_organization_id, row.replica_id, row.workspace_id, reason);
+}
+
+async function writeTombstone(tx: SqlExecutor, issuer: string, organization: string, providerWorkspaceId: string,
+  workspaceId: string, reason: string): Promise<void> {
   await tx.query(
     `INSERT INTO replica_identity_tombstones (issuer, provider_organization_id, provider_workspace_id, workspace_id, reason)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (issuer, provider_organization_id, provider_workspace_id)
        DO UPDATE SET workspace_id = EXCLUDED.workspace_id, reason = EXCLUDED.reason, released_at = now()`,
-    [row.issuer, row.provider_organization_id, row.replica_id, row.workspace_id, reason],
+    [issuer, organization, providerWorkspaceId, workspaceId, reason],
   );
+}
+
+/**
+ * A per-launch (spawn or bind) release tombstones its replica too: the
+ * configured identity issuer, the connected provider organization and the
+ * replica id as the provider workspace. Without a configured issuer or a
+ * connected organization there is nothing the tombstone could match.
+ */
+async function launchTombstoneInTx(deps: ReplicasDeps, tx: SqlExecutor, row: SpawnRow, reason: string): Promise<void> {
+  const issuer = deps.identity?.issuer;
+  if (!issuer || !row.replica_id) return;
+  const connection = await tx.query<{ provider_account: string | null }>(
+    "SELECT provider_account FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'",
+    [row.workspace_id],
+  );
+  const organization = connection.rows[0]?.provider_account?.toLowerCase();
+  if (!organization) return;
+  await writeTombstone(tx, issuer, organization, row.replica_id.toLowerCase(), row.workspace_id, reason);
+}
+
+/**
+ * Workspace deletion, inside the deletion transaction: every live
+ * environment-identity binding of the workspace is tombstoned (reason
+ * workspace_deleted), then its hosted Relay participant rows and the
+ * environment-identity spawn rows themselves are removed. Those rows are
+ * Relay participants registered by a customer environment, not compute, so
+ * the deletion retires them. Launch and bind rows (sources spawn/bind) are
+ * left alone and still restrict the deletion. The tombstones outlive the
+ * workspace (workspace_id becomes NULL) and keep refusing those provider
+ * workspaces. The Relay side is not touched.
+ */
+export async function retireWorkspaceIdentitiesInTx(tx: SqlExecutor, workspaceId: string): Promise<void> {
+  await tx.query(
+    `INSERT INTO replica_identity_tombstones (issuer, provider_organization_id, provider_workspace_id, workspace_id, reason)
+     SELECT DISTINCT ON (issuer, provider_organization_id, replica_id) issuer, provider_organization_id, replica_id, workspace_id, 'workspace_deleted'
+       FROM replica_spawns
+      WHERE workspace_id = $1 AND source = $2 AND state <> 'gone'
+        AND issuer IS NOT NULL AND provider_organization_id IS NOT NULL AND replica_id IS NOT NULL
+     ON CONFLICT (issuer, provider_organization_id, provider_workspace_id)
+       DO UPDATE SET workspace_id = EXCLUDED.workspace_id, reason = EXCLUDED.reason, released_at = now()`,
+    [workspaceId, ENVIRONMENT_IDENTITY],
+  );
+  // Same keys as the per-launch release; participants of other sources stay.
+  await tx.query(
+    `DELETE FROM hosted_relay_participants AS participant
+      USING replica_spawns AS spawn
+      WHERE spawn.workspace_id = $1 AND spawn.source = $2
+        AND participant.workspace_id = spawn.workspace_id AND participant.user_id = spawn.user_id
+        AND participant.agent_name = spawn.agent_name AND participant.agent_remote_id = spawn.agent_remote_id`,
+    [workspaceId, ENVIRONMENT_IDENTITY],
+  );
+  // replica_deliveries cascade with their spawn row.
+  await tx.query("DELETE FROM replica_spawns WHERE workspace_id = $1 AND source = $2", [workspaceId, ENVIRONMENT_IDENTITY]);
 }
 
 const launchMarker = (marker: string, events: Array<{ type: string; payload?: Record<string, unknown> }>, startsWith: boolean) =>
@@ -805,23 +878,32 @@ export async function recoverReplica(deps: ReplicasDeps, actor: ReplicasActor, i
 }
 
 /**
- * Explicit admin revival of a released environment-identity binding: removes
- * its tombstone so the provider workspace can enrol again on its next call.
- * The released row stays released; a new binding is enrolled.
+ * Explicit admin revival of a released binding (environment identity or a
+ * per-launch spawn/bind): removes its tombstone so the provider workspace can
+ * enrol again on its next call. The released row stays released; a new
+ * binding is enrolled.
  */
 async function reviveIdentity(deps: ReplicasDeps, actor: ReplicasActor, id: string, replicaId: string) {
   return withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
     const row = await owned(tx, actor, id);
-    if (row.source !== ENVIRONMENT_IDENTITY) throw new ReplicasError("Only environment-identity bindings are revived.", 409);
     if (row.replica_id?.toLowerCase() !== replicaId.toLowerCase()) throw new ReplicasError("This binding belongs to another replica.", 409);
     if (row.state !== "gone") throw new ReplicasError("Only a released binding is revived.", 409);
-    const removed = await tx.query(
-      `DELETE FROM replica_identity_tombstones
-        WHERE issuer = $1 AND provider_organization_id = $2 AND provider_workspace_id = $3 AND workspace_id = $4
-        RETURNING provider_workspace_id`,
-      [row.issuer, row.provider_organization_id, row.replica_id, actor.workspaceId],
-    );
+    const removed = row.source === ENVIRONMENT_IDENTITY
+      ? await tx.query(
+        `DELETE FROM replica_identity_tombstones
+          WHERE issuer = $1 AND provider_organization_id = $2 AND provider_workspace_id = $3 AND workspace_id = $4
+          RETURNING provider_workspace_id`,
+        [row.issuer, row.provider_organization_id, row.replica_id, actor.workspaceId],
+      )
+      // A per-launch tombstone was keyed by the configured issuer and the
+      // organization connected at release time; the replica id is unique.
+      : await tx.query(
+        `DELETE FROM replica_identity_tombstones
+          WHERE issuer = $1 AND provider_workspace_id = $2 AND workspace_id = $3
+          RETURNING provider_workspace_id`,
+        [deps.identity?.issuer ?? null, replicaId.toLowerCase(), actor.workspaceId],
+      );
     if (removed.rows.length) await audit(tx, row, actor, "replicas.identity.revived");
     return { ...spawnView(row), revived: removed.rows.length > 0 };
   });

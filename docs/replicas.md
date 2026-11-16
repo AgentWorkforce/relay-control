@@ -18,6 +18,10 @@ Relay Cloud Replicas bridge.
 - `publicBaseUrl` must be reachable from the replica and from Relaycast: the
   replica calls `{publicBaseUrl}/api/v1/replicas/agents/{spawn}/messages` and
   Relaycast posts webhooks to `{publicBaseUrl}/api/v1/replicas/relay-events/{spawn}`.
+- `SELFHOST_REPLICAS_SYNC_INTERVAL_SECONDS` (default `60`, minimum `30`; lower
+  values are raised to 30; `0` turns it off): how often Control runs the
+  environment sync for every Replicas connection whose all-environments
+  default is on (see "Policies and registration").
 
 ## Who may call
 
@@ -76,7 +80,7 @@ helper script remains the fallback named in the task prompt.
 | `GET /api/v1/workspaces/{ws}/replicas/environment-policies` | Environment policies (see below) |
 | `POST /api/v1/workspaces/{ws}/replicas/spawns` | Spawn (201) |
 | `GET /api/v1/workspaces/{ws}/replicas/spawns/{id}` | Status, continues preparation |
-| `DELETE /api/v1/workspaces/{ws}/replicas/spawns/{id}` | Release |
+| `DELETE /api/v1/workspaces/{ws}/replicas/spawns/{id}` | Release (writes a tombstone for the replica) |
 | `POST /api/v1/replicas/agents/{id}/messages` | Capability calls from the replica |
 | `POST /api/v1/replicas/relay-events/{id}` | Relaycast webhook (Standard Webhooks) |
 | `POST /api/v1/replicas/mcp` | Environment-level MCP (workspace identity) |
@@ -142,6 +146,8 @@ Each call is admitted in this order:
    JWKS origin) the call answers 503 `replica_identity_unavailable` without
    `WWW-Authenticate`: the outage is not the token's fault.
 2. A released replica (tombstone) is refused with 403 `replica_released`.
+   Any tombstone for the token's issuer, organization and replica counts,
+   including one whose workspace was deleted.
 3. The token's environment must be enabled in exactly one Control workspace
    whose Replicas connection belongs to the token's organization, and that
    provider organization must not be connected in any other Control
@@ -196,7 +202,14 @@ semantics below. The connect response reports `environmentDiscovery`
 {allEnvironments, environments}` (the enable and registration status per
 environment). Setup failures are reported there and never fail the connect:
 the connection is saved and a sync, a re-connect or an enable retries them
-(a failed or refused default enable is not an opt-out). Admins opt out per
+(a failed or refused default enable is not an opt-out). When discovery failed
+or any environment ends in `registration_failed`, `registration_unconfirmed`,
+`enabled_elsewhere`, `organization_shared` or `stale_connection`, the 200
+response also carries `provisioning_error: {code:
+"replica_environment_setup_failed", stage: "environment_setup", retryable,
+environments: [ids]}`: `environments` lists the failing environments (empty
+when discovery failed) and `retryable` is true when discovery failed or any
+failing environment can be retried as is. Admins opt out per
 environment. Enabling an environment never admits a replica on its own:
 each call still needs a mapped creator or the VM principal (see the
 admission order above).
@@ -209,12 +222,19 @@ admission order above).
 | `POST /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}` (re-enable those) or `{all: true}` (turn the default back on and clear every opt-out and re-enable every environment), optionally with `principalUserId`: set the principal, then enable and register the entry |
 | `DELETE /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}`: opt those environments out; `{all: true}`: turn the default off for the workspace and disable every environment. Disables, then removes the entry |
 | `POST /api/v1/workspaces/{ws}/replicas/environments/sync` | Rediscover; while the default is on, every disabled environment that is not opted out (newly found, or a default enable that failed or was refused) is enabled and registered and enabled ones without an entry are registered again. Opted-out environments stay disabled |
+| `DELETE /api/v1/workspaces/{ws}/replicas/environment-tombstones/{providerWorkspaceId}` | Revive a replica whose tombstone outlived its workspace (see below). Owner or admin of the workspace holding that organization's Replicas connection; 404 when there is no such tombstone |
 
 `GET .../environments` stays the live list of environments the key can use
 (`{environments: [{id, name}]}`). Discovery lists every environment of the
 organization (`scope=all`), not only the key holder's. Environments that
-appear later are picked up by the next sync (`POST .../environments/sync`);
-nothing polls the provider automatically.
+appear later are picked up by the next sync: `POST .../environments/sync`, or
+the periodic sync Control runs at startup and then every
+`SELFHOST_REPLICAS_SYNC_INTERVAL_SECONDS` (default 60) for every Replicas
+connection whose all-environments default is on (a workspace without a
+settings row counts as on). The periodic sync has the same semantics as the
+route, never overlaps a running sync, logs a failing connection and goes on
+with the next, never sets or infers the VM principal, and is audited as the
+`replicas-sync` service. It stops on shutdown.
 
 An admin opts one environment out with `PUT .../environments/{id}` and
 `enabled: false`, or `DELETE .../environment-mcp` with `{environmentIds}`;
@@ -295,13 +315,27 @@ workspace: their Relay identities are retired, no tombstone is written, and
 each replica enrols again on its next call once the environment is enabled
 again.
 
-Releasing an environment-enrolled replica releases its Relay identity and
-writes a tombstone, so its tokens keep being refused. An owner or admin
-revives it with `recover_replica_spawn` and `revive: true`, which deletes the
-tombstone; the next call enrols again. Disconnecting Replicas disables every
-policy and releases its bindings first, then removes the registered entries
-best effort. Policies, pending creators, the principal and tombstones are
-stored in migration 0067; they are deleted with their workspace.
+Releasing a replica writes a tombstone in the same transaction as the
+revoke, before any cleanup, so its tokens keep being refused. This holds for
+an environment-enrolled replica and for a per-launch spawn or bind released
+with `release_replica` or `DELETE .../replicas/spawns/{id}` (keyed by the
+connection's provider organization and the replica id; skipped when no
+identity issuer is configured). An owner or admin revives it with
+`recover_replica_spawn` and `revive: true`, which deletes the tombstone and
+is audited as `replicas.identity.revived`; the next call enrols again.
+Disconnecting Replicas disables every policy and releases its bindings first,
+then removes the registered entries best effort.
+
+Policies, pending creators and the principal (migration 0067) are deleted
+with their workspace. Tombstones are not: deleting a workspace tombstones
+every live environment-enrolled replica of it (reason `workspace_deleted`)
+and removes its environment-identity bindings in the same transaction, and
+from migration 0069 a tombstone outlives its workspace with no workspace
+attached, so those replicas stay refused. An owner or admin of the workspace
+now holding that organization's Replicas connection revives one with `DELETE
+.../replicas/environment-tombstones/{providerWorkspaceId}`. A workspace with
+launch or bind records still answers 409 `in_use` until those replicas are
+released.
 
 ## Not yet covered
 
