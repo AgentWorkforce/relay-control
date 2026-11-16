@@ -72,12 +72,13 @@ helper script remains the fallback named in the task prompt.
 | Route | Purpose |
 | --- | --- |
 | `GET /api/v1/workspaces/{ws}/replicas` | `{connection, spawns}`, masked |
-| `GET /api/v1/workspaces/{ws}/replicas/environments` | Environments the key can use |
+| `GET /api/v1/workspaces/{ws}/replicas/environments` | Environment policies (see below) |
 | `POST /api/v1/workspaces/{ws}/replicas/spawns` | Spawn (201) |
 | `GET /api/v1/workspaces/{ws}/replicas/spawns/{id}` | Status, continues preparation |
 | `DELETE /api/v1/workspaces/{ws}/replicas/spawns/{id}` | Release |
 | `POST /api/v1/replicas/agents/{id}/messages` | Capability calls from the replica |
 | `POST /api/v1/replicas/relay-events/{id}` | Relaycast webhook (Standard Webhooks) |
+| `POST /api/v1/replicas/mcp` | Environment-level MCP (workspace identity) |
 
 Responses are `Cache-Control: no-store`. The capability, webhook secret and
 provider key are stored encrypted and never returned, logged or audited.
@@ -112,8 +113,89 @@ provider-side create/message idempotency contract, so a locally stable request
 ID must not be advertised as one. A lifecycle 204 is a bodyless command
 acknowledgement, not proof of final sleep/wake state. Read that state separately.
 
+## Environment-level MCP (workspace identity)
+
+Instead of installing an MCP server inside each replica, an admin can register
+one HTTP MCP entry in a Replicas environment's configuration. Every Replicas
+workspace in that environment then reaches
+`POST /api/v1/replicas/mcp` with a short-lived `workspace_identity` token that
+the provider mints for the entry's audience. Control installs nothing inside
+the replica: no helper, credentials file or exec call.
+
+The endpoint is stateless streamable HTTP and pull-only. It answers 404 before
+authentication while `SELFHOST_REPLICAS_ENABLED` is off, is not an OAuth
+resource, and accepts only a Bearer `workspace_identity` token. Person
+credentials and capabilities are refused.
+
+Each call is admitted in this order:
+
+1. The token is an RS256 JWT from `SELFHOST_REPLICAS_IDENTITY_ISSUER`, signed by
+   a key from the issuer's discovery document (same-origin JWKS), with this
+   endpoint's URL as audience and a valid expiry. Otherwise 401
+   `replica_identity_invalid`. The `jti` is not treated as single-use.
+2. A released replica (tombstone) is refused with 403 `replica_released`.
+3. The token's environment must be enabled in exactly one Control workspace
+   whose Replicas connection belongs to the token's organization. Otherwise 403
+   `replica_environment_not_enabled`.
+4. The token's creator must be mapped to a Control person who is still a
+   current member of the organization. A token without a creator is refused.
+   Otherwise 403 `replica_creator_not_allowed`. Mapping and membership are
+   re-read on every call, so removing a member stops their replicas at once.
+5. The first admitted call enrols the replica: one `replica_spawns` row with
+   source `environment_identity`, `replica_id` = the Replicas workspace id and
+   a Relay identity named `replicas-<16 hex>`. Later calls reuse it. A replica
+   already bound through a per-launch spawn answers 409
+   `replica_already_bound`.
+
+The server offers the same three tools as the per-launch server:
+`list_relay_agents`, `check_relay_inbox` and `send_relay_message`. Messages are
+pulled with `check_relay_inbox`; nothing is pushed into the replica's chat.
+Future wake-up delivery will need a chat selection and will answer 409
+`replica_chat_selection_required` when none is set.
+
+Audit actions: `replicas.identity.enrolled` and `replicas.identity.refused`
+(reason code only, no token, claim or email), `replicas.identity.revived`,
+`replicas.environment.enabled`, `replicas.environment.disabled`,
+`replicas.environment.creators_updated`,
+`replicas.environment.mcp_registered`, `replicas.environment.mcp_removed`,
+`replicas.environment.all_enabled` and `replicas.environment.all_disabled`.
+
+### Policies and registration
+
+Connecting Replicas discovers the key's environments and stores each one
+disabled; the connect response reports `environmentDiscovery` per
+environment. A discovery failure never fails the connect. Connecting enables
+nothing.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/v1/workspaces/{ws}/replicas/environments` | Policies: enabled, registration status, creator mapping with masked email hints, binding counts |
+| `PUT /api/v1/workspaces/{ws}/replicas/environments/{id}` | `{enabled?, creators?: [{creatorId, userId}]}`; creators replace the list and must be current members |
+| `POST /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}` or `{all: true}`: enable and register the entry |
+| `DELETE /api/v1/workspaces/{ws}/replicas/environment-mcp` | Same body: remove the entry, then disable |
+| `POST /api/v1/workspaces/{ws}/replicas/environments/sync` | Rediscover; with `all` set, newly found environments are enabled and registered |
+
+All are owner/admin only. The registered entry is:
+
+```json
+{"name": "agent-relay-replica", "transport": "http",
+ "config": {"url": "<public base>/api/v1/replicas/mcp", "headers": {},
+            "auth": {"type": "workspace_identity", "audience": "<same url>"}}}
+```
+
+Registration and removal report a status per environment
+(`registered`, `registration_failed`, `disabled`, `removal_failed`); failures
+are `retryable`. An environment can be enabled in only one Control workspace.
+
+Releasing an environment-enrolled replica releases its Relay identity and
+writes a tombstone, so its tokens keep being refused. An owner or admin
+revives it with `recover_replica_spawn` and `revive: true`, which deletes the
+tombstone; the next call enrols again. Disconnecting Replicas removes the
+registered entries best effort, then disables every policy (bindings are
+released by the existing disconnect cleanup). Policies are stored in migration
+0067.
+
 ## Not yet covered
 
 - Background history through the push-only producer/consumer contract.
-- A workspace-level replica identity and HTTP MCP endpoint.
 - Webapp journeys and acceptance on an owned test instance.

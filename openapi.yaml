@@ -7798,19 +7798,136 @@ paths:
     get:
       operationId: listReplicasEnvironments
       tags: [replicas]
-      summary: Environments the connected Replicas key can use. Owner/admin person only.
+      summary: Environment-level MCP policies for this workspace (stored; no provider call). Owner/admin person only.
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
       responses:
         "200":
-          description: "{environments: [...]}"
+          description: "{mcpUrl, organizationId, allEnvironments, environments: [{environmentId, name, enabled, status: disabled|enabled|registered, stale, registeredMcpId, bindings, creators: [{creatorId, userId, emailHint}]}]}; email hints are masked"
+        "403":
+          description: Not a current owner or admin, or not a person credential
+  /api/v1/workspaces/{workspaceId}/replicas/environments/sync:
+    post:
+      operationId: syncReplicasEnvironments
+      tags: [replicas]
+      summary: Rediscover the key's environments (stored disabled). When all-environments mode is on, newly discovered environments are enabled and registered. Owner/admin person only.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{discovery: {status: ok|partial|failed, environments}, allEnvironments, environments: [per-environment registration result]}"
         "409":
           description: Replicas is not connected
-        "429":
-          description: Replicas rate limit reached
-        "502":
-          description: Provider failed; no provider body is returned
+  /api/v1/workspaces/{workspaceId}/replicas/environments/{environmentId}:
+    put:
+      operationId: updateReplicasEnvironmentPolicy
+      tags: [replicas]
+      summary: Enable or disable one discovered environment and replace its creator mapping. Creators must be current members of the organization. Owner/admin person only.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: environmentId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                enabled: { type: boolean }
+                creators:
+                  type: array
+                  maxItems: 100
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [creatorId, userId]
+                    properties:
+                      creatorId: { type: string, maxLength: 256 }
+                      userId: { type: string, format: uuid }
+      responses:
+        "200":
+          description: "{environment}"
+        "400":
+          description: Invalid body, duplicate creator, or a creator that is not a current member
+        "404":
+          description: Environment not discovered for this workspace
+        "409":
+          description: Enabled in another workspace, or the policy belongs to a previous Replicas organization
+  /api/v1/workspaces/{workspaceId}/replicas/environment-mcp:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: registerReplicasEnvironmentMcp
+      tags: [replicas]
+      summary: "Enable the selected environments and register the agent-relay-replica HTTP MCP entry ({name, transport: http, config: {url, headers: {}, auth: {type: workspace_identity, audience: url}}}) in each. {all: true} also enables environments discovered later. Owner/admin person only."
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, required: [all], properties: { all: { const: true } } }
+                - { type: object, required: [environmentIds], properties: { environmentIds: { type: array, minItems: 1, maxItems: 100, items: { type: string, format: uuid } } } }
+      responses:
+        "200":
+          description: "{discovery?, environments: [{environmentId, status: registered|registration_failed|not_found|enabled_elsewhere|stale_connection|disabled, retryable?}]}"
+        "400":
+          description: Invalid selection
+        "409":
+          description: Replicas is not connected
+    delete:
+      operationId: removeReplicasEnvironmentMcp
+      tags: [replicas]
+      summary: Remove the registered entry from the selected environments (best effort; a missing entry counts as removed) and disable them. Existing bindings are refused from the next call. Owner/admin person only.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, required: [all], properties: { all: { const: true } } }
+                - { type: object, required: [environmentIds], properties: { environmentIds: { type: array, minItems: 1, maxItems: 100, items: { type: string, format: uuid } } } }
+      responses:
+        "200":
+          description: "{environments: [{environmentId, status: disabled|removal_failed, retryable?}]}"
+        "400":
+          description: Invalid selection
+  /api/v1/replicas/mcp:
+    post:
+      operationId: replicasEnvironmentMcp
+      tags: [replicas]
+      summary: "Environment-level Agent Relay MCP for Replicas workspaces. Stateless streamable HTTP (JSON-RPC), pull-only, not an OAuth resource. Admission order: valid workspace_identity token (else 401 replica_identity_invalid); not released (else 403 replica_released); environment enabled for the token's organization (else 403 replica_environment_not_enabled); creator mapped to a current member, re-read on every call, null creator refused (else 403 replica_creator_not_allowed); then the replica's Relay identity is resolved or enrolled once. Tools: list_relay_agents, check_relay_inbox, send_relay_message. Future wake-up delivery will answer 409 replica_chat_selection_required when no chat is selected. 404 before auth when SELFHOST_REPLICAS_ENABLED is off."
+      security: [{ replicasWorkspaceIdentity: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: JSON-RPC 2.0 MCP request }
+      responses:
+        "200":
+          description: JSON-RPC result
+        "400":
+          description: Invalid JSON
+        "401":
+          description: replica_identity_invalid (WWW-Authenticate Bearer error="invalid_token")
+        "403":
+          description: replica_released, replica_environment_not_enabled or replica_creator_not_allowed
+        "404":
+          description: Feature off
+        "405":
+          description: Only POST is served (stateless, no SSE stream)
+        "409":
+          description: replica_already_bound (bound through a per-launch spawn)
+        "413":
+          description: Request is too large
+        "503":
+          description: Identity issuer or relay unavailable
   /api/v1/workspaces/{workspaceId}/replicas/spawns:
     post:
       operationId: spawnReplica
@@ -8194,6 +8311,11 @@ components:
       type: http
       scheme: bearer
       description: Per-launch capability installed in one replica through the provider exec API; stored only encrypted, never returned, logged or audited, revoked on release, disconnect or member removal.
+    replicasWorkspaceIdentity:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Replicas workspace_identity token (RS256) from SELFHOST_REPLICAS_IDENTITY_ISSUER with this endpoint's URL as audience. Never a person credential.
     ampInternalSecret:
       type: http
       scheme: bearer

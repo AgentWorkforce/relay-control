@@ -89,6 +89,11 @@ export type RemoteAgentConnectionOptions = {
    * (the key is needed to sleep compute). Throws to keep the connection.
    */
   replicasCleanup?: (actor: ConnectionActor) => Promise<void>;
+  /**
+   * After a Replicas connect: discovers the account's environments and
+   * records them disabled. Its failure never fails the connect.
+   */
+  replicasDiscover?: (actor: ConnectionActor) => Promise<unknown>;
 };
 
 export class RemoteAgentConnections {
@@ -237,6 +242,16 @@ export class RemoteAgentConnections {
         actor: { kind: "user", userId: actor.userId }, action: "remote_agent.connect", target: provider });
       return view(saved.rows[0]!);
     });
+  }
+
+  /** Environment discovery after a Replicas connect: a per-environment report, or `{status: "failed"}`. Never throws. */
+  async replicasDiscovery(actor: ConnectionActor): Promise<unknown> {
+    if (!this.options.replicasDiscover) return undefined;
+    try {
+      return await this.options.replicasDiscover(actor);
+    } catch {
+      return { status: "failed", environments: [] };
+    }
   }
 
   async disconnect(actor: ConnectionActor, provider: RemoteAgentId): Promise<void> {

@@ -8,7 +8,6 @@ import { ReplicasRuntimeError } from "./runtime.js";
 import {
   GENERIC_FAILURE,
   getSpawn,
-  listEnvironments,
   OWNER_ADMIN_REFUSAL,
   relayEvent,
   releaseReplica,
@@ -20,6 +19,14 @@ import {
   type ReplicasDeps,
 } from "./service.js";
 import { capabilityCall } from "./tools.js";
+import { handleEnvironmentMcp } from "./environment-mcp.js";
+import {
+  disableEnvironmentMcp,
+  enableEnvironmentMcp,
+  listEnvironmentPolicies,
+  syncEnvironments,
+  updateEnvironmentPolicy,
+} from "./environments.js";
 
 type Json = (response: ServerResponse, status: number, body: unknown, noStore?: boolean) => void;
 export type ReplicasHelpers = {
@@ -36,10 +43,11 @@ const RELAY_EVENT_MAX_BYTES = 256 * 1024;
 const WORKSPACE = /^\/api\/v1\/workspaces\/([^/]+)\/replicas(\/.*)?$/;
 const CAPABILITY = /^\/api\/v1\/replicas\/agents\/([^/]+)\/messages$/;
 const RELAY_EVENTS = /^\/api\/v1\/replicas\/relay-events\/([^/]+)$/;
+const MCP = /^\/api\/v1\/replicas\/mcp$/;
 
 /** Every route this module owns, on the normalized (/cloud-stripped) path. */
 export function isReplicasPath(path: string): boolean {
-  return WORKSPACE.test(path) || CAPABILITY.test(path) || RELAY_EVENTS.test(path);
+  return WORKSPACE.test(path) || CAPABILITY.test(path) || RELAY_EVENTS.test(path) || MCP.test(path);
 }
 
 class BodyTooLarge extends Error {}
@@ -120,14 +128,25 @@ export function createReplicasHandler(input: {
 
   async function workspaceRoute(request: IncomingMessage, method: string, workspaceId: string, rest: string, helpers: ReplicasHelpers) {
     const spawn = /^\/spawns\/([^/]+)$/.exec(rest);
+    const environment = /^\/environments\/([^/]+)$/.exec(rest);
+    const sync = rest === "/environments/sync";
     const known = (rest === "" && method === "GET")
       || (rest === "/environments" && method === "GET")
+      || (sync && method === "POST")
+      || (!sync && environment && method === "PUT")
+      || (rest === "/environment-mcp" && (method === "POST" || method === "DELETE"))
       || (rest === "/spawns" && method === "POST")
       || (spawn && (method === "GET" || method === "DELETE"));
     if (!known) throw new ReplicasError("Not found", 404);
     const actor = await personActor(request, workspaceId, method, helpers);
     if (rest === "") return { status: 200, body: await workspaceReplicas(deps, actor) };
-    if (rest === "/environments") return { status: 200, body: await listEnvironments(deps, actor) };
+    if (rest === "/environments") return { status: 200, body: await listEnvironmentPolicies(deps, actor) };
+    if (sync) return { status: 200, body: await syncEnvironments(deps, actor) };
+    if (environment) return { status: 200, body: await updateEnvironmentPolicy(deps, actor, decode(environment[1]!), await readJson(request)) };
+    if (rest === "/environment-mcp") {
+      const body = await readJson(request);
+      return { status: 200, body: method === "POST" ? await enableEnvironmentMcp(deps, actor, body) : await disableEnvironmentMcp(deps, actor, body) };
+    }
     if (rest === "/spawns") return { status: 201, body: await spawnReplica(deps, actor, await readJson(request)) };
     const id = decode(spawn![1]!);
     if (method === "GET") return { status: 200, body: await getSpawn(deps, actor, id) };
@@ -145,6 +164,11 @@ export function createReplicasHandler(input: {
     const send = (status: number, body: unknown) => helpers.json(response, status, body, true);
     // Off: the surface does not exist, answered before any authentication.
     if (!input.enabled) return send(404, { error: "Not found" }), true;
+    if (MCP.test(path)) {
+      // Not an OAuth resource: only a Replicas workspace_identity bearer is accepted.
+      await handleEnvironmentMcp(deps, request, response, method);
+      return true;
+    }
     const events = RELAY_EVENTS.exec(path);
     if (events) {
       if (method !== "POST") return send(405, { ok: false }), true;

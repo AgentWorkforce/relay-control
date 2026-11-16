@@ -36,6 +36,10 @@ function createProvider() {
       calls.push("environments");
       return { environments: [{ id: ENVIRONMENT, name: "default" }] };
     },
+    allEnvironments: async (key: string) => {
+      assert.equal(key, REPLICAS_KEY);
+      return { environments: [{ id: ENVIRONMENT, name: "default" }], complete: true };
+    },
     create: async (key: string, input: { coding_agent: string; message: string }) => {
       assert.equal(key, REPLICAS_KEY);
       calls.push("create");
@@ -198,7 +202,8 @@ test("Replicas bridge: spawn, MCP provisioning retry, capability, relay events, 
   await t.test("environments come from the workspace key", async () => {
     const listed = await api(`${base}/environments`, { token: ownerToken });
     assert.equal(listed.status, 200, listed.text);
-    assert.deepEqual(listed.body, { environments: [{ id: ENVIRONMENT, name: "default" }] });
+    assert.deepEqual(listed.body.environments.map((item: any) => [item.environmentId, item.name, item.status, item.enabled]),
+      [[ENVIRONMENT, "default", "disabled", false]]);
     assert.equal(listed.headers.get("cache-control"), "no-store");
   });
 

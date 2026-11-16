@@ -52,7 +52,8 @@ export function remoteAgentRoutes(connections: RemoteAgentConnections) {
           throw new RemoteAgentError(400, "invalid_request", "Unsupported connection field.");
         }
         const connection = await connections.connect(actor, provider, { key: body.key, ...(provider === "devin" ? { orgId: body.orgId } : {}) });
-        send(200, { connection });
+        const environmentDiscovery = provider === "replicas" ? await connections.replicasDiscovery(actor) : undefined;
+        send(200, { connection, ...(environmentDiscovery === undefined ? {} : { environmentDiscovery }) });
       }
     } catch (error) {
       if (!(error instanceof RemoteAgentError)) throw error;

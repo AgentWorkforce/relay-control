@@ -26,6 +26,14 @@ const historyPage=z.object({events:z.array(historyEvent),cursor:cursor.nullable(
   before_cursor:cursor.nullable().optional(),has_more:z.boolean().optional()});
 const createInput=z.object({name:z.string().min(1).max(100).regex(/^\S+$/),environment_id:uuid,
   coding_agent:z.enum(["claude","codex"]),model:identifier.optional(),message:text,lifecycle_policy:z.literal("default")}).strict();
+const environmentPage=z.object({environments:z.array(z.object({id:uuid,name:z.string().max(4096)})),
+  page:z.number().int().optional(),total_pages:z.number().int().min(0).optional()});
+const ENVIRONMENT_PAGES=20;
+const environmentMcpInput=z.object({name:z.literal("agent-relay-replica"),transport:z.literal("http"),
+  config:z.object({url:z.string().url().startsWith("https://"),headers:z.object({}).strict(),
+    auth:z.object({type:z.literal("workspace_identity"),audience:z.string().url()}).strict()}).strict()}).strict()
+  .refine(value=>value.config.url===value.config.auth.audience);
+export type EnvironmentMcpInput=z.infer<typeof environmentMcpInput>;
 export type Replica=z.infer<typeof replica>;
 export type ReplicaHistoryPage=z.infer<typeof historyPage>;
 export type ReplicasCreateInput=z.infer<typeof createInput>;
@@ -59,16 +67,16 @@ async function json(response:Response,signal:AbortSignal):Promise<unknown> {
 export function createReplicasRuntime(options:{fetchImpl?:typeof fetch;timeoutMs?:number}={}) {
   const fetchImpl=options.fetchImpl??fetch;
   const timeoutMs=input(z.number().int().min(1).max(TIMEOUT_MS),options.timeoutMs??TIMEOUT_MS);
-  async function call<T>(key:string,path:string,schema:z.ZodType<T>,body?:Record<string,unknown>,allowEmpty=false):Promise<T> {
+  async function call<T>(key:string,path:string,schema:z.ZodType<T>,body?:Record<string,unknown>,allowEmpty=false,remove=false):Promise<T> {
     input(z.string().regex(/^[A-Za-z0-9_.-]{16,512}$/),key); // canonical remote-agent-connections grammar
-    const write=body!==undefined,controller=new AbortController(),signal=controller.signal;
+    const write=body!==undefined||remove,controller=new AbortController(),signal=controller.signal;
     // Own a ref'd deadline: even a non-cooperative fetch in an otherwise
     // idle process must settle the caller, rather than let Node exit early.
     const timer=setTimeout(()=>controller.abort(new Error("replicas_deadline")),timeoutMs);
     try {
-      const response=await bounded(()=>fetchImpl(ORIGIN+path,{method:write?"POST":"GET",redirect:"error",cache:"no-store",signal,
+      const response=await bounded(()=>fetchImpl(ORIGIN+path,{method:remove?"DELETE":write?"POST":"GET",redirect:"error",cache:"no-store",signal,
         headers:{authorization:`Bearer ${key}`,"X-Replicas-Api-Version":VERSION,accept:"application/json","content-type":"application/json"},
-        ...(write?{body:JSON.stringify(body)}:{})}).then(response=>{
+        ...(body!==undefined?{body:JSON.stringify(body)}:{})}).then(response=>{
           if(signal.aborted) void response.body?.cancel().catch(()=>undefined);return response;
         }),signal);
       if(!response.ok) {
@@ -93,7 +101,35 @@ export function createReplicasRuntime(options:{fetchImpl?:typeof fetch;timeoutMs
   }
   return {
     identity:(key:string)=>call(key,"/whoami",z.object({organization:z.object({id:identifier,name:z.string().max(4096)})})),
-    environments:(key:string)=>call(key,"/environments",z.object({environments:z.array(z.object({id:uuid,name:z.string().max(4096)}))})),
+    environments:(key:string)=>call(key,"/environments",environmentPage),
+    /**
+     * Every environment, following `total_pages` when the provider pages the
+     * list (an unpaged answer is one page). Bounded to ENVIRONMENT_PAGES.
+     */
+    allEnvironments:async(key:string)=>{
+      const first=await call(key,"/environments",environmentPage);
+      const all=[...first.environments];
+      const pages=Math.min(first.total_pages??1,ENVIRONMENT_PAGES);
+      for(let page=2;page<=pages;page++) {
+        const next=await call(key,`/environments?page=${page}&limit=100`,environmentPage);
+        all.push(...next.environments);
+      }
+      const seen=new Set<string>();
+      return {environments:all.filter(env=>!seen.has(env.id.toLowerCase())&&seen.add(env.id.toLowerCase())),
+        complete:(first.total_pages??1)<=ENVIRONMENT_PAGES};
+    },
+    /** Adds an MCP entry to an environment's configuration. Not idempotent provider-side. */
+    registerEnvironmentMcp:async(key:string,environmentId:string,value:EnvironmentMcpInput)=>{
+      input(uuid,environmentId);
+      const entry=await call(key,`/environments/${environmentId}/mcps`,
+        z.object({id:identifier.optional(),mcp:z.object({id:identifier}).passthrough().optional()}).passthrough()
+          .refine(body=>Boolean(body.id??body.mcp?.id)),input(environmentMcpInput,value));
+      return {id:(entry.mcp?.id??entry.id)!};
+    },
+    removeEnvironmentMcp:async(key:string,environmentId:string,mcpId:string)=>{
+      input(uuid,environmentId);input(z.string().regex(/^[A-Za-z0-9_.:-]{1,256}$/),mcpId);
+      return call(key,`/environments/${environmentId}/mcps/${encodeURIComponent(mcpId)}`,z.unknown(),undefined,true,true);
+    },
     create:async(key:string,value:ReplicasCreateInput)=>call(key,"/replica",z.object({replica}),input(createInput,value)),
     list:async(key:string,page:number)=>{
       input(z.number().int().min(1).max(1_000_000),page);

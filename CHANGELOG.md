@@ -5,6 +5,16 @@ assigned at release.
 
 ## Unreleased
 
+- Added: environment-level Replicas MCP. `POST /api/v1/replicas/mcp` accepts
+  only a Replicas `workspace_identity` token (RS256, issuer
+  `SELFHOST_REPLICAS_IDENTITY_ISSUER`, default `https://api.replicas.dev`) and
+  admits a replica only when its environment is enabled, its creator maps to a
+  current member, and it was not released. The first call enrols one Relay
+  identity per replica; tools are pull-only. Connecting discovers environments
+  disabled; owners and admins enable them and register the MCP entry through
+  `/replicas/environments` and `/replicas/environment-mcp`. Release writes a
+  tombstone; `recover_replica_spawn` with `revive: true` lifts it. Migration
+  0067. See [Replicas](docs/replicas.md).
 - Added: Replicas agent bridge behind `SELFHOST_REPLICAS_ENABLED` (default
   off). Owners and admins spawn, recover, bind and release Replicas agents
   through six MCP tools or the `/api/v1/workspaces/{ws}/replicas` routes. Each

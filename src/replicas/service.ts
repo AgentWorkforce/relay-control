@@ -8,6 +8,7 @@ import { isValidAgentName } from "../mcp/oauth/agent-name.js";
 import { HOSTED_SOURCE, ownerHash } from "../mcp/relay-participants.js";
 import { verifyWebhook } from "../amp/webhook.js";
 import { mcpInstall, REPLICA_MCP_FAILURE, REPLICA_MCP_READY } from "./mcp.js";
+import type { ReplicaIdentityVerifier } from "./identity.js";
 import { ReplicasRuntimeError, type ReplicasRuntime } from "./runtime.js";
 
 /**
@@ -33,6 +34,12 @@ export type ReplicasDeps = {
   /** Public origin of this API; the replica's capability URL and the relay-events URL are built from it. */
   publicBaseUrl: string;
   now: () => Date;
+  /**
+   * The environment-level MCP (./environments.ts): the only accepted
+   * workspace_identity issuer, the endpoint URL (also the token audience)
+   * and the verifier. Absent: that surface is unavailable.
+   */
+  identity?: { issuer: string; mcpUrl: string; verifier: ReplicaIdentityVerifier };
 };
 
 /** A person acting through REST or MCP. Authority is re-read from Postgres on every call. */
@@ -56,7 +63,7 @@ export type SpawnInput = {
   coding_agent: string;
   model?: string;
   report_to?: string;
-  origin?: "existing";
+  origin?: "existing" | "environment_identity";
   cleanup_complete?: boolean;
   relay_mcp_version?: number;
 };
@@ -82,10 +89,16 @@ export type SpawnRow = {
   mention_subscription_id: string | null;
   task_message_id: string | null;
   last_error: string | null;
+  /** Environment-identity bindings only (source 'environment_identity', migration 0067). */
+  environment_id: string | null;
+  provider_organization_id: string | null;
+  issuer: string | null;
 };
-const COLUMNS = `id, workspace_id, organization_id, user_id, client_request_id, source, input, replica_id, chat_id,
+export const COLUMNS = `id, workspace_id, organization_id, user_id, client_request_id, source, input, replica_id, chat_id,
   state, relay_workspace_id, agent_name, agent_remote_id, token_ciphertext, helper_ciphertext, helper_hash,
-  hook_ciphertext, subscription_id, mention_subscription_id, task_message_id, last_error`;
+  hook_ciphertext, subscription_id, mention_subscription_id, task_message_id, last_error,
+  environment_id, provider_organization_id, issuer`;
+export const ENVIRONMENT_IDENTITY = "environment_identity";
 
 export type WorkspaceRelay = { relaycastWorkspaceId: string; key: string };
 
@@ -98,11 +111,11 @@ export const spawnInput = z.object({
 });
 
 const UUID = z.string().uuid();
-const isUuid = (value: unknown): value is string => UUID.safeParse(value).success;
+export const isUuid = (value: unknown): value is string => UUID.safeParse(value).success;
 export const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const shellQuote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const encrypt = (deps: ReplicasDeps, value: string) => encryptSecret(value, deps.keyring.active);
+export const encrypt = (deps: ReplicasDeps, value: string) => encryptSecret(value, deps.keyring.active);
 export const decrypt = (deps: ReplicasDeps, value: string) => decryptSecret(value, deps.keyring);
 /** Statuses a provider write answers when it definitely did not act. */
 const REJECTED = [400, 401, 402, 403, 404, 422, 429];
@@ -138,8 +151,8 @@ export function withReplicasLock<T>(
   });
 }
 
-const scopeOf = (row: SpawnRow) => ({ workspaceId: row.workspace_id, organizationId: row.organization_id });
-const audit = (tx: SqlExecutor, row: SpawnRow, actor: ReplicasActor | null, action: string) => {
+export const scopeOf = (row: SpawnRow) => ({ workspaceId: row.workspace_id, organizationId: row.organization_id });
+export const audit = (tx: SqlExecutor, row: SpawnRow, actor: ReplicasActor | null, action: string) => {
   const who: AuditActor = actor ? { kind: "user", userId: actor.userId } : { kind: "service", subject: `replicas-binding:${row.id}` };
   return recordAudit(tx, { organizationId: row.organization_id, workspaceId: row.workspace_id, actor: who, action, target: row.id });
 };
@@ -188,7 +201,7 @@ export async function relayFor(
 }
 
 /** The workspace's canonical relay without a person check: cleanup only. */
-async function cleanupRelay(deps: ReplicasDeps, tx: SqlExecutor, row: SpawnRow): Promise<WorkspaceRelay> {
+export async function cleanupRelay(deps: ReplicasDeps, tx: SqlExecutor, row: SpawnRow): Promise<WorkspaceRelay> {
   const result = await tx.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
     "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM workspaces WHERE id = $1",
     [row.workspace_id],
@@ -213,7 +226,7 @@ export async function keyFor(deps: ReplicasDeps, executor: SqlExecutor, workspac
   return decrypt(deps, row.key_ciphertext);
 }
 
-async function byId(executor: SqlExecutor, id: string, lock = false): Promise<SpawnRow | null> {
+export async function byId(executor: SqlExecutor, id: string, lock = false): Promise<SpawnRow | null> {
   if (!isUuid(id)) return null;
   const result = await executor.query<SpawnRow>(`SELECT ${COLUMNS} FROM replica_spawns WHERE id = $1${lock ? " FOR UPDATE" : ""}`, [id]);
   return result.rows[0] ?? null;
@@ -222,7 +235,7 @@ async function byId(executor: SqlExecutor, id: string, lock = false): Promise<Sp
 const PATCHABLE = new Set(["input", "replica_id", "chat_id", "state", "relay_workspace_id", "agent_name", "agent_remote_id",
   "token_ciphertext", "helper_ciphertext", "helper_hash", "hook_ciphertext", "subscription_id", "mention_subscription_id",
   "task_message_id", "last_error"]);
-async function patch(tx: SqlExecutor, id: string, values: Partial<SpawnRow>): Promise<SpawnRow> {
+export async function patch(tx: SqlExecutor, id: string, values: Partial<SpawnRow>): Promise<SpawnRow> {
   const keys = Object.keys(values).filter((key) => PATCHABLE.has(key));
   const sets = keys.map((key, index) => `${key} = $${index + 2}${key === "input" ? "::jsonb" : ""}`);
   const params = keys.map((key) => {
@@ -240,8 +253,11 @@ async function patch(tx: SqlExecutor, id: string, values: Partial<SpawnRow>): Pr
 
 async function owned(tx: SqlExecutor, actor: ReplicasActor, id: string, lock = true): Promise<SpawnRow> {
   if (!isUuid(id)) throw new ReplicasError("Use the spawn_id returned by Replicas spawn.");
+  // Environment-identity bindings belong to the workspace, not to the person
+  // they act for: any current owner/admin manages them.
   const result = await tx.query<SpawnRow>(
-    `SELECT ${COLUMNS} FROM replica_spawns WHERE id = $1 AND workspace_id = $2 AND user_id = $3${lock ? " FOR UPDATE" : ""}`,
+    `SELECT ${COLUMNS} FROM replica_spawns
+      WHERE id = $1 AND workspace_id = $2 AND (user_id = $3 OR source = '${ENVIRONMENT_IDENTITY}')${lock ? " FOR UPDATE" : ""}`,
     [id, actor.workspaceId, actor.userId],
   );
   const row = result.rows[0];
@@ -402,7 +418,7 @@ async function advanceStep(deps: ReplicasDeps, tx: SqlExecutor, id: string, acto
   if (actor) await requireAdmin(tx, actor);
   let row = await byId(tx, id, true);
   if (!row) throw new ReplicasError("Replica launch no longer exists.", 404);
-  if (["creating", "dispatching", "gone", "rejected"].includes(row.state) || !row.replica_id
+  if (row.source === ENVIRONMENT_IDENTITY || ["creating", "dispatching", "gone", "rejected"].includes(row.state) || !row.replica_id
     || (row.state === "bound" && row.input.relay_mcp_version === 1)) return { row, next: "done" };
   try {
     const key = await keyFor(deps, tx, row.workspace_id);
@@ -576,7 +592,8 @@ async function retireRemote(deps: ReplicasDeps, tx: SqlExecutor, start: SpawnRow
       [row.workspace_id, row.user_id, row.agent_name, row.agent_remote_id],
     );
   }
-  if (row.replica_id) {
+  // An environment-identity replica's compute belongs to its creator; only its Relay identity is retired.
+  if (row.replica_id && row.source !== ENVIRONMENT_IDENTITY) {
     try {
       await deps.replicas.sleep(await keyFor(deps, tx, row.workspace_id), row.replica_id);
     } catch (error) {
@@ -597,6 +614,7 @@ export async function releaseReplica(deps: ReplicasDeps, actor: ReplicasActor, i
     if (current.state === "creating" && !current.replica_id) {
       throw new ReplicasError("Recover the unknown create before release, so its compute can be stopped safely.", 409);
     }
+    if (current.source === ENVIRONMENT_IDENTITY) await tombstoneInTx(tx, current, "released");
     if (current.state === "gone") return current;
     return patch(tx, current.id, { state: "gone", helper_hash: null });
   });
@@ -604,6 +622,21 @@ export async function releaseReplica(deps: ReplicasDeps, actor: ReplicasActor, i
     await requireAdmin(tx, actor);
     return retireRemote(deps, tx, await owned(tx, actor, row.id), actor);
   });
+}
+
+/**
+ * A released environment-identity binding stays released: the provider
+ * workspace is refused (403 replica_released) until an admin revives it.
+ */
+async function tombstoneInTx(tx: SqlExecutor, row: SpawnRow, reason: string): Promise<void> {
+  if (!row.issuer || !row.provider_organization_id || !row.replica_id) return;
+  await tx.query(
+    `INSERT INTO replica_identity_tombstones (issuer, provider_organization_id, provider_workspace_id, workspace_id, reason)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (issuer, provider_organization_id, provider_workspace_id)
+       DO UPDATE SET workspace_id = EXCLUDED.workspace_id, reason = EXCLUDED.reason, released_at = now()`,
+    [row.issuer, row.provider_organization_id, row.replica_id, row.workspace_id, reason],
+  );
 }
 
 const launchMarker = (marker: string, events: Array<{ type: string; payload?: Record<string, unknown> }>, startsWith: boolean) =>
@@ -693,6 +726,9 @@ export async function disconnectReplicas(deps: ReplicasDeps, actor: ReplicasActo
 /** Revokes inside a remote-agent disconnect transaction, for rows created after the cleanup above. */
 export async function revokeWorkspaceReplicas(tx: SqlExecutor, workspaceId: string): Promise<void> {
   await revokeInTx(tx, "workspace_id = $1", [workspaceId]);
+  // No environment identity is admitted into a workspace without its connection.
+  await tx.query("UPDATE replica_environment_policies SET enabled = false, updated_at = now() WHERE workspace_id = $1 AND enabled", [workspaceId]);
+  await tx.query("UPDATE replica_environment_settings SET all_environments = false, updated_at = now() WHERE workspace_id = $1", [workspaceId]);
 }
 
 /**
@@ -720,11 +756,15 @@ export async function releaseMemberReplicas(deps: ReplicasDeps, member: { organi
 }
 
 /** Explicit recovery proves a lost create or task send through its marker in the original chat. */
-export async function recoverReplica(deps: ReplicasDeps, actor: ReplicasActor, id: string, replicaId: string) {
+export async function recoverReplica(deps: ReplicasDeps, actor: ReplicasActor, id: string, replicaId: string, options: { revive?: boolean } = {}) {
   if (!isUuid(replicaId)) throw new ReplicasError("Use a replica UUID.");
+  if (options.revive) return reviveIdentity(deps, actor, id, replicaId);
   const result = await withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
     const row = await owned(tx, actor, id);
+    if (row.source === ENVIRONMENT_IDENTITY) {
+      throw new ReplicasError("An environment-identity binding is recovered with revive: true after its release.", 409);
+    }
     if (!["creating", "dispatching"].includes(row.state)) return { row, advance: false };
     if (row.replica_id && row.replica_id !== replicaId) throw new ReplicasError("This launch belongs to another replica.", 409);
     const key = await keyFor(deps, tx, actor.workspaceId);
@@ -742,6 +782,29 @@ export async function recoverReplica(deps: ReplicasDeps, actor: ReplicasActor, i
     return { row: recovered, advance: true };
   });
   return spawnView(result.advance ? await advance(deps, result.row, actor) : result.row);
+}
+
+/**
+ * Explicit admin revival of a released environment-identity binding: removes
+ * its tombstone so the provider workspace can enrol again on its next call.
+ * The released row stays released; a new binding is enrolled.
+ */
+async function reviveIdentity(deps: ReplicasDeps, actor: ReplicasActor, id: string, replicaId: string) {
+  return withReplicasLock(deps, actor, async (tx) => {
+    await requireAdmin(tx, actor);
+    const row = await owned(tx, actor, id);
+    if (row.source !== ENVIRONMENT_IDENTITY) throw new ReplicasError("Only environment-identity bindings are revived.", 409);
+    if (row.replica_id?.toLowerCase() !== replicaId.toLowerCase()) throw new ReplicasError("This binding belongs to another replica.", 409);
+    if (row.state !== "gone") throw new ReplicasError("Only a released binding is revived.", 409);
+    const removed = await tx.query(
+      `DELETE FROM replica_identity_tombstones
+        WHERE issuer = $1 AND provider_organization_id = $2 AND provider_workspace_id = $3 AND workspace_id = $4
+        RETURNING provider_workspace_id`,
+      [row.issuer, row.provider_organization_id, row.replica_id, actor.workspaceId],
+    );
+    if (removed.rows.length) await audit(tx, row, actor, "replicas.identity.revived");
+    return { ...spawnView(row), revived: removed.rows.length > 0 };
+  });
 }
 
 /** Connects an existing chat without creating a replica or running a repository task. */
