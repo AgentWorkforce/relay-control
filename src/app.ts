@@ -73,6 +73,7 @@ import {
   OrganizationBoundaryError,
   OrganizationConflictError,
   ReservedClientNameError,
+  RelaycastBindingUnavailableError,
   type ControlPlaneStore,
   type Principal,
 } from "./store.js";
@@ -614,10 +615,10 @@ export function createApp(input: {
     },
     workspaceAccess:async principal=>{
       if(!(await store.readiness()).ready) return false;
-      const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
+      const workspace=await store.workspaceMembershipForUser(principal.workspaceId,principal.userId);
       return workspace?.organizationId===principal.organizationId;
     },
-    workspaceLabel:async principal=>(await store.workspaceForUser(principal.workspaceId,principal.userId))?.name??principal.workspaceId,
+    workspaceLabel:async principal=>(await store.workspaceMembershipForUser(principal.workspaceId,principal.userId))?.name??principal.workspaceId,
     checkAgentNameAvailability:async(principal,name)=>{
       const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
       if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
@@ -2688,7 +2689,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         json(response, 200, {
           ...identity,
           urls: { relaycastUrl: config.relaycastPublicUrl, relaygateUrl: config.relaygatePublicUrl },
-          provisioned: false,
+          provisioned: workspace.relaycastProvisioned,
         }, true);
         return;
       }
@@ -2704,7 +2705,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         ...identity,
         relaycastApiKey: workspace.relaycastApiKey,
         urls: { relaycastUrl: config.relaycastPublicUrl },
-        provisioned: false,
+        provisioned: workspace.relaycastProvisioned,
       }, true);
       return;
     }
@@ -3100,6 +3101,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       if (error instanceof NodeClaimError) {
         json(response, error.status, { error: "node_claim_refused", message: error.message }, true);
+        return;
+      }
+      if (error instanceof RelaycastBindingUnavailableError) {
+        response.setHeader("retry-after", String(error.retryAfterSeconds));
+        json(response, error.status, { error: error.code, message: error.message }, true);
         return;
       }
       if (error instanceof MembershipConflictError) {

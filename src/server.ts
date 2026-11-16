@@ -51,14 +51,16 @@ const database = new PostgresDatabase(config.databaseUrl);
 
 // bootstrap-signup lane: first-boot org/workspace, OIDC/email sign-in, invites.
 const identityConfig = loadIdentityConfig();
-const store = new ControlPlaneStore(database, config.encryptionKeyring, undefined, {
-  tenancy: identityConfig.tenancy.mode,
-});
 // Creates Relaycast workspaces for the bootstrap and (multi mode) personal
-// and self-serve organizations; null without RELAYCAST_INTERNAL_SECRET.
+// and self-serve organizations, plus lazy bindings for imported Cloud
+// workspaces; null without RELAYCAST_INTERNAL_SECRET.
 const provisioner = identityConfig.relaycastInternalSecret
   ? relaycastProvisioner(config.relaycastUrl, identityConfig.relaycastInternalSecret)
   : null;
+const store = new ControlPlaneStore(database, config.encryptionKeyring, undefined, {
+  tenancy: identityConfig.tenancy.mode,
+  relaycastProvisioner: provisioner,
+});
 const identityStore = new IdentityStore(database, config.encryptionKeyring, {
   inviteTtlMs: identityConfig.inviteTtlMs,
   autoJoinDomains: identityConfig.autoJoinDomains,
