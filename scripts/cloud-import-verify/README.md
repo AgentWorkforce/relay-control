@@ -17,6 +17,23 @@ objects and local encrypted Postgres blobs, including a repeat copy.
 `import-report.example.json` is that full synthetic receipt; application smokes are
 pending and no real-data import has run.
 
+Credential selection follows the producer revision: through `.24`, every
+matching copied-source row participates; from `cloud-identity-2026-11-16.25`,
+only `copied`/`updated` rows participate. `already_present` and `control_newer`
+rows do not supply Cloud selection winners or inflate the reported selection
+summary. A written winner may demote other rows in its group, as the producer
+does. Otherwise untouched Control flags require a genuine prior credential
+baseline or an unchanged full convergence tuple. Missing prior evidence fails;
+an empty producer selection summary cannot waive a changed Control choice.
+The independent content/outcome gates still apply, so `control_newer` is not
+made acceptable by excluding it from selection expectations.
+
+The current-main importer in this harness still emits revision `.11`. The
+written-only adapter has causal consumer fixtures, including a real local
+Control login deactivated between copies; full qualification of `.25` requires
+the matching reviewed producer stack. Workspace binding-conflict and
+generation-kept warnings do not waive workspace comparison drift.
+
 The target runs all checked-in Control migrations, including the actual
 0053/0054/0056/0057/0058/0061/0062 files and the owner-only 0063 ledger migration. The
 staff-grant table comes from the checked-in 0061 migration. The shared Cloud fixture

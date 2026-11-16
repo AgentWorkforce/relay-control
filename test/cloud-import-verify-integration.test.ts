@@ -1,4 +1,5 @@
 import { credentialConvergenceCohort,captureCredentialConvergence,compareCredentialConvergence,computeCredentialCheckpoint,validateCredentialCheckpoint } from "../scripts/cloud-import-verify/convergence.js";
+import { credentialCloudSelection,type SourceSelection,type TargetSelection } from "../scripts/cloud-import-verify/credential-selection.js";
 import assert from "node:assert/strict";
 import { before,after,beforeEach,test,type TestFn } from "node:test";
 import { Client } from "pg";
@@ -73,7 +74,7 @@ async function copiedFixture() {
   ]);
   const reader = {get:async (key:string) => objects.get(key) ?? null};
   const blobs = new CredentialBlobStore(new PostgresObjectBackend(targetDb),fixtureKeyring);
-  const deps = {source:sourceDb,target:targetDb,reader,cloudKeyHex,keyring:fixtureKeyring,
+  const deps = {source:sourceDb,target:targetDb,reader,cloudKeyHex,keyring:fixtureKeyring,blobs,
     codingAgents:new CodingAgentStore(targetDb,fixtureKeyring,undefined,blobs),
     logins:new SubscriptionLoginStore(targetDb,fixtureKeyring,blobs)};
   const copy = await copyCodingAgentCredentials(deps,scope,"apply");
@@ -386,6 +387,40 @@ fixtureTest("wrong Cloud credential selection fails even with unchanged cardinal
   assert.ok(report.findings.filter((f) => f.kind === "credential_selection").every((f) => f.ok));
   assert.equal(report.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
   assert.equal(report.findings.find((f) => f.kind === "credential_cloud_selection")!.ok,false);
+});
+
+fixtureTest("written-only consumer preserves a real Control-deactivated login on an untouched rerun",async () => {
+  const fixture=await copiedFixture();
+  const login=fixture.copy.controlIds[id(0x806)]!;
+  await target.query("UPDATE coding_agent_credentials SET harness_active=false WHERE id=$1",[login]);
+  const flags=async () => new Map((await target.query("SELECT id,workspace_id,model_provider,is_active,harness_active FROM coding_agent_credentials")).rows
+    .map((row) => [row.id,{group:`${row.workspace_id}:${row.model_provider}`,active:row.is_active,harness:row.harness_active}] as [string,TargetSelection]));
+  const baseline=await flags();
+  const sourceRows=new Map((await source.query("SELECT * FROM provider_credentials")).rows.map((row) => [row.id,row]));
+  const entries:SourceSelection[]=Object.entries(fixture.copy.controlIds).map(([sourceId,controlId]) => {
+    const row=sourceRows.get(sourceId)!;
+    return {id:sourceId,key:controlId,group:baseline.get(controlId)!.group,active:row.is_active,
+      harness:row.harness_active && ["oauth_token","provider_oauth"].includes(row.auth_type),updated:new Date(row.updated_at).getTime()};
+  });
+  const check=async () => {
+    const current=await flags();
+    return credentialCloudSelection({revision:"cloud-identity-2026-11-16.25",entries,
+      outcomes:Object.fromEntries(entries.map((row) => [row.id,"already_present"])),flags:current,
+      nativeFlags:new Map(),baseline,allFlags:[...current.values()],unchangedKeys:new Set(),reported:undefined});
+  };
+  assert.equal((await check()).ok,true);
+  await target.query("UPDATE coding_agent_credentials SET harness_active=true WHERE id=$1",[login]);
+  assert.equal((await check()).ok,false,"re-activating an untouched login fails independently of the producer's empty selection summary");
+});
+
+fixtureTest("retained workspace binding warnings do not waive visible comparison drift",async () => {
+  const ledger=await apply();
+  ledger.warnings.workspaces_binding_conflict=1;
+  ledger.warnings.workspaces_generation_kept=1;
+  await target.query("UPDATE workspaces SET relaycast_workspace_id='synthetic-retained-provider-binding' WHERE id=$1",[id(0x201)]);
+  const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.ok,false);
+  assert.equal(report.findings.find((finding) => finding.kind === "table" && finding.name === "workspaces")!.ok,false);
 });
 
 fixtureTest("unselected copied credentials preserve native selections and report fallback conflicts",async () => {
