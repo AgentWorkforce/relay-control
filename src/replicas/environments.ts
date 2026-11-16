@@ -81,8 +81,10 @@ type PolicyRow = {
   opted_out: boolean;
   /** A create was (or was about to be) sent with an unknown outcome: automatic runs only relist. */
   create_unconfirmed: boolean;
+  /** Set when a complete discovery listing no longer showed this enabled environment; fences admission. */
+  discovery_missing_since: Date | string | null;
 };
-const POLICY = "id, workspace_id, issuer, provider_organization_id, environment_id, environment_name, enabled, registered_mcp_id, opted_out, create_unconfirmed";
+const POLICY = "id, workspace_id, issuer, provider_organization_id, environment_id, environment_name, enabled, registered_mcp_id, opted_out, create_unconfirmed, discovery_missing_since";
 
 /** actsAs: "creator" for a mapped creator, "principal" for the workspace VM principal. */
 type Admission = { policy: PolicyRow; organizationId: string; userId: string; actsAs: "creator" | "principal" };
@@ -135,7 +137,7 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
        LEFT JOIN remote_agent_connections c ON c.workspace_id = p.workspace_id AND c.provider = 'replicas'
        LEFT JOIN replica_environment_settings s ON s.workspace_id = p.workspace_id
        LEFT JOIN organization_memberships pm ON pm.user_id = s.principal_user_id AND pm.organization_id = w.organization_id
-      WHERE p.enabled AND p.issuer = $1 AND p.provider_organization_id = $2 AND p.environment_id = $3`,
+      WHERE p.enabled AND p.discovery_missing_since IS NULL AND p.issuer = $1 AND p.provider_organization_id = $2 AND p.environment_id = $3`,
     [claims.issuer, claims.organizationId, claims.environmentId],
   );
   const candidate = policies.rows.length === 1 ? policies.rows[0]! : null;
@@ -471,7 +473,8 @@ export async function setEnvironmentPrincipal(deps: ReplicasDeps, actor: Replica
 }
 
 /** An enabled policy without an entry whose last create has an unknown outcome is registration_unconfirmed. */
-const policyStatus = (policy: PolicyRow) => !policy.enabled ? "disabled" : policy.registered_mcp_id ? "registered"
+const policyStatus = (policy: PolicyRow) => !policy.enabled ? "disabled"
+  : policy.discovery_missing_since ? "discovery_missing" : policy.registered_mcp_id ? "registered"
   : policy.create_unconfirmed ? "registration_unconfirmed" : "enabled";
 
 export type DiscoveryResult = {
@@ -510,7 +513,9 @@ export async function discoverEnvironments(deps: ReplicasDeps, actor: ReplicasAc
         [actor.workspaceId, environmentId],
       );
       if (existing.rows[0]) {
-        await tx.query("UPDATE replica_environment_policies SET environment_name = $2, updated_at = now() WHERE id = $1",
+        // Listed again: the discovery fence (if any) is lifted.
+        await tx.query(
+          "UPDATE replica_environment_policies SET environment_name = $2, discovery_missing_since = NULL, updated_at = now() WHERE id = $1",
           [existing.rows[0].id, name]);
         environments.push({ environmentId, name, status: "known" });
         continue;
@@ -521,6 +526,14 @@ export async function discoverEnvironments(deps: ReplicasDeps, actor: ReplicasAc
         [randomUUID(), actor.workspaceId, issuer, organization, environmentId, name],
       );
       environments.push({ environmentId, name, status: "discovered" });
+    }
+    // Only a complete listing proves absence: fence each enabled policy it
+    // no longer shows (first timestamp kept). opted_out is never touched.
+    if (listed.complete) {
+      await tx.query(
+        `UPDATE replica_environment_policies SET discovery_missing_since = now(), updated_at = now()
+          WHERE workspace_id = $1 AND enabled AND discovery_missing_since IS NULL AND NOT (environment_id = ANY($2::text[]))`,
+        [actor.workspaceId, environments.map((item) => item.environmentId)]);
     }
     return { status: listed.complete ? "ok" : "partial", environments };
   });
@@ -572,6 +585,8 @@ export async function listEnvironmentPolicies(deps: ReplicasDeps, actor: Replica
         name: policy.environment_name,
         enabled: policy.enabled,
         status: policy.enabled && connection?.access_revoked_at ? "access_revoked" : policyStatus(policy),
+        // When a complete discovery listing stopped showing this enabled environment (admission refused until listed again).
+        discoveryMissingSince: policy.discovery_missing_since ? new Date(policy.discovery_missing_since).toISOString() : null,
         // An admin opt-out: sync and re-connect leave it disabled; a disabled policy without it is retried.
         optedOut: policy.opted_out,
         // A policy recorded for an earlier connection never admits a token.
@@ -833,12 +848,13 @@ function matchEntry(entries: EnvironmentMcp[], policy: PolicyRow, config: unknow
  * (connect): every one that is not enabled and registered. sync (under the
  * all-environments flag only): every disabled one that is not opted out (new,
  * or a default enable that failed or was refused earlier) plus enabled ones
- * whose registration is missing; an opted-out policy is never re-enabled here.
+ * whose registration is missing; an opted-out policy is never re-enabled here,
+ * and a policy fenced by discovery (discovery_missing_since) is skipped.
  */
 type DefaultSelection = { defaults: "setup" | "sync" };
 const DEFAULTS = {
   setup: "NOT (enabled AND registered_mcp_id IS NOT NULL)",
-  sync: "(NOT enabled AND NOT opted_out) OR (enabled AND registered_mcp_id IS NULL)",
+  sync: "discovery_missing_since IS NULL AND ((NOT enabled AND NOT opted_out) OR (enabled AND registered_mcp_id IS NULL))",
 };
 
 async function defaultPolicies(tx: SqlExecutor, workspaceId: string, organization: string, defaults: DefaultSelection["defaults"]) {

@@ -455,3 +455,78 @@ test("access-revoked latch: a provider 401 refuses every token until a 2xx envir
   assert.equal((await latch()).access_revoked_at, null);
   assert.equal((await rpc(api, token(), "tools/list")).status, 200);
 });
+
+test("discovery-away fencing: a complete listing without an enabled environment refuses it until it is listed again", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider, database } = env;
+  const base = `/api/v1/workspaces/${workspaceId}/replicas`;
+  provider.environments.push({ id: ENV_C, name: "gamma" });
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  assert.equal((await api(`${base}/environments/${ENV_B}`, {
+    method: "PUT", token: ownerToken, body: { enabled: true, creators: [{ creatorId: "creator-owner", userId: env.ownerId }] },
+  })).status, 200);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  // ENV_C is opted out by the admin; ENV_B lost its registration and is due for a retry.
+  assert.equal((await api(`${base}/environments/${ENV_C}`, { method: "PUT", token: ownerToken, body: { enabled: false } })).status, 200);
+  assert.equal((await policyRow(env, ENV_C)).opted_out, true);
+  provider.entriesOf(ENV_B).length = 0;
+  await database.query("UPDATE replica_environment_policies SET registered_mcp_id = NULL WHERE workspace_id = $1 AND environment_id = $2",
+    [workspaceId, ENV_B]);
+  const creates = countCreates(env);
+  const sweep = new ReplicasSyncSweep({ replicas: env.replicas.deps, intervalSeconds: 30 });
+  t.after(() => sweep.stop());
+  const listOnly = (...ids: string[]) => {
+    const all = [{ id: ENV_A, name: "alpha" }, { id: ENV_B, name: "beta" }, { id: ENV_C, name: "gamma" }];
+    provider.environments.splice(0, provider.environments.length, ...all.filter((item) => ids.includes(item.id)));
+  };
+
+  // A partial or failed listing without ENV_A changes nothing.
+  listOnly(ENV_B);
+  for (const mode of ["partial", "fail", "unavailable"] as const) {
+    provider.mode.discover = mode;
+    await syncEnvironments(env.replicas.deps, serviceActor(env));
+    assert.equal((await policyRow(env, ENV_A)).discovery_missing_since, null, mode);
+    assert.equal((await rpc(api, token(), "tools/list")).status, 200, mode);
+  }
+  creates.length = 0;
+  await database.query("UPDATE replica_environment_policies SET registered_mcp_id = NULL WHERE workspace_id = $1 AND environment_id = $2",
+    [workspaceId, ENV_B]);
+  provider.entriesOf(ENV_B).length = 0;
+
+  // A complete listing without ENV_A (and ENV_C): ENV_A is fenced and refused, ENV_B still registers.
+  provider.mode.discover = "ok";
+  await sweep.tick();
+  const fenced = await policyRow(env, ENV_A);
+  assert.ok(fenced.discovery_missing_since);
+  assert.equal(fenced.enabled, true);
+  assert.equal(fenced.opted_out, false);
+  const refused = await rpc(api, token(), "tools/list");
+  assert.equal(refused.status, 403, refused.text);
+  assert.equal(refused.body.error.message, "replica_environment_not_enabled");
+  assert.deepEqual(creates, [ENV_B]);
+  assert.ok((await policyRow(env, ENV_B)).registered_mcp_id);
+  const otherEnvironment = await rpc(api, token({ environment_id: ENV_B, workspace_id: WORKSPACE_2 }), "tools/list");
+  assert.equal(otherEnvironment.status, 200, otherEnvironment.text);
+  // The opted-out ENV_C was not enabled, so it is not fenced, and its opt-out survives.
+  const optedOut = await policyRow(env, ENV_C);
+  assert.equal(optedOut.discovery_missing_since, null);
+  assert.equal(optedOut.opted_out, true);
+  const view = await api(`${base}/environment-policies`, { token: ownerToken });
+  const viewA = view.body.environments.find((item: any) => item.environmentId === ENV_A);
+  assert.equal(viewA.status, "discovery_missing");
+  assert.equal(viewA.discoveryMissingSince, new Date(fenced.discovery_missing_since).toISOString());
+  // A later complete listing keeps the first timestamp.
+  await sweep.tick();
+  assert.equal((await policyRow(env, ENV_A)).discovery_missing_since.getTime(), fenced.discovery_missing_since.getTime());
+
+  // Listed again: the fence is lifted and ENV_A admits; ENV_C stays opted out.
+  listOnly(ENV_A, ENV_B, ENV_C);
+  await sweep.tick();
+  assert.equal((await policyRow(env, ENV_A)).discovery_missing_since, null);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const after = await policyRow(env, ENV_C);
+  assert.equal(after.opted_out, true);
+  assert.equal(after.enabled, false);
+  assert.deepEqual(creates, [ENV_B]);
+});
