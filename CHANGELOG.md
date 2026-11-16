@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `users.signup_source` (migration 0068), where an account was
+  created: `teams`, `flows` or `desktop` (hosted Cloud's values; the
+  identity import's carry lands in a follow-up) or `mcp`. Control records `mcp` when a new person
+  signs in (OIDC or email link) on the way back to MCP OAuth consent
+  (`/cloud/oauth/authorize`, e.g. ChatGPT's Agent Relay app). Set once at
+  creation; a later sign-in never rewrites it. Password sign-ups have no
+  return path and stay unattributed. Nullable; existing accounts are NULL.
 - Added: workspace deletes reach relayfile-control (migration 0052). With
   `RELAYFILE_CONTROL_URL` and a dedicated `RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET`,
   deleting a workspace queues `DELETE /internal/v1/flows/workspaces/{id}` in

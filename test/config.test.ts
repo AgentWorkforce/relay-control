@@ -77,6 +77,13 @@ test("session search @name parsing is default off and strictly boolean", () => {
   assert.throws(() => loadConfig({ ...completeEnv, SESSION_SEARCH_AGENT_TOKENS: "1" }), /SESSION_SEARCH_AGENT_TOKENS/);
 });
 
+test("the read API mint role is default off and strictly boolean", () => {
+  assert.equal(loadConfig(completeEnv).sessionReadMintIncludeRole, false);
+  assert.equal(loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_ROLE: "false" }).sessionReadMintIncludeRole, false);
+  assert.equal(loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_ROLE: "true" }).sessionReadMintIncludeRole, true);
+  assert.throws(() => loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_ROLE: "1" }), /SESSION_READ_MINT_INCLUDE_ROLE/);
+});
+
 test("the session erase API is default off and requires its full configuration", () => {
   assert.equal(loadConfig(completeEnv).sessionErasureApi, null);
   const eraser = {
