@@ -219,11 +219,14 @@ function upsertSql(table: ImportTable, columns: string[], fill = "'{}'::jsonb"):
   const secretColumn = spec.secret?.target ?? spec.inviteTokenHash ?? spec.freshTokenHash;
   const relation = `public.${quote(spec.table)}`;
   const keep = spec.keepTargetBinding;
+  const keepWhen = keep
+    ? `__t.${quote(keep.when)} IS NOT NULL AND (EXCLUDED.${quote(keep.when)} IS NULL OR EXCLUDED.${quote(keep.when)} <> __t.${quote(keep.when)}${
+      keep.generation && columns.includes(keep.generation) ? ` OR EXCLUDED.${quote(keep.generation)} < __t.${quote(keep.generation)}` : ""})`
+    : "";
   const updates = columns
     .filter((column) => !spec.primaryKey.includes(column) && !(spec.insertOnly ?? []).includes(column))
     .map((column) => keep?.columns.includes(column)
-      ? `${quote(column)} = CASE WHEN EXCLUDED.${quote(keep.when)} IS NULL AND __t.${quote(keep.when)} IS NOT NULL
-           THEN __t.${quote(column)} ELSE EXCLUDED.${quote(column)} END`
+      ? `${quote(column)} = CASE WHEN ${keepWhen} THEN __t.${quote(column)} ELSE EXCLUDED.${quote(column)} END`
       : `${quote(column)} = EXCLUDED.${quote(column)}`);
   return `INSERT INTO ${relation} AS __t (${columns.map(quote).join(", ")})
 SELECT ${columns.map((column) => `p.${quote(column)}`).join(", ")}
@@ -592,9 +595,36 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     //    rolled back at the end.
     const writeRows = async (tx: SqlExecutor, table: ImportTable, rows: PreparedRow[]) => {
       if (rows.length === 0) return;
+      const keep = TARGETS[table].keepTargetBinding;
+      if (keep) await countKeptBindings(tx, table, keep, rows);
       const sql = upsertSql(table, write[table], fills[table]);
       for (const batch of chunks(rows, batchSize)) {
         await tx.query(sql, [batch.map((row) => row.row), batch.map((row) => row.secret), batch.map((row) => row.override ?? null)]);
+      }
+    };
+    // Target rows a re-run leaves bound as they are (keepTargetBinding),
+    // counted so an operator sees them: a binding Cloud made after Control's
+    // (binding_conflict), or Control's newer key generation (generation_kept).
+    const countKeptBindings = async (
+      tx: SqlExecutor, table: ImportTable, keep: { when: string; generation?: string }, rows: PreparedRow[],
+    ) => {
+      const generation = keep.generation && write[table]!.includes(keep.generation) ? keep.generation : null;
+      const current = new Map((await tx.query<{ key: string; bound: string | null; generation: number | null }>(
+        `SELECT id::text AS key, ${quote(keep.when)}::text AS bound, ${generation ? `${quote(generation)}::int` : "NULL::int"} AS generation
+           FROM public.${quote(TARGETS[table].table)} WHERE id::text = ANY($1::text[])`,
+        [rows.map((row) => row.key)],
+      )).rows.map((row) => [row.key, row]));
+      for (const row of rows) {
+        const target = current.get(row.key);
+        if (!target?.bound) continue;
+        const incoming = JSON.parse(row.row) as Record<string, unknown>;
+        const bound = incoming[keep.when];
+        if (bound !== null && bound !== undefined && String(bound) !== target.bound) {
+          report.warnings[`${table}_binding_conflict`] = (report.warnings[`${table}_binding_conflict`] ?? 0) + 1;
+        } else if (bound !== null && bound !== undefined && generation && target.generation !== null
+          && Number(incoming[generation]) < target.generation) {
+          report.warnings[`${table}_generation_kept`] = (report.warnings[`${table}_generation_kept`] ?? 0) + 1;
+        }
       }
     };
     const runOrg = async (tx: SqlExecutor, org: string) => {
