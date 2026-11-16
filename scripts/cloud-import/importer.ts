@@ -227,7 +227,9 @@ function upsertSql(table: ImportTable, columns: string[], fill = "'{}'::jsonb"):
     .filter((column) => !spec.primaryKey.includes(column) && !(spec.insertOnly ?? []).includes(column))
     .map((column) => [column, keep?.columns.includes(column)
       ? `CASE WHEN ${keepWhen} THEN __t.${quote(column)} ELSE EXCLUDED.${quote(column)} END`
-      : `EXCLUDED.${quote(column)}`] as const);
+      : (spec.monotonic ?? []).includes(column)
+        ? `GREATEST(__t.${quote(column)}, EXCLUDED.${quote(column)})`
+        : `EXCLUDED.${quote(column)}`] as const);
   const updates = assigned.map(([column, value]) => `${quote(column)} = ${value}`);
   // A re-run of unchanged rows writes nothing: no same-value UPDATE, so row
   // versions (xmin) stay put and convergence checkpoints can prove it.

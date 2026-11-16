@@ -226,6 +226,19 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   // no updated_at, no status moves (storeLogin would rewrite every login).
   const snapshot = async () => (await target.query<{ id: string; v: number | null; u: string; status: string }>(
     "SELECT id::text AS id, blob_version AS v, updated_at::text AS u, status FROM coding_agent_credentials WHERE auth_type <> 'relay_managed' ORDER BY id")).rows;
+  // The identity import re-runs after the copy (every convergence rerun
+  // does): it must not re-impose Cloud's flags on the relay_managed rows the
+  // copier's selection demoted (one active LLM credential per workspace and
+  // provider, coding_agent_one_llm), and it must write no credential row.
+  const flagsOf = async () => (await target.query<{ id: string; a: boolean; h: boolean }>(
+    "SELECT id::text AS id, is_active AS a, harness_active AS h FROM coding_agent_credentials ORDER BY id")).rows;
+  const flagsBefore = await flagsOf();
+  const xminBefore = (await target.query<{ x: string }>("SELECT string_agg(xmin::text, ',' ORDER BY id) AS x FROM coding_agent_credentials")).rows[0]!.x;
+  const identityAgain = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(identityAgain.ok, true, JSON.stringify(identityAgain.orgs));
+  assert.deepEqual(await flagsOf(), flagsBefore, "the identity re-run keeps Control's selection");
+  assert.equal((await target.query<{ x: string }>("SELECT string_agg(xmin::text, ',' ORDER BY id) AS x FROM coding_agent_credentials")).rows[0]!.x,
+    xminBefore, "and writes no credential row");
   const before = await snapshot();
   // Re-run converges on Control's own dedupe keys. The lost key is found
   // this time, so the only remaining problem is the selection conflict.
