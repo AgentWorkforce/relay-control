@@ -15,6 +15,14 @@ assigned at release.
   (`409 too_many_tokens`), 10 mints per hour (`429 rate_limited`), expiry at
   most 90 days. Audited `relay_node.token.self_minted` and
   `relay_node.token.self_revoked` with the Desktop host name. No migration.
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), Agent
+  Relay Desktop claims its relay node at `POST /api/v1/fleet/nodes/claim` with
+  `{workspaceId, nodeName}`: the proof is the node's enrolment through this
+  Control (`relay_node_credentials`, a relay-node token minted in the
+  workspace and bound to that name), and Relaycast is not asked. A
+  `nodeToken` is refused with 400; a name that never enrolled here is 403
+  `node_claim_refused`. Claim rules and release are unchanged. Unset, nothing
+  changes. See docs/relay-node-credential.md.
 - Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), relay
   nodes no longer hold their Relaycast node token. `POST /relay-node/v1/nodes`
   stores it sealed (migration 0059 `relay_node_credentials`), answers the host

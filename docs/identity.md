@@ -1286,6 +1286,8 @@ per-identity handouts stop too:
   A member's signed-in Agent Relay Desktop can mint its own relay-node token
   at `POST /api/v1/workspaces/{id}/relay-node/self-tokens`, without an admin
   ([relay-node-credential.md](relay-node-credential.md#member-self-mint)).
+  Agent Relay Desktop claims such a node by its enrolled name instead of a
+  node token ([Claiming the node](relay-node-credential.md#claiming-the-node)).
 - MCP join and spawn keep their participant tokens server-side and return
   none to callers, so they are unchanged.
 - Person identities Control registers server-side (messaging conversation
