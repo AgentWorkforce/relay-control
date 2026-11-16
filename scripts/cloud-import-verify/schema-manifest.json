@@ -64,7 +64,8 @@
     {"name":"0059_relay_node_credentials.sql","sha256":"0c53f5f647e1640d1354d1b0a9e398ce4f0b159ab518b2a163bd9c20d704591f"},
     {"name":"0060_relay_launch_credentials.sql","sha256":"004bde8e76a9da5fe1d33fa5d188ddb883df7f56a4a41fc804e75a1847d04022"},
     {"name":"0062_cloud_identity_security.sql","sha256":"89856c37785fd8ff3dbecf1263939626e1683650607eac974793f24501a97448"},
-    {"name":"0063_cloud_import_ledger.sql","sha256":"a6e432e4454b5cb6244cce4677a35601f7cb34a9b29be09ba12884843aee48ba"}
+    {"name":"0063_cloud_import_ledger.sql","sha256":"a6e432e4454b5cb6244cce4677a35601f7cb34a9b29be09ba12884843aee48ba"},
+    {"name":"0068_user_signup_source.sql","sha256":"e27ca538d6dab7a04edaf0f65d07001a185d0d2c972a62914017a2573ae2ec7d"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -985,6 +986,7 @@
     {"kind":"column","name":"public.users.last_organization_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":6,"type":"uuid"}},
     {"kind":"column","name":"public.users.last_workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":7,"type":"uuid"}},
     {"kind":"column","name":"public.users.name","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"text"}},
+    {"kind":"column","name":"public.users.signup_source","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"text"}},
     {"kind":"column","name":"public.users.updated_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":5,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.work_assignments.acked_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.work_assignments.assigned_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":7,"type":"timestamp with time zone"}},
@@ -1489,6 +1491,7 @@
     {"kind":"constraint","name":"public.users.users_last_organization_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (last_organization_id) REFERENCES organizations(id) ON DELETE SET NULL","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_setnull_del","table":"public.organizations","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.organizations","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.users","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.users","type":17}],"type":"f","validated":true}},
     {"kind":"constraint","name":"public.users.users_last_workspace_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (last_workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.users","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.users","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_setnull_del","table":"public.workspaces","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.workspaces","type":17}],"type":"f","validated":true}},
     {"kind":"constraint","name":"public.users.users_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
+    {"kind":"constraint","name":"public.users.users_signup_source_known","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((signup_source IS NULL) OR (signup_source = ANY (ARRAY['teams'::text, 'flows'::text, 'desktop'::text, 'mcp'::text]))))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.work_assignments.work_assignments_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.work_assignments.work_assignments_run_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (run_id) REFERENCES workflow_runs(id) ON DELETE CASCADE","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.work_assignments","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.work_assignments","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_cascade_del","table":"public.workflow_runs","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.workflow_runs","type":17}],"type":"f","validated":true}},
     {"kind":"constraint","name":"public.work_assignments.work_assignments_run_id_key","definition":{"deferrable":false,"deferred":false,"definition":"UNIQUE (run_id)","no_inherit":true,"triggers":[],"type":"u","validated":true}},
@@ -1914,5 +1917,5 @@
       {"kind":"table","name":"public.staff_read_grants","definition":{"force_row_security":false,"kind":"r","row_security":false}}
     ]
   },
-  "sha256":"8a9af68db47188be01ed88b966cfb73fea01e18190b59f1b3b744654a93275a0"
+  "sha256":"64c0a20e927d9771e3b5f1bb427693acb965e1c9292ca807935e260c4cee65e6"
 }
