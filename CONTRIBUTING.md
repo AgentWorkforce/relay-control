@@ -43,4 +43,4 @@ change that doesn't fit the project's direction.
 ## License
 
 By contributing, you agree that your contributions are licensed under the
-[Apache License 2.0](LICENSE), the license of this repository.
+Functional Source License 1.1, ALv2 Future License (FSL-1.1-ALv2; see LICENSE), the license of this repository.

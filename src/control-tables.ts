@@ -75,6 +75,8 @@ export const CONTROL_TABLES: readonly string[] = [
   "relay_spawns",
   "relaycast_rekey_backups",
   "remote_agent_connections",
+  "replica_deliveries",
+  "replica_spawns",
   "run_events",
   "run_objects",
   "run_steps",

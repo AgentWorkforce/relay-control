@@ -12,6 +12,13 @@ assigned at release.
   (`/cloud/oauth/authorize`, e.g. ChatGPT's Agent Relay app). Set once at
   creation; a later sign-in never rewrites it. Password sign-ups have no
   return path and stay unattributed. Nullable; existing accounts are NULL.
+- Added: Replicas agent bridge behind `SELFHOST_REPLICAS_ENABLED` (default
+  off). Owners and admins spawn, recover, bind and release Replicas agents
+  through six MCP tools or the `/api/v1/workspaces/{ws}/replicas` routes. Each
+  bound replica gets its own Relay identity, a scoped Agent Relay MCP server
+  and reply helper installed through the provider exec API, and signed
+  delivery of messages addressed to it. Release revokes the capability before
+  cleanup. Migration 0065 `replica_spawns`. See [Replicas](docs/replicas.md).
 - Added: workspace deletes reach relayfile-control (migration 0052). With
   `RELAYFILE_CONTROL_URL` and a dedicated `RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET`,
   deleting a workspace queues `DELETE /internal/v1/flows/workspaces/{id}` in

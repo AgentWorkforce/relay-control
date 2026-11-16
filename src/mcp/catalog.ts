@@ -97,7 +97,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; staffReadGrant?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; staffReadGrant?: boolean } = {}): ToolPlanEntry[] {
   // A staff read grant (docs/staff-read-grants.md) reaches the shared-session
   // reads and capability discovery only, whatever else the server enables.
   if (options.staffReadGrant) {
@@ -111,6 +111,8 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; laun
   if (options.amp) groups.push("amp");
   // Factory tools exist only when SELFHOST_FACTORY_ENABLED is on.
   if (options.factory) groups.push("factory");
+  // Replicas tools exist only when SELFHOST_REPLICAS_ENABLED is on.
+  if (options.replicas) groups.push("replicas");
   if (options.capyPermits) groups.push("capy_binding");
   if (options.grokRoutines) groups.push("grok_routines");
   groups.push("capability_discovery");
@@ -180,6 +182,7 @@ export function describeCapabilities(input: {
   role: WorkspaceRole;
   amp?: boolean;
   factory?: boolean;
+  replicas?: boolean;
   launch?: boolean;
   capyPermits?: boolean;
   customerSupport?: boolean;
@@ -188,7 +191,7 @@ export function describeCapabilities(input: {
 }): CapabilityReport {
   const launchRole = input.role === "owner" || input.role === "admin";
   const canLaunch = Boolean(input.launch) && launchRole;
-  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, launch: input.launch,
+  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, replicas: input.replicas, launch: input.launch,
     capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines,
     staffReadGrant: input.authMode === "staff_read_grant" })
     .map(item => [item.group, item]));
@@ -215,6 +218,11 @@ export function describeCapabilities(input: {
         reason: LAUNCH_ROLE_REFUSAL,
         how_to_enable: "Ask a workspace owner to make you an owner or admin." };
     }
+    if (item && id === "replicas" && !launchRole) {
+      return { ...base, status: "restricted", tools: [...item.tools],
+        reason: "Only current workspace owners and admins with a person connection can manage Replicas.",
+        how_to_enable: "Ask a workspace owner to make you an owner or admin." };
+    }
     if (item) return { ...base, status: "available", tools: [...item.tools], ...(id === "customer_support"
       ? { call_requirements: "Available to all signed-in customers. Current credentials and workspace membership are checked before sending and before returning an answer." } : {}) };
     if (id === "grok_routines") return { ...base, status: "unavailable", tools: [...definition.tools],
@@ -223,6 +231,9 @@ export function describeCapabilities(input: {
     if (id === "events") return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "The MCP Events endpoint is not available here. Self-hosted Grok Bot webhook wake-ups use the grok_routines group on this connection.",
       how_to_enable: "Use connect_grok_bot_routine from a Grok Bot OAuth connection to this server's /cloud/api/v1/mcp/shared-sessions endpoint." };
+    if (id === "replicas") return { ...base, status: "unavailable", tools: [...definition.tools],
+      reason: "Replicas agents are not enabled on this self-hosted installation.",
+      how_to_enable: "An operator sets SELFHOST_REPLICAS_ENABLED=true and an owner or admin connects Replicas in Settings → Connections." };
     if (id === "hosted_launch") {
       return { ...base, status: "unavailable", tools: [...definition.tools],
         reason: "Agent launches are not enabled on this self-hosted installation.",
