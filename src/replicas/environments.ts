@@ -1078,38 +1078,6 @@ export async function syncEnvironments(deps: ReplicasDeps, actor: ReplicasActor)
 }
 
 /**
- * Revives a tombstone whose workspace was deleted (workspace_id NULL). Only an
- * owner/admin of a workspace that currently holds the tombstone's provider
- * organization connection may remove it: 404 when the connected organization
- * has no such orphaned tombstone. The revival is audited in the caller's workspace.
- */
-export async function reviveOrphanedTombstone(deps: ReplicasDeps, actor: ReplicasActor, providerWorkspaceId: string) {
-  const { issuer } = identityConfig(deps);
-  const notFound = () => new ReplicasError("No released replica with this provider workspace id was found for the connected organization.", 404);
-  return withReplicasLock(deps, actor, async (tx) => {
-    await requireAdmin(tx, actor);
-    if (!isUuid(providerWorkspaceId)) throw notFound();
-    const connection = await tx.query<{ provider_account: string | null }>(
-      "SELECT provider_account FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'",
-      [actor.workspaceId],
-    );
-    const organization = connection.rows[0]?.provider_account?.toLowerCase();
-    if (!organization) throw notFound();
-    const removed = await tx.query<{ provider_workspace_id: string }>(
-      `DELETE FROM replica_identity_tombstones
-        WHERE issuer = $1 AND provider_organization_id = $2 AND provider_workspace_id = $3 AND workspace_id IS NULL
-        RETURNING provider_workspace_id`,
-      [issuer, organization, providerWorkspaceId.toLowerCase()],
-    );
-    const revived = removed.rows[0];
-    if (!revived) throw notFound();
-    await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-      actor: auditActor(actor), action: "replicas.identity.revived", target: revived.provider_workspace_id });
-    return { providerWorkspaceId: revived.provider_workspace_id, revived: true };
-  });
-}
-
-/**
  * Disconnect: stop admission for every environment and revoke its bindings
  * (committed), then remove the registered provider entries best effort while
  * the key still exists, then retire the released Relay identities.

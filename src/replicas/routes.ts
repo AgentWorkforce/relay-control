@@ -25,7 +25,6 @@ import {
   disableEnvironmentMcp,
   enableEnvironmentMcp,
   listEnvironmentPolicies,
-  reviveOrphanedTombstone,
   setEnvironmentPrincipal,
   syncEnvironments,
   updateEnvironmentPolicy,
@@ -136,7 +135,6 @@ export function createReplicasHandler(input: {
     const spawn = /^\/spawns\/([^/]+)$/.exec(rest);
     const environment = /^\/environments\/([^/]+)$/.exec(rest);
     const sync = rest === "/environments/sync";
-    const tombstone = /^\/environment-tombstones\/([^/]+)$/.exec(rest);
     const known = (rest === "" && method === "GET")
       || (rest === "/environments" && method === "GET")
       || (rest === "/environment-policies" && method === "GET")
@@ -144,7 +142,6 @@ export function createReplicasHandler(input: {
       || (!sync && environment && method === "PUT")
       || (rest === "/environment-mcp" && (method === "POST" || method === "DELETE"))
       || (rest === "/environment-principal" && method === "PUT")
-      || (tombstone && method === "DELETE")
       || (rest === "/spawns" && method === "POST")
       || (spawn && (method === "GET" || method === "DELETE"));
     if (!known) throw new ReplicasError("Not found", 404);
@@ -155,7 +152,6 @@ export function createReplicasHandler(input: {
     if (rest === "/environment-policies") return { status: 200, body: await listEnvironmentPolicies(deps, actor) };
     if (sync) return { status: 200, body: await syncEnvironments(deps, actor) };
     if (rest === "/environment-principal") return { status: 200, body: await setEnvironmentPrincipal(deps, actor, await readJson(request)) };
-    if (tombstone) return { status: 200, body: await reviveOrphanedTombstone(deps, actor, decode(tombstone[1]!)) };
     if (environment) return { status: 200, body: await updateEnvironmentPolicy(deps, actor, decode(environment[1]!), await readJson(request)) };
     if (rest === "/environment-mcp") {
       const body = await readJson(request);

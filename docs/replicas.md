@@ -234,7 +234,6 @@ admission order above).
 | `POST /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}` (re-enable those) or `{all: true}` (turn the default back on and clear every opt-out and re-enable every environment), optionally with `principalUserId`: set the principal, then enable and register the entry |
 | `DELETE /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}`: opt those environments out; `{all: true}`: turn the default off for the workspace and disable every environment. Disables, then removes the entry |
 | `POST /api/v1/workspaces/{ws}/replicas/environments/sync` | Rediscover; while the default is on, every disabled environment that is not opted out (newly found, or a default enable that failed or was refused) is enabled and registered and enabled ones without an entry are registered again. Opted-out environments stay disabled |
-| `DELETE /api/v1/workspaces/{ws}/replicas/environment-tombstones/{providerWorkspaceId}` | Revive a replica whose tombstone outlived its workspace (see below). Owner or admin of the workspace holding that organization's Replicas connection; 404 when there is no such tombstone |
 
 `GET .../environments` stays the live list of environments the key can use
 (`{environments: [{id, name}]}`). Discovery lists every environment of the
@@ -347,11 +346,11 @@ with their workspace. Tombstones are not: deleting a workspace tombstones
 every live environment-enrolled replica of it (reason `workspace_deleted`)
 and removes its environment-identity bindings in the same transaction, and
 from migration 0069 a tombstone outlives its workspace with no workspace
-attached, so those replicas stay refused. An owner or admin of the workspace
-now holding that organization's Replicas connection revives one with `DELETE
-.../replicas/environment-tombstones/{providerWorkspaceId}`. A workspace with
-launch or bind records still answers 409 `in_use` until those replicas are
-released.
+attached, so those replicas stay refused, also when the organization is
+connected in another workspace. A tombstone that outlived its workspace stays
+in force: there is no in-product revive for it, matching the hosted
+edition's tenant pin. A workspace with launch or bind records still answers
+409 `in_use` until those replicas are released.
 
 ## Not yet covered
 

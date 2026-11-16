@@ -15,10 +15,9 @@ assigned at release.
   (`workspace_deleted`) and removes their bindings in the same transaction
   (launch and bind records still answer 409 `in_use`); migration 0069 keeps tombstones after their workspace
   is deleted (nullable `workspace_id`, `ON DELETE SET NULL`), admission refuses
-  any matching tombstone, and `DELETE
-  /api/v1/workspaces/{ws}/replicas/environment-tombstones/{providerWorkspaceId}`
-  lets an owner or admin of the workspace holding that organization's
-  connection revive one. Control runs the environment sync at startup and every
+  any matching tombstone. A tombstone that outlived its workspace stays in
+  force: there is no in-product revive for it, matching the hosted edition's
+  tenant pin. Control runs the environment sync at startup and every
   `SELFHOST_REPLICAS_SYNC_INTERVAL_SECONDS` (default 60, minimum 30, `0` off)
   for every connection whose all-environments default is on. The Replicas
   connect response adds `provisioning_error` (`replica_environment_setup_failed`,

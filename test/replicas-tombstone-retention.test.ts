@@ -327,9 +327,9 @@ test("an explicit release tombstones a binding a disable left gone without one; 
   assert.equal((await tombstones(env)).length, 1);
 });
 
-test("tombstones survive workspace deletion; only the org's connected workspace admin revives them", async (t) => {
+test("tombstones survive workspace deletion and stay in force when the organization is connected in another workspace", async (t) => {
   const env = await start(t);
-  const { api, workspaceId, ownerId, memberId, database, store } = env;
+  const { api, workspaceId, ownerId, database, store } = env;
   const secondary = await api(`/api/v1/organizations/${env.organizationId}/workspaces`, {
     method: "POST", token: BOOTSTRAP, body: { name: "secondary", relaycastWorkspaceId: "rc-secondary", relaycastApiKey: "rk_live_secondary" },
   });
@@ -369,32 +369,14 @@ test("tombstones survive workspace deletion; only the org's connected workspace 
 
   // The organization is connected again in another workspace: the orphan is still refused.
   const ownerToken = await env.login(ownerId, next);
-  const memberToken = await env.login(memberId, next);
   assert.equal((await connect(env, next, ownerToken)).status, 200);
   await mapOwner(env, next, ownerToken);
   assert.equal((await rpc(api, token({ workspace_id: WORKSPACE_1 }), "tools/list")).body.error.message, "replica_released");
-  const route = (id: string) => `/api/v1/workspaces/${next}/replicas/environment-tombstones/${id}`;
-  assert.equal((await api(route(WORKSPACE_1), { method: "DELETE", token: memberToken })).status, 403);
-  assert.equal((await api(route(randomUUID()), { method: "DELETE", token: ownerToken })).status, 404);
-  assert.equal((await api(route("not-a-uuid"), { method: "DELETE", token: ownerToken })).status, 404);
-  // An orphan of another provider organization is not this connection's to revive.
-  const foreign = "6f6f6f6f-6f6f-4f6f-8f6f-6f6f6f6f6f6f";
-  await database.query(`INSERT INTO replica_identity_tombstones (issuer, provider_organization_id, provider_workspace_id, workspace_id, reason)
-    VALUES ($1, $2, $3, NULL, 'workspace_deleted')`, [ISSUER, foreign, WORKSPACE_2]);
-  assert.equal((await api(route(WORKSPACE_2), { method: "DELETE", token: ownerToken })).status, 404);
-  const revived = await api(route(WORKSPACE_1.toUpperCase()), { method: "DELETE", token: ownerToken });
-  assert.equal(revived.status, 200, revived.text);
-  assert.deepEqual(revived.body, { providerWorkspaceId: WORKSPACE_1, revived: true });
-  assert.equal(await count(env,
-    "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.identity.revived' AND workspace_id = $1 AND actor_kind = 'user' AND actor_id = $2",
-    [next, ownerId]), 1);
-  assert.equal((await api(route(WORKSPACE_1), { method: "DELETE", token: ownerToken })).status, 404);
-  // A tombstone still held by a workspace is not an orphan.
-  const released = (await database.query<{ n: number }>("SELECT count(*)::int AS n FROM replica_identity_tombstones WHERE workspace_id IS NOT NULL")).rows[0]!.n;
-  assert.equal(released, 0);
-  const readmitted = await rpc(api, token({ workspace_id: WORKSPACE_1 }), "tools/list");
-  assert.equal(readmitted.status, 200, readmitted.text);
-  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE workspace_id = $1 AND replica_id = $2 AND state <> 'gone'", [next, WORKSPACE_1]), 1);
+  // No tenant reassignment: the tombstone stays unattached and nothing re-enrols in the new workspace.
+  assert.deepEqual(await tombstones(env), [{
+    issuer: ISSUER, provider_organization_id: PROVIDER_ORG, provider_workspace_id: WORKSPACE_1, workspace_id: null, reason: "workspace_deleted",
+  }]);
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE workspace_id = $1 AND replica_id = $2 AND state <> 'gone'", [next, WORKSPACE_1]), 0);
 });
 
 test("a launch record still restricts workspace deletion and writes no tombstone", async (t) => {
@@ -410,17 +392,6 @@ test("a launch record still restricts workspace deletion and writes no tombstone
   // The whole deletion rolled back: the launch row and the environment identity are both kept.
   assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE id = $1", [launched]), 1);
   assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE source = 'environment_identity' AND state <> 'gone'"), 1);
-});
-
-test("the orphan revive refuses a tombstone still held by a workspace", async (t) => {
-  const env = await start(t);
-  const { api, workspaceId, ownerToken } = env;
-  assert.equal((await connect(env)).status, 200);
-  await env.database.query(`INSERT INTO replica_identity_tombstones (issuer, provider_organization_id, provider_workspace_id, workspace_id, reason)
-    VALUES ($1, $2, $3, $4, 'released')`, [ISSUER, PROVIDER_ORG, WORKSPACE_1, workspaceId]);
-  const response = await api(`/api/v1/workspaces/${workspaceId}/replicas/environment-tombstones/${WORKSPACE_1}`, { method: "DELETE", token: ownerToken });
-  assert.equal(response.status, 404);
-  assert.equal((await tombstones(env)).length, 1);
 });
 
 test("sync sweep: every all-environments connection, service actor, no overlap, errors do not stop it", async (t) => {
