@@ -5,6 +5,20 @@ assigned at release.
 
 ## Unreleased
 
+- Added: staff read grants (migration 0061, table `staff_read_grants`). An
+  owner of the operator organization, on its domains when it has any, mints a
+  short-lived `sh_sr_` credential (scope `rth:read`, at most 90 days, no
+  refresh) for one customer workspace with
+  `POST /api/v1/workspaces/{id}/staff-read-grants`, lists grants with `GET`
+  and revokes with `DELETE .../{grantId}`; every non-staff caller gets `404`.
+  The credential works only as a bearer on `/api/v1/mcp/shared-sessions`,
+  reaches only the shared-session read tools and `describe_capabilities` of
+  that workspace, and re-checks revocation, expiry and the staff rule on every
+  request. Mint and revoke are audited (`staff_read_grant.minted`,
+  `staff_read_grant.revoked`); reads appear in the shared-session read audit
+  with `auth_mode` `staff_read_grant`. Introspection answers it as a
+  `desktop-user` pinned to the workspace. See
+  [Staff read grants](docs/staff-read-grants.md).
 - Changed: credential-refresh transactions (subscription-login auth files and
   integration-connection OAuth tokens) now set
   `SET LOCAL idle_in_transaction_session_timeout = '60s'` and
