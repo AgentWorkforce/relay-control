@@ -77,8 +77,10 @@ type PolicyRow = {
   enabled: boolean;
   registered_mcp_id: string | null;
   opted_out: boolean;
+  /** A create was (or was about to be) sent with an unknown outcome: automatic runs only relist. */
+  create_unconfirmed: boolean;
 };
-const POLICY = "id, workspace_id, issuer, provider_organization_id, environment_id, environment_name, enabled, registered_mcp_id, opted_out";
+const POLICY = "id, workspace_id, issuer, provider_organization_id, environment_id, environment_name, enabled, registered_mcp_id, opted_out, create_unconfirmed";
 
 /** actsAs: "creator" for a mapped creator, "principal" for the workspace VM principal. */
 type Admission = { policy: PolicyRow; organizationId: string; userId: string; actsAs: "creator" | "principal" };
@@ -463,7 +465,9 @@ export async function setEnvironmentPrincipal(deps: ReplicasDeps, actor: Replica
   return listEnvironmentPolicies(deps, actor);
 }
 
-const policyStatus = (policy: PolicyRow) => !policy.enabled ? "disabled" : policy.registered_mcp_id ? "registered" : "enabled";
+/** An enabled policy without an entry whose last create has an unknown outcome is registration_unconfirmed. */
+const policyStatus = (policy: PolicyRow) => !policy.enabled ? "disabled" : policy.registered_mcp_id ? "registered"
+  : policy.create_unconfirmed ? "registration_unconfirmed" : "enabled";
 
 export type DiscoveryResult = {
   status: "ok" | "partial" | "failed";
@@ -822,8 +826,13 @@ async function defaultPolicies(tx: SqlExecutor, workspaceId: string, organizatio
       ORDER BY environment_id FOR UPDATE`, [workspaceId, organization])).rows;
 }
 
+/**
+ * automatic: the run was not started by a person route (startup run, sweep);
+ * it never sends a create while an earlier create's outcome is unconfirmed.
+ * Defaults to whether the actor is a service.
+ */
 async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
-  selection: Selection | EnableSelection | DefaultSelection): Promise<EnvironmentMcpResult[]> {
+  selection: Selection | EnableSelection | DefaultSelection, options: { automatic?: boolean } = {}): Promise<EnvironmentMcpResult[]> {
   const { mcpUrl } = identityConfig(deps);
   const results: EnvironmentMcpResult[] = [];
   const released: string[] = [];
@@ -871,65 +880,119 @@ async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
   await retireIdentityBindings(deps, actor, released);
   const config = { url: mcpUrl, headers: {}, auth: { type: "workspace_identity" as const, audience: mcpUrl } };
   for (const policy of toRegister) {
-    // Once a create was sent, only a definite rejection proves no entry was
-    // created; anything else (timeout, 5xx, unreadable answer, our own
-    // UPDATE or commit failing) leaves the outcome unknown.
-    let asked = false;
-    try {
-      results.push(await withReplicasLock(deps, actor, async (tx): Promise<EnvironmentMcpResult> => {
-        await requireAdmin(tx, actor);
-        const current = await policyFor(tx, actor.workspaceId, policy.environment_id);
-        if (!current || !current.enabled) return { environmentId: policy.environment_id, status: "disabled" };
-        if (current.registered_mcp_id) return { environmentId: current.environment_id, status: "registered" };
-        let key: string;
-        try {
-          key = await keyFor(deps, tx, actor.workspaceId);
-        } catch {
-          return { environmentId: current.environment_id, status: "registration_failed", retryable: true };
-        }
-        const failed = (retryable: boolean): EnvironmentMcpResult => ({ environmentId: current.environment_id, status: "registration_failed", retryable });
-        const unconfirmed: EnvironmentMcpResult = { environmentId: current.environment_id, status: "registration_unconfirmed", retryable: true };
-        // Read first: reuse a matching entry, never overwrite a foreign or duplicated one.
-        let found: EntryMatch;
-        try {
-          found = matchEntry(await deps.replicas.listEnvironmentMcps(key, current.environment_id), current, config);
-        } catch {
-          return failed(true);
-        }
-        if (found.kind === "conflict") return failed(false);
-        if (found.kind === "none") {
-          asked = true;
-          let createdId: string | null = null;
-          try {
-            createdId = (await deps.replicas.registerEnvironmentMcp(key, current.environment_id,
-              { name: IDENTITY_SERVER_NAME, transport: "http", config })).id;
-          } catch (error) {
-            // A 409 or a lost answer may still have created the entry: read it back below.
-            if (rejectedByProvider(error)) {
-              asked = false;
-              return failed(true);
-            }
-          }
-          try {
-            found = matchEntry(await deps.replicas.listEnvironmentMcps(key, current.environment_id), current, config);
-          } catch {
-            return unconfirmed;
-          }
-          if (found.kind === "conflict") return failed(false);
-          if (found.kind !== "match" || (createdId !== null && found.id !== createdId)) return unconfirmed;
-        }
-        const entry = { id: found.id };
-        await tx.query("UPDATE replica_environment_policies SET registered_mcp_id = $2, updated_at = now() WHERE id = $1", [current.id, entry.id]);
-        await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-          actor: auditActor(actor), action: "replicas.environment.mcp_registered", target: current.id });
-        return { environmentId: current.environment_id, status: "registered" };
-      }));
-    } catch (error) {
-      if (!asked) throw error;
-      results.push({ environmentId: policy.environment_id, status: "registration_unconfirmed", retryable: true });
-    }
+    results.push(await registerPolicy(deps, actor, policy.environment_id, config, options.automatic ?? Boolean(actor.service)));
   }
   return results;
+}
+
+type IdentityMcpConfig = { url: string; headers: Record<string, never>; auth: { type: "workspace_identity"; audience: string } };
+type RegistrationTarget = { current: PolicyRow; key: string };
+
+/** Re-reads one policy under the lock: still enabled, not yet registered, and the key is readable. */
+async function registrationTarget(deps: ReplicasDeps, tx: SqlExecutor, actor: ReplicasActor,
+  environmentId: string): Promise<EnvironmentMcpResult | RegistrationTarget> {
+  await requireAdmin(tx, actor);
+  const current = await policyFor(tx, actor.workspaceId, environmentId);
+  if (!current || !current.enabled) return { environmentId, status: "disabled" };
+  if (current.registered_mcp_id) return { environmentId: current.environment_id, status: "registered" };
+  try {
+    return { current, key: await keyFor(deps, tx, actor.workspaceId) };
+  } catch {
+    return { environmentId: current.environment_id, status: "registration_failed", retryable: true };
+  }
+}
+
+async function setCreateIntent(tx: SqlExecutor, policyId: string, value: boolean): Promise<void> {
+  await tx.query("UPDATE replica_environment_policies SET create_unconfirmed = $2, updated_at = now() WHERE id = $1", [policyId, value]);
+}
+
+async function markRegistered(tx: SqlExecutor, actor: ReplicasActor, policy: PolicyRow, mcpId: string): Promise<EnvironmentMcpResult> {
+  await tx.query(
+    "UPDATE replica_environment_policies SET registered_mcp_id = $2, create_unconfirmed = false, updated_at = now() WHERE id = $1",
+    [policy.id, mcpId]);
+  await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
+    actor: auditActor(actor), action: "replicas.environment.mcp_registered", target: policy.id });
+  return { environmentId: policy.environment_id, status: "registered" };
+}
+
+/**
+ * Registers one enabled policy's provider MCP entry in two locked steps.
+ * Step 1 lists the environment's entries: a matching entry is recorded as
+ * registered (and the create intent cleared); otherwise the create intent
+ * (create_unconfirmed) is committed before any create is sent. While the
+ * intent is set from an earlier attempt, an automatic run (startup, sweep)
+ * only relists and reports registration_unconfirmed; a person-driven run may
+ * create again, and only after a complete listing showed no entry. Step 2
+ * relists (another run may have created it meanwhile), then creates and reads
+ * the entry back. Only a definite provider rejection clears the intent; a
+ * timeout, 5xx, unreadable answer or a failed listing leaves it set.
+ */
+async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environmentId: string,
+  config: IdentityMcpConfig, automatic: boolean): Promise<EnvironmentMcpResult> {
+  const failed = (retryable: boolean): EnvironmentMcpResult => ({ environmentId, status: "registration_failed", retryable });
+  const unconfirmed: EnvironmentMcpResult = { environmentId, status: "registration_unconfirmed", retryable: true };
+  const list = (target: RegistrationTarget) => deps.replicas.listEnvironmentMcps(target.key, target.current.environment_id)
+    .then((entries) => matchEntry(entries, target.current, config));
+  const intent = await withReplicasLock(deps, actor, async (tx): Promise<EnvironmentMcpResult | { previous: boolean }> => {
+    const target = await registrationTarget(deps, tx, actor, environmentId);
+    if (!("current" in target)) return target;
+    let found: EntryMatch;
+    try {
+      found = await list(target);
+    } catch {
+      return target.current.create_unconfirmed ? unconfirmed : failed(true);
+    }
+    if (found.kind === "conflict") return failed(false);
+    if (found.kind === "match") return markRegistered(tx, actor, target.current, found.id);
+    if (target.current.create_unconfirmed && automatic) return unconfirmed;
+    await setCreateIntent(tx, target.current.id, true);
+    return { previous: target.current.create_unconfirmed };
+  });
+  if ("status" in intent) return intent;
+  // Once a create was sent, only a definite rejection proves no entry was
+  // created; anything else (timeout, 5xx, unreadable answer, our own
+  // UPDATE or commit failing) leaves the outcome unknown.
+  let asked = false;
+  try {
+    return await withReplicasLock(deps, actor, async (tx): Promise<EnvironmentMcpResult> => {
+      const target = await registrationTarget(deps, tx, actor, environmentId);
+      if (!("current" in target)) return target;
+      let found: EntryMatch;
+      try {
+        found = await list(target);
+      } catch {
+        // Nothing was sent in this attempt: restore the intent it found.
+        if (!intent.previous) await setCreateIntent(tx, target.current.id, false);
+        return intent.previous ? unconfirmed : failed(true);
+      }
+      if (found.kind === "conflict") return failed(false);
+      if (found.kind === "match") return markRegistered(tx, actor, target.current, found.id);
+      asked = true;
+      let createdId: string | null = null;
+      try {
+        createdId = (await deps.replicas.registerEnvironmentMcp(target.key, target.current.environment_id,
+          { name: IDENTITY_SERVER_NAME, transport: "http", config })).id;
+      } catch (error) {
+        // A 409 or a lost answer may still have created the entry: read it back below.
+        if (rejectedByProvider(error)) {
+          asked = false;
+          await setCreateIntent(tx, target.current.id, false);
+          return failed(true);
+        }
+      }
+      try {
+        found = await list(target);
+      } catch {
+        return unconfirmed;
+      }
+      if (found.kind === "conflict") return failed(false);
+      if (found.kind !== "match" || (createdId !== null && found.id !== createdId)) return unconfirmed;
+      return markRegistered(tx, actor, target.current, found.id);
+    });
+  } catch (error) {
+    if (!asked) throw error;
+    return unconfirmed;
+  }
 }
 
 /**
@@ -1067,13 +1130,14 @@ export async function setupEnvironments(deps: ReplicasDeps, actor: ReplicasActor
  * that failed or was refused earlier) is enabled and registered and enabled
  * ones without a registration are retried; opted-out environments stay disabled.
  */
-export async function syncEnvironments(deps: ReplicasDeps, actor: ReplicasActor) {
+export async function syncEnvironments(deps: ReplicasDeps, actor: ReplicasActor, options: { automatic?: boolean } = {}) {
+  const automatic = options.automatic ?? Boolean(actor.service);
   const discovery = await discoverEnvironments(deps, actor);
   const all = await withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
     return allEnvironmentsFlag(tx, actor.workspaceId);
   });
-  const environments = all ? await enableSelected(deps, actor, { defaults: "sync" }) : [];
+  const environments = all ? await enableSelected(deps, actor, { defaults: "sync" }, { automatic }) : [];
   return { discovery, allEnvironments: all, environments };
 }
 

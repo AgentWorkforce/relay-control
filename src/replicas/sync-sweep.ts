@@ -49,7 +49,7 @@ export class ReplicasSyncSweep {
         userId: "", workspaceId: target.workspace_id, organizationId: target.organization_id, service: REPLICAS_SYNC_SERVICE,
       };
       try {
-        await syncEnvironments(this.deps.replicas, actor);
+        await syncEnvironments(this.deps.replicas, actor, { automatic: true });
       } catch {
         this.deps.log?.({ code: "replicas_sync_failed", workspaceId: target.workspace_id });
       }
