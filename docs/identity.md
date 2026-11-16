@@ -1274,6 +1274,8 @@ broker's enrol answer carries no token; Control keeps it sealed (migration
 attaches each launch's credential (below) to the spawn invocation it forwards
 as `input.launch_credential` and does not forward `deliver` frames. See
 [relay-node-credential.md](relay-node-credential.md#gate-only-installs).
+Agent Relay Desktop claims such a node by its enrolled name instead of a node
+token ([Claiming the node](relay-node-credential.md#claiming-the-node)).
 Unset, nothing changes.
 
 #### Relay launch credentials

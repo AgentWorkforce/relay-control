@@ -2038,21 +2038,36 @@ paths:
       description: >-
         Records a Relaycast node as the caller's own computer (hosted Cloud's
         fleet/nodes/claim): Agent Relay Desktop claims its spawn node so spawns
-        onto it are accepted. The node token is proven against Relaycast
-        (/v1/node/me, then the workspace key's read of that node) and never
-        stored. Idempotent for the same person; a node owned by someone else,
-        through another workspace, or through a previous relay binding is
-        refused with 409. Rate limit 20 per hour per user.
+        onto it are accepted. Send exactly one proof. Standard installs:
+        `nodeToken`, proven against Relaycast (/v1/node/me, then the workspace
+        key's read of that node) and never stored. Gate-only installs
+        (SELFHOST_RELAYGATE_PUBLIC_URL set): `nodeName`, the node's enrolled
+        name, proven by its enrolment through this Control's relay-node broker
+        in this workspace (docs/relay-node-credential.md, "Claiming the
+        node"); Relaycast is not asked and `nodeToken` is refused. Idempotent
+        for the same person; a node owned by someone else, through another
+        workspace, or through a previous relay binding is refused with 409.
+        Rate limit 20 per hour per user.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [workspaceId, nodeToken]
+              required: [workspaceId]
+              description: >-
+                workspaceId plus one of nodeToken (standard installs, required
+                there) or nodeName (gate-only installs, required there).
               properties:
                 workspaceId: { type: string, description: Must be the token's workspace }
-                nodeToken: { type: string, pattern: "^(?:nt_live_[A-Za-z0-9_-]{8,256}|ar_nd_[0-9A-Za-z]{11}_[a-z][0-9A-Za-z]{10}_[0-9A-Za-z]{49})$" }
+                nodeToken:
+                  type: string
+                  description: Standard installs only; refused with 400 on gate-only installs.
+                  pattern: "^(?:nt_live_[A-Za-z0-9_-]{8,256}|ar_nd_[0-9A-Za-z]{11}_[a-z][0-9A-Za-z]{10}_[0-9A-Za-z]{49})$"
+                nodeName:
+                  type: string
+                  description: Gate-only installs only; the node's enrolled relay-node name. Ignored on standard installs.
+                  pattern: "^[A-Za-z0-9._:-]{1,200}$"
       responses:
         "200":
           description: Claim result
@@ -2066,9 +2081,16 @@ paths:
                   claimed: { type: boolean, description: false when the caller already owned it }
                   owner: { type: string, enum: [you] }
         "400":
-          description: Missing workspaceId or malformed node token
+          description: >-
+            Missing workspaceId; standard installs: missing or malformed node
+            token; gate-only installs: a nodeToken was sent, or nodeName is
+            missing or malformed
         "403":
-          description: The token is not a valid node token for this workspace
+          description: >-
+            node_claim_refused. Standard installs: the token is not a valid
+            node token for this workspace. Gate-only installs: the node has not
+            enrolled through this installation. Either: the caller is not an
+            organization member
         "404":
           description: Workspace not found
         "409":
