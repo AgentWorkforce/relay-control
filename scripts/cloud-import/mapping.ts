@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.11";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.18";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -47,6 +47,19 @@ const normEmail = (expression: string) => `lower(btrim(${expression}))`;
 const ROLE_RANK = (expression: string) =>
   `(CASE ${expression} WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END)`;
 const RW_FORMAT = "'^rw_[0-9a-f]{8}$'";
+/**
+ * Cloud's provider normalisation, in SQL: canonicalConnectionProvider
+ * (packages/web/lib/billing/connection-provider.ts) plus gemini -> google
+ * from the serving path's normalizeModelProvider
+ * (packages/web/lib/billing/house-keys.ts). Cloud stores these aliases and
+ * serves them as the canonical provider, so the import does the same.
+ */
+export const PROVIDER = (expression: string) =>
+  `(CASE lower(btrim(${expression})) WHEN 'claude' THEN 'anthropic' WHEN 'codex' THEN 'openai' WHEN 'grok' THEN 'xai'` +
+  ` WHEN 'cursor-agent' THEN 'cursor' WHEN 'agent' THEN 'cursor' WHEN 'gemini' THEN 'google' ELSE lower(btrim(${expression})) END)`;
+// A Cloud workspace with no usable Relaycast binding (rw and rw alias the
+// workspace and its relay_workspaces row in workspace_rows).
+const UNBOUND = "(w.relay_workspace_id IS NULL OR rw.id IS NULL OR COALESCE(rw.relaycast_workspace_id, '') = '' OR COALESCE(rw.relaycast_api_key, '') = '')";
 
 /**
  * Shared CTEs. Order matters: later CTEs read earlier ones.
@@ -113,29 +126,42 @@ imported_members AS (
 ),
 workspace_rows AS (
   SELECT w.id, w.organization_id, w.name,
-         rw.relaycast_workspace_id,
-         rw.relaycast_api_key,
+         -- R4 (relay-control 0064): a workspace Cloud never bound to Relaycast
+         -- imports with both Relaycast columns NULL; Control binds the pair
+         -- on first use. The importer skips it instead on a target whose
+         -- columns are still NOT NULL (pre-0064).
+         CASE WHEN ${UNBOUND} THEN NULL ELSE rw.relaycast_workspace_id END AS relaycast_workspace_id,
+         CASE WHEN ${UNBOUND} THEN NULL ELSE rw.relaycast_api_key END AS relaycast_api_key,
+         CASE
+           WHEN w.relay_workspace_id IS NULL THEN 'no_relay_workspace'
+           WHEN rw.id IS NULL THEN 'relay_workspace_missing'
+           WHEN rw.relaycast_workspace_id IS NULL OR rw.relaycast_workspace_id = '' THEN 'no_relaycast_binding'
+           WHEN rw.relaycast_api_key IS NULL OR rw.relaycast_api_key = '' THEN 'no_relaycast_key'
+         END AS unbound_reason,
          w.default_runtime AS runtime_config,
+         -- The pre-existing hosted rw_ identity (0053), kept even when that
+         -- relay workspace never got a Relaycast binding; never Control's
+         -- live binding.
          CASE WHEN w.relay_workspace_id ~ ${RW_FORMAT} THEN w.relay_workspace_id END AS cloud_relay_workspace_id,
          w.slug,
          -- Canonicalised in the importer (Control's canonicalRelayhistoryOrigin,
          -- #163), which overrides this column on the target.
          w.relayhistory_origin AS relayhistory_origin_raw,
-         rw.relaycast_api_key_generation,
+         -- NOT NULL DEFAULT 1 on the target (0056); a workspace with no relay
+         -- row has none, and Control starts its first key at generation 1.
+         COALESCE(rw.relaycast_api_key_generation, 1) AS relaycast_api_key_generation,
          (w.relayhistory_dashboard_url IS NOT NULL) AS has_dashboard_url,
          w.created_at, w.updated_at,
          CASE
            WHEN w.deletion_requested_at IS NOT NULL THEN 'workspace_being_deleted'
-           WHEN w.relay_workspace_id IS NULL THEN 'no_relay_workspace'
-           WHEN rw.id IS NULL THEN 'relay_workspace_missing'
-           WHEN rw.relaycast_workspace_id IS NULL OR rw.relaycast_workspace_id = '' THEN 'no_relaycast_binding'
-           WHEN rw.relaycast_api_key IS NULL OR rw.relaycast_api_key = '' THEN 'no_relaycast_key'
-           WHEN row_number() OVER (
+           -- Duplicates only among real bindings: NULLs would otherwise share
+           -- one partition and skip every unbound workspace after the first.
+           WHEN w.relay_workspace_id IS NOT NULL AND row_number() OVER (
              PARTITION BY w.relay_workspace_id
              ORDER BY (w.deletion_requested_at IS NOT NULL), w.created_at, w.id
            ) > 1 THEN 'duplicate_rw_binding'
-           WHEN row_number() OVER (
-             PARTITION BY w.organization_id, rw.relaycast_workspace_id
+           WHEN NOT ${UNBOUND} AND row_number() OVER (
+             PARTITION BY w.organization_id, (CASE WHEN ${UNBOUND} THEN NULL ELSE rw.relaycast_workspace_id END)
              ORDER BY (w.deletion_requested_at IS NOT NULL), w.created_at, w.id
            ) > 1 THEN 'duplicate_relaycast_binding'
          END AS skip_reason
@@ -283,7 +309,7 @@ SELECT organization_id, user_id, cloud_user_id, role, created_at, updated_at, sk
   FROM member_rows`,
     workspaces: `
 SELECT id, organization_id, name, relaycast_workspace_id, relaycast_api_key AS secret_plaintext,
-       runtime_config, cloud_relay_workspace_id, slug, relayhistory_origin_raw, relaycast_api_key_generation,
+       unbound_reason, runtime_config, cloud_relay_workspace_id, slug, relayhistory_origin_raw, relaycast_api_key_generation,
        has_dashboard_url, created_at, updated_at, skip_reason
   FROM workspace_rows`,
     organization_invitations: `
@@ -312,6 +338,8 @@ SELECT p.id, p.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
        p.agent_name, p.agent_remote_id, p.token_envelope AS secret_envelope, p.created_at,
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
+         -- Relaycast identities need a live binding; an unbound workspace has none yet.
+         WHEN iw.relaycast_workspace_id IS NULL THEN 'workspace_unbound'
          WHEN iu.id IS NULL THEN 'user_not_imported'
          -- A removed or suspended member keeps no agent token in Control.
          WHEN NOT EXISTS (
@@ -335,6 +363,8 @@ SELECT h.id, h.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
        h.created_at, h.created_at AS updated_at,
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
+         -- Relaycast identities need a live binding; an unbound workspace has none yet.
+         WHEN iw.relaycast_workspace_id IS NULL THEN 'workspace_unbound'
          WHEN iu.id IS NULL THEN 'user_not_imported'
          WHEN NOT EXISTS (
            SELECT 1 FROM imported_members im WHERE im.organization_id = w.organization_id AND im.user_id = iu.id
@@ -365,6 +395,8 @@ SELECT d.id, d.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
        d.token_envelope AS secret_envelope, d.created_at, d.updated_at,
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
+         -- Relaycast identities need a live binding; an unbound workspace has none yet.
+         WHEN iw.relaycast_workspace_id IS NULL THEN 'workspace_unbound'
          WHEN iu.id IS NULL THEN 'user_not_imported'
          WHEN NOT EXISTS (
            SELECT 1 FROM imported_members im WHERE im.organization_id = w.organization_id AND im.user_id = iu.id
@@ -390,6 +422,8 @@ SELECT f.id, f.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
        f.node_id, NULL::text AS node_name, f.created_at,
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
+         -- Relaycast identities need a live binding; an unbound workspace has none yet.
+         WHEN iw.relaycast_workspace_id IS NULL THEN 'workspace_unbound'
          WHEN iu.id IS NULL THEN 'user_not_imported'
          WHEN NOT EXISTS (
            SELECT 1 FROM imported_members im WHERE im.organization_id = w.organization_id AND im.user_id = iu.id
@@ -444,13 +478,13 @@ SELECT g.id, g.workspace_id, iw.organization_id, iu.id AS staff_user_id,
   LEFT JOIN imported_users iu ON iu.id = um.user_id`,
     coding_agent_credentials: `
 SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS created_by_user_id,
-       p.model_provider, p.harness, p.auth_type, p.display_name, p.label, p.account_email,
+       ${PROVIDER("p.model_provider")} AS model_provider, p.harness, p.auth_type, p.display_name, p.label, p.account_email,
        (p.is_active AND row_number() OVER (
-          PARTITION BY p.workspace_id, p.model_provider, p.is_active, (p.auth_type = 'relay_managed')
+          PARTITION BY p.workspace_id, ${PROVIDER("p.model_provider")}, p.is_active, (p.auth_type = 'relay_managed')
           ORDER BY p.updated_at DESC, p.id
         ) = 1) AS is_active,
        (p.is_active AND row_number() OVER (
-          PARTITION BY p.workspace_id, p.model_provider, p.is_active, (p.auth_type = 'relay_managed')
+          PARTITION BY p.workspace_id, ${PROVIDER("p.model_provider")}, p.is_active, (p.auth_type = 'relay_managed')
           ORDER BY p.updated_at DESC, p.id
         ) > 1) AS active_demoted,
        false AS harness_active,
@@ -458,7 +492,7 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS created_by_user_id,
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
          WHEN p.auth_type <> 'relay_managed' THEN 'secret_in_cloud_credential_store'
-         WHEN p.model_provider NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
+         WHEN ${PROVIDER("p.model_provider")} NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
          WHEN p.status NOT IN ('connected', 'error', 'refresh_failed') THEN 'unsupported_status'
        END AS skip_reason
   FROM public.provider_credentials p
@@ -478,27 +512,14 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS created_by_user_id,
  * the imported (merge-survivor) Control user used as the audit actor.
  */
 export function credentialCopyQuery(scope: ImportScope): string {
-  const canonical = (expression: string) =>
-    `(CASE ${expression} WHEN 'claude' THEN 'anthropic' WHEN 'codex' THEN 'openai' WHEN 'grok' THEN 'xai' ELSE ${expression} END)`;
-  return `WITH ${ctes(scope)},
--- The legacy object {user}/{provider}/credentials.json.enc is per user and
--- provider, not per row: setup tokens and logins of one provider share it.
--- It may stand in for a row only when that row is the user's only one that
--- could live there (counted across every Cloud org, not just this scope).
-legacy_rows AS (
-  SELECT x.id,
-         count(*) OVER (PARTITION BY x.user_id, ${canonical("x.model_provider")}) AS sharing
-    FROM public.provider_credentials x
-   WHERE x.auth_type IN ('oauth_token', 'provider_oauth')
-)
+  return `WITH ${ctes(scope)}
 SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS cloud_user_id,
-       p.model_provider, p.harness, p.auth_type, p.label, p.account_email, p.provider_account_id,
+       ${PROVIDER("p.model_provider")} AS model_provider, p.harness, p.auth_type, p.label, p.account_email, p.provider_account_id,
        p.is_active, p.harness_active,
        -- Saved but neither the LLM-call nor the sandbox selection: carried
        -- over, then left inactive in Control.
        (p.is_active OR p.harness_active) AS selected,
        p.updated_at,
-       COALESCE(lr.sharing = 1, false) AS legacy_allowed,
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
          WHEN iu.id IS NULL THEN 'user_not_imported'
@@ -506,13 +527,19 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS 
          WHEN NOT EXISTS (
            SELECT 1 FROM imported_members im WHERE im.organization_id = iw.organization_id AND im.user_id = iu.id
          ) THEN 'not_a_member'
-         -- Only usable credentials: connected and not refresh-exhausted.
-         WHEN p.status <> 'connected' OR p.refresh_exhausted THEN 'credential_not_usable'
-         WHEN p.model_provider NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
-         WHEN p.auth_type = 'oauth_token' AND p.model_provider <> 'anthropic' THEN 'unsupported_model_provider'
-         WHEN p.auth_type = 'provider_oauth' AND p.model_provider NOT IN ('anthropic', 'openai', 'xai') THEN 'unsupported_model_provider'
+         -- A login whose refresh is exhausted is already dead in Cloud: its
+         -- user must sign in again there too, so it is dropped on purpose.
+         WHEN p.refresh_exhausted OR (p.auth_type IN ('oauth_token', 'provider_oauth') AND p.status = 'refresh_failed')
+           THEN 'dead_login'
+         WHEN p.status <> 'connected' THEN 'credential_not_usable'
+         WHEN p.auth_type <> 'provider_oauth' AND ${PROVIDER("p.model_provider")} NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
+         WHEN p.auth_type = 'oauth_token' AND ${PROVIDER("p.model_provider")} <> 'anthropic' THEN 'unsupported_model_provider'
+         -- Khaliq: "drop". A subscription login for a provider Control has no
+         -- login for (OpenRouter: an API-key provider in Control; Daytona:
+         -- removed in 0006) is dropped on purpose; Cloud tells the user.
+         WHEN p.auth_type = 'provider_oauth' AND ${PROVIDER("p.model_provider")} NOT IN ('anthropic', 'openai', 'xai') THEN 'unsupported_dropped'
          -- #150: an Anthropic login needs the Cloud account email as its identity.
-         WHEN p.auth_type = 'provider_oauth' AND p.model_provider = 'anthropic' AND NULLIF(btrim(p.account_email), '') IS NULL
+         WHEN p.auth_type = 'provider_oauth' AND ${PROVIDER("p.model_provider")} = 'anthropic' AND NULLIF(btrim(p.account_email), '') IS NULL
            THEN 'anthropic_login_without_account_email'
        END AS skip_reason
   FROM public.provider_credentials p
@@ -521,7 +548,6 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS 
   LEFT JOIN imported_workspaces iw ON iw.id = p.workspace_id
   LEFT JOIN user_map um ON um.cloud_user_id = p.user_id
   LEFT JOIN imported_users iu ON iu.id = um.user_id
-  LEFT JOIN legacy_rows lr ON lr.id = p.id
  WHERE p.auth_type IN ('byo_api_key', 'oauth_token', 'provider_oauth')
  -- Order is irrelevant to selection: the copier sets is_active/harness_active
  -- explicitly afterwards (credentials.ts applyCloudSelection).
@@ -551,6 +577,14 @@ export type TargetSpec = {
   /** Invites: a fresh sh_inv_ token hash, generated on insert only. */
   inviteTokenHash?: string;
   insertOnly?: readonly string[];
+  /**
+   * Columns updated as one unit. Once the target is bound (`when` not NULL)
+   * a re-run keeps all of `columns` as the target has them when the source
+   * is unbound, names a different binding, or has a lower `generation`
+   * (Control bound or rotated it since): Control owns a live binding, and a
+   * generation never goes backwards. Differences are counted as warnings.
+   */
+  keepTargetBinding?: { when: string; generation?: string; columns: readonly string[] };
   /** Row key expression for the ledger (default id). */
   key?: string;
   /**
@@ -626,6 +660,15 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
     // Control column; rows that set it are counted as a warning.
     optional: ["cloud_relay_workspace_id", "slug", "relayhistory_origin", "relaycast_api_key_generation"],
     secret: { source: "secret_plaintext", target: "relaycast_api_key_ciphertext" },
+    // A binding Control holds is never replaced by a re-run: not reset to
+    // NULL/NULL after a lazy bind (0064), not swapped for a binding Cloud made
+    // later, not rolled back to an older key generation. Either would orphan
+    // a live Relaycast workspace or key.
+    keepTargetBinding: {
+      when: "relaycast_workspace_id",
+      generation: "relaycast_api_key_generation",
+      columns: ["relaycast_workspace_id", "relaycast_api_key_ciphertext", "relaycast_api_key_generation"],
+    },
   },
   organization_invitations: {
     table: "organization_invitations",
@@ -692,7 +735,20 @@ export type ComparisonSpec = {
  */
 const ts = (column: string) => `to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US')`;
 
-type Projection = { key: string; org: string; workspace?: string; columns: Record<string, string> };
+type Projection = {
+  key: string; org: string; workspace?: string; columns: Record<string, string>;
+  /** Target-side expressions where they differ from the source side's. */
+  targetColumns?: Record<string, string>;
+};
+
+/**
+ * Ledger namespace marking workspaces this import wrote unbound (NULL/NULL
+ * Relaycast pair). Control may bind them lazily later; the verifier compares
+ * those as unbound, the state Cloud has. The importer's reconcile reads only
+ * ORG_TABLES, so this never reaches it.
+ */
+export const UNBOUND_WORKSPACE_MARKER = "workspace_unbound";
+const importedUnbound = `EXISTS (SELECT 1 FROM public.${IMPORT_LEDGER_TABLE} l WHERE l.table_name = '${UNBOUND_WORKSPACE_MARKER}' AND l.row_key = id::text)`;
 
 const PROJECTIONS: Record<ImportTable, Projection> = {
   staff_read_grants: {
@@ -726,6 +782,11 @@ const PROJECTIONS: Record<ImportTable, Projection> = {
   workspaces: {
     key: "id::text", org: "organization_id::text", workspace: "id::text",
     columns: { id: "id::text", organization_id: "organization_id::text", name: "name", relaycast_workspace_id: "relaycast_workspace_id", cloud_relay_workspace_id: "cloud_relay_workspace_id", slug: "slug", relaycast_api_key_generation: "relaycast_api_key_generation", runtime_config: "runtime_config::jsonb::text", created_at: ts("created_at"), updated_at: ts("updated_at") },
+    // Imported unbound and since bound by Control: expected, not drift.
+    targetColumns: {
+      relaycast_workspace_id: `CASE WHEN ${importedUnbound} THEN NULL ELSE relaycast_workspace_id END`,
+      relaycast_api_key_generation: `CASE WHEN ${importedUnbound} THEN 1 ELSE relaycast_api_key_generation END`,
+    },
   },
   organization_invitations: {
     key: "id::text", org: "organization_id::text",
@@ -794,6 +855,7 @@ export function verifierComparisons(
     const names = Object.keys(projection.columns).filter((column) =>
       !(TARGETS[table].optional ?? []).includes(column) || targetHasColumns.has(`${table}.${column}`));
     const list = names.map((name) => `${projection.columns[name]} AS ${name}`).join(", ");
+    const targetList = names.map((name) => `${projection.targetColumns?.[name] ?? projection.columns[name]} AS ${name}`).join(", ");
     const target = targetScope(table, scope);
     const workspace = projection.workspace ? `, ${projection.workspace} AS __workspace` : "";
     return {
@@ -803,8 +865,8 @@ export function verifierComparisons(
       // Control-native rows (the operator org, natively minted grants) never
       // count as drift. Users are global and compared in full.
       targetSql: table === "users"
-        ? `SELECT ${list}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}`
-        : `SELECT v.* FROM (SELECT ${list}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}) v
+        ? `SELECT ${targetList}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}`
+        : `SELECT v.* FROM (SELECT ${targetList}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}) v
             WHERE EXISTS (SELECT 1 FROM public.${IMPORT_LEDGER_TABLE} l WHERE l.table_name = '${table}' AND l.row_key = v.__key)`,
       ...(projection.workspace ? { workspaceScoped: true } : {}),
     };

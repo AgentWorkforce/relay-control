@@ -46,7 +46,6 @@ export type CredentialOutcome =
   | "copied"
   | "already_present"
   | "object_missing"
-  | "skipped:legacy_key_ambiguous"
   | "decrypt_failed"
   | "payload_invalid"
   | `store_rejected:${string}`
@@ -182,8 +181,6 @@ type Candidate = {
   label: string | null;
   account_email: string | null;
   provider_account_id: string | null;
-  /** The per-user legacy object may stand in for this row (see mapping). */
-  legacy_allowed: boolean;
   /** Cloud selected it for LLM calls or the sandbox. */
   selected: boolean;
   is_active: boolean;
@@ -193,24 +190,50 @@ type Candidate = {
 };
 
 // Cloud's cli-credentials.ts aliases: claude -> anthropic, codex -> openai, grok -> xai.
-const CANONICAL: Record<string, string> = { claude: "anthropic", codex: "openai", grok: "xai" };
-export const canonicalProvider = (value: string) => CANONICAL[value] ?? value;
+// Cloud's canonicalConnectionProvider (packages/web/lib/billing/connection-provider.ts)
+// plus gemini -> google from normalizeModelProvider (packages/web/lib/billing/house-keys.ts).
+const CANONICAL: Record<string, string> = {
+  claude: "anthropic", codex: "openai", grok: "xai", "cursor-agent": "cursor", agent: "cursor", gemini: "google",
+};
+export const canonicalProvider = (value: string) => {
+  const normalized = value.trim().toLowerCase();
+  return CANONICAL[normalized] ?? normalized;
+};
 
 /**
- * Object keys to try, in order, relative to the "credentials" prefix. The
- * per-user legacy key is offered only when `legacy_allowed`: otherwise it
- * could hold another row's (another account's) secret.
+ * Object keys to try, in order, relative to the "credentials" prefix: exactly
+ * the object(s) Cloud's runtime reads for this row, so Control never receives
+ * a secret Cloud would not serve for it (review C2). Cloud trunk call sites:
+ * - byo_api_key: the row's own object ({user}/{rowId}), written by
+ *   app/api/v1/provider-credentials/byok/route.ts and read by
+ *   lib/billing/provider-credential-runtime.ts (and flow-byok-credentials.ts).
+ * - oauth_token: the account object, then the provider (legacy) object,
+ *   whatever other rows share it: lib/auth/setup-token-credential.ts
+ *   readSetupTokenCredential (retrieveAccount, then retrieve).
+ * - provider_oauth: the account object iff the row has provider_account_id,
+ *   otherwise the provider (legacy) object, never both:
+ *   lib/billing/provider-credential-runtime.ts (useAccountObject =
+ *   subscriptionMultiAccountEnabled && provider_account_id). The
+ *   multi-account flag's database fallback
+ *   (lib/auth/credential-store-backend.ts hasAccountScopedSubscriptionCredential)
+ *   is true whenever such a row exists, so provider_account_id decides.
  */
-export function cloudObjectKeys(row: Pick<Candidate, "id" | "cloud_user_id" | "auth_type" | "model_provider" | "provider_account_id" | "legacy_allowed">): string[] {
+export function cloudObjectKeys(row: Pick<Candidate, "id" | "cloud_user_id" | "auth_type" | "model_provider" | "provider_account_id">): string[] {
   const account = `${row.cloud_user_id}/accounts/${row.id}/credentials.json.enc`;
   const legacy = `${row.cloud_user_id}/${canonicalProvider(row.model_provider)}/credentials.json.enc`;
   switch (row.auth_type) {
     case "byo_api_key":
       return [`${row.cloud_user_id}/${row.id}/credentials.json.enc`];
     case "oauth_token":
-      return row.legacy_allowed ? [account, legacy] : [account];
-    case "provider_oauth":
-      return [...(row.provider_account_id ? [account] : []), ...(row.legacy_allowed ? [legacy] : [])];
+      return [account, legacy];
+    case "provider_oauth": {
+      // subscriptionMultiAccountEnabled is false for any provider other than
+      // openai and anthropic (credential-store-backend.ts), so an xai login
+      // always reads the legacy object, even with a provider_account_id.
+      const provider = canonicalProvider(row.model_provider);
+      const multiAccount = (provider === "openai" || provider === "anthropic") && Boolean(row.provider_account_id);
+      return multiAccount ? [account] : [legacy];
+    }
   }
 }
 
@@ -252,6 +275,15 @@ export async function copyCodingAgentCredentials(
       record(row.id, "skipped:plan");
       continue;
     }
+    // The importer may have skipped this workspace on this target (an
+    // unbound workspace before 0064): never let a store fail on its FK,
+    // and never read a secret that cannot land.
+    const onTarget = await deps.target.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM workspaces WHERE id = $1", [row.workspace_id]);
+    if ((onTarget.rows[0]?.n ?? 0) === 0) {
+      record(row.id, "skipped:workspace_not_on_target");
+      continue;
+    }
     let plaintext: string | null = null;
     try {
       for (const key of cloudObjectKeys(row)) {
@@ -265,10 +297,9 @@ export async function copyCodingAgentCredentials(
       continue;
     }
     if (plaintext === null) {
-      // Missing where it may live; if only the shared legacy key was ruled
-      // out, say so: the operator must resolve which row owns it.
-      const ruledOut = row.auth_type !== "byo_api_key" && !row.legacy_allowed;
-      record(row.id, ruledOut ? "skipped:legacy_key_ambiguous" : "object_missing");
+      // Not where Cloud's runtime reads it: the credential is broken in
+      // Cloud too, and its user must sign in again.
+      record(row.id, "object_missing");
       continue;
     }
 
