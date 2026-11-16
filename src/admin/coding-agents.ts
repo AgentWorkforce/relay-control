@@ -21,7 +21,7 @@ import {
 import { iso, recordAudit, type AuditActor } from "./audit.js";
 import type { CredentialBlobStore } from "./credential-blobs.js";
 
-/** byo_api_key = API key; oauth_token = Claude setup token; provider_oauth = Codex/Grok device login. */
+/** byo_api_key = API key; oauth_token = Claude setup token; provider_oauth = a CLI login file. */
 export type CodingAgentAuthType = "byo_api_key" | "oauth_token" | "provider_oauth";
 
 export type CodingAgentProvider = {
@@ -32,7 +32,9 @@ export type CodingAgentProvider = {
   apiKeyEnv: string;
   /** Can hold a subscription login a sandbox CLI mounts ("Sandbox access"). */
   setupToken: boolean;
-  /** Has a browser device login (hosted provider_oauth) whose auth file a run's CLI mounts. */
+  /** Can store and mount an imported provider_oauth login file. */
+  providerOauth: boolean;
+  /** Can start an interactive provider device flow from the connect dialog. */
   deviceLogin: boolean;
   keyPlaceholder: string;
   docsUrl: string;
@@ -48,6 +50,7 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     harness: "claude",
     apiKeyEnv: "ANTHROPIC_API_KEY",
     setupToken: true,
+    providerOauth: true,
     deviceLogin: false,
     keyPlaceholder: "sk-ant-api03-…",
     docsUrl: "https://console.anthropic.com/settings/keys",
@@ -58,6 +61,7 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     harness: "codex",
     apiKeyEnv: "OPENAI_API_KEY",
     setupToken: false,
+    providerOauth: true,
     deviceLogin: true,
     keyPlaceholder: "sk-…",
     docsUrl: "https://platform.openai.com/api-keys",
@@ -68,6 +72,7 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     harness: "openrouter",
     apiKeyEnv: "OPENROUTER_API_KEY",
     setupToken: false,
+    providerOauth: false,
     deviceLogin: false,
     keyPlaceholder: "sk-or-v1-…",
     docsUrl: "https://openrouter.ai/settings/keys",
@@ -78,6 +83,7 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     harness: "grok",
     apiKeyEnv: "XAI_API_KEY",
     setupToken: false,
+    providerOauth: true,
     deviceLogin: true,
     keyPlaceholder: "xai-…",
     docsUrl: "https://console.x.ai",
@@ -88,6 +94,7 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     harness: "gemini",
     apiKeyEnv: "GEMINI_API_KEY",
     setupToken: false,
+    providerOauth: false,
     deviceLogin: false,
     keyPlaceholder: "AIza…",
     docsUrl: "https://aistudio.google.com/apikey",
@@ -492,7 +499,7 @@ export class CodingAgentStore {
       throw new CodingAgentError(409, "sandbox_not_supported", "Only a subscription login can be used for sandbox access");
     }
     if (selection === "model" && existing.authType === "provider_oauth") {
-      // A Codex/Grok login is mounted as the CLI's auth file; it is not an API
+      // A subscription login is mounted as the CLI's auth file; it is not an API
       // key a flow can call models with.
       throw new CodingAgentError(409, "llm_not_supported", "A subscription login is used for sandbox access only");
     }
