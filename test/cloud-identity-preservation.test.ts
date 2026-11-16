@@ -41,25 +41,50 @@ test("Cloud identity preservation columns match the import contract", async (t) 
   assert.equal(generation.is_nullable, "NO");
   assert.equal(generation.column_default, "1");
 
-  const indexes = await database.query<{ indexname: string }>(`
-    SELECT indexname FROM pg_indexes
-     WHERE indexname IN ('organizations_slug_unique', 'workspaces_org_slug_unique')
+  const indexes = await database.query<{ indexname: string; indexdef: string }>(`
+    SELECT indexname, indexdef FROM pg_indexes
+     WHERE indexname IN (
+       'organizations_slug_unique',
+       'workspaces_org_slug_unique',
+       'workspaces_relayhistory_origin_unique'
+     )
      ORDER BY indexname
   `);
-  assert.deepEqual(indexes.rows.map((row) => row.indexname), ["organizations_slug_unique", "workspaces_org_slug_unique"]);
+  assert.deepEqual(indexes.rows.map((row) => row.indexname), [
+    "organizations_slug_unique",
+    "workspaces_org_slug_unique",
+    "workspaces_relayhistory_origin_unique",
+  ]);
+  assert.match(indexes.rows[0]!.indexdef, /lower\(slug\)/);
+  assert.match(indexes.rows[1]!.indexdef, /organization_id, lower\(slug\)/);
+  assert.match(indexes.rows[2]!.indexdef, /lower\(relayhistory_origin\)/);
 
   const organizationId = "00000000-0000-4000-8000-000000000056";
+  const otherOrganizationId = "00000000-0000-4000-8000-000000000058";
   const workspaceId = "00000000-0000-4000-8000-000000000057";
+  const siblingWorkspaceId = "00000000-0000-4000-8000-000000000059";
+  const otherWorkspaceId = "00000000-0000-4000-8000-000000000060";
   await database.query("INSERT INTO organizations (id, name) VALUES ($1, 'Imported org')", [organizationId]);
+  await database.query("INSERT INTO organizations (id, name) VALUES ($1, 'Other imported org')", [otherOrganizationId]);
   await database.query(
     `INSERT INTO workspaces
        (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
      VALUES ($1, $2, 'Imported workspace', 'relay-ws-0056', 'ciphertext')`,
     [workspaceId, organizationId],
   );
+  await database.query(
+    `INSERT INTO workspaces
+       (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
+     VALUES
+       ($1, $3, 'Sibling workspace', 'relay-ws-0056-sibling', 'ciphertext'),
+       ($2, $4, 'Other workspace', 'relay-ws-0056-other', 'ciphertext')`,
+    [siblingWorkspaceId, otherWorkspaceId, organizationId, otherOrganizationId],
+  );
   for (const origin of [
     "https://history.customer.example",
     "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://[::1]:3000",
     "https://[2001:db8::1]:8443",
   ]) {
     await database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [workspaceId, origin]);
@@ -71,6 +96,7 @@ test("Cloud identity preservation columns match the import contract", async (t) 
   }
   for (const invalid of [
     "history.customer.example",
+    "http://history.customer.example",
     "ftp://history.customer.example",
     "https://history.customer.example/",
     "https://history.customer.example/path",
@@ -83,4 +109,28 @@ test("Cloud identity preservation columns match the import contract", async (t) 
       invalid,
     );
   }
+
+  await database.query("UPDATE organizations SET slug = 'Acme' WHERE id = $1", [organizationId]);
+  await assert.rejects(
+    database.query("UPDATE organizations SET slug = 'acme' WHERE id = $1", [otherOrganizationId]),
+    /organizations_slug_unique/,
+  );
+  await database.query("UPDATE workspaces SET slug = 'Primary' WHERE id = $1", [workspaceId]);
+  await assert.rejects(
+    database.query("UPDATE workspaces SET slug = 'primary' WHERE id = $1", [siblingWorkspaceId]),
+    /workspaces_org_slug_unique/,
+  );
+  await database.query("UPDATE workspaces SET slug = 'primary' WHERE id = $1", [otherWorkspaceId]);
+
+  await database.query(
+    "UPDATE workspaces SET relayhistory_origin = 'https://history.unique.example' WHERE id = $1",
+    [workspaceId],
+  );
+  await assert.rejects(
+    database.query(
+      "UPDATE workspaces SET relayhistory_origin = 'https://HISTORY.UNIQUE.EXAMPLE' WHERE id = $1",
+      [otherWorkspaceId],
+    ),
+    /workspaces_relayhistory_origin_unique/,
+  );
 });

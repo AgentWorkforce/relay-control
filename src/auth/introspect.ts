@@ -263,6 +263,14 @@ export function acceptedAudiences(config: SelfhostConfig): string[] {
     .filter((origin): origin is string => origin !== null);
 }
 
+/** The configured audience value whose normalized origin matches `value`. */
+export function matchingIntrospectionAudience(config: SelfhostConfig, value: string): string | undefined {
+  const requested = normalizedOrigin(value);
+  if (requested === null) return undefined;
+  return (config.introspectAudiences ?? [config.relayhistoryPublicUrl])
+    .find((configured) => normalizedOrigin(configured) === requested);
+}
+
 /** relayfile-agent (principal `agent`) and acquisition-operator (`service`) tokens. */
 async function introspectWorkspaceApiToken(
   config: SelfhostConfig,
@@ -392,12 +400,7 @@ export async function introspect(
   if (held ? session.expiresAt.getTime() <= Date.now() : session.expired) {
     return { active: false, reason: "expired" };
   }
-  const requested = normalizedOrigin(request.aud);
-  const aud = requested === null
-    ? undefined
-    : [...(config.introspectAudiences ?? [config.relayhistoryPublicUrl]), session.relayhistoryOrigin]
-      .filter((candidate): candidate is string => candidate !== null)
-      .find((configured) => normalizedOrigin(configured) === requested);
+  const aud = matchingIntrospectionAudience(config, request.aud);
   if (!aud) return { active: false, reason: "audience" };
   if (request.workspace !== undefined && session.workspaceId !== request.workspace) {
     return { active: false, reason: "workspace" };

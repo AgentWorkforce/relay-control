@@ -428,6 +428,24 @@ test("introspection audiences compare normalized origins and echo the configured
   );
 });
 
+test("an imported History origin does not bypass the operator audience allowlist", async (t) => {
+  const imported = "https://history.customer.example";
+  const denied = await setup(t);
+  await denied.database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [denied.alpha, imported]);
+  const deniedToken = await denied.login(denied.alpha);
+  assert.deepEqual(
+    (await denied.introspect({ token: deniedToken.accessToken, aud: imported, workspace: denied.alpha })).body,
+    { active: false, reason: "audience" },
+  );
+
+  const allowed = await setup(t, { introspectAudiences: [HISTORY_PUBLIC, imported] });
+  await allowed.database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [allowed.alpha, imported]);
+  const allowedToken = await allowed.login(allowed.alpha);
+  const active = await allowed.introspect({ token: allowedToken.accessToken, aud: imported, workspace: allowed.alpha });
+  assert.equal(active.body.active, true);
+  assert.equal(active.body.aud, imported);
+});
+
 test("readyz lists exactly the audiences introspection accepts, never the secret", async (t) => {
   const env = await setup(t, { introspectAudiences: ["https://Files.Selfhosted.test:443/", "http://history.svc:8080"] });
   const ready = await request(env.origin, "/readyz");

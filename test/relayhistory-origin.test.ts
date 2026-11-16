@@ -41,6 +41,7 @@ async function call(
 }
 
 const historyOrigin = "https://history.selfhosted.test";
+const customerHistoryOrigin = "https://history.customer.example";
 
 /**
  * A sessions pipeline read API double that answers the Control handoff and
@@ -79,7 +80,10 @@ async function startHistory(t: TestContext) {
   return { origin, requests };
 }
 
-async function setup(t: TestContext, options: { tenancy?: "single" | "multi" } = {}) {
+async function setup(
+  t: TestContext,
+  options: { tenancy?: "single" | "multi"; introspectAudiences?: string[] } = {},
+) {
   const history = await startHistory(t);
   const database = new PGliteDatabase();
   await migrate(database);
@@ -100,6 +104,7 @@ async function setup(t: TestContext, options: { tenancy?: "single" | "multi" } =
     internalServiceToken: serviceToken,
     oauthRedirectUrl: "https://control.internal.example/api/v1/integrations/oauth/callback",
     dashboardUrl: "https://control.internal.example/",
+    ...(options.introspectAudiences ? { introspectAudiences: options.introspectAudiences } : {}),
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0, { tenancy: options.tenancy ?? "single" });
   const admin = createAdminModule({ config, database, keyring: config.encryptionKeyring });
@@ -205,14 +210,15 @@ test("an authorized member reads the workspace History origin and audience", asy
 });
 
 test("an imported workspace History origin wins for lookup and sync issuance", async (t) => {
-  const { origin, unconfiguredOrigin, database, alpha, memberToken } = await setup(t);
-  const customerHistory = "https://history.customer.example";
-  await database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [alpha, customerHistory]);
+  const { origin, unconfiguredOrigin, database, alpha, memberToken } = await setup(t, {
+    introspectAudiences: [historyOrigin, customerHistoryOrigin],
+  });
+  await database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [alpha, customerHistoryOrigin]);
 
   for (const controlOrigin of [origin, unconfiguredOrigin]) {
     const answer = await call(controlOrigin, originPath(alpha), { token: memberToken });
     assert.equal(answer.status, 200);
-    assert.deepEqual(answer.body, { workspace: alpha, origin: customerHistory, audience: customerHistory });
+    assert.deepEqual(answer.body, { workspace: alpha, origin: customerHistoryOrigin, audience: customerHistoryOrigin });
   }
   const sync = await call(origin, `/api/v1/workspaces/${alpha}/relayhistory/session`, {
     method: "POST",
@@ -220,8 +226,26 @@ test("an imported workspace History origin wins for lookup and sync issuance", a
     body: { mode: "sync" },
   });
   assert.equal(sync.status, 200, JSON.stringify(sync.body));
-  assert.equal(sync.body.baseUrl, customerHistory);
+  assert.equal(sync.body.baseUrl, customerHistoryOrigin);
   assert.equal(sync.body.accessToken, memberToken);
+});
+
+test("an imported History origin must be in the operator audience allowlist", async (t) => {
+  const { origin, database, alpha, memberToken } = await setup(t);
+  await database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [alpha, customerHistoryOrigin]);
+
+  const lookup = await call(origin, originPath(alpha), { token: memberToken });
+  assert.equal(lookup.status, 404);
+  assert.equal(lookup.body.error, "relayhistory_not_configured");
+
+  const sync = await call(origin, `/api/v1/workspaces/${alpha}/relayhistory/session`, {
+    method: "POST",
+    token: memberToken,
+    body: { mode: "sync" },
+  });
+  assert.equal(sync.status, 404);
+  assert.equal(sync.body.error, "relayhistory_not_configured");
+  assert.equal(JSON.stringify(sync.body).includes(memberToken), false);
 });
 
 test("the origin lookup refuses missing, invalid and foreign-workspace tokens", async (t) => {
