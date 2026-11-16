@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.25";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.26";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -588,6 +588,8 @@ export type TargetSpec = {
   /** Invites: a fresh sh_inv_ token hash, generated on insert only. */
   inviteTokenHash?: string;
   insertOnly?: readonly string[];
+  /** Timestamps a re-run only ever moves forward (GREATEST of target and source). */
+  monotonic?: readonly string[];
   /**
    * Columns updated as one unit. Once the target is bound (`when` not NULL)
    * a re-run keeps all of `columns` as the target has them when the source
@@ -644,6 +646,14 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
     table: "coding_agent_credentials",
     primaryKey: ["id"],
     columns: ["id", "organization_id", "workspace_id", "created_by_user_id", "model_provider", "harness", "auth_type", "display_name", "label", "account_email", "is_active", "harness_active", "status", "last_error", "last_authenticated_at", "last_used_at", "created_at", "updated_at"],
+    // Selection is Cloud's on insert only. After that it is Control's (the
+    // copier's selection pass, an operator): a re-run must not re-activate a
+    // relay_managed row the copier demoted, which would also violate
+    // coding_agent_one_llm against the key the copier selected.
+    insertOnly: ["is_active", "harness_active"],
+    // Control's own writes (the selection pass) bump updated_at; a re-run
+    // never moves it back to Cloud's older value.
+    monotonic: ["updated_at"],
   },
   users: {
     table: "users",

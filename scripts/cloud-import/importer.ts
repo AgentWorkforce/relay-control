@@ -223,11 +223,19 @@ function upsertSql(table: ImportTable, columns: string[], fill = "'{}'::jsonb"):
     ? `__t.${quote(keep.when)} IS NOT NULL AND (EXCLUDED.${quote(keep.when)} IS NULL OR EXCLUDED.${quote(keep.when)} <> __t.${quote(keep.when)}${
       keep.generation && columns.includes(keep.generation) ? ` OR EXCLUDED.${quote(keep.generation)} < __t.${quote(keep.generation)}` : ""})`
     : "";
-  const updates = columns
+  const assigned = columns
     .filter((column) => !spec.primaryKey.includes(column) && !(spec.insertOnly ?? []).includes(column))
-    .map((column) => keep?.columns.includes(column)
-      ? `${quote(column)} = CASE WHEN ${keepWhen} THEN __t.${quote(column)} ELSE EXCLUDED.${quote(column)} END`
-      : `${quote(column)} = EXCLUDED.${quote(column)}`);
+    .map((column) => [column, keep?.columns.includes(column)
+      ? `CASE WHEN ${keepWhen} THEN __t.${quote(column)} ELSE EXCLUDED.${quote(column)} END`
+      : (spec.monotonic ?? []).includes(column)
+        ? `GREATEST(__t.${quote(column)}, EXCLUDED.${quote(column)})`
+        : `EXCLUDED.${quote(column)}`] as const);
+  const updates = assigned.map(([column, value]) => `${quote(column)} = ${value}`);
+  // A re-run of unchanged rows writes nothing: no same-value UPDATE, so row
+  // versions (xmin) stay put and convergence checkpoints can prove it.
+  const changed = assigned.length
+    ? ` WHERE ROW(${assigned.map(([column]) => `__t.${quote(column)}`).join(", ")}) IS DISTINCT FROM ROW(${assigned.map(([, value]) => value).join(", ")})`
+    : "";
   return `INSERT INTO ${relation} AS __t (${columns.map(quote).join(", ")})
 SELECT ${columns.map((column) => `p.${quote(column)}`).join(", ")}
   FROM unnest($1::text[], $2::text[], $3::text[]) AS u(r, s, o)
@@ -235,7 +243,7 @@ SELECT ${columns.map((column) => `p.${quote(column)}`).join(", ")}
    NULL::${relation},
    u.r::jsonb || COALESCE(u.o::jsonb, '{}'::jsonb) || ${fill} || ${secretColumn ? `CASE WHEN u.s IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('${secretColumn}', u.s) END` : "'{}'::jsonb"}
  ) AS p
-ON CONFLICT (${spec.primaryKey.map(quote).join(", ")}) DO ${updates.length ? `UPDATE SET ${updates.join(", ")}` : "NOTHING"}`;
+ON CONFLICT (${spec.primaryKey.map(quote).join(", ")}) DO ${updates.length ? `UPDATE SET ${updates.join(", ")}${changed}` : "NOTHING"}`;
 }
 
 /** Keys of `rows` not yet present on the target (first import). */
