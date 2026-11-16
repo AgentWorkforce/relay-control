@@ -214,6 +214,21 @@ function sessionItem(value: unknown): Record<string, unknown> {
   };
 }
 
+/**
+ * relaygate's owning-group label for one session (`relaygate: {gid, label}`,
+ * relaygate docs/contract.md "Group labels"), when the read API is relaygate
+ * and the session's group has one. Only the two known fields pass; anything
+ * else is dropped.
+ */
+function groupLabelOf(body: Record<string, unknown>): { relaygate?: { gid: number; label: string } } {
+  const value = body.relaygate;
+  if (!isRecord(value)) return {};
+  const { gid, label } = value;
+  if (!Number.isSafeInteger(gid) || (gid as number) < 0) return {};
+  if (typeof label !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,22}[A-Za-z0-9._-])?$/.test(label)) return {};
+  return { relaygate: { gid: gid as number, label } };
+}
+
 function eventItem(value: unknown): Record<string, unknown> {
   if (
     !isRecord(value) ||
@@ -609,6 +624,7 @@ async function routeSessions(ctx: SessionRouteContext): Promise<boolean> {
         children: list(body.children),
         commitLinks: list(body.commitLinks),
         truncated: body.truncated === true,
+        ...groupLabelOf(body),
       });
       return true;
     }
