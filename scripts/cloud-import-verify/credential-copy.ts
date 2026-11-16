@@ -159,7 +159,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
         let content:string;
         let fp:string;
         if (row.auth_type === "provider_oauth") {
-          const described = describeAuthFile(provider as SubscriptionProvider,plaintext);
+          const described = describeAuthFile(provider as SubscriptionProvider,plaintext,row.account_email);
           identity = `account:${described.accountId}`;
           content = plaintext;
           fp = fingerprint(provider,row.auth_type,described.refreshToken,keyring);

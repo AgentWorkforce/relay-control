@@ -946,3 +946,21 @@ fixtureTest("copier marker writes fail convergence independently of credential a
   const detail=finding.detail as {credentialChanges:{changed:number};blobChanges:{changed:number};markerChanges:{inserted:number}};
   assert.equal(detail.credentialChanges.changed,0);assert.equal(detail.blobChanges.changed,0);assert.equal(detail.markerChanges.inserted,1);
 });
+
+fixtureTest("Claude copied auth files use the source account email held beside the envelope",async () => {
+  const fixture=await copiedFixture();const credentialId=id(0x810);
+  await source.query(`INSERT INTO provider_credentials(id,organization_id,workspace_id,user_id,harness,model_provider,auth_type,
+    display_name,account_email,is_active,harness_active,status,created_at,updated_at)
+    VALUES($1,$2,$3,$4,'claude','anthropic','provider_oauth','Synthetic Claude','ALICE@example.test',false,true,'connected',
+      '2026-01-10T00:00:00Z','2026-01-10T00:00:00Z')`,[credentialId,ORG_A,id(0x201),id(1)]);
+  const refreshToken='synthetic-private-claude-refresh';
+  const auth=JSON.stringify({claudeAiOauth:{accessToken:'synthetic-private-claude-access',refreshToken,expiresAt:1893456000000}});
+  fixture.objects.set(`${id(1)}/anthropic/credentials.json.enc`,JSON.stringify(cloudEnvelope(auth,cloudKeyHex)));
+  const ledger=await apply();
+  const copy=await copyCodingAgentCredentials(fixture.deps,scope,'apply');
+  assert.equal(copy.rows[credentialId],'copied');assert.equal(copy.ok,true);
+  const checked=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(checked.credentialCopy,'verified',JSON.stringify(checked.findings.filter((finding) => !finding.ok)));
+  assert.ok(!JSON.stringify(checked).includes(refreshToken));
+});
