@@ -187,6 +187,11 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
   const targetKeysById=new Map<string,string>();
   let duplicateKeys = 0;
   let contentFailures = 0;
+  // Fixed reason names and counts only: no target IDs, ciphertext, account
+  // values, plaintext, driver messages or object locations enter diagnostics.
+  // A row can have several reasons; contentFailures still counts rows once.
+  const contentFailureReasons={organizationMismatch:0,statusNotConnected:0,fingerprintMismatch:0,
+    contentMismatch:0,blobBackendMismatch:0,targetReadOrDecryptFailed:0};
   let extra = 0;
   let unexplainedTarget=0;
   const nativeFlags=new Map<string,{group:string;active:boolean;harness:boolean}>();
@@ -216,20 +221,27 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
         continue;
       }
       flags.set(key,{group:`${row.workspace_id}:${row.model_provider}`,active:row.is_active,harness:row.harness_active});
-      try {
-        if (row.auth_type === "provider_oauth" && row.blob_backend !== evidence.targetBlobs.kind) throw new Error("blob_backend_mismatch");
-        const content = row.auth_type === "provider_oauth"
-          ? await evidence.targetBlobs.read(row.blob_location,row.id,Number(row.blob_version),targetExecutor)
-          : decryptSecret(row.secret_ciphertext,keyring);
-        if (row.organization_id !== wanted.org || row.status !== "connected"
-          || row.key_fingerprint !== wanted.fingerprint || hash(content) !== wanted.contentHash) contentFailures++;
-      } catch {contentFailures++;}
+      let failed=false;
+      if (row.organization_id !== wanted.org) {contentFailureReasons.organizationMismatch++;failed=true;}
+      if (row.status !== "connected") {contentFailureReasons.statusNotConnected++;failed=true;}
+      if (row.key_fingerprint !== wanted.fingerprint) {contentFailureReasons.fingerprintMismatch++;failed=true;}
+      if (row.auth_type === "provider_oauth" && row.blob_backend !== evidence.targetBlobs.kind) {
+        contentFailureReasons.blobBackendMismatch++;failed=true;
+      } else {
+        try {
+          const content = row.auth_type === "provider_oauth"
+            ? await evidence.targetBlobs.read(row.blob_location,row.id,Number(row.blob_version),targetExecutor)
+            : decryptSecret(row.secret_ciphertext,keyring);
+          if (hash(content) !== wanted.contentHash) {contentFailureReasons.contentMismatch++;failed=true;}
+        } catch {contentFailureReasons.targetReadOrDecryptFailed++;failed=true;}
+      }
+      if (failed) contentFailures++;
     }
   }} finally {await target.query("CLOSE credential_target_cursor");}
   const missing = [...expected.keys()].filter((key) => !seen.has(key)).length;
   findings.push({kind:"credential_natural_keys",name:"coding_agent_credentials",
     ok:!sourceFailures && !unresolvedSourceSkips && !duplicateKeys && !contentFailures && !missing && !unexplainedTarget,
-    detail:{expected:expected.size,target:seen.size,missing,unmatchedTarget:extra,unexplainedTarget,duplicateKeys,contentFailures,
+    detail:{expected:expected.size,target:seen.size,missing,unmatchedTarget:extra,unexplainedTarget,duplicateKeys,contentFailures,contentFailureReasons,
       sourceFailures,unresolvedSourceSkips,sourceChecksum:digestKeys(expected.keys()),targetChecksum:digestKeys(flags.keys())}});
   const controlIds=report.controlIds;
   const validMap=controlIds !== null && typeof controlIds === "object" && !Array.isArray(controlIds);

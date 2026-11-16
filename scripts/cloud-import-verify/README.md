@@ -388,3 +388,12 @@ before reading data. Reports and new snapshots record the observed settings in
 options, which Supavisor can drop. The local harness proves these checks without
 startup options; the authorized remote rehearsal must retain the actual pooler
 settings as evidence.
+
+`credential_natural_keys` separates source exclusions/reads from copied-target
+checks. `contentFailures` counts copied target rows failing organization, status,
+fingerprint, exact plaintext content, blob-backend or read/decrypt checks. Fixed
+`contentFailureReasons` counters distinguish those causes without IDs, accounts,
+object locations or driver errors. A row may contribute multiple reasons but
+counts once in `contentFailures`. Matching natural-key checksums establish the
+row identity set; they do not establish matching decrypted content. Source
+`credential_not_usable` exclusions never increment `contentFailures`.
