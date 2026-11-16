@@ -1,3 +1,4 @@
+import { AuthorizationProbeQueue, credentialTransport, verifyProviderAuthorization, type AuthorizationHealth } from "@relayfile/connection-health";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import {
@@ -52,7 +53,7 @@ export type OAuthAppRecord = {
 };
 
 /** Public connection record; never carries tokens or API keys. */
-export type ConnectionRecord = {
+export type ConnectionRecord = Partial<AuthorizationHealth> & {
   connectionId: string;
   version: string;
   provider: string;
@@ -78,6 +79,8 @@ export type ConnectionRecord = {
 
 export type RuntimeToken = {
   connectionId: string;
+  /** Exact encrypted credential snapshot returned atomically with this token. */
+  credentialVersion: string;
   provider: string;
   authMode: "oauth2" | "api_key" | "github_app";
   installationId: string | null;
@@ -838,6 +841,74 @@ export class ConnectionStore {
     return result.rows.map((row) => this.toRecord(row));
   }
 
+  private readonly authorizationQueue = new AuthorizationProbeQueue({concurrency:8, networkMs:5_000, queueMs:5_000, maxPending:64});
+  private readonly authorizationCache = new Map<string, {expires:number; health:AuthorizationHealth}>();
+  private readonly authorizationWarnings = new Map<string, number>();
+
+  /** Live proof for management listings. Runtime/env callers keep the plain list contract. */
+  async listHealth(workspaceId: string, actor: AuditActor, options: {refreshAuthorization?:boolean} = {}): Promise<ConnectionRecord[]> {
+    return Promise.all((await this.list(workspaceId)).map(async record => {
+      const cacheKey = JSON.stringify([workspaceId, record.connectionId, record.version]);
+      const cached = this.authorizationCache.get(cacheKey);
+      if (!options.refreshAuthorization && cached && cached.expires > Date.now()) return {...record,...cached.health,authMode:record.authMode};
+      const started = Date.now();
+      let checkedVersion = record.version;
+      const health = await this.authorizationQueue.probe(
+        JSON.stringify([workspaceId, record.connectionId, record.version]),
+        async signal => {
+          try {
+            const token = await this.runtimeToken({workspaceId, provider:record.provider, actor});
+            if (token.connectionId !== record.connectionId) throw new Error("connection_changed");
+            checkedVersion = token.credentialVersion;
+            const verified = await verifyProviderAuthorization({
+              provider:record.provider,
+              authMode:record.authMode === "github_app" ? "APP" : record.authMode,
+              transport:credentialTransport({accessToken:token.accessToken,tokenType:token.tokenType,signal,
+                fetch:(url,init)=>this.fetchImpl(String(url),init ?? {})}),
+            });
+            const current = await this.get(workspaceId, record.provider);
+            if (!current || current.connectionId !== record.connectionId || current.version !== token.credentialVersion) throw new Error("connection_changed");
+            checkedVersion = current.version;
+            // Presence at the native credential authority is separate from authorization.
+            return {...verified,upstreamConnected:true};
+          } catch (error) {
+            const failed = await this.get(workspaceId, record.provider).catch(() => null);
+            const sameBinding = failed?.connectionId === record.connectionId;
+            const expired = failed?.authMode === "oauth2" && !failed.refreshable &&
+              failed.accessTokenExpiresAt !== null && Date.parse(failed.accessTokenExpiresAt) <= Date.now();
+            const inactive = error instanceof ConnectionError && sameBinding && (
+              (error.code === "token_expired" && expired) ||
+              (error.code === "refresh_failed" && failed?.lastError === "refresh_failed: invalid_grant")
+            );
+            // runtimeToken commits its own error marker. That marker changes the
+            // edit version, but it must not erase a definitive authorization failure.
+            if (inactive && failed) checkedVersion = failed.version;
+            return {authorizationStatus:inactive ? "inactive" as const : "unknown" as const,
+              authorizationReason:inactive ? "credentials_rejected" : "credentials_unavailable",
+              authorizationCheckedAt:new Date().toISOString(),upstreamConnected:inactive ? true : null};
+          }
+        },
+      );
+      const current = await this.get(workspaceId, record.provider).catch(() => null);
+      if (!current || current.connectionId !== record.connectionId || current.version !== checkedVersion) {
+        return {...(current ?? record),authorizationStatus:"unknown" as const,
+          authorizationReason:"connection_changed",authorizationCheckedAt:new Date().toISOString(),upstreamConnected:null};
+      }
+      if (health.authorizationStatus !== "unknown") {
+        if (this.authorizationCache.size >= 512) this.authorizationCache.delete(this.authorizationCache.keys().next().value!);
+        this.authorizationCache.set(JSON.stringify([workspaceId,current.connectionId,current.version]), {expires:Date.now()+30_000,health});
+      } else {
+        const key = JSON.stringify([record.provider,health.authorizationReason]);
+        if ((this.authorizationWarnings.get(key) ?? 0) <= Date.now()) {
+          if (this.authorizationWarnings.size >= 128) this.authorizationWarnings.delete(this.authorizationWarnings.keys().next().value!);
+          this.authorizationWarnings.set(key,Date.now()+60_000);
+          console.warn("[connection-authorization]",{backend:"native",provider:record.provider,reason:health.authorizationReason,durationMs:Date.now()-started});
+        }
+      }
+      return {...current,...health,authMode:current.authMode};
+    }));
+  }
+
   async get(workspaceId: string, providerId: string): Promise<ConnectionRecord | null> {
     const provider = this.provider(providerId);
     const result = await this.database.query<ConnectionRow>(
@@ -1139,6 +1210,7 @@ export class ConnectionStore {
     delete metadata.config;
     return {
       connectionId: row.id,
+      credentialVersion: connectionVersion(row),
       provider: row.provider,
       authMode: row.auth_mode,
       installationId: row.installation_id,

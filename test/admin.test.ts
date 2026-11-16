@@ -13,7 +13,8 @@ import {
 import { maskValue, envKeyReachesRuntime } from "../src/admin/env-policy.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { loadConfig, loadOperatorOAuthApps } from "../src/config.js";
-import { decryptSecret } from "../src/crypto.js";
+import { decryptSecret, encryptSecret } from "../src/crypto.js";
+import type { FetchLike } from "../src/admin/connections.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { close, listen, PGliteDatabase, request } from "./support/harness.js";
@@ -151,7 +152,7 @@ async function deviceToken(
   return issued.body.access_token as string;
 }
 
-async function setup(t: test.TestContext, extra: Partial<SelfhostConfig> = {}) {
+async function setup(t: test.TestContext, extra: Partial<SelfhostConfig> = {}, fetchImpl?: FetchLike) {
   const mock = await startMockOAuth();
   const database = new PGliteDatabase();
   await migrate(database);
@@ -177,7 +178,7 @@ async function setup(t: test.TestContext, extra: Partial<SelfhostConfig> = {}) {
     ...extra,
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
-  const admin = createAdminModule({ config, database, keyring: KEYRING, providers });
+  const admin = createAdminModule({ config, database, keyring: KEYRING, providers, ...(fetchImpl ? {fetchImpl} : {}) });
   control.on("request", createApp({ config, store, admin }));
   t.after(async () => {
     await close(control);
@@ -210,6 +211,7 @@ async function setup(t: test.TestContext, extra: Partial<SelfhostConfig> = {}) {
   const workspaceId = workspaces[0]!;
   return {
     database,
+    connections: admin.connections,
     mock,
     origin: controlOrigin,
     organizationId: org.body.id as string,
@@ -952,4 +954,78 @@ test("operator OAuth apps load from env and mounted Secret files", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("connection health: catalog and listing verify API keys, preserve refusal vs outage, and retry", async t => {
+  let providerStatus=200;
+  const requests: Array<{url:string;authorization:string|null}> = [];
+  const ctx=await setup(t,{},async(url,init)=>{
+    requests.push({url,authorization:new Headers(init.headers).get("authorization")});
+    return Response.json({id:"neon-user",email:"bot@example.test"}, {status:providerStatus});
+  });
+  const ws=`/api/v1/workspaces/${ctx.workspaceId}`;
+  const saved=await request(ctx.origin,`${ws}/integrations/neon`,{method:"POST",token:ctx.owner,body:{credentials:{apiKey:"health-secret-sentinel"}}});
+  assert.equal(saved.status,201);
+  const catalog=await request(ctx.origin,`${ws}/integrations/providers`,{token:ctx.member});
+  const connection=catalog.body.providers.find((p:any)=>p.id === "neon").connection;
+  assert.equal(connection.authorizationStatus,"active");
+  assert.equal(connection.authorizationReason,"provider_verified");
+  assert.equal(requests[0]?.url,"https://console.neon.tech/api/v2/users/me");
+  assert.equal(requests[0]?.authorization,"Bearer health-secret-sentinel");
+  assert(!catalog.raw.includes("health-secret-sentinel"));
+  await request(ctx.origin,`${ws}/integrations`,{token:ctx.member});
+  assert.equal(requests.length,1,"repeated listings reuse the revision-bound proof");
+  const internal=await request(ctx.origin,`/internal/v1/workspaces/${ctx.workspaceId}/integrations`,{token:SERVICE});
+  assert.equal(internal.status,200);
+  assert.equal(internal.body.integrations[0].upstreamConnected,true,"internal local readiness contract is unchanged");
+  providerStatus=429;
+  const limited=await request(ctx.origin,`${ws}/integrations?refreshAuthorization=true`,{token:ctx.member});
+  assert.equal(limited.body[0].authorizationStatus,"unknown");
+  assert.equal(limited.body[0].authorizationReason,"rate_limited");
+  assert.equal(limited.body[0].upstreamConnected,true);
+  providerStatus=401;
+  const rejected=await request(ctx.origin,`${ws}/integrations?refreshAuthorization=true`,{token:ctx.member});
+  assert.equal(rejected.body[0].authorizationStatus,"inactive");
+  providerStatus=200;
+  const retried=await request(ctx.origin,`${ws}/integrations?refreshAuthorization=true`,{token:ctx.member});
+  assert.equal(retried.body[0].authorizationStatus,"active");
+  const other=await request(ctx.origin,`/api/v1/workspaces/${ctx.otherWorkspaceId}/integrations`,{token:ctx.owner});
+  assert.notEqual(other.status,200);
+});
+
+test("expired unrefreshable credentials stay inactive despite the committed error-marker version", async t => {
+  const ctx=await setup(t);
+  await ctx.database.query(`INSERT INTO integration_connections
+    (id,workspace_id,provider,auth_mode,status,credentials_ciphertext,token_type,access_token_expires_at)
+    VALUES (gen_random_uuid(),$1,'mockhub','oauth2','ready',$2,'bearer',now()-interval '1 hour')`,
+    [ctx.workspaceId,encryptSecret(JSON.stringify({accessToken:"expired-secret",refreshToken:null}),KEYRING.active)]);
+  const ws=`/api/v1/workspaces/${ctx.workspaceId}`;
+  for(let attempt=0;attempt<2;attempt++){
+    const listed=await request(ctx.origin,`${ws}/integrations`,{token:ctx.member});
+    assert.equal(listed.status,200);
+    assert.equal(listed.body[0].authorizationStatus,"inactive");
+    assert.equal(listed.body[0].authorizationReason,"credentials_rejected");
+    assert(!listed.raw.includes("expired-secret"));
+  }
+});
+
+test("authorization proof is bound atomically to the token version across same-id reconnects", async t => {
+  const ctx=await setup(t,{},async()=>Response.json({id:"neon-user",email:"bot@example.test"}));
+  const ws=`/api/v1/workspaces/${ctx.workspaceId}`;
+  const saved=await request(ctx.origin,`${ws}/integrations/neon`,{method:"POST",token:ctx.owner,body:{credentials:{apiKey:"old-key"}}});
+  assert.equal(saved.status,201);
+  const original=ctx.connections.runtimeToken.bind(ctx.connections);
+  ctx.connections.runtimeToken=async input=>{
+    const token=await original(input);
+    await ctx.database.query(`UPDATE integration_connections SET credentials_ciphertext=$2,updated_at=now()
+      WHERE workspace_id=$1 AND provider='neon'`,
+      [ctx.workspaceId,encryptSecret(JSON.stringify({fields:{apiKey:"replacement-key"}}),KEYRING.active)]);
+    return token;
+  };
+  const listed=await request(ctx.origin,`${ws}/integrations`,{token:ctx.member});
+  assert.equal(listed.status,200);
+  assert.equal(listed.body[0].connectionId,saved.body.connectionId,"reconnect retained the binding id");
+  assert.equal(listed.body[0].authorizationStatus,"unknown","old credentials cannot verify a replacement");
+  assert.equal(listed.body[0].authorizationReason,"connection_changed");
+  assert(!listed.raw.includes("old-key") && !listed.raw.includes("replacement-key"));
 });
