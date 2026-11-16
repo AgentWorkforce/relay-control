@@ -213,6 +213,22 @@ test("hold on: a general audience does not require a History-origin lookup durin
   assert.equal(held.body.aud, GENERAL_AUDIENCE);
 });
 
+test("hold on: History and general audiences retain independent confirmations", async (t) => {
+  const env = await setup(t, { holdMs: 60_000, introspectAudiences: [GENERAL_AUDIENCE] });
+  const token = await env.login();
+  assert.equal((await env.introspect({ token, aud: HISTORY_PUBLIC })).body.active, true);
+  assert.equal((await env.introspect({ token, aud: GENERAL_AUDIENCE })).body.active, true);
+
+  env.database.outage = true;
+  for (const audience of [HISTORY_PUBLIC, GENERAL_AUDIENCE]) {
+    const held = await env.introspect({ token, aud: audience });
+    assert.equal(held.status, 200, audience);
+    assert.equal(held.body.active, true, audience);
+    assert.equal(held.body.held, true, audience);
+    assert.equal(held.body.aud, audience, audience);
+  }
+});
+
 test("hold on: a held token cannot switch to an unconfirmed general-list History origin", async (t) => {
   const importedOrigin = "https://history.beta-customer.test";
   const env = await setup(t, {
@@ -321,9 +337,8 @@ test("IntrospectionHold serves an entry only within holdMs and before token expi
   now = 14_000;
   const entry = hold.lookup("a");
   assert.ok(entry, "exactly 1000 ms left: returned");
-  assert.equal(entry.audience, "https://history.a.test");
-  assert.equal(entry.checkedAt, 10_000);
-  assert.equal(entry.validUntil, 15_000);
+  assert.equal(entry.audiences.get("https://history.a.test")?.checkedAt, 10_000);
+  assert.equal(entry.audiences.get("https://history.a.test")?.validUntil, 15_000);
   now = 14_001;
   assert.equal(hold.lookup("a"), null, "999 ms left of the hold: not served");
   assert.equal(hold.size, 0, "stale entries are deleted on lookup");
@@ -331,11 +346,33 @@ test("IntrospectionHold serves an entry only within holdMs and before token expi
   now = 0;
   hold.observe(token("b", { expiresAt: new Date(3_000) }), { audience: "https://history.b.test" });
   now = 1_000;
-  assert.equal(hold.lookup("b")?.validUntil, 3_000, "validUntil = min(expiry, checkedAt + holdMs)");
+  assert.equal(
+    hold.lookup("b")?.audiences.get("https://history.b.test")?.validUntil,
+    3_000,
+    "validUntil = min(expiry, checkedAt + holdMs)",
+  );
   now = 2_000;
   assert.ok(hold.lookup("b"), "1000 ms left of the token's life: returned");
   now = 2_001;
   assert.equal(hold.lookup("b"), null, "999 ms left of the token's life: not served");
+});
+
+test("IntrospectionHold expires each confirmed audience on its own clock", () => {
+  let now = 0;
+  const hold = new IntrospectionHold(5_000, { now: () => now });
+  hold.observe(token("a"), { audience: "https://history.a.test" });
+  now = 3_000;
+  hold.observe(token("a"), { audience: GENERAL_AUDIENCE });
+
+  now = 4_000;
+  const both = hold.lookup("a");
+  assert.equal(both?.audiences.get("https://history.a.test")?.validUntil, 5_000);
+  assert.equal(both?.audiences.get(GENERAL_AUDIENCE)?.validUntil, 8_000);
+
+  now = 4_001;
+  const generalOnly = hold.lookup("a");
+  assert.equal(generalOnly?.audiences.has("https://history.a.test"), false);
+  assert.equal(generalOnly?.audiences.get(GENERAL_AUDIENCE)?.validUntil, 8_000);
 });
 
 test("IntrospectionHold forgets on unknown, revoked or expired verdicts", () => {

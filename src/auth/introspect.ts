@@ -8,7 +8,7 @@ import { hashSecret } from "../crypto.js";
 import { databaseErrorCause, isDatabaseUnavailable } from "../database.js";
 import type { FlowRunRelayfileCredentials } from "../flows/relayfile-credentials.js";
 import { NODE_ID_PATTERN, type ControlPlaneStore, type IntrospectedToken, type Principal } from "../store.js";
-import type { IntrospectionHold } from "./introspection-hold.js";
+import type { HeldAudienceVerdict, IntrospectionHold } from "./introspection-hold.js";
 
 /**
  * POST /internal/v1/auth/introspect: the sessions pipeline (and relayfile)
@@ -76,9 +76,9 @@ import type { IntrospectionHold } from "./introspection-hold.js";
  *   The one exception is the opt-in database outage hold
  *   (SELFHOST_INTROSPECT_OUTAGE_HOLD_MS, docs/identity.md): only when the
  *   `sh_at_` lookup fails with a connection-class database error, the last
- *   ACTIVE verdict the database gave for that token and audience within the
- *   hold answers instead, marked `held: true` with `exp` clamped to the end
- *   of the hold.
+ *   ACTIVE verdict the database gave for that token and requested audience
+ *   within the hold answers instead, marked `held: true` with `exp` clamped
+ *   to that audience confirmation's end.
  *   Machine claims are never held.
  * - The token, its hash, the secret and the body are never logged.
  */
@@ -397,7 +397,7 @@ export async function introspect(
   }
   const hold = options?.hold;
   let session: IntrospectedToken | null;
-  let held: { audience: string; checkedAt: number; validUntil: number; cause: string } | null = null;
+  let held: { audiences: ReadonlyMap<string, HeldAudienceVerdict>; cause: string } | null = null;
   let outage: unknown;
   try {
     session = await store.introspectAccessToken(request.token);
@@ -407,9 +407,7 @@ export async function introspect(
     if (!entry) throw error;
     session = entry.session;
     held = {
-      audience: entry.audience,
-      checkedAt: entry.checkedAt,
-      validUntil: entry.validUntil,
+      audiences: entry.audiences,
       cause: databaseErrorCause(error),
     };
     outage = error;
@@ -445,10 +443,11 @@ export async function introspect(
     if (await store.workspaceIdForRelayhistoryOrigin(requestedHistoryOrigin) !== null) aud = undefined;
   }
   if (!aud) return { active: false, reason: "audience" };
-  // The hold re-serves one authoritative verdict, not merely a token session.
-  // This keeps the DB-backed legacy History-origin fence in force without a
-  // second database query during the outage.
-  if (held && held.audience !== aud) return { active: false, reason: "audience" };
+  // The hold re-serves authoritative token+audience verdicts, not merely a
+  // token session. This keeps the DB-backed legacy History-origin fence in
+  // force without a second database query during the outage.
+  const heldAudience = held?.audiences.get(aud) ?? null;
+  if (held && !heldAudience) return { active: false, reason: "audience" };
   if (request.workspace !== undefined && session.workspaceId !== request.workspace) {
     return { active: false, reason: "workspace" };
   }
@@ -472,7 +471,7 @@ export async function introspect(
       token_id: tokenId,
       aud,
       workspace: session.workspaceId,
-      age_ms: Math.max(0, Date.now() - held.checkedAt),
+      age_ms: Math.max(0, Date.now() - heldAudience!.checkedAt),
       cause: held.cause,
     });
   }
@@ -490,7 +489,7 @@ export async function introspect(
     scopes: [...session.scopes],
     aud,
     iat: epochSeconds(session.issuedAt),
-    exp: epochSeconds(held ? new Date(held.validUntil) : session.expiresAt),
+    exp: epochSeconds(held ? new Date(heldAudience!.validUntil) : session.expiresAt),
     token_id: tokenId,
     capture_policy: session.capturePolicy,
     ...(held ? { held: true as const } : {}),
