@@ -13,7 +13,7 @@
 import { createDecipheriv, randomBytes } from "node:crypto";
 import { recordAudit } from "../../src/admin/audit.js";
 import { canonicalRelayhistoryOrigin } from "../../src/relayhistory-origin.js";
-import { encryptSecret, hashSecret, opaqueToken, type EncryptionKeyring } from "../../src/crypto.js";
+import { decryptSecret, encryptSecret, hashSecret, opaqueToken, type EncryptionKeyring } from "../../src/crypto.js";
 import type { Database, SqlExecutor } from "../../src/database.js";
 import {
   MAPPING_REVISION,
@@ -627,37 +627,101 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       for (const batch of chunks(rows, batchSize)) {
         const params: unknown[] = [batch.map((row) => row.row), batch.map((row) => row.secret), batch.map((row) => row.override ?? null)];
         if (secret) params.push(org);
-        await tx.query(sql, params);
-        if (secret && org) await recordSecrets(tx, table, secret, org, batch);
+        if (secret && org) {
+          const settled = await settleSecrets(tx, table, secret, org, batch);
+          params[1] = batch.map((row) => settled.get(row.key) ?? row.secret);
+          await tx.query(sql, params);
+          await recordSecrets(tx, table, secret, org, batch, settled);
+        } else {
+          await tx.query(sql, params);
+        }
       }
     };
     // After the upsert: a row now holding the ciphertext this run sent was
     // written by the import, so its marker moves to that ciphertext; a row
     // holding anything else kept Control's secret (counted).
-    const recordSecrets = async (tx: SqlExecutor, table: ImportTable, secret: string, org: string, rows: PreparedRow[]) => {
+    // Before the upsert, per row whose target already holds a secret T:
+    // - T is the import's own (its marker) and decrypts to Cloud's plaintext:
+    //   send T back unchanged, so nothing is rewritten and the marker stays
+    //   (no fresh-IV churn on a converged re-run);
+    // - no marker at all (imported before .28, or pre-seeded): when T decrypts
+    //   to Cloud's plaintext, adopt it (record the marker, no write) so later
+    //   Cloud rotations flow; otherwise it is Control's and the upsert keeps it;
+    // - a marker for another value: Control rotated it; the upsert keeps it.
+    // Returns the ciphertext to send for rows whose target value is reused.
+    const settleSecrets = async (tx: SqlExecutor, table: ImportTable, secret: string, org: string, rows: PreparedRow[]) => {
       const relation = TARGETS[table].table;
-      const stored = new Map((await tx.query<{ id: string; value: string | null; digest: string | null }>(
-        `SELECT id::text AS id, ${quote(secret)} AS value, encode(sha256(convert_to(${quote(secret)}, 'UTF8')), 'hex') AS digest
-           FROM public.${quote(relation)} WHERE id::text = ANY($1::text[])`,
-        [rows.map((row) => row.key)])).rows.map((row) => [row.id, row]));
-      const written: Array<[string, string]> = [];
+      const current = (await tx.query<{ id: string; value: string; digest: string; marker: string | null }>(
+        `SELECT t.id::text AS id, t.${quote(secret)} AS value,
+                encode(sha256(convert_to(t.${quote(secret)}, 'UTF8')), 'hex') AS digest,
+                (SELECT l.row_key FROM public.${IMPORT_LEDGER_TABLE} l WHERE l.organization_id = $2::uuid AND l.table_name = $3
+                   AND starts_with(l.row_key, $4 || ':' || t.id::text || ':') LIMIT 1) AS marker
+           FROM public.${quote(relation)} t
+          WHERE t.id::text = ANY($1::text[]) AND t.${quote(secret)} IS NOT NULL`,
+        [rows.map((row) => row.key), org, SECRET_MARKER, relation])).rows;
+      const incoming = new Map(rows.map((row) => [row.key, row]));
+      const plain = (ciphertext: string | null) => {
+        if (ciphertext === null) return null;
+        try { return decryptSecret(ciphertext, deps.keyring); } catch { return null; }
+      };
+      const reuse = new Map<string, string>();
+      const adopt: string[] = [];
+      for (const target of current) {
+        const row = incoming.get(target.id);
+        const cloud = plain(row?.secret ?? null);
+        if (!row || cloud === null) continue;
+        const ownMarker = `${relation}:${target.id}:${target.digest}`;
+        if (target.marker === ownMarker) {
+          if (plain(target.value) === cloud) reuse.set(target.id, target.value);
+        } else if (target.marker === null && plain(target.value) === cloud) {
+          reuse.set(target.id, target.value);
+          adopt.push(ownMarker);
+        }
+      }
+      if (adopt.length) {
+        await tx.query(
+          `INSERT INTO public.${IMPORT_LEDGER_TABLE} (organization_id, table_name, row_key, mapping_revision)
+           SELECT $1::uuid, $2, k, $4 FROM unnest($3::text[]) AS u(k) ON CONFLICT DO NOTHING`,
+          [org, SECRET_MARKER, adopt, MAPPING_REVISION]);
+        report.warnings[`${table}_secret_adopted`] = (report.warnings[`${table}_secret_adopted`] ?? 0) + adopt.length;
+      }
+      return reuse;
+    };
+    // After the upsert: a row now holding the ciphertext this run sent carries
+    // the import's value, so its marker names that ciphertext (written only
+    // when it changed); a row holding anything else kept Control's secret.
+    const recordSecrets = async (tx: SqlExecutor, table: ImportTable, secret: string, org: string, rows: PreparedRow[], sent: Map<string, string>) => {
+      const relation = TARGETS[table].table;
+      const stored = new Map((await tx.query<{ id: string; value: string | null; digest: string | null; markers: string[] }>(
+        `SELECT t.id::text AS id, t.${quote(secret)} AS value, encode(sha256(convert_to(t.${quote(secret)}, 'UTF8')), 'hex') AS digest,
+                ARRAY(SELECT l.row_key FROM public.${IMPORT_LEDGER_TABLE} l WHERE l.organization_id = $2::uuid AND l.table_name = $3
+                        AND starts_with(l.row_key, $4 || ':' || t.id::text || ':')) AS markers
+           FROM public.${quote(relation)} t WHERE t.id::text = ANY($1::text[])`,
+        [rows.map((row) => row.key), org, SECRET_MARKER, relation])).rows.map((row) => [row.id, row]));
+      const moved: Array<[string, string]> = [];
       for (const row of rows) {
         const now = stored.get(row.key);
+        const value = sent.get(row.key) ?? row.secret;
         if (!now?.value) continue;
-        if (row.secret !== null && now.value === row.secret) written.push([row.key, `${relation}:${row.key}:${now.digest}`]);
-        else report.warnings[`${table}_secret_kept`] = (report.warnings[`${table}_secret_kept`] ?? 0) + 1;
+        if (value !== null && now.value === value) {
+          const key = `${relation}:${row.key}:${now.digest}`;
+          if (now.markers.length !== 1 || now.markers[0] !== key) moved.push([row.key, key]);
+        } else {
+          report.warnings[`${table}_secret_kept`] = (report.warnings[`${table}_secret_kept`] ?? 0) + 1;
+        }
       }
-      if (!written.length) return;
+      if (!moved.length) return;
       await tx.query(
         `DELETE FROM public.${IMPORT_LEDGER_TABLE} l USING unnest($3::text[], $4::text[]) AS u(id, k)
-          WHERE l.organization_id = $1::uuid AND l.table_name = $2 AND l.row_key LIKE $5 || ':' || u.id || ':%' AND l.row_key <> u.k`,
-        [org, SECRET_MARKER, written.map(([id]) => id), written.map(([, key]) => key), relation],
+          WHERE l.organization_id = $1::uuid AND l.table_name = $2
+            AND starts_with(l.row_key, $5 || ':' || u.id || ':') AND l.row_key <> u.k`,
+        [org, SECRET_MARKER, moved.map(([id]) => id), moved.map(([, key]) => key), relation],
       );
       await tx.query(
         `INSERT INTO public.${IMPORT_LEDGER_TABLE} (organization_id, table_name, row_key, mapping_revision)
          SELECT $1::uuid, $2, k, $4 FROM unnest($3::text[]) AS u(k)
-         ON CONFLICT (organization_id, table_name, row_key) DO UPDATE SET mapping_revision = EXCLUDED.mapping_revision`,
-        [org, SECRET_MARKER, written.map(([, key]) => key), MAPPING_REVISION],
+         ON CONFLICT (organization_id, table_name, row_key) DO NOTHING`,
+        [org, SECRET_MARKER, moved.map(([, key]) => key), MAPPING_REVISION],
       );
     };
     // A credential new to Control enters inactive when its (workspace,

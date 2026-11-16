@@ -701,6 +701,8 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
       generation: "relaycast_api_key_generation",
       columns: ["relaycast_workspace_id", "relaycast_api_key_ciphertext", "relaycast_api_key_generation"],
     },
+    // A kept Control key keeps its own binding and generation (never torn).
+    secretGroup: ["relaycast_workspace_id", "relaycast_api_key_generation"],
   },
   organization_invitations: {
     table: "organization_invitations",
@@ -789,7 +791,12 @@ export const UNBOUND_WORKSPACE_MARKER = "workspace_unbound";
  * target secret only while it is still exactly the one recorded here (or
  * NULL); a secret Control rotated since (a token refresh, a re-issued
  * participant token, a rekey) is kept, with its secretGroup, and counted
- * as <table>_secret_kept. Reconcile reads only ORG_TABLES.
+ * as <table>_secret_kept. A row with no marker (imported before .28, or
+ * pre-seeded) is adopted when its decrypted value equals Cloud's plaintext
+ * (marker recorded, nothing written; <table>_secret_adopted), else kept.
+ * An unchanged plaintext reuses the stored ciphertext: a converged re-run
+ * rewrites no secret and writes no marker.
+ * Reconcile reads only ORG_TABLES.
  */
 export const SECRET_MARKER = "secret_written";
 const importedUnbound = `EXISTS (SELECT 1 FROM public.${IMPORT_LEDGER_TABLE} l WHERE l.table_name = '${UNBOUND_WORKSPACE_MARKER}' AND l.row_key = id::text)`;
