@@ -99,7 +99,10 @@ Amp) and the relay agent id. The inbox's wake target becomes
 `https://agent-dm.events-shim.invalid/v1/hooks/esdm_<inbox id>`, with a fresh
 secret whose SHA-256 the link keeps. Link and unlink lock the inbox row and
 write the link and the wake target in one transaction, so overlapping calls
-apply one at a time. Relinking keeps the identity unless the workspace moved
+apply one at a time. Each link's wake time is later than the one it replaces,
+so a late failure under an older link cannot mark the new one broken. A
+reused identity keeps the token stored at that moment, which
+`relaycast-rekey` may have upgraded. Relinking keeps the identity unless the workspace moved
 to another Relaycast workspace; then a new one is registered and the old one
 released.
 
@@ -129,7 +132,8 @@ forwards of one post reuse its idempotency key.
 `unlink_webhook_inbox` clears the link and releases the identity. A sender is
 always released, by exact id, on the Relaycast workspace it was registered on.
 When an expired inbox is deleted, its link row stays (no foreign key) until
-the minute sweep releases its identity and deletes the row.
+the minute sweep releases its identity and deletes the row. A release that
+fails or takes longer than 10 seconds keeps the row for the next sweep.
 
 A DM wakes the agent only where that agent's delivery runs on this control
 plane: Amp and Replicas do. Native Capy bindings have no delivery path here

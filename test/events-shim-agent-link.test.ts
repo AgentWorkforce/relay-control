@@ -60,6 +60,7 @@ async function fixture(t: TestContext) {
     /** `<workspace key>:<sender name>` per release, so the relay it happened on is checked too. */
     released: [] as string[],
     sendFails: null as { status: number } | null,
+    releaseFails: null as "error" | "stall" | null,
     pending: [] as Promise<unknown>[],
     /** Who holds each relay name now (the relay's agent id). */
     holders: new Map<string, string>(),
@@ -76,6 +77,8 @@ async function fixture(t: TestContext) {
       return { id: `agent-${name}`, name, token: `ar_token_${name}` };
     },
     releaseHosted: async (key, name) => {
+      if (state.releaseFails === "error") throw Object.assign(new Error("relaycast down"), { status: 503 });
+      if (state.releaseFails === "stall") return new Promise<void>(() => undefined);
       state.released.push(`${key}:${name}`);
     },
     sendDirectMessage: async (input) => {
@@ -478,4 +481,68 @@ test("the webhook_inbox group is planned only with the events_shim deps, and the
   const store = { listStalledWakes: async () => [] } as never;
   await new EventsShimWakeSweeper({ store, releaseOrphans: async () => { released += 1; } }).tick();
   assert.equal(released, 1);
+});
+
+test("an orphan whose release fails or stalls keeps its row for the next sweep", async (t) => {
+  const f = await fixture(t);
+  const deps: AgentLinkDeps = { ...f.deps, releaseTimeoutMs: 50 };
+  const shim = await f.inbox();
+  const linked = await linkInboxToAgent(deps, f.owner, { inbox: shim.shim_id, agent: "capy-a" });
+  await f.settle();
+  await f.database.query("DELETE FROM events_shims WHERE id = $1", [shim.shim_id]);
+  const rows = async () => (await f.database.query("SELECT 1 FROM events_shim_agent_links WHERE shim_id = $1", [shim.shim_id])).rows.length;
+  f.state.releaseFails = "error";
+  assert.equal(await releaseOrphanedAgentLinks(deps), 0);
+  assert.equal(await rows(), 1);
+  f.state.releaseFails = "stall";
+  assert.equal(await releaseOrphanedAgentLinks(deps), 0);
+  assert.equal(await rows(), 1);
+  f.state.releaseFails = null;
+  assert.equal(await releaseOrphanedAgentLinks(deps), 1);
+  assert.equal(await rows(), 0);
+  assert.deepEqual(f.state.released, [`rk_${RELAY}:${linked.sender}`]);
+});
+
+test("each link gets a later wake time than the one it replaces, so a stale failure cannot break the new link", async (t) => {
+  const f = await fixture(t);
+  const fixed = new Date();
+  const deps: AgentLinkDeps = { ...f.deps, now: () => fixed };
+  const shim = await f.inbox();
+  await linkInboxToAgent(deps, f.owner, { inbox: shim.shim_id, agent: "capy-a" });
+  const linkedAt = async () => new Date((await f.database.query<{ wake_linked_at: Date }>(
+    "SELECT wake_linked_at FROM events_shims WHERE id = $1", [shim.shim_id])).rows[0]!.wake_linked_at).toISOString();
+  const first = await linkedAt();
+  await linkInboxToAgent(deps, f.owner, { inbox: shim.shim_id, agent: "amp-c" });
+  const second = await linkedAt();
+  assert.ok(second > first, `${second} > ${first}`);
+  await f.settle();
+  // A delivery under the first link fails late: only that link's generation may be marked broken.
+  const store = new PostgresEventsShimStore(f.database, KEYRING);
+  await store.markWakeBroken(shim.shim_id, first, "relay refused the wake (HTTP 410)", new Date().toISOString());
+  assert.equal((await f.wake(shim.shim_id)).wake_broken_reason, null);
+});
+
+test("a relink reusing the sender keeps a token relaycast-rekey upgraded meanwhile", async (t) => {
+  const f = await fixture(t);
+  const shim = await f.inbox();
+  await linkInboxToAgent(f.deps, f.owner, { inbox: shim.shim_id, agent: "capy-a" });
+  await f.settle();
+  const upgraded = encryptSecret("ar_upgraded_token", KEYRING.active);
+  // Rekey commits between the link's read of the row and its upsert.
+  const racing: AgentLinkDeps = { ...f.deps, database: Object.assign(Object.create(f.database), {
+    transaction: <T>(work: Parameters<typeof f.database.transaction<T>>[0]) => f.database.transaction((tx) => work({
+      query: async (sql: string, params?: unknown[]) => {
+        const result = await tx.query(sql, params as never);
+        if (sql.startsWith("SELECT * FROM events_shim_agent_links")) {
+          await tx.query("UPDATE events_shim_agent_links SET sender_token_ciphertext = $2 WHERE shim_id = $1", [shim.shim_id, upgraded]);
+        }
+        return result;
+      },
+    } as never)),
+  }) };
+  await linkInboxToAgent(racing, f.owner, { inbox: shim.shim_id, agent: "amp-c" });
+  await f.settle();
+  const token = (await f.database.query<{ sender_token_ciphertext: string }>(
+    "SELECT sender_token_ciphertext FROM events_shim_agent_links WHERE shim_id = $1", [shim.shim_id])).rows[0]!.sender_token_ciphertext;
+  assert.equal(decryptSecret(token, KEYRING), "ar_upgraded_token");
 });

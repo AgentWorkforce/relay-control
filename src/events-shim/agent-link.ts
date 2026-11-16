@@ -44,6 +44,8 @@ export type AgentLinkDeps = {
   store: EventsShimStore;
   now?: () => Date;
   defer?: (work: Promise<unknown>) => void;
+  /** Longest one sender release may take before it counts as failed and is retried later (default 10 s). */
+  releaseTimeoutMs?: number;
 };
 
 /** The person acting through MCP. Authority is re-read from Postgres on every call. */
@@ -187,7 +189,8 @@ const shimIdFromHook = (hookId: string) => {
     : null;
 };
 
-const lockInbox = (tx: SqlExecutor, shimId: string) => tx.query("SELECT id FROM events_shims WHERE id = $1 FOR UPDATE", [shimId]);
+const lockInbox = (tx: SqlExecutor, shimId: string) =>
+  tx.query<{ id: string; wake_linked_at: Date | string | null }>("SELECT id, wake_linked_at FROM events_shims WHERE id = $1 FOR UPDATE", [shimId]);
 
 export type AgentLinkResult = { inbox_id: string; agent: string; kind: CloudAgentKind; sender: string; forwarded_waiting: number };
 
@@ -217,15 +220,18 @@ export async function linkInboxToAgent(
     throw new AgentLinkError(404,
       `${agent} is not a Capy thread, Replica or Amp thread you bound in this workspace. Bind it first.`);
   }
-  const now = clock(deps);
   const secret = `wh_live_${randomBytes(24).toString("hex")}`;
-  const target: WakeTarget = { url: `${AGENT_DM_ORIGIN}/v1/hooks/${hookIdFor(shim.id)}`, secret, linkedAt: now.toISOString() };
+  const target: WakeTarget = { url: `${AGENT_DM_ORIGIN}/v1/hooks/${hookIdFor(shim.id)}`, secret, linkedAt: "" };
   let created: Sender | null = null;
   let retired: Sender | null = null;
   let sender: Sender;
   try {
     sender = await deps.database.transaction(async (tx) => {
-      await lockInbox(tx, shim.id);
+      const previous = (await lockInbox(tx, shim.id)).rows[0];
+      // The package fences a stale delivery's failure by wake_linked_at alone, so each link
+      // gets a time strictly after the one it replaces, even within one millisecond.
+      const at = Math.max(clock(deps).getTime(), previous?.wake_linked_at ? new Date(previous.wake_linked_at).getTime() + 1 : 0);
+      target.linkedAt = new Date(at).toISOString();
       // Re-checked under the lock: authority may have changed since the reads above.
       await requireAdmin(tx, actor);
       const existing = (await tx.query<LinkRow>("SELECT * FROM events_shim_agent_links WHERE shim_id = $1", [shim.id])).rows[0];
@@ -256,16 +262,19 @@ export async function linkInboxToAgent(
            relaycast_workspace_id = EXCLUDED.relaycast_workspace_id, agent_name = EXCLUDED.agent_name,
            agent_kind = EXCLUDED.agent_kind, binding_id = EXCLUDED.binding_id, binding_generation = EXCLUDED.binding_generation,
            agent_remote_id = EXCLUDED.agent_remote_id, sender_name = EXCLUDED.sender_name,
-           sender_remote_id = EXCLUDED.sender_remote_id, sender_token_ciphertext = EXCLUDED.sender_token_ciphertext,
+           sender_remote_id = EXCLUDED.sender_remote_id,
+           -- A reused sender keeps the token stored now: relaycast-rekey may have upgraded it since it was read.
+           sender_token_ciphertext = CASE WHEN events_shim_agent_links.sender_remote_id = EXCLUDED.sender_remote_id
+             THEN events_shim_agent_links.sender_token_ciphertext ELSE EXCLUDED.sender_token_ciphertext END,
            secret_hash = EXCLUDED.secret_hash, linked_at = EXCLUDED.linked_at`,
         [shim.id, actor.workspaceId, actor.userId, relay.relaycastWorkspaceId, agent, bound.kind, bound.bindingId,
           bound.generation, bound.agentRemoteId, current.name, current.id, current.tokenCiphertext,
-          await sha256Hex(secret), now],
+          await sha256Hex(secret), new Date(target.linkedAt)],
       );
       await tx.query(
         `UPDATE events_shims SET wake_url = $2, wake_secret_ciphertext = $3, wake_linked_at = $4,
            wake_broken_at = NULL, wake_broken_reason = NULL WHERE id = $1`,
-        [shim.id, target.url, encryptSecret(secret, deps.keyring.active), now],
+        [shim.id, target.url, encryptSecret(secret, deps.keyring.active), new Date(target.linkedAt)],
       );
       return current;
     });
@@ -278,7 +287,7 @@ export async function linkInboxToAgent(
     throw error;
   }
   if (retired) await releaseSender(deps, retired);
-  const waiting = await deps.store.countPending(shim.id, new Date(now.getTime() - 60_000).toISOString()).catch(() => 0);
+  const waiting = await deps.store.countPending(shim.id, new Date(clock(deps).getTime() - 60_000).toISOString()).catch(() => 0);
   void deliverInBackground(deliveryDeps(deps), shim.id, target);
   return { inbox_id: shim.id, agent, kind: bound.kind, sender: sender.name, forwarded_waiting: waiting };
 }
@@ -330,22 +339,31 @@ async function senderSaved(deps: AgentLinkDeps, shimId: string, sender: Sender):
  * longer be its workspace's current one. Exact-id release never deletes a
  * successor that took the name.
  */
-async function releaseSender(deps: AgentLinkDeps, sender: Sender): Promise<boolean> {
+async function releaseSender(deps: AgentLinkDeps, sender: Sender): Promise<"released" | "no_relay" | "failed"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const relay = await relayById(deps, sender.relaycastWorkspaceId);
-    if (!relay) return false;
-    await deps.relaycast.releaseHosted(relay.key, sender.name, sender.id);
-    return true;
+    // No workspace holds that Relaycast workspace any more: nothing is left to release it on.
+    if (!relay) return "no_relay";
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("release_timeout")), deps.releaseTimeoutMs ?? 10_000);
+    });
+    await Promise.race([deps.relaycast.releaseHosted(relay.key, sender.name, sender.id), deadline]);
+    return "released";
   } catch {
-    // Best effort: a sender cannot send without its token, which is gone with its row.
-    return false;
+    // Transient: a Relaycast outage or a stalled request. The orphan sweep retries it.
+    return "failed";
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 /**
  * Releases the relay identities of links whose inbox is gone (expired inboxes
  * are deleted by `prune`; their link rows stay for this), then deletes those
- * rows. The wake sweeper runs it.
+ * rows. A release that fails (an outage, or no answer within
+ * `releaseTimeoutMs`) keeps its row for the next sweep; a Relaycast workspace
+ * no workspace holds any more is final. The wake sweeper runs it.
  *
  * @returns How many links were cleaned up.
  */
@@ -358,7 +376,8 @@ export async function releaseOrphanedAgentLinks(deps: AgentLinkDeps, limit = 25)
   )).rows;
   let cleaned = 0;
   for (const link of orphans) {
-    await releaseSender(deps, linkSender(link));
+    // A failed release keeps the row (its sender id and token) for the next sweep.
+    if ((await releaseSender(deps, linkSender(link))) === "failed") continue;
     await deps.database.query("DELETE FROM events_shim_agent_links WHERE shim_id = $1 AND sender_remote_id = $2",
       [link.shim_id, link.sender_remote_id]);
     cleaned += 1;

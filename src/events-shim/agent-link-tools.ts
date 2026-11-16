@@ -39,7 +39,8 @@ export function registerWebhookInboxTools(server: McpServer, context: McpContext
     description:
       "Link a webhook inbox you created to one of your bound cloud agents (a Capy thread, Replica or Amp thread): each webhook post is then sent to that agent as a relay DM from the inbox's own identity, framed as untrusted webhook data, and wakes it. Replaces the inbox's current wake link; posts already waiting are sent too. Requires current owner/admin access.",
     inputSchema: { inbox, agent: z.string().min(1).max(129).describe("The bound agent's relay name, e.g. capy-01m6dvs5.") },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    // Replaces the wake link and sends waiting posts as DMs, which cannot be recalled.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   }, ({ inbox: id, agent }) => run(() => linkInboxToAgent(deps, actor, { inbox: id, agent })));
   server.registerTool("unlink_webhook_inbox", {
     title: "Unlink a webhook inbox",
