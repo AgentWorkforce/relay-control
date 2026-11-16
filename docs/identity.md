@@ -806,7 +806,7 @@ takes effect on the service's next check; refresh, bootstrap and worker
 tokens, and every workspace API token other than a relayfile agent or
 acquisition operator token (below), are always reported as `wrong-kind` (an
 `sh_wk_` that matches no token is `unknown`). See
-[RelayHistory (sessions pipeline)](../README.md#relayhistory-sessions-pipeline).
+[RelayHistory (sessions pipeline)](repository-guide.md#relayhistory-sessions-pipeline).
 `GET /readyz` lists the accepted audiences (`introspection.audiences`, empty
 while introspection is disabled), so a scheme or port mismatch shows up there
 instead of as a runtime 401.
