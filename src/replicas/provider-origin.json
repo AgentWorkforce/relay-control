@@ -1,8 +1,8 @@
 {
-  "commit": "6145d69fea2d0640efd709dde3c343c9f2d6ea28",
+  "commit": "905c888ed574f2c62a412f7d0e99643d8b18cffe",
   "path": "packages/web/lib/replicas/mcp.ts",
   "target": "src/replicas/mcp.ts",
-  "sha256": "e3669cf45a716969e69a4128b43caec4f4750adb0a65c9161b0750c2cee85de9",
+  "sha256": "c360e23ece466deb3ad3637161c7b275e0986b7f7236bf60b032d1f2baab038c",
   "ported": [
     "packages/web/lib/replicas/service.ts",
     "packages/web/lib/replicas/tools.ts",

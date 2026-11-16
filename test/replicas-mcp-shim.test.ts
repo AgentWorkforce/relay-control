@@ -10,14 +10,18 @@ import { helperInstall } from "../src/replicas/service.js";
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
+// Real CLI captures: current Claude/Codex and Claude 2.1.0 from its official
+// package. Only per-test name/path/scope/command values are substituted.
+const harnessCaptures = JSON.parse(readFileSync(new URL("./fixtures/replicas/harness-cli.json", import.meta.url), "utf8"));
+
 // The replica-side MCP server and its installer are vendored byte for byte
-// from the hosted control plane (Cloud 6145d69, mcp.ts sha256 e3669cf4).
+// from the hosted control plane (Cloud 905c888, mcp.ts sha256 c360e23e).
 // A change here must be a deliberate re-vendor: update the hosted copy and
 // these pins together.
 test("vendored replica MCP shim matches the pinned hosted source", () => {
   assert.equal(sha256(replicaMcpSource), "1624e788afb02435b2e0bd9b18d84eda474ae318bba74ca218a4f5dd720913a8");
-  assert.equal(sha256(mcpInstall("claude")), "13144798088bc6a7cb323c9a9d5f3ad8e6f55516de169c8544e91afcb0c73fb0");
-  assert.equal(sha256(mcpInstall("codex")), "5bc2c4b68dc07e24b405cee2c9bfeef03864a17573067f7f2227071ccb402431");
+  assert.equal(sha256(mcpInstall("claude")), "d4a7a9a2c43d3b6335487034f7e1a05d4642e0bd7b43648ee738a631d460ddf1");
+  assert.equal(sha256(mcpInstall("codex")), "254ae68fb8318fcee63faeb4dc78192aa78dad5987b916d853e0794847428fb8");
   assert.ok(replicaMcpSource.includes("stop retrying until binding access is restored"));
   assert.equal(REPLICA_MCP_READY, "agent-relay-mcp-ready-v1");
   assert.match(REPLICA_MCP_FAILURE, /^Agent Relay MCP provisioning failed\./);
@@ -48,13 +52,14 @@ test("the installer carries no credential and exposes exactly the three relay to
 });
 
 /** A private HOME with a fake harness CLI; the installed Python MCP server and its handshake are real. */
-function sandbox(t: TestContext, harness: string) {
+function sandbox(t: TestContext, harness: string, capture = harness) {
   const home = mkdtempSync(join(tmpdir(), "replicas-mcp-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const bin = join(home, "bin");
   mkdirSync(bin);
   writeFileSync(join(bin, harness), `#!/usr/bin/env python3
-import json,pathlib,sys,time
+import base64,json,pathlib,sys,time
+captures=json.loads(base64.b64decode('${Buffer.from(JSON.stringify(harnessCaptures[capture])).toString("base64")}'))
 p=pathlib.Path.home()/'registrations.json'
 registry=json.loads(p.read_text()) if p.exists() else {}
 operation=sys.argv[2]
@@ -64,12 +69,20 @@ if operation=='add':
  registry[name]={'type':'stdio','command':sys.argv[separator+1],'args':sys.argv[separator+2:],'scope':'user'}
 elif operation=='get':
  name=sys.argv[3]
- if name not in registry: print('No MCP server named '+name,file=sys.stderr);sys.exit(1)
+ if name not in registry:
+  missing=captures['missing']
+  sys.stdout.write(missing['stdout'].replace('{{name}}',name));sys.stderr.write(missing['stderr'].replace('{{name}}',name));sys.exit(missing['exit_code'])
  entry=registry[name]
  if entry.get('slow_get'): time.sleep(10)
  if entry.get('fail_get'): print('private-provider-output');sys.exit(1)
- if '--json' in sys.argv: print(json.dumps({'name':name,'transport':entry,'enabled':entry.get('enabled',True)}))
- else: print('Scope: '+('User config' if entry.get('scope')=='user' else 'Local config')+'\\nType: '+entry['type']+'\\nCommand: '+entry['command']+'\\nArgs: '+' '.join(entry['args']))
+ captured=captures['owned' if entry['command']=='python3' else 'unrelated']['stdout']
+ if '--json' in sys.argv:
+  reply=json.loads(captured);reply['name']=name;reply['enabled']=entry.get('enabled',True)
+  reply['transport'].update({key:entry[key] for key in ('type','command','args')})
+  print(json.dumps(reply))
+ else:
+  scope='User config (available in all your projects)' if entry.get('scope')=='user' else 'Local config'
+  print(captured.replace('{{name}}',name).replace('{{scope}}',scope).replace('{{command}}',entry['command']).replace('{{server_path}}',' '.join(entry['args'])))
 elif operation=='remove':
  name=sys.argv[-1]
  if registry[name].get('fail_remove'): print('private-provider-output');sys.exit(1)
@@ -82,6 +95,12 @@ p.write_text(json.dumps(registry))
   const server = join(home, ".local/share/agent-relay-replicas/mcp.py");
   return { env, registry, server, read: () => JSON.parse(readFileSync(registry, "utf8")) };
 }
+
+test("the installer accepts the captured Claude 2.1.0 missing-entry response before adding the stable server", (t) => {
+  const box = sandbox(t, "claude", "claude-2.1.0");
+  assert.equal(execFileSync("sh", ["-c", mcpInstall("claude")], { env: box.env, encoding: "utf8" }).trim(), REPLICA_MCP_READY);
+  assert.equal(box.read()["agent-relay-replica"].command, "python3");
+});
 
 test("the installer caps the legacy names at the eight it is given first", () => {
   const ids = Array.from({ length: 12 }, (_, i) => `id${i}`);

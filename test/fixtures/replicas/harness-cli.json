@@ -1,0 +1,59 @@
+{
+  "captured_at": "2026-11-16",
+  "description": "Captured real CLI mcp get output using private temporary Claude configuration and Codex in-memory config overrides. Fixture commands point to an absent dummy server; connection status is not a live MCP proof. Only fixture names, paths, commands and scope values are normalized.",
+  "claude": {
+    "version": "2.1.325",
+    "missing": {
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "No MCP server named \"{{name}}\". Run `claude mcp add` to add one.\n"
+    },
+    "owned": {
+      "exit_code": 0,
+      "stdout": "{{name}}:\n  Scope: {{scope}}\n  Status: \u2718 Failed to connect\n  Issue: CONNECTION_CLOSED: Connection closed\n  Type: stdio\n  Command: {{command}}\n  Args: {{server_path}}\n  Environment:\n\nTo remove this server, run: claude mcp remove {{name}} -s user\n",
+      "stderr": ""
+    },
+    "unrelated": {
+      "exit_code": 0,
+      "stdout": "{{name}}:\n  Scope: {{scope}}\n  Status: \u2718 Failed to connect\n  Issue: CONNECTION_CLOSED: Connection closed\n  Type: stdio\n  Command: {{command}}\n  Args: {{server_path}}\n  Environment:\n\nTo remove this server, run: claude mcp remove {{name}} -s user\n",
+      "stderr": ""
+    }
+  },
+  "claude-2.1.0": {
+    "version": "2.1.0",
+    "missing": {
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "No MCP server found with name: {{name}}\n"
+    },
+    "owned": {
+      "exit_code": 0,
+      "stdout": "{{name}}:\n  Scope: {{scope}}\n  Status: \u2717 Failed to connect\n  Type: stdio\n  Command: {{command}}\n  Args: {{server_path}}\n  Environment:\n\nTo remove this server, run: claude mcp remove \"{{name}}\" -s user\n",
+      "stderr": ""
+    },
+    "unrelated": {
+      "exit_code": 0,
+      "stdout": "{{name}}:\n  Scope: {{scope}}\n  Status: \u2717 Failed to connect\n  Type: stdio\n  Command: {{command}}\n  Args: {{server_path}}\n  Environment:\n\nTo remove this server, run: claude mcp remove \"{{name}}\" -s user\n",
+      "stderr": ""
+    },
+    "source": "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.0.tgz"
+  },
+  "codex": {
+    "version": "0.166.0",
+    "missing": {
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Error: No MCP server named '{{name}}' found.\n"
+    },
+    "owned": {
+      "exit_code": 0,
+      "stdout": "{\n  \"name\": \"{{name}}\",\n  \"enabled\": true,\n  \"disabled_reason\": null,\n  \"transport\": {\n    \"type\": \"stdio\",\n    \"command\": \"python3\",\n    \"args\": [\n      \"{{server_path}}\"\n    ],\n    \"env\": null,\n    \"env_vars\": [],\n    \"cwd\": null\n  },\n  \"enabled_tools\": null,\n  \"disabled_tools\": null,\n  \"startup_timeout_sec\": null,\n  \"tool_timeout_sec\": null\n}\n",
+      "stderr": ""
+    },
+    "unrelated": {
+      "exit_code": 0,
+      "stdout": "{\n  \"name\": \"{{name}}\",\n  \"enabled\": true,\n  \"disabled_reason\": null,\n  \"transport\": {\n    \"type\": \"stdio\",\n    \"command\": \"node\",\n    \"args\": [\n      \"{{server_path}}\"\n    ],\n    \"env\": null,\n    \"env_vars\": [],\n    \"cwd\": null\n  },\n  \"enabled_tools\": null,\n  \"disabled_tools\": null,\n  \"startup_timeout_sec\": null,\n  \"tool_timeout_sec\": null\n}\n",
+      "stderr": ""
+    }
+  }
+}
