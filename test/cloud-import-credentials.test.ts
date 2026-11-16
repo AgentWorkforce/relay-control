@@ -6,7 +6,7 @@ import { CredentialBlobStore, PostgresObjectBackend } from "../src/admin/credent
 import { SubscriptionLoginStore } from "../src/admin/subscription-logins.js";
 import { decryptSecret, type EncryptionKeyring } from "../src/crypto.js";
 import { migrate } from "../src/migrations.js";
-import { CLOUD_FIXTURE_DDL, cloudEnvelope, cloudFixtureSeed, id } from "../scripts/cloud-import/cloud-fixture.js";
+import { CLOUD_FIXTURE_DDL, cloudEnvelope, cloudFixtureSeed, id, ORG_A } from "../scripts/cloud-import/cloud-fixture.js";
 import { cloudObjectKeys, copyCodingAgentCredentials } from "../scripts/cloud-import/credentials.js";
 import { runImport } from "../scripts/cloud-import/importer.js";
 import { PGliteDatabase } from "./support/harness.js";
@@ -63,6 +63,8 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     [`${id(2)}/anthropic/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "oauth_token", modelProvider: "anthropic", token: "sk-ant-oat01-synthetic-token-00000000000" }), CLOUD_KEY))],
     [`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(codexAuth, CLOUD_KEY))],
     [`${id(1)}/${id(0x80d)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "anthropic", key: "sk-ant-api03-synthetic-selected-0000" }), CLOUD_KEY))],
+    [`${id(1)}/${id(0x80e)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "google", key: "AIza-synthetic-cloud-google-key-000000" }), CLOUD_KEY))],
+    [`${id(2)}/${id(0x80f)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "openrouter", key: "sk-or-v1-synthetic-cloud-openrouter-0" }), CLOUD_KEY))],
     // Saved but unselected in Cloud: copied, left inactive.
     [`${id(2)}/${id(0x80b)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "anthropic", key: "sk-ant-api03-synthetic-unselected-000" }), CLOUD_KEY))],
   ]);
@@ -79,9 +81,15 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     logins: new SubscriptionLoginStore(target, KEYRING, blobs),
   };
 
+  // S1 probe: Control already has a native, active Google key in workspace A.
+  const native = await deps.codingAgents.putApiKey({
+    workspaceId: id(0x201), organizationId: ORG_A,
+    modelProvider: "google", key: "AIza-synthetic-native-google-key-00000", label: "Native", actor: { kind: "user", userId: id(1) },
+  });
+  assert.equal(native.record.isActive, true);
   const plan = await copyCodingAgentCredentials(deps, { orgIds: null }, "plan");
   assert.equal(reads.length, 0, "plan never reads the object store");
-  assert.equal(plan.candidates, 10);
+  assert.equal(plan.candidates, 12);
 
   const report = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
   assert.deepEqual(report.rows, {
@@ -95,6 +103,8 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     [id(0x80a)]: "skipped:credential_not_usable",
     [id(0x80b)]: "copied",
     [id(0x80d)]: "copied",
+    [id(0x80e)]: "copied",
+    [id(0x80f)]: "copied",
     // C2: Alice has two openai logins, so her legacy openai object is ambiguous.
     [id(0x80c)]: "skipped:legacy_key_ambiguous",
   });
@@ -108,7 +118,10 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.deepEqual(rows.map((row) => `${row.auth_type} ${row.model_provider} ${row.workspace_id}`).sort(), [
     `byo_api_key anthropic ${id(0x201)}`,
     `byo_api_key anthropic ${id(0x201)}`,
+    `byo_api_key google ${id(0x201)}`,
+    `byo_api_key google ${id(0x201)}`,
     `byo_api_key openai ${id(0x201)}`,
+    `byo_api_key openrouter ${id(0x205)}`,
     `oauth_token anthropic ${id(0x205)}`,
     `provider_oauth openai ${id(0x201)}`,
   ]);
@@ -136,7 +149,14 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     assert.ok(rowsInGroup.filter((row) => row.is_active).length <= 1, group);
     assert.ok(rowsInGroup.filter((row) => row.harness_active).length <= 1, group);
   }
-  assert.deepEqual(report.selection, { groups: 3, active: 3, harness: 2, activeDemoted: 0, harnessDemoted: 0 });
+  // S1: the native Google key stays active; the unselected Cloud copy is inactive.
+  const google = flags.filter((row) => row.workspace_id === id(0x201) && row.model_provider === "google");
+  assert.deepEqual(google.filter((row) => row.is_active).map(plain), ["AIza-synthetic-native-google-key-00000"]);
+  // A group with no Cloud selection and nothing else active keeps the copy
+  // active (never zero) and is reported as a conflict.
+  const openrouter = flags.filter((row) => row.model_provider === "openrouter");
+  assert.deepEqual(openrouter.map((row) => row.is_active), [true]);
+  assert.deepEqual(report.selection, { groups: 5, active: 3, harness: 2, activeDemoted: 0, harnessDemoted: 0, selectionConflicts: 1 });
   assert.equal(await deps.logins.freshAuthFile(id(0x201), (await target.query<{ id: string }>(
     "SELECT id FROM coding_agent_credentials WHERE auth_type = 'provider_oauth'")).rows[0]!.id), codexAuth);
 
@@ -146,7 +166,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.equal(again.rows[id(0x805)], "already_present");
   assert.equal(again.rows[id(0x80b)], "already_present");
   const count = (await target.query<{ n: number }>("SELECT count(*)::int AS n FROM coding_agent_credentials")).rows[0]!.n;
-  assert.equal(count, 5);
+  assert.equal(count, 8);
   // The re-run re-applies the same selection.
   const activeAfter = (await target.query<{ secret_ciphertext: string }>(
     "SELECT secret_ciphertext FROM coding_agent_credentials WHERE workspace_id = $1 AND model_provider = 'anthropic' AND is_active", [id(0x201)])).rows;

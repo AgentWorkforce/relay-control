@@ -62,24 +62,33 @@ export type CredentialCopyReport = {
   /** Cloud provider_credentials id -> outcome. Ids only. */
   rows: Record<string, CredentialOutcome>;
   /** How Cloud's selection was applied (see applyCloudSelection). */
-  selection?: { groups: number; active: number; harness: number; activeDemoted: number; harnessDemoted: number };
+  /**
+   * selectionConflicts: groups where Cloud selected no copied row, no other
+   * Control row was active, and a copy had been auto-activated: it is kept
+   * active (never zero) and counted here for review.
+   */
+  selection?: { groups: number; active: number; harness: number; activeDemoted: number; harnessDemoted: number; selectionConflicts: number };
 };
 
 /**
  * The store seams auto-activate the first credential per provider, so the
- * copier sets the selection explicitly afterwards, in one transaction: per
- * (workspace, provider) every row is cleared, then is_active goes to the
- * row Cloud selected for LLM calls and harness_active to the row Cloud
- * selected for the sandbox (subscription logins and setup tokens only,
- * Control's CHECK). Cloud selects per user, Control per workspace: when
- * several Cloud users selected one, the most recently updated wins and the
- * others are counted as demoted. Unselected Cloud keys stay inactive.
+ * copier sets the selection explicitly afterwards, in one transaction, per
+ * (workspace, provider) and per flag (is_active = LLM calls, harness_active
+ * = sandbox, the latter for setup tokens and logins only):
+ * - Cloud's selected row was copied in this run: it gets the flag and every
+ *   other row in the group loses it.
+ * - Otherwise only this run's copies lose it; Control-native, relay_managed
+ *   and earlier rows are untouched. If that would leave no active LLM row
+ *   where a copy had been auto-activated and nothing else is active, the
+ *   copy keeps it and the group counts as a selection conflict.
+ * Cloud selects per user, Control per workspace: the most recently updated
+ * Cloud selection wins; the others are counted as demoted.
  */
 export async function applyCloudSelection(
   target: Database,
   copied: Array<{ row: Candidate; controlId: string }>,
 ): Promise<NonNullable<CredentialCopyReport["selection"]>> {
-  const summary = { groups: 0, active: 0, harness: 0, activeDemoted: 0, harnessDemoted: 0 };
+  const summary = { groups: 0, active: 0, harness: 0, activeDemoted: 0, harnessDemoted: 0, selectionConflicts: 0 };
   await target.transaction(async (tx) => {
     const ids = [...new Set(copied.map((entry) => entry.controlId))];
     const control = new Map((await tx.query<{ id: string; workspace_id: string; model_provider: string; auth_type: string }>(
@@ -99,24 +108,58 @@ export async function applyCloudSelection(
       [...entries].sort((a, b) => new Date(b.row.updated_at).getTime() - new Date(a.row.updated_at).getTime() || a.row.id.localeCompare(b.row.id))[0];
     for (const [key, entries] of groups) {
       const [workspaceId, provider] = key.split("\0") as [string, string];
+      const copiedIds = [...new Set(entries.map((entry) => entry.controlId))];
       const llm = entries.filter((entry) => entry.row.is_active);
       const sandbox = entries.filter((entry) =>
         entry.row.harness_active && (entry.authType === "oauth_token" || entry.authType === "provider_oauth"));
-      const active = newest(llm);
-      const harness = newest(sandbox);
-      // Clear first, then set: the partial unique indexes never see two.
-      await tx.query(
-        `UPDATE coding_agent_credentials SET is_active = false, harness_active = false, updated_at = now()
-          WHERE workspace_id = $1 AND model_provider = $2`,
-        [workspaceId, provider],
-      );
-      if (active) await tx.query("UPDATE coding_agent_credentials SET is_active = true WHERE id = $1", [active.controlId]);
-      if (harness) await tx.query("UPDATE coding_agent_credentials SET harness_active = true WHERE id = $1", [harness.controlId]);
+      for (const [column, chosen, candidates] of [
+        ["is_active", newest(llm), llm],
+        ["harness_active", newest(sandbox), sandbox],
+      ] as const) {
+        if (chosen) {
+          // Cloud's selection was copied in this run: it wins the group (the
+          // partial unique index allows one), clearing first.
+          await tx.query(
+            `UPDATE coding_agent_credentials SET ${column} = false, updated_at = now()
+              WHERE workspace_id = $1 AND model_provider = $2 AND id <> $3 AND ${column}`,
+            [workspaceId, provider, chosen.controlId],
+          );
+          await tx.query(`UPDATE coding_agent_credentials SET ${column} = true WHERE id = $1`, [chosen.controlId]);
+          if (column === "is_active") summary.active += 1;
+          else summary.harness += 1;
+          const demoted = new Set(candidates.map((entry) => entry.controlId)).size - 1;
+          if (column === "is_active") summary.activeDemoted += Math.max(0, demoted);
+          else summary.harnessDemoted += Math.max(0, demoted);
+          continue;
+        }
+        // Cloud selected nothing this run copied (nothing at all, or a row such
+        // as relay_managed that the copier does not write). Only this run's
+        // copies are deactivated; Control-native, relay_managed and earlier
+        // rows keep their flags. A group is never left with no selection when
+        // it had one: then the seam's pick stays and it is a conflict.
+        const others = await tx.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM coding_agent_credentials
+            WHERE workspace_id = $1 AND model_provider = $2 AND ${column} AND NOT (id::text = ANY($3::text[]))`,
+          [workspaceId, provider, copiedIds],
+        );
+        const flaggedCopies = await tx.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM coding_agent_credentials WHERE id::text = ANY($1::text[]) AND ${column}`,
+          [copiedIds],
+        );
+        if ((flaggedCopies.rows[0]?.n ?? 0) === 0) continue;
+        if ((others.rows[0]?.n ?? 0) > 0 || column === "harness_active") {
+          // Another row carries the selection, or (sandbox) none is required:
+          // an empty sandbox selection is valid. The auto-selected copies go
+          // back to inactive.
+          await tx.query(
+            `UPDATE coding_agent_credentials SET ${column} = false, updated_at = now() WHERE id::text = ANY($1::text[])`,
+            [copiedIds],
+          );
+        } else {
+          summary.selectionConflicts += 1;
+        }
+      }
       summary.groups += 1;
-      summary.active += active ? 1 : 0;
-      summary.harness += harness ? 1 : 0;
-      summary.activeDemoted += Math.max(0, new Set(llm.map((entry) => entry.controlId)).size - 1);
-      summary.harnessDemoted += Math.max(0, new Set(sandbox.map((entry) => entry.controlId)).size - 1);
     }
   });
   return summary;
