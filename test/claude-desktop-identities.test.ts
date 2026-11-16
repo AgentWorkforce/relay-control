@@ -30,7 +30,7 @@ async function claudeDesktop(t: TestContext) {
   const env = await copilotDesktopSetup(t);
   const parent = await env.desktopSignIn({ hostName: "sf-mini" });
   const signer = await claudeSigner();
-  const sourceId = randomUUID();
+  const sourceId = "desktop-source-claude";
   const sid = randomUUID();
   const chat = env.world.addAgent("claude-chat", { source: "relay-desktop", owner_hash: ownerHash(env.ownerId) });
   env.world.addAgent("peer");

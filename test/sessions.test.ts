@@ -729,6 +729,19 @@ test("History read tokens are cached per user, organization and workspace", asyn
  * for one authorized identity. See docs/sessions-read-api.md. */
 const READ_API_UNSUPPORTED_MESSAGE = "The configured session backend does not serve this view";
 
+test("read API: behind relaygate a dashboard read names browser for a cookie and device for a bearer", async (t) => {
+  const env = await setup(t);
+  env.config.sessionReadApi.mintReaderKind = true;
+  const token = await env.login(env.ownerId, env.alpha);
+  const path = `/cloud/api/v1/workspaces/${env.alpha}/sessions`;
+  assert.equal((await call(env.origin, path, { token })).status, 200);
+  const cookie = await fetch(`${env.origin}${path}`, { headers: { cookie: `agent_relay_session=${token}` } });
+  assert.equal(cookie.status, 200);
+  await cookie.body?.cancel();
+  // A pair minted for one reader kind is never reused for another.
+  assert.deepEqual(env.history.handoffs.map((body) => body.reader_kind), ["device", "browser"]);
+});
+
 test("read API: the handoff names one identity and reads carry the token it answers", async (t) => {
   const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);
@@ -1110,7 +1123,7 @@ test("read API: callers without an sh_at_ token read through the same handoff", 
   const env = await setup(t);
   const read = await readWorkspaceHistory(env.config, {
     userId: env.ownerId, organizationId: env.organizationId,
-    workspaceId: env.alpha, callerToken: "synthetic-admitted-oauth-token",
+    workspaceId: env.alpha, callerToken: "synthetic-admitted-oauth-token", readerKind: "mcp",
   }, "/v1/sessions", new URLSearchParams());
   assert.equal(read.status, "ok");
   if (read.status === "ok") assert.equal((read.body.sessions as any[])[0].sessionId, "alpha-1");

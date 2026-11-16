@@ -105,3 +105,11 @@ export const CONTROL_SEQUENCES: readonly string[] = [
   "desktop_feed_publish_seq",
   "desktop_feed_publisher_tokens_seq_seq",
 ];
+
+// Tables a migration creates that the runtime role must NOT be granted:
+// owner-only state written by operator tools. grantRuntimeDatabaseRole grants
+// CONTROL_TABLES only, so these stay invisible to the runtime role.
+export const OWNER_ONLY_TABLES: readonly string[] = [
+  // scripts/cloud-import: the Cloud identity import ledger (0063).
+  "cloud_import_ledger",
+];

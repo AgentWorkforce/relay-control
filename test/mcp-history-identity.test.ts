@@ -3,6 +3,7 @@ import test, { type TestContext } from "node:test";
 import type { SelfhostConfig } from "../src/config.js";
 import { historyReader } from "../src/mcp/context.js";
 import { forgetSessionReadTokens } from "../src/mcp/session-read-reader.js";
+import { mcpReaderMarker } from "../src/session-read.js";
 import type { Principal } from "../src/store.js";
 
 const CONTROL = "https://control.example.com";
@@ -14,7 +15,7 @@ const WORKSPACE_HEADER = "x-relayhistory-workspace-id";
 const originalFetch=globalThis.fetch;
 const padded = (value: string) => value.replace(/[^A-Za-z0-9_-]/g, "_").padEnd(44, "x");
 
-type Issue = { body: Record<string, string>; bearer: string | null; path: string };
+type Issue = { body: Record<string, string>; bearer: string | null; path: string; marker?: string | null };
 type Read = { url: URL; bearer: string | null };
 type Options = {
   ttlMs?: number;
@@ -53,7 +54,7 @@ function fake(t: TestContext, options: Options = {}) {
     const bearer = new Headers(init.headers).get("authorization");
     if (url.origin===CONTROL && /\/session-read\/(session|refresh)$/.test(url.pathname)) {
       const body = JSON.parse(String(init.body)) as Record<string, string>;
-      issues.push({ body, bearer, path: url.pathname });
+      issues.push({ body, bearer, path: url.pathname, marker: new Headers(init.headers).get("x-relaycontrol-session-reader") });
       const status = options.issueStatus?.(url.pathname) ?? 200;
       if (status !== 200) return new Response("", { status });
       serial += 1;
@@ -111,7 +112,18 @@ test("the setting off leaves MCP reads on the existing History path", async (t) 
   assert.equal(seen.handoffs.length, 1);
   assert.equal(seen.handoffs[0]!.bearer, `Bearer ${SECRET}`);
   assert.ok(!JSON.stringify(seen.handoffs[0]!.body).includes("sh_at_user_a"), "the caller token never reaches the handoff");
+  assert.equal("reader_kind" in seen.handoffs[0]!.body, false, "without relaygate the mint body is unchanged");
   assert.match(seen.history[0]!.bearer!, /^Bearer rth_at_read_/);
+});
+
+test("behind relaygate the in-process MCP mint names the mcp reader kind", async (t) => {
+  const seen = fake(t);
+  const cfg = config(false);
+  cfg.sessionReadApi.mintReaderKind = true;
+  await historyReader(cfg, principal("user-a"), workspace("ws-a", "org-a"), "sh_at_user_a")("/v1/sessions");
+  assert.equal(seen.handoffs.length, 1);
+  assert.equal(seen.handoffs[0]!.body.reader_kind, "mcp");
+  assert.equal("readerKind" in seen.handoffs[0]!.body, false);
 });
 
 test("each MCP read carries only the calling user's token, never a shared credential", async (t) => {
@@ -132,6 +144,8 @@ test("each MCP read carries only the calling user's token, never a shared creden
     [[true, "ws-a"], [true, "ws-b"]],
   );
   assert.ok(seen.reads[0]!.bearer!.includes("user-a") && seen.reads[1]!.bearer!.includes("user-b"));
+  // The hop proves it is the MCP reader with the secret-derived marker, never the secret.
+  assert.deepEqual(seen.issues.map(({ marker }) => marker), [mcpReaderMarker(SECRET), mcpReaderMarker(SECRET)]);
   for (const read of seen.reads) {
     assert.match(read.bearer!, /^Bearer rth_at_read_/);
     assert.ok(!read.bearer!.includes(SECRET), "the service secret never reaches a read");
@@ -189,6 +203,7 @@ test("a near-expiry token is refreshed once, sending only the held refresh token
   assert.match(seen.issues[1]!.body.refreshToken!, /^rth_rt_read_user-a_1/);
   assert.equal(seen.issues[1]!.bearer,"Bearer sh_at_user_a");
   assert.deepEqual(Object.keys(seen.issues[1]!.body),["refreshToken"]);
+  assert.equal(seen.issues[1]!.marker,mcpReaderMarker(SECRET));
 });
 
 test("every selected-reader501 stays unsupported with zero History calls regardless of reason",async t=>{
