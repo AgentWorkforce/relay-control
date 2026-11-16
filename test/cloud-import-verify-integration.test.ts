@@ -473,14 +473,20 @@ fixtureTest("equal-count credential fingerprint or blob corruption fails natural
   const backendMismatch=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
   assert.equal(backendMismatch.credentialCopy,"failed");
+  const backendDetail=backendMismatch.findings.find((f) => f.kind === "credential_natural_keys")!.detail as {contentFailureReasons:Record<string,number>};
+  assert.ok(backendDetail.contentFailureReasons.blobBackendMismatch! > 0);
+  assert.equal(backendDetail.contentFailureReasons.targetReadOrDecryptFailed,0);
   await target.query("UPDATE coding_agent_credentials SET blob_backend='postgres' WHERE auth_type='provider_oauth'");
   await target.query("UPDATE coding_agent_credentials SET key_fingerprint=repeat('0',64) WHERE auth_type='byo_api_key' AND model_provider='openai' AND workspace_id=$1",[id(0x201)]);
+  await target.query("UPDATE coding_agent_credentials SET key_fingerprint=repeat('0',64) WHERE auth_type='provider_oauth'");
   await target.query("UPDATE coding_agent_credential_blobs SET envelope='{}'");
   const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
   assert.equal(report.ok,false);
   assert.equal(report.credentialCopy,"failed");
   assert.equal(report.findings.find((f) => f.kind === "credential_natural_keys")!.ok,false);
+  const reasons=(report.findings.find((f) => f.kind === "credential_natural_keys")!.detail as {contentFailureReasons:Record<string,number>}).contentFailureReasons;
+  assert.ok(reasons.fingerprintMismatch! > 0);assert.ok(reasons.targetReadOrDecryptFailed! > 0);
   assert.ok(!JSON.stringify(report).includes("rt-synthetic-only"));
   assert.ok(!JSON.stringify(report).includes("sk-synthetic"));
 });
@@ -793,3 +799,28 @@ for (const relation of ["relay_node_credentials","relay_launch_credentials"]) {
     assert.ok(!missing.findings.some((finding) => finding.kind === "table"));
   });
 }
+
+fixtureTest("target content diagnostics distinguish copied-row failures from intentional source exclusions",async () => {
+  const fixture=await copiedFixture();
+  const controlId=fixture.copy.controlIds[id(0x803)]!;
+  const before=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(before.credentialCopy,"verified");
+  // Ciphertext stays valid: prove exact content checks independently of key
+  // identity, source exclusions and read/decrypt exceptions.
+  const {encryptSecret}=await import("../src/crypto.js");
+  const marker="synthetic-private-wrong-content";
+  await target.query("UPDATE coding_agent_credentials SET status='error',secret_ciphertext=$1 WHERE id=$2",
+    [encryptSecret(marker,fixtureKeyring.active),controlId]);
+  const after=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  const detail=after.findings.find((f) => f.kind === "credential_natural_keys")!.detail as {
+    contentFailures:number;sourceFailures:number;unresolvedSourceSkips:number;sourceChecksum:string;targetChecksum:string;
+    contentFailureReasons:Record<string,number>};
+  assert.equal(after.credentialCopy,"failed");assert.equal(detail.contentFailures,1);
+  assert.equal(detail.sourceFailures,0);assert.equal(detail.unresolvedSourceSkips,0);
+  assert.equal(detail.sourceChecksum,detail.targetChecksum,"natural key equality does not establish content equality");
+  assert.deepEqual(detail.contentFailureReasons,{organizationMismatch:0,statusNotConnected:1,fingerprintMismatch:0,
+    contentMismatch:1,blobBackendMismatch:0,targetReadOrDecryptFailed:0});
+  assert.ok(!JSON.stringify(after).includes(marker));assert.ok(!JSON.stringify(detail).includes(controlId));
+});
