@@ -402,6 +402,7 @@ fixtureTest("latest Cloud selection wins across users and demotion counters reco
 
 fixtureTest("wrong Cloud credential selection fails even with unchanged cardinality and content",async () => {
   const fixture=await copiedFixture();
+  assert.ok(fixture.copy.selectionDiverged,"the actual producer reports copy-time divergence");
   const rows=(await target.query("SELECT id,is_active FROM coding_agent_credentials WHERE workspace_id=$1 AND model_provider='anthropic' AND auth_type='byo_api_key'",[id(0x201)])).rows;
   const inactive=rows.find((row) => !row.is_active)!;
   await target.query("UPDATE coding_agent_credentials SET is_active=false WHERE workspace_id=$1 AND model_provider='anthropic'",[id(0x201)]);
@@ -411,8 +412,22 @@ fixtureTest("wrong Cloud credential selection fails even with unchanged cardinal
   assert.ok(report.findings.filter((f) => f.kind === "credential_selection").every((f) => f.ok));
   assert.equal(report.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
   assert.equal(report.findings.find((f) => f.kind === "credential_cloud_selection")!.ok,false);
-  assert.equal(report.findings.find((f) => f.kind === "selection_diverged")!.ok,true,"visible divergence cannot waive a wrong newly written selection");
+  const difference=report.findings.find((f) => f.kind === "selection_diverged")!;
+  assert.equal(difference.ok,false,"copy-time counters are stale after the target mutation");
+  assert.equal((difference.detail as {producerCounter:string}).producerCounter,"mismatched");
   assert.equal(report.ok,false);
+  assert.equal(report.credentialCopy,"failed");
+  // Isolate the selection gate from the independently fatal counter mismatch.
+  // An absent optional diagnostic still cannot waive incorrect written flags.
+  const withoutCounter={...fixture.copy};delete withoutCounter.selectionDiverged;
+  const independent=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:withoutCounter,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  const diagnostic=independent.findings.find((f) => f.kind === "selection_diverged")!;
+  assert.equal(diagnostic.ok,true);
+  assert.equal((diagnostic.detail as {producerCounter:string}).producerCounter,"not_reported");
+  assert.equal(independent.findings.find((f) => f.kind === "credential_cloud_selection")!.ok,false);
+  assert.equal(independent.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
+  assert.equal(independent.credentialCopy,"failed");assert.equal(independent.ok,false);
 });
 
 fixtureTest("written-only consumer preserves a real Control-deactivated login on an untouched rerun",async () => {
@@ -563,6 +578,8 @@ fixtureTest("producer selection-divergence counters must match independent count
   const initial=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
   const difference=initial.findings.find((row) => row.kind === "selection_diverged")!;
+  assert.equal(difference.ok,true);
+  assert.equal((difference.detail as {producerCounter:string}).producerCounter,"matched","the actual producer counter matches independent reads");
   const counts=(difference.detail as {perOrg:Record<string,{active:number;harness:number}>}).perOrg;
   assert.ok(Object.keys(counts).length > 0,"the initial Cloud/Control demotions stay visible");
   const report={...fixture.copy,selectionDiverged:structuredClone(counts)};

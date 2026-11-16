@@ -28,7 +28,7 @@ an empty producer selection summary cannot waive a changed Control choice.
 The independent content/outcome gates still apply, so `control_newer` is not
 made acceptable by excluding it from selection expectations.
 
-The paired harness uses the producer's actual revision `.28` reports and
+The paired harness uses the producer's actual revision `.29` reports and
 `runProducer` path, including its fresh before-write checkpoint validation.
 It exercises a real local Control login deactivated between copies and rejects
 a relabelled after-checkpoint against the actual run receipt. Workspace
@@ -42,8 +42,10 @@ for metadata and independently linked copied credentials. These are visible
 diagnostics; wrong newly written selections and all existing content, linkage,
 cardinality and convergence checks remain fatal. Optional copier counters must
 exactly match the independently read sparse per-org counts. See
-[SELECTION_DIVERGENCE.md](SELECTION_DIVERGENCE.md) for the shared field shape,
-counting unit and the explicit `not_reported` status before the producer adds it.
+[SELECTION_DIVERGENCE.md](SELECTION_DIVERGENCE.md) for the shared field shape
+and counting unit. The actual `.29` producer counter is independently checked
+and reported as `matched` or `mismatched`. An absent optional counter remains
+explicitly `not_reported`; it cannot waive wrong newly written selections.
 
 From revision `.21`, duplicate subscription logins are resolved from decrypted
 source account identities: freshest `updated_at`, then lowest source UUID.
