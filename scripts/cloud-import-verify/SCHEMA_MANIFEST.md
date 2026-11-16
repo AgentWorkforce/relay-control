@@ -52,6 +52,12 @@ The compact file has one object per line so a named constraint/index diff is
 reviewable. A changed PostgreSQL deparser representation is a failure to
 investigate, not an automatic normalization or waiver.
 
+The manifest is a PostgreSQL 15 catalog fingerprint. Generate and verify it with
+PostgreSQL 15 binaries (`CLOUD_VERIFY_PG_BIN` pointing at a 15 `bin` directory,
+for example `/usr/lib/postgresql/15/bin`). A different major reports unexpected
+objects and is not a schema change; 18, for example, records NOT NULL constraints
+in `pg_constraint`. CI's harness job installs PostgreSQL 15 for this reason.
+
 Every `verifyImport` report contains normalized `scope` (lowercase, sorted,
 deduplicated UUIDs, or `orgIds:null` for all) and `sourceOrganizationCensus`.
 The census streams every source organization independently of the requested
