@@ -63,6 +63,24 @@ test("installation mint signs a valid RS256 App JWT, pins GitHub and refuses red
   assert.equal(result.accessToken, "ghs_installation-token");
 });
 
+test("installation expiry tolerates GitHub clock skew and bounds the local cache lifetime", async (t) => {
+  const now = Date.parse("2026-11-16T12:00:00Z");
+  t.mock.method(Date, "now", () => now);
+  for (const lifetime of [3_720_000, 86_400_000]) {
+    const result = await mintGithubInstallationToken(app, "41", async () => json({
+      token: "ghs_skew-test", expires_at: new Date(now + lifetime).toISOString(),
+    }));
+    assert.equal(result.expiresAt.getTime(), now + 3_600_000);
+  }
+  const shorter = await mintGithubInstallationToken(app, "41", async () => json({
+    token: "ghs_short-test", expires_at: new Date(now + 1_800_000).toISOString(),
+  }));
+  assert.equal(shorter.expiresAt.getTime(), now + 1_800_000, "never extend GitHub's advertised expiry");
+  await assert.rejects(mintGithubInstallationToken(app, "41", async () => json({
+    token: "ghs_near-expiry", expires_at: new Date(now + 120_000).toISOString(),
+  })), /invalid_token_response/);
+});
+
 test("mint errors expose only fixed codes and classify retryable failures", async () => {
   for (const [status, expected] of [[401, 409], [403, 409], [404, 409], [422, 409], [429, 503], [500, 503], [302, 503]]) {
     await assert.rejects(mintGithubInstallationToken(app, "41", async () => json({ message: "echoed-private-key-or-jwt" }, status)), error =>
@@ -72,8 +90,7 @@ test("mint errors expose only fixed codes and classify retryable failures", asyn
     error instanceof GithubAppTokenError && error.status === 503);
   await assert.rejects(mintGithubInstallationToken(app, "41", async () => { throw new Error(pem); }), error =>
     error instanceof GithubAppTokenError && !error.message.includes("PRIVATE KEY"));
-  for (const body of [{}, null, { token: "secret", expires_at: "bad" }, { token: "secret", expires_at: new Date(0).toISOString() },
-    { token: "secret", expires_at: new Date(Date.now() + 86_400_000).toISOString() }]) {
+  for (const body of [{}, null, { token: "secret", expires_at: "bad" }, { token: "secret", expires_at: new Date(0).toISOString() }]) {
     await assert.rejects(mintGithubInstallationToken(app, "41", async () => json(body)), /invalid_token_response/);
   }
   await assert.rejects(mintGithubInstallationToken(app, "41", async () => new Response("not-json", { status: 201 })), /invalid_token_response/);

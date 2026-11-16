@@ -13,7 +13,10 @@ invalid RSA key fails startup with a fixed message. Config retains a parsed key
 object, not the PEM text. Never print the config or private key. This change
 does not provision, retrieve, rotate, or copy any deployed secret.
 
-When configured, the GitHub provider catalog reports `authMode: APP`. Existing
+When configured, the GitHub provider catalog reports `authMode: APP`, meaning
+import-only credentials with no interactive connect flow. `configured: true`
+and `configuredBy: operator` report that the signing key is available; they
+do not advertise an OAuth connect flow. Existing
 OAuth rows continue to work with their OAuth refresh mechanism. New OAuth
 connects for GitHub are disabled in App mode. Installing/relinking a new App
 installation is a separate setup flow; this change supports existing imported
@@ -54,6 +57,9 @@ integration credential, not a repository-scoped run credential.
 
 Tokens are cached encrypted in Postgres across restarts and instances, reused
 until two minutes before expiry, and minted again on expiry or `forceRefresh`.
+Cache expiry is the earlier of GitHub's advertised expiry and one hour after
+receipt on the local clock, so a server clock behind GitHub does not reject a
+valid token for exceeding the local one-hour window.
 Disconnect removes the connection/cache. Public connection records include
 `installationId` and `refreshable`, never tokens. GitHub response bodies,
 transport errors, JWTs and signing keys never enter error messages or audits.

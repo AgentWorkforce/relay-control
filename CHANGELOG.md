@@ -10,6 +10,8 @@ assigned at release.
   their installation IDs and mint replacement tokens without reconnecting.
   Tokens are cached encrypted and refreshed under the connection row lock.
   See [GitHub App credentials](docs/github-app-connections.md).
+- Changed: connection edit versions include auth mode and installation ID;
+  existing clients must refresh their opaque connection version once after upgrading.
 
 - Added: `SELFHOST_RELAYGATE_PUBLIC_URL` (unset by default) for gate-only
   installs, where relaygate is the only public way into Relaycast. When set,

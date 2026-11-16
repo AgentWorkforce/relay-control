@@ -60,9 +60,12 @@ export async function mintGithubInstallationToken(
   }
   const data = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
   const expiresAt = typeof data.expires_at === "string" ? Date.parse(data.expires_at) : NaN;
+  const receivedAt = Date.now();
   if (typeof data.token !== "string" || !data.token.trim() || /[\s\u0000-\u001f\u007f]/u.test(data.token) ||
-      !Number.isFinite(expiresAt) || expiresAt <= Date.now() + 120_000 || expiresAt > Date.now() + 3_660_000) {
+      !Number.isFinite(expiresAt) || expiresAt <= receivedAt + 120_000) {
     throw new GithubAppTokenError("invalid_token_response", 503);
   }
-  return { accessToken: data.token, expiresAt: new Date(expiresAt) };
+  // GitHub's clock may be ahead of ours. Bound cache lifetime locally rather
+  // than rejecting every otherwise valid token until the clocks converge.
+  return { accessToken: data.token, expiresAt: new Date(Math.min(expiresAt, receivedAt + 3_600_000)) };
 }
