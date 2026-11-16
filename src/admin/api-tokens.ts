@@ -145,6 +145,7 @@ type Row = {
 export type ApiTokenIntrospection = {
   tokenId: string;
   workspaceId: string;
+  cloudRelayWorkspaceId: string | null;
   organizationId: string;
   purpose: ApiTokenPurpose;
   scopes: string[];
@@ -808,6 +809,7 @@ export class ApiTokenStore {
     const result = await this.database.query<{
       id: string;
       workspace_id: string;
+      cloud_relay_workspace_id: string | null;
       organization_id: string;
       purpose: ApiTokenPurpose;
       scopes: string[];
@@ -818,7 +820,8 @@ export class ApiTokenStore {
       revoked: boolean;
       expired: boolean;
     }>(
-      `SELECT t.id, t.workspace_id, w.organization_id, t.purpose, t.scopes, t.agent_name, t.aud,
+      `SELECT t.id, t.workspace_id, w.cloud_relay_workspace_id, w.organization_id,
+              t.purpose, t.scopes, t.agent_name, t.aud,
               t.created_at, t.expires_at,
               t.revoked_at IS NOT NULL AS revoked,
               (t.expires_at IS NOT NULL AND t.expires_at <= now()) AS expired
@@ -841,6 +844,7 @@ export class ApiTokenStore {
     return {
       tokenId: row.id,
       workspaceId: row.workspace_id,
+      cloudRelayWorkspaceId: row.cloud_relay_workspace_id,
       organizationId: row.organization_id,
       purpose: row.purpose,
       scopes: row.scopes,
