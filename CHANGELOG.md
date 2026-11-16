@@ -23,6 +23,11 @@ assigned at release.
   `deliver` frames. Audited as `relay_node.socket.opened`,
   `relay_node.socket.closed` and `relay_node.launch_credential.attached`.
   Unset, nothing changes. See docs/relay-node-credential.md.
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set) every
+  Sessions read-token mint names the reader kind (`browser`, `device` or
+  `mcp`) from how the caller authenticated, so relaygate can tell a person's
+  own reads from agent reads on their behalf. Other installs send the same
+  mint body as before. See [Sessions read API](docs/sessions-read-api.md).
 - Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), every
   agent launch through `spawn_relay_agent` mints a one-time `sh_lt_` launch
   credential (10 minutes, bound to the workspace, node, agent name and
@@ -62,7 +67,18 @@ assigned at release.
   and is unaffected. The events-shim temporary workspace
   (`POST /t/<mcp token>/workspace`) is also withheld (`404 not_found`), so
   `events-shim setup` on a machine not signed in here cannot start its own
-  core. Unset, both are byte-for-byte as before. See docs/identity.md
+  core. The person credential
+  (`POST /api/v1/workspaces/{id}/messaging/identity/credential`) answers
+  `403 gate_only` with both urls, registers no person identity on Relaycast
+  (the desktop enrols its own name at relaygate `/v1/register` with its device
+  token) and is audited as `workspace.person_credential.withheld`; the
+  relay-node broker's enrol (`POST /relay-node/v1/nodes`) keeps the node
+  token in Control (see the relay-node entry above), so no node token leaves. MCP join
+  and spawn are unchanged (their participant tokens stay server-side).
+  Person identities Control newly registers server-side (messaging
+  conversation sends, support reply notices) are named with the `control-`
+  prefix, which relaygate reserves, while existing identities keep their
+  names. Unset, all of these are byte-for-byte as before. See docs/identity.md
   ("Gate-only installs").
 - Added: `send_relay_message` results include `recipient_card` when the
   recipient has an agent card (`has_card`): `{ description, skills, version, updated_at, note }`, where `description` is null

@@ -854,12 +854,15 @@ startup. `GET /readyz` shows the value in effect as
 
 While the database answers nothing changes: every introspection runs the
 query, and the hold is never consulted. Each active answer for an `sh_at_`
-token is remembered in memory, keyed by the token hash (never the token),
-with the time of the check; an `unknown`, `revoked` or `expired` answer
-removes it. At most 10000 tokens are remembered per process, least recently
-used first out. When the query then fails with a connection-class database
-error (connection refused, reset or timed out, DNS failure, pool connect
-timeout, connection terminated, SQLSTATE class `08`, `57P01`-`57P03`,
+token adds or refreshes that audience's in-memory confirmation, keyed by the
+token hash (never the token), with the time of the check; an `unknown`,
+`revoked` or `expired` answer removes every audience for the token. At most
+10000 tokens are remembered per process, least recently used first out. A
+live `audience` refusal removes that audience's earlier confirmation while
+retaining the token's other audiences. When the query then fails with a
+connection-class
+database error (connection refused, reset or timed out, DNS failure, pool
+connect timeout, connection terminated, SQLSTATE class `08`, `57P01`-`57P03`,
 `53300`), and only then, the remembered answer for that token is served if it
 is at most the hold old and the token has not expired. Held answers stop one
 second before the hold or the token would run out, so a verifier never reads
@@ -870,9 +873,11 @@ replica remembers only the tokens it verified itself.
 
 The verifier sees the normal active answer plus `held: true`, with `exp`
 clamped to the earlier of the token's expiry and the end of the hold. The
-audience and `workspace` checks still run against the request. A request that
-sends `machine` is never held: machine ownership needs the node-claims query,
-so it still fails with 500. `sh_wk_` and `sh_fr_` tokens are never held.
+requested audience must have its own still-current authoritative active
+answer, and the `workspace` check still runs against the request. A request
+that sends `machine` is never held: machine ownership needs the node-claims
+query, so it still fails with 500. `sh_wk_` and `sh_fr_` tokens are never
+held.
 
 The bound this accepts: a revocation, membership removal or workspace removal
 that happened after the token's last successful introspection and before the
@@ -1261,21 +1266,33 @@ hands no Relaycast workspace key to anything outside the cluster:
 - The events-shim temporary workspace (`POST /t/<mcp token>/workspace`) is not
   issued ([events-shim.md](events-shim.md#temporary-agent-relay-workspace)).
 
-Per-identity credentials are unchanged, because relaygate can apply policy to
-each one: the person credential
-(`POST /api/v1/workspaces/{id}/messaging/identity/credential`, the caller's
-own agent token), and MCP join and spawn, which deal in per-agent participant
-tokens and never the workspace key.
+Agents never hold a Relaycast credential on a gate-only install, so the
+per-identity handouts stop too:
 
-Relay nodes do not hold their Relaycast node token either. The relay-node
-broker's enrol answer carries no token; Control keeps it sealed (migration
-0059 `relay_node_credentials`) and the node connects to Control's
-`GET /relay-node/v1/ws` bridge instead of Relaycast's node socket. The bridge
-attaches each launch's credential (below) to the spawn invocation it forwards
-as `input.launch_credential` and does not forward `deliver` frames. See
-[relay-node-credential.md](relay-node-credential.md#gate-only-installs).
-Agent Relay Desktop claims such a node by its enrolled name instead of a node
-token ([Claiming the node](relay-node-credential.md#claiming-the-node)).
+- The person credential
+  (`POST /api/v1/workspaces/{id}/messaging/identity/credential`) answers
+  `403 gate_only` with `urls.relaycastUrl` and `urls.relaygateUrl`, audited as
+  `workspace.person_credential.withheld`. Control registers no person identity
+  on Relaycast: the desktop enrols the name it chooses at relaygate
+  `/v1/register` with its Control device token.
+- Relay nodes do not hold their Relaycast node token either. The relay-node
+  broker's enrol answer carries no token; Control keeps it sealed (migration
+  0059 `relay_node_credentials`) and the node connects to Control's
+  `GET /relay-node/v1/ws` bridge instead of Relaycast's node socket. The
+  bridge attaches each launch's credential (below) to the spawn invocation it
+  forwards as `input.launch_credential` and does not forward `deliver` frames.
+  The broker's read routes are unchanged. See
+  [relay-node-credential.md](relay-node-credential.md#gate-only-installs).
+  Agent Relay Desktop claims such a node by its enrolled name instead of a
+  node token ([Claiming the node](relay-node-credential.md#claiming-the-node)).
+- MCP join and spawn keep their participant tokens server-side and return
+  none to callers, so they are unchanged.
+- Person identities Control registers server-side (messaging conversation
+  sends, customer-support reply notices) get names starting `control-`.
+  relaygate reserves that prefix at `/v1/register`, so a desktop-enrolled name
+  never collides with one. Only new registrations get it: identities that
+  already exist keep their stored names and are not renamed.
+
 Unset, nothing changes.
 
 #### Relay launch credentials
