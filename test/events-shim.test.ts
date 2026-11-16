@@ -290,7 +290,9 @@ test("a duplicate idempotency key is stored once", async (t) => {
   assert.equal(first.status, 202);
   const again = await p.post(shim.webhook_url, { n: 1 }, { "idempotency-key": "delivery-1" });
   assert.equal(again.status, 200);
-  assert.deepEqual(again.body, { ok: true, duplicate: true, event_id: first.body.event_id, seq: first.body.seq });
+  const { message, ...duplicate } = again.body as { message?: unknown };
+  assert.deepEqual(duplicate, { ok: true, duplicate: true, event_id: first.body.event_id, seq: first.body.seq });
+  assert.match(String(message), /Idempotency-Key/);
   const next = await p.post(shim.webhook_url, { n: 2 }, { "idempotency-key": "delivery-2" });
   assert.equal(next.body.seq, 2);
   assert.equal((await p.database.query("SELECT 1 FROM events_shim_events")).rows.length, 2);
