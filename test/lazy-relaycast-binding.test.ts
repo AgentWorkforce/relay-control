@@ -169,6 +169,31 @@ test("a stale durable claim is reclaimed with the stable workspace idempotency k
   opaqueIdempotencyKey(keys[0], workspaceId);
 });
 
+test("fresh workspaces receive unrelated idempotency capabilities", async (t) => {
+  const keys: Array<string | undefined> = [];
+  const provisioner: RelaycastProvisioner = {
+    async create(_name, idempotencyKey) {
+      keys.push(idempotencyKey);
+      const suffix = keys.length;
+      return { id: `rw_unrelated_${suffix}`, apiKey: `rk_unrelated_${suffix}` };
+    },
+    async remove() {},
+  };
+  const { database, store, organization, workspaceId } = await fixture(t, provisioner);
+  const otherWorkspaceId = "00000000-0000-4000-8000-000000000067";
+  await database.query(
+    "INSERT INTO workspaces (id, organization_id, name) VALUES ($1, $2, 'Another imported workspace')",
+    [otherWorkspaceId, organization.id],
+  );
+
+  assert.equal((await store.relaycastBinding(workspaceId))!.relaycastWorkspaceId, "rw_unrelated_1");
+  assert.equal((await store.relaycastBinding(otherWorkspaceId))!.relaycastWorkspaceId, "rw_unrelated_2");
+  assert.equal(keys.length, 2);
+  const first = opaqueIdempotencyKey(keys[0], workspaceId);
+  const second = opaqueIdempotencyKey(keys[1], otherWorkspaceId);
+  assert.notEqual(first, second);
+});
+
 test("a stale-claim loser does not delete the keyed workspace owned by the live replacement claim", async (t) => {
   let createAttempt = 0;
   let enterFirst!: () => void;
