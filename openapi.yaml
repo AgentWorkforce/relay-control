@@ -7798,20 +7798,37 @@ paths:
     get:
       operationId: listReplicasEnvironments
       tags: [replicas]
+      summary: Environments the connected Replicas key can use. Owner/admin person only.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{environments: [...]}"
+        "409":
+          description: Replicas is not connected
+        "429":
+          description: Replicas rate limit reached
+        "502":
+          description: Provider failed; no provider body is returned
+  /api/v1/workspaces/{workspaceId}/replicas/environment-policies:
+    get:
+      operationId: listReplicasEnvironmentPolicies
+      tags: [replicas]
       summary: Environment-level MCP policies for this workspace (stored; no provider call). Owner/admin person only.
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
       responses:
         "200":
-          description: "{mcpUrl, organizationId, allEnvironments, environments: [{environmentId, name, enabled, status: disabled|enabled|registered, stale, registeredMcpId, bindings, creators: [{creatorId, userId, emailHint}]}]}; email hints are masked"
+          description: "{mcpUrl, organizationId, allEnvironments, environments: [{environmentId, name, enabled, status: disabled|enabled|registered, stale, registeredMcpId, bindings, creators: [{creatorId, userId, emailHint}], pendingCreators: [{creatorId, emailHint, lastSeenAt, count}]}]}; email hints are masked; pendingCreators are the unmapped creators whose calls were refused, newest first, at most 50 per environment"
         "403":
           description: Not a current owner or admin, or not a person credential
   /api/v1/workspaces/{workspaceId}/replicas/environments/sync:
     post:
       operationId: syncReplicasEnvironments
       tags: [replicas]
-      summary: Rediscover the key's environments (stored disabled). When all-environments mode is on, newly discovered environments are enabled and registered. Owner/admin person only.
+      summary: Rediscover the key's environments (stored disabled). When all-environments mode is on, newly discovered environments are enabled and registered here; nothing runs automatically. Owner/admin person only.
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
@@ -7824,7 +7841,7 @@ paths:
     put:
       operationId: updateReplicasEnvironmentPolicy
       tags: [replicas]
-      summary: Enable or disable one discovered environment and replace its creator mapping. Creators must be current members of the organization. Owner/admin person only.
+      summary: Enable or disable one discovered environment and replace its creator mapping. Creators must be current members of the organization; mapping a creator removes its pending entry. Disabling releases the environment's enrolled bindings in this workspace without a tombstone; they enrol again once the environment is enabled. Owner/admin person only.
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
@@ -7863,7 +7880,7 @@ paths:
     post:
       operationId: registerReplicasEnvironmentMcp
       tags: [replicas]
-      summary: "Enable the selected environments and register the agent-relay-replica HTTP MCP entry ({name, transport: http, config: {url, headers: {}, auth: {type: workspace_identity, audience: url}}}) in each. {all: true} also enables environments discovered later. Owner/admin person only."
+      summary: "Enable the selected environments and register the agent-relay-replica HTTP MCP entry ({name, transport: http, config: {url, headers: {}, auth: {type: workspace_identity, audience: url}}}) in each. {all: true} also enables environments discovered later, on the next sync (POST .../environments/sync). Owner/admin person only."
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       requestBody:
         required: true
@@ -7875,7 +7892,7 @@ paths:
                 - { type: object, required: [environmentIds], properties: { environmentIds: { type: array, minItems: 1, maxItems: 100, items: { type: string, format: uuid } } } }
       responses:
         "200":
-          description: "{discovery?, environments: [{environmentId, status: registered|registration_failed|not_found|enabled_elsewhere|stale_connection|disabled, retryable?}]}"
+          description: "{discovery?, environments: [{environmentId, status: registered|registration_failed|registration_unconfirmed|not_found|enabled_elsewhere|stale_connection|disabled, retryable?}]}. registration_failed: the provider rejected the entry (400, 401, 402, 403, 404, 422, 429). registration_unconfirmed: the outcome is unknown; the provider may already hold an agent-relay-replica entry for that environment; check the environment's MCP entries in Replicas before retrying."
         "400":
           description: Invalid selection
         "409":
@@ -7883,7 +7900,7 @@ paths:
     delete:
       operationId: removeReplicasEnvironmentMcp
       tags: [replicas]
-      summary: Remove the registered entry from the selected environments (best effort; a missing entry counts as removed) and disable them. Existing bindings are refused from the next call. Owner/admin person only.
+      summary: Disable the selected environments, then remove the registered entry from each (best effort; a missing entry counts as removed). The environments' enrolled bindings in this workspace are released without a tombstone and enrol again once the environment is enabled. Owner/admin person only.
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       requestBody:
         required: true
@@ -7902,7 +7919,7 @@ paths:
     post:
       operationId: replicasEnvironmentMcp
       tags: [replicas]
-      summary: "Environment-level Agent Relay MCP for Replicas workspaces. Stateless streamable HTTP (JSON-RPC), pull-only, not an OAuth resource. Admission order: valid workspace_identity token (else 401 replica_identity_invalid); not released (else 403 replica_released); environment enabled for the token's organization (else 403 replica_environment_not_enabled); creator mapped to a current member, re-read on every call, null creator refused (else 403 replica_creator_not_allowed); then the replica's Relay identity is resolved or enrolled once. Tools: list_relay_agents, check_relay_inbox, send_relay_message. Future wake-up delivery will answer 409 replica_chat_selection_required when no chat is selected. 404 before auth when SELFHOST_REPLICAS_ENABLED is off."
+      summary: "Environment-level Agent Relay MCP for Replicas workspaces. Stateless streamable HTTP (JSON-RPC), pull-only, not an OAuth resource. Admission order: valid workspace_identity token (else 401 replica_identity_invalid); not released (else 403 replica_released); environment enabled for the token's organization (else 403 replica_environment_not_enabled); creator mapped to a current member, re-read on every call, null creator refused (else 403 replica_creator_not_allowed); then the replica's Relay identity is resolved or enrolled once. Tools: list_relay_agents, check_relay_inbox, send_relay_message. Future wake-up delivery will answer 409 replica_chat_selection_required when no chat is selected. 404 before auth when SELFHOST_REPLICAS_ENABLED is off. Rate limited per source IP (120 per minute). Only refusals that name a Control workspace are audited."
       security: [{ replicasWorkspaceIdentity: [] }]
       requestBody:
         required: true
@@ -7923,11 +7940,13 @@ paths:
         "405":
           description: Only POST is served (stateless, no SSE stream)
         "409":
-          description: replica_already_bound (bound through a per-launch spawn)
+          description: replica_already_bound (bound through a per-launch spawn or another workspace)
         "413":
           description: Request is too large
+        "429":
+          description: JSON-RPC -32000 rate_limited, with Retry-After
         "503":
-          description: Identity issuer or relay unavailable
+          description: replica_identity_unavailable (issuer discovery or JWKS unreadable; no WWW-Authenticate) or relay unavailable
   /api/v1/workspaces/{workspaceId}/replicas/spawns:
     post:
       operationId: spawnReplica

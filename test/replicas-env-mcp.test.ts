@@ -49,7 +49,7 @@ function createProvider() {
   const environments = [{ id: ENV_A, name: "alpha" }, { id: ENV_B, name: "beta" }];
   const registered: Array<{ environmentId: string; id: string; body: any }> = [];
   const removed: string[] = [];
-  const mode = { register: "ok" as "ok" | "fail", discover: "ok" as "ok" | "fail" };
+  const mode = { register: "ok" as "ok" | "fail" | "reject", discover: "ok" as "ok" | "fail" };
   const runtime = {
     identity: async () => ({ organization: { id: PROVIDER_ORG, name: "Org" } }),
     environments: async () => ({ environments }),
@@ -61,6 +61,7 @@ function createProvider() {
     registerEnvironmentMcp: async (key: string, environmentId: string, body: unknown) => {
       assert.equal(key, REPLICAS_KEY);
       if (mode.register === "fail") throw new ReplicasRuntimeError("unknown", "replicas_timeout");
+      if (mode.register === "reject") throw new ReplicasRuntimeError("rejected", "replicas_rejected", 422);
       const id = `mcp_${registered.length + 1}`;
       registered.push({ environmentId, id, body });
       return { id };
@@ -94,7 +95,7 @@ function relaycastFetch(world: RelaycastWorld, roster: unknown[]): typeof fetch 
   }) as typeof fetch;
 }
 
-async function start(t: TestContext, enabled = true) {
+async function start(t: TestContext, enabled = true, issuerFetch: typeof fetch = identityFetch()) {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -119,7 +120,7 @@ async function start(t: TestContext, enabled = true) {
   const provider = createProvider();
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
   const replicas = createReplicasModule({
-    replicas: { enabled }, config, database, relaycastFetch: messagingFetch, runtime: provider.runtime, identityFetch: identityFetch(),
+    replicas: { enabled }, config, database, relaycastFetch: messagingFetch, runtime: provider.runtime, identityFetch: issuerFetch,
   });
   const remoteAgentFetch = (async (input: string | URL | Request) => {
     if (String(input).endsWith("/whoami")) return Response.json({ organization: { id: PROVIDER_ORG, name: "Org" } });
@@ -207,22 +208,26 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
       ],
     });
     assert.equal(provider.registered.length, 0, "connect registers nothing");
-    const listed = await api(`${base}/environments`, { token: ownerToken });
+    const listed = await api(`${base}/environment-policies`, { token: ownerToken });
     assert.equal(listed.status, 200, listed.text);
     assert.equal(listed.body.mcpUrl, MCP_URL);
     assert.equal(listed.body.allEnvironments, false);
-    assert.deepEqual(listed.body.environments.map((item: any) => [item.environmentId, item.status, item.enabled]),
-      [[ENV_A, "disabled", false], [ENV_B, "disabled", false]]);
-    assert.equal((await api(`${base}/environments`, { token: memberToken })).status, 403);
+    assert.deepEqual(listed.body.environments.map((item: any) => [item.environmentId, item.status, item.enabled, item.pendingCreators]),
+      [[ENV_A, "disabled", false, []], [ENV_B, "disabled", false, []]]);
+    assert.equal((await api(`${base}/environment-policies`, { token: memberToken })).status, 403);
+    // The live provider list keeps its own route and shape.
+    const live = await api(`${base}/environments`, { token: ownerToken });
+    assert.deepEqual(live.body, { environments: [{ id: ENV_A, name: "alpha" }, { id: ENV_B, name: "beta" }] });
   });
 
-  await t.test("a not-enabled environment is refused and nothing is enrolled", async () => {
+  await t.test("a not-enabled environment is refused, nothing is enrolled and the scope-less refusal is not audited", async () => {
     const response = await rpc(api, token(), "tools/list");
     assert.equal(response.status, 403, response.text);
     assert.equal(response.body.error.message, "replica_environment_not_enabled");
     assert.equal(await spawns(env), 0);
-    const audits = await database.query<{ target: string }>("SELECT target FROM admin_audit_events WHERE action = 'replicas.identity.refused'");
-    assert.deepEqual(audits.rows.map((row) => row.target), ["replica_environment_not_enabled"]);
+    // No tenant is known for this token: a foreign organization cannot fill the audit log.
+    assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.identity.refused'"), 0);
+    assert.equal(await count(env, "SELECT 1 FROM replica_environment_creator_requests"), 0);
   });
 
   await t.test("an invalid or missing token is 401 and never audited", async () => {
@@ -234,7 +239,7 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     }
     // A person credential is not a workspace identity.
     assert.equal((await rpc(api, ownerToken, "tools/list")).status, 401);
-    assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.identity.refused'"), 1);
+    assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.identity.refused'"), 0);
   });
 
   await t.test("PUT validates creators and enables the policy", async () => {
@@ -252,19 +257,43 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     assert.equal(enabled.body.environment.status, "enabled");
   });
 
-  await t.test("a missing or null creator mapping is refused without enrolment", async () => {
+  await t.test("a missing or null creator mapping is refused without enrolment and an unmapped creator becomes pending", async () => {
     let response = await rpc(api, token(), "tools/list");
     assert.equal(response.status, 403);
     assert.equal(response.body.error.message, "replica_creator_not_allowed");
     response = await rpc(api, token({ creator_id: null }), "tools/list");
     assert.equal(response.body.error.message, "replica_creator_not_allowed");
     assert.equal(await spawns(env), 0);
+    // Scoped refusals are audited.
+    assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.identity.refused'"), 2);
+    let view = await api(`${base}/environment-policies`, { token: ownerToken });
+    let pending = view.body.environments.find((item: any) => item.environmentId === ENV_A).pendingCreators;
+    // A null creator is never recorded; the hint is masked.
+    assert.equal(pending.length, 1);
+    assert.deepEqual({ ...pending[0], lastSeenAt: typeof pending[0].lastSeenAt },
+      { creatorId: "creator-owner", emailHint: "o…@acme.test", lastSeenAt: "string", count: 1 });
+    assert.doesNotMatch(view.text, /owner@acme\.test/);
+    // Bounded to the 50 most recent per policy.
+    const policyId = (await database.query<{ id: string }>("SELECT id FROM replica_environment_policies WHERE environment_id = $1", [ENV_A])).rows[0]!.id;
+    await database.query(`INSERT INTO replica_environment_creator_requests (policy_id, creator_id, last_seen_at)
+      SELECT $1, 'old-' || n, now() - interval '1 day' - n * interval '1 minute' FROM generate_series(1, 50) n`, [policyId]);
+    await rpc(api, token(), "tools/list");
+    view = await api(`${base}/environment-policies`, { token: ownerToken });
+    pending = view.body.environments.find((item: any) => item.environmentId === ENV_A).pendingCreators;
+    assert.equal(pending.length, 50);
+    assert.deepEqual([pending[0].creatorId, pending[0].count], ["creator-owner", 2]);
+    assert.ok(!pending.some((item: any) => item.creatorId === "old-50"), "the oldest request is dropped");
+    assert.ok(pending.every((item: any, index: number) => index === 0 || item.lastSeenAt <= pending[index - 1].lastSeenAt));
   });
 
   await t.test("a mapped creator enrols once; later calls reuse the binding", async () => {
     const mapped = await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken,
       body: { creators: [{ creatorId: "creator-owner", userId: ownerId }, { creatorId: "creator-member", userId: memberId }] } });
     assert.equal(mapped.status, 200, mapped.text);
+    // Mapping a creator clears its pending request; the others stay.
+    assert.equal(mapped.body.environment.pendingCreators.length, 49);
+    assert.ok(!mapped.body.environment.pendingCreators.some((item: any) => item.creatorId === "creator-owner"));
+    await database.query("DELETE FROM replica_environment_creator_requests");
     const listed = await rpc(api, token(), "tools/list");
     assert.equal(listed.status, 200, listed.text);
     assert.deepEqual(listed.body.result.tools.map((tool: any) => tool.name).sort(),
@@ -285,8 +314,12 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     assert.equal(agents.body.result.structuredContent.agent, agent);
     assert.equal(await spawns(env), 1);
     assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.identity.enrolled'"), 1);
+    // RFC 7235: the scheme is case-insensitive, any whitespace follows it.
+    const lower = await api("/api/v1/replicas/mcp", { method: "POST", headers: { ...MCP_HEADERS, authorization: `bearer \t ${token()}` },
+      body: { jsonrpc: "2.0", id: ++rpcSequence, method: "tools/list", params: {} } });
+    assert.equal(lower.status, 200, lower.text);
     // The creator hint is masked.
-    const creators = await api(`${base}/environments`, { token: ownerToken });
+    const creators = await api(`${base}/environment-policies`, { token: ownerToken });
     const policy = creators.body.environments.find((item: any) => item.environmentId === ENV_A);
     assert.equal(policy.bindings, 1);
     assert.equal(policy.creators.find((item: any) => item.creatorId === "creator-owner").emailHint, "o…@acme.test");
@@ -324,12 +357,35 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     assert.equal(refused.body.error.message, "replica_creator_not_allowed");
   });
 
-  await t.test("disabling the environment refuses existing bindings", async () => {
+  await t.test("a live binding in another workspace is replica_already_bound", async () => {
+    const other = await api(`/api/v1/organizations/${env.organizationId}/workspaces`, {
+      method: "POST", token: BOOTSTRAP, body: { name: "secondary", relaycastWorkspaceId: "rc-secondary", relaycastApiKey: "rk_live_secondary" },
+    });
+    assert.equal(other.status, 201, other.text);
+    const row = (await database.query<{ id: string }>("SELECT id FROM replica_spawns WHERE replica_id = $1 AND state <> 'gone'", [WORKSPACE_1])).rows[0]!;
+    await database.query("UPDATE replica_spawns SET workspace_id = $2 WHERE id = $1", [row.id, other.body.id]);
+    const refused = await callTool(api, token(), "list_relay_agents");
+    assert.equal(refused.status, 409, refused.text);
+    assert.equal(refused.body.error.message, "replica_already_bound");
+    await database.query("UPDATE replica_spawns SET workspace_id = $2 WHERE id = $1", [row.id, workspaceId]);
+  });
+
+  await t.test("disabling the environment releases its bindings without a tombstone; enabling re-enrols", async () => {
+    const agent = `replicas-${WORKSPACE_1.replaceAll("-", "").slice(0, 16)}`;
+    const before = (await database.query<{ id: string }>("SELECT id FROM replica_spawns WHERE replica_id = $1 AND state <> 'gone'", [WORKSPACE_1])).rows[0]!;
+    assert.equal(await spawns(env), 2);
     assert.equal((await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { enabled: false } })).status, 200);
+    assert.equal(await spawns(env), 0);
+    assert.equal(world.agents.has(agent), false, "the Relay identity is retired");
+    assert.equal(await count(env, "SELECT 1 FROM replica_identity_tombstones"), 0);
+    assert.equal(await count(env, "SELECT 1 FROM hosted_relay_participants WHERE agent_name = $1", [agent]), 0);
     const refused = await callTool(api, token(), "list_relay_agents");
     assert.equal(refused.body.error.message, "replica_environment_not_enabled");
     assert.equal((await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { enabled: true } })).status, 200);
     assert.equal((await callTool(api, token(), "list_relay_agents")).status, 200);
+    const after = (await database.query<{ id: string }>("SELECT id FROM replica_spawns WHERE replica_id = $1 AND state <> 'gone'", [WORKSPACE_1])).rows[0]!;
+    assert.notEqual(after.id, before.id, "a fresh binding");
+    assert.equal(world.agents.get(agent)?.metadata.replicas_spawn_id, after.id);
   });
 
   await t.test("release writes a tombstone; only an admin revive re-admits", async () => {
@@ -371,7 +427,12 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     provider.mode.register = "fail";
     const synced = await api(`${base}/environments/sync`, { method: "POST", token: ownerToken });
     assert.equal(synced.status, 200, synced.text);
-    assert.deepEqual(synced.body.environments, [{ environmentId: ENV_C, status: "registration_failed", retryable: true }]);
+    // A timeout leaves the provider outcome unknown.
+    assert.deepEqual(synced.body.environments, [{ environmentId: ENV_C, status: "registration_unconfirmed", retryable: true }]);
+    // A definite provider rejection created nothing.
+    provider.mode.register = "reject";
+    const rejected = await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { environmentIds: [ENV_C] } });
+    assert.deepEqual(rejected.body.environments, [{ environmentId: ENV_C, status: "registration_failed", retryable: true }]);
     provider.mode.register = "ok";
     const retried = await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { environmentIds: [ENV_C] } });
     assert.deepEqual(retried.body.environments, [{ environmentId: ENV_C, status: "registered" }]);
@@ -379,19 +440,75 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     assert.equal(removed.status, 200, removed.text);
     assert.deepEqual(removed.body.environments, [{ environmentId: ENV_B, status: "disabled" }]);
     assert.deepEqual(provider.removed, ["mcp_2"]);
-    const listed = await api(`${base}/environments`, { token: ownerToken });
+    const listed = await api(`${base}/environment-policies`, { token: ownerToken });
     assert.deepEqual(listed.body.environments.map((item: any) => [item.environmentId, item.status]),
       [[ENV_A, "registered"], [ENV_B, "disabled"], [ENV_C, "registered"]]);
   });
 
-  await t.test("disconnect removes entries, disables every policy and refuses tokens", async () => {
+  await t.test("disconnect disables every policy, releases bindings, removes entries and refuses tokens", async () => {
     const disconnected = await api(`${connections}/replicas`, { method: "DELETE", token: ownerToken });
     assert.equal(disconnected.status, 200, disconnected.text);
     assert.equal(provider.removed.length, 3);
     assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE enabled"), 0);
     assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE registered_mcp_id IS NOT NULL"), 0);
+    assert.equal(await spawns(env), 0);
     const refused = await rpc(api, token(), "tools/list");
     assert.equal(refused.status, 403);
     assert.equal(refused.body.error.message, "replica_environment_not_enabled");
   });
+});
+
+test("an unreadable issuer is 503 without a challenge; a bad signature stays 401", async (t) => {
+  const down = await start(t, true, (async () => new Response("{}", { status: 500 })) as typeof fetch);
+  const unavailable = await rpc(down.api, token(), "tools/list");
+  assert.equal(unavailable.status, 503, unavailable.text);
+  assert.equal(unavailable.body.error.message, "replica_identity_unavailable");
+  assert.equal(unavailable.headers.get("www-authenticate"), null);
+  const up = await start(t);
+  const valid = token();
+  const forged = `${valid.slice(0, valid.lastIndexOf("."))}.${Buffer.alloc(256, 1).toString("base64url")}`;
+  const refused = await rpc(up.api, forged, "tools/list");
+  assert.equal(refused.status, 401, refused.text);
+  assert.ok(refused.headers.get("www-authenticate"));
+});
+
+test("a concurrent enable in another workspace is enabled_elsewhere, not a 500", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, database, provider } = env;
+  const saved = await api(`/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.equal(saved.status, 200, saved.text);
+  const other = await api(`/api/v1/organizations/${env.organizationId}/workspaces`, {
+    method: "POST", token: BOOTSTRAP, body: { name: "secondary", relaycastWorkspaceId: "rc-secondary", relaycastApiKey: "rk_live_secondary" },
+  });
+  assert.equal(other.status, 201, other.text);
+  await database.query(`INSERT INTO replica_environment_policies (id, workspace_id, issuer, provider_organization_id, environment_id)
+    VALUES (gen_random_uuid(), $1, $2, $3, $4)`, [other.body.id, ISSUER, PROVIDER_ORG, ENV_A]);
+  // Simulates the other workspace enabling ENV_A after this workspace's pre-check: the unique index decides.
+  await database.query(`CREATE FUNCTION race_enable() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      UPDATE replica_environment_policies SET enabled = true WHERE workspace_id = '${other.body.id}' AND environment_id = NEW.environment_id;
+      RETURN NEW;
+    END $$`);
+  await database.query(`CREATE TRIGGER race_enable BEFORE UPDATE ON replica_environment_policies FOR EACH ROW
+    WHEN (NEW.enabled AND NOT OLD.enabled AND NEW.workspace_id = '${workspaceId}' AND NEW.environment_id = '${ENV_A}') EXECUTE FUNCTION race_enable()`);
+  const enabled = await api(`/api/v1/workspaces/${workspaceId}/replicas/environment-mcp`, { method: "POST", token: ownerToken,
+    body: { environmentIds: [ENV_A, ENV_B] } });
+  assert.equal(enabled.status, 200, enabled.text);
+  assert.deepEqual(enabled.body.environments, [
+    { environmentId: ENV_A, status: "enabled_elsewhere" },
+    { environmentId: ENV_B, status: "registered" },
+  ]);
+  assert.deepEqual(provider.registered.map((item) => item.environmentId), [ENV_B]);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE workspace_id = $1 AND enabled", [workspaceId]), 1);
+});
+
+test("the environment-level MCP is rate limited per source IP", async (t) => {
+  const env = await start(t);
+  for (let index = 0; index < 120; index++) {
+    assert.equal((await rpc(env.api, null, "tools/list")).status, 401);
+  }
+  const limited = await rpc(env.api, token(), "tools/list");
+  assert.equal(limited.status, 429, limited.text);
+  assert.deepEqual(limited.body.error, { code: -32000, message: "rate_limited" });
+  assert.ok(Number(limited.headers.get("retry-after")) >= 1);
 });

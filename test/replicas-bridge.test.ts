@@ -202,8 +202,7 @@ test("Replicas bridge: spawn, MCP provisioning retry, capability, relay events, 
   await t.test("environments come from the workspace key", async () => {
     const listed = await api(`${base}/environments`, { token: ownerToken });
     assert.equal(listed.status, 200, listed.text);
-    assert.deepEqual(listed.body.environments.map((item: any) => [item.environmentId, item.name, item.status, item.enabled]),
-      [[ENVIRONMENT, "default", "disabled", false]]);
+    assert.deepEqual(listed.body, { environments: [{ id: ENVIRONMENT, name: "default" }] });
     assert.equal(listed.headers.get("cache-control"), "no-store");
   });
 

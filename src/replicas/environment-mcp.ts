@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import { admitIdentity, IDENTITY_SERVER_NAME, IdentityRefusal, withIdentityBinding } from "./environments.js";
-import { ReplicaIdentityError, type ReplicaIdentityClaims } from "./identity.js";
+import { ReplicaIdentityError, ReplicaIdentityUnavailable, type ReplicaIdentityClaims } from "./identity.js";
 import { ReplicasError, type ReplicasDeps } from "./service.js";
 import { checkRelayInbox, listRelayAgents, sendRelayMessage } from "./tools.js";
 
@@ -97,18 +97,29 @@ function buildServer(deps: ReplicasDeps, claims: ReplicaIdentityClaims): McpServ
   return server;
 }
 
-/** Answers one environment-level MCP request. The caller has already answered 404 when Replicas is off. */
+/**
+ * Answers one environment-level MCP request. The caller has already answered
+ * 404 when Replicas is off. `rateLimit` (per source IP) runs before any token
+ * work, so an unauthenticated flood never reaches the issuer or the database.
+ */
 export async function handleEnvironmentMcp(deps: ReplicasDeps, request: IncomingMessage, response: ServerResponse,
-  method: string): Promise<void> {
+  method: string, rateLimit?: () => { allowed: boolean; retryAfterSeconds: number }): Promise<void> {
   if (!deps.identity) return rpcError(response, 404, -32004, "Not found");
   if (method !== "POST") return rpcError(response, 405, -32000, "Use POST.", null, { allow: "POST" });
+  const limited = rateLimit?.();
+  if (limited && !limited.allowed) {
+    return rpcError(response, 429, -32000, "rate_limited", null, { "retry-after": String(limited.retryAfterSeconds) });
+  }
   const header = request.headers.authorization ?? "";
-  const match = header.length <= MAX_BEARER ? /^Bearer ([A-Za-z0-9._-]+)$/.exec(header) : null;
+  // RFC 7235: the scheme is case-insensitive and followed by any whitespace.
+  const match = header.length <= MAX_BEARER ? /^Bearer\s+([A-Za-z0-9._-]+)$/i.exec(header) : null;
   if (!match) return rpcError(response, 401, -32001, "replica_identity_invalid", null, INVALID);
   let claims: ReplicaIdentityClaims;
   try {
     claims = await deps.identity.verifier.verify(match[1]!);
   } catch (error) {
+    // The issuer being unreachable is not the caller's fault: no invalid_token challenge.
+    if (error instanceof ReplicaIdentityUnavailable) return rpcError(response, 503, -32000, "replica_identity_unavailable");
     if (error instanceof ReplicaIdentityError) return rpcError(response, 401, -32001, "replica_identity_invalid", null, INVALID);
     return rpcError(response, 503, -32000, "replica_identity_unavailable");
   }

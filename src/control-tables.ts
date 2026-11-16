@@ -75,6 +75,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "relaycast_rekey_backups",
   "remote_agent_connections",
   "replica_deliveries",
+  "replica_environment_creator_requests",
   "replica_environment_creators",
   "replica_environment_policies",
   "replica_environment_settings",

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import test from "node:test";
-import { createReplicaIdentityVerifier, emailHint, ReplicaIdentityError } from "../src/replicas/identity.js";
+import { createReplicaIdentityVerifier, emailHint, ReplicaIdentityError, ReplicaIdentityUnavailable } from "../src/replicas/identity.js";
 
 const ISSUER = "https://api.replicas.dev";
 const AUDIENCE = "https://control.selfhosted.company/api/v1/replicas/mcp";
@@ -121,11 +121,41 @@ test("keys are cached by kid, an unknown kid refetches once, the TTL forces a re
   assert.equal(fetched.requests.length, 6, "TTL refresh");
 });
 
-test("discovery must name the issuer and a same-origin JWKS", async () => {
+const unavailable = (promise: Promise<unknown>) => assert.rejects(promise, (error: unknown) =>
+  error instanceof ReplicaIdentityUnavailable && !(error instanceof ReplicaIdentityError) && error.message === "replica_identity_unavailable");
+
+test("discovery must name the issuer and a same-origin JWKS, else the issuer is unavailable", async () => {
   const elsewhere = setup({ jwksUri: "https://keys.example.net/jwks.json" });
-  await rejects(elsewhere.verifier.verify(jwt(elsewhere.first.privateKey, elsewhere.claims())));
+  await unavailable(elsewhere.verifier.verify(jwt(elsewhere.first.privateKey, elsewhere.claims())));
   const wrongIssuer = setup({ issuer: "https://evil.example.net" });
-  await rejects(wrongIssuer.verifier.verify(jwt(wrongIssuer.first.privateKey, wrongIssuer.claims())));
+  await unavailable(wrongIssuer.verifier.verify(jwt(wrongIssuer.first.privateKey, wrongIssuer.claims())));
+});
+
+test("an unreadable issuer is unavailable, not an invalid token; a bad signature stays invalid", async () => {
+  const keys = pair();
+  const claims = {
+    iss: ISSUER, aud: AUDIENCE, exp: Math.floor(Date.now() / 1000) + 300, jti: "jti-1",
+    organization_id: ORG, environment_id: ENV, workspace_id: WS, creator_id: "creator-1",
+  };
+  const verifierFor = (impl: (url: string) => Response | Promise<Response>) =>
+    createReplicaIdentityVerifier({ issuer: ISSUER, audience: AUDIENCE, fetchImpl: (async (input: string | URL | Request) => impl(String(input))) as typeof fetch });
+  // Issuer 5xx.
+  await unavailable(verifierFor(() => new Response("{}", { status: 500 })).verify(jwt(keys.privateKey, claims)));
+  // Network failure.
+  await unavailable(verifierFor(() => { throw new TypeError("fetch failed"); }).verify(jwt(keys.privateKey, claims)));
+  // A document over the 64 KiB cap, streamed without a content-length.
+  const oversize = () => new Response(new ReadableStream({
+    start(controller) {
+      for (let index = 0; index < 80; index++) controller.enqueue(new TextEncoder().encode(index === 0 ? "{\"pad\":\"" : "x".repeat(1024)));
+      controller.close();
+    },
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  await unavailable(verifierFor(oversize).verify(jwt(keys.privateKey, claims)));
+  // Not JSON.
+  await unavailable(verifierFor(() => new Response("<html>", { status: 200 })).verify(jwt(keys.privateKey, claims)));
+  // A readable issuer and a signature by another key: the token is at fault.
+  const { verifier, claims: valid } = setup();
+  await rejects(verifier.verify(jwt(pair().privateKey, valid())));
 });
 
 test("errors and hints never carry the token or the full email", async () => {

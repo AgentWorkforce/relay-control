@@ -10,7 +10,7 @@
 
 CREATE TABLE IF NOT EXISTS replica_environment_policies (
   id uuid PRIMARY KEY,
-  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   issuer text NOT NULL,
   provider_organization_id text NOT NULL,
   environment_id text NOT NULL,
@@ -38,6 +38,19 @@ CREATE TABLE IF NOT EXISTS replica_environment_creators (
   PRIMARY KEY (policy_id, creator_id)
 );
 
+-- Unmapped creators seen on an enabled policy, so an admin can learn which
+-- creator_id to map. Bounded to the 50 most recent per policy; mapping a
+-- creator deletes its row.
+CREATE TABLE IF NOT EXISTS replica_environment_creator_requests (
+  policy_id uuid NOT NULL REFERENCES replica_environment_policies(id) ON DELETE CASCADE,
+  creator_id text NOT NULL,
+  creator_email_hint text,
+  first_seen_at timestamptz NOT NULL DEFAULT now(),
+  last_seen_at timestamptz NOT NULL DEFAULT now(),
+  count integer NOT NULL DEFAULT 1,
+  PRIMARY KEY (policy_id, creator_id)
+);
+
 -- The workspace-level grant "every environment of the connected
 -- organization, including ones discovered later".
 CREATE TABLE IF NOT EXISTS replica_environment_settings (
@@ -52,7 +65,7 @@ CREATE TABLE IF NOT EXISTS replica_identity_tombstones (
   issuer text NOT NULL,
   provider_organization_id text NOT NULL,
   provider_workspace_id text NOT NULL,
-  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   released_at timestamptz NOT NULL DEFAULT now(),
   reason text NOT NULL,
   PRIMARY KEY (issuer, provider_organization_id, provider_workspace_id)

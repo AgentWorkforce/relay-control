@@ -10,8 +10,10 @@ import { createPublicKey, verify as verifySignature, type KeyObject } from "node
  * unknown kid triggers at most one refetch (and forced refetches are spaced,
  * so random kids cannot turn callers into a JWKS amplifier).
  *
- * Every failure is the same ReplicaIdentityError with no token, claim or
- * email text in it. Tokens are never logged.
+ * Every token failure is the same ReplicaIdentityError with no token, claim
+ * or email text in it; an issuer that cannot be read (discovery or JWKS) is
+ * ReplicaIdentityUnavailable instead, so callers answer 503, not 401. Tokens
+ * are never logged.
  */
 export type ReplicaIdentityClaims = {
   issuer: string;
@@ -32,6 +34,14 @@ export class ReplicaIdentityError extends Error {
   }
 }
 
+/** Discovery or JWKS could not be fetched or read: the token was not judged. */
+export class ReplicaIdentityUnavailable extends Error {
+  constructor() {
+    super("replica_identity_unavailable");
+    this.name = "ReplicaIdentityUnavailable";
+  }
+}
+
 export type ReplicaIdentityVerifier = { verify(token: string): Promise<ReplicaIdentityClaims> };
 
 const KEY_TTL_MS = 10 * 60_000;
@@ -46,6 +56,9 @@ const SEGMENT = /^[A-Za-z0-9_-]+$/;
 const fail = (): never => {
   throw new ReplicaIdentityError();
 };
+const unavailable = (): never => {
+  throw new ReplicaIdentityUnavailable();
+};
 
 function decodeJson(segment: string): Record<string, unknown> {
   if (!SEGMENT.test(segment)) fail();
@@ -59,6 +72,28 @@ function decodeJson(segment: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/** Reads at most MAX_DOCUMENT_BYTES; a larger body is refused without buffering it. */
+async function boundedText(response: Response): Promise<string> {
+  if (!response.body) return unavailable();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > MAX_DOCUMENT_BYTES) unavailable();
+      chunks.push(chunk.value);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  } finally {
+    void reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
+/** Every failure (network, timeout, redirect, non-2xx, oversize, not a JSON object) is ReplicaIdentityUnavailable. */
 async function fetchJson(fetchImpl: typeof fetch, url: string): Promise<Record<string, unknown>> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -67,15 +102,13 @@ async function fetchJson(fetchImpl: typeof fetch, url: string): Promise<Record<s
       headers: { accept: "application/json" } });
     if (!response.ok) {
       void response.body?.cancel().catch(() => undefined);
-      return fail();
+      return unavailable();
     }
-    const text = await response.text();
-    if (Buffer.byteLength(text) > MAX_DOCUMENT_BYTES) fail();
-    const value = JSON.parse(text) as unknown;
-    if (!value || typeof value !== "object" || Array.isArray(value)) fail();
+    const value = JSON.parse(await boundedText(response)) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) unavailable();
     return value as Record<string, unknown>;
   } catch {
-    return fail();
+    return unavailable();
   } finally {
     clearTimeout(timer);
   }
@@ -108,20 +141,22 @@ export function createReplicaIdentityVerifier(options: {
   let lastAttempt = -Infinity;
   let lastForced = -Infinity;
   let inflight: Promise<void> | null = null;
+  // Whether the most recent discovery/JWKS load failed: then a missing key is an outage, not a bad token.
+  let lastLoadFailed = false;
 
   async function load(): Promise<void> {
     const discovery = await fetchJson(fetchImpl, `${options.issuer}/.well-known/openid-configuration`);
-    if (discovery.issuer !== options.issuer || typeof discovery.jwks_uri !== "string") fail();
+    if (discovery.issuer !== options.issuer || typeof discovery.jwks_uri !== "string") unavailable();
     let jwksUrl: URL;
     try {
       jwksUrl = new URL(discovery.jwks_uri as string);
     } catch {
-      return fail();
+      return unavailable();
     }
     // Keys come from the configured issuer only, never from a URL it points elsewhere.
-    if (jwksUrl.protocol !== "https:" || jwksUrl.origin !== issuerOrigin || jwksUrl.username || jwksUrl.password) fail();
+    if (jwksUrl.protocol !== "https:" || jwksUrl.origin !== issuerOrigin || jwksUrl.username || jwksUrl.password) unavailable();
     const jwks = await fetchJson(fetchImpl, jwksUrl.href);
-    if (!Array.isArray(jwks.keys)) fail();
+    if (!Array.isArray(jwks.keys)) unavailable();
     const next = new Map<string, KeyObject>();
     for (const entry of jwks.keys as unknown[]) {
       if (!entry || typeof entry !== "object") continue;
@@ -132,6 +167,7 @@ export function createReplicaIdentityVerifier(options: {
     }
     keys = next;
     fetchedAt = now().getTime();
+    lastLoadFailed = false;
   }
 
   /**
@@ -145,6 +181,7 @@ export function createReplicaIdentityVerifier(options: {
     lastAttempt = now().getTime();
     if (forced) lastForced = lastAttempt;
     inflight = load().catch(() => {
+      lastLoadFailed = true;
       // Fail closed: expired keys are not reused after a failed refresh.
       if (now().getTime() - fetchedAt >= KEY_TTL_MS) keys = new Map();
     }).finally(() => {
@@ -156,13 +193,15 @@ export function createReplicaIdentityVerifier(options: {
   async function keyFor(kid: string): Promise<KeyObject> {
     if (now().getTime() - fetchedAt >= KEY_TTL_MS) {
       await refresh();
-      if (now().getTime() - fetchedAt >= KEY_TTL_MS) return fail();
+      // No current keys means the issuer could not be read.
+      if (now().getTime() - fetchedAt >= KEY_TTL_MS) return unavailable();
     }
     const cached = keys.get(kid);
     if (cached) return cached;
-    // One refetch for an unknown kid (key rotation).
+    // One refetch for an unknown kid (key rotation). Still unknown after a
+    // successful load is a bad token; after a failed one, an outage.
     await refresh(true);
-    return keys.get(kid) ?? fail();
+    return keys.get(kid) ?? (lastLoadFailed ? unavailable() : fail());
   }
 
   return {

@@ -119,7 +119,7 @@ export const encrypt = (deps: ReplicasDeps, value: string) => encryptSecret(valu
 export const decrypt = (deps: ReplicasDeps, value: string) => decryptSecret(value, deps.keyring);
 /** Statuses a provider write answers when it definitely did not act. */
 const REJECTED = [400, 401, 402, 403, 404, 422, 429];
-const rejectedByProvider = (error: unknown, statuses = REJECTED) => error instanceof ReplicasRuntimeError
+export const rejectedByProvider = (error: unknown, statuses = REJECTED) => error instanceof ReplicasRuntimeError
   && (statuses.includes(error.status) || (error.outcome === "rejected" && error.code === "replicas_invalid_input"));
 
 /** Stored and returned failure text: only Control-authored messages, never a provider or Relay body. */
@@ -753,6 +753,20 @@ export async function releaseMemberReplicas(deps: ReplicasDeps, member: { organi
     await withReplicasLock(deps, { workspaceId: workspace_id, organizationId: member.organizationId }, async (tx) => {
       const row = await byId(tx, id, true);
       if (row && row.state === "gone" && !row.input.cleanup_complete) await retireRemote(deps, tx, row, null);
+    }).catch(() => undefined);
+  }
+}
+
+/**
+ * Retires environment-identity bindings that a policy disable already marked
+ * gone (committed, no tombstone). One row's failure must not block the rest;
+ * a later disconnect or member removal retries it.
+ */
+export async function retireIdentityBindings(deps: ReplicasDeps, actor: ReplicasActor, ids: string[]): Promise<void> {
+  for (const id of ids) {
+    await withReplicasLock(deps, actor, async (tx) => {
+      const row = await byId(tx, id, true);
+      if (row && row.state === "gone" && !row.input.cleanup_complete) await retireRemote(deps, tx, row, actor);
     }).catch(() => undefined);
   }
 }

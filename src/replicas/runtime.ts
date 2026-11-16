@@ -29,6 +29,9 @@ const createInput=z.object({name:z.string().min(1).max(100).regex(/^\S+$/),envir
 const environmentPage=z.object({environments:z.array(z.object({id:uuid,name:z.string().max(4096)})),
   page:z.number().int().optional(),total_pages:z.number().int().min(0).optional()});
 const ENVIRONMENT_PAGES=20;
+// Each requested page is capped like list() and must be the page asked for.
+const environmentPageOf=(page:number)=>z.object({environments:z.array(z.object({id:uuid,name:z.string().max(4096)})).max(100),
+  page:z.number().int().optional(),total_pages:z.number().int().min(0).optional()}).refine(value=>value.page===undefined||value.page===page);
 const environmentMcpInput=z.object({name:z.literal("agent-relay-replica"),transport:z.literal("http"),
   config:z.object({url:z.string().url().startsWith("https://"),headers:z.object({}).strict(),
     auth:z.object({type:z.literal("workspace_identity"),audience:z.string().url()}).strict()}).strict()}).strict()
@@ -107,11 +110,11 @@ export function createReplicasRuntime(options:{fetchImpl?:typeof fetch;timeoutMs
      * list (an unpaged answer is one page). Bounded to ENVIRONMENT_PAGES.
      */
     allEnvironments:async(key:string)=>{
-      const first=await call(key,"/environments",environmentPage);
+      const first=await call(key,"/environments?page=1&limit=100",environmentPageOf(1));
       const all=[...first.environments];
       const pages=Math.min(first.total_pages??1,ENVIRONMENT_PAGES);
       for(let page=2;page<=pages;page++) {
-        const next=await call(key,`/environments?page=${page}&limit=100`,environmentPage);
+        const next=await call(key,`/environments?page=${page}&limit=100`,environmentPageOf(page));
         all.push(...next.environments);
       }
       const seen=new Set<string>();

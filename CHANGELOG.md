@@ -11,10 +11,15 @@ assigned at release.
   admits a replica only when its environment is enabled, its creator maps to a
   current member, and it was not released. The first call enrols one Relay
   identity per replica; tools are pull-only. Connecting discovers environments
-  disabled; owners and admins enable them and register the MCP entry through
-  `/replicas/environments` and `/replicas/environment-mcp`. Release writes a
-  tombstone; `recover_replica_spawn` with `revive: true` lifts it. Migration
-  0067. See [Replicas](docs/replicas.md).
+  disabled; owners and admins see policies and pending (unmapped) creators at
+  `/replicas/environment-policies`, enable them and register the MCP entry
+  through `/replicas/environments/{id}` and `/replicas/environment-mcp`
+  (`registration_failed` on a provider rejection, `registration_unconfirmed`
+  when the outcome is unknown). Disabling releases the environment's bindings
+  without a tombstone. Release writes a tombstone; `recover_replica_spawn` with
+  `revive: true` lifts it. The endpoint is rate limited per IP and answers 503
+  when the issuer cannot be read. Migration 0067. See
+  [Replicas](docs/replicas.md).
 - Added: Replicas agent bridge behind `SELFHOST_REPLICAS_ENABLED` (default
   off). Owners and admins spawn, recover, bind and release Replicas agents
   through six MCP tools or the `/api/v1/workspaces/{ws}/replicas` routes. Each
