@@ -130,6 +130,16 @@ export type SelfhostConfig = {
    */
   relaygatePublicUrl?: string | null;
   /**
+   * SELFHOST_RELAY_NODE_SELF_MINT (docs/relay-node-credential.md, "Member
+   * self-mint"): on a gate-only install, whether a member's signed-in Agent
+   * Relay Desktop may mint its own relay-node token at
+   * POST /api/v1/workspaces/{id}/relay-node/self-tokens. Default true;
+   * `false`, `0` or `off` turns it off (403 `self_mint_disabled`), and the
+   * owner/admin mint is unchanged either way. Absent means true. Ignored
+   * when relaygatePublicUrl is null: those routes are then 404.
+   */
+  relayNodeSelfMint?: boolean;
+  /**
    * SELFHOST_IMAGE_VERSION: the image tag, set by the image (Dockerfile).
    * Null when run from source. Shown by GET /cloud/api/health and telemetry.
    */
@@ -471,6 +481,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     capturePolicyUploads: loadCapturePolicyUploads(env),
     eventsShimRelayOrigins: loadEventsShimRelayOrigins(env),
     relaygatePublicUrl,
+    relayNodeSelfMint: loadRelayNodeSelfMint(env),
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
@@ -1064,6 +1075,17 @@ function uploadEndpoint(env: Env, name: string): string | null {
 export function loadRelaygatePublicUrl(env: Env = process.env): string | null {
   if (!env.SELFHOST_RELAYGATE_PUBLIC_URL?.trim()) return null;
   return publicServiceUrl(env, "SELFHOST_RELAYGATE_PUBLIC_URL");
+}
+
+/**
+ * SELFHOST_RELAY_NODE_SELF_MINT: unset, blank, `true`, `1` or `on`: true;
+ * `false`, `0` or `off`: false; anything else refuses startup.
+ */
+export function loadRelayNodeSelfMint(env: Env = process.env): boolean {
+  const value = env.SELFHOST_RELAY_NODE_SELF_MINT?.trim().toLowerCase();
+  if (!value || value === "true" || value === "1" || value === "on") return true;
+  if (value === "false" || value === "0" || value === "off") return false;
+  throw new Error("SELFHOST_RELAY_NODE_SELF_MINT must be true or false");
 }
 
 export function loadEventsShimRelayOrigins(env: Env = process.env): string[] | null {
