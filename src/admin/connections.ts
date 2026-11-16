@@ -1,3 +1,4 @@
+import { AuthorizationProbeQueue, credentialTransport, verifyProviderAuthorization, type AuthorizationHealth } from "@relayfile/connection-health";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import {
@@ -52,7 +53,7 @@ export type OAuthAppRecord = {
 };
 
 /** Public connection record; never carries tokens or API keys. */
-export type ConnectionRecord = {
+export type ConnectionRecord = Partial<AuthorizationHealth> & {
   connectionId: string;
   version: string;
   provider: string;
@@ -836,6 +837,46 @@ export class ConnectionStore {
       [workspaceId],
     );
     return result.rows.map((row) => this.toRecord(row));
+  }
+
+  private readonly authorizationQueue = new AuthorizationProbeQueue();
+
+  /** Live proof for management listings. Runtime/env callers keep the plain list contract. */
+  async listHealth(workspaceId: string, actor: AuditActor): Promise<ConnectionRecord[]> {
+    return Promise.all((await this.list(workspaceId)).map(async record => {
+      let checkedVersion = record.version;
+      const health = await this.authorizationQueue.probe(
+        JSON.stringify([workspaceId, record.connectionId, record.version]),
+        async signal => {
+          try {
+            const token = await this.runtimeToken({workspaceId, provider:record.provider, actor});
+            if (token.connectionId !== record.connectionId) throw new Error("connection_changed");
+            const checked = await this.get(workspaceId, record.provider);
+            const verified = await verifyProviderAuthorization({
+              provider:record.provider,
+              authMode:record.authMode === "github_app" ? "APP" : record.authMode,
+              transport:credentialTransport({accessToken:token.accessToken,tokenType:token.tokenType,signal,
+                fetch:(url,init)=>this.fetchImpl(String(url),init ?? {})}),
+            });
+            const current = await this.get(workspaceId, record.provider);
+            if (!checked || !current || current.connectionId !== record.connectionId || current.version !== checked.version) throw new Error("connection_changed");
+            checkedVersion = current.version;
+            return {...verified,upstreamConnected:true};
+          } catch (error) {
+            const inactive = error instanceof ConnectionError && ["token_expired","invalid_grant"].includes(error.code);
+            return {authorizationStatus:inactive ? "inactive" as const : "unknown" as const,
+              authorizationReason:inactive ? "credentials_rejected" : "credentials_unavailable",
+              authorizationCheckedAt:new Date().toISOString(),upstreamConnected:null};
+          }
+        },
+      );
+      const current = await this.get(workspaceId, record.provider);
+      if (!current || current.connectionId !== record.connectionId || current.version !== checkedVersion) {
+        return {...(current ?? record),authorizationStatus:"unknown" as const,
+          authorizationReason:"connection_changed",authorizationCheckedAt:new Date().toISOString(),upstreamConnected:null};
+      }
+      return {...current,...health,authMode:current.authMode};
+    }));
   }
 
   async get(workspaceId: string, providerId: string): Promise<ConnectionRecord | null> {

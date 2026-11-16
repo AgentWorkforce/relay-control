@@ -975,3 +975,11 @@ no Agent Relay house key ("Agent Relay API key", "OpenCode managed"), keys are
 not probed at save (use Check token). Members are
 added directly (there is no email invite flow), and workspaces cannot be
 deleted from the API.
+
+Connection management listings verify authorization with read-only provider
+identity requests. `authorizationStatus` (`active`, `inactive`, `unknown`),
+`authorizationReason` and `authorizationCheckedAt` describe that check separately
+from the stored connection status. A saved credential alone is not verification.
+Refresh retries unknown checks; rate limits, insufficient verification scopes,
+unsupported providers and outages remain unknown rather than appearing revoked.
+The provider checks and bounded scheduler come from `@relayfile/connection-health`.

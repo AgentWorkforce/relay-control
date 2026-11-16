@@ -14,6 +14,7 @@ import { maskValue, envKeyReachesRuntime } from "../src/admin/env-policy.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { loadConfig, loadOperatorOAuthApps } from "../src/config.js";
 import { decryptSecret } from "../src/crypto.js";
+import type { FetchLike } from "../src/admin/connections.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { close, listen, PGliteDatabase, request } from "./support/harness.js";
@@ -151,7 +152,7 @@ async function deviceToken(
   return issued.body.access_token as string;
 }
 
-async function setup(t: test.TestContext, extra: Partial<SelfhostConfig> = {}) {
+async function setup(t: test.TestContext, extra: Partial<SelfhostConfig> = {}, fetchImpl?: FetchLike) {
   const mock = await startMockOAuth();
   const database = new PGliteDatabase();
   await migrate(database);
@@ -177,7 +178,7 @@ async function setup(t: test.TestContext, extra: Partial<SelfhostConfig> = {}) {
     ...extra,
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
-  const admin = createAdminModule({ config, database, keyring: KEYRING, providers });
+  const admin = createAdminModule({ config, database, keyring: KEYRING, providers, ...(fetchImpl ? {fetchImpl} : {}) });
   control.on("request", createApp({ config, store, admin }));
   t.after(async () => {
     await close(control);
@@ -952,4 +953,36 @@ test("operator OAuth apps load from env and mounted Secret files", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("connection health: catalog and listing verify API keys, preserve refusal vs outage, and retry", async t => {
+  let providerStatus=200;
+  const requests: Array<{url:string;authorization:string|null}> = [];
+  const ctx=await setup(t,{},async(url,init)=>{
+    requests.push({url,authorization:new Headers(init.headers).get("authorization")});
+    return Response.json({id:"neon-user",email:"bot@example.test"}, {status:providerStatus});
+  });
+  const ws=`/api/v1/workspaces/${ctx.workspaceId}`;
+  const saved=await request(ctx.origin,`${ws}/integrations/neon`,{method:"POST",token:ctx.owner,body:{credentials:{apiKey:"health-secret-sentinel"}}});
+  assert.equal(saved.status,201);
+  const catalog=await request(ctx.origin,`${ws}/integrations/providers`,{token:ctx.member});
+  const connection=catalog.body.providers.find((p:any)=>p.id === "neon").connection;
+  assert.equal(connection.authorizationStatus,"active");
+  assert.equal(connection.authorizationReason,"provider_verified");
+  assert.equal(requests[0]?.url,"https://console.neon.tech/api/v2/users/me");
+  assert.equal(requests[0]?.authorization,"Bearer health-secret-sentinel");
+  assert(!catalog.raw.includes("health-secret-sentinel"));
+  providerStatus=429;
+  const limited=await request(ctx.origin,`${ws}/integrations`,{token:ctx.member});
+  assert.equal(limited.body[0].authorizationStatus,"unknown");
+  assert.equal(limited.body[0].authorizationReason,"rate_limited");
+  assert.equal(limited.body[0].upstreamConnected,true);
+  providerStatus=401;
+  const rejected=await request(ctx.origin,`${ws}/integrations`,{token:ctx.member});
+  assert.equal(rejected.body[0].authorizationStatus,"inactive");
+  providerStatus=200;
+  const retried=await request(ctx.origin,`${ws}/integrations`,{token:ctx.member});
+  assert.equal(retried.body[0].authorizationStatus,"active");
+  const other=await request(ctx.origin,`/api/v1/workspaces/${ctx.otherWorkspaceId}/integrations`,{token:ctx.owner});
+  assert.notEqual(other.status,200);
 });
