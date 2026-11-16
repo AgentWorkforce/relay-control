@@ -508,8 +508,8 @@ export async function pendingReleases(
   executor: SqlExecutor,
   limit: number,
   filter: { userId?: string; sessionId?: string; bindingIds?: string[] } = {},
-): Promise<Array<FactoryRelease & { relaycast_api_key_ciphertext: string }>> {
-  const result = await executor.query<FactoryRelease & { relaycast_api_key_ciphertext: string }>(
+): Promise<Array<FactoryRelease & { relaycast_api_key_ciphertext: string | null }>> {
+  const result = await executor.query<FactoryRelease & { relaycast_api_key_ciphertext: string | null }>(
     `SELECT b.id, b.workspace_id, b.relay_agent_name, b.relay_agent_id, w.relaycast_api_key_ciphertext
        FROM factory_bindings b
        JOIN workspaces w ON w.id = b.workspace_id

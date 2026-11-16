@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { PostgresDatabase } from "../src/database.js";
+import { decryptSecret } from "../src/crypto.js";
 import { migrate } from "../src/migrations.js";
-import { ControlPlaneStore, OrganizationConflictError } from "../src/store.js";
+import { ControlPlaneStore, OrganizationConflictError, RelaycastBindingUnavailableError } from "../src/store.js";
 import { loadIdentityConfig } from "../src/identity/config.js";
 import { IdentityError, IdentityStore } from "../src/identity/store.js";
 import { loadTenancyConfig } from "../src/tenancy.js";
@@ -22,7 +23,7 @@ const skip = url ? false : "TEST_DATABASE_URL is not set (two-connection lock-or
 const KEYRING = { active: { id: "race-key", key: Buffer.alloc(32, 9) } };
 const EMAIL = "ada@race.test";
 // "Ada's Workspace" is the personal organization a sign-in that wins the race creates.
-const FIXTURE_ORGS = ["Race", "Ada Co", "Ada's Workspace", "Solo", "Other"];
+const FIXTURE_ORGS = ["Race", "Ada Co", "Ada's Workspace", "Solo", "Other", "Lazy race", "Lazy reconcile"];
 
 test("lock order: one identity racing first sign-in, create-organization and bootstrap on two connections", { skip, timeout: 60_000 }, async (t) => {
   // Two pools, so the three writers run on different server connections.
@@ -133,4 +134,118 @@ test("lock order: single-mode bootstrap and create-organization race to one orga
   if (created.status === "rejected") assert(created.reason instanceof OrganizationConflictError, String(created.reason));
   const orgs = await first.query<{ n: number }>("SELECT count(*)::int AS n FROM organizations");
   assert.equal(orgs.rows[0]!.n, 1);
+});
+
+test("lazy Relaycast binding: a two-connection first-use race provisions once", { skip, timeout: 60_000 }, async (t) => {
+  const first = new PostgresDatabase(url!);
+  const second = new PostgresDatabase(url!);
+  t.after(async () => {
+    await first.close();
+    await second.close();
+  });
+  await migrate(first);
+  await first.query("DELETE FROM organizations");
+  await first.query("DELETE FROM users WHERE email = 'lazy-race@control.test'");
+  const organizationId = "00000000-0000-4000-8000-000000000164";
+  const workspaceId = "00000000-0000-4000-8000-000000000264";
+  await first.query("INSERT INTO organizations (id, name) VALUES ($1, 'Lazy race')", [organizationId]);
+  await first.query(
+    "INSERT INTO workspaces (id, organization_id, name) VALUES ($1, $2, 'Imported')",
+    [workspaceId, organizationId],
+  );
+
+  let creates = 0;
+  let enteredCreate!: () => void;
+  let releaseCreate!: () => void;
+  const entered = new Promise<void>((resolve) => { enteredCreate = resolve; });
+  const release = new Promise<void>((resolve) => { releaseCreate = resolve; });
+  const provisioner: RelaycastProvisioner = {
+    async create() {
+      creates += 1;
+      enteredCreate();
+      await release;
+      return { id: "rw_postgres_race", apiKey: "rk_postgres_race" };
+    },
+    async remove() {},
+  };
+  const a = new ControlPlaneStore(first, KEYRING, 0, { relaycastProvisioner: provisioner });
+  const b = new ControlPlaneStore(second, KEYRING, 0, { relaycastProvisioner: provisioner });
+  const creator = a.relaycastBinding(workspaceId);
+  await entered;
+  const keyShareStarted = Date.now();
+  await second.query("SELECT id FROM workspaces WHERE id = $1 FOR KEY SHARE", [workspaceId]);
+  assert(Date.now() - keyShareStarted < 500, "remote create must not hold a conflicting workspace row lock");
+  await assert.rejects(b.relaycastBinding(workspaceId), RelaycastBindingUnavailableError);
+  releaseCreate();
+  const created = await creator;
+
+  assert.equal(creates, 1);
+  assert.equal(created!.relaycastWorkspaceId, "rw_postgres_race");
+  assert.equal(created!.provisioned, true);
+  const retry = await b.relaycastBinding(workspaceId);
+  assert.equal(retry!.relaycastWorkspaceId, "rw_postgres_race");
+  assert.equal(retry!.provisioned, false);
+});
+
+test("lazy Relaycast binding: a vanished claim binds the canonical replay without deleting it", { skip, timeout: 60_000 }, async (t) => {
+  const first = new PostgresDatabase(url!);
+  const second = new PostgresDatabase(url!);
+  t.after(async () => {
+    await first.close();
+    await second.close();
+  });
+  await migrate(first);
+  await first.query("DELETE FROM organizations");
+  const organizationId = "00000000-0000-4000-8000-000000000165";
+  const workspaceId = "00000000-0000-4000-8000-000000000265";
+  await first.query("INSERT INTO organizations (id, name) VALUES ($1, 'Lazy reconcile')", [organizationId]);
+  await first.query(
+    "INSERT INTO workspaces (id, organization_id, name) VALUES ($1, $2, 'Imported')",
+    [workspaceId, organizationId],
+  );
+
+  let enteredCreate!: () => void;
+  let releaseCreate!: () => void;
+  const entered = new Promise<void>((resolve) => { enteredCreate = resolve; });
+  const release = new Promise<void>((resolve) => { releaseCreate = resolve; });
+  const removed: string[] = [];
+  let idempotencyKey: string | undefined;
+  const provisioner: RelaycastProvisioner = {
+    async create(_name, key) {
+      idempotencyKey = key;
+      enteredCreate();
+      await release;
+      return { id: "rw_postgres_recovered", apiKey: "rk_postgres_recovered" };
+    },
+    async remove(id) { removed.push(id); },
+  };
+  const store = new ControlPlaneStore(first, KEYRING, 0, { relaycastProvisioner: provisioner });
+  const binding = store.relaycastBinding(workspaceId);
+  await entered;
+  const pending = (await second.query<{
+    relaycast_binding_idempotency_key_ciphertext: string;
+  }>(`SELECT relaycast_binding_idempotency_key_ciphertext
+        FROM workspaces WHERE id = $1`, [workspaceId])).rows[0]!;
+  assert.match(idempotencyKey ?? "", /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(idempotencyKey!.includes(workspaceId), false);
+  assert.equal(decryptSecret(pending.relaycast_binding_idempotency_key_ciphertext, KEYRING), idempotencyKey);
+  await second.query(
+    `UPDATE workspaces
+        SET relaycast_binding_claim_id = NULL,
+            relaycast_binding_claimed_at = NULL
+      WHERE id = $1`,
+    [workspaceId],
+  );
+  releaseCreate();
+
+  const recovered = await binding;
+  assert.equal(recovered!.relaycastWorkspaceId, "rw_postgres_recovered");
+  assert.deepEqual(removed, []);
+  const row = (await second.query<{
+    relaycast_workspace_id: string;
+    relaycast_binding_idempotency_key_ciphertext: string | null;
+  }>(`SELECT relaycast_workspace_id, relaycast_binding_idempotency_key_ciphertext
+        FROM workspaces WHERE id = $1`, [workspaceId])).rows[0]!;
+  assert.equal(row.relaycast_workspace_id, "rw_postgres_recovered");
+  assert.equal(row.relaycast_binding_idempotency_key_ciphertext, null);
 });

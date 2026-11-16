@@ -10,6 +10,7 @@ import { GrokRoutines } from "./mcp/grok-routines.js";
 import { retiringIdentity } from "./mcp/oauth/retirement.js";
 import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Duplex } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -21,9 +22,12 @@ import { ApiTokenStore, ENROLLMENT_KEY_PREFIX } from "./admin/api-tokens.js";
 import { recordAudit } from "./admin/audit.js";
 import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
 import { handleChiefRelay } from "./chief-relay.js";
-import { handleRelayNode } from "./relay-node/broker.js";
+import { handleRelayNode, RELAY_NODE_RATE_LIMIT } from "./relay-node/broker.js";
+import { relayNodeCredentials, type RelayNodeCredentials } from "./relay-node/credentials.js";
+import { createRelayNodeSocketBridge, refuseUpgrade } from "./relay-node/socket.js";
 import { handleFlowsBroker } from "./flows-broker.js";
 import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
+import { relayLaunchCredentials } from "./mcp/relay-launch-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { UsageRangeError, usageDays, usageReport } from "./usage/routes.js";
 import { UsageStore } from "./usage/store.js";
@@ -32,7 +36,8 @@ import { listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError }
 import {
   PeopleInputError, PersonNotFoundError, peopleAudit, peopleReport, personSessions, recordPeopleView, UsagePeopleStore,
 } from "./usage/people.js";
-import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
+import { mcpReaderMarker, readerKindOf, readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
+import { bearer } from "./auth/bearer.js";
 import { z } from "zod";
 import {
   acceptedAudiences,
@@ -68,11 +73,19 @@ import {
   OrganizationBoundaryError,
   OrganizationConflictError,
   ReservedClientNameError,
+  RelaycastBindingUnavailableError,
   type ControlPlaneStore,
   type Principal,
 } from "./store.js";
 import { createFlowsHandler } from "./flows/routes.js";
 import { isUuid, type FlowsStore } from "./flows/store.js";
+import {
+  grantJson,
+  parseMintRequest,
+  StaffReadGrantError,
+  StaffReadGrants,
+  type StaffPerson,
+} from "./admin/staff-read-grants.js";
 import type { TelemetryModule } from "./telemetry/module.js";
 import { identityErrorResponse, type IdentityModule } from "./identity/routes.js";
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
@@ -83,6 +96,10 @@ import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./f
 import { createMcpHandler } from "./mcp/routes.js";
 import { createCustomerSupportNoticeHandler } from "./mcp/customer-support-notice.js";
 import type { AmpModule } from "./amp/module.js";
+import type { ReplicasModule } from "./replicas/module.js";
+import { isReplicasPath } from "./replicas/routes.js";
+import { disconnectEnvironments, setupEnvironments } from "./replicas/environments.js";
+import { disconnectReplicas, purgeMemberReplicas, releaseMemberReplicas, ReplicasError } from "./replicas/service.js";
 import { isAmpPath } from "./amp/routes.js";
 import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
 import { purgeMemberAmp, releaseMemberAmp } from "./amp/service.js";
@@ -96,7 +113,7 @@ import {
 import { handleDesktopIdentityRoutes } from "./messaging/desktop-identities.js";
 import { handleChiefRoutes, type ChiefBackend } from "./chief/routes.js";
 import { handleProviderRoutes } from "./providers/routes.js";
-import { RemoteAgentConnections } from "./remote-agents/connections.js";
+import { RemoteAgentConnections, RemoteAgentError } from "./remote-agents/connections.js";
 import { remoteAgentRoutes } from "./remote-agents/routes.js";
 import type { ProviderProbes } from "./providers/registry.js";
 import {
@@ -190,13 +207,6 @@ function json(response: ServerResponse, status: number, body: unknown, noStore =
 function text(response: ServerResponse, status: number, body: string, type = "text/plain"): void {
   response.writeHead(status, { "content-type": `${type}; charset=utf-8` });
   response.end(body);
-}
-
-function bearer(request: IncomingMessage): string | null {
-  const header = request.headers.authorization;
-  if (!header) return null;
-  const match = /^Bearer\s+(.+)$/i.exec(header);
-  return match?.[1]?.trim() || null;
 }
 
 function cookie(request: IncomingMessage, name: string): string | null {
@@ -370,6 +380,16 @@ function cookieDeleteAllowed(request: IncomingMessage, browserOrigins: string[])
     : request.headers["sec-fetch-site"] === "same-origin";
 }
 
+/**
+ * The request handler, plus the HTTP upgrade handler for server "upgrade"
+ * events: the relay-node socket bridge on gate-only installs, 404 otherwise.
+ */
+export type AppHandler = ((request: IncomingMessage, response: ServerResponse) => void) & {
+  handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void;
+  /** Ends every bridged socket (shutdown). */
+  closeUpgrades(): void;
+};
+
 export function createApp(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
@@ -388,6 +408,8 @@ export function createApp(input: {
   features?: SelectedFeatures;
   /** Amp control (src/amp). Absent or disabled: every Amp route answers 404 before auth. */
   amp?: AmpModule;
+  /** Replicas agents (src/replicas). Absent or disabled: every Replicas bridge route answers 404 before auth. */
+  replicas?: ReplicasModule;
   /** Server-owned worker; absent tests use the same on-demand cleanup without a timer. */
   mcpOAuthTeardown?: McpOAuthTeardown;
   grokRoutines?: GrokRoutines;
@@ -439,7 +461,7 @@ export function createApp(input: {
   /** Test hooks for claim leases and crash injection. Production leaves this unset. */
   messaging?: Pick<MessagingDeps,
     "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck">;
-}): (request: IncomingMessage, response: ServerResponse) => void {
+}): AppHandler {
   const { config, store, admin, telemetry, identity } = input;
   const features = input.features ?? NO_FEATURES;
   const workspaceHistoryOrigin = (
@@ -508,6 +530,7 @@ export function createApp(input: {
     database: store.database,
     keyring: config.encryptionKeyring,
     relaycastUrl: config.relaycastUrl,
+    relaygatePublicUrl: config.relaygatePublicUrl,
     fetchImpl: input.messagingFetch,
     now: input.now,
     ...input.messaging,
@@ -515,6 +538,7 @@ export function createApp(input: {
   const messaging = createMessagingHandler({
     ...messagingDeps,
     relaycastPublicUrl: config.relaycastPublicUrl,
+    relaygatePublicUrl: config.relaygatePublicUrl,
     internalServiceToken: config.internalServiceToken,
     browserOrigins,
   });
@@ -550,7 +574,23 @@ export function createApp(input: {
   // Hosted MCP (shared-sessions facade): reads, team activity, capabilities.
   const amp = input.amp?.config.enabled ? input.amp : null;
   const providerProbes: ProviderProbes = input.providerProbes ?? {};
-  const remoteAgents = remoteAgentRoutes(new RemoteAgentConnections(store.database, config.encryptionKeyring, input.remoteAgentFetch));
+  const replicas = input.replicas?.config.enabled ? input.replicas : null;
+  const remoteAgents = remoteAgentRoutes(new RemoteAgentConnections(store.database, config.encryptionKeyring, input.remoteAgentFetch, {
+    replicasEnabled: Boolean(replicas),
+    // Bindings are revoked and retired while the key still exists to sleep their compute.
+    ...(replicas ? { replicasCleanup: async (actor: { userId: string; workspaceId: string; organizationId: string }) => {
+      try {
+        // Stop environment-level admission and remove provider MCP entries first, then retire bindings.
+        await disconnectEnvironments(replicas.deps, actor);
+        await disconnectReplicas(replicas.deps, actor);
+      } catch (error) {
+        if (error instanceof ReplicasError) throw new RemoteAgentError(error.status, "replicas_cleanup_failed", error.message);
+        throw new RemoteAgentError(502, "replicas_cleanup_failed", "Replicas cleanup could not finish. Retry the disconnect.");
+      }
+    },
+    replicasSetup: (actor: { userId: string; workspaceId: string; organizationId: string }, options: { reconnect: boolean }) =>
+      setupEnvironments(replicas.deps, actor, options) } : {}),
+  }));
   const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
   const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({
     database:store.database,keyring:config.encryptionKeyring,
@@ -580,10 +620,10 @@ export function createApp(input: {
     },
     workspaceAccess:async principal=>{
       if(!(await store.readiness()).ready) return false;
-      const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
+      const workspace=await store.workspaceMembershipForUser(principal.workspaceId,principal.userId);
       return workspace?.organizationId===principal.organizationId;
     },
-    workspaceLabel:async principal=>(await store.workspaceForUser(principal.workspaceId,principal.userId))?.name??principal.workspaceId,
+    workspaceLabel:async principal=>(await store.workspaceMembershipForUser(principal.workspaceId,principal.userId))?.name??principal.workspaceId,
     checkAgentNameAvailability:async(principal,name)=>{
       const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
       if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
@@ -600,6 +640,7 @@ export function createApp(input: {
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
     ...(amp ? { amp: amp.deps } : {}),
+    ...(replicas ? { replicas: replicas.deps } : {}),
     ...(factory.enabled ? { factory: factory.mcp } : {}),
     ...(input.capy ? { capy: input.capy } : {}),
     ...(features.launch ? { launch: true } : {}),
@@ -688,6 +729,59 @@ export function createApp(input: {
       throw new HttpError(403, "insufficient_scope", "Requires a cli:auth or account session");
     }
     return principal;
+  }
+
+  const staffReadGrants = new StaffReadGrants(store.database, store.tenancy, () => input.now?.() ?? new Date());
+  const STAFF_READ_GRANT_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
+
+  /**
+   * /api/v1/workspaces/{id}/staff-read-grants (docs/staff-read-grants.md):
+   * the staff rule, presented by a browser account session or an interactive
+   * CLI login. Not a Desktop session (including a device code Desktop
+   * started), an enrollment-key session, a handoff,
+   * a Desktop provider credential or any other credential kind. Every
+   * refusal after the CSRF check is the same 404, so the routes are no
+   * oracle for staff status or for workspace existence.
+   */
+  async function staffReadGrantCaller(
+    request: IncomingMessage,
+    workspaceId: string,
+  ): Promise<{ staff: StaffPerson; workspace: { id: string; organizationId: string } }> {
+    const notFound = () => new HttpError(404, "not_found", "Route not found");
+    if (request.method !== "GET" && !bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+      throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+    }
+    let auth: Auth;
+    try {
+      auth = await authenticate(request);
+    } catch (error) {
+      if (error instanceof HttpError) throw notFound();
+      throw error;
+    }
+    if (auth.kind !== "user") throw notFound();
+    const { principal } = auth;
+    const interactive = principal.scopes.includes(ACCOUNT_SCOPE) || principal.scopes.includes("cli:auth");
+    if (
+      !interactive || principal.scopes.includes(DESKTOP_WORKSPACES_SCOPE) || principal.scopes.includes("mcp:desktop") ||
+      principal.provisionedByTokenId || principal.pendingHandoff || principal.handoff || principal.desktopHostName
+    ) {
+      throw notFound();
+    }
+    // Agent Relay Desktop also signs in by device code, naming its host; such
+    // a session carries no Desktop marker, so look at the device code itself.
+    const desktopDeviceCode = await store.database.query(
+      "SELECT 1 FROM device_authorizations WHERE api_token_session_id = $1 AND desktop_host_name IS NOT NULL",
+      [principal.sessionId],
+    );
+    if (desktopDeviceCode.rows.length > 0) throw notFound();
+    const staff = await staffReadGrants.staff(principal.userId);
+    if (!staff || !isUuid(workspaceId)) throw notFound();
+    const workspace = (await store.database.query<{ id: string; organization_id: string }>(
+      "SELECT id, organization_id FROM workspaces WHERE id = $1",
+      [workspaceId],
+    )).rows[0];
+    if (!workspace) throw notFound();
+    return { staff, workspace: { id: workspace.id, organizationId: workspace.organization_id } };
   }
 
   // analytics lane: the client gateway. Authority comes only from the
@@ -805,7 +899,61 @@ export function createApp(input: {
     return auth;
   }
 
+  // Standard installs: the node token proves the node against Relaycast; it
+  // is never stored or logged.
+  async function proveNodeToken(workspaceKey: string, body: Record<string, unknown>) {
+    const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken.trim() : "";
+    if (!NODE_TOKEN.test(nodeToken)) {
+      throw new HttpError(400, "invalid_request", "Send workspaceId and the node's token (nt_live_... or ar_nd_...).");
+    }
+    return verifyNodeToken(config.relaycastUrl, workspaceKey, nodeToken);
+  }
+
+  // Gate-only installs: the node host never holds its Relaycast node token,
+  // so the proof is the node's enrolment through this Control's relay-node
+  // broker with a relay-node token minted in this workspace and bound to that
+  // name (docs/relay-node-credential.md, "Claiming the node"). Relaycast is
+  // not asked. A row whose sealed token no longer opens still proves the
+  // enrolment; the socket bridge refuses that node separately.
+  async function proveEnrolledNode(
+    credentials: RelayNodeCredentials,
+    workspaceId: string,
+    body: Record<string, unknown>,
+  ) {
+    if (body.nodeToken !== undefined) {
+      throw new HttpError(
+        400,
+        "invalid_request",
+        "This installation runs behind relaygate; send workspaceId and nodeName (the node's enrolled name).",
+      );
+    }
+    const nodeName = body.nodeName;
+    if (typeof nodeName !== "string" || !NODE_ID.test(nodeName)) {
+      throw new HttpError(400, "invalid_request", "Send workspaceId and nodeName.");
+    }
+    const enrolled = await credentials.find({ workspaceId, nodeName });
+    if (!enrolled) throw new NodeClaimError(403, "That node has not enrolled through this installation.");
+    return { id: enrolled.relaycastNodeId, name: enrolled.nodeName };
+  }
+
   const apiTokens = new ApiTokenStore(store.database);
+  // Gate-only installs only: relaygate introspects one-time `sh_lt_` launch credentials.
+  const relayLaunchCredentialStore = config.relaygatePublicUrl
+    ? relayLaunchCredentials(store.database, config.encryptionKeyring) : undefined;
+  // Gate-only installs only: Control holds relay nodes' Relaycast node tokens and bridges their sockets.
+  const relayNodeCredentialStore = config.relaygatePublicUrl
+    ? relayNodeCredentials(store.database, config.encryptionKeyring) : undefined;
+  const relayNodeSocket = relayNodeCredentialStore && relayLaunchCredentialStore
+    ? createRelayNodeSocketBridge({
+      apiTokens,
+      nodeCredentials: relayNodeCredentialStore,
+      launchCredentials: relayLaunchCredentialStore,
+      relaycastUrl: config.relaycastUrl,
+      database: store.database,
+      rateLimit: (key) => limiter.consume(key, RELAY_NODE_RATE_LIMIT.limit, RELAY_NODE_RATE_LIMIT.windowMs).allowed,
+      log: (message, fields) => console.warn(`[selfhost-api] ${message}`, fields),
+    })
+    : undefined;
   const flowRelayfileCredentials = input.flowRelayfileCredentials ?? new FlowRunRelayfileCredentials(
     store.database,
     () => input.now?.() ?? new Date(),
@@ -976,9 +1124,12 @@ export function createApp(input: {
       if (!parsed.success) throw new HttpError(400, "invalid_request", "Invalid session read request");
       rateLimit(response, `session-read:${principal.userId}:${workspace.id}`,
         { limit: 30, windowMs: 60_000 }, "rate_limited", "Too many session read credential requests");
+      // Same facts as `browser` above: cookie -> browser, bearer -> device
+      // (or mcp with the MCP reader's marker; see readerKindOf).
       const session = await requestReadSession(api, {
-        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
-      }, parsed.data);
+        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id, role: workspace.role,
+        readerKind: readerKindOf(request, mcpReaderMarker(api.secret)),
+      }, parsed.data, { includeRole: config.sessionReadMintIncludeRole });
       const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
       return browser ? accessOnly : session;
     }
@@ -1147,7 +1298,7 @@ export function createApp(input: {
     // Internal only: never reachable through the /cloud alias.
     if (method === "POST" && publicPath === INTROSPECT_PATH) {
       const outcome = await handleIntrospection(
-        config, store, request, undefined, admin?.apiTokens, flowRelayfileCredentials, introspectionHold,
+        config, store, request, undefined, admin?.apiTokens, flowRelayfileCredentials, relayLaunchCredentialStore, introspectionHold,
       );
       if (outcome.status === 200) json(response, 200, outcome.body, true);
       else json(response, outcome.status, { error: outcome.error, message: outcome.message }, true);
@@ -1192,6 +1343,7 @@ export function createApp(input: {
         rateLimit(res, key, rule, "rate_limited", "Too many relay-node requests; retry later"),
       bodyText: (incoming) => bodyText(incoming),
       json,
+      ...(relayNodeCredentialStore ? { nodeCredentials: relayNodeCredentialStore } : {}),
     })) {
       return;
     }
@@ -1211,6 +1363,14 @@ export function createApp(input: {
         return;
       }
       if (await amp.handle(request, response, path, publicPath, method, { workspaceAccess, bearer, json })) return;
+    }
+    // Replicas agents: gated before any authentication (off answers 404).
+    if (isReplicasPath(path)) {
+      if (!replicas) {
+        json(response, 404, { error: "Not found" }, true);
+        return;
+      }
+      if (await replicas.handle(request, response, path, method, { workspaceAccess, bearer, json })) return;
     }
     // Events shim: 404 before any authentication while the feature is off.
     if (isEventsShimPath(path)) {
@@ -1531,8 +1691,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     }
 
     // Whose computer a Relaycast node is (hosted: fleet/nodes/claim). The
-    // Desktop claims its own spawn node with its workspace-bound sign-in. The
-    // node token is proven against Relaycast and never stored or logged.
+    // Desktop claims its own spawn node with its workspace-bound sign-in:
+    // with the node token on standard installs, by enrolled node name on
+    // gate-only installs (proveNodeToken / proveEnrolledNode).
     if (path === "/api/v1/fleet/nodes/claim" && (method === "POST" || method === "DELETE")) {
       const auth = await authenticate(request);
       if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
@@ -1561,11 +1722,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         "rate_limited",
         "Too many node claims. Try again later.",
       );
-      const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken.trim() : "";
-      if (!NODE_TOKEN.test(nodeToken)) {
-        throw new HttpError(400, "invalid_request", "Send workspaceId and the node's token (nt_live_... or ar_nd_...).");
-      }
-      const proven = await verifyNodeToken(config.relaycastUrl, workspace.relaycastApiKey, nodeToken);
+      const proven = relayNodeCredentialStore
+        ? await proveEnrolledNode(relayNodeCredentialStore, workspaceId, body)
+        : await proveNodeToken(workspace.relaycastApiKey, body);
       const result = await store.claimNode({
         workspaceId,
         organizationId: workspace.organizationId,
@@ -2027,7 +2186,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       requireFeature("usage_people");
       const sub = peopleRoute[2];
-      const owner = { userId: auth.principal.userId, token: auth.token };
+      const owner = { userId: auth.principal.userId, token: auth.token, readerKind: readerKindOf(request) };
       const now = input.now?.() ?? new Date();
       if (sub === "audit") {
         if ([...url.searchParams.keys()].length > 0) throw new HttpError(400, "invalid_request", "No parameters are accepted");
@@ -2097,11 +2256,52 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           store,
           usage,
           organizationId: usageRoute[0]!,
-          owner: { userId: auth.principal.userId, token: auth.token },
+          owner: { userId: auth.principal.userId, token: auth.token, readerKind: readerKindOf(request) },
           days,
           now: input.now?.() ?? new Date(),
         }),
       }, true);
+      return;
+    }
+
+    // Staff read grants (docs/staff-read-grants.md): list, mint, revoke.
+    const staffGrantsRoute = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/staff-read-grants$/);
+    if (staffGrantsRoute && (method === "GET" || method === "POST")) {
+      const { staff, workspace } = await staffReadGrantCaller(request, staffGrantsRoute[0]!);
+      if (method === "GET") {
+        const grants = await staffReadGrants.list(workspace.id);
+        json(response, 200, { workspace_id: workspace.id, grants: grants.map(grantJson) }, true);
+        return;
+      }
+      let parsed;
+      try {
+        parsed = parseMintRequest(await requestObject(request));
+      } catch (error) {
+        if (error instanceof StaffReadGrantError) throw new HttpError(error.status, error.code, error.message);
+        throw error;
+      }
+      rateLimit(response, `staff-read-grant-mint:${staff.userId}`, STAFF_READ_GRANT_MINT_RATE, "rate_limited",
+        "Too many staff read grants minted; try again later");
+      const minted = await staffReadGrants.mint({
+        workspaceId: workspace.id,
+        organizationId: workspace.organizationId,
+        staff,
+        reason: parsed.reason,
+        expiresInDays: parsed.expiresInDays,
+      });
+      json(response, 201, {
+        grant: grantJson(minted.grant),
+        token: { accessToken: minted.accessToken, workspaceId: workspace.id, expiresAt: minted.grant.expiresAt },
+      }, true);
+      return;
+    }
+    const staffGrantRoute = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/staff-read-grants\/([^/]+)$/);
+    if (staffGrantRoute && method === "DELETE") {
+      const { staff, workspace } = await staffReadGrantCaller(request, staffGrantRoute[0]!);
+      const grantId = staffGrantRoute[1]!;
+      const grant = isUuid(grantId) ? await staffReadGrants.revoke(workspace.id, grantId, staff.userId) : null;
+      if (!grant) throw new HttpError(404, "not_found", "Route not found");
+      json(response, 200, { grant: grantJson(grant) }, true);
       return;
     }
 
@@ -2328,6 +2528,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         userId,
         async (tx, member) => {
           await purgeMemberAmp(tx, member);
+          await purgeMemberReplicas(tx, { organizationId, userId });
           await factory.purgeMemberInTx(tx, organizationId, userId);
           await revokeOrganizationMcpOAuthGrants(tx, member, input.now?.() ?? new Date());
           // The member's desktop enrollment keys, exchanged ones included,
@@ -2349,6 +2550,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       await identity?.auditMembership({ organizationId, auth, action: "membership.remove", target: userId });
       await revokeRemovedMember(messagingDeps, organizationId, userId);
       if (amp) await releaseMemberAmp(amp.deps, { organizationId, userId }).catch(() => undefined);
+      if (replicas) await releaseMemberReplicas(replicas.deps, { organizationId, userId }).catch(() => undefined);
       await factory.afterMemberRemoved(organizationId, userId);
       oauthTeardown?.kick();
       response.writeHead(204);
@@ -2500,7 +2702,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         json(response, 200, {
           ...identity,
           urls: { relaycastUrl: config.relaycastPublicUrl, relaygateUrl: config.relaygatePublicUrl },
-          provisioned: false,
+          provisioned: workspace.relaycastProvisioned,
         }, true);
         return;
       }
@@ -2516,7 +2718,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         ...identity,
         relaycastApiKey: workspace.relaycastApiKey,
         urls: { relaycastUrl: config.relaycastPublicUrl },
-        provisioned: false,
+        provisioned: workspace.relaycastProvisioned,
       }, true);
       return;
     }
@@ -2580,9 +2782,13 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (!parsed.success) throw new HttpError(400, "invalid_request", "Invalid session read request");
       rateLimit(response, `session-read:${principal.userId}:${workspace.id}`,
         { limit: 30, windowMs: 60_000 }, "rate_limited", "Too many session read credential requests");
+      // Cookie -> browser, bearer -> device, bearer plus the MCP reader's
+      // marker (src/mcp/session-read-reader.ts) -> mcp. The marker is never
+      // logged or echoed.
       const session = await requestReadSession(config.sessionReadApi, {
-        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
-      }, parsed.data);
+        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id, role: workspace.role,
+        readerKind: readerKindOf(request, mcpReaderMarker(config.sessionReadApi.secret)),
+      }, parsed.data, { includeRole: config.sessionReadMintIncludeRole });
       // Page scripts get a short-lived access token only. Renew by requesting
       // a new session through the cookie path, which rechecks live membership.
       const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
@@ -2822,6 +3028,8 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       organizationAccess,
       requestObject,
       bearer,
+      rateLimit: (res, key, rule) =>
+        rateLimit(res, key, rule, "rate_limited", "Too many requests. Try again later."),
     })) {
       return;
     }
@@ -2837,7 +3045,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     throw new HttpError(404, "not_found", "Route not found");
   }
 
-  return (request, response) => {
+  const handler = (request: IncomingMessage, response: ServerResponse): void => {
     // telemetry lane: aggregate usage per feature area (no bodies or queries).
     if (telemetry) {
       const routePath = new URL(request.url ?? "/", config.publicBaseUrl).pathname;
@@ -2908,6 +3116,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         json(response, error.status, { error: "node_claim_refused", message: error.message }, true);
         return;
       }
+      if (error instanceof RelaycastBindingUnavailableError) {
+        response.setHeader("retry-after", String(error.retryAfterSeconds));
+        json(response, error.status, { error: error.code, message: error.message }, true);
+        return;
+      }
       if (error instanceof MembershipConflictError) {
         json(response, 409, {
           error: "last_owner_required",
@@ -2949,4 +3162,13 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       json(response, 500, { error: "internal", message: "Internal server error" }, true);
     });
   };
+  return Object.assign(handler, {
+    handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+      if (relayNodeSocket) relayNodeSocket.handleUpgrade(request, socket, head);
+      else refuseUpgrade(socket, 404);
+    },
+    closeUpgrades(): void {
+      relayNodeSocket?.close();
+    },
+  });
 }

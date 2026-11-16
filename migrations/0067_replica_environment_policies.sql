@@ -1,0 +1,93 @@
+-- Environment-level Replicas MCP (src/replicas/environments.ts). A Replicas
+-- workspace authenticates to POST /api/v1/replicas/mcp with its
+-- workspace_identity token; these tables decide whether that identity is
+-- admitted and which tenant workspace and person it acts for.
+--
+-- Policies are discovered and enabled when an owner/admin connects Replicas,
+-- and environments discovered later are enabled on sync; admins opt out per
+-- environment (opted_out). A token is still admitted only as a mapped creator
+-- or the explicit VM principal (replica_environment_settings). No token, email
+-- address or provider key is stored here; creator_email_hint is a masked hint
+-- (first character and domain) shown to admins.
+
+CREATE TABLE IF NOT EXISTS replica_environment_policies (
+  id uuid PRIMARY KEY,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  issuer text NOT NULL,
+  provider_organization_id text NOT NULL,
+  environment_id text NOT NULL,
+  environment_name text NOT NULL DEFAULT '',
+  enabled boolean NOT NULL DEFAULT false,
+  registered_mcp_id text,
+  -- An admin opt-out. A disabled policy that is not opted out (a default
+  -- enable that failed or was refused) is retried on sync.
+  opted_out boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, environment_id)
+);
+
+-- One tenant workspace per provider environment: a token can never be
+-- admitted into two workspaces.
+CREATE UNIQUE INDEX IF NOT EXISTS replica_environment_policies_enabled
+  ON replica_environment_policies (issuer, provider_organization_id, environment_id) WHERE enabled;
+
+-- Which provider creator acts as which person. A creator without a row (or a
+-- token without a creator) acts as the workspace principal when one is set
+-- (replica_environment_settings) and is refused otherwise.
+CREATE TABLE IF NOT EXISTS replica_environment_creators (
+  policy_id uuid NOT NULL REFERENCES replica_environment_policies(id) ON DELETE CASCADE,
+  creator_id text NOT NULL,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  creator_email_hint text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (policy_id, creator_id)
+);
+
+-- Unmapped creators seen on an enabled policy (admitted as the principal when
+-- one is set, refused otherwise), so an admin can learn which creator_id to
+-- map. Bounded to the 50 most recent per policy; mapping a
+-- creator deletes its row.
+CREATE TABLE IF NOT EXISTS replica_environment_creator_requests (
+  policy_id uuid NOT NULL REFERENCES replica_environment_policies(id) ON DELETE CASCADE,
+  creator_id text NOT NULL,
+  creator_email_hint text,
+  first_seen_at timestamptz NOT NULL DEFAULT now(),
+  last_seen_at timestamptz NOT NULL DEFAULT now(),
+  count integer NOT NULL DEFAULT 1,
+  PRIMARY KEY (policy_id, creator_id)
+);
+
+-- Workspace-level settings. all_environments ("every environment of the
+-- connected organization, including ones discovered later") is on by
+-- default; false means an admin turned the default off for this workspace
+-- (DELETE /replicas/environment-mcp {all: true}). principal_user_id is the explicit principal that VMs without a
+-- mapped creator (including tokens without a creator) act for; unset = such
+-- VMs are refused. Never derived from an email or the workspace owner.
+CREATE TABLE IF NOT EXISTS replica_environment_settings (
+  workspace_id uuid PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+  all_environments boolean NOT NULL DEFAULT true,
+  principal_user_id uuid NULL REFERENCES users(id) ON DELETE SET NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- A released environment-identity binding: the same provider workspace is
+-- refused until an admin revives it through the recover route.
+CREATE TABLE IF NOT EXISTS replica_identity_tombstones (
+  issuer text NOT NULL,
+  provider_organization_id text NOT NULL,
+  provider_workspace_id text NOT NULL,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  released_at timestamptz NOT NULL DEFAULT now(),
+  reason text NOT NULL,
+  PRIMARY KEY (issuer, provider_organization_id, provider_workspace_id)
+);
+
+-- Environment-identity bindings are keyed by the provider identity.
+ALTER TABLE replica_spawns ADD COLUMN IF NOT EXISTS environment_id text;
+ALTER TABLE replica_spawns ADD COLUMN IF NOT EXISTS provider_organization_id text;
+ALTER TABLE replica_spawns ADD COLUMN IF NOT EXISTS issuer text;
+
+CREATE UNIQUE INDEX IF NOT EXISTS replica_spawns_identity
+  ON replica_spawns (issuer, provider_organization_id, replica_id)
+  WHERE source = 'environment_identity' AND state <> 'gone';

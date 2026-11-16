@@ -39,12 +39,29 @@ test("customer support uses an optional complete dedicated service connection, n
 
 test("SELFHOST_RELAYGATE_PUBLIC_URL is optional and must be a public https origin", () => {
   assert.equal(loadConfig(completeEnv).relaygatePublicUrl, null);
+  // reader_kind goes into the read-token mint body only behind relaygate.
+  assert.equal(loadConfig(completeEnv).sessionReadApi.mintReaderKind, false);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: "https://cast.selfhosted.company" })
+    .sessionReadApi.mintReaderKind, true);
   assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: "  " }).relaygatePublicUrl, null);
   assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: " https://cast.selfhosted.company/ " }).relaygatePublicUrl,
     "https://cast.selfhosted.company");
   for (const bad of ["http://cast.selfhosted.company", "https://cast.selfhosted.company/v1", "https://u:p@cast.selfhosted.company",
     "https://localhost", "https://10.0.0.1", "not a url"]) {
     assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: bad }), /SELFHOST_RELAYGATE_PUBLIC_URL/, bad);
+  }
+});
+
+test("SELFHOST_RELAY_NODE_SELF_MINT defaults on and is strictly boolean", () => {
+  assert.equal(loadConfig(completeEnv).relayNodeSelfMint, true);
+  for (const on of ["", "  ", "true", "1", "on", "TRUE"]) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAY_NODE_SELF_MINT: on }).relayNodeSelfMint, true, on);
+  }
+  for (const off of ["false", "0", "off", " Off "]) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAY_NODE_SELF_MINT: off }).relayNodeSelfMint, false, off);
+  }
+  for (const bad of ["yes", "no", "disabled", "2"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_RELAY_NODE_SELF_MINT: bad }), /SELFHOST_RELAY_NODE_SELF_MINT/, bad);
   }
 });
 
@@ -58,6 +75,13 @@ test("session search @name parsing is default off and strictly boolean", () => {
   assert.equal(loadConfig(completeEnv).sessionSearchAgentTokens, false);
   assert.equal(loadConfig({ ...completeEnv, SESSION_SEARCH_AGENT_TOKENS: "true" }).sessionSearchAgentTokens, true);
   assert.throws(() => loadConfig({ ...completeEnv, SESSION_SEARCH_AGENT_TOKENS: "1" }), /SESSION_SEARCH_AGENT_TOKENS/);
+});
+
+test("the read API mint role is default off and strictly boolean", () => {
+  assert.equal(loadConfig(completeEnv).sessionReadMintIncludeRole, false);
+  assert.equal(loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_ROLE: "false" }).sessionReadMintIncludeRole, false);
+  assert.equal(loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_ROLE: "true" }).sessionReadMintIncludeRole, true);
+  assert.throws(() => loadConfig({ ...completeEnv, SESSION_READ_MINT_INCLUDE_ROLE: "1" }), /SESSION_READ_MINT_INCLUDE_ROLE/);
 });
 
 test("the session erase API is default off and requires its full configuration", () => {
@@ -86,6 +110,7 @@ test("the read API handoff is required and must be fully configured", () => {
     url: reader.SESSION_READ_API_URL,
     publicUrl: "https://history.selfhosted.company",
     secret: reader.SESSION_READ_API_SECRET,
+    mintReaderKind: false,
   });
   // History is the read API: its URLs are the History URLs.
   assert.equal(config.relayhistoryUrl, reader.SESSION_READ_API_URL);
@@ -265,8 +290,10 @@ test("token introspection is required and validates its secret and audiences", (
   t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
   const compatibleOverlap = loadConfig({
     ...completeEnv,
+    SELFHOST_RELAYHISTORY_AUDIENCES:
+      `${completeEnv.SESSION_READ_API_PUBLIC_URL},https://xn--bcher-kva.example`,
     SELFHOST_INTROSPECT_AUDIENCES:
-      `${completeEnv.SESSION_READ_API_PUBLIC_URL},http://relayfile.files.svc:8080`,
+      "https://HISTORY.SELFHOSTED.COMPANY.:0443,https://BÜCHER.example.:443,http://relayfile.files.svc:8080",
   });
   assert.deepEqual(compatibleOverlap.introspectAudiences, ["http://relayfile.files.svc:8080"]);
   assert.equal(warnings.length, 1);

@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ApiTokenStore } from "../admin/api-tokens.js";
+import { recordAudit } from "../admin/audit.js";
 import { cookieRequestAllowed } from "../auth/device-approval.js";
 import { secureEqual } from "../crypto.js";
 import type { Principal } from "../store.js";
@@ -74,6 +75,7 @@ function duplicateBody(identity: PersonIdentity, claim: SendClaim, clientMessage
 
 export function createMessagingHandler(input: MessagingDeps & {
   relaycastPublicUrl: string;
+  relaygatePublicUrl?: string | null;
   internalServiceToken: string | null;
   browserOrigins: readonly string[];
 }) {
@@ -290,6 +292,25 @@ export function createMessagingHandler(input: MessagingDeps & {
     }
 
     if (credential && method === "POST") {
+      // Gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): agents never hold
+      // a Relaycast credential, so no person identity is registered here and
+      // no agent token leaves. The desktop enrols the name it chooses at
+      // relaygate with its device token. The refusal is audited.
+      if (input.relaygatePublicUrl) {
+        await recordAudit(input.database, {
+          organizationId: access.workspace.organizationId,
+          workspaceId: access.workspace.id,
+          actor: { kind: "user", userId: access.principal.userId },
+          action: "workspace.person_credential.withheld",
+          target: `session:${access.principal.sessionId}`,
+        });
+        helpers.json(response, 403, {
+          error: "gate_only",
+          message: "This install is gate-only: Control issues no Relaycast agent token. Enrol at relaygate with your device token.",
+          urls: { relaycastUrl: input.relaycastPublicUrl, relaygateUrl: input.relaygatePublicUrl },
+        }, true);
+        return true;
+      }
       const identity = await ensurePersonIdentity(deps, person);
       helpers.json(response, 200, {
         identity: {
