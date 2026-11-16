@@ -11,7 +11,6 @@ import { iso, recordAudit, type AuditActor } from "./audit.js";
 import { maskValue } from "./env-policy.js";
 import { GithubAppTokenError, mintGithubInstallationToken, type GithubAppConfig } from "./github-app.js";
 import {
-  DEFAULT_PROVIDERS,
   GITHUB_APP_PROVIDER,
   parseStandardTokenResponse,
   ProviderTokenError,
@@ -117,12 +116,16 @@ type ConnectionRow = {
   updated_by_user_id: string | null;
   created_at: Date | string;
   updated_at: Date | string;
+  github_app_refresh_id: string | null;
+  github_app_refresh_until: Date | string | null;
 };
 
 const CONNECTION_COLUMNS = `id, provider, auth_mode, installation_id, status, credentials_ciphertext, token_type,
   scopes, access_token_expires_at, account_id, account_label, metadata,
   last_refreshed_at, last_error, created_by_user_id, updated_by_user_id,
-  created_at, updated_at`;
+  created_at, updated_at, github_app_refresh_id, github_app_refresh_until`;
+
+type GithubAppClaim = { githubAppClaim: { row: ConnectionRow; claimId: string } };
 
 function metadataObject(value: ConnectionRow["metadata"]): Record<string, unknown> {
   if (!value) return {};
@@ -214,9 +217,9 @@ export class ConnectionStore {
     private readonly githubApp: GithubAppConfig | null = null,
   ) {}
 
-  /** Whether the operator configured this provider's OAuth or GitHub App credentials. */
+  /** OAuth setup remains independent from the optional GitHub App signing key. */
   operatorConfigured(providerId: string): boolean {
-    return (providerId === "github" && this.githubApp !== null) || Object.hasOwn(this.operatorApps, providerId);
+    return Object.hasOwn(this.operatorApps, providerId);
   }
 
   provider(id: string): ProviderDefinition {
@@ -614,15 +617,35 @@ export class ConnectionStore {
     installationId?: string;
   }): Promise<ConnectionRecord> {
     return this.database.transaction(async (tx) => {
+      if (input.provider.authMode === "github_app") {
+        const workspace = await tx.query(
+          "SELECT id FROM workspaces WHERE id = $1 AND organization_id = $2 FOR SHARE",
+          [input.workspaceId, input.organizationId],
+        );
+        if (!workspace.rows[0]) throw new ConnectionError(409, "workspace_organization_mismatch", "Workspace does not belong to the import organization");
+        // A unique installation owner serializes concurrent imports, including
+        // imports into different workspaces. Sharing inside one org is allowed.
+        const owner = await tx.query(
+          `INSERT INTO github_app_installations (installation_id, organization_id) VALUES ($1, $2)
+           ON CONFLICT (installation_id) DO UPDATE SET installation_id = EXCLUDED.installation_id
+             WHERE github_app_installations.organization_id = EXCLUDED.organization_id
+           RETURNING installation_id`,
+          [input.installationId, input.organizationId],
+        );
+        if (!owner.rows[0]) throw new ConnectionError(409, "installation_organization_mismatch", "GitHub installation belongs to another organization");
+      }
       const result = await tx.query<ConnectionRow>(
         `INSERT INTO integration_connections
            (id, workspace_id, provider, auth_mode, status, credentials_ciphertext, token_type,
             scopes, access_token_expires_at, refresh_token_expires_at, account_id,
-            account_label, metadata, created_by_user_id, updated_by_user_id, installation_id)
-         VALUES ($1, $2, $3, $4, 'ready', $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $13, $14)
+            account_label, metadata, created_by_user_id, updated_by_user_id, installation_id, github_app_organization_id)
+         VALUES ($1, $2, $3, $4, 'ready', $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $13, $14, $15)
          ON CONFLICT (workspace_id, provider) DO UPDATE SET
            auth_mode = EXCLUDED.auth_mode,
            installation_id = EXCLUDED.installation_id,
+           github_app_organization_id = EXCLUDED.github_app_organization_id,
+           github_app_refresh_id = NULL,
+           github_app_refresh_until = NULL,
            status = 'ready',
            credentials_ciphertext = EXCLUDED.credentials_ciphertext,
            token_type = EXCLUDED.token_type,
@@ -655,6 +678,7 @@ export class ConnectionStore {
           JSON.stringify(input.metadata),
           input.actor.kind === "user" ? input.actor.userId : null,
           input.installationId ?? null,
+          input.provider.authMode === "github_app" ? input.organizationId : null,
         ],
       );
       const row = result.rows[0]!;
@@ -888,9 +912,8 @@ export class ConnectionStore {
   }
 
   /**
-   * Runtime token fetch. Refreshes OAuth/App tokens that are expired or within
-   * REFRESH_SKEW_MS of expiry (or when forced) under a row lock, so
-   * concurrent consumers never race a refresh-token rotation.
+   * OAuth refresh retains its rotation lock. App refresh takes a short lease
+   * here, mints outside the transaction, then conditionally publishes the token.
    */
   async runtimeToken(input: {
     workspaceId: string;
@@ -899,7 +922,7 @@ export class ConnectionStore {
     actor: AuditActor;
   }): Promise<RuntimeToken> {
     const provider = this.provider(input.provider);
-    const token = await this.database.transaction(async (tx) => {
+    let token = await this.database.transaction(async (tx) => {
       const result = await tx.query<ConnectionRow>(
         `SELECT ${CONNECTION_COLUMNS} FROM integration_connections
           WHERE workspace_id = $1 AND provider = $2 FOR UPDATE`,
@@ -924,7 +947,7 @@ export class ConnectionStore {
       }
       const config = (metadataObject(row.metadata).config ?? {}) as Record<string, string>;
       if (row.auth_mode === "github_app") {
-        return this.githubInstallationToken(tx, row, credentials, input, config);
+        return this.claimGithubInstallationRefresh(tx, row, credentials, input, config);
       }
       if (provider.authMode === "api_key") {
         const primary = provider.credentialFields.find((field) => field.secret)!;
@@ -948,9 +971,7 @@ export class ConnectionStore {
       }
       let refreshed: ParsedToken;
       try {
-        const oauth = provider.authMode === "github_app"
-          ? DEFAULT_PROVIDERS.find(item => item.id === "github")!
-          : provider;
+        const oauth = provider;
         if (oauth.authMode !== "oauth2") throw new ConnectionError(409, "connection_mode_mismatch", "Connection auth mode does not match provider");
         const client = await this.oauthClient(tx, input.workspaceId, oauth);
         refreshed = await this.tokenRequest(oauth, client, {
@@ -1006,6 +1027,9 @@ export class ConnectionStore {
       });
       return this.runtimeResult(updated.rows[0]!, next.accessToken!, updated.rows[0]!.token_type ?? "bearer", nextExpiry, config);
     });
+    if ("githubAppClaim" in token) {
+      token = await this.finishGithubInstallationRefresh(token.githubAppClaim, input);
+    }
     // Errors are returned (not thrown) from the transaction so the error
     // status written by markError commits.
     if ("error" in token) throw token.error;
@@ -1018,13 +1042,13 @@ export class ConnectionStore {
     return token;
   }
 
-  private async githubInstallationToken(
+  private async claimGithubInstallationRefresh(
     tx: SqlExecutor,
     row: ConnectionRow,
     credentials: StoredCredentials,
     input: { workspaceId: string; forceRefresh?: boolean; actor: AuditActor },
     config: Record<string, string>,
-  ): Promise<RuntimeToken | { error: ConnectionError }> {
+  ): Promise<RuntimeToken | { error: ConnectionError } | GithubAppClaim> {
     if (row.provider !== "github" || !row.installation_id) {
       return { error: new ConnectionError(409, "invalid_installation_id", "GitHub connection has no installation routing") };
     }
@@ -1032,27 +1056,74 @@ export class ConnectionStore {
       return { error: new ConnectionError(503, "github_app_not_configured", "The operator must configure the GitHub App signing key") };
     }
     const expiresAt = row.access_token_expires_at ? new Date(iso(row.access_token_expires_at)) : null;
+    const leaseActive = row.github_app_refresh_until && new Date(iso(row.github_app_refresh_until)).getTime() > Date.now();
     if (!input.forceRefresh && row.status === "ready" && credentials.accessToken && expiresAt &&
         expiresAt.getTime() - Date.now() > REFRESH_SKEW_MS) {
       return this.runtimeResult(row, credentials.accessToken, "bearer", expiresAt, config);
     }
-    let minted: Awaited<ReturnType<typeof mintGithubInstallationToken>>;
+    if (leaseActive) {
+      if (row.status === "ready" && credentials.accessToken && expiresAt && expiresAt.getTime() > Date.now()) {
+        return this.runtimeResult(row, credentials.accessToken, "bearer", expiresAt, config);
+      }
+      return { error: new ConnectionError(503, "github_app_refresh_in_progress", "GitHub App token refresh is in progress; retry shortly") };
+    }
+    const claimId = randomUUID();
+    await tx.query(
+      `UPDATE integration_connections SET github_app_refresh_id = $2,
+         github_app_refresh_until = now() + interval '30 seconds' WHERE id = $1`,
+      [row.id, claimId],
+    );
+    return { githubAppClaim: { row, claimId } };
+  }
+
+  private async finishGithubInstallationRefresh(
+    claim: GithubAppClaim["githubAppClaim"],
+    input: { workspaceId: string; actor: AuditActor },
+  ): Promise<RuntimeToken | { error: ConnectionError }> {
+    let minted: Awaited<ReturnType<typeof mintGithubInstallationToken>> | undefined;
+    let failure: GithubAppTokenError | undefined;
     try {
-      minted = await mintGithubInstallationToken(this.githubApp, row.installation_id, this.fetchImpl);
+      // No row lock, open transaction or checked-out pool connection here.
+      minted = await mintGithubInstallationToken(this.githubApp!, claim.row.installation_id!, this.fetchImpl);
     } catch (error) {
       if (!(error instanceof GithubAppTokenError)) throw error;
-      await this.markError(tx, row.id, error.code);
-      return { error: new ConnectionError(error.status, "github_app_token_failed", error.message) };
+      failure = error;
     }
-    const updated = await tx.query<ConnectionRow>(
-      `UPDATE integration_connections SET status = 'ready', credentials_ciphertext = $2,
-         token_type = 'bearer', access_token_expires_at = $3, refresh_token_expires_at = NULL,
-         last_refreshed_at = now(), last_error = NULL, updated_at = now()
-       WHERE id = $1 RETURNING ${CONNECTION_COLUMNS}`,
-      [row.id, encryptSecret(JSON.stringify({ accessToken: minted.accessToken }), this.keyring.active), minted.expiresAt.toISOString()],
-    );
-    await recordAudit(tx, { workspaceId: input.workspaceId, actor: input.actor, action: "integration.refresh", target: "github" });
-    return this.runtimeResult(updated.rows[0]!, minted.accessToken, "bearer", minted.expiresAt, config);
+    return this.database.transaction(async tx => {
+      const current = await tx.query<ConnectionRow>(
+        `SELECT ${CONNECTION_COLUMNS} FROM integration_connections WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+        [claim.row.id, input.workspaceId],
+      );
+      const row = current.rows[0];
+      if (!row || row.auth_mode !== "github_app" || row.installation_id !== claim.row.installation_id ||
+          row.github_app_refresh_id !== claim.claimId) {
+        return { error: new ConnectionError(409, "connection_changed", "Connection changed during GitHub App refresh; retry") };
+      }
+      const config = (metadataObject(row.metadata).config ?? {}) as Record<string, string>;
+      if (failure) {
+        const credentials = this.credentials(row);
+        const expiresAt = row.access_token_expires_at ? new Date(iso(row.access_token_expires_at)) : null;
+        const fallback = failure.status === 503 && row.status === "ready" && credentials.accessToken &&
+          expiresAt && expiresAt.getTime() > Date.now();
+        const updated = await tx.query<ConnectionRow>(
+          `UPDATE integration_connections SET github_app_refresh_id = NULL, github_app_refresh_until = NULL,
+             status = $2, last_error = $3, updated_at = now() WHERE id = $1 RETURNING ${CONNECTION_COLUMNS}`,
+          [row.id, fallback ? "ready" : "error", failure.code],
+        );
+        if (fallback) return this.runtimeResult(updated.rows[0]!, credentials.accessToken!, "bearer", expiresAt, config);
+        return { error: new ConnectionError(failure.status, "github_app_token_failed", failure.message) };
+      }
+      const updated = await tx.query<ConnectionRow>(
+        `UPDATE integration_connections SET status = 'ready', credentials_ciphertext = $2,
+           token_type = 'bearer', access_token_expires_at = $3, refresh_token_expires_at = NULL,
+           github_app_refresh_id = NULL, github_app_refresh_until = NULL,
+           last_refreshed_at = now(), last_error = NULL, updated_at = now()
+         WHERE id = $1 RETURNING ${CONNECTION_COLUMNS}`,
+        [row.id, encryptSecret(JSON.stringify({ accessToken: minted!.accessToken }), this.keyring.active), minted!.expiresAt.toISOString()],
+      );
+      await recordAudit(tx, { workspaceId: input.workspaceId, actor: input.actor, action: "integration.refresh", target: "github" });
+      return this.runtimeResult(updated.rows[0]!, minted!.accessToken, "bearer", minted!.expiresAt, config);
+    });
   }
 
   private runtimeResult(

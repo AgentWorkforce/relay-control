@@ -21,7 +21,6 @@ import { EnvVarValidationError } from "./env-policy.js";
 import {
   catalogEntry,
   DEFAULT_PROVIDERS,
-  GITHUB_APP_PROVIDER,
   ProviderRegistry,
   ProviderTokenError,
   type ProviderDefinition,
@@ -155,8 +154,7 @@ export function createAdminModule(input: {
   credentialBackend?: CredentialObjectBackend;
 }): AdminModule {
   const { config, database } = input;
-  const providers = new ProviderRegistry(input.providers ?? DEFAULT_PROVIDERS.map(provider =>
-    config.githubApp && provider.id === "github" ? GITHUB_APP_PROVIDER : provider));
+  const providers = new ProviderRegistry(input.providers ?? DEFAULT_PROVIDERS);
   const envVars = new EnvVarStore(database, input.keyring);
   const connections = new ConnectionStore(
     database,
@@ -515,6 +513,11 @@ export function createAdminModule(input: {
           const configured = provider.authMode === "api_key" || operator || app !== null;
           return {
             ...catalogEntry(provider),
+            ...(provider.id === "github" ? {
+              supportedAuthModes: ["OAUTH2", "APP"],
+              githubAppConfigured: Boolean(config.githubApp),
+              githubAppSetup: "import",
+            } : {}),
             configured,
             configuredBy: provider.authMode === "api_key" ? null : operator ? "operator" : app ? "workspace" : null,
             ...(configured

@@ -830,7 +830,8 @@ Existing Cloud GitHub App installations can use direct installation token
 minting with `SELFHOST_GITHUB_APP_ID` and
 `SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`, using the same App registration as
 Cloud. The trusted importer retains the installation ID; users do not need
-to reconnect. See [GitHub App credentials](docs/github-app-connections.md)
+to reconnect. OAuth connect and callbacks continue to work; credential mode
+is selected per connection row. See [GitHub App credentials](docs/github-app-connections.md)
 for the import contract, encrypted token cache, and refresh behavior.
 
 Register this callback URL in every provider app:

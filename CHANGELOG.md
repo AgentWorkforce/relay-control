@@ -8,7 +8,10 @@ assigned at release.
 - Added: GitHub App installation credentials with `SELFHOST_GITHUB_APP_ID`
   and `SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`. Imported connections retain
   their installation IDs and mint replacement tokens without reconnecting.
-  Tokens are cached encrypted and refreshed under the connection row lock.
+  OAuth connect and callbacks remain available alongside imported App rows.
+  Tokens are cached encrypted; short database leases serialize App refreshes
+  without holding a transaction across GitHub requests. Installation ownership
+  is bound to one organization and can be shared by its workspaces.
   See [GitHub App credentials](docs/github-app-connections.md).
 - Changed: connection edit versions include auth mode and installation ID;
   existing clients must refresh their opaque connection version once after upgrading.
