@@ -47,6 +47,7 @@ export type ReplicaIdentityVerifier = { verify(token: string): Promise<ReplicaId
 const KEY_TTL_MS = 10 * 60_000;
 const FORCED_REFETCH_INTERVAL_MS = 30_000;
 const SKEW_SECONDS = 30;
+const MAX_LIFETIME_SECONDS = 60 * 60;
 const FETCH_TIMEOUT_MS = 5_000;
 const MAX_DOCUMENT_BYTES = 64 * 1024;
 const MAX_TOKEN_BYTES = 8 * 1024;
@@ -223,6 +224,7 @@ export function createReplicaIdentityVerifier(options: {
       if (!audienceOk) fail();
       const seconds = now().getTime() / 1000;
       if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp) || seconds >= claims.exp + SKEW_SECONDS) fail();
+      if (claims.exp - seconds > MAX_LIFETIME_SECONDS + SKEW_SECONDS) fail();
       if (claims.nbf !== undefined && (typeof claims.nbf !== "number" || !Number.isFinite(claims.nbf) || seconds < claims.nbf - SKEW_SECONDS)) fail();
       for (const name of ["organization_id", "environment_id", "workspace_id"]) {
         if (typeof claims[name] !== "string" || !UUID.test(claims[name] as string)) fail();

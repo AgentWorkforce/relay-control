@@ -134,7 +134,8 @@ Each call is admitted in this order:
 
 1. The token is an RS256 JWT from `SELFHOST_REPLICAS_IDENTITY_ISSUER`, signed by
    a key from the issuer's discovery document (same-origin JWKS), with this
-   endpoint's URL as audience and a valid expiry. Otherwise 401
+   endpoint's URL as audience and a valid expiry no more than one hour ahead
+   (30 s skew). Otherwise 401
    `replica_identity_invalid`. The `jti` is not treated as single-use. When
    the issuer's discovery document or JWKS cannot be read (network error,
    timeout, non-2xx, a body over 64 KiB, invalid JSON or schema, a foreign

@@ -103,6 +103,13 @@ test("exp and nbf allow thirty seconds of skew", async () => {
   await rejects(verifier.verify(expiring));
 });
 
+test("exp more than one hour ahead is refused", async () => {
+  const { verifier, claims, first } = setup();
+  const base = claims();
+  await verifier.verify(jwt(first.privateKey, { ...base, exp: (base.iat as number) + 3600 + 20 }));
+  await rejects(verifier.verify(jwt(first.privateKey, { ...base, exp: (base.iat as number) + 3600 + 60 })));
+});
+
 test("keys are cached by kid, an unknown kid refetches once, the TTL forces a refresh", async () => {
   const { verifier, claims, first, fetched, rotate, advance } = setup();
   await verifier.verify(jwt(first.privateKey, claims()));
