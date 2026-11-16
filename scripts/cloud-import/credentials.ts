@@ -24,7 +24,7 @@ import { CodingAgentError, type CodingAgentStore } from "../../src/admin/coding-
 import { describeAuthFile, type SubscriptionLoginStore, type SubscriptionProvider } from "../../src/admin/subscription-logins.js";
 import type { CredentialBlobStore } from "../../src/admin/credential-blobs.js";
 import { decryptCloudEnvelope } from "./importer.js";
-import { assertScope, credentialCopyQuery, MAPPING_REVISION, type ImportScope } from "./mapping.js";
+import { assertScope, credentialCopyQuery, MAPPING_REVISION, sourceQuery, type ImportScope } from "./mapping.js";
 
 /**
  * Cloud's status and history on a row the copier just wrote (the store seams
@@ -128,6 +128,16 @@ export type CredentialCopyReport = {
    * so this is what a rollback deletes by.
    */
   controlIds: Record<string, string>;
+  /**
+   * Apply only. Per organization, distinct Control credentials whose active /
+   * sandbox flag differs from Cloud's selection (selection is Control's after
+   * insert): relay_managed rows against the identity mapping's effective
+   * flags, copied credentials against their linked Cloud rows (OR-ed when
+   * several link to one; duplicate winners carry their group's flags).
+   * Sparse: only nonzero organizations; {} when none
+   * (scripts/cloud-import-verify/SELECTION_DIVERGENCE.md).
+   */
+  selectionDiverged?: Record<string, { active: number; harness: number }>;
   /**
    * Writes this run actually made, counted from statement outcomes (store
    * results and UPDATE ... RETURNING row counts), never inferred. A
@@ -302,6 +312,52 @@ export const canonicalProvider = (value: string) => {
  *   (lib/auth/credential-store-backend.ts hasAccountScopedSubscriptionCredential)
  *   is true whenever such a row exists, so provider_account_id decides.
  */
+/**
+ * Read-only: Control credentials whose selection flags differ from Cloud's
+ * (see CredentialCopyReport.selectionDiverged). Counts only; no ids leave.
+ */
+async function selectionDiverged(
+  deps: CredentialCopyDeps,
+  scope: ImportScope,
+  controlIds: Record<string, string>,
+  effective: Map<string, Candidate>,
+): Promise<Record<string, { active: number; harness: number }>> {
+  const expected = new Map<string, { org: string; active: boolean; harness: boolean }>();
+  const metadata = await deps.source.transaction(async (tx) => {
+    await tx.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+    await tx.exec("SET LOCAL TIME ZONE 'UTC'");
+    return (await tx.query<{ id: string; org: string; active: boolean; harness: boolean }>(
+      `SELECT id::text AS id, organization_id::text AS org, is_active AS active, harness_active AS harness
+         FROM (${sourceQuery("coding_agent_credentials", scope)}) q
+        WHERE skip_reason IS NULL AND auth_type = 'relay_managed'`)).rows;
+  });
+  for (const row of metadata) expected.set(row.id, { org: row.org, active: row.active, harness: row.harness });
+  for (const [cloudId, controlId] of Object.entries(controlIds)) {
+    const row = effective.get(cloudId);
+    if (!row?.organization_id) continue;
+    const prior = expected.get(controlId);
+    expected.set(controlId, {
+      org: row.organization_id,
+      active: row.is_active || prior?.active === true,
+      harness: row.harness_active || prior?.harness === true,
+    });
+  }
+  if (!expected.size) return {};
+  const actual = (await deps.target.query<{ id: string; active: boolean; harness: boolean }>(
+    "SELECT id::text AS id, is_active AS active, harness_active AS harness FROM coding_agent_credentials WHERE id::text = ANY($1::text[])",
+    [[...expected.keys()]])).rows;
+  const counts: Record<string, { active: number; harness: number }> = {};
+  for (const row of actual) {
+    const want = expected.get(row.id)!;
+    const active = Number(row.active !== want.active);
+    const harness = Number(row.harness !== want.harness);
+    if (!active && !harness) continue;
+    const prior = counts[want.org] ?? { active: 0, harness: 0 };
+    counts[want.org] = { active: prior.active + active, harness: prior.harness + harness };
+  }
+  return counts;
+}
+
 /** Winner order for Cloud rows naming one Control login: newest, then lowest id. */
 function compareLoginRows(a: Candidate, b: Candidate): number {
   const at = new Date(a.updated_at).getTime();
@@ -436,6 +492,8 @@ export async function copyCodingAgentCredentials(
     carried.set(key, winner);
   }
 
+  // The Cloud row (winners carry their group's flags) each source id stands for.
+  const effective = new Map<string, Candidate>();
   for (const { row: original, plaintext } of ready) {
     const key = loginKey(original, plaintext);
     if (key !== null && winners.get(key) !== original) {
@@ -443,6 +501,7 @@ export async function copyCodingAgentCredentials(
       continue;
     }
     const row = key === null ? original : carried.get(key)!;
+    effective.set(original.id, row);
     const actor = { kind: "user" as const, userId: row.user_id! };
     const base = { workspaceId: row.workspace_id, organizationId: row.organization_id!, actor };
     try {
@@ -555,6 +614,7 @@ export async function copyCodingAgentCredentials(
     report.selection = await applyCloudSelection(deps.target, copied);
     report.writes.selectionWrites = report.selection.writes;
   }
+  if (mode === "apply") report.selectionDiverged = await selectionDiverged(deps, scope, report.controlIds, effective);
   // A selection conflict needs a human choice per (workspace, provider)
   // before cutover sign-off, so it is never a clean run.
   report.ok = Object.keys(report.outcomes).every((outcome) =>

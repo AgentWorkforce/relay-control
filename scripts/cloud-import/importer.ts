@@ -924,7 +924,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     report.ok = false;
   }
   report.finishedAt = now().toISOString();
-  log("cloud_import.done", { mode, ok: report.ok, refused: report.refused, tables: summary(report) });
+  log("cloud_import.done", { mode, ok: report.ok, refused: report.refused, tables: summary(report), warnings: report.warnings });
   return report;
 }
 

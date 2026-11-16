@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.28";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.29";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -695,7 +695,9 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
     // A binding Control holds is never replaced by a re-run: not reset to
     // NULL/NULL after a lazy bind (0064), not swapped for a binding Cloud made
     // later, not rolled back to an older key generation. Either would orphan
-    // a live Relaycast workspace or key.
+    // a live Relaycast workspace or key. At an equal generation, a different
+    // key is Cloud's rotation (taken) unless Control changed the key since the
+    // import, which the secret rule keeps (SECRET_MARKER).
     keepTargetBinding: {
       when: "relaycast_workspace_id",
       generation: "relaycast_api_key_generation",
