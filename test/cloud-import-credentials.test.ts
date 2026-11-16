@@ -243,12 +243,26 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   // A third run with nothing new writes nothing at all.
   const third = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
   assert.deepEqual(third.writes, { inserted: 0, updated: 0, blobWrites: 0, metadataWrites: 0, selectionWrites: 0 });
-  assert.equal(again.selection?.selectionConflicts, 1);
-  assert.equal(again.ok, false, "a selection conflict is never a clean run");
+  // Cloud's selection is applied only to rows a run writes: the first run
+  // reported the conflict, and rows Control already holds keep Control's
+  // own choice (the operator resolves the conflict there), so the re-run
+  // re-evaluates only the newly written 0x808.
+  assert.deepEqual(again.selection, { groups: 1, active: 1, harness: 0, activeDemoted: 0, harnessDemoted: 0, selectionConflicts: 0, writes: 0 });
+  assert.equal(again.ok, false, "0x80c's object is still missing");
   // Org A alone has no conflict (its Google group has a native active key).
   const orgA = await copyCodingAgentCredentials(deps, { orgIds: [ORG_A] }, "apply");
-  assert.equal(orgA.selection?.selectionConflicts, 0);
+  assert.equal(orgA.selection, undefined, "nothing written, so no selection pass");
   assert.equal(orgA.ok, true);
+  // A login Control turned off stays off: a re-run never re-activates it.
+  const login806 = again.controlIds[id(0x806)]!;
+  const harness = async () => (await target.query<{ h: boolean }>("SELECT harness_active AS h FROM coding_agent_credentials WHERE id = $1", [login806])).rows[0]!.h;
+  assert.equal(await harness(), true);
+  await target.query("UPDATE coding_agent_credentials SET harness_active = false WHERE id = $1", [login806]);
+  const deactivated = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.equal(deactivated.rows[id(0x806)], "already_present");
+  assert.equal(await harness(), false, "Control's deselection survives a re-run");
+  assert.equal(deactivated.writes.selectionWrites, 0);
+  await target.query("UPDATE coding_agent_credentials SET harness_active = true WHERE id = $1", [login806]);
   assert.equal(again.rows[id(0x803)], "already_present");
   assert.equal(again.rows[id(0x805)], "already_present");
   assert.equal(again.rows[id(0x80b)], "already_present");

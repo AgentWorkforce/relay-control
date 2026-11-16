@@ -358,6 +358,9 @@ export async function copyCodingAgentCredentials(
   });
   report.candidates = candidates.length;
 
+  // Rows this run wrote. Cloud's selection is applied to these only: a row
+  // Control already holds (already_present, control_newer) keeps Control's
+  // own selection, so a re-run never re-activates a login Control turned off.
   const copied: Array<{ row: Candidate; controlId: string }> = [];
   const ready: Array<{ row: Candidate; plaintext: string }> = [];
   for (const row of candidates) {
@@ -470,7 +473,6 @@ export async function copyCodingAgentCredentials(
           }
           report.controlIds[row.id] = existing.id;
           if (stored === plaintext) {
-            copied.push({ row, controlId: existing.id });
             record(row.id, "already_present");
             continue;
           }
@@ -481,7 +483,6 @@ export async function copyCodingAgentCredentials(
           // created), means Control owns newer state: never clobber it.
           const marker = await loginMarker(deps.target, row.organization_id!, existing.id);
           if (marker === null || marker !== existing.blob_version) {
-            copied.push({ row, controlId: existing.id });
             record(row.id, "control_newer");
             continue;
           }
@@ -506,7 +507,6 @@ export async function copyCodingAgentCredentials(
           });
         } catch (error) {
           if (error instanceof CodingAgentError && error.code === "login_version_conflict") {
-            if (existing) copied.push({ row, controlId: existing.id });
             record(row.id, "control_newer");
             continue;
           }
@@ -539,7 +539,7 @@ export async function copyCodingAgentCredentials(
         report.writes.inserted += 1;
         report.writes.metadataWrites += await preserveCloudState(deps.target, result.record.id, row);
       }
-      copied.push({ row, controlId: result.record.id });
+      if (result.created) copied.push({ row, controlId: result.record.id });
       report.controlIds[row.id] = result.record.id;
       record(row.id, result.created ? "copied" : "already_present");
     } catch (error) {
