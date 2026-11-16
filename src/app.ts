@@ -10,6 +10,7 @@ import { GrokRoutines } from "./mcp/grok-routines.js";
 import { retiringIdentity } from "./mcp/oauth/retirement.js";
 import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Duplex } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -21,7 +22,9 @@ import { ApiTokenStore, ENROLLMENT_KEY_PREFIX } from "./admin/api-tokens.js";
 import { recordAudit } from "./admin/audit.js";
 import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
 import { handleChiefRelay } from "./chief-relay.js";
-import { handleRelayNode } from "./relay-node/broker.js";
+import { handleRelayNode, RELAY_NODE_RATE_LIMIT } from "./relay-node/broker.js";
+import { relayNodeCredentials, type RelayNodeCredentials } from "./relay-node/credentials.js";
+import { createRelayNodeSocketBridge, refuseUpgrade } from "./relay-node/socket.js";
 import { handleFlowsBroker } from "./flows-broker.js";
 import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
 import { relayLaunchCredentials } from "./mcp/relay-launch-credentials.js";
@@ -368,6 +371,16 @@ function cookieDeleteAllowed(request: IncomingMessage, browserOrigins: string[])
     : request.headers["sec-fetch-site"] === "same-origin";
 }
 
+/**
+ * The request handler, plus the HTTP upgrade handler for server "upgrade"
+ * events: the relay-node socket bridge on gate-only installs, 404 otherwise.
+ */
+export type AppHandler = ((request: IncomingMessage, response: ServerResponse) => void) & {
+  handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void;
+  /** Ends every bridged socket (shutdown). */
+  closeUpgrades(): void;
+};
+
 export function createApp(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
@@ -439,7 +452,7 @@ export function createApp(input: {
   /** Test hooks for claim leases and crash injection. Production leaves this unset. */
   messaging?: Pick<MessagingDeps,
     "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck">;
-}): (request: IncomingMessage, response: ServerResponse) => void {
+}): AppHandler {
   const { config, store, admin, telemetry, identity } = input;
   const features = input.features ?? NO_FEATURES;
   const workspaceHistoryOrigin = (
@@ -820,10 +833,61 @@ export function createApp(input: {
     return auth;
   }
 
+  // Standard installs: the node token proves the node against Relaycast; it
+  // is never stored or logged.
+  async function proveNodeToken(workspaceKey: string, body: Record<string, unknown>) {
+    const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken.trim() : "";
+    if (!NODE_TOKEN.test(nodeToken)) {
+      throw new HttpError(400, "invalid_request", "Send workspaceId and the node's token (nt_live_... or ar_nd_...).");
+    }
+    return verifyNodeToken(config.relaycastUrl, workspaceKey, nodeToken);
+  }
+
+  // Gate-only installs: the node host never holds its Relaycast node token,
+  // so the proof is the node's enrolment through this Control's relay-node
+  // broker with a relay-node token minted in this workspace and bound to that
+  // name (docs/relay-node-credential.md, "Claiming the node"). Relaycast is
+  // not asked. A row whose sealed token no longer opens still proves the
+  // enrolment; the socket bridge refuses that node separately.
+  async function proveEnrolledNode(
+    credentials: RelayNodeCredentials,
+    workspaceId: string,
+    body: Record<string, unknown>,
+  ) {
+    if (body.nodeToken !== undefined) {
+      throw new HttpError(
+        400,
+        "invalid_request",
+        "This installation runs behind relaygate; send workspaceId and nodeName (the node's enrolled name).",
+      );
+    }
+    const nodeName = body.nodeName;
+    if (typeof nodeName !== "string" || !NODE_ID.test(nodeName)) {
+      throw new HttpError(400, "invalid_request", "Send workspaceId and nodeName.");
+    }
+    const enrolled = await credentials.find({ workspaceId, nodeName });
+    if (!enrolled) throw new NodeClaimError(403, "That node has not enrolled through this installation.");
+    return { id: enrolled.relaycastNodeId, name: enrolled.nodeName };
+  }
+
   const apiTokens = new ApiTokenStore(store.database);
   // Gate-only installs only: relaygate introspects one-time `sh_lt_` launch credentials.
   const relayLaunchCredentialStore = config.relaygatePublicUrl
     ? relayLaunchCredentials(store.database, config.encryptionKeyring) : undefined;
+  // Gate-only installs only: Control holds relay nodes' Relaycast node tokens and bridges their sockets.
+  const relayNodeCredentialStore = config.relaygatePublicUrl
+    ? relayNodeCredentials(store.database, config.encryptionKeyring) : undefined;
+  const relayNodeSocket = relayNodeCredentialStore && relayLaunchCredentialStore
+    ? createRelayNodeSocketBridge({
+      apiTokens,
+      nodeCredentials: relayNodeCredentialStore,
+      launchCredentials: relayLaunchCredentialStore,
+      relaycastUrl: config.relaycastUrl,
+      database: store.database,
+      rateLimit: (key) => limiter.consume(key, RELAY_NODE_RATE_LIMIT.limit, RELAY_NODE_RATE_LIMIT.windowMs).allowed,
+      log: (message, fields) => console.warn(`[selfhost-api] ${message}`, fields),
+    })
+    : undefined;
   const flowRelayfileCredentials = input.flowRelayfileCredentials ?? new FlowRunRelayfileCredentials(
     store.database,
     () => input.now?.() ?? new Date(),
@@ -1208,12 +1272,12 @@ export function createApp(input: {
       apiTokens,
       relaycastUrl: config.relaycastUrl,
       relaycastBinding: (id) => store.relaycastBinding(id),
-      relaygatePublicUrl: config.relaygatePublicUrl,
       bearer,
       rateLimit: (res, key, rule) =>
         rateLimit(res, key, rule, "rate_limited", "Too many relay-node requests; retry later"),
       bodyText: (incoming) => bodyText(incoming),
       json,
+      ...(relayNodeCredentialStore ? { nodeCredentials: relayNodeCredentialStore } : {}),
     })) {
       return;
     }
@@ -1561,8 +1625,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     }
 
     // Whose computer a Relaycast node is (hosted: fleet/nodes/claim). The
-    // Desktop claims its own spawn node with its workspace-bound sign-in. The
-    // node token is proven against Relaycast and never stored or logged.
+    // Desktop claims its own spawn node with its workspace-bound sign-in:
+    // with the node token on standard installs, by enrolled node name on
+    // gate-only installs (proveNodeToken / proveEnrolledNode).
     if (path === "/api/v1/fleet/nodes/claim" && (method === "POST" || method === "DELETE")) {
       const auth = await authenticate(request);
       if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
@@ -1591,11 +1656,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         "rate_limited",
         "Too many node claims. Try again later.",
       );
-      const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken.trim() : "";
-      if (!NODE_TOKEN.test(nodeToken)) {
-        throw new HttpError(400, "invalid_request", "Send workspaceId and the node's token (nt_live_... or ar_nd_...).");
-      }
-      const proven = await verifyNodeToken(config.relaycastUrl, workspace.relaycastApiKey, nodeToken);
+      const proven = relayNodeCredentialStore
+        ? await proveEnrolledNode(relayNodeCredentialStore, workspaceId, body)
+        : await proveNodeToken(workspace.relaycastApiKey, body);
       const result = await store.claimNode({
         workspaceId,
         organizationId: workspace.organizationId,
@@ -2873,7 +2936,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     throw new HttpError(404, "not_found", "Route not found");
   }
 
-  return (request, response) => {
+  const handler = (request: IncomingMessage, response: ServerResponse): void => {
     // telemetry lane: aggregate usage per feature area (no bodies or queries).
     if (telemetry) {
       const routePath = new URL(request.url ?? "/", config.publicBaseUrl).pathname;
@@ -2985,4 +3048,13 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       json(response, 500, { error: "internal", message: "Internal server error" }, true);
     });
   };
+  return Object.assign(handler, {
+    handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+      if (relayNodeSocket) relayNodeSocket.handleUpgrade(request, socket, head);
+      else refuseUpgrade(socket, 404);
+    },
+    closeUpgrades(): void {
+      relayNodeSocket?.close();
+    },
+  });
 }

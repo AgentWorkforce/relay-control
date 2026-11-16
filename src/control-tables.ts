@@ -70,6 +70,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "person_messages",
   "person_revocations",
   "relay_launch_credentials",
+  "relay_node_credentials",
   "relay_spawns",
   "relaycast_rekey_backups",
   "remote_agent_connections",

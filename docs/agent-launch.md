@@ -38,7 +38,9 @@ workspace's own Relaycast key**. A node enrolled in another workspace or
 another installation is never listed and cannot be selected. Owners come from
 `fleet_node_owners` rows for this workspace and its Relaycast workspace
 (Agent Relay Desktop records them through `POST /api/v1/fleet/nodes/claim`
-when its person signs in).
+when its person signs in; on gate-only installs it claims by enrolled node
+name, see
+[relay-node-credential.md](relay-node-credential.md#claiming-the-node)).
 
 | Node | Allowed |
 |---|---|

@@ -90,7 +90,6 @@ envelope `{"ok": false, "error": {"code", "message"}}`:
 | 401 | `token_invalid` | No bearer, or not a live (unrevoked, unexpired) relay-node token |
 | 403 | `scope_denied` | Path or method outside the table above |
 | 403 | `node_mismatch` | `POST /nodes` body names another node; nothing is sent to Relaycast |
-| 403 | `gate_only` | `POST /nodes` on a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set, see [identity.md](identity.md#gate-only-installs-relaygate)); checked after `node_mismatch`, nothing is sent to Relaycast and no node token is issued |
 | 400 | `invalid_request` | `POST /nodes` body is not JSON, or a malformed path segment |
 | 413 | `payload_too_large` | Body over 1 MiB |
 | 429 | `rate_limited` | Over 600 requests per minute for this token |
@@ -100,3 +99,104 @@ A Relaycast 401 is never passed through, so a node never mistakes a stale
 workspace key on the relay-control side for its own token being rejected. Any
 other Relaycast status and JSON body (for example 403 for a suspended
 workspace, 404, 409, 429 with `Retry-After`, 5xx) passes through unchanged.
+
+## Gate-only installs
+
+On a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set, see
+[identity.md](identity.md#gate-only-installs-relaygate)) the node host never
+holds its Relaycast node token either: relay-control keeps it and bridges the
+node's socket. Unset, everything above is unchanged.
+
+### Enrolment
+
+`POST /relay-node/v1/nodes` keeps the same `node_mismatch` rule, but:
+
+- The host's `X-Relaycast-Node-Token` header is ignored. When the node
+  enrolled through this relay-control before, relay-control sends the node
+  token it holds in that header itself, so Relaycast treats the call as a
+  rotation. `Idempotency-Key` is still forwarded.
+- On a 2xx answer, relay-control stores the node token sealed under the active
+  encryption key (table `relay_node_credentials`, migration 0059, one row per
+  workspace and node name, rotated in place with the Relaycast node id and the
+  enrolling relay-node token's id) and answers the host
+  `{"ok": true, "data": {"id", "name"}}`: the token is never returned.
+- A 2xx answer without a string token is `502 relaycast_unavailable` and
+  nothing is stored. Any other status passes through as above.
+
+### Node socket
+
+Instead of Relaycast's `/v1/node/ws`, the node connects to:
+
+```
+GET /relay-node/v1/ws
+Authorization: Bearer <relay-node token>
+```
+
+The token is read from the `Authorization` header only, never from the query
+string. relay-control opens Relaycast's node socket with the stored node token
+and relays frames in both directions (up to 4 MiB each; up to 100 node frames
+are held while the Relaycast socket opens). When either side closes, the other
+is closed with the same code; codes a peer may not send (1005, 1006, 1015)
+become 1011. Node frames pass through unchanged; `node.register` and
+`node.heartbeat` also update the row's `last_heartbeat_at` (at most once per
+30 s per connection). Frames that are not JSON objects pass through untouched.
+
+Two edits on frames from Relaycast to the node, and no others:
+
+- **Launch credential.** An `action.invoke` whose `action` starts with
+  `spawn:` and whose `invocation_id` is a launch journaled by
+  `spawn_relay_agent` for this node gains one field,
+  `input.launch_credential`: the launch's one-time `sh_lt_` credential
+  ([identity.md](identity.md#relay-launch-credentials)). The node reads it
+  once, exports it to the launched agent only as `RELAY_LAUNCH_CREDENTIAL`
+  for its relaygate registration, and never persists or logs it. Attaching
+  does not redeem it; relaygate's introspection does. An invocation that
+  matches no launch, or whose credential is expired or redeemed, passes
+  through unchanged, and relaygate then refuses that agent's registration.
+- **No message delivery.** `deliver` frames are dropped and not acknowledged
+  by relay-control: launched agents read their messages through relaygate.
+
+Everything else, including `action.invoke` for `release`, `ping`, `reply` and
+`error`, passes through unchanged.
+
+Audit events (actor: service `relay-node:<token id>`):
+`relay_node.socket.opened` (target `node=<name>`),
+`relay_node.socket.closed` (target `node=<name> code=<n>`) and
+`relay_node.launch_credential.attached` (target `node=<name> spawn=<spawn id>`).
+Tokens and frames are never logged or audited.
+
+Upgrade refusals are plain HTTP answers with no body:
+
+| Status | When |
+| --- | --- |
+| 401 | No bearer, or not a live relay-node token |
+| 403 | The node has not enrolled through this relay-control, or its stored node token cannot be read with the current encryption keyring (re-enrol) |
+| 404 | Not a gate-only install, or any other upgrade path |
+| 429 | Over 600 requests per minute for this token (shared with the broker routes) |
+| 503 | The bridge is at its connection limit or shutting down |
+
+### Claiming the node
+
+Agent Relay Desktop records whose computer a node is with
+`POST /api/v1/fleet/nodes/claim` (user bearer, same workspace checks and rate
+limit as standard installs). A standard install proves the node with its
+Relaycast node token; a gate-only node never holds one, so the body is
+`{"workspaceId", "nodeName"}` instead, where `nodeName` is the node's enrolled
+name (the relay-node token's name rule: 1-200 letters, digits, `.`, `_`, `:`
+or `-`).
+
+The proof is the node's enrolment row: the node enrolled through this
+relay-control with a relay-node token that a workspace owner or admin minted
+in this workspace and bound to that name, so the row means "this workspace's
+own node host enrolled this name". The claim answers the stored Relaycast node
+id and is recorded with the same rules as standard installs (organization
+members only, one owner per node, first claim wins, `409` conflicts, release
+with `DELETE`). Relaycast is not asked. A row whose stored node token can no
+longer be read still proves the enrolment; the socket bridge refuses that node
+until it re-enrols.
+
+| Status | When |
+| --- | --- |
+| 400 `invalid_request` | `nodeToken` is sent (any value), or `nodeName` is missing or malformed |
+| 403 `node_claim_refused` | The node has not enrolled through this relay-control in this workspace, or the caller is not an organization member |
+| 409 `node_claim_refused` | Someone else owns the node, or it is owned through another workspace or relay |

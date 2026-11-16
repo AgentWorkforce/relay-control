@@ -12,6 +12,24 @@ assigned at release.
   and reply helper installed through the provider exec API, and signed
   delivery of messages addressed to it. Release revokes the capability before
   cleanup. Migration 0065 `replica_spawns`. See [Replicas](docs/replicas.md).
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), Agent
+  Relay Desktop claims its relay node at `POST /api/v1/fleet/nodes/claim` with
+  `{workspaceId, nodeName}`: the proof is the node's enrolment through this
+  Control (`relay_node_credentials`, a relay-node token minted in the
+  workspace and bound to that name), and Relaycast is not asked. A
+  `nodeToken` is refused with 400; a name that never enrolled here is 403
+  `node_claim_refused`. Claim rules and release are unchanged. Unset, nothing
+  changes. See docs/relay-node-credential.md.
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), relay
+  nodes no longer hold their Relaycast node token. `POST /relay-node/v1/nodes`
+  stores it sealed (migration 0059 `relay_node_credentials`), answers the host
+  without it and presents it itself on re-enrolment; the node connects to the
+  new `GET /relay-node/v1/ws` bridge (Bearer relay-node token), which relays
+  the Relaycast node socket, attaches each launch's one-time credential to its
+  spawn invocation as `input.launch_credential`, and does not forward
+  `deliver` frames. Audited as `relay_node.socket.opened`,
+  `relay_node.socket.closed` and `relay_node.launch_credential.attached`.
+  Unset, nothing changes. See docs/relay-node-credential.md.
 - Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set) every
   Sessions read-token mint names the reader kind (`browser`, `device` or
   `mcp`) from how the caller authenticated, so relaygate can tell a person's
@@ -24,8 +42,8 @@ assigned at release.
   introspects it at `POST /internal/v1/auth/introspect`, which answers
   principal_type `relay_launch` with `node_name` and `scopes`
   `["relay:agent:enrol"]` and burns it on the first active answer. It is
-  stored sealed and never sent to Relaycast; delivery to the node is a later
-  change. Audited as `relay_launch.credential.issued` and
+  stored sealed and never sent to Relaycast; the relay-node socket bridge
+  delivers it to the node. Audited as `relay_launch.credential.issued` and
   `relay_launch.credential.redeemed`. Unset, nothing changes. See
   docs/identity.md.
 - Added: on gate-only installs, `spawn_relay_agent` first asks relaygate's
@@ -61,8 +79,8 @@ assigned at release.
   `403 gate_only` with both urls, registers no person identity on Relaycast
   (the desktop enrols its own name at relaygate `/v1/register` with its device
   token) and is audited as `workspace.person_credential.withheld`; the
-  relay-node broker's enrol (`POST /relay-node/v1/nodes`) answers
-  `403 gate_only` before any Relaycast call, so no node token leaves. MCP join
+  relay-node broker's enrol (`POST /relay-node/v1/nodes`) keeps the node
+  token in Control (see the relay-node entry above), so no node token leaves. MCP join
   and spawn are unchanged (their participant tokens stay server-side).
   Person identities Control newly registers server-side (messaging
   conversation sends, support reply notices) are named with the `control-`
