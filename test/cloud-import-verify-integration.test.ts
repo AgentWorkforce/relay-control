@@ -1,3 +1,4 @@
+import { captureCredentialConvergence,compareCredentialConvergence } from "../scripts/cloud-import-verify/convergence.js";
 import assert from "node:assert/strict";
 import { before,after,beforeEach,test,type TestFn } from "node:test";
 import { Client } from "pg";
@@ -819,3 +820,26 @@ for (const [provider,accounted] of [["opencode",true],["synthetic-unknown-provid
       {reason:"unsupported_model_provider",accounted:Number(accounted),unresolved:Number(!accounted)}]);
   });
 }
+
+fixtureTest("convergence snapshots detect in-place OAuth rewrites and same-value updates",async () => {
+  const fixture=await copiedFixture();
+  const before=await captureCredentialConvergence(target);
+  const unchanged=await captureCredentialConvergence(target,"after");
+  assert.equal(compareCredentialConvergence(before,unchanged,{writeCount:0,blobWriteCount:0}).ok,true);
+  assert.equal(compareCredentialConvergence(before,unchanged,undefined).ok,false,"missing counters never mean zero");
+  const sameId=fixture.copy.controlIds[id(0x803)]!;
+  await target.query("UPDATE coding_agent_credentials SET status=status WHERE id=$1",[sameId]);
+  const sameValue=await captureCredentialConvergence(target,"after");
+  const changed=compareCredentialConvergence(before,sameValue,{writeCount:0,blobWriteCount:0});
+  assert.equal(changed.ok,false,"same-value DML is independently detected despite a false zero-write claim");
+  assert.equal((changed.detail as {credentialChanges:{changed:number}}).credentialChanges.changed,1);
+  const beforeCopy=await captureCredentialConvergence(target);
+  const rerun=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  assert.equal(rerun.ok,true);
+  const afterCopy=await captureCredentialConvergence(target,"after");
+  const nonConverged=compareCredentialConvergence(beforeCopy,afterCopy,{writeCount:0,blobWriteCount:0});
+  assert.equal(nonConverged.ok,false);
+  assert.ok((nonConverged.detail as {blobVersionChanges:number}).blobVersionChanges > 0);
+  assert.ok(!JSON.stringify(before).includes(sameId));
+  assert.ok(!JSON.stringify(before).includes("acct-synthetic"));
+});
