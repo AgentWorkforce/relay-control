@@ -11,6 +11,11 @@ export async function beginReadOnlySnapshot(client:Client):Promise<ReadOnlySetti
   await client.query("SET LOCAL TIME ZONE 'UTC'");
   await client.query("SET LOCAL DateStyle='ISO, YMD'");
   await client.query("SET LOCAL row_security=off");
+  return await inspectReadOnlySnapshot(client);
+}
+
+/** Inspect actual in-session settings before reading a checkpoint. */
+export async function inspectReadOnlySnapshot(client:Client):Promise<ReadOnlySettings> {
   const show=async (name:string):Promise<string> => Object.values((await client.query(`SHOW ${name}`)).rows[0])[0] as string;
   const settings={transactionReadOnly:await show("transaction_read_only"),isolation:await show("transaction_isolation"),
     statementTimeout:await show("statement_timeout"),lockTimeout:await show("lock_timeout")};

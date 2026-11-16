@@ -1,3 +1,4 @@
+import type { CredentialConvergenceSnapshot } from "./convergence.js";
 import { readFile,realpath,stat } from "node:fs/promises";
 import { resolve,sep } from "node:path";
 import { Client } from "pg";
@@ -41,7 +42,13 @@ try {
     if (!credentialBeforePath || credentialBeforePath.startsWith("--")) throw new Error("credential_snapshot_path_required");
     args.splice(credentialBeforeAt,2);
   }
-  if (credentialBeforePath && !copyPath) throw new Error("credential_copy_report_required");
+  const convergenceAt=args.indexOf("--convergence-before");let convergencePath:string|undefined;
+  if (convergenceAt >= 0) {
+    convergencePath=args[convergenceAt+1];
+    if (!convergencePath || convergencePath.startsWith("--")) throw new Error("convergence_snapshot_path_required");
+    args.splice(convergenceAt,2);
+  }
+  if ((credentialBeforePath || convergencePath) && !copyPath) throw new Error("credential_copy_report_required");
   const path = args[0];
   let scope:ImportScope;
   if (args.length === 2 && args[1] === "--all-organizations") scope = {orgIds:null};
@@ -63,6 +70,7 @@ try {
     if (!process.env.CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR) throw new Error("local_object_directory_required");
     const root = await realpath(process.env.CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR);
     credentialCopy = {
+      convergenceBefore:convergencePath ? JSON.parse(await readFile(convergencePath,"utf8")) as CredentialConvergenceSnapshot : undefined,
       previousTarget:credentialBeforePath ? JSON.parse(await readFile(credentialBeforePath,"utf8")) as CredentialTargetSnapshot : undefined,
       report:JSON.parse(await readFile(copyPath,"utf8")) as CredentialCopyReport,
       targetBlobs:readOnlyPostgresBlobs(target,keyring),

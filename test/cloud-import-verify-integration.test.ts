@@ -1,10 +1,14 @@
+import { credentialConvergenceCohort,captureCredentialConvergence,compareCredentialConvergence,computeCredentialCheckpoint,validateCredentialCheckpoint } from "../scripts/cloud-import-verify/convergence.js";
+import { credentialCloudSelection,type SourceSelection,type TargetSelection } from "../scripts/cloud-import-verify/credential-selection.js";
+import { unboundWorkspaceMarkers } from "../scripts/cloud-import-verify/unbound-markers.js";
+import { beginReadOnlySnapshot } from "../scripts/cloud-import-verify/read-only.js";
 import assert from "node:assert/strict";
 import { before,after,beforeEach,test,type TestFn } from "node:test";
 import { Client } from "pg";
 import type { Database,SqlExecutor } from "../src/database.js";
 import { migrate,grantRuntimeDatabaseRole } from "../src/migrations.js";
 import { canonicalRelayhistoryOrigin } from "../src/relayhistory-origin.js";
-import { runImport,type ImportReport } from "../scripts/cloud-import/importer.js";
+import { runImport,decryptCloudEnvelope,type ImportReport } from "../scripts/cloud-import/importer.js";
 import { CLOUD_FIXTURE_DDL,cloudFixtureSeed,cloudEnvelope,id,ORG_A,ORG_B } from "../scripts/cloud-import/cloud-fixture.js";
 import { fixtureKeyring } from "../scripts/cloud-import-verify/fixtures.js";
 import { verifyImport } from "../scripts/cloud-import-verify/import-contract.js";
@@ -20,7 +24,7 @@ import { SubscriptionLoginStore } from "../src/admin/subscription-logins.js";
 import { copyCodingAgentCredentials } from "../scripts/cloud-import/credentials.js";
 import { normalizedScope,cutoverScopeFinding,requireAllSourceScope } from "../scripts/cloud-import-verify/organization-scope.js";
 import { schemaCatalog,migrationFiles,sealManifest,manifestJson,type SchemaEntry } from "../scripts/cloud-import-verify/schema.js";
-import { captureCredentialTarget } from "../scripts/cloud-import-verify/credential-copy.js";
+import { captureCredentialTarget,credentialCopyFindings } from "../scripts/cloud-import-verify/credential-copy.js";
 import { captureOwnership } from "../scripts/cloud-import-verify/reconciliation.js";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -64,6 +68,13 @@ async function copiedFixture() {
     [`${id(5)}/${id(0x803)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-synthetic-openai-key-0000000000"}),cloudKeyHex))],
     [`${id(2)}/anthropic/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({token:"sk-ant-oat01-synthetic-token-00000000"}),cloudKeyHex))],
     [`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(auth,cloudKeyHex))],
+    // Rows the cloud-import stack's fixture adds: an account-less legacy
+    // ChatGPT login (0x810) and the claude/gemini alias keys (0x814, 0x817).
+    [`${id(1)}/openai/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({auth_mode:"chatgpt",tokens:{
+      access_token:jwt({exp:1893456000}),id_token:jwt({email:"alice.legacy@example.test"}),
+      refresh_token:"rt-synthetic-legacy",account_id:"acct-synthetic-legacy"}}),cloudKeyHex))],
+    [`${id(2)}/${id(0x814)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-ant-api03-synthetic-alias-0000000"}),cloudKeyHex))],
+    [`${id(2)}/${id(0x817)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"AIza-synthetic-gemini-alias-key-000000"}),cloudKeyHex))],
     [`${id(2)}/${id(0x80b)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-ant-api03-unselected-synthetic-00000"}),cloudKeyHex))],
     [`${id(1)}/${id(0x80d)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-ant-api03-selected-synthetic-0000000"}),cloudKeyHex))],
     [`${id(1)}/${id(0x80e)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"AIza-synthetic-google-key-000000000000"}),cloudKeyHex))],
@@ -72,9 +83,9 @@ async function copiedFixture() {
   ]);
   const reader = {get:async (key:string) => objects.get(key) ?? null};
   const blobs = new CredentialBlobStore(new PostgresObjectBackend(targetDb),fixtureKeyring);
-  const deps = {source:sourceDb,target:targetDb,reader,cloudKeyHex,keyring:fixtureKeyring,
+  const deps = {source:sourceDb,target:targetDb,reader,cloudKeyHex,keyring:fixtureKeyring,blobs,
     codingAgents:new CodingAgentStore(targetDb,fixtureKeyring,undefined,blobs),
-    logins:new SubscriptionLoginStore(targetDb,fixtureKeyring,blobs),blobs};
+    logins:new SubscriptionLoginStore(targetDb,fixtureKeyring,blobs)};
   const copy = await copyCodingAgentCredentials(deps,scope,"apply");
   assert.equal(copy.ok,true,JSON.stringify(copy));
   return {ledger,copy,deps,objects,blobs,reader};
@@ -385,6 +396,40 @@ fixtureTest("wrong Cloud credential selection fails even with unchanged cardinal
   assert.ok(report.findings.filter((f) => f.kind === "credential_selection").every((f) => f.ok));
   assert.equal(report.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
   assert.equal(report.findings.find((f) => f.kind === "credential_cloud_selection")!.ok,false);
+});
+
+fixtureTest("written-only consumer preserves a real Control-deactivated login on an untouched rerun",async () => {
+  const fixture=await copiedFixture();
+  const login=fixture.copy.controlIds[id(0x806)]!;
+  await target.query("UPDATE coding_agent_credentials SET harness_active=false WHERE id=$1",[login]);
+  const flags=async () => new Map((await target.query("SELECT id,workspace_id,model_provider,is_active,harness_active FROM coding_agent_credentials")).rows
+    .map((row) => [row.id,{group:`${row.workspace_id}:${row.model_provider}`,active:row.is_active,harness:row.harness_active}] as [string,TargetSelection]));
+  const baseline=await flags();
+  const sourceRows=new Map((await source.query("SELECT * FROM provider_credentials")).rows.map((row) => [row.id,row]));
+  const entries:SourceSelection[]=Object.entries(fixture.copy.controlIds).map(([sourceId,controlId]) => {
+    const row=sourceRows.get(sourceId)!;
+    return {id:sourceId,key:controlId,group:baseline.get(controlId)!.group,active:row.is_active,
+      harness:row.harness_active && ["oauth_token","provider_oauth"].includes(row.auth_type),updated:new Date(row.updated_at).getTime()};
+  });
+  const check=async () => {
+    const current=await flags();
+    return credentialCloudSelection({revision:"cloud-identity-2026-11-16.25",entries,
+      outcomes:Object.fromEntries(entries.map((row) => [row.id,"already_present"])),flags:current,
+      nativeFlags:new Map(),baseline,allFlags:[...current.values()],unchangedKeys:new Set(),reported:undefined});
+  };
+  assert.equal((await check()).ok,true);
+  await target.query("UPDATE coding_agent_credentials SET harness_active=true WHERE id=$1",[login]);
+  assert.equal((await check()).ok,false,"re-activating an untouched login fails independently of the producer's empty selection summary");
+});
+
+fixtureTest("retained workspace binding warnings do not waive visible comparison drift",async () => {
+  const ledger=await apply();
+  ledger.warnings.workspaces_binding_conflict=1;
+  ledger.warnings.workspaces_generation_kept=1;
+  await target.query("UPDATE workspaces SET relaycast_workspace_id='synthetic-retained-provider-binding' WHERE id=$1",[id(0x201)]);
+  const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.ok,false);
+  assert.equal(report.findings.find((finding) => finding.kind === "table" && finding.name === "workspaces")!.ok,false);
 });
 
 fixtureTest("unselected copied credentials preserve native selections and report fallback conflicts",async () => {
@@ -819,3 +864,262 @@ for (const [provider,accounted] of [["opencode",true],["synthetic-unknown-provid
       {reason:"unsupported_model_provider",accounted:Number(accounted),unresolved:Number(!accounted)}]);
   });
 }
+
+fixtureTest("convergence snapshots detect in-place OAuth rewrites and same-value updates",async () => {
+  const fixture=await copiedFixture();
+  const before=await captureCredentialConvergence(target);
+  const unchanged=await captureCredentialConvergence(target,"after");
+  const cohort=credentialConvergenceCohort(Object.values(fixture.copy.controlIds));
+  const zeroReport={version:1,mappingRevision:MAPPING_REVISION,mode:"apply",ok:true,outcomes:{},
+    writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0},
+    convergence:{beforeDigest:before.digest,nonce:before.nonce}};
+  assert.equal(compareCredentialConvergence(before,unchanged,zeroReport,cohort).ok,true);
+  assert.equal(compareCredentialConvergence(before,unchanged,undefined,cohort).ok,false,"missing counters never mean zero");
+  const sameId=fixture.copy.controlIds[id(0x803)]!;
+  await target.query("UPDATE coding_agent_credentials SET status=status WHERE id=$1",[sameId]);
+  const sameValue=await captureCredentialConvergence(target,"after");
+  const changed=compareCredentialConvergence(before,sameValue,zeroReport,cohort);
+  assert.equal(changed.ok,false,"same-value DML is independently detected despite a false zero-write claim");
+  assert.equal((changed.detail as {credentialChanges:{changed:number}}).credentialChanges.changed,1);
+  const beforeCopy=await captureCredentialConvergence(target);
+  zeroReport.convergence={beforeDigest:beforeCopy.digest,nonce:beforeCopy.nonce};
+  const rerun=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  assert.equal(rerun.ok,true);
+  const afterCopy=await captureCredentialConvergence(target,"after");
+  const nonConverged=compareCredentialConvergence(beforeCopy,afterCopy,zeroReport,cohort);
+  assert.equal(nonConverged.ok,false);
+  assert.ok((nonConverged.detail as {blobVersionChanges:number}).blobVersionChanges > 0);
+  assert.ok(!JSON.stringify(before).includes(sameId));
+  assert.ok(!JSON.stringify(before).includes("acct-synthetic"));
+});
+
+fixtureTest("qualified convergence binds the real checkpoint and rejects old copier mutations despite zero claims",async () => {
+  const fixture=await copiedFixture();
+  const before=await captureCredentialConvergence(target);
+  const rows=Object.fromEntries(Object.entries(fixture.copy.rows).map(([key,outcome]) => [key,outcome === "copied" ? "already_present" : outcome]));
+  const outcomes:Record<string,number>={};for (const outcome of Object.values(rows)) outcomes[outcome]=(outcomes[outcome] ?? 0)+1;
+  const noOp={...fixture.copy,rows,outcomes,convergence:{beforeDigest:before.digest,nonce:before.nonce},writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0},
+    selection:fixture.copy.selection ? {...fixture.copy.selection,writes:0} : undefined};
+  const options={credentialCopy:{report:noOp,reader:fixture.reader,targetBlobs:fixture.blobs,convergenceBefore:before}};
+  const positive=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
+  assert.equal(positive.ok,true,JSON.stringify(positive.findings.filter((f) => !f.ok)));
+  assert.equal(positive.credentialConvergence,"verified");
+  await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  const changed=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
+  assert.equal(changed.ok,false);assert.equal(changed.credentialConvergence,"failed");assert.equal(changed.credentialCopy,"failed");
+  assert.ok((changed.findings.find((f) => f.kind === "credential_convergence")!.detail as {blobVersionChanges:number}).blobVersionChanges > 0);
+  assert.ok(changed.findings.filter((f) => f.kind.startsWith("credential_") && f.kind !== "credential_convergence").every((f) => f.ok));
+  await assert.rejects(verifyImport(source,target,{orgIds:[ORG_A]},fixture.ledger,fixtureKeyring,cloudKeyHex,options),/all source organizations/);
+});
+
+fixtureTest("updated copy outcomes require valid explicit write receipts and exact target contents",async () => {
+  const fixture=await copiedFixture();
+  const row=id(0x806);
+  const controlId=fixture.copy.controlIds[row]!;
+  await target.query(`INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision)
+    SELECT organization_id,'copier_login',id::text||':'||blob_version::text,$2 FROM coding_agent_credentials WHERE id=$1`,[controlId,MAPPING_REVISION]);
+  const outcomes={...fixture.copy.outcomes,copied:fixture.copy.outcomes.copied!-1,updated:1};
+  const report={...fixture.copy,rows:{...fixture.copy.rows,[row]:"updated"},outcomes,
+    writes:{inserted:outcomes.copied,updated:1,blobWrites:1,metadataWrites:0,selectionWrites:0},
+    selection:fixture.copy.selection ? {...fixture.copy.selection,writes:0} : undefined};
+  const checked=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:report as unknown as typeof fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(checked.credentialCopy,"verified",JSON.stringify(checked.findings.filter((f) => !f.ok)));
+  assert.equal(checked.credentialConvergence,"not_requested");
+  report.writes.updated=0;
+  const invalid=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:report as unknown as typeof fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(invalid.credentialCopy,"failed");
+  for (const outcome of ["control_newer","blob_read_failed"]) {
+    report.rows[row]=outcome;
+    report.outcomes={...fixture.copy.outcomes,copied:outcomes.copied,[outcome]:1} as typeof report.outcomes;
+    report.writes={inserted:outcomes.copied,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0};
+    const refused=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+      {credentialCopy:{report:report as unknown as typeof fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+    assert.equal(refused.credentialCopy,"failed",outcome);
+    assert.equal(refused.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
+    assert.equal(refused.findings.find((f) => f.kind === "credential_copy_ledger")!.ok,false);
+  }
+});
+
+fixtureTest("convergence capture CLI requires all scope and creates a private non-overwritable checkpoint",async () => {
+  const directory=await mkdtemp(join(tmpdir(),"verify-convergence-cli-"));
+  try {
+    const output=join(directory,"before.json");
+    const url=new URL("postgresql:/");url.hostname="127.0.0.1";url.port=String(port);
+    url.username=config.user;url.pathname="/cloud_import_target_fixture";
+    const env:NodeJS.ProcessEnv={...process.env,CLOUD_VERIFY_TARGET_URL:url.href};
+    delete env.CLOUD_VERIFY_TARGET_URL_FILE;
+    const run=(args:string[]) => spawnSync(process.execPath,["--import","tsx",
+      fileURLToPath(new URL("../scripts/cloud-import-verify/convergence-snapshot-cli.ts",import.meta.url)),...args],
+      {env,encoding:"utf8",timeout:10000});
+    assert.equal(run([output,"--org-ids",ORG_A]).status,2);
+    assert.equal(run([output,"--all-organizations"]).status,2,"empty checkpoint is refused");
+    await copiedFixture();
+    const captured=run([output,"--all-organizations"]);assert.equal(captured.status,0,captured.stderr);
+    const body=await readFile(output,"utf8");assert.equal(JSON.parse(body).phase,"before");
+    assert.equal((await stat(output)).mode & 0o077,0);
+    assert.equal(run([output,"--all-organizations"]).status,2);
+    assert.equal(await readFile(output,"utf8"),body);
+  } finally {await rm(directory,{recursive:true,force:true});}
+});
+
+fixtureTest("copier marker namespace is accounted separately without hiding unknown or malformed ownership",async () => {
+  const fixture=await copiedFixture();const controlId=fixture.copy.controlIds[id(0x806)]!;
+  await target.query(`INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision)
+    SELECT organization_id,'copier_login',id::text||':'||blob_version::text,$2 FROM coding_agent_credentials WHERE id=$1`,[controlId,MAPPING_REVISION]);
+  const ownership=await captureOwnership(target,scope);
+  assert.ok(ownership.rows.every((row) => String(row.table_name) !== 'copier_login'));
+  const checked=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(checked.credentialCopy,"verified");
+  assert.equal((checked.findings.find((f) => f.kind === "credential_copy_markers")!.detail as {observed:number}).observed,1);
+  await target.query("UPDATE cloud_import_ledger SET row_key='synthetic-private-invalid-marker' WHERE table_name='copier_login'");
+  const invalid=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(invalid.ok,false);assert.ok(!JSON.stringify(invalid).includes('synthetic-private-invalid-marker'));
+  await target.query("DELETE FROM cloud_import_ledger WHERE table_name='copier_login'");
+  await target.query(`INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision) VALUES($1,'unknown-namespace',$2,$3)`,[ORG_A,id(0xbeef),MAPPING_REVISION]);
+  await assert.rejects(captureOwnership(target,scope),/Invalid ownership/);
+});
+
+fixtureTest("copier marker writes fail convergence independently of credential and blob state",async () => {
+  const fixture=await copiedFixture();const controlId=fixture.copy.controlIds[id(0x806)]!;
+  const before=await captureCredentialConvergence(target);
+  await target.query(`INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision)
+    SELECT organization_id,'copier_login',id::text||':'||blob_version::text,$2 FROM coding_agent_credentials WHERE id=$1`,[controlId,MAPPING_REVISION]);
+  const after=await captureCredentialConvergence(target,"after");
+  const report={version:1,mappingRevision:MAPPING_REVISION,mode:'apply',ok:true,outcomes:{},
+    writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0},
+    convergence:{beforeDigest:before.digest,nonce:before.nonce}};
+  const finding=compareCredentialConvergence(before,after,report,credentialConvergenceCohort(Object.values(fixture.copy.controlIds)));
+  assert.equal(finding.ok,false);
+  const detail=finding.detail as {credentialChanges:{changed:number};blobChanges:{changed:number};markerChanges:{inserted:number}};
+  assert.equal(detail.credentialChanges.changed,0);assert.equal(detail.blobChanges.changed,0);assert.equal(detail.markerChanges.inserted,1);
+});
+
+fixtureTest("Claude copied auth files use the source account email held beside the envelope",async () => {
+  const fixture=await copiedFixture();const credentialId=id(0x810);
+  await source.query(`INSERT INTO provider_credentials(id,organization_id,workspace_id,user_id,harness,model_provider,auth_type,
+    display_name,account_email,is_active,harness_active,status,created_at,updated_at)
+    VALUES($1,$2,$3,$4,'claude','anthropic','provider_oauth','Synthetic Claude','ALICE@example.test',false,true,'connected',
+      '2026-01-10T00:00:00Z','2026-01-10T00:00:00Z')`,[credentialId,ORG_A,id(0x201),id(1)]);
+  const refreshToken='synthetic-private-claude-refresh';
+  const auth=JSON.stringify({claudeAiOauth:{accessToken:'synthetic-private-claude-access',refreshToken,expiresAt:1893456000000}});
+  fixture.objects.set(`${id(1)}/anthropic/credentials.json.enc`,JSON.stringify(cloudEnvelope(auth,cloudKeyHex)));
+  const ledger=await apply();
+  const copy=await copyCodingAgentCredentials(fixture.deps,scope,'apply');
+  assert.equal(copy.rows[credentialId],'copied');assert.equal(copy.ok,true);
+  const checked=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(checked.credentialCopy,'verified',JSON.stringify(checked.findings.filter((finding) => !finding.ok)));
+  assert.ok(!JSON.stringify(checked).includes(refreshToken));
+});
+
+fixtureTest("producer transaction computes the checkpoint digest freshly before any writes",async () => {
+  await copiedFixture();const before=await captureCredentialConvergence(target);
+  validateCredentialCheckpoint(before,scope);
+  await targetDb.transaction(async (tx) => {
+    await tx.exec('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
+    assert.equal((await computeCredentialCheckpoint(tx,scope)).digest,before.digest);
+  });
+  await target.query('UPDATE coding_agent_credentials SET status=status');
+  let writes=0;
+  await assert.rejects(targetDb.transaction(async (tx) => {
+    await tx.exec('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
+    const fresh=await computeCredentialCheckpoint(tx,scope);
+    if (fresh.digest !== before.digest) throw new Error('checkpoint_mismatch');
+    writes++;
+  }),/checkpoint_mismatch/);
+  assert.equal(writes,0);
+});
+
+fixtureTest("historical marker revisions cannot prove a current updated login",async () => {
+  const fixture=await copiedFixture();const row=id(0x806),controlId=fixture.copy.controlIds[row]!;
+  await target.query(`INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision)
+    SELECT organization_id,'copier_login',id::text||':'||blob_version::text,'cloud-identity-2000-01-01.0'
+    FROM coding_agent_credentials WHERE id=$1`,[controlId]);
+  const report={...fixture.copy,rows:{...fixture.copy.rows,[row]:'updated'},
+    outcomes:{...fixture.copy.outcomes,copied:fixture.copy.outcomes.copied!-1,updated:1},
+    writes:{inserted:fixture.copy.outcomes.copied!-1,updated:1,blobWrites:1,metadataWrites:0,selectionWrites:0},
+    selection:fixture.copy.selection ? {...fixture.copy.selection,writes:0} : undefined};
+  const options={credentialCopy:{report:report as unknown as typeof fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}};
+  const stale=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
+  assert.equal(stale.credentialCopy,'failed');
+  assert.equal(stale.findings.find((f) => f.kind === 'credential_copy_markers')!.ok,true,'historical marker is well-formed');
+  assert.equal(stale.findings.find((f) => f.kind === 'credential_natural_keys')!.ok,true);
+  assert.equal(stale.findings.find((f) => f.kind === 'credential_copy_ledger')!.ok,true);
+  const links=stale.findings.find((f) => f.kind === 'credential_marker_links')!;
+  assert.equal(links.ok,false);
+  assert.deepEqual(links.detail,{receiptStatus:'valid',expected:1,missing:0,mismatches:0,revisionMismatches:1});
+  await target.query("UPDATE cloud_import_ledger SET mapping_revision=$1 WHERE table_name='copier_login'",[MAPPING_REVISION]);
+  const current=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
+  assert.equal(current.credentialCopy,'verified',JSON.stringify(current.findings.filter((f) => !f.ok)));
+});
+
+fixtureTest("unbound namespace validates source set and live org/ownership links before hiding a later binding",async () => {
+  const ledger=await apply();
+  const key=id(0x201),expected=new Map([[key,ORG_A]]);
+  const inspect=async (set=expected,selectedScope:ImportScope=scope) => {
+    await beginReadOnlySnapshot(target);
+    try {return await unboundWorkspaceMarkers(target,selectedScope,set);} finally {await target.query("ROLLBACK");}
+  };
+  assert.equal((await inspect()).ok,false,"an expected marker cannot be omitted");
+  await target.query("INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision) VALUES($1,'workspace_unbound',$2,$3)",[ORG_A,key,MAPPING_REVISION]);
+  assert.equal((await inspect()).ok,true,"a later live Control binding is allowed by the namespace contract");
+  const ownership=await captureOwnership(target,scope);
+  assert.ok(ownership.rows.every((row) => String(row.table_name) !== "workspace_unbound"));
+  const forged=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(forged.ok,false,"the actual source is bound, so this marker cannot authorize projection masking");
+  assert.equal((forged.findings.find((row) => row.kind === "workspace_unbound_markers")!.detail as {unexpected:number}).unexpected,1);
+  await target.query("UPDATE cloud_import_ledger SET mapping_revision='cloud-identity-2000-01-01.0' WHERE table_name='workspace_unbound'");
+  assert.equal((await inspect()).ok,false);
+  await target.query("UPDATE cloud_import_ledger SET mapping_revision=$1 WHERE table_name='workspace_unbound'",[MAPPING_REVISION]);
+  await target.query("DELETE FROM cloud_import_ledger WHERE table_name='workspaces' AND row_key=$1",[key]);
+  assert.equal((await inspect()).ok,false,"a marker cannot claim a workspace outside the identity ownership ledger");
+  await target.query("INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision) VALUES($1,'workspaces',$2,$3)",[ORG_A,key,MAPPING_REVISION]);
+  await target.query("UPDATE cloud_import_ledger SET organization_id=$1 WHERE table_name='workspace_unbound'",[ORG_B]);
+  assert.equal((await inspect()).ok,false,"org links must match both the workspace and its ownership");
+  assert.equal((await inspect(expected,{orgIds:[ORG_A]})).ok,false,"a foreign-org marker affecting an in-scope projection is still checked");
+  await target.query("UPDATE cloud_import_ledger SET organization_id=$1,row_key='synthetic-private-invalid-unbound-marker' WHERE table_name='workspace_unbound'",[ORG_A]);
+  const invalid=await inspect();assert.equal(invalid.ok,false);
+  assert.ok(!JSON.stringify(invalid).includes("synthetic-private-invalid-unbound-marker"));
+});
+
+fixtureTest("duplicate-login consumer derives content from the newest decrypted source and rejects false duplicate labels",async () => {
+  const fixture=await copiedFixture(),older=id(0x806),fresh=id(0x810);
+  await source.query(`INSERT INTO provider_credentials(id,organization_id,workspace_id,user_id,harness,model_provider,auth_type,display_name,label,account_email,
+    provider_account_id,is_active,harness_active,status,created_at,updated_at)
+    SELECT $1,organization_id,workspace_id,user_id,harness,model_provider,auth_type,display_name,label,account_email,provider_account_id,
+      false,false,status,created_at,updated_at+interval '1 day' FROM provider_credentials WHERE id=$2`,[fresh,older]);
+  const oldKey=`${id(1)}/accounts/${older}/credentials.json.enc`;
+  const auth=JSON.parse(decryptCloudEnvelope(JSON.parse(fixture.objects.get(oldKey)!),cloudKeyHex));
+  auth.tokens.refresh_token="synthetic-newest-refresh-only";
+  fixture.objects.set(`${id(1)}/accounts/${fresh}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify(auth),cloudKeyHex)));
+  // Use the current main writer to construct real encrypted target content.
+  // This is a future-contract consumer probe, never a relabelled qualification.
+  const actual=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  const rows={...actual.rows,[older]:"duplicate_login"};
+  const report={...actual,mappingRevision:"cloud-identity-2026-11-16.25",rows,
+    outcomes:{...actual.outcomes,copied:actual.outcomes.copied!-1,duplicate_login:1},controlIds:{...actual.controlIds}};
+  delete report.controlIds[older];
+  const inspect=async () => {
+    await beginReadOnlySnapshot(source);await beginReadOnlySnapshot(target);
+    try {return await credentialCopyFindings(source,target,scope,
+      {report:report as unknown as typeof actual,reader:fixture.reader,targetBlobs:fixture.blobs},fixtureKeyring,cloudKeyHex);
+    } finally {await source.query("ROLLBACK");await target.query("ROLLBACK");}
+  };
+  const findings=await inspect();
+  const ledger=findings.find((row) => row.kind === "credential_copy_ledger")!;
+  assert.equal(ledger.ok,false,"the .25 consumer probe must not qualify against the .11 producer revision");
+  assert.equal((ledger.detail as {outcomesMatch:boolean}).outcomesMatch,true);
+  assert.equal((ledger.detail as {duplicateLogins:number}).duplicateLogins,1);
+  assert.equal(findings.find((row) => row.kind === "credential_natural_keys")!.ok,true);
+  assert.equal(findings.find((row) => row.kind === "credential_control_ids")!.ok,true);
+  report.rows[older]="copied";
+  const wrong=await inspect();
+  assert.equal((wrong.find((row) => row.kind === "credential_copy_ledger")!.detail as {outcomesMatch:boolean}).outcomesMatch,false);
+  report.rows[older]="duplicate_login";
+  await source.query("UPDATE provider_credentials SET updated_at=updated_at+interval '2 days' WHERE id=$1",[older]);
+  const staleContent=await inspect();
+  assert.equal(staleContent.find((row) => row.kind === "credential_natural_keys")!.ok,false,"a newer source login cannot be waived by labelling it duplicate");
+});

@@ -17,6 +17,42 @@ objects and local encrypted Postgres blobs, including a repeat copy.
 `import-report.example.json` is that full synthetic receipt; application smokes are
 pending and no real-data import has run.
 
+Credential selection follows the producer revision: through `.24`, every
+matching copied-source row participates; from `cloud-identity-2026-11-16.25`,
+only `copied`/`updated` rows participate. `already_present` and `control_newer`
+rows do not supply Cloud selection winners or inflate the reported selection
+summary. A written winner may demote other rows in its group, as the producer
+does. Otherwise untouched Control flags require a genuine prior credential
+baseline or an unchanged full convergence tuple. Missing prior evidence fails;
+an empty producer selection summary cannot waive a changed Control choice.
+The independent content/outcome gates still apply, so `control_newer` is not
+made acceptable by excluding it from selection expectations.
+
+The current-main importer in this harness still emits revision `.11`. The
+written-only adapter has causal consumer fixtures, including a real local
+Control login deactivated between copies; full qualification of `.25` requires
+the matching reviewed producer stack. Workspace binding-conflict and
+generation-kept warnings do not waive workspace comparison drift.
+
+From revision `.21`, duplicate subscription logins are resolved from decrypted
+source account identities: freshest `updated_at`, then lowest source UUID.
+Only the independent winner supplies expected target content and a Control-ID
+link; its Cloud selection flags are the union of the group's flags. Every
+other usable source row must report `duplicate_login`, with no Control-ID
+entry or inserted/updated write credit. Wrong labels and stale target content
+remain fatal. API keys and setup tokens are not collapsed by this rule.
+
+The exact `workspace_unbound` ledger namespace is separate from identity
+ownership. Each marker must reference the correct live workspace/org and its
+current workspace ownership entry, with the current mapping revision. Its
+complete set must equal imported source workspaces with a NULL provider
+binding; marker labels cannot hide drift on bound source rows. Incoming
+foreign-org markers that affect an in-scope workspace are checked too. A
+legitimately unbound workspace may never have had an `rw_` id; existing Cloud
+bindings still must be preserved. Later Control binding is permitted by the
+mapping projection, only when this independent marker proof passes. Other
+ledger namespaces remain strict. Diagnostics retain fixed counts only.
+
 The target runs all checked-in Control migrations, including the actual
 0053/0054/0056/0057/0058/0061/0062 files and the owner-only 0063 ledger migration. The
 staff-grant table comes from the checked-in 0061 migration. The shared Cloud fixture
@@ -412,3 +448,48 @@ match the independently observed source reason and matching revision. Copy
 source status/exhaustion facts are read from the source table in the same frozen
 snapshot, never from a producer report. Older reports are not relabeled. This
 accounting never clears a copied-target content failure.
+
+Convergence is an explicit separate check: capture a genuine all-target
+checkpoint immediately before the rerun, then pass `--convergence-before` to
+the copy verifier using the rerun's own apply/copy reports. See
+[REMOTE_CONVERGENCE_RUN.md](REMOTE_CONVERGENCE_RUN.md). It requires all five
+`CredentialCopyReport.writes` counters to be explicit, valid and zero, as well
+as zero independent credential/blob tuple changes and zero `blob_version`
+changes. Tuple hashes include xmin/ctid, so same-value UPDATEs do not pass.
+All target credentials (including native/relay-managed) and all Postgres blobs
+are checked; other blob backends are refused. No source/object data or tuple
+identity is exposed in findings. Missing counters or a missing actual baseline
+cannot become proof of no writes. Snapshots hash state but are not signed
+attestations: the operator must preserve genuine capture-before provenance.
+Physical table rewrites or concurrent writers also fail; keep the target
+quiescent. This proves credential/blob state plus the copier's explicit
+statement-outcome accounting, not absence of unrelated service writes.
+
+The `.18` copier's exact `copier_login` ledger namespace is checked separately
+from identity ownership. Marker keys/revisions, duplicates and live references
+are validated and counted; stale pointers after credential deletion are reported
+as orphans rather than treated as write authority. New/updated copied logins
+with write receipts require exact marker links to the actual Control ID, org and
+blob version. Unknown ledger namespaces remain invalid. Convergence also
+requires zero marker insertions, deletions and tuple changes. `control_newer`
+and `blob_read_failed` outcomes do not qualify a copy, even with a producer
+`ok:true` or matching plaintext.
+
+Checkpoint version 2 requires a fresh random nonce and canonical state digest.
+The producer must independently reread the target before any write, compare its
+computed digest with `--convergence-checkpoint`, and bind that computed digest
+and checkpoint nonce in the actual `report.convergence` receipt. See
+[CONVERGENCE_CONTRACT.md](CONVERGENCE_CONTRACT.md) for the shared compute/validate
+API. Empty state and missing or mismatched receipt bindings do not qualify;
+post-rerun relabelling cannot replace the genuine before artifact. The older
+operator-ordering-only contract is superseded.
+
+Convergence also requires a nonempty independently expected source cohort.
+The qualified verifier derives natural keys from decrypted source credentials,
+validates each report Control-ID link against actual target natural keys, then
+forms a deduplicated hashed-ID count/digest. Both before and after checkpoints
+must contain that complete expected cohort; checkpoint rows never define the
+expectation. Missing, empty or incomplete expected cohorts fail, and unrelated
+native credentials cannot substitute. Current copied/updated login links also
+require marker.mapping_revision to equal both the actual report revision and
+MAPPING_REVISION. Historical unrelated markers remain observable/nonfatal.
