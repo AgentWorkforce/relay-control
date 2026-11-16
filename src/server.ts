@@ -24,6 +24,7 @@ import { loadAmpConfig } from "./amp/config.js";
 import { createAmpModule } from "./amp/module.js";
 import { loadReplicasConfig } from "./replicas/config.js";
 import { createReplicasModule } from "./replicas/module.js";
+import { ReplicasSyncSweep } from "./replicas/sync-sweep.js";
 import { CapyBindings } from "./capy/bindings.js";
 import { CapyCleanup,capyCleanupFetch } from "./capy/cleanup.js";
 import { FlowsWorkspaceDeletions } from "./flows-workspace-delete.js";
@@ -125,8 +126,16 @@ const telemetry = createTelemetryModule({
 });
 // Amp control: off unless SELFHOST_AMP_ENABLED=true; off starts no worker.
 const amp = createAmpModule({ amp: loadAmpConfig(process.env), config, database });
-// Replicas agents: off unless SELFHOST_REPLICAS_ENABLED=true; no worker either way.
+// Replicas agents: off unless SELFHOST_REPLICAS_ENABLED=true.
 const replicas = createReplicasModule({ replicas: loadReplicasConfig(process.env), config, database });
+// Environment sync sweep: only with Replicas on and SELFHOST_REPLICAS_SYNC_INTERVAL_SECONDS > 0.
+const replicasSync = replicas.config.enabled && (replicas.config.syncIntervalSeconds ?? 0) > 0
+  ? new ReplicasSyncSweep({
+      replicas: replicas.deps,
+      intervalSeconds: replicas.config.syncIntervalSeconds!,
+      log: (event) => console.warn("[replicas] environment sync deferred", event),
+    })
+  : null;
 // Cleanup runs with new Capy work still off; it has no provider dispatch path.
 const capyCleanup=new CapyCleanup({database,bindings:new CapyBindings({
   database,keyring:config.encryptionKeyring,runtime:createCapyRuntime(),
@@ -208,6 +217,7 @@ async function start(): Promise<void> {
   amp.start();
   capyCleanup.start();
   flowsWorkspaceDeletions?.start();
+  replicasSync?.start();
   eventsShimSweeper?.start();
   if(mcpOAuthActive(config)) {
     console.log("[selfhost-api] hosted MCP OAuth active", mcpOAuthActiveNotice());
@@ -278,6 +288,7 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   await amp.stop();
   await capyCleanup.stop();
   await flowsWorkspaceDeletions?.stop();
+  await replicasSync?.stop();
   await eventsShimSweeper?.stop();
   await mcpOAuthTeardown.stop();
   await grokRoutines.stop();

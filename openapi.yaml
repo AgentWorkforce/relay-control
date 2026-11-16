@@ -8119,7 +8119,7 @@ paths:
     post:
       operationId: replicasEnvironmentMcp
       tags: [replicas]
-      summary: "Environment-level Agent Relay MCP for Replicas workspaces. Stateless streamable HTTP (JSON-RPC), pull-only, not an OAuth resource. Admission order: valid workspace_identity token with an expiry at most one hour ahead (else 401 replica_identity_invalid); not released (else 403 replica_released); environment enabled for the token's organization, which is connected in no other workspace (else 403 replica_environment_not_enabled); a creator mapped to a current member acts as that member, otherwise (null or unmapped creator) the workspace's explicit VM principal when set and a current member, re-read on every call (else 403 replica_creator_not_allowed); then the replica's Relay identity is resolved or enrolled once. Tools: list_relay_agents, check_relay_inbox, send_relay_message. Future wake-up delivery will answer 409 replica_chat_selection_required when no chat is selected. 404 before auth when SELFHOST_REPLICAS_ENABLED is off. Rate limited per source IP (120 per minute). Only refusals that name a Control workspace are audited."
+      summary: "Environment-level Agent Relay MCP for Replicas workspaces. Stateless streamable HTTP (JSON-RPC), pull-only, not an OAuth resource. Admission order: valid workspace_identity token with an expiry at most one hour ahead (else 401 replica_identity_invalid); not released (else 403 replica_released); the token's organization connected in no other workspace (else 403 organization_shared) and its environment enabled (else 403 replica_environment_not_enabled); a creator mapped to a current member acts as that member, otherwise (null or unmapped creator) the workspace's explicit VM principal when set and a current member, re-read on every call (else 403 replica_creator_not_allowed); then the replica's Relay identity is resolved or enrolled once. Tools: list_relay_agents, check_relay_inbox, send_relay_message. Future wake-up delivery will answer 409 replica_chat_selection_required when no chat is selected. 404 before auth when SELFHOST_REPLICAS_ENABLED is off. Rate limited per source IP (120 per minute). Only refusals that name a Control workspace are audited."
       security: [{ replicasWorkspaceIdentity: [] }]
       requestBody:
         required: true
@@ -8134,7 +8134,7 @@ paths:
         "401":
           description: replica_identity_invalid (WWW-Authenticate Bearer error="invalid_token")
         "403":
-          description: replica_released, replica_environment_not_enabled or replica_creator_not_allowed
+          description: replica_released, organization_shared, replica_environment_not_enabled or replica_creator_not_allowed
         "404":
           description: Feature off
         "405":

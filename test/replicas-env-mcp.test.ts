@@ -690,7 +690,7 @@ test("an organization connected in two workspaces is refused, never enabled, and
   [workspaceId, other.body.id]);
   const refused = await callTool(api, token(), "list_relay_agents");
   assert.equal(refused.status, 403, refused.text);
-  assert.equal(refused.body.error.message, "replica_environment_not_enabled");
+  assert.equal(refused.body.error.message, "organization_shared");
   // The candidate's scope is known, so the refusal is audited.
   assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.identity.refused' AND workspace_id = $1", [workspaceId]), 1);
   const put = await api(`${base}/environments/${ENV_B}`, { method: "PUT", token: ownerToken, body: { enabled: true } });

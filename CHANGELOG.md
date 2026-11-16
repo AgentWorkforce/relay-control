@@ -13,6 +13,31 @@ assigned at release.
   Operator imports pass the version they read and get `409
   login_version_conflict`, with nothing written, if the login changed.
 
+- Added: Replicas tombstone retention, periodic sync and setup errors.
+  Releasing a per-launch replica (`release_replica`, `DELETE
+  .../replicas/spawns/{id}`) now writes a tombstone in the revoke
+  transaction, and `recover_replica_spawn` with `revive: true` revives it; a
+  release of an already released replica is a no-op, so a repeated release
+  does not undo a revive.
+  Deleting a workspace tombstones its live environment-enrolled replicas
+  (`workspace_deleted`) and removes their bindings in the same transaction
+  (launch and bind records still answer 409 `in_use`); migration 0069 keeps tombstones after their workspace
+  is deleted (nullable `workspace_id`, `ON DELETE SET NULL`), admission refuses
+  any matching tombstone. A tombstone that outlived its workspace stays in
+  force: there is no in-product revive for it, matching the hosted edition's
+  tenant pin. Control runs the environment sync at startup and every
+  `SELFHOST_REPLICAS_SYNC_INTERVAL_SECONDS` (default 60, minimum 30, `0` off)
+  for every connection whose all-environments default is on. The Replicas
+  connect response adds `provisioning_error` (`replica_environment_setup_failed`,
+  stage `environment_setup`, `retryable`, `environments`) when environment
+  setup failed; the status stays 200 and the connection is kept. The
+  environment MCP of a replica already launched or bound through the API in
+  the same workspace now acts as that binding and its owner instead of
+  answering 409 `replica_already_bound`; when the owner leaves the
+  organization it is refused with `replica_creator_not_allowed`, never moved
+  to the principal. An environment MCP call for a provider organization
+  connected in more than one workspace is refused with 403
+  `organization_shared` (was `replica_environment_not_enabled`), as Cloud.
 - Added: environment-level Replicas MCP. `POST /api/v1/replicas/mcp` accepts
   only a Replicas `workspace_identity` token (RS256, issuer
   `SELFHOST_REPLICAS_IDENTITY_ISSUER`, default `https://api.replicas.dev`) and
