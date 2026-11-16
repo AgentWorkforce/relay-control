@@ -113,6 +113,19 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.equal(reads.length, 0, "plan never reads the object store");
   assert.equal(plan.candidates, 18);
 
+  // 0064 imports the workspace before binding it. A missing credential object
+  // is therefore distinct from a workspace absent on an older target.
+  const unbound = (await target.query<{ relaycast_workspace_id: string | null; relaycast_api_key_ciphertext: string | null }>(
+    "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM workspaces WHERE id = $1", [id(0x202)])).rows;
+  assert.deepEqual(unbound, [{ relaycast_workspace_id: null, relaycast_api_key_ciphertext: null }]);
+  const missingReads: string[] = [];
+  const withoutObjects = await copyCodingAgentCredentials({ ...deps,
+    reader: { get: async (key: string) => { missingReads.push(key); return null; } },
+  }, { orgIds: null }, "apply");
+  assert.equal(withoutObjects.rows[id(0x812)], "object_missing");
+  assert.ok(missingReads.includes(`${id(1)}/${id(0x812)}/credentials.json.enc`));
+  assert.deepEqual(withoutObjects.writes, { inserted: 0, updated: 0, blobWrites: 0, metadataWrites: 0, selectionWrites: 0 });
+
   const report = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
   // A dropped login is classified in SQL before any object is read: none of
   // the keys Cloud would read for it is fetched.
@@ -138,7 +151,6 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     // 0x810 has none: Cloud reads the legacy object, and so does the copier.
     [id(0x810)]: "copied",
     [id(0x811)]: "skipped:dead_login",
-    // Its workspace (a2, unbound) is not on this pre-0064 target.
     // On unbound a2, which imports on a 0064 target and binds lazily later.
     [id(0x812)]: "copied",
     // Khaliq: "drop" (no OpenRouter/Daytona login in Control).

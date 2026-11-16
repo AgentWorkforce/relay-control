@@ -47,13 +47,13 @@
       "ok": true,
       "detail": {
         "baseline": "control-main-b79cb5f",
-        "manifestSha256": "0090f5f5e2562255e6247c1368c0a8716714568d89d5e5a7b42f7207d2db813e",
-        "expectedSchemaSha256": "bf117e2406f5036a34ad6c111b24b6876f387ee553c8c6c34d74e4c90399c515",
-        "actualSchemaSha256": "bf117e2406f5036a34ad6c111b24b6876f387ee553c8c6c34d74e4c90399c515",
+        "manifestSha256": "b9880619eaf56a6f67b921f3292e374d0f0a83675cd74d7455f4483802d5a8a8",
+        "expectedSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
+        "actualSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
         "profile": "main",
         "optionalRelations": [],
-        "expectedObjects": 1898,
-        "actualObjects": 1898,
+        "expectedObjects": 1969,
+        "actualObjects": 1969,
         "missing": [],
         "changed": [],
         "unexpectedCount": 0,
@@ -1458,11 +1458,11 @@
         "cohort": {
           "expectedValid": true,
           "expectedCount": 12,
-          "expectedSha256": "c1c8e8588a2f12d0c08729952982d6dfe6403501620f4d2e41d7a666a81687a2",
+          "expectedSha256": "0bc64f5817e98c3794390237e9e971f9568466b8ea2a610a2ba12df6f05e9536",
           "beforeCount": 12,
-          "beforeSha256": "c1c8e8588a2f12d0c08729952982d6dfe6403501620f4d2e41d7a666a81687a2",
+          "beforeSha256": "0bc64f5817e98c3794390237e9e971f9568466b8ea2a610a2ba12df6f05e9536",
           "afterCount": 12,
-          "afterSha256": "c1c8e8588a2f12d0c08729952982d6dfe6403501620f4d2e41d7a666a81687a2"
+          "afterSha256": "0bc64f5817e98c3794390237e9e971f9568466b8ea2a610a2ba12df6f05e9536"
         },
         "binding": {
           "receiptValid": true,
@@ -3562,13 +3562,13 @@
   },
   "targetSchema": {
     "baseline": "control-main-b79cb5f",
-    "manifestSha256": "0090f5f5e2562255e6247c1368c0a8716714568d89d5e5a7b42f7207d2db813e",
-    "expectedSchemaSha256": "bf117e2406f5036a34ad6c111b24b6876f387ee553c8c6c34d74e4c90399c515",
-    "actualSchemaSha256": "bf117e2406f5036a34ad6c111b24b6876f387ee553c8c6c34d74e4c90399c515",
+    "manifestSha256": "b9880619eaf56a6f67b921f3292e374d0f0a83675cd74d7455f4483802d5a8a8",
+    "expectedSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
+    "actualSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
     "profile": "main",
     "optionalRelations": [],
-    "expectedObjects": 1898,
-    "actualObjects": 1898,
+    "expectedObjects": 1969,
+    "actualObjects": 1969,
     "missing": [],
     "changed": [],
     "unexpectedCount": 0,
@@ -3588,8 +3588,8 @@
       "selectionWrites": 0
     },
     "convergence": {
-      "beforeDigest": "1eb970136ef0232dfb683f4197a57d868208a8da28c33b8cebb8b9655be2436a",
-      "nonce": "6d7a7e614113c88c882cbc5d684adead7fa3c9fb504a8bf0521e21e847405ac8"
+      "beforeDigest": "33653b1600d398547793535f38a1fa918ffcb1742930a72eca6ce0cd7d53d5ef",
+      "nonce": "d22586ad38c5c5cd1cf59fd437f325c0a2e4cfe71218cf4787c66889c0cddece"
     }
   }
 }
