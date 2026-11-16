@@ -236,6 +236,7 @@ test("cloud import: current target (every checked-in migration) keeps rw_, slugs
   assert.equal((await target.query<{ token_hash: string }>("SELECT token_hash FROM staff_read_grants WHERE id = $1", [id(0xa01)])).rows[0]!.token_hash, grant.token_hash);
   assert.deepEqual(report.optionalColumns.sort(), [
     "organizations.slug",
+    "users.signup_source",
     "workspaces.cloud_relay_workspace_id",
     "workspaces.relaycast_api_key_generation",
     "workspaces.relayhistory_origin",
@@ -332,11 +333,7 @@ test("cloud import: signup_source is carried normalised, unknown values as NULL,
     await source.close();
     await target.close();
   });
-  // 0068 (#177, users.signup_source), as proposed.
-  await target.exec(`ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS signup_source text,
-    ADD CONSTRAINT users_signup_source_known
-      CHECK (signup_source IS NULL OR signup_source IN ('teams', 'flows', 'desktop', 'mcp'));`);
+  // 0068 (users.signup_source, #177) is a checked-in migration.
   // Cloud's column has no CHECK: case, padding and unknown values all occur.
   await source.exec(`
     UPDATE users SET signup_source = ' Teams ' WHERE id = '${id(1)}';
