@@ -38,9 +38,11 @@ jobs:
     # unnoticed. Runs on every push to main, and on pull requests that touch src/, scripts/,
     # migrations/, the cloud-import tests, the package files or this workflow.
     # The harness runs on PostgreSQL 15 because the committed schema manifest is a PostgreSQL 15
-    # catalog fingerprint and newer majors catalog objects differently.
+    # catalog fingerprint and newer majors catalog objects differently. ubuntu-latest (26.04) has
+    # no postgresql-15 package, so the job pins ubuntu-24.04 and installs 15 from the PostgreSQL
+    # apt repository (apt.postgresql.org), which still publishes every supported major.
     name: Cloud import verifier harness (PostgreSQL)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -79,6 +81,9 @@ jobs:
       - name: Install PostgreSQL 15 (the schema manifest's catalog version)
         if: steps.scope.outputs.run == 'true'
         run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends postgresql-15
 
