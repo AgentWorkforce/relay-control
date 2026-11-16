@@ -64,6 +64,7 @@ CREATE TABLE provider_credentials (
   harness text NOT NULL, model_provider text NOT NULL DEFAULT '', auth_type text NOT NULL DEFAULT 'provider_oauth',
   label text, key_fingerprint text, display_name text NOT NULL, account_email text, provider_account_id text,
   is_active boolean NOT NULL DEFAULT false, harness_active boolean NOT NULL DEFAULT false, status text NOT NULL,
+  refresh_exhausted boolean NOT NULL DEFAULT false,
   last_authenticated_at timestamptz, last_used_at timestamptz, last_error text,
   created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
 );
@@ -169,9 +170,16 @@ INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, ha
   ('${id(0x805)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'claude', 'anthropic', 'oauth_token', 'Bob token', true, true, 'connected', ${t}, ${t}),
   ('${id(0x806)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT', false, true, 'connected', ${t}, ${t}),
   ('${id(0x807)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'claude', 'anthropic', 'provider_oauth', 'Claude login', false, true, 'connected', ${t}, ${t}),
-  ('${id(0x808)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'codex', 'openai', 'byo_api_key', 'Lost key', false, false, 'connected', ${t}, ${t});
+  ('${id(0x808)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'codex', 'openai', 'byo_api_key', 'Lost key', true, false, 'connected', ${t}, ${t}),
+  -- C1: a suspended member's key, an errored key, an unselected key.
+  ('${id(0x809)}', '${ORG_A}', '${id(0x201)}', '${id(6)}', 'codex', 'openai', 'byo_api_key', 'Dave key', true, false, 'connected', ${t}, ${t}),
+  ('${id(0x80a)}', '${ORG_A}', '${id(0x201)}', '${id(2)}', 'codex', 'openai', 'byo_api_key', 'Errored', true, false, 'error', ${t}, ${t}),
+  ('${id(0x80b)}', '${ORG_A}', '${id(0x201)}', '${id(2)}', 'claude', 'anthropic', 'byo_api_key', 'Unselected', false, false, 'connected', ${t}, ${t}),
+  -- C2: Alice's second ChatGPT login (org B) shares her legacy openai object.
+  ('${id(0x80c)}', '${ORG_B}', '${id(0x205)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT 2', false, true, 'connected', ${t}, ${t});
 UPDATE provider_credentials SET label = 'Bob token', account_email = 'bob@example.test' WHERE id = '${id(0x805)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-1' WHERE id = '${id(0x806)}';
+UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-2' WHERE id = '${id(0x80c)}';
 INSERT INTO workspace_integrations (id, workspace_id, provider, name, created_by_user_id, connection_id, installation_id, created_at, updated_at) VALUES
   ('${id(0x901)}', 'rw_0000a201', 'github', NULL, '${id(5)}', 'nango-1', '12345', ${t}, ${t}),
   ('${id(0x902)}', 'rw_0000a201', 'github', 'second', '${id(1)}', 'nango-2', '12345', ${t}, ${t}),
@@ -215,7 +223,7 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
   // Pre-0058 target: the two relay_managed rows are refused by the importer.
   coding_agent_credentials: {
     imported: 0,
-    skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 5, target_lacks_relay_managed: 2 },
+    skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 9, target_lacks_relay_managed: 2 },
   },
   // Pre-0061 target: grants wait for the migration.
   staff_read_grants: { imported: 0, skipped: { workspace_not_imported: 1, target_lacks_staff_read_grants: 1 } },

@@ -121,7 +121,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   const plan = await runImport({ ...deps, target: undefined }, scope, "plan");
   assert.equal(plan.ok, true);
   const expectedPlan = structuredClone(EXPECTED_FULL);
-  expectedPlan.coding_agent_credentials = { imported: 2, skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 5 } };
+  expectedPlan.coding_agent_credentials = { imported: 2, skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 9 } };
   expectedPlan.github_app_installations = { imported: 1, skipped: {} };
   expectedPlan.staff_read_grants = { imported: 1, skipped: { workspace_not_imported: 1 } };
   expectedPlan.github_app_connections = {

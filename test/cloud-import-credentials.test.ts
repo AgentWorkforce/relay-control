@@ -17,13 +17,18 @@ const jwt = (payload: Record<string, unknown>) =>
   `e30.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.sig`;
 
 test("cloud object keys follow Cloud's runtime read order", () => {
-  const base = { id: id(9), cloud_user_id: id(1), model_provider: "codex", provider_account_id: null };
+  const base = { id: id(9), cloud_user_id: id(1), model_provider: "codex", provider_account_id: null, legacy_allowed: true };
   assert.deepEqual(cloudObjectKeys({ ...base, auth_type: "byo_api_key" }), [`${id(1)}/${id(9)}/credentials.json.enc`]);
   assert.deepEqual(cloudObjectKeys({ ...base, auth_type: "provider_oauth" }), [`${id(1)}/openai/credentials.json.enc`]);
   assert.deepEqual(cloudObjectKeys({ ...base, auth_type: "provider_oauth", provider_account_id: "a" }), [
     `${id(1)}/accounts/${id(9)}/credentials.json.enc`,
     `${id(1)}/openai/credentials.json.enc`,
   ]);
+  // C2: the shared legacy key is never offered when another row could own it.
+  assert.deepEqual(cloudObjectKeys({ ...base, auth_type: "provider_oauth", provider_account_id: "a", legacy_allowed: false }), [
+    `${id(1)}/accounts/${id(9)}/credentials.json.enc`,
+  ]);
+  assert.deepEqual(cloudObjectKeys({ ...base, auth_type: "provider_oauth", legacy_allowed: false }), []);
   assert.deepEqual(cloudObjectKeys({ ...base, model_provider: "anthropic", auth_type: "oauth_token" }), [
     `${id(1)}/accounts/${id(9)}/credentials.json.enc`,
     `${id(1)}/anthropic/credentials.json.enc`,
@@ -72,7 +77,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
 
   const plan = await copyCodingAgentCredentials(deps, { orgIds: null }, "plan");
   assert.equal(reads.length, 0, "plan never reads the object store");
-  assert.equal(plan.candidates, 5);
+  assert.equal(plan.candidates, 9);
 
   const report = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
   assert.deepEqual(report.rows, {
@@ -81,7 +86,15 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     [id(0x806)]: "copied",
     [id(0x807)]: "skipped:anthropic_login_without_account_email",
     [id(0x808)]: "object_missing",
+    // C1
+    [id(0x809)]: "skipped:not_a_member",
+    [id(0x80a)]: "skipped:credential_not_usable",
+    [id(0x80b)]: "skipped:credential_not_selected",
+    // C2: Alice has two openai logins, so her legacy openai object is ambiguous.
+    [id(0x80c)]: "skipped:legacy_key_ambiguous",
   });
+  // Alice's legacy object was never read: it could belong to either login.
+  assert.ok(!reads.includes(`${id(1)}/openai/credentials.json.enc`));
   assert.equal(report.ok, false, "a missing object is not a clean copy");
   assert.doesNotMatch(JSON.stringify(report), /sk-|rt-synthetic|example\.test/);
 
@@ -104,4 +117,17 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.equal(again.rows[id(0x805)], "already_present");
   const count = (await target.query<{ n: number }>("SELECT count(*)::int AS n FROM coding_agent_credentials")).rows[0]!.n;
   assert.equal(count, 3);
+});
+
+test("credential copier CLI: apply refuses up front when copy settings are missing", async () => {
+  const { copyApplyPreflight } = await import("../scripts/cloud-import/cli.js");
+  assert.deepEqual(copyApplyPreflight({ mode: "plan", copyCredentials: true }, {}), []);
+  assert.deepEqual(copyApplyPreflight({ mode: "apply", copyCredentials: false }, {}), []);
+  assert.deepEqual(copyApplyPreflight({ mode: "apply", copyCredentials: true }, { CLOUD_IMPORT_TARGET_URL: "postgres://x" }), [
+    "CLOUD_CREDENTIAL_ENCRYPTION_KEY",
+    "CLOUD_CREDENTIAL_R2_ENDPOINT",
+    "CLOUD_CREDENTIAL_R2_BUCKET",
+    "CLOUD_CREDENTIAL_R2_ACCESS_KEY_ID",
+    "CLOUD_CREDENTIAL_R2_SECRET_ACCESS_KEY",
+  ]);
 });

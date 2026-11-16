@@ -44,6 +44,7 @@ export type CredentialOutcome =
   | "copied"
   | "already_present"
   | "object_missing"
+  | "skipped:legacy_key_ambiguous"
   | "decrypt_failed"
   | "payload_invalid"
   | `store_rejected:${string}`
@@ -71,6 +72,8 @@ type Candidate = {
   label: string | null;
   account_email: string | null;
   provider_account_id: string | null;
+  /** The per-user legacy object may stand in for this row (see mapping). */
+  legacy_allowed: boolean;
   skip_reason: string | null;
 };
 
@@ -78,17 +81,21 @@ type Candidate = {
 const CANONICAL: Record<string, string> = { claude: "anthropic", codex: "openai", grok: "xai" };
 export const canonicalProvider = (value: string) => CANONICAL[value] ?? value;
 
-/** Object keys to try, in order, relative to the "credentials" prefix. */
-export function cloudObjectKeys(row: Pick<Candidate, "id" | "cloud_user_id" | "auth_type" | "model_provider" | "provider_account_id">): string[] {
+/**
+ * Object keys to try, in order, relative to the "credentials" prefix. The
+ * per-user legacy key is offered only when `legacy_allowed`: otherwise it
+ * could hold another row's (another account's) secret.
+ */
+export function cloudObjectKeys(row: Pick<Candidate, "id" | "cloud_user_id" | "auth_type" | "model_provider" | "provider_account_id" | "legacy_allowed">): string[] {
   const account = `${row.cloud_user_id}/accounts/${row.id}/credentials.json.enc`;
   const legacy = `${row.cloud_user_id}/${canonicalProvider(row.model_provider)}/credentials.json.enc`;
   switch (row.auth_type) {
     case "byo_api_key":
       return [`${row.cloud_user_id}/${row.id}/credentials.json.enc`];
     case "oauth_token":
-      return [account, `${row.cloud_user_id}/anthropic/credentials.json.enc`];
+      return row.legacy_allowed ? [account, legacy] : [account];
     case "provider_oauth":
-      return row.provider_account_id ? [account, legacy] : [legacy];
+      return [...(row.provider_account_id ? [account] : []), ...(row.legacy_allowed ? [legacy] : [])];
   }
 }
 
@@ -140,7 +147,10 @@ export async function copyCodingAgentCredentials(
       continue;
     }
     if (plaintext === null) {
-      record(row.id, "object_missing");
+      // Missing where it may live; if only the shared legacy key was ruled
+      // out, say so: the operator must resolve which row owns it.
+      const ruledOut = row.auth_type !== "byo_api_key" && !row.legacy_allowed;
+      record(row.id, ruledOut ? "skipped:legacy_key_ambiguous" : "object_missing");
       continue;
     }
 

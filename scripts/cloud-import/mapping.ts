@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.8";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.9";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -478,13 +478,34 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS created_by_user_id,
  * the imported (merge-survivor) Control user used as the audit actor.
  */
 export function credentialCopyQuery(scope: ImportScope): string {
-  return `WITH ${ctes(scope)}
+  const canonical = (expression: string) =>
+    `(CASE ${expression} WHEN 'claude' THEN 'anthropic' WHEN 'codex' THEN 'openai' WHEN 'grok' THEN 'xai' ELSE ${expression} END)`;
+  return `WITH ${ctes(scope)},
+-- The legacy object {user}/{provider}/credentials.json.enc is per user and
+-- provider, not per row: setup tokens and logins of one provider share it.
+-- It may stand in for a row only when that row is the user's only one that
+-- could live there (counted across every Cloud org, not just this scope).
+legacy_rows AS (
+  SELECT x.id,
+         count(*) OVER (PARTITION BY x.user_id, ${canonical("x.model_provider")}) AS sharing
+    FROM public.provider_credentials x
+   WHERE x.auth_type IN ('oauth_token', 'provider_oauth')
+)
 SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS cloud_user_id,
        p.model_provider, p.harness, p.auth_type, p.label, p.account_email, p.provider_account_id,
        p.is_active, p.harness_active,
+       COALESCE(lr.sharing = 1, false) AS legacy_allowed,
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
          WHEN iu.id IS NULL THEN 'user_not_imported'
+         -- A removed or suspended member's secrets stay behind.
+         WHEN NOT EXISTS (
+           SELECT 1 FROM imported_members im WHERE im.organization_id = iw.organization_id AND im.user_id = iu.id
+         ) THEN 'not_a_member'
+         -- Only usable credentials: connected and not refresh-exhausted.
+         WHEN p.status <> 'connected' OR p.refresh_exhausted THEN 'credential_not_usable'
+         -- Neither the LLM-call nor the sandbox selection: not carried over.
+         WHEN NOT p.is_active AND NOT p.harness_active THEN 'credential_not_selected'
          WHEN p.model_provider NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
          WHEN p.auth_type = 'oauth_token' AND p.model_provider <> 'anthropic' THEN 'unsupported_model_provider'
          WHEN p.auth_type = 'provider_oauth' AND p.model_provider NOT IN ('anthropic', 'openai', 'xai') THEN 'unsupported_model_provider'
@@ -498,6 +519,7 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS 
   LEFT JOIN imported_workspaces iw ON iw.id = p.workspace_id
   LEFT JOIN user_map um ON um.cloud_user_id = p.user_id
   LEFT JOIN imported_users iu ON iu.id = um.user_id
+  LEFT JOIN legacy_rows lr ON lr.id = p.id
  WHERE p.auth_type IN ('byo_api_key', 'oauth_token', 'provider_oauth')
  ORDER BY p.id`;
 }
