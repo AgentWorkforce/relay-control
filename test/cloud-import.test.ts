@@ -358,6 +358,43 @@ test("cloud import: org scope imports one organization and its members only", as
   assert.throws(() => verifierComparisons({ orgIds: ["not-a-uuid"] }), /UUID/);
 });
 
+test("cloud import: signup_source is carried normalised, unknown values as NULL, set on insert only (0068)", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  // 0068 (#177, users.signup_source), as proposed.
+  await target.exec(`ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS signup_source text,
+    ADD CONSTRAINT users_signup_source_known
+      CHECK (signup_source IS NULL OR signup_source IN ('teams', 'flows', 'desktop', 'mcp'));`);
+  // Cloud's column has no CHECK: case, padding and unknown values all occur.
+  await source.exec(`
+    UPDATE users SET signup_source = ' Teams ' WHERE id = '${id(1)}';
+    UPDATE users SET signup_source = 'desktop' WHERE id = '${id(5)}';
+    UPDATE users SET signup_source = 'bogus' WHERE id = '${id(2)}';
+    UPDATE users SET signup_source = 'MCP' WHERE id = '${id(6)}';`);
+  const sources = async () => Object.fromEntries((await target.query<{ id: string; signup_source: string | null }>(
+    "SELECT id::text AS id, signup_source FROM users ORDER BY id")).rows.map((row) => [row.id, row.signup_source]));
+  const report = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(report.ok, true, JSON.stringify(report.orgs));
+  assert.ok(report.optionalColumns.includes("users.signup_source"));
+  assert.deepEqual(await sources(), {
+    [id(1)]: "teams", // the survivor keeps its own value, not the merged duplicate's
+    [id(2)]: null, // unknown Cloud value
+    [id(3)]: null, // never set in Cloud
+    [id(6)]: "mcp",
+  });
+  // A re-run never overwrites what the target holds, whatever Cloud says now.
+  await target.query("UPDATE users SET signup_source = 'flows' WHERE id = $1", [id(1)]);
+  await source.exec(`UPDATE users SET signup_source = 'desktop' WHERE id IN ('${id(1)}', '${id(2)}');`);
+  const again = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(again.ok, true);
+  assert.deepEqual(await sources(), { [id(1)]: "flows", [id(2)]: null, [id(3)]: null, [id(6)]: "mcp" });
+});
+
 test("cloud import: an existing Control user with an imported email under another id refuses the run", async (t) => {
   const source = await cloudSource();
   const target = await controlTarget("0051");

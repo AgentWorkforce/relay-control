@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.18";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.19";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -96,7 +96,11 @@ cloud_users AS (
          COALESCE(
            CASE WHEN ${validEmail(normEmail("u.primary_email"))} THEN ${normEmail("u.primary_email")} END,
            ie.email
-         ) AS email
+         ) AS email,
+         -- Cloud's column has no CHECK: keep only values Control's 0068
+         -- accepts, normalised; anything else imports as NULL.
+         CASE WHEN lower(btrim(u.signup_source)) IN ('teams', 'flows', 'desktop', 'mcp')
+              THEN lower(btrim(u.signup_source)) END AS signup_source
     FROM public.users u
     LEFT JOIN ident_email ie ON ie.user_id = u.id
 ),
@@ -176,7 +180,7 @@ imported_workspaces AS (
 user_rows AS (
   SELECT cu.id, cu.email,
          COALESCE(NULLIF(btrim(cu.name), ''), cu.email) AS name,
-         cu.created_at, cu.updated_at,
+         cu.created_at, cu.updated_at, cu.signup_source,
          CASE WHEN EXISTS (
            SELECT 1 FROM imported_members im
             WHERE im.user_id = cu.id AND im.organization_id = cu.last_organization_id
@@ -299,7 +303,7 @@ function selects(): Record<ImportTable, string> {
   return {
     users: `
 SELECT id, email, name, created_at, updated_at, last_organization_id, last_workspace_id,
-       NULL::uuid AS organization_id, skip_reason
+       signup_source, NULL::uuid AS organization_id, skip_reason
   FROM user_rows`,
     organizations: `
 SELECT o.id, o.id AS organization_id, o.name, o.slug, o.created_at, o.updated_at, NULL::text AS skip_reason
@@ -638,6 +642,10 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
     primaryKey: ["id"],
     // last_* are written after every organisation is in (FKs), see importer.
     columns: ["id", "email", "name", "created_at", "updated_at"],
+    // 0068. Set when the import creates the user; a re-run, or a user
+    // Control already has, keeps the target's value.
+    optional: ["signup_source"],
+    insertOnly: ["signup_source"],
   },
   organizations: {
     table: "organizations",
