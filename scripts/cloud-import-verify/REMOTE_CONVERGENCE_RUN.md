@@ -78,7 +78,9 @@ node --import tsx /path/to/private/capture-credential-convergence.mjs /path/to/p
 ```
 
 Require exit 0 and a new checkpoint file before executing the separately
-approved copier-enabled rerun. Use fresh rerun apply/copy report paths. Then use
+approved copier-enabled rerun. Pass the same path to the fixed producer's
+`--convergence-checkpoint` option; it must independently compute the target
+digest before writing and refuse a mismatch. Use fresh rerun apply/copy report paths. Then use
 the updated complete runner from [REMOTE_COPY_RUN.md](REMOTE_COPY_RUN.md):
 
 ```sh
@@ -115,3 +117,12 @@ blob version. Unknown ledger namespaces remain invalid. Convergence also
 requires zero marker insertions, deletions and tuple changes. `control_newer`
 and `blob_read_failed` outcomes do not qualify a copy, even with a producer
 `ok:true` or matching plaintext.
+
+Checkpoint version 2 requires a fresh random nonce and canonical state digest.
+The producer must independently reread the target before any write, compare its
+computed digest with `--convergence-checkpoint`, and bind that computed digest
+and checkpoint nonce in the actual `report.convergence` receipt. See
+[CONVERGENCE_CONTRACT.md](CONVERGENCE_CONTRACT.md) for the shared compute/validate
+API. Empty state and missing or mismatched receipt bindings do not qualify;
+post-rerun relabelling cannot replace the genuine before artifact. The older
+operator-ordering-only contract is superseded.

@@ -1,3 +1,4 @@
+import { validateCredentialCheckpoint } from "./convergence.js";
 import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
 import { readCopierMarkers } from "./copier-markers.js";
 import type { Client } from "pg";
@@ -52,7 +53,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
   keyring:EncryptionKeyring,cloudKeyHex:string,options:{pepperVersions?:readonly number[];credentialCopy?:CredentialEvidence;previousReport?:ImportReport;
     previousOwnership?:OwnershipSnapshot;canonicalOrigin?:(raw:string) => string|null} = {}) {
   scope=normalizedScope(scope);
-  if (options.credentialCopy?.convergenceBefore && scope.orgIds !== null) throw new Error("Convergence requires all source organizations");
+  if (options.credentialCopy?.convergenceBefore) validateCredentialCheckpoint(options.credentialCopy.convergenceBefore,scope);
   if (!/^[0-9a-f]{64}$/i.test(cloudKeyHex)) throw new Error("Cloud key must be 32 bytes of hex");
   const base = contractFor(scope,new Set());
   let sourceOrganizationCensus:Awaited<ReturnType<typeof organizationCensus>>|undefined;

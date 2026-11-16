@@ -1,6 +1,6 @@
 import { accountCredentialExclusion,exclusionAccounting } from "../scripts/cloud-import-verify/exclusions.js";
 
-import { credentialWriteCounts,compareCredentialConvergence,type CredentialConvergenceSnapshot } from "../scripts/cloud-import-verify/convergence.js";
+import { credentialWriteCounts,compareCredentialConvergence,credentialCheckpointDigest,validateCredentialCheckpoint,type CredentialConvergenceSnapshot } from "../scripts/cloud-import-verify/convergence.js";
 import { MAPPING_REVISION } from "../scripts/cloud-import/mapping.js";
 import { migrationFiles,sealManifest,type SchemaManifest } from "../scripts/cloud-import-verify/schema.js";
 import assert from "node:assert/strict";
@@ -118,9 +118,14 @@ test("exhausted API key cannot be accounted as a dead OAuth login",() => {
 
 const convergenceReport=() => ({version:1,mappingRevision:MAPPING_REVISION,mode:"apply",ok:true,outcomes:{} as Record<string,number>,
   writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0}});
-const emptyCheckpoint=(phase:"before"|"after"):CredentialConvergenceSnapshot => ({version:1,kind:"credential-convergence",phase,
-  mappingRevision:MAPPING_REVISION,scope:{orgIds:null},sessionSafety:{transactionReadOnly:"on",isolation:"repeatable read",statementTimeout:"1min",lockTimeout:"5s"},
-  credentials:[],blobs:[],markers:[]});
+const checkpoint=(phase:"before"|"after",empty=false):CredentialConvergenceSnapshot => {
+  const state={version:2 as const,mappingRevision:MAPPING_REVISION,scope:{orgIds:null},
+    credentials:empty ? [] : [{key:"a".repeat(64),stateSha256:"b".repeat(64),blobVersion:null}],blobs:[],markers:[]};
+  return {...state,kind:"credential-convergence",phase,nonce:(phase === "before" ? "c" : "d").repeat(64),
+    digest:credentialCheckpointDigest(state),sessionSafety:{transactionReadOnly:"on",isolation:"repeatable read",statementTimeout:"1min",lockTimeout:"5s"}};
+};
+const receiptReport=(before:CredentialConvergenceSnapshot) => ({...convergenceReport(),
+  convergence:{beforeDigest:before.digest,nonce:before.nonce}});
 
 test("convergence requires all five explicit valid write counters and bound report outcomes",() => {
   const report=convergenceReport();assert.deepEqual(credentialWriteCounts(report),report.writes);
@@ -140,11 +145,11 @@ test("convergence requires all five explicit valid write counters and bound repo
 });
 
 test("nonzero counters fail convergence even when all independent target state is unchanged",() => {
-  const before=emptyCheckpoint("before"),after=emptyCheckpoint("after");
-  assert.equal(compareCredentialConvergence(before,after,convergenceReport()).ok,true);
+  const before=checkpoint("before"),after=checkpoint("after");
+  assert.equal(compareCredentialConvergence(before,after,receiptReport(before)).ok,true);
   assert.equal(compareCredentialConvergence(before,after,{}).ok,false);
   for (const key of Object.keys(convergenceReport().writes) as (keyof ReturnType<typeof convergenceReport>["writes"])[]) {
-    const report=convergenceReport();report.writes[key]=1;
+    const report=receiptReport(before);report.writes[key]=1;
     if (key === "inserted") report.outcomes.copied=1;
     if (key === "updated") report.outcomes.updated=1;
     const complete=key === "selectionWrites" ? {...report,selection:{writes:1}} : report;
@@ -152,4 +157,30 @@ test("nonzero counters fail convergence even when all independent target state i
     assert.equal(compareCredentialConvergence(before,after,complete).ok,false,key);
   }
   assert.throws(() => compareCredentialConvergence(after,after,convergenceReport()),/baseline/);
+});
+
+test("empty state cannot qualify convergence even with zero counters and a matching receipt",() => {
+  const before=checkpoint('before',true),after=checkpoint('after',true);
+  assert.throws(() => validateCredentialCheckpoint(before,{orgIds:null}),/empty/);
+  const finding=compareCredentialConvergence(before,after,receiptReport(before));
+  assert.equal(finding.ok,false);
+  assert.equal((finding.detail as {nonemptyBefore:boolean}).nonemptyBefore,false);
+  assert.deepEqual((finding.detail as {binding:unknown}).binding,{receiptValid:true,digestMatches:true,nonceMatches:true});
+});
+
+test("post-rerun relabelled checkpoints fail receipt nonce or fresh-before digest binding",() => {
+  const before=checkpoint('before'),after=checkpoint('after');
+  const report=receiptReport(before);
+  const relabelled={...after,phase:'before' as const};
+  assert.doesNotThrow(() => validateCredentialCheckpoint(relabelled,{orgIds:null}));
+  const wrongNonce=compareCredentialConvergence(relabelled,after,report);
+  assert.equal(wrongNonce.ok,false);
+  assert.deepEqual((wrongNonce.detail as {binding:unknown}).binding,{receiptValid:true,digestMatches:true,nonceMatches:false});
+  const changed={...after,credentials:[{...after.credentials[0]!,stateSha256:'e'.repeat(64)}]};
+  changed.digest=credentialCheckpointDigest(changed);
+  const replayedNonce={...changed,phase:'before' as const,nonce:before.nonce};
+  const wrongDigest=compareCredentialConvergence(replayedNonce,changed,report);
+  assert.equal(wrongDigest.ok,false);
+  assert.deepEqual((wrongDigest.detail as {binding:unknown}).binding,{receiptValid:true,digestMatches:false,nonceMatches:true});
+  assert.deepEqual((wrongDigest.detail as {credentialChanges:unknown}).credentialChanges,{inserted:0,removed:0,changed:0});
 });

@@ -1,4 +1,4 @@
-import { captureCredentialConvergence,compareCredentialConvergence } from "../scripts/cloud-import-verify/convergence.js";
+import { captureCredentialConvergence,compareCredentialConvergence,computeCredentialCheckpoint,validateCredentialCheckpoint } from "../scripts/cloud-import-verify/convergence.js";
 import assert from "node:assert/strict";
 import { before,after,beforeEach,test,type TestFn } from "node:test";
 import { Client } from "pg";
@@ -826,7 +826,8 @@ fixtureTest("convergence snapshots detect in-place OAuth rewrites and same-value
   const before=await captureCredentialConvergence(target);
   const unchanged=await captureCredentialConvergence(target,"after");
   const zeroReport={version:1,mappingRevision:MAPPING_REVISION,mode:"apply",ok:true,outcomes:{},
-    writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0}};
+    writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0},
+    convergence:{beforeDigest:before.digest,nonce:before.nonce}};
   assert.equal(compareCredentialConvergence(before,unchanged,zeroReport).ok,true);
   assert.equal(compareCredentialConvergence(before,unchanged,undefined).ok,false,"missing counters never mean zero");
   const sameId=fixture.copy.controlIds[id(0x803)]!;
@@ -836,6 +837,7 @@ fixtureTest("convergence snapshots detect in-place OAuth rewrites and same-value
   assert.equal(changed.ok,false,"same-value DML is independently detected despite a false zero-write claim");
   assert.equal((changed.detail as {credentialChanges:{changed:number}}).credentialChanges.changed,1);
   const beforeCopy=await captureCredentialConvergence(target);
+  zeroReport.convergence={beforeDigest:beforeCopy.digest,nonce:beforeCopy.nonce};
   const rerun=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
   assert.equal(rerun.ok,true);
   const afterCopy=await captureCredentialConvergence(target,"after");
@@ -851,7 +853,7 @@ fixtureTest("qualified convergence binds the real checkpoint and rejects old cop
   const before=await captureCredentialConvergence(target);
   const rows=Object.fromEntries(Object.entries(fixture.copy.rows).map(([key,outcome]) => [key,outcome === "copied" ? "already_present" : outcome]));
   const outcomes:Record<string,number>={};for (const outcome of Object.values(rows)) outcomes[outcome]=(outcomes[outcome] ?? 0)+1;
-  const noOp={...fixture.copy,rows,outcomes,writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0},
+  const noOp={...fixture.copy,rows,outcomes,convergence:{beforeDigest:before.digest,nonce:before.nonce},writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0},
     selection:fixture.copy.selection ? {...fixture.copy.selection,writes:0} : undefined};
   const options={credentialCopy:{report:noOp,reader:fixture.reader,targetBlobs:fixture.blobs,convergenceBefore:before}};
   const positive=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
@@ -907,6 +909,8 @@ fixtureTest("convergence capture CLI requires all scope and creates a private no
       fileURLToPath(new URL("../scripts/cloud-import-verify/convergence-snapshot-cli.ts",import.meta.url)),...args],
       {env,encoding:"utf8",timeout:10000});
     assert.equal(run([output,"--org-ids",ORG_A]).status,2);
+    assert.equal(run([output,"--all-organizations"]).status,2,"empty checkpoint is refused");
+    await copiedFixture();
     const captured=run([output,"--all-organizations"]);assert.equal(captured.status,0,captured.stderr);
     const body=await readFile(output,"utf8");assert.equal(JSON.parse(body).phase,"before");
     assert.equal((await stat(output)).mode & 0o077,0);
@@ -940,7 +944,8 @@ fixtureTest("copier marker writes fail convergence independently of credential a
     SELECT organization_id,'copier_login',id::text||':'||blob_version::text,$2 FROM coding_agent_credentials WHERE id=$1`,[controlId,MAPPING_REVISION]);
   const after=await captureCredentialConvergence(target,"after");
   const report={version:1,mappingRevision:MAPPING_REVISION,mode:'apply',ok:true,outcomes:{},
-    writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0}};
+    writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0},
+    convergence:{beforeDigest:before.digest,nonce:before.nonce}};
   const finding=compareCredentialConvergence(before,after,report);
   assert.equal(finding.ok,false);
   const detail=finding.detail as {credentialChanges:{changed:number};blobChanges:{changed:number};markerChanges:{inserted:number}};
@@ -963,4 +968,22 @@ fixtureTest("Claude copied auth files use the source account email held beside t
     {credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
   assert.equal(checked.credentialCopy,'verified',JSON.stringify(checked.findings.filter((finding) => !finding.ok)));
   assert.ok(!JSON.stringify(checked).includes(refreshToken));
+});
+
+fixtureTest("producer transaction computes the checkpoint digest freshly before any writes",async () => {
+  await copiedFixture();const before=await captureCredentialConvergence(target);
+  validateCredentialCheckpoint(before,scope);
+  await targetDb.transaction(async (tx) => {
+    await tx.exec('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
+    assert.equal((await computeCredentialCheckpoint(tx,scope)).digest,before.digest);
+  });
+  await target.query('UPDATE coding_agent_credentials SET status=status');
+  let writes=0;
+  await assert.rejects(targetDb.transaction(async (tx) => {
+    await tx.exec('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
+    const fresh=await computeCredentialCheckpoint(tx,scope);
+    if (fresh.digest !== before.digest) throw new Error('checkpoint_mismatch');
+    writes++;
+  }),/checkpoint_mismatch/);
+  assert.equal(writes,0);
 });
