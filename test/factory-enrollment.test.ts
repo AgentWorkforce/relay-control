@@ -246,7 +246,7 @@ test("7: config reads SELFHOST_ACQUISITION_ORIGIN only with Factory on and fails
     () => loadConfig(complete),
     (error: Error) => /SELFHOST_ACQUISITION_ORIGIN/.test(error.message) && /SELFHOST_INTROSPECT_AUDIENCES/.test(error.message),
   );
-  const loaded = loadConfig({ ...complete, SELFHOST_INTROSPECT_AUDIENCES: `https://history.selfhosted.company,${ACQUISITION}` });
+  const loaded = loadConfig({ ...complete, SELFHOST_INTROSPECT_AUDIENCES: ACQUISITION });
   assert.equal(loaded.factory?.acquisitionOrigin, ACQUISITION);
   const { RELAYCONTROL_INTROSPECT_SECRET: _secret, ...withoutSecret } = complete;
   assert.throws(() => loadConfig(withoutSecret), /RELAYCONTROL_INTROSPECT_SECRET/);

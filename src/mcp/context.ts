@@ -5,6 +5,7 @@ import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { readWorkspaceHistory } from "../sessions/history.js";
 import { readViaSessionRead } from "./session-read-reader.js";
+import { mcpReaderMarker } from "../session-read.js";
 import type { EncryptionKeyring } from "../crypto.js";
 import type { Database, SqlExecutor } from "../database.js";
 import type { RelaycastClient, RosterAgent, PresenceRow } from "../messaging/relaycast.js";
@@ -15,6 +16,7 @@ import type { DesktopCallContext } from "./desktop-call.js";
 import type { McpOAuthConnection } from "./oauth/admission.js";
 import type { CustomerSupportConnection } from "./customer-support.js";
 import type { GrokRoutines } from "./grok-routines.js";
+import type { RelayLaunchCheck } from "./relay-launch-check.js";
 
 export type McpWorkspace = {
   id: string;
@@ -62,6 +64,13 @@ export type McpContext = {
     sessionId: string | undefined;
     /** Relaycast's public base URL; agent cards name `<it>/a2a/rpc` as their A2A endpoint. */
     relaycastPublicUrl: string;
+    /**
+     * SELFHOST_RELAYGATE_PUBLIC_URL, when set (a gate-only install): agent
+     * launches then mint a one-time relay launch credential.
+     */
+    relaygatePublicUrl?: string;
+    /** Gate-only installs only: relaygate's pre-spawn POST /v1/check (./relay-launch-check.ts). */
+    launchCheck?: RelayLaunchCheck;
   };
   /** Amp control (SELFHOST_AMP_ENABLED); absent when the feature is off. */
   amp?: AmpDeps;
@@ -111,7 +120,12 @@ export function historyReader(
     organizationId: workspace.organizationId,
     workspaceId: workspace.id,
     callerToken,
+    // Every MCP read is on the person's behalf, in both read modes.
+    readerKind: "mcp" as const,
   };
+  // Proves the flagged mode's hop to the public session-read route is this
+  // reader (see readerKindOf). Derived from the secret; never logged.
+  const marker = mcpReaderMarker(config.sessionReadApi.secret);
   return async (path: string, options: { timeoutMessage?: string } = {}): Promise<unknown> => {
     // MCP admission authenticates the person; content reads additionally need
     // the issue-time read scope. Neither a handoff nor a service credential
@@ -126,7 +140,7 @@ export function historyReader(
     try {
       // The per-user session-read route is a dashboard route that refuses a
       // grant by shape, so a grant always reads through the workspace reader.
-      const result = (staffGrant ? null : await readViaSessionRead(config, identity, url.pathname, url.searchParams))
+      const result = (staffGrant ? null : await readViaSessionRead(config, identity, url.pathname, url.searchParams, marker))
         ?? await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
       if (result.status === "unsupported") {
         throw new SharedSessionsToolError("The selected backend does not support this view (unsupported_by_backend).");

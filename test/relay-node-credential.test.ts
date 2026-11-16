@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import test, { type TestContext } from "node:test";
 import { createApp } from "../src/app.js";
 import { createAdminModule } from "../src/admin/routes.js";
+import { decryptSecret } from "../src/crypto.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
@@ -40,7 +41,7 @@ async function deviceToken(origin: string, userId: string, workspaceId: string):
   return issued.body.access_token as string;
 }
 
-async function setup(t: TestContext) {
+async function setup(t: TestContext, options: { gate?: boolean } = {}) {
   // Fake Relaycast: records every call; `reply` picks the answer per call.
   const calls: RelaycastCall[] = [];
   let reply: (call: RelaycastCall) => Reply = () => ({ status: 200, body: { ok: true, data: {} } });
@@ -83,6 +84,7 @@ async function setup(t: TestContext) {
     dashboardUrl: `${origin}/dashboard/`,
     port: 0,
     host: "127.0.0.1",
+    ...(options.gate ? { relaygatePublicUrl: "https://gate.selfhosted.test" } : {}),
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
   const admin = createAdminModule({ config, database, keyring: KEYRING });
@@ -367,6 +369,8 @@ test("broker POST nodes enrolls only the token's own node and forwards node head
   assert.equal(call.headers["x-relaycast-node-token"], "rn_existing");
   assert.equal(call.headers["content-type"], "application/json");
   assert.equal(call.headers["x-other"], undefined);
+  // Not gate-only: the token goes back to the host and Control keeps nothing.
+  assert.equal((await ctx.database.query("SELECT 1 FROM relay_node_credentials")).rows.length, 0);
 
   // A 409 from Relaycast passes through.
   ctx.setReply(() => ({ status: 409, body: { ok: false, error: { code: "conflict" } } }));
@@ -378,6 +382,61 @@ test("broker POST nodes enrolls only the token's own node and forwards node head
   const before = ctx.calls.length;
   assert.equal((await ctx.broker("/relay-node/v1/nodes", node.accessToken, { method: "POST", body: "{" })).status, 400);
   assert.equal(ctx.calls.length, before);
+});
+
+test("gate-only: POST nodes keeps the node token sealed in Control and rotates it on re-enrolment", async (t) => {
+  const ctx = await setup(t, { gate: true });
+  const node = await ctx.mintNode("node-a");
+  const raw = JSON.stringify({ name: "node-a" });
+  const enrol = (headers: Record<string, string> = {}) => ctx.broker("/relay-node/v1/nodes", node.accessToken, {
+    method: "POST", body: raw, headers: { "content-type": "application/json", ...headers },
+  });
+  const stored = async () => (await ctx.database.query<Record<string, any>>(
+    "SELECT * FROM relay_node_credentials WHERE workspace_id = $1 AND node_name = 'node-a'", [ctx.workspaceId])).rows;
+
+  // A 2xx answer without a string token: 502, nothing stored.
+  ctx.setReply(() => ({ status: 201, body: { ok: true, data: { id: "n-1", name: "node-a" } } }));
+  const missing = await enrol();
+  assert.equal(missing.status, 502);
+  assert.equal(missing.body.error.code, "relaycast_unavailable");
+  assert.equal((await stored()).length, 0);
+
+  // First enrolment: the host's node-token header is ignored and the answer carries no token.
+  ctx.calls.length = 0;
+  ctx.setReply(() => ({ status: 201, body: { ok: true, data: { id: "n-1", name: "node-a", token: "nt_live_first" } } }));
+  const first = await enrol({ "idempotency-key": "idem-1", "x-relaycast-node-token": "nt_live_from_host" });
+  assert.equal(first.status, 201);
+  assert.deepEqual(first.body, { ok: true, data: { id: "n-1", name: "node-a" } });
+  assert(!first.raw.includes("nt_live_"));
+  assert.equal(first.headers.get("cache-control"), "no-store");
+  assert.equal(ctx.calls[0]!.headers["x-relaycast-node-token"], undefined);
+  assert.equal(ctx.calls[0]!.headers["idempotency-key"], "idem-1");
+  let rows = await stored();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.relaycast_node_id, "n-1");
+  assert.equal(rows[0]!.api_token_id, node.id);
+  assert.notEqual(rows[0]!.token_ciphertext, "nt_live_first");
+  assert(!String(rows[0]!.token_ciphertext).includes("nt_live_first"));
+  assert.equal(decryptSecret(rows[0]!.token_ciphertext, KEYRING), "nt_live_first");
+
+  // Re-enrolment: Control presents the stored token itself, never the host's, and rotates the row.
+  ctx.calls.length = 0;
+  ctx.setReply(() => ({ status: 200, body: { ok: true, data: { id: "n-2", name: "node-a", token: "nt_live_second" } } }));
+  const second = await enrol({ "x-relaycast-node-token": "nt_live_from_host" });
+  assert.equal(second.status, 200);
+  assert.deepEqual(second.body, { ok: true, data: { id: "n-2", name: "node-a" } });
+  assert.equal(ctx.calls[0]!.headers["x-relaycast-node-token"], "nt_live_first");
+  rows = await stored();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.relaycast_node_id, "n-2");
+  assert.equal(decryptSecret(rows[0]!.token_ciphertext, KEYRING), "nt_live_second");
+
+  // Non-2xx answers pass through and leave the row alone.
+  ctx.setReply(() => ({ status: 409, body: { ok: false, error: { code: "conflict" } } }));
+  const conflict = await enrol();
+  assert.equal(conflict.status, 409);
+  assert.deepEqual(conflict.body, { ok: false, error: { code: "conflict" } });
+  assert.equal(decryptSecret((await stored())[0]!.token_ciphertext, KEYRING), "nt_live_second");
 });
 
 test("broker refuses everything outside the allowlist with 403 scope_denied", async (t) => {

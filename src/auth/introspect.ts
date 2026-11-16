@@ -3,12 +3,16 @@ import type { IncomingMessage } from "node:http";
 import type { ApiTokenStore } from "../admin/api-tokens.js";
 import { STAFF_READ_GRANT_PREFIX, StaffReadGrants } from "../admin/staff-read-grants.js";
 import type { SelfhostConfig } from "../config.js";
+import { canonicalRelayhistoryOrigin } from "../relayhistory-origin.js";
 import type { CapturePolicy } from "../capture-policy.js";
 import { hashSecret } from "../crypto.js";
 import { databaseErrorCause, isDatabaseUnavailable } from "../database.js";
 import type { FlowRunRelayfileCredentials } from "../flows/relayfile-credentials.js";
+import {
+  RELAY_LAUNCH_CREDENTIAL_PREFIX, RELAY_LAUNCH_SCOPE, type RelayLaunchCredentials,
+} from "../mcp/relay-launch-credentials.js";
 import { NODE_ID_PATTERN, type ControlPlaneStore, type IntrospectedToken, type Principal } from "../store.js";
-import type { IntrospectionHold } from "./introspection-hold.js";
+import type { HeldAudienceVerdict, IntrospectionHold } from "./introspection-hold.js";
 
 /**
  * POST /internal/v1/auth/introspect: the sessions pipeline (and relayfile)
@@ -61,6 +65,17 @@ import type { IntrospectionHold } from "./introspection-hold.js";
  *   Active answers have principal_type `agent`, agent_name
  *   `flows-run-<runId>`, sub = token_id = the credential id, the stored
  *   path scopes, iat = minted and exp = the credential's expiry.
+ * - Relay launch credentials (gate-only installs, SELFHOST_RELAYGATE_PUBLIC_URL;
+ *   docs/identity.md): an `sh_lt_` token minted for one agent launch, which
+ *   relaygate presents here with its own audience. Inactive reasons
+ *   `unknown`, `expired`, `revoked` (already redeemed), `audience`,
+ *   `workspace` and, for any `machine`, `machine_not_owned`. Only once every
+ *   check passes is the credential burned; the first active answer is the
+ *   only one, a lost race answers inactive. Active answers have
+ *   principal_type `relay_launch`, sub = the launching user, agent_name and
+ *   node_name of the launch, scopes `["relay:agent:enrol"]`, token_id = the
+ *   credential id, iat = minted and exp = the credential's expiry. Unset gate
+ *   URL: every `sh_lt_` is `unknown`.
  * - User tokens also carry `role`, the live organization role, so optional
  *   add-on services can make the same admin decisions as this service without
  *   reading its database. Each add-on is one more origin in
@@ -76,8 +91,9 @@ import type { IntrospectionHold } from "./introspection-hold.js";
  *   The one exception is the opt-in database outage hold
  *   (SELFHOST_INTROSPECT_OUTAGE_HOLD_MS, docs/identity.md): only when the
  *   `sh_at_` lookup fails with a connection-class database error, the last
- *   ACTIVE verdict the database gave for that token within the hold answers
- *   instead, marked `held: true` with `exp` clamped to the end of the hold.
+ *   ACTIVE verdict the database gave for that token and requested audience
+ *   within the hold answers instead, marked `held: true` with `exp` clamped
+ *   to that audience confirmation's end.
  *   Machine claims are never held.
  * - The token, its hash, the secret and the body are never logged.
  */
@@ -151,6 +167,24 @@ export type IntrospectionResult =
     org: string;
     workspace: string;
     cloud_relay_workspace_id: string | null;
+    scopes: string[];
+    aud: string;
+    iat: number;
+    exp: number;
+    token_id: string;
+  }
+  | {
+    active: true;
+    /** The launching user. */
+    sub: string;
+    email: null;
+    principal_type: "relay_launch";
+    agent_name: string;
+    node_name: string;
+    machine_id: null;
+    org: string;
+    workspace: string;
+    /** Always `["relay:agent:enrol"]` (RELAY_LAUNCH_SCOPE). */
     scopes: string[];
     aud: string;
     iat: number;
@@ -259,9 +293,31 @@ function epochSeconds(value: Date): number {
  */
 export function acceptedAudiences(config: SelfhostConfig): string[] {
   if (!config.introspectSecret) return [];
-  return (config.introspectAudiences ?? [config.relayhistoryPublicUrl])
+  return [...new Set([
+    ...(config.introspectAudiences ?? []),
+    ...(config.relayhistoryAudiences ?? [config.relayhistoryPublicUrl]),
+  ])]
     .map(normalizedOrigin)
     .filter((origin): origin is string => origin !== null);
+}
+
+/** The configured audience value whose normalized origin matches `value`. */
+export function matchingIntrospectionAudience(config: SelfhostConfig, value: string): string | undefined {
+  const requested = normalizedOrigin(value);
+  if (requested === null) return undefined;
+  return [
+    ...(config.introspectAudiences ?? []),
+    ...(config.relayhistoryAudiences ?? [config.relayhistoryPublicUrl]),
+  ]
+    .find((configured) => normalizedOrigin(configured) === requested);
+}
+
+/** A dedicated History audience match, distinct from acquisition/Relayfile. */
+export function matchingRelayhistoryAudience(config: SelfhostConfig, value: string): string | undefined {
+  const requested = canonicalRelayhistoryOrigin(value);
+  if (requested === null) return undefined;
+  return (config.relayhistoryAudiences ?? [config.relayhistoryPublicUrl])
+    .find((configured) => canonicalRelayhistoryOrigin(configured) === requested);
 }
 
 /** relayfile-agent (principal `agent`) and acquisition-operator (`service`) tokens. */
@@ -399,12 +455,53 @@ async function introspectStaffReadGrant(
   };
 }
 
+/** One-time relay launch credentials (`sh_lt_`, principal `relay_launch`); burned on the active answer. */
+async function introspectRelayLaunchCredential(
+  config: SelfhostConfig,
+  credentials: RelayLaunchCredentials | undefined,
+  request: IntrospectionRequest,
+): Promise<IntrospectionResult> {
+  const found = credentials ? await credentials.peek(request.token) : { state: "unknown" as const };
+  if (found.state === "unknown") return { active: false, reason: "unknown" };
+  if (found.state === "redeemed") return { active: false, reason: "revoked" };
+  if (found.state === "expired") return { active: false, reason: "expired" };
+  const aud = normalizedOrigin(request.aud);
+  if (aud === null || !acceptedAudiences(config).includes(aud)) return { active: false, reason: "audience" };
+  if (request.workspace !== undefined && found.credential.workspaceId !== request.workspace) {
+    return { active: false, reason: "workspace" };
+  }
+  if (request.machine !== undefined) return { active: false, reason: "machine_not_owned" };
+  // Every check passed: burn it. Only the caller that wins the burn is answered active.
+  const redeemed = await credentials!.redeem(request.token);
+  if (redeemed.state !== "active") {
+    return { active: false, reason: redeemed.state === "expired" ? "expired" : redeemed.state === "unknown" ? "unknown" : "revoked" };
+  }
+  const credential = redeemed.credential;
+  return {
+    active: true,
+    sub: credential.userId,
+    email: null,
+    principal_type: "relay_launch",
+    agent_name: credential.agentName,
+    node_name: credential.nodeName,
+    machine_id: null,
+    org: credential.organizationId,
+    workspace: credential.workspaceId,
+    scopes: [RELAY_LAUNCH_SCOPE],
+    aud,
+    iat: epochSeconds(credential.createdAt),
+    exp: epochSeconds(credential.expiresAt),
+    token_id: credential.id,
+  };
+}
+
 export async function introspect(
   config: SelfhostConfig,
   store: ControlPlaneStore,
   request: IntrospectionRequest,
   apiTokens?: ApiTokenStore,
   flowRunCredentials?: FlowRunRelayfileCredentials,
+  launchCredentials?: RelayLaunchCredentials,
   options?: IntrospectionOptions,
 ): Promise<IntrospectionResult> {
   if (request.token.startsWith(WORKSPACE_API_TOKEN_PREFIX)) {
@@ -416,6 +513,9 @@ export async function introspect(
   if (request.token.startsWith(STAFF_READ_GRANT_PREFIX)) {
     return introspectStaffReadGrant(config, store, request);
   }
+  if (request.token.startsWith(RELAY_LAUNCH_CREDENTIAL_PREFIX)) {
+    return introspectRelayLaunchCredential(config, launchCredentials, request);
+  }
   // Refresh, internal, bootstrap, worker, run and enrollment tokens are
   // never looked up as user tokens. That includes sh_ek_ desktop enrollment
   // keys: they are exchanged once at POST /api/v1/auth/enrollment/token and
@@ -423,34 +523,66 @@ export async function introspect(
   if (!request.token.startsWith(USER_ACCESS_TOKEN_PREFIX)) {
     return { active: false, reason: "wrong-kind" };
   }
+  const accessTokenHash = hashSecret(request.token);
   const hold = options?.hold;
   let session: IntrospectedToken | null;
-  let held: { checkedAt: number; validUntil: number; cause: string } | null = null;
+  let held: { audiences: ReadonlyMap<string, HeldAudienceVerdict>; cause: string } | null = null;
   let outage: unknown;
   try {
     session = await store.introspectAccessToken(request.token);
   } catch (error) {
     if (!hold || !isDatabaseUnavailable(error)) throw error;
-    const entry = hold.lookup(hashSecret(request.token));
+    const entry = hold.lookup(accessTokenHash);
     if (!entry) throw error;
     session = entry.session;
-    held = { checkedAt: entry.checkedAt, validUntil: entry.validUntil, cause: databaseErrorCause(error) };
+    held = {
+      audiences: entry.audiences,
+      cause: databaseErrorCause(error),
+    };
     outage = error;
   }
-  if (!held) hold?.observe(session, session ? undefined : hashSecret(request.token));
-  if (!session) return { active: false, reason: "unknown" };
-  if (session.revoked) return { active: false, reason: "revoked" };
+  if (!session) {
+    if (!held) hold?.observe(null, { hash: accessTokenHash });
+    return { active: false, reason: "unknown" };
+  }
+  if (session.revoked) {
+    if (!held) hold?.observe(session);
+    return { active: false, reason: "revoked" };
+  }
   // A held verdict's flag was computed when it was checked: recompute it.
   if (held ? session.expiresAt.getTime() <= Date.now() : session.expired) {
+    if (!held) hold?.observe(session);
     return { active: false, reason: "expired" };
   }
-  const requested = normalizedOrigin(request.aud);
-  const aud = requested === null
-    ? undefined
-    : [...(config.introspectAudiences ?? [config.relayhistoryPublicUrl]), session.relayhistoryOrigin]
-      .filter((candidate): candidate is string => candidate !== null)
-      .find((configured) => normalizedOrigin(configured) === requested);
-  if (!aud) return { active: false, reason: "audience" };
+  let aud = matchingIntrospectionAudience(config, request.aud);
+  const matchedAudience = aud;
+  const historyAudience = matchingRelayhistoryAudience(config, request.aud);
+  const requestedHistoryOrigin = canonicalRelayhistoryOrigin(request.aud);
+  const expectedHistoryOrigin = canonicalRelayhistoryOrigin(
+    session.relayhistoryOrigin ?? config.relayhistoryPublicUrl,
+  );
+  if (historyAudience !== undefined) {
+    aud = expectedHistoryOrigin !== null && requestedHistoryOrigin === expectedHistoryOrigin
+      ? historyAudience
+      : undefined;
+  } else if (!held && aud !== undefined && requestedHistoryOrigin !== null) {
+    // Legacy configs may still name a customer History origin in the old
+    // general list. The unique origin index makes this lookup unambiguous;
+    // refuse the general-list match for every workspace, including tenants
+    // other than the owner, until the operator moves it to the dedicated list.
+    if (await store.workspaceIdForRelayhistoryOrigin(requestedHistoryOrigin) !== null) aud = undefined;
+  }
+  if (!aud) {
+    // A live refusal is authoritative for this token+audience. Do not let an
+    // earlier confirmation outlive a newly imported History-origin fence.
+    if (!held && matchedAudience) hold?.forgetAudience(accessTokenHash, matchedAudience);
+    return { active: false, reason: "audience" };
+  }
+  // The hold re-serves authoritative token+audience verdicts, not merely a
+  // token session. This keeps the DB-backed legacy History-origin fence in
+  // force without a second database query during the outage.
+  const heldAudience = held?.audiences.get(aud) ?? null;
+  if (held && !heldAudience) return { active: false, reason: "audience" };
   if (request.workspace !== undefined && session.workspaceId !== request.workspace) {
     return { active: false, reason: "workspace" };
   }
@@ -467,13 +599,14 @@ export async function introspect(
     if (here.userId !== session.userId) return { active: false, reason: "machine_not_owned" };
     machineId = request.machine;
   }
+  if (!held) hold?.observe(session, { audience: aud });
   const tokenId = tokenIdFor(session.accessTokenHash);
   if (held) {
     options?.log?.("[selfhost-api] token introspection held", {
       token_id: tokenId,
       aud,
       workspace: session.workspaceId,
-      age_ms: Math.max(0, Date.now() - held.checkedAt),
+      age_ms: Math.max(0, Date.now() - heldAudience!.checkedAt),
       cause: held.cause,
     });
   }
@@ -491,7 +624,7 @@ export async function introspect(
     scopes: [...session.scopes],
     aud,
     iat: epochSeconds(session.issuedAt),
-    exp: epochSeconds(held ? new Date(held.validUntil) : session.expiresAt),
+    exp: epochSeconds(held ? new Date(heldAudience!.validUntil) : session.expiresAt),
     token_id: tokenId,
     capture_policy: session.capturePolicy,
     ...(held ? { held: true as const } : {}),
@@ -506,6 +639,7 @@ export async function handleIntrospection(
     console.warn(message, fields),
   apiTokens?: ApiTokenStore,
   flowRunCredentials?: FlowRunRelayfileCredentials,
+  launchCredentials?: RelayLaunchCredentials,
   hold?: IntrospectionHold,
 ): Promise<IntrospectionOutcome> {
   const secret = config.introspectSecret;
@@ -530,5 +664,5 @@ export async function handleIntrospection(
       message: "Body must be a JSON object with string token and aud, optionally a non-empty string (or null) workspace, and optionally a node-id string machine (at most 16 KiB)",
     };
   }
-  return { status: 200, body: await introspect(config, store, body, apiTokens, flowRunCredentials, { hold, log }) };
+  return { status: 200, body: await introspect(config, store, body, apiTokens, flowRunCredentials, launchCredentials, { hold, log }) };
 }

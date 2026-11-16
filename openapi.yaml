@@ -881,7 +881,12 @@ paths:
                       token: { type: string }
                       relaycastUrl: { type: string, format: uri }
         "403":
-          description: Agent, CI, or service credential, or cookie request failed the origin check
+          description: >-
+            Agent, CI, or service credential, or cookie request failed the origin check;
+            or `gate_only` on a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): no
+            identity is registered and no token is issued, the body carries
+            `urls.relaycastUrl` and `urls.relaygateUrl`, and the call is audited as
+            `workspace.person_credential.withheld`
         "409":
           description: register_human admission is full, or the name is held by someone else
   /api/v1/workspaces/{workspaceId}/messaging/conversations/{agentName}:
@@ -3691,7 +3696,9 @@ paths:
         lookups. `origin` and `audience` are both the workspace's imported
         customer-hosted History origin when set, otherwise the configured
         public History origin (SESSION_READ_API_PUBLIC_URL). It is the exact
-        introspection audience and sync-session `baseUrl`.
+        introspection audience and sync-session `baseUrl`. An imported origin
+        must also be listed in SELFHOST_RELAYHISTORY_AUDIENCES; otherwise the
+        route fails closed as `relayhistory_not_configured`.
       responses:
         "200":
           description: The workspace's RelayHistory origin and session audience
@@ -3732,9 +3739,9 @@ paths:
           description: |
             `workspace_not_found`: workspace does not exist, is outside the
             token's organization (even if the same person is a member there),
-            or the caller is not a member. `relayhistory_not_configured`: the History origin is unset (checked
-            after authorization; startup requires it, so a running install
-            does not answer this).
+            or the caller is not a member. `relayhistory_not_configured`: the
+            History origin is unset or an imported origin is not in
+            SELFHOST_RELAYHISTORY_AUDIENCES (checked after authorization).
   /api/v1/workspaces/{workspaceId}/relayhistory/session:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -3758,9 +3765,11 @@ paths:
         expiry capped at 15 minutes.
 
         In sync mode `baseUrl` is the workspace's imported customer-hosted
-        origin when set, otherwise SESSION_READ_API_PUBLIC_URL. Read mode uses
-        the configured read API. Caller-supplied service URLs or tenant IDs
-        are rejected because they are not request fields. See
+        origin when set and operator-allowlisted, otherwise
+        SESSION_READ_API_PUBLIC_URL. A present but unallowlisted imported
+        origin fails closed without returning the caller's token. Read mode
+        uses the configured read API. Caller-supplied service URLs or tenant
+        IDs are rejected because they are not request fields. See
         docs/sessions-read-api.md.
       requestBody:
         required: false
@@ -5712,7 +5721,12 @@ paths:
         Relaycast POST /v1/nodes for the token's own node. The body is
         forwarded unchanged with Content-Type, Idempotency-Key and
         X-Relaycast-Node-Token when present; its `name` must equal the
-        token's nodeName. The answer can carry a node token.
+        token's nodeName. The answer can carry a node token. On gate-only
+        installs (SELFHOST_RELAYGATE_PUBLIC_URL set) Control keeps the node
+        token: the X-Relaycast-Node-Token header is ignored (Control sends
+        the stored token itself on re-enrolment), a 2xx answer is reduced to
+        {ok: true, data: {id, name}}, and a 2xx answer without a token is 502
+        relaycast_unavailable.
       security: [{ relayNodeBearer: [] }]
       parameters:
         - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
@@ -5739,6 +5753,24 @@ paths:
         "413": { description: "payload_too_large: body over 1 MiB" }
         "502": { $ref: "#/components/responses/RelayNodeRelaycastUnavailable" }
         default: { $ref: "#/components/responses/RelayNodePassthrough" }
+  /relay-node/v1/ws:
+    get:
+      operationId: relayNodeSocket
+      tags: [relay-node]
+      summary: >-
+        Gate-only installs only: WebSocket upgrade that bridges the node to
+        Relaycast's node socket with the node token Control holds. Frames
+        pass through unchanged except that spawn invocations journaled for
+        this node gain input.launch_credential and deliver frames are not
+        forwarded. See docs/relay-node-credential.md, "Gate-only installs".
+      security: [{ relayNodeBearer: [] }]
+      responses:
+        "101": { description: Switching Protocols; the bridge is open. }
+        "401": { description: No bearer, or not a live relay-node token. A token in the query string is not read. }
+        "403": { description: The node has not enrolled through this Control, or its stored node token is unreadable (re-enrol). }
+        "404": { description: Not a gate-only install. }
+        "429": { description: Over 600 requests per minute for this token (shared with the broker routes). }
+        "503": { description: The bridge is at its connection limit or shutting down. }
   /relay-node/v1/nodes/{name}:
     get:
       operationId: relayNodeGetNode
@@ -6003,11 +6035,14 @@ paths:
         Checks, in order: `wrong-kind` (not an `sh_at_` token: refresh,
         internal, bootstrap, worker or run tokens are never looked up; an
         `sh_wk_` token is only accepted as described below), `unknown` (no such token, including a token replaced by refresh),
-        `revoked`, `expired`, `audience` (`aud` is not one of
-        SELFHOST_INTROSPECT_AUDIENCES, compared as normalized origins:
-        scheme, lowercase host and port; path ignored), `workspace` (the token
-        session is bound to another workspace; only when `workspace` is
-        supplied). Only then, when `machine` is
+        `revoked`, `expired`, `audience` (`aud` is not in the configured
+        general-service or dedicated History audience lists; a History
+        audience must also equal the token session workspace's own imported
+        origin, or the installation default; the lists are disjoint and a
+        stored History origin never falls back to the general list),
+        `workspace` (the token session
+        is bound to another workspace; only when `workspace` is supplied).
+        Only then, when `machine` is
         supplied, it is matched against fleet node claims
         (POST /api/v1/fleet/nodes/claim), so an inactive token never reveals
         machine state: `machine_not_owned` (claimed by another user in the
@@ -6051,6 +6086,19 @@ paths:
         token passes the same checks and answers the same way except
         principal_type `service`, `agent_name` null and `scopes`
         `["acquisition:operate"]`.
+
+        Relay launch credentials (gate-only installs only, when
+        SELFHOST_RELAYGATE_PUBLIC_URL is set; otherwise every `sh_lt_` is
+        `unknown`): a one-time `sh_lt_` token minted for one agent launch and
+        presented by relaygate. Inactive reasons `unknown`, `expired`,
+        `revoked` (already redeemed), `audience` (`aud` must normalize to an
+        accepted audience), `workspace`, and `machine_not_owned` for any
+        `machine`. Only when every check passes is the credential burned: the
+        first active answer is the only one. The active answer has
+        principal_type `relay_launch`, `sub` the launching user, `agent_name`
+        and `node_name` of the launch, `scopes` `["relay:agent:enrol"]`,
+        `token_id` the credential id, `iat` the mint time and `exp` its expiry
+        (10 minutes later).
       requestBody:
         required: true
         content:
@@ -6169,6 +6217,27 @@ paths:
                       iat: { type: integer, description: Mint time }
                       exp: { type: integer, description: "The token's expiry, or now + 3600 (recomputed per call) when it has none" }
                       token_id: { type: string, format: uuid }
+                  - type: object
+                    additionalProperties: false
+                    required: [active, sub, email, principal_type, agent_name, node_name, machine_id, org, workspace, scopes, aud, iat, exp, token_id]
+                    description: A one-time relay launch credential (`sh_lt_`, gate-only installs), burned by this answer.
+                    properties:
+                      active: { const: true }
+                      sub: { type: string, format: uuid, description: The launching user's id }
+                      email: { type: "null" }
+                      principal_type: { const: relay_launch }
+                      agent_name: { type: string, description: The launched agent's name }
+                      node_name: { type: string, description: The name of the node the agent was launched on }
+                      machine_id: { type: "null" }
+                      org: { type: string }
+                      workspace: { type: string, description: "The launch's workspace; authoritative when the request omitted `workspace`" }
+                      scopes:
+                        type: array
+                        items: { const: "relay:agent:enrol" }
+                      aud: { type: string, description: The normalized request audience }
+                      iat: { type: integer, description: Mint time }
+                      exp: { type: integer, description: Expiry, 10 minutes after mint }
+                      token_id: { type: string, format: uuid, description: The credential id }
                   - type: object
                     additionalProperties: false
                     required: [active, reason]

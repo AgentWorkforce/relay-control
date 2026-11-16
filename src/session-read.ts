@@ -1,5 +1,9 @@
+import type { IncomingMessage } from "node:http";
+import { createHmac } from "node:crypto";
 import { z } from "zod";
+import { bearer } from "./auth/bearer.js";
 import type { SelfhostConfig } from "./config.js";
+import { secureEqual } from "./crypto.js";
 
 const opaqueToken = (prefix: string) => z.string().max(4096).regex(new RegExp(`^${prefix}[A-Za-z0-9_-]{43,}$`));
 export const readSessionRequest = z.object({
@@ -28,7 +32,47 @@ export class SessionReadError extends Error {
   }
 }
 
-export type ReadIdentity = { userId: string; orgId: string; workspaceId: string };
+/**
+ * How the person behind a read-token mint reached Control. It is derived from
+ * the request's authentication, never from a request body:
+ * - `browser`: cookie session (no Authorization bearer);
+ * - `device`: `sh_at_` bearer (Desktop and device clients); a request with
+ *   both a cookie and a bearer is a bearer request;
+ * - `mcp`: an MCP read on the person's behalf.
+ */
+export type ReaderKind = "browser" | "device" | "mcp";
+
+/** Header the MCP session reader sends on its hop to the public session-read route. */
+export const MCP_READER_HEADER = "x-relaycontrol-session-reader";
+
+/**
+ * The marker the MCP session reader presents in MCP_READER_HEADER:
+ * HMAC-SHA256(key = the read API issuer secret, data = a fixed string), hex.
+ * Derived from the shared secret, so it is equal on every replica, and it is
+ * not the secret. Never log or echo it.
+ */
+export function mcpReaderMarker(secret: string): string {
+  return createHmac("sha256", secret).update("relay-control session-read mcp reader").digest("hex");
+}
+
+/**
+ * The reader kind of a request. `marker` is given only on the public
+ * session-read route, which the flagged MCP reader calls over HTTP with the
+ * caller's bearer; a matching marker on a bearer request names that hop `mcp`.
+ * A cookie request is always `browser`, whatever headers it carries. A device
+ * that sent the header could only call itself `mcp`, which grants nothing:
+ * `mcp` and `device` reads are treated alike downstream (neither is a browser
+ * read). The marker is derived from the shared issuer secret, so it is equal
+ * on every replica.
+ */
+export function readerKindOf(request: IncomingMessage, marker?: string): ReaderKind {
+  if (!bearer(request)) return "browser";
+  const presented = request.headers[MCP_READER_HEADER];
+  if (marker && typeof presented === "string" && secureEqual(presented, marker)) return "mcp";
+  return "device";
+}
+
+export type ReadIdentity = { userId: string; orgId: string; workspaceId: string; readerKind: ReaderKind };
 
 /** The read API is the issuer. Control authorizes a single identity and validates its reply. */
 export async function requestReadSession(
@@ -37,6 +81,7 @@ export async function requestReadSession(
   input: { label?: string } | { refreshToken: string },
 ) {
   const refreshing = "refreshToken" in input;
+  const { readerKind, ...person } = identity;
   const path = refreshing ? "/internal/v1/session-read/sessions/refresh" : "/internal/v1/session-read/sessions";
   let response: Response;
   let value: unknown;
@@ -46,7 +91,13 @@ export async function requestReadSession(
       redirect: "error",
       signal: AbortSignal.timeout(10_000),
       headers: { authorization: `Bearer ${config.secret}`, "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({ ...identity, audience: config.publicUrl, scopes: ["rth:read"], ...input }),
+      body: JSON.stringify({
+        ...person,
+        // Only behind relaygate, which records it and strips it before proxying;
+        // the read API's strict mint schema rejects unknown fields.
+        ...(config.mintReaderKind ? { reader_kind: readerKind } : {}),
+        audience: config.publicUrl, scopes: ["rth:read"], ...input,
+      }),
     });
     if (!response.ok) {
       await response.body?.cancel();
