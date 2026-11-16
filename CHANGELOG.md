@@ -28,7 +28,15 @@ assigned at release.
   and is unaffected. The events-shim temporary workspace
   (`POST /t/<mcp token>/workspace`) is also withheld (`404 not_found`), so
   `events-shim setup` on a machine not signed in here cannot start its own
-  core. Unset, both are byte-for-byte as before. See docs/identity.md
+  core. The person credential
+  (`POST /api/v1/workspaces/{id}/messaging/identity/credential`) answers
+  `403 gate_only` with both urls, registers no person identity on Relaycast
+  (the desktop enrols its own name at relaygate `/v1/register` with its device
+  token) and is audited as `workspace.person_credential.withheld`; the
+  relay-node broker's enrol (`POST /relay-node/v1/nodes`) answers
+  `403 gate_only` before any Relaycast call, so no node token leaves. MCP join
+  and spawn are unchanged (their participant tokens stay server-side). Unset,
+  all of these are byte-for-byte as before. See docs/identity.md
   ("Gate-only installs").
 - Added: `send_relay_message` results include `recipient_card` when the
   recipient has an agent card (`has_card`): `{ description, skills, version, updated_at, note }`, where `description` is null

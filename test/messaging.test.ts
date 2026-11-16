@@ -1383,3 +1383,96 @@ test("resolve: gate-only keeps every refusal", async (t) => {
   assert.equal((await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.config.bootstrapToken })).status, 401);
   assert.equal((await jsonRequest(fx.origin, resolvePath(fx.otherWorkspaceId), { token: fx.accessToken })).status, 404);
 });
+
+// ---- POST /messaging/identity/credential on gate-only installs ---------------
+
+async function credentialWithheldAudits(database: Database) {
+  return (await database.query<Record<string, unknown>>(
+    "SELECT * FROM admin_audit_events WHERE action = 'workspace.person_credential.withheld' ORDER BY created_at",
+  )).rows;
+}
+
+test("person credential: without SELFHOST_RELAYGATE_PUBLIC_URL the token is still issued", async (t) => {
+  const fx = await harness(t);
+  const credential = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: fx.accessToken });
+  assert.equal(credential.status, 200);
+  assert.equal(credential.body.identity.token, "ar_ag_1");
+  assert.equal(fx.state.registerCalls, 1);
+  assert.equal((await credentialWithheldAudits(fx.database)).length, 0);
+});
+
+test("person credential: gate-only issues no Relaycast token", async (t) => {
+  const fx = await harness(t, { config: { relaygatePublicUrl: "https://gate.selfhosted.example" } });
+  const cookie = `agent_relay_session=${fx.accessToken}`;
+  for (const [cloud, auth] of [
+    [false, { token: fx.accessToken }],
+    [true, { cookie }],
+  ] as const) {
+    const withheld = await jsonRequest(fx.origin, credentialPath(fx.workspaceId, cloud), { method: "POST", body: {}, ...auth });
+    assert.equal(withheld.status, 403);
+    assert.equal(withheld.body.error, "gate_only");
+    assert.equal(typeof withheld.body.message, "string");
+    assert.deepEqual(withheld.body.urls, {
+      relaycastUrl: "https://cast.selfhosted.example",
+      relaygateUrl: "https://gate.selfhosted.example",
+    });
+    assert.equal("identity" in withheld.body, false);
+    assert.equal(JSON.stringify(withheld.body).includes("ar_ag_"), false);
+  }
+  // No person identity was registered on Relaycast or stored here.
+  assert.equal(fx.state.registerCalls, 0);
+  assert.equal((await fx.database.query("SELECT id FROM person_identities")).rows.length, 0);
+  const audits = await credentialWithheldAudits(fx.database);
+  assert.equal(audits.length, 2);
+  for (const audit of audits) {
+    assert.equal(audit.actor_id, fx.userId);
+    assert.equal(audit.workspace_id, fx.workspaceId);
+    assert.match(String(audit.target), /^session:[0-9a-f-]{36}$/);
+  }
+  assert.equal(JSON.stringify(audits).includes("ar_ag_"), false);
+
+  // Every earlier refusal still answers first, and none of them is audited as withheld.
+  const agentToken = await new ApiTokenStore(fx.database).create({
+    workspaceId: fx.workspaceId,
+    organizationId: fx.orgId,
+    label: "agent",
+    purpose: "agent-runtime",
+    expiryDays: 1,
+    neverExpires: undefined,
+    actor: { kind: "user", userId: fx.userId },
+  });
+  const agent = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: agentToken.accessToken });
+  assert.equal(agent.status, 403);
+  assert.notEqual(agent.body.error, "gate_only");
+  const service = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: fx.config.internalServiceToken! });
+  assert.equal(service.status, 403);
+  assert.notEqual(service.body.error, "gate_only");
+  const lowScope = await fx.signIn(fx.userId);
+  await dropCliAuth(fx.database, lowScope);
+  const scoped = await jsonRequest(fx.origin, credentialPath(fx.workspaceId), { method: "POST", token: lowScope });
+  assert.equal(scoped.status, 403);
+  assert.equal(scoped.body.error, "forbidden");
+  const foreign = await jsonRequest(fx.origin, credentialPath(fx.otherWorkspaceId), { method: "POST", token: fx.accessToken });
+  assert.equal(foreign.status, 404);
+  const evil = await jsonRequest(fx.origin, credentialPath(fx.workspaceId, true), {
+    method: "POST",
+    cookie,
+    origin: "https://evil.internal.example",
+    contentType: "text/plain",
+    rawBody: "{}",
+  });
+  assert.equal(evil.status, 403);
+  assert.equal(evil.body.error, "csrf_rejected");
+  assert.equal((await credentialWithheldAudits(fx.database)).length, 2);
+  assert.equal(fx.state.registerCalls, 0);
+
+  // Reads are unchanged: the directory answers, and a thread has no identity yet.
+  const people = await jsonRequest(fx.origin, `/api/v1/workspaces/${fx.workspaceId}/messaging/people`, { token: fx.accessToken });
+  assert.equal(people.status, 200);
+  assert.deepEqual(people.body.people, []);
+  const thread = await jsonRequest(fx.origin, threadPath(fx.workspaceId, "helper"), { token: fx.accessToken });
+  assert.equal(thread.status, 200);
+  assert.equal(thread.body.you, null);
+  assert.deepEqual(thread.body.messages, []);
+  assert.equal(fx.state.registerCalls, 0);
+});
