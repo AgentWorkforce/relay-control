@@ -111,6 +111,11 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   // Alice's legacy object was never read: it could belong to either login.
   assert.ok(!reads.includes(`${id(1)}/openai/credentials.json.enc`));
   assert.equal(report.ok, false, "a missing object is not a clean copy");
+  // Rollback handle: every written Cloud row maps to its Control row.
+  assert.equal(Object.keys(report.controlIds).length, 7); // 0x808 object missing
+  const mapped = (await target.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM coding_agent_credentials WHERE id::text = ANY($1::text[])", [Object.values(report.controlIds)])).rows[0]!.n;
+  assert.equal(mapped, 7);
   assert.doesNotMatch(JSON.stringify(report), /sk-|rt-synthetic|example\.test/);
 
   const rows = (await target.query<{ auth_type: string; model_provider: string; secret_ciphertext: string | null; blob_location: string | null; workspace_id: string }>(

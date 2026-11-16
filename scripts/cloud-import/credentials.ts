@@ -61,6 +61,12 @@ export type CredentialCopyReport = {
   outcomes: Record<string, number>;
   /** Cloud provider_credentials id -> outcome. Ids only. */
   rows: Record<string, CredentialOutcome>;
+  /**
+   * Cloud id -> the Control coding_agent_credentials id it was written to
+   * (copied or already present). Copier rows are not in the import ledger,
+   * so this is what a rollback deletes by.
+   */
+  controlIds: Record<string, string>;
   /** How Cloud's selection was applied (see applyCloudSelection). */
   /**
    * selectionConflicts: groups where Cloud selected no copied row, no other
@@ -222,6 +228,7 @@ export async function copyCodingAgentCredentials(
     candidates: 0,
     outcomes: {},
     rows: {},
+    controlIds: {},
   };
   const record = (id: string, outcome: CredentialOutcome) => {
     report.rows[id] = outcome;
@@ -279,6 +286,7 @@ export async function copyCodingAgentCredentials(
         };
         const id = await deps.logins.storeLogin(login);
         copied.push({ row, controlId: id });
+        report.controlIds[row.id] = id;
         record(row.id, "copied");
         continue;
       }
@@ -295,6 +303,7 @@ export async function copyCodingAgentCredentials(
         continue;
       }
       copied.push({ row, controlId: result.record.id });
+      report.controlIds[row.id] = result.record.id;
       record(row.id, result.created ? "copied" : "already_present");
     } catch (error) {
       if (error instanceof SyntaxError) {
