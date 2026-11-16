@@ -96,6 +96,9 @@ import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./f
 import { createMcpHandler } from "./mcp/routes.js";
 import { createCustomerSupportNoticeHandler } from "./mcp/customer-support-notice.js";
 import type { AmpModule } from "./amp/module.js";
+import type { ReplicasModule } from "./replicas/module.js";
+import { isReplicasPath } from "./replicas/routes.js";
+import { disconnectReplicas, purgeMemberReplicas, releaseMemberReplicas, ReplicasError } from "./replicas/service.js";
 import { isAmpPath } from "./amp/routes.js";
 import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
 import { purgeMemberAmp, releaseMemberAmp } from "./amp/service.js";
@@ -109,7 +112,7 @@ import {
 import { handleDesktopIdentityRoutes } from "./messaging/desktop-identities.js";
 import { handleChiefRoutes, type ChiefBackend } from "./chief/routes.js";
 import { handleProviderRoutes } from "./providers/routes.js";
-import { RemoteAgentConnections } from "./remote-agents/connections.js";
+import { RemoteAgentConnections, RemoteAgentError } from "./remote-agents/connections.js";
 import { remoteAgentRoutes } from "./remote-agents/routes.js";
 import type { ProviderProbes } from "./providers/registry.js";
 import {
@@ -404,6 +407,8 @@ export function createApp(input: {
   features?: SelectedFeatures;
   /** Amp control (src/amp). Absent or disabled: every Amp route answers 404 before auth. */
   amp?: AmpModule;
+  /** Replicas agents (src/replicas). Absent or disabled: every Replicas bridge route answers 404 before auth. */
+  replicas?: ReplicasModule;
   /** Server-owned worker; absent tests use the same on-demand cleanup without a timer. */
   mcpOAuthTeardown?: McpOAuthTeardown;
   grokRoutines?: GrokRoutines;
@@ -568,7 +573,19 @@ export function createApp(input: {
   // Hosted MCP (shared-sessions facade): reads, team activity, capabilities.
   const amp = input.amp?.config.enabled ? input.amp : null;
   const providerProbes: ProviderProbes = input.providerProbes ?? {};
-  const remoteAgents = remoteAgentRoutes(new RemoteAgentConnections(store.database, config.encryptionKeyring, input.remoteAgentFetch));
+  const replicas = input.replicas?.config.enabled ? input.replicas : null;
+  const remoteAgents = remoteAgentRoutes(new RemoteAgentConnections(store.database, config.encryptionKeyring, input.remoteAgentFetch, {
+    replicasEnabled: Boolean(replicas),
+    // Bindings are revoked and retired while the key still exists to sleep their compute.
+    ...(replicas ? { replicasCleanup: async (actor: { userId: string; workspaceId: string; organizationId: string }) => {
+      try {
+        await disconnectReplicas(replicas.deps, actor);
+      } catch (error) {
+        if (error instanceof ReplicasError) throw new RemoteAgentError(error.status, "replicas_cleanup_failed", error.message);
+        throw new RemoteAgentError(502, "replicas_cleanup_failed", "Replicas cleanup could not finish. Retry the disconnect.");
+      }
+    } } : {}),
+  }));
   const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
   const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({
     database:store.database,keyring:config.encryptionKeyring,
@@ -618,6 +635,7 @@ export function createApp(input: {
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
     ...(amp ? { amp: amp.deps } : {}),
+    ...(replicas ? { replicas: replicas.deps } : {}),
     ...(factory.enabled ? { factory: factory.mcp } : {}),
     ...(input.capy ? { capy: input.capy } : {}),
     ...(features.launch ? { launch: true } : {}),
@@ -1332,6 +1350,14 @@ export function createApp(input: {
         return;
       }
       if (await amp.handle(request, response, path, publicPath, method, { workspaceAccess, bearer, json })) return;
+    }
+    // Replicas agents: gated before any authentication (off answers 404).
+    if (isReplicasPath(path)) {
+      if (!replicas) {
+        json(response, 404, { error: "Not found" }, true);
+        return;
+      }
+      if (await replicas.handle(request, response, path, method, { workspaceAccess, bearer, json })) return;
     }
     // Events shim: 404 before any authentication while the feature is off.
     if (isEventsShimPath(path)) {
@@ -2489,6 +2515,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         userId,
         async (tx, member) => {
           await purgeMemberAmp(tx, member);
+          await purgeMemberReplicas(tx, { organizationId, userId });
           await factory.purgeMemberInTx(tx, organizationId, userId);
           await revokeOrganizationMcpOAuthGrants(tx, member, input.now?.() ?? new Date());
           // The member's desktop enrollment keys, exchanged ones included,
@@ -2510,6 +2537,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       await identity?.auditMembership({ organizationId, auth, action: "membership.remove", target: userId });
       await revokeRemovedMember(messagingDeps, organizationId, userId);
       if (amp) await releaseMemberAmp(amp.deps, { organizationId, userId }).catch(() => undefined);
+      if (replicas) await releaseMemberReplicas(replicas.deps, { organizationId, userId }).catch(() => undefined);
       await factory.afterMemberRemoved(organizationId, userId);
       oauthTeardown?.kick();
       response.writeHead(204);

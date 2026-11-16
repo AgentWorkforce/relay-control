@@ -112,7 +112,7 @@ export function createReplicasRuntime(options:{fetchImpl?:typeof fetch;timeoutMs
     },
     exec:async(key:string,id:string,command:string)=>{
       input(uuid,id);input(z.string().min(1).refine(s=>s.trim().length>0 && Buffer.byteLength(s)<=64*1024),command);
-      return call(key,`/replica/${id}/exec`,z.object({exit_code:z.number().int().nullable(),timed_out:z.boolean()}),{command,timeout_seconds:30});
+      return call(key,`/replica/${id}/exec`,z.object({exit_code:z.number().int().nullable(),timed_out:z.boolean(),output:z.string().optional()}),{command,timeout_seconds:30});
     },
     sleep:async(key:string,id:string)=>{input(uuid,id);return call(key,`/replica/${id}/sleep`,z.unknown(),{},true);},
     wake:async(key:string,id:string)=>{input(uuid,id);return call(key,`/replica/${id}/wake`,z.unknown(),{},true);},

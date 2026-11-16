@@ -162,7 +162,7 @@ jobs:
             ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.release_tag }}
             ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.sha_tag }}
           labels: |
-            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.licenses=FSL-1.1-ALv2
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
             org.opencontainers.image.version=${{ needs.validate.outputs.release_tag }}
