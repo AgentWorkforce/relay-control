@@ -475,7 +475,11 @@ test("an environment identity reuses the live API binding of the same VM", async
   assert.equal(row.source, "spawn");
   assert.equal(row.state, "bound");
   assert.equal(row.agent_name, "worker-agent");
-  assert.deepEqual(row.input, input);
+  // The reuse only adds the tenant pin of the first verified admission.
+  const { identity_admitted: admitted, ...options } = row.input;
+  assert.deepEqual(options, input);
+  assert.equal(admitted?.issuer, ISSUER);
+  assert.equal(admitted?.organization_id, PROVIDER_ORG);
   assert.equal(await count(env, "SELECT 1 FROM replica_spawns"), 1);
   assert.deepEqual(relayCalls, []);
   assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.identity.enrolled'"), 0);
@@ -498,7 +502,8 @@ test("an environment identity reuses the live API binding of the same VM", async
     method: "POST", token: BOOTSTRAP, body: { name: "secondary", relaycastWorkspaceId: "rc-secondary", relaycastApiKey: "rk_live_secondary" },
   });
   assert.equal(other.status, 201, other.text);
-  await env.database.query("UPDATE replica_spawns SET workspace_id = $2 WHERE id = $1", [id, other.body.id]);
+  // (Never admitted there: a pinned row elsewhere would be replica_owned_elsewhere instead.)
+  await env.database.query("UPDATE replica_spawns SET workspace_id = $2, input = input - 'identity_admitted' WHERE id = $1", [id, other.body.id]);
   await assert.rejects(admitIdentity(env.replicas.deps, claims), (error: unknown) =>
     error instanceof IdentityRefusal && error.code === "replica_already_bound" && error.status === 409);
 });
