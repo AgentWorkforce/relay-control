@@ -502,6 +502,36 @@ test("Replicas bridge: unpinned relay, live delivery while MCP setup is retried,
     const listed = await api(`/api/v1/replicas/agents/${rebound.spawn_id}/messages`, { method: "POST", token: next, body: { action: "list_relay_agents" } });
     assert.equal(listed.status, 200, listed.text);
   });
+
+  await t.test("a rebind passes only the newest eight launches of the same workspace to the installer", async () => {
+    const found = (await database.query<{ id: string; replica_id: string; chat_id: string }>(
+      "SELECT id, replica_id, chat_id FROM replica_spawns WHERE state <> 'gone' AND replica_id IS NOT NULL ORDER BY created_at DESC LIMIT 1")).rows[0]!;
+    assert.equal((await api(`${base}/spawns/${found.id}`, { method: "DELETE", token: ownerToken })).status, 200);
+    const old = (await database.query<{ id: string }>("SELECT gen_random_uuid() AS id FROM generate_series(1, 12)")).rows.map((r) => r.id);
+    for (const [i, id] of old.entries()) {
+      await database.query(`INSERT INTO replica_spawns (id, workspace_id, organization_id, user_id, client_request_id, source, input, replica_id, chat_id, state, created_at)
+        SELECT $2, workspace_id, organization_id, user_id, $3, source, input, replica_id, chat_id, 'gone', now() - interval '1 day' - $4 * interval '1 second'
+        FROM replica_spawns WHERE id = $1`, [found.id, id, `history-${i}`, i]);
+    }
+    const otherWorkspace = randomUUID();
+    const otherSpawn = randomUUID();
+    await database.query(`INSERT INTO workspaces (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
+      SELECT $2, organization_id, 'other', 'rc-other', relaycast_api_key_ciphertext FROM workspaces WHERE id = $1`, [workspaceId, otherWorkspace]);
+    await database.query(`INSERT INTO replica_spawns (id, workspace_id, organization_id, user_id, client_request_id, source, input, replica_id, chat_id, state, created_at)
+      SELECT $2, $3, organization_id, user_id, 'other-workspace', source, input, replica_id, chat_id, 'gone', now() + interval '1 day'
+      FROM replica_spawns WHERE id = $1`, [found.id, otherSpawn, otherWorkspace]);
+    provider.replicas.get(found.replica_id)!.status = "active";
+    const before = provider.execs.length;
+    const actor = { workspaceId, userId: ownerId, organizationId };
+    assert.equal((await bindReplica(deps, actor, { replica_id: found.replica_id, chat_id: found.chat_id }) as { status: string }).status, "bound");
+    const install = provider.execs.slice(before).find((item) => item.command.includes(REPLICA_MCP_READY))!;
+    const encoded = /b64decode\([^A-Za-z0-9+/=]*([A-Za-z0-9+/=]{20,})/.exec(install.command)![1]!;
+    const names: string[] = JSON.parse(Buffer.from(encoded, "base64").toString("utf8")).legacy_names;
+    assert.equal(names.length, 8);
+    assert.ok(names.includes(`agent-relay-${found.id}`));
+    assert.ok(!names.includes(`agent-relay-${otherSpawn}`));
+    assert.ok(!names.includes(`agent-relay-${old[11]}`));
+  });
 });
 
 test("Replicas bind refuses a chat whose harness is not Claude Code or Codex before saving anything", async (t) => {

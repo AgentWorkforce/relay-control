@@ -7,7 +7,7 @@ import type { RelaycastClient } from "../messaging/relaycast.js";
 import { isValidAgentName } from "../mcp/oauth/agent-name.js";
 import { HOSTED_SOURCE, ownerHash } from "../mcp/relay-participants.js";
 import { verifyWebhook } from "../amp/webhook.js";
-import { mcpInstall, REPLICA_MCP_FAILURE, REPLICA_MCP_READY } from "./mcp.js";
+import { mcpInstall, REPLICA_MCP_FAILURE, REPLICA_MCP_LEGACY_LIMIT, REPLICA_MCP_READY } from "./mcp.js";
 import type { ReplicaIdentityVerifier } from "./identity.js";
 import { ReplicasRuntimeError, type ReplicasRuntime } from "./runtime.js";
 
@@ -485,10 +485,12 @@ async function advanceStep(deps: ReplicasDeps, tx: SqlExecutor, id: string, acto
       const installed = await deps.replicas.exec(key, row.replica_id!, helperInstall(capabilityUrl(deps, row.id), decrypt(deps, row.helper_ciphertext!)));
       if (installed.exit_code !== 0 || installed.timed_out) throw new Error("helper");
       if (row.input.relay_mcp_version !== 1) {
-        // Every launch ever recorded for this replica (released ones and this
-        // one included): the installer removes their per-launch entries only
-        // when it verifies the entry is exactly ours.
-        const legacy = await tx.query<{ id: string }>("SELECT id FROM replica_spawns WHERE replica_id = $1 ORDER BY created_at, id", [row.replica_id]);
+        // The newest eight launches of this workspace on this replica (released
+        // ones and this one included): the installer removes their per-launch
+        // entries only when it verifies the entry is exactly ours.
+        const legacy = await tx.query<{ id: string }>(
+          "SELECT id FROM replica_spawns WHERE replica_id = $1 AND workspace_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3",
+          [row.replica_id, row.workspace_id, REPLICA_MCP_LEGACY_LIMIT]);
         const mcp = await deps.replicas.exec(key, row.replica_id!,
           mcpInstall(row.input.coding_agent as "claude" | "codex", legacy.rows.map((spawn) => spawn.id)));
         if (mcp.exit_code !== 0 || mcp.timed_out || mcp.output?.trim() !== REPLICA_MCP_READY) throw new Error("mcp");

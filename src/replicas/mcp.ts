@@ -3,6 +3,7 @@
  * Never attach this capability to an environment: other replicas inherit it.
  */
 export const REPLICA_MCP_FAILURE = "Agent Relay MCP provisioning failed. Retry get_replica_spawn with the same spawn_id; the task has not been dispatched by this attempt.";
+export const REPLICA_MCP_LEGACY_LIMIT = 8;
 export const REPLICA_MCP_READY = "agent-relay-mcp-ready-v1";
 
 export const replicaMcpSource = String.raw`import json,pathlib,sys,urllib.request,urllib.error,uuid
@@ -75,8 +76,8 @@ export function mcpInstall(harness: string, legacySpawnIds: string[] = []) {
   // There is at most one live binding per replica. Reuse its entry across
   // releases/rebinds; the private credential file supplies the current binding.
   const payload = Buffer.from(JSON.stringify({ source: replicaMcpSource, harness, name: "agent-relay-replica",
-    legacy_names: legacySpawnIds.map(id => `agent-relay-${id}`) })).toString("base64");
-  const script = String.raw`import base64,json,os,pathlib,subprocess,sys
+    legacy_names: legacySpawnIds.slice(0, REPLICA_MCP_LEGACY_LIMIT).map(id => `agent-relay-${id}`) })).toString("base64");
+  const script = String.raw`import base64,json,os,pathlib,subprocess,sys,time
 try:
  os.umask(0o077)
  config=json.loads(base64.b64decode('${payload}'))
@@ -85,14 +86,16 @@ try:
  server=directory/'mcp.py'
  temporary=directory/'mcp.py.tmp'
  temporary.write_text(config['source']); os.chmod(temporary,0o600); temporary.replace(server)
- def owned_entry(name):
+ def owned_entry(name,timeout=5):
   command=[config['harness'],'mcp','get',name]+(['--json'] if config['harness']=='codex' else [])
-  entry=subprocess.run(command,capture_output=True,timeout=5)
+  entry=subprocess.run(command,capture_output=True,timeout=timeout)
   if entry.returncode:
    if b'No MCP server named' in entry.stdout+entry.stderr: return None
    raise ValueError()
   if config['harness']=='codex':
-   transport=json.loads(entry.stdout)['transport']
+   registration=json.loads(entry.stdout)
+   if registration.get('enabled') is False: return False
+   transport=registration['transport']
    return transport.get('type')=='stdio' and transport.get('command')=='python3' and transport.get('args')==[str(server)]
   fields={}
   for line in entry.stdout.decode().splitlines():
@@ -119,10 +122,19 @@ try:
  if checked.returncode or len(results)!=2 or {t['name'] for t in results[1]['result']['tools']}!={'list_relay_agents','check_relay_inbox','send_relay_message'}: raise ValueError()
  # Only recorded historical spawn names with the exact owned command/path
  # qualify. Never remove another server by prefix or path substring alone.
+ # Cleanup is best effort and cannot consume the 30-second /exec budget.
+ # Failed/slow lookups are unproven ownership: preserve those registrations.
+ deadline=time.monotonic()+4
  for name in config['legacy_names']:
-  if not owned_entry(name): continue
+  remaining=deadline-time.monotonic()
+  if remaining<=0: break
+  try: owned=owned_entry(name,timeout=min(1,remaining))
+  except Exception: continue
+  if not owned: continue
+  remaining=deadline-time.monotonic()
+  if remaining<=0: break
   command=[config['harness'],'mcp','remove']+(['--scope','user'] if config['harness']=='claude' else [])+[name]
-  if subprocess.run(command,capture_output=True,timeout=5).returncode: raise ValueError()
+  if subprocess.run(command,capture_output=True,timeout=min(2,remaining)).returncode: raise ValueError()
  print('${REPLICA_MCP_READY}')
 except Exception:
  raise SystemExit('Agent Relay MCP provisioning failed') from None
