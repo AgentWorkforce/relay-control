@@ -9,14 +9,23 @@ export const INTROSPECTION_HOLD_MAX_ENTRIES = 10_000;
  */
 export const HOLD_TAIL_MS = 1_000;
 
-type HeldEntry = { session: IntrospectedToken; checkedAt: number };
-
-export type HeldVerdict = {
+type HeldAudience = { checkedAt: number };
+type HeldEntry = {
   session: IntrospectedToken;
-  /** When the database last confirmed the token active (ms since epoch). */
+  audiences: Map<string, HeldAudience>;
+};
+
+export type HeldAudienceVerdict = {
+  /** When the database last confirmed this token and audience (ms since epoch). */
   checkedAt: number;
   /** min(token expiry, checkedAt + holdMs), in ms since epoch. */
   validUntil: number;
+};
+
+export type HeldVerdict = {
+  session: IntrospectedToken;
+  /** Every still-current authoritative audience confirmation for this token. */
+  audiences: ReadonlyMap<string, HeldAudienceVerdict>;
 };
 
 /**
@@ -55,66 +64,90 @@ export class IntrospectionHold {
   }
 
   /**
-   * Record one authoritative SQL answer. Active: remember it (as the newest
-   * entry). Unknown (null, with the hash), revoked or expired: forget it.
+   * Record one authoritative answer. Active: add or refresh its audience and
+   * make the token the newest entry. Unknown (null, with the hash), revoked or
+   * expired: forget the token and all of its audiences.
    */
-  observe(session: IntrospectedToken | null, hash?: string): void {
+  observe(
+    session: IntrospectedToken | null,
+    options: { hash?: string; audience?: string } = {},
+  ): void {
     if (!session) {
-      if (hash !== undefined) this.forget(hash);
+      if (options.hash !== undefined) this.forget(options.hash);
       return;
     }
     const key = session.accessTokenHash;
     if (session.revoked || session.expired) {
       this.forget(key);
-      if (hash !== undefined && hash !== key) this.forget(hash);
+      if (options.hash !== undefined && options.hash !== key) this.forget(options.hash);
       return;
     }
+    if (!options.audience) throw new Error("IntrospectionHold requires an audience for an active verdict");
     const now = this.#now();
+    const existing = this.#entries.get(key);
+    const audiences = existing?.audiences ?? new Map<string, HeldAudience>();
+    if (existing) this.#pruneAudiences(existing, now);
+    audiences.set(options.audience, { checkedAt: now });
     this.#entries.delete(key);
-    if (this.#entries.size >= this.#maxEntries) this.#makeRoom(now);
-    this.#entries.set(key, { session, checkedAt: now });
+    if (!existing && this.#entries.size >= this.#maxEntries) this.#makeRoom(now);
+    this.#entries.set(key, { session, audiences });
   }
 
   forget(hash: string): void {
     this.#entries.delete(hash);
   }
 
+  /** Forget one authoritative audience while retaining the token's others. */
+  forgetAudience(hash: string, audience: string): void {
+    const entry = this.#entries.get(hash);
+    if (!entry) return;
+    entry.audiences.delete(audience);
+    if (entry.audiences.size === 0) this.#entries.delete(hash);
+  }
+
   /**
    * The held verdict for this hash, or null. Returned only while at least
-   * one second (HOLD_TAIL_MS) remains before the earlier of the token's
-   * expiry and checkedAt + holdMs; anything else is deleted. Held answers
-   * stop one second before the hold or the token would run out, so a
-   * verifier never reads a held `exp` (whole seconds) as already passed.
+   * one audience has at least one second (HOLD_TAIL_MS) left before the
+   * earlier of token expiry and its own checkedAt + holdMs. Stale audience
+   * confirmations are pruned independently; an entry with none is deleted.
    */
   lookup(hash: string): HeldVerdict | null {
     const entry = this.#entries.get(hash);
     if (!entry) return null;
     const now = this.#now();
-    if (!this.#usable(entry, now)) {
+    if (!this.#pruneAudiences(entry, now)) {
       this.#entries.delete(hash);
       return null;
     }
     this.#entries.delete(hash);
     this.#entries.set(hash, entry);
-    return {
-      session: entry.session,
-      checkedAt: entry.checkedAt,
-      validUntil: this.#validUntil(entry),
-    };
+    const audiences = new Map<string, HeldAudienceVerdict>();
+    for (const [audience, confirmation] of entry.audiences) {
+      audiences.set(audience, {
+        checkedAt: confirmation.checkedAt,
+        validUntil: this.#validUntil(entry.session, confirmation.checkedAt),
+      });
+    }
+    return { session: entry.session, audiences };
   }
 
-  /** At least HOLD_TAIL_MS before the earlier of token expiry and the end of the hold. */
-  #usable(entry: HeldEntry, now: number): boolean {
-    return this.#validUntil(entry) - now >= HOLD_TAIL_MS;
+  /** Drop stale audience confirmations; true while the token retains one. */
+  #pruneAudiences(entry: HeldEntry, now: number): boolean {
+    for (const [audience, confirmation] of entry.audiences) {
+      if (this.#validUntil(entry.session, confirmation.checkedAt) - now < HOLD_TAIL_MS) {
+        entry.audiences.delete(audience);
+      }
+    }
+    return entry.audiences.size > 0;
   }
 
-  #validUntil(entry: HeldEntry): number {
-    return Math.min(entry.session.expiresAt.getTime(), entry.checkedAt + this.holdMs);
+  #validUntil(session: IntrospectedToken, checkedAt: number): number {
+    return Math.min(session.expiresAt.getTime(), checkedAt + this.holdMs);
   }
 
   #makeRoom(now: number): void {
     for (const [key, entry] of this.#entries) {
-      if (!this.#usable(entry, now)) this.#entries.delete(key);
+      if (!this.#pruneAudiences(entry, now)) this.#entries.delete(key);
     }
     while (this.#entries.size >= this.#maxEntries) {
       const oldest = this.#entries.keys().next();

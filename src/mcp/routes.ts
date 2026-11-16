@@ -27,6 +27,7 @@ import type { McpOAuthSessions } from "./oauth/sessions.js";
 import { MCP_RELAY_SCOPE, type McpOAuthResourcePath } from "./oauth/protocol.js";
 import { sendCustomerSupport } from "./customer-support.js";
 import { customerSupportDesktop } from "./customer-support-notice.js";
+import { controlSessionToken } from "../auth/session-cookie.js";
 
 /**
  * `POST /api/v1/mcp/shared-sessions` (also `/cloud/api/v1/...`, the path
@@ -39,7 +40,6 @@ const MAX_BODY_BYTES = 64 * 1024;
 /** Copilot calls carry a signed proof of the exact arguments, so their cap is larger (Cloud's limit). */
 const COPILOT_MAX_BODY_BYTES = 128 * 1024;
 const MCP_SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/;
-const SESSION_COOKIE = "agent_relay_session";
 
 type JsonRpcId = string | number | null;
 
@@ -62,19 +62,6 @@ function withoutDesktopMarker(headers: Headers): Headers {
 function bearerToken(request: IncomingMessage): string | null {
   const match = /^Bearer\s+(.+)$/i.exec(request.headers.authorization ?? "");
   return match?.[1]?.trim() || null;
-}
-
-function cookieValue(request: IncomingMessage, name: string): string | null {
-  for (const part of (request.headers.cookie ?? "").split(";")) {
-    const separator = part.indexOf("=");
-    if (separator < 0 || part.slice(0, separator).trim() !== name) continue;
-    try {
-      return decodeURIComponent(part.slice(separator + 1).trim());
-    } catch {
-      return null;
-    }
-  }
-  return null;
 }
 
 class BodyTooLarge extends Error {}
@@ -169,7 +156,7 @@ export function createMcpHandler(input: {
       return null;
     }
     const headerToken = bearerToken(request);
-    const cookieToken = rawPath.startsWith("/cloud/") ? cookieValue(request, SESSION_COOKIE) : null;
+    const cookieToken = rawPath.startsWith("/cloud/") ? controlSessionToken(request.headers.cookie) : null;
     const token = headerToken ?? cookieToken;
     if (!token) {
       rpcError(response, 401, -32001, "Unauthorized", null, { "www-authenticate": challenge(rawPath,false) });
