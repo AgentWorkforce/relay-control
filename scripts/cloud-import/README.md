@@ -61,7 +61,18 @@ The CLI reads its settings from the environment. Each variable also accepts a `N
 - Sign-in auto-accepts open invites by email, and an admin's "Copy link"/"Resend" issues a working link.
 - Imported invites have no `invitation.create` audit row.
 
-**Coding-agent credentials:** only `relay_managed` rows are imported, because they carry no secret (0058). Cloud keeps API keys, setup tokens and subscription logins in its S3 credential store, so those rows are skipped as `secret_in_cloud_credential_store` until a bucket copy is approved. **GitHub App connections** (#146) are a follow-up.
+**Coding-agent credentials:**
+- `relay_managed` rows carry no secret and are imported by the main run (0058).
+- API keys, setup tokens and subscription logins live in Cloud's credential store, which is Cloudflare R2 under the prefix `credentials/`.
+  - They are copied only with `--copy-credentials` (`credentials.ts`).
+  - The copier reads each object the Cloud runtime reads and decrypts it with the Cloud key.
+  - It stores the secret through `CodingAgentStore.putApiKey` / `putSetupToken` and `SubscriptionLoginStore.storeLogin`.
+  - Those seams dedupe, so a re-run converges.
+  - Control assigns new row ids, and `--credentials-report` maps each outcome by Cloud id.
+  - The R2 token must be read-only.
+- In the main run these rows appear as `secret_in_cloud_credential_store`.
+
+**GitHub App connections** (#146, 0054): the default Cloud GitHub connection becomes a `github_app` connection that claims its installation for the mapped organization. Named connections, invalid installation ids and installations claimed by another org are skipped and reported.
 
 ## Target prerequisites
 
