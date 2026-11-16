@@ -426,9 +426,11 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   const sessionReadApi = loadSessionReadApiConfig(env);
   const loadedIntrospection = loadIntrospectionConfig(env);
   const relayhistoryAudiences = loadRelayhistoryAudiences(env, sessionReadApi.publicUrl);
-  const introspectAudiences = loadedIntrospection.introspectAudiences.filter((audience) =>
-    !relayhistoryAudiences.includes(new URL(audience).origin)
-  );
+  const relayhistoryAudienceSet = new Set(relayhistoryAudiences);
+  const introspectAudiences = loadedIntrospection.introspectAudiences.filter((audience) => {
+    const canonicalHistoryAudience = canonicalRelayhistoryOrigin(audience);
+    return canonicalHistoryAudience === null || !relayhistoryAudienceSet.has(canonicalHistoryAudience);
+  });
   if (introspectAudiences.length !== loadedIntrospection.introspectAudiences.length) {
     console.warn(
       "[selfhost-api] ignoring History origins in SELFHOST_INTROSPECT_AUDIENCES; configure them only in SELFHOST_RELAYHISTORY_AUDIENCES",

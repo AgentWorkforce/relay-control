@@ -265,8 +265,10 @@ test("token introspection is required and validates its secret and audiences", (
   t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
   const compatibleOverlap = loadConfig({
     ...completeEnv,
+    SELFHOST_RELAYHISTORY_AUDIENCES:
+      `${completeEnv.SESSION_READ_API_PUBLIC_URL},https://xn--bcher-kva.example`,
     SELFHOST_INTROSPECT_AUDIENCES:
-      `${completeEnv.SESSION_READ_API_PUBLIC_URL},http://relayfile.files.svc:8080`,
+      "https://HISTORY.SELFHOSTED.COMPANY.:0443,https://BÜCHER.example.:443,http://relayfile.files.svc:8080",
   });
   assert.deepEqual(compatibleOverlap.introspectAudiences, ["http://relayfile.files.svc:8080"]);
   assert.equal(warnings.length, 1);
