@@ -46,6 +46,11 @@ export type TableLedger = {
   candidates: number;
   imported: number;
   skipped: Record<string, number>;
+  /**
+   * Row keys skipped by the importer itself (not by the mapping's SQL), so a
+   * verifier can reconcile them: ids are Cloud UUIDs, never emails or values.
+   */
+  importerSkips: Record<string, string[]>;
 };
 
 export type OrgLedger = {
@@ -73,6 +78,7 @@ export type ImportReport = {
 };
 
 type SourceRow = {
+  key: string;
   skip: string | null;
   org: string | null;
   email: string | null;
@@ -84,7 +90,7 @@ type SourceRow = {
   flags: string[] | null;
 };
 
-type PreparedRow = { org: string | null; email: string | null; row: string; secret: string | null; flags: string[] | null };
+type PreparedRow = { key: string; org: string | null; email: string | null; row: string; secret: string | null; flags: string[] | null };
 
 type EncryptedEnvelope = { v: number; iv: string; tag: string; ciphertext: string };
 
@@ -110,7 +116,8 @@ async function readSource(tx: SqlExecutor, table: ImportTable, scope: ImportScop
   const secret = TARGETS[table].secret?.source;
   const email = table === "users" ? "q.email" : "NULL::text";
   const result = await tx.query<SourceRow>(
-    `SELECT q.skip_reason AS skip,
+    `SELECT ${table === "organization_memberships" ? "q.organization_id::text || ':' || q.user_id::text" : "q.id::text"} AS key,
+            q.skip_reason AS skip,
             ${table === "users" ? "NULL::text" : "q.organization_id::text"} AS org,
             ${email} AS email,
             ${secret === "secret_plaintext" ? "q.secret_plaintext" : secret === "secret_envelope" ? "q.secret_envelope::text" : "NULL::text"} AS secret,
@@ -125,7 +132,8 @@ const ROW_FLAGS: Partial<Record<ImportTable, string>> = {
   workspaces: `array_remove(ARRAY[
       CASE WHEN q.cloud_relay_workspace_id IS NULL THEN 'workspace_rw_id_not_rw_8hex' END,
       CASE WHEN q.has_dashboard_url THEN 'relayhistory_dashboard_url_dropped' END,
-      CASE WHEN q.relayhistory_origin IS NOT NULL THEN 'relayhistory_origin_set' END
+      CASE WHEN q.relayhistory_origin IS NOT NULL THEN 'relayhistory_origin_set' END,
+      CASE WHEN q.origin_invalid THEN 'relayhistory_origin_invalid_dropped' END
     ], NULL)`,
   desktop_relay_identities: `CASE WHEN NOT q.source_id_is_uuid THEN ARRAY['source_id_not_uuid'] END`,
 };
@@ -229,14 +237,15 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     startedAt,
     finishedAt: startedAt,
     ok: false,
-    tables: Object.fromEntries(SOURCE_TABLES.map((table) => [table, { candidates: 0, imported: 0, skipped: {} }])) as Record<ImportTable, TableLedger>,
+    tables: Object.fromEntries(SOURCE_TABLES.map((table) => [table, { candidates: 0, imported: 0, skipped: {}, importerSkips: {} }])) as Record<ImportTable, TableLedger>,
     orgs: {},
     optionalColumns: [],
     warnings: {},
   };
-  const skip = (table: ImportTable, reason: string) => {
-    const skipped = report.tables[table].skipped;
-    skipped[reason] = (skipped[reason] ?? 0) + 1;
+  const skip = (table: ImportTable, reason: string, key?: string) => {
+    const ledger = report.tables[table];
+    ledger.skipped[reason] = (ledger.skipped[reason] ?? 0) + 1;
+    if (key !== undefined) (ledger.importerSkips[reason] ??= []).push(key);
   };
   const warn = (name: string) => {
     report.warnings[name] = (report.warnings[name] ?? 0) + 1;
@@ -271,11 +280,11 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
             secret = hashSecret(opaqueToken("sh_inv_"));
           }
         } catch {
-          skip(table, "cloud_decrypt_failed");
+          skip(table, "cloud_decrypt_failed", row.key);
           continue;
         }
         for (const flag of row.flags ?? []) if (flag !== "source_id_not_uuid") warn(flag);
-        kept.push({ org: row.org, email: row.email, row: row.row, secret, flags: row.flags });
+        kept.push({ key: row.key, org: row.org, email: row.email, row: row.row, secret, flags: row.flags });
       }
       prepared[table] = kept;
     }
@@ -316,7 +325,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     if (columns.get("desktop_relay_identities")?.get("source_id")?.udt === "uuid") {
       prepared.desktop_relay_identities = prepared.desktop_relay_identities.filter((row) => {
         if (!row.flags?.includes("source_id_not_uuid")) return true;
-        skip("desktop_relay_identities", "source_id_not_uuid");
+        skip("desktop_relay_identities", "source_id_not_uuid", row.key);
         return false;
       });
     }

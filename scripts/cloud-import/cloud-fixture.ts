@@ -32,7 +32,8 @@ CREATE TABLE workspaces (
 );
 CREATE TABLE relay_workspaces (
   id text PRIMARY KEY, owner_user_id uuid NOT NULL, name text NOT NULL,
-  relaycast_api_key text NOT NULL DEFAULT '', relaycast_workspace_id text UNIQUE,
+  relaycast_api_key text NOT NULL DEFAULT '', relaycast_api_key_generation integer NOT NULL DEFAULT 1,
+  relaycast_workspace_id text UNIQUE,
   permissions_json text NOT NULL DEFAULT '{}',
   created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
 );
@@ -115,7 +116,7 @@ INSERT INTO relay_workspaces (id, owner_user_id, name, relaycast_api_key, relayc
   ('rw_0000b201', '${id(2)}', 'b1', 'rk_live_synthetic_b1', 'rc-ws-b1', ${t}, ${t}),
   ('rw_legacy-01', '${id(2)}', 'b2', 'rk_live_synthetic_b2', 'rc-ws-b2', ${t}, ${t});
 INSERT INTO workspaces (id, organization_id, slug, name, default_runtime, relay_workspace_id, relayhistory_origin, deletion_requested_at, created_at, updated_at) VALUES
-  ('${id(0x201)}', '${ORG_A}', 'a1', 'A one', '{"id":"sandbox","config":{"size":2}}', 'rw_0000a201', 'https://history.example.test', NULL, ${t}, ${t}),
+  ('${id(0x201)}', '${ORG_A}', 'a1', 'A one', '{"id":"sandbox","config":{"size":2}}', 'rw_0000a201', 'https://History.Example.test/', NULL, ${t}, ${t}),
   ('${id(0x202)}', '${ORG_A}', 'a2', 'A two (no key)', NULL, 'rw_0000a202', NULL, NULL, ${t}, ${t}),
   ('${id(0x203)}', '${ORG_A}', 'a3', 'A three (unbound)', NULL, NULL, NULL, NULL, ${t}, ${t}),
   ('${id(0x204)}', '${ORG_A}', 'a4', 'A four (deleting)', NULL, 'rw_0000a201', NULL, ${t}, ${t}, ${t}),

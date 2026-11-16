@@ -47,6 +47,11 @@ const normEmail = (expression: string) => `lower(btrim(${expression}))`;
 const ROLE_RANK = (expression: string) =>
   `(CASE ${expression} WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END)`;
 const RW_FORMAT = "'^rw_[0-9a-f]{8}$'";
+// 0056 workspaces_relayhistory_origin_format. Cloud stores a bare https
+// origin; it is lowercased and stripped of a trailing slash. A value that
+// still does not fit is dropped (NULL = Control default) and flagged.
+const ORIGIN_FORMAT = "'^https?://([[:alnum:].-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?$'";
+const ORIGIN = (expression: string) => `lower(rtrim(btrim(${expression}), '/'))`;
 
 /**
  * Shared CTEs. Order matters: later CTEs read earlier ones.
@@ -118,7 +123,9 @@ workspace_rows AS (
          w.default_runtime AS runtime_config,
          CASE WHEN w.relay_workspace_id ~ ${RW_FORMAT} THEN w.relay_workspace_id END AS cloud_relay_workspace_id,
          w.slug,
-         w.relayhistory_origin,
+         CASE WHEN ${ORIGIN("w.relayhistory_origin")} ~ ${ORIGIN_FORMAT}
+              THEN ${ORIGIN("w.relayhistory_origin")} END AS relayhistory_origin,
+         (w.relayhistory_origin IS NOT NULL AND ${ORIGIN("w.relayhistory_origin")} !~ ${ORIGIN_FORMAT}) AS origin_invalid,
          rw.relaycast_api_key_generation,
          (w.relayhistory_dashboard_url IS NOT NULL) AS has_dashboard_url,
          w.created_at, w.updated_at,
@@ -204,7 +211,7 @@ SELECT organization_id, user_id, cloud_user_id, role, created_at, updated_at, sk
     workspaces: `
 SELECT id, organization_id, name, relaycast_workspace_id, relaycast_api_key AS secret_plaintext,
        runtime_config, cloud_relay_workspace_id, slug, relayhistory_origin, relaycast_api_key_generation,
-       has_dashboard_url, created_at, updated_at, skip_reason
+       has_dashboard_url, origin_invalid, created_at, updated_at, skip_reason
   FROM workspace_rows`,
     organization_invitations: `
 SELECT i.id, i.organization_id, ${normEmail("i.email")} AS email, i.role,
@@ -408,7 +415,13 @@ export const IMPORTER_SKIP_REASONS = [
 // ---------------------------------------------------------------------------
 // Verifier contract (consumed by scripts/cloud-import-verify).
 
-export type ComparisonSpec = { name: string; sourceSql: string; targetSql: string };
+export type ComparisonSpec = {
+  name: string;
+  sourceSql: string;
+  targetSql: string;
+  /** True when both projections also expose __workspace (workspace id text). */
+  workspaceScoped?: boolean;
+};
 
 /**
  * Like-for-like projections over the imported scope. Ciphertext and token
@@ -417,7 +430,7 @@ export type ComparisonSpec = { name: string; sourceSql: string; targetSql: strin
  */
 const ts = (column: string) => `to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US')`;
 
-type Projection = { key: string; org: string; columns: Record<string, string> };
+type Projection = { key: string; org: string; workspace?: string; columns: Record<string, string> };
 
 const PROJECTIONS: Record<ImportTable, Projection> = {
   users: {
@@ -433,7 +446,7 @@ const PROJECTIONS: Record<ImportTable, Projection> = {
     columns: { organization_id: "organization_id::text", user_id: "user_id::text", role: "role", created_at: ts("created_at"), updated_at: ts("updated_at") },
   },
   workspaces: {
-    key: "id::text", org: "organization_id::text",
+    key: "id::text", org: "organization_id::text", workspace: "id::text",
     columns: { id: "id::text", organization_id: "organization_id::text", name: "name", relaycast_workspace_id: "relaycast_workspace_id", cloud_relay_workspace_id: "cloud_relay_workspace_id", slug: "slug", relayhistory_origin: "relayhistory_origin", relaycast_api_key_generation: "relaycast_api_key_generation", runtime_config: "runtime_config::jsonb::text", created_at: ts("created_at"), updated_at: ts("updated_at") },
   },
   organization_invitations: {
@@ -441,19 +454,19 @@ const PROJECTIONS: Record<ImportTable, Projection> = {
     columns: { id: "id::text", organization_id: "organization_id::text", email: "email", role: "role", invited_by_user_id: "invited_by_user_id::text", expires_at: ts("expires_at"), created_at: ts("created_at") },
   },
   person_identities: {
-    key: "id::text", org: "organization_id::text",
+    key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
     columns: { id: "id::text", workspace_id: "workspace_id::text", user_id: "user_id::text", relaycast_workspace_id: "relaycast_workspace_id", agent_name: "agent_name", agent_remote_id: "agent_remote_id", created_at: ts("created_at") },
   },
   hosted_relay_participants: {
-    key: "id::text", org: "organization_id::text",
+    key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
     columns: { id: "id::text", workspace_id: "workspace_id::text", user_id: "user_id::text", relaycast_workspace_id: "relaycast_workspace_id", session_hash: "session_hash", agent_name: "agent_name", agent_remote_id: "agent_remote_id", created_at: ts("created_at") },
   },
   desktop_relay_identities: {
-    key: "id::text", org: "organization_id::text",
+    key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
     columns: { id: "id::text", workspace_id: "workspace_id::text", organization_id: "organization_id::text", user_id: "user_id::text", relaycast_workspace_id: "relaycast_workspace_id", source_id: "lower(source_id::text)", agent_name: "agent_name", agent_remote_id: "agent_remote_id", address: "address", native_session_kind: "native_session_kind", native_session_id: "native_session_id", created_at: ts("created_at") },
   },
   fleet_node_owners: {
-    key: "id::text", org: "organization_id::text",
+    key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
     columns: { id: "id::text", workspace_id: "workspace_id::text", organization_id: "organization_id::text", relaycast_workspace_id: "relaycast_workspace_id", node_id: "node_id", node_name: "COALESCE(node_name, node_id)", user_id: "user_id::text", created_at: ts("created_at") },
   },
 };
@@ -494,10 +507,12 @@ export function verifierComparisons(scope: ImportScope, targetHasColumns: Readon
       !(TARGETS[table].optional ?? []).includes(column) || targetHasColumns.has(`${table}.${column}`));
     const list = names.map((name) => `${projection.columns[name]} AS ${name}`).join(", ");
     const target = targetScope(table, scope);
+    const workspace = projection.workspace ? `, ${projection.workspace} AS __workspace` : "";
     return {
       name: table,
-      sourceSql: `WITH ${ctes(scope)}, src AS (${selects()[table]})\nSELECT ${list}, ${projection.key} AS __key, ${projection.org} AS __org FROM src WHERE skip_reason IS NULL`,
-      targetSql: `SELECT ${list}, ${projection.key} AS __key, ${target.org} AS __org FROM ${target.from}`,
+      sourceSql: `WITH ${ctes(scope)}, src AS (${selects()[table]})\nSELECT ${list}, ${projection.key} AS __key, ${projection.org} AS __org${workspace} FROM src WHERE skip_reason IS NULL`,
+      targetSql: `SELECT ${list}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}`,
+      ...(projection.workspace ? { workspaceScoped: true } : {}),
     };
   });
 }
@@ -506,13 +521,15 @@ export function verifierComparisons(scope: ImportScope, targetHasColumns: Readon
 export const TARGET_RELATIONS = SOURCE_TABLES.map((table) => `public.${TARGETS[table].table}`);
 
 /** Encrypted columns the verifier decrypts with Control's keyring. */
-export function encryptedSamples(limit = 200): { name: string; sql: string; minimum: number; limit: number }[] {
+export function encryptedSamples(limit = 200, scope: ImportScope = { orgIds: null }): { name: string; sql: string; minimum: number; limit: number }[] {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("limit must be 1..1000");
   return SOURCE_TABLES.flatMap((table) => {
     const secret = TARGETS[table].secret;
     if (!secret) return [];
+    const target = targetScope(table, scope);
     return [{
       name: `${table}.${secret.target}`,
-      sql: `SELECT ${secret.target} AS ciphertext FROM public.${TARGETS[table].table} ORDER BY id LIMIT ${limit}`,
+      sql: `SELECT ${secret.target} AS ciphertext FROM ${target.from} ORDER BY id LIMIT ${limit}`,
       minimum: 1,
       limit,
     }];
