@@ -57,6 +57,29 @@ fixtureTest("rw_ mapping corruption fails identity comparison even when payload 
   assert.equal(report.findings.find((f) => f.kind === "identity")!.ok, false);
 });
 
+fixtureTest("Relay workspace rw_ ID and Relaycast provider ID remain distinct", async () => {
+  await admin.query("UPDATE control_fixture.workspaces SET relaycast_workspace_id=cloud_relay_workspace_id WHERE id=$1",[fixtureIds.workspace]);
+  const report = await check();
+  assert.equal(report.findings.find((f) => f.name === "workspace_uuid_and_rw_id")!.ok,true);
+  assert.equal(report.findings.find((f) => f.name === "relay_workspace_to_provider")!.ok,false);
+});
+
+fixtureTest("active-only memberships and normalized user emails/names use the same UUIDs", async () => {
+  const report = await check();
+  const memberships = report.findings.find((f) => f.name === "memberships")!.detail as {source:{count:number}};
+  assert.equal(memberships.source.count,2);
+  const user = await admin.query("SELECT email,name FROM control_fixture.users WHERE id=$1",[fixtureIds.otherUser]);
+  assert.deepEqual(user.rows[0],{email:"fallback@example.invalid",name:"fallback@example.invalid"});
+  await admin.query("INSERT INTO control_fixture.memberships VALUES($1,$2,'member')",[fixtureIds.org,fixtureIds.otherUser]);
+  assert.equal((await check()).findings.find((f) => f.name === "memberships")!.ok,false);
+});
+
+fixtureTest("workspace without a relay binding cannot silently qualify as imported", async () => {
+  await admin.query("INSERT INTO cloud_fixture.workspaces VALUES($1,$2,NULL,'Unbound',now())",
+    ["20000000-0000-4000-8000-000000000003",fixtureIds.org]);
+  assert.equal((await check()).findings.find((f) => f.name === "workspaces")!.ok,false);
+});
+
 fixtureTest("FK scan detects orphans left by disabled triggers", async () => {
   await admin.query("SET session_replication_role=replica");
   try { await admin.query("DELETE FROM control_fixture.organizations WHERE id=$1", [fixtureIds.org]); }
@@ -111,7 +134,7 @@ fixtureTest("stale sequence fails without consuming a sequence value", async () 
 });
 
 fixtureTest("undecryptable and absent encrypted samples fail without logging their values", async () => {
-  await admin.query("UPDATE control_fixture.workspaces SET key_ciphertext='private-corrupt-ciphertext'");
+  await admin.query("UPDATE control_fixture.workspaces SET relaycast_api_key_ciphertext='private-corrupt-ciphertext'");
   const report = await check();
   assert.ok(report.findings.some((f) => f.kind === "decrypt" && !f.ok));
   assert.ok(!JSON.stringify(report).includes("private-corrupt-ciphertext"));
@@ -121,19 +144,19 @@ fixtureTest("undecryptable and absent encrypted samples fail without logging the
 });
 
 fixtureTest("duplicate projection keys fail; JSON key order and timestamp offsets normalize", async () => {
+  await admin.query(`UPDATE control_fixture.payload_probe SET payload='{"n":9007199254740993,"nested":{"a":1,"b":2}}'`);
   await admin.query(`UPDATE control_fixture.workspaces SET
-    settings='{"n":9007199254740993,"nested":{"a":1,"b":2}}',
     created_at='2026-11-09T05:00:00+01:00' WHERE id=$1`, [fixtureIds.workspace]);
   assert.equal((await check()).ok,true);
   const contract = fixtureContract();
-  contract.tables[0]!.sourceSql = "SELECT uuid AS __key,uuid AS __org,name FROM cloud_fixture.organizations UNION ALL SELECT uuid,uuid,name FROM cloud_fixture.organizations";
+  contract.tables[0]!.sourceSql = "SELECT id AS __key,id AS __org,name FROM cloud_fixture.organizations UNION ALL SELECT id,id,name FROM cloud_fixture.organizations";
   const report = await verify(source,target,contract,fixtureKeyring);
   assert.equal(report.findings[0]!.ok,false);
 });
 
 fixtureTest("writes in contract SQL are rejected by read-only transactions; snapshots release on failure", async () => {
   const contract = fixtureContract();
-  contract.tables[0]!.sourceSql = "SELECT uuid AS __key,uuid AS __org,name FROM cloud_fixture.organizations FOR UPDATE";
+  contract.tables[0]!.sourceSql = "SELECT id AS __key,id AS __org,name FROM cloud_fixture.organizations FOR UPDATE";
   await assert.rejects(verify(source,target,contract,fixtureKeyring));
   assert.equal((await check()).ok,true);
 });
@@ -141,12 +164,12 @@ fixtureTest("writes in contract SQL are rejected by read-only transactions; snap
 fixtureTest("streamed checksums span multiple batches with exact large numeric values", async () => {
   await admin.query(`INSERT INTO cloud_fixture.organizations
     SELECT md5('fixture-org-'||n)::uuid,'Org '||n FROM generate_series(1,300) n;
-    INSERT INTO control_fixture.organizations SELECT uuid,name FROM cloud_fixture.organizations ON CONFLICT DO NOTHING`);
+    INSERT INTO control_fixture.organizations SELECT id,name FROM cloud_fixture.organizations ON CONFLICT DO NOTHING`);
   const report = await check();
   assert.equal(report.ok,true);
   assert.equal((report.findings[0]!.detail as {source:{count:number}}).source.count,302);
-  await admin.query(`UPDATE control_fixture.workspaces SET settings=jsonb_set(settings,'{n}','9007199254740992') WHERE id=$1`,[fixtureIds.workspace]);
-  assert.equal((await check()).findings.find((f) => f.name === "workspaces")!.ok,false);
+  await admin.query(`UPDATE control_fixture.payload_probe SET payload=jsonb_set(payload,'{n}','9007199254740992')`);
+  assert.equal((await check()).findings.find((f) => f.name === "payload_probe")!.ok,false);
 });
 
 fixtureTest("CLI emits JSON with useful exit codes and hides URL/SQL errors", async () => {

@@ -4,7 +4,7 @@ This directory owns the independent verifier and synthetic dry-run harness.
 The importer and authoritative mapping belong in `../cloud-import/`.
 
 **Current scope:** the engine and its reference fixtures work independently of
-the importer. `synthetic-reference-v1-NOT-production-mapping` is an explicit
+the importer. `synthetic-reference-v2-plan-part1-NOT-production-mapping` is an explicit
 placeholder revision. The importer has not yet published `mapping.ts`; the
 production table projections, skip rules and importer invocation must be wired
 and reviewed against that contract before this can qualify an import. Passing
@@ -30,8 +30,14 @@ CLOUD_VERIFY_PG_BIN=/opt/homebrew/opt/postgresql@15/bin \
 Omit `CLOUD_VERIFY_PG_BIN` when `initdb` and `postgres` are available to Node
 through `PATH`. `--report` is optional. Only the synthetic fixtures are seeded;
 there is no Neon/Supabase connection and no production importer invocation.
-The fixtures include `rw_actual-text-01` and `rw_not_a_uuid_02` Cloud workspace
-identifiers alongside their distinct UUID identity column.
+The fixtures follow the plan's identifier shapes: `workspaces.id` is a UUID,
+`workspaces.relay_workspace_id` references text `relay_workspaces.id` values
+such as `rw_000000a1`, and `relay_workspaces.relaycast_workspace_id` contains a
+distinct provider ID. Both the UUID and `rw_` → provider joins are checked.
+Users/orgs also have UUID `id` columns; active-only membership filtering and
+lowercase email/name fallback are represented. These are reduced synthetic
+shapes, not the final importer contract. JSON/precision stress payloads live in
+separate `payload_probe` tables and do not imply a production workspace column.
 
 The test file is `test/cloud-import-verify.test.ts`. Normal repository test
 runs skip its database cases with an explicit reason; only this harness starts
@@ -77,9 +83,11 @@ and nullable `__org`. SQL is trusted, reviewed configuration. Projections must:
 - Include each mapped row in the source and its corresponding imported target
   scope. Make importer skip reasons explicit; do not hide unexplained drops
   with a target filter. Reconcile skipped rows with the importer JSON ledger.
-- Use Cloud `uuid` as `__key` and Control `id` as `__key` for people, orgs and
-  workspaces. For workspace identity comparisons, additionally project Cloud
-  `id` as `cloud_relay_workspace_id` and the matching Control text column.
+- Use Cloud's UUID-valued `id` as `__key` and Control `id` as `__key` for people,
+  orgs and workspaces. For workspace identity comparisons, additionally project
+  Cloud `workspaces.relay_workspace_id` as `cloud_relay_workspace_id` and the
+  matching Control text column. Separately join `relay_workspaces.id` to compare
+  the Relaycast provider ID; an `rw_` value must never be used as that provider ID.
 - Include the same org identity on both sides. A genuinely global table can
   use `NULL::text AS __org`; membership joins must use a stable composite key.
 - Normalize intentional transformations in the reviewed projection, including

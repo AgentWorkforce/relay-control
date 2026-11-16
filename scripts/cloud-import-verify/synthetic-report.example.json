@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "mappingRevision": "synthetic-reference-v1-NOT-production-mapping",
+  "mappingRevision": "synthetic-reference-v2-plan-part1-NOT-production-mapping",
   "ok": true,
   "findings": [
     {
@@ -62,13 +62,13 @@
             "email",
             "name"
           ],
-          "count": 1,
-          "checksum": "f6e43a89ae510794d5e1633113607aaaee634b6f64f4d9b5a06437cd100a30f3",
+          "count": 2,
+          "checksum": "4083d8e79cefd89c4c8bfae8f7706aba5d9e0e2732f3ec36985ce290a0628ef6",
           "invalidKeys": 0,
           "orgs": {
             "null": {
-              "count": 1,
-              "checksum": "f6e43a89ae510794d5e1633113607aaaee634b6f64f4d9b5a06437cd100a30f3"
+              "count": 2,
+              "checksum": "4083d8e79cefd89c4c8bfae8f7706aba5d9e0e2732f3ec36985ce290a0628ef6"
             }
           }
         },
@@ -79,13 +79,13 @@
             "email",
             "name"
           ],
-          "count": 1,
-          "checksum": "f6e43a89ae510794d5e1633113607aaaee634b6f64f4d9b5a06437cd100a30f3",
+          "count": 2,
+          "checksum": "4083d8e79cefd89c4c8bfae8f7706aba5d9e0e2732f3ec36985ce290a0628ef6",
           "invalidKeys": 0,
           "orgs": {
             "null": {
-              "count": 1,
-              "checksum": "f6e43a89ae510794d5e1633113607aaaee634b6f64f4d9b5a06437cd100a30f3"
+              "count": 2,
+              "checksum": "4083d8e79cefd89c4c8bfae8f7706aba5d9e0e2732f3ec36985ce290a0628ef6"
             }
           }
         }
@@ -148,20 +148,19 @@
             "__key",
             "__org",
             "created_at",
-            "name",
-            "settings"
+            "name"
           ],
           "count": 2,
-          "checksum": "834a56ea528f5975cb1ad562e337c9a75ea184b50996a7871886bac63fb7b59f",
+          "checksum": "1895b349b8176801cfa35348abb0f00e5bcb7d9832e46d3cb3f8e26f4ce27f7e",
           "invalidKeys": 0,
           "orgs": {
             "\"10000000-0000-4000-8000-000000000001\"": {
               "count": 1,
-              "checksum": "3f670ebc135fbd0b8885387f2a284c5786a6be95b7586e3f61f4d2e877892a84"
+              "checksum": "f11c6a2cc7b0a6c128a24b9d9a81cc85ea3a69f7eee88c5504dfa176fa677a3d"
             },
             "\"10000000-0000-4000-8000-000000000002\"": {
               "count": 1,
-              "checksum": "4f25acf1d7ebf7e4819c394fe82a8fa8c38a859124570e4e9866e14bc4432dff"
+              "checksum": "e5d41c927236bb3e0545926a7310ca2c925cd3f05ea2a97cecaf1109cc46c836"
             }
           }
         },
@@ -170,20 +169,58 @@
             "__key",
             "__org",
             "created_at",
-            "name",
-            "settings"
+            "name"
           ],
           "count": 2,
-          "checksum": "834a56ea528f5975cb1ad562e337c9a75ea184b50996a7871886bac63fb7b59f",
+          "checksum": "1895b349b8176801cfa35348abb0f00e5bcb7d9832e46d3cb3f8e26f4ce27f7e",
           "invalidKeys": 0,
           "orgs": {
             "\"10000000-0000-4000-8000-000000000001\"": {
               "count": 1,
-              "checksum": "3f670ebc135fbd0b8885387f2a284c5786a6be95b7586e3f61f4d2e877892a84"
+              "checksum": "f11c6a2cc7b0a6c128a24b9d9a81cc85ea3a69f7eee88c5504dfa176fa677a3d"
             },
             "\"10000000-0000-4000-8000-000000000002\"": {
               "count": 1,
-              "checksum": "4f25acf1d7ebf7e4819c394fe82a8fa8c38a859124570e4e9866e14bc4432dff"
+              "checksum": "e5d41c927236bb3e0545926a7310ca2c925cd3f05ea2a97cecaf1109cc46c836"
+            }
+          }
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "payload_probe",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "payload"
+          ],
+          "count": 1,
+          "checksum": "29d6bceaf9df785d817d93d40168e958359e607c1e1c7c22a4b5f724de7ae776",
+          "invalidKeys": 0,
+          "orgs": {
+            "null": {
+              "count": 1,
+              "checksum": "29d6bceaf9df785d817d93d40168e958359e607c1e1c7c22a4b5f724de7ae776"
+            }
+          }
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "payload"
+          ],
+          "count": 1,
+          "checksum": "29d6bceaf9df785d817d93d40168e958359e607c1e1c7c22a4b5f724de7ae776",
+          "invalidKeys": 0,
+          "orgs": {
+            "null": {
+              "count": 1,
+              "checksum": "29d6bceaf9df785d817d93d40168e958359e607c1e1c7c22a4b5f724de7ae776"
             }
           }
         }
@@ -201,16 +238,16 @@
             "cloud_relay_workspace_id"
           ],
           "count": 2,
-          "checksum": "9b0cbd3a6d6311f1af30d41b1a63e3014a3b24f6c253b9cdde311d74cd2bc02a",
+          "checksum": "c117dd48d9be91d659d2c0156e2a792e597acb5418cbcc988cfbbb5770777960",
           "invalidKeys": 0,
           "orgs": {
             "\"10000000-0000-4000-8000-000000000001\"": {
               "count": 1,
-              "checksum": "057421443b314d66b5e0a7dee3575846eebe9236c1148c46a2001241f061daaa"
+              "checksum": "7dd115a64b355d5812dd4df543e151194fdba81977be354b4b94e8d12529efa4"
             },
             "\"10000000-0000-4000-8000-000000000002\"": {
               "count": 1,
-              "checksum": "80c3172c91d549cd322f7b03856ba9175635abe5df751d7099db2ed17961289a"
+              "checksum": "d6db2b5dd0a74faea96b9c26afed8488c80babb50afd478f0df15c325fa77dad"
             }
           }
         },
@@ -221,16 +258,63 @@
             "cloud_relay_workspace_id"
           ],
           "count": 2,
-          "checksum": "9b0cbd3a6d6311f1af30d41b1a63e3014a3b24f6c253b9cdde311d74cd2bc02a",
+          "checksum": "c117dd48d9be91d659d2c0156e2a792e597acb5418cbcc988cfbbb5770777960",
           "invalidKeys": 0,
           "orgs": {
             "\"10000000-0000-4000-8000-000000000001\"": {
               "count": 1,
-              "checksum": "057421443b314d66b5e0a7dee3575846eebe9236c1148c46a2001241f061daaa"
+              "checksum": "7dd115a64b355d5812dd4df543e151194fdba81977be354b4b94e8d12529efa4"
             },
             "\"10000000-0000-4000-8000-000000000002\"": {
               "count": 1,
-              "checksum": "80c3172c91d549cd322f7b03856ba9175635abe5df751d7099db2ed17961289a"
+              "checksum": "d6db2b5dd0a74faea96b9c26afed8488c80babb50afd478f0df15c325fa77dad"
+            }
+          }
+        }
+      }
+    },
+    {
+      "kind": "identity",
+      "name": "relay_workspace_to_provider",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "relaycast_workspace_id"
+          ],
+          "count": 2,
+          "checksum": "2df786485b586b7898805ebb8669e51331675b75a9490faf6ff9b5d3b0fbbf27",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"10000000-0000-4000-8000-000000000001\"": {
+              "count": 1,
+              "checksum": "6c740cdbaccf878a1f21da8f954cc7a855dd42bbfc6bb872c3a1fa1651a09de0"
+            },
+            "\"10000000-0000-4000-8000-000000000002\"": {
+              "count": 1,
+              "checksum": "84916bf1b40cc0f702203277476bbcdd607e442e4a725be8671f7c40b69ab0dd"
+            }
+          }
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "relaycast_workspace_id"
+          ],
+          "count": 2,
+          "checksum": "2df786485b586b7898805ebb8669e51331675b75a9490faf6ff9b5d3b0fbbf27",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"10000000-0000-4000-8000-000000000001\"": {
+              "count": 1,
+              "checksum": "6c740cdbaccf878a1f21da8f954cc7a855dd42bbfc6bb872c3a1fa1651a09de0"
+            },
+            "\"10000000-0000-4000-8000-000000000002\"": {
+              "count": 1,
+              "checksum": "84916bf1b40cc0f702203277476bbcdd607e442e4a725be8671f7c40b69ab0dd"
             }
           }
         }
@@ -334,6 +418,16 @@
     {
       "kind": "unique",
       "name": "control_fixture.workspaces.workspaces_cloud_relay_workspace_id_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "control_fixture.workspaces.workspaces_organization_id_relaycast_workspace_id_key",
       "ok": true,
       "detail": {
         "valid": true,
