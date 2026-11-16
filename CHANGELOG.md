@@ -84,6 +84,14 @@ assigned at release.
   and reply helper installed through the provider exec API, and signed
   delivery of messages addressed to it. Release revokes the capability before
   cleanup. Migration 0065 `replica_spawns`. See [Replicas](docs/replicas.md).
+- Added: workspace deletes reach relayfile-control (migration 0052). With
+  `RELAYFILE_CONTROL_URL` and a dedicated `RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET`,
+  deleting a workspace queues `DELETE /internal/v1/flows/workspaces/{id}` in
+  the same transaction; a worker sends it and retries with backoff (30 s
+  doubling to 1 h) until relayfile-control confirms (a 200 naming the
+  workspace, or an authenticated 404 `flows_not_enabled`). Refusals, a bare
+  404 and outages keep the row. Unset, nothing is queued; the legacy local Flows rows
+  still cascade as before.
 - Added: staff read grants (migration 0061, table `staff_read_grants`). An
   owner of the operator organization, on its domains when it has any, mints a
   short-lived `sh_sr_` credential (scope `rth:read`, at most 90 days, no

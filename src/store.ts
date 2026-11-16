@@ -585,13 +585,16 @@ export class ControlPlaneStore {
    * restrict deletion until teardown finishes. Replicas environment-identity
    * bindings are tombstoned and retired by the deletion; Replicas launch and
    * bind records still restrict it. The organization's rows are locked so two concurrent deletes cannot
-   * both pass the last-workspace check. The Relaycast workspace is not touched.
+   * both pass the last-workspace check. The Relaycast workspace is not touched. With queueFlowsDelete, the
+   * relayfile-control delete is queued in the same transaction (src/flows-workspace-delete.ts).
    */
   async deleteWorkspace(input: {
     organizationId: string;
     workspaceId: string;
     allowLast: boolean;
     actor: AuditActor;
+    /** Queue the same delete for relayfile-control (config.flowsWorkspaceDelete). */
+    queueFlowsDelete?: boolean;
   }): Promise<"deleted" | "not_found" | "last_workspace" | "in_use"> {
     try {
       return await this.database.transaction(async (tx) => {
@@ -619,6 +622,11 @@ export class ControlPlaneStore {
           input.workspaceId,
           input.organizationId,
         ]);
+        if (input.queueFlowsDelete) {
+          // Same transaction: the workspace is never gone here while its Flows data is unowed there.
+          await tx.query(`INSERT INTO flows_workspace_deletions (workspace_id, organization_id) VALUES ($1, $2)
+            ON CONFLICT (workspace_id) DO NOTHING`, [input.workspaceId, input.organizationId]);
+        }
         await recordAudit(tx, {
           organizationId: input.organizationId,
           actor: input.actor,

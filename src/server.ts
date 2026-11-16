@@ -27,6 +27,7 @@ import { createReplicasModule } from "./replicas/module.js";
 import { ReplicasSyncSweep } from "./replicas/sync-sweep.js";
 import { CapyBindings } from "./capy/bindings.js";
 import { CapyCleanup,capyCleanupFetch } from "./capy/cleanup.js";
+import { FlowsWorkspaceDeletions } from "./flows-workspace-delete.js";
 import { PostgresEventsShimStore } from "./events-shim/store.js";
 import { EventsShimWakeSweeper } from "./events-shim/sweeper.js";
 import { createCapyRuntime } from "./capy/runtime.js";
@@ -140,6 +141,14 @@ const capyCleanup=new CapyCleanup({database,bindings:new CapyBindings({
   database,keyring:config.encryptionKeyring,runtime:createCapyRuntime(),
   relaycast:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:capyCleanupFetch()}),
 }),log:event=>console.warn("[capy] cleanup deferred",event)});
+// relayfile-control Flows data: deletes queued with each workspace delete. Unset queues nothing.
+const flowsWorkspaceDeletions = config.flowsWorkspaceDelete
+  ? new FlowsWorkspaceDeletions({
+      database,
+      endpoint: config.flowsWorkspaceDelete,
+      log: (event) => console.warn("[flows] workspace delete deferred", event),
+    })
+  : null;
 // Events shim: recover webhook wakes a Relaycast outage left pending. Off with the feature.
 const eventsShimSweeper = features.events_shim
   ? new EventsShimWakeSweeper({
@@ -207,6 +216,7 @@ async function start(): Promise<void> {
   identity.start();
   amp.start();
   capyCleanup.start();
+  flowsWorkspaceDeletions?.start();
   replicasSync?.start();
   eventsShimSweeper?.start();
   if(mcpOAuthActive(config)) {
@@ -229,6 +239,8 @@ async function start(): Promise<void> {
         smtp: identityConfig.smtp !== null,
         autoJoinDomains: identityConfig.autoJoinDomains.length,
       },
+      // Off: deleting a workspace leaves any relayfile-control Flows data in place.
+      flowsWorkspaceDelete: config.flowsWorkspaceDelete !== null && config.flowsWorkspaceDelete !== undefined,
       amp: {
         enabled: amp.config.enabled,
         transport: amp.config.transport !== null,
@@ -275,6 +287,7 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   await telemetry.stop();
   await amp.stop();
   await capyCleanup.stop();
+  await flowsWorkspaceDeletions?.stop();
   await replicasSync?.stop();
   await eventsShimSweeper?.stop();
   await mcpOAuthTeardown.stop();

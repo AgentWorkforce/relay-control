@@ -21,30 +21,6 @@ import { PGliteDatabase } from "./support/harness.js";
 const CLOUD_KEY = randomBytes(32).toString("hex");
 const KEYRING: EncryptionKeyring = { active: { id: "import-test", key: randomBytes(32) } };
 
-// 0061 (staff read grants, #165) is a checked-in migration now; this copy
-// matches it and IF NOT EXISTS keeps it a no-op on the real migrations.
-const POST_0058_DDL = `
--- 0061 (#165, staff read grants), same as the checked-in migration.
-CREATE TABLE IF NOT EXISTS staff_read_grants (
-  id uuid PRIMARY KEY,
-  workspace_id uuid NOT NULL,
-  organization_id uuid NOT NULL,
-  staff_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  staff_organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-  reason text NOT NULL CONSTRAINT staff_read_grant_reason CHECK (length(btrim(reason)) > 0 AND length(reason) <= 500),
-  token_hash text NOT NULL UNIQUE,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  expires_at timestamptz NOT NULL,
-  revoked_at timestamptz,
-  revoked_by uuid,
-  last_used_at timestamptz,
-  CONSTRAINT staff_read_grant_workspace FOREIGN KEY (workspace_id, organization_id)
-    REFERENCES workspaces(id, organization_id) ON DELETE CASCADE,
-  CONSTRAINT staff_read_grant_lifetime CHECK (expires_at > created_at AND expires_at <= created_at + interval '90 days')
-);
--- 0058 (relay_managed coding agents) is a real migration now.
-`;
-
 async function cloudSource(): Promise<PGliteDatabase> {
   const source = new PGliteDatabase();
   await source.exec(CLOUD_FIXTURE_DDL);
@@ -54,13 +30,13 @@ async function cloudSource(): Promise<PGliteDatabase> {
 
 /**
  * "0051": the baseline the importer gates down to (migrations <= 0051 only).
- * "current": every migration on this branch plus the proposed 0061.
+ * "current": every checked-in migration (0061 staff grants and 0064 lazy
+ *   Relaycast binding included).
  */
 async function controlTarget(kind: "0051" | "current", ledger = true): Promise<PGliteDatabase> {
   const target = new PGliteDatabase();
   if (kind === "current") {
     await migrate(target);
-    await target.exec(POST_0058_DDL);
     // 0063 already created the ledger; ledger=false drops it to test refusal.
     if (!ledger) await target.exec("DROP TABLE cloud_import_ledger");
     return target;
@@ -107,9 +83,12 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   const plan = await runImport({ ...deps, target: undefined }, scope, "plan");
   assert.equal(plan.ok, true);
   const expectedPlan = structuredClone(EXPECTED_FULL);
-  expectedPlan.coding_agent_credentials = { imported: 2, skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 12 } };
+  // Plan has no target, so the pre-0064 unbound-workspace gate cannot apply:
+  // unbound workspaces (a2 no key, a3 no rw_) count as importable.
+  expectedPlan.workspaces = { imported: 5, skipped: { workspace_being_deleted: 1 } };
+  expectedPlan.coding_agent_credentials = { imported: 4, skipped: { secret_in_cloud_credential_store: 18 } };
   expectedPlan.github_app_installations = { imported: 1, skipped: {} };
-  expectedPlan.staff_read_grants = { imported: 1, skipped: { workspace_not_imported: 1 } };
+  expectedPlan.staff_read_grants = { imported: 2, skipped: {} };
   expectedPlan.github_app_connections = {
     imported: 1,
     skipped: { named_connection_needs_policy: 1, installation_claimed_by_other_org: 1, invalid_installation_id: 1, duplicate_default_connection: 1 },
@@ -225,7 +204,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   }
 });
 
-test("cloud import: current target (main + proposed 0061) keeps rw_, slugs, History origin and text source ids", async (t) => {
+test("cloud import: current target (every checked-in migration) keeps rw_, slugs, History origin and text source ids", async (t) => {
   const source = await cloudSource();
   const target = await controlTarget("current");
   t.after(async () => {
@@ -271,8 +250,21 @@ test("cloud import: current target (main + proposed 0061) keeps rw_, slugs, Hist
   assert.equal(strict.warnings.relayhistory_origin_invalid_dropped, 1);
   assert.equal(report.warnings.fleet_node_name_filled_with_node_id, undefined);
 
+  // R4 (0064): unbound Cloud workspaces arrive with the Relaycast pair NULL.
+  const unbound = (await target.query<{ id: string; relaycast_workspace_id: string | null; relaycast_api_key_ciphertext: string | null; cloud_relay_workspace_id: string | null }>(
+    "SELECT id, relaycast_workspace_id, relaycast_api_key_ciphertext, cloud_relay_workspace_id FROM workspaces WHERE relaycast_workspace_id IS NULL ORDER BY id")).rows;
+  assert.deepEqual(unbound, [
+    // a2: a Cloud rw_ whose Relaycast key is empty keeps its hosted rw_ identity.
+    { id: id(0x202), relaycast_workspace_id: null, relaycast_api_key_ciphertext: null, cloud_relay_workspace_id: "rw_0000a202" },
+    // a3: never had a relay workspace.
+    { id: id(0x203), relaycast_workspace_id: null, relaycast_api_key_ciphertext: null, cloud_relay_workspace_id: null },
+  ]);
+  assert.equal(report.warnings.workspace_imported_unbound, 2);
+  assert.equal(report.tables.person_identities.skipped.workspace_unbound, 1);
+  assert.equal(report.tables.fleet_node_owners.skipped.workspace_unbound, 1);
+  assert.equal(report.tables.coding_agent_credentials.imported, 4, "relay_managed rows on unbound workspaces import");
   const workspaces = (await target.query<{ id: string; cloud_relay_workspace_id: string | null; slug: string; relayhistory_origin: string | null }>(
-    "SELECT id, cloud_relay_workspace_id, slug, relayhistory_origin FROM workspaces ORDER BY id")).rows;
+    "SELECT id, cloud_relay_workspace_id, slug, relayhistory_origin FROM workspaces WHERE relaycast_workspace_id IS NOT NULL ORDER BY id")).rows;
   assert.deepEqual(workspaces, [
     { id: id(0x201), cloud_relay_workspace_id: "rw_0000a201", slug: "a1", relayhistory_origin: "https://history.example.test" },
     { id: id(0x205), cloud_relay_workspace_id: "rw_0000b201", slug: "b1", relayhistory_origin: null },
@@ -289,7 +281,14 @@ test("cloud import: current target (main + proposed 0061) keeps rw_, slugs, Hist
   assert.deepEqual(agents, [
     { id: id(0x801), is_active: true, harness_active: false, secret_ciphertext: null },
     { id: id(0x802), is_active: false, harness_active: false, secret_ciphertext: null },
+    // On a2, which now imports unbound (0064); Cloud had it unselected.
+    { id: id(0x804), is_active: false, harness_active: false, secret_ciphertext: null },
+    // Stored as the alias "claude"; imported as anthropic, the only one in b1.
+    { id: id(0x816), is_active: true, harness_active: false, secret_ciphertext: null },
   ]);
+  const alias = (await target.query<{ model_provider: string }>(
+    "SELECT model_provider FROM coding_agent_credentials WHERE id = $1", [id(0x816)])).rows[0]!;
+  assert.equal(alias.model_provider, "anthropic");
   assert.equal(report.warnings.coding_agent_active_demoted, 1);
   const github = (await target.query<{ id: string; installation_id: string; github_app_organization_id: string; credentials_ciphertext: string; created_by_user_id: string }>(
     "SELECT id, installation_id, github_app_organization_id, credentials_ciphertext, created_by_user_id FROM integration_connections WHERE auth_mode = 'github_app'")).rows;
@@ -324,6 +323,74 @@ test("cloud import: org scope imports one organization and its members only", as
   assert.equal(report.tables.users.skipped.outside_org_scope, 2);
   assert.equal(report.tables.workspaces.imported, 2);
   assert.throws(() => verifierComparisons({ orgIds: ["not-a-uuid"] }), /UUID/);
+});
+
+test("cloud import: a re-run keeps a binding Control made lazily on an unbound import (0064)", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  const deps = { source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY };
+  assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
+  const pair = async (workspace: string) => (await target.query<{ rc: string | null; key: string | null; generation: number }>(
+    "SELECT relaycast_workspace_id AS rc, relaycast_api_key_ciphertext AS key, relaycast_api_key_generation AS generation FROM workspaces WHERE id = $1",
+    [workspace])).rows[0]!;
+  assert.deepEqual(await pair(id(0x202)), { rc: null, key: null, generation: 1 });
+  const bound = await pair(id(0x201));
+
+  // Control binds a2 on first use (lazy binding), after the import.
+  await target.query(
+    "UPDATE workspaces SET relaycast_workspace_id = 'rc_lazy_a202', relaycast_api_key_ciphertext = 'control-ciphertext', relaycast_api_key_generation = 2 WHERE id = $1",
+    [id(0x202)]);
+  const again = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(again.ok, true, JSON.stringify(again.orgs));
+  assert.deepEqual(await pair(id(0x202)), { rc: "rc_lazy_a202", key: "control-ciphertext", generation: 2 }, "the lazy binding survives as one unit");
+  assert.deepEqual(await pair(id(0x203)), { rc: null, key: null, generation: 1 }, "a still-unbound import stays unbound");
+  assert.equal((await pair(id(0x201))).rc, bound.rc, "a bound import still takes Cloud's binding");
+
+  // The verifier treats a2's lazy binding as expected: its projections agree.
+  const columns = new Set(["workspaces.cloud_relay_workspace_id", "workspaces.slug", "workspaces.relaycast_api_key_generation"]);
+  const workspaces = verifierComparisons({ orgIds: null }, columns, new Set()).find((comparison) => comparison.name === "workspaces")!;
+  const excluded = new Set(Object.values(again.tables.workspaces.importerSkips).flat());
+  const sourceRows = (await source.query<{ __key: string }>(workspaces.sourceSql)).rows
+    .filter((row) => !excluded.has(row.__key)).map((row) => JSON.stringify(row)).sort();
+  const targetRows = (await target.query(workspaces.targetSql)).rows.map((row) => JSON.stringify(row)).sort();
+  assert.deepEqual(targetRows, sourceRows);
+  // Bound imports are still compared for real.
+  await target.query("UPDATE workspaces SET relaycast_workspace_id = 'rc_drifted' WHERE id = $1", [id(0x201)]);
+  const drifted = (await target.query(workspaces.targetSql)).rows.map((row) => JSON.stringify(row)).sort();
+  assert.notDeepEqual(drifted, sourceRows);
+});
+
+test("cloud import: a binding Control holds wins over a later Cloud binding and an older key generation", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  const deps = { source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY };
+  assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
+  const pair = async (workspace: string) => (await target.query<{ rc: string | null; key: string | null; generation: number }>(
+    "SELECT relaycast_workspace_id AS rc, relaycast_api_key_ciphertext AS key, relaycast_api_key_generation AS generation FROM workspaces WHERE id = $1",
+    [workspace])).rows[0]!;
+  // Control binds a2 lazily, and rotates a1's key (generation 1 -> 5).
+  await target.query(
+    "UPDATE workspaces SET relaycast_workspace_id = 'rc_lazy_a202', relaycast_api_key_ciphertext = 'control-ciphertext', relaycast_api_key_generation = 2 WHERE id = $1",
+    [id(0x202)]);
+  await target.query("UPDATE workspaces SET relaycast_api_key_ciphertext = 'control-rotated', relaycast_api_key_generation = 5 WHERE id = $1", [id(0x201)]);
+  const a1 = await pair(id(0x201));
+  // Then Cloud binds a2 too, to a different Relaycast workspace.
+  await source.exec("UPDATE relay_workspaces SET relaycast_api_key = 'rk_cloud_late', relaycast_workspace_id = 'rc-ws-a2-cloud', relaycast_api_key_generation = 3 WHERE id = 'rw_0000a202'");
+
+  const again = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(again.ok, true, JSON.stringify(again.orgs));
+  assert.deepEqual(await pair(id(0x202)), { rc: "rc_lazy_a202", key: "control-ciphertext", generation: 2 }, "Control's binding is kept");
+  assert.deepEqual(await pair(id(0x201)), a1, "a generation never goes backwards");
+  assert.equal(again.warnings.workspaces_binding_conflict, 1);
+  assert.equal(again.warnings.workspaces_generation_kept, 1);
 });
 
 test("cloud import: an existing Control user with an imported email under another id refuses the run", async (t) => {
