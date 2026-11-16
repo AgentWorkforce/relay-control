@@ -1,6 +1,7 @@
+import { migrationFiles,sealManifest,type SchemaManifest } from "../scripts/cloud-import-verify/schema.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp,writeFile,rm } from "node:fs/promises";
+import { mkdtemp,writeFile,rm,readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { requireAllSourceScope,cutoverScopeFinding,normalizedScope } from "../scripts/cloud-import-verify/organization-scope.js";
@@ -68,4 +69,12 @@ test("cutover scope rejects subsets and unbound or incomplete global census",() 
   assert.equal(cutoverScopeFinding({...record,evidenceKind:"contract-only"}).ok,false);
   assert.equal(cutoverScopeFinding({...record,targetSchema:{profile:"main-plus-proposed-0061",ok:true}}).ok,false);
   assert.equal(cutoverScopeFinding({...record,sourceOrganizationCensus:{...record.sourceOrganizationCensus,selected:{count:1,sha256:"other"}}}).ok,false);
+});
+
+test("committed verifier manifest tracks every checked-in migration in ordinary CI",async () => {
+  const manifest=JSON.parse(await readFile(new URL("../scripts/cloud-import-verify/schema-manifest.json",import.meta.url),"utf8")) as SchemaManifest;
+  const {sha256,...content}=manifest;
+  assert.equal(sha256,sealManifest(content).sha256,"manifest seal must cover the complete inventory");
+  assert.deepEqual(manifest.migrations,await migrationFiles(),
+    "Migration drift requires a reviewed manifest generated from a fresh local migration database; never use the qualification target");
 });
