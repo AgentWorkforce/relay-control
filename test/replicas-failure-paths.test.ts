@@ -291,3 +291,97 @@ test("persisted create intent: automatic runs only relist while a create is unco
   assert.equal((await policyRow(env, ENV_E)).create_unconfirmed, false);
   assert.equal((await policyRow(env, ENV_E)).registered_mcp_id, null);
 });
+
+const AGENT = `replicas-${WORKSPACE_1.replaceAll("-", "").slice(0, 16)}`;
+const liveBinding = async (env: Env) => (await env.database.query<any>(
+  "SELECT id, user_id, input FROM replica_spawns WHERE source = 'environment_identity' AND replica_id = $1 AND state <> 'gone'", [WORKSPACE_1])).rows[0];
+const spawnRow = async (env: Env, id: string) => (await env.database.query<any>("SELECT * FROM replica_spawns WHERE id = $1", [id])).rows[0];
+
+test("removing a creator mapping releases its binding: it enrols as the principal, or is refused without one", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, ownerId, memberId, world } = env;
+  const base = `/api/v1/workspaces/${workspaceId}/replicas`;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const first = await liveBinding(env);
+  assert.equal(first.input.acts_as, "creator");
+  assert.equal(first.user_id, ownerId);
+  assert.equal(world.agents.get(AGENT)?.metadata.replicas_spawn_id, first.id);
+
+  const unmapped = await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { creators: [] } });
+  assert.equal(unmapped.status, 200, unmapped.text);
+  assert.equal(await liveBinding(env), undefined);
+  assert.equal(world.agents.get(AGENT), undefined, "the old Relay agent is retired");
+  assert.equal((await spawnRow(env, first.id)).input.cleanup_complete, true);
+  const refused = await rpc(api, token(), "tools/list");
+  assert.equal(refused.status, 403, refused.text);
+  assert.equal(refused.body.error.message, "replica_creator_not_allowed");
+
+  assert.equal((await api(`${base}/environment-principal`, { method: "PUT", token: ownerToken, body: { userId: memberId } })).status, 200);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const second = await liveBinding(env);
+  assert.equal(second.input.acts_as, "principal");
+  assert.equal(second.user_id, memberId);
+});
+
+test("sweep cleanup retry: an incomplete Relay release is retried with backoff", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, world, database } = env;
+  const base = `/api/v1/workspaces/${workspaceId}/replicas`;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const first = await liveBinding(env);
+  const releases: string[] = [];
+  const relaycast = env.replicas.deps.relaycast;
+  const release = relaycast.releaseHosted.bind(relaycast);
+  relaycast.releaseHosted = (...args) => { releases.push(args[1]); return release(...args); };
+  const events: Array<{ code: string; spawnId?: string }> = [];
+  const sweep = new ReplicasSyncSweep({ replicas: env.replicas.deps, intervalSeconds: 30, log: (event) => events.push(event) });
+  t.after(() => sweep.stop());
+
+  // The disable commits; the Relay release after it answers 503.
+  world.failNext("POST", "/v1/agents/release-exact", 503);
+  assert.equal((await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { enabled: false } })).status, 200);
+  let row = await spawnRow(env, first.id);
+  assert.equal(row.state, "gone");
+  assert.notEqual(row.input.cleanup_complete, true);
+  assert.ok(world.agents.get(AGENT));
+
+  // Relay healthy again: one sweep tick completes the cleanup.
+  await sweep.tick();
+  row = await spawnRow(env, first.id);
+  assert.equal(row.input.cleanup_complete, true);
+  assert.equal(row.input.cleanup_attempts, 1);
+  assert.ok(row.input.cleanup_last_attempt_at);
+  assert.equal(world.agents.get(AGENT), undefined);
+  assert.equal(events.length, 0);
+
+  // A row that keeps failing backs off.
+  assert.equal((await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { enabled: true } })).status, 200);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const second = await liveBinding(env);
+  world.failNext("POST", "/v1/agents/release-exact", 503);
+  assert.equal((await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { enabled: false } })).status, 200);
+  releases.length = 0;
+  world.failNext("POST", "/v1/agents/release-exact", 503);
+  await sweep.tick();
+  assert.deepEqual(releases, [AGENT]);
+  assert.deepEqual(events.map((event) => [event.code, event.spawnId]), [["replicas_cleanup_failed", second.id]]);
+  row = await spawnRow(env, second.id);
+  assert.equal(row.input.cleanup_attempts, 1);
+  assert.notEqual(row.input.cleanup_complete, true);
+  await sweep.tick();
+  assert.deepEqual(releases, [AGENT], "skipped before its backoff elapses");
+  assert.equal((await spawnRow(env, second.id)).input.cleanup_attempts, 1);
+  // Once the backoff elapsed it is retried and completes.
+  await database.query(`UPDATE replica_spawns SET input = jsonb_set(input, '{cleanup_last_attempt_at}', to_jsonb($2::text)) WHERE id = $1`,
+    [second.id, new Date(Date.now() - 61_000).toISOString()]);
+  await sweep.tick();
+  assert.deepEqual(releases, [AGENT, AGENT]);
+  row = await spawnRow(env, second.id);
+  assert.equal(row.input.cleanup_complete, true);
+  assert.equal(row.input.cleanup_attempts, 2);
+  assert.equal(world.agents.get(AGENT), undefined);
+});

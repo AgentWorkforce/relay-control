@@ -703,9 +703,20 @@ export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: Replica
           [policy.id, creatorId, userId.toLowerCase()],
         );
       }
+      // A binding acting as a creator whose mapping was removed is released
+      // (no tombstone): it enrols again as the principal when one is set and
+      // is refused otherwise; its Relay agent is retired after commit.
+      const unmapped = await tx.query<{ id: string }>(
+        `UPDATE replica_spawns SET state = 'gone', helper_hash = NULL, updated_at = now()
+          WHERE source = '${ENVIRONMENT_IDENTITY}' AND workspace_id = $1 AND environment_id = $2 AND state <> 'gone'
+            AND input->>'acts_as' = 'creator' AND NOT (COALESCE(input->>'creator_id', '') = ANY($3::text[]))
+          RETURNING id`,
+        [actor.workspaceId, policy.environment_id, creators.map((item) => item.creatorId)],
+      );
+      released.push(...unmapped.rows.map((row) => row.id));
       // A binding of a newly mapped creator that acts as the principal or as
       // another member is released (no tombstone) and enrols again as the
-      // mapped member. Removing a mapping releases nothing: admission refuses.
+      // mapped member.
       for (const { creatorId, userId } of creators) {
         const revoked = await tx.query<{ id: string }>(
           `UPDATE replica_spawns SET state = 'gone', helper_hash = NULL, updated_at = now()

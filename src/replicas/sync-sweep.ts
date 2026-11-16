@@ -1,9 +1,13 @@
 import { syncEnvironments } from "./environments.js";
-import type { ReplicasActor, ReplicasDeps } from "./service.js";
+import { retirePendingCleanup, type ReplicasActor, type ReplicasDeps } from "./service.js";
 
 export const REPLICAS_SYNC_SERVICE = "replicas-sync";
 
-export type ReplicasSyncLog = (event: { code: "replicas_sync_failed" | "replicas_sync_scan_failed"; workspaceId?: string }) => void;
+export type ReplicasSyncLog = (event: {
+  code: "replicas_sync_failed" | "replicas_sync_scan_failed" | "replicas_cleanup_failed" | "replicas_cleanup_scan_failed";
+  workspaceId?: string;
+  spawnId?: string;
+}) => void;
 
 /**
  * Periodic environment sync: the semantics of `POST
@@ -11,7 +15,10 @@ export type ReplicasSyncLog = (event: { code: "replicas_sync_failed" | "replicas
  * all-environments default is on (no settings row = on). Runs once at start,
  * then every interval; a run never overlaps the previous one. A failing
  * connection is logged and the sweep moves on. It acts as a service, never as
- * a person, and never sets or infers the VM principal.
+ * a person, and never sets or infers the VM principal. Being automatic, it
+ * never re-sends a create whose earlier outcome is unconfirmed. After the
+ * sync it retries incomplete remote cleanup of gone bindings for every
+ * Replicas connection (whatever its default), with per-row backoff.
  */
 export class ReplicasSyncSweep {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -29,6 +36,40 @@ export class ReplicasSyncSweep {
   }
 
   private async run(): Promise<void> {
+    await this.sync();
+    await this.cleanup();
+  }
+
+  private actor(target: { workspace_id: string; organization_id: string }): ReplicasActor {
+    return { userId: "", workspaceId: target.workspace_id, organizationId: target.organization_id, service: REPLICAS_SYNC_SERVICE };
+  }
+
+  private async cleanup(): Promise<void> {
+    let targets: Array<{ workspace_id: string; organization_id: string }>;
+    try {
+      targets = (await this.deps.replicas.database.query<{ workspace_id: string; organization_id: string }>(
+        `SELECT c.workspace_id, w.organization_id
+           FROM remote_agent_connections c
+           JOIN workspaces w ON w.id = c.workspace_id
+          WHERE c.provider = 'replicas'
+          ORDER BY c.workspace_id`,
+      )).rows;
+    } catch {
+      this.deps.log?.({ code: "replicas_cleanup_scan_failed" });
+      return;
+    }
+    for (const target of targets) {
+      if (this.stopped) break;
+      try {
+        await retirePendingCleanup(this.deps.replicas, this.actor(target),
+          (spawnId) => this.deps.log?.({ code: "replicas_cleanup_failed", workspaceId: target.workspace_id, spawnId }));
+      } catch {
+        this.deps.log?.({ code: "replicas_cleanup_scan_failed", workspaceId: target.workspace_id });
+      }
+    }
+  }
+
+  private async sync(): Promise<void> {
     let targets: Array<{ workspace_id: string; organization_id: string }>;
     try {
       targets = (await this.deps.replicas.database.query<{ workspace_id: string; organization_id: string }>(
@@ -45,11 +86,8 @@ export class ReplicasSyncSweep {
     }
     for (const target of targets) {
       if (this.stopped) break;
-      const actor: ReplicasActor = {
-        userId: "", workspaceId: target.workspace_id, organizationId: target.organization_id, service: REPLICAS_SYNC_SERVICE,
-      };
       try {
-        await syncEnvironments(this.deps.replicas, actor, { automatic: true });
+        await syncEnvironments(this.deps.replicas, this.actor(target), { automatic: true });
       } catch {
         this.deps.log?.({ code: "replicas_sync_failed", workspaceId: target.workspace_id });
       }

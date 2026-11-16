@@ -73,6 +73,9 @@ export type SpawnInput = {
   report_to?: string;
   origin?: "existing" | "environment_identity";
   cleanup_complete?: boolean;
+  /** Sweep retries of an incomplete cleanup: attempts so far and when the last one started (ISO). */
+  cleanup_attempts?: number;
+  cleanup_last_attempt_at?: string;
   /** Set by an explicit release (it wrote the tombstone); a repeat of that release is a no-op. */
   released?: true;
   relay_mcp_version?: number;
@@ -851,6 +854,51 @@ export async function retireIdentityBindings(deps: ReplicasDeps, actor: Replicas
       const row = await byId(tx, id, true);
       if (row && row.state === "gone" && !row.input.cleanup_complete) await retireRemote(deps, tx, row, actor);
     }).catch(() => undefined);
+  }
+}
+
+/** Sweep cleanup retry backoff: 60 s doubling per failed attempt, capped at one hour. */
+export const CLEANUP_BACKOFF_BASE_MS = 60_000;
+export const CLEANUP_BACKOFF_MAX_MS = 3_600_000;
+export const cleanupBackoffMs = (attempts: number) =>
+  Math.min(CLEANUP_BACKOFF_MAX_MS, CLEANUP_BACKOFF_BASE_MS * 2 ** Math.max(0, Math.min(attempts, 20) - 1));
+
+/**
+ * Sweep retry of remote cleanup left incomplete (for example a Relay release
+ * that failed after a disable, a creator unmapping or a member removal had
+ * already committed the revoke). Every gone row of the workspace with
+ * cleanup incomplete is retried under the workspace lock once its backoff
+ * has elapsed; each attempt is recorded (committed) before it runs, so a
+ * failing row backs off. One row's failure is reported and never blocks the rest.
+ */
+export async function retirePendingCleanup(deps: ReplicasDeps, actor: ReplicasActor,
+  onError: (id: string) => void = () => undefined, now: () => number = Date.now): Promise<void> {
+  const rows = await deps.database.query<{ id: string }>(
+    `SELECT id FROM replica_spawns
+      WHERE workspace_id = $1 AND state = 'gone' AND COALESCE((input->>'cleanup_complete')::boolean, false) = false
+      ORDER BY updated_at, id`,
+    [actor.workspaceId],
+  );
+  for (const { id } of rows.rows) {
+    try {
+      const due = await withReplicasLock(deps, actor, async (tx) => {
+        const row = await byId(tx, id, true);
+        if (!row || row.state !== "gone" || row.input.cleanup_complete) return false;
+        const attempts = row.input.cleanup_attempts ?? 0;
+        const last = row.input.cleanup_last_attempt_at ? Date.parse(row.input.cleanup_last_attempt_at) : NaN;
+        if (attempts > 0 && Number.isFinite(last) && now() - last < cleanupBackoffMs(attempts)) return false;
+        await patch(tx, row.id, { input: { ...row.input, cleanup_attempts: attempts + 1,
+          cleanup_last_attempt_at: new Date(now()).toISOString() } });
+        return true;
+      });
+      if (!due) continue;
+      await withReplicasLock(deps, actor, async (tx) => {
+        const row = await byId(tx, id, true);
+        if (row && row.state === "gone" && !row.input.cleanup_complete) await retireRemote(deps, tx, row, actor);
+      });
+    } catch {
+      onError(id);
+    }
   }
 }
 
