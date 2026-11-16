@@ -5,9 +5,9 @@
 --
 -- Policies are discovered and enabled when an owner/admin connects Replicas,
 -- and environments discovered later are enabled on sync; admins opt out per
--- environment. A token is still admitted only as a mapped creator or the
--- explicit VM principal (replica_environment_settings). No token, email address
--- or provider key is stored here; creator_email_hint is a masked hint
+-- environment (opted_out). A token is still admitted only as a mapped creator
+-- or the explicit VM principal (replica_environment_settings). No token, email
+-- address or provider key is stored here; creator_email_hint is a masked hint
 -- (first character and domain) shown to admins.
 
 CREATE TABLE IF NOT EXISTS replica_environment_policies (
@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS replica_environment_policies (
   environment_name text NOT NULL DEFAULT '',
   enabled boolean NOT NULL DEFAULT false,
   registered_mcp_id text,
+  -- An admin opt-out. A disabled policy that is not opted out (a default
+  -- enable that failed or was refused) is retried on sync.
+  opted_out boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (workspace_id, environment_id)

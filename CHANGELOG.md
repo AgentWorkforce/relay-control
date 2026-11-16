@@ -25,19 +25,23 @@ assigned at release.
   Owners and admins see policies, the principal and pending (unmapped)
   creators at `/replicas/environment-policies` and opt out per environment
   (`PUT /replicas/environments/{id}` with `enabled: false`, or `DELETE
-  /replicas/environment-mcp` with `environmentIds`); sync never re-enables an
-  opted-out environment. `DELETE /replicas/environment-mcp` with `{all: true}`
-  turns the default off and `POST` with `{all: true}` turns it back on, from
-  the dashboard or the CLI. A ship created by the provider with no creator is
+  /replicas/environment-mcp` with `environmentIds`, shown as `optedOut`);
+  sync and a re-connect never re-enable an opted-out environment but retry a
+  default enable that failed or was refused. `DELETE /replicas/environment-mcp`
+  with `{all: true}` turns the default off (no opt-out) and `POST` with
+  `{all: true}` turns it back on and clears every opt-out, from the dashboard
+  or the CLI. A ship created by the provider with no creator is
   admitted only as the explicit VM principal, re-checked on every admission
   and call. Registration reads existing entries first, reuses a
   matching one, never overwrites a conflicting one, and reads the entry back
   after a create (`registration_failed`, `registration_unconfirmed`). Changing
   the principal or mapping a creator releases the affected bindings, and
-  disabling releases the environment's bindings, all without a tombstone. Release writes a tombstone; `recover_replica_spawn` with
+  disabling releases the environment's bindings, all without a tombstone; a
+  Relay agent left by such a release whose cleanup failed is cleaned up on
+  the replica's next call instead of blocking it. Release writes a tombstone; `recover_replica_spawn` with
   `revive: true` lifts it. The endpoint is rate limited per IP and answers 503
   when the issuer cannot be read. Migration 0067 (`all_environments`
-  defaults to true). See
+  defaults to true; `opted_out` per policy). See
   [Replicas](docs/replicas.md).
 - Added: Replicas agent bridge behind `SELFHOST_REPLICAS_ENABLED` (default
   off). Owners and admins spawn, recover, bind and release Replicas agents

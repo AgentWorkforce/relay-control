@@ -839,6 +839,11 @@ test("connect with the organization already connected in another workspace enabl
   assert.equal(provider.registered.length, 0);
   assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE enabled"), 0);
   assert.equal(await count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'", [workspaceId]), 1);
+  // A refusal is not an opt-out: once the other workspace disconnects, sync enables both.
+  await database.query("DELETE FROM remote_agent_connections WHERE workspace_id = $1", [other.body.id]);
+  const synced = await api(`/api/v1/workspaces/${workspaceId}/replicas/environments/sync`, { method: "POST", token: ownerToken });
+  assert.equal(synced.status, 200, synced.text);
+  assert.deepEqual(synced.body.environments, [{ environmentId: ENV_A, status: "registered" }, { environmentId: ENV_B, status: "registered" }]);
 });
 
 test("a re-connect (key rotation) keeps per-environment opt-outs and a default turned off", async (t) => {
@@ -885,4 +890,98 @@ test("disconnect then connect enables every environment again, including opted-o
     environments: [{ environmentId: ENV_A, status: "registered" }, { environmentId: ENV_B, status: "registered" }],
   });
   assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE enabled AND registered_mcp_id IS NOT NULL"), 2);
+});
+
+test("a failed default enable is retried by sync and by a re-connect; an opt-out is not", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider, database } = env;
+  const base = `/api/v1/workspaces/${workspaceId}/replicas`;
+  const connection = `/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`;
+  const views = async () => (await api(`${base}/environment-policies`, { token: ownerToken })).body.environments
+    .map((item: any) => [item.environmentId, item.status, item.optedOut]);
+  await database.query("CREATE FUNCTION fail_enable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'enable failed'; END $$");
+  const failEnable = (environmentId: string) => database.query(`CREATE TRIGGER fail_enable BEFORE UPDATE ON replica_environment_policies
+    FOR EACH ROW WHEN (NEW.enabled AND NOT OLD.enabled AND NEW.environment_id = '${environmentId}') EXECUTE FUNCTION fail_enable()`);
+  const allow = () => database.query("DROP TRIGGER fail_enable ON replica_environment_policies");
+
+  await failEnable(ENV_B);
+  const saved = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.equal(saved.status, 200, saved.text);
+  assert.deepEqual(saved.body.environmentSetup.environments, [
+    { environmentId: ENV_A, status: "registration_failed", retryable: true },
+    { environmentId: ENV_B, status: "registration_failed", retryable: true },
+  ]);
+  assert.deepEqual(await views(), [[ENV_A, "disabled", false], [ENV_B, "disabled", false]]);
+  await allow();
+  let synced = await api(`${base}/environments/sync`, { method: "POST", token: ownerToken });
+  assert.equal(synced.status, 200, synced.text);
+  assert.deepEqual(synced.body.environments, [{ environmentId: ENV_A, status: "registered" }, { environmentId: ENV_B, status: "registered" }]);
+
+  // A re-connect retries a default enable that failed on the previous re-connect.
+  provider.environments.push({ id: ENV_C, name: "gamma" });
+  await failEnable(ENV_C);
+  let rotated = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.equal(rotated.status, 200, rotated.text);
+  assert.deepEqual(rotated.body.environmentSetup.environments, [{ environmentId: ENV_C, status: "registration_failed", retryable: true }]);
+  await allow();
+  rotated = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.deepEqual(rotated.body.environmentSetup.environments, [{ environmentId: ENV_C, status: "registered" }]);
+
+  // Opt-outs (PUT and DELETE) survive sync and re-connect.
+  assert.equal((await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { enabled: false } })).status, 200);
+  assert.equal((await api(`${base}/environment-mcp`, { method: "DELETE", token: ownerToken, body: { environmentIds: [ENV_B] } })).status, 200);
+  synced = await api(`${base}/environments/sync`, { method: "POST", token: ownerToken });
+  assert.deepEqual(synced.body.environments, []);
+  rotated = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.deepEqual(rotated.body.environmentSetup.environments, []);
+  assert.deepEqual(await views(), [[ENV_A, "disabled", true], [ENV_B, "disabled", true], [ENV_C, "registered", false]]);
+
+  // An explicit enable clears one opt-out; POST {all: true} clears every one.
+  assert.equal((await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { enabled: true } })).status, 200);
+  assert.deepEqual(await views(), [[ENV_A, "registered", false], [ENV_B, "disabled", true], [ENV_C, "registered", false]]);
+  assert.equal((await api(`${base}/environment-mcp`, { method: "DELETE", token: ownerToken, body: { all: true } })).status, 200);
+  assert.deepEqual(await views(), [[ENV_A, "disabled", false], [ENV_B, "disabled", true], [ENV_C, "disabled", false]]);
+  assert.equal((await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { all: true } })).status, 200);
+  assert.deepEqual(await views(), [[ENV_A, "registered", false], [ENV_B, "registered", false], [ENV_C, "registered", false]]);
+});
+
+test("a retired binding's leftover Relay agent is cleaned up on the replica's next call; a foreign agent still blocks", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, ownerId, world, database } = env;
+  const base = `/api/v1/workspaces/${workspaceId}/replicas`;
+  await connectAndEnable(env);
+  assert.equal((await api(`${base}/environment-principal`, { method: "PUT", token: ownerToken, body: { userId: ownerId } })).status, 200);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const agent = `replicas-${WORKSPACE_1.replaceAll("-", "").slice(0, 16)}`;
+  const first = await binding(env, WORKSPACE_1);
+
+  // The disable commits; the Relay release after it fails and leaves the agent behind.
+  world.failNext("POST", "/v1/agents/release-exact", 503);
+  assert.equal((await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { enabled: false } })).status, 200);
+  assert.equal(world.agents.get(agent)?.metadata.replicas_spawn_id, first.id, "the retired binding's agent survived");
+  assert.equal((await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { enabled: true } })).status, 200);
+
+  // The retry fails again: a retryable 503, never replica_already_bound, and nothing is enrolled.
+  world.failNext("POST", "/v1/agents/release-exact", 503);
+  const retry = await callTool(api, token(), "list_relay_agents");
+  assert.equal(retry.status, 503, retry.text);
+  assert.equal(await binding(env, WORKSPACE_1), undefined);
+
+  const listed = await callTool(api, token(), "list_relay_agents");
+  assert.equal(listed.status, 200, listed.text);
+  const second = await binding(env, WORKSPACE_1);
+  assert.notEqual(second.id, first.id);
+  assert.equal(world.agents.get(agent)?.metadata.replicas_spawn_id, second.id);
+  const retired = (await database.query<any>("SELECT input FROM replica_spawns WHERE id = $1", [first.id])).rows[0];
+  assert.equal(retired.input.cleanup_complete, true);
+
+  // An agent bridging another replica, or claiming a gone binding of another replica, is not a predecessor.
+  world.addAgent("foreign-bridge", { replica_id: WORKSPACE_2, replicas_spawn_id: randomUUID() });
+  let refused = await callTool(api, token({ workspace_id: WORKSPACE_2 }), "list_relay_agents");
+  assert.equal(refused.status, 409, refused.text);
+  assert.equal(refused.body.error.message, "replica_already_bound");
+  world.agents.get("foreign-bridge")!.metadata.replicas_spawn_id = first.id;
+  refused = await callTool(api, token({ workspace_id: WORKSPACE_2 }), "list_relay_agents");
+  assert.equal(refused.status, 409, refused.text);
+  assert.equal(refused.body.error.message, "replica_already_bound");
 });

@@ -66,7 +66,7 @@
     {"name":"0062_cloud_identity_security.sql","sha256":"89856c37785fd8ff3dbecf1263939626e1683650607eac974793f24501a97448"},
     {"name":"0063_cloud_import_ledger.sql","sha256":"a6e432e4454b5cb6244cce4677a35601f7cb34a9b29be09ba12884843aee48ba"},
     {"name":"0065_replica_spawns.sql","sha256":"555ea60fa7dd4e1416866c14e3a4f98cef950a29f6dbf5c2da8954ef68aebee5"},
-    {"name":"0067_replica_environment_policies.sql","sha256":"0daf9f155a1bf7c201be50c22745b9ae22da6f8d76bf898cca795cc97662fec3"}
+    {"name":"0067_replica_environment_policies.sql","sha256":"94234299d57c6e983c4c8f148e934406804fe4bb152db610621fbdcbe31cabac"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -840,15 +840,16 @@
     {"kind":"column","name":"public.replica_environment_creators.creator_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"text"}},
     {"kind":"column","name":"public.replica_environment_creators.policy_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
     {"kind":"column","name":"public.replica_environment_creators.user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"uuid"}},
-    {"kind":"column","name":"public.replica_environment_policies.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":9,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.replica_environment_policies.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":10,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.replica_environment_policies.enabled","definition":{"collation":null,"default":"false","generated":"","identity":"","not_null":true,"position":7,"type":"boolean"}},
     {"kind":"column","name":"public.replica_environment_policies.environment_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"text"}},
     {"kind":"column","name":"public.replica_environment_policies.environment_name","definition":{"collation":"pg_catalog.default","default":"''::text","generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
     {"kind":"column","name":"public.replica_environment_policies.id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
     {"kind":"column","name":"public.replica_environment_policies.issuer","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"text"}},
+    {"kind":"column","name":"public.replica_environment_policies.opted_out","definition":{"collation":null,"default":"false","generated":"","identity":"","not_null":true,"position":9,"type":"boolean"}},
     {"kind":"column","name":"public.replica_environment_policies.provider_organization_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"text"}},
     {"kind":"column","name":"public.replica_environment_policies.registered_mcp_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"text"}},
-    {"kind":"column","name":"public.replica_environment_policies.updated_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":10,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.replica_environment_policies.updated_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":11,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.replica_environment_policies.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
     {"kind":"column","name":"public.replica_environment_settings.all_environments","definition":{"collation":null,"default":"true","generated":"","identity":"","not_null":true,"position":2,"type":"boolean"}},
     {"kind":"column","name":"public.replica_environment_settings.principal_user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":3,"type":"uuid"}},
@@ -2022,5 +2023,5 @@
       {"kind":"table","name":"public.staff_read_grants","definition":{"force_row_security":false,"kind":"r","row_security":false}}
     ]
   },
-  "sha256":"e4f036f266769097d1a73616543b65a13b32648c59aa014000fc0c65eb618843"
+  "sha256":"1e7818b715ea1a230c0b4d58226a63e351d1f8d1dfae1c335d1bb164ccd672d3"
 }

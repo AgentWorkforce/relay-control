@@ -10,6 +10,7 @@ import {
   decrypt,
   encrypt,
   ENVIRONMENT_IDENTITY,
+  isUuid,
   keyFor,
   patch,
   rejectedByProvider,
@@ -17,6 +18,7 @@ import {
   ReplicasError,
   requireAdmin,
   retireIdentityBindings,
+  retireRemote,
   withReplicasLock,
   type ReplicasActor,
   type ReplicasDeps,
@@ -72,8 +74,9 @@ type PolicyRow = {
   environment_name: string;
   enabled: boolean;
   registered_mcp_id: string | null;
+  opted_out: boolean;
 };
-const POLICY = "id, workspace_id, issuer, provider_organization_id, environment_id, environment_name, enabled, registered_mcp_id";
+const POLICY = "id, workspace_id, issuer, provider_organization_id, environment_id, environment_name, enabled, registered_mcp_id, opted_out";
 
 /** actsAs: "creator" for a mapped creator, "principal" for the workspace VM principal. */
 type Admission = { policy: PolicyRow; organizationId: string; userId: string; actsAs: "creator" | "principal" };
@@ -175,6 +178,17 @@ async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admis
   return row;
 }
 
+/** This replica's own released environment-identity binding in the admitted workspace, locked. */
+async function retiredPredecessor(tx: SqlExecutor, claims: ReplicaIdentityClaims, admission: Admission, spawnId: unknown): Promise<SpawnRow | null> {
+  if (!isUuid(spawnId)) return null;
+  const result = await tx.query<SpawnRow>(
+    `SELECT ${COLUMNS} FROM replica_spawns WHERE id = $1 AND workspace_id = $2 AND lower(replica_id) = $3
+        AND source = '${ENVIRONMENT_IDENTITY}' AND state = 'gone' FOR UPDATE`,
+    [spawnId, admission.policy.workspace_id, claims.workspaceId],
+  );
+  return result.rows[0] ?? null;
+}
+
 /**
  * Refusals are audited with their reason code only (no subject, jti or
  * email), and only when the tenant is known: a token of a foreign
@@ -270,9 +284,23 @@ async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIde
   const name = identityAgentName(claims.workspaceId);
   const ownId = row?.id;
   // A replica already bridged by another binding (a PR A spawn or bind) is never enrolled twice.
-  const bridged = (await deps.relaycast.listAgents(relay.key, "all")).find((agent) =>
+  const bridged = (await deps.relaycast.listAgents(relay.key, "all")).filter((agent) =>
     String(agent.metadata.replica_id ?? "").toLowerCase() === claims.workspaceId && agent.metadata.replicas_spawn_id !== ownId);
-  if (bridged) throw new IdentityRefusal("replica_already_bound", 409, scopeOf(admission));
+  const predecessors: SpawnRow[] = [];
+  for (const agent of bridged) {
+    const predecessor = await retiredPredecessor(tx, claims, admission, agent.metadata.replicas_spawn_id);
+    if (!predecessor) throw new IdentityRefusal("replica_already_bound", 409, scopeOf(admission));
+    predecessors.push(predecessor);
+  }
+  // This replica's own released binding whose Relay cleanup failed after commit
+  // (disable, principal or mapping change): nothing else retries it, so it is retried here.
+  for (const predecessor of predecessors) {
+    try {
+      await retireRemote(deps, tx, predecessor, null);
+    } catch {
+      throw new ReplicasError("Replicas enrolment could not finish. Retry the call.", 503);
+    }
+  }
   if (!row) {
     const id = randomUUID();
     const input: SpawnInput = { environment_id: claims.environmentId, name, task: "", coding_agent: "replicas",
@@ -513,6 +541,8 @@ export async function listEnvironmentPolicies(deps: ReplicasDeps, actor: Replica
         name: policy.environment_name,
         enabled: policy.enabled,
         status: policyStatus(policy),
+        // An admin opt-out: sync and re-connect leave it disabled; a disabled policy without it is retried.
+        optedOut: policy.opted_out,
         // A policy recorded for an earlier connection never admits a token.
         stale: Boolean(connection?.provider_account) && policy.provider_organization_id !== connection!.provider_account!.toLowerCase(),
         registeredMcpId: policy.registered_mcp_id,
@@ -546,6 +576,16 @@ class OrganizationShared extends ReplicasError {
 class EnabledElsewhere extends ReplicasError {
   constructor() {
     super("This Replicas environment is enabled in another workspace.", 409);
+  }
+}
+
+/** An admin enable withdraws the opt-out, whether or not the enable itself succeeds. */
+async function clearOptOut(tx: SqlExecutor, workspaceId: string, policies: PolicyRow[] | "all"): Promise<void> {
+  if (policies === "all") {
+    await tx.query("UPDATE replica_environment_policies SET opted_out = false, updated_at = now() WHERE workspace_id = $1 AND opted_out", [workspaceId]);
+  } else if (policies.length) {
+    await tx.query("UPDATE replica_environment_policies SET opted_out = false, updated_at = now() WHERE id = ANY($1::uuid[]) AND opted_out",
+      [policies.map((policy) => policy.id)]);
   }
 }
 
@@ -586,9 +626,15 @@ async function enablePolicy(tx: SqlExecutor, actor: ReplicasActor, policy: Polic
  * environment's environment-identity bindings in the workspace, without a
  * tombstone: they enrol again once the environment is enabled. The revoked
  * ids are pushed to `released`; the caller retires their Relay identities
- * after this transaction commits.
+ * after this transaction commits. optOut records an admin opt-out, which
+ * sync and re-connect respect; turning the default off or disconnecting is not one.
  */
-async function disablePolicy(tx: SqlExecutor, actor: ReplicasActor, policy: PolicyRow, released: string[]): Promise<PolicyRow> {
+async function disablePolicy(tx: SqlExecutor, actor: ReplicasActor, policy: PolicyRow, released: string[],
+  optOut = false): Promise<PolicyRow> {
+  if (optOut && !policy.opted_out) {
+    policy = (await tx.query<PolicyRow>(
+      `UPDATE replica_environment_policies SET opted_out = true, updated_at = now() WHERE id = $1 RETURNING ${POLICY}`, [policy.id])).rows[0]!;
+  }
   const revoked = await tx.query<{ id: string }>(
     `UPDATE replica_spawns SET state = 'gone', helper_hash = NULL, updated_at = now()
       WHERE source = '${ENVIRONMENT_IDENTITY}' AND environment_id = $1 AND workspace_id = $2 AND state <> 'gone' RETURNING id`,
@@ -655,8 +701,11 @@ export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: Replica
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
         actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.creators_updated", target: policy.id });
     }
-    if (enabled === true) policy = await enablePolicy(tx, actor, policy, await connectedOrganization(tx, actor.workspaceId));
-    if (enabled === false) policy = await disablePolicy(tx, actor, policy, released);
+    if (enabled === true) {
+      await clearOptOut(tx, actor.workspaceId, [policy]);
+      policy = await enablePolicy(tx, actor, policy, await connectedOrganization(tx, actor.workspaceId));
+    }
+    if (enabled === false) policy = await disablePolicy(tx, actor, policy, released, true);
   });
   await retireIdentityBindings(deps, actor, released);
   const view = await listEnvironmentPolicies(deps, actor);
@@ -690,14 +739,15 @@ function parseSelection(raw: unknown): Selection {
 
 /**
  * Enables the selected environments and registers the environment-level MCP
- * in each one's provider configuration. `{all: true}` turns the
- * all-environments default back on and re-enables every environment,
- * including opted-out ones; environments discovered later are enabled on sync. Registration reads the
- * environment's entries first and reuses a matching one; a second entry with
- * the same name, or one with another transport or config, is never
- * overwritten (registration_failed, not retryable). After a create (or a
- * conflict or lost answer) the entry is read back; an entry that cannot be
- * confirmed is registration_unconfirmed and a retry reconciles it.
+ * in each one's provider configuration; an explicit enable clears the
+ * opt-out. `{all: true}` turns the all-environments default back on, clears
+ * every opt-out and re-enables every environment; environments discovered
+ * later are enabled on sync. Registration reads the environment's entries
+ * first and reuses a matching one; a second entry with the same name, or one
+ * with another transport or config, is never overwritten (registration_failed,
+ * not retryable). After a create (or a conflict or lost answer) the entry is
+ * read back; an entry that cannot be confirmed is registration_unconfirmed
+ * and a retry reconciles it.
  */
 export async function enableEnvironmentMcp(deps: ReplicasDeps, actor: ReplicasActor, raw: unknown) {
   const parsed = enableInput.safeParse(raw);
@@ -737,13 +787,23 @@ function matchEntry(entries: EnvironmentMcp[], policy: PolicyRow, config: unknow
 }
 
 /**
- * The default selections, resolved under the lock. setup (connect): every
- * policy of the connected organization that is not enabled and registered.
- * sync: under the all-environments flag only, the freshly discovered ones
- * plus enabled ones whose registration is missing; an opted-out (disabled)
- * policy is never re-enabled here.
+ * The default selections of the connected organization's policies. setup
+ * (connect): every one that is not enabled and registered. sync (under the
+ * all-environments flag only): every disabled one that is not opted out (new,
+ * or a default enable that failed or was refused earlier) plus enabled ones
+ * whose registration is missing; an opted-out policy is never re-enabled here.
  */
-type DefaultSelection = { defaults: "setup" } | { defaults: "sync"; fresh: string[] };
+type DefaultSelection = { defaults: "setup" | "sync" };
+const DEFAULTS = {
+  setup: "NOT (enabled AND registered_mcp_id IS NOT NULL)",
+  sync: "(NOT enabled AND NOT opted_out) OR (enabled AND registered_mcp_id IS NULL)",
+};
+
+async function defaultPolicies(tx: SqlExecutor, workspaceId: string, organization: string, defaults: DefaultSelection["defaults"]) {
+  return (await tx.query<PolicyRow>(
+    `SELECT ${POLICY} FROM replica_environment_policies WHERE workspace_id = $1 AND provider_organization_id = $2 AND (${DEFAULTS[defaults]})
+      ORDER BY environment_id FOR UPDATE`, [workspaceId, organization])).rows;
+}
 
 async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
   selection: Selection | EnableSelection | DefaultSelection): Promise<EnvironmentMcpResult[]> {
@@ -759,16 +819,11 @@ async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
     }
     let policies: PolicyRow[];
     if ("defaults" in selection) {
-      const fresh = selection.defaults === "sync" ? selection.fresh : [];
-      policies = selection.defaults === "sync" && !await allEnvironmentsFlag(tx, actor.workspaceId) ? [] : (await tx.query<PolicyRow>(
-        `SELECT ${POLICY} FROM replica_environment_policies WHERE workspace_id = $1 AND provider_organization_id = $2
-            AND (${selection.defaults === "setup"
-    ? "NOT (enabled AND registered_mcp_id IS NOT NULL)"
-    : "(NOT enabled AND environment_id = ANY($3::text[])) OR (enabled AND registered_mcp_id IS NULL)"})
-          ORDER BY environment_id FOR UPDATE`,
-        selection.defaults === "setup" ? [actor.workspaceId, organization] : [actor.workspaceId, organization, fresh])).rows;
+      policies = selection.defaults === "sync" && !await allEnvironmentsFlag(tx, actor.workspaceId)
+        ? [] : await defaultPolicies(tx, actor.workspaceId, organization, selection.defaults);
     } else if ("all" in selection) {
       await setAllEnvironments(tx, actor.workspaceId, true);
+      await clearOptOut(tx, actor.workspaceId, "all");
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
         actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.all_enabled", target: actor.workspaceId });
       policies = (await tx.query<PolicyRow>(
@@ -781,6 +836,7 @@ async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
         if (policy) policies.push(policy);
         else results.push({ environmentId, status: "not_found" });
       }
+      await clearOptOut(tx, actor.workspaceId, policies);
     }
     const enabled: PolicyRow[] = [];
     for (const policy of policies) {
@@ -888,7 +944,8 @@ export async function disableEnvironmentMcp(deps: ReplicasDeps, actor: ReplicasA
       }
     }
     const disabled: PolicyRow[] = [];
-    for (const policy of policies) disabled.push(await disablePolicy(tx, actor, policy, released));
+    // {all: true} turns the workspace default off; it is not a per-environment opt-out.
+    for (const policy of policies) disabled.push(await disablePolicy(tx, actor, policy, released, !("all" in selection)));
     return disabled;
   });
   for (const policy of targets) results.push(await removeEntry(deps, actor, policy, true));
@@ -939,7 +996,7 @@ async function enableDefaults(deps: ReplicasDeps, actor: ReplicasActor, selectio
 /**
  * Connect-time setup. A fresh connect (no Replicas connection before it,
  * including a connect after a disconnect) turns the all-environments default
- * on (a stale false from the disconnect never survives), discovers the
+ * on and clears every opt-out (neither survives a disconnect), discovers the
  * organization's environments, then enables and registers every one that is
  * not already enabled and registered. A re-connect (a key rotation over an
  * existing connection) changes no flag and no opt-out: it runs the sync
@@ -958,18 +1015,21 @@ export async function setupEnvironments(deps: ReplicasDeps, actor: ReplicasActor
     } catch {
       discovery = { status: "failed", environments: [] };
     }
-    const all = await withReplicasLock(deps, actor, async (tx) => {
+    const { all, targets } = await withReplicasLock(deps, actor, async (tx) => {
       await requireAdmin(tx, actor);
-      return allEnvironmentsFlag(tx, actor.workspaceId);
+      const all = await allEnvironmentsFlag(tx, actor.workspaceId);
+      const targets = all ? await defaultPolicies(tx, actor.workspaceId, await connectedOrganization(tx, actor.workspaceId), "sync") : [];
+      return { all, targets: targets.map((policy) => policy.environment_id) };
     });
-    const fresh = discovery.environments.filter((item) => item.status === "discovered").map((item) => item.environmentId);
-    const environments = all ? await enableDefaults(deps, actor, { defaults: "sync", fresh }, fresh) : [];
+    const environments = all ? await enableDefaults(deps, actor, { defaults: "sync" }, targets) : [];
     return { discovery, allEnvironments: all, environments };
   }
   await withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
     await connectedOrganization(tx, actor.workspaceId);
     await setAllEnvironments(tx, actor.workspaceId, true);
+    // A fresh connect starts clean: earlier opt-outs do not survive a disconnect.
+    await clearOptOut(tx, actor.workspaceId, "all");
     await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
       actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.all_enabled", target: actor.workspaceId });
   });
@@ -985,9 +1045,10 @@ export async function setupEnvironments(deps: ReplicasDeps, actor: ReplicasActor
 }
 
 /**
- * Rediscovers environments. Under the all-environments flag, newly
- * discovered ones are enabled and registered and enabled ones without a
- * registration are retried; opted-out environments stay disabled.
+ * Rediscovers environments. Under the all-environments flag, every disabled
+ * environment that is not opted out (newly discovered, or a default enable
+ * that failed or was refused earlier) is enabled and registered and enabled
+ * ones without a registration are retried; opted-out environments stay disabled.
  */
 export async function syncEnvironments(deps: ReplicasDeps, actor: ReplicasActor) {
   const discovery = await discoverEnvironments(deps, actor);
@@ -995,8 +1056,7 @@ export async function syncEnvironments(deps: ReplicasDeps, actor: ReplicasActor)
     await requireAdmin(tx, actor);
     return allEnvironmentsFlag(tx, actor.workspaceId);
   });
-  const fresh = discovery.environments.filter((item) => item.status === "discovered").map((item) => item.environmentId);
-  const environments = all ? await enableSelected(deps, actor, { defaults: "sync", fresh }) : [];
+  const environments = all ? await enableSelected(deps, actor, { defaults: "sync" }) : [];
   return { discovery, allEnvironments: all, environments };
 }
 

@@ -568,7 +568,7 @@ async function revokeInTx(tx: SqlExecutor, where: string, params: unknown[]): Pr
  * identity, its participant row, then the replica's compute (slept, kept with
  * its history). Clears every stored secret and marks cleanup complete.
  */
-async function retireRemote(deps: ReplicasDeps, tx: SqlExecutor, start: SpawnRow, actor: ReplicasActor | null) {
+export async function retireRemote(deps: ReplicasDeps, tx: SqlExecutor, start: SpawnRow, actor: ReplicasActor | null) {
   let row = start;
   if (row.state === "creating" && !row.replica_id) {
     throw new ReplicasError("Recover the unknown create before release, so its compute can be stopped safely.", 409);

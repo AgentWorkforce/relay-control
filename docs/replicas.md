@@ -163,7 +163,10 @@ Each call is admitted in this order:
    source `environment_identity`, `replica_id` = the Replicas workspace id and
    a Relay identity named `replicas-<16 hex>`. Later calls reuse it. A replica
    already bound through a per-launch spawn, or through another Control
-   workspace, answers 409 `replica_already_bound`.
+   workspace, answers 409 `replica_already_bound`. A Relay agent left behind
+   by this replica's own released binding (its cleanup failed after a
+   disable, principal or mapping change) is not a conflict: enrolment retries
+   its cleanup first and answers a retryable 503 while that keeps failing.
 
 The server offers the same three tools as the per-launch server:
 `list_relay_agents`, `check_relay_inbox` and `send_relay_message`. Messages are
@@ -192,19 +195,20 @@ semantics below. The connect response reports `environmentDiscovery`
 (the discovery report per environment) and `environmentSetup:
 {allEnvironments, environments}` (the enable and registration status per
 environment). Setup failures are reported there and never fail the connect:
-the connection is saved and a sync or enable retries them. Admins opt out
-per environment. Enabling an environment never admits a replica on its own:
+the connection is saved and a sync, a re-connect or an enable retries them
+(a failed or refused default enable is not an opt-out). Admins opt out per
+environment. Enabling an environment never admits a replica on its own:
 each call still needs a mapped creator or the VM principal (see the
 admission order above).
 
 | Route | Purpose |
 | --- | --- |
-| `GET /api/v1/workspaces/{ws}/replicas/environment-policies` | Policies: enabled, registration status, creator mapping with masked email hints, pending creators, binding counts |
+| `GET /api/v1/workspaces/{ws}/replicas/environment-policies` | Policies: enabled, opted out, registration status, creator mapping with masked email hints, pending creators, binding counts |
 | `PUT /api/v1/workspaces/{ws}/replicas/environments/{id}` | `{enabled?, creators?: [{creatorId, userId}]}`; creators replace the list and must be current members |
 | `PUT /api/v1/workspaces/{ws}/replicas/environment-principal` | `{userId: <member id> \| null}`: set or clear the VM principal; answers the policy view |
-| `POST /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}` (re-enable those) or `{all: true}` (turn the default back on and re-enable every environment, including opted-out ones), optionally with `principalUserId`: set the principal, then enable and register the entry |
+| `POST /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}` (re-enable those) or `{all: true}` (turn the default back on and clear every opt-out and re-enable every environment), optionally with `principalUserId`: set the principal, then enable and register the entry |
 | `DELETE /api/v1/workspaces/{ws}/replicas/environment-mcp` | `{environmentIds}`: opt those environments out; `{all: true}`: turn the default off for the workspace and disable every environment. Disables, then removes the entry |
-| `POST /api/v1/workspaces/{ws}/replicas/environments/sync` | Rediscover; while the default is on, newly found environments are enabled and registered and enabled ones without an entry are registered again. Opted-out environments stay disabled |
+| `POST /api/v1/workspaces/{ws}/replicas/environments/sync` | Rediscover; while the default is on, every disabled environment that is not opted out (newly found, or a default enable that failed or was refused) is enabled and registered and enabled ones without an entry are registered again. Opted-out environments stay disabled |
 
 `GET .../environments` stays the live list of environments the key can use
 (`{environments: [{id, name}]}`). Discovery lists every environment of the
@@ -213,12 +217,15 @@ appear later are picked up by the next sync (`POST .../environments/sync`);
 nothing polls the provider automatically.
 
 An admin opts one environment out with `PUT .../environments/{id}` and
-`enabled: false`, or `DELETE .../environment-mcp` with `{environmentIds}`. An
-opted-out environment stays disabled across syncs until an admin enables it
-again. `DELETE .../environment-mcp` with `{all: true}` turns the default off
+`enabled: false`, or `DELETE .../environment-mcp` with `{environmentIds}`;
+the policy view shows it as `optedOut`. An opted-out environment stays
+disabled across syncs and re-connects until an admin enables it again (`PUT`
+with `enabled: true` or `POST .../environment-mcp`), which clears the
+opt-out. `DELETE .../environment-mcp` with `{all: true}` turns the default off
 for the workspace: every environment is disabled and sync enables nothing
-new. `POST .../environment-mcp` with `{all: true}` turns it back on and
-re-enables every environment. The policy view reports the default as
+new, but no environment is opted out. `POST .../environment-mcp` with
+`{all: true}` turns it back on, clears every opt-out and re-enables every
+environment. The policy view reports the default as
 `allEnvironments`. A key rotation (re-connect) changes neither the default nor
 any opt-out. Disconnecting Replicas turns the default off; connecting again
 after the disconnect turns it back on and enables every environment again.

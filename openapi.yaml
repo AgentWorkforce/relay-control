@@ -7901,14 +7901,14 @@ paths:
         - $ref: "#/components/parameters/WorkspaceId"
       responses:
         "200":
-          description: "{mcpUrl, organizationId, allEnvironments, principal: {userId, member} | null, organizationShared, environments: [{environmentId, name, enabled, status: disabled|enabled|registered, stale, registeredMcpId, bindings, creators: [{creatorId, userId, emailHint}], pendingCreators: [{creatorId, emailHint, lastSeenAt, count}]}]}; email hints are masked; principal is the workspace VM principal (member false: it left the organization and admits nobody); organizationShared is true when the same Replicas organization is connected in another workspace (nothing is admitted or enabled then); pendingCreators are creators seen without a mapping (admitted as the principal when one is set, refused otherwise), newest first, at most 50 per environment"
+          description: "{mcpUrl, organizationId, allEnvironments, principal: {userId, member} | null, organizationShared, environments: [{environmentId, name, enabled, optedOut, status: disabled|enabled|registered, stale, registeredMcpId, bindings, creators: [{creatorId, userId, emailHint}], pendingCreators: [{creatorId, emailHint, lastSeenAt, count}]}]}; email hints are masked; optedOut is true when an admin opted the environment out (sync and a re-connect leave it disabled until an admin enables it; POST .../environment-mcp {all: true} clears every opt-out); principal is the workspace VM principal (member false: it left the organization and admits nobody); organizationShared is true when the same Replicas organization is connected in another workspace (nothing is admitted or enabled then); pendingCreators are creators seen without a mapping (admitted as the principal when one is set, refused otherwise), newest first, at most 50 per environment"
         "403":
           description: Not a current owner or admin, or not a person credential
   /api/v1/workspaces/{workspaceId}/replicas/environments/sync:
     post:
       operationId: syncReplicasEnvironments
       tags: [replicas]
-      summary: "Rediscover the key's environments. While the all-environments default is on (it is on after connect; DELETE .../environment-mcp {all: true} turns it off), newly discovered environments are enabled and registered, and enabled environments without a registered entry are registered again. Environments an admin opted out stay disabled. Nothing polls the provider automatically. Owner/admin person only."
+      summary: "Rediscover the key's environments. While the all-environments default is on (it is on after connect; DELETE .../environment-mcp {all: true} turns it off), every disabled environment that is not opted out (newly discovered, or a default enable that failed or was refused earlier) is enabled and registered, and enabled environments without a registered entry are registered again. Environments an admin opted out stay disabled. Nothing polls the provider automatically. Owner/admin person only."
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
@@ -7985,7 +7985,7 @@ paths:
     post:
       operationId: registerReplicasEnvironmentMcp
       tags: [replicas]
-      summary: "Enable the selected environments and register the agent-relay-replica HTTP MCP entry ({name, transport: http, config: {url, headers: {}, auth: {type: workspace_identity, audience: url}}}) in each. Every environment gets Relay by default once Replicas is connected; {environmentIds} re-enables the chosen ones, and {all: true} turns the all-environments default back on and re-enables every environment, including opted-out ones (environments discovered later are enabled on sync). An optional principalUserId sets the VM principal in the same transaction before enabling. Registration reads the environment's entries first and reuses a matching one, never overwrites a duplicated or different same-name entry, and reads the entry back after a create. Owner/admin person only."
+      summary: "Enable the selected environments and register the agent-relay-replica HTTP MCP entry ({name, transport: http, config: {url, headers: {}, auth: {type: workspace_identity, audience: url}}}) in each. Every environment gets Relay by default once Replicas is connected; {environmentIds} re-enables the chosen ones, and {all: true} turns the all-environments default back on, clears every opt-out and re-enables every environment (environments discovered later are enabled on sync). An optional principalUserId sets the VM principal in the same transaction before enabling. Registration reads the environment's entries first and reuses a matching one, never overwrites a duplicated or different same-name entry, and reads the entry back after a create. Owner/admin person only."
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       requestBody:
         required: true
@@ -8005,7 +8005,7 @@ paths:
     delete:
       operationId: removeReplicasEnvironmentMcp
       tags: [replicas]
-      summary: "Opt out: {environmentIds} disables those environments and they stay disabled across syncs until re-enabled; {all: true} turns the all-environments default off for the workspace and disables every environment. Then removes the registered entry from each (best effort; a missing entry counts as removed). The environments' enrolled bindings in this workspace are released without a tombstone and enrol again once the environment is enabled. Owner/admin person only."
+      summary: "Opt out: {environmentIds} disables those environments and marks them opted out, so they stay disabled across syncs and re-connects until re-enabled; {all: true} turns the all-environments default off for the workspace and disables every environment without opting any out. Then removes the registered entry from each (best effort; a missing entry counts as removed). The environments' enrolled bindings in this workspace are released without a tombstone and enrol again once the environment is enabled. Owner/admin person only."
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       requestBody:
         required: true
@@ -8045,7 +8045,7 @@ paths:
         "405":
           description: Only POST is served (stateless, no SSE stream)
         "409":
-          description: replica_already_bound (bound through a per-launch spawn or another workspace)
+          description: replica_already_bound (bound through a per-launch spawn or another workspace; a leftover Relay agent of this replica's own released binding is cleaned up instead, answering 503 while that cleanup fails)
         "413":
           description: Request is too large
         "429":
