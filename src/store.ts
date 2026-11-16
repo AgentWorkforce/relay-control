@@ -7,6 +7,7 @@ import { consentAttemptKey, type ConsentAttempt } from "./auth/desktop-login.js"
 import type { Database, SqlExecutor } from "./database.js";
 import { revokeMcpOAuthGrantRows } from "./mcp/oauth/store.js";
 import { lockRelaycastWorkspace } from "./relaycast-workspace-lock.js";
+import { retireWorkspaceIdentitiesInTx } from "./replicas/service.js";
 import { DASHBOARD_DEVICE_CLIENT, isDeviceReservedClientName } from "./reserved-client-names.js";
 import {
   lockIdentity,
@@ -581,14 +582,19 @@ export class ControlPlaneStore {
    * sessions, tokens, credentials, flows and workspace-scoped audit events;
    * the deletion itself is recorded at organization level so it outlives them.
    * Factory connections/bindings and live MCP OAuth grants or pending cleanup
-   * restrict deletion until teardown finishes. The organization's rows are locked so two concurrent deletes cannot
-   * both pass the last-workspace check. The Relaycast workspace is not touched.
+   * restrict deletion until teardown finishes. Replicas environment-identity
+   * bindings are tombstoned and retired by the deletion; Replicas launch and
+   * bind records still restrict it. The organization's rows are locked so two concurrent deletes cannot
+   * both pass the last-workspace check. The Relaycast workspace is not touched. With queueFlowsDelete, the
+   * relayfile-control delete is queued in the same transaction (src/flows-workspace-delete.ts).
    */
   async deleteWorkspace(input: {
     organizationId: string;
     workspaceId: string;
     allowLast: boolean;
     actor: AuditActor;
+    /** Queue the same delete for relayfile-control (config.flowsWorkspaceDelete). */
+    queueFlowsDelete?: boolean;
   }): Promise<"deleted" | "not_found" | "last_workspace" | "in_use"> {
     try {
       return await this.database.transaction(async (tx) => {
@@ -609,10 +615,18 @@ export class ControlPlaneStore {
           LIMIT 1`, [input.organizationId,input.workspaceId]);
         if (oauth.rows.length) return "in_use";
         if (!await removeCompletedWorkspaceCapyInTx(tx,input.organizationId,input.workspaceId)) return "in_use";
+        // Environment identities are tombstoned (they stay refused after the
+        // workspace is gone) and retired; launch/bind rows still restrict.
+        await retireWorkspaceIdentitiesInTx(tx, input.workspaceId);
         await tx.query("DELETE FROM workspaces WHERE id = $1 AND organization_id = $2", [
           input.workspaceId,
           input.organizationId,
         ]);
+        if (input.queueFlowsDelete) {
+          // Same transaction: the workspace is never gone here while its Flows data is unowed there.
+          await tx.query(`INSERT INTO flows_workspace_deletions (workspace_id, organization_id) VALUES ($1, $2)
+            ON CONFLICT (workspace_id) DO NOTHING`, [input.workspaceId, input.organizationId]);
+        }
         await recordAudit(tx, {
           organizationId: input.organizationId,
           actor: input.actor,

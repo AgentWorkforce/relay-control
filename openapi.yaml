@@ -3102,7 +3102,7 @@ paths:
                   description: Required for Devin (Cognition organization ID).
       responses:
         "200":
-          description: Validated connection hint and timestamp, never the key
+          description: "{connection, environmentDiscovery?, environmentSetup?}: the validated connection hint and timestamp, never the key. For replicas (when SELFHOST_REPLICAS_ENABLED is on), every environment of the connected organization gets Relay by default, including ones discovered later on sync. A fresh connect (none before it, or after a disconnect) turns the default on and enables and registers every environment; a re-connect over an existing connection (key rotation) keeps the default and every opt-out and runs the sync semantics (environmentSetup.allEnvironments is the current default). environmentDiscovery is the discovery report ({status: ok|partial|failed, environments: [{environmentId, name, status: discovered|known}]}) and environmentSetup is {allEnvironments, environments: [per-environment enable and registration result, as POST .../replicas/environment-mcp]}. Setup failures are reported there and never fail the connect; the connection is saved. When the provider organization is connected in another workspace nothing is enabled and each result is organization_shared. Admins opt out per environment."
         "400":
           description: Invalid key, organization or field
         "403":
@@ -7986,6 +7986,167 @@ paths:
           description: Replicas rate limit reached
         "502":
           description: Provider failed; no provider body is returned
+  /api/v1/workspaces/{workspaceId}/replicas/environment-policies:
+    get:
+      operationId: listReplicasEnvironmentPolicies
+      tags: [replicas]
+      summary: Environment-level MCP policies for this workspace (stored; no provider call). Owner/admin person only.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{mcpUrl, organizationId, allEnvironments, principal: {userId, member} | null, organizationShared, environments: [{environmentId, name, enabled, optedOut, status: disabled|enabled|registered, stale, registeredMcpId, bindings, creators: [{creatorId, userId, emailHint}], pendingCreators: [{creatorId, emailHint, lastSeenAt, count}]}]}; email hints are masked; optedOut is true when an admin opted the environment out (sync and a re-connect leave it disabled until an admin enables it; POST .../environment-mcp {all: true} clears every opt-out); principal is the workspace VM principal (member false: it left the organization and admits nobody); organizationShared is true when the same Replicas organization is connected in another workspace (nothing is admitted or enabled then); pendingCreators are creators seen without a mapping (admitted as the principal when one is set, refused otherwise), newest first, at most 50 per environment"
+        "403":
+          description: Not a current owner or admin, or not a person credential
+  /api/v1/workspaces/{workspaceId}/replicas/environments/sync:
+    post:
+      operationId: syncReplicasEnvironments
+      tags: [replicas]
+      summary: "Rediscover the key's environments. While the all-environments default is on (it is on after connect; DELETE .../environment-mcp {all: true} turns it off), every disabled environment that is not opted out (newly discovered, or a default enable that failed or was refused earlier) is enabled and registered, and enabled environments without a registered entry are registered again. Environments an admin opted out stay disabled. Nothing polls the provider automatically. Owner/admin person only."
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{discovery: {status: ok|partial|failed, environments}, allEnvironments, environments: [per-environment registration result]}"
+        "409":
+          description: Replicas is not connected
+  /api/v1/workspaces/{workspaceId}/replicas/environments/{environmentId}:
+    put:
+      operationId: updateReplicasEnvironmentPolicy
+      tags: [replicas]
+      summary: Enable or disable one discovered environment and replace its creator mapping. Creators must be current members of the organization; mapping a creator removes its pending entry and releases (no tombstone) that creator's bindings that act as the principal or as another person, so they enrol again as the mapped member. Removing a mapping releases nothing. Disabling releases the environment's enrolled bindings in this workspace without a tombstone; they enrol again once the environment is enabled. Owner/admin person only.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - { name: environmentId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                enabled: { type: boolean }
+                creators:
+                  type: array
+                  maxItems: 100
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [creatorId, userId]
+                    properties:
+                      creatorId: { type: string, maxLength: 256 }
+                      userId: { type: string, format: uuid }
+      responses:
+        "200":
+          description: "{environment}"
+        "400":
+          description: Invalid body, duplicate creator, or a creator that is not a current member
+        "404":
+          description: Environment not discovered for this workspace
+        "409":
+          description: Enabled in another workspace, the policy belongs to a previous Replicas organization, or "This Replicas organization is connected in another workspace."
+  /api/v1/workspaces/{workspaceId}/replicas/environment-principal:
+    put:
+      operationId: setReplicasEnvironmentPrincipal
+      tags: [replicas]
+      summary: Set or clear the workspace VM principal, the current member a replica acts as when its token has no creator or an unmapped one. It is never derived from an email or the owner. A change or clear releases every live binding acting as the principal (no tombstone); they enrol again under the new principal, or are refused when it was cleared. Audited as replicas.environment.principal_updated. Owner/admin person only.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [userId]
+              properties:
+                userId: { type: [string, "null"], format: uuid }
+      responses:
+        "200":
+          description: The policy view (as GET .../environment-policies)
+        "400":
+          description: Invalid body, or the user is not a current member of the organization
+        "403":
+          description: Not a current owner or admin, or not a person credential
+  /api/v1/workspaces/{workspaceId}/replicas/environment-mcp:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: registerReplicasEnvironmentMcp
+      tags: [replicas]
+      summary: "Enable the selected environments and register the agent-relay-replica HTTP MCP entry ({name, transport: http, config: {url, headers: {}, auth: {type: workspace_identity, audience: url}}}) in each. Every environment gets Relay by default once Replicas is connected; {environmentIds} re-enables the chosen ones, and {all: true} turns the all-environments default back on, clears every opt-out and re-enables every environment (environments discovered later are enabled on sync). An optional principalUserId sets the VM principal in the same transaction before enabling. Registration reads the environment's entries first and reuses a matching one, never overwrites a duplicated or different same-name entry, and reads the entry back after a create. Owner/admin person only."
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, additionalProperties: false, required: [all], properties: { all: { const: true }, principalUserId: { type: string, format: uuid } } }
+                - { type: object, additionalProperties: false, required: [environmentIds], properties: { environmentIds: { type: array, minItems: 1, maxItems: 100, items: { type: string, format: uuid } }, principalUserId: { type: string, format: uuid } } }
+      responses:
+        "200":
+          description: "{discovery?, environments: [{environmentId, status: registered|registration_failed|registration_unconfirmed|not_found|enabled_elsewhere|organization_shared|stale_connection|disabled, retryable?}]}. registration_failed with retryable false: two or more agent-relay-replica entries, or one with another transport or config, exist and are left untouched. registration_failed with retryable true: the entries could not be read or the provider rejected the create (400, 401, 402, 403, 404, 422, 429). registration_unconfirmed: the create was sent but the entry could not be read back; a retry reconciles it. organization_shared (retryable false): the Replicas organization is connected in another workspace."
+        "400":
+          description: Invalid selection, or principalUserId is not a current member
+        "409":
+          description: Replicas is not connected
+    delete:
+      operationId: removeReplicasEnvironmentMcp
+      tags: [replicas]
+      summary: "Opt out: {environmentIds} disables those environments and marks them opted out, so they stay disabled across syncs and re-connects until re-enabled; {all: true} turns the all-environments default off for the workspace and disables every environment without opting any out. Then removes the registered entry from each (best effort; a missing entry counts as removed). The environments' enrolled bindings in this workspace are released without a tombstone and enrol again once the environment is enabled. Owner/admin person only."
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, required: [all], properties: { all: { const: true } } }
+                - { type: object, required: [environmentIds], properties: { environmentIds: { type: array, minItems: 1, maxItems: 100, items: { type: string, format: uuid } } } }
+      responses:
+        "200":
+          description: "{environments: [{environmentId, status: disabled|removal_failed, retryable?}]}"
+        "400":
+          description: Invalid selection
+  /api/v1/replicas/mcp:
+    post:
+      operationId: replicasEnvironmentMcp
+      tags: [replicas]
+      summary: "Environment-level Agent Relay MCP for Replicas workspaces. Stateless streamable HTTP (JSON-RPC), pull-only, not an OAuth resource. Admission order: valid workspace_identity token with an expiry at most one hour ahead (else 401 replica_identity_invalid); not released (else 403 replica_released); the token's organization connected in no other workspace (else 403 organization_shared) and its environment enabled (else 403 replica_environment_not_enabled); a creator mapped to a current member acts as that member, otherwise (null or unmapped creator) the workspace's explicit VM principal when set and a current member, re-read on every call (else 403 replica_creator_not_allowed); then the replica's Relay identity is resolved or enrolled once. Tools: list_relay_agents, check_relay_inbox, send_relay_message. Future wake-up delivery will answer 409 replica_chat_selection_required when no chat is selected. 404 before auth when SELFHOST_REPLICAS_ENABLED is off. Rate limited per source IP (120 per minute). Only refusals that name a Control workspace are audited."
+      security: [{ replicasWorkspaceIdentity: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: JSON-RPC 2.0 MCP request }
+      responses:
+        "200":
+          description: JSON-RPC result
+        "400":
+          description: Invalid JSON
+        "401":
+          description: replica_identity_invalid (WWW-Authenticate Bearer error="invalid_token")
+        "403":
+          description: replica_released, organization_shared, replica_environment_not_enabled or replica_creator_not_allowed
+        "404":
+          description: Feature off
+        "405":
+          description: Only POST is served (stateless, no SSE stream)
+        "409":
+          description: replica_already_bound (bound through a per-launch spawn or another workspace; a leftover Relay agent of this replica's own released binding is cleaned up instead, answering 503 while that cleanup fails)
+        "413":
+          description: Request is too large
+        "429":
+          description: JSON-RPC -32000 rate_limited, with Retry-After
+        "503":
+          description: replica_identity_unavailable (issuer discovery or JWKS unreadable; no WWW-Authenticate) or relay unavailable
   /api/v1/workspaces/{workspaceId}/replicas/spawns:
     post:
       operationId: spawnReplica
@@ -8369,6 +8530,11 @@ components:
       type: http
       scheme: bearer
       description: Per-launch capability installed in one replica through the provider exec API; stored only encrypted, never returned, logged or audited, revoked on release, disconnect or member removal.
+    replicasWorkspaceIdentity:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Replicas workspace_identity token (RS256) from SELFHOST_REPLICAS_IDENTITY_ISSUER with this endpoint's URL as audience. Never a person credential.
     ampInternalSecret:
       type: http
       scheme: bearer

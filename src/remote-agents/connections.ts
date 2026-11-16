@@ -89,6 +89,14 @@ export type RemoteAgentConnectionOptions = {
    * (the key is needed to sleep compute). Throws to keep the connection.
    */
   replicasCleanup?: (actor: ConnectionActor) => Promise<void>;
+  /**
+   * After a Replicas connect. A fresh connect turns the all-environments
+   * default on, discovers the account's environments, enables them and
+   * registers their MCP entries; a re-connect over an existing connection
+   * (`reconnect`, a key rotation) keeps the flag and every opt-out and runs
+   * the sync semantics. Its failure never fails the connect.
+   */
+  replicasSetup?: (actor: ConnectionActor, options: { reconnect: boolean }) => Promise<{ discovery: unknown; allEnvironments: boolean; environments: unknown[] }>;
 };
 
 export class RemoteAgentConnections {
@@ -136,6 +144,13 @@ export class RemoteAgentConnections {
   }
 
   async connect(actor: ConnectionActor, provider: RemoteAgentId, input: Record<string, unknown>): Promise<RemoteConnection> {
+    return (await this.connectReporting(actor, provider, input)).connection;
+  }
+
+  /** connect, also reporting whether it replaced a connection that already existed (a re-connect). */
+  async connectReporting(actor: ConnectionActor, provider: RemoteAgentId, input: Record<string, unknown>): Promise<{
+    connection: RemoteConnection; replaced: boolean;
+  }> {
     const prior = await this.authorized(actor, async tx => {
       const existing = await tx.query<{ key_ciphertext: string }>(
         "SELECT key_ciphertext FROM remote_agent_connections WHERE workspace_id=$1 AND provider=$2", [actor.workspaceId, provider],
@@ -235,8 +250,30 @@ export class RemoteAgentConnections {
       );
       await recordAudit(tx, { workspaceId: actor.workspaceId, organizationId: actor.organizationId,
         actor: { kind: "user", userId: actor.userId }, action: "remote_agent.connect", target: provider });
-      return view(saved.rows[0]!);
+      return { connection: view(saved.rows[0]!), replaced: existing.rows.length > 0 };
     });
+  }
+
+  /**
+   * Environment setup after a Replicas connect: the discovery report (or
+   * `{status: "failed"}`) and the per-environment enable results. Never
+   * throws; when the setup could not start, the default is reported as not
+   * confirmed (allEnvironments false) and a sync or enable retries it.
+   */
+  async replicasSetup(actor: ConnectionActor, options: { reconnect: boolean }): Promise<{
+    environmentDiscovery: unknown; environmentSetup: { allEnvironments: boolean; environments: unknown[] };
+    provisioning_error?: ReplicasProvisioningError;
+  } | undefined> {
+    if (!this.options.replicasSetup) return undefined;
+    let report: { environmentDiscovery: unknown; environmentSetup: { allEnvironments: boolean; environments: unknown[] } };
+    try {
+      const { discovery, allEnvironments, environments } = await this.options.replicasSetup(actor, options);
+      report = { environmentDiscovery: discovery, environmentSetup: { allEnvironments, environments } };
+    } catch {
+      report = { environmentDiscovery: { status: "failed", environments: [] }, environmentSetup: { allEnvironments: false, environments: [] } };
+    }
+    const provisioningError = replicasProvisioningError(report.environmentDiscovery, report.environmentSetup.environments);
+    return provisioningError ? { ...report, provisioning_error: provisioningError } : report;
   }
 
   async disconnect(actor: ConnectionActor, provider: RemoteAgentId): Promise<void> {
@@ -258,4 +295,33 @@ export class RemoteAgentConnections {
     );
     return result.rows[0] ? decryptSecret(result.rows[0].key_ciphertext, this.keyring) : null;
   }
+}
+
+export type ReplicasProvisioningError = {
+  code: "replica_environment_setup_failed";
+  stage: "environment_setup";
+  retryable: boolean;
+  environments: string[];
+};
+
+/** Environment-setup statuses that mean an environment was not provisioned. */
+const FAILED_SETUP = new Set(["registration_failed", "registration_unconfirmed", "enabled_elsewhere", "organization_shared", "stale_connection"]);
+
+/**
+ * The connect response's provisioning_error: set when discovery failed or any
+ * environment ended in a failing status. The connect itself still succeeds
+ * (200) and the connection is kept. A failed discovery is retried by sync,
+ * so it counts as retryable.
+ */
+export function replicasProvisioningError(discovery: unknown, environments: unknown[]): ReplicasProvisioningError | undefined {
+  const discoveryFailed = (discovery as { status?: unknown } | null)?.status === "failed";
+  const failing = environments.filter((item): item is { environmentId: string; status: string; retryable?: boolean } =>
+    !!item && typeof item === "object" && FAILED_SETUP.has(String((item as { status?: unknown }).status)));
+  if (!discoveryFailed && !failing.length) return undefined;
+  return {
+    code: "replica_environment_setup_failed",
+    stage: "environment_setup",
+    retryable: discoveryFailed || failing.some((item) => item.retryable === true),
+    environments: failing.map((item) => item.environmentId),
+  };
 }
