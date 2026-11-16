@@ -119,7 +119,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   // Plan has no target, so the pre-0064 unbound-workspace gate cannot apply:
   // unbound workspaces (a2 no key, a3 no rw_) count as importable.
   expectedPlan.workspaces = { imported: 5, skipped: { workspace_being_deleted: 1 } };
-  expectedPlan.coding_agent_credentials = { imported: 3, skipped: { secret_in_cloud_credential_store: 16 } };
+  expectedPlan.coding_agent_credentials = { imported: 4, skipped: { secret_in_cloud_credential_store: 17 } };
   expectedPlan.github_app_installations = { imported: 1, skipped: {} };
   expectedPlan.staff_read_grants = { imported: 2, skipped: {} };
   expectedPlan.github_app_connections = {
@@ -295,7 +295,7 @@ test("cloud import: current target (main + proposed 0061) keeps rw_, slugs, Hist
   assert.equal(report.warnings.workspace_imported_unbound, 2);
   assert.equal(report.tables.person_identities.skipped.workspace_unbound, 1);
   assert.equal(report.tables.fleet_node_owners.skipped.workspace_unbound, 1);
-  assert.equal(report.tables.coding_agent_credentials.imported, 3, "relay_managed rows on unbound workspaces import");
+  assert.equal(report.tables.coding_agent_credentials.imported, 4, "relay_managed rows on unbound workspaces import");
   const workspaces = (await target.query<{ id: string; cloud_relay_workspace_id: string | null; slug: string; relayhistory_origin: string | null }>(
     "SELECT id, cloud_relay_workspace_id, slug, relayhistory_origin FROM workspaces WHERE relaycast_workspace_id IS NOT NULL ORDER BY id")).rows;
   assert.deepEqual(workspaces, [
@@ -316,7 +316,12 @@ test("cloud import: current target (main + proposed 0061) keeps rw_, slugs, Hist
     { id: id(0x802), is_active: false, harness_active: false, secret_ciphertext: null },
     // On a2, which now imports unbound (0064); Cloud had it unselected.
     { id: id(0x804), is_active: false, harness_active: false, secret_ciphertext: null },
+    // Stored as the alias "claude"; imported as anthropic, the only one in b1.
+    { id: id(0x816), is_active: true, harness_active: false, secret_ciphertext: null },
   ]);
+  const alias = (await target.query<{ model_provider: string }>(
+    "SELECT model_provider FROM coding_agent_credentials WHERE id = $1", [id(0x816)])).rows[0]!;
+  assert.equal(alias.model_provider, "anthropic");
   assert.equal(report.warnings.coding_agent_active_demoted, 1);
   const github = (await target.query<{ id: string; installation_id: string; github_app_organization_id: string; credentials_ciphertext: string; created_by_user_id: string }>(
     "SELECT id, installation_id, github_app_organization_id, credentials_ciphertext, created_by_user_id FROM integration_connections WHERE auth_mode = 'github_app'")).rows;
