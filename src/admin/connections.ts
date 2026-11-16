@@ -841,11 +841,17 @@ export class ConnectionStore {
     return result.rows.map((row) => this.toRecord(row));
   }
 
-  private readonly authorizationQueue = new AuthorizationProbeQueue();
+  private readonly authorizationQueue = new AuthorizationProbeQueue({concurrency:8, networkMs:5_000, queueMs:5_000, maxPending:64});
+  private readonly authorizationCache = new Map<string, {expires:number; health:AuthorizationHealth}>();
+  private readonly authorizationWarnings = new Map<string, number>();
 
   /** Live proof for management listings. Runtime/env callers keep the plain list contract. */
-  async listHealth(workspaceId: string, actor: AuditActor): Promise<ConnectionRecord[]> {
+  async listHealth(workspaceId: string, actor: AuditActor, options: {refreshAuthorization?:boolean} = {}): Promise<ConnectionRecord[]> {
     return Promise.all((await this.list(workspaceId)).map(async record => {
+      const cacheKey = JSON.stringify([workspaceId, record.connectionId, record.version]);
+      const cached = this.authorizationCache.get(cacheKey);
+      if (!options.refreshAuthorization && cached && cached.expires > Date.now()) return {...record,...cached.health,authMode:record.authMode};
+      const started = Date.now();
       let checkedVersion = record.version;
       const health = await this.authorizationQueue.probe(
         JSON.stringify([workspaceId, record.connectionId, record.version]),
@@ -887,6 +893,17 @@ export class ConnectionStore {
       if (!current || current.connectionId !== record.connectionId || current.version !== checkedVersion) {
         return {...(current ?? record),authorizationStatus:"unknown" as const,
           authorizationReason:"connection_changed",authorizationCheckedAt:new Date().toISOString(),upstreamConnected:null};
+      }
+      if (health.authorizationStatus !== "unknown") {
+        if (this.authorizationCache.size >= 512) this.authorizationCache.delete(this.authorizationCache.keys().next().value!);
+        this.authorizationCache.set(JSON.stringify([workspaceId,current.connectionId,current.version]), {expires:Date.now()+30_000,health});
+      } else {
+        const key = JSON.stringify([record.provider,health.authorizationReason]);
+        if ((this.authorizationWarnings.get(key) ?? 0) <= Date.now()) {
+          if (this.authorizationWarnings.size >= 128) this.authorizationWarnings.delete(this.authorizationWarnings.keys().next().value!);
+          this.authorizationWarnings.set(key,Date.now()+60_000);
+          console.warn("[connection-authorization]",{backend:"native",provider:record.provider,reason:health.authorizationReason,durationMs:Date.now()-started});
+        }
       }
       return {...current,...health,authMode:current.authMode};
     }));

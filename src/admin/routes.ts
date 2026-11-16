@@ -518,7 +518,7 @@ export function createAdminModule(input: {
     // Provider connections.
     if (rest === "integrations" && method === "GET") {
       const access = await helpers.workspaceAccess(request, workspaceId, false);
-      const list = await connections.listHealth(access.workspace.id, userActor(access));
+      const list = await connections.listHealth(access.workspace.id, userActor(access), {refreshAuthorization:url.searchParams.get("refreshAuthorization") === "true"});
       // Bare array, as hosted (relayfile CLI `integration list` parses this).
       json(response, 200, list.map((connection) =>
         listEntry(providers.get(connection.provider), connection)
@@ -530,7 +530,7 @@ export function createAdminModule(input: {
       const access = await helpers.workspaceAccess(request, workspaceId, false);
       const [apps, list] = await Promise.all([
         connections.listOAuthApps(access.workspace.id),
-        connections.listHealth(access.workspace.id, userActor(access)),
+        connections.listHealth(access.workspace.id, userActor(access), {refreshAuthorization:url.searchParams.get("refreshAuthorization") === "true"}),
       ]);
       json(response, 200, {
         redirectUri: config.oauthRedirectUrl,

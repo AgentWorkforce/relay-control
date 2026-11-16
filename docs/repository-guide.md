@@ -983,3 +983,5 @@ from the stored connection status. A saved credential alone is not verification.
 Refresh retries unknown checks; rate limits, insufficient verification scopes,
 unsupported providers and outages remain unknown rather than appearing revoked.
 The provider checks and bounded scheduler come from `@relayfile/connection-health`.
+
+Authorization checks cache completed proofs for 30 seconds, keyed by workspace and credential revision. Explicit Refresh (`refreshAuthorization=true` on management GETs) bypasses completed proofs; concurrent reads still share in-flight work. Up to eight checks run at once, with at most five seconds queued and five seconds active (ten seconds total for authorization checks). Overflow returns unknown/checks_busy. Unknown results are not cached and emit a sanitized, per-provider/reason warning at most once a minute. Runtime/environment listings keep their existing readiness contract.
