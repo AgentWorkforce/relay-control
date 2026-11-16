@@ -22,6 +22,8 @@ import { relaycastProvisioner, startBootstrap } from "./identity/bootstrap.js";
 import { FEATURES, gateCredentialVerifier, loadSelectedFeatures } from "./features.js";
 import { loadAmpConfig } from "./amp/config.js";
 import { createAmpModule } from "./amp/module.js";
+import { loadReplicasConfig } from "./replicas/config.js";
+import { createReplicasModule } from "./replicas/module.js";
 import { CapyBindings } from "./capy/bindings.js";
 import { CapyCleanup,capyCleanupFetch } from "./capy/cleanup.js";
 import { PostgresEventsShimStore } from "./events-shim/store.js";
@@ -49,14 +51,16 @@ const database = new PostgresDatabase(config.databaseUrl);
 
 // bootstrap-signup lane: first-boot org/workspace, OIDC/email sign-in, invites.
 const identityConfig = loadIdentityConfig();
-const store = new ControlPlaneStore(database, config.encryptionKeyring, undefined, {
-  tenancy: identityConfig.tenancy.mode,
-});
 // Creates Relaycast workspaces for the bootstrap and (multi mode) personal
-// and self-serve organizations; null without RELAYCAST_INTERNAL_SECRET.
+// and self-serve organizations, plus lazy bindings for imported Cloud
+// workspaces; null without RELAYCAST_INTERNAL_SECRET.
 const provisioner = identityConfig.relaycastInternalSecret
   ? relaycastProvisioner(config.relaycastUrl, identityConfig.relaycastInternalSecret)
   : null;
+const store = new ControlPlaneStore(database, config.encryptionKeyring, undefined, {
+  tenancy: identityConfig.tenancy.mode,
+  relaycastProvisioner: provisioner,
+});
 const identityStore = new IdentityStore(database, config.encryptionKeyring, {
   inviteTtlMs: identityConfig.inviteTtlMs,
   autoJoinDomains: identityConfig.autoJoinDomains,
@@ -120,6 +124,8 @@ const telemetry = createTelemetryModule({
 });
 // Amp control: off unless SELFHOST_AMP_ENABLED=true; off starts no worker.
 const amp = createAmpModule({ amp: loadAmpConfig(process.env), config, database });
+// Replicas agents: off unless SELFHOST_REPLICAS_ENABLED=true; no worker either way.
+const replicas = createReplicasModule({ replicas: loadReplicasConfig(process.env), config, database });
 // Cleanup runs with new Capy work still off; it has no provider dispatch path.
 const capyCleanup=new CapyCleanup({database,bindings:new CapyBindings({
   database,keyring:config.encryptionKeyring,runtime:createCapyRuntime(),
@@ -173,6 +179,7 @@ const app = createApp({
   factory,
   features,
   amp,
+  replicas,
   providerProbes: buildProviderProbes({ factory, amp, config }),
   analytics: { port: analytics, config: analyticsConfig },
   mcpOAuthTeardown,
@@ -217,6 +224,7 @@ async function start(): Promise<void> {
         transport: amp.config.transport !== null,
         internalJob: amp.config.internalSecret !== null,
       },
+      replicas: { enabled: replicas.config.enabled },
     });
     emitServiceStarted(analytics, {
       componentVersion: relaycontrolVersion,

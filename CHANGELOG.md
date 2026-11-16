@@ -13,6 +13,26 @@ assigned at release.
   Operator imports pass the version they read and get `409
   login_version_conflict`, with nothing written, if the login changed.
 
+- Fixed: staff read grants (`sh_sr_`) introspect active only through the
+  History audience fence (the workspace's own History origin, else the
+  configured History URL); every other introspection audience, including
+  `SELFHOST_INTROSPECT_AUDIENCES`, answers inactive `audience`. A device-code
+  login started by Agent Relay Desktop can no longer mint or list grants.
+- Added: `users.signup_source` (migration 0068), where an account was
+  created: `teams`, `flows` or `desktop` (hosted Cloud's values; the
+  identity import's carry lands in a follow-up) or `mcp`. Control records `mcp` when a new person
+  signs in (OIDC or email link) on the way back to MCP OAuth consent
+  (`/cloud/oauth/authorize`, e.g. ChatGPT's Agent Relay app). Set once at
+  creation; a later sign-in never rewrites it. Password sign-ups have no
+  return path and stay unattributed. Nullable; existing accounts are NULL.
+
+- Added: Replicas agent bridge behind `SELFHOST_REPLICAS_ENABLED` (default
+  off). Owners and admins spawn, recover, bind and release Replicas agents
+  through six MCP tools or the `/api/v1/workspaces/{ws}/replicas` routes. Each
+  bound replica gets its own Relay identity, a scoped Agent Relay MCP server
+  and reply helper installed through the provider exec API, and signed
+  delivery of messages addressed to it. Release revokes the capability before
+  cleanup. Migration 0065 `replica_spawns`. See [Replicas](docs/replicas.md).
 - Added: staff read grants (migration 0061, table `staff_read_grants`). An
   owner of the operator organization, on its domains when it has any, mints a
   short-lived `sh_sr_` credential (scope `rth:read`, at most 90 days, no

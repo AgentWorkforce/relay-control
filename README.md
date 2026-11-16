@@ -197,6 +197,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_TELEMETRY_LEVEL` | Telemetry: `off` (default when unset), `errors`, or `full`. See [docs/telemetry.md](docs/telemetry.md) for this and the other `SELFHOST_TELEMETRY_*` settings |
 | `PORT` | Listener port, default `3000` |
 | `SELFHOST_AMP_ENABLED` | Optional `true` turns on Amp control (default `false`). Off: every Amp route answers 404 `{"error":"Not found"}` before authentication and no outbox worker runs. See [docs/amp.md](docs/amp.md) |
+| `SELFHOST_REPLICAS_ENABLED` | Optional `true` turns on the Replicas agent bridge (default `false`). Off: every Replicas bridge route answers 404 `{"error":"Not found"}` before authentication and no Replicas MCP tool is registered. See [docs/replicas.md](docs/replicas.md) |
 | `SELFHOST_MCP_OAUTH` | Optional, default on. Hosted MCP OAuth connectors; `off`, `false` or `0` disables them (`on`/`true`/`1` enables; other spellings fail start-up). A missing or partial signing-key set, invalid key material or an unreadable MCP OIDC `_FILE` leaves the server running (routes answer 501 `mcp_oauth_unavailable`); a value supplied both directly and via `_FILE` still fails start-up. See [docs/mcp-oauth.md](docs/mcp-oauth.md) |
 | `SELFHOST_MCP_EVENTS` | Optional, default off (`on`/`true`/`1` or `off`/`false`/`0`). Setting for the separate MCP Events module, which this server does not mount. See [docs/mcp-oauth.md](docs/mcp-oauth.md) |
 | `SELFHOST_MCP_EVENTS_PUMP` | Optional, default off, same spellings. Events pump setting; `on` requires `SELFHOST_MCP_EVENTS=on` or start-up fails |
@@ -290,6 +291,9 @@ The internal reader contract is `POST /internal/v1/session-read/sessions` or
 `/internal/v1/session-read/sessions/refresh`, authenticated by the dedicated
 secret. Control supplies `{ userId, orgId, workspaceId, audience, scopes:
 ["rth:read"], label? }`, with `refreshToken` instead of `label` on refresh.
+With `SESSION_READ_MINT_INCLUDE_ROLE=true` (default false) the body also
+carries `role: "owner" | "admin" | "member"`, the caller's live organization
+role ([docs/sessions-read-api.md](docs/sessions-read-api.md#read-credentials)).
 The reader returns the bearer response above without `baseUrl`; Control sets
 that from configuration. Keep these internal routes off public ingress.
 
