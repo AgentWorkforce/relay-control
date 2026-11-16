@@ -395,6 +395,45 @@ test("cloud import: signup_source is carried normalised, unknown values as NULL,
   assert.deepEqual(await sources(), { [id(1)]: "flows", [id(2)]: null, [id(3)]: null, [id(6)]: "mcp" });
 });
 
+test("cloud import: a re-run keeps a binding Control made lazily on an unbound import (0064)", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  const deps = { source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY };
+  assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
+  const pair = async (workspace: string) => (await target.query<{ rc: string | null; key: string | null; generation: number }>(
+    "SELECT relaycast_workspace_id AS rc, relaycast_api_key_ciphertext AS key, relaycast_api_key_generation AS generation FROM workspaces WHERE id = $1",
+    [workspace])).rows[0]!;
+  assert.deepEqual(await pair(id(0x202)), { rc: null, key: null, generation: 1 });
+  const bound = await pair(id(0x201));
+
+  // Control binds a2 on first use (lazy binding), after the import.
+  await target.query(
+    "UPDATE workspaces SET relaycast_workspace_id = 'rc_lazy_a202', relaycast_api_key_ciphertext = 'control-ciphertext', relaycast_api_key_generation = 2 WHERE id = $1",
+    [id(0x202)]);
+  const again = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(again.ok, true, JSON.stringify(again.orgs));
+  assert.deepEqual(await pair(id(0x202)), { rc: "rc_lazy_a202", key: "control-ciphertext", generation: 2 }, "the lazy binding survives as one unit");
+  assert.deepEqual(await pair(id(0x203)), { rc: null, key: null, generation: 1 }, "a still-unbound import stays unbound");
+  assert.equal((await pair(id(0x201))).rc, bound.rc, "a bound import still takes Cloud's binding");
+
+  // The verifier treats a2's lazy binding as expected: its projections agree.
+  const columns = new Set(["workspaces.cloud_relay_workspace_id", "workspaces.slug", "workspaces.relaycast_api_key_generation"]);
+  const workspaces = verifierComparisons({ orgIds: null }, columns, new Set()).find((comparison) => comparison.name === "workspaces")!;
+  const excluded = new Set(Object.values(again.tables.workspaces.importerSkips).flat());
+  const sourceRows = (await source.query<{ __key: string }>(workspaces.sourceSql)).rows
+    .filter((row) => !excluded.has(row.__key)).map((row) => JSON.stringify(row)).sort();
+  const targetRows = (await target.query(workspaces.targetSql)).rows.map((row) => JSON.stringify(row)).sort();
+  assert.deepEqual(targetRows, sourceRows);
+  // Bound imports are still compared for real.
+  await target.query("UPDATE workspaces SET relaycast_workspace_id = 'rc_drifted' WHERE id = $1", [id(0x201)]);
+  const drifted = (await target.query(workspaces.targetSql)).rows.map((row) => JSON.stringify(row)).sort();
+  assert.notDeepEqual(drifted, sourceRows);
+});
+
 test("cloud import: an existing Control user with an imported email under another id refuses the run", async (t) => {
   const source = await cloudSource();
   const target = await controlTarget("0051");
