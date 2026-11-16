@@ -31,8 +31,10 @@ export type CodingAgentProvider = {
   harness: string;
   /** Env var a flow run receives when this provider's LLM credential is selected. */
   apiKeyEnv: string;
-  /** Provider-specific credentials/config that must not bypass a selected managed row. */
+  /** Non-family credentials/config that must not bypass a selected managed row. */
   managedBlockedEnv: readonly string[];
+  /** Credential/config families read by this provider's CLIs. */
+  managedBlockedPrefixes: readonly string[];
   /** Can hold a subscription login a sandbox CLI mounts ("Sandbox access"). */
   setupToken: boolean;
   /** Can store and mount an imported provider_oauth login file. */
@@ -52,15 +54,8 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     displayName: "Anthropic",
     harness: "claude",
     apiKeyEnv: "ANTHROPIC_API_KEY",
-    managedBlockedEnv: [
-      "ANTHROPIC_API_KEY",
-      "ANTHROPIC_AUTH_TOKEN",
-      "ANTHROPIC_BASE_URL",
-      "CLAUDE_CODE_OAUTH_TOKEN",
-      "CLAUDE_CONFIG_DIR",
-      "CLAUDE_CODE_USE_BEDROCK",
-      "AWS_BEARER_TOKEN_BEDROCK",
-    ],
+    managedBlockedEnv: ["CLAUDE_CONFIG_DIR", "AWS_BEARER_TOKEN_BEDROCK", "CLOUD_ML_REGION"],
+    managedBlockedPrefixes: ["ANTHROPIC_", "CLAUDE_CODE_"],
     setupToken: true,
     providerOauth: true,
     deviceLogin: false,
@@ -72,7 +67,8 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     displayName: "OpenAI",
     harness: "codex",
     apiKeyEnv: "OPENAI_API_KEY",
-    managedBlockedEnv: ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CODEX_HOME"],
+    managedBlockedEnv: [],
+    managedBlockedPrefixes: ["OPENAI_", "CODEX_", "AZURE_OPENAI_"],
     setupToken: false,
     providerOauth: true,
     deviceLogin: true,
@@ -84,7 +80,8 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     displayName: "OpenRouter",
     harness: "openrouter",
     apiKeyEnv: "OPENROUTER_API_KEY",
-    managedBlockedEnv: ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE"],
+    managedBlockedEnv: [],
+    managedBlockedPrefixes: ["OPENROUTER_", "OPENAI_"],
     setupToken: false,
     providerOauth: false,
     deviceLogin: false,
@@ -96,7 +93,8 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     displayName: "xAI",
     harness: "grok",
     apiKeyEnv: "XAI_API_KEY",
-    managedBlockedEnv: ["XAI_API_KEY", "GROK_XAI_API_BASE_URL", "GROK_HOME"],
+    managedBlockedEnv: [],
+    managedBlockedPrefixes: ["XAI_", "GROK_"],
     setupToken: false,
     providerOauth: true,
     deviceLogin: true,
@@ -108,7 +106,14 @@ export const CODING_AGENT_PROVIDERS: readonly CodingAgentProvider[] = [
     displayName: "Google",
     harness: "gemini",
     apiKeyEnv: "GEMINI_API_KEY",
-    managedBlockedEnv: ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_API_BASE", "GOOGLE_APPLICATION_CREDENTIALS"],
+    managedBlockedEnv: [
+      "GOOGLE_API_KEY",
+      "GOOGLE_API_BASE",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "GOOGLE_CLOUD_PROJECT",
+      "GOOGLE_CLOUD_LOCATION",
+    ],
+    managedBlockedPrefixes: ["GEMINI_", "GOOGLE_GENAI_", "GOOGLE_GEMINI_"],
     setupToken: false,
     providerOauth: false,
     deviceLogin: false,
@@ -274,6 +279,8 @@ export type RuntimeCodingAgentEnvironment = {
   env: Record<string, string>;
   /** Workspace variables with these names must not impersonate a selected credential. */
   blockedNames: string[];
+  /** Workspace variables in these provider families must not impersonate a selected credential. */
+  blockedPrefixes: string[];
   skipped: Array<{ name: string; reason: "undecryptable" | "relay_managed_unavailable" }>;
 };
 
@@ -714,6 +721,7 @@ export class CodingAgentStore {
     );
     const env: Record<string, string> = Object.create(null) as Record<string, string>;
     const blockedNames = new Set<string>();
+    const blockedPrefixes = new Set<string>();
     const skipped: RuntimeCodingAgentEnvironment["skipped"] = [];
     const used: string[] = [];
     for (const row of result.rows) {
@@ -721,6 +729,7 @@ export class CodingAgentStore {
       if (!provider) continue;
       if (row.auth_type === "relay_managed") {
         for (const name of provider.managedBlockedEnv) blockedNames.add(name);
+        for (const prefix of provider.managedBlockedPrefixes) blockedPrefixes.add(prefix);
         skipped.push({ name: provider.apiKeyEnv, reason: "relay_managed_unavailable" });
         continue;
       }
@@ -752,6 +761,11 @@ export class CodingAgentStore {
         target: `${used.length} credentials`,
       });
     }
-    return { env: { ...env }, blockedNames: [...blockedNames], skipped };
+    return {
+      env: { ...env },
+      blockedNames: [...blockedNames],
+      blockedPrefixes: [...blockedPrefixes],
+      skipped,
+    };
   }
 }

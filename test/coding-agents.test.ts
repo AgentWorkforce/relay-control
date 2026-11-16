@@ -322,27 +322,57 @@ test("coding agents: imported relay-managed rows remain metadata-only and fail c
   const ctx = await setup(t);
   const base = `/api/v1/workspaces/${ctx.workspaceId}`;
   const managedId = "77777777-7777-4777-8777-777777777777";
-  const expectedBlocked = {
-    anthropic: [
-      "ANTHROPIC_API_KEY",
-      "ANTHROPIC_AUTH_TOKEN",
-      "ANTHROPIC_BASE_URL",
-      "CLAUDE_CODE_OAUTH_TOKEN",
-      "CLAUDE_CONFIG_DIR",
-      "CLAUDE_CODE_USE_BEDROCK",
-      "AWS_BEARER_TOKEN_BEDROCK",
+  const expectedBlockedEnv = {
+    anthropic: ["CLAUDE_CONFIG_DIR", "AWS_BEARER_TOKEN_BEDROCK", "CLOUD_ML_REGION"],
+    openai: [],
+    openrouter: [],
+    xai: [],
+    google: [
+      "GOOGLE_API_KEY",
+      "GOOGLE_API_BASE",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "GOOGLE_CLOUD_PROJECT",
+      "GOOGLE_CLOUD_LOCATION",
     ],
-    openai: ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CODEX_HOME"],
-    openrouter: ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE"],
-    xai: ["XAI_API_KEY", "GROK_XAI_API_BASE_URL", "GROK_HOME"],
-    google: ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_API_BASE", "GOOGLE_APPLICATION_CREDENTIALS"],
+  };
+  const expectedBlockedPrefixes = {
+    anthropic: ["ANTHROPIC_", "CLAUDE_CODE_"],
+    openai: ["OPENAI_", "CODEX_", "AZURE_OPENAI_"],
+    openrouter: ["OPENROUTER_", "OPENAI_"],
+    xai: ["XAI_", "GROK_"],
+    google: ["GEMINI_", "GOOGLE_GENAI_", "GOOGLE_GEMINI_"],
   };
   assert.deepEqual(
     Object.fromEntries(CODING_AGENT_PROVIDERS.map((provider) => [provider.id, provider.managedBlockedEnv])),
-    expectedBlocked,
+    expectedBlockedEnv,
+  );
+  assert.deepEqual(
+    Object.fromEntries(CODING_AGENT_PROVIDERS.map((provider) => [provider.id, provider.managedBlockedPrefixes])),
+    expectedBlockedPrefixes,
   );
 
-  for (const name of new Set(Object.values(expectedBlocked).flat())) {
+  const blockedProbeNames = new Set([
+    ...Object.values(expectedBlockedEnv).flat(),
+    ...Object.values(expectedBlockedPrefixes).flat().map((prefix) => `${prefix}FUTURE_AUTH_ROUTE`),
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "CLAUDE_CODE_USE_VERTEX",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "OPENAI_BASE_URL",
+    "CODEX_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+    "GROK_XAI_API_BASE_URL",
+    "GEMINI_API_KEY",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "GOOGLE_GEMINI_BASE_URL",
+  ]);
+  for (const name of blockedProbeNames) {
     const workspaceFallback = await request(ctx.origin, `${base}/secrets`, {
       method: "POST",
       token: ctx.owner,
@@ -412,7 +442,7 @@ test("coding agents: imported relay-managed rows remain metadata-only and fail c
     `/internal/v1/workspaces/${ctx.workspaceId}/environment?includeIntegrations=1`,
     { token: SERVICE },
   );
-  for (const name of new Set(Object.values(expectedBlocked).flat())) {
+  for (const name of blockedProbeNames) {
     assert.equal(runtime.body.env[name], undefined, `${name} cannot bypass a managed selection`);
     assert(!runtime.body.secretEnvNames.includes(name), `${name} is not advertised to the run`);
   }

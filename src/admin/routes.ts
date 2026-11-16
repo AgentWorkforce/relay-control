@@ -249,8 +249,11 @@ export function createAdminModule(input: {
     // wins over a same-named workspace variable, and integration env wins
     // over both.
     const blocked = new Set(agentEnvironment.blockedNames);
+    const blockedPrefixes = agentEnvironment.blockedPrefixes;
     const workspaceEnv = Object.fromEntries(
-      Object.entries(environment.env).filter(([name]) => !blocked.has(name)),
+      Object.entries(environment.env).filter(([name]) =>
+        !blocked.has(name) && !blockedPrefixes.some((prefix) => name.startsWith(prefix))
+      ),
     );
     const env = { ...workspaceEnv, ...agentEnvironment.env, ...integrationEnv };
     return {
