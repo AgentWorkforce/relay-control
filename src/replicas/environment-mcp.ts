@@ -16,12 +16,13 @@ import { checkRelayInbox, listRelayAgents, sendRelayMessage } from "./tools.js";
  *
  * Admission order, nothing written until all pass: (1) token verification
  * 401 replica_identity_invalid, (2) release tombstone 403 replica_released,
- * (3) enabled environment policy, refused as well when the provider
- * organization is connected in more than one workspace, 403
+ * (3) the provider organization connected in no other workspace, else 403
+ * organization_shared, and an enabled environment policy, else 403
  * replica_environment_not_enabled, (4) a creator mapping to a current member,
  * else (no or unmapped creator) the workspace's VM principal when it is set
  * and a current member, 403 replica_creator_not_allowed,
- * (5) binding lookup or enrolment. Every tool call repeats 2-4 under the
+ * (5) binding lookup (a live launch or bind of the same replica in this
+ * workspace is reused while its owner is a member) or enrolment. Every tool call repeats 2-4 under the
  * workspace lock. Pull-only: nothing is pushed into the replica's chats.
  */
 const BODY_MAX_BYTES = 256 * 1024;

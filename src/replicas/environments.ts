@@ -6,6 +6,7 @@ import { HOSTED_SOURCE, ownerHash } from "../mcp/relay-participants.js";
 import { emailHint, type ReplicaIdentityClaims } from "./identity.js";
 import { ReplicasRuntimeError, type EnvironmentMcp } from "./runtime.js";
 import {
+  auditActor,
   COLUMNS,
   decrypt,
   encrypt,
@@ -49,6 +50,7 @@ export type IdentityRefusalCode =
   | "replica_identity_invalid"
   | "replica_released"
   | "replica_environment_not_enabled"
+  | "organization_shared"
   | "replica_creator_not_allowed"
   | "replica_already_bound";
 
@@ -109,14 +111,16 @@ async function organizationShared(tx: SqlExecutor, organization: string | null):
  * workspace's VM principal is used when it is set and still a member.
  */
 async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): Promise<Admission> {
-  const tombstone = await tx.query<{ workspace_id: string; organization_id: string }>(
-    `SELECT t.workspace_id, w.organization_id FROM replica_identity_tombstones t JOIN workspaces w ON w.id = t.workspace_id
+  // Any matching tombstone refuses, also one whose workspace was deleted (workspace_id NULL).
+  const tombstone = await tx.query<{ workspace_id: string | null; organization_id: string | null }>(
+    `SELECT t.workspace_id, w.organization_id FROM replica_identity_tombstones t LEFT JOIN workspaces w ON w.id = t.workspace_id
       WHERE t.issuer = $1 AND t.provider_organization_id = $2 AND t.provider_workspace_id = $3`,
     [claims.issuer, claims.organizationId, claims.workspaceId],
   );
   const released = tombstone.rows[0];
   if (released) {
-    throw new IdentityRefusal("replica_released", 403, { workspaceId: released.workspace_id, organizationId: released.organization_id });
+    throw new IdentityRefusal("replica_released", 403, released.workspace_id && released.organization_id
+      ? { workspaceId: released.workspace_id, organizationId: released.organization_id } : null);
   }
   const policies = await tx.query<PolicyRow & { organization_id: string; provider_account: string | null; principal_member: string | null }>(
     `SELECT ${POLICY.split(", ").map((column) => `p.${column}`).join(", ")}, w.organization_id, c.provider_account,
@@ -132,7 +136,7 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
   const candidate = policies.rows.length === 1 ? policies.rows[0]! : null;
   // An organization connected in several workspaces has no single tenant: refuse before any creator check.
   if (await organizationShared(tx, claims.organizationId)) {
-    throw new IdentityRefusal("replica_environment_not_enabled", 403,
+    throw new IdentityRefusal("organization_shared", 403,
       candidate ? { workspaceId: candidate.workspace_id, organizationId: candidate.organization_id } : null);
   }
   // The workspace must still hold a connection to the same provider organization.
@@ -167,6 +171,15 @@ async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admis
   );
   const row = live.rows[0];
   if (!row) return null;
+  // A launch or bind of the same replica in this workspace is reused as is: the identity acts as
+  // that binding and its owner (never the principal or a creator mapping) while the owner is a member.
+  // A rejected launch binds nothing by itself, so it stays a conflict until recovered or released.
+  if (row.source !== ENVIRONMENT_IDENTITY && row.workspace_id === admission.policy.workspace_id && row.state !== "rejected") {
+    const owner = await tx.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
+      [admission.organizationId, row.user_id]);
+    if (!owner.rows.length) throw new IdentityRefusal("replica_creator_not_allowed", 403, scopeOf(admission));
+    return row;
+  }
   // A live binding in another workspace (for example under an earlier policy) is a bound replica, not a creator problem.
   if (row.source !== ENVIRONMENT_IDENTITY || row.workspace_id !== admission.policy.workspace_id) {
     throw new IdentityRefusal("replica_already_bound", 409, scopeOf(admission));
@@ -263,6 +276,8 @@ async function underAdmission<T>(deps: ReplicasDeps, claims: ReplicaIdentityClai
  * first use. Nothing is written until every check passed. Enrolment commits
  * the binding row (with its deterministic agent name) before the Relay
  * registration, so a lost registration is recovered, never duplicated.
+ * A live launch or bind of the same replica in the admitted workspace is
+ * returned as is, acting as its owner.
  */
 export async function admitIdentity(deps: ReplicasDeps, claims: ReplicaIdentityClaims): Promise<SpawnRow> {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -274,6 +289,8 @@ export async function admitIdentity(deps: ReplicasDeps, claims: ReplicaIdentityC
 
 async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIdentityClaims, admission: Admission): Promise<SpawnRow> {
   let row = await liveBinding(tx, claims, admission);
+  // A reused launch or bind is never enrolled: its own lifecycle binds it (admitIdentity 503s until then).
+  if (row && row.source !== ENVIRONMENT_IDENTITY) return row;
   const hint = emailHint(claims.creatorEmail);
   if (hint) {
     await tx.query("UPDATE replica_environment_creators SET creator_email_hint = $3 WHERE policy_id = $1 AND creator_id = $2 AND creator_email_hint IS DISTINCT FROM $3",
@@ -427,7 +444,7 @@ async function setPrincipal(tx: SqlExecutor, actor: ReplicasActor, userId: strin
     released.push(...revoked.rows.map((row) => row.id));
   }
   await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-    actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.principal_updated", target: actor.workspaceId });
+    actor: auditActor(actor), action: "replicas.environment.principal_updated", target: actor.workspaceId });
 }
 
 const principalInput = z.object({ userId: z.string().uuid().nullable() }).strict();
@@ -617,7 +634,7 @@ async function enablePolicy(tx: SqlExecutor, actor: ReplicasActor, policy: Polic
     throw error;
   }
   await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-    actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.enabled", target: policy.id });
+    actor: auditActor(actor), action: "replicas.environment.enabled", target: policy.id });
   return result.rows[0]!;
 }
 
@@ -645,7 +662,7 @@ async function disablePolicy(tx: SqlExecutor, actor: ReplicasActor, policy: Poli
   const result = await tx.query<PolicyRow>(
     `UPDATE replica_environment_policies SET enabled = false, updated_at = now() WHERE id = $1 RETURNING ${POLICY}`, [policy.id]);
   await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-    actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.disabled", target: policy.id });
+    actor: auditActor(actor), action: "replicas.environment.disabled", target: policy.id });
   return result.rows[0]!;
 }
 
@@ -699,7 +716,7 @@ export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: Replica
       await tx.query("DELETE FROM replica_environment_creator_requests WHERE policy_id = $1 AND creator_id = ANY($2::text[])",
         [policy.id, creators.map((item) => item.creatorId)]);
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-        actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.creators_updated", target: policy.id });
+        actor: auditActor(actor), action: "replicas.environment.creators_updated", target: policy.id });
     }
     if (enabled === true) {
       await clearOptOut(tx, actor.workspaceId, [policy]);
@@ -825,7 +842,7 @@ async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
       await setAllEnvironments(tx, actor.workspaceId, true);
       await clearOptOut(tx, actor.workspaceId, "all");
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-        actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.all_enabled", target: actor.workspaceId });
+        actor: auditActor(actor), action: "replicas.environment.all_enabled", target: actor.workspaceId });
       policies = (await tx.query<PolicyRow>(
         `SELECT ${POLICY} FROM replica_environment_policies WHERE workspace_id = $1 AND provider_organization_id = $2
           ORDER BY environment_id FOR UPDATE`, [actor.workspaceId, organization])).rows;
@@ -904,7 +921,7 @@ async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
         const entry = { id: found.id };
         await tx.query("UPDATE replica_environment_policies SET registered_mcp_id = $2, updated_at = now() WHERE id = $1", [current.id, entry.id]);
         await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-          actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.mcp_registered", target: current.id });
+          actor: auditActor(actor), action: "replicas.environment.mcp_registered", target: current.id });
         return { environmentId: current.environment_id, status: "registered" };
       }));
     } catch (error) {
@@ -931,7 +948,7 @@ export async function disableEnvironmentMcp(deps: ReplicasDeps, actor: ReplicasA
     if ("all" in selection) {
       await setAllEnvironments(tx, actor.workspaceId, false);
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-        actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.all_disabled", target: actor.workspaceId });
+        actor: auditActor(actor), action: "replicas.environment.all_disabled", target: actor.workspaceId });
       policies = (await tx.query<PolicyRow>(
         `SELECT ${POLICY} FROM replica_environment_policies WHERE workspace_id = $1 AND (enabled OR registered_mcp_id IS NOT NULL)
           ORDER BY environment_id FOR UPDATE`, [actor.workspaceId])).rows;
@@ -969,7 +986,7 @@ async function removeEntry(deps: ReplicasDeps, actor: ReplicasActor, policy: Pol
       }
       await tx.query("UPDATE replica_environment_policies SET registered_mcp_id = NULL, updated_at = now() WHERE id = $1", [current.id]);
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-        actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.mcp_removed", target: current.id });
+        actor: auditActor(actor), action: "replicas.environment.mcp_removed", target: current.id });
       return { environmentId: current.environment_id, status: "disabled" };
     } catch {
       return { environmentId: current.environment_id, status: "removal_failed", retryable: true };
@@ -1031,7 +1048,7 @@ export async function setupEnvironments(deps: ReplicasDeps, actor: ReplicasActor
     // A fresh connect starts clean: earlier opt-outs do not survive a disconnect.
     await clearOptOut(tx, actor.workspaceId, "all");
     await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-      actor: { kind: "user", userId: actor.userId }, action: "replicas.environment.all_enabled", target: actor.workspaceId });
+      actor: auditActor(actor), action: "replicas.environment.all_enabled", target: actor.workspaceId });
   });
   let discovery: DiscoveryResult;
   try {

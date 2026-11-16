@@ -49,13 +49,13 @@ export function registerReplicasTools(server: McpServer, context: McpContext, de
     ({ spawn_id }) => run(() => replicaStatus(deps, actor, spawn_id)));
   server.registerTool("recover_replica_spawn", { description: "Recover an unconfirmed create or task send without replaying it. The existing replica UUID is verified against the launch marker in its original chat; recovery remains attached to the original launch id and may continue setup through dispatch of its original task.",
     inputSchema: { spawn_id: z.string().uuid(), replica_id: z.string().uuid(),
-      revive: z.boolean().optional().describe("Owner/admin only: re-admit a released environment-level identity (its workspace_identity token is refused until revived). The next admitted call enrols it again.") },
+      revive: z.boolean().optional().describe("Owner/admin only: re-admit a released replica, environment-level identity or per-launch (its workspace_identity token is refused until revived). The next admitted call enrols it again.") },
     annotations: { ...annotations, destructiveHint: true } },
     ({ spawn_id, replica_id, revive }) => run(() => recoverReplica(deps, actor, spawn_id, replica_id, { revive: revive === true })));
   server.registerTool("bind_replica", { description: "Connect an existing Replicas chat to Relay without creating a replica. The operation stops when another bridge already owns the chat. Requires current workspace owner or admin access. A pending result retains a spawn_id for later status reads.",
     inputSchema: { replica_id: z.string().uuid(), chat_id: z.string().uuid() }, annotations },
     (input) => run(() => bindReplica(deps, actor, input)));
-  server.registerTool("release_replica", { description: "Disconnect a spawned Replicas agent from Relay and sleep its compute. The repeat-safe operation revokes MCP and reply capability and removes subscriptions while preserving the replica and its history.",
+  server.registerTool("release_replica", { description: "Disconnect a spawned Replicas agent from Relay and sleep its compute. The repeat-safe operation revokes MCP and reply capability and removes subscriptions while preserving the replica and its history. The released replica stays refused by the environment-level MCP until an owner/admin revives it with recover_replica_spawn revive: true.",
     inputSchema: { spawn_id: z.string().uuid() }, annotations: { ...annotations, destructiveHint: true } },
     ({ spawn_id }) => run(() => releaseReplica(deps, actor, spawn_id)));
 }
