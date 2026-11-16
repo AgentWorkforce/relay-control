@@ -21,39 +21,6 @@ import { PGliteDatabase } from "./support/harness.js";
 const CLOUD_KEY = randomBytes(32).toString("hex");
 const KEYRING: EncryptionKeyring = { active: { id: "import-test", key: randomBytes(32) } };
 
-// 0061 (staff read grants, #165) is a checked-in migration now; this copy
-// matches it and IF NOT EXISTS keeps it a no-op on the real migrations.
-const POST_0058_DDL = `
--- 0061 (#165, staff read grants), same as the checked-in migration.
-CREATE TABLE IF NOT EXISTS staff_read_grants (
-  id uuid PRIMARY KEY,
-  workspace_id uuid NOT NULL,
-  organization_id uuid NOT NULL,
-  staff_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  staff_organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-  reason text NOT NULL CONSTRAINT staff_read_grant_reason CHECK (length(btrim(reason)) > 0 AND length(reason) <= 500),
-  token_hash text NOT NULL UNIQUE,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  expires_at timestamptz NOT NULL,
-  revoked_at timestamptz,
-  revoked_by uuid,
-  last_used_at timestamptz,
-  CONSTRAINT staff_read_grant_workspace FOREIGN KEY (workspace_id, organization_id)
-    REFERENCES workspaces(id, organization_id) ON DELETE CASCADE,
-  CONSTRAINT staff_read_grant_lifetime CHECK (expires_at > created_at AND expires_at <= created_at + interval '90 days')
-);
--- 0064 (#169, lazy Relaycast binding), as proposed.
-ALTER TABLE workspaces
-  ALTER COLUMN relaycast_workspace_id DROP NOT NULL,
-  ALTER COLUMN relaycast_api_key_ciphertext DROP NOT NULL,
-  ADD CONSTRAINT workspaces_relaycast_binding_pair
-    CHECK (
-      (relaycast_workspace_id IS NULL AND relaycast_api_key_ciphertext IS NULL)
-      OR (relaycast_workspace_id IS NOT NULL AND relaycast_api_key_ciphertext IS NOT NULL)
-    );
--- 0058 (relay_managed coding agents) is a real migration now.
-`;
-
 async function cloudSource(): Promise<PGliteDatabase> {
   const source = new PGliteDatabase();
   await source.exec(CLOUD_FIXTURE_DDL);
@@ -63,13 +30,13 @@ async function cloudSource(): Promise<PGliteDatabase> {
 
 /**
  * "0051": the baseline the importer gates down to (migrations <= 0051 only).
- * "current": every migration on this branch plus the proposed 0061.
+ * "current": every checked-in migration (0061 staff grants and 0064 lazy
+ *   Relaycast binding included).
  */
 async function controlTarget(kind: "0051" | "current", ledger = true): Promise<PGliteDatabase> {
   const target = new PGliteDatabase();
   if (kind === "current") {
     await migrate(target);
-    await target.exec(POST_0058_DDL);
     // 0063 already created the ledger; ledger=false drops it to test refusal.
     if (!ledger) await target.exec("DROP TABLE cloud_import_ledger");
     return target;
@@ -237,7 +204,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   }
 });
 
-test("cloud import: current target (main + proposed 0061) keeps rw_, slugs, History origin and text source ids", async (t) => {
+test("cloud import: current target (every checked-in migration) keeps rw_, slugs, History origin and text source ids", async (t) => {
   const source = await cloudSource();
   const target = await controlTarget("current");
   t.after(async () => {
