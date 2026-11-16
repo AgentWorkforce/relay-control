@@ -199,6 +199,8 @@ INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, ha
   -- gemini -> google (normalizeModelProvider).
   ('${id(0x817)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'gemini', 'Gemini', 'byo_api_key', 'Gemini key', true, false, 'connected', '2026-01-01T00:00:00.123456Z', '2026-01-01T00:00:00.123456Z');
 UPDATE provider_credentials SET refresh_exhausted = true WHERE id = '${id(0x811)}';
+-- A connected API key with a stray exhausted flag is not a dead login.
+UPDATE provider_credentials SET refresh_exhausted = true WHERE id = '${id(0x80d)}';
 UPDATE provider_credentials SET label = 'Bob token', account_email = 'bob@example.test' WHERE id = '${id(0x805)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-1' WHERE id = '${id(0x806)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-2' WHERE id = '${id(0x80c)}';
