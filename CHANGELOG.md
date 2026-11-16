@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Added: Replicas agent bridge behind `SELFHOST_REPLICAS_ENABLED` (default
+  off). Owners and admins spawn, recover, bind and release Replicas agents
+  through six MCP tools or the `/api/v1/workspaces/{ws}/replicas` routes. Each
+  bound replica gets its own Relay identity, a scoped Agent Relay MCP server
+  and reply helper installed through the provider exec API, and signed
+  delivery of messages addressed to it. Release revokes the capability before
+  cleanup. Migration 0065 `replica_spawns`. See [Replicas](docs/replicas.md).
 - Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set) every
   Sessions read-token mint names the reader kind (`browser`, `device` or
   `mcp`) from how the caller authenticated, so relaygate can tell a person's

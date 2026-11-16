@@ -61,6 +61,11 @@ tags:
       Factory sessions (docs/factory-sessions.md). Every operation answers
       404 not_found when SELFHOST_FACTORY_ENABLED is off. Errors are
       {error, message} with stable codes; secrets are never returned.
+  - name: replicas
+    description: |
+      Replicas agent bridge (SELFHOST_REPLICAS_ENABLED, default off). See
+      docs/replicas.md. While off every path answers 404 {"error":"Not found"}
+      before authentication.
   - name: relay-node
     description: |
       Relay node broker (docs/relay-node-credential.md). A relay node host
@@ -7727,6 +7732,148 @@ paths:
           description: binding_gone
         "413":
           description: payload_too_large
+  /api/v1/workspaces/{workspaceId}/replicas:
+    get:
+      operationId: getReplicasWorkspace
+      tags: [replicas]
+      summary: Masked Replicas connection plus this workspace's spawns. Owner/admin person only. 404 {"error":"Not found"} before auth when SELFHOST_REPLICAS_ENABLED is off. Responses are Cache-Control no-store.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{connection, spawns}; never a key, capability or webhook secret"
+        "401":
+          description: Person authentication required
+        "403":
+          description: Not a current owner or admin, or not a person credential
+        "404":
+          description: Feature off or workspace not accessible
+  /api/v1/workspaces/{workspaceId}/replicas/environments:
+    get:
+      operationId: listReplicasEnvironments
+      tags: [replicas]
+      summary: Environments the connected Replicas key can use. Owner/admin person only.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: "{environments: [...]}"
+        "409":
+          description: Replicas is not connected
+        "429":
+          description: Replicas rate limit reached
+        "502":
+          description: Provider failed; no provider body is returned
+  /api/v1/workspaces/{workspaceId}/replicas/spawns:
+    post:
+      operationId: spawnReplica
+      tags: [replicas]
+      summary: Start a replica in an environment. The same client_request_id with the same options returns the same launch; different options answer 409. Status reads continue preparation (relay identity, scoped MCP and reply helper install, subscriptions, task dispatch) until the launch is bound.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Same input as the spawn_replica MCP tool (environment, task, harness, client_request_id).
+      responses:
+        "201":
+          description: "Launch state with spawn_id; binding and provisioning_error ({code: relay_mcp_provisioning_failed, component: relay_mcp, retryable: true}) when the MCP install failed"
+        "400":
+          description: Invalid input
+        "403":
+          description: Not a current owner or admin, or the key cannot use that environment
+        "409":
+          description: Not connected, request id reused with different options, or relay unavailable
+        "429":
+          description: Replicas rate limit reached
+        "502":
+          description: Provider failed; keep the same request id and read the launch status
+  /api/v1/workspaces/{workspaceId}/replicas/spawns/{spawnId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: spawnId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      operationId: getReplicaSpawn
+      tags: [replicas]
+      summary: Continue preparation and return the launch state (preparing, dispatching, bound, unknown or released). Owner/admin person who launched it.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      responses:
+        "200":
+          description: Launch state; a bound result includes binding.agent
+        "404":
+          description: Launch not found for this person and workspace
+    delete:
+      operationId: releaseReplicaSpawn
+      tags: [replicas]
+      summary: Revoke the capability and webhook secret in one transaction, then delete both Relaycast subscriptions, release the relay agent and sleep the replica. Repeat-safe; the replica and its history are kept.
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      responses:
+        "200":
+          description: Released launch state
+        "409":
+          description: Recover the unknown create before release, or relay unavailable for cleanup
+  /api/v1/replicas/agents/{spawnId}/messages:
+    post:
+      operationId: replicaAgentCall
+      tags: [replicas]
+      summary: Agent Relay calls from inside one bound replica through its scoped capability. A body with action list_relay_agents or check_relay_inbox (optional acknowledge) reads; any other body is a send {to | reply_to, text, request_id}. No session, admin, spawn or channel-management scope.
+      security: [{ replicasCapabilityBearer: [] }]
+      parameters:
+        - { name: spawnId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, required: [action], properties: { action: { const: list_relay_agents } } }
+                - { type: object, required: [action], properties: { action: { const: check_relay_inbox }, acknowledge: { type: array, maxItems: 100, items: { type: string } } } }
+                - type: object
+                  required: [text, request_id]
+                  properties:
+                    to: { type: string }
+                    reply_to: { type: string, pattern: "^[0-9]{1,32}$" }
+                    text: { type: string, maxLength: 20000 }
+                    request_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Read result, or the sent message; a repeat of the same request_id is one Relay message
+        "400":
+          description: Invalid JSON, unsupported action or arguments
+        "401":
+          description: Unknown, revoked or released capability, or the launching person is no longer a member
+        "403":
+          description: Reply parent not visible to this agent
+        "413":
+          description: Request is too large
+  /api/v1/replicas/relay-events/{spawnId}:
+    post:
+      operationId: receiveReplicasRelayEvent
+      tags: [replicas]
+      summary: Relaycast webhook for one bound replica, verified with Standard Webhooks v1 against the stored secret. A DM, thread reply or mention for the agent is sent into the replica's chat once per message id.
+      security: []
+      parameters:
+        - { name: spawnId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: webhook-id, in: header, required: true, schema: { type: string } }
+        - { name: webhook-timestamp, in: header, required: true, schema: { type: string } }
+        - { name: webhook-signature, in: header, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: "{ok, delivered} | {ok, duplicate} | {ok, outcome_unknown} | {ok: false, rejected, retry: false}"
+        "400":
+          description: Invalid event body
+        "401":
+          description: Bad or missing signature
+        "410":
+          description: Launch released or not bound
+        "503":
+          description: Provider rejected the delivery for a retryable reason
   /api/v1/internal/amp/job:
     post:
       operationId: runAmpJob
@@ -7998,6 +8145,10 @@ components:
       type: http
       scheme: bearer
       description: "`amp_reply_<43 base64url>` capability embedded in one Amp prompt; stored only as a SHA-256 hash, bound to one binding, message and request, revoked on unbind, disconnect or member removal, expires after 24 h."
+    replicasCapabilityBearer:
+      type: http
+      scheme: bearer
+      description: Per-launch capability installed in one replica through the provider exec API; stored only encrypted, never returned, logged or audited, revoked on release, disconnect or member removal.
     ampInternalSecret:
       type: http
       scheme: bearer
