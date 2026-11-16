@@ -42,6 +42,8 @@ async function setup(t: TestContext, options: { gate?: boolean } = {}) {
     const url = new URL(String(input instanceof Request ? input.url : input));
     const headers = new Headers(init?.headers);
     const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    // relaygate's pre-spawn check (test/relay-launch-check.test.ts covers its refusals).
+    if (url.origin === GATE && url.pathname === "/v1/check") return json(200, { decision: "allow" });
     if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") return json(200, { ok: true, data: agents });
     if (url.pathname === "/v1/agents/presence") return json(200, { ok: true, data: [] });
     const body = typeof init?.body === "string" && init.body ? JSON.parse(init.body) as Record<string, any> : null;

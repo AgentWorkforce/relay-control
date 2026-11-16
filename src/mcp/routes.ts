@@ -13,6 +13,7 @@ import { secureEqual } from "../crypto.js";
 import type { AmpDeps } from "../amp/service.js";
 import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
+import { relayLaunchCheck } from "./relay-launch-check.js";
 import { providerStatuses, type ProviderProbes } from "../providers/registry.js";
 import type { ControlPlaneStore } from "../store.js";
 import { MCP_FACADE, type McpAuthMode } from "./catalog.js";
@@ -127,6 +128,11 @@ export function createMcpHandler(input: {
   const desktopCredentials = new DesktopMcpCredentials(store.database);
   const attestations = postgresAttestationStore(store.database);
   const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.fetchImpl });
+  // Gate-only installs only: relaygate checks every agent launch before it is reserved or sent.
+  const launchCheck = config.relaygatePublicUrl
+    ? relayLaunchCheck({ relaygatePublicUrl: config.relaygatePublicUrl, store, database: store.database,
+      ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}) })
+    : undefined;
   // Citations open the dashboard's session page.
   const citationOrigin = new URL(config.dashboardUrl).origin;
   const oauthSessions = mcpOAuthActive(config) ? input.oauthSessions : undefined;
@@ -324,6 +330,7 @@ export function createMcpHandler(input: {
         sessionId: typeof sessionId === "string" ? sessionId : undefined,
         relaycastPublicUrl: config.relaycastPublicUrl,
         ...(config.relaygatePublicUrl ? { relaygatePublicUrl: config.relaygatePublicUrl } : {}),
+        ...(launchCheck ? { launchCheck } : {}),
       },
       ...(!oauth && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && input.factory ? { factory: input.factory } : {}),

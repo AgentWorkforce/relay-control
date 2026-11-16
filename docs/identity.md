@@ -1320,7 +1320,32 @@ launched agent presents to relaygate's `POST /v1/register`:
   credential id, spawn id, node name and agent name, plus the expiry on
   issue). The token and its hash are never logged or audited.
 
-Unset `SELFHOST_RELAYGATE_PUBLIC_URL`: no credential is minted and every
+#### Launch check
+
+Before a launch is journaled, its credential minted or anything sent to
+Relaycast, Control asks relaygate whether the launching person may send this
+task to the target node:
+
+- `POST <SELFHOST_RELAYGATE_PUBLIC_URL>/v1/check` with
+  `{"op": "w", "resource": {"kind": "stream", "id": "node:<workspace id>/<node name>"}, "content": <task>}`.
+  `content` is the caller's `task` exactly as passed.
+- The bearer is an `sh_at_` Control mints for the launching person just for
+  this call (the MCP caller's own credential may be an OAuth grant or API key):
+  no scopes, valid 60 seconds, revoked right after the check whatever the
+  answer. It is never returned, logged or audited, nor is the task text.
+- `200 {"decision": "allow"}` lets the launch continue. `403` refuses it with
+  `relaygate_classified` (when relaygate answers that error) or
+  `relaygate_denied` (any other 403), not retryable. `400` (relaygate rejected
+  the check body) and `401` (it rejected the check token) are answers about
+  this check rather than an outage and refuse it with `relaygate_denied` too.
+  `503`, any other status, an unexpected body, a network error or a 5-second
+  timeout refuse it with `relaygate_unavailable`, retryable. A refused launch reserves nothing, so
+  retrying with the same `idempotency_key` checks again.
+- Audit events `relay_launch.check.denied` (target: node name, code and HTTP status) and
+  `relay_launch.check.unavailable` (target: node name and HTTP status), actor
+  the launching user. An allowed check is not audited separately.
+
+Unset `SELFHOST_RELAYGATE_PUBLIC_URL`: no check is made, no credential is minted and every
 `sh_lt_` introspects as `unknown`.
 
 ### Scope mint matrix
@@ -1337,6 +1362,7 @@ adds one.
 | Device / CLI token | `POST /api/v1/auth/device/token` | `cli:auth rth:read rth:sync rth:acquire` |
 | Enrollment key session | `POST /api/v1/auth/enrollment/token` (one exchange of an `sh_ek_` key) | `cli:auth rth:read rth:sync rth:acquire` |
 | Refreshed token | `POST /api/v1/auth/token/refresh` | Unchanged from the session it refreshes |
+| Launch-check token (gate-only installs) | Control itself, for one relaygate `POST /v1/check` per launch; 60 seconds, revoked after the check | None |
 | MCP, workspace API, worker and service tokens | Their own routes | Never `account` or `desktop:workspaces` |
 
 Hosted MCP OAuth connectors (`mcp_at_`/`mcp_rt_`) are on by default and work only
