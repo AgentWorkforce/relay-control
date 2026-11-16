@@ -108,14 +108,17 @@ test("copier: several Cloud rows for one Control login pick one winner and conve
   objects.set(`${id(1)}/accounts/${id(0x8f0)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(auth("rt-cloud-dup"), CLOUD_KEY)));
 
   const first = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
-  assert.equal(first.rows[id(0x806)], "copied", "Cloud's selected row wins");
-  assert.equal(first.rows[id(0x8f0)], "duplicate_login");
+  assert.equal(first.rows[id(0x8f0)], "copied", "the freshest token wins, not the older selected row");
+  assert.equal(first.rows[id(0x806)], "duplicate_login");
   const loginId = (await loginRow(target))[0]!.id;
-  assert.match((await deps.logins.freshAuthFile(id(0x201), loginId))!, /rt-cloud-0/);
+  assert.match((await deps.logins.freshAuthFile(id(0x201), loginId))!, /rt-cloud-dup/);
+  const flags = (await target.query<{ harness_active: boolean }>(
+    "SELECT harness_active FROM coding_agent_credentials WHERE id = $1", [loginId])).rows[0]!;
+  assert.equal(flags.harness_active, true, "the winner carries the older row's Cloud selection");
 
   const again = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
-  assert.equal(again.rows[id(0x806)], "already_present");
-  assert.equal(again.rows[id(0x8f0)], "duplicate_login");
+  assert.equal(again.rows[id(0x8f0)], "already_present");
+  assert.equal(again.rows[id(0x806)], "duplicate_login");
   assert.deepEqual(again.writes, { inserted: 0, updated: 0, blobWrites: 0, metadataWrites: 0, selectionWrites: 0 }, "a re-run converges");
   assert.equal((await loginRow(target))[0]!.v, 1);
 });
@@ -158,4 +161,46 @@ test("storeLogin: a login created after the unlocked lookup is retried with the 
   assert.ok(advisory >= 0 && advisory < workspaceLock, "attempt 2 takes the advisory lock before the workspace lock");
   const version = (await target.query<{ v: number }>("SELECT blob_version AS v FROM coding_agent_credentials WHERE id = $1", [existingId])).rows[0]!.v;
   assert.equal(version, 2, "the abandoned attempt wrote nothing");
+});
+
+test("copier: duplicate winner tie-breaks are newest updated_at, then lowest id", async (t) => {
+  const { source, target, objects, deps } = await setup(t);
+  // Neither row is Cloud-selected: the newer one wins.
+  await source.exec(`
+    UPDATE provider_credentials SET is_active = false, harness_active = false WHERE id = '${id(0x806)}';
+    INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, harness, model_provider, auth_type, display_name, is_active, harness_active, status, created_at, updated_at, provider_account_id)
+    VALUES ('${id(0x8f0)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT again', false, false, 'connected', '2030-01-01T00:00:00Z', '2030-01-01T00:00:00Z', 'acct-synthetic-1');`);
+  objects.set(`${id(1)}/accounts/${id(0x8f0)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(auth("rt-cloud-newer"), CLOUD_KEY)));
+  const newer = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.equal(newer.rows[id(0x8f0)], "copied", "the newer row wins");
+  assert.equal(newer.rows[id(0x806)], "duplicate_login");
+  const loginId = (await loginRow(target))[0]!.id;
+  assert.match((await deps.logins.freshAuthFile(id(0x201), loginId))!, /rt-cloud-newer/);
+
+  // Same updated_at: the lowest id wins (0x806 < 0x8f0); it replaces the import's own write.
+  await source.exec(`UPDATE provider_credentials SET updated_at = (SELECT updated_at FROM provider_credentials WHERE id = '${id(0x806)}') WHERE id = '${id(0x8f0)}';`);
+  const tie = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.equal(tie.rows[id(0x806)], "updated", "the lowest id wins a tie");
+  assert.equal(tie.rows[id(0x8f0)], "duplicate_login");
+  assert.match((await deps.logins.freshAuthFile(id(0x201), loginId))!, /rt-cloud-0/);
+});
+
+test("storeLogin: an onStored failure rolls back the whole store", async (t) => {
+  const { target, logins, blobs, deps } = await setup(t);
+  await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  const [{ id: loginId, v: before }] = (await loginRow(target)) as Array<{ id: string; v: number }> as [{ id: string; v: number }];
+  const state = async () => (await target.query<{ v: number; loc: string; status: string; ra: number; audits: number; markers: number }>(
+    `SELECT c.blob_version AS v, c.blob_location AS loc, c.status, c.refresh_attempts AS ra,
+            (SELECT count(*)::int FROM admin_audit_events WHERE target LIKE '%' || c.id::text) AS audits,
+            (SELECT count(*)::int FROM cloud_import_ledger WHERE table_name = 'copier_login') AS markers
+       FROM coding_agent_credentials c WHERE c.id = $1`, [loginId])).rows[0]!;
+  const snapshot = await state();
+  await assert.rejects(logins.storeLogin({
+    provider: "openai", workspaceId: id(0x201), organizationId: ORG_A, actor, authFile: auth("rt-rolled-back"),
+    expectedVersion: before,
+    onStored: async () => { throw new Error("marker write failed"); },
+  }), /marker write failed/);
+  assert.deepEqual(await state(), snapshot, "row, audit and markers unchanged");
+  assert.doesNotMatch(await blobs.read(snapshot.loc, loginId, snapshot.v), /rt-rolled-back/);
+  await assert.rejects(blobs.read(`workspaces/${id(0x201)}/accounts/${loginId}/v${before + 1}.json.enc`, loginId, before + 1), "no blob at the next version");
 });

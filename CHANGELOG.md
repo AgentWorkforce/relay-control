@@ -5,6 +5,14 @@ assigned at release.
 
 ## Unreleased
 
+- Changed: storing a subscription login (device-login completion and
+  operator imports) takes the per-credential refresh lock before the
+  workspace lock, so it no longer deadlocks with a concurrent write-back.
+  If a login for the same account is created concurrently it retries, and
+  after three attempts answers `409 login_busy` (retry the sign-in).
+  Operator imports pass the version they read and get `409
+  login_version_conflict`, with nothing written, if the login changed.
+
 - Added: GitHub App installation credentials with `SELFHOST_GITHUB_APP_ID`
   and `SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`. Imported connections retain
   their installation IDs and mint replacement tokens without reconnecting.
