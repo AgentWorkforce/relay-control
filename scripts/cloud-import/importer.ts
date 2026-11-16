@@ -644,10 +644,11 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     // - T is the import's own (its marker) and decrypts to Cloud's plaintext:
     //   send T back unchanged, so nothing is rewritten and the marker stays
     //   (no fresh-IV churn on a converged re-run);
-    // - no marker at all (imported before .28, or pre-seeded): when T decrypts
-    //   to Cloud's plaintext, adopt it (record the marker, no write) so later
-    //   Cloud rotations flow; otherwise it is Control's and the upsert keeps it;
-    // - a marker for another value: Control rotated it; the upsert keeps it.
+    // - no marker, or a marker for another ciphertext: when T decrypts to
+    //   Cloud's plaintext (imported before .28, pre-seeded, or re-encrypted by
+    //   Control, e.g. a keyring rotation), adopt it (record the marker, no
+    //   write) so later Cloud rotations flow; otherwise Control rotated it and
+    //   the upsert keeps it.
     // Returns the ciphertext to send for rows whose target value is reused.
     const settleSecrets = async (tx: SqlExecutor, table: ImportTable, secret: string, org: string, rows: PreparedRow[]) => {
       const relation = TARGETS[table].table;
@@ -673,7 +674,10 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
         const ownMarker = `${relation}:${target.id}:${target.digest}`;
         if (target.marker === ownMarker) {
           if (plain(target.value) === cloud) reuse.set(target.id, target.value);
-        } else if (target.marker === null && plain(target.value) === cloud) {
+        } else if (plain(target.value) === cloud) {
+          // No marker (imported before .28, pre-seeded) or a marker for an
+          // older ciphertext of the same plaintext (Control re-encrypted it,
+          // e.g. a keyring rotation): adopt the stored ciphertext.
           reuse.set(target.id, target.value);
           adopt.push(ownMarker);
         }
