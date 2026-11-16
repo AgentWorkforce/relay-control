@@ -857,8 +857,10 @@ query, and the hold is never consulted. Each active answer for an `sh_at_`
 token adds or refreshes that audience's in-memory confirmation, keyed by the
 token hash (never the token), with the time of the check; an `unknown`,
 `revoked` or `expired` answer removes every audience for the token. At most
-10000 tokens are remembered per process, least recently used first out. When
-the query then fails with a connection-class
+10000 tokens are remembered per process, least recently used first out. A
+live `audience` refusal removes that audience's earlier confirmation while
+retaining the token's other audiences. When the query then fails with a
+connection-class
 database error (connection refused, reset or timed out, DNS failure, pool
 connect timeout, connection terminated, SQLSTATE class `08`, `57P01`-`57P03`,
 `53300`), and only then, the remembered answer for that token is served if it

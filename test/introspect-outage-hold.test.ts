@@ -250,6 +250,33 @@ test("hold on: a held token cannot switch to an unconfirmed general-list History
   assert.equal((await env.introspect({ token, aud: GENERAL_AUDIENCE })).body.held, true);
 });
 
+test("hold on: a live History-origin refusal invalidates an older audience confirmation", async (t) => {
+  const importedOrigin = "https://history.alpha-customer.test";
+  const env = await setup(t, {
+    holdMs: 60_000,
+    introspectAudiences: [importedOrigin],
+  });
+  const token = await env.login(env.beta);
+  assert.equal((await env.introspect({ token, aud: HISTORY_PUBLIC })).body.active, true);
+  assert.equal((await env.introspect({ token, aud: importedOrigin })).body.active, true);
+
+  await env.database.query(
+    "UPDATE workspaces SET relayhistory_origin = $1 WHERE id = $2",
+    [importedOrigin, env.alpha],
+  );
+  assert.deepEqual(
+    (await env.introspect({ token, aud: importedOrigin })).body,
+    { active: false, reason: "audience" },
+  );
+
+  env.database.outage = true;
+  assert.deepEqual(
+    (await env.introspect({ token, aud: "https://History.Alpha-Customer.Test:443" })).body,
+    { active: false, reason: "audience" },
+  );
+  assert.equal((await env.introspect({ token, aud: HISTORY_PUBLIC })).body.held, true);
+});
+
 test("hold on: only verified tokens are held; request checks still run; machine claims never held", async (t) => {
   const env = await setup(t, { holdMs: 60_000 });
   const token = await env.login();
@@ -373,6 +400,20 @@ test("IntrospectionHold expires each confirmed audience on its own clock", () =>
   const generalOnly = hold.lookup("a");
   assert.equal(generalOnly?.audiences.has("https://history.a.test"), false);
   assert.equal(generalOnly?.audiences.get(GENERAL_AUDIENCE)?.validUntil, 8_000);
+});
+
+test("IntrospectionHold forgets one audience without dropping the token's others", () => {
+  const hold = new IntrospectionHold(60_000, { now: () => 0 });
+  hold.observe(token("a"), { audience: "https://history.a.test" });
+  hold.observe(token("a"), { audience: GENERAL_AUDIENCE });
+
+  hold.forgetAudience("a", GENERAL_AUDIENCE);
+  assert.equal(hold.lookup("a")?.audiences.has(GENERAL_AUDIENCE), false);
+  assert.equal(hold.lookup("a")?.audiences.has("https://history.a.test"), true);
+
+  hold.forgetAudience("a", "https://history.a.test");
+  assert.equal(hold.lookup("a"), null);
+  assert.equal(hold.size, 0);
 });
 
 test("IntrospectionHold forgets on unknown, revoked or expired verdicts", () => {

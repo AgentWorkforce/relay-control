@@ -97,6 +97,14 @@ export class IntrospectionHold {
     this.#entries.delete(hash);
   }
 
+  /** Forget one authoritative audience while retaining the token's others. */
+  forgetAudience(hash: string, audience: string): void {
+    const entry = this.#entries.get(hash);
+    if (!entry) return;
+    entry.audiences.delete(audience);
+    if (entry.audiences.size === 0) this.#entries.delete(hash);
+  }
+
   /**
    * The held verdict for this hash, or null. Returned only while at least
    * one audience has at least one second (HOLD_TAIL_MS) left before the

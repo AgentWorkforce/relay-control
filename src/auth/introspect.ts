@@ -395,6 +395,7 @@ export async function introspect(
   if (!request.token.startsWith(USER_ACCESS_TOKEN_PREFIX)) {
     return { active: false, reason: "wrong-kind" };
   }
+  const accessTokenHash = hashSecret(request.token);
   const hold = options?.hold;
   let session: IntrospectedToken | null;
   let held: { audiences: ReadonlyMap<string, HeldAudienceVerdict>; cause: string } | null = null;
@@ -403,7 +404,7 @@ export async function introspect(
     session = await store.introspectAccessToken(request.token);
   } catch (error) {
     if (!hold || !isDatabaseUnavailable(error)) throw error;
-    const entry = hold.lookup(hashSecret(request.token));
+    const entry = hold.lookup(accessTokenHash);
     if (!entry) throw error;
     session = entry.session;
     held = {
@@ -413,7 +414,7 @@ export async function introspect(
     outage = error;
   }
   if (!session) {
-    if (!held) hold?.observe(null, { hash: hashSecret(request.token) });
+    if (!held) hold?.observe(null, { hash: accessTokenHash });
     return { active: false, reason: "unknown" };
   }
   if (session.revoked) {
@@ -426,6 +427,7 @@ export async function introspect(
     return { active: false, reason: "expired" };
   }
   let aud = matchingIntrospectionAudience(config, request.aud);
+  const matchedAudience = aud;
   const historyAudience = matchingRelayhistoryAudience(config, request.aud);
   const requestedHistoryOrigin = canonicalRelayhistoryOrigin(request.aud);
   const expectedHistoryOrigin = canonicalRelayhistoryOrigin(
@@ -442,7 +444,12 @@ export async function introspect(
     // other than the owner, until the operator moves it to the dedicated list.
     if (await store.workspaceIdForRelayhistoryOrigin(requestedHistoryOrigin) !== null) aud = undefined;
   }
-  if (!aud) return { active: false, reason: "audience" };
+  if (!aud) {
+    // A live refusal is authoritative for this token+audience. Do not let an
+    // earlier confirmation outlive a newly imported History-origin fence.
+    if (!held && matchedAudience) hold?.forgetAudience(accessTokenHash, matchedAudience);
+    return { active: false, reason: "audience" };
+  }
   // The hold re-serves authoritative token+audience verdicts, not merely a
   // token session. This keeps the DB-backed legacy History-origin fence in
   // force without a second database query during the outage.
