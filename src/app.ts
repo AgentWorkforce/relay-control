@@ -2986,6 +2986,8 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       organizationAccess,
       requestObject,
       bearer,
+      rateLimit: (res, key, rule) =>
+        rateLimit(res, key, rule, "rate_limited", "Too many requests. Try again later."),
     })) {
       return;
     }

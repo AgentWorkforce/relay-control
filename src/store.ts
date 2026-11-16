@@ -101,6 +101,14 @@ export type Principal = {
    * `provisioning`); absent for every other session.
    */
   provisionedByTokenId?: string;
+  /**
+   * The Desktop host name on the session row: set for an Agent Relay Desktop
+   * sign-in with host consent (PKCE handoff and its redeemed pair) and for a
+   * desktop-enrollment key exchange; absent for device-code and browser
+   * sessions. A pending or original handoff also carries it, so callers that
+   * want a redeemed Desktop session check `handoff` too.
+   */
+  desktopHostName?: string;
 };
 
 export type IssuedTokens = {
@@ -189,6 +197,7 @@ type TokenContextRow = {
   pending_handoff: boolean;
   handoff: boolean;
   provisioned_by_token_id: string | null;
+  desktop_host_name: string | null;
 };
 
 function cleanName(value: string, field: string): string {
@@ -1135,7 +1144,7 @@ export class ControlPlaneStore {
               s.workspace_id, w.name AS workspace_name, m.role, s.scopes,
               (s.desktop_exchange_challenge IS NOT NULL AND s.desktop_exchanged_at IS NULL) AS pending_handoff,
               (s.desktop_exchange_challenge IS NOT NULL) AS handoff,
-              s.provisioned_by_token_id
+              s.provisioned_by_token_id, s.desktop_host_name
          FROM token_sessions s
          JOIN users u ON u.id = s.user_id
          JOIN organizations o ON o.id = s.organization_id
@@ -1167,6 +1176,7 @@ export class ControlPlaneStore {
       pendingHandoff: row.pending_handoff === true,
       handoff: row.handoff === true,
       ...(row.provisioned_by_token_id ? { provisionedByTokenId: row.provisioned_by_token_id } : {}),
+      ...(row.desktop_host_name ? { desktopHostName: row.desktop_host_name } : {}),
     };
   }
 
