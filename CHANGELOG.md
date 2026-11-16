@@ -19,7 +19,12 @@ assigned at release.
   with `auth_mode` `staff_read_grant`. Introspection answers it as a
   `desktop-user` pinned to the workspace. See
   [Staff read grants](docs/staff-read-grants.md).
-
+- Changed: credential-refresh transactions (subscription-login auth files and
+  integration-connection OAuth tokens) now set
+  `SET LOCAL idle_in_transaction_session_timeout = '60s'` and
+  `SET LOCAL lock_timeout = '30s'`, so a provider token exchange is not killed
+  mid-refresh by a shorter server default and a concurrent refresher waits at
+  most 30 s for the per-credential lock.
 - Added: on gate-only installs a member's signed-in Agent Relay Desktop can
   mint, list and revoke its own relay-node token at
   `/api/v1/workspaces/{id}/relay-node/self-tokens` (also under

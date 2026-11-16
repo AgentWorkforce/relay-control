@@ -120,7 +120,7 @@ beforeEach(async () => {
     await target.query("BEGIN READ ONLY");
     let optional:SchemaEntry[];
     try {optional=await schemaCatalog(target,["staff_read_grants"]);} finally {await target.query("ROLLBACK");}
-    const manifest=sealManifest({version:1,baseline:"control-main-c13c294",migrations:await migrationFiles(),required,
+    const manifest=sealManifest({version:1,baseline:"control-main-b79cb5f",migrations:await migrationFiles(),required,
       optional:{staff_read_grants:optional}});
     await writeFile(process.env.CLOUD_VERIFY_SCHEMA_MANIFEST_PATH!,manifestJson(manifest));manifestWritten=true;
   }
@@ -780,3 +780,16 @@ fixtureTest("source Oslo sessions retain UTC expiry and conflicts fail copy",asy
   assert.equal(conflict.selection!.selectionConflicts,1);assert.equal(conflict.ok,false);
   assert.equal((await source.query("SELECT current_setting('TimeZone') AS zone")).rows[0].zone,"Europe/Oslo");
 });
+
+for (const relation of ["relay_node_credentials","relay_launch_credentials"]) {
+  fixtureTest(`new credential schema ${relation} is required even when empty`,async () => {
+    const ledger=await apply();
+    assert.equal((await target.query(`SELECT count(*)::int AS n FROM public.${relation}`)).rows[0].n,0);
+    assert.equal((await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex)).ok,true);
+    await target.query(`DROP TABLE public.${relation}`);
+    const missing=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+    assert.equal(missing.ok,false);
+    assert.ok(missing.targetSchema.missing.includes(`table:public.${relation}`));
+    assert.ok(!missing.findings.some((finding) => finding.kind === "table"));
+  });
+}

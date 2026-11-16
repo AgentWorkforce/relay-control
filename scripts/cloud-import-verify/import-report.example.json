@@ -43,19 +43,19 @@
     },
     {
       "kind": "schema_manifest",
-      "name": "control-main-c13c294",
+      "name": "control-main-b79cb5f",
       "ok": true,
       "detail": {
-        "baseline": "control-main-c13c294",
-        "manifestSha256": "aa2379731cb02efbbd3494d5c4b34892ff8d5f73ef0d9d32f8b1a2a02ff50928",
-        "expectedSchemaSha256": "f174593f8209b7546e744f24997fb5771eef14854065984c2dcd1c28227a81f7",
-        "actualSchemaSha256": "f174593f8209b7546e744f24997fb5771eef14854065984c2dcd1c28227a81f7",
+        "baseline": "control-main-b79cb5f",
+        "manifestSha256": "8a9af68db47188be01ed88b966cfb73fea01e18190b59f1b3b744654a93275a0",
+        "expectedSchemaSha256": "d6c22ca7c1cdaf9d08076cc348be075eb8e3f431c43fa0d4a82fce8b83df9ed6",
+        "actualSchemaSha256": "d6c22ca7c1cdaf9d08076cc348be075eb8e3f431c43fa0d4a82fce8b83df9ed6",
         "profile": "main-plus-proposed-0061",
         "optionalRelations": [
           "staff_read_grants"
         ],
-        "expectedObjects": 1799,
-        "actualObjects": 1799,
+        "expectedObjects": 1842,
+        "actualObjects": 1842,
         "missing": [],
         "changed": [],
         "unexpectedCount": 0,
@@ -3302,16 +3302,16 @@
     "unknownRequested": 0
   },
   "targetSchema": {
-    "baseline": "control-main-c13c294",
-    "manifestSha256": "aa2379731cb02efbbd3494d5c4b34892ff8d5f73ef0d9d32f8b1a2a02ff50928",
-    "expectedSchemaSha256": "f174593f8209b7546e744f24997fb5771eef14854065984c2dcd1c28227a81f7",
-    "actualSchemaSha256": "f174593f8209b7546e744f24997fb5771eef14854065984c2dcd1c28227a81f7",
+    "baseline": "control-main-b79cb5f",
+    "manifestSha256": "8a9af68db47188be01ed88b966cfb73fea01e18190b59f1b3b744654a93275a0",
+    "expectedSchemaSha256": "d6c22ca7c1cdaf9d08076cc348be075eb8e3f431c43fa0d4a82fce8b83df9ed6",
+    "actualSchemaSha256": "d6c22ca7c1cdaf9d08076cc348be075eb8e3f431c43fa0d4a82fce8b83df9ed6",
     "profile": "main-plus-proposed-0061",
     "optionalRelations": [
       "staff_read_grants"
     ],
-    "expectedObjects": 1799,
-    "actualObjects": 1799,
+    "expectedObjects": 1842,
+    "actualObjects": 1842,
     "missing": [],
     "changed": [],
     "unexpectedCount": 0,
