@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { recordAudit, type AuditActor } from "./admin/audit.js";
+import { ProvisionError, type RelaycastProvisioner } from "./identity/bootstrap.js";
 import { removeCompletedWorkspaceCapyInTx, retireCapyBindingsInTx } from "./capy/lifecycle.js";
 import { capturePolicyFromRow, type CapturePolicy } from "./capture-policy.js";
 import { consentAttemptKey, type ConsentAttempt } from "./auth/desktop-login.js";
@@ -67,6 +68,8 @@ const LAUNCH_CHECK_SCOPES: string[] = [];
 const LAUNCH_CHECK_TTL_MS = 60 * 1_000;
 /** desktop-auth lane, browser flow: hosted Cloud's 15-minute loopback handoff. */
 const DESKTOP_HANDOFF_TTL_MS = 15 * 60 * 1_000;
+/** Longer than Relaycast's 300 s cold-create bound, with room to persist. */
+const RELAYCAST_BINDING_CLAIM_TTL_SQL = "interval '6 minutes'";
 
 class RelaycastBindingMoved extends Error {}
 /** The Desktop consent screen's single-use token lives as long as the screen. */
@@ -138,6 +141,17 @@ export type EncryptionRotationStatus = {
 export class MembershipConflictError extends Error {}
 export class OrganizationConflictError extends Error {}
 export class OrganizationBoundaryError extends Error {}
+/** An imported workspace is unbound and this installation cannot provision it yet. */
+export class RelaycastBindingUnavailableError extends Error {
+  readonly status = 503;
+  readonly code = "relaycast_not_ready";
+  readonly retryAfterSeconds = 5;
+
+  constructor(message = "Agent Relay could not provision this workspace yet. Try again shortly.") {
+    super(message);
+    this.name = "RelaycastBindingUnavailableError";
+  }
+}
 /** A device authorization asked for the reserved dashboard client name. */
 export class ReservedClientNameError extends Error {}
 /**
@@ -220,13 +234,15 @@ export class ControlPlaneStore {
     readonly database: Database,
     private readonly encryptionKeyring: EncryptionKeyring,
     private readonly devicePollIntervalSeconds = 5,
-    options: { tenancy?: TenancyMode } = {},
+    options: { tenancy?: TenancyMode; relaycastProvisioner?: RelaycastProvisioner | null } = {},
   ) {
     this.tenancy = options.tenancy ?? "single";
+    this.relaycastProvisioner = options.relaycastProvisioner ?? null;
   }
 
   /** SELFHOST_TENANCY: the request-time gate that replaced the schema singleton (0014). */
   readonly tenancy: TenancyMode;
+  private readonly relaycastProvisioner: RelaycastProvisioner | null;
 
   async ready(): Promise<boolean> {
     return (await this.readiness()).ready;
@@ -413,6 +429,69 @@ export class ControlPlaneStore {
     const apiKey = input.relaycastApiKey?.trim() || null;
     if (input.relaycastApiKey !== undefined && !apiKey) throw new Error("relaycastApiKey is required");
     if (name === null && relaycastWorkspaceId === null && apiKey === null) throw new Error("nothing to update");
+    const owned = await this.database.query<{
+      relaycast_workspace_id: string | null;
+      relaycast_api_key_ciphertext: string | null;
+    }>(
+      `SELECT relaycast_workspace_id, relaycast_api_key_ciphertext
+         FROM workspaces WHERE id = $1 AND organization_id = $2`,
+      [input.workspaceId, input.organizationId],
+    );
+    const current = owned.rows[0];
+    if (!current) return null;
+    const unbound = current.relaycast_workspace_id === null && current.relaycast_api_key_ciphertext === null;
+    if ((current.relaycast_workspace_id === null) !== (current.relaycast_api_key_ciphertext === null)) {
+      throw new Error(`Workspace ${input.workspaceId} has an incomplete Relaycast binding`);
+    }
+    if (unbound && ((relaycastWorkspaceId === null) !== (apiKey === null))) {
+      throw new Error("relaycastWorkspaceId and relaycastApiKey are both required for an unbound workspace");
+    }
+    if (unbound && relaycastWorkspaceId !== null && apiKey !== null) {
+      const installed = await this.database.transaction(async (tx) => {
+        await this.requireOrganization(tx, input.organizationId);
+        await lockRelaycastWorkspace(tx, relaycastWorkspaceId);
+        const existing = await tx.query<{ ciphertext: string }>(
+          `SELECT relaycast_api_key_ciphertext AS ciphertext
+             FROM workspaces
+            WHERE relaycast_workspace_id = $1 AND id <> $2
+            ORDER BY id
+            FOR UPDATE`,
+          [relaycastWorkspaceId, input.workspaceId],
+        );
+        for (const row of existing.rows) {
+          if (!secureEqual(decryptSecret(row.ciphertext, this.encryptionKeyring), apiKey)) {
+            throw new Error("relaycastApiKey does not match the existing Relaycast workspace binding");
+          }
+        }
+        const result = await tx.query<{ id: string; name: string; relaycast_workspace_id: string }>(
+          `UPDATE workspaces
+              SET name = COALESCE($3, name),
+                  relaycast_workspace_id = $4,
+                  relaycast_api_key_ciphertext = $5,
+                  relaycast_binding_claim_id = NULL,
+                  relaycast_binding_claimed_at = NULL,
+                  relaycast_binding_claim_name = NULL,
+                  relaycast_binding_idempotency_key_ciphertext = NULL,
+                  updated_at = now()
+            WHERE id = $1 AND organization_id = $2
+              AND relaycast_workspace_id IS NULL
+              AND relaycast_api_key_ciphertext IS NULL
+            RETURNING id, name, relaycast_workspace_id`,
+          [input.workspaceId, input.organizationId, name, relaycastWorkspaceId,
+            encryptSecret(apiKey, this.encryptionKeyring.active)],
+        );
+        return result.rows[0] ?? null;
+      });
+      if (installed) return {
+        id: installed.id,
+        organizationId: input.organizationId,
+        name: installed.name,
+        relaycastWorkspaceId: installed.relaycast_workspace_id,
+      };
+      // A concurrent lazy bind won. Re-enter the ordinary bound update path.
+    } else if (unbound) {
+      await this.ensureRelaycastBinding(input.workspaceId);
+    }
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await this.database.transaction(async (tx) => {
@@ -631,7 +710,7 @@ export class ControlPlaneStore {
       id: string;
       organization_id: string;
       name: string;
-      relaycast_workspace_id: string;
+      relaycast_workspace_id: string | null;
       runtime_config: unknown;
     }>(
       `SELECT id, organization_id, name, relaycast_workspace_id, runtime_config
@@ -832,16 +911,310 @@ export class ControlPlaneStore {
     }));
   }
 
-  /** A workspace's Relaycast credentials, for the Flows service that assigns its runs. */
-  async relaycastBinding(workspaceId: string): Promise<{ relaycastWorkspaceId: string; relaycastApiKey: string } | null> {
-    const result = await this.database.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
-      "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM workspaces WHERE id = $1",
+  /** Membership metadata that never provisions or reads a Relaycast binding. */
+  async workspaceMembershipForUser(
+    workspaceId: string,
+    userId: string,
+  ): Promise<{
+    id: string;
+    organizationId: string;
+    name: string;
+    role: Principal["role"];
+  } | null> {
+    const result = await this.database.query<{
+      id: string;
+      organization_id: string;
+      name: string;
+      role: Principal["role"];
+    }>(
+      `SELECT w.id, w.organization_id, w.name, m.role
+         FROM workspaces w
+         JOIN organization_memberships m
+           ON m.organization_id = w.organization_id AND m.user_id = $2
+        WHERE w.id = $1`,
+      [workspaceId, userId],
+    );
+    const row = result.rows[0];
+    return row ? {
+      id: row.id,
+      organizationId: row.organization_id,
+      name: row.name,
+      role: row.role,
+    } : null;
+  }
+
+  /** A workspace's Relaycast credentials, for services that use Relaycast. */
+  async relaycastBinding(workspaceId: string): Promise<{
+    relaycastWorkspaceId: string;
+    relaycastApiKey: string;
+    provisioned: boolean;
+  } | null> {
+    const result = await this.database.query<{
+      name: string;
+      relaycast_workspace_id: string | null;
+      relaycast_api_key_ciphertext: string | null;
+    }>(
+      "SELECT name, relaycast_workspace_id, relaycast_api_key_ciphertext FROM workspaces WHERE id = $1",
       [workspaceId],
     );
     const row = result.rows[0];
-    return row
-      ? { relaycastWorkspaceId: row.relaycast_workspace_id, relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring) }
-      : null;
+    if (!row) return null;
+    if (row.relaycast_workspace_id !== null && row.relaycast_api_key_ciphertext !== null) {
+      return {
+        relaycastWorkspaceId: row.relaycast_workspace_id,
+        relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring),
+        provisioned: false,
+      };
+    }
+    return this.ensureRelaycastBinding(workspaceId);
+  }
+
+  /**
+   * Binds an imported Cloud workspace on first Relaycast use. A short,
+   * committed claim elects one creator; the slow remote call holds neither a
+   * transaction nor a pool connection. Waiters fail retryably. Stale claims
+   * retry a workspace-stable, encrypted CSPRNG idempotency capability, then
+   * one conditional update installs the encrypted pair and clears the claim.
+   */
+  private async ensureRelaycastBinding(workspaceId: string): Promise<{
+    relaycastWorkspaceId: string;
+    relaycastApiKey: string;
+    provisioned: boolean;
+  } | null> {
+    const claimId = randomUUID();
+    const nextIdempotencyKey = randomBytes(32).toString("base64url");
+    const claimed = await this.database.query<{
+      claim_name: string;
+      idempotency_key_ciphertext: string;
+    }>(
+      `UPDATE workspaces
+          SET relaycast_binding_claim_id = $2,
+              relaycast_binding_claimed_at = now(),
+              relaycast_binding_claim_name = COALESCE(relaycast_binding_claim_name, name),
+              relaycast_binding_idempotency_key_ciphertext = COALESCE(
+                relaycast_binding_idempotency_key_ciphertext,
+                $3
+              ),
+              updated_at = now()
+        WHERE id = $1
+          AND relaycast_workspace_id IS NULL
+          AND relaycast_api_key_ciphertext IS NULL
+          AND (
+            relaycast_binding_claim_id IS NULL
+            OR relaycast_binding_claimed_at < now() - ${RELAYCAST_BINDING_CLAIM_TTL_SQL}
+          )
+        RETURNING relaycast_binding_claim_name AS claim_name,
+                  relaycast_binding_idempotency_key_ciphertext AS idempotency_key_ciphertext`,
+      [workspaceId, claimId, encryptSecret(nextIdempotencyKey, this.encryptionKeyring.active)],
+    );
+    if (!claimed.rows[0]) {
+      const current = await this.database.query<{
+        relaycast_workspace_id: string | null;
+        relaycast_api_key_ciphertext: string | null;
+      }>(
+        "SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM workspaces WHERE id = $1",
+        [workspaceId],
+      );
+      const row = current.rows[0];
+      if (!row) return null;
+      if (row.relaycast_workspace_id !== null && row.relaycast_api_key_ciphertext !== null) {
+        return {
+          relaycastWorkspaceId: row.relaycast_workspace_id,
+          relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring),
+          provisioned: false,
+        };
+      }
+      throw new RelaycastBindingUnavailableError("Agent Relay is provisioning this workspace. Try again shortly.");
+    }
+    if (!this.relaycastProvisioner) {
+      await this.clearRelaycastBindingClaim(workspaceId, claimId);
+      throw new RelaycastBindingUnavailableError();
+    }
+
+    let created: { id: string; apiKey: string };
+    try {
+      created = await this.relaycastProvisioner.create(
+        claimed.rows[0].claim_name,
+        decryptSecret(claimed.rows[0].idempotency_key_ciphertext, this.encryptionKeyring),
+      );
+    } catch (error) {
+      // A response-bearing refusal did not create anything. A transport loss
+      // may have created the deterministic, idempotency-keyed workspace, so
+      // retain the durable claim for the stale-claim retry instead.
+      if (!(error instanceof ProvisionError) || !error.outcomeUnknown) {
+        await this.clearRelaycastBindingClaim(workspaceId, claimId);
+      }
+      throw new RelaycastBindingUnavailableError(
+        `Agent Relay could not provision this workspace yet. Try again shortly. (${error instanceof Error ? error.message : String(error)})`,
+      );
+    }
+
+    try {
+      const bound = await this.database.query<{ id: string }>(
+        `UPDATE workspaces
+            SET relaycast_workspace_id = $3,
+                relaycast_api_key_ciphertext = $4,
+                relaycast_binding_claim_id = NULL,
+                relaycast_binding_claimed_at = NULL,
+                relaycast_binding_claim_name = NULL,
+                relaycast_binding_idempotency_key_ciphertext = NULL,
+                updated_at = now()
+          WHERE id = $1
+            AND relaycast_binding_claim_id = $2
+            AND relaycast_workspace_id IS NULL
+            AND relaycast_api_key_ciphertext IS NULL
+          RETURNING id`,
+        [workspaceId, claimId, created.id, encryptSecret(created.apiKey, this.encryptionKeyring.active)],
+      );
+      if (bound.rows[0]) {
+        return {
+          relaycastWorkspaceId: created.id,
+          relaycastApiKey: created.apiKey,
+          provisioned: true,
+        };
+      }
+    } catch (error) {
+      // The claim and stable idempotency capability make this recoverable by a later
+      // stale-claim pass. Surface the non-secret remote id for operators.
+      throw new Error(
+        `Relaycast workspace ${created.id} was retained after its Control binding write failed; claim ${claimId} will be reconciled`,
+        { cause: error },
+      );
+    }
+
+    // The claim may have expired or been cleared while create() was in flight.
+    // Reconcile under one short row lock: the idempotent create returned the
+    // canonical remote pair, so an unbound row with no live foreign claimant
+    // must bind it. Deleting it would terminalize the durable key forever.
+    const current = await this.reconcileCreatedRelaycastBinding(workspaceId, claimId, created).catch((error) => {
+      throw new Error(
+        `Relaycast workspace ${created.id} was retained after its Control recovery write failed; claim ${claimId} will be reconciled`,
+        { cause: error },
+      );
+    });
+    if (current.kind === "recovered") {
+      return {
+        relaycastWorkspaceId: created.id,
+        relaycastApiKey: created.apiKey,
+        provisioned: true,
+      };
+    }
+    if (current.kind === "bound") {
+      // Never delete a workspace which another writer bound, even if that
+      // writer rotated the key before this request observed the row.
+      if (current.binding.relaycastWorkspaceId !== created.id) {
+        await this.removeUnusedRelaycastWorkspace(created.id, workspaceId);
+      }
+      return { ...current.binding, provisioned: false };
+    }
+    // A stale-claim winner may be creating the same deterministic remote.
+    // Its fresh DB-clock lease owns cleanup; deleting here would terminalize
+    // the shared idempotency capability and strand the winner.
+    if (current.kind === "pending") {
+      throw new RelaycastBindingUnavailableError("Agent Relay is provisioning this workspace. Try again shortly.");
+    }
+    // The local workspace was deleted while the remote create was in flight;
+    // no Control row can ever retry this capability, so cleanup is safe.
+    await this.removeUnusedRelaycastWorkspace(created.id, workspaceId);
+    throw new RelaycastBindingUnavailableError();
+  }
+
+  private async reconcileCreatedRelaycastBinding(
+    workspaceId: string,
+    claimId: string,
+    created: { id: string; apiKey: string },
+  ): Promise<
+    | { kind: "recovered" }
+    | { kind: "bound"; binding: { relaycastWorkspaceId: string; relaycastApiKey: string } }
+    | { kind: "pending" }
+    | { kind: "gone" }
+  > {
+    return this.database.transaction(async (tx) => {
+      const result = await tx.query<{
+        relaycast_workspace_id: string | null;
+        relaycast_api_key_ciphertext: string | null;
+        relaycast_binding_claim_id: string | null;
+        claim_live: boolean;
+      }>(
+        `SELECT relaycast_workspace_id,
+                relaycast_api_key_ciphertext,
+                relaycast_binding_claim_id,
+                relaycast_binding_claim_id IS NOT NULL
+                  AND relaycast_binding_claimed_at >= now() - ${RELAYCAST_BINDING_CLAIM_TTL_SQL} AS claim_live
+           FROM workspaces
+          WHERE id = $1
+          FOR UPDATE`,
+        [workspaceId],
+      );
+      const row = result.rows[0];
+      if (!row) return { kind: "gone" } as const;
+      if (row.relaycast_workspace_id !== null && row.relaycast_api_key_ciphertext !== null) {
+        return {
+          kind: "bound",
+          binding: {
+            relaycastWorkspaceId: row.relaycast_workspace_id,
+            relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring),
+          },
+        } as const;
+      }
+      if (row.claim_live && row.relaycast_binding_claim_id !== claimId) {
+        return { kind: "pending" } as const;
+      }
+      await tx.query(
+        `UPDATE workspaces
+            SET relaycast_workspace_id = $2,
+                relaycast_api_key_ciphertext = $3,
+                relaycast_binding_claim_id = NULL,
+                relaycast_binding_claimed_at = NULL,
+                relaycast_binding_claim_name = NULL,
+                relaycast_binding_idempotency_key_ciphertext = NULL,
+                updated_at = now()
+          WHERE id = $1`,
+        [workspaceId, created.id, encryptSecret(created.apiKey, this.encryptionKeyring.active)],
+      );
+      return { kind: "recovered" } as const;
+    });
+  }
+
+  private async clearRelaycastBindingClaim(workspaceId: string, claimId: string): Promise<void> {
+    await this.database.query(
+      `UPDATE workspaces
+          SET relaycast_binding_claim_id = NULL,
+              relaycast_binding_claimed_at = NULL,
+              updated_at = now()
+        WHERE id = $1 AND relaycast_binding_claim_id = $2
+          AND relaycast_workspace_id IS NULL
+          AND relaycast_api_key_ciphertext IS NULL`,
+      [workspaceId, claimId],
+    );
+  }
+
+  private async relaycastBindingRow(workspaceId: string): Promise<{
+    relaycastWorkspaceId: string;
+    relaycastApiKey: string;
+  } | null> {
+    const result = await this.database.query<{
+      relaycast_workspace_id: string | null;
+      relaycast_api_key_ciphertext: string | null;
+    }>("SELECT relaycast_workspace_id, relaycast_api_key_ciphertext FROM workspaces WHERE id = $1", [workspaceId]);
+    const row = result.rows[0];
+    if (!row || row.relaycast_workspace_id === null || row.relaycast_api_key_ciphertext === null) return null;
+    return {
+      relaycastWorkspaceId: row.relaycast_workspace_id,
+      relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring),
+    };
+  }
+
+  private async removeUnusedRelaycastWorkspace(relaycastWorkspaceId: string, workspaceId: string): Promise<void> {
+    try {
+      await this.relaycastProvisioner?.remove(relaycastWorkspaceId);
+    } catch (error) {
+      console.error("[selfhost-api] lazy Relaycast binding cleanup failed", {
+        workspaceId,
+        relaycastWorkspaceId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async workspaceForUser(
@@ -854,6 +1227,7 @@ export class ControlPlaneStore {
     relaycastWorkspaceId: string;
     cloudRelayWorkspaceId: string | null;
     relaycastApiKey: string;
+    relaycastProvisioned: boolean;
     relayhistoryOrigin: string | null;
     runtime: unknown;
     role: Principal["role"];
@@ -862,9 +1236,9 @@ export class ControlPlaneStore {
       id: string;
       organization_id: string;
       name: string;
-      relaycast_workspace_id: string;
+      relaycast_workspace_id: string | null;
       cloud_relay_workspace_id: string | null;
-      relaycast_api_key_ciphertext: string;
+      relaycast_api_key_ciphertext: string | null;
       relayhistory_origin: string | null;
       runtime_config: unknown;
       role: Principal["role"];
@@ -880,13 +1254,22 @@ export class ControlPlaneStore {
     );
     const row = result.rows[0];
     if (!row) return null;
+    const binding = row.relaycast_workspace_id !== null && row.relaycast_api_key_ciphertext !== null
+      ? {
+          relaycastWorkspaceId: row.relaycast_workspace_id,
+          relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring),
+          provisioned: false,
+        }
+      : await this.ensureRelaycastBinding(row.id);
+    if (!binding) return null;
     return {
       id: row.id,
       organizationId: row.organization_id,
       name: row.name,
-      relaycastWorkspaceId: row.relaycast_workspace_id,
+      relaycastWorkspaceId: binding.relaycastWorkspaceId,
       cloudRelayWorkspaceId: row.cloud_relay_workspace_id,
-      relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring),
+      relaycastApiKey: binding.relaycastApiKey,
+      relaycastProvisioned: binding.provisioned,
       relayhistoryOrigin: row.relayhistory_origin,
       runtime: row.runtime_config,
       role: row.role,
@@ -1017,7 +1400,7 @@ export class ControlPlaneStore {
     if (new Date(current.expires_at).getTime() <= Date.now()) return "expired";
     if (current.status !== "pending") return "already_decided";
 
-    const workspace = await this.workspaceForUser(input.workspaceId, input.userId);
+    const workspace = await this.workspaceMembershipForUser(input.workspaceId, input.userId);
     if (!workspace) return "not_member";
     const result = await this.database.query<{ id: string }>(
       `UPDATE device_authorizations

@@ -34,7 +34,9 @@ workspace.
 
 The caller must be signed in interactively: the dashboard browser session or
 a CLI login (`sh_at_` with `cli:auth`). A Desktop session
-(`desktop:workspaces`), a Desktop provider credential, a session issued by an
+(`desktop:workspaces`), a device-code login Agent Relay Desktop started
+(the code names a `desktop_host_name`), a Desktop provider credential, a
+session issued by an
 enrollment key, a pending handoff, workspace API tokens, the service token
 and a staff read grant itself are all refused.
 
@@ -96,12 +98,17 @@ and the scope is not widened.
 
 ### Introspection
 
-RelayHistory and other services introspect the credential at
-`POST /internal/v1/auth/introspect`. An active grant answers
+RelayHistory introspects the credential at
+`POST /internal/v1/auth/introspect`. Only the History audience activates a
+grant: an origin listed in `SELFHOST_RELAYHISTORY_AUDIENCES` (by default the
+session read API's public URL) that is the workspace's own History origin
+when it has one, else the configured History URL. Every other introspection
+audience, including those in `SELFHOST_INTROSPECT_AUDIENCES`, is inactive
+with `audience`. An active grant answers
 `principal_type: "desktop-user"` with `sub` the staff person, `org` and
 `workspace` the grant's customer organization and workspace,
 `role: "member"`, `scopes: ["rth:read"]`, and `iat`/`exp` from the grant.
-Any `machine` is `machine_not_owned`; another `workspace`, an unlisted
+Any `machine` is `machine_not_owned`; another `workspace`, another
 audience, revocation, expiry or a lost staff rule is inactive. Introspection
 does not count as a use.
 
