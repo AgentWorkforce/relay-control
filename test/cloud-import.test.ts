@@ -170,21 +170,52 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
     .filter((table) => !TARGETS[table].gate)
     .map(async (table) => [table, await count(target, TARGETS[table].table)] as const)));
   const before = await counts();
-  const rerun = await runImport(deps, scope, "apply");
+  // A re-run without the previous ledger is refused: it could not reconcile.
+  const blind = await runImport(deps, scope, "apply");
+  assert.equal(blind.refused, "rerun_requires_previous_report");
+  assert.deepEqual(await counts(), before);
+  const rerun = await runImport(deps, scope, "apply", { previous: applied });
   assert.equal(rerun.ok, true);
   assert.deepEqual(await counts(), before);
+  assert.equal(Object.values(rerun.tables).reduce((n, ledger) => n + ledger.deleted, 0), 0);
   const inviteAfter = (await target.query<{ token_hash: string }>(
     "SELECT token_hash FROM organization_invitations WHERE id = $1", [id(0x302)])).rows[0]!;
   assert.equal(inviteAfter.token_hash, invite.token_hash);
 
+  // Delta after removals in Cloud: the reconcile deletes exactly the rows this
+  // tool imported earlier that the source no longer yields.
+  await source.exec(`
+    DELETE FROM organization_memberships WHERE organization_id = '${ORG_A}' AND user_id = '${id(3)}';
+    UPDATE organization_invites SET canceled_at = now() WHERE id = '${id(0x302)}';
+    DELETE FROM workspace_person_identities WHERE id = '${id(0x401)}';
+  `);
+  // A Control-side row the import never wrote must survive the reconcile.
+  await target.query("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'member')", [ORG_B, id(6)]);
+  const delta = await runImport(deps, scope, "apply", { previous: rerun });
+  assert.equal(delta.ok, true, JSON.stringify(delta.orgs));
+  assert.equal(delta.tables.organization_memberships.deleted, 1);
+  assert.equal(delta.tables.organization_invitations.deleted, 1);
+  assert.equal(delta.tables.person_identities.deleted, 1);
+  // Carol (user 3) lost her membership, so her fleet node claim goes too (the
+  // membership FK cascades before the explicit reconcile reaches it).
+  assert.equal(delta.tables.fleet_node_owners.imported, 0);
+  assert.equal(await count(target, "fleet_node_owners"), 0);
+  assert.equal((await target.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [ORG_A, id(3)])).rows.length, 0);
+  assert.equal((await target.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [ORG_B, id(6)])).rows.length, 1);
+  // Canceling the newer invite un-supersedes the older one for the same
+  // email; deleting first keeps the open-invite unique index satisfied.
+  assert.deepEqual((await target.query<{ id: string }>("SELECT id FROM organization_invitations ORDER BY id")).rows.map((row) => row.id), [id(0x301), id(0x305)]);
+  await target.query("DELETE FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [ORG_B, id(6)]);
+  const finalReport = delta;
+
   // The verifier projections agree row for row with what was imported.
   for (const comparison of verifierComparisons(scope, new Set(), new Set())) {
-    const excluded = new Set(Object.values(applied.tables[comparison.name as keyof typeof applied.tables].importerSkips).flat());
+    const excluded = new Set(Object.values(finalReport.tables[comparison.name as keyof typeof finalReport.tables].importerSkips).flat());
     const sourceRows = (await source.query<{ __key: string }>(comparison.sourceSql)).rows
       .filter((row) => !excluded.has(row.__key)).map((row) => JSON.stringify(row)).sort();
     const targetRows = (await target.query(comparison.targetSql)).rows.map((row) => JSON.stringify(row)).sort();
     assert.deepEqual(targetRows, sourceRows, comparison.name);
-    assert.equal(sourceRows.length, EXPECTED_FULL[comparison.name]!.imported, `${comparison.name} projection count`);
+    assert.equal(sourceRows.length, finalReport.tables[comparison.name as keyof typeof finalReport.tables].imported, `${comparison.name} projection count`);
   }
 });
 

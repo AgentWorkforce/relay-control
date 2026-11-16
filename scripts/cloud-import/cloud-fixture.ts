@@ -145,11 +145,13 @@ INSERT INTO organization_invites (id, organization_id, email, role, token, invit
 INSERT INTO workspace_person_identities (id, workspace_id, user_id, relay_workspace_id, agent_name, agent_remote_id, token_envelope, created_at, updated_at) VALUES
   ('${id(0x401)}', '${id(0x201)}', '${id(1)}', 'rw_0000a201', 'alice', 'ag-1', ${env("tok_person_alice")}, ${t}, ${t}),
   ('${id(0x402)}', '${id(0x202)}', '${id(2)}', 'rw_0000a202', 'bob', 'ag-2', ${env("tok_person_bob")}, ${t}, ${t}),
-  ('${id(0x403)}', '${id(0x205)}', '${id(2)}', 'rw_0000b201', 'bob', 'ag-3', ${env("tok_person_bob_b", staleKey)}, ${t}, ${t});
+  ('${id(0x403)}', '${id(0x205)}', '${id(2)}', 'rw_0000b201', 'bob', 'ag-3', ${env("tok_person_bob_b", staleKey)}, ${t}, ${t}),
+  ('${id(0x404)}', '${id(0x201)}', '${id(6)}', 'rw_0000a201', 'dave', 'ag-4', ${env("tok_person_dave")}, ${t}, ${t});
 INSERT INTO hosted_relay_participants (id, workspace_id, user_id, relay_workspace_id, session_hash, agent_name, agent_remote_id, token_envelope, created_at) VALUES
   ('${id(0x501)}', '${id(0x205)}', '${id(1)}', 'rw_0000b201', 'sh-1', 'alice-mcp', 'ag-5', ${env("tok_hosted_1")}, ${t}),
   ('${id(0x502)}', '${id(0x205)}', '${id(5)}', 'rw_0000b201', NULL, 'alice-mcp', 'ag-6', ${env("tok_hosted_2")}, '2026-01-02T00:00:00Z'),
-  ('${id(0x503)}', '${id(0x201)}', '${id(2)}', 'rw_0000beef', NULL, 'bob-mcp', 'ag-7', ${env("tok_hosted_3")}, ${t});
+  ('${id(0x503)}', '${id(0x201)}', '${id(2)}', 'rw_0000beef', NULL, 'bob-mcp', 'ag-7', ${env("tok_hosted_3")}, ${t}),
+  ('${id(0x504)}', '${id(0x201)}', '${id(6)}', 'rw_0000a201', NULL, 'dave-mcp', 'ag-11', ${env("tok_hosted_4")}, ${t});
 INSERT INTO desktop_relay_identities (id, workspace_id, user_id, relay_workspace_id, source_id, agent_name, agent_remote_id, address, native_session_kind, native_session_id, token_envelope, created_at, updated_at) VALUES
   ('${id(0x601)}', '${id(0x201)}', '${id(1)}', 'rw_0000a201', '${id(0x9001).toUpperCase()}', 'alice-desk', 'ag-8', 'alice-desk@host', 'copilot', 'chat-1', ${env("tok_desk_1")}, ${t}, ${t}),
   ('${id(0x602)}', '${id(0x201)}', '${id(2)}', 'rw_0000a201', 'not-a-uuid', 'bob-desk', 'ag-9', 'bob-desk@host', 'copilot', NULL, ${env("tok_desk_2")}, ${t}, ${t}),
@@ -196,8 +198,8 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
     imported: 2,
     skipped: { superseded_open_invite: 1, already_member: 1, canceled: 1 },
   },
-  person_identities: { imported: 1, skipped: { workspace_not_imported: 1, cloud_decrypt_failed: 1 } },
-  hosted_relay_participants: { imported: 1, skipped: { duplicate_after_merge: 1, stale_relay_workspace: 1 } },
+  person_identities: { imported: 1, skipped: { workspace_not_imported: 1, cloud_decrypt_failed: 1, not_a_member: 1 } },
+  hosted_relay_participants: { imported: 1, skipped: { duplicate_after_merge: 1, stale_relay_workspace: 1, not_a_member: 1 } },
   desktop_relay_identities: { imported: 1, skipped: { source_id_not_uuid: 1, not_a_member: 1 } },
   fleet_node_owners: { imported: 1, skipped: { workspace_not_imported: 1 } },
   // Pre-0058 target: the two relay_managed rows are refused by the importer.

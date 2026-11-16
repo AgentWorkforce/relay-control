@@ -16,6 +16,7 @@ import type { Database, SqlExecutor } from "../../src/database.js";
 import {
   MAPPING_REVISION,
   ORG_TABLES,
+  RECONCILED_TABLES,
   REQUIRED_MIGRATION,
   SOURCE_TABLES,
   TARGETS,
@@ -55,6 +56,8 @@ export type TableLedger = {
    * verifier can reconcile them: ids are Cloud UUIDs, never emails or values.
    */
   importerSkips: Record<string, string[]>;
+  /** Rows deleted because an earlier run imported them and this one did not. */
+  deleted: number;
 };
 
 export type OrgLedger = {
@@ -62,6 +65,12 @@ export type OrgLedger = {
   /** SQLSTATE and constraint name only; never the driver message. */
   error?: { code: string; constraint?: string; table?: string };
   imported: Partial<Record<ImportTable, number>>;
+  /**
+   * Keys written for this organization (Cloud UUIDs; memberships org:user).
+   * The next run's reconcile reads them from this report.
+   */
+  keys: Partial<Record<ImportTable, string[]>>;
+  deleted: Partial<Record<ImportTable, number>>;
 };
 
 export type ImportReport = {
@@ -231,7 +240,37 @@ function chunks<T>(items: T[], size: number): T[][] {
   return out;
 }
 
-export async function runImport(deps: ImportDeps, scope: ImportScope, mode: ImportMode): Promise<ImportReport> {
+export type ImportOptions = {
+  /**
+   * The report of the previous apply against this target. Required to re-run
+   * apply onto a target that already holds imported organizations: rows it
+   * imported that this run no longer imports are deleted (RECONCILED_TABLES).
+   */
+  previous?: ImportReport;
+};
+
+function deleteSql(table: ImportTable): string {
+  switch (table) {
+    case "organization_memberships":
+      return `DELETE FROM public.organization_memberships
+               WHERE organization_id = $2 AND (organization_id::text || ':' || user_id::text) = ANY($1::text[])`;
+    case "person_identities":
+    case "hosted_relay_participants":
+      return `DELETE FROM public.${table} x USING public.workspaces w
+               WHERE w.id = x.workspace_id AND w.organization_id = $2 AND x.id::text = ANY($1::text[])`;
+    case "github_app_connections":
+      return `DELETE FROM public.integration_connections
+               WHERE auth_mode = 'github_app' AND github_app_organization_id = $2 AND id::text = ANY($1::text[])`;
+    case "coding_agent_credentials":
+      // Only the main run's relay_managed rows; copier rows have Control ids.
+      return `DELETE FROM public.coding_agent_credentials
+               WHERE auth_type = 'relay_managed' AND organization_id = $2 AND id::text = ANY($1::text[])`;
+    default:
+      return `DELETE FROM public.${quote(TARGETS[table].table)} WHERE organization_id = $2 AND id::text = ANY($1::text[])`;
+  }
+}
+
+export async function runImport(deps: ImportDeps, scope: ImportScope, mode: ImportMode, options: ImportOptions = {}): Promise<ImportReport> {
   assertScope(scope);
   const now = deps.now ?? (() => new Date());
   const log: ImportLogger = deps.log ?? (() => {});
@@ -246,7 +285,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     startedAt,
     finishedAt: startedAt,
     ok: false,
-    tables: Object.fromEntries(SOURCE_TABLES.map((table) => [table, { candidates: 0, imported: 0, skipped: {}, importerSkips: {} }])) as Record<ImportTable, TableLedger>,
+    tables: Object.fromEntries(SOURCE_TABLES.map((table) => [table, { candidates: 0, imported: 0, skipped: {}, importerSkips: {}, deleted: 0 }])) as Record<ImportTable, TableLedger>,
     orgs: {},
     optionalColumns: [],
     warnings: {},
@@ -304,7 +343,16 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
   });
 
   const orgIds = [...new Set(prepared.organizations.map((row) => row.org!))].sort();
-  for (const org of orgIds) report.orgs[org] = { status: "planned", imported: {} };
+  for (const org of orgIds) {
+    const keys: Partial<Record<ImportTable, string[]>> = {};
+    for (const table of ORG_TABLES) keys[table] = prepared[table].filter((row) => row.org === org).map((row) => row.key).sort();
+    report.orgs[org] = { status: "planned", imported: {}, keys, deleted: {} };
+  }
+  const previous = options.previous;
+  if (previous) {
+    if (previous.version !== 1 || previous.mode !== "apply") throw new Error("previous report must be an apply report");
+    for (const org of Object.keys(previous.orgs)) if (!report.orgs[org]) warn("org_absent_in_source");
+  }
 
   if (mode === "plan") {
     for (const table of SOURCE_TABLES) {
@@ -380,6 +428,15 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
         WHERE t.id::text <> (x.r::jsonb ->> 'id')`,
       [prepared.users.map((row) => row.row)],
     );
+    // A re-run must reconcile against the previous ledger; without it,
+    // rows removed in Cloud would silently survive in Control.
+    if (!previous && orgIds.length > 0) {
+      const existing = await target.query<{ n: string }>(
+        "SELECT count(*)::text AS n FROM public.organizations WHERE id::text = ANY($1::text[])",
+        [orgIds],
+      );
+      if (Number(existing.rows[0]?.n ?? 0) > 0) throw new ImportRefused("rerun_requires_previous_report");
+    }
     if (Number(conflicts.rows[0]?.n ?? 0) > 0) {
       report.tables.users.skipped.target_email_conflict = Number(conflicts.rows[0]!.n);
       throw new ImportRefused("target_email_conflict");
@@ -396,6 +453,20 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       }
     };
     const runOrg = async (tx: SqlExecutor, org: string) => {
+      // Deletes first: a replacement row (an invite re-sent to the same
+      // email) must not collide with the row it replaces.
+      for (const table of RECONCILED_TABLES) {
+        const before = previous?.orgs[org]?.keys?.[table] ?? [];
+        if (before.length === 0) continue;
+        const now = new Set(report.orgs[org]!.keys[table] ?? []);
+        const gone = before.filter((key) => !now.has(key));
+        if (gone.length === 0) continue;
+        const result = await tx.query<{ n: number }>(
+          `WITH d AS (${deleteSql(table)} RETURNING 1) SELECT count(*)::int AS n FROM d`,
+          [gone, org],
+        );
+        report.orgs[org]!.deleted[table] = result.rows[0]?.n ?? 0;
+      }
       for (const table of ORG_TABLES) {
         const rows = prepared[table].filter((row) => row.org === org);
         await writeRows(tx, table, rows);
@@ -411,10 +482,13 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
         try {
           await unit((tx) => runOrg(tx, org));
           report.orgs[org]!.status = "ok";
-          for (const table of ORG_TABLES) report.tables[table].imported += report.orgs[org]!.imported[table] ?? 0;
+          for (const table of ORG_TABLES) {
+            report.tables[table].imported += report.orgs[org]!.imported[table] ?? 0;
+            report.tables[table].deleted += report.orgs[org]!.deleted[table] ?? 0;
+          }
           log("cloud_import.org", { org, status: "ok" });
         } catch (error) {
-          report.orgs[org] = { status: "failed", error: errorFields(error), imported: {} };
+          report.orgs[org] = { status: "failed", error: errorFields(error), imported: {}, keys: previous?.orgs[org]?.keys ?? {}, deleted: {} };
           log("cloud_import.org", { org, status: "failed", ...errorFields(error) });
         }
       }
