@@ -1,4 +1,5 @@
 import { webcrypto } from "node:crypto";
+import { normalizeDesktopSourceId } from "../desktop-source-id.js";
 import {
   ATTESTATION_ARGUMENT, ATTESTATION_TYPE, attestationKeyId, decodeBase64Url, type AttestationStore,
 } from "./copilot-attestation.js";
@@ -98,7 +99,7 @@ export async function verifyClaudeAttestation(input: {
     return fail("unexpected payload");
   }
   const { sid, tuid, tool } = payload as { sid: string; tuid: string; tool: string };
-  const src = payload.src as string;
+  const src = normalizeDesktopSourceId(payload.src as string);
   const iat = payload.iat as number;
   const exp = payload.exp as number;
 
