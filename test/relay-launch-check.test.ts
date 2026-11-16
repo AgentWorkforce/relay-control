@@ -224,7 +224,7 @@ for (const [mode, code] of [["denied", "relaygate_denied"], ["classified", "rela
     assert.equal(rows.length, 1);
     assert.equal(rows[0]!.actor_id, env.ownerId);
     assert.equal(rows[0]!.workspace_id, env.workspaceId);
-    assert.equal(rows[0]!.target, `node=studio-desktop code=${code}`);
+    assert.equal(rows[0]!.target, `node=studio-desktop code=${code} status=403`);
 
     // Nothing was cached: the same key is checked again once relaygate allows it.
     env.gate.mode = "allow";
@@ -293,12 +293,18 @@ test("relayLaunchCheck maps odd answers, normalises the URL and never logs the t
   assert.deepEqual(await check.check(input), { decision: "unavailable" });
   Object.assign(answer, { status: 403, body: "not json" });
   assert.deepEqual(await check.check(input), { decision: "deny", code: "relaygate_denied" });
+  // relaygate's own answers about this check: a rejected token or body is final, not an outage.
+  Object.assign(answer, { status: 401, body: JSON.stringify({ error: "relaygate_unauthenticated" }) });
+  assert.deepEqual(await check.check(input), { decision: "deny", code: "relaygate_denied" });
+  Object.assign(answer, { status: 400, body: JSON.stringify({ error: "relaygate_bad_request" }) });
+  assert.deepEqual(await check.check(input), { decision: "deny", code: "relaygate_denied" });
   Object.assign(answer, { status: 200, body: JSON.stringify({ decision: "allow" }) });
   assert.deepEqual(await check.check(input), { decision: "allow" });
-  assert.deepEqual(urls, Array(4).fill("https://gate.example.test/v1/check"));
+  assert.deepEqual(urls, Array(6).fill("https://gate.example.test/v1/check"));
   assert.deepEqual(revoked, issued);
-  assert.equal(logged.length, 3);
-  assert.equal(audited.length, 3);
+  assert.equal(logged.length, 5);
+  assert.equal(audited.length, 5);
+  assert.equal(JSON.stringify(audited).includes("status=401"), true);
   const leaked = JSON.stringify([logged, audited]);
   assert.equal(leaked.includes("sh_at_"), false);
   assert.equal(leaked.includes("secret task text"), false);

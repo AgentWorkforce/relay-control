@@ -87,6 +87,10 @@ export function relayLaunchCheck(deps: {
       return { status, outcome: { decision: "deny",
         code: body?.error === "relaygate_classified" ? "relaygate_classified" : "relaygate_denied" } };
     }
+    // relaygate's 400 (bad body) and 401 (the check token itself refused) are
+    // answers about this check, not an outage: a fresh token would be a new
+    // check, so neither is retryable. Everything else is unavailable.
+    if (status === 400 || status === 401) return { status, outcome: { decision: "deny", code: "relaygate_denied" } };
     return { status, outcome: { decision: "unavailable" } };
   }
 
@@ -99,7 +103,7 @@ export function relayLaunchCheck(deps: {
         actor: { kind: "user", userId: input.userId },
         action: outcome.decision === "deny" ? "relay_launch.check.denied" : "relay_launch.check.unavailable",
         target: outcome.decision === "deny"
-          ? `node=${input.nodeName} code=${outcome.code}`
+          ? `node=${input.nodeName} code=${outcome.code} status=${status ?? "none"}`
           : `node=${input.nodeName} status=${status ?? "none"}`,
       });
     } catch {

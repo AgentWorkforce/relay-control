@@ -1315,11 +1315,13 @@ task to the target node:
   answer. It is never returned, logged or audited, nor is the task text.
 - `200 {"decision": "allow"}` lets the launch continue. `403` refuses it with
   `relaygate_classified` (when relaygate answers that error) or
-  `relaygate_denied` (any other 403), not retryable. `503`, any other status,
-  an unexpected body, a network error or a 5-second timeout refuse it with
-  `relaygate_unavailable`, retryable. A refused launch reserves nothing, so
+  `relaygate_denied` (any other 403), not retryable. `400` (relaygate rejected
+  the check body) and `401` (it rejected the check token) are answers about
+  this check rather than an outage and refuse it with `relaygate_denied` too.
+  `503`, any other status, an unexpected body, a network error or a 5-second
+  timeout refuse it with `relaygate_unavailable`, retryable. A refused launch reserves nothing, so
   retrying with the same `idempotency_key` checks again.
-- Audit events `relay_launch.check.denied` (target: node name and code) and
+- Audit events `relay_launch.check.denied` (target: node name, code and HTTP status) and
   `relay_launch.check.unavailable` (target: node name and HTTP status), actor
   the launching user. An allowed check is not audited separately.
 
