@@ -13,6 +13,7 @@
 //
 // Exit 0: done, every organization ok. 1: refused, or an organization failed.
 // 2: usage or configuration error. Output is JSON lines without values.
+import { randomBytes } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { loadEncryptionKeyring, readSecret, type Env } from "../../src/config.js";
 import { PostgresDatabase } from "../../src/database.js";
@@ -58,16 +59,24 @@ function required(env: Env, name: string): string {
 
 async function main(argv: readonly string[], env: Env): Promise<number> {
   let args: CliArgs;
-  let config: { sourceUrl: string; targetUrl?: string; cloudKey: string; keyring: ReturnType<typeof loadEncryptionKeyring> };
+  let config: { sourceUrl: string; targetUrl?: string; cloudKey?: string; keyring: ReturnType<typeof loadEncryptionKeyring> };
   try {
     args = parseArgs(argv);
-    const cloudKey = required(env, "CLOUD_CREDENTIAL_ENCRYPTION_KEY");
-    if (!/^[0-9a-f]{64}$/i.test(cloudKey)) throw new Error("CLOUD_CREDENTIAL_ENCRYPTION_KEY must be 64 hex characters");
+    // Plan mode may run without the Cloud key (agent tokens are then not
+    // test-decrypted); dry-run and apply need it.
+    const cloudKey = args.mode === "plan"
+      ? readSecret(env, "CLOUD_CREDENTIAL_ENCRYPTION_KEY")
+      : required(env, "CLOUD_CREDENTIAL_ENCRYPTION_KEY");
+    if (cloudKey !== undefined && !/^[0-9a-f]{64}$/i.test(cloudKey)) throw new Error("CLOUD_CREDENTIAL_ENCRYPTION_KEY must be 64 hex characters");
     config = {
       sourceUrl: required(env, "CLOUD_IMPORT_SOURCE_URL"),
       ...(args.mode === "plan" ? {} : { targetUrl: required(env, "CLOUD_IMPORT_TARGET_URL") }),
-      cloudKey,
-      keyring: loadEncryptionKeyring(env),
+      ...(cloudKey ? { cloudKey } : {}),
+      // Plan writes nothing, so without Control's keyring a throwaway key
+      // stands in for the re-encryption pass.
+      keyring: args.mode === "plan" && !readSecret(env, "SELFHOST_ENCRYPTION_KEY")
+        ? { active: { id: "plan-only", key: randomBytes(32) } }
+        : loadEncryptionKeyring(env),
     };
   } catch (error) {
     // Usage errors name flags and variables, never values.
@@ -95,7 +104,7 @@ async function main(argv: readonly string[], env: Env): Promise<number> {
       source,
       ...(target ? { target } : {}),
       keyring: config.keyring,
-      cloudKeyHex: config.cloudKey,
+      ...(config.cloudKey ? { cloudKeyHex: config.cloudKey } : {}),
       log: (event, fields) => console.log(JSON.stringify({ event, ...fields })),
     }, scope, args.mode);
     if (args.report) writeFileSync(args.report, JSON.stringify(report, null, 2), { mode: 0o600 });

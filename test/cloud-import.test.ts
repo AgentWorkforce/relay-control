@@ -174,6 +174,9 @@ test("cloud import: post-0057 target keeps rw_, slugs, History origin and text s
   const desktop = (await target.query<{ source_id: string }>(
     "SELECT source_id FROM desktop_relay_identities WHERE id = $1", [id(0x602)])).rows[0]!;
   assert.equal(desktop.source_id, "not-a-uuid");
+  const uuidSource = (await target.query<{ source_id: string }>(
+    "SELECT source_id FROM desktop_relay_identities WHERE id = $1", [id(0x601)])).rows[0]!;
+  assert.equal(uuidSource.source_id, id(0x9001));
   const fleet = (await target.query<{ node_name: string | null }>("SELECT node_name FROM fleet_node_owners")).rows;
   assert.deepEqual(fleet, [{ node_name: null }]);
 
@@ -222,4 +225,10 @@ test("cloud import: importer-side skips carry ids only", async (t) => {
   t.after(() => source.close());
   const report = await runImport({ source, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "plan");
   assert.deepEqual(report.tables.person_identities.importerSkips, { cloud_decrypt_failed: [id(0x403)] });
+  // Without the Cloud key, plan still runs and says the envelopes were not opened.
+  const keyless = await runImport({ source, keyring: KEYRING }, { orgIds: null }, "plan");
+  assert.equal(keyless.ok, true);
+  assert.deepEqual(keyless.tables.person_identities.importerSkips, {});
+  assert.ok((keyless.warnings.secrets_not_checked ?? 0) > 0);
+  await assert.rejects(runImport({ source, keyring: KEYRING }, { orgIds: null }, "dry-run"), /Cloud credential key/);
 });

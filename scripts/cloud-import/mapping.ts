@@ -274,7 +274,9 @@ SELECT h.id, h.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
   LEFT JOIN imported_users iu ON iu.id = um.user_id`,
     desktop_relay_identities: `
 SELECT d.id, d.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_workspace_id,
-       d.source_id,
+       -- #152: lowercase UUID-shaped ids, keep opaque ids byte for byte.
+       CASE WHEN d.source_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            THEN lower(d.source_id) ELSE d.source_id END AS source_id,
        (d.source_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') AS source_id_is_uuid,
        d.agent_name, d.agent_remote_id, d.address,
        CASE WHEN d.native_session_kind IS NOT NULL AND d.native_session_id IS NOT NULL THEN d.native_session_kind END AS native_session_kind,
@@ -288,7 +290,9 @@ SELECT d.id, d.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
          ) THEN 'not_a_member'
          WHEN d.relay_workspace_id IS DISTINCT FROM w.relay_workspace_id THEN 'stale_relay_workspace'
          WHEN row_number() OVER (
-           PARTITION BY d.workspace_id, iu.id, d.source_id, d.agent_remote_id ORDER BY d.updated_at DESC, d.id
+           PARTITION BY d.workspace_id, iu.id,
+             CASE WHEN d.source_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN lower(d.source_id) ELSE d.source_id END,
+             d.agent_remote_id ORDER BY d.updated_at DESC, d.id
          ) > 1 THEN 'duplicate_after_merge'
        END AS skip_reason
   FROM public.desktop_relay_identities d
@@ -463,7 +467,7 @@ const PROJECTIONS: Record<ImportTable, Projection> = {
   },
   desktop_relay_identities: {
     key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
-    columns: { id: "id::text", workspace_id: "workspace_id::text", organization_id: "organization_id::text", user_id: "user_id::text", relaycast_workspace_id: "relaycast_workspace_id", source_id: "lower(source_id::text)", agent_name: "agent_name", agent_remote_id: "agent_remote_id", address: "address", native_session_kind: "native_session_kind", native_session_id: "native_session_id", created_at: ts("created_at") },
+    columns: { id: "id::text", workspace_id: "workspace_id::text", organization_id: "organization_id::text", user_id: "user_id::text", relaycast_workspace_id: "relaycast_workspace_id", source_id: "source_id::text", agent_name: "agent_name", agent_remote_id: "agent_remote_id", address: "address", native_session_kind: "native_session_kind", native_session_id: "native_session_id", created_at: ts("created_at") },
   },
   fleet_node_owners: {
     key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",

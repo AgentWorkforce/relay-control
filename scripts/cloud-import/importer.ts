@@ -34,8 +34,12 @@ export type ImportDeps = {
   /** Not used (and may be omitted) in plan mode. */
   target?: Database;
   keyring: EncryptionKeyring;
-  /** Cloud CREDENTIAL_ENCRYPTION_KEY, 64 hex characters. */
-  cloudKeyHex: string;
+  /**
+   * Cloud CREDENTIAL_ENCRYPTION_KEY, 64 hex characters. Optional in plan
+   * mode only: without it envelopes are not opened and the ledger carries a
+   * `secrets_not_checked` warning instead of decrypt skips.
+   */
+  cloudKeyHex?: string;
   log?: ImportLogger;
   now?: () => Date;
   /** Rows per insert statement. */
@@ -228,6 +232,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
   const now = deps.now ?? (() => new Date());
   const log: ImportLogger = deps.log ?? (() => {});
   const batchSize = deps.batchSize ?? 250;
+  if (mode !== "plan" && !deps.cloudKeyHex) throw new Error("the Cloud credential key is required outside plan mode");
   const startedAt = now().toISOString();
   const report: ImportReport = {
     version: 1,
@@ -269,8 +274,10 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
         try {
           if (spec.secret?.source === "secret_plaintext") {
             secret = encryptSecret(row.secret ?? "", deps.keyring.active);
+          } else if (spec.secret?.source === "secret_envelope" && !deps.cloudKeyHex) {
+            warn("secrets_not_checked");
           } else if (spec.secret?.source === "secret_envelope") {
-            const plaintext = decryptCloudEnvelope(JSON.parse(row.secret ?? "null") as EncryptedEnvelope, deps.cloudKeyHex);
+            const plaintext = decryptCloudEnvelope(JSON.parse(row.secret ?? "null") as EncryptedEnvelope, deps.cloudKeyHex!);
             secret = encryptSecret(plaintext, deps.keyring.active);
           } else if (spec.inviteTokenHash) {
             // Same mint as IdentityStore.createInvitation: an sh_inv_ opaque
