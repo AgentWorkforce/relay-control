@@ -453,6 +453,7 @@ export class ControlPlaneStore {
                   relaycast_binding_claim_id = NULL,
                   relaycast_binding_claimed_at = NULL,
                   relaycast_binding_claim_name = NULL,
+                  relaycast_binding_idempotency_key_ciphertext = NULL,
                   updated_at = now()
             WHERE id = $1 AND organization_id = $2
               AND relaycast_workspace_id IS NULL
@@ -1033,6 +1034,7 @@ export class ControlPlaneStore {
                 relaycast_binding_claim_id = NULL,
                 relaycast_binding_claimed_at = NULL,
                 relaycast_binding_claim_name = NULL,
+                relaycast_binding_idempotency_key_ciphertext = NULL,
                 updated_at = now()
           WHERE id = $1
             AND relaycast_binding_claim_id = $2
@@ -1142,6 +1144,7 @@ export class ControlPlaneStore {
                 relaycast_binding_claim_id = NULL,
                 relaycast_binding_claimed_at = NULL,
                 relaycast_binding_claim_name = NULL,
+                relaycast_binding_idempotency_key_ciphertext = NULL,
                 updated_at = now()
           WHERE id = $1`,
         [workspaceId, created.id, encryptSecret(created.apiKey, this.encryptionKeyring.active)],
@@ -1155,7 +1158,6 @@ export class ControlPlaneStore {
       `UPDATE workspaces
           SET relaycast_binding_claim_id = NULL,
               relaycast_binding_claimed_at = NULL,
-              relaycast_binding_claim_name = NULL,
               updated_at = now()
         WHERE id = $1 AND relaycast_binding_claim_id = $2
           AND relaycast_workspace_id IS NULL

@@ -19,15 +19,21 @@ ALTER TABLE workspaces
     ),
   ADD CONSTRAINT workspaces_relaycast_binding_claim_pair
     CHECK (
+      (relaycast_binding_claim_id IS NULL AND relaycast_binding_claimed_at IS NULL)
+      OR
+      (relaycast_binding_claim_id IS NOT NULL AND relaycast_binding_claimed_at IS NOT NULL)
+    ),
+  ADD CONSTRAINT workspaces_relaycast_binding_request_pair
+    CHECK (
       (
-        relaycast_binding_claim_id IS NULL
-        AND relaycast_binding_claimed_at IS NULL
-        AND relaycast_binding_claim_name IS NULL
+        relaycast_binding_claim_name IS NULL
+        AND relaycast_binding_idempotency_key_ciphertext IS NULL
       )
       OR
       (
-        relaycast_binding_claim_id IS NOT NULL
-        AND relaycast_binding_claimed_at IS NOT NULL
-        AND relaycast_binding_claim_name IS NOT NULL
+        relaycast_binding_claim_name IS NOT NULL
+        AND relaycast_binding_idempotency_key_ciphertext IS NOT NULL
+        AND relaycast_workspace_id IS NULL
+        AND relaycast_api_key_ciphertext IS NULL
       )
     );

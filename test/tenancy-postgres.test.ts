@@ -222,11 +222,17 @@ test("lazy Relaycast binding: a vanished claim binds the canonical replay withou
   const store = new ControlPlaneStore(first, KEYRING, 0, { relaycastProvisioner: provisioner });
   const binding = store.relaycastBinding(workspaceId);
   await entered;
+  const pending = (await second.query<{
+    relaycast_binding_idempotency_key_ciphertext: string;
+  }>(`SELECT relaycast_binding_idempotency_key_ciphertext
+        FROM workspaces WHERE id = $1`, [workspaceId])).rows[0]!;
+  assert.match(idempotencyKey ?? "", /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(idempotencyKey!.includes(workspaceId), false);
+  assert.equal(decryptSecret(pending.relaycast_binding_idempotency_key_ciphertext, KEYRING), idempotencyKey);
   await second.query(
     `UPDATE workspaces
         SET relaycast_binding_claim_id = NULL,
-            relaycast_binding_claimed_at = NULL,
-            relaycast_binding_claim_name = NULL
+            relaycast_binding_claimed_at = NULL
       WHERE id = $1`,
     [workspaceId],
   );
@@ -235,14 +241,11 @@ test("lazy Relaycast binding: a vanished claim binds the canonical replay withou
   const recovered = await binding;
   assert.equal(recovered!.relaycastWorkspaceId, "rw_postgres_recovered");
   assert.deepEqual(removed, []);
-  assert.match(idempotencyKey ?? "", /^[A-Za-z0-9_-]{43}$/);
-  assert.equal(idempotencyKey!.includes(workspaceId), false);
   const row = (await second.query<{
     relaycast_workspace_id: string;
-    relaycast_binding_idempotency_key_ciphertext: string;
+    relaycast_binding_idempotency_key_ciphertext: string | null;
   }>(`SELECT relaycast_workspace_id, relaycast_binding_idempotency_key_ciphertext
         FROM workspaces WHERE id = $1`, [workspaceId])).rows[0]!;
   assert.equal(row.relaycast_workspace_id, "rw_postgres_recovered");
-  assert.notEqual(row.relaycast_binding_idempotency_key_ciphertext, idempotencyKey);
-  assert.equal(decryptSecret(row.relaycast_binding_idempotency_key_ciphertext, KEYRING), idempotencyKey);
+  assert.equal(row.relaycast_binding_idempotency_key_ciphertext, null);
 });

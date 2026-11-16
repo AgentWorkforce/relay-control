@@ -128,26 +128,35 @@ test("a concurrent waiter gets retryable not-ready without holding a transaction
     assert.equal(error.retryAfterSeconds, 5);
     return true;
   });
+  const pending = (await database.query<{
+    relaycast_binding_idempotency_key_ciphertext: string;
+  }>(`SELECT relaycast_binding_idempotency_key_ciphertext
+        FROM workspaces WHERE id = $1`, [workspaceId])).rows[0]!;
+  assert.notEqual(pending.relaycast_binding_idempotency_key_ciphertext, idempotencyKeys[0]);
+  assert.equal(
+    decryptSecret(pending.relaycast_binding_idempotency_key_ciphertext, KEYRING),
+    idempotencyKeys[0],
+  );
   releaseCreate();
   assert.equal((await first)!.relaycastWorkspaceId, "rw_waiter");
   assert.equal(idempotencyKeys.length, 1);
-  const idempotencyKey = opaqueIdempotencyKey(idempotencyKeys[0], workspaceId);
+  opaqueIdempotencyKey(idempotencyKeys[0], workspaceId);
   const claim = (await database.query<{
     relaycast_binding_claim_id: string | null;
     relaycast_binding_claimed_at: Date | null;
-    relaycast_binding_idempotency_key_ciphertext: string;
+    relaycast_binding_idempotency_key_ciphertext: string | null;
   }>(`SELECT relaycast_binding_claim_id,
              relaycast_binding_claimed_at,
              relaycast_binding_idempotency_key_ciphertext
         FROM workspaces WHERE id = $1`, [workspaceId])).rows[0]!;
   assert.equal(claim.relaycast_binding_claim_id, null);
   assert.equal(claim.relaycast_binding_claimed_at, null);
-  assert.notEqual(claim.relaycast_binding_idempotency_key_ciphertext, idempotencyKey);
-  assert.equal(decryptSecret(claim.relaycast_binding_idempotency_key_ciphertext, KEYRING), idempotencyKey);
+  assert.equal(claim.relaycast_binding_idempotency_key_ciphertext, null);
 });
 
 test("a stale durable claim is reclaimed with the stable workspace idempotency key", async (t) => {
   const keys: Array<string | undefined> = [];
+  const persistedKey = Buffer.alloc(32, 7).toString("base64url");
   const provisioner: RelaycastProvisioner = {
     async create(_name, idempotencyKey) {
       keys.push(idempotencyKey);
@@ -160,13 +169,13 @@ test("a stale durable claim is reclaimed with the stable workspace idempotency k
     `UPDATE workspaces
         SET relaycast_binding_claim_id = '00000000-0000-4000-8000-000000000001',
             relaycast_binding_claimed_at = now() - interval '10 minutes',
-            relaycast_binding_claim_name = name
+            relaycast_binding_claim_name = name,
+            relaycast_binding_idempotency_key_ciphertext = $2
       WHERE id = $1`,
-    [workspaceId],
+    [workspaceId, encryptSecret(persistedKey, KEYRING.active)],
   );
   assert.equal((await store.relaycastBinding(workspaceId))!.relaycastWorkspaceId, "rw_reconciled");
-  assert.equal(keys.length, 1);
-  opaqueIdempotencyKey(keys[0], workspaceId);
+  assert.deepEqual(keys, [persistedKey]);
 });
 
 test("fresh workspaces receive unrelated idempotency capabilities", async (t) => {
@@ -263,8 +272,7 @@ test("a creator whose claim vanished atomically binds the canonical workspace in
   await database.query(
     `UPDATE workspaces
         SET relaycast_binding_claim_id = NULL,
-            relaycast_binding_claimed_at = NULL,
-            relaycast_binding_claim_name = NULL
+            relaycast_binding_claimed_at = NULL
       WHERE id = $1`,
     [workspaceId],
   );
@@ -338,6 +346,7 @@ test("a lost create response retains its durable claim and reconciles with the s
       keys.push(idempotencyKey);
       names.push(name);
       if (attempt === 1) throw new ProvisionError("Relaycast is unreachable", true, true);
+      if (attempt === 2) throw new ProvisionError("Relaycast capability discovery is unavailable", true, false);
       return { id: "rw_after_lost_response", apiKey: "rk_after_lost_response" };
     },
     async remove() {},
@@ -352,15 +361,41 @@ test("a lost create response retains its durable claim and reconciles with the s
   assert.equal(attempt, 1, "a fresh claim prevents an immediate duplicate create");
   await database.query(
     `UPDATE workspaces
-        SET name = 'Renamed after uncertain create',
-            relaycast_binding_claimed_at = now() - interval '10 minutes'
+        SET relaycast_binding_claimed_at = now() - interval '10 minutes'
       WHERE id = $1`,
     [workspaceId],
   );
+  await assert.rejects(store.relaycastBinding(workspaceId), RelaycastBindingUnavailableError);
+  const released = (await database.query<{
+    relaycast_binding_claim_id: string | null;
+    relaycast_binding_claimed_at: Date | null;
+    relaycast_binding_claim_name: string;
+    relaycast_binding_idempotency_key_ciphertext: string;
+  }>(`SELECT relaycast_binding_claim_id,
+             relaycast_binding_claimed_at,
+             relaycast_binding_claim_name,
+             relaycast_binding_idempotency_key_ciphertext
+        FROM workspaces WHERE id = $1`, [workspaceId])).rows[0]!;
+  assert.equal(released.relaycast_binding_claim_id, null);
+  assert.equal(released.relaycast_binding_claimed_at, null);
+  assert.equal(released.relaycast_binding_claim_name, "Imported workspace");
+  assert.equal(
+    decryptSecret(released.relaycast_binding_idempotency_key_ciphertext, KEYRING),
+    keys[0],
+  );
+  await database.query(
+    "UPDATE workspaces SET name = 'Renamed after definite release' WHERE id = $1",
+    [workspaceId],
+  );
   assert.equal((await store.relaycastBinding(workspaceId))!.relaycastWorkspaceId, "rw_after_lost_response");
-  assert.equal(keys.length, 2);
-  assert.equal(opaqueIdempotencyKey(keys[0], workspaceId), keys[1]);
-  assert.deepEqual(names, ["Imported workspace", "Imported workspace"], "the retried request digest is stable across a rename");
+  assert.equal(keys.length, 3);
+  const persistedKey = opaqueIdempotencyKey(keys[0], workspaceId);
+  assert.deepEqual(keys, [persistedKey, persistedKey, persistedKey]);
+  assert.deepEqual(
+    names,
+    ["Imported workspace", "Imported workspace", "Imported workspace"],
+    "the keyed request digest remains stable through a definite release and rename",
+  );
 });
 
 test("the Relaycast client forwards create idempotency and surfaces cleanup failures", async () => {
@@ -521,10 +556,17 @@ test("migration 0064 permits only complete or empty Relaycast binding pairs", as
   await assert.rejects(
     database.query(
       `UPDATE workspaces
-          SET relaycast_binding_claim_id = '00000000-0000-4000-8000-000000000066',
-              relaycast_binding_claim_name = 'half claim'
+          SET relaycast_binding_claim_id = '00000000-0000-4000-8000-000000000066'
         WHERE id = '00000000-0000-4000-8000-000000000064'`,
     ),
     /workspaces_relaycast_binding_claim_pair/,
+  );
+  await assert.rejects(
+    database.query(
+      `UPDATE workspaces
+          SET relaycast_binding_claim_name = 'half request'
+        WHERE id = '00000000-0000-4000-8000-000000000064'`,
+    ),
+    /workspaces_relaycast_binding_request_pair/,
   );
 });
