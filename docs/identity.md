@@ -1283,6 +1283,9 @@ per-identity handouts stop too:
   forwards as `input.launch_credential` and does not forward `deliver` frames.
   The broker's read routes are unchanged. See
   [relay-node-credential.md](relay-node-credential.md#gate-only-installs).
+  A member's signed-in Agent Relay Desktop can mint its own relay-node token
+  at `POST /api/v1/workspaces/{id}/relay-node/self-tokens`, without an admin
+  ([relay-node-credential.md](relay-node-credential.md#member-self-mint)).
   Agent Relay Desktop claims such a node by its enrolled name instead of a
   node token ([Claiming the node](relay-node-credential.md#claiming-the-node)).
 - MCP join and spawn keep their participant tokens server-side and return
@@ -1322,6 +1325,10 @@ launched agent presents to relaygate's `POST /v1/register`:
   `{active: true, sub: <launching user id>, email: null, principal_type:
   "relay_launch", agent_name, node_name, machine_id: null, org, workspace,
   scopes: ["relay:agent:enrol"], aud, iat, exp, token_id: <credential id>}`.
+  `node_name` there is informational for relaygate: relaygate verifies
+  `agent_name`, and the node binding rests on the credential reaching only
+  that node's bridge, single use and the 10 minute TTL; relaygate does not
+  re-prove the node at `/v1/register`.
 - Audit events `relay_launch.credential.issued` and
   `relay_launch.credential.redeemed` (actor: the launching user; target: the
   credential id, spawn id, node name and agent name, plus the expiry on

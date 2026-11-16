@@ -52,6 +52,19 @@ test("SELFHOST_RELAYGATE_PUBLIC_URL is optional and must be a public https origi
   }
 });
 
+test("SELFHOST_RELAY_NODE_SELF_MINT defaults on and is strictly boolean", () => {
+  assert.equal(loadConfig(completeEnv).relayNodeSelfMint, true);
+  for (const on of ["", "  ", "true", "1", "on", "TRUE"]) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAY_NODE_SELF_MINT: on }).relayNodeSelfMint, true, on);
+  }
+  for (const off of ["false", "0", "off", " Off "]) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAY_NODE_SELF_MINT: off }).relayNodeSelfMint, false, off);
+  }
+  for (const bad of ["yes", "no", "disabled", "2"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_RELAY_NODE_SELF_MINT: bad }), /SELFHOST_RELAY_NODE_SELF_MINT/, bad);
+  }
+});
+
 test("the image version is read from SELFHOST_IMAGE_VERSION and null from source", () => {
   assert.equal(loadConfig(completeEnv).imageVersion, null);
   assert.equal(loadConfig({ ...completeEnv, SELFHOST_IMAGE_VERSION: "  " }).imageVersion, null);
