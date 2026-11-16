@@ -55,7 +55,8 @@ normalization, read-only transactions, cleanup and CLI exit/redaction behavior.
 ## Contract and CLI
 
 `verify.ts` exports `Contract` and `verify(sourceClient, targetClient, contract,
-keyring)`. `fixtures.ts:fixtureContract()` is a runnable example of the contract.
+keyring, {pepperVersions})`. The final options argument is optional.
+`fixtures.ts:fixtureContract()` is a runnable example of the contract.
 Use two separate connected `pg.Client` instances. The CLI accepts a JSON file:
 
 ```sh
@@ -78,7 +79,11 @@ because they can contain credentials or row contents.
 
 Each named table and identity comparison supplies `sourceSql` and `targetSql`.
 Both must produce the same named columns, including a unique non-null `__key`
-and nullable `__org`. SQL is trusted, reviewed configuration. Projections must:
+and nullable `__org`. Workspace-scoped comparisons additionally set
+`workspaceScoped: true` and project non-null `__workspace` on both sides.
+Their reports contain per-workspace counts and checksums as well as per-org
+summaries; other comparisons explicitly report workspace summaries as null.
+SQL is trusted, reviewed configuration. Projections must:
 
 - Include each mapped row in the source and its corresponding imported target
   scope. Make importer skip reasons explicit; do not hide unexplained drops
@@ -111,8 +116,23 @@ state. It does not advance sequences. UUID-only tables report sequence checks
 as `not_applicable`. Sequences must have a next value strictly beyond imported
 data in their increment direction, within bounds, and not cycle.
 
+Sequences without an owned table column, including `desktop_feed_publish_seq`,
+must be listed in `standaloneSequences`. Each entry names its target `relation`
+and source/target bounds queries that each return one row with `min_value` and
+`max_value`. The next sequence value must be beyond both data bounds, using
+exact bigint arithmetic. These reads never call `nextval` or `setval`.
+
+`pepperChecks` entries query only `pepper_version` from each relevant credential
+table. Every non-null version must exist in the supplied `pepperVersions`.
+The CLI obtains these versions through Control's `readPepperFile` and
+`parsePepperFile` using `SELFHOST_PASSWORD_PEPPER_FILE`, retaining the existing
+ownership and mode-600 permission checks. No hash or pepper value enters a
+report; absent files fail coverage when any stored version is non-null.
+
 Freeze writes before checking: the source and target use independent
 repeatable-read snapshots, not a synchronized cross-database snapshot.
+Use direct or session-mode database connections; transaction poolers cannot
+support the cursor/snapshot contract.
 PostgreSQL sequences themselves are not MVCC snapshots. Each query has a
 60-second timeout. This is a correctness checker, not a production impact
 benchmark. Catalog scans apply to the whole listed target relation; comparisons
@@ -146,6 +166,9 @@ Before a cohort can be marked ready:
    creation and Desktop sync, before the final delta and verifier snapshots.
    Finish the six application smokes below before flipping authenticated routes.
    Database checks do not authorize routing changes or a deployment.
+6. Obtain the infrastructure owner's approved restore-proof receipt for the
+   destination. The local synthetic harness does not qualify a production
+   project restore and never provisions or accesses Supabase.
 
 These contract-integration steps remain pending. Rollback keeps the source
 intact; writes created in Control after cutover need separate reconciliation.

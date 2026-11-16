@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, beforeEach, test, type TestFn } from "node:test";
 import { Client } from "pg";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,6 +78,34 @@ fixtureTest("workspace without a relay binding cannot silently qualify as import
   await admin.query("INSERT INTO cloud_fixture.workspaces VALUES($1,$2,NULL,'Unbound',now())",
     ["20000000-0000-4000-8000-000000000003",fixtureIds.org]);
   assert.equal((await check()).findings.find((f) => f.name === "workspaces")!.ok,false);
+});
+
+fixtureTest("per-workspace summaries are explicit and null scoped workspace bindings fail", async () => {
+  const report = await check();
+  const detail = report.findings.find((f) => f.name === "workspaces")!.detail as {source:{workspaces:Record<string,{count:number}>}};
+  assert.equal(Object.keys(detail.source.workspaces).length,2);
+  assert.ok(Object.values(detail.source.workspaces).every((group) => group.count === 1));
+  const contract = fixtureContract();
+  const item = contract.tables.find((t) => t.name === "workspaces")!;
+  item.sourceSql = item.sourceSql.replace("id AS __workspace","NULL::uuid AS __workspace");
+  item.targetSql = item.targetSql.replace("id AS __workspace","NULL::uuid AS __workspace");
+  assert.equal((await verify(source,target,contract,fixtureKeyring)).findings.find((f) => f.name === "workspaces")!.ok,false);
+});
+
+fixtureTest("standalone feed sequence must be ahead of source and target bounds without nextval", async () => {
+  await admin.query("INSERT INTO cloud_fixture.publish_probe VALUES(9007199254740998)");
+  const report = await check();
+  assert.equal(report.findings.find((f) => f.kind === "standalone_sequence")!.ok,false);
+  const state = await admin.query("SELECT last_value::text,is_called FROM control_fixture.desktop_feed_publish_seq");
+  assert.deepEqual(state.rows[0],{last_value:"9007199254740993",is_called:true});
+});
+
+fixtureTest("every non-null password pepper version must exist in the configured key set", async () => {
+  await admin.query("UPDATE control_fixture.password_credentials SET pepper_version=2");
+  assert.equal((await check()).findings.find((f) => f.kind === "pepper")!.ok,false);
+  const report = await verify(source,target,fixtureContract(),fixtureKeyring,{pepperVersions:[1,2]});
+  assert.equal(report.ok,true);
+  assert.ok(!JSON.stringify(report).includes("synthetic-hash-placeholder"));
 });
 
 fixtureTest("FK scan detects orphans left by disabled triggers", async () => {
@@ -181,6 +209,7 @@ fixtureTest("CLI emits JSON with useful exit codes and hides URL/SQL errors", as
     url.hostname = "127.0.0.1"; url.port = port!;
     url.username = config.user; url.pathname = "/postgres";
     const env = {...process.env,CLOUD_VERIFY_SOURCE_URL:url.toString(),CLOUD_VERIFY_TARGET_URL:url.toString(),
+      SELFHOST_PASSWORD_PEPPER_FILE:"",
       SELFHOST_ENCRYPTION_KEY_ID:fixtureKeyring.active.id,
       SELFHOST_ENCRYPTION_KEY:fixtureKeyring.active.key.toString("base64"),
       SELFHOST_ENCRYPTION_PREVIOUS_KEY_ID:fixtureKeyring.previous!.id,
@@ -202,5 +231,13 @@ fixtureTest("CLI emits JSON with useful exit codes and hides URL/SQL errors", as
     const override = new URL(url);
     override.searchParams.set("host",remote.hostname);
     assert.equal(run({CLOUD_VERIFY_SOURCE_URL:override.toString()}).status,2);
+    await admin.query("UPDATE control_fixture.workspaces t SET name=s.name FROM cloud_fixture.workspaces s WHERE s.id=t.id");
+    await admin.query("UPDATE control_fixture.password_credentials SET pepper_version=2");
+    assert.equal(run().status,1);
+    const pepperPath = join(directory,"synthetic-peppers");
+    await writeFile(pepperPath,`v2:${"x".repeat(32)}\n`,{mode:0o600});
+    assert.equal(run({SELFHOST_PASSWORD_PEPPER_FILE:pepperPath}).status,0);
+    await chmod(pepperPath,0o644);
+    assert.equal(run({SELFHOST_PASSWORD_PEPPER_FILE:pepperPath}).status,2);
   } finally { await rm(directory,{recursive:true,force:true}); }
 });

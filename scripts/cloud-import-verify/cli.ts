@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { Client } from "pg";
 import { loadEncryptionKeyring } from "../../src/config.js";
+import { parsePepperFile, readPepperFile } from "../../src/identity/config.js";
 import { validateContract, verify, type Contract } from "./verify.js";
 
 // Synthetic/local use only until remote verification is separately authorized.
@@ -23,11 +24,14 @@ try {
   const contract = JSON.parse(await readFile(path, "utf8")) as Contract;
   validateContract(contract);
   const keyring = loadEncryptionKeyring();
+  const pepperPath = process.env.SELFHOST_PASSWORD_PEPPER_FILE?.trim();
+  const pepperVersions = contract.pepperChecks?.length && pepperPath
+    ? parsePepperFile(readPepperFile(pepperPath)).map((pepper) => pepper.version) : [];
   source = new Client({ connectionString: localUrl(process.env.CLOUD_VERIFY_SOURCE_URL) });
   target = new Client({ connectionString: localUrl(process.env.CLOUD_VERIFY_TARGET_URL) });
   await source.connect();
   await target.connect();
-  const report = await verify(source, target, contract, keyring);
+  const report = await verify(source, target, contract, keyring,{pepperVersions});
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   process.exitCode = report.ok ? 0 : 1;
 } catch {

@@ -26,7 +26,9 @@
               "count": 1,
               "checksum": "009d6e02767fff309cbdaa5ffa049995d00f6d0a4cdefc552b3477396e2c7574"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         },
         "target": {
           "columns": [
@@ -46,7 +48,9 @@
               "count": 1,
               "checksum": "009d6e02767fff309cbdaa5ffa049995d00f6d0a4cdefc552b3477396e2c7574"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         }
       }
     },
@@ -70,7 +74,9 @@
               "count": 2,
               "checksum": "4083d8e79cefd89c4c8bfae8f7706aba5d9e0e2732f3ec36985ce290a0628ef6"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         },
         "target": {
           "columns": [
@@ -87,7 +93,9 @@
               "count": 2,
               "checksum": "4083d8e79cefd89c4c8bfae8f7706aba5d9e0e2732f3ec36985ce290a0628ef6"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         }
       }
     },
@@ -114,7 +122,9 @@
               "count": 1,
               "checksum": "03470eb93c55b18fe07b768b429b2059942cb454f6bd86781978ee227d105f2a"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         },
         "target": {
           "columns": [
@@ -134,7 +144,9 @@
               "count": 1,
               "checksum": "03470eb93c55b18fe07b768b429b2059942cb454f6bd86781978ee227d105f2a"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         }
       }
     },
@@ -147,43 +159,67 @@
           "columns": [
             "__key",
             "__org",
+            "__workspace",
             "created_at",
             "name"
           ],
           "count": 2,
-          "checksum": "1895b349b8176801cfa35348abb0f00e5bcb7d9832e46d3cb3f8e26f4ce27f7e",
+          "checksum": "38eac9750b6c09ff0e1d117d5fd80ba00e6406583aaa1af473b253d007c8f683",
           "invalidKeys": 0,
           "orgs": {
             "\"10000000-0000-4000-8000-000000000001\"": {
               "count": 1,
-              "checksum": "f11c6a2cc7b0a6c128a24b9d9a81cc85ea3a69f7eee88c5504dfa176fa677a3d"
+              "checksum": "1138a68eb0c321c8bcc5ba8ed4d7bbf0809e9ebbb22058ba82dc3f59f33b426a"
             },
             "\"10000000-0000-4000-8000-000000000002\"": {
               "count": 1,
-              "checksum": "e5d41c927236bb3e0545926a7310ca2c925cd3f05ea2a97cecaf1109cc46c836"
+              "checksum": "b579b8a925ccb777bb7438ab9066e5919f5a76dab3450734981479038d0f056f"
             }
-          }
+          },
+          "workspaces": {
+            "\"20000000-0000-4000-8000-000000000001\"": {
+              "count": 1,
+              "checksum": "1138a68eb0c321c8bcc5ba8ed4d7bbf0809e9ebbb22058ba82dc3f59f33b426a"
+            },
+            "\"20000000-0000-4000-8000-000000000002\"": {
+              "count": 1,
+              "checksum": "b579b8a925ccb777bb7438ab9066e5919f5a76dab3450734981479038d0f056f"
+            }
+          },
+          "invalidWorkspaceBindings": 0
         },
         "target": {
           "columns": [
             "__key",
             "__org",
+            "__workspace",
             "created_at",
             "name"
           ],
           "count": 2,
-          "checksum": "1895b349b8176801cfa35348abb0f00e5bcb7d9832e46d3cb3f8e26f4ce27f7e",
+          "checksum": "38eac9750b6c09ff0e1d117d5fd80ba00e6406583aaa1af473b253d007c8f683",
           "invalidKeys": 0,
           "orgs": {
             "\"10000000-0000-4000-8000-000000000001\"": {
               "count": 1,
-              "checksum": "f11c6a2cc7b0a6c128a24b9d9a81cc85ea3a69f7eee88c5504dfa176fa677a3d"
+              "checksum": "1138a68eb0c321c8bcc5ba8ed4d7bbf0809e9ebbb22058ba82dc3f59f33b426a"
             },
             "\"10000000-0000-4000-8000-000000000002\"": {
               "count": 1,
-              "checksum": "e5d41c927236bb3e0545926a7310ca2c925cd3f05ea2a97cecaf1109cc46c836"
+              "checksum": "b579b8a925ccb777bb7438ab9066e5919f5a76dab3450734981479038d0f056f"
             }
-          }
+          },
+          "workspaces": {
+            "\"20000000-0000-4000-8000-000000000001\"": {
+              "count": 1,
+              "checksum": "1138a68eb0c321c8bcc5ba8ed4d7bbf0809e9ebbb22058ba82dc3f59f33b426a"
+            },
+            "\"20000000-0000-4000-8000-000000000002\"": {
+              "count": 1,
+              "checksum": "b579b8a925ccb777bb7438ab9066e5919f5a76dab3450734981479038d0f056f"
+            }
+          },
+          "invalidWorkspaceBindings": 0
         }
       }
     },
@@ -206,7 +242,9 @@
               "count": 1,
               "checksum": "29d6bceaf9df785d817d93d40168e958359e607c1e1c7c22a4b5f724de7ae776"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         },
         "target": {
           "columns": [
@@ -222,7 +260,9 @@
               "count": 1,
               "checksum": "29d6bceaf9df785d817d93d40168e958359e607c1e1c7c22a4b5f724de7ae776"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         }
       }
     },
@@ -249,7 +289,9 @@
               "count": 1,
               "checksum": "d6db2b5dd0a74faea96b9c26afed8488c80babb50afd478f0df15c325fa77dad"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         },
         "target": {
           "columns": [
@@ -269,7 +311,9 @@
               "count": 1,
               "checksum": "d6db2b5dd0a74faea96b9c26afed8488c80babb50afd478f0df15c325fa77dad"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         }
       }
     },
@@ -296,7 +340,9 @@
               "count": 1,
               "checksum": "84916bf1b40cc0f702203277476bbcdd607e442e4a725be8671f7c40b69ab0dd"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         },
         "target": {
           "columns": [
@@ -316,7 +362,9 @@
               "count": 1,
               "checksum": "84916bf1b40cc0f702203277476bbcdd607e442e4a725be8671f7c40b69ab0dd"
             }
-          }
+          },
+          "workspaces": null,
+          "invalidWorkspaceBindings": 0
         }
       }
     },
@@ -485,6 +533,32 @@
         "minimum": "9007199254740993",
         "maximum": "9007199254740993",
         "cycle": false
+      }
+    },
+    {
+      "kind": "standalone_sequence",
+      "name": "desktop_feed_publish_seq",
+      "ok": true,
+      "detail": {
+        "next": "9007199254740994",
+        "source": {
+          "min_value": "9007199254740993",
+          "max_value": "9007199254740993"
+        },
+        "target": {
+          "min_value": "9007199254740993",
+          "max_value": "9007199254740993"
+        },
+        "cycle": false
+      }
+    },
+    {
+      "kind": "pepper",
+      "name": "password_credentials",
+      "ok": true,
+      "detail": {
+        "versions": [],
+        "missing": []
       }
     },
     {

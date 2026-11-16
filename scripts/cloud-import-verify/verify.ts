@@ -10,6 +10,7 @@ export interface Comparison {
   name: string;
   sourceSql: string;
   targetSql: string;
+  workspaceScoped?: boolean;
 }
 export interface Contract {
   version: 1;
@@ -18,6 +19,8 @@ export interface Contract {
   identities: Comparison[];
   targetRelations: string[];
   encryptedSamples: { name: string; sql: string; minimum: number; limit: number }[];
+  standaloneSequences?: { name: string; relation: string; sourceBoundsSql: string; targetBoundsSql: string }[];
+  pepperChecks?: { name: string; sql: string }[];
 }
 type OrgSummary = { count: number; checksum: string };
 type Snapshot = {
@@ -26,6 +29,8 @@ type Snapshot = {
   checksum: string;
   invalidKeys: number;
   orgs: Record<string, OrgSummary>;
+  workspaces: Record<string, OrgSummary> | null;
+  invalidWorkspaceBindings: number;
 };
 export type Finding = { kind: string; name: string; ok: boolean; detail: unknown };
 export type Report = {
@@ -42,55 +47,85 @@ function hashRow(hash: ReturnType<typeof createHash>, row: string): void {
   hash.update(`${Buffer.byteLength(row)}:`).update(row);
 }
 
-async function snapshot(client: Client, sql: string): Promise<Snapshot> {
+async function snapshot(client: Client, sql: string, workspaceScoped = false): Promise<Snapshot> {
   const shape = await client.query(`SELECT * FROM (${sql}) p LIMIT 0`);
   const columns = shape.fields.map((f) => f.name).sort();
-  if (!columns.includes("__key") || !columns.includes("__org")) {
-    throw new Error("Projection requires __key and __org columns");
+  if (!columns.includes("__key") || !columns.includes("__org")
+    || (workspaceScoped && !columns.includes("__workspace")) || new Set(columns).size !== columns.length) {
+    throw new Error("Projection requires unique aliases, __key, __org and scoped __workspace");
   }
   const badKeys = await client.query(`SELECT count(*)::text AS n FROM (
     SELECT __key FROM (${sql}) p GROUP BY __key HAVING __key IS NULL OR count(*) > 1
   ) duplicate_keys`);
+  const invalidWorkspaceBindings = workspaceScoped
+    ? Number((await client.query(`SELECT count(*)::text AS n FROM (${sql}) p WHERE __workspace IS NULL`)).rows[0].n) : 0;
   // PostgreSQL canonicalizes jsonb object keys and preserves numeric precision.
   // Length framing avoids concatenation ambiguities; C order is locale independent.
   await client.query(`DECLARE cloud_verify_cursor NO SCROLL CURSOR FOR
-    SELECT to_jsonb(p)::text AS canonical, to_jsonb(p.__org)::text AS org
+    SELECT to_jsonb(p)::text AS canonical, to_jsonb(p.__org)::text AS org,
+      ${workspaceScoped ? "to_jsonb(p.__workspace)::text" : "NULL::text"} AS workspace
     FROM (${sql}) p ORDER BY to_jsonb(p)::text COLLATE "C"`);
   const hash = createHash("sha256");
   const orgs = new Map<string, { count: number; hash: ReturnType<typeof createHash> }>();
+  const workspaces: typeof orgs = new Map();
+  const accumulate = (groups: typeof orgs, key: string, row: string) => {
+    const group = groups.get(key) ?? { count: 0, hash: createHash("sha256") };
+    group.count++; hashRow(group.hash,row); groups.set(key,group);
+  };
   let count = 0;
   try {
     for (;;) {
       const batch = await client.query("FETCH FORWARD 250 FROM cloud_verify_cursor");
       if (!batch.rows.length) break;
-      for (const row of batch.rows as { canonical: string; org: string | null }[]) {
+      for (const row of batch.rows as { canonical: string; org: string | null; workspace: string | null }[]) {
         count++;
         hashRow(hash, row.canonical);
         // JSON encoding distinguishes a null org from a literal string "null".
-        const key = row.org ?? "null";
-        const group = orgs.get(key) ?? { count: 0, hash: createHash("sha256") };
-        group.count++;
-        hashRow(group.hash, row.canonical);
-        orgs.set(key, group);
+        accumulate(orgs,row.org ?? "null",row.canonical);
+        if (workspaceScoped) accumulate(workspaces,row.workspace ?? "null",row.canonical);
       }
     }
   } finally {
     await client.query("CLOSE cloud_verify_cursor");
   }
+  const finish = (groups: typeof orgs) => Object.fromEntries([...groups].sort(([a],[b]) => a.localeCompare(b))
+    .map(([key,value]) => [key,{count:value.count,checksum:value.hash.digest("hex")} ]));
   return {
     columns, count, checksum: hash.digest("hex"), invalidKeys: Number(badKeys.rows[0].n),
-    orgs: Object.fromEntries([...orgs].sort(([a], [b]) => a.localeCompare(b))
-      .map(([org, value]) => [org, { count: value.count, checksum: value.hash.digest("hex") }])),
+    orgs: finish(orgs), workspaces: workspaceScoped ? finish(workspaces) : null, invalidWorkspaceBindings,
   };
 }
 
 async function compare(source: Client, target: Client, item: Comparison, kind: string): Promise<Finding> {
-  const left = await snapshot(source, item.sourceSql);
-  const right = await snapshot(target, item.targetSql);
+  const left = await snapshot(source, item.sourceSql,item.workspaceScoped);
+  const right = await snapshot(target, item.targetSql,item.workspaceScoped);
   return { kind, name: item.name,
     ok: left.invalidKeys === 0 && right.invalidKeys === 0
+      && left.invalidWorkspaceBindings === 0 && right.invalidWorkspaceBindings === 0
       && JSON.stringify(left) === JSON.stringify(right),
     detail: { source: left, target: right } };
+}
+
+async function standaloneSequence(source: Client,target: Client,item: NonNullable<Contract["standaloneSequences"]>[number]): Promise<Finding> {
+  const metadata = await target.query(`SELECT n.nspname AS schema,c.relname AS name,
+    s.seqincrement::text AS increment,s.seqmin::text AS minimum,s.seqmax::text AS maximum,s.seqcycle AS cycle
+    FROM pg_sequence s JOIN pg_class c ON c.oid=s.seqrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE s.seqrelid=to_regclass($1)`,[item.relation]);
+  if (metadata.rowCount !== 1) return {kind:"standalone_sequence",name:item.name,ok:false,detail:"missing_sequence"};
+  const seq = metadata.rows[0];
+  const state = (await target.query(`SELECT last_value::text,is_called FROM ${qualified(seq.schema,seq.name)}`)).rows[0];
+  const next = BigInt(state.last_value) + (state.is_called ? BigInt(seq.increment) : 0n);
+  const bounds = [];
+  for (const [client,sql] of [[source,item.sourceBoundsSql],[target,item.targetBoundsSql]] as const) {
+    const result = await client.query(`SELECT min_value::text,max_value::text FROM (${sql}) b`);
+    if (result.rowCount !== 1) throw new Error("Sequence bounds require exactly one row");
+    bounds.push(result.rows[0] as {min_value:string|null;max_value:string|null});
+  }
+  const ahead = bounds.every((b) => BigInt(seq.increment) > 0n
+    ? b.max_value === null || next > BigInt(b.max_value) : b.min_value === null || next < BigInt(b.min_value));
+  return {kind:"standalone_sequence",name:item.name,
+    ok:ahead && !seq.cycle && next >= BigInt(seq.minimum) && next <= BigInt(seq.maximum),
+    detail:{next:next.toString(),source:bounds[0],target:bounds[1],cycle:seq.cycle}};
 }
 
 async function relationChecks(client: Client, relation: string): Promise<Finding[]> {
@@ -178,6 +213,7 @@ export function validateContract(contract: Contract): void {
   const names = new Set<string>();
   for (const item of [...contract.tables, ...contract.identities]) {
     if (!item.name || !item.sourceSql || !item.targetSql || names.has(item.name)) throw new Error("Invalid or duplicate comparison");
+    if (item.workspaceScoped !== undefined && typeof item.workspaceScoped !== "boolean") throw new Error("workspaceScoped must be boolean");
     names.add(item.name);
   }
   for (const sample of contract.encryptedSamples) {
@@ -186,12 +222,19 @@ export function validateContract(contract: Contract): void {
       throw new Error("Encrypted sample requires 1 <= minimum <= limit <= 1000");
     }
   }
+  for (const item of contract.standaloneSequences ?? []) {
+    if (!item.name || !item.relation || !item.sourceBoundsSql || !item.targetBoundsSql) throw new Error("Invalid standalone sequence check");
+  }
+  for (const item of contract.pepperChecks ?? []) {
+    if (!item.name || !item.sql) throw new Error("Invalid pepper check");
+  }
 }
 
 /** Call with separate connected clients. Never writes or consumes sequences.
  * Freeze importer writes before taking these independent repeatable-read snapshots.
  */
-export async function verify(source: Client, target: Client, contract: Contract, keyring: EncryptionKeyring): Promise<Report> {
+export async function verify(source: Client, target: Client, contract: Contract, keyring: EncryptionKeyring,
+  options: {pepperVersions?: readonly number[]} = {}): Promise<Report> {
   if (source === target) throw new Error("Separate source and target clients required");
   validateContract(contract);
   const findings: Finding[] = [];
@@ -207,6 +250,13 @@ export async function verify(source: Client, target: Client, contract: Contract,
     for (const item of contract.tables) findings.push(await compare(source, target, item, "table"));
     for (const item of contract.identities) findings.push(await compare(source, target, item, "identity"));
     for (const relation of contract.targetRelations) findings.push(...await relationChecks(target, relation));
+    for (const item of contract.standaloneSequences ?? []) findings.push(await standaloneSequence(source,target,item));
+    for (const item of contract.pepperChecks ?? []) {
+      const rows = await target.query(`SELECT DISTINCT pepper_version FROM (${item.sql}) p WHERE pepper_version IS NOT NULL`);
+      const versions = rows.rows.map((row) => Number(row.pepper_version)).sort((a,b) => a-b);
+      const missing = versions.filter((v) => !Number.isSafeInteger(v) || v < 1 || !options.pepperVersions?.includes(v));
+      findings.push({kind:"pepper",name:item.name,ok:missing.length === 0,detail:{versions,missing}});
+    }
     for (const sample of contract.encryptedSamples) {
       const rows = await target.query(`SELECT ciphertext FROM (${sample.sql}) sample LIMIT $1`, [sample.limit]);
       let failures = 0;
