@@ -2,6 +2,8 @@ import { validateCredentialCheckpoint } from "./convergence.js";
 import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
 import { readCopierMarkers } from "./copier-markers.js";
 import { unboundWorkspaceMarkers } from "./unbound-markers.js";
+import { selectionDivergence } from "./selection-divergence.js";
+import { secretMarkerFinding } from "./secret-markers.js";
 import type { Client } from "pg";
 import { schemaFindings } from "./schema.js";
 import { normalizedScope,organizationCensus } from "./organization-scope.js";
@@ -67,6 +69,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     const schema=await schemaFindings(t);targetSchema=schema.summary;findings.push(schema.finding);
     if (schema.halt) return {contract:base,findings,halt:true};
     findings.push((await readCopierMarkers(t,scope)).finding);
+    findings.push(await secretMarkerFinding(t,scope));
     findings.push({kind:"ledger",name:"run",ok:ledger.version === 1 && ledger.mappingRevision === MAPPING_REVISION
       && ledger.mode === "apply" && ledger.ok === true && !ledger.refused && equalScope(scope,ledger.scope),
       detail:{expectedRevision:MAPPING_REVISION,revisionMatches:ledger.mappingRevision === MAPPING_REVISION,
@@ -98,6 +101,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     const canonicalOrigin=options.canonicalOrigin ?? canonicalRelayhistoryOrigin;
     const origins=new Map<string,string|null>();
     const unboundWorkspaces=new Map<string,string>();
+    let boundWorkspaceCount=0;
     const exclusions = new Map<string,string[]>();
     const counts = new Map<ImportTable,number>();
     for (const table of SOURCE_TABLES) {
@@ -163,6 +167,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
           const origin=table === "workspaces" && row.history_origin_raw !== null ? canonicalOrigin(row.history_origin_raw) : null;
           if (table === "workspaces") origins.set(row.key,origin);
           if (table === "workspaces" && row.source_unbound) unboundWorkspaces.set(row.key,row.org);
+          if (table === "workspaces" && !row.source_unbound) boundWorkspaceCount++;
           if (row.loses_history_route || (table === "workspaces" && row.history_origin_raw !== null && origin === null)) historyLoss++;
           if ((origin !== null && !columns.has("workspaces.relayhistory_origin"))
             || (row.has_generation && !columns.has("workspaces.relaycast_api_key_generation"))) metadataLoss++;
@@ -247,21 +252,35 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
       if (counts.get(table) === 0) {
         findings.push({kind:"decrypt",name:sample.name,ok:true,detail:"not_applicable_no_imported_rows"}); return [];
       }
+      if (table === "workspaces") {
+        if (!boundWorkspaceCount) {
+          findings.push({kind:"decrypt",name:sample.name,ok:true,detail:"not_applicable_no_bound_source_workspaces"});return [];
+        }
+        // 0064 allows a genuinely unbound NULL pair. Filter before sampling,
+        // not after LIMIT, and retain a positive minimum for bound sources.
+        const orgFilter=scope.orgIds === null ? "true" : `w.organization_id::text IN (${scope.orgIds.map(literal).join(",")})`;
+        return [{...sample,sql:`SELECT w.relaycast_api_key_ciphertext AS ciphertext FROM public.workspaces w
+          WHERE w.relaycast_api_key_ciphertext IS NOT NULL AND ${orgFilter}
+            AND EXISTS(SELECT 1 FROM public.cloud_import_ledger l WHERE l.table_name='workspaces'
+              AND l.organization_id=w.organization_id AND l.row_key=w.id::text)
+          ORDER BY w.id LIMIT ${sample.limit}`}];
+      }
       return [sample];
     });
     // Preserve fail-closed sampling if the entire cohort lacks an importable
     // workspace: an empty cohort cannot qualify the credential migration.
-    if (!contract.encryptedSamples.length) contract.encryptedSamples = base.encryptedSamples;
+    if (!contract.encryptedSamples.length && !counts.get("workspaces")) contract.encryptedSamples = base.encryptedSamples;
     findings.push(...await credentialSelections(t,scope));
     if (options.credentialCopy) findings.push(...await credentialCopyFindings(s,t,scope,options.credentialCopy,keyring,cloudKeyHex));
+    else findings.push(await selectionDivergence(s,t,scope));
     return {contract,findings};
   }});
-  const copyChecks=["credential_copy_ledger","credential_natural_keys","credential_control_ids","credential_cloud_selection","credential_copy_markers","credential_marker_links"];
+  const copyChecks=["credential_copy_ledger","credential_natural_keys","credential_control_ids","credential_cloud_selection","credential_copy_markers","credential_marker_links","selection_diverged"];
   return {...checked,evidenceKind:"identity-import" as const,scope,sourceOrganizationCensus:sourceOrganizationCensus!,targetSchema:targetSchema!,
     credentialConvergence:options.credentialCopy?.convergenceBefore
       ? checked.findings.some((f) => f.kind === "credential_convergence" && f.ok) ? "verified" : "failed" : "not_requested",
     credentialCopy:options.credentialCopy
     ? copyChecks.every((kind) => checked.findings.some((f) => f.kind === kind))
-      && checked.findings.filter((f) => f.kind.startsWith("credential_")).every((f) => f.ok) ? "verified" : "failed"
+      && checked.findings.filter((f) => f.kind.startsWith("credential_") || f.kind === "selection_diverged").every((f) => f.ok) ? "verified" : "failed"
     : "not_requested"};
 }

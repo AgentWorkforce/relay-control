@@ -34,12 +34,13 @@ async function unusedPort(): Promise<number> {
 
 try {
   const args=process.argv.slice(2);
-  let reportPath:string|undefined,manifestPath:string|undefined;
+  let reportPath:string|undefined,manifestPath:string|undefined,testPattern:string|undefined;
   while (args.length) {
     const flag=args.shift(),value=args.shift();
     if (!value || value.startsWith("--")) throw new Error("output_path_required");
     if (flag === "--report" && !reportPath) reportPath=value;
     else if (flag === "--write-schema-manifest" && !manifestPath) manifestPath=value;
+    else if (flag === "--test-pattern" && !testPattern) {new RegExp(value);testPattern=value;}
     else throw new Error("unknown_or_duplicate_argument");
   }
   // No Docker, shared databases, npm installs or parallel test workers.
@@ -68,6 +69,7 @@ try {
   }
   if (!ready) throw new Error("postgres_not_ready");
   testProcess = spawn(process.execPath,["--import","tsx","--test","--test-concurrency=1",
+    ...(testPattern ? ["--test-name-pattern",testPattern] : []),
     join(here,"../../test/cloud-import-verify.test.ts"),join(here,"../../test/cloud-import-verify-integration.test.ts"),
     join(here,"../../test/cloud-import-verify-readers.test.ts")], {
     cwd:join(here,"../.."), stdio:"inherit",

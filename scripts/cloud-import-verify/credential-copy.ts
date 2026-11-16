@@ -2,6 +2,7 @@ import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js"
 
 import { credentialCloudSelection,type SourceSelection } from "./credential-selection.js";
 import { credentialLoginCohort,deduplicatesLogins } from "./credential-cohort.js";
+import { selectionDivergence,type LinkedSourceSelection } from "./selection-divergence.js";
 
 import { readCopierMarkers } from "./copier-markers.js";
 import { credentialConvergenceCohort,credentialWriteCounts,readCredentialConvergence,compareCredentialConvergence,type CredentialConvergenceSnapshot } from "./convergence.js";
@@ -92,10 +93,17 @@ function priorCredentials(snapshot:CredentialTargetSnapshot|undefined,scope:Impo
 
 /** Read-only selection cardinality: model and sandbox are distinct selectors.
  * Sandbox selection may be empty; copied Cloud choices are checked separately.
+ * Source-unbound relay-managed rows are inert metadata, even after a lazy
+ * Control binding. The exact unbound namespace is independently source-checked
+ * by verifyImport; API keys and bound-source model groups still require a pick.
  */
 export async function credentialSelections(target:Client,scope:ImportScope):Promise<Finding[]> {
   const groups = await target.query(`SELECT c.workspace_id::text,c.model_provider,
-    count(*) FILTER(WHERE c.auth_type <> 'provider_oauth')::int AS model_eligible,
+    count(*) FILTER(WHERE c.auth_type <> 'provider_oauth'
+      AND (c.auth_type <> 'relay_managed' OR (w.relaycast_workspace_id IS NOT NULL
+        AND NOT EXISTS(SELECT 1 FROM public.cloud_import_ledger unbound
+          WHERE unbound.table_name='workspace_unbound' AND unbound.organization_id=w.organization_id
+            AND unbound.row_key=w.id::text))))::int AS model_eligible,
     count(*) FILTER(WHERE c.auth_type IN ('oauth_token','provider_oauth'))::int AS harness_eligible,
     count(*) FILTER(WHERE c.is_active)::int AS model_active,
     count(*) FILTER(WHERE c.harness_active)::int AS harness_active
@@ -286,6 +294,15 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
   findings.push({kind:"credential_control_ids",name:"coding_agent_credentials",
     ok:validMap && mapEntries.length === expectedBySourceId.size && !idMismatches && !extraIds,
     detail:{expected:expectedBySourceId.size,reported:validMap ? mapEntries.length : null,idMismatches,extraIds}});
+  const linkedSelections:LinkedSourceSelection[]=[];
+  let unmappedSelections=0;
+  for (const entry of selections) {
+    const id=report.controlIds?.[entry.id],want=expected.get(entry.key)!;
+    if (typeof id !== "string" || targetKeysById.get(id) !== entry.key) {unmappedSelections++;continue;}
+    linkedSelections.push({id,org:want.org,workspace:want.workspace,active:entry.active,harness:entry.harness});
+  }
+  findings.push(await selectionDivergence(source,target,scope,linkedSelections,unmappedSelections,
+    {present:Object.hasOwn(report,"selectionDiverged"),value:(report as typeof report & {selectionDiverged?:unknown}).selectionDiverged}));
   const allFlags=(await target.query(`SELECT workspace_id::text,model_provider,is_active,harness_active FROM public.coding_agent_credentials c
     JOIN public.workspaces w ON w.id=c.workspace_id WHERE $1::uuid[] IS NULL OR w.organization_id=ANY($1::uuid[])`,[scope.orgIds])).rows;
   const after=evidence.convergenceBefore ? await readCredentialConvergence(target,"after") : undefined;

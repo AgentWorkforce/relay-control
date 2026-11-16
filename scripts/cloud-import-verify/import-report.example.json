@@ -15,7 +15,7 @@
     }
   },
   "version": 1,
-  "mappingRevision": "cloud-identity-2026-11-16.11",
+  "mappingRevision": "cloud-identity-2026-11-16.28",
   "ok": true,
   "findings": [
     {
@@ -47,13 +47,13 @@
       "ok": true,
       "detail": {
         "baseline": "control-main-b79cb5f",
-        "manifestSha256": "72b678444d73be19b4440d82d891e42ced7ba70df36216485a1ed6e2b29ecbda",
-        "expectedSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
-        "actualSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
+        "manifestSha256": "b9880619eaf56a6f67b921f3292e374d0f0a83675cd74d7455f4483802d5a8a8",
+        "expectedSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
+        "actualSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
         "profile": "main",
         "optionalRelations": [],
-        "expectedObjects": 1843,
-        "actualObjects": 1843,
+        "expectedObjects": 1969,
+        "actualObjects": 1969,
         "missing": [],
         "changed": [],
         "unexpectedCount": 0,
@@ -66,7 +66,7 @@
       "name": "copier_login",
       "ok": true,
       "detail": {
-        "observed": 0,
+        "observed": 2,
         "invalidKeys": 0,
         "invalidRevisions": 0,
         "duplicateCredentials": 0,
@@ -77,11 +77,28 @@
       }
     },
     {
+      "kind": "secret_markers",
+      "name": "secret_written",
+      "ok": true,
+      "detail": {
+        "observed": 9,
+        "invalidKeys": 0,
+        "invalidRevisions": 0,
+        "duplicates": 0,
+        "invalidReferences": 0,
+        "historicalRevisions": 0,
+        "orphanMarkers": 0,
+        "matched": 9,
+        "changedSinceImport": 0,
+        "cleared": 0
+      }
+    },
+    {
       "kind": "ledger",
       "name": "run",
       "ok": true,
       "detail": {
-        "expectedRevision": "cloud-identity-2026-11-16.11",
+        "expectedRevision": "cloud-identity-2026-11-16.28",
         "revisionMatches": true,
         "mode": "apply",
         "ok": true
@@ -100,12 +117,13 @@
       "detail": {
         "expected": [
           "organizations.slug",
+          "users.signup_source",
           "workspaces.cloud_relay_workspace_id",
           "workspaces.relaycast_api_key_generation",
           "workspaces.relayhistory_origin",
           "workspaces.slug"
         ],
-        "reportedCount": 5
+        "reportedCount": 6
       }
     },
     {
@@ -205,22 +223,18 @@
       "detail": {
         "observed": {
           "candidates": 6,
-          "imported": 3,
+          "imported": 5,
           "skipped": {
-            "workspace_being_deleted": 1,
-            "no_relaycast_key": 1,
-            "no_relay_workspace": 1
+            "workspace_being_deleted": 1
           },
           "importerSkips": {}
         },
         "reported": {
           "candidates": 6,
-          "imported": 3,
+          "imported": 5,
           "deleted": 0,
           "skipped": {
-            "workspace_being_deleted": 1,
-            "no_relaycast_key": 1,
-            "no_relay_workspace": 1
+            "workspace_being_deleted": 1
           }
         }
       }
@@ -262,7 +276,7 @@
           "imported": 2,
           "skipped": {
             "not_a_member": 1,
-            "workspace_not_imported": 1
+            "workspace_unbound": 1
           },
           "importerSkips": {}
         },
@@ -272,7 +286,7 @@
           "deleted": 0,
           "skipped": {
             "not_a_member": 1,
-            "workspace_not_imported": 1
+            "workspace_unbound": 1
           }
         }
       }
@@ -336,7 +350,7 @@
           "candidates": 2,
           "imported": 1,
           "skipped": {
-            "workspace_not_imported": 1
+            "workspace_unbound": 1
           },
           "importerSkips": {}
         },
@@ -345,7 +359,7 @@
           "imported": 1,
           "deleted": 0,
           "skipped": {
-            "workspace_not_imported": 1
+            "workspace_unbound": 1
           }
         }
       }
@@ -380,21 +394,19 @@
       "ok": true,
       "detail": {
         "observed": {
-          "candidates": 13,
-          "imported": 2,
+          "candidates": 20,
+          "imported": 4,
           "skipped": {
-            "secret_in_cloud_credential_store": 10,
-            "workspace_not_imported": 1
+            "secret_in_cloud_credential_store": 16
           },
           "importerSkips": {}
         },
         "reported": {
-          "candidates": 13,
-          "imported": 2,
+          "candidates": 20,
+          "imported": 4,
           "deleted": 0,
           "skipped": {
-            "secret_in_cloud_credential_store": 10,
-            "workspace_not_imported": 1
+            "secret_in_cloud_credential_store": 16
           }
         }
       }
@@ -454,19 +466,15 @@
       "detail": {
         "observed": {
           "candidates": 2,
-          "imported": 1,
-          "skipped": {
-            "workspace_not_imported": 1
-          },
+          "imported": 2,
+          "skipped": {},
           "importerSkips": {}
         },
         "reported": {
           "candidates": 2,
-          "imported": 1,
+          "imported": 2,
           "deleted": 0,
-          "skipped": {
-            "workspace_not_imported": 1
-          }
+          "skipped": {}
         }
       }
     },
@@ -489,31 +497,31 @@
         "expected": {
           "organizations": 1,
           "organization_memberships": 3,
-          "workspaces": 1,
+          "workspaces": 3,
           "organization_invitations": 1,
           "person_identities": 1,
           "desktop_relay_identities": 2,
           "fleet_node_owners": 1,
-          "coding_agent_credentials": 2,
+          "coding_agent_credentials": 3,
           "github_app_installations": 1,
           "github_app_connections": 1,
-          "staff_read_grants": 1
+          "staff_read_grants": 2
         },
         "reported": {
           "status": "ok",
           "imported": {
             "organizations": 1,
             "organization_memberships": 3,
-            "workspaces": 1,
+            "workspaces": 3,
             "organization_invitations": 1,
             "person_identities": 1,
             "hosted_relay_participants": 0,
             "desktop_relay_identities": 2,
             "fleet_node_owners": 1,
-            "coding_agent_credentials": 2,
+            "coding_agent_credentials": 3,
             "github_app_installations": 1,
             "github_app_connections": 1,
-            "staff_read_grants": 1
+            "staff_read_grants": 2
           }
         }
       }
@@ -529,7 +537,8 @@
           "workspaces": 2,
           "organization_invitations": 1,
           "person_identities": 1,
-          "hosted_relay_participants": 1
+          "hosted_relay_participants": 1,
+          "coding_agent_credentials": 1
         },
         "reported": {
           "status": "ok",
@@ -542,7 +551,7 @@
             "hosted_relay_participants": 1,
             "desktop_relay_identities": 0,
             "fleet_node_owners": 0,
-            "coding_agent_credentials": 0,
+            "coding_agent_credentials": 1,
             "github_app_installations": 0,
             "github_app_connections": 0,
             "staff_read_grants": 0
@@ -555,7 +564,7 @@
       "name": "cloud_import_ledger",
       "ok": true,
       "detail": {
-        "entries": 23,
+        "entries": 28,
         "keyMismatches": 0,
         "revisionMismatches": 0,
         "extraOrgs": 0
@@ -606,8 +615,8 @@
       "name": "00000000-0000-4000-8000-0000000000a1:workspaces",
       "ok": true,
       "detail": {
-        "observed": 1,
-        "reported": 1
+        "observed": 3,
+        "reported": 3
       }
     },
     {
@@ -726,8 +735,8 @@
       "name": "00000000-0000-4000-8000-0000000000a1:coding_agent_credentials",
       "ok": true,
       "detail": {
-        "observed": 2,
-        "reported": 2
+        "observed": 3,
+        "reported": 3
       }
     },
     {
@@ -786,8 +795,8 @@
       "name": "00000000-0000-4000-8000-0000000000a1:staff_read_grants",
       "ok": true,
       "detail": {
-        "observed": 1,
-        "reported": 1
+        "observed": 2,
+        "reported": 2
       }
     },
     {
@@ -966,8 +975,8 @@
       "name": "00000000-0000-4000-8000-0000000000b1:coding_agent_credentials",
       "ok": true,
       "detail": {
-        "observed": 0,
-        "reported": 0
+        "observed": 1,
+        "reported": 1
       }
     },
     {
@@ -1172,11 +1181,26 @@
       }
     },
     {
+      "kind": "workspace_unbound_markers",
+      "name": "workspace_unbound",
+      "ok": true,
+      "detail": {
+        "observed": 2,
+        "expected": 2,
+        "missing": 0,
+        "unexpected": 0,
+        "invalidKeys": 0,
+        "invalidReferences": 0,
+        "revisionMismatches": 0,
+        "duplicates": 0
+      }
+    },
+    {
       "kind": "canonical_history_origins",
       "name": "workspaces",
       "ok": true,
       "detail": {
-        "workspaces": 3,
+        "workspaces": 5,
         "distinctOrigins": 1,
         "mismatches": 0,
         "reportedDistinctCount": 1
@@ -1187,7 +1211,7 @@
       "name": "staff_read_grants",
       "ok": true,
       "detail": {
-        "imported": 1,
+        "imported": 2,
         "invalid": 0
       }
     },
@@ -1225,9 +1249,35 @@
         "workspace_id": "00000000-0000-4000-8000-000000000201",
         "model_provider": "openai",
         "model_eligible": 1,
-        "harness_eligible": 1,
+        "harness_eligible": 2,
         "model_active": 1,
         "harness_active": 1
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000202:anthropic",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000202",
+        "model_provider": "anthropic",
+        "model_eligible": 0,
+        "harness_eligible": 0,
+        "model_active": 0,
+        "harness_active": 0
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000202:openai",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000202",
+        "model_provider": "openai",
+        "model_eligible": 1,
+        "harness_eligible": 0,
+        "model_active": 1,
+        "harness_active": 0
       }
     },
     {
@@ -1237,10 +1287,23 @@
       "detail": {
         "workspace_id": "00000000-0000-4000-8000-000000000205",
         "model_provider": "anthropic",
-        "model_eligible": 1,
+        "model_eligible": 3,
         "harness_eligible": 1,
         "model_active": 1,
         "harness_active": 1
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000205:google",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000205",
+        "model_provider": "google",
+        "model_eligible": 1,
+        "harness_eligible": 0,
+        "model_active": 1,
+        "harness_active": 0
       }
     },
     {
@@ -1274,10 +1337,12 @@
       "name": "run",
       "ok": true,
       "detail": {
-        "candidates": 10,
+        "candidates": 16,
         "sourceFailures": 0,
         "unresolvedSourceSkips": 0,
-        "reportedCandidates": 10
+        "duplicateLogins": 0,
+        "outcomesMatch": true,
+        "reportedCandidates": 16
       }
     },
     {
@@ -1288,12 +1353,12 @@
         "classes": [
           {
             "reason": "unsupported_dropped",
-            "accounted": 0,
+            "accounted": 1,
             "unresolved": 0
           },
           {
             "reason": "dead_login",
-            "accounted": 0,
+            "accounted": 1,
             "unresolved": 0
           },
           {
@@ -1310,8 +1375,8 @@
       "name": "coding_agent_credentials",
       "ok": true,
       "detail": {
-        "expected": 8,
-        "target": 8,
+        "expected": 12,
+        "target": 12,
         "missing": 0,
         "unmatchedTarget": 0,
         "unexplainedTarget": 0,
@@ -1327,8 +1392,8 @@
         },
         "sourceFailures": 0,
         "unresolvedSourceSkips": 0,
-        "sourceChecksum": "79915a2c7412f90863412007ca2e643f6dde08f670673169d062a92f220db210",
-        "targetChecksum": "79915a2c7412f90863412007ca2e643f6dde08f670673169d062a92f220db210"
+        "sourceChecksum": "49ce80c962ccf6c51c2b8afda86913a67338bb67c06a8b2a6848a49660d88ac0",
+        "targetChecksum": "49ce80c962ccf6c51c2b8afda86913a67338bb67c06a8b2a6848a49660d88ac0"
       }
     },
     {
@@ -1336,22 +1401,38 @@
       "name": "coding_agent_credentials",
       "ok": true,
       "detail": {
-        "expected": 8,
-        "reported": 8,
+        "expected": 12,
+        "reported": 12,
         "idMismatches": 0,
         "extraIds": 0
       }
     },
     {
-      "kind": "credential_marker_links",
-      "name": "written_logins",
+      "kind": "selection_diverged",
+      "name": "coding_agent_credentials",
       "ok": true,
       "detail": {
-        "receiptStatus": "legacy_without_write_receipt",
-        "expected": 0,
+        "unit": "distinct_linked_credential_flags",
+        "classification": "cloud_control_selection_differences",
+        "perOrg": {
+          "00000000-0000-4000-8000-0000000000b1": {
+            "active": 2,
+            "harness": 0
+          },
+          "00000000-0000-4000-8000-0000000000a1": {
+            "active": 1,
+            "harness": 0
+          }
+        },
+        "compared": {
+          "metadata": 4,
+          "copied": 12
+        },
         "missing": 0,
-        "mismatches": 0,
-        "revisionMismatches": 0
+        "unmappedCopied": 0,
+        "invalidSource": 0,
+        "invalidTarget": 0,
+        "producerCounter": "not_reported"
       }
     },
     {
@@ -1359,14 +1440,79 @@
       "name": "coding_agent_credentials",
       "ok": true,
       "detail": {
-        "groups": 6,
-        "active": 6,
-        "harness": 2,
+        "groups": 0,
+        "active": 0,
+        "harness": 0,
         "activeDemoted": 0,
         "harnessDemoted": 0,
         "selectionConflicts": 0,
         "selectionMismatches": 0,
-        "reportMatches": true
+        "untouchedWithoutBaseline": 0,
+        "reportMatches": true,
+        "policy": "written_rows",
+        "selectionKeys": 0,
+        "untouchedKeys": 12
+      }
+    },
+    {
+      "kind": "credential_marker_links",
+      "name": "written_logins",
+      "ok": true,
+      "detail": {
+        "receiptStatus": "valid",
+        "expected": 0,
+        "missing": 0,
+        "mismatches": 0,
+        "revisionMismatches": 0
+      }
+    },
+    {
+      "kind": "credential_convergence",
+      "name": "no_writes_or_blob_version_changes",
+      "ok": true,
+      "detail": {
+        "nonemptyBefore": true,
+        "cohort": {
+          "expectedValid": true,
+          "expectedCount": 12,
+          "expectedSha256": "3ae7aa8e6a0c07c8a829e2365698d8358243a84579bc11bebc8fc10c331a9694",
+          "beforeCount": 12,
+          "beforeSha256": "3ae7aa8e6a0c07c8a829e2365698d8358243a84579bc11bebc8fc10c331a9694",
+          "afterCount": 12,
+          "afterSha256": "3ae7aa8e6a0c07c8a829e2365698d8358243a84579bc11bebc8fc10c331a9694"
+        },
+        "binding": {
+          "receiptValid": true,
+          "digestMatches": true,
+          "nonceMatches": true
+        },
+        "credentialChanges": {
+          "inserted": 0,
+          "removed": 0,
+          "changed": 0
+        },
+        "blobChanges": {
+          "inserted": 0,
+          "removed": 0,
+          "changed": 0
+        },
+        "markerChanges": {
+          "inserted": 0,
+          "removed": 0,
+          "changed": 0
+        },
+        "blobVersionChanges": 0,
+        "reportedWrites": {
+          "inserted": 0,
+          "updated": 0,
+          "blobWrites": 0,
+          "metadataWrites": 0,
+          "selectionWrites": 0
+        },
+        "reportedWriteCount": 0,
+        "reportedBlobWriteCount": 0,
+        "evidenceScope": "all_target_credentials_postgres_blobs_and_copier_markers",
+        "physicalTupleIdentityIncluded": true
       }
     },
     {
@@ -1563,13 +1709,13 @@
             "slug",
             "updated_at"
           ],
-          "count": 3,
-          "checksum": "e99f3155c67db8a1e45b2a8c3d30f02e23d1fd915ad8cd08399a7a6e55b79ce5",
+          "count": 5,
+          "checksum": "2d7af94e62ce2deb6b6ca57366c2078d8fd3719f9d87040296885e27bac7ef5e",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
-              "count": 1,
-              "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
+              "count": 3,
+              "checksum": "1d32ae9e5ef56bb835c1b57d5806af5d8193a80fe1990ae6bb27ace5fcac84c8"
             },
             "\"00000000-0000-4000-8000-0000000000b1\"": {
               "count": 2,
@@ -1580,6 +1726,14 @@
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 1,
               "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
+            },
+            "\"00000000-0000-4000-8000-000000000202\"": {
+              "count": 1,
+              "checksum": "12d4ce9b24d1a0d9baaca572ea4b5956af534b209e8bb128a265709f13ac33b7"
+            },
+            "\"00000000-0000-4000-8000-000000000203\"": {
+              "count": 1,
+              "checksum": "1350180949152c89559812e5afa35a3672f85edbe8b6f796226565f241dd8c34"
             },
             "\"00000000-0000-4000-8000-000000000205\"": {
               "count": 1,
@@ -1608,13 +1762,13 @@
             "slug",
             "updated_at"
           ],
-          "count": 3,
-          "checksum": "e99f3155c67db8a1e45b2a8c3d30f02e23d1fd915ad8cd08399a7a6e55b79ce5",
+          "count": 5,
+          "checksum": "2d7af94e62ce2deb6b6ca57366c2078d8fd3719f9d87040296885e27bac7ef5e",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
-              "count": 1,
-              "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
+              "count": 3,
+              "checksum": "1d32ae9e5ef56bb835c1b57d5806af5d8193a80fe1990ae6bb27ace5fcac84c8"
             },
             "\"00000000-0000-4000-8000-0000000000b1\"": {
               "count": 2,
@@ -1625,6 +1779,14 @@
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 1,
               "checksum": "cc637f03a84b1672bb36673bbd66641be0115bb0418fc49d0ea6e143f234c3b3"
+            },
+            "\"00000000-0000-4000-8000-000000000202\"": {
+              "count": 1,
+              "checksum": "12d4ce9b24d1a0d9baaca572ea4b5956af534b209e8bb128a265709f13ac33b7"
+            },
+            "\"00000000-0000-4000-8000-000000000203\"": {
+              "count": 1,
+              "checksum": "1350180949152c89559812e5afa35a3672f85edbe8b6f796226565f241dd8c34"
             },
             "\"00000000-0000-4000-8000-000000000205\"": {
               "count": 1,
@@ -2012,19 +2174,31 @@
             "__workspace",
             "payload"
           ],
-          "count": 2,
-          "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e",
+          "count": 4,
+          "checksum": "24b9cdf7a13b0927613305cb5487eef55788ae7a6d354f112daa86c61dfa8304",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
-              "count": 2,
-              "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
+              "count": 3,
+              "checksum": "951cb2ac039a0fe9c0581ddbb8f0eaecea5a37ccfed137158c7b50280c62970a"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "89274f5705ea722589eadbdfca365d4db4830b1b20acd421e1f92eb6c606ab27"
             }
           },
           "workspaces": {
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 2,
               "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
+            },
+            "\"00000000-0000-4000-8000-000000000202\"": {
+              "count": 1,
+              "checksum": "36a39bdc27290285879dc6d35557b06d2544e91c6ded4e46f317f1d59bbe2de3"
+            },
+            "\"00000000-0000-4000-8000-000000000205\"": {
+              "count": 1,
+              "checksum": "89274f5705ea722589eadbdfca365d4db4830b1b20acd421e1f92eb6c606ab27"
             }
           },
           "invalidWorkspaceBindings": 0
@@ -2036,19 +2210,31 @@
             "__workspace",
             "payload"
           ],
-          "count": 2,
-          "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e",
+          "count": 4,
+          "checksum": "24b9cdf7a13b0927613305cb5487eef55788ae7a6d354f112daa86c61dfa8304",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
-              "count": 2,
-              "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
+              "count": 3,
+              "checksum": "951cb2ac039a0fe9c0581ddbb8f0eaecea5a37ccfed137158c7b50280c62970a"
+            },
+            "\"00000000-0000-4000-8000-0000000000b1\"": {
+              "count": 1,
+              "checksum": "89274f5705ea722589eadbdfca365d4db4830b1b20acd421e1f92eb6c606ab27"
             }
           },
           "workspaces": {
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 2,
               "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
+            },
+            "\"00000000-0000-4000-8000-000000000202\"": {
+              "count": 1,
+              "checksum": "36a39bdc27290285879dc6d35557b06d2544e91c6ded4e46f317f1d59bbe2de3"
+            },
+            "\"00000000-0000-4000-8000-000000000205\"": {
+              "count": 1,
+              "checksum": "89274f5705ea722589eadbdfca365d4db4830b1b20acd421e1f92eb6c606ab27"
             }
           },
           "invalidWorkspaceBindings": 0
@@ -2191,19 +2377,23 @@
             "staff_user_id",
             "workspace_id"
           ],
-          "count": 1,
-          "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2",
+          "count": 2,
+          "checksum": "ac011d955fb2548c554a82c8f0a788e80fa8edd517bbb5e151743067f90fae4c",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
-              "count": 1,
-              "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
+              "count": 2,
+              "checksum": "ac011d955fb2548c554a82c8f0a788e80fa8edd517bbb5e151743067f90fae4c"
             }
           },
           "workspaces": {
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 1,
               "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
+            },
+            "\"00000000-0000-4000-8000-000000000203\"": {
+              "count": 1,
+              "checksum": "233ed98c9967ecc90aa3fd94cce4cecb596ebd1fff0ba27175133c481970e0af"
             }
           },
           "invalidWorkspaceBindings": 0
@@ -2221,19 +2411,23 @@
             "staff_user_id",
             "workspace_id"
           ],
-          "count": 1,
-          "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2",
+          "count": 2,
+          "checksum": "ac011d955fb2548c554a82c8f0a788e80fa8edd517bbb5e151743067f90fae4c",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
-              "count": 1,
-              "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
+              "count": 2,
+              "checksum": "ac011d955fb2548c554a82c8f0a788e80fa8edd517bbb5e151743067f90fae4c"
             }
           },
           "workspaces": {
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 1,
               "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
+            },
+            "\"00000000-0000-4000-8000-000000000203\"": {
+              "count": 1,
+              "checksum": "233ed98c9967ecc90aa3fd94cce4cecb596ebd1fff0ba27175133c481970e0af"
             }
           },
           "invalidWorkspaceBindings": 0
@@ -2347,13 +2541,13 @@
             "id",
             "relaycast_workspace_id"
           ],
-          "count": 3,
-          "checksum": "6bac7052434f6ab4f2fa5b4c65a9fba54c8bd4cc9d7b7c6ec4092f72d8400a1d",
+          "count": 5,
+          "checksum": "a43908268b66b1566de37b7ecf21e60b25621ae0a61f568f33da7c7f63cab695",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
-              "count": 1,
-              "checksum": "12d248486fe631ab0e002370d540110bdf47edecace180306e253c594e7ad0b4"
+              "count": 3,
+              "checksum": "736fe9476805dd3e7579f8fc8fcfe7f9e0b256336e6dd885a6d572916bc8e3e5"
             },
             "\"00000000-0000-4000-8000-0000000000b1\"": {
               "count": 2,
@@ -2371,13 +2565,13 @@
             "id",
             "relaycast_workspace_id"
           ],
-          "count": 3,
-          "checksum": "6bac7052434f6ab4f2fa5b4c65a9fba54c8bd4cc9d7b7c6ec4092f72d8400a1d",
+          "count": 5,
+          "checksum": "a43908268b66b1566de37b7ecf21e60b25621ae0a61f568f33da7c7f63cab695",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
-              "count": 1,
-              "checksum": "12d248486fe631ab0e002370d540110bdf47edecace180306e253c594e7ad0b4"
+              "count": 3,
+              "checksum": "736fe9476805dd3e7579f8fc8fcfe7f9e0b256336e6dd885a6d572916bc8e3e5"
             },
             "\"00000000-0000-4000-8000-0000000000b1\"": {
               "count": 2,
@@ -3385,20 +3579,34 @@
   },
   "targetSchema": {
     "baseline": "control-main-b79cb5f",
-    "manifestSha256": "72b678444d73be19b4440d82d891e42ced7ba70df36216485a1ed6e2b29ecbda",
-    "expectedSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
-    "actualSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
+    "manifestSha256": "b9880619eaf56a6f67b921f3292e374d0f0a83675cd74d7455f4483802d5a8a8",
+    "expectedSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
+    "actualSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
     "profile": "main",
     "optionalRelations": [],
-    "expectedObjects": 1843,
-    "actualObjects": 1843,
+    "expectedObjects": 1969,
+    "actualObjects": 1969,
     "missing": [],
     "changed": [],
     "unexpectedCount": 0,
     "migrationsMatch": true,
     "ok": true
   },
-  "credentialConvergence": "not_requested",
+  "credentialConvergence": "verified",
   "credentialCopy": "verified",
-  "credentialCopyVerified": true
+  "credentialCopyVerified": true,
+  "syntheticProducerReceipt": {
+    "mappingRevision": "cloud-identity-2026-11-16.28",
+    "writes": {
+      "inserted": 0,
+      "updated": 0,
+      "blobWrites": 0,
+      "metadataWrites": 0,
+      "selectionWrites": 0
+    },
+    "convergence": {
+      "beforeDigest": "4e6c0887b9d2418524241f17dcc5079177244424ed6944d2e53e6fa89fcbb955",
+      "nonce": "50cc9c3a1913fe8de0bfb31f7fa0abeccd1f97d0164f45cfe92b5d5ade5a407c"
+    }
+  }
 }

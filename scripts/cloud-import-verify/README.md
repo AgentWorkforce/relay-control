@@ -6,7 +6,7 @@ The importer and authoritative mapping belong in `../cloud-import/`.
 `import-contract.ts` binds the verifier to the published
 `scripts/cloud-import/mapping.ts` from importer PR #155. It uses
 `MAPPING_REVISION`, shared comparisons, target specs/relations and encrypted
-sample definitions. PR #155 has merged; PR #148 now targets main.
+sample definitions.
 
 The harness executes the actual importer against its synthetic Cloud fixture
 and separate source/target databases. It checks rollback mode, committed apply
@@ -14,8 +14,8 @@ and a second apply, reconciles all thirteen mapped tables and per-org ledgers, p
 invite hashes and proves sessions/reconnect state stay empty.
 It then runs the opt-in credential copier against in-memory encrypted Cloud
 objects and local encrypted Postgres blobs, including a repeat copy.
-`import-report.example.json` is that full synthetic receipt; application smokes are
-pending and no real-data import has run.
+`import-report.example.json` contains synthetic data only. Application smokes
+remain separate and pending.
 
 Credential selection follows the producer revision: through `.24`, every
 matching copied-source row participates; from `cloud-identity-2026-11-16.25`,
@@ -28,11 +28,22 @@ an empty producer selection summary cannot waive a changed Control choice.
 The independent content/outcome gates still apply, so `control_newer` is not
 made acceptable by excluding it from selection expectations.
 
-The current-main importer in this harness still emits revision `.11`. The
-written-only adapter has causal consumer fixtures, including a real local
-Control login deactivated between copies; full qualification of `.25` requires
-the matching reviewed producer stack. Workspace binding-conflict and
-generation-kept warnings do not waive workspace comparison drift.
+The paired harness uses the producer's actual revision `.28` reports and
+`runProducer` path, including its fresh before-write checkpoint validation.
+It exercises a real local Control login deactivated between copies and rejects
+a relabelled after-checkpoint against the actual run receipt. Workspace
+binding-conflict and generation-kept warnings do not waive workspace drift.
+`--report` ends with the successful whole-rerun verification and its actual
+synthetic producer write/digest/nonce receipt, captured before the causal
+post-run mutations. The example stays labelled `synthetic-local-postgres`.
+
+`selection_diverged` separately reports effective Cloud/Control flag differences
+for metadata and independently linked copied credentials. These are visible
+diagnostics; wrong newly written selections and all existing content, linkage,
+cardinality and convergence checks remain fatal. Optional copier counters must
+exactly match the independently read sparse per-org counts. See
+[SELECTION_DIVERGENCE.md](SELECTION_DIVERGENCE.md) for the shared field shape,
+counting unit and the explicit `not_reported` status before the producer adds it.
 
 From revision `.21`, duplicate subscription logins are resolved from decrypted
 source account identities: freshest `updated_at`, then lowest source UUID.
@@ -53,8 +64,21 @@ bindings still must be preserved. Later Control binding is permitted by the
 mapping projection, only when this independent marker proof passes. Other
 ledger namespaces remain strict. Diagnostics retain fixed counts only.
 
+The exact `secret_written` namespace records immutable import-write provenance
+as `<target_relation>:<row_uuid>:<ciphertext_sha256>`. The verifier checks the
+five mapped secret relations, live tenant and workspace links, identity
+ownership, unique relation/row links and marker syntax. Historical revisions
+and markers left by reconciled deletions are informational: they cannot assert
+a current write. A changed ciphertext digest is reported separately as
+`changedSinceImport`; the independent decrypt and data checks still apply.
+Reports contain counts only, with no marker keys, hashes or secret values.
+The actual importer integration test independently rotates an integration and
+a hosted-participant secret, reruns the import twice, and requires byte-for-byte
+preservation and decryption to Control's value rather than Cloud's. It also
+requires the original provenance markers to remain unchanged.
+
 The target runs all checked-in Control migrations, including the actual
-0053/0054/0056/0057/0058/0061/0062 files and the owner-only 0063 ledger migration. The
+0053/0054/0056/0057/0058/0061/0062/0064 files and the owner-only 0063 ledger migration. The
 staff-grant table comes from the checked-in 0061 migration. The shared Cloud fixture
 now includes the generation column, so there is no verifier-owned source guard.
 The smaller fixtures in `fixtures.ts` independently
@@ -80,6 +104,8 @@ CLOUD_VERIFY_PG_BIN=/opt/homebrew/opt/postgresql@15/bin \
 Omit `CLOUD_VERIFY_PG_BIN` when `initdb` and `postgres` are available to Node
 through `PATH`. `--report` is optional and writes the actual importer's synthetic
 verification receipt. There is no Neon/Supabase connection or production run.
+Use `--test-pattern 'actual producer'` to run a focused serial subset in its
+own disposable cluster. Omit the pattern for the complete required check.
 The fixtures follow the plan's identifier shapes: `workspaces.id` is a UUID,
 `workspaces.relay_workspace_id` references text `relay_workspaces.id` values
 such as `rw_000000a1`, and `relay_workspaces.relaycast_workspace_id` contains a
