@@ -190,7 +190,11 @@ Europe/Oslo session timezone found that the importer's `created_at + interval
 '90 days'` staff-grant clamp shifts one hour across DST compared with the
 verifier's UTC snapshot. The fix on `feat/cloud-import-followups` at `6b338a5` sets both importer source
 transactions to UTC and gates selection conflicts. It is fixed pending merge;
-qualification requires that follow-up. The verifier retains UTC checks.
+qualification requires that follow-up. A temporary local merge of that exact
+follow-up passed the 53-case suite plus an independent source-Oslo regression
+that also checks session restoration and conflict failure (54 checks total).
+The temporary merge was undone; the follow-up remains in its owner's branch.
+The verifier retains UTC checks.
 
 The library entry point is `verifyImport(source, target, scope, ledger, keyring,
 cloudKeyHex, {pepperVersions, previousOwnership, previousReport, canonicalOrigin,
