@@ -529,6 +529,10 @@ workspace Relaycast key to a person credential with the `cli:auth` scope
 `403`; the bootstrap token gets `401`; another or departed tenant gets `404`.
 Each disclosure is audited as `workspace.relaycast_key.resolved` with the
 session id, never the key or token.
+On a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set) the key is never
+returned: the answer adds `urls.relaygateUrl`, omits `relaycastApiKey`, and is
+audited as `workspace.relaycast_key.withheld`. See
+[docs/identity.md](docs/identity.md#gate-only-installs-relaygate).
 
 ### Replacing a workspace's Relaycast key
 
