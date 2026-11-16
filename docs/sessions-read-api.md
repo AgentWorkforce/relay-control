@@ -88,6 +88,21 @@ without a matching header is `device`. Control validates the reply's identity, a
 format (`rth_at_read_`/`rth_rt_read_`) and expiry, and sets `baseUrl` from
 configuration. Keep the internal routes off public ingress.
 
+`SESSION_READ_MINT_INCLUDE_ROLE=true` (default false) adds `role` to both
+bodies: `"owner"`, `"admin"` or `"member"`, the caller's organization role
+from the same live membership row Control authorizes the request with, read
+on every mint and refresh. A gateway in front of the read API can record it
+with the minted token's owner, so a later read token maps to a role. Every
+mint path sends it: the `session-read` routes, `relayhistory/session` read
+mode, dashboard and MCP reads, and usage reports.
+
+Read APIs that predate this field refuse a body with an unknown field, so the
+rollout order is: first deploy a read API that accepts `role` on
+`/internal/v1/session-read/sessions` and `/sessions/refresh`, then set
+`SESSION_READ_MINT_INCLUDE_ROLE=true` on Control. Turning it on against an
+older read API makes every mint and refresh fail with 502. To roll back, turn
+the flag off first.
+
 Dashboard reads cache one read token per caller token session (at most 5
 minutes, never past the upstream expiry minus 60 s) and renew it on its own
 refresh lineage. On a 401 the cached token is dropped and Control requests a

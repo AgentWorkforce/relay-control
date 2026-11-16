@@ -290,6 +290,9 @@ The internal reader contract is `POST /internal/v1/session-read/sessions` or
 `/internal/v1/session-read/sessions/refresh`, authenticated by the dedicated
 secret. Control supplies `{ userId, orgId, workspaceId, audience, scopes:
 ["rth:read"], label? }`, with `refreshToken` instead of `label` on refresh.
+With `SESSION_READ_MINT_INCLUDE_ROLE=true` (default false) the body also
+carries `role: "owner" | "admin" | "member"`, the caller's live organization
+role ([docs/sessions-read-api.md](docs/sessions-read-api.md#read-credentials)).
 The reader returns the bearer response above without `baseUrl`; Control sets
 that from configuration. Keep these internal routes off public ingress.
 

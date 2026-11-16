@@ -1095,9 +1095,9 @@ export function createApp(input: {
       // Same facts as `browser` above: cookie -> browser, bearer -> device
       // (or mcp with the MCP reader's marker; see readerKindOf).
       const session = await requestReadSession(api, {
-        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
+        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id, role: workspace.role,
         readerKind: readerKindOf(request, mcpReaderMarker(api.secret)),
-      }, parsed.data);
+      }, parsed.data, { includeRole: config.sessionReadMintIncludeRole });
       const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
       return browser ? accessOnly : session;
     }
@@ -2744,9 +2744,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // marker (src/mcp/session-read-reader.ts) -> mcp. The marker is never
       // logged or echoed.
       const session = await requestReadSession(config.sessionReadApi, {
-        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
+        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id, role: workspace.role,
         readerKind: readerKindOf(request, mcpReaderMarker(config.sessionReadApi.secret)),
-      }, parsed.data);
+      }, parsed.data, { includeRole: config.sessionReadMintIncludeRole });
       // Page scripts get a short-lived access token only. Renew by requesting
       // a new session through the cookie path, which rechecks live membership.
       const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
