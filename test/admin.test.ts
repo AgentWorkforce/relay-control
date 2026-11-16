@@ -851,6 +851,8 @@ test("every admin operation is documented in openapi.yaml", async () => {
     "/api/v1/workspaces/{workspaceId}/integrations/{provider}/settings:",
     "/api/v1/workspaces/{workspaceId}/deployment-api-tokens:",
     "/api/v1/workspaces/{workspaceId}/deployment-api-tokens/{tokenId}:",
+    "/api/v1/workspaces/{workspaceId}/relay-node/self-tokens:",
+    "/api/v1/workspaces/{workspaceId}/relay-node/self-tokens/{tokenId}:",
     "/api/v1/workspaces/{workspaceId}/admin/audit:",
     "/api/v1/workspaces/{workspaceId}/cloud-agents:",
     "/api/v1/workspaces/{workspaceId}/cloud-agents/{agentId}:",

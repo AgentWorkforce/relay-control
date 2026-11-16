@@ -47,6 +47,10 @@ To rotate: mint a successor for the same `nodeName`, place it on the node,
 restart the node, then `DELETE .../deployment-api-tokens/{oldTokenId}`.
 Revocation takes effect on the next broker request.
 
+On a gate-only install a member's signed-in Agent Relay Desktop can also mint
+its own relay-node token, with no admin step: see
+[Member self-mint](#member-self-mint).
+
 ### Placing it on the node
 
 Treat the token like any other secret:
@@ -174,3 +178,77 @@ Upgrade refusals are plain HTTP answers with no body:
 | 404 | Not a gate-only install, or any other upgrade path |
 | 429 | Over 600 requests per minute for this token (shared with the broker routes) |
 | 503 | The bridge is at its connection limit or shutting down |
+
+### Member self-mint
+
+On a gate-only install any workspace member (not only an owner or admin) can
+have their signed-in Agent Relay Desktop mint the relay-node token for its own
+node. These routes are also served at `/cloud/api/v1`, and answer
+`404 not_found` when the install is not gate-only:
+
+```
+POST   /api/v1/workspaces/{id}/relay-node/self-tokens
+{"nodeName": "build-01", "label": "desktop build-01", "expiryDays": 90}
+GET    /api/v1/workspaces/{id}/relay-node/self-tokens
+DELETE /api/v1/workspaces/{id}/relay-node/self-tokens/{tokenId}
+```
+
+- **POST** answers `201` with the same record and one-time `accessToken`
+  (`sh_wk_`, purpose `relay-node`, the fixed scopes above) as the admin mint.
+  `nodeName` is required (same pattern as the admin mint). `label` defaults to
+  `desktop <host name>`. `expiryDays` is 1 to 90 and defaults to 90; a
+  self-minted token always expires, so `neverExpires` is refused.
+- **GET** answers `200 {"tokens": [...]}`: the caller's own live relay-node
+  tokens (created by the caller, not revoked, not expired), never their values.
+- **DELETE** answers `204` and revokes one of the caller's own live relay-node
+  tokens; it takes effect on the next broker request. Any other token
+  (another member's, an admin-minted one, another purpose) is
+  `404 token_not_found`.
+
+Who may call: only a redeemed Agent Relay Desktop session, that is a session
+whose row carries the Desktop host name (a Desktop sign-in with host consent,
+after its PKCE exchange, or a desktop-enrollment key exchange). Device-code
+and browser sessions, the pending browser handoff and workspace API tokens may
+not, whatever the caller's role.
+
+`SELFHOST_RELAY_NODE_SELF_MINT` turns the routes off when `false`, `0` or
+`off` (`403 self_mint_disabled`); it defaults to on, and any other value
+refuses startup. The admin mint is unaffected either way.
+
+Caps, checked in one transaction:
+
+- A node name belongs to one person: while someone else (including an admin
+  mint) holds a live relay-node token for that `nodeName`, the mint is
+  `409 node_name_taken`. The same caller may hold several live tokens for one
+  `nodeName`, to rotate.
+- At most 3 live relay-node tokens per person per workspace
+  (`409 too_many_tokens`); revoking one frees a slot.
+- At most 10 mints per person per hour (`429 rate_limited` with
+  `Retry-After`). GET and DELETE are not counted.
+
+| Status | Code | When |
+| --- | --- | --- |
+| 400 | `invalid_request` | Missing or malformed `nodeName`, `label` or `expiryDays`, `expiryDays` above 90, or `neverExpires` |
+| 401 | `unauthorized` | No bearer, or not a user session (for example a workspace API token) |
+| 403 | `desktop_session_required` | The session is not a redeemed Agent Relay Desktop session |
+| 403 | `self_mint_disabled` | `SELFHOST_RELAY_NODE_SELF_MINT` is off |
+| 404 | `not_found` | Not a gate-only install |
+| 404 | `token_not_found` | DELETE of a token that is not the caller's own live relay-node token |
+| 409 | `node_name_taken` | Another person holds a live relay-node token for this `nodeName` |
+| 409 | `too_many_tokens` | The caller already holds 3 live relay-node tokens |
+| 429 | `rate_limited` | More than 10 mints in an hour |
+
+Audit events (actor: the caller), besides the usual `api_token.create` and
+`api_token.revoke` rows: `relay_node.token.self_minted` and
+`relay_node.token.self_revoked`, both with the target
+`<token id> (relay-node: <nodeName>) host=<Desktop host name>`.
+
+The Desktop flow:
+
+1. The member signs in to Agent Relay Desktop.
+2. Desktop calls `POST .../relay-node/self-tokens` with its node name.
+3. Desktop keeps the `sh_wk_` value in the OS keychain only.
+4. Desktop enrols with `POST /relay-node/v1/nodes` and `Authorization: Bearer
+   sh_wk_...` (see [Enrolment](#enrolment)).
+5. Desktop opens `GET /relay-node/v1/ws` with the same bearer (see
+   [Node socket](#node-socket)).

@@ -5676,6 +5676,86 @@ paths:
       responses:
         "204": { description: Revoked }
         "404": { description: token_not_found }
+  /api/v1/workspaces/{workspaceId}/relay-node/self-tokens:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listSelfMintedRelayNodeTokens
+      description: |
+        Gate-only installs only (404 not_found otherwise). Any workspace member,
+        from a redeemed Agent Relay Desktop session only (403
+        desktop_session_required otherwise; 403 self_mint_disabled when
+        SELFHOST_RELAY_NODE_SELF_MINT is off). The caller's own live relay-node
+        tokens: created by the caller, not revoked, not expired. Also served at
+        /cloud/api/v1. See docs/relay-node-credential.md "Member self-mint".
+      responses:
+        "200":
+          description: Tokens (never the token value)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    type: array
+                    items: { $ref: "#/components/schemas/WorkspaceApiToken" }
+        "401": { description: "unauthorized: not a user session" }
+        "403": { description: "desktop_session_required or self_mint_disabled" }
+        "404": { description: "not_found: not a gate-only install" }
+    post:
+      operationId: selfMintRelayNodeToken
+      description: |
+        Same access rules as GET. Mints a relay-node token (sh_wk_, the fixed
+        relay-node scopes) for the caller's own node, in the same shape as
+        the admin mint. A nodeName belongs to one person while they hold a
+        live relay-node token for it (409 node_name_taken); the same caller
+        may hold several for one nodeName (rotation). At most 3 live
+        relay-node tokens per person (409 too_many_tokens) and 10 mints per
+        person per hour (429 rate_limited). Audited api_token.create and
+        relay_node.token.self_minted (target `<token id> (relay-node:
+        <nodeName>) host=<Desktop host name>`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nodeName]
+              properties:
+                nodeName: { type: string, pattern: "^[A-Za-z0-9._:-]{1,200}$" }
+                label: { type: string, maxLength: 128, description: "Default `desktop <Desktop host name>`" }
+                expiryDays: { type: integer, minimum: 1, maximum: 90, default: 90 }
+                neverExpires: { type: boolean, enum: [false], description: "Self-minted tokens always expire; true is a 400" }
+      responses:
+        "201":
+          description: Created; accessToken shown once
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/WorkspaceApiToken"
+                  - type: object
+                    properties:
+                      accessToken: { type: string }
+        "400": { description: "invalid_request: bad nodeName, label or expiryDays, or neverExpires" }
+        "401": { description: "unauthorized: not a user session" }
+        "403": { description: "desktop_session_required or self_mint_disabled" }
+        "404": { description: "not_found: not a gate-only install" }
+        "409": { description: "node_name_taken or too_many_tokens" }
+        "429": { description: "rate_limited, with Retry-After" }
+  /api/v1/workspaces/{workspaceId}/relay-node/self-tokens/{tokenId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: tokenId, in: path, required: true, schema: { type: string, format: uuid } }
+    delete:
+      operationId: revokeSelfMintedRelayNodeToken
+      description: |
+        Same access rules as GET. Revokes one of the caller's own live
+        relay-node tokens. Audited api_token.revoke and
+        relay_node.token.self_revoked.
+      responses:
+        "204": { description: Revoked }
+        "404": { description: "token_not_found: not the caller's own live relay-node token; not_found: not a gate-only install" }
   /relay-node/v1/workspace:
     get:
       operationId: relayNodeWorkspace
