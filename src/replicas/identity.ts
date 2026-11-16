@@ -224,7 +224,7 @@ export function createReplicaIdentityVerifier(options: {
       if (!audienceOk) fail();
       const seconds = now().getTime() / 1000;
       if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp) || seconds >= claims.exp + SKEW_SECONDS) fail();
-      if (claims.exp - seconds > MAX_LIFETIME_SECONDS + SKEW_SECONDS) fail();
+      if ((claims.exp as number) - seconds > MAX_LIFETIME_SECONDS + SKEW_SECONDS) fail();
       if (claims.nbf !== undefined && (typeof claims.nbf !== "number" || !Number.isFinite(claims.nbf) || seconds < claims.nbf - SKEW_SECONDS)) fail();
       for (const name of ["organization_id", "environment_id", "workspace_id"]) {
         if (typeof claims[name] !== "string" || !UUID.test(claims[name] as string)) fail();
