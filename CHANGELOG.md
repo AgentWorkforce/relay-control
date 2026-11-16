@@ -5,6 +5,11 @@ assigned at release.
 
 ## Unreleased
 
+- Fixed: staff read grants (`sh_sr_`) introspect active only through the
+  History audience fence (the workspace's own History origin, else the
+  configured History URL); every other introspection audience, including
+  `SELFHOST_INTROSPECT_AUDIENCES`, answers inactive `audience`. A device-code
+  login started by Agent Relay Desktop can no longer mint or list grants.
 - Added: staff read grants (migration 0061, table `staff_read_grants`). An
   owner of the operator organization, on its domains when it has any, mints a
   short-lived `sh_sr_` credential (scope `rth:read`, at most 90 days, no

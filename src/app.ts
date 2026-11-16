@@ -713,7 +713,8 @@ export function createApp(input: {
   /**
    * /api/v1/workspaces/{id}/staff-read-grants (docs/staff-read-grants.md):
    * the staff rule, presented by a browser account session or an interactive
-   * CLI login. Not a Desktop session, an enrollment-key session, a handoff,
+   * CLI login. Not a Desktop session (including a device code Desktop
+   * started), an enrollment-key session, a handoff,
    * a Desktop provider credential or any other credential kind. Every
    * refusal after the CSRF check is the same 404, so the routes are no
    * oracle for staff status or for workspace existence.
@@ -738,10 +739,17 @@ export function createApp(input: {
     const interactive = principal.scopes.includes(ACCOUNT_SCOPE) || principal.scopes.includes("cli:auth");
     if (
       !interactive || principal.scopes.includes(DESKTOP_WORKSPACES_SCOPE) || principal.scopes.includes("mcp:desktop") ||
-      principal.provisionedByTokenId || principal.pendingHandoff || principal.handoff
+      principal.provisionedByTokenId || principal.pendingHandoff || principal.handoff || principal.desktopHostName
     ) {
       throw notFound();
     }
+    // Agent Relay Desktop also signs in by device code, naming its host; such
+    // a session carries no Desktop marker, so look at the device code itself.
+    const desktopDeviceCode = await store.database.query(
+      "SELECT 1 FROM device_authorizations WHERE api_token_session_id = $1 AND desktop_host_name IS NOT NULL",
+      [principal.sessionId],
+    );
+    if (desktopDeviceCode.rows.length > 0) throw notFound();
     const staff = await staffReadGrants.staff(principal.userId);
     if (!staff || !isUuid(workspaceId)) throw notFound();
     const workspace = (await store.database.query<{ id: string; organization_id: string }>(
