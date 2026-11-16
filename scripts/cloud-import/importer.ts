@@ -140,6 +140,7 @@ const ROW_FLAGS: Partial<Record<ImportTable, string>> = {
       CASE WHEN q.origin_invalid THEN 'relayhistory_origin_invalid_dropped' END
     ], NULL)`,
   desktop_relay_identities: `CASE WHEN NOT q.source_id_is_uuid THEN ARRAY['source_id_not_uuid'] END`,
+  coding_agent_credentials: `CASE WHEN q.active_demoted THEN ARRAY['coding_agent_active_demoted'] END`,
 };
 
 type ColumnInfo = { udt: string; nullable: boolean };
@@ -333,6 +334,20 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       prepared.desktop_relay_identities = prepared.desktop_relay_identities.filter((row) => {
         if (!row.flags?.includes("source_id_not_uuid")) return true;
         skip("desktop_relay_identities", "source_id_not_uuid", row.key);
+        return false;
+      });
+    }
+    // Before 0058 Control cannot hold a relay_managed credential.
+    const relayManaged = await target.query<{ ok: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM pg_constraint c
+          WHERE c.conrelid = 'public.coding_agent_credentials'::regclass AND c.contype = 'c'
+            AND pg_get_constraintdef(c.oid) LIKE '%auth_type%' AND pg_get_constraintdef(c.oid) LIKE '%relay_managed%'
+       ) AS ok`,
+    );
+    if (relayManaged.rows[0]?.ok !== true) {
+      prepared.coding_agent_credentials = prepared.coding_agent_credentials.filter((row) => {
+        skip("coding_agent_credentials", "target_lacks_relay_managed", row.key);
         return false;
       });
     }

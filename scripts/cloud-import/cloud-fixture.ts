@@ -59,6 +59,14 @@ CREATE TABLE desktop_relay_identities (
   native_session_kind text, native_session_id text, token_envelope jsonb NOT NULL, web_session_id text,
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE provider_credentials (
+  id uuid PRIMARY KEY, organization_id uuid NOT NULL, workspace_id uuid NOT NULL, user_id uuid NOT NULL,
+  harness text NOT NULL, model_provider text NOT NULL DEFAULT '', auth_type text NOT NULL DEFAULT 'provider_oauth',
+  label text, key_fingerprint text, display_name text NOT NULL, account_email text,
+  is_active boolean NOT NULL DEFAULT false, harness_active boolean NOT NULL DEFAULT false, status text NOT NULL,
+  last_authenticated_at timestamptz, last_used_at timestamptz, last_error text,
+  created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
+);
 CREATE TABLE fleet_node_owners (
   id uuid PRIMARY KEY, workspace_id uuid NOT NULL, relay_workspace_id text NOT NULL, node_id text NOT NULL,
   user_id uuid NOT NULL, source text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
@@ -140,6 +148,11 @@ INSERT INTO desktop_relay_identities (id, workspace_id, user_id, relay_workspace
   ('${id(0x601)}', '${id(0x201)}', '${id(1)}', 'rw_0000a201', '${id(0x9001).toUpperCase()}', 'alice-desk', 'ag-8', 'alice-desk@host', 'copilot', 'chat-1', ${env("tok_desk_1")}, ${t}, ${t}),
   ('${id(0x602)}', '${id(0x201)}', '${id(2)}', 'rw_0000a201', 'not-a-uuid', 'bob-desk', 'ag-9', 'bob-desk@host', 'copilot', NULL, ${env("tok_desk_2")}, ${t}, ${t}),
   ('${id(0x603)}', '${id(0x201)}', '${id(6)}', 'rw_0000a201', '${id(0x9003)}', 'dave-desk', 'ag-10', 'dave-desk@host', NULL, NULL, ${env("tok_desk_3")}, ${t}, ${t});
+INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, harness, model_provider, auth_type, display_name, is_active, harness_active, status, created_at, updated_at) VALUES
+  ('${id(0x801)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'claude', 'anthropic', 'relay_managed', 'Relay Claude', true, true, 'connected', ${t}, '2026-01-03T00:00:00Z'),
+  ('${id(0x802)}', '${ORG_A}', '${id(0x201)}', '${id(2)}', 'claude', 'anthropic', 'relay_managed', 'Relay Claude (bob)', true, false, 'connected', ${t}, ${t}),
+  ('${id(0x803)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'byo_api_key', 'My key', true, false, 'connected', ${t}, ${t}),
+  ('${id(0x804)}', '${ORG_A}', '${id(0x202)}', '${id(1)}', 'claude', 'anthropic', 'relay_managed', 'Unbound', false, false, 'connected', ${t}, ${t});
 INSERT INTO fleet_node_owners (id, workspace_id, relay_workspace_id, node_id, user_id, source, created_at) VALUES
   ('${id(0x701)}', '${id(0x201)}', 'rw_0000a201', 'node-1', '${id(3)}', 'claim', ${t}),
   ('${id(0x702)}', '${id(0x203)}', 'rw_0000a203', 'node-2', '${id(1)}', 'claim', ${t});
@@ -169,4 +182,9 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
   hosted_relay_participants: { imported: 1, skipped: { duplicate_after_merge: 1, stale_relay_workspace: 1 } },
   desktop_relay_identities: { imported: 1, skipped: { source_id_not_uuid: 1, not_a_member: 1 } },
   fleet_node_owners: { imported: 1, skipped: { workspace_not_imported: 1 } },
+  // Pre-0058 target: the two relay_managed rows are refused by the importer.
+  coding_agent_credentials: {
+    imported: 0,
+    skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 1, target_lacks_relay_managed: 2 },
+  },
 };

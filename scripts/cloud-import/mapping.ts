@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-15.1";
+export const MAPPING_REVISION = "cloud-identity-2026-11-15.2";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -190,6 +190,7 @@ export const SOURCE_TABLES = [
   "hosted_relay_participants",
   "desktop_relay_identities",
   "fleet_node_owners",
+  "coding_agent_credentials",
 ] as const;
 export type ImportTable = (typeof SOURCE_TABLES)[number];
 
@@ -318,6 +319,37 @@ SELECT f.id, f.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
   LEFT JOIN imported_workspaces iw ON iw.id = f.workspace_id
   LEFT JOIN user_map um ON um.cloud_user_id = f.user_id
   LEFT JOIN imported_users iu ON iu.id = um.user_id`,
+    // Cloud keeps every coding-agent secret in its credential store (S3),
+    // not in the database. Only relay_managed rows carry no secret, so only
+    // they are imported (0058 contract): credential fields stay NULL and
+    // harness_active is forced off. Control allows one active credential per
+    // (workspace, provider); Cloud allows one per user, so extra active rows
+    // are demoted (flagged) to the newest one.
+    coding_agent_credentials: `
+SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS created_by_user_id,
+       p.model_provider, p.harness, p.auth_type, p.display_name, p.label, p.account_email,
+       (p.is_active AND row_number() OVER (
+          PARTITION BY p.workspace_id, p.model_provider, p.is_active, (p.auth_type = 'relay_managed')
+          ORDER BY p.updated_at DESC, p.id
+        ) = 1) AS is_active,
+       (p.is_active AND row_number() OVER (
+          PARTITION BY p.workspace_id, p.model_provider, p.is_active, (p.auth_type = 'relay_managed')
+          ORDER BY p.updated_at DESC, p.id
+        ) > 1) AS active_demoted,
+       false AS harness_active,
+       p.status, p.last_error, p.last_authenticated_at, p.last_used_at, p.created_at, p.updated_at,
+       CASE
+         WHEN iw.id IS NULL THEN 'workspace_not_imported'
+         WHEN p.auth_type <> 'relay_managed' THEN 'secret_in_cloud_credential_store'
+         WHEN p.model_provider NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
+         WHEN p.status NOT IN ('connected', 'error', 'refresh_failed') THEN 'unsupported_status'
+       END AS skip_reason
+  FROM public.provider_credentials p
+  JOIN public.workspaces w ON w.id = p.workspace_id
+  JOIN scope_orgs s ON s.id = w.organization_id
+  LEFT JOIN imported_workspaces iw ON iw.id = p.workspace_id
+  LEFT JOIN user_map um ON um.cloud_user_id = p.user_id
+  LEFT JOIN imported_users iu ON iu.id = um.user_id`,
   };
 }
 
@@ -347,6 +379,11 @@ export type TargetSpec = {
 };
 
 export const TARGETS: Record<ImportTable, TargetSpec> = {
+  coding_agent_credentials: {
+    table: "coding_agent_credentials",
+    primaryKey: ["id"],
+    columns: ["id", "organization_id", "workspace_id", "created_by_user_id", "model_provider", "harness", "auth_type", "display_name", "label", "account_email", "is_active", "harness_active", "status", "last_error", "last_authenticated_at", "last_used_at", "created_at", "updated_at"],
+  },
   users: {
     table: "users",
     primaryKey: ["id"],
@@ -409,10 +446,12 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
 };
 
 /** Importer-side skips (decided after the query, recorded in the ledger). */
+// coding_agent_credentials: "target_lacks_relay_managed" before 0058.
 export const IMPORTER_SKIP_REASONS = [
   "cloud_decrypt_failed",
   // desktop_relay_identities.source_id is uuid before 0057.
   "source_id_not_uuid",
+  "target_lacks_relay_managed",
   "target_email_conflict",
 ] as const;
 
@@ -437,6 +476,10 @@ const ts = (column: string) => `to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-D
 type Projection = { key: string; org: string; workspace?: string; columns: Record<string, string> };
 
 const PROJECTIONS: Record<ImportTable, Projection> = {
+  coding_agent_credentials: {
+    key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
+    columns: { id: "id::text", organization_id: "organization_id::text", workspace_id: "workspace_id::text", created_by_user_id: "created_by_user_id::text", model_provider: "model_provider", harness: "harness", auth_type: "auth_type", display_name: "display_name", label: "label", account_email: "account_email", is_active: "is_active", harness_active: "harness_active", status: "status", last_error: "last_error", last_authenticated_at: ts("last_authenticated_at"), last_used_at: ts("last_used_at"), created_at: ts("created_at") },
+  },
   users: {
     key: "id::text", org: "NULL::text",
     columns: { id: "id::text", email: "email", name: "name", created_at: ts("created_at"), updated_at: ts("updated_at"), last_organization_id: "last_organization_id::text", last_workspace_id: "last_workspace_id::text" },

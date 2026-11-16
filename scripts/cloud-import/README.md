@@ -61,7 +61,7 @@ The CLI reads its settings from the environment. Each variable also accepts a `N
 - Sign-in auto-accepts open invites by email, and an admin's "Copy link"/"Resend" issues a working link.
 - Imported invites have no `invitation.create` audit row.
 
-**Coding-agent credentials and GitHub App connections** are follow-ups and are not in this tool yet.
+**Coding-agent credentials:** only `relay_managed` rows are imported, because they carry no secret (0058). Cloud keeps API keys, setup tokens and subscription logins in its S3 credential store, so those rows are skipped as `secret_in_cloud_credential_store` until a bucket copy is approved. **GitHub App connections** (#146) are a follow-up.
 
 ## Target prerequisites
 

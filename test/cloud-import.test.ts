@@ -36,6 +36,21 @@ CREATE UNIQUE INDEX workspaces_org_slug_unique ON workspaces (organization_id, s
 ALTER TABLE desktop_relay_identities ALTER COLUMN source_id TYPE text USING source_id::text;
 ALTER TABLE desktop_attestation_keys ALTER COLUMN source_id TYPE text USING source_id::text;
 ALTER TABLE fleet_node_owners ALTER COLUMN node_name DROP NOT NULL;
+-- 0058 (control-relay-managed), approximated: relay_managed rows carry no secret.
+ALTER TABLE coding_agent_credentials
+  ALTER COLUMN secret_preview DROP NOT NULL,
+  ALTER COLUMN key_fingerprint DROP NOT NULL,
+  DROP CONSTRAINT IF EXISTS selfhost_coding_agent_auth_type,
+  DROP CONSTRAINT IF EXISTS coding_agent_auth_type,
+  DROP CONSTRAINT IF EXISTS selfhost_coding_agent_secret_storage,
+  DROP CONSTRAINT IF EXISTS coding_agent_secret_storage,
+  ADD CONSTRAINT coding_agent_auth_type
+    CHECK (auth_type IN ('byo_api_key', 'oauth_token', 'provider_oauth', 'relay_managed')),
+  ADD CONSTRAINT coding_agent_secret_storage CHECK (
+    (auth_type = 'relay_managed' AND secret_ciphertext IS NULL AND NOT harness_active)
+    OR (auth_type = 'provider_oauth' AND secret_ciphertext IS NULL AND blob_location IS NOT NULL)
+    OR (auth_type IN ('byo_api_key', 'oauth_token') AND secret_ciphertext IS NOT NULL)
+  );
 `;
 
 async function cloudSource(): Promise<PGliteDatabase> {
@@ -79,6 +94,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   const plan = await runImport({ ...deps, target: undefined }, scope, "plan");
   assert.equal(plan.ok, true);
   const expectedPlan = structuredClone(EXPECTED_FULL);
+  expectedPlan.coding_agent_credentials = { imported: 2, skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 1 } };
   expectedPlan.desktop_relay_identities = { imported: 2, skipped: { not_a_member: 1 } };
   assert.deepEqual(ledger(plan), expectedPlan);
 
@@ -177,6 +193,13 @@ test("cloud import: post-0057 target keeps rw_, slugs, History origin and text s
   const uuidSource = (await target.query<{ source_id: string }>(
     "SELECT source_id FROM desktop_relay_identities WHERE id = $1", [id(0x601)])).rows[0]!;
   assert.equal(uuidSource.source_id, id(0x9001));
+  const agents = (await target.query<{ id: string; is_active: boolean; harness_active: boolean; secret_ciphertext: string | null }>(
+    "SELECT id, is_active, harness_active, secret_ciphertext FROM coding_agent_credentials ORDER BY id")).rows;
+  assert.deepEqual(agents, [
+    { id: id(0x801), is_active: true, harness_active: false, secret_ciphertext: null },
+    { id: id(0x802), is_active: false, harness_active: false, secret_ciphertext: null },
+  ]);
+  assert.equal(report.warnings.coding_agent_active_demoted, 1);
   const fleet = (await target.query<{ node_name: string | null }>("SELECT node_name FROM fleet_node_owners")).rows;
   assert.deepEqual(fleet, [{ node_name: null }]);
 
