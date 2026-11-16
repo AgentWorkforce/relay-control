@@ -11,6 +11,7 @@ COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
 COPY migrations ./migrations
 COPY openapi.yaml README.md LICENSE NOTICE ./
+COPY LICENSES ./LICENSES
 RUN npm run build \
  && npm pack --pack-destination /tmp
 

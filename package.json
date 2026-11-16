@@ -16,7 +16,8 @@
     "openapi.yaml",
     "README.md",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    "LICENSES"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
