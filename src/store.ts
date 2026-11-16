@@ -57,6 +57,14 @@ export { DASHBOARD_DEVICE_CLIENT };
 const ACCOUNT_SCOPES = [...BROWSER_SESSION_SCOPES, ACCOUNT_SCOPE];
 /** Desktop sessions: device scopes (with rth:acquire) plus "desktop:workspaces". */
 const DESKTOP_SCOPES = [...DEVICE_SCOPES, DESKTOP_WORKSPACES_SCOPE];
+/**
+ * Control's own short-lived token for relaygate's POST /v1/check on a gate-only
+ * launch: no scopes at all (relaygate's check needs none, so the token is
+ * useless for /v1/register, uploads or reads even while a cached introspection
+ * outlives the revoke).
+ */
+const LAUNCH_CHECK_SCOPES: string[] = [];
+const LAUNCH_CHECK_TTL_MS = 60 * 1_000;
 /** desktop-auth lane, browser flow: hosted Cloud's 15-minute loopback handoff. */
 const DESKTOP_HANDOFF_TTL_MS = 15 * 60 * 1_000;
 /** Longer than Relaycast's 300 s cold-create bound, with room to persist. */
@@ -96,6 +104,14 @@ export type Principal = {
    * `provisioning`); absent for every other session.
    */
   provisionedByTokenId?: string;
+  /**
+   * The Desktop host name on the session row: set for an Agent Relay Desktop
+   * sign-in with host consent (PKCE handoff and its redeemed pair) and for a
+   * desktop-enrollment key exchange; absent for device-code and browser
+   * sessions. A pending or original handoff also carries it, so callers that
+   * want a redeemed Desktop session check `handoff` too.
+   */
+  desktopHostName?: string;
 };
 
 export type IssuedTokens = {
@@ -195,6 +211,7 @@ type TokenContextRow = {
   pending_handoff: boolean;
   handoff: boolean;
   provisioned_by_token_id: string | null;
+  desktop_host_name: string | null;
 };
 
 function cleanName(value: string, field: string): string {
@@ -1506,7 +1523,7 @@ export class ControlPlaneStore {
               s.workspace_id, w.name AS workspace_name, m.role, s.scopes,
               (s.desktop_exchange_challenge IS NOT NULL AND s.desktop_exchanged_at IS NULL) AS pending_handoff,
               (s.desktop_exchange_challenge IS NOT NULL) AS handoff,
-              s.provisioned_by_token_id
+              s.provisioned_by_token_id, s.desktop_host_name
          FROM token_sessions s
          JOIN users u ON u.id = s.user_id
          JOIN organizations o ON o.id = s.organization_id
@@ -1538,6 +1555,7 @@ export class ControlPlaneStore {
       pendingHandoff: row.pending_handoff === true,
       handoff: row.handoff === true,
       ...(row.provisioned_by_token_id ? { provisionedByTokenId: row.provisioned_by_token_id } : {}),
+      ...(row.desktop_host_name ? { desktopHostName: row.desktop_host_name } : {}),
     };
   }
 
@@ -2169,6 +2187,26 @@ export class ControlPlaneStore {
     input: { userId: string; organizationId: string; workspaceId: string; label: string },
   ): Promise<IssuedTokens> {
     return this.issueTokens(tx, input, { scopes: ACCOUNT_SCOPES });
+  }
+
+  /**
+   * A one-use, ~60 s access token with which Control itself asks relaygate to
+   * check a launch on the launching person's behalf (POST /v1/check). Revoked
+   * right after the check. Only the access token is returned.
+   */
+  async issueLaunchCheckSession(input: {
+    userId: string;
+    organizationId: string;
+    workspaceId: string;
+  }): Promise<{ accessToken: string }> {
+    const issued = await this.database.transaction((tx) =>
+      this.issueTokens(tx, { ...input, label: "relay-launch-check" }, {
+        scopes: LAUNCH_CHECK_SCOPES,
+        accessTtlMs: LAUNCH_CHECK_TTL_MS,
+        refreshTtlMs: LAUNCH_CHECK_TTL_MS,
+      }),
+    );
+    return { accessToken: issued.accessToken };
   }
 
   private async issueTokens(

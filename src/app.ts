@@ -10,6 +10,7 @@ import { GrokRoutines } from "./mcp/grok-routines.js";
 import { retiringIdentity } from "./mcp/oauth/retirement.js";
 import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Duplex } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -21,9 +22,12 @@ import { ApiTokenStore, ENROLLMENT_KEY_PREFIX } from "./admin/api-tokens.js";
 import { recordAudit } from "./admin/audit.js";
 import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
 import { handleChiefRelay } from "./chief-relay.js";
-import { handleRelayNode } from "./relay-node/broker.js";
+import { handleRelayNode, RELAY_NODE_RATE_LIMIT } from "./relay-node/broker.js";
+import { relayNodeCredentials, type RelayNodeCredentials } from "./relay-node/credentials.js";
+import { createRelayNodeSocketBridge, refuseUpgrade } from "./relay-node/socket.js";
 import { handleFlowsBroker } from "./flows-broker.js";
 import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
+import { relayLaunchCredentials } from "./mcp/relay-launch-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { UsageRangeError, usageDays, usageReport } from "./usage/routes.js";
 import { UsageStore } from "./usage/store.js";
@@ -32,7 +36,8 @@ import { listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError }
 import {
   PeopleInputError, PersonNotFoundError, peopleAudit, peopleReport, personSessions, recordPeopleView, UsagePeopleStore,
 } from "./usage/people.js";
-import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
+import { mcpReaderMarker, readerKindOf, readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
+import { bearer } from "./auth/bearer.js";
 import { z } from "zod";
 import {
   acceptedAudiences,
@@ -191,13 +196,6 @@ function json(response: ServerResponse, status: number, body: unknown, noStore =
 function text(response: ServerResponse, status: number, body: string, type = "text/plain"): void {
   response.writeHead(status, { "content-type": `${type}; charset=utf-8` });
   response.end(body);
-}
-
-function bearer(request: IncomingMessage): string | null {
-  const header = request.headers.authorization;
-  if (!header) return null;
-  const match = /^Bearer\s+(.+)$/i.exec(header);
-  return match?.[1]?.trim() || null;
 }
 
 function cookie(request: IncomingMessage, name: string): string | null {
@@ -371,6 +369,16 @@ function cookieDeleteAllowed(request: IncomingMessage, browserOrigins: string[])
     : request.headers["sec-fetch-site"] === "same-origin";
 }
 
+/**
+ * The request handler, plus the HTTP upgrade handler for server "upgrade"
+ * events: the relay-node socket bridge on gate-only installs, 404 otherwise.
+ */
+export type AppHandler = ((request: IncomingMessage, response: ServerResponse) => void) & {
+  handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void;
+  /** Ends every bridged socket (shutdown). */
+  closeUpgrades(): void;
+};
+
 export function createApp(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
@@ -440,7 +448,7 @@ export function createApp(input: {
   /** Test hooks for claim leases and crash injection. Production leaves this unset. */
   messaging?: Pick<MessagingDeps,
     "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck">;
-}): (request: IncomingMessage, response: ServerResponse) => void {
+}): AppHandler {
   const { config, store, admin, telemetry, identity } = input;
   const features = input.features ?? NO_FEATURES;
   const workspaceHistoryOrigin = (
@@ -509,6 +517,7 @@ export function createApp(input: {
     database: store.database,
     keyring: config.encryptionKeyring,
     relaycastUrl: config.relaycastUrl,
+    relaygatePublicUrl: config.relaygatePublicUrl,
     fetchImpl: input.messagingFetch,
     now: input.now,
     ...input.messaging,
@@ -516,6 +525,7 @@ export function createApp(input: {
   const messaging = createMessagingHandler({
     ...messagingDeps,
     relaycastPublicUrl: config.relaycastPublicUrl,
+    relaygatePublicUrl: config.relaygatePublicUrl,
     internalServiceToken: config.internalServiceToken,
     browserOrigins,
   });
@@ -806,7 +816,61 @@ export function createApp(input: {
     return auth;
   }
 
+  // Standard installs: the node token proves the node against Relaycast; it
+  // is never stored or logged.
+  async function proveNodeToken(workspaceKey: string, body: Record<string, unknown>) {
+    const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken.trim() : "";
+    if (!NODE_TOKEN.test(nodeToken)) {
+      throw new HttpError(400, "invalid_request", "Send workspaceId and the node's token (nt_live_... or ar_nd_...).");
+    }
+    return verifyNodeToken(config.relaycastUrl, workspaceKey, nodeToken);
+  }
+
+  // Gate-only installs: the node host never holds its Relaycast node token,
+  // so the proof is the node's enrolment through this Control's relay-node
+  // broker with a relay-node token minted in this workspace and bound to that
+  // name (docs/relay-node-credential.md, "Claiming the node"). Relaycast is
+  // not asked. A row whose sealed token no longer opens still proves the
+  // enrolment; the socket bridge refuses that node separately.
+  async function proveEnrolledNode(
+    credentials: RelayNodeCredentials,
+    workspaceId: string,
+    body: Record<string, unknown>,
+  ) {
+    if (body.nodeToken !== undefined) {
+      throw new HttpError(
+        400,
+        "invalid_request",
+        "This installation runs behind relaygate; send workspaceId and nodeName (the node's enrolled name).",
+      );
+    }
+    const nodeName = body.nodeName;
+    if (typeof nodeName !== "string" || !NODE_ID.test(nodeName)) {
+      throw new HttpError(400, "invalid_request", "Send workspaceId and nodeName.");
+    }
+    const enrolled = await credentials.find({ workspaceId, nodeName });
+    if (!enrolled) throw new NodeClaimError(403, "That node has not enrolled through this installation.");
+    return { id: enrolled.relaycastNodeId, name: enrolled.nodeName };
+  }
+
   const apiTokens = new ApiTokenStore(store.database);
+  // Gate-only installs only: relaygate introspects one-time `sh_lt_` launch credentials.
+  const relayLaunchCredentialStore = config.relaygatePublicUrl
+    ? relayLaunchCredentials(store.database, config.encryptionKeyring) : undefined;
+  // Gate-only installs only: Control holds relay nodes' Relaycast node tokens and bridges their sockets.
+  const relayNodeCredentialStore = config.relaygatePublicUrl
+    ? relayNodeCredentials(store.database, config.encryptionKeyring) : undefined;
+  const relayNodeSocket = relayNodeCredentialStore && relayLaunchCredentialStore
+    ? createRelayNodeSocketBridge({
+      apiTokens,
+      nodeCredentials: relayNodeCredentialStore,
+      launchCredentials: relayLaunchCredentialStore,
+      relaycastUrl: config.relaycastUrl,
+      database: store.database,
+      rateLimit: (key) => limiter.consume(key, RELAY_NODE_RATE_LIMIT.limit, RELAY_NODE_RATE_LIMIT.windowMs).allowed,
+      log: (message, fields) => console.warn(`[selfhost-api] ${message}`, fields),
+    })
+    : undefined;
   const flowRelayfileCredentials = input.flowRelayfileCredentials ?? new FlowRunRelayfileCredentials(
     store.database,
     () => input.now?.() ?? new Date(),
@@ -977,8 +1041,11 @@ export function createApp(input: {
       if (!parsed.success) throw new HttpError(400, "invalid_request", "Invalid session read request");
       rateLimit(response, `session-read:${principal.userId}:${workspace.id}`,
         { limit: 30, windowMs: 60_000 }, "rate_limited", "Too many session read credential requests");
+      // Same facts as `browser` above: cookie -> browser, bearer -> device
+      // (or mcp with the MCP reader's marker; see readerKindOf).
       const session = await requestReadSession(api, {
         userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
+        readerKind: readerKindOf(request, mcpReaderMarker(api.secret)),
       }, parsed.data);
       const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
       return browser ? accessOnly : session;
@@ -1148,7 +1215,7 @@ export function createApp(input: {
     // Internal only: never reachable through the /cloud alias.
     if (method === "POST" && publicPath === INTROSPECT_PATH) {
       const outcome = await handleIntrospection(
-        config, store, request, undefined, admin?.apiTokens, flowRelayfileCredentials, introspectionHold,
+        config, store, request, undefined, admin?.apiTokens, flowRelayfileCredentials, relayLaunchCredentialStore, introspectionHold,
       );
       if (outcome.status === 200) json(response, 200, outcome.body, true);
       else json(response, outcome.status, { error: outcome.error, message: outcome.message }, true);
@@ -1193,6 +1260,7 @@ export function createApp(input: {
         rateLimit(res, key, rule, "rate_limited", "Too many relay-node requests; retry later"),
       bodyText: (incoming) => bodyText(incoming),
       json,
+      ...(relayNodeCredentialStore ? { nodeCredentials: relayNodeCredentialStore } : {}),
     })) {
       return;
     }
@@ -1532,8 +1600,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     }
 
     // Whose computer a Relaycast node is (hosted: fleet/nodes/claim). The
-    // Desktop claims its own spawn node with its workspace-bound sign-in. The
-    // node token is proven against Relaycast and never stored or logged.
+    // Desktop claims its own spawn node with its workspace-bound sign-in:
+    // with the node token on standard installs, by enrolled node name on
+    // gate-only installs (proveNodeToken / proveEnrolledNode).
     if (path === "/api/v1/fleet/nodes/claim" && (method === "POST" || method === "DELETE")) {
       const auth = await authenticate(request);
       if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
@@ -1562,11 +1631,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         "rate_limited",
         "Too many node claims. Try again later.",
       );
-      const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken.trim() : "";
-      if (!NODE_TOKEN.test(nodeToken)) {
-        throw new HttpError(400, "invalid_request", "Send workspaceId and the node's token (nt_live_... or ar_nd_...).");
-      }
-      const proven = await verifyNodeToken(config.relaycastUrl, workspace.relaycastApiKey, nodeToken);
+      const proven = relayNodeCredentialStore
+        ? await proveEnrolledNode(relayNodeCredentialStore, workspaceId, body)
+        : await proveNodeToken(workspace.relaycastApiKey, body);
       const result = await store.claimNode({
         workspaceId,
         organizationId: workspace.organizationId,
@@ -2028,7 +2095,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       requireFeature("usage_people");
       const sub = peopleRoute[2];
-      const owner = { userId: auth.principal.userId, token: auth.token };
+      const owner = { userId: auth.principal.userId, token: auth.token, readerKind: readerKindOf(request) };
       const now = input.now?.() ?? new Date();
       if (sub === "audit") {
         if ([...url.searchParams.keys()].length > 0) throw new HttpError(400, "invalid_request", "No parameters are accepted");
@@ -2098,7 +2165,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           store,
           usage,
           organizationId: usageRoute[0]!,
-          owner: { userId: auth.principal.userId, token: auth.token },
+          owner: { userId: auth.principal.userId, token: auth.token, readerKind: readerKindOf(request) },
           days,
           now: input.now?.() ?? new Date(),
         }),
@@ -2581,8 +2648,12 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (!parsed.success) throw new HttpError(400, "invalid_request", "Invalid session read request");
       rateLimit(response, `session-read:${principal.userId}:${workspace.id}`,
         { limit: 30, windowMs: 60_000 }, "rate_limited", "Too many session read credential requests");
+      // Cookie -> browser, bearer -> device, bearer plus the MCP reader's
+      // marker (src/mcp/session-read-reader.ts) -> mcp. The marker is never
+      // logged or echoed.
       const session = await requestReadSession(config.sessionReadApi, {
         userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
+        readerKind: readerKindOf(request, mcpReaderMarker(config.sessionReadApi.secret)),
       }, parsed.data);
       // Page scripts get a short-lived access token only. Renew by requesting
       // a new session through the cookie path, which rechecks live membership.
@@ -2823,6 +2894,8 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       organizationAccess,
       requestObject,
       bearer,
+      rateLimit: (res, key, rule) =>
+        rateLimit(res, key, rule, "rate_limited", "Too many requests. Try again later."),
     })) {
       return;
     }
@@ -2838,7 +2911,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     throw new HttpError(404, "not_found", "Route not found");
   }
 
-  return (request, response) => {
+  const handler = (request: IncomingMessage, response: ServerResponse): void => {
     // telemetry lane: aggregate usage per feature area (no bodies or queries).
     if (telemetry) {
       const routePath = new URL(request.url ?? "/", config.publicBaseUrl).pathname;
@@ -2955,4 +3028,13 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       json(response, 500, { error: "internal", message: "Internal server error" }, true);
     });
   };
+  return Object.assign(handler, {
+    handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+      if (relayNodeSocket) relayNodeSocket.handleUpgrade(request, socket, head);
+      else refuseUpgrade(socket, 404);
+    },
+    closeUpgrades(): void {
+      relayNodeSocket?.close();
+    },
+  });
 }

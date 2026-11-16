@@ -881,7 +881,12 @@ paths:
                       token: { type: string }
                       relaycastUrl: { type: string, format: uri }
         "403":
-          description: Agent, CI, or service credential, or cookie request failed the origin check
+          description: >-
+            Agent, CI, or service credential, or cookie request failed the origin check;
+            or `gate_only` on a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): no
+            identity is registered and no token is issued, the body carries
+            `urls.relaycastUrl` and `urls.relaygateUrl`, and the call is audited as
+            `workspace.person_credential.withheld`
         "409":
           description: register_human admission is full, or the name is held by someone else
   /api/v1/workspaces/{workspaceId}/messaging/conversations/{agentName}:
@@ -2038,21 +2043,36 @@ paths:
       description: >-
         Records a Relaycast node as the caller's own computer (hosted Cloud's
         fleet/nodes/claim): Agent Relay Desktop claims its spawn node so spawns
-        onto it are accepted. The node token is proven against Relaycast
-        (/v1/node/me, then the workspace key's read of that node) and never
-        stored. Idempotent for the same person; a node owned by someone else,
-        through another workspace, or through a previous relay binding is
-        refused with 409. Rate limit 20 per hour per user.
+        onto it are accepted. Send exactly one proof. Standard installs:
+        `nodeToken`, proven against Relaycast (/v1/node/me, then the workspace
+        key's read of that node) and never stored. Gate-only installs
+        (SELFHOST_RELAYGATE_PUBLIC_URL set): `nodeName`, the node's enrolled
+        name, proven by its enrolment through this Control's relay-node broker
+        in this workspace (docs/relay-node-credential.md, "Claiming the
+        node"); Relaycast is not asked and `nodeToken` is refused. Idempotent
+        for the same person; a node owned by someone else, through another
+        workspace, or through a previous relay binding is refused with 409.
+        Rate limit 20 per hour per user.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [workspaceId, nodeToken]
+              required: [workspaceId]
+              description: >-
+                workspaceId plus one of nodeToken (standard installs, required
+                there) or nodeName (gate-only installs, required there).
               properties:
                 workspaceId: { type: string, description: Must be the token's workspace }
-                nodeToken: { type: string, pattern: "^(?:nt_live_[A-Za-z0-9_-]{8,256}|ar_nd_[0-9A-Za-z]{11}_[a-z][0-9A-Za-z]{10}_[0-9A-Za-z]{49})$" }
+                nodeToken:
+                  type: string
+                  description: Standard installs only; refused with 400 on gate-only installs.
+                  pattern: "^(?:nt_live_[A-Za-z0-9_-]{8,256}|ar_nd_[0-9A-Za-z]{11}_[a-z][0-9A-Za-z]{10}_[0-9A-Za-z]{49})$"
+                nodeName:
+                  type: string
+                  description: Gate-only installs only; the node's enrolled relay-node name. Ignored on standard installs.
+                  pattern: "^[A-Za-z0-9._:-]{1,200}$"
       responses:
         "200":
           description: Claim result
@@ -2066,9 +2086,16 @@ paths:
                   claimed: { type: boolean, description: false when the caller already owned it }
                   owner: { type: string, enum: [you] }
         "400":
-          description: Missing workspaceId or malformed node token
+          description: >-
+            Missing workspaceId; standard installs: missing or malformed node
+            token; gate-only installs: a nodeToken was sent, or nodeName is
+            missing or malformed
         "403":
-          description: The token is not a valid node token for this workspace
+          description: >-
+            node_claim_refused. Standard installs: the token is not a valid
+            node token for this workspace. Gate-only installs: the node has not
+            enrolled through this installation. Either: the caller is not an
+            organization member
         "404":
           description: Workspace not found
         "409":
@@ -5671,6 +5698,86 @@ paths:
       responses:
         "204": { description: Revoked }
         "404": { description: token_not_found }
+  /api/v1/workspaces/{workspaceId}/relay-node/self-tokens:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listSelfMintedRelayNodeTokens
+      description: |
+        Gate-only installs only (404 not_found otherwise). Any workspace member,
+        from a redeemed Agent Relay Desktop session only (403
+        desktop_session_required otherwise; 403 self_mint_disabled when
+        SELFHOST_RELAY_NODE_SELF_MINT is off). The caller's own live relay-node
+        tokens: created by the caller, not revoked, not expired. Also served at
+        /cloud/api/v1. See docs/relay-node-credential.md "Member self-mint".
+      responses:
+        "200":
+          description: Tokens (never the token value)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    type: array
+                    items: { $ref: "#/components/schemas/WorkspaceApiToken" }
+        "401": { description: "unauthorized: not a user session" }
+        "403": { description: "desktop_session_required or self_mint_disabled" }
+        "404": { description: "not_found: not a gate-only install" }
+    post:
+      operationId: selfMintRelayNodeToken
+      description: |
+        Same access rules as GET. Mints a relay-node token (sh_wk_, the fixed
+        relay-node scopes) for the caller's own node, in the same shape as
+        the admin mint. A nodeName belongs to one person while they hold a
+        live relay-node token for it (409 node_name_taken); the same caller
+        may hold several for one nodeName (rotation). At most 3 live
+        relay-node tokens per person (409 too_many_tokens) and 10 mints per
+        person per hour (429 rate_limited). Audited api_token.create and
+        relay_node.token.self_minted (target `<token id> (relay-node:
+        <nodeName>) host=<Desktop host name>`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nodeName]
+              properties:
+                nodeName: { type: string, pattern: "^[A-Za-z0-9._:-]{1,200}$" }
+                label: { type: string, maxLength: 128, description: "Default `desktop <Desktop host name>`" }
+                expiryDays: { type: integer, minimum: 1, maximum: 90, default: 90 }
+                neverExpires: { type: boolean, enum: [false], description: "Self-minted tokens always expire; true is a 400" }
+      responses:
+        "201":
+          description: Created; accessToken shown once
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/WorkspaceApiToken"
+                  - type: object
+                    properties:
+                      accessToken: { type: string }
+        "400": { description: "invalid_request: bad nodeName, label or expiryDays, or neverExpires" }
+        "401": { description: "unauthorized: not a user session" }
+        "403": { description: "desktop_session_required or self_mint_disabled" }
+        "404": { description: "not_found: not a gate-only install" }
+        "409": { description: "node_name_taken or too_many_tokens" }
+        "429": { description: "rate_limited, with Retry-After" }
+  /api/v1/workspaces/{workspaceId}/relay-node/self-tokens/{tokenId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: tokenId, in: path, required: true, schema: { type: string, format: uuid } }
+    delete:
+      operationId: revokeSelfMintedRelayNodeToken
+      description: |
+        Same access rules as GET. Revokes one of the caller's own live
+        relay-node tokens. Audited api_token.revoke and
+        relay_node.token.self_revoked.
+      responses:
+        "204": { description: Revoked }
+        "404": { description: "token_not_found: not the caller's own live relay-node token; not_found: not a gate-only install" }
   /relay-node/v1/workspace:
     get:
       operationId: relayNodeWorkspace
@@ -5716,7 +5823,12 @@ paths:
         Relaycast POST /v1/nodes for the token's own node. The body is
         forwarded unchanged with Content-Type, Idempotency-Key and
         X-Relaycast-Node-Token when present; its `name` must equal the
-        token's nodeName. The answer can carry a node token.
+        token's nodeName. The answer can carry a node token. On gate-only
+        installs (SELFHOST_RELAYGATE_PUBLIC_URL set) Control keeps the node
+        token: the X-Relaycast-Node-Token header is ignored (Control sends
+        the stored token itself on re-enrolment), a 2xx answer is reduced to
+        {ok: true, data: {id, name}}, and a 2xx answer without a token is 502
+        relaycast_unavailable.
       security: [{ relayNodeBearer: [] }]
       parameters:
         - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
@@ -5743,6 +5855,24 @@ paths:
         "413": { description: "payload_too_large: body over 1 MiB" }
         "502": { $ref: "#/components/responses/RelayNodeRelaycastUnavailable" }
         default: { $ref: "#/components/responses/RelayNodePassthrough" }
+  /relay-node/v1/ws:
+    get:
+      operationId: relayNodeSocket
+      tags: [relay-node]
+      summary: >-
+        Gate-only installs only: WebSocket upgrade that bridges the node to
+        Relaycast's node socket with the node token Control holds. Frames
+        pass through unchanged except that spawn invocations journaled for
+        this node gain input.launch_credential and deliver frames are not
+        forwarded. See docs/relay-node-credential.md, "Gate-only installs".
+      security: [{ relayNodeBearer: [] }]
+      responses:
+        "101": { description: Switching Protocols; the bridge is open. }
+        "401": { description: No bearer, or not a live relay-node token. A token in the query string is not read. }
+        "403": { description: The node has not enrolled through this Control, or its stored node token is unreadable (re-enrol). }
+        "404": { description: Not a gate-only install. }
+        "429": { description: Over 600 requests per minute for this token (shared with the broker routes). }
+        "503": { description: The bridge is at its connection limit or shutting down. }
   /relay-node/v1/nodes/{name}:
     get:
       operationId: relayNodeGetNode
@@ -5963,6 +6093,19 @@ paths:
         token passes the same checks and answers the same way except
         principal_type `service`, `agent_name` null and `scopes`
         `["acquisition:operate"]`.
+
+        Relay launch credentials (gate-only installs only, when
+        SELFHOST_RELAYGATE_PUBLIC_URL is set; otherwise every `sh_lt_` is
+        `unknown`): a one-time `sh_lt_` token minted for one agent launch and
+        presented by relaygate. Inactive reasons `unknown`, `expired`,
+        `revoked` (already redeemed), `audience` (`aud` must normalize to an
+        accepted audience), `workspace`, and `machine_not_owned` for any
+        `machine`. Only when every check passes is the credential burned: the
+        first active answer is the only one. The active answer has
+        principal_type `relay_launch`, `sub` the launching user, `agent_name`
+        and `node_name` of the launch, `scopes` `["relay:agent:enrol"]`,
+        `token_id` the credential id, `iat` the mint time and `exp` its expiry
+        (10 minutes later).
       requestBody:
         required: true
         content:
@@ -6081,6 +6224,27 @@ paths:
                       iat: { type: integer, description: Mint time }
                       exp: { type: integer, description: "The token's expiry, or now + 3600 (recomputed per call) when it has none" }
                       token_id: { type: string, format: uuid }
+                  - type: object
+                    additionalProperties: false
+                    required: [active, sub, email, principal_type, agent_name, node_name, machine_id, org, workspace, scopes, aud, iat, exp, token_id]
+                    description: A one-time relay launch credential (`sh_lt_`, gate-only installs), burned by this answer.
+                    properties:
+                      active: { const: true }
+                      sub: { type: string, format: uuid, description: The launching user's id }
+                      email: { type: "null" }
+                      principal_type: { const: relay_launch }
+                      agent_name: { type: string, description: The launched agent's name }
+                      node_name: { type: string, description: The name of the node the agent was launched on }
+                      machine_id: { type: "null" }
+                      org: { type: string }
+                      workspace: { type: string, description: "The launch's workspace; authoritative when the request omitted `workspace`" }
+                      scopes:
+                        type: array
+                        items: { const: "relay:agent:enrol" }
+                      aud: { type: string, description: The normalized request audience }
+                      iat: { type: integer, description: Mint time }
+                      exp: { type: integer, description: Expiry, 10 minutes after mint }
+                      token_id: { type: string, format: uuid, description: The credential id }
                   - type: object
                     additionalProperties: false
                     required: [active, reason]

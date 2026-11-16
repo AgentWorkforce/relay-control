@@ -164,7 +164,7 @@ emitConfigLoaded(analytics, {
   flowsEnabled: features.flows,
   operatorOAuthApps: Object.keys(config.operatorOAuthApps ?? {}).length,
 });
-const server = createServer(createApp({
+const app = createApp({
   config,
   store,
   relaycastInternalSecret: identityConfig.relaycastInternalSecret,
@@ -179,7 +179,10 @@ const server = createServer(createApp({
   analytics: { port: analytics, config: analyticsConfig },
   mcpOAuthTeardown,
   grokRoutines,
-}));
+});
+const server = createServer(app);
+// Gate-only installs: the relay-node socket bridge (GET /relay-node/v1/ws); 404 otherwise.
+server.on("upgrade", (request, socket, head) => app.handleUpgrade(request, socket, head));
 const bootstrapAbort = new AbortController();
 // Worker queue streams are long-lived SSE responses.
 server.requestTimeout = 0;
@@ -262,6 +265,7 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   await factory.stop();
   identity.stop();
   await emitStopping(analytics, signal, analyticsConfig.shutdownDeadlineMs);
+  app.closeUpgrades();
   server.close(async () => {
     await database.close();
     process.exit(0);

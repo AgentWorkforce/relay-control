@@ -33,8 +33,14 @@ export type SelfhostConfig = {
   chiefRelaySecret?: string | null;
   /** Dedicated relay-agent support HTTP connection; no customer allowlist. */
   customerSupport?: { url: string; token: string } | null;
-  /** Independent read service; owns issuance, rotation and verification of its tokens. Required. */
-  sessionReadApi: { url: string; publicUrl: string; secret: string };
+  /**
+   * Independent read service; owns issuance, rotation and verification of its tokens. Required.
+   * mintReaderKind: send `reader_kind` in the mint body. True only on gate-only
+   * installs (SELFHOST_RELAYGATE_PUBLIC_URL set): relaygate reads it and strips
+   * it before proxying, and the read API's strict mint schema rejects it.
+   * Absent means false.
+   */
+  sessionReadApi: { url: string; publicUrl: string; secret: string; mintReaderKind?: boolean };
   /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
   sessionErasureApi?: { url: string; secret: string } | null;
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
@@ -123,6 +129,16 @@ export type SelfhostConfig = {
    * instead. Null or absent: resolve hands out the key as before.
    */
   relaygatePublicUrl?: string | null;
+  /**
+   * SELFHOST_RELAY_NODE_SELF_MINT (docs/relay-node-credential.md, "Member
+   * self-mint"): on a gate-only install, whether a member's signed-in Agent
+   * Relay Desktop may mint its own relay-node token at
+   * POST /api/v1/workspaces/{id}/relay-node/self-tokens. Default true;
+   * `false`, `0` or `off` turns it off (403 `self_mint_disabled`), and the
+   * owner/admin mint is unchanged either way. Absent means true. Ignored
+   * when relaygatePublicUrl is null: those routes are then 404.
+   */
+  relayNodeSelfMint?: boolean;
   /**
    * SELFHOST_IMAGE_VERSION: the image tag, set by the image (Dockerfile).
    * Null when run from source. Shown by GET /cloud/api/health and telemetry.
@@ -423,12 +439,15 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
 
   refuseRemovedHistoryVariables(env);
   // One History origin, the read API's. Nothing may name a second one.
-  const sessionReadApi = loadSessionReadApiConfig(env);
+  const relaygatePublicUrl = loadRelaygatePublicUrl(env);
+  const sessionReadApi = { ...loadSessionReadApiConfig(env), mintReaderKind: relaygatePublicUrl !== null };
   const loadedIntrospection = loadIntrospectionConfig(env);
   const relayhistoryAudiences = loadRelayhistoryAudiences(env, sessionReadApi.publicUrl);
-  const introspectAudiences = loadedIntrospection.introspectAudiences.filter((audience) =>
-    !relayhistoryAudiences.includes(new URL(audience).origin)
-  );
+  const relayhistoryAudienceSet = new Set(relayhistoryAudiences);
+  const introspectAudiences = loadedIntrospection.introspectAudiences.filter((audience) => {
+    const canonicalHistoryAudience = canonicalRelayhistoryOrigin(audience);
+    return canonicalHistoryAudience === null || !relayhistoryAudienceSet.has(canonicalHistoryAudience);
+  });
   if (introspectAudiences.length !== loadedIntrospection.introspectAudiences.length) {
     console.warn(
       "[selfhost-api] ignoring History origins in SELFHOST_INTROSPECT_AUDIENCES; configure them only in SELFHOST_RELAYHISTORY_AUDIENCES",
@@ -461,7 +480,8 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     historyUpload: loadHistoryUploadConfig(env),
     capturePolicyUploads: loadCapturePolicyUploads(env),
     eventsShimRelayOrigins: loadEventsShimRelayOrigins(env),
-    relaygatePublicUrl: loadRelaygatePublicUrl(env),
+    relaygatePublicUrl,
+    relayNodeSelfMint: loadRelayNodeSelfMint(env),
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
@@ -1055,6 +1075,17 @@ function uploadEndpoint(env: Env, name: string): string | null {
 export function loadRelaygatePublicUrl(env: Env = process.env): string | null {
   if (!env.SELFHOST_RELAYGATE_PUBLIC_URL?.trim()) return null;
   return publicServiceUrl(env, "SELFHOST_RELAYGATE_PUBLIC_URL");
+}
+
+/**
+ * SELFHOST_RELAY_NODE_SELF_MINT: unset, blank, `true`, `1` or `on`: true;
+ * `false`, `0` or `off`: false; anything else refuses startup.
+ */
+export function loadRelayNodeSelfMint(env: Env = process.env): boolean {
+  const value = env.SELFHOST_RELAY_NODE_SELF_MINT?.trim().toLowerCase();
+  if (!value || value === "true" || value === "1" || value === "on") return true;
+  if (value === "false" || value === "0" || value === "off") return false;
+  throw new Error("SELFHOST_RELAY_NODE_SELF_MINT must be true or false");
 }
 
 export function loadEventsShimRelayOrigins(env: Env = process.env): string[] | null {
