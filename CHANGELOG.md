@@ -24,8 +24,11 @@ assigned at release.
   token) and is audited as `workspace.person_credential.withheld`; the
   relay-node broker's enrol (`POST /relay-node/v1/nodes`) answers
   `403 gate_only` before any Relaycast call, so no node token leaves. MCP join
-  and spawn are unchanged (their participant tokens stay server-side). Unset,
-  all of these are byte-for-byte as before. See docs/identity.md
+  and spawn are unchanged (their participant tokens stay server-side).
+  Person identities Control newly registers server-side (messaging
+  conversation sends, support reply notices) are named with the `control-`
+  prefix, which relaygate reserves, while existing identities keep their
+  names. Unset, all of these are byte-for-byte as before. See docs/identity.md
   ("Gate-only installs").
 - Added: `send_relay_message` results include `recipient_card` when the
   recipient has an agent card (`has_card`): `{ description, skills, version, updated_at, note }`, where `description` is null

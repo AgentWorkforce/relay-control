@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import test from "node:test";
 import { ApiTokenStore } from "../src/admin/api-tokens.js";
 import { createApp } from "../src/app.js";
-import { hashSecret } from "../src/crypto.js";
+import { encryptSecret, hashSecret } from "../src/crypto.js";
 import type { SelfhostConfig } from "../src/config.js";
 import type { Database, SqlExecutor } from "../src/database.js";
 import { SendAbandoned } from "../src/messaging/http.js";
@@ -46,6 +47,8 @@ type RelayState = {
   readTokens: string[];
   dmTokens: string[];
   registerKeys: string[];
+  /** The name of every POST /v1/agents call, in order. */
+  registerNames: string[];
   admission: boolean;
   failRevoke: boolean;
   malformedNext: boolean;
@@ -79,6 +82,7 @@ function relayState(): RelayState {
     readTokens: [],
     dmTokens: [],
     registerKeys: [],
+    registerNames: [],
     admission: false,
     failRevoke: false,
     malformedNext: false,
@@ -124,6 +128,7 @@ function createRelay(state: RelayState) {
     if (request.method === "POST" && url.pathname === "/v1/agents") {
       state.registerCalls += 1;
       state.registerKeys.push(token);
+      state.registerNames.push(String(parsed.name));
       if (state.admission) {
         sendJson(response, 409, { error: { code: "admission", message: "register_human admission is full" } });
         return;
@@ -1469,4 +1474,74 @@ test("person credential: gate-only issues no Relaycast token", async (t) => {
   assert.equal(thread.body.you, null);
   assert.deepEqual(thread.body.messages, []);
   assert.equal(fx.state.registerCalls, 0);
+});
+
+// ---- server-side person identity names on gate-only installs -----------------
+
+async function storedPersonName(database: Database, userId: string): Promise<string | undefined> {
+  const rows = await database.query<{ agent_name: string }>(
+    "SELECT agent_name FROM person_identities WHERE user_id = $1",
+    [userId],
+  );
+  return rows.rows[0]?.agent_name;
+}
+
+test("person identity: a default install registers the unprefixed name", async (t) => {
+  const fx = await harness(t);
+  const send = await jsonRequest(fx.origin, threadPath(fx.workspaceId, "helper"), {
+    method: "POST",
+    token: fx.accessToken,
+    body: { text: "hello", clientMessageId: "default-name-1" },
+  });
+  assert.equal(send.status, 201);
+  assert.deepEqual(fx.state.registerNames, ["owner"]);
+  assert.equal(await storedPersonName(fx.database, fx.userId), "owner");
+  assert.equal(fx.state.messages.at(-1)?.sender, "owner");
+});
+
+test("person identity: gate-only registers a control- name for a conversation send", async (t) => {
+  const fx = await harness(t, { config: { relaygatePublicUrl: "https://gate.selfhosted.example" } });
+  const send = await jsonRequest(fx.origin, threadPath(fx.workspaceId, "helper"), {
+    method: "POST",
+    token: fx.accessToken,
+    body: { text: "hello", clientMessageId: "gate-name-1" },
+  });
+  assert.equal(send.status, 201);
+  assert.equal(fx.state.registerCalls, 1);
+  assert.deepEqual(fx.state.registerNames, ["control-owner"]);
+  assert.equal(await storedPersonName(fx.database, fx.userId), "control-owner");
+  assert.equal(fx.state.messages.at(-1)?.sender, "control-owner");
+  const thread = await jsonRequest(fx.origin, threadPath(fx.workspaceId, "helper"), { token: fx.accessToken });
+  assert.equal(thread.status, 200);
+  assert.equal(thread.body.you, "control-owner");
+});
+
+test("person identity: gate-only reuses an existing unprefixed identity as stored", async (t) => {
+  const fx = await harness(t, { config: { relaygatePublicUrl: "https://gate.selfhosted.example" } });
+  seed(fx.state, "owner", "ag_owner_existing", "at_owner_existing");
+  await fx.database.query(
+    `INSERT INTO person_identities
+       (id, workspace_id, user_id, agent_name, agent_remote_id, token_ciphertext, relaycast_workspace_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      randomUUID(),
+      fx.workspaceId,
+      fx.userId,
+      "owner",
+      "ag_owner_existing",
+      encryptSecret("at_owner_existing", fx.config.encryptionKeyring.active),
+      "rc-first",
+    ],
+  );
+  const send = await jsonRequest(fx.origin, threadPath(fx.workspaceId, "helper"), {
+    method: "POST",
+    token: fx.accessToken,
+    body: { text: "hello", clientMessageId: "gate-existing-1" },
+  });
+  assert.equal(send.status, 201);
+  assert.equal(fx.state.registerCalls, 0);
+  assert.deepEqual(fx.state.registerNames, []);
+  assert.equal(await storedPersonName(fx.database, fx.userId), "owner");
+  assert.equal(fx.state.messages.at(-1)?.sender, "owner");
+  assert.deepEqual(fx.state.dmTokens, ["at_owner_existing"]);
 });

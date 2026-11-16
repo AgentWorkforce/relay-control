@@ -485,6 +485,7 @@ export function createApp(input: {
     database: store.database,
     keyring: config.encryptionKeyring,
     relaycastUrl: config.relaycastUrl,
+    relaygatePublicUrl: config.relaygatePublicUrl,
     fetchImpl: input.messagingFetch,
     now: input.now,
     ...input.messaging,
