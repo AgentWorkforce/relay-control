@@ -18,9 +18,9 @@ objects and local encrypted Postgres blobs, including a repeat copy.
 pending and no real-data import has run.
 
 The target runs all checked-in Control migrations, including the actual
-0053/0054/0056/0057 files and the owner-only 0063 ledger migration from the
-importer branch. The pending 0058 relay-managed credential and 0061 staff-grant schemas use
-test-only models; these do not prove either pending migration file. The shared Cloud fixture
+0053/0054/0056/0057/0058 files and the owner-only 0063 ledger migration from the
+importer branch. Only the pending 0061 staff-grant schema uses a test-only
+model; it does not prove that pending migration file. The shared Cloud fixture
 now includes the generation column, so there is no verifier-owned source guard.
 The smaller fixtures in `fixtures.ts` independently
 stress the engine and are explicitly labeled as reference shapes.
@@ -188,8 +188,9 @@ operator organization remains an unresolved skip.
 The main synthetic fixture uses UTC sessions. A separate audit on PostgreSQL's
 Europe/Oslo session timezone found that the importer's `created_at + interval
 '90 days'` staff-grant clamp shifts one hour across DST compared with the
-verifier's UTC snapshot. This is reported to the importer owner; qualification
-requires deterministic UTC source transforms. The verifier retains UTC checks.
+verifier's UTC snapshot. The fix on `feat/cloud-import-followups` at `6b338a5` sets both importer source
+transactions to UTC and gates selection conflicts. It is fixed pending merge;
+qualification requires that follow-up. The verifier retains UTC checks.
 
 The library entry point is `verifyImport(source, target, scope, ledger, keyring,
 cloudKeyHex, {pepperVersions, previousOwnership, previousReport, canonicalOrigin,

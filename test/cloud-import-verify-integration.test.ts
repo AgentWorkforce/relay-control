@@ -98,7 +98,7 @@ beforeEach(async () => {
     UPDATE workspaces SET relay_workspace_id='rw_0000b202' WHERE relay_workspace_id='rw_legacy-01'`);
   await migrate(targetDb);
   // All checked-in migrations, including 0053/0054/0056/0057, ran above.
-  // Pending 0061 is modeled as revoked staff-grant history; 0058 is also modeled.
+  // Only pending 0061 is modeled as revoked staff-grant history; 0058 is real.
   await target.query(`CREATE TABLE staff_read_grants (
     id uuid PRIMARY KEY,workspace_id uuid NOT NULL,organization_id uuid NOT NULL,
     staff_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -110,17 +110,6 @@ beforeEach(async () => {
     CHECK(expires_at > created_at AND expires_at <= created_at + interval '90 days'))`);
   await target.query("INSERT INTO organizations(id,name) VALUES($1,'Synthetic operator')",[id(0xcafe)]);
   await target.query("INSERT INTO installation_bootstrap(installation_slot,organization_id) VALUES(1,$1) ON CONFLICT(installation_slot) DO UPDATE SET organization_id=EXCLUDED.organization_id",[id(0xcafe)]);
-  await target.query(`    ALTER TABLE coding_agent_credentials
-      ALTER COLUMN secret_preview DROP NOT NULL,ALTER COLUMN key_fingerprint DROP NOT NULL,
-      DROP CONSTRAINT IF EXISTS selfhost_coding_agent_auth_type,
-      DROP CONSTRAINT IF EXISTS coding_agent_auth_type,
-      DROP CONSTRAINT IF EXISTS selfhost_coding_agent_secret_storage,
-      DROP CONSTRAINT IF EXISTS coding_agent_secret_storage,
-      ADD CONSTRAINT coding_agent_auth_type CHECK(auth_type IN ('byo_api_key','oauth_token','provider_oauth','relay_managed')),
-      ADD CONSTRAINT coding_agent_secret_storage CHECK(
-        (auth_type='relay_managed' AND secret_ciphertext IS NULL AND NOT harness_active)
-        OR (auth_type='provider_oauth' AND secret_ciphertext IS NULL AND blob_location IS NOT NULL)
-        OR (auth_type IN ('byo_api_key','oauth_token') AND secret_ciphertext IS NOT NULL))`);
 });
 
 fixtureTest("actual importer rollback, apply and rerun reconcile all mapped tables and keep invite hashes",async () => {
