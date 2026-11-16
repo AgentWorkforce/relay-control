@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ApiTokenStore } from "../admin/api-tokens.js";
-import { cookieRequestAllowed } from "../auth/device-approval.js";
+import { clientIp, cookieRequestAllowed, limiterKey, RateLimiter } from "../auth/device-approval.js";
 import type { Database } from "../database.js";
 import { secureEqual } from "../crypto.js";
 import type { Principal } from "../store.js";
@@ -20,6 +20,15 @@ import {
   type ReplicasDeps,
 } from "./service.js";
 import { capabilityCall } from "./tools.js";
+import { handleEnvironmentMcp } from "./environment-mcp.js";
+import {
+  disableEnvironmentMcp,
+  enableEnvironmentMcp,
+  listEnvironmentPolicies,
+  setEnvironmentPrincipal,
+  syncEnvironments,
+  updateEnvironmentPolicy,
+} from "./environments.js";
 
 type Json = (response: ServerResponse, status: number, body: unknown, noStore?: boolean) => void;
 export type ReplicasHelpers = {
@@ -36,10 +45,13 @@ const RELAY_EVENT_MAX_BYTES = 256 * 1024;
 const WORKSPACE = /^\/api\/v1\/workspaces\/([^/]+)\/replicas(\/.*)?$/;
 const CAPABILITY = /^\/api\/v1\/replicas\/agents\/([^/]+)\/messages$/;
 const RELAY_EVENTS = /^\/api\/v1\/replicas\/relay-events\/([^/]+)$/;
+const MCP = /^\/api\/v1\/replicas\/mcp$/;
+/** Per source IP on the environment-level MCP, which any caller can reach without a session. */
+export const REPLICAS_MCP_RATE_LIMIT = { limit: 120, windowMs: 60_000 };
 
 /** Every route this module owns, on the normalized (/cloud-stripped) path. */
 export function isReplicasPath(path: string): boolean {
-  return WORKSPACE.test(path) || CAPABILITY.test(path) || RELAY_EVENTS.test(path);
+  return WORKSPACE.test(path) || CAPABILITY.test(path) || RELAY_EVENTS.test(path) || MCP.test(path);
 }
 
 class BodyTooLarge extends Error {}
@@ -93,6 +105,7 @@ export function createReplicasHandler(input: {
 }) {
   const apiTokens = new ApiTokenStore(input.database);
   const { deps } = input;
+  const mcpLimiter = new RateLimiter(() => deps.now().getTime());
 
   async function personActor(request: IncomingMessage, workspaceId: string, method: string, helpers: ReplicasHelpers): Promise<ReplicasActor> {
     // Agent, CI and service credentials never act as a person here.
@@ -120,14 +133,30 @@ export function createReplicasHandler(input: {
 
   async function workspaceRoute(request: IncomingMessage, method: string, workspaceId: string, rest: string, helpers: ReplicasHelpers) {
     const spawn = /^\/spawns\/([^/]+)$/.exec(rest);
+    const environment = /^\/environments\/([^/]+)$/.exec(rest);
+    const sync = rest === "/environments/sync";
     const known = (rest === "" && method === "GET")
       || (rest === "/environments" && method === "GET")
+      || (rest === "/environment-policies" && method === "GET")
+      || (sync && method === "POST")
+      || (!sync && environment && method === "PUT")
+      || (rest === "/environment-mcp" && (method === "POST" || method === "DELETE"))
+      || (rest === "/environment-principal" && method === "PUT")
       || (rest === "/spawns" && method === "POST")
       || (spawn && (method === "GET" || method === "DELETE"));
     if (!known) throw new ReplicasError("Not found", 404);
     const actor = await personActor(request, workspaceId, method, helpers);
     if (rest === "") return { status: 200, body: await workspaceReplicas(deps, actor) };
+    // The live provider list (PR A); the policy view has its own route.
     if (rest === "/environments") return { status: 200, body: await listEnvironments(deps, actor) };
+    if (rest === "/environment-policies") return { status: 200, body: await listEnvironmentPolicies(deps, actor) };
+    if (sync) return { status: 200, body: await syncEnvironments(deps, actor) };
+    if (rest === "/environment-principal") return { status: 200, body: await setEnvironmentPrincipal(deps, actor, await readJson(request)) };
+    if (environment) return { status: 200, body: await updateEnvironmentPolicy(deps, actor, decode(environment[1]!), await readJson(request)) };
+    if (rest === "/environment-mcp") {
+      const body = await readJson(request);
+      return { status: 200, body: method === "POST" ? await enableEnvironmentMcp(deps, actor, body) : await disableEnvironmentMcp(deps, actor, body) };
+    }
     if (rest === "/spawns") return { status: 201, body: await spawnReplica(deps, actor, await readJson(request)) };
     const id = decode(spawn![1]!);
     if (method === "GET") return { status: 200, body: await getSpawn(deps, actor, id) };
@@ -145,6 +174,12 @@ export function createReplicasHandler(input: {
     const send = (status: number, body: unknown) => helpers.json(response, status, body, true);
     // Off: the surface does not exist, answered before any authentication.
     if (!input.enabled) return send(404, { error: "Not found" }), true;
+    if (MCP.test(path)) {
+      // Not an OAuth resource: only a Replicas workspace_identity bearer is accepted.
+      await handleEnvironmentMcp(deps, request, response, method, () => mcpLimiter.consume(
+        `replicas-mcp:${limiterKey(clientIp(request))}`, REPLICAS_MCP_RATE_LIMIT.limit, REPLICAS_MCP_RATE_LIMIT.windowMs));
+      return true;
+    }
     const events = RELAY_EVENTS.exec(path);
     if (events) {
       if (method !== "POST") return send(405, { ok: false }), true;

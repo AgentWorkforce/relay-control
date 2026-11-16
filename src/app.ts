@@ -98,6 +98,7 @@ import { createCustomerSupportNoticeHandler } from "./mcp/customer-support-notic
 import type { AmpModule } from "./amp/module.js";
 import type { ReplicasModule } from "./replicas/module.js";
 import { isReplicasPath } from "./replicas/routes.js";
+import { disconnectEnvironments, setupEnvironments } from "./replicas/environments.js";
 import { disconnectReplicas, purgeMemberReplicas, releaseMemberReplicas, ReplicasError } from "./replicas/service.js";
 import { isAmpPath } from "./amp/routes.js";
 import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
@@ -579,12 +580,16 @@ export function createApp(input: {
     // Bindings are revoked and retired while the key still exists to sleep their compute.
     ...(replicas ? { replicasCleanup: async (actor: { userId: string; workspaceId: string; organizationId: string }) => {
       try {
+        // Stop environment-level admission and remove provider MCP entries first, then retire bindings.
+        await disconnectEnvironments(replicas.deps, actor);
         await disconnectReplicas(replicas.deps, actor);
       } catch (error) {
         if (error instanceof ReplicasError) throw new RemoteAgentError(error.status, "replicas_cleanup_failed", error.message);
         throw new RemoteAgentError(502, "replicas_cleanup_failed", "Replicas cleanup could not finish. Retry the disconnect.");
       }
-    } } : {}),
+    },
+    replicasSetup: (actor: { userId: string; workspaceId: string; organizationId: string }, options: { reconnect: boolean }) =>
+      setupEnvironments(replicas.deps, actor, options) } : {}),
   }));
   const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
   const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({
