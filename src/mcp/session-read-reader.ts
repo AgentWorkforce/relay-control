@@ -32,7 +32,7 @@ function cacheFor(config:ReaderConfig) {
 }
 function cacheKey(identity:HistoryIdentity) {
   const hash=createHash("sha256").update(identity.callerToken).digest("hex");
-  return JSON.stringify([identity.userId,identity.organizationId,identity.workspaceId,hash]);
+  return JSON.stringify([identity.userId,identity.organizationId,identity.workspaceId,identity.role,hash]);
 }
 export function forgetSessionReadTokens(config:ReaderConfig):void { caches.delete(config); }
 function refused(error:unknown):boolean {
