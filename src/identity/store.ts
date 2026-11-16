@@ -141,6 +141,18 @@ type SignInContext = {
   role(organizationId: string): Role | null;
 };
 
+/**
+ * `remove` throws so the bootstrap retry loop can retry; these callers must
+ * not mask the original error or fail a completed sign-in over a cleanup.
+ */
+async function releaseUnused(provisioner: RelaycastProvisioner, id: string): Promise<void> {
+  try {
+    await provisioner.remove(id);
+  } catch {
+    /* best effort: the workspace stays orphaned, reconciled later */
+  }
+}
+
 export class IdentityStore {
   constructor(
     private readonly database: Database,
@@ -303,7 +315,7 @@ export class IdentityStore {
         return created;
       });
     } catch (error) {
-      if (!bodyCompleted) await provisioner.remove(relaycast.id);
+      if (!bodyCompleted) await releaseUnused(provisioner, relaycast.id);
       else await this.reconcileUnknownCommit(provisioner, relaycast.id, error);
       throw error;
     }
@@ -332,7 +344,7 @@ export class IdentityStore {
     error: unknown,
   ): Promise<void> {
     if (isDefiniteAbort(error)) {
-      await provisioner.remove(relaycastWorkspaceId);
+      await releaseUnused(provisioner, relaycastWorkspaceId);
       return;
     }
     const reason = error instanceof Error ? error.message : String(error);
@@ -906,13 +918,13 @@ export class IdentityStore {
     } catch (error) {
       // Rolled back before COMMIT, or the body never bound the workspace:
       // it is unused. Otherwise release only on a proven abort.
-      if (!bodyCompleted || !inserted) await provisioner.remove(relaycast.id);
+      if (!bodyCompleted || !inserted) await releaseUnused(provisioner, relaycast.id);
       else await this.reconcileUnknownCommit(provisioner, relaycast.id, error);
       throw error;
     }
     // Another sign-in or invite resolved the person meanwhile: release the
     // unused Relaycast workspace.
-    if (!inserted) await provisioner.remove(relaycast.id);
+    if (!inserted) await releaseUnused(provisioner, relaycast.id);
     return signedIn;
   }
 

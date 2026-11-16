@@ -1712,6 +1712,34 @@ test("multi: a Relaycast workspace is released without verification when the bod
   assert.equal(verifications, 0, "a pre-commit rollback releases without a verification read");
 });
 
+test("multi: a sign-in that lost the personal-organization race still succeeds when releasing the unused workspace fails", async (t) => {
+  const ctx = await setup(t, { multi: true });
+  let racing = false;
+  let rival: (() => Promise<unknown>) | null = null;
+  const provisioner: RelaycastProvisioner = {
+    async create() {
+      // The first caller is overtaken by a rival sign-in for the same person.
+      if (!racing) {
+        racing = true;
+        await rival!();
+      }
+      return { id: `rw_race_${racing ? 1 : 0}`, apiKey: "rk_race" };
+    },
+    async remove() { throw new Error("relaycast unreachable"); },
+  };
+  const store = new IdentityStore(ctx.database, KEYRING, {
+    inviteTtlMs: ctx.identityConfig.inviteTtlMs,
+    autoJoinDomains: [],
+    tenancy: ctx.identityConfig.tenancy,
+    provisioner,
+    issueSession: (tx, session) => ctx.store.issueBrowserSession(tx, session),
+  });
+  const input = { email: "racer@elsewhere.test", name: "Racer", inviteTokenHash: null, method: "email" as const };
+  rival = () => store.signIn(input);
+  const result = await store.signIn(input);
+  assert(result, "the completed sign-in is not failed by a cleanup error");
+});
+
 test("multi: a Relaycast workspace is retained when COMMIT landed but its acknowledgement was lost", async (t) => {
   const ctx = await setup(t, { multi: true });
   const person = await oidcSignIn(ctx, { email: "maker@elsewhere.test", name: "Maker" });
