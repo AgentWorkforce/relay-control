@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.4";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.5";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -223,11 +223,12 @@ export const SOURCE_TABLES = [
 export type ImportTable = (typeof SOURCE_TABLES)[number];
 
 /**
- * Tables whose rows a re-run deletes when they were imported by an earlier
- * run (its ledger) but are no longer imported now: removed in Cloud, or now
- * skipped. Users, organizations and workspaces are never deleted (their
- * cascades are too wide); their disappearance is reported instead. GitHub
- * installation claims are kept on purpose (#146).
+ * Tables whose rows a re-run deletes when the target ledger says an earlier
+ * run imported them but this run does not: removed in Cloud, or now skipped.
+ * Never reconciled, by design: users (global), organizations and workspaces
+ * (their cascades would take Control-side data with them) and GitHub
+ * installation claims (#146). For those the report counts
+ * `<table>_absent_in_source` warnings and an operator decides.
  */
 export const RECONCILED_TABLES: readonly ImportTable[] = [
   "organization_memberships",
@@ -239,6 +240,25 @@ export const RECONCILED_TABLES: readonly ImportTable[] = [
   "coding_agent_credentials",
   "github_app_connections",
 ];
+
+/**
+ * The import ledger on the target: every row the import wrote, per org,
+ * written in the same per-org transaction as the rows. Reconcile reads only
+ * this table (never a report file), so it can delete nothing the import did
+ * not write. An imported org always has its own `organizations` entry, which
+ * distinguishes "imported, now empty" from "never imported".
+ * Shipped as a Control migration; tests apply this same DDL.
+ */
+export const IMPORT_LEDGER_TABLE = "cloud_import_ledger";
+export const IMPORT_LEDGER_DDL = `
+CREATE TABLE IF NOT EXISTS cloud_import_ledger (
+  organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  table_name text NOT NULL,
+  row_key text NOT NULL,
+  mapping_revision text NOT NULL,
+  imported_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (organization_id, table_name, row_key)
+);`;
 
 /** Organisation-scoped tables are imported in one target transaction per org. */
 export const ORG_TABLES: readonly ImportTable[] = SOURCE_TABLES.filter((t) => t !== "users");

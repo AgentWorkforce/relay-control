@@ -21,7 +21,7 @@
 // Exit 0: done, every organization ok. 1: refused, or an organization failed.
 // 2: usage or configuration error. Output is JSON lines without values.
 import { randomBytes } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { loadEncryptionKeyring, readSecret, type Env } from "../../src/config.js";
 import { PostgresDatabase } from "../../src/database.js";
 import { CodingAgentStore } from "../../src/admin/coding-agents.js";
@@ -29,8 +29,8 @@ import { CredentialBlobStore, credentialBackendFromEnv, S3ObjectBackend } from "
 import { SubscriptionLoginStore } from "../../src/admin/subscription-logins.js";
 import type { EncryptionKeyring } from "../../src/crypto.js";
 import { copyCodingAgentCredentials, type CloudObjectReader } from "./credentials.js";
-import { runImport, type ImportMode, type ImportReport } from "./importer.js";
-import { encryptedSamples, MAPPING_REVISION, TARGET_RELATIONS, verifierComparisons } from "./mapping.js";
+import { runImport, type ImportMode } from "./importer.js";
+import { encryptedSamples, IMPORT_LEDGER_DDL, MAPPING_REVISION, TARGET_RELATIONS, verifierComparisons } from "./mapping.js";
 
 export type CliArgs = {
   mode: ImportMode;
@@ -39,10 +39,10 @@ export type CliArgs = {
   verifierContract?: string;
   copyCredentials: boolean;
   credentialsReport?: string;
-  previousReport?: string;
+  initLedger: boolean;
 };
 
-export const USAGE = "usage: cloud-import --mode plan|dry-run|apply [--org <uuid>]... [--report <path>] [--verifier-contract <path>] [--previous-report <path>] [--copy-credentials [--credentials-report <path>]]";
+export const USAGE = "usage: cloud-import --mode plan|dry-run|apply [--org <uuid>]... [--report <path>] [--verifier-contract <path>] [--init-ledger] [--copy-credentials [--credentials-report <path>]]";
 
 export function parseArgs(argv: readonly string[]): CliArgs {
   let mode: ImportMode | undefined;
@@ -51,11 +51,15 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   let verifierContract: string | undefined;
   let copyCredentials = false;
   let credentialsReport: string | undefined;
-  let previousReport: string | undefined;
+  let initLedger = false;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--copy-credentials") {
       copyCredentials = true;
+      continue;
+    }
+    if (flag === "--init-ledger") {
+      initLedger = true;
       continue;
     }
     const value = argv[index + 1];
@@ -68,7 +72,6 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     else if (flag === "--report") report = value;
     else if (flag === "--verifier-contract") verifierContract = value;
     else if (flag === "--credentials-report") credentialsReport = value;
-    else if (flag === "--previous-report") previousReport = value;
     else throw new Error(`unknown flag ${flag}`);
   }
   if (!mode) throw new Error("--mode is required");
@@ -77,10 +80,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     mode,
     orgIds: orgs.length ? orgs : null,
     copyCredentials,
+    initLedger,
     ...(report ? { report } : {}),
     ...(verifierContract ? { verifierContract } : {}),
     ...(credentialsReport ? { credentialsReport } : {}),
-    ...(previousReport ? { previousReport } : {}),
   };
 }
 
@@ -133,15 +136,18 @@ async function main(argv: readonly string[], env: Env): Promise<number> {
   const source = new PostgresDatabase(config.sourceUrl);
   const target = config.targetUrl ? new PostgresDatabase(config.targetUrl) : undefined;
   try {
+    if (args.initLedger && target && args.mode !== "plan") {
+      // Until the ledger ships as a Control migration: an explicit operator
+      // step that creates only this table, idempotently.
+      await target.exec(IMPORT_LEDGER_DDL);
+    }
     const report = await runImport({
       source,
       ...(target ? { target } : {}),
       keyring: config.keyring,
       ...(config.cloudKey ? { cloudKeyHex: config.cloudKey } : {}),
       log: (event, fields) => console.log(JSON.stringify({ event, ...fields })),
-    }, scope, args.mode, args.previousReport
-      ? { previous: JSON.parse(readFileSync(args.previousReport, "utf8")) as ImportReport }
-      : {});
+    }, scope, args.mode);
     if (args.report) writeFileSync(args.report, JSON.stringify(report, null, 2), { mode: 0o600 });
     if (!args.copyCredentials) return report.ok ? 0 : 1;
     if (args.mode === "apply" && !report.ok) return 1;
