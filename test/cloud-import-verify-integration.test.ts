@@ -100,28 +100,12 @@ beforeEach(async () => {
   await source.query(`UPDATE relay_workspaces SET id='rw_0000b202' WHERE id='rw_legacy-01';
     UPDATE workspaces SET relay_workspace_id='rw_0000b202' WHERE relay_workspace_id='rw_legacy-01'`);
   await migrate(targetDb);
-  let required:SchemaEntry[]|undefined;
+  // All checked-in migrations, including 0053/0054/0056/0057/0058/0061/0062, ran above.
   if (process.env.CLOUD_VERIFY_SCHEMA_MANIFEST_PATH && !manifestWritten) {
     await target.query("BEGIN READ ONLY");
+    let required:SchemaEntry[];
     try {required=await schemaCatalog(target);} finally {await target.query("ROLLBACK");}
-  }
-  // All checked-in migrations, including 0053/0054/0056/0057, ran above.
-  // Only pending 0061 is modeled as revoked staff-grant history; 0058 is real.
-  await target.query(`CREATE TABLE staff_read_grants (
-    id uuid PRIMARY KEY,workspace_id uuid NOT NULL,organization_id uuid NOT NULL,
-    staff_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    staff_organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-    reason text NOT NULL CHECK(length(btrim(reason)) > 0 AND length(reason) <= 500),
-    token_hash text NOT NULL UNIQUE,created_at timestamptz NOT NULL DEFAULT now(),expires_at timestamptz NOT NULL,
-    revoked_at timestamptz,revoked_by uuid,last_used_at timestamptz,
-    FOREIGN KEY(workspace_id,organization_id) REFERENCES workspaces(id,organization_id) ON DELETE CASCADE,
-    CHECK(expires_at > created_at AND expires_at <= created_at + interval '90 days'))`);
-  if (required) {
-    await target.query("BEGIN READ ONLY");
-    let optional:SchemaEntry[];
-    try {optional=await schemaCatalog(target,["staff_read_grants"]);} finally {await target.query("ROLLBACK");}
-    const manifest=sealManifest({version:1,baseline:"control-main-b79cb5f",migrations:await migrationFiles(),required,
-      optional:{staff_read_grants:optional}});
+    const manifest=sealManifest({version:1,baseline:"control-main-b79cb5f",migrations:await migrationFiles(),required,optional:{}});
     await writeFile(process.env.CLOUD_VERIFY_SCHEMA_MANIFEST_PATH!,manifestJson(manifest));manifestWritten=true;
   }
   await target.query("INSERT INTO organizations(id,name) VALUES($1,'Synthetic operator')",[id(0xcafe)]);
@@ -279,7 +263,7 @@ fixtureTest("older source without staff grants reports explicit absence and veri
   assert.equal(report.findings.find((f) => f.kind === "source_availability")!.ok,true);
 });
 
-fixtureTest("staff grants require both target support and an operator organization",async () => {
+fixtureTest("staff grants require an operator organization and a target without 0061 halts on its schema",async () => {
   await target.query("UPDATE installation_bootstrap SET organization_id=NULL");
   const noOperator=await apply();
   assert.equal(noOperator.tables.staff_read_grants.skipped.no_operator_organization,1);
@@ -290,7 +274,8 @@ fixtureTest("staff grants require both target support and an operator organizati
   const noSchema=await apply();
   assert.equal(noSchema.tables.staff_read_grants.skipped.target_lacks_staff_read_grants,1);
   const two=await verifyImport(source,target,scope,noSchema,fixtureKeyring,cloudKeyHex);
-  assert.equal(two.findings.find((f) => f.kind === "ledger" && f.name === "staff_read_grants")!.ok,true);
+  assert.equal(two.findings.find((f) => f.kind === "schema_manifest")!.ok,false);
+  assert.ok(two.targetSchema.missing.includes("table:public.staff_read_grants"));
   assert.equal(two.ok,false);
 });
 
@@ -473,14 +458,20 @@ fixtureTest("equal-count credential fingerprint or blob corruption fails natural
   const backendMismatch=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
   assert.equal(backendMismatch.credentialCopy,"failed");
+  const backendDetail=backendMismatch.findings.find((f) => f.kind === "credential_natural_keys")!.detail as {contentFailureReasons:Record<string,number>};
+  assert.ok(backendDetail.contentFailureReasons.blobBackendMismatch! > 0);
+  assert.equal(backendDetail.contentFailureReasons.targetReadOrDecryptFailed,0);
   await target.query("UPDATE coding_agent_credentials SET blob_backend='postgres' WHERE auth_type='provider_oauth'");
   await target.query("UPDATE coding_agent_credentials SET key_fingerprint=repeat('0',64) WHERE auth_type='byo_api_key' AND model_provider='openai' AND workspace_id=$1",[id(0x201)]);
+  await target.query("UPDATE coding_agent_credentials SET key_fingerprint=repeat('0',64) WHERE auth_type='provider_oauth'");
   await target.query("UPDATE coding_agent_credential_blobs SET envelope='{}'");
   const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
   assert.equal(report.ok,false);
   assert.equal(report.credentialCopy,"failed");
   assert.equal(report.findings.find((f) => f.kind === "credential_natural_keys")!.ok,false);
+  const reasons=(report.findings.find((f) => f.kind === "credential_natural_keys")!.detail as {contentFailureReasons:Record<string,number>}).contentFailureReasons;
+  assert.ok(reasons.fingerprintMismatch! > 0);assert.ok(reasons.targetReadOrDecryptFailed! > 0);
   assert.ok(!JSON.stringify(report).includes("rt-synthetic-only"));
   assert.ok(!JSON.stringify(report).includes("sk-synthetic"));
 });
@@ -569,7 +560,6 @@ fixtureTest("pre-0057 non-UUID Desktop source IDs remain visible as unresolved i
 });
 
 fixtureTest("cohort scope counts and encrypted samples exclude another org's corrupt key",async () => {
-  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
   const first=await apply();assert.equal(first.ok,true);
   const ownership=await captureOwnership(target,scope);
   await target.query("UPDATE workspaces SET relaycast_api_key_ciphertext='synthetic-corrupt' WHERE organization_id=$1",[ORG_B]);
@@ -649,7 +639,6 @@ fixtureTest("unexpected non-extension schema objects fail without exposing their
 });
 
 fixtureTest("subset reports bind normalized scope and a census outside that scope",async () => {
-  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
   const selected={orgIds:[ORG_A]};const ledger=await apply(selected);
   const one=await verifyImport(source,target,{orgIds:[ORG_A.toUpperCase(),ORG_A]},ledger,fixtureKeyring,cloudKeyHex);
   assert.equal(one.ok,true,JSON.stringify(one.findings.filter((f) => !f.ok)));
@@ -664,7 +653,6 @@ fixtureTest("subset reports bind normalized scope and a census outside that scop
 });
 
 fixtureTest("gated-table visibility cannot hide absent SELECT privileges",async () => {
-  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
   await source.query("DELETE FROM workspace_integrations WHERE provider='github'");
   const ledger=await apply();
   await grantRuntimeDatabaseRole(targetDb,"cloud_verify_runtime");
@@ -678,7 +666,6 @@ fixtureTest("gated-table visibility cannot hide absent SELECT privileges",async 
 });
 
 fixtureTest("all-source scope and the production manifest bind successful copier evidence",async () => {
-  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
   const fixture=await copiedFixture();
   const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
@@ -791,5 +778,44 @@ for (const relation of ["relay_node_credentials","relay_launch_credentials"]) {
     assert.equal(missing.ok,false);
     assert.ok(missing.targetSchema.missing.includes(`table:public.${relation}`));
     assert.ok(!missing.findings.some((finding) => finding.kind === "table"));
+  });
+}
+
+fixtureTest("target content diagnostics distinguish copied-row failures from intentional source exclusions",async () => {
+  const fixture=await copiedFixture();
+  const controlId=fixture.copy.controlIds[id(0x803)]!;
+  const before=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(before.credentialCopy,"verified");
+  // Ciphertext stays valid: prove exact content checks independently of key
+  // identity, source exclusions and read/decrypt exceptions.
+  const {encryptSecret}=await import("../src/crypto.js");
+  const marker="synthetic-private-wrong-content";
+  await target.query("UPDATE coding_agent_credentials SET status='error',secret_ciphertext=$1 WHERE id=$2",
+    [encryptSecret(marker,fixtureKeyring.active),controlId]);
+  const after=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  const detail=after.findings.find((f) => f.kind === "credential_natural_keys")!.detail as {
+    contentFailures:number;sourceFailures:number;unresolvedSourceSkips:number;sourceChecksum:string;targetChecksum:string;
+    contentFailureReasons:Record<string,number>};
+  assert.equal(after.credentialCopy,"failed");assert.equal(detail.contentFailures,1);
+  assert.equal(detail.sourceFailures,0);assert.equal(detail.unresolvedSourceSkips,0);
+  assert.equal(detail.sourceChecksum,detail.targetChecksum,"natural key equality does not establish content equality");
+  assert.deepEqual(detail.contentFailureReasons,{organizationMismatch:0,statusNotConnected:1,fingerprintMismatch:0,
+    contentMismatch:1,blobBackendMismatch:0,targetReadOrDecryptFailed:0});
+  assert.ok(!JSON.stringify(after).includes(marker));assert.ok(!JSON.stringify(detail).includes(controlId));
+});
+
+for (const [provider,accounted] of [["opencode",true],["synthetic-unknown-provider",false]] as const) {
+  fixtureTest(`relay-managed exclusion ${provider} is explicitly ${accounted ? "accounted" : "unresolved"}`,async () => {
+    await source.query("UPDATE provider_credentials SET model_provider=$1 WHERE id=$2",[provider,id(0x801)]);
+    const ledger=await apply();
+    assert.equal(ledger.tables.coding_agent_credentials.skipped.unsupported_model_provider,1);
+    const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+    const finding=report.findings.find((f) => f.kind === "credential_exclusions" && f.name === "identity_metadata")!;
+    assert.equal(finding.ok,accounted);assert.equal(report.ok,accounted);
+    assert.deepEqual((finding.detail as {classes:unknown}).classes,[
+      {reason:"unsupported_dropped",accounted:0,unresolved:0},{reason:"dead_login",accounted:0,unresolved:0},
+      {reason:"unsupported_model_provider",accounted:Number(accounted),unresolved:Number(!accounted)}]);
   });
 }
