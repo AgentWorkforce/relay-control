@@ -230,6 +230,7 @@ export async function copyCodingAgentCredentials(
 
   const candidates = await deps.source.transaction(async (tx) => {
     await tx.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+    await tx.exec("SET LOCAL TIME ZONE 'UTC'");
     return (await tx.query<Candidate>(credentialCopyQuery(scope))).rows;
   });
   report.candidates = candidates.length;
@@ -307,8 +308,11 @@ export async function copyCodingAgentCredentials(
   if (mode === "apply" && copied.length > 0) {
     report.selection = await applyCloudSelection(deps.target, copied);
   }
+  // A selection conflict needs a human choice per (workspace, provider)
+  // before cutover sign-off, so it is never a clean run.
   report.ok = Object.keys(report.outcomes).every((outcome) =>
-    outcome === "copied" || outcome === "already_present" || outcome.startsWith("skipped:"));
+    outcome === "copied" || outcome === "already_present" || outcome.startsWith("skipped:"))
+    && (report.selection?.selectionConflicts ?? 0) === 0;
   deps.log?.("cloud_import.credentials", { mode, ok: report.ok, candidates: report.candidates, outcomes: report.outcomes });
   return report;
 }
