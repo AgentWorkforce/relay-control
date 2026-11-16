@@ -598,10 +598,15 @@ export class SubscriptionLoginStore {
     const fingerprint = this.keyFingerprint(input.provider, described.refreshToken);
     let previousLocation: string | null = null;
     const id = await this.database.transaction(async (tx) => {
-      await tx.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [input.workspaceId]);
+      // Bounded lock waits, as the refresh transactions do (#175,
+      // REFRESH_TX_LOCK_TIMEOUT), scoped to this transaction only.
+      await tx.exec("SET LOCAL lock_timeout = '30s'");
       // A replaced login takes the same per-credential advisory lock as
-      // refresh and write-back (before its row lock, in the same order), so a
-      // concurrent refresh cannot also write blob version N + 1.
+      // refresh and write-back, and FIRST: write-back holds that lock while
+      // its audit INSERT takes KEY SHARE on the workspaces row, so taking the
+      // workspaces row lock before the advisory lock would deadlock (40P01).
+      // The lock also stops a concurrent refresh from writing blob version
+      // N + 1 too.
       const prior = await tx.query<{ id: string }>(
         `SELECT id FROM coding_agent_credentials
           WHERE workspace_id = $1 AND model_provider = $2 AND auth_type = 'provider_oauth'
@@ -611,6 +616,7 @@ export class SubscriptionLoginStore {
       if (prior.rows[0]) {
         await tx.query("SELECT pg_advisory_xact_lock(hashtext('selfhost-cli-credential-refresh'), hashtext($1))", [prior.rows[0].id]);
       }
+      await tx.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [input.workspaceId]);
       const existing = await tx.query<{ id: string; blob_version: number; blob_location: string }>(
         `SELECT id, blob_version, blob_location FROM coding_agent_credentials
           WHERE workspace_id = $1 AND model_provider = $2 AND auth_type = 'provider_oauth'

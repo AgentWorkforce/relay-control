@@ -90,3 +90,37 @@ test("copier marker vs a concurrent Control rotation on two real connections", {
     }
   }
 });
+
+test("storeLogin vs a write-back on two real connections: no lock-order deadlock", { skip, timeout: 60_000 }, async (t) => {
+  const first = new PostgresDatabase(url!);
+  t.after(() => first.close());
+  await migrate(first);
+  const foreign = await first.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM organizations WHERE id::text <> ALL($1::text[])", [[ORG_A, ORG_B]]);
+  assert.equal(foreign.rows[0]!.n, 0, "TEST_DATABASE_URL must be an empty throwaway database");
+  const blobs = new CredentialBlobStore(new PostgresObjectBackend(first), KEYRING);
+  const logins = new SubscriptionLoginStore(first, KEYRING, blobs);
+  // The first test left ORG_A imported with Alice's login; make sure it exists.
+  const loginId = await logins.storeLogin({ provider: "openai", workspaceId: id(0x201), organizationId: ORG_A, actor: { kind: "user", userId: id(1) }, authFile: auth("rt-seed") });
+
+  // Session B has write-back's lock shape: the per-credential advisory lock,
+  // then an audit INSERT (FK KEY SHARE on the workspaces row).
+  const { default: pg } = await import("pg");
+  const writeBack = new pg.Client({ connectionString: url! });
+  await writeBack.connect();
+  t.after(() => writeBack.end());
+  await writeBack.query("BEGIN");
+  await writeBack.query("SELECT pg_advisory_xact_lock(hashtext('selfhost-cli-credential-refresh'), hashtext($1))", [loginId]);
+
+  // storeLogin replaces the same login while B holds the advisory lock.
+  const replacing = logins.storeLogin({ provider: "openai", workspaceId: id(0x201), organizationId: ORG_A, actor: { kind: "user", userId: id(1) }, authFile: auth("rt-replaced") });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  // With the old order (workspaces FOR UPDATE, then advisory), this INSERT
+  // waits for storeLogin and PostgreSQL aborts one side with 40P01.
+  await writeBack.query(
+    "INSERT INTO admin_audit_events (id, organization_id, workspace_id, actor_kind, actor_id, action, target) VALUES (gen_random_uuid(), $1, $2, 'service', 'race', 'coding_agent.write_back', 'race')",
+    [ORG_A, id(0x201)],
+  );
+  await writeBack.query("COMMIT");
+  assert.equal(await replacing, loginId, "storeLogin completes after the write-back commits");
+});
