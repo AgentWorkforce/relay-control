@@ -55,8 +55,11 @@ export const REFRESH_WINDOW_MS = 45 * 60_000;
 export const RUN_REFERENCE_TTL_MS = 6 * 60 * 60_000;
 const MAX_FAILED_REFRESHES = 3;
 const MAX_AUTH_FILE_BYTES = 64 * 1024;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const OPENAI_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token";
+// Verified against AgentWorkforce/cloud credential-refresher.ts and the
+// official @anthropic-ai/claude-code-darwin-arm64@2.1.325 npm binary.
 const ANTHROPIC_TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token";
 const XAI_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token";
 const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -145,7 +148,7 @@ function anthropicExpiry(value: unknown): Date | null {
 }
 
 /** Identity, expiry and fingerprint input of a stored auth file. */
-export function describeAuthFile(provider: SubscriptionProvider, content: string): {
+export function describeAuthFile(provider: SubscriptionProvider, content: string, accountEmail?: string | null): {
   accountId: string;
   email: string | null;
   expiresAt: Date | null;
@@ -165,18 +168,28 @@ export function describeAuthFile(provider: SubscriptionProvider, content: string
     if (!oauth?.accessToken || !oauth.refreshToken) {
       throw new CodingAgentError(422, "invalid_auth_file", "Not a Claude subscription login");
     }
-    const email = typeof oauth.emailAddress === "string"
+    const embeddedEmail = typeof oauth.emailAddress === "string"
       ? oauth.emailAddress
       : typeof oauth.email === "string"
         ? oauth.email
         : null;
-    const normalizedEmail = email?.trim().toLowerCase() || null;
+    const suppliedEmail = accountEmail?.trim() || null;
+    for (const email of [embeddedEmail, suppliedEmail]) {
+      if (email !== null && !EMAIL_RE.test(email.trim())) {
+        throw new CodingAgentError(422, "invalid_auth_file", "Claude subscription login has an invalid account email");
+      }
+    }
+    if (embeddedEmail && suppliedEmail && embeddedEmail.trim().toLowerCase() !== suppliedEmail.toLowerCase()) {
+      throw new CodingAgentError(422, "invalid_auth_file", "Claude subscription login account email does not match the import record");
+    }
+    const email = embeddedEmail?.trim() || suppliedEmail;
+    const normalizedEmail = email?.toLowerCase() || null;
     if (!normalizedEmail) {
       throw new CodingAgentError(422, "invalid_auth_file", "Claude subscription login has no account email");
     }
     return {
       accountId: normalizedEmail,
-      email: email!.trim(),
+      email,
       expiresAt: anthropicExpiry(oauth.expiresAt),
       refreshToken: oauth.refreshToken,
     };
@@ -308,6 +321,7 @@ type CredentialRow = {
   blob_location: string;
   blob_version: number;
   provider_account_id: string;
+  account_email: string | null;
   credential_expires_at: Date | string | null;
   status: string;
   refresh_attempts: number;
@@ -567,11 +581,13 @@ export class SubscriptionLoginStore {
     organizationId: string;
     actor: AuditActor & { kind: "user" };
     authFile: string;
+    /** Cloud stores Claude account identity beside the auth file, not inside it. */
+    accountEmail?: string | null;
   }): Promise<string> {
     if (Buffer.byteLength(input.authFile) > MAX_AUTH_FILE_BYTES) {
       throw new CodingAgentError(422, "invalid_auth_file", "Auth file is too large");
     }
-    const described = describeAuthFile(input.provider, input.authFile);
+    const described = describeAuthFile(input.provider, input.authFile, input.accountEmail);
     const files = SUBSCRIPTION_CLI_FILES[input.provider];
     const fingerprint = this.keyFingerprint(input.provider, described.refreshToken);
     let previousLocation: string | null = null;
@@ -747,7 +763,7 @@ export class SubscriptionLoginStore {
 
   private async row(executor: SqlExecutor, workspaceId: string, credentialId: string): Promise<CredentialRow | null> {
     const result = await executor.query<CredentialRow>(
-      `SELECT id, model_provider, blob_location, blob_version, provider_account_id,
+      `SELECT id, model_provider, blob_location, blob_version, provider_account_id, account_email,
               credential_expires_at, status, refresh_attempts
          FROM coding_agent_credentials
         WHERE workspace_id = $1 AND id = $2 AND auth_type = 'provider_oauth'`,
@@ -774,7 +790,7 @@ export class SubscriptionLoginStore {
       if (!expiresAt || expiresAt.getTime() - now.getTime() > REFRESH_WINDOW_MS) return current;
       try {
         const refreshed = await refreshAuthFile(row.model_provider, current, this.fetchImpl, now);
-        const described = describeAuthFile(row.model_provider, refreshed);
+        const described = describeAuthFile(row.model_provider, refreshed, row.account_email);
         const version = row.blob_version + 1;
         const location = await this.blobs.write(workspaceId, row.id, version, refreshed, tx);
         await tx.query(
@@ -830,7 +846,7 @@ export class SubscriptionLoginStore {
       await tx.query("SELECT pg_advisory_xact_lock(hashtext('selfhost-cli-credential-refresh'), hashtext($1))", [credentialId]);
       const row = await this.row(tx, workspaceId, credentialId);
       if (!row) throw new CodingAgentError(404, "credential_not_found", "Credential not found");
-      const described = describeAuthFile(row.model_provider, content);
+      const described = describeAuthFile(row.model_provider, content, row.account_email);
       if (described.accountId !== row.provider_account_id) {
         throw new CodingAgentError(409, "account_mismatch", "Auth file belongs to a different account");
       }

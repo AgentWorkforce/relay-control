@@ -51,7 +51,6 @@ function claudeAuth(expiresAt: number, refresh = "rt-anthropic-secret-1") {
       accessToken: "at-anthropic-secret-1",
       refreshToken: refresh,
       expiresAt,
-      emailAddress: "claude@acme.test",
       scopes: ["user:inference"],
     },
   });
@@ -320,6 +319,7 @@ test("materialise and refresh: run reference, refresh-if-stale, write-back, revo
     organizationId: ctx.tenant.organizationId,
     actor: { kind: "user", userId: owner },
     authFile: claudeAuth(Date.now() + REFRESH_WINDOW_MS / 2),
+    accountEmail: "claude@acme.test",
   });
   const credentialId = await ctx.admin.logins.storeLogin({
     provider: "openai",
@@ -485,10 +485,23 @@ test("Grok auth file: identity, expiry and refresh rotate the single-use refresh
 });
 
 test("Claude auth files require a stable account email", () => {
+  const authFile = JSON.stringify({
+    claudeAiOauth: { accessToken: "access", refreshToken: "refresh", expiresAt: Date.now() + 60_000 },
+  });
+  assert.throws(
+    () => describeAuthFile("anthropic", authFile),
+    /account email/,
+  );
+  assert.deepEqual(describeAuthFile("anthropic", authFile, "Claude@Acme.test"), {
+    accountId: "claude@acme.test",
+    email: "Claude@Acme.test",
+    expiresAt: new Date(JSON.parse(authFile).claudeAiOauth.expiresAt),
+    refreshToken: "refresh",
+  });
   assert.throws(
     () => describeAuthFile("anthropic", JSON.stringify({
-      claudeAiOauth: { accessToken: "access", refreshToken: "refresh", expiresAt: Date.now() + 60_000 },
-    })),
-    /account email/,
+      claudeAiOauth: { accessToken: "access", refreshToken: "refresh", emailAddress: "one@acme.test" },
+    }), "two@acme.test"),
+    /does not match/,
   );
 });
