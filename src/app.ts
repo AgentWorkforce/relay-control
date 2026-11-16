@@ -2459,6 +2459,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       const identity = {
         workspaceId: workspace.id,
         cloudWorkspaceId: workspace.id,
+        cloudRelayWorkspaceId: workspace.cloudRelayWorkspaceId,
         relaycastWorkspaceId: workspace.relaycastWorkspaceId,
         organizationId: workspace.organizationId,
         name: workspace.name,

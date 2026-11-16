@@ -208,6 +208,7 @@ test("introspection describes an active access token and rotates token_id on ref
     machine_id: null,
     org: env.organizationId,
     workspace: env.alpha,
+    cloud_relay_workspace_id: null,
     role: "owner",
     scopes: ["cli:auth", "rth:read", "rth:sync", "rth:acquire"],
     aud: HISTORY_PUBLIC,
@@ -247,6 +248,25 @@ test("introspection describes an active access token and rotates token_id on ref
   assert.deepEqual(
     (await env.introspect({ token: accessToken, aud: HISTORY_PUBLIC, workspace: env.alpha })).body,
     { active: false, reason: "unknown" },
+  );
+});
+
+test("introspection exposes the imported Cloud relay-workspace identity", async (t) => {
+  const env = await setup(t);
+  await env.database.query(
+    "UPDATE workspaces SET cloud_relay_workspace_id = 'rw_a1b2c3d4' WHERE id = $1",
+    [env.alpha],
+  );
+  const { accessToken } = await env.login(env.alpha);
+  const active = await env.introspect({ token: accessToken, aud: HISTORY_PUBLIC, workspace: env.alpha });
+  assert.equal(active.body.active, true);
+  assert.equal(active.body.cloud_relay_workspace_id, "rw_a1b2c3d4");
+
+  await assert.rejects(
+    env.database.query("UPDATE workspaces SET cloud_relay_workspace_id = 'not-an-rw-id' WHERE id = $1", [env.alpha]),
+  );
+  await assert.rejects(
+    env.database.query("UPDATE workspaces SET cloud_relay_workspace_id = 'rw_a1b2c3d4' WHERE id = $1", [env.beta]),
   );
 });
 

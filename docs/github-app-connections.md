@@ -59,6 +59,41 @@ be reported for repair, never guessed from account IDs or repository names.
 Named Cloud connections need an explicit selection policy: this store still
 supports one default connection per workspace/provider.
 
+### Manually unbind an installation
+
+The first import binds an installation to its organization. Disconnecting its
+last workspace does **not** remove that claim; deleting the organization
+removes it by cascade. To correct a mis-mapped import without deleting the
+organization, an operator must explicitly remove the old claim:
+
+1. Pause imports for the installation and verify its current organization and
+   the intended destination mapping.
+2. Disconnect every App connection for that installation in the old
+   organization through the normal workspace integration API. This removes
+   the cached credentials and fences pending refreshes. Unbinding does not
+   revoke tokens already handed to consumers: revoke those tokens or wait
+   for their GitHub expiry before transferring ownership across organizations.
+3. With separately authorized database maintenance access, set the psql
+   variables `installation_id` and `previous_organization_id` to the verified
+   identifiers, then run this guarded deletion:
+
+   ```sql
+   DELETE FROM github_app_installations
+   WHERE installation_id = :'installation_id'
+     AND organization_id = :'previous_organization_id'::uuid
+   RETURNING installation_id;
+   ```
+
+   Exactly one row should be returned. Zero rows means the expected claim was
+   absent or its owner differed; recheck the mapping rather than removing the
+   organization guard. The foreign key refuses deletion while a connection
+   still references the claim. Keep that constraint enabled and do not use
+   cascading deletion to bypass it.
+4. Re-run `ConnectionStore.importGithubAppConnection` with the verified
+   destination organization/workspace mapping, then resume imports. The new
+   claim is created by the normal tenant checks; do not copy the old token
+   cache. This operation does not uninstall the GitHub App.
+
 ## Runtime behavior
 
 The existing authorized internal token route and runtime environment injection

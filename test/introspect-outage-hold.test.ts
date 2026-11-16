@@ -261,6 +261,7 @@ function token(hash: string, overrides: Partial<IntrospectedToken> = {}): Intros
     email: "user@example.test",
     organizationId: "org",
     workspaceId: "ws",
+    cloudRelayWorkspaceId: null,
     role: "member",
     scopes: ["history:write"],
     accessTokenHash: hash,
