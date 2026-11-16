@@ -121,6 +121,35 @@ the same PostgreSQL major version for byte-level JSON rendering comparisons.
 Review schema coverage as well: catalog scans cannot infer a dropped constraint
 that is absent from the reviewed target schema.
 
+## Qualification after the importer contract lands
+
+The source-verified plan requires a one-time, repeatable import per cohort.
+Before a cohort can be marked ready:
+
+1. Pin the importer and verifier to the same `mapping.ts` revision. Reconcile
+   raw source counts with imported rows and every skipped row/reason in its
+   JSON ledger, including active-only memberships, unresolved users and unbound
+   workspaces. A passing projection alone cannot prove skip accounting.
+2. Seed the importer's actual synthetic source shapes and apply Control's
+   migrations in the harness. Run the importer twice; compare both verification
+   receipts and the second ledger to prove PK-upsert idempotency. Include open
+   invite deduplication and agent identity uniqueness in this integration.
+   The current reference seed is not this importer test.
+3. Check transformed identity tables: users' deferred `last_*` references,
+   refreshed invite hashes, re-encrypted person/Desktop/hosted-participant
+   tokens, Desktop `source_id` text-to-UUID handling and derived fleet fields.
+   Unsupported inputs must fail or have explicit reviewed skip accounting.
+4. On a fresh target, assert that Cloud browser/API sessions, device grants,
+   CI/durable tokens, MCP grants and reconnect-only state were not imported.
+   Existing target operator sessions require an explicit scoped baseline.
+5. Freeze cohort identity writes, including memberships, invites, workspace
+   creation and Desktop sync, before the final delta and verifier snapshots.
+   Finish the six application smokes below before flipping authenticated routes.
+   Database checks do not authorize routing changes or a deployment.
+
+These contract-integration steps remain pending. Rollback keeps the source
+intact; writes created in Control after cutover need separate reconciliation.
+
 ## Application smoke checklist
 
 Record identity/org/workspace IDs, service build, timestamp, outcome and a
@@ -130,11 +159,11 @@ Use approved staging/local services and synthetic providers until authorized.
 
 | Smoke | Action and required result |
 | --- | --- |
-| Login | Sign in as a migrated person using the deployed login method. `/cloud/api/auth/session` and `/api/v1/auth/whoami` identify the same Cloud UUID and intended membership. A revoked session is refused. |
+| Login | Force a fresh login with the deployed method. `/cloud/api/auth/session` and `/api/v1/auth/whoami` identify the preserved UUID and membership. Old Cloud cookie/access/refresh credentials must fail Control authentication, introspection and refresh consistently; a revoked new session is refused. Test duplicate Cloud/Control cookies in both header orders and verify the agreed clearing/renaming behavior. |
 | Workspace list | List `/api/v1/organizations/{organizationId}/workspaces` and Desktop's `/api/v1/auth/desktop/workspaces`. Compare IDs/names/roles to the source fixture and verify another org's workspace is inaccessible. |
-| Relaycast key resolve | Resolve the migrated workspace using `/api/v1/workspaces/{workspaceId}/resolve`. Verify the UUID and `rw_` binding and use the resolved credential for one approved Relaycast request. Record success only, never the key. |
+| Relaycast key resolve | Resolve the migrated workspace using `/api/v1/workspaces/{workspaceId}/resolve`. Verify the UUID, preserved `rw_` binding and distinct provider ID, then use the resolved credential for one approved Relaycast request. Confirm a Relayfile lookup still reaches its existing `rw_` namespace. Record success only, never the key. |
 | Flows run | Through the deployed `relayfile-control` HTTP boundary, run one approved synthetic Flow using the migrated identity and credential broker. Verify workspace/run binding, terminal success and events. Do not read the Flows database. |
-| Integration token refresh | With a synthetic provider, refresh one migrated integration credential, verify the next provider call succeeds and org/workspace binding remains correct. Confirm the rotated envelope decrypts with Control's keyring; keep the token out of evidence. |
+| Integration token refresh | With a synthetic provider, refresh one migrated integration credential, verify the next provider call succeeds and org/workspace binding remains correct. Verify existing Nango connection lookup uses the preserved `rw_` identity where applicable. Confirm the rotated envelope decrypts with Control's keyring; keep the token out of evidence. |
 | Desktop feed | Sign in with Desktop, choose the migrated workspace, and load its session/activity feed. Emit one synthetic event, verify it arrives once, then verify workspace switching cannot expose the other org's feed. |
 
 The verifier emits all six as `pending`. A database `ok:true` is never evidence
