@@ -247,7 +247,9 @@ export const RECONCILED_TABLES: readonly ImportTable[] = [
  * this table (never a report file), so it can delete nothing the import did
  * not write. An imported org always has its own `organizations` entry, which
  * distinguishes "imported, now empty" from "never imported".
- * Shipped as a Control migration; tests apply this same DDL.
+ * Shipped as Control migration 0063_cloud_import_ledger.sql. This copy (with
+ * IF NOT EXISTS) serves only `--init-ledger` on a scratch target built from
+ * an older Control, and the 0051-baseline tests.
  */
 export const IMPORT_LEDGER_TABLE = "cloud_import_ledger";
 export const IMPORT_LEDGER_DDL = `

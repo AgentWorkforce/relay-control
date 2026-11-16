@@ -67,7 +67,10 @@ Every org transaction also writes the **target ledger**, `cloud_import_ledger`: 
 
 **After the flip:** do not run `apply` again. Upserts would overwrite edits made in Control.
 
-**Ledger table:** until it ships as a Control migration, `--init-ledger` creates it, idempotently, as an explicit operator step. Without the ledger, `dry-run` and `apply` are refused (`target_lacks_import_ledger`).
+**Ledger table:** migration `0063_cloud_import_ledger.sql` creates it.
+- It is owner-only (`OWNER_ONLY_TABLES`) and gets no runtime grant, so run the importer with the migration/owner role.
+- `--init-ledger` exists only for a scratch target built from an older Control. Do not use it in production.
+- Without the ledger, `dry-run` and `apply` are refused (`target_lacks_import_ledger`).
 
 ## Deliberately not migrated
 

@@ -9,7 +9,6 @@ import { migrate } from "../src/migrations.js";
 import { CLOUD_FIXTURE_DDL, cloudEnvelope, cloudFixtureSeed, id } from "../scripts/cloud-import/cloud-fixture.js";
 import { cloudObjectKeys, copyCodingAgentCredentials } from "../scripts/cloud-import/credentials.js";
 import { runImport } from "../scripts/cloud-import/importer.js";
-import { IMPORT_LEDGER_DDL } from "../scripts/cloud-import/mapping.js";
 import { PGliteDatabase } from "./support/harness.js";
 
 const CLOUD_KEY = randomBytes(32).toString("hex");
@@ -40,8 +39,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   });
   await source.exec(CLOUD_FIXTURE_DDL);
   await source.exec(cloudFixtureSeed(CLOUD_KEY));
-  await migrate(target);
-  await target.exec(IMPORT_LEDGER_DDL);
+  await migrate(target); // includes 0063 cloud_import_ledger
   const identity = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
   assert.equal(identity.ok, true);
 

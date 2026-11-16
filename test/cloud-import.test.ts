@@ -57,7 +57,8 @@ async function controlTarget(kind: "0051" | "current", ledger = true): Promise<P
   if (kind === "current") {
     await migrate(target);
     await target.exec(POST_0058_DDL);
-    if (ledger) await target.exec(IMPORT_LEDGER_DDL);
+    // 0063 already created the ledger; ledger=false drops it to test refusal.
+    if (!ledger) await target.exec("DROP TABLE cloud_import_ledger");
     return target;
   }
   const directory = await mkdtemp(join(tmpdir(), "cloud-import-0051-"));
