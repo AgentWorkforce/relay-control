@@ -3692,7 +3692,7 @@ paths:
         customer-hosted History origin when set, otherwise the configured
         public History origin (SESSION_READ_API_PUBLIC_URL). It is the exact
         introspection audience and sync-session `baseUrl`. An imported origin
-        must also be listed in SELFHOST_INTROSPECT_AUDIENCES; otherwise the
+        must also be listed in SELFHOST_RELAYHISTORY_AUDIENCES; otherwise the
         route fails closed as `relayhistory_not_configured`.
       responses:
         "200":
@@ -3736,7 +3736,7 @@ paths:
             token's organization (even if the same person is a member there),
             or the caller is not a member. `relayhistory_not_configured`: the
             History origin is unset or an imported origin is not in
-            SELFHOST_INTROSPECT_AUDIENCES (checked after authorization).
+            SELFHOST_RELAYHISTORY_AUDIENCES (checked after authorization).
   /api/v1/workspaces/{workspaceId}/relayhistory/session:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -5912,11 +5912,12 @@ paths:
         Checks, in order: `wrong-kind` (not an `sh_at_` token: refresh,
         internal, bootstrap, worker or run tokens are never looked up; an
         `sh_wk_` token is only accepted as described below), `unknown` (no such token, including a token replaced by refresh),
-        `revoked`, `expired`, `audience` (`aud` is not one of
-        SELFHOST_INTROSPECT_AUDIENCES, compared as normalized origins:
-        scheme, lowercase host and port; path ignored), `workspace` (the token
-        session is bound to another workspace; only when `workspace` is
-        supplied). Only then, when `machine` is
+        `revoked`, `expired`, `audience` (`aud` is not in the configured
+        general-service or dedicated History audience lists; a History
+        audience must also equal the token session workspace's own imported
+        origin, or the installation default), `workspace` (the token session
+        is bound to another workspace; only when `workspace` is supplied).
+        Only then, when `machine` is
         supplied, it is matched against fleet node claims
         (POST /api/v1/fleet/nodes/claim), so an inactive token never reveals
         machine state: `machine_not_owned` (claimed by another user in the

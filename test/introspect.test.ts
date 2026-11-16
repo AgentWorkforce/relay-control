@@ -72,7 +72,11 @@ async function startIngestEdge(t: TestContext, control: () => string) {
 
 async function setup(
   t: TestContext,
-  options: { introspectSecret?: string | null; introspectAudiences?: string[] } = {},
+  options: {
+    introspectSecret?: string | null;
+    introspectAudiences?: string[];
+    relayhistoryAudiences?: string[];
+  } = {},
 ) {
   let controlOrigin = "";
   const history = await startIngestEdge(t, () => controlOrigin);
@@ -88,6 +92,7 @@ async function setup(
     sessionReadApi: { url: history.origin, publicUrl: HISTORY_PUBLIC, secret: "session-read-secret-".repeat(2) },
     introspectSecret: options.introspectSecret === undefined ? INTROSPECT_SECRET : options.introspectSecret,
     ...(options.introspectAudiences ? { introspectAudiences: options.introspectAudiences } : {}),
+    ...(options.relayhistoryAudiences ? { relayhistoryAudiences: options.relayhistoryAudiences } : {}),
     bootstrapToken: BOOTSTRAP,
     encryptionKeyring: { active: { id: "test-key", key: Buffer.alloc(32, 7) } },
     internalServiceToken: INTERNAL,
@@ -421,16 +426,17 @@ test("introspection audiences compare normalized origins and echo the configured
   assert.equal(internal.body.aud, "http://relayhistory.history.svc.cluster.local:8080");
   const files = await custom.introspect({ token: own.accessToken, aud: "https://files.selfhosted.test", workspace: custom.alpha });
   assert.equal(files.body.aud, "https://Files.Selfhosted.test");
-  // The default audience is replaced, not extended.
-  assert.deepEqual(
-    (await custom.introspect({ token: own.accessToken, aud: HISTORY_PUBLIC, workspace: custom.alpha })).body,
-    { active: false, reason: "audience" },
+  // The general list is replaced, while the dedicated default History
+  // audience remains accepted and scoped to this workspace.
+  assert.equal(
+    (await custom.introspect({ token: own.accessToken, aud: HISTORY_PUBLIC, workspace: custom.alpha })).body.active,
+    true,
   );
 });
 
 test("an imported History origin does not bypass the operator audience allowlist", async (t) => {
   const imported = "https://history.customer.example";
-  const denied = await setup(t);
+  const denied = await setup(t, { introspectAudiences: [HISTORY_PUBLIC, imported] });
   await denied.database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [denied.alpha, imported]);
   const deniedToken = await denied.login(denied.alpha);
   assert.deepEqual(
@@ -438,12 +444,38 @@ test("an imported History origin does not bypass the operator audience allowlist
     { active: false, reason: "audience" },
   );
 
-  const allowed = await setup(t, { introspectAudiences: [HISTORY_PUBLIC, imported] });
+  const allowed = await setup(t, { relayhistoryAudiences: [HISTORY_PUBLIC, imported] });
   await allowed.database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [allowed.alpha, imported]);
   const allowedToken = await allowed.login(allowed.alpha);
   const active = await allowed.introspect({ token: allowedToken.accessToken, aud: imported, workspace: allowed.alpha });
   assert.equal(active.body.active, true);
   assert.equal(active.body.aud, imported);
+});
+
+test("a customer History audience is bound to its own workspace", async (t) => {
+  const alphaHistory = "https://history.alpha.example";
+  const betaHistory = "https://history.beta.example";
+  const relayfile = "https://relayfile.selfhosted.test";
+  const env = await setup(t, {
+    introspectAudiences: [relayfile],
+    relayhistoryAudiences: [HISTORY_PUBLIC, alphaHistory, betaHistory],
+  });
+  await env.database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [env.alpha, alphaHistory]);
+  await env.database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [env.beta, betaHistory]);
+  const alpha = await env.login(env.alpha);
+  const beta = await env.login(env.beta);
+
+  assert.equal((await env.introspect({ token: alpha.accessToken, aud: alphaHistory })).body.active, true);
+  assert.deepEqual(
+    (await env.introspect({ token: alpha.accessToken, aud: betaHistory })).body,
+    { active: false, reason: "audience" },
+  );
+  assert.equal((await env.introspect({ token: beta.accessToken, aud: betaHistory })).body.active, true);
+  assert.equal(
+    (await env.introspect({ token: alpha.accessToken, aud: relayfile, workspace: env.alpha })).body.active,
+    true,
+    "non-History service audiences remain installation-wide",
+  );
 });
 
 test("readyz lists exactly the audiences introspection accepts, never the secret", async (t) => {
@@ -452,7 +484,11 @@ test("readyz lists exactly the audiences introspection accepts, never the secret
   assert.equal(ready.status, 200);
   assert.deepEqual(ready.body, {
     status: "ready",
-    introspection: { enabled: true, audiences: ["https://files.selfhosted.test", "http://history.svc:8080"], outageHoldMs: 0 },
+    introspection: {
+      enabled: true,
+      audiences: ["https://files.selfhosted.test", "http://history.svc:8080", HISTORY_PUBLIC],
+      outageHoldMs: 0,
+    },
     // No features wired: core only.
     capabilities: { flows: false, relayfile: false, chief: false, usage: false, launch: false, usage_people: false, events_shim: false, session_delete: false, enrollment_keys: true },
   });

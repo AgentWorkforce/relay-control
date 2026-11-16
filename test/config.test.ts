@@ -242,12 +242,13 @@ test("token introspection is required and validates its secret and audiences", (
   const config = loadConfig(completeEnv);
   assert.equal(config.introspectSecret, completeEnv.RELAYCONTROL_INTROSPECT_SECRET);
   assert.deepEqual(config.introspectAudiences, [completeEnv.SESSION_READ_API_PUBLIC_URL]);
+  assert.deepEqual(config.relayhistoryAudiences, [completeEnv.SESSION_READ_API_PUBLIC_URL]);
   assert.throws(() => loadConfig({ ...completeEnv, RELAYCONTROL_INTROSPECT_SECRET: "" }), {
     message: "RELAYCONTROL_INTROSPECT_SECRET is required: the sessions pipeline verifies every History token through introspection",
   });
-  assert.throws(
-    () => loadConfig({ ...completeEnv, SELFHOST_INTROSPECT_AUDIENCES: "http://relayfile.files.svc:8080" }),
-    { message: "SELFHOST_INTROSPECT_AUDIENCES must include SESSION_READ_API_PUBLIC_URL" },
+  assert.deepEqual(
+    loadConfig({ ...completeEnv, SELFHOST_INTROSPECT_AUDIENCES: "http://relayfile.files.svc:8080" }).introspectAudiences,
+    ["http://relayfile.files.svc:8080"],
   );
 
   const secret = "j".repeat(32);
@@ -261,6 +262,29 @@ test("token introspection is required and validates its secret and audiences", (
     "https://history.selfhosted.company",
     "http://relayfile.files.svc:8080",
   ]);
+  const importedHistory = loadConfig({
+    ...completeEnv,
+    SELFHOST_RELAYHISTORY_AUDIENCES:
+      " https://history.selfhosted.company/ , https://BÜCHER.example.:0443 ",
+  });
+  assert.deepEqual(importedHistory.relayhistoryAudiences, [
+    "https://history.selfhosted.company",
+    "https://xn--bcher-kva.example",
+  ]);
+  assert.throws(
+    () => loadConfig({
+      ...completeEnv,
+      SELFHOST_RELAYHISTORY_AUDIENCES: "https://history.customer.example",
+    }),
+    { message: "SELFHOST_RELAYHISTORY_AUDIENCES must include SESSION_READ_API_PUBLIC_URL" },
+  );
+  for (const invalid of ["http://history.customer.example", "ftp://history.example", "https://u:p@h.example"]) {
+    assert.throws(
+      () => loadConfig({ ...completeEnv, SELFHOST_RELAYHISTORY_AUDIENCES: invalid }),
+      /SELFHOST_RELAYHISTORY_AUDIENCES/,
+      invalid,
+    );
+  }
   assert.doesNotMatch(configFingerprint(enabled), new RegExp(secret));
 
   assert.throws(

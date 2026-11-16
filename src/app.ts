@@ -39,7 +39,7 @@ import {
   handleIntrospection,
   introspect,
   INTROSPECT_PATH,
-  matchingIntrospectionAudience,
+  matchingRelayhistoryAudience,
 } from "./auth/introspect.js";
 import { IntrospectionHold } from "./auth/introspection-hold.js";
 import { controlSessionToken, SESSION_COOKIE } from "./auth/session-cookie.js";
@@ -126,6 +126,7 @@ import {
   type SelectedFeatures,
 } from "./features.js";
 import type { AnalyticsConfig } from "./analytics/config.js";
+import { canonicalRelayhistoryOrigin } from "./relayhistory-origin.js";
 import {
   clientAttribution,
   GATEWAY_RATE_LIMITS,
@@ -445,14 +446,17 @@ export function createApp(input: {
     workspace: { relayhistoryOrigin: string | null },
     fallback: string,
   ): string => {
-    const imported = workspace.relayhistoryOrigin;
-    if (imported && matchingIntrospectionAudience(config, imported) === undefined) {
+    const stored = workspace.relayhistoryOrigin;
+    const imported = stored === null ? null : canonicalRelayhistoryOrigin(stored);
+    if (stored !== null && (
+      imported === null || matchingRelayhistoryAudience(config, imported) === undefined
+    )) {
       // Do not hand a user bearer to an imported destination the operator did
       // not explicitly allow. Use the same 404 as an unconfigured backend so
       // callers cannot enumerate operator configuration.
       throw new HttpError(404, "relayhistory_not_configured", "RelayHistory is not configured");
     }
-    return imported ?? fallback;
+    return imported ?? canonicalRelayhistoryOrigin(fallback) ?? fallback;
   };
   // Installation wiring, not an opt-in SELFHOST_FEATURES name or a grant to
   // the caller. DELETE still checks organization role and the operator gate.

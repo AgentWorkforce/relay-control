@@ -57,7 +57,8 @@ test("Cloud identity preservation columns match the import contract", async (t) 
   ]);
   assert.match(indexes.rows[0]!.indexdef, /lower\(slug\)/);
   assert.match(indexes.rows[1]!.indexdef, /organization_id, lower\(slug\)/);
-  assert.match(indexes.rows[2]!.indexdef, /lower\(relayhistory_origin\)/);
+  assert.match(indexes.rows[2]!.indexdef, /\(relayhistory_origin\)/);
+  assert.doesNotMatch(indexes.rows[2]!.indexdef, /lower\(relayhistory_origin\)/);
 
   const organizationId = "00000000-0000-4000-8000-000000000056";
   const otherOrganizationId = "00000000-0000-4000-8000-000000000058";
@@ -82,6 +83,7 @@ test("Cloud identity preservation columns match the import contract", async (t) 
   );
   for (const origin of [
     "https://history.customer.example",
+    "https://xn--bcher-kva.example",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://[::1]:3000",
@@ -97,6 +99,11 @@ test("Cloud identity preservation columns match the import contract", async (t) 
   for (const invalid of [
     "history.customer.example",
     "http://history.customer.example",
+    "https://HISTORY.customer.example",
+    "https://history.customer.example:443",
+    "https://history.customer.example:0443",
+    "https://history.customer.example.",
+    "https://bücher.example",
     "ftp://history.customer.example",
     "https://history.customer.example/",
     "https://history.customer.example/path",
@@ -128,7 +135,7 @@ test("Cloud identity preservation columns match the import contract", async (t) 
   );
   await assert.rejects(
     database.query(
-      "UPDATE workspaces SET relayhistory_origin = 'https://HISTORY.UNIQUE.EXAMPLE' WHERE id = $1",
+      "UPDATE workspaces SET relayhistory_origin = 'https://history.unique.example' WHERE id = $1",
       [otherWorkspaceId],
     ),
     /workspaces_relayhistory_origin_unique/,

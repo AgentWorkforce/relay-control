@@ -82,7 +82,11 @@ async function startHistory(t: TestContext) {
 
 async function setup(
   t: TestContext,
-  options: { tenancy?: "single" | "multi"; introspectAudiences?: string[] } = {},
+  options: {
+    tenancy?: "single" | "multi";
+    introspectAudiences?: string[];
+    relayhistoryAudiences?: string[];
+  } = {},
 ) {
   const history = await startHistory(t);
   const database = new PGliteDatabase();
@@ -105,6 +109,7 @@ async function setup(
     oauthRedirectUrl: "https://control.internal.example/api/v1/integrations/oauth/callback",
     dashboardUrl: "https://control.internal.example/",
     ...(options.introspectAudiences ? { introspectAudiences: options.introspectAudiences } : {}),
+    ...(options.relayhistoryAudiences ? { relayhistoryAudiences: options.relayhistoryAudiences } : {}),
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0, { tenancy: options.tenancy ?? "single" });
   const admin = createAdminModule({ config, database, keyring: config.encryptionKeyring });
@@ -211,7 +216,7 @@ test("an authorized member reads the workspace History origin and audience", asy
 
 test("an imported workspace History origin wins for lookup and sync issuance", async (t) => {
   const { origin, unconfiguredOrigin, database, alpha, memberToken } = await setup(t, {
-    introspectAudiences: [historyOrigin, customerHistoryOrigin],
+    relayhistoryAudiences: [historyOrigin, customerHistoryOrigin],
   });
   await database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [alpha, customerHistoryOrigin]);
 
@@ -231,7 +236,9 @@ test("an imported workspace History origin wins for lookup and sync issuance", a
 });
 
 test("an imported History origin must be in the operator audience allowlist", async (t) => {
-  const { origin, database, alpha, memberToken } = await setup(t);
+  const { origin, database, alpha, memberToken } = await setup(t, {
+    introspectAudiences: [historyOrigin, customerHistoryOrigin],
+  });
   await database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [alpha, customerHistoryOrigin]);
 
   const lookup = await call(origin, originPath(alpha), { token: memberToken });

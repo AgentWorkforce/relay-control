@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { ApiTokenStore } from "../admin/api-tokens.js";
 import type { SelfhostConfig } from "../config.js";
+import { canonicalRelayhistoryOrigin } from "../relayhistory-origin.js";
 import type { CapturePolicy } from "../capture-policy.js";
 import { hashSecret } from "../crypto.js";
 import { databaseErrorCause, isDatabaseUnavailable } from "../database.js";
@@ -258,7 +259,10 @@ function epochSeconds(value: Date): number {
  */
 export function acceptedAudiences(config: SelfhostConfig): string[] {
   if (!config.introspectSecret) return [];
-  return (config.introspectAudiences ?? [config.relayhistoryPublicUrl])
+  return [...new Set([
+    ...(config.introspectAudiences ?? [config.relayhistoryPublicUrl]),
+    ...(config.relayhistoryAudiences ?? [config.relayhistoryPublicUrl]),
+  ])]
     .map(normalizedOrigin)
     .filter((origin): origin is string => origin !== null);
 }
@@ -267,8 +271,19 @@ export function acceptedAudiences(config: SelfhostConfig): string[] {
 export function matchingIntrospectionAudience(config: SelfhostConfig, value: string): string | undefined {
   const requested = normalizedOrigin(value);
   if (requested === null) return undefined;
-  return (config.introspectAudiences ?? [config.relayhistoryPublicUrl])
+  return [
+    ...(config.introspectAudiences ?? [config.relayhistoryPublicUrl]),
+    ...(config.relayhistoryAudiences ?? [config.relayhistoryPublicUrl]),
+  ]
     .find((configured) => normalizedOrigin(configured) === requested);
+}
+
+/** A dedicated History audience match, distinct from acquisition/Relayfile. */
+export function matchingRelayhistoryAudience(config: SelfhostConfig, value: string): string | undefined {
+  const requested = canonicalRelayhistoryOrigin(value);
+  if (requested === null) return undefined;
+  return (config.relayhistoryAudiences ?? [config.relayhistoryPublicUrl])
+    .find((configured) => canonicalRelayhistoryOrigin(configured) === requested);
 }
 
 /** relayfile-agent (principal `agent`) and acquisition-operator (`service`) tokens. */
@@ -400,7 +415,25 @@ export async function introspect(
   if (held ? session.expiresAt.getTime() <= Date.now() : session.expired) {
     return { active: false, reason: "expired" };
   }
-  const aud = matchingIntrospectionAudience(config, request.aud);
+  let aud = matchingIntrospectionAudience(config, request.aud);
+  const historyAudience = matchingRelayhistoryAudience(config, request.aud);
+  const requestedHistoryOrigin = canonicalRelayhistoryOrigin(request.aud);
+  const expectedHistoryOrigin = canonicalRelayhistoryOrigin(
+    session.relayhistoryOrigin ?? config.relayhistoryPublicUrl,
+  );
+  if (historyAudience !== undefined) {
+    aud = expectedHistoryOrigin !== null && requestedHistoryOrigin === expectedHistoryOrigin
+      ? historyAudience
+      : undefined;
+  } else if (
+    session.relayhistoryOrigin !== null &&
+    requestedHistoryOrigin !== null &&
+    requestedHistoryOrigin === expectedHistoryOrigin
+  ) {
+    // A stored workspace History origin never falls back to the general
+    // acquisition/Relayfile audience list merely because the strings match.
+    aud = undefined;
+  }
   if (!aud) return { active: false, reason: "audience" };
   if (request.workspace !== undefined && session.workspaceId !== request.workspace) {
     return { active: false, reason: "workspace" };
