@@ -795,7 +795,7 @@ paths:
         - cookieAuth: []
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
-        - { name: source_id, in: query, required: true, schema: { type: string, format: uuid } }
+        - { name: source_id, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 200 } }
       responses:
         "200":
           description: Identities and capabilities
@@ -881,7 +881,12 @@ paths:
                       token: { type: string }
                       relaycastUrl: { type: string, format: uri }
         "403":
-          description: Agent, CI, or service credential, or cookie request failed the origin check
+          description: >-
+            Agent, CI, or service credential, or cookie request failed the origin check;
+            or `gate_only` on a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): no
+            identity is registered and no token is issued, the body carries
+            `urls.relaycastUrl` and `urls.relaygateUrl`, and the call is audited as
+            `workspace.person_credential.withheld`
         "409":
           description: register_human admission is full, or the name is held by someone else
   /api/v1/workspaces/{workspaceId}/messaging/conversations/{agentName}:
@@ -3688,11 +3693,12 @@ paths:
         issued, RelayHistory is not called, and it does not count against
         anything the session issue/renew path does, so Agent Relay Desktop
         can use it for site-push admission and cold-process delete/revoke
-        lookups. `origin` and `audience` are both the configured
-        public History origin (SESSION_READ_API_PUBLIC_URL), the exact string
-        sessions are bound to (read token audience, default introspection
-        audience, returned `baseUrl`); it is installation-wide, not per
-        workspace.
+        lookups. `origin` and `audience` are both the workspace's imported
+        customer-hosted History origin when set, otherwise the configured
+        public History origin (SESSION_READ_API_PUBLIC_URL). It is the exact
+        introspection audience and sync-session `baseUrl`. An imported origin
+        must also be listed in SELFHOST_RELAYHISTORY_AUDIENCES; otherwise the
+        route fails closed as `relayhistory_not_configured`.
       responses:
         "200":
           description: The workspace's RelayHistory origin and session audience
@@ -3733,9 +3739,9 @@ paths:
           description: |
             `workspace_not_found`: workspace does not exist, is outside the
             token's organization (even if the same person is a member there),
-            or the caller is not a member. `relayhistory_not_configured`: the History origin is unset (checked
-            after authorization; startup requires it, so a running install
-            does not answer this).
+            or the caller is not a member. `relayhistory_not_configured`: the
+            History origin is unset or an imported origin is not in
+            SELFHOST_RELAYHISTORY_AUDIENCES (checked after authorization).
   /api/v1/workspaces/{workspaceId}/relayhistory/session:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -3758,8 +3764,11 @@ paths:
         renew through this route), and both expiries are the token's own
         expiry capped at 15 minutes.
 
-        In every mode `baseUrl` is the public History origin
-        (SESSION_READ_API_PUBLIC_URL). Caller-supplied service URLs or tenant
+        In sync mode `baseUrl` is the workspace's imported customer-hosted
+        origin when set and operator-allowlisted, otherwise
+        SESSION_READ_API_PUBLIC_URL. A present but unallowlisted imported
+        origin fails closed without returning the caller's token. Read mode
+        uses the configured read API. Caller-supplied service URLs or tenant
         IDs are rejected because they are not request fields. See
         docs/sessions-read-api.md.
       requestBody:
@@ -5732,7 +5741,7 @@ paths:
         "400": { description: "invalid_request: the body is not JSON; Relaycast's own 400 also passes through" }
         "401": { $ref: "#/components/responses/RelayNodeTokenInvalid" }
         "403":
-          description: "node_mismatch: body.name is not the token's nodeName (nothing is forwarded); or scope_denied"
+          description: "node_mismatch: body.name is not the token's nodeName (nothing is forwarded); or scope_denied; or gate_only on a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): nothing is forwarded and no node token is issued"
           content:
             application/json:
               schema: { $ref: "#/components/schemas/RelayNodeError" }
@@ -5908,11 +5917,14 @@ paths:
         Checks, in order: `wrong-kind` (not an `sh_at_` token: refresh,
         internal, bootstrap, worker or run tokens are never looked up; an
         `sh_wk_` token is only accepted as described below), `unknown` (no such token, including a token replaced by refresh),
-        `revoked`, `expired`, `audience` (`aud` is not one of
-        SELFHOST_INTROSPECT_AUDIENCES, compared as normalized origins:
-        scheme, lowercase host and port; path ignored), `workspace` (the token
-        session is bound to another workspace; only when `workspace` is
-        supplied). Only then, when `machine` is
+        `revoked`, `expired`, `audience` (`aud` is not in the configured
+        general-service or dedicated History audience lists; a History
+        audience must also equal the token session workspace's own imported
+        origin, or the installation default; the lists are disjoint and a
+        stored History origin never falls back to the general list),
+        `workspace` (the token session
+        is bound to another workspace; only when `workspace` is supplied).
+        Only then, when `machine` is
         supplied, it is matched against fleet node claims
         (POST /api/v1/fleet/nodes/claim), so an inactive token never reveals
         machine state: `machine_not_owned` (claimed by another user in the
@@ -8277,7 +8289,7 @@ components:
         caller's own access token; the edge introspects it on every upload.
       required: [baseUrl, accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType, scopes, orgId, workspaceId]
       properties:
-        baseUrl: { type: string, format: uri, description: The public History origin (SESSION_READ_API_PUBLIC_URL). }
+        baseUrl: { type: string, format: uri, description: The workspace's customer-hosted History origin when set, otherwise SESSION_READ_API_PUBLIC_URL. }
         accessToken: { type: string, pattern: '^sh_at_' }
         accessTokenExpiresAt: { type: string, format: date-time }
         refreshToken:
@@ -9712,7 +9724,7 @@ components:
       additionalProperties: false
       required: [source_id, identities]
       properties:
-        source_id: { type: string, format: uuid }
+        source_id: { type: string, minLength: 1, maxLength: 200 }
         identities:
           type: array
           maxItems: 200

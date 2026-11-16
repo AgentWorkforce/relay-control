@@ -35,7 +35,13 @@ import {
 } from "./usage/people.js";
 import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
 import { z } from "zod";
-import { acceptedAudiences, handleIntrospection, introspect, INTROSPECT_PATH } from "./auth/introspect.js";
+import {
+  acceptedAudiences,
+  handleIntrospection,
+  introspect,
+  INTROSPECT_PATH,
+  matchingRelayhistoryAudience,
+} from "./auth/introspect.js";
 import { IntrospectionHold } from "./auth/introspection-hold.js";
 import { controlSessionToken, SESSION_COOKIE } from "./auth/session-cookie.js";
 import { handleAcquisitionRoutes } from "./acquisition/routes.js";
@@ -121,6 +127,7 @@ import {
   type SelectedFeatures,
 } from "./features.js";
 import type { AnalyticsConfig } from "./analytics/config.js";
+import { canonicalRelayhistoryOrigin } from "./relayhistory-origin.js";
 import {
   clientAttribution,
   GATEWAY_RATE_LIMITS,
@@ -436,6 +443,22 @@ export function createApp(input: {
 }): (request: IncomingMessage, response: ServerResponse) => void {
   const { config, store, admin, telemetry, identity } = input;
   const features = input.features ?? NO_FEATURES;
+  const workspaceHistoryOrigin = (
+    workspace: { relayhistoryOrigin: string | null },
+    fallback: string,
+  ): string => {
+    const stored = workspace.relayhistoryOrigin;
+    const imported = stored === null ? null : canonicalRelayhistoryOrigin(stored);
+    if (stored !== null && (
+      imported === null || matchingRelayhistoryAudience(config, imported) === undefined
+    )) {
+      // Do not hand a user bearer to an imported destination the operator did
+      // not explicitly allow. Use the same 404 as an unconfigured backend so
+      // callers cannot enumerate operator configuration.
+      throw new HttpError(404, "relayhistory_not_configured", "RelayHistory is not configured");
+    }
+    return imported ?? canonicalRelayhistoryOrigin(fallback) ?? fallback;
+  };
   // Installation wiring, not an opt-in SELFHOST_FEATURES name or a grant to
   // the caller. DELETE still checks organization role and the operator gate.
   const capabilities = () => ({
@@ -493,6 +516,7 @@ export function createApp(input: {
   const messaging = createMessagingHandler({
     ...messagingDeps,
     relaycastPublicUrl: config.relaycastPublicUrl,
+    relaygatePublicUrl: config.relaygatePublicUrl,
     internalServiceToken: config.internalServiceToken,
     browserOrigins,
   });
@@ -916,7 +940,8 @@ export function createApp(input: {
       throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
     }
     if (!token.startsWith(ACCESS_TOKEN_PREFIX)) throw new HttpError(401, "unauthorized", "User token required");
-    const active = await introspect(config, store, { token, aud: config.sessionReadApi.publicUrl, workspace: workspace.id });
+    const historyOrigin = workspaceHistoryOrigin(workspace, config.sessionReadApi.publicUrl);
+    const active = await introspect(config, store, { token, aud: historyOrigin, workspace: workspace.id });
     if (!active.active || !active.scopes.includes("rth:sync")) {
       throw new HttpError(401, "unauthorized", "Token is not valid for uploads");
     }
@@ -965,7 +990,7 @@ export function createApp(input: {
     const active = await assertNativeUploadCaller(request, access);
     const expiresAt = new Date(Math.min(active.exp * 1_000, Date.now() + NATIVE_UPLOAD_SESSION_MAX_MS)).toISOString();
     return {
-      baseUrl: api.publicUrl,
+      baseUrl: workspaceHistoryOrigin(workspace, api.publicUrl),
       accessToken: token,
       accessTokenExpiresAt: expiresAt,
       refreshToken: NATIVE_UPLOAD_NO_REFRESH,
@@ -1167,6 +1192,7 @@ export function createApp(input: {
       apiTokens,
       relaycastUrl: config.relaycastUrl,
       relaycastBinding: (id) => store.relaycastBinding(id),
+      relaygatePublicUrl: config.relaygatePublicUrl,
       bearer,
       rateLimit: (res, key, rule) =>
         rateLimit(res, key, rule, "rate_limited", "Too many relay-node requests; retry later"),
@@ -2602,17 +2628,18 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         throw new HttpError(404, "workspace_not_found", "Workspace not found");
       }
       if (!workspace) throw new HttpError(404, "workspace_not_found", "Workspace not found");
-      // Sessions are bound to relayhistoryPublicUrl, the read API's public
-      // origin (default introspection audience, returned baseUrl, ingest edge
-      // origin). One installation-wide value. loadConfig requires it to be a
-      // bare origin, and introspection compares the audience by exact string.
-      if (!config.relayhistoryUrl || !config.relayhistoryPublicUrl) {
+      // An allowlisted imported customer-hosted origin wins for this
+      // workspace. NULL uses the installation default. Both are exact
+      // introspection audiences.
+      const importedOrigin = workspace.relayhistoryOrigin;
+      if (!importedOrigin && (!config.relayhistoryUrl || !config.relayhistoryPublicUrl)) {
         throw new HttpError(404, "relayhistory_not_configured", "RelayHistory is not configured");
       }
+      const origin = workspaceHistoryOrigin(workspace, config.relayhistoryPublicUrl);
       json(response, 200, {
         workspace: workspace.id,
-        origin: config.relayhistoryPublicUrl,
-        audience: config.relayhistoryPublicUrl,
+        origin,
+        audience: origin,
       }, true);
       return;
     }

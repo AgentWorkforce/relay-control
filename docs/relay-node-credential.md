@@ -90,6 +90,7 @@ envelope `{"ok": false, "error": {"code", "message"}}`:
 | 401 | `token_invalid` | No bearer, or not a live (unrevoked, unexpired) relay-node token |
 | 403 | `scope_denied` | Path or method outside the table above |
 | 403 | `node_mismatch` | `POST /nodes` body names another node; nothing is sent to Relaycast |
+| 403 | `gate_only` | `POST /nodes` on a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set, see [identity.md](identity.md#gate-only-installs-relaygate)); checked after `node_mismatch`, nothing is sent to Relaycast and no node token is issued |
 | 400 | `invalid_request` | `POST /nodes` body is not JSON, or a malformed path segment |
 | 413 | `payload_too_large` | Body over 1 MiB |
 | 429 | `rate_limited` | Over 600 requests per minute for this token |

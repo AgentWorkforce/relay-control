@@ -14,8 +14,8 @@ import {
 import type { AdminRouteHelpers, WorkspaceAccess } from "./routes.js";
 import {
   DEVICE_BINDING_COOKIES,
+  type DeviceSubscriptionProvider,
   type SubscriptionLoginStore,
-  type SubscriptionProvider,
 } from "./subscription-logins.js";
 
 function readCookie(request: IncomingMessage, name: string): string | null {
@@ -47,6 +47,7 @@ export function codingAgentCatalog() {
     authTypes: [
       ...(provider.setupToken ? ["oauth_token"] : []),
       ...(provider.deviceLogin ? ["provider_oauth"] : []),
+      "relay_managed",
       "byo_api_key",
     ],
     keyPlaceholder: provider.keyPlaceholder,
@@ -136,7 +137,7 @@ export async function handleCodingAgentRoute(input: {
   // device logins with no hosted callback. Owner/admin only (credential write).
   const device = /^provider-credentials\/(openai|xai)-device\/(start|status)$/.exec(rest);
   if (device && method === "POST") {
-    const provider = device[1] as SubscriptionProvider;
+    const provider = device[1] as DeviceSubscriptionProvider;
     input.requireJsonWrite(request);
     const access = await helpers.workspaceAccess(request, workspaceId, true);
     const cookieName = DEVICE_BINDING_COOKIES[provider];
