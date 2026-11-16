@@ -5712,7 +5712,12 @@ paths:
         Relaycast POST /v1/nodes for the token's own node. The body is
         forwarded unchanged with Content-Type, Idempotency-Key and
         X-Relaycast-Node-Token when present; its `name` must equal the
-        token's nodeName. The answer can carry a node token.
+        token's nodeName. The answer can carry a node token. On gate-only
+        installs (SELFHOST_RELAYGATE_PUBLIC_URL set) Control keeps the node
+        token: the X-Relaycast-Node-Token header is ignored (Control sends
+        the stored token itself on re-enrolment), a 2xx answer is reduced to
+        {ok: true, data: {id, name}}, and a 2xx answer without a token is 502
+        relaycast_unavailable.
       security: [{ relayNodeBearer: [] }]
       parameters:
         - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
@@ -5739,6 +5744,24 @@ paths:
         "413": { description: "payload_too_large: body over 1 MiB" }
         "502": { $ref: "#/components/responses/RelayNodeRelaycastUnavailable" }
         default: { $ref: "#/components/responses/RelayNodePassthrough" }
+  /relay-node/v1/ws:
+    get:
+      operationId: relayNodeSocket
+      tags: [relay-node]
+      summary: >-
+        Gate-only installs only: WebSocket upgrade that bridges the node to
+        Relaycast's node socket with the node token Control holds. Frames
+        pass through unchanged except that spawn invocations journaled for
+        this node gain input.launch_credential and deliver frames are not
+        forwarded. See docs/relay-node-credential.md, "Gate-only installs".
+      security: [{ relayNodeBearer: [] }]
+      responses:
+        "101": { description: Switching Protocols; the bridge is open. }
+        "401": { description: No bearer, or not a live relay-node token. A token in the query string is not read. }
+        "403": { description: The node has not enrolled through this Control, or its stored node token is unreadable (re-enrol). }
+        "404": { description: Not a gate-only install. }
+        "429": { description: Over 600 requests per minute for this token (shared with the broker routes). }
+        "503": { description: The bridge is at its connection limit or shutting down. }
   /relay-node/v1/nodes/{name}:
     get:
       operationId: relayNodeGetNode

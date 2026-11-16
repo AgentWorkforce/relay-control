@@ -10,6 +10,7 @@ import { GrokRoutines } from "./mcp/grok-routines.js";
 import { retiringIdentity } from "./mcp/oauth/retirement.js";
 import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Duplex } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -21,7 +22,9 @@ import { ApiTokenStore, ENROLLMENT_KEY_PREFIX } from "./admin/api-tokens.js";
 import { recordAudit } from "./admin/audit.js";
 import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
 import { handleChiefRelay } from "./chief-relay.js";
-import { handleRelayNode } from "./relay-node/broker.js";
+import { handleRelayNode, RELAY_NODE_RATE_LIMIT } from "./relay-node/broker.js";
+import { relayNodeCredentials } from "./relay-node/credentials.js";
+import { createRelayNodeSocketBridge, refuseUpgrade } from "./relay-node/socket.js";
 import { handleFlowsBroker } from "./flows-broker.js";
 import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
 import { relayLaunchCredentials } from "./mcp/relay-launch-credentials.js";
@@ -364,6 +367,16 @@ function cookieDeleteAllowed(request: IncomingMessage, browserOrigins: string[])
     : request.headers["sec-fetch-site"] === "same-origin";
 }
 
+/**
+ * The request handler, plus the HTTP upgrade handler for server "upgrade"
+ * events: the relay-node socket bridge on gate-only installs, 404 otherwise.
+ */
+export type AppHandler = ((request: IncomingMessage, response: ServerResponse) => void) & {
+  handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void;
+  /** Ends every bridged socket (shutdown). */
+  closeUpgrades(): void;
+};
+
 export function createApp(input: {
   config: SelfhostConfig;
   store: ControlPlaneStore;
@@ -433,7 +446,7 @@ export function createApp(input: {
   /** Test hooks for claim leases and crash injection. Production leaves this unset. */
   messaging?: Pick<MessagingDeps,
     "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck">;
-}): (request: IncomingMessage, response: ServerResponse) => void {
+}): AppHandler {
   const { config, store, admin, telemetry, identity } = input;
   const features = input.features ?? NO_FEATURES;
   // Installation wiring, not an opt-in SELFHOST_FEATURES name or a grant to
@@ -787,6 +800,20 @@ export function createApp(input: {
   // Gate-only installs only: relaygate introspects one-time `sh_lt_` launch credentials.
   const relayLaunchCredentialStore = config.relaygatePublicUrl
     ? relayLaunchCredentials(store.database, config.encryptionKeyring) : undefined;
+  // Gate-only installs only: Control holds relay nodes' Relaycast node tokens and bridges their sockets.
+  const relayNodeCredentialStore = config.relaygatePublicUrl
+    ? relayNodeCredentials(store.database, config.encryptionKeyring) : undefined;
+  const relayNodeSocket = relayNodeCredentialStore && relayLaunchCredentialStore
+    ? createRelayNodeSocketBridge({
+      apiTokens,
+      nodeCredentials: relayNodeCredentialStore,
+      launchCredentials: relayLaunchCredentialStore,
+      relaycastUrl: config.relaycastUrl,
+      database: store.database,
+      rateLimit: (key) => limiter.consume(key, RELAY_NODE_RATE_LIMIT.limit, RELAY_NODE_RATE_LIMIT.windowMs).allowed,
+      log: (message, fields) => console.warn(`[selfhost-api] ${message}`, fields),
+    })
+    : undefined;
   const flowRelayfileCredentials = input.flowRelayfileCredentials ?? new FlowRunRelayfileCredentials(
     store.database,
     () => input.now?.() ?? new Date(),
@@ -1172,6 +1199,7 @@ export function createApp(input: {
         rateLimit(res, key, rule, "rate_limited", "Too many relay-node requests; retry later"),
       bodyText: (incoming) => bodyText(incoming),
       json,
+      ...(relayNodeCredentialStore ? { nodeCredentials: relayNodeCredentialStore } : {}),
     })) {
       return;
     }
@@ -2815,7 +2843,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     throw new HttpError(404, "not_found", "Route not found");
   }
 
-  return (request, response) => {
+  const handler = (request: IncomingMessage, response: ServerResponse): void => {
     // telemetry lane: aggregate usage per feature area (no bodies or queries).
     if (telemetry) {
       const routePath = new URL(request.url ?? "/", config.publicBaseUrl).pathname;
@@ -2927,4 +2955,13 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       json(response, 500, { error: "internal", message: "Internal server error" }, true);
     });
   };
+  return Object.assign(handler, {
+    handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+      if (relayNodeSocket) relayNodeSocket.handleUpgrade(request, socket, head);
+      else refuseUpgrade(socket, 404);
+    },
+    closeUpgrades(): void {
+      relayNodeSocket?.close();
+    },
+  });
 }

@@ -5,6 +5,16 @@ assigned at release.
 
 ## Unreleased
 
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), relay
+  nodes no longer hold their Relaycast node token. `POST /relay-node/v1/nodes`
+  stores it sealed (migration 0059 `relay_node_credentials`), answers the host
+  without it and presents it itself on re-enrolment; the node connects to the
+  new `GET /relay-node/v1/ws` bridge (Bearer relay-node token), which relays
+  the Relaycast node socket, attaches each launch's one-time credential to its
+  spawn invocation as `input.launch_credential`, and does not forward
+  `deliver` frames. Audited as `relay_node.socket.opened`,
+  `relay_node.socket.closed` and `relay_node.launch_credential.attached`.
+  Unset, nothing changes. See docs/relay-node-credential.md.
 - Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), every
   agent launch through `spawn_relay_agent` mints a one-time `sh_lt_` launch
   credential (10 minutes, bound to the workspace, node, agent name and
@@ -12,8 +22,8 @@ assigned at release.
   introspects it at `POST /internal/v1/auth/introspect`, which answers
   principal_type `relay_launch` with `node_name` and `scopes`
   `["relay:agent:enrol"]` and burns it on the first active answer. It is
-  stored sealed and never sent to Relaycast; delivery to the node is a later
-  change. Audited as `relay_launch.credential.issued` and
+  stored sealed and never sent to Relaycast; the relay-node socket bridge
+  delivers it to the node. Audited as `relay_launch.credential.issued` and
   `relay_launch.credential.redeemed`. Unset, nothing changes. See
   docs/identity.md.
 - Added: on gate-only installs, `spawn_relay_agent` first asks relaygate's

@@ -18,10 +18,10 @@ import type { Database } from "../database.js";
  *
  * The credential is NOT sent to Relaycast in the spawn invocation body:
  * Relaycast never sees it. This module only mints it and stores it sealed
- * (sha256 hash for lookup, ciphertext under the active encryption key). A
- * later change, the Control node-socket bridge, reads it with sealedFor() and
- * attaches it to the spawn invocation frame it forwards to the node. Until
- * then no route returns the plaintext, and it is never logged or audited.
+ * (sha256 hash for lookup, ciphertext under the active encryption key). The
+ * relay-node socket bridge (src/relay-node/socket.ts) reads it with
+ * sealedFor() and attaches it to the spawn invocation frame it forwards to the
+ * node. No route returns the plaintext, and it is never logged or audited.
  */
 export const RELAY_LAUNCH_CREDENTIAL_PREFIX = "sh_lt_";
 export const RELAY_LAUNCH_CREDENTIAL_TTL_MS = 10 * 60 * 1_000;
@@ -156,7 +156,7 @@ export function relayLaunchCredentials(database: Database, keyring: EncryptionKe
 
     /**
      * The plaintext credential of a launch, or null once redeemed, expired or
-     * absent. Only for the Control node-socket bridge (a separate change),
+     * absent. Only for the relay-node socket bridge,
      * which attaches it to the spawn frame it forwards to the node. Never
      * exposed over any route, MCP tool or Relaycast call.
      */

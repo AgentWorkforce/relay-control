@@ -1264,9 +1264,16 @@ hands no Relaycast workspace key to anything outside the cluster:
 Per-identity credentials are unchanged, because relaygate can apply policy to
 each one: the person credential
 (`POST /api/v1/workspaces/{id}/messaging/identity/credential`, the caller's
-own agent token), the relay-node broker's enrol answer (that node's own
-token), and MCP join and spawn, which deal in per-agent participant tokens and
-never the workspace key.
+own agent token), and MCP join and spawn, which deal in per-agent participant
+tokens and never the workspace key.
+
+Relay nodes do not hold their Relaycast node token either. The relay-node
+broker's enrol answer carries no token; Control keeps it sealed (migration
+0059 `relay_node_credentials`) and the node connects to Control's
+`GET /relay-node/v1/ws` bridge instead of Relaycast's node socket. The bridge
+attaches each launch's credential (below) to the spawn invocation it forwards
+as `input.launch_credential` and does not forward `deliver` frames. See
+[relay-node-credential.md](relay-node-credential.md#gate-only-installs).
 Unset, nothing changes.
 
 #### Relay launch credentials
@@ -1282,8 +1289,9 @@ launched agent presents to relaygate's `POST /v1/register`:
   under the active encryption key, and never returns it to the MCP caller.
 - It is minted after the launch is journaled and before it is sent. It is not
   part of the spawn invocation sent to Relaycast, so Relaycast never sees it.
-  The Control node-socket bridge, a separate change, attaches it to the spawn
-  frame it forwards to the node. A launch Relaycast rejects outright deletes
+  The relay-node socket bridge attaches it to the spawn frame it forwards to
+  the node as `input.launch_credential`
+  ([relay-node-credential.md](relay-node-credential.md#gate-only-installs)). A launch Relaycast rejects outright deletes
   its credential.
 - relaygate introspects it at `POST /internal/v1/auth/introspect` with
   `{token, aud}`, `aud` being its configured audience (one of
