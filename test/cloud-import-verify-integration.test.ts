@@ -100,28 +100,12 @@ beforeEach(async () => {
   await source.query(`UPDATE relay_workspaces SET id='rw_0000b202' WHERE id='rw_legacy-01';
     UPDATE workspaces SET relay_workspace_id='rw_0000b202' WHERE relay_workspace_id='rw_legacy-01'`);
   await migrate(targetDb);
-  let required:SchemaEntry[]|undefined;
+  // All checked-in migrations, including 0053/0054/0056/0057/0058/0061/0062, ran above.
   if (process.env.CLOUD_VERIFY_SCHEMA_MANIFEST_PATH && !manifestWritten) {
     await target.query("BEGIN READ ONLY");
+    let required:SchemaEntry[];
     try {required=await schemaCatalog(target);} finally {await target.query("ROLLBACK");}
-  }
-  // All checked-in migrations, including 0053/0054/0056/0057, ran above.
-  // Only pending 0061 is modeled as revoked staff-grant history; 0058 is real.
-  await target.query(`CREATE TABLE staff_read_grants (
-    id uuid PRIMARY KEY,workspace_id uuid NOT NULL,organization_id uuid NOT NULL,
-    staff_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    staff_organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-    reason text NOT NULL CHECK(length(btrim(reason)) > 0 AND length(reason) <= 500),
-    token_hash text NOT NULL UNIQUE,created_at timestamptz NOT NULL DEFAULT now(),expires_at timestamptz NOT NULL,
-    revoked_at timestamptz,revoked_by uuid,last_used_at timestamptz,
-    FOREIGN KEY(workspace_id,organization_id) REFERENCES workspaces(id,organization_id) ON DELETE CASCADE,
-    CHECK(expires_at > created_at AND expires_at <= created_at + interval '90 days'))`);
-  if (required) {
-    await target.query("BEGIN READ ONLY");
-    let optional:SchemaEntry[];
-    try {optional=await schemaCatalog(target,["staff_read_grants"]);} finally {await target.query("ROLLBACK");}
-    const manifest=sealManifest({version:1,baseline:"control-main-b79cb5f",migrations:await migrationFiles(),required,
-      optional:{staff_read_grants:optional}});
+    const manifest=sealManifest({version:1,baseline:"control-main-b79cb5f",migrations:await migrationFiles(),required,optional:{}});
     await writeFile(process.env.CLOUD_VERIFY_SCHEMA_MANIFEST_PATH!,manifestJson(manifest));manifestWritten=true;
   }
   await target.query("INSERT INTO organizations(id,name) VALUES($1,'Synthetic operator')",[id(0xcafe)]);
@@ -279,7 +263,7 @@ fixtureTest("older source without staff grants reports explicit absence and veri
   assert.equal(report.findings.find((f) => f.kind === "source_availability")!.ok,true);
 });
 
-fixtureTest("staff grants require both target support and an operator organization",async () => {
+fixtureTest("staff grants require an operator organization and a target without 0061 halts on its schema",async () => {
   await target.query("UPDATE installation_bootstrap SET organization_id=NULL");
   const noOperator=await apply();
   assert.equal(noOperator.tables.staff_read_grants.skipped.no_operator_organization,1);
@@ -290,7 +274,8 @@ fixtureTest("staff grants require both target support and an operator organizati
   const noSchema=await apply();
   assert.equal(noSchema.tables.staff_read_grants.skipped.target_lacks_staff_read_grants,1);
   const two=await verifyImport(source,target,scope,noSchema,fixtureKeyring,cloudKeyHex);
-  assert.equal(two.findings.find((f) => f.kind === "ledger" && f.name === "staff_read_grants")!.ok,true);
+  assert.equal(two.findings.find((f) => f.kind === "schema_manifest")!.ok,false);
+  assert.ok(two.targetSchema.missing.includes("table:public.staff_read_grants"));
   assert.equal(two.ok,false);
 });
 
@@ -575,7 +560,6 @@ fixtureTest("pre-0057 non-UUID Desktop source IDs remain visible as unresolved i
 });
 
 fixtureTest("cohort scope counts and encrypted samples exclude another org's corrupt key",async () => {
-  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
   const first=await apply();assert.equal(first.ok,true);
   const ownership=await captureOwnership(target,scope);
   await target.query("UPDATE workspaces SET relaycast_api_key_ciphertext='synthetic-corrupt' WHERE organization_id=$1",[ORG_B]);
@@ -655,7 +639,6 @@ fixtureTest("unexpected non-extension schema objects fail without exposing their
 });
 
 fixtureTest("subset reports bind normalized scope and a census outside that scope",async () => {
-  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
   const selected={orgIds:[ORG_A]};const ledger=await apply(selected);
   const one=await verifyImport(source,target,{orgIds:[ORG_A.toUpperCase(),ORG_A]},ledger,fixtureKeyring,cloudKeyHex);
   assert.equal(one.ok,true,JSON.stringify(one.findings.filter((f) => !f.ok)));
@@ -670,7 +653,6 @@ fixtureTest("subset reports bind normalized scope and a census outside that scop
 });
 
 fixtureTest("gated-table visibility cannot hide absent SELECT privileges",async () => {
-  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
   await source.query("DELETE FROM workspace_integrations WHERE provider='github'");
   const ledger=await apply();
   await grantRuntimeDatabaseRole(targetDb,"cloud_verify_runtime");
@@ -684,7 +666,6 @@ fixtureTest("gated-table visibility cannot hide absent SELECT privileges",async 
 });
 
 fixtureTest("all-source scope and the production manifest bind successful copier evidence",async () => {
-  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
   const fixture=await copiedFixture();
   const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
