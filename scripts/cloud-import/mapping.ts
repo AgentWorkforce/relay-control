@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-15.1";
+export const MAPPING_REVISION = "cloud-identity-2026-11-15.2";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -47,6 +47,11 @@ const normEmail = (expression: string) => `lower(btrim(${expression}))`;
 const ROLE_RANK = (expression: string) =>
   `(CASE ${expression} WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END)`;
 const RW_FORMAT = "'^rw_[0-9a-f]{8}$'";
+// 0056 workspaces_relayhistory_origin_format. Cloud stores a bare https
+// origin; it is lowercased and stripped of a trailing slash. A value that
+// still does not fit is dropped (NULL = Control default) and flagged.
+const ORIGIN_FORMAT = "'^https?://([[:alnum:].-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?$'";
+const ORIGIN = (expression: string) => `lower(rtrim(btrim(${expression}), '/'))`;
 
 /**
  * Shared CTEs. Order matters: later CTEs read earlier ones.
@@ -118,7 +123,9 @@ workspace_rows AS (
          w.default_runtime AS runtime_config,
          CASE WHEN w.relay_workspace_id ~ ${RW_FORMAT} THEN w.relay_workspace_id END AS cloud_relay_workspace_id,
          w.slug,
-         w.relayhistory_origin,
+         CASE WHEN ${ORIGIN("w.relayhistory_origin")} ~ ${ORIGIN_FORMAT}
+              THEN ${ORIGIN("w.relayhistory_origin")} END AS relayhistory_origin,
+         (w.relayhistory_origin IS NOT NULL AND ${ORIGIN("w.relayhistory_origin")} !~ ${ORIGIN_FORMAT}) AS origin_invalid,
          rw.relaycast_api_key_generation,
          (w.relayhistory_dashboard_url IS NOT NULL) AS has_dashboard_url,
          w.created_at, w.updated_at,
@@ -183,6 +190,7 @@ export const SOURCE_TABLES = [
   "hosted_relay_participants",
   "desktop_relay_identities",
   "fleet_node_owners",
+  "coding_agent_credentials",
 ] as const;
 export type ImportTable = (typeof SOURCE_TABLES)[number];
 
@@ -204,7 +212,7 @@ SELECT organization_id, user_id, cloud_user_id, role, created_at, updated_at, sk
     workspaces: `
 SELECT id, organization_id, name, relaycast_workspace_id, relaycast_api_key AS secret_plaintext,
        runtime_config, cloud_relay_workspace_id, slug, relayhistory_origin, relaycast_api_key_generation,
-       has_dashboard_url, created_at, updated_at, skip_reason
+       has_dashboard_url, origin_invalid, created_at, updated_at, skip_reason
   FROM workspace_rows`,
     organization_invitations: `
 SELECT i.id, i.organization_id, ${normEmail("i.email")} AS email, i.role,
@@ -267,7 +275,9 @@ SELECT h.id, h.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
   LEFT JOIN imported_users iu ON iu.id = um.user_id`,
     desktop_relay_identities: `
 SELECT d.id, d.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_workspace_id,
-       d.source_id,
+       -- #152: lowercase UUID-shaped ids, keep opaque ids byte for byte.
+       CASE WHEN d.source_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            THEN lower(d.source_id) ELSE d.source_id END AS source_id,
        (d.source_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') AS source_id_is_uuid,
        d.agent_name, d.agent_remote_id, d.address,
        CASE WHEN d.native_session_kind IS NOT NULL AND d.native_session_id IS NOT NULL THEN d.native_session_kind END AS native_session_kind,
@@ -281,7 +291,9 @@ SELECT d.id, d.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
          ) THEN 'not_a_member'
          WHEN d.relay_workspace_id IS DISTINCT FROM w.relay_workspace_id THEN 'stale_relay_workspace'
          WHEN row_number() OVER (
-           PARTITION BY d.workspace_id, iu.id, d.source_id, d.agent_remote_id ORDER BY d.updated_at DESC, d.id
+           PARTITION BY d.workspace_id, iu.id,
+             CASE WHEN d.source_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN lower(d.source_id) ELSE d.source_id END,
+             d.agent_remote_id ORDER BY d.updated_at DESC, d.id
          ) > 1 THEN 'duplicate_after_merge'
        END AS skip_reason
   FROM public.desktop_relay_identities d
@@ -306,6 +318,37 @@ SELECT f.id, f.workspace_id, w.organization_id, iu.id AS user_id, iw.relaycast_w
   JOIN scope_orgs s ON s.id = w.organization_id
   LEFT JOIN imported_workspaces iw ON iw.id = f.workspace_id
   LEFT JOIN user_map um ON um.cloud_user_id = f.user_id
+  LEFT JOIN imported_users iu ON iu.id = um.user_id`,
+    // Cloud keeps every coding-agent secret in its credential store (S3),
+    // not in the database. Only relay_managed rows carry no secret, so only
+    // they are imported (0058 contract): credential fields stay NULL and
+    // harness_active is forced off. Control allows one active credential per
+    // (workspace, provider); Cloud allows one per user, so extra active rows
+    // are demoted (flagged) to the newest one.
+    coding_agent_credentials: `
+SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS created_by_user_id,
+       p.model_provider, p.harness, p.auth_type, p.display_name, p.label, p.account_email,
+       (p.is_active AND row_number() OVER (
+          PARTITION BY p.workspace_id, p.model_provider, p.is_active, (p.auth_type = 'relay_managed')
+          ORDER BY p.updated_at DESC, p.id
+        ) = 1) AS is_active,
+       (p.is_active AND row_number() OVER (
+          PARTITION BY p.workspace_id, p.model_provider, p.is_active, (p.auth_type = 'relay_managed')
+          ORDER BY p.updated_at DESC, p.id
+        ) > 1) AS active_demoted,
+       false AS harness_active,
+       p.status, p.last_error, p.last_authenticated_at, p.last_used_at, p.created_at, p.updated_at,
+       CASE
+         WHEN iw.id IS NULL THEN 'workspace_not_imported'
+         WHEN p.auth_type <> 'relay_managed' THEN 'secret_in_cloud_credential_store'
+         WHEN p.model_provider NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
+         WHEN p.status NOT IN ('connected', 'error', 'refresh_failed') THEN 'unsupported_status'
+       END AS skip_reason
+  FROM public.provider_credentials p
+  JOIN public.workspaces w ON w.id = p.workspace_id
+  JOIN scope_orgs s ON s.id = w.organization_id
+  LEFT JOIN imported_workspaces iw ON iw.id = p.workspace_id
+  LEFT JOIN user_map um ON um.cloud_user_id = p.user_id
   LEFT JOIN imported_users iu ON iu.id = um.user_id`,
   };
 }
@@ -336,6 +379,11 @@ export type TargetSpec = {
 };
 
 export const TARGETS: Record<ImportTable, TargetSpec> = {
+  coding_agent_credentials: {
+    table: "coding_agent_credentials",
+    primaryKey: ["id"],
+    columns: ["id", "organization_id", "workspace_id", "created_by_user_id", "model_provider", "harness", "auth_type", "display_name", "label", "account_email", "is_active", "harness_active", "status", "last_error", "last_authenticated_at", "last_used_at", "created_at", "updated_at"],
+  },
   users: {
     table: "users",
     primaryKey: ["id"],
@@ -398,17 +446,25 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
 };
 
 /** Importer-side skips (decided after the query, recorded in the ledger). */
+// coding_agent_credentials: "target_lacks_relay_managed" before 0058.
 export const IMPORTER_SKIP_REASONS = [
   "cloud_decrypt_failed",
   // desktop_relay_identities.source_id is uuid before 0057.
   "source_id_not_uuid",
+  "target_lacks_relay_managed",
   "target_email_conflict",
 ] as const;
 
 // ---------------------------------------------------------------------------
 // Verifier contract (consumed by scripts/cloud-import-verify).
 
-export type ComparisonSpec = { name: string; sourceSql: string; targetSql: string };
+export type ComparisonSpec = {
+  name: string;
+  sourceSql: string;
+  targetSql: string;
+  /** True when both projections also expose __workspace (workspace id text). */
+  workspaceScoped?: boolean;
+};
 
 /**
  * Like-for-like projections over the imported scope. Ciphertext and token
@@ -417,9 +473,13 @@ export type ComparisonSpec = { name: string; sourceSql: string; targetSql: strin
  */
 const ts = (column: string) => `to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US')`;
 
-type Projection = { key: string; org: string; columns: Record<string, string> };
+type Projection = { key: string; org: string; workspace?: string; columns: Record<string, string> };
 
 const PROJECTIONS: Record<ImportTable, Projection> = {
+  coding_agent_credentials: {
+    key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
+    columns: { id: "id::text", organization_id: "organization_id::text", workspace_id: "workspace_id::text", created_by_user_id: "created_by_user_id::text", model_provider: "model_provider", harness: "harness", auth_type: "auth_type", display_name: "display_name", label: "label", account_email: "account_email", is_active: "is_active", harness_active: "harness_active", status: "status", last_error: "last_error", last_authenticated_at: ts("last_authenticated_at"), last_used_at: ts("last_used_at"), created_at: ts("created_at") },
+  },
   users: {
     key: "id::text", org: "NULL::text",
     columns: { id: "id::text", email: "email", name: "name", created_at: ts("created_at"), updated_at: ts("updated_at"), last_organization_id: "last_organization_id::text", last_workspace_id: "last_workspace_id::text" },
@@ -433,7 +493,7 @@ const PROJECTIONS: Record<ImportTable, Projection> = {
     columns: { organization_id: "organization_id::text", user_id: "user_id::text", role: "role", created_at: ts("created_at"), updated_at: ts("updated_at") },
   },
   workspaces: {
-    key: "id::text", org: "organization_id::text",
+    key: "id::text", org: "organization_id::text", workspace: "id::text",
     columns: { id: "id::text", organization_id: "organization_id::text", name: "name", relaycast_workspace_id: "relaycast_workspace_id", cloud_relay_workspace_id: "cloud_relay_workspace_id", slug: "slug", relayhistory_origin: "relayhistory_origin", relaycast_api_key_generation: "relaycast_api_key_generation", runtime_config: "runtime_config::jsonb::text", created_at: ts("created_at"), updated_at: ts("updated_at") },
   },
   organization_invitations: {
@@ -441,19 +501,19 @@ const PROJECTIONS: Record<ImportTable, Projection> = {
     columns: { id: "id::text", organization_id: "organization_id::text", email: "email", role: "role", invited_by_user_id: "invited_by_user_id::text", expires_at: ts("expires_at"), created_at: ts("created_at") },
   },
   person_identities: {
-    key: "id::text", org: "organization_id::text",
+    key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
     columns: { id: "id::text", workspace_id: "workspace_id::text", user_id: "user_id::text", relaycast_workspace_id: "relaycast_workspace_id", agent_name: "agent_name", agent_remote_id: "agent_remote_id", created_at: ts("created_at") },
   },
   hosted_relay_participants: {
-    key: "id::text", org: "organization_id::text",
+    key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
     columns: { id: "id::text", workspace_id: "workspace_id::text", user_id: "user_id::text", relaycast_workspace_id: "relaycast_workspace_id", session_hash: "session_hash", agent_name: "agent_name", agent_remote_id: "agent_remote_id", created_at: ts("created_at") },
   },
   desktop_relay_identities: {
-    key: "id::text", org: "organization_id::text",
-    columns: { id: "id::text", workspace_id: "workspace_id::text", organization_id: "organization_id::text", user_id: "user_id::text", relaycast_workspace_id: "relaycast_workspace_id", source_id: "lower(source_id::text)", agent_name: "agent_name", agent_remote_id: "agent_remote_id", address: "address", native_session_kind: "native_session_kind", native_session_id: "native_session_id", created_at: ts("created_at") },
+    key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
+    columns: { id: "id::text", workspace_id: "workspace_id::text", organization_id: "organization_id::text", user_id: "user_id::text", relaycast_workspace_id: "relaycast_workspace_id", source_id: "source_id::text", agent_name: "agent_name", agent_remote_id: "agent_remote_id", address: "address", native_session_kind: "native_session_kind", native_session_id: "native_session_id", created_at: ts("created_at") },
   },
   fleet_node_owners: {
-    key: "id::text", org: "organization_id::text",
+    key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
     columns: { id: "id::text", workspace_id: "workspace_id::text", organization_id: "organization_id::text", relaycast_workspace_id: "relaycast_workspace_id", node_id: "node_id", node_name: "COALESCE(node_name, node_id)", user_id: "user_id::text", created_at: ts("created_at") },
   },
 };
@@ -494,10 +554,12 @@ export function verifierComparisons(scope: ImportScope, targetHasColumns: Readon
       !(TARGETS[table].optional ?? []).includes(column) || targetHasColumns.has(`${table}.${column}`));
     const list = names.map((name) => `${projection.columns[name]} AS ${name}`).join(", ");
     const target = targetScope(table, scope);
+    const workspace = projection.workspace ? `, ${projection.workspace} AS __workspace` : "";
     return {
       name: table,
-      sourceSql: `WITH ${ctes(scope)}, src AS (${selects()[table]})\nSELECT ${list}, ${projection.key} AS __key, ${projection.org} AS __org FROM src WHERE skip_reason IS NULL`,
-      targetSql: `SELECT ${list}, ${projection.key} AS __key, ${target.org} AS __org FROM ${target.from}`,
+      sourceSql: `WITH ${ctes(scope)}, src AS (${selects()[table]})\nSELECT ${list}, ${projection.key} AS __key, ${projection.org} AS __org${workspace} FROM src WHERE skip_reason IS NULL`,
+      targetSql: `SELECT ${list}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}`,
+      ...(projection.workspace ? { workspaceScoped: true } : {}),
     };
   });
 }
@@ -506,13 +568,15 @@ export function verifierComparisons(scope: ImportScope, targetHasColumns: Readon
 export const TARGET_RELATIONS = SOURCE_TABLES.map((table) => `public.${TARGETS[table].table}`);
 
 /** Encrypted columns the verifier decrypts with Control's keyring. */
-export function encryptedSamples(limit = 200): { name: string; sql: string; minimum: number; limit: number }[] {
+export function encryptedSamples(limit = 200, scope: ImportScope = { orgIds: null }): { name: string; sql: string; minimum: number; limit: number }[] {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("limit must be 1..1000");
   return SOURCE_TABLES.flatMap((table) => {
     const secret = TARGETS[table].secret;
     if (!secret) return [];
+    const target = targetScope(table, scope);
     return [{
       name: `${table}.${secret.target}`,
-      sql: `SELECT ${secret.target} AS ciphertext FROM public.${TARGETS[table].table} ORDER BY id LIMIT ${limit}`,
+      sql: `SELECT ${secret.target} AS ciphertext FROM ${target.from} ORDER BY id LIMIT ${limit}`,
       minimum: 1,
       limit,
     }];
