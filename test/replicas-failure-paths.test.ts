@@ -1033,3 +1033,130 @@ test("an API bind reused by a verified environment call pins the replica to its 
   }]);
   assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE id = $1", [bound]), 1, "launch and bind rows are never deleted there");
 });
+
+test("disconnect reads back an unconfirmed create: no entry fails retryably and keeps the connection, a late entry is removed, never re-sent", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider } = env;
+  const connection = `/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`;
+  const connected = () => count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'", [workspaceId]);
+  assert.equal((await connect(env)).status, 200);
+  provider.environments.push({ id: ENV_C, name: "gamma" });
+  provider.mode.register = "fail";
+  await syncEnvironments(env.replicas.deps, serviceActor(env));
+  assert.equal((await policyRow(env, ENV_C)).create_unconfirmed, true);
+  provider.mode.register = "ok";
+  const creates = countCreates(env);
+
+  // A complete, empty listing does not prove the create failed: the disconnect stops before the key is deleted.
+  const failed = await api(connection, { method: "DELETE", token: ownerToken });
+  assert.equal(failed.status, 503, failed.text);
+  assert.equal(failed.body.error, "replicas_cleanup_failed");
+  assert.equal(await connected(), 1, "the connection and its key stay for the retry");
+  assert.equal((await policyRow(env, ENV_C)).create_unconfirmed, true, "the intent stays");
+  assert.deepEqual(creates, [], "disconnect never sends a create");
+
+  // The lost create surfaces: the retry records its id, removes it and completes the disconnect.
+  provider.entriesOf(ENV_C).push({ id: "mcp_late", organization_id: PROVIDER_ORG, environment_id: ENV_C,
+    name: "agent-relay-replica", transport: "http", config: structuredClone(IDENTITY_CONFIG) });
+  const retried = await api(connection, { method: "DELETE", token: ownerToken });
+  assert.equal(retried.status, 200, retried.text);
+  assert.ok(provider.removed.includes("mcp_late"));
+  assert.deepEqual(provider.entriesOf(ENV_C), []);
+  assert.equal(await connected(), 0);
+  assert.deepEqual(creates, []);
+});
+
+test("an environment move: the binding follows the current environment, creator and mode, so the right change retires it", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, ownerId } = env;
+  const base = `/api/v1/workspaces/${workspaceId}/replicas`;
+  const principal = (userId: string | null) => api(`${base}/environment-principal`, { method: "PUT", token: ownerToken, body: { userId } });
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  assert.equal((await principal(ownerId)).status, 200);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const enrolled = await liveBinding(env);
+  assert.equal(enrolled.input.acts_as, "creator");
+  assert.equal((await spawnRow(env, enrolled.id)).environment_id, ENV_A);
+
+  // The same replica and owner under B, where its creator is unmapped: it acts for the principal (the owner).
+  assert.equal((await rpc(api, token({ environment_id: ENV_B, creator_id: "creator-other" }), "tools/list")).status, 200);
+  let row = await spawnRow(env, enrolled.id);
+  assert.equal(row.state, "bound");
+  assert.equal(row.environment_id, ENV_B);
+  assert.equal(row.input.environment_id, ENV_B);
+  assert.equal(row.input.creator_id, "creator-other");
+  assert.equal(row.input.acts_as, "principal");
+
+  // Disabling A no longer touches it; changing the principal retires it.
+  assert.equal((await api(`${base}/environments/${ENV_A}`, { method: "PUT", token: ownerToken, body: { enabled: false } })).status, 200);
+  assert.equal((await liveBinding(env))?.id, enrolled.id);
+  assert.equal((await principal(null)).status, 200);
+  assert.equal(await liveBinding(env), undefined);
+  assert.equal((await spawnRow(env, enrolled.id)).state, "gone");
+
+  // Re-enrolled under A as the mapped creator, then moved to B under the same mapping: disabling B retires it.
+  await mapOwner(env);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const again = await liveBinding(env);
+  assert.notEqual(again.id, enrolled.id);
+  assert.equal((await api(`${base}/environments/${ENV_B}`, {
+    method: "PUT", token: ownerToken, body: { enabled: true, creators: [{ creatorId: "creator-owner", userId: ownerId }] },
+  })).status, 200);
+  assert.equal((await rpc(api, token({ environment_id: ENV_B }), "tools/list")).status, 200);
+  row = await spawnRow(env, again.id);
+  assert.equal(row.environment_id, ENV_B);
+  assert.equal(row.input.acts_as, "creator");
+  assert.equal(row.input.creator_id, "creator-owner");
+  assert.equal((await api(`${base}/environments/${ENV_B}`, { method: "PUT", token: ownerToken, body: { enabled: false } })).status, 200);
+  assert.equal(await liveBinding(env), undefined);
+  assert.equal((await spawnRow(env, again.id)).state, "gone");
+});
+
+test("the access latch is keyed to the stored key: a late answer about a replaced key neither latches nor clears", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, provider, database } = env;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const stored = async () => (await database.query<{ key_ciphertext: string; access_revoked_at: Date | null; access_error: string | null }>(
+    "SELECT key_ciphertext, access_revoked_at, access_error FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'",
+    [workspaceId])).rows[0]!;
+  // The next discovery reads key A, then a re-connect stores key B while its listing is in flight.
+  const runtime = env.replicas.deps.replicas;
+  const original = runtime.allEnvironments.bind(runtime);
+  let late: "revoked" | "ok" | null = null;
+  runtime.allEnvironments = async (key) => {
+    const answer = late;
+    if (!answer) return original(key);
+    late = null;
+    // The re-connect's own discovery answers under B: 401 in the mirror case.
+    provider.mode.discover = answer === "ok" ? "revoked" : "ok";
+    assert.equal((await connect(env)).status, 200);
+    provider.mode.discover = "ok";
+    if (answer === "revoked") throw new ReplicasRuntimeError("rejected", "replicas_http_401", 401);
+    return original(key);
+  };
+
+  // A late 401 about A: B is stored, nothing is latched, admission works.
+  const keyA = (await stored()).key_ciphertext;
+  late = "revoked";
+  await syncEnvironments(env.replicas.deps, serviceActor(env));
+  let now = await stored();
+  assert.notEqual(now.key_ciphertext, keyA);
+  assert.equal(now.access_revoked_at, null);
+  assert.equal(now.access_error, null);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+
+  // Mirror: B is refused (latched under B), then a late 2xx about the replaced key does not clear it.
+  const keyB = now.key_ciphertext;
+  late = "ok";
+  await syncEnvironments(env.replicas.deps, serviceActor(env));
+  now = await stored();
+  assert.notEqual(now.key_ciphertext, keyB);
+  assert.ok(now.access_revoked_at, "the 401 under the current key latched");
+  assert.match(now.access_error!, /HTTP 401/);
+  const refused = await rpc(api, token(), "tools/list");
+  assert.equal(refused.status, 403, refused.text);
+  assert.equal(refused.body.error.message, "replica_environment_not_enabled");
+});

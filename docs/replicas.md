@@ -361,7 +361,12 @@ started them. The intent clears only when:
   registered; or
 - a create sent by the same run is definitely rejected by the provider.
 
-A failed listing leaves the intent as it was. Each time the intent is set its
+A failed listing leaves the intent as it was. Disconnect reads an
+unconfirmed create back before the key is deleted: a complete listing that
+finds the matching entry records its id and the entry is removed. A failed
+listing, a conflicting entry or no entry fails the disconnect with 503
+`replicas_cleanup_failed` (retryable), and the connection and the intent
+stay. Disconnect never sends a create. Each time the intent is set its
 generation (`create_attempt`) is incremented, and a run clears only the
 generation it set itself: when an operator recovery sent its own create
 between a run's two locked steps, that run neither clears the recovery's
@@ -388,7 +393,19 @@ environment-mcp`, or disconnect) commits the disable first, then removes the
 provider entry, and releases the environment's enrolled bindings in this
 workspace: their Relay identities are retired, no tombstone is written, and
 each replica enrols again on its next call once the environment is enabled
-again.
+again. On disconnect an unconfirmed create is read back first (see above),
+and an entry that cannot be confirmed or removed fails the disconnect with a
+retryable 503 `replicas_cleanup_failed` before the connection is deleted; the
+released bindings are retired either way. Disable keeps reporting
+`removal_failed` per environment instead.
+
+An enrolled binding follows the replica's current environment, creator and
+mode (`creator` or `principal`): when a replica of the same owner presents a
+token for another enabled environment of the workspace, or its creator or
+mode changed, the binding's environment and recorded creator and mode are
+updated on that call, before it is served. A later disable, principal change
+or creator-mapping change then retires the binding through the environment
+it is in now, not the one it first enrolled in.
 
 Releasing a replica writes a tombstone in the same transaction as the
 revoke, before any cleanup, so its tokens keep being refused. This holds for
@@ -442,7 +459,10 @@ A 5xx, a timeout or an unreadable answer proves nothing and changes nothing.
 While the latch is set every token of the workspace is refused with 403
 `replica_environment_not_enabled`. The latch clears on the next 2xx answer to
 an environments list (a sync or `GET .../environments`) or on a successful
-re-connect. The connection list (`GET .../remote-agent-connections`) and the
+re-connect. Both are keyed to the stored key: a refusal latches only while
+the stored key (its ciphertext) is still the one the refused call was made
+with, and a 2xx clears the latch only for that key, so a late answer about a
+key that a re-connect replaced neither latches nor clears the new one. The connection list (`GET .../remote-agent-connections`) and the
 policy view report it as `accessRevoked: {since, error}`, and the policy view
 shows each enabled environment as `access_revoked`, distinct from
 `stale_connection` (a policy recorded for an earlier provider organization).

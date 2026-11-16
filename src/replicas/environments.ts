@@ -12,6 +12,7 @@ import {
   encrypt,
   ENVIRONMENT_IDENTITY,
   isUuid,
+  connectionKey,
   keyFor,
   patch,
   accessRevoked,
@@ -107,6 +108,12 @@ function identityConfig(deps: ReplicasDeps) {
   if (!deps.identity) throw new ReplicasError("The environment-level Replicas MCP is not configured.", 404);
   return deps.identity;
 }
+
+/** The provider MCP entry config every registration and read-back compares. */
+const identityMcpConfig = (deps: ReplicasDeps): IdentityMcpConfig => {
+  const { mcpUrl } = identityConfig(deps);
+  return { url: mcpUrl, headers: {}, auth: { type: "workspace_identity", audience: mcpUrl } };
+};
 
 /** The environment-level MCP URL; it is also the token audience. */
 export const environmentMcpUrl = (publicBaseUrl: string) => `${publicBaseUrl.replace(/\/+$/, "")}/api/v1/replicas/mcp`;
@@ -368,6 +375,14 @@ async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIde
     await tx.query("UPDATE replica_environment_creators SET creator_email_hint = $3 WHERE policy_id = $1 AND creator_id = $2 AND creator_email_hint IS DISTINCT FROM $3",
       [admission.policy.id, claims.creatorId, hint]);
   }
+  // The binding follows the current policy so a later principal/creator change or environment disable
+  // retires the right binding: a replica moved to another environment (same owner and person) or a
+  // changed creator or mode is recorded on the row before it is served, bound or not.
+  if (row && (row.environment_id !== claims.environmentId || row.input.environment_id !== claims.environmentId
+    || (row.input.creator_id ?? null) !== claims.creatorId || row.input.acts_as !== actsAs)) {
+    row = await patch(tx, row.id, { environment_id: claims.environmentId,
+      input: { ...row.input, environment_id: claims.environmentId, creator_id: claims.creatorId, acts_as: actsAs } });
+  }
   if (row?.state === "bound" && row.token_ciphertext) return row;
   const relay = await relayFor(deps, tx, { workspaceId: admission.policy.workspace_id, userId }, row?.relay_workspace_id);
   const name = identityAgentName(claims.workspaceId);
@@ -551,19 +566,20 @@ export type DiscoveryResult = {
  */
 export async function discoverEnvironments(deps: ReplicasDeps, actor: ReplicasActor): Promise<DiscoveryResult> {
   const { issuer } = identityConfig(deps);
-  const key = await withReplicasLock(deps, actor, async (tx) => {
+  const { key, ciphertext } = await withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
     await connectedOrganization(tx, actor.workspaceId);
-    return keyFor(deps, tx, actor.workspaceId);
+    return connectionKey(deps, tx, actor.workspaceId);
   });
   let listed: Awaited<ReturnType<ReplicasDeps["replicas"]["allEnvironments"]>>;
   try {
     listed = await deps.replicas.allEnvironments(key);
   } catch (error) {
-    await recordProviderAccess(deps.database, actor.workspaceId, error);
+    // Recorded against the key this listing used: a reconnect in between is not latched or cleared.
+    await recordProviderAccess(deps.database, actor.workspaceId, error, ciphertext);
     return { status: "failed", environments: [] };
   }
-  await recordProviderAccess(deps.database, actor.workspaceId, "granted");
+  await recordProviderAccess(deps.database, actor.workspaceId, "granted", ciphertext);
   return withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
     const organization = await connectedOrganization(tx, actor.workspaceId);
@@ -842,9 +858,7 @@ export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: Replica
   });
   await retireIdentityBindings(deps, actor, released);
   if (retry) {
-    const { mcpUrl } = identityConfig(deps);
-    await registerPolicy(deps, actor, environmentId.toLowerCase(),
-      { url: mcpUrl, headers: {}, auth: { type: "workspace_identity", audience: mcpUrl } }, true);
+    await registerPolicy(deps, actor, environmentId.toLowerCase(), identityMcpConfig(deps), true);
   }
   const view = await listEnvironmentPolicies(deps, actor);
   return { environment: view.environments.find((item) => item.environmentId === environmentId.toLowerCase()) ?? null };
@@ -947,7 +961,7 @@ async function defaultPolicies(tx: SqlExecutor, workspaceId: string, organizatio
 /** Enables a selection and registers each enabled policy; never replays an unconfirmed create (registerPolicy). */
 async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
   selection: Selection | EnableSelection | DefaultSelection): Promise<EnvironmentMcpResult[]> {
-  const { mcpUrl } = identityConfig(deps);
+  const config = identityMcpConfig(deps);
   const results: EnvironmentMcpResult[] = [];
   const released: string[] = [];
   const toRegister = await withReplicasLock(deps, actor, async (tx) => {
@@ -992,7 +1006,6 @@ async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
     return enabled;
   });
   await retireIdentityBindings(deps, actor, released);
-  const config = { url: mcpUrl, headers: {}, auth: { type: "workspace_identity" as const, audience: mcpUrl } };
   for (const policy of toRegister) {
     results.push(await registerPolicy(deps, actor, policy.environment_id, config));
   }
@@ -1000,7 +1013,7 @@ async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
 }
 
 type IdentityMcpConfig = { url: string; headers: Record<string, never>; auth: { type: "workspace_identity"; audience: string } };
-type RegistrationTarget = { current: PolicyRow; key: string };
+type RegistrationTarget = { current: PolicyRow; key: string; ciphertext: string };
 
 /** Re-reads one policy under the lock: still enabled, not yet registered, and the key is readable. */
 async function registrationTarget(deps: ReplicasDeps, tx: SqlExecutor, actor: ReplicasActor,
@@ -1010,7 +1023,7 @@ async function registrationTarget(deps: ReplicasDeps, tx: SqlExecutor, actor: Re
   if (!current || !current.enabled) return { environmentId, status: "disabled" };
   if (current.registered_mcp_id) return { environmentId: current.environment_id, status: "registered" };
   try {
-    return { current, key: await keyFor(deps, tx, actor.workspaceId) };
+    return { current, ...await connectionKey(deps, tx, actor.workspaceId) };
   } catch {
     return { environmentId: current.environment_id, status: "registration_failed", retryable: true };
   }
@@ -1080,7 +1093,7 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
     try {
       found = await list(target);
     } catch (error) {
-      await recordProviderAccess(tx, actor.workspaceId, error);
+      await recordProviderAccess(tx, actor.workspaceId, error, target.ciphertext);
       return target.current.create_unconfirmed ? unconfirmed : accessRevoked(error) ? revoked : failed(true);
     }
     if (found.kind === "conflict") return failed(false);
@@ -1101,7 +1114,7 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
       try {
         found = await list(target);
       } catch (error) {
-        await recordProviderAccess(tx, actor.workspaceId, error);
+        await recordProviderAccess(tx, actor.workspaceId, error, target.ciphertext);
         // Nothing was sent in this attempt: restore the intent it found, unless a newer
         // attempt set it since (then that attempt's create is unresolved: unconfirmed).
         if (intent.previous || !await clearCreateIntent(tx, target.current.id, intent.attempt)) return unconfirmed;
@@ -1123,7 +1136,7 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
           { name: IDENTITY_SERVER_NAME, transport: "http", config })).id;
       } catch (error) {
         // A 409 or a lost answer may still have created the entry: read it back below.
-        await recordProviderAccess(tx, actor.workspaceId, error);
+        await recordProviderAccess(tx, actor.workspaceId, error, target.ciphertext);
         if (rejectedByProvider(error)) {
           asked = false;
           // Only this attempt's intent is cleared; a newer one stays unresolved.
@@ -1134,7 +1147,7 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
       try {
         found = await list(target);
       } catch (error) {
-        await recordProviderAccess(tx, actor.workspaceId, error);
+        await recordProviderAccess(tx, actor.workspaceId, error, target.ciphertext);
         return unconfirmed;
       }
       if (found.kind === "conflict") return failed(false);
@@ -1191,8 +1204,12 @@ async function removeEntry(deps: ReplicasDeps, actor: ReplicasActor, policy: Pol
     if (admin) await requireAdmin(tx, actor);
     const current = await policyFor(tx, actor.workspaceId, policy.environment_id);
     if (!current?.registered_mcp_id) return { environmentId: policy.environment_id, status: "disabled" };
+    // Empty until the key is read: a refusal is only recorded against the key it was made with.
+    let ciphertext = "";
     try {
-      const key = await keyFor(deps, tx, actor.workspaceId);
+      const stored = await connectionKey(deps, tx, actor.workspaceId);
+      const key = stored.key;
+      ciphertext = stored.ciphertext;
       try {
         await deps.replicas.removeEnvironmentMcp(key, current.environment_id, current.registered_mcp_id);
       } catch (error) {
@@ -1204,7 +1221,7 @@ async function removeEntry(deps: ReplicasDeps, actor: ReplicasActor, policy: Pol
         actor: auditActor(actor), action: "replicas.environment.mcp_removed", target: current.id });
       return { environmentId: current.environment_id, status: "disabled" };
     } catch (error) {
-      await recordProviderAccess(tx, actor.workspaceId, error);
+      await recordProviderAccess(tx, actor.workspaceId, error, ciphertext);
       return { environmentId: current.environment_id, status: "removal_failed", retryable: true };
     }
   });
@@ -1293,24 +1310,65 @@ export async function syncEnvironments(deps: ReplicasDeps, actor: ReplicasActor)
   return { discovery, allEnvironments: all, environments };
 }
 
+const CLEANUP_UNCONFIRMED = "Replicas cleanup could not confirm an environment registration. Retry the disconnect.";
+
+/**
+ * Disconnect read-back of an unconfirmed create (create_unconfirmed, no
+ * entry id): a complete listing that finds the entry records its id, so the
+ * removal below deletes it. Never creates. Returns null when the outcome is
+ * still unknown (failed listing, conflict, no entry); a refusal is latched
+ * against the key the listing used and committed with the unknown outcome.
+ */
+async function confirmCreate(deps: ReplicasDeps, actor: ReplicasActor, policy: PolicyRow): Promise<PolicyRow | null> {
+  return withReplicasLock(deps, actor, async (tx) => {
+    await requireAdmin(tx, actor);
+    const current = await policyFor(tx, actor.workspaceId, policy.environment_id);
+    if (!current?.create_unconfirmed || current.registered_mcp_id) return current ?? policy;
+    const { key, ciphertext } = await connectionKey(deps, tx, actor.workspaceId);
+    let found: EntryMatch;
+    try {
+      found = matchEntry(await deps.replicas.listEnvironmentMcps(key, current.environment_id), current, identityMcpConfig(deps));
+    } catch (error) {
+      await recordProviderAccess(tx, actor.workspaceId, error, ciphertext);
+      return null;
+    }
+    if (found.kind !== "match") return null;
+    await markRegistered(tx, actor, current, found.id);
+    return { ...current, registered_mcp_id: found.id, create_unconfirmed: false };
+  });
+}
+
 /**
  * Disconnect: stop admission for every environment and revoke its bindings
- * (committed), then remove the registered provider entries best effort while
- * the key still exists, then retire the released Relay identities.
- * Called before the provider connection is deleted.
+ * (committed), then, while the key still exists, read back each unconfirmed
+ * create (confirmCreate) and remove every registered provider entry, then
+ * retire the released Relay identities (also when cleanup fails). An entry
+ * that cannot be confirmed or removed fails the disconnect with a retryable
+ * 503, so the connection and its key stay for the retry instead of leaving an
+ * orphaned provider entry. Called before the provider connection is deleted.
  */
 export async function disconnectEnvironments(deps: ReplicasDeps, actor: ReplicasActor): Promise<void> {
   const released: string[] = [];
-  const registered = await withReplicasLock(deps, actor, async (tx) => {
-    await requireAdmin(tx, actor);
-    await setAllEnvironments(tx, actor.workspaceId, false);
-    const policies = (await tx.query<PolicyRow>(
-      `SELECT ${POLICY} FROM replica_environment_policies WHERE workspace_id = $1 ORDER BY environment_id FOR UPDATE`,
-      [actor.workspaceId])).rows;
-    const disabled: PolicyRow[] = [];
-    for (const policy of policies) disabled.push(await disablePolicy(tx, actor, policy, released));
-    return disabled.filter((policy) => policy.registered_mcp_id);
-  });
-  for (const policy of registered) await removeEntry(deps, actor, policy, true).catch(() => undefined);
-  await retireIdentityBindings(deps, actor, released);
+  try {
+    const pending = await withReplicasLock(deps, actor, async (tx) => {
+      await requireAdmin(tx, actor);
+      await setAllEnvironments(tx, actor.workspaceId, false);
+      const policies = (await tx.query<PolicyRow>(
+        `SELECT ${POLICY} FROM replica_environment_policies WHERE workspace_id = $1 ORDER BY environment_id FOR UPDATE`,
+        [actor.workspaceId])).rows;
+      const disabled: PolicyRow[] = [];
+      for (const policy of policies) disabled.push(await disablePolicy(tx, actor, policy, released));
+      return disabled.filter((policy) => policy.registered_mcp_id || policy.create_unconfirmed);
+    });
+    for (const policy of pending) {
+      const registered = policy.registered_mcp_id ? policy : await confirmCreate(deps, actor, policy);
+      if (!registered) throw new ReplicasError(CLEANUP_UNCONFIRMED, 503);
+      const removed = await removeEntry(deps, actor, registered, true);
+      if (removed.status === "removal_failed") {
+        throw new ReplicasError("Replicas cleanup could not remove an environment registration. Retry the disconnect.", 503);
+      }
+    }
+  } finally {
+    await retireIdentityBindings(deps, actor, released);
+  }
 }
