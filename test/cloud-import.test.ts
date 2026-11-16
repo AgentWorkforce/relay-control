@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import test from "node:test";
 import { decryptSecret, type EncryptionKeyring } from "../src/crypto.js";
-import { migrate } from "../src/migrations.js";
+import { copyFile, mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { defaultMigrationsDirectory, migrate } from "../src/migrations.js";
 import {
   CLOUD_FIXTURE_DDL,
   EXPECTED_FULL,
@@ -18,44 +21,9 @@ import { PGliteDatabase } from "./support/harness.js";
 const CLOUD_KEY = randomBytes(32).toString("hex");
 const KEYRING: EncryptionKeyring = { active: { id: "import-test", key: randomBytes(32) } };
 
-// Control migrations 0053/0056/0057 as proposed in #149/#151/#152, applied
-// only by the "post-0057" test so the importer is exercised on both shapes.
-const POST_0057_DDL = `
-ALTER TABLE workspaces
-  ADD COLUMN cloud_relay_workspace_id text,
-  ADD CONSTRAINT workspaces_cloud_relay_workspace_id_format
-    CHECK (cloud_relay_workspace_id IS NULL OR cloud_relay_workspace_id ~ '^rw_[0-9a-f]{8}$'),
-  ADD CONSTRAINT workspaces_cloud_relay_workspace_id_unique UNIQUE (cloud_relay_workspace_id);
-ALTER TABLE organizations ADD COLUMN slug text;
-CREATE UNIQUE INDEX organizations_slug_unique ON organizations (slug);
-ALTER TABLE workspaces
-  ADD COLUMN slug text,
-  ADD COLUMN relayhistory_origin text,
-  ADD COLUMN relaycast_api_key_generation integer NOT NULL DEFAULT 1;
-CREATE UNIQUE INDEX workspaces_org_slug_unique ON workspaces (organization_id, slug);
-ALTER TABLE desktop_relay_identities ALTER COLUMN source_id TYPE text USING source_id::text;
-ALTER TABLE desktop_attestation_keys ALTER COLUMN source_id TYPE text USING source_id::text;
-ALTER TABLE fleet_node_owners ALTER COLUMN node_name DROP NOT NULL;
--- 0054 (#146) GitHub App connections.
-CREATE TABLE github_app_installations (
-  installation_id text PRIMARY KEY CHECK (installation_id ~ '^[1-9][0-9]{0,19}$'),
-  organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-  UNIQUE (installation_id, organization_id)
-);
-ALTER TABLE integration_connections ADD COLUMN installation_id text;
-ALTER TABLE integration_connections ADD COLUMN github_app_organization_id uuid;
-ALTER TABLE integration_connections ADD COLUMN github_app_refresh_id uuid;
-ALTER TABLE integration_connections ADD COLUMN github_app_refresh_until timestamptz;
-ALTER TABLE integration_connections DROP CONSTRAINT IF EXISTS selfhost_connection_auth_mode;
-ALTER TABLE integration_connections DROP CONSTRAINT IF EXISTS connection_auth_mode;
-ALTER TABLE integration_connections ADD CONSTRAINT connection_auth_mode
-  CHECK (auth_mode IN ('oauth2', 'api_key', 'github_app'));
-ALTER TABLE integration_connections ADD CONSTRAINT connection_github_installation_owner
-  FOREIGN KEY (installation_id, github_app_organization_id)
-  REFERENCES github_app_installations (installation_id, organization_id);
-ALTER TABLE integration_connections ADD CONSTRAINT connection_github_workspace_owner
-  FOREIGN KEY (workspace_id, github_app_organization_id)
-  REFERENCES workspaces (id, organization_id);
+// 0058 (relay_managed coding agents, control-relay-managed) is not on main
+// yet; the "current" target approximates it on top of the real migrations.
+const POST_0058_DDL = `
 -- 0058 (control-relay-managed), approximated: relay_managed rows carry no secret.
 ALTER TABLE coding_agent_credentials
   ALTER COLUMN secret_preview DROP NOT NULL,
@@ -80,10 +48,28 @@ async function cloudSource(): Promise<PGliteDatabase> {
   return source;
 }
 
-async function controlTarget(post0057 = false): Promise<PGliteDatabase> {
+/**
+ * "0051": the baseline the importer gates down to (migrations <= 0051 only).
+ * "current": every migration on this branch plus the 0058 approximation.
+ */
+async function controlTarget(kind: "0051" | "current"): Promise<PGliteDatabase> {
   const target = new PGliteDatabase();
-  await migrate(target);
-  if (post0057) await target.exec(POST_0057_DDL);
+  if (kind === "current") {
+    await migrate(target);
+    await target.exec(POST_0058_DDL);
+    return target;
+  }
+  const directory = await mkdtemp(join(tmpdir(), "cloud-import-0051-"));
+  try {
+    for (const name of await readdir(defaultMigrationsDirectory())) {
+      if (/^\d+/.test(name) && Number(name.slice(0, 4)) <= 51) {
+        await copyFile(join(defaultMigrationsDirectory(), name), join(directory, name));
+      }
+    }
+    await migrate(target, directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
   return target;
 }
 
@@ -101,7 +87,7 @@ async function count(database: PGliteDatabase, table: string): Promise<number> {
 
 test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 target)", async (t) => {
   const source = await cloudSource();
-  const target = await controlTarget();
+  const target = await controlTarget("0051");
   t.after(async () => {
     await source.close();
     await target.close();
@@ -219,9 +205,9 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   }
 });
 
-test("cloud import: post-0057 target keeps rw_, slugs, History origin and text source ids", async (t) => {
+test("cloud import: current target (0053-0057 + 0058) keeps rw_, slugs, History origin and text source ids", async (t) => {
   const source = await cloudSource();
-  const target = await controlTarget(true);
+  const target = await controlTarget("current");
   t.after(async () => {
     await source.close();
     await target.close();
@@ -295,7 +281,7 @@ test("cloud import: org scope imports one organization and its members only", as
 
 test("cloud import: an existing Control user with an imported email under another id refuses the run", async (t) => {
   const source = await cloudSource();
-  const target = await controlTarget();
+  const target = await controlTarget("0051");
   t.after(async () => {
     await source.close();
     await target.close();
