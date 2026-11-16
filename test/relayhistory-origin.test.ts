@@ -202,6 +202,26 @@ test("an authorized member reads the workspace History origin and audience", asy
   );
 });
 
+test("an imported workspace History origin wins for lookup and sync issuance", async (t) => {
+  const { origin, unconfiguredOrigin, database, alpha, memberToken } = await setup(t);
+  const customerHistory = "https://history.customer.example";
+  await database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [alpha, customerHistory]);
+
+  for (const controlOrigin of [origin, unconfiguredOrigin]) {
+    const answer = await call(controlOrigin, originPath(alpha), { token: memberToken });
+    assert.equal(answer.status, 200);
+    assert.deepEqual(answer.body, { workspace: alpha, origin: customerHistory, audience: customerHistory });
+  }
+  const sync = await call(origin, `/api/v1/workspaces/${alpha}/relayhistory/session`, {
+    method: "POST",
+    token: memberToken,
+    body: { mode: "sync" },
+  });
+  assert.equal(sync.status, 200, JSON.stringify(sync.body));
+  assert.equal(sync.body.baseUrl, customerHistory);
+  assert.equal(sync.body.accessToken, memberToken);
+});
+
 test("the origin lookup refuses missing, invalid and foreign-workspace tokens", async (t) => {
   const { origin, history, alpha, beta, memberToken } = await setup(t);
   const anonymous = await call(origin, originPath(alpha));

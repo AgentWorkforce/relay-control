@@ -912,7 +912,8 @@ export function createApp(input: {
       throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
     }
     if (!token.startsWith(ACCESS_TOKEN_PREFIX)) throw new HttpError(401, "unauthorized", "User token required");
-    const active = await introspect(config, store, { token, aud: config.sessionReadApi.publicUrl, workspace: workspace.id });
+    const historyOrigin = workspace.relayhistoryOrigin ?? config.sessionReadApi.publicUrl;
+    const active = await introspect(config, store, { token, aud: historyOrigin, workspace: workspace.id });
     if (!active.active || !active.scopes.includes("rth:sync")) {
       throw new HttpError(401, "unauthorized", "Token is not valid for uploads");
     }
@@ -961,7 +962,7 @@ export function createApp(input: {
     const active = await assertNativeUploadCaller(request, access);
     const expiresAt = new Date(Math.min(active.exp * 1_000, Date.now() + NATIVE_UPLOAD_SESSION_MAX_MS)).toISOString();
     return {
-      baseUrl: api.publicUrl,
+      baseUrl: workspace.relayhistoryOrigin ?? api.publicUrl,
       accessToken: token,
       accessTokenExpiresAt: expiresAt,
       refreshToken: NATIVE_UPLOAD_NO_REFRESH,
@@ -2598,17 +2599,16 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         throw new HttpError(404, "workspace_not_found", "Workspace not found");
       }
       if (!workspace) throw new HttpError(404, "workspace_not_found", "Workspace not found");
-      // Sessions are bound to relayhistoryPublicUrl, the read API's public
-      // origin (default introspection audience, returned baseUrl, ingest edge
-      // origin). One installation-wide value. loadConfig requires it to be a
-      // bare origin, and introspection compares the audience by exact string.
-      if (!config.relayhistoryUrl || !config.relayhistoryPublicUrl) {
+      // An imported customer-hosted origin wins for this workspace. NULL uses
+      // the installation default. Both are exact introspection audiences.
+      const origin = workspace.relayhistoryOrigin ?? config.relayhistoryPublicUrl;
+      if (!origin) {
         throw new HttpError(404, "relayhistory_not_configured", "RelayHistory is not configured");
       }
       json(response, 200, {
         workspace: workspace.id,
-        origin: config.relayhistoryPublicUrl,
-        audience: config.relayhistoryPublicUrl,
+        origin,
+        audience: origin,
       }, true);
       return;
     }

@@ -149,6 +149,8 @@ export type IntrospectedToken = {
   workspaceId: string;
   /** Hosted Cloud's stable rw_<8hex> identity, when this workspace was imported. */
   cloudRelayWorkspaceId: string | null;
+  /** Imported customer-hosted History audience for this workspace, if any. */
+  relayhistoryOrigin: string | null;
   role: Principal["role"];
   scopes: string[];
   /** SHA-256 of the access token as stored; never returned to callers. */
@@ -829,6 +831,7 @@ export class ControlPlaneStore {
     relaycastWorkspaceId: string;
     cloudRelayWorkspaceId: string | null;
     relaycastApiKey: string;
+    relayhistoryOrigin: string | null;
     runtime: unknown;
     role: Principal["role"];
   } | null> {
@@ -839,12 +842,13 @@ export class ControlPlaneStore {
       relaycast_workspace_id: string;
       cloud_relay_workspace_id: string | null;
       relaycast_api_key_ciphertext: string;
+      relayhistory_origin: string | null;
       runtime_config: unknown;
       role: Principal["role"];
     }>(
       `SELECT w.id, w.organization_id, w.name, w.relaycast_workspace_id,
               w.cloud_relay_workspace_id,
-              w.relaycast_api_key_ciphertext, w.runtime_config, m.role
+              w.relaycast_api_key_ciphertext, w.relayhistory_origin, w.runtime_config, m.role
          FROM workspaces w
          JOIN organization_memberships m
            ON m.organization_id = w.organization_id AND m.user_id = $2
@@ -860,6 +864,7 @@ export class ControlPlaneStore {
       relaycastWorkspaceId: row.relaycast_workspace_id,
       cloudRelayWorkspaceId: row.cloud_relay_workspace_id,
       relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring),
+      relayhistoryOrigin: row.relayhistory_origin,
       runtime: row.runtime_config,
       role: row.role,
     };
@@ -1161,6 +1166,7 @@ export class ControlPlaneStore {
       organization_id: string;
       workspace_id: string;
       cloud_relay_workspace_id: string | null;
+      relayhistory_origin: string | null;
       role: Principal["role"];
       scopes: string[];
       access_token_hash: string;
@@ -1173,7 +1179,7 @@ export class ControlPlaneStore {
       policy_sharing_mode_since: Date | string | null;
     }>(
       `SELECT s.user_id, u.email, s.organization_id, s.workspace_id,
-              w.cloud_relay_workspace_id, m.role, s.scopes,
+              w.cloud_relay_workspace_id, w.relayhistory_origin, m.role, s.scopes,
               s.access_token_hash,
               (s.revoked_at IS NOT NULL OR (
                 'mcp:desktop' = ANY(s.scopes) AND NOT EXISTS (
@@ -1217,6 +1223,7 @@ export class ControlPlaneStore {
       organizationId: row.organization_id,
       workspaceId: row.workspace_id,
       cloudRelayWorkspaceId: row.cloud_relay_workspace_id,
+      relayhistoryOrigin: row.relayhistory_origin,
       role: row.role,
       scopes: row.scopes,
       accessTokenHash: row.access_token_hash,

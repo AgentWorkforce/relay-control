@@ -262,6 +262,7 @@ function token(hash: string, overrides: Partial<IntrospectedToken> = {}): Intros
     organizationId: "org",
     workspaceId: "ws",
     cloudRelayWorkspaceId: null,
+    relayhistoryOrigin: null,
     role: "member",
     scopes: ["history:write"],
     accessTokenHash: hash,

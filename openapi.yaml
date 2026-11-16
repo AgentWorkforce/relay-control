@@ -3688,11 +3688,10 @@ paths:
         issued, RelayHistory is not called, and it does not count against
         anything the session issue/renew path does, so Agent Relay Desktop
         can use it for site-push admission and cold-process delete/revoke
-        lookups. `origin` and `audience` are both the configured
-        public History origin (SESSION_READ_API_PUBLIC_URL), the exact string
-        sessions are bound to (read token audience, default introspection
-        audience, returned `baseUrl`); it is installation-wide, not per
-        workspace.
+        lookups. `origin` and `audience` are both the workspace's imported
+        customer-hosted History origin when set, otherwise the configured
+        public History origin (SESSION_READ_API_PUBLIC_URL). It is the exact
+        introspection audience and sync-session `baseUrl`.
       responses:
         "200":
           description: The workspace's RelayHistory origin and session audience
@@ -3758,9 +3757,10 @@ paths:
         renew through this route), and both expiries are the token's own
         expiry capped at 15 minutes.
 
-        In every mode `baseUrl` is the public History origin
-        (SESSION_READ_API_PUBLIC_URL). Caller-supplied service URLs or tenant
-        IDs are rejected because they are not request fields. See
+        In sync mode `baseUrl` is the workspace's imported customer-hosted
+        origin when set, otherwise SESSION_READ_API_PUBLIC_URL. Read mode uses
+        the configured read API. Caller-supplied service URLs or tenant IDs
+        are rejected because they are not request fields. See
         docs/sessions-read-api.md.
       requestBody:
         required: false
@@ -8243,7 +8243,7 @@ components:
         caller's own access token; the edge introspects it on every upload.
       required: [baseUrl, accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType, scopes, orgId, workspaceId]
       properties:
-        baseUrl: { type: string, format: uri, description: The public History origin (SESSION_READ_API_PUBLIC_URL). }
+        baseUrl: { type: string, format: uri, description: The workspace's customer-hosted History origin when set, otherwise SESSION_READ_API_PUBLIC_URL. }
         accessToken: { type: string, pattern: '^sh_at_' }
         accessTokenExpiresAt: { type: string, format: date-time }
         refreshToken:
