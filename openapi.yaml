@@ -881,7 +881,12 @@ paths:
                       token: { type: string }
                       relaycastUrl: { type: string, format: uri }
         "403":
-          description: Agent, CI, or service credential, or cookie request failed the origin check
+          description: >-
+            Agent, CI, or service credential, or cookie request failed the origin check;
+            or `gate_only` on a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): no
+            identity is registered and no token is issued, the body carries
+            `urls.relaycastUrl` and `urls.relaygateUrl`, and the call is audited as
+            `workspace.person_credential.withheld`
         "409":
           description: register_human admission is full, or the name is held by someone else
   /api/v1/workspaces/{workspaceId}/messaging/conversations/{agentName}:
@@ -5732,7 +5737,7 @@ paths:
         "400": { description: "invalid_request: the body is not JSON; Relaycast's own 400 also passes through" }
         "401": { $ref: "#/components/responses/RelayNodeTokenInvalid" }
         "403":
-          description: "node_mismatch: body.name is not the token's nodeName (nothing is forwarded); or scope_denied"
+          description: "node_mismatch: body.name is not the token's nodeName (nothing is forwarded); or scope_denied; or gate_only on a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL): nothing is forwarded and no node token is issued"
           content:
             application/json:
               schema: { $ref: "#/components/schemas/RelayNodeError" }

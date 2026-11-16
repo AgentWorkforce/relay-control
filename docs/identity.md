@@ -1261,12 +1261,22 @@ hands no Relaycast workspace key to anything outside the cluster:
 - The events-shim temporary workspace (`POST /t/<mcp token>/workspace`) is not
   issued ([events-shim.md](events-shim.md#temporary-agent-relay-workspace)).
 
-Per-identity credentials are unchanged, because relaygate can apply policy to
-each one: the person credential
-(`POST /api/v1/workspaces/{id}/messaging/identity/credential`, the caller's
-own agent token), the relay-node broker's enrol answer (that node's own
-token), and MCP join and spawn, which deal in per-agent participant tokens and
-never the workspace key.
+Agents never hold a Relaycast credential on a gate-only install, so the
+per-identity handouts stop too:
+
+- The person credential
+  (`POST /api/v1/workspaces/{id}/messaging/identity/credential`) answers
+  `403 gate_only` with `urls.relaycastUrl` and `urls.relaygateUrl`, audited as
+  `workspace.person_credential.withheld`. Control registers no person identity
+  on Relaycast: the desktop enrols the name it chooses at relaygate
+  `/v1/register` with its Control device token.
+- The relay-node broker's enrol (`POST /relay-node/v1/nodes`) answers
+  `403 gate_only` before any Relaycast call, so no node token leaves. Spawn
+  nodes on gate-only installs wait for the relaygate node credential design.
+  The broker's read routes are unchanged.
+- MCP join and spawn keep their participant tokens server-side and return
+  none to callers, so they are unchanged.
+
 Unset, nothing changes.
 
 ### Scope mint matrix

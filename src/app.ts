@@ -492,6 +492,7 @@ export function createApp(input: {
   const messaging = createMessagingHandler({
     ...messagingDeps,
     relaycastPublicUrl: config.relaycastPublicUrl,
+    relaygatePublicUrl: config.relaygatePublicUrl,
     internalServiceToken: config.internalServiceToken,
     browserOrigins,
   });
@@ -1165,6 +1166,7 @@ export function createApp(input: {
       apiTokens,
       relaycastUrl: config.relaycastUrl,
       relaycastBinding: (id) => store.relaycastBinding(id),
+      relaygatePublicUrl: config.relaygatePublicUrl,
       bearer,
       rateLimit: (res, key, rule) =>
         rateLimit(res, key, rule, "rate_limited", "Too many relay-node requests; retry later"),
