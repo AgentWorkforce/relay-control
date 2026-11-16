@@ -24,6 +24,24 @@ const KEYRING: EncryptionKeyring = { active: { id: "import-test", key: randomByt
 // 0058 (relay_managed coding agents, control-relay-managed) is not on main
 // yet; the "current" target approximates it on top of the real migrations.
 const POST_0058_DDL = `
+-- 0061 (#165, staff read grants), as proposed.
+CREATE TABLE IF NOT EXISTS staff_read_grants (
+  id uuid PRIMARY KEY,
+  workspace_id uuid NOT NULL,
+  organization_id uuid NOT NULL,
+  staff_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  staff_organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  reason text NOT NULL CONSTRAINT staff_read_grant_reason CHECK (length(btrim(reason)) > 0 AND length(reason) <= 500),
+  token_hash text NOT NULL UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL,
+  revoked_at timestamptz,
+  revoked_by uuid,
+  last_used_at timestamptz,
+  CONSTRAINT staff_read_grant_workspace FOREIGN KEY (workspace_id, organization_id)
+    REFERENCES workspaces(id, organization_id) ON DELETE CASCADE,
+  CONSTRAINT staff_read_grant_lifetime CHECK (expires_at > created_at AND expires_at <= created_at + interval '90 days')
+);
 -- 0058 (control-relay-managed), approximated: relay_managed rows carry no secret.
 ALTER TABLE coding_agent_credentials
   ALTER COLUMN secret_preview DROP NOT NULL,
@@ -105,6 +123,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   const expectedPlan = structuredClone(EXPECTED_FULL);
   expectedPlan.coding_agent_credentials = { imported: 2, skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 5 } };
   expectedPlan.github_app_installations = { imported: 1, skipped: {} };
+  expectedPlan.staff_read_grants = { imported: 1, skipped: { workspace_not_imported: 1 } };
   expectedPlan.github_app_connections = {
     imported: 1,
     skipped: { named_connection_needs_policy: 1, installation_claimed_by_other_org: 1, invalid_installation_id: 1, duplicate_default_connection: 1 },
@@ -227,8 +246,29 @@ test("cloud import: current target (0053-0057 + 0058) keeps rw_, slugs, History 
     await source.close();
     await target.close();
   });
+  // The operator organization of this Control install (staff grants record it).
+  const OPS = id(0xc0ffee);
+  await target.query("INSERT INTO organizations (id, name) VALUES ($1, 'Operator')", [OPS]);
+  await target.query("INSERT INTO installation_bootstrap (installation_slot, organization_id) VALUES (1, $1) ON CONFLICT (installation_slot) DO UPDATE SET organization_id = EXCLUDED.organization_id", [OPS]);
   const report = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
   assert.equal(report.ok, true, JSON.stringify(report.orgs));
+  // Staff grants: revoked history with a fresh hash, lifetime clamped, audited once.
+  const grant = (await target.query<{ staff_user_id: string; staff_organization_id: string; reason: string; token_hash: string; revoked_at: Date | null; lifetime: string }>(
+    "SELECT staff_user_id, staff_organization_id, reason, token_hash, revoked_at, (expires_at - created_at)::text AS lifetime FROM staff_read_grants WHERE id = $1", [id(0xa01)])).rows[0]!;
+  assert.equal(grant.staff_user_id, id(1), "merged staff user maps to the survivor");
+  assert.equal(grant.staff_organization_id, OPS);
+  assert.equal(grant.reason, "Investigating a support ticket");
+  assert.match(grant.token_hash, /^[0-9a-f]{64}$/);
+  assert.ok(grant.revoked_at);
+  assert.equal(grant.lifetime, "90 days");
+  const audits = async () => (await target.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM admin_audit_events WHERE action = 'staff_read_grant.imported' AND target = $1",
+    [`${id(0xa01)} workspace ${id(0x201)}`])).rows[0]!.n;
+  assert.equal(await audits(), 1);
+  const again = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(again.ok, true);
+  assert.equal(await audits(), 1, "re-runs do not re-audit");
+  assert.equal((await target.query<{ token_hash: string }>("SELECT token_hash FROM staff_read_grants WHERE id = $1", [id(0xa01)])).rows[0]!.token_hash, grant.token_hash);
   assert.deepEqual(report.optionalColumns.sort(), [
     "organizations.slug",
     "workspaces.cloud_relay_workspace_id",
@@ -315,6 +355,17 @@ test("cloud import: an existing Control user with an imported email under anothe
   // The ledger never carries emails or secrets.
   const text = JSON.stringify(report);
   assert.doesNotMatch(text, /@example\.test|rk_live|tok_/);
+});
+
+test("cloud import: a source branch without staff_read_grants imports the rest", async (t) => {
+  const source = await cloudSource();
+  t.after(() => source.close());
+  await source.exec("DROP TABLE staff_read_grants");
+  const report = await runImport({ source, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "plan");
+  assert.equal(report.ok, true);
+  assert.equal(report.warnings.source_lacks_staff_read_grants, 1);
+  assert.equal(report.tables.staff_read_grants.candidates, 0);
+  assert.equal(report.tables.users.imported, 4);
 });
 
 test("cloud import: importer-side skips carry ids only", async (t) => {

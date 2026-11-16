@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.7";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.8";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -222,6 +222,7 @@ export const SOURCE_TABLES = [
   "coding_agent_credentials",
   "github_app_installations",
   "github_app_connections",
+  "staff_read_grants",
 ] as const;
 export type ImportTable = (typeof SOURCE_TABLES)[number];
 
@@ -419,6 +420,28 @@ SELECT id, workspace_id, 'github'::text AS provider, 'github_app'::text AS auth_
        'empty-credentials'::text AS secret_plaintext,
        created_at, updated_at, skip_reason
   FROM github_rows`,
+    // Hosted staff read grants (Cloud drizzle 0419) arrive as revoked history
+    // (relay-control 0061, docs/staff-read-grants.md): fresh random token
+    // hash, revoked at import time, lifetime clamped to Control's 90 days.
+    // staff_organization_id (the operator org) is set by the importer from
+    // the target's installation_bootstrap.
+    staff_read_grants: `
+SELECT g.id, g.workspace_id, iw.organization_id, iu.id AS staff_user_id,
+       left(btrim(g.reason), 500) AS reason, g.created_at,
+       LEAST(g.expires_at, g.created_at + interval '90 days') AS expires_at,
+       now() AS revoked_at, NULL::uuid AS revoked_by, NULL::timestamptz AS last_used_at,
+       CASE
+         WHEN iw.id IS NULL THEN 'workspace_not_imported'
+         WHEN iu.id IS NULL THEN 'user_not_imported'
+         WHEN g.expires_at <= g.created_at THEN 'invalid_lifetime'
+         WHEN length(btrim(g.reason)) = 0 THEN 'invalid_reason'
+       END AS skip_reason
+  FROM public.staff_read_grants g
+  JOIN public.workspaces w ON w.id = g.workspace_id
+  JOIN scope_orgs s ON s.id = w.organization_id
+  LEFT JOIN imported_workspaces iw ON iw.id = g.workspace_id
+  LEFT JOIN user_map um ON um.cloud_user_id = g.staff_user_id
+  LEFT JOIN imported_users iu ON iu.id = um.user_id`,
     coding_agent_credentials: `
 SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS created_by_user_id,
        p.model_provider, p.harness, p.auth_type, p.display_name, p.label, p.account_email,
@@ -512,9 +535,22 @@ export type TargetSpec = {
   gate?: string;
   /** The secret is a constant, not a source value. */
   secretConstant?: string;
+  /** Column that gets sha256 of 32 fresh random bytes (never a hosted token). */
+  freshTokenHash?: string;
+  /** A Cloud table that may not exist yet on the source branch. */
+  sourceRelation?: string;
 };
 
 export const TARGETS: Record<ImportTable, TargetSpec> = {
+  staff_read_grants: {
+    table: "staff_read_grants",
+    primaryKey: ["id"],
+    columns: ["id", "workspace_id", "organization_id", "staff_user_id", "staff_organization_id", "reason", "created_at", "expires_at", "revoked_at", "revoked_by", "last_used_at"],
+    freshTokenHash: "token_hash",
+    insertOnly: ["token_hash", "revoked_at"],
+    gate: "target_lacks_staff_read_grants",
+    sourceRelation: "staff_read_grants",
+  },
   github_app_installations: {
     table: "github_app_installations",
     primaryKey: ["installation_id"],
@@ -607,6 +643,8 @@ export const IMPORTER_SKIP_REASONS = [
   "source_id_not_uuid",
   "target_lacks_relay_managed",
   "target_lacks_github_app",
+  "target_lacks_staff_read_grants",
+  "no_operator_organization",
   "target_email_conflict",
 ] as const;
 
@@ -631,6 +669,10 @@ const ts = (column: string) => `to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-D
 type Projection = { key: string; org: string; workspace?: string; columns: Record<string, string> };
 
 const PROJECTIONS: Record<ImportTable, Projection> = {
+  staff_read_grants: {
+    key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
+    columns: { id: "id::text", workspace_id: "workspace_id::text", organization_id: "organization_id::text", staff_user_id: "staff_user_id::text", reason: "reason", created_at: ts("created_at"), expires_at: ts("expires_at") },
+  },
   github_app_installations: {
     key: "installation_id", org: "organization_id::text",
     columns: { installation_id: "installation_id", organization_id: "organization_id::text" },
@@ -731,7 +773,13 @@ export function verifierComparisons(
     return {
       name: table,
       sourceSql: `WITH ${ctes(scope)}, src AS (${selects()[table]})\nSELECT ${list}, ${projection.key} AS __key, ${projection.org} AS __org${workspace} FROM src WHERE skip_reason IS NULL`,
-      targetSql: `SELECT ${list}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}`,
+      // Org tables compare only rows the import wrote (the target ledger), so
+      // Control-native rows (the operator org, natively minted grants) never
+      // count as drift. Users are global and compared in full.
+      targetSql: table === "users"
+        ? `SELECT ${list}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}`
+        : `SELECT v.* FROM (SELECT ${list}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}) v
+            WHERE EXISTS (SELECT 1 FROM public.${IMPORT_LEDGER_TABLE} l WHERE l.table_name = '${table}' AND l.row_key = v.__key)`,
       ...(projection.workspace ? { workspaceScoped: true } : {}),
     };
   });

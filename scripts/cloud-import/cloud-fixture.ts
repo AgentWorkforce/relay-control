@@ -73,6 +73,11 @@ CREATE TABLE workspace_integrations (
   metadata_json text NOT NULL DEFAULT '{}',
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE staff_read_grants (
+  id uuid PRIMARY KEY, workspace_id uuid NOT NULL, organization_id uuid NOT NULL, staff_user_id uuid NOT NULL,
+  reason text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz NOT NULL,
+  revoked_at timestamptz, revoked_by uuid
+);
 CREATE TABLE fleet_node_owners (
   id uuid PRIMARY KEY, workspace_id uuid NOT NULL, relay_workspace_id text NOT NULL, node_id text NOT NULL,
   user_id uuid NOT NULL, source text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
@@ -175,6 +180,9 @@ INSERT INTO workspace_integrations (id, workspace_id, provider, name, created_by
   ('${id(0x905)}', 'rw_0000a201', 'slack', NULL, '${id(1)}', 'nango-5', NULL, ${t}, ${t}),
   -- An older default for the same workspace, keyed by the app workspace UUID.
   ('${id(0x906)}', '${id(0x201)}', 'github', NULL, '${id(1)}', 'nango-6', '12345', '2025-06-01T00:00:00Z', '2026-03-01T00:00:00Z');
+INSERT INTO staff_read_grants (id, workspace_id, organization_id, staff_user_id, reason, created_at, expires_at) VALUES
+  ('${id(0xa01)}', '${id(0x201)}', '${ORG_A}', '${id(5)}', '  Investigating a support ticket  ', ${t}, '2026-09-01T00:00:00Z'),
+  ('${id(0xa02)}', '${id(0x203)}', '${ORG_A}', '${id(1)}', 'Unbound workspace', ${t}, '2026-02-01T00:00:00Z');
 INSERT INTO fleet_node_owners (id, workspace_id, relay_workspace_id, node_id, user_id, source, created_at) VALUES
   ('${id(0x701)}', '${id(0x201)}', 'rw_0000a201', 'node-1', '${id(3)}', 'claim', ${t}),
   ('${id(0x702)}', '${id(0x203)}', 'rw_0000a203', 'node-2', '${id(1)}', 'claim', ${t});
@@ -209,6 +217,8 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
     imported: 0,
     skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 5, target_lacks_relay_managed: 2 },
   },
+  // Pre-0061 target: grants wait for the migration.
+  staff_read_grants: { imported: 0, skipped: { workspace_not_imported: 1, target_lacks_staff_read_grants: 1 } },
   // Pre-0054 target: the GitHub App rows wait for the migration.
   github_app_installations: { imported: 0, skipped: { target_lacks_github_app: 1 } },
   github_app_connections: {
