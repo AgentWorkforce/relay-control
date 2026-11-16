@@ -76,6 +76,7 @@ try {
   }
   const copyPath = takePath("--credential-copy-report", true);
   const credentialBeforePath = takePath("--previous-credentials");
+  const convergencePath = takePath("--convergence-before");
   const beforeAt = args.indexOf("--previous-ownership");
   let beforePath;
   if (beforeAt >= 0) {
@@ -99,6 +100,8 @@ try {
     || copyReport.mode !== "apply") throw new Error("matching_copy_report_required");
   const previousTarget = credentialBeforePath
     ? JSON.parse(await readFile(credentialBeforePath, "utf8")) : undefined;
+  const convergenceBefore = convergencePath
+    ? JSON.parse(await readFile(convergencePath, "utf8")) : undefined;
   const reader = readOnlyCloudCredentials(process.env);
   async function clientFor(side) {
     const value = readSecret(process.env, `CLOUD_VERIFY_${side}_URL`);
@@ -130,7 +133,7 @@ try {
   await source.connect();
   await target.connect();
   const credentialCopy = {report: copyReport, reader,
-    targetBlobs: readOnlyPostgresBlobs(target, keyring), previousTarget};
+    targetBlobs: readOnlyPostgresBlobs(target, keyring), previousTarget, convergenceBefore};
   const report = await verifyImport(source, target, scope, ledger, keyring, cloudKeyHex,
     {pepperVersions, previousOwnership, credentialCopy});
   const scopeCheck = cutoverScopeFinding(report);
@@ -139,6 +142,12 @@ try {
   const copierVerified = report.credentialCopy === "verified";
   report.findings.push({kind: "cutover_credential_copy", name: "copier_required", ok: copierVerified, detail: {status: report.credentialCopy}});
   report.ok = report.ok && copierVerified;
+  if (convergencePath) {
+    const converged = report.credentialConvergence === "verified";
+    report.findings.push({kind: "cutover_convergence", name: "zero_writes_required", ok: converged,
+      detail: {status: report.credentialConvergence}});
+    report.ok = report.ok && converged;
+  }
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   process.exitCode = report.ok ? 0 : 1;
 } catch {
@@ -184,3 +193,8 @@ records must show `on`, `repeatable read`, `1min` and `5s`. Libpq startup option
 are not used: Supavisor session poolers can silently drop them. A real pooler
 run must retain these returned settings as evidence; local tests alone do not
 prove pooler behavior. A mismatch aborts before row or credential reads.
+
+For a convergence qualification, follow [REMOTE_CONVERGENCE_RUN.md](REMOTE_CONVERGENCE_RUN.md)
+and pass its genuine pre-rerun checkpoint as `--convergence-before`. That adds an
+explicit zero-write requirement. Without that flag, `credentialConvergence` is
+`not_requested`; an initial copy verification never proves convergence.

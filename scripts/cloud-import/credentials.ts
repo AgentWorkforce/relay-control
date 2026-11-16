@@ -139,6 +139,12 @@ export type CredentialCopyReport = {
    */
   selectionDiverged?: Record<string, { active: number; harness: number }>;
   /**
+   * Convergence reruns only: the before-state digest this run computed
+   * itself before writing, and the checkpoint's nonce (cli.ts
+   * bindConvergence). Absent otherwise.
+   */
+  convergence?: { beforeDigest: string; nonce: string };
+  /**
    * Writes this run actually made, counted from statement outcomes (store
    * results and UPDATE ... RETURNING row counts), never inferred. A
    * converged re-run reports zero for every field.

@@ -1,4 +1,9 @@
 import { accountCredentialExclusion,exclusionAccounting } from "../scripts/cloud-import-verify/exclusions.js";
+import { credentialCloudSelection,writtenOnlySelection,type SourceSelection,type TargetSelection } from "../scripts/cloud-import-verify/credential-selection.js";
+import { credentialLoginCohort,deduplicatesLogins } from "../scripts/cloud-import-verify/credential-cohort.js";
+
+import { credentialConvergenceCohort,credentialWriteCounts,compareCredentialConvergence,credentialCheckpointDigest,validateCredentialCheckpoint,type CredentialConvergenceSnapshot } from "../scripts/cloud-import-verify/convergence.js";
+import { MAPPING_REVISION } from "../scripts/cloud-import/mapping.js";
 import { migrationFiles,sealManifest,type SchemaManifest } from "../scripts/cloud-import-verify/schema.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -10,6 +15,64 @@ import { readOnlyCloudCredentials } from "../scripts/cloud-import-verify/credent
 
 const inputs={CLOUD_CREDENTIAL_R2_ENDPOINT:"https://objects.example.test",CLOUD_CREDENTIAL_R2_BUCKET:"synthetic-fixtures",
   CLOUD_CREDENTIAL_R2_ACCESS_KEY_ID:"SYNTHETIC_ACCESS",CLOUD_CREDENTIAL_R2_SECRET_ACCESS_KEY:"synthetic-secret-only"};
+
+test("duplicate login winner is independently freshest then lowest id and inherits all Cloud choices",() => {
+  const make=(id:string,updated:number,active:boolean,harness:boolean) => ({authType:"provider_oauth",content:id,
+    selection:{id,key:"decrypted-account-key",group:"workspace:provider",updated,active,harness}});
+  const old=make("001",1,true,false),fresh=make("003",2,false,false),tie=make("002",2,false,true);
+  const cohort=credentialLoginCohort([old,fresh,tie],true);
+  assert.equal(cohort.selected.length,1);assert.equal(cohort.selected[0]!.content,"002");
+  assert.deepEqual([...cohort.duplicates].sort(),["001","003"]);
+  assert.equal(cohort.selected[0]!.selection.active,true);assert.equal(cohort.selected[0]!.selection.harness,true);
+  assert.equal(tie.selection.active,false,"source values are not mutated");
+  const separate={...old,selection:{...old.selection,id:"004",key:"different-decrypted-account"}};
+  const api={...fresh,authType:"byo_api_key",selection:{...fresh.selection,id:"005"}};
+  assert.equal(credentialLoginCohort([old,fresh,tie,separate,api],true).selected.length,3);
+  assert.equal(credentialLoginCohort([old,fresh,tie],false).selected.length,3);
+  assert.equal(deduplicatesLogins("cloud-identity-2026-11-16.11"),false);
+  assert.equal(deduplicatesLogins("cloud-identity-2026-11-16.21"),true);
+});
+
+test("written-only selection preserves Control choices and rejects missing or changed prior evidence",() => {
+  const entry:SourceSelection={id:"source",key:"existing",group:"workspace:provider",active:true,harness:true,updated:1};
+  const prior:TargetSelection={group:entry.group,active:false,harness:false};
+  const input={revision:"cloud-identity-2026-11-16.25",entries:[entry],outcomes:{source:"already_present"},
+    flags:new Map([[entry.key,prior]]),nativeFlags:new Map<string,TargetSelection>(),baseline:new Map([[entry.key,prior]]),
+    allFlags:[prior],unchangedKeys:new Set<string>(),reported:undefined};
+  const finding=credentialCloudSelection(input);
+  assert.equal(finding.ok,true);assert.equal((finding.detail as {untouchedKeys:number}).untouchedKeys,1);
+  assert.equal(credentialCloudSelection({...input,outcomes:{source:"control_newer"}}).ok,true);
+  assert.equal(credentialCloudSelection({...input,revision:"cloud-identity-2026-11-16.24"}).ok,false);
+  assert.equal(credentialCloudSelection({...input,baseline:new Map()}).ok,false);
+  assert.equal(credentialCloudSelection({...input,baseline:new Map(),unchangedKeys:new Set([entry.key])}).ok,true);
+  assert.equal(credentialCloudSelection({...input,baseline:new Map([[entry.key,{...prior,active:true}]]),
+    unchangedKeys:new Set([entry.key])}).ok,true,"the genuine pre-rerun tuple supersedes pre-first-copy flags");
+  assert.equal(credentialCloudSelection({...input,flags:new Map([[entry.key,{...prior,harness:true}]])}).ok,false);
+  assert.equal(credentialCloudSelection({...input,reported:{groups:1,active:1,harness:1,activeDemoted:0,harnessDemoted:0,selectionConflicts:0}}).ok,false);
+  assert.equal(writtenOnlySelection("cloud-identity-2026-11-16.11"),false);
+  assert.equal(writtenOnlySelection("cloud-identity-2026-11-16.26"),true);
+});
+
+test("written selection cohorts exclude untouched source winners without weakening written winner checks",() => {
+  const entries:SourceSelection[]=[
+    {id:"new",key:"written",group:"workspace:provider",active:false,harness:false,updated:1},
+    {id:"old",key:"existing",group:"workspace:provider",active:true,harness:true,updated:2},
+  ];
+  const prior:TargetSelection={group:entries[0]!.group,active:true,harness:true};
+  const written={...prior,active:false,harness:false};
+  const input={revision:"cloud-identity-2026-11-16.25",entries,outcomes:{new:"copied",old:"already_present"},
+    flags:new Map([["written",written],["existing",prior]]),nativeFlags:new Map<string,TargetSelection>(),
+    baseline:new Map([["existing",prior]]),allFlags:[written,prior],unchangedKeys:new Set<string>(),
+    reported:{groups:1,active:0,harness:0,activeDemoted:0,harnessDemoted:0,selectionConflicts:0}};
+  assert.equal(credentialCloudSelection(input).ok,true);
+  assert.equal(credentialCloudSelection({...input,flags:new Map([["written",prior],["existing",written]])}).ok,false);
+  const selected={...input,entries:entries.map((entry) => ({...entry,active:true,harness:true})),
+    outcomes:{new:"updated",old:"already_present"},flags:new Map([["written",prior],["existing",written]]),
+    allFlags:[prior,written],reported:{...input.reported,active:1,harness:1}};
+  assert.equal(credentialCloudSelection(selected).ok,true);
+  assert.equal(credentialCloudSelection({...selected,flags:input.flags}).ok,false);
+  assert.equal(credentialCloudSelection({...selected,reported:{...selected.reported,activeDemoted:1}}).ok,false);
+});
 
 test("Cloud credential reader exposes signed GET only with no redirects",async () => {
   const calls:{url:string;init:RequestInit}[]=[];
@@ -111,4 +174,86 @@ test("exhausted API key cannot be accounted as a dead OAuth login",() => {
   assert.equal(accountCredentialExclusion(summary,{reason:"dead_login",provider:"openai",authType:"byo_api_key",
     status:"connected",refreshExhausted:true}),false);
   assert.deepEqual(summary.find((entry) => entry.reason === "dead_login"),{reason:"dead_login",accounted:0,unresolved:1});
+});
+
+const convergenceReport=() => ({version:1,mappingRevision:MAPPING_REVISION,mode:"apply",ok:true,outcomes:{} as Record<string,number>,
+  writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0}});
+const independentCohort=credentialConvergenceCohort(["00000000-0000-4000-8000-000000000001"]);
+const checkpoint=(phase:"before"|"after",empty=false):CredentialConvergenceSnapshot => {
+  const state={version:2 as const,mappingRevision:MAPPING_REVISION,scope:{orgIds:null},
+    credentials:empty ? [] : [{key:independentCohort.keys[0]!,stateSha256:"b".repeat(64),blobVersion:null}],blobs:[],markers:[]};
+  return {...state,kind:"credential-convergence",phase,nonce:(phase === "before" ? "c" : "d").repeat(64),
+    digest:credentialCheckpointDigest(state),sessionSafety:{transactionReadOnly:"on",isolation:"repeatable read",statementTimeout:"1min",lockTimeout:"5s"}};
+};
+const receiptReport=(before:CredentialConvergenceSnapshot) => ({...convergenceReport(),
+  convergence:{beforeDigest:before.digest,nonce:before.nonce}});
+
+test("convergence requires all five explicit valid write counters and bound report outcomes",() => {
+  const report=convergenceReport();assert.deepEqual(credentialWriteCounts(report),report.writes);
+  for (const key of Object.keys(report.writes)) {
+    const absent=structuredClone(report) as unknown as {writes:Record<string,unknown>};delete absent.writes[key];
+    assert.equal(credentialWriteCounts(absent),null);
+    for (const invalid of [-1,0.5,"0",null,Number.MAX_SAFE_INTEGER+1]) {
+      const malformed=structuredClone(report) as unknown as {writes:Record<string,unknown>};malformed.writes[key]=invalid;
+      assert.equal(credentialWriteCounts(malformed),null);
+    }
+  }
+  assert.equal(credentialWriteCounts({...report,writes:{...report.writes,unknownWrites:0}}),null);
+  assert.equal(credentialWriteCounts({...report,mappingRevision:"old-revision"}),null);
+  assert.equal(credentialWriteCounts({...report,mode:"plan"}),null);
+  assert.equal(credentialWriteCounts({...report,outcomes:{updated:1}}),null);
+  assert.equal(credentialWriteCounts({...report,selection:{writes:1}}),null);
+});
+
+test("nonzero counters fail convergence even when all independent target state is unchanged",() => {
+  const before=checkpoint("before"),after=checkpoint("after");
+  assert.equal(compareCredentialConvergence(before,after,receiptReport(before),independentCohort).ok,true);
+  assert.equal(compareCredentialConvergence(before,after,{},independentCohort).ok,false);
+  for (const key of Object.keys(convergenceReport().writes) as (keyof ReturnType<typeof convergenceReport>["writes"])[]) {
+    const report=receiptReport(before);report.writes[key]=1;
+    if (key === "inserted") report.outcomes.copied=1;
+    if (key === "updated") report.outcomes.updated=1;
+    const complete=key === "selectionWrites" ? {...report,selection:{writes:1}} : report;
+    assert.notEqual(credentialWriteCounts(complete),null);
+    assert.equal(compareCredentialConvergence(before,after,complete,independentCohort).ok,false,key);
+  }
+  assert.throws(() => compareCredentialConvergence(after,after,convergenceReport(),independentCohort),/baseline/);
+});
+
+test("empty state cannot qualify convergence even with zero counters and a matching receipt",() => {
+  const before=checkpoint('before',true),after=checkpoint('after',true);
+  assert.throws(() => validateCredentialCheckpoint(before,{orgIds:null}),/empty/);
+  const finding=compareCredentialConvergence(before,after,receiptReport(before),independentCohort);
+  assert.equal(finding.ok,false);
+  assert.equal((finding.detail as {nonemptyBefore:boolean}).nonemptyBefore,false);
+  assert.deepEqual((finding.detail as {binding:unknown}).binding,{receiptValid:true,digestMatches:true,nonceMatches:true});
+});
+
+test("post-rerun relabelled checkpoints fail receipt nonce or fresh-before digest binding",() => {
+  const before=checkpoint('before'),after=checkpoint('after');
+  const report=receiptReport(before);
+  const relabelled={...after,phase:'before' as const};
+  assert.doesNotThrow(() => validateCredentialCheckpoint(relabelled,{orgIds:null}));
+  const wrongNonce=compareCredentialConvergence(relabelled,after,report,independentCohort);
+  assert.equal(wrongNonce.ok,false);
+  assert.deepEqual((wrongNonce.detail as {binding:unknown}).binding,{receiptValid:true,digestMatches:true,nonceMatches:false});
+  const changed={...after,credentials:[{...after.credentials[0]!,stateSha256:'e'.repeat(64)}]};
+  changed.digest=credentialCheckpointDigest(changed);
+  const replayedNonce={...changed,phase:'before' as const,nonce:before.nonce};
+  const wrongDigest=compareCredentialConvergence(replayedNonce,changed,report,independentCohort);
+  assert.equal(wrongDigest.ok,false);
+  assert.deepEqual((wrongDigest.detail as {binding:unknown}).binding,{receiptValid:true,digestMatches:false,nonceMatches:true});
+  assert.deepEqual((wrongDigest.detail as {credentialChanges:unknown}).credentialChanges,{inserted:0,removed:0,changed:0});
+});
+
+test("nonempty unrelated state cannot substitute for the independent source cohort",() => {
+  const before=checkpoint('before'),after=checkpoint('after'),report=receiptReport(before);
+  assert.equal(compareCredentialConvergence(before,after,report).ok,false,'missing source cohort fails');
+  assert.equal(compareCredentialConvergence(before,after,report,credentialConvergenceCohort([])).ok,false,'empty source cohort fails even with nonempty target');
+  const unrelated=credentialConvergenceCohort(['00000000-0000-4000-8000-000000000002']);
+  const finding=compareCredentialConvergence(before,after,report,unrelated);
+  assert.equal(finding.ok,false);
+  assert.equal((finding.detail as {nonemptyBefore:boolean}).nonemptyBefore,true);
+  const cohort=(finding.detail as {cohort:{expectedCount:number;beforeCount:number;afterCount:number}}).cohort;
+  assert.equal(cohort.expectedCount,1);assert.equal(cohort.beforeCount,0);assert.equal(cohort.afterCount,0);
 });
