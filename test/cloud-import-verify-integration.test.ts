@@ -410,6 +410,8 @@ fixtureTest("wrong Cloud credential selection fails even with unchanged cardinal
   assert.ok(report.findings.filter((f) => f.kind === "credential_selection").every((f) => f.ok));
   assert.equal(report.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
   assert.equal(report.findings.find((f) => f.kind === "credential_cloud_selection")!.ok,false);
+  assert.equal(report.findings.find((f) => f.kind === "selection_diverged")!.ok,true,"visible divergence cannot waive a wrong newly written selection");
+  assert.equal(report.ok,false);
 });
 
 fixtureTest("written-only consumer preserves a real Control-deactivated login on an untouched rerun",async () => {
@@ -423,6 +425,9 @@ fixtureTest("written-only consumer preserves a real Control-deactivated login on
   const verified=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{report:actual,reader:fixture.reader,targetBlobs:fixture.blobs,previousTarget}});
   assert.equal(verified.credentialCopy,"verified",JSON.stringify(verified.findings.filter((row) => !row.ok)));
+  const divergence=verified.findings.find((row) => row.kind === "selection_diverged")!;
+  assert.equal(divergence.ok,true);
+  assert.equal((divergence.detail as {perOrg:Record<string,{harness:number}>}).perOrg[ORG_A]!.harness,1);
   const flags=async () => new Map((await target.query("SELECT id,workspace_id,model_provider,is_active,harness_active FROM coding_agent_credentials")).rows
     .map((row) => [row.id,{group:`${row.workspace_id}:${row.model_provider}`,active:row.is_active,harness:row.harness_active}] as [string,TargetSelection]));
   const baseline=await flags();
@@ -464,6 +469,46 @@ fixtureTest("a source-unbound workspace can bind later in Control while bound ke
   const corrupt=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
   assert.equal(corrupt.ok,false);assert.equal(corrupt.findings.find((finding) => finding.kind === "decrypt"
     && finding.name === "workspaces.relaycast_api_key_ciphertext")!.ok,false);
+});
+
+fixtureTest("new relay-managed rows keep Control's active key and report selection divergence without generic drift",async () => {
+  const fixture=await copiedFixture(),fresh=id(0xf900);
+  await source.query(`INSERT INTO provider_credentials(id,organization_id,workspace_id,user_id,harness,model_provider,auth_type,
+    display_name,is_active,harness_active,status,created_at,updated_at)
+    VALUES($1,$2,$3,$4,'claude','anthropic','relay_managed','Synthetic new managed',true,false,'connected',
+      '2026-01-01T00:00:00Z','2027-01-01T00:00:00Z')`,[fresh,ORG_A,id(0x201),id(1)]);
+  const ledger=await apply();assert.equal(ledger.ok,true,JSON.stringify(ledger.orgs));
+  assert.equal(ledger.warnings.coding_agent_credentials_control_active_kept,1);
+  const active=(await target.query("SELECT id,is_active FROM coding_agent_credentials WHERE id=ANY($1::uuid[])",[[fresh,fixture.copy.controlIds[id(0x80d)]]])).rows;
+  assert.equal(active.find((row) => row.id === fresh)!.is_active,false);
+  assert.equal(active.find((row) => row.id !== fresh)!.is_active,true);
+  const checked=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(checked.ok,true,JSON.stringify(checked.findings.filter((row) => !row.ok)));
+  assert.equal(checked.findings.find((row) => row.kind === "table" && row.name === "coding_agent_credentials")!.ok,true);
+  const difference=checked.findings.find((row) => row.kind === "selection_diverged")!;
+  assert.equal(difference.ok,true);
+  assert.ok((difference.detail as {perOrg:Record<string,{active:number}>}).perOrg[ORG_A]!.active >= 1);
+});
+
+fixtureTest("producer selection-divergence counters must match independent counts and cannot hide failures",async () => {
+  const fixture=await copiedFixture();
+  const initial=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  const difference=initial.findings.find((row) => row.kind === "selection_diverged")!;
+  const counts=(difference.detail as {perOrg:Record<string,{active:number;harness:number}>}).perOrg;
+  assert.ok(Object.keys(counts).length > 0,"the initial Cloud/Control demotions stay visible");
+  const report={...fixture.copy,selectionDiverged:structuredClone(counts)};
+  const options={credentialCopy:{report,reader:fixture.reader,targetBlobs:fixture.blobs}};
+  const matched=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
+  assert.equal(matched.ok,true,JSON.stringify(matched.findings.filter((row) => !row.ok)));
+  report.selectionDiverged={};
+  const hidden=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
+  assert.equal(hidden.ok,false);assert.equal(hidden.credentialCopy,"failed");
+  assert.equal(hidden.findings.find((row) => row.kind === "selection_diverged")!.ok,false);
+  assert.equal(hidden.findings.find((row) => row.kind === "credential_natural_keys")!.ok,true);
+  report.selectionDiverged={"synthetic-private-counter":{active:1,harness:0}};
+  const invalid=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
+  assert.equal(invalid.ok,false);assert.ok(!JSON.stringify(invalid).includes("synthetic-private-counter"));
 });
 
 fixtureTest("unselected newly written credentials preserve native selections and report fallback conflicts",async () => {

@@ -2,6 +2,7 @@ import { validateCredentialCheckpoint } from "./convergence.js";
 import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
 import { readCopierMarkers } from "./copier-markers.js";
 import { unboundWorkspaceMarkers } from "./unbound-markers.js";
+import { selectionDivergence } from "./selection-divergence.js";
 import type { Client } from "pg";
 import { schemaFindings } from "./schema.js";
 import { normalizedScope,organizationCensus } from "./organization-scope.js";
@@ -269,14 +270,15 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     if (!contract.encryptedSamples.length && !counts.get("workspaces")) contract.encryptedSamples = base.encryptedSamples;
     findings.push(...await credentialSelections(t,scope));
     if (options.credentialCopy) findings.push(...await credentialCopyFindings(s,t,scope,options.credentialCopy,keyring,cloudKeyHex));
+    else findings.push(await selectionDivergence(s,t,scope));
     return {contract,findings};
   }});
-  const copyChecks=["credential_copy_ledger","credential_natural_keys","credential_control_ids","credential_cloud_selection","credential_copy_markers","credential_marker_links"];
+  const copyChecks=["credential_copy_ledger","credential_natural_keys","credential_control_ids","credential_cloud_selection","credential_copy_markers","credential_marker_links","selection_diverged"];
   return {...checked,evidenceKind:"identity-import" as const,scope,sourceOrganizationCensus:sourceOrganizationCensus!,targetSchema:targetSchema!,
     credentialConvergence:options.credentialCopy?.convergenceBefore
       ? checked.findings.some((f) => f.kind === "credential_convergence" && f.ok) ? "verified" : "failed" : "not_requested",
     credentialCopy:options.credentialCopy
     ? copyChecks.every((kind) => checked.findings.some((f) => f.kind === kind))
-      && checked.findings.filter((f) => f.kind.startsWith("credential_")).every((f) => f.ok) ? "verified" : "failed"
+      && checked.findings.filter((f) => f.kind.startsWith("credential_") || f.kind === "selection_diverged").every((f) => f.ok) ? "verified" : "failed"
     : "not_requested"};
 }

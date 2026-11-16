@@ -15,7 +15,7 @@
     }
   },
   "version": 1,
-  "mappingRevision": "cloud-identity-2026-11-16.26",
+  "mappingRevision": "cloud-identity-2026-11-16.27",
   "ok": true,
   "findings": [
     {
@@ -81,7 +81,7 @@
       "name": "run",
       "ok": true,
       "detail": {
-        "expectedRevision": "cloud-identity-2026-11-16.26",
+        "expectedRevision": "cloud-identity-2026-11-16.27",
         "revisionMatches": true,
         "mode": "apply",
         "ok": true
@@ -1391,6 +1391,34 @@
       }
     },
     {
+      "kind": "selection_diverged",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "unit": "distinct_linked_credential_flags",
+        "classification": "cloud_control_selection_differences",
+        "perOrg": {
+          "00000000-0000-4000-8000-0000000000b1": {
+            "active": 2,
+            "harness": 0
+          },
+          "00000000-0000-4000-8000-0000000000a1": {
+            "active": 1,
+            "harness": 0
+          }
+        },
+        "compared": {
+          "metadata": 4,
+          "copied": 12
+        },
+        "missing": 0,
+        "unmappedCopied": 0,
+        "invalidSource": 0,
+        "invalidTarget": 0,
+        "producerCounter": "not_reported"
+      }
+    },
+    {
       "kind": "credential_cloud_selection",
       "name": "coding_agent_credentials",
       "ok": true,
@@ -1430,11 +1458,11 @@
         "cohort": {
           "expectedValid": true,
           "expectedCount": 12,
-          "expectedSha256": "b537bb8a3e5331601bfe3cb921838b0cfe600370b73c06f79189eb65fab9f414",
+          "expectedSha256": "c1c8e8588a2f12d0c08729952982d6dfe6403501620f4d2e41d7a666a81687a2",
           "beforeCount": 12,
-          "beforeSha256": "b537bb8a3e5331601bfe3cb921838b0cfe600370b73c06f79189eb65fab9f414",
+          "beforeSha256": "c1c8e8588a2f12d0c08729952982d6dfe6403501620f4d2e41d7a666a81687a2",
           "afterCount": 12,
-          "afterSha256": "b537bb8a3e5331601bfe3cb921838b0cfe600370b73c06f79189eb65fab9f414"
+          "afterSha256": "c1c8e8588a2f12d0c08729952982d6dfe6403501620f4d2e41d7a666a81687a2"
         },
         "binding": {
           "receiptValid": true,
@@ -3551,7 +3579,7 @@
   "credentialCopy": "verified",
   "credentialCopyVerified": true,
   "syntheticProducerReceipt": {
-    "mappingRevision": "cloud-identity-2026-11-16.26",
+    "mappingRevision": "cloud-identity-2026-11-16.27",
     "writes": {
       "inserted": 0,
       "updated": 0,
@@ -3560,8 +3588,8 @@
       "selectionWrites": 0
     },
     "convergence": {
-      "beforeDigest": "04b52d5690937110273214be83e65451723f327e7150bb247d121f5246293c80",
-      "nonce": "62e8ff20a36569ff17a6b5ed5ca3a2457697c75672a9ca03a9607000909f53b2"
+      "beforeDigest": "1eb970136ef0232dfb683f4197a57d868208a8da28c33b8cebb8b9655be2436a",
+      "nonce": "6d7a7e614113c88c882cbc5d684adead7fa3c9fb504a8bf0521e21e847405ac8"
     }
   }
 }

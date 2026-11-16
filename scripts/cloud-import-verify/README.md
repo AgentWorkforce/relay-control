@@ -28,7 +28,7 @@ an empty producer selection summary cannot waive a changed Control choice.
 The independent content/outcome gates still apply, so `control_newer` is not
 made acceptable by excluding it from selection expectations.
 
-The paired harness uses the producer's actual revision `.26` reports and
+The paired harness uses the producer's actual revision `.27` reports and
 `runProducer` path, including its fresh before-write checkpoint validation.
 It exercises a real local Control login deactivated between copies and rejects
 a relabelled after-checkpoint against the actual run receipt. Workspace
@@ -36,6 +36,14 @@ binding-conflict and generation-kept warnings do not waive workspace drift.
 `--report` ends with the successful whole-rerun verification and its actual
 synthetic producer write/digest/nonce receipt, captured before the causal
 post-run mutations. The example stays labelled `synthetic-local-postgres`.
+
+`selection_diverged` separately reports effective Cloud/Control flag differences
+for metadata and independently linked copied credentials. These are visible
+diagnostics; wrong newly written selections and all existing content, linkage,
+cardinality and convergence checks remain fatal. Optional copier counters must
+exactly match the independently read sparse per-org counts. See
+[SELECTION_DIVERGENCE.md](SELECTION_DIVERGENCE.md) for the shared field shape,
+counting unit and the explicit `not_reported` status before the producer adds it.
 
 From revision `.21`, duplicate subscription logins are resolved from decrypted
 source account identities: freshest `updated_at`, then lowest source UUID.

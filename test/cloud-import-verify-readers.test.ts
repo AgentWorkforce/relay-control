@@ -1,6 +1,7 @@
 import { accountCredentialExclusion,exclusionAccounting } from "../scripts/cloud-import-verify/exclusions.js";
 import { credentialCloudSelection,writtenOnlySelection,type SourceSelection,type TargetSelection } from "../scripts/cloud-import-verify/credential-selection.js";
 import { credentialLoginCohort,deduplicatesLogins } from "../scripts/cloud-import-verify/credential-cohort.js";
+import { reportedSelectionDiverged } from "../scripts/cloud-import-verify/selection-divergence.js";
 
 import { credentialConvergenceCohort,credentialWriteCounts,compareCredentialConvergence,credentialCheckpointDigest,validateCredentialCheckpoint,type CredentialConvergenceSnapshot } from "../scripts/cloud-import-verify/convergence.js";
 import { MAPPING_REVISION } from "../scripts/cloud-import/mapping.js";
@@ -15,6 +16,19 @@ import { readOnlyCloudCredentials } from "../scripts/cloud-import-verify/credent
 
 const inputs={CLOUD_CREDENTIAL_R2_ENDPOINT:"https://objects.example.test",CLOUD_CREDENTIAL_R2_BUCKET:"synthetic-fixtures",
   CLOUD_CREDENTIAL_R2_ACCESS_KEY_ID:"SYNTHETIC_ACCESS",CLOUD_CREDENTIAL_R2_SECRET_ACCESS_KEY:"synthetic-secret-only"};
+
+test("selection divergence counters require exact sparse per-org flag counts",() => {
+  const org="00000000-0000-4000-8000-0000000000a1",known=new Set([org]);
+  assert.deepEqual(reportedSelectionDiverged({},known),{});
+  assert.deepEqual(reportedSelectionDiverged({[org]:{harness:2,active:1}},known),{[org]:{active:1,harness:2}});
+  for (const value of [null,[],{unknown:{active:1,harness:0}},
+    {[org]:{active:0,harness:0}},{[org]:{active:-1,harness:0}},{[org]:{active:1.5,harness:0}},
+    {[org]:{active:Number.MAX_SAFE_INTEGER+1,harness:0}},{[org]:{active:true,harness:0}},
+    {[org]:{active:1}},{[org]:{active:1,harness:0,credential:"synthetic-private-counter"}}]) {
+    assert.equal(reportedSelectionDiverged(value,known),null);
+  }
+  assert.equal(reportedSelectionDiverged({[org]:{active:1,harness:0}},new Set()),null);
+});
 
 test("duplicate login winner is independently freshest then lowest id and inherits all Cloud choices",() => {
   const make=(id:string,updated:number,active:boolean,harness:boolean) => ({authType:"provider_oauth",content:id,
