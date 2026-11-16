@@ -4,6 +4,7 @@ import { z } from "zod";
 import { bearer } from "./auth/bearer.js";
 import type { SelfhostConfig } from "./config.js";
 import { secureEqual } from "./crypto.js";
+import type { Principal } from "./store.js";
 
 const opaqueToken = (prefix: string) => z.string().max(4096).regex(new RegExp(`^${prefix}[A-Za-z0-9_-]{43,}$`));
 export const readSessionRequest = z.object({
@@ -72,16 +73,46 @@ export function readerKindOf(request: IncomingMessage, marker?: string): ReaderK
   return "device";
 }
 
-export type ReadIdentity = { userId: string; orgId: string; workspaceId: string; readerKind: ReaderKind };
+
+/**
+ * `role` is the member's live organization role, the one Control authorized
+ * this request with (the membership row `workspaceForUser` reads).
+ */
+export type ReadIdentity = {
+  userId: string; orgId: string; workspaceId: string; role: Principal["role"]; readerKind: ReaderKind;
+};
+
+/**
+ * The internal mint/refresh body. `role` is sent only when
+ * SESSION_READ_MINT_INCLUDE_ROLE is on: read APIs that predate it refuse
+ * unknown fields, so turn it on only after the read API accepts `role`.
+ * `reader_kind` is sent only behind relaygate (config.mintReaderKind), which
+ * records it and strips it before proxying; the read API's strict mint schema
+ * rejects unknown fields.
+ */
+export function readSessionBody(
+  config: NonNullable<SelfhostConfig["sessionReadApi"]>,
+  identity: ReadIdentity,
+  input: { label?: string } | { refreshToken: string },
+  options: { includeRole?: boolean } = {},
+): Record<string, unknown> {
+  const { role, readerKind, ...ids } = identity;
+  return {
+    ...ids,
+    ...(options.includeRole ? { role } : {}),
+    ...(config.mintReaderKind ? { reader_kind: readerKind } : {}),
+    audience: config.publicUrl, scopes: ["rth:read"], ...input,
+  };
+}
 
 /** The read API is the issuer. Control authorizes a single identity and validates its reply. */
 export async function requestReadSession(
   config: NonNullable<SelfhostConfig["sessionReadApi"]>,
   identity: ReadIdentity,
   input: { label?: string } | { refreshToken: string },
+  options: { includeRole?: boolean } = {},
 ) {
   const refreshing = "refreshToken" in input;
-  const { readerKind, ...person } = identity;
   const path = refreshing ? "/internal/v1/session-read/sessions/refresh" : "/internal/v1/session-read/sessions";
   let response: Response;
   let value: unknown;
@@ -91,13 +122,7 @@ export async function requestReadSession(
       redirect: "error",
       signal: AbortSignal.timeout(10_000),
       headers: { authorization: `Bearer ${config.secret}`, "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({
-        ...person,
-        // Only behind relaygate, which records it and strips it before proxying;
-        // the read API's strict mint schema rejects unknown fields.
-        ...(config.mintReaderKind ? { reader_kind: readerKind } : {}),
-        audience: config.publicUrl, scopes: ["rth:read"], ...input,
-      }),
+      body: JSON.stringify(readSessionBody(config, identity, input, options)),
     });
     if (!response.ok) {
       await response.body?.cancel();

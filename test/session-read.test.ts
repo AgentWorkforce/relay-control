@@ -6,7 +6,7 @@ import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { hashSecret } from "../src/crypto.js";
 import { migrate } from "../src/migrations.js";
-import { mcpReaderMarker } from "../src/session-read.js";
+import { mcpReaderMarker, readSessionBody } from "../src/session-read.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { close, listen, PGliteDatabase, request } from "./support/harness.js";
 
@@ -183,7 +183,7 @@ test("the browser handoff requires CSRF checks and withholds refresh credentials
 
 test("client tenant, scope and URL overrides are rejected", async (t) => {
   const env = await setup(t);
-  for (const field of ["userId", "orgId", "workspaceId", "audience", "scopes", "baseUrl", "mode"]) {
+  for (const field of ["userId", "orgId", "workspaceId", "role", "audience", "scopes", "baseUrl", "mode"]) {
     assert.equal((await env.post("session", { [field]: "override" })).status, 400, field);
   }
   assert.equal((await env.post("refresh", { refreshToken: "rth_rt_short" })).status, 400);
@@ -215,4 +215,47 @@ test("wrong identity, audience, scope, short tokens and expired replies fail clo
   assert.equal(unavailable.raw.includes(secret), false);
   env.respond(() => ({ debug: "x".repeat(20_000) }));
   assert.equal((await env.post()).status, 502, "response body is bounded");
+});
+
+test("SESSION_READ_MINT_INCLUDE_ROLE off: mint and refresh bodies carry no role", async (t) => {
+  const env = await setup(t);
+  assert.equal((await env.post("session", { label: "MCP" })).status, 200);
+  assert.equal((await env.post("refresh", { refreshToken })).status, 200);
+  assert.equal(env.calls.length, 2);
+  for (const call of env.calls) assert.equal("role" in call.body, false, call.path);
+  assert.deepEqual(env.calls[1]!.body, { userId: env.org.owner.id, orgId: env.org.id, workspaceId: env.alpha.id,
+    audience: publicUrl, scopes: ["rth:read"], refreshToken });
+});
+
+test("SESSION_READ_MINT_INCLUDE_ROLE on: mint and refresh bodies carry the live org role", async (t) => {
+  const env = await setup(t);
+  env.config.sessionReadMintIncludeRole = true;
+  const identity = { userId: env.org.owner.id, orgId: env.org.id, workspaceId: env.alpha.id };
+  for (const role of ["owner", "admin", "member"] as const) {
+    // The membership row is the authorization source; a change after the
+    // Control token was issued is reflected on the next mint.
+    await env.database.query("UPDATE organization_memberships SET role = $1 WHERE user_id = $2", [role, env.org.owner.id]);
+    env.calls.length = 0;
+    assert.equal((await env.post("session", { label: "MCP" })).status, 200, role);
+    assert.equal((await env.post("refresh", { refreshToken })).status, 200, role);
+    assert.deepEqual(env.calls.map((call) => call.path),
+      ["/internal/v1/session-read/sessions", "/internal/v1/session-read/sessions/refresh"]);
+    assert.deepEqual(env.calls[0]!.body, { ...identity, role, audience: publicUrl, scopes: ["rth:read"], label: "MCP" });
+    assert.deepEqual(env.calls[1]!.body, { ...identity, role, audience: publicUrl, scopes: ["rth:read"], refreshToken });
+  }
+  // The relayhistory/session read mode mints through the same body.
+  env.calls.length = 0;
+  const viaHistory = await request(env.origin, `/api/v1/workspaces/${env.alpha.id}/relayhistory/session`,
+    { method: "POST", token: env.pair.accessToken, body: { mode: "read" } });
+  assert.equal(viaHistory.status, 200, viaHistory.raw);
+  assert.equal(env.calls[0]!.body.role, "member");
+});
+
+test("readSessionBody adds role only when asked", () => {
+  const api = { url: "http://reader.internal", publicUrl, secret };
+  const identity = { userId: "u", orgId: "o", workspaceId: "w", role: "admin" as const, readerKind: "device" as const };
+  assert.deepEqual(readSessionBody(api, identity, { label: "x" }),
+    { userId: "u", orgId: "o", workspaceId: "w", audience: publicUrl, scopes: ["rth:read"], label: "x" });
+  assert.deepEqual(readSessionBody(api, identity, { refreshToken }, { includeRole: true }),
+    { userId: "u", orgId: "o", workspaceId: "w", role: "admin", audience: publicUrl, scopes: ["rth:read"], refreshToken });
 });
