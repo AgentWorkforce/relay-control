@@ -190,8 +190,15 @@ type Candidate = {
 };
 
 // Cloud's cli-credentials.ts aliases: claude -> anthropic, codex -> openai, grok -> xai.
-const CANONICAL: Record<string, string> = { claude: "anthropic", codex: "openai", grok: "xai" };
-export const canonicalProvider = (value: string) => CANONICAL[value] ?? value;
+// Cloud's canonicalConnectionProvider (packages/web/lib/billing/connection-provider.ts)
+// plus gemini -> google from normalizeModelProvider (packages/web/lib/billing/house-keys.ts).
+const CANONICAL: Record<string, string> = {
+  claude: "anthropic", codex: "openai", grok: "xai", "cursor-agent": "cursor", agent: "cursor", gemini: "google",
+};
+export const canonicalProvider = (value: string) => {
+  const normalized = value.trim().toLowerCase();
+  return CANONICAL[normalized] ?? normalized;
+};
 
 /**
  * Object keys to try, in order, relative to the "credentials" prefix: exactly
@@ -219,8 +226,14 @@ export function cloudObjectKeys(row: Pick<Candidate, "id" | "cloud_user_id" | "a
       return [`${row.cloud_user_id}/${row.id}/credentials.json.enc`];
     case "oauth_token":
       return [account, legacy];
-    case "provider_oauth":
-      return row.provider_account_id ? [account] : [legacy];
+    case "provider_oauth": {
+      // subscriptionMultiAccountEnabled is false for any provider other than
+      // openai and anthropic (credential-store-backend.ts), so an xai login
+      // always reads the legacy object, even with a provider_account_id.
+      const provider = canonicalProvider(row.model_provider);
+      const multiAccount = (provider === "openai" || provider === "anthropic") && Boolean(row.provider_account_id);
+      return multiAccount ? [account] : [legacy];
+    }
   }
 }
 

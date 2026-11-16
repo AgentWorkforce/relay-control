@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.14";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.16";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -47,6 +47,16 @@ const normEmail = (expression: string) => `lower(btrim(${expression}))`;
 const ROLE_RANK = (expression: string) =>
   `(CASE ${expression} WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END)`;
 const RW_FORMAT = "'^rw_[0-9a-f]{8}$'";
+/**
+ * Cloud's provider normalisation, in SQL: canonicalConnectionProvider
+ * (packages/web/lib/billing/connection-provider.ts) plus gemini -> google
+ * from the serving path's normalizeModelProvider
+ * (packages/web/lib/billing/house-keys.ts). Cloud stores these aliases and
+ * serves them as the canonical provider, so the import does the same.
+ */
+export const PROVIDER = (expression: string) =>
+  `(CASE lower(btrim(${expression})) WHEN 'claude' THEN 'anthropic' WHEN 'codex' THEN 'openai' WHEN 'grok' THEN 'xai'` +
+  ` WHEN 'cursor-agent' THEN 'cursor' WHEN 'agent' THEN 'cursor' WHEN 'gemini' THEN 'google' ELSE lower(btrim(${expression})) END)`;
 // A Cloud workspace with no usable Relaycast binding (rw and rw alias the
 // workspace and its relay_workspaces row in workspace_rows).
 const UNBOUND = "(w.relay_workspace_id IS NULL OR rw.id IS NULL OR COALESCE(rw.relaycast_workspace_id, '') = '' OR COALESCE(rw.relaycast_api_key, '') = '')";
@@ -468,13 +478,13 @@ SELECT g.id, g.workspace_id, iw.organization_id, iu.id AS staff_user_id,
   LEFT JOIN imported_users iu ON iu.id = um.user_id`,
     coding_agent_credentials: `
 SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS created_by_user_id,
-       p.model_provider, p.harness, p.auth_type, p.display_name, p.label, p.account_email,
+       ${PROVIDER("p.model_provider")} AS model_provider, p.harness, p.auth_type, p.display_name, p.label, p.account_email,
        (p.is_active AND row_number() OVER (
-          PARTITION BY p.workspace_id, p.model_provider, p.is_active, (p.auth_type = 'relay_managed')
+          PARTITION BY p.workspace_id, ${PROVIDER("p.model_provider")}, p.is_active, (p.auth_type = 'relay_managed')
           ORDER BY p.updated_at DESC, p.id
         ) = 1) AS is_active,
        (p.is_active AND row_number() OVER (
-          PARTITION BY p.workspace_id, p.model_provider, p.is_active, (p.auth_type = 'relay_managed')
+          PARTITION BY p.workspace_id, ${PROVIDER("p.model_provider")}, p.is_active, (p.auth_type = 'relay_managed')
           ORDER BY p.updated_at DESC, p.id
         ) > 1) AS active_demoted,
        false AS harness_active,
@@ -482,7 +492,7 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS created_by_user_id,
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
          WHEN p.auth_type <> 'relay_managed' THEN 'secret_in_cloud_credential_store'
-         WHEN p.model_provider NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
+         WHEN ${PROVIDER("p.model_provider")} NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
          WHEN p.status NOT IN ('connected', 'error', 'refresh_failed') THEN 'unsupported_status'
        END AS skip_reason
   FROM public.provider_credentials p
@@ -504,7 +514,7 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS created_by_user_id,
 export function credentialCopyQuery(scope: ImportScope): string {
   return `WITH ${ctes(scope)}
 SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS cloud_user_id,
-       p.model_provider, p.harness, p.auth_type, p.label, p.account_email, p.provider_account_id,
+       ${PROVIDER("p.model_provider")} AS model_provider, p.harness, p.auth_type, p.label, p.account_email, p.provider_account_id,
        p.is_active, p.harness_active,
        -- Saved but neither the LLM-call nor the sandbox selection: carried
        -- over, then left inactive in Control.
@@ -522,14 +532,14 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS 
          WHEN p.refresh_exhausted OR (p.auth_type IN ('oauth_token', 'provider_oauth') AND p.status = 'refresh_failed')
            THEN 'dead_login'
          WHEN p.status <> 'connected' THEN 'credential_not_usable'
-         WHEN p.auth_type <> 'provider_oauth' AND p.model_provider NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
-         WHEN p.auth_type = 'oauth_token' AND p.model_provider <> 'anthropic' THEN 'unsupported_model_provider'
+         WHEN p.auth_type <> 'provider_oauth' AND ${PROVIDER("p.model_provider")} NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
+         WHEN p.auth_type = 'oauth_token' AND ${PROVIDER("p.model_provider")} <> 'anthropic' THEN 'unsupported_model_provider'
          -- Khaliq: "drop". A subscription login for a provider Control has no
          -- login for (OpenRouter: an API-key provider in Control; Daytona:
          -- removed in 0006) is dropped on purpose; Cloud tells the user.
-         WHEN p.auth_type = 'provider_oauth' AND p.model_provider NOT IN ('anthropic', 'openai', 'xai') THEN 'unsupported_dropped'
+         WHEN p.auth_type = 'provider_oauth' AND ${PROVIDER("p.model_provider")} NOT IN ('anthropic', 'openai', 'xai') THEN 'unsupported_dropped'
          -- #150: an Anthropic login needs the Cloud account email as its identity.
-         WHEN p.auth_type = 'provider_oauth' AND p.model_provider = 'anthropic' AND NULLIF(btrim(p.account_email), '') IS NULL
+         WHEN p.auth_type = 'provider_oauth' AND ${PROVIDER("p.model_provider")} = 'anthropic' AND NULLIF(btrim(p.account_email), '') IS NULL
            THEN 'anthropic_login_without_account_email'
        END AS skip_reason
   FROM public.provider_credentials p
