@@ -1283,6 +1283,8 @@ per-identity handouts stop too:
   forwards as `input.launch_credential` and does not forward `deliver` frames.
   The broker's read routes are unchanged. See
   [relay-node-credential.md](relay-node-credential.md#gate-only-installs).
+  Agent Relay Desktop claims such a node by its enrolled name instead of a
+  node token ([Claiming the node](relay-node-credential.md#claiming-the-node)).
 - MCP join and spawn keep their participant tokens server-side and return
   none to callers, so they are unchanged.
 - Person identities Control registers server-side (messaging conversation

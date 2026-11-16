@@ -123,6 +123,7 @@ async function setup(t: TestContext, options: { gate?: boolean } = {}) {
     origin,
     base,
     owner,
+    orgId: org.body.id as string,
     workspaceId,
     calls,
     stopRelaycast,
@@ -516,4 +517,76 @@ test("broker maps Relaycast failures: refused stored key and outages are 502, ot
   assert.equal(down.status, 502);
   assert.equal(down.body.error.code, "relaycast_unavailable");
   assert(!down.raw.includes(WORKSPACE_KEY));
+});
+
+// ------------------------------------------------------------ node claim
+
+test("gate-only: the Desktop claims an enrolled node by name, never with a node token or Relaycast", async (t) => {
+  const ctx = await setup(t, { gate: true });
+  const claim = (body: unknown, token = ctx.owner, method = "POST") =>
+    request(ctx.origin, "/cloud/api/v1/fleet/nodes/claim", { method, token, body });
+
+  // A node token is refused outright and never forwarded.
+  ctx.calls.length = 0;
+  const withToken = await claim({ workspaceId: ctx.workspaceId, nodeToken: "nt_live_desktop_token_abc" });
+  assert.equal(withToken.status, 400);
+  assert.equal(withToken.body.error, "invalid_request");
+  assert.match(withToken.body.message, /relaygate; send workspaceId and nodeName/);
+  assert(!withToken.raw.includes("nt_live_desktop_token_abc"));
+  for (const nodeName of [undefined, "", "bad name", 7, "x".repeat(201)]) {
+    const bad = await claim({ workspaceId: ctx.workspaceId, nodeName });
+    assert.equal(bad.status, 400, String(nodeName));
+    assert.equal(bad.body.message, "Send workspaceId and nodeName.");
+  }
+
+  // A name that never enrolled through this Control is refused.
+  const unknown = await claim({ workspaceId: ctx.workspaceId, nodeName: "node-a" });
+  assert.equal(unknown.status, 403);
+  assert.equal(unknown.body.error, "node_claim_refused");
+  assert.equal(unknown.body.message, "That node has not enrolled through this installation.");
+  assert.equal(ctx.calls.length, 0, "Relaycast is never asked");
+
+  // Enrol node-a through the broker; the claim then names it.
+  const node = await ctx.mintNode("node-a");
+  ctx.setReply(() => ({ status: 201, body: { ok: true, data: { id: "n-1", name: "node-a", token: "nt_live_sealed" } } }));
+  const enrolled = await ctx.broker("/relay-node/v1/nodes", node.accessToken, {
+    method: "POST", body: JSON.stringify({ name: "node-a" }), headers: { "content-type": "application/json" },
+  });
+  assert.equal(enrolled.status, 201);
+  ctx.calls.length = 0;
+  const first = await claim({ workspaceId: ctx.workspaceId, nodeName: "node-a" });
+  assert.equal(first.status, 200, first.raw);
+  assert.deepEqual(first.body, { nodeId: "n-1", claimed: true, owner: "you" });
+  assert(!first.raw.includes("nt_live_sealed"));
+  const again = await claim({ workspaceId: ctx.workspaceId, nodeName: "node-a" });
+  assert.deepEqual(again.body, { nodeId: "n-1", claimed: false, owner: "you" });
+
+  // Another member of the organization cannot take it (first claim wins).
+  const added = await request(ctx.origin, `/api/v1/organizations/${ctx.orgId}/memberships`, {
+    method: "POST", token: BOOTSTRAP, body: { email: "member@acme.test", name: "Member", role: "member" },
+  });
+  assert.equal(added.status, 200, added.raw);
+  const member = await deviceToken(ctx.origin, added.body.userId ?? added.body.user?.id, ctx.workspaceId);
+  const taken = await claim({ workspaceId: ctx.workspaceId, nodeName: "node-a" }, member);
+  assert.equal(taken.status, 409);
+  assert.equal(taken.body.error, "node_claim_refused");
+
+  // A row whose sealed token no longer opens still proves the enrolment.
+  await ctx.database.query("UPDATE relay_node_credentials SET token_ciphertext = 'unreadable'");
+  const released = await claim({ workspaceId: ctx.workspaceId, nodeId: "n-1" }, ctx.owner, "DELETE");
+  assert.deepEqual(released.body, { released: true });
+  const unsealable = await claim({ workspaceId: ctx.workspaceId, nodeName: "node-a" }, member);
+  assert.deepEqual(unsealable.body, { nodeId: "n-1", claimed: true, owner: "you" });
+  assert.equal(ctx.calls.length, 0, "the only Relaycast call was the enrolment");
+});
+
+test("not gate-only: the claim still requires a node token; nodeName alone is refused", async (t) => {
+  const ctx = await setup(t);
+  ctx.calls.length = 0;
+  const refused = await request(ctx.origin, "/cloud/api/v1/fleet/nodes/claim", {
+    method: "POST", token: ctx.owner, body: { workspaceId: ctx.workspaceId, nodeName: "node-a" },
+  });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.message, "Send workspaceId and the node's token (nt_live_... or ar_nd_...).");
+  assert.equal(ctx.calls.length, 0);
 });
