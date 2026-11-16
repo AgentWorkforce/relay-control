@@ -397,3 +397,18 @@ object locations or driver errors. A row may contribute multiple reasons but
 counts once in `contentFailures`. Matching natural-key checksums establish the
 row identity set; they do not establish matching decrypted content. Source
 `credential_not_usable` exclusions never increment `contentFailures`.
+
+`credential_exclusions` findings list all deliberate classes with explicit
+`accounted` and `unresolved` counts, separately for imported identity metadata
+and secret copying. Source-derived predicates are narrow: `unsupported_dropped`
+is a connected, non-exhausted OpenRouter/Daytona `provider_oauth` login;
+`dead_login` requires `oauth_token`/`provider_oauth` for both refresh
+exhaustion and `refresh_failed` status; exhausted BYO keys remain unresolved.
+`unsupported_model_provider` is accounted only for opencode
+`relay_managed` metadata. The copy query does not contain relay-managed rows.
+Live logins, other providers/auth types, unknown skips, missing objects and
+ambiguous legacy reads remain unresolved. Producer outcome labels must still
+match the independently observed source reason and matching revision. Copy
+source status/exhaustion facts are read from the source table in the same frozen
+snapshot, never from a producer report. Older reports are not relabeled. This
+accounting never clears a copied-target content failure.
