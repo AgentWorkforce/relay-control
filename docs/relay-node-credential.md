@@ -174,3 +174,29 @@ Upgrade refusals are plain HTTP answers with no body:
 | 404 | Not a gate-only install, or any other upgrade path |
 | 429 | Over 600 requests per minute for this token (shared with the broker routes) |
 | 503 | The bridge is at its connection limit or shutting down |
+
+### Claiming the node
+
+Agent Relay Desktop records whose computer a node is with
+`POST /api/v1/fleet/nodes/claim` (user bearer, same workspace checks and rate
+limit as standard installs). A standard install proves the node with its
+Relaycast node token; a gate-only node never holds one, so the body is
+`{"workspaceId", "nodeName"}` instead, where `nodeName` is the node's enrolled
+name (the relay-node token's name rule: 1-200 letters, digits, `.`, `_`, `:`
+or `-`).
+
+The proof is the node's enrolment row: the node enrolled through this
+relay-control with a relay-node token that a workspace owner or admin minted
+in this workspace and bound to that name, so the row means "this workspace's
+own node host enrolled this name". The claim answers the stored Relaycast node
+id and is recorded with the same rules as standard installs (organization
+members only, one owner per node, first claim wins, `409` conflicts, release
+with `DELETE`). Relaycast is not asked. A row whose stored node token can no
+longer be read still proves the enrolment; the socket bridge refuses that node
+until it re-enrols.
+
+| Status | When |
+| --- | --- |
+| 400 `invalid_request` | `nodeToken` is sent (any value), or `nodeName` is missing or malformed |
+| 403 `node_claim_refused` | The node has not enrolled through this relay-control in this workspace, or the caller is not an organization member |
+| 409 `node_claim_refused` | Someone else owns the node, or it is owned through another workspace or relay |

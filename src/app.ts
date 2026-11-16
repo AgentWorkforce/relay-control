@@ -23,7 +23,7 @@ import { recordAudit } from "./admin/audit.js";
 import { ReadCursorExpiredError, UpstreamError } from "./relayhistory.js";
 import { handleChiefRelay } from "./chief-relay.js";
 import { handleRelayNode, RELAY_NODE_RATE_LIMIT } from "./relay-node/broker.js";
-import { relayNodeCredentials } from "./relay-node/credentials.js";
+import { relayNodeCredentials, type RelayNodeCredentials } from "./relay-node/credentials.js";
 import { createRelayNodeSocketBridge, refuseUpgrade } from "./relay-node/socket.js";
 import { handleFlowsBroker } from "./flows-broker.js";
 import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
@@ -867,6 +867,43 @@ export function createApp(input: {
     return auth;
   }
 
+  // Standard installs: the node token proves the node against Relaycast; it
+  // is never stored or logged.
+  async function proveNodeToken(workspaceKey: string, body: Record<string, unknown>) {
+    const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken.trim() : "";
+    if (!NODE_TOKEN.test(nodeToken)) {
+      throw new HttpError(400, "invalid_request", "Send workspaceId and the node's token (nt_live_... or ar_nd_...).");
+    }
+    return verifyNodeToken(config.relaycastUrl, workspaceKey, nodeToken);
+  }
+
+  // Gate-only installs: the node host never holds its Relaycast node token,
+  // so the proof is the node's enrolment through this Control's relay-node
+  // broker with a relay-node token minted in this workspace and bound to that
+  // name (docs/relay-node-credential.md, "Claiming the node"). Relaycast is
+  // not asked. A row whose sealed token no longer opens still proves the
+  // enrolment; the socket bridge refuses that node separately.
+  async function proveEnrolledNode(
+    credentials: RelayNodeCredentials,
+    workspaceId: string,
+    body: Record<string, unknown>,
+  ) {
+    if (body.nodeToken !== undefined) {
+      throw new HttpError(
+        400,
+        "invalid_request",
+        "This installation runs behind relaygate; send workspaceId and nodeName (the node's enrolled name).",
+      );
+    }
+    const nodeName = body.nodeName;
+    if (typeof nodeName !== "string" || !NODE_ID.test(nodeName)) {
+      throw new HttpError(400, "invalid_request", "Send workspaceId and nodeName.");
+    }
+    const enrolled = await credentials.find({ workspaceId, nodeName });
+    if (!enrolled) throw new NodeClaimError(403, "That node has not enrolled through this installation.");
+    return { id: enrolled.relaycastNodeId, name: enrolled.nodeName };
+  }
+
   const apiTokens = new ApiTokenStore(store.database);
   // Gate-only installs only: relaygate introspects one-time `sh_lt_` launch credentials.
   const relayLaunchCredentialStore = config.relaygatePublicUrl
@@ -1614,8 +1651,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     }
 
     // Whose computer a Relaycast node is (hosted: fleet/nodes/claim). The
-    // Desktop claims its own spawn node with its workspace-bound sign-in. The
-    // node token is proven against Relaycast and never stored or logged.
+    // Desktop claims its own spawn node with its workspace-bound sign-in:
+    // with the node token on standard installs, by enrolled node name on
+    // gate-only installs (proveNodeToken / proveEnrolledNode).
     if (path === "/api/v1/fleet/nodes/claim" && (method === "POST" || method === "DELETE")) {
       const auth = await authenticate(request);
       if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
@@ -1644,11 +1682,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         "rate_limited",
         "Too many node claims. Try again later.",
       );
-      const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken.trim() : "";
-      if (!NODE_TOKEN.test(nodeToken)) {
-        throw new HttpError(400, "invalid_request", "Send workspaceId and the node's token (nt_live_... or ar_nd_...).");
-      }
-      const proven = await verifyNodeToken(config.relaycastUrl, workspace.relaycastApiKey, nodeToken);
+      const proven = relayNodeCredentialStore
+        ? await proveEnrolledNode(relayNodeCredentialStore, workspaceId, body)
+        : await proveNodeToken(workspace.relaycastApiKey, body);
       const result = await store.claimNode({
         workspaceId,
         organizationId: workspace.organizationId,
