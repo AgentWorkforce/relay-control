@@ -108,6 +108,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
   evidence:CredentialEvidence,keyring:EncryptionKeyring,cloudKeyHex:string):Promise<Finding[]> {
   const expected = new Map<string,Expected>();
   const sourceIds = new Set<string>();
+  const expectedBySourceId=new Map<string,string>();
   const selections:{id:string;key:string;group:string;active:boolean;harness:boolean;updated:number}[]=[];
   const expectedOutcomes:Record<string,number> = {};
   const {report} = evidence;
@@ -162,6 +163,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
         // Last source row wins when Control replaces a setup token or login
         // for the same account. Only hashes, never plaintext, are retained.
         const key=naturalKey(row.workspace_id,provider,row.auth_type,identity);
+        expectedBySourceId.set(row.id,key);
         selections.push({id:row.id,key,group:`${row.workspace_id}:${provider}`,active:row.is_active,
           harness:row.harness_active && ["oauth_token","provider_oauth"].includes(row.auth_type),updated:new Date(row.updated_at).getTime()});
         expected.set(key,{
@@ -181,6 +183,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
       && totals(report.outcomes) === totals(expectedOutcomes),
     detail:{candidates,sourceFailures,unresolvedSourceSkips,reportedCandidates:Number.isSafeInteger(report.candidates) ? report.candidates : null}}];
   const seen = new Set<string>();
+  const targetKeysById=new Map<string,string>();
   let duplicateKeys = 0;
   let contentFailures = 0;
   let extra = 0;
@@ -200,6 +203,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
     for (const row of batch.rows) {
       if (seen.size > 10000) throw new Error("Credential verification exceeds the bounded cohort size");
       const key = targetKey(row);
+      targetKeysById.set(row.id,key);
       if (seen.has(key)) duplicateKeys++;
       seen.add(key);
       const wanted = expected.get(key);
@@ -226,6 +230,19 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
     ok:!sourceFailures && !unresolvedSourceSkips && !duplicateKeys && !contentFailures && !missing && !unexplainedTarget,
     detail:{expected:expected.size,target:seen.size,missing,unmatchedTarget:extra,unexplainedTarget,duplicateKeys,contentFailures,
       sourceFailures,unresolvedSourceSkips,sourceChecksum:digestKeys(expected.keys()),targetChecksum:digestKeys(flags.keys())}});
+  const controlIds=report.controlIds;
+  const validMap=controlIds !== null && typeof controlIds === "object" && !Array.isArray(controlIds);
+  const mapEntries=validMap ? Object.entries(controlIds) : [];
+  let idMismatches=0;
+  for (const [sourceId,key] of expectedBySourceId) {
+    const controlId=validMap ? controlIds[sourceId] : undefined;
+    if (typeof controlId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(controlId)
+      || targetKeysById.get(controlId) !== key) idMismatches++;
+  }
+  const extraIds=mapEntries.filter(([id]) => !expectedBySourceId.has(id)).length;
+  findings.push({kind:"credential_control_ids",name:"coding_agent_credentials",
+    ok:validMap && mapEntries.length === expectedBySourceId.size && !idMismatches && !extraIds,
+    detail:{expected:expectedBySourceId.size,reported:validMap ? mapEntries.length : null,idMismatches,extraIds}});
   const summary={groups:0,active:0,harness:0,activeDemoted:0,harnessDemoted:0,selectionConflicts:0};
   let selectionMismatches=0;
   const allFlags=(await target.query(`SELECT workspace_id::text,model_provider,is_active,harness_active FROM public.coding_agent_credentials c

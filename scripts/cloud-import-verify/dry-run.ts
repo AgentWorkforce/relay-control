@@ -62,7 +62,8 @@ try {
   }
   if (!ready) throw new Error("postgres_not_ready");
   testProcess = spawn(process.execPath,["--import","tsx","--test","--test-concurrency=1",
-    join(here,"../../test/cloud-import-verify.test.ts"),join(here,"../../test/cloud-import-verify-integration.test.ts")], {
+    join(here,"../../test/cloud-import-verify.test.ts"),join(here,"../../test/cloud-import-verify-integration.test.ts"),
+    join(here,"../../test/cloud-import-verify-readers.test.ts")], {
     cwd:join(here,"../.."), stdio:"inherit",
     env: { ...process.env, CLOUD_VERIFY_FIXTURE_CLUSTER:"synthetic-only", CLOUD_VERIFY_FIXTURE_PORT:String(port),
       CLOUD_VERIFY_IMPORT_REPORT_PATH:process.argv[3] ?? "" },

@@ -123,3 +123,6 @@ skips and current ownership, checks continuity, constraints/sequences/keyring
 samples, and proves declared removals when the prior snapshot exists. It does
 not qualify the separate credential copier or provide application smoke proof.
 A passing identity-only report is not a completed cutover approval.
+
+When the final scope includes copying credentials, use [REMOTE_COPY_RUN.md](REMOTE_COPY_RUN.md)
+instead; this identity-only command cannot sign off the copier.

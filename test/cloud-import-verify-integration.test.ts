@@ -307,6 +307,7 @@ fixtureTest("copied credential natural keys verify reminted IDs, encrypted blobs
   assert.equal(copiedRows.length,8);
   assert.ok(copiedRows.every((row) => ![id(0x803),id(0x805),id(0x806),id(0x808)].includes(row.id)));
   await target.query("UPDATE coding_agent_credentials SET id=$1 WHERE auth_type='byo_api_key' AND model_provider='openai' AND workspace_id=$2",[id(0xdeadbeef),id(0x201)]);
+  fixture.copy.controlIds[id(0x803)]=id(0xdeadbeef);
   assert.equal((await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,{credentialCopy:evidence})).ok,true);
   const again = await copyCodingAgentCredentials(fixture.deps,scope,"apply");
   const report = await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
@@ -343,6 +344,20 @@ fixtureTest("copied credential natural keys verify reminted IDs, encrypted blobs
     assert.equal(child.status,0,child.stderr);
     assert.equal(JSON.parse(child.stdout).ok,true);
   } finally {await rm(directory,{recursive:true,force:true});}
+});
+
+fixtureTest("copy report Control IDs must resolve to independently derived natural keys",async () => {
+  const fixture=await copiedFixture();
+  fixture.copy.controlIds[id(0x803)]=fixture.copy.controlIds[id(0x805)]!;
+  const one=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(one.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
+  assert.equal(one.findings.find((f) => f.kind === "credential_control_ids")!.ok,false);
+  fixture.copy.controlIds[id(0x803)]="private-control-id-must-not-echo";
+  fixture.copy.controlIds[id(0x809)]=fixture.copy.controlIds[id(0x805)]!;
+  const two=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(two.credentialCopy,"failed");assert.ok(!JSON.stringify(two).includes("private-control-id-must-not-echo"));
 });
 
 fixtureTest("latest Cloud selection wins across users and demotion counters reconcile",async () => {

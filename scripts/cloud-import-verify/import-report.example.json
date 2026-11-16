@@ -1202,6 +1202,17 @@
       }
     },
     {
+      "kind": "credential_control_ids",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "expected": 8,
+        "reported": 8,
+        "idMismatches": 0,
+        "extraIds": 0
+      }
+    },
+    {
       "kind": "credential_cloud_selection",
       "name": "coding_agent_credentials",
       "ok": true,

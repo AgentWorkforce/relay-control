@@ -53,8 +53,9 @@ lowercase email/name fallback are represented. These are reduced synthetic
 shapes, not the final importer contract. JSON/precision stress payloads live in
 separate `payload_probe` tables and do not imply a production workspace column.
 
-The test files are `test/cloud-import-verify.test.ts` and
-`test/cloud-import-verify-integration.test.ts`. Normal repository test
+The database tests are `test/cloud-import-verify.test.ts` and
+`test/cloud-import-verify-integration.test.ts`; GET-only reader tests live in
+`test/cloud-import-verify-readers.test.ts`. Normal repository test
 runs skip their database cases with an explicit reason; only this harness starts
 their isolated cluster. Code under `scripts/` and tests under `test/` are both
 covered by the root `npm run typecheck`.
@@ -358,3 +359,13 @@ distinct from full import qualification.
 
 Use [REMOTE_IMPORT_RUN.md](REMOTE_IMPORT_RUN.md) for matching-revision identity
 qualification; the contract-only runner remains lower-level evidence.
+
+The final copier-enabled qualification uses [REMOTE_COPY_RUN.md](REMOTE_COPY_RUN.md)
+and must report `credentialCopy: verified`. Its source reader is GET-only; copied
+Control IDs are cross-checked against independently derived natural keys.
+
+Current copier reports must include #168's `controlIds` map. Each successful
+Cloud row must map to a real Control row with its independently derived natural
+key; missing, extra or mismatched links fail. Multiple Cloud rows may deduplicate
+to one Control ID when their natural key agrees. The map never authorizes a skip
+or excludes an unexplained target row.
