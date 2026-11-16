@@ -15,7 +15,7 @@
     }
   },
   "version": 1,
-  "mappingRevision": "cloud-identity-2026-11-16.28",
+  "mappingRevision": "cloud-identity-2026-11-16.29",
   "ok": true,
   "findings": [
     {
@@ -47,13 +47,13 @@
       "ok": true,
       "detail": {
         "baseline": "control-main-b79cb5f",
-        "manifestSha256": "b9880619eaf56a6f67b921f3292e374d0f0a83675cd74d7455f4483802d5a8a8",
-        "expectedSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
-        "actualSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
+        "manifestSha256": "29650657f52eafe7cacaa8c957baa8800da97364092c26f041c08495cbf783c1",
+        "expectedSchemaSha256": "58ee4cc0e3b120ce140929374041eb6e2ba2d5da8209b5cc82fa6a2afc1ce168",
+        "actualSchemaSha256": "58ee4cc0e3b120ce140929374041eb6e2ba2d5da8209b5cc82fa6a2afc1ce168",
         "profile": "main",
         "optionalRelations": [],
-        "expectedObjects": 1969,
-        "actualObjects": 1969,
+        "expectedObjects": 1974,
+        "actualObjects": 1974,
         "missing": [],
         "changed": [],
         "unexpectedCount": 0,
@@ -98,7 +98,7 @@
       "name": "run",
       "ok": true,
       "detail": {
-        "expectedRevision": "cloud-identity-2026-11-16.28",
+        "expectedRevision": "cloud-identity-2026-11-16.29",
         "revisionMatches": true,
         "mode": "apply",
         "ok": true
@@ -1432,7 +1432,7 @@
         "unmappedCopied": 0,
         "invalidSource": 0,
         "invalidTarget": 0,
-        "producerCounter": "not_reported"
+        "producerCounter": "matched"
       }
     },
     {
@@ -1475,11 +1475,11 @@
         "cohort": {
           "expectedValid": true,
           "expectedCount": 12,
-          "expectedSha256": "3ae7aa8e6a0c07c8a829e2365698d8358243a84579bc11bebc8fc10c331a9694",
+          "expectedSha256": "aaa1cdc0462ec735fda7dc08926d0dbff2b17bb342e89919b33489a3a05cfc7d",
           "beforeCount": 12,
-          "beforeSha256": "3ae7aa8e6a0c07c8a829e2365698d8358243a84579bc11bebc8fc10c331a9694",
+          "beforeSha256": "aaa1cdc0462ec735fda7dc08926d0dbff2b17bb342e89919b33489a3a05cfc7d",
           "afterCount": 12,
-          "afterSha256": "3ae7aa8e6a0c07c8a829e2365698d8358243a84579bc11bebc8fc10c331a9694"
+          "afterSha256": "aaa1cdc0462ec735fda7dc08926d0dbff2b17bb342e89919b33489a3a05cfc7d"
         },
         "binding": {
           "receiptValid": true,
@@ -3579,13 +3579,13 @@
   },
   "targetSchema": {
     "baseline": "control-main-b79cb5f",
-    "manifestSha256": "b9880619eaf56a6f67b921f3292e374d0f0a83675cd74d7455f4483802d5a8a8",
-    "expectedSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
-    "actualSchemaSha256": "fac28e142c3233c6e1cfc522cddfd3ccfcb0e8051647ee77d5e7e50042961073",
+    "manifestSha256": "29650657f52eafe7cacaa8c957baa8800da97364092c26f041c08495cbf783c1",
+    "expectedSchemaSha256": "58ee4cc0e3b120ce140929374041eb6e2ba2d5da8209b5cc82fa6a2afc1ce168",
+    "actualSchemaSha256": "58ee4cc0e3b120ce140929374041eb6e2ba2d5da8209b5cc82fa6a2afc1ce168",
     "profile": "main",
     "optionalRelations": [],
-    "expectedObjects": 1969,
-    "actualObjects": 1969,
+    "expectedObjects": 1974,
+    "actualObjects": 1974,
     "missing": [],
     "changed": [],
     "unexpectedCount": 0,
@@ -3596,7 +3596,7 @@
   "credentialCopy": "verified",
   "credentialCopyVerified": true,
   "syntheticProducerReceipt": {
-    "mappingRevision": "cloud-identity-2026-11-16.28",
+    "mappingRevision": "cloud-identity-2026-11-16.29",
     "writes": {
       "inserted": 0,
       "updated": 0,
@@ -3605,8 +3605,8 @@
       "selectionWrites": 0
     },
     "convergence": {
-      "beforeDigest": "4e6c0887b9d2418524241f17dcc5079177244424ed6944d2e53e6fa89fcbb955",
-      "nonce": "50cc9c3a1913fe8de0bfb31f7fa0abeccd1f97d0164f45cfe92b5d5ade5a407c"
+      "beforeDigest": "8bcad80344677847149b9b21defcfdc3a710c2e1f110fbd72c25d772f549a0f2",
+      "nonce": "8960c74d1728cf49b4183c9ea1b666e6074aa259d8c0ef46c7281f671bd7feb0"
     }
   }
 }

@@ -300,8 +300,27 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   const login806 = again.controlIds[id(0x806)]!;
   const harness = async () => (await target.query<{ h: boolean }>("SELECT harness_active AS h FROM coding_agent_credentials WHERE id = $1", [login806])).rows[0]!.h;
   assert.equal(await harness(), true);
+  // selectionDiverged: a sparse per-org count; before the deselection it is
+  // whatever the copier's own resolution produced (stable across re-runs).
+  const settled = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  const divergence = settled.selectionDiverged!;
+  assert.ok(divergence && typeof divergence === "object");
+  for (const [org, counts] of Object.entries(divergence)) {
+    assert.match(org, /^[0-9a-f-]{36}$/);
+    assert.deepEqual(Object.keys(counts).sort(), ["active", "harness"]);
+    assert.ok(counts.active + counts.harness > 0, "sparse: no zero entries");
+  }
+  assert.doesNotMatch(JSON.stringify(divergence), /sk-|rt-|@example/);
   await target.query("UPDATE coding_agent_credentials SET harness_active = false WHERE id = $1", [login806]);
   const deactivated = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  // Control's deselection of Cloud's sandbox login is one more harness difference in org A.
+  const orgABefore = divergence[ORG_A] ?? { active: 0, harness: 0 };
+  // relay_managed 0x801 is Cloud-active, but the copier's selection made the
+  // copied 0x80d key a1's active anthropic credential: a metadata difference.
+  const relay801 = (await target.query<{ a: boolean }>("SELECT is_active AS a FROM coding_agent_credentials WHERE id = $1", [id(0x801)])).rows[0]!.a;
+  assert.equal(relay801, false);
+  assert.ok(orgABefore.active >= 1, "the demoted relay_managed row is counted");
+  assert.deepEqual(deactivated.selectionDiverged![ORG_A], { active: orgABefore.active, harness: orgABefore.harness + 1 });
   assert.equal(deactivated.rows[id(0x806)], "already_present");
   assert.equal(await harness(), false, "Control's deselection survives a re-run");
   assert.equal(deactivated.writes.selectionWrites, 0);
