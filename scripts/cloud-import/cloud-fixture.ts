@@ -190,7 +190,9 @@ INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, ha
   ('${id(0x811)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT dead', false, false, 'refresh_failed', ${t}, ${t});
 INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, harness, model_provider, auth_type, display_name, is_active, harness_active, status, created_at, updated_at) VALUES
   -- On a2, which is unbound: a pre-0064 target never gets that workspace.
-  ('${id(0x812)}', '${ORG_A}', '${id(0x202)}', '${id(1)}', 'codex', 'openai', 'byo_api_key', 'On unbound a2', true, false, 'connected', '2026-01-01T00:00:00.123456Z', '2026-01-01T00:00:00.123456Z');
+  ('${id(0x812)}', '${ORG_A}', '${id(0x202)}', '${id(1)}', 'codex', 'openai', 'byo_api_key', 'On unbound a2', true, false, 'connected', '2026-01-01T00:00:00.123456Z', '2026-01-01T00:00:00.123456Z'),
+  -- A subscription login for a provider Control has no login for: dropped.
+  ('${id(0x813)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'opencode', 'openrouter', 'provider_oauth', 'OpenRouter login', true, false, 'connected', '2026-01-01T00:00:00.123456Z', '2026-01-01T00:00:00.123456Z');
 UPDATE provider_credentials SET refresh_exhausted = true WHERE id = '${id(0x811)}';
 UPDATE provider_credentials SET label = 'Bob token', account_email = 'bob@example.test' WHERE id = '${id(0x805)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-1' WHERE id = '${id(0x806)}';
@@ -240,7 +242,7 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
   coding_agent_credentials: {
     imported: 0,
     // Pre-0064: 0x804's workspace (a2, unbound) is skipped, so 0x804 follows it.
-    skipped: { workspace_unbound_pre_0064: 1, secret_in_cloud_credential_store: 15, target_lacks_relay_managed: 2 },
+    skipped: { workspace_unbound_pre_0064: 1, secret_in_cloud_credential_store: 16, target_lacks_relay_managed: 2 },
   },
   // Pre-0061 target: grants wait for the migration.
   staff_read_grants: { imported: 0, skipped: { target_lacks_staff_read_grants: 2 } },

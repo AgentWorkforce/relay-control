@@ -98,7 +98,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.equal(native.record.isActive, true);
   const plan = await copyCodingAgentCredentials(deps, { orgIds: null }, "plan");
   assert.equal(reads.length, 0, "plan never reads the object store");
-  assert.equal(plan.candidates, 15);
+  assert.equal(plan.candidates, 16);
 
   const report = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
   assert.deepEqual(report.rows, {
@@ -122,6 +122,8 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     [id(0x811)]: "skipped:dead_login",
     // Its workspace (a2, unbound) is not on this pre-0064 target.
     [id(0x812)]: "skipped:workspace_not_on_target",
+    // Khaliq: "drop" (no OpenRouter/Daytona login in Control).
+    [id(0x813)]: "skipped:unsupported_dropped",
   });
   // Control receives only what Cloud's runtime reads for each row.
   assert.ok(!reads.includes(`${id(1)}/accounts/${id(0x810)}/credentials.json.enc`), "no account read for an account-less login");

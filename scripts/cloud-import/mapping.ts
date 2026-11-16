@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.13";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.14";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -522,9 +522,12 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS 
          WHEN p.refresh_exhausted OR (p.auth_type IN ('oauth_token', 'provider_oauth') AND p.status = 'refresh_failed')
            THEN 'dead_login'
          WHEN p.status <> 'connected' THEN 'credential_not_usable'
-         WHEN p.model_provider NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
+         WHEN p.auth_type <> 'provider_oauth' AND p.model_provider NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
          WHEN p.auth_type = 'oauth_token' AND p.model_provider <> 'anthropic' THEN 'unsupported_model_provider'
-         WHEN p.auth_type = 'provider_oauth' AND p.model_provider NOT IN ('anthropic', 'openai', 'xai') THEN 'unsupported_model_provider'
+         -- Khaliq: "drop". A subscription login for a provider Control has no
+         -- login for (OpenRouter: an API-key provider in Control; Daytona:
+         -- removed in 0006) is dropped on purpose; Cloud tells the user.
+         WHEN p.auth_type = 'provider_oauth' AND p.model_provider NOT IN ('anthropic', 'openai', 'xai') THEN 'unsupported_dropped'
          -- #150: an Anthropic login needs the Cloud account email as its identity.
          WHEN p.auth_type = 'provider_oauth' AND p.model_provider = 'anthropic' AND NULLIF(btrim(p.account_email), '') IS NULL
            THEN 'anthropic_login_without_account_email'
