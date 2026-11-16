@@ -112,6 +112,7 @@ export type IntrospectionResult =
     machine_id: string | null;
     org: string;
     workspace: string;
+    cloud_relay_workspace_id: string | null;
     role: Principal["role"];
     scopes: string[];
     aud: string;
@@ -132,6 +133,7 @@ export type IntrospectionResult =
     machine_id: null;
     org: string;
     workspace: string;
+    cloud_relay_workspace_id: string | null;
     scopes: string[];
     aud: string;
     iat: number;
@@ -147,6 +149,7 @@ export type IntrospectionResult =
     machine_id: null;
     org: string;
     workspace: string;
+    cloud_relay_workspace_id: string | null;
     scopes: string[];
     aud: string;
     iat: number;
@@ -298,6 +301,7 @@ async function introspectWorkspaceApiToken(
     machine_id: null,
     org: token.organizationId,
     workspace: token.workspaceId,
+    cloud_relay_workspace_id: token.cloudRelayWorkspaceId,
     scopes: [...token.scopes],
     aud: token.aud,
     iat: epochSeconds(token.createdAt),
@@ -337,6 +341,7 @@ async function introspectFlowRunCredential(
     machine_id: null,
     org: credential.organizationId,
     workspace: credential.workspaceId,
+    cloud_relay_workspace_id: credential.cloudRelayWorkspaceId,
     scopes: [...credential.scopes],
     aud: credential.aud,
     iat: epochSeconds(credential.createdAt),
@@ -428,6 +433,7 @@ export async function introspect(
     machine_id: machineId,
     org: session.organizationId,
     workspace: session.workspaceId,
+    cloud_relay_workspace_id: session.cloudRelayWorkspaceId,
     role: session.role,
     scopes: [...session.scopes],
     aud,

@@ -1159,12 +1159,17 @@ async function addMember(fx: Awaited<ReturnType<typeof harness>>, email: string)
 
 test("resolve: an owner cli:auth bearer receives the key", async (t) => {
   const fx = await harness(t);
+  await fx.database.query(
+    "UPDATE workspaces SET cloud_relay_workspace_id = 'rw_a1b2c3d4' WHERE id = $1",
+    [fx.workspaceId],
+  );
   const resolved = await jsonRequest(fx.origin, resolvePath(fx.workspaceId), { token: fx.accessToken });
   assert.equal(resolved.status, 200);
   assert.deepEqual(Object.keys(resolved.body).sort(), [
-    "cloudWorkspaceId", "name", "organizationId", "provisioned", "relaycastApiKey",
+    "cloudRelayWorkspaceId", "cloudWorkspaceId", "name", "organizationId", "provisioned", "relaycastApiKey",
     "relaycastWorkspaceId", "urls", "workspaceId",
   ]);
+  assert.equal(resolved.body.cloudRelayWorkspaceId, "rw_a1b2c3d4");
   assert.equal(resolved.body.relaycastApiKey, "rk_live_first");
 });
 
@@ -1335,9 +1340,10 @@ test("resolve: gate-only answers urls.relaygateUrl and never the workspace key",
     const resolved = await jsonRequest(fx.origin, resolvePath(fx.workspaceId, cloud), auth);
     assert.equal(resolved.status, 200);
     assert.deepEqual(Object.keys(resolved.body).sort(), [
-      "cloudWorkspaceId", "name", "organizationId", "provisioned",
+      "cloudRelayWorkspaceId", "cloudWorkspaceId", "name", "organizationId", "provisioned",
       "relaycastWorkspaceId", "urls", "workspaceId",
     ]);
+    assert.equal(resolved.body.cloudRelayWorkspaceId, null);
     assert.equal("relaycastApiKey" in resolved.body, false);
     assert.deepEqual(resolved.body.urls, {
       relaycastUrl: "https://cast.selfhosted.example",

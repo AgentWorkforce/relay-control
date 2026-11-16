@@ -5990,7 +5990,7 @@ paths:
                 oneOf:
                   - type: object
                     additionalProperties: false
-                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, role, scopes, aud, iat, exp, token_id, capture_policy]
+                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, cloud_relay_workspace_id, role, scopes, aud, iat, exp, token_id, capture_policy]
                     properties:
                       active: { const: true }
                       sub: { type: string, description: relaycontrol user id }
@@ -6002,6 +6002,10 @@ paths:
                         description: The verified machine id when `machine` was supplied; null when it was absent
                       org: { type: string, description: Organization id from the token session }
                       workspace: { type: string, description: "Workspace id from the token session; authoritative for the caller when the request omitted `workspace`" }
+                      cloud_relay_workspace_id:
+                        type: [string, "null"]
+                        pattern: "^rw_[0-9a-f]{8}$"
+                        description: The imported Cloud relay-workspace identity used by Relayfile and provider integrations; null for a workspace created in Control.
                       scopes:
                         type: array
                         items: { type: string }
@@ -6026,7 +6030,7 @@ paths:
                         description: Present and true only when the answer was served from Control's last authoritative verification during a database outage; `exp` is then clamped to the end of the hold.
                   - type: object
                     additionalProperties: false
-                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, scopes, aud, iat, exp, token_id]
+                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, cloud_relay_workspace_id, scopes, aud, iat, exp, token_id]
                     description: A relayfile-agent workspace API token.
                     properties:
                       active: { const: true }
@@ -6037,6 +6041,9 @@ paths:
                       machine_id: { type: "null" }
                       org: { type: string }
                       workspace: { type: string, description: "The token's workspace; authoritative when the request omitted `workspace`" }
+                      cloud_relay_workspace_id:
+                        type: [string, "null"]
+                        pattern: "^rw_[0-9a-f]{8}$"
                       scopes:
                         type: array
                         items: { enum: ["fs:read", "fs:write", "sync:read", "sync:trigger"] }
@@ -6046,7 +6053,7 @@ paths:
                       token_id: { type: string, format: uuid }
                   - type: object
                     additionalProperties: false
-                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, scopes, aud, iat, exp, token_id]
+                    required: [active, sub, email, principal_type, agent_name, machine_id, org, workspace, cloud_relay_workspace_id, scopes, aud, iat, exp, token_id]
                     description: An acquisition-operator workspace API token (an operator service).
                     properties:
                       active: { const: true }
@@ -6057,6 +6064,9 @@ paths:
                       machine_id: { type: "null" }
                       org: { type: string }
                       workspace: { type: string, description: "The token's workspace; authoritative when the request omitted `workspace`" }
+                      cloud_relay_workspace_id:
+                        type: [string, "null"]
+                        pattern: "^rw_[0-9a-f]{8}$"
                       scopes:
                         type: array
                         items: { const: "acquisition:operate" }
@@ -8841,6 +8851,7 @@ components:
       required:
         - workspaceId
         - cloudWorkspaceId
+        - cloudRelayWorkspaceId
         - relaycastWorkspaceId
         - organizationId
         - name
@@ -8853,6 +8864,10 @@ components:
         cloudWorkspaceId:
           type: string
           format: uuid
+        cloudRelayWorkspaceId:
+          type: [string, "null"]
+          pattern: "^rw_[0-9a-f]{8}$"
+          description: The imported Cloud relay-workspace identity used by Relayfile and provider integrations; null for a workspace created in Control.
         relaycastWorkspaceId:
           type: string
         organizationId:
