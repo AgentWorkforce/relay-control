@@ -1275,10 +1275,14 @@ per-identity handouts stop too:
   `workspace.person_credential.withheld`. Control registers no person identity
   on Relaycast: the desktop enrols the name it chooses at relaygate
   `/v1/register` with its Control device token.
-- The relay-node broker's enrol (`POST /relay-node/v1/nodes`) answers
-  `403 gate_only` before any Relaycast call, so no node token leaves. Spawn
-  nodes on gate-only installs wait for the relaygate node credential design.
-  The broker's read routes are unchanged.
+- Relay nodes do not hold their Relaycast node token either. The relay-node
+  broker's enrol answer carries no token; Control keeps it sealed (migration
+  0059 `relay_node_credentials`) and the node connects to Control's
+  `GET /relay-node/v1/ws` bridge instead of Relaycast's node socket. The
+  bridge attaches each launch's credential (below) to the spawn invocation it
+  forwards as `input.launch_credential` and does not forward `deliver` frames.
+  The broker's read routes are unchanged. See
+  [relay-node-credential.md](relay-node-credential.md#gate-only-installs).
 - MCP join and spawn keep their participant tokens server-side and return
   none to callers, so they are unchanged.
 - Person identities Control registers server-side (messaging conversation
@@ -1302,8 +1306,9 @@ launched agent presents to relaygate's `POST /v1/register`:
   under the active encryption key, and never returns it to the MCP caller.
 - It is minted after the launch is journaled and before it is sent. It is not
   part of the spawn invocation sent to Relaycast, so Relaycast never sees it.
-  The Control node-socket bridge, a separate change, attaches it to the spawn
-  frame it forwards to the node. A launch Relaycast rejects outright deletes
+  The relay-node socket bridge attaches it to the spawn frame it forwards to
+  the node as `input.launch_credential`
+  ([relay-node-credential.md](relay-node-credential.md#gate-only-installs)). A launch Relaycast rejects outright deletes
   its credential.
 - relaygate introspects it at `POST /internal/v1/auth/introspect` with
   `{token, aud}`, `aud` being its configured audience (one of
