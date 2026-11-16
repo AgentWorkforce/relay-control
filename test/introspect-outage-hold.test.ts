@@ -19,6 +19,7 @@ const INTROSPECT_SECRET = "introspect-secret-that-is-at-least-32-bytes";
 const BOOTSTRAP = "bootstrap-token-that-is-at-least-32-bytes";
 const INTERNAL = "internal-service-token-at-least-32-bytes!";
 const HISTORY_PUBLIC = "https://history.selfhosted.test";
+const GENERAL_AUDIENCE = "https://acquisition.selfhosted.test";
 const NODE = "node_0123456789abcdef";
 
 function refused(): Error {
@@ -60,7 +61,7 @@ function quietLogs(t: TestContext): string[] {
   return logged;
 }
 
-async function setup(t: TestContext, options: { holdMs?: number } = {}) {
+async function setup(t: TestContext, options: { holdMs?: number; introspectAudiences?: string[] } = {}) {
   const logged = quietLogs(t);
   const database = new FailingDatabase(new PGliteDatabase());
   await migrate(database);
@@ -74,6 +75,7 @@ async function setup(t: TestContext, options: { holdMs?: number } = {}) {
     sessionReadApi: { url: "http://history.internal", publicUrl: HISTORY_PUBLIC, secret: "session-read-secret-".repeat(2) },
     introspectSecret: INTROSPECT_SECRET,
     ...(options.holdMs !== undefined ? { introspectOutageHoldMs: options.holdMs } : {}),
+    ...(options.introspectAudiences ? { introspectAudiences: options.introspectAudiences } : {}),
     bootstrapToken: BOOTSTRAP,
     encryptionKeyring: { active: { id: "test-key", key: Buffer.alloc(32, 7) } },
     internalServiceToken: INTERNAL,
@@ -195,6 +197,86 @@ test("hold on: an outage answers the last active verdict, marked held with a cla
   assert.equal(recovered.body.exp, fresh.body.exp);
 });
 
+test("hold on: a general audience does not require a History-origin lookup during an outage", async (t) => {
+  const env = await setup(t, { holdMs: 60_000, introspectAudiences: [GENERAL_AUDIENCE] });
+  const token = await env.login();
+  const fresh = await env.introspect({ token, aud: GENERAL_AUDIENCE });
+  assert.equal(fresh.status, 200);
+  assert.equal(fresh.body.active, true);
+  assert.equal(fresh.body.aud, GENERAL_AUDIENCE);
+
+  env.database.outage = true;
+  const held = await env.introspect({ token, aud: GENERAL_AUDIENCE });
+  assert.equal(held.status, 200);
+  assert.equal(held.body.active, true);
+  assert.equal(held.body.held, true);
+  assert.equal(held.body.aud, GENERAL_AUDIENCE);
+});
+
+test("hold on: History and general audiences retain independent confirmations", async (t) => {
+  const env = await setup(t, { holdMs: 60_000, introspectAudiences: [GENERAL_AUDIENCE] });
+  const token = await env.login();
+  assert.equal((await env.introspect({ token, aud: HISTORY_PUBLIC })).body.active, true);
+  assert.equal((await env.introspect({ token, aud: GENERAL_AUDIENCE })).body.active, true);
+
+  env.database.outage = true;
+  for (const audience of [HISTORY_PUBLIC, GENERAL_AUDIENCE]) {
+    const held = await env.introspect({ token, aud: audience });
+    assert.equal(held.status, 200, audience);
+    assert.equal(held.body.active, true, audience);
+    assert.equal(held.body.held, true, audience);
+    assert.equal(held.body.aud, audience, audience);
+  }
+});
+
+test("hold on: a held token cannot switch to an unconfirmed general-list History origin", async (t) => {
+  const importedOrigin = "https://history.beta-customer.test";
+  const env = await setup(t, {
+    holdMs: 60_000,
+    introspectAudiences: [GENERAL_AUDIENCE, importedOrigin],
+  });
+  await env.database.query(
+    "UPDATE workspaces SET relayhistory_origin = $1 WHERE id = $2",
+    [importedOrigin, env.beta],
+  );
+  const token = await env.login(env.alpha);
+  assert.equal((await env.introspect({ token, aud: GENERAL_AUDIENCE })).body.active, true);
+
+  env.database.outage = true;
+  assert.deepEqual(
+    (await env.introspect({ token, aud: importedOrigin })).body,
+    { active: false, reason: "audience" },
+  );
+  assert.equal((await env.introspect({ token, aud: GENERAL_AUDIENCE })).body.held, true);
+});
+
+test("hold on: a live History-origin refusal invalidates an older audience confirmation", async (t) => {
+  const importedOrigin = "https://history.alpha-customer.test";
+  const env = await setup(t, {
+    holdMs: 60_000,
+    introspectAudiences: [importedOrigin],
+  });
+  const token = await env.login(env.beta);
+  assert.equal((await env.introspect({ token, aud: HISTORY_PUBLIC })).body.active, true);
+  assert.equal((await env.introspect({ token, aud: importedOrigin })).body.active, true);
+
+  await env.database.query(
+    "UPDATE workspaces SET relayhistory_origin = $1 WHERE id = $2",
+    [importedOrigin, env.alpha],
+  );
+  assert.deepEqual(
+    (await env.introspect({ token, aud: importedOrigin })).body,
+    { active: false, reason: "audience" },
+  );
+
+  env.database.outage = true;
+  assert.deepEqual(
+    (await env.introspect({ token, aud: "https://History.Alpha-Customer.Test:443" })).body,
+    { active: false, reason: "audience" },
+  );
+  assert.equal((await env.introspect({ token, aud: HISTORY_PUBLIC })).body.held, true);
+});
+
 test("hold on: only verified tokens are held; request checks still run; machine claims never held", async (t) => {
   const env = await setup(t, { holdMs: 60_000 });
   const token = await env.login();
@@ -278,32 +360,68 @@ function token(hash: string, overrides: Partial<IntrospectedToken> = {}): Intros
 test("IntrospectionHold serves an entry only within holdMs and before token expiry", () => {
   let now = 10_000;
   const hold = new IntrospectionHold(5_000, { now: () => now });
-  hold.observe(token("a"));
+  hold.observe(token("a"), { audience: "https://history.a.test" });
   now = 14_000;
   const entry = hold.lookup("a");
   assert.ok(entry, "exactly 1000 ms left: returned");
-  assert.equal(entry.checkedAt, 10_000);
-  assert.equal(entry.validUntil, 15_000);
+  assert.equal(entry.audiences.get("https://history.a.test")?.checkedAt, 10_000);
+  assert.equal(entry.audiences.get("https://history.a.test")?.validUntil, 15_000);
   now = 14_001;
   assert.equal(hold.lookup("a"), null, "999 ms left of the hold: not served");
   assert.equal(hold.size, 0, "stale entries are deleted on lookup");
 
   now = 0;
-  hold.observe(token("b", { expiresAt: new Date(3_000) }));
+  hold.observe(token("b", { expiresAt: new Date(3_000) }), { audience: "https://history.b.test" });
   now = 1_000;
-  assert.equal(hold.lookup("b")?.validUntil, 3_000, "validUntil = min(expiry, checkedAt + holdMs)");
+  assert.equal(
+    hold.lookup("b")?.audiences.get("https://history.b.test")?.validUntil,
+    3_000,
+    "validUntil = min(expiry, checkedAt + holdMs)",
+  );
   now = 2_000;
   assert.ok(hold.lookup("b"), "1000 ms left of the token's life: returned");
   now = 2_001;
   assert.equal(hold.lookup("b"), null, "999 ms left of the token's life: not served");
 });
 
+test("IntrospectionHold expires each confirmed audience on its own clock", () => {
+  let now = 0;
+  const hold = new IntrospectionHold(5_000, { now: () => now });
+  hold.observe(token("a"), { audience: "https://history.a.test" });
+  now = 3_000;
+  hold.observe(token("a"), { audience: GENERAL_AUDIENCE });
+
+  now = 4_000;
+  const both = hold.lookup("a");
+  assert.equal(both?.audiences.get("https://history.a.test")?.validUntil, 5_000);
+  assert.equal(both?.audiences.get(GENERAL_AUDIENCE)?.validUntil, 8_000);
+
+  now = 4_001;
+  const generalOnly = hold.lookup("a");
+  assert.equal(generalOnly?.audiences.has("https://history.a.test"), false);
+  assert.equal(generalOnly?.audiences.get(GENERAL_AUDIENCE)?.validUntil, 8_000);
+});
+
+test("IntrospectionHold forgets one audience without dropping the token's others", () => {
+  const hold = new IntrospectionHold(60_000, { now: () => 0 });
+  hold.observe(token("a"), { audience: "https://history.a.test" });
+  hold.observe(token("a"), { audience: GENERAL_AUDIENCE });
+
+  hold.forgetAudience("a", GENERAL_AUDIENCE);
+  assert.equal(hold.lookup("a")?.audiences.has(GENERAL_AUDIENCE), false);
+  assert.equal(hold.lookup("a")?.audiences.has("https://history.a.test"), true);
+
+  hold.forgetAudience("a", "https://history.a.test");
+  assert.equal(hold.lookup("a"), null);
+  assert.equal(hold.size, 0);
+});
+
 test("IntrospectionHold forgets on unknown, revoked or expired verdicts", () => {
   const hold = new IntrospectionHold(60_000, { now: () => 0 });
-  hold.observe(token("a"));
-  hold.observe(token("b"));
-  hold.observe(token("c"));
-  hold.observe(null, "a");
+  hold.observe(token("a"), { audience: "https://history.a.test" });
+  hold.observe(token("b"), { audience: "https://history.b.test" });
+  hold.observe(token("c"), { audience: "https://history.c.test" });
+  hold.observe(null, { hash: "a" });
   hold.observe(token("b", { revoked: true }));
   hold.observe(token("c", { expired: true }));
   assert.equal(hold.lookup("a"), null);
@@ -317,10 +435,10 @@ test("IntrospectionHold forgets on unknown, revoked or expired verdicts", () => 
 test("IntrospectionHold is a bounded LRU", () => {
   let now = 0;
   const hold = new IntrospectionHold(60_000, { maxEntries: 2, now: () => now });
-  hold.observe(token("a"));
-  hold.observe(token("b"));
+  hold.observe(token("a"), { audience: "https://history.a.test" });
+  hold.observe(token("b"), { audience: "https://history.b.test" });
   assert.ok(hold.lookup("a"), "touch a: b is now the oldest");
-  hold.observe(token("c"));
+  hold.observe(token("c"), { audience: "https://history.c.test" });
   assert.equal(hold.size, 2);
   assert.equal(hold.lookup("b"), null);
   assert.ok(hold.lookup("a"));
@@ -328,10 +446,10 @@ test("IntrospectionHold is a bounded LRU", () => {
 
   // At capacity, stale entries are pruned before a live one is evicted.
   now = 1;
-  hold.observe(token("d", { expiresAt: new Date(2) }));
+  hold.observe(token("d", { expiresAt: new Date(2) }), { audience: "https://history.d.test" });
   assert.equal(hold.lookup("a"), null, "a was the least recently used");
   now = 5;
-  hold.observe(token("e"));
+  hold.observe(token("e"), { audience: "https://history.e.test" });
   assert.ok(hold.lookup("c"), "the expired d made room, not c");
   assert.ok(hold.lookup("e"));
   assert.equal(hold.size, 2);
