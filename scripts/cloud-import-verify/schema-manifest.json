@@ -65,7 +65,7 @@
     {"name":"0060_relay_launch_credentials.sql","sha256":"004bde8e76a9da5fe1d33fa5d188ddb883df7f56a4a41fc804e75a1847d04022"},
     {"name":"0062_cloud_identity_security.sql","sha256":"89856c37785fd8ff3dbecf1263939626e1683650607eac974793f24501a97448"},
     {"name":"0063_cloud_import_ledger.sql","sha256":"a6e432e4454b5cb6244cce4677a35601f7cb34a9b29be09ba12884843aee48ba"},
-    {"name":"0068_user_signup_source.sql","sha256":"e27ca538d6dab7a04edaf0f65d07001a185d0d2c972a62914017a2573ae2ec7d"}
+    {"name":"0068_user_signup_source.sql","sha256":"aed4f6c0aee5aecbc8fca128219b4e6e68e7702c4aff04bf1d5a79cb17cc0224"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -1917,5 +1917,5 @@
       {"kind":"table","name":"public.staff_read_grants","definition":{"force_row_security":false,"kind":"r","row_security":false}}
     ]
   },
-  "sha256":"64c0a20e927d9771e3b5f1bb427693acb965e1c9292ca807935e260c4cee65e6"
+  "sha256":"fb890630fa35e0c5ba9f28fdf1b17d040d0c95088b138193d02454513c7f93ca"
 }

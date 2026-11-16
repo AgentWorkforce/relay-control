@@ -1,5 +1,5 @@
--- Where an account was created, carried over from hosted Cloud and set by
--- Control for its own sign-ups. Nullable: most accounts have no attributed
+-- Where an account was created, set by Control for its own sign-ups (the
+-- identity import's carry of hosted Cloud values lands in a follow-up). Nullable: most accounts have no attributed
 -- source. The set is exactly the values hosted Cloud holds (teams, flows,
 -- desktop) plus mcp, an MCP connector's OAuth consent (ChatGPT's Agent Relay
 -- app and any other MCP OAuth client). Set once, at user creation; never

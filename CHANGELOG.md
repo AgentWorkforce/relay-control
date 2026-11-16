@@ -6,8 +6,8 @@ assigned at release.
 ## Unreleased
 
 - Added: `users.signup_source` (migration 0068), where an account was
-  created: `teams`, `flows` or `desktop` (carried over from hosted Cloud by
-  the identity import) or `mcp`. Control records `mcp` when a new person
+  created: `teams`, `flows` or `desktop` (hosted Cloud's values; the
+  identity import's carry lands in a follow-up) or `mcp`. Control records `mcp` when a new person
   signs in (OIDC or email link) on the way back to MCP OAuth consent
   (`/cloud/oauth/authorize`, e.g. ChatGPT's Agent Relay app). Set once at
   creation; a later sign-in never rewrites it. Password sign-ups have no
