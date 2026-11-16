@@ -947,6 +947,7 @@ fixtureTest("convergence snapshots detect direct OAuth rewrites and same-value u
 
 fixtureTest("actual producer receipt qualifies the whole rerun and a later blob rewrite or relabelled checkpoint cannot reuse it",async () => {
   const fixture=await copiedFixture(),before=await captureCredentialConvergence(target);
+  const previousTarget=await captureCredentialTarget(target,scope);
   const files=new Map<string,unknown>();let copies=0;
   const args:CliArgs={mode:"apply",orgIds:null,copyCredentials:true,initLedger:false,report:"apply.json",
     credentialsReport:"copy.json",convergenceCheckpoint:"before.json"};
@@ -958,10 +959,13 @@ fixtureTest("actual producer receipt qualifies the whole rerun and a later blob 
   const copy=files.get("copy.json") as typeof fixture.copy;
   assert.deepEqual(copy.convergence,{beforeDigest:before.digest,nonce:before.nonce});
   assert.deepEqual(copy.writes,{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0});
-  const options={credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs,convergenceBefore:before}};
+  const options={credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs,convergenceBefore:before,previousTarget}};
   const positive=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex,options);
   assert.equal(positive.ok,true,JSON.stringify(positive.findings.filter((f) => !f.ok)));
   assert.equal(positive.credentialConvergence,"verified");
+  if (process.env.CLOUD_VERIFY_IMPORT_REPORT_PATH) await writeFile(process.env.CLOUD_VERIFY_IMPORT_REPORT_PATH,
+    `${JSON.stringify({...positive,evidenceKind:"synthetic-local-postgres",credentialCopyVerified:true,
+      syntheticProducerReceipt:{mappingRevision:copy.mappingRevision,writes:copy.writes,convergence:copy.convergence}},null,2)}\n`,{mode:0o600});
   const relabelled={...await captureCredentialConvergence(target,"after"),phase:"before" as const};
   const replay=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{...options.credentialCopy,convergenceBefore:relabelled}});
@@ -1078,10 +1082,11 @@ fixtureTest("Claude copied auth files use the source account email held beside t
   fixture.objects.set(`${id(1)}/anthropic/credentials.json.enc`,JSON.stringify(cloudEnvelope(auth,cloudKeyHex)));
   const ledger=await apply();
   assert.equal(ledger.ok,true,JSON.stringify(ledger.orgs));
+  const previousTarget=await captureCredentialTarget(target,scope);
   const copy=await copyCodingAgentCredentials(fixture.deps,scope,'apply');
   assert.equal(copy.rows[credentialId],'copied');assert.equal(copy.ok,true);
   const checked=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex,
-    {credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+    {credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs,previousTarget}});
   assert.equal(checked.credentialCopy,'verified',JSON.stringify(checked.findings.filter((finding) => !finding.ok)));
   assert.ok(!JSON.stringify(checked).includes(refreshToken));
 });
