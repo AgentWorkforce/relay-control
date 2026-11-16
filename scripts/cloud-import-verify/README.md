@@ -10,7 +10,7 @@ sample definitions. PR #148 is stacked on the importer branch.
 
 The harness executes the actual importer against its synthetic Cloud fixture
 and separate source/target databases. It checks rollback mode, committed apply
-and a second apply, reconciles all twelve mapped tables and per-org ledgers, preserves
+and a second apply, reconciles all thirteen mapped tables and per-org ledgers, preserves
 invite hashes and proves sessions/reconnect state stay empty.
 It then runs the opt-in credential copier against in-memory encrypted Cloud
 objects and local encrypted Postgres blobs, including a repeat copy.
@@ -19,9 +19,8 @@ pending and no real-data import has run.
 
 The target runs all checked-in Control migrations, including the actual
 0053/0054/0056/0057 files and the owner-only 0063 ledger migration from the
-importer branch. Only the separate
-0058 relay-managed credential shape still uses a test-only model; that model
-does not prove the pending migration file. The shared Cloud fixture
+importer branch. The pending 0058 relay-managed credential and 0061 staff-grant schemas use
+test-only models; these do not prove either pending migration file. The shared Cloud fixture
 now includes the generation column, so there is no verifier-owned source guard.
 The smaller fixtures in `fixtures.ts` independently
 stress the engine and are explicitly labeled as reference shapes.
@@ -82,9 +81,12 @@ node --import tsx scripts/cloud-import-verify/ownership-cli.ts /path/to/before.j
 # After the importer commits, verify removals against that database snapshot:
 node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/current-ledger.json --all-organizations \
   --previous-ownership /path/to/before.json
-# After the opt-in secret copy, also verify its ledger and local object snapshot:
+# Capture existing target credentials before the opt-in secret copy:
+node --import tsx scripts/cloud-import-verify/credential-snapshot-cli.ts /path/to/credential-baseline.json --all-organizations
+# After copying, verify its ledger and local object snapshot:
 node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledger.json --all-organizations \
-  --credential-copy-report /path/to/credential-copy-ledger.json
+  --credential-copy-report /path/to/credential-copy-ledger.json \
+  --previous-credentials /path/to/credential-baseline.json
 ```
 
 Supply `CLOUD_VERIFY_SOURCE_URL`, `CLOUD_VERIFY_TARGET_URL`,
@@ -108,6 +110,17 @@ the pre-import database snapshot fail. An optional `--previous-report` adds an
 old-report cross-check; it is not ownership authority. Other tables must report
 zero deletions. Tests prove runtime SELECT/DELETE are denied on the ledger and
 that reruns preserve unowned Control rows instead of claiming or deleting them.
+Revision `.8` onward scopes target comparisons to the ownership ledger, so native
+Control organizations, invitations and grants can coexist with imported rows.
+Users remain global under the shared mapping contract.
+
+Before the opt-in secret copy, `credential-snapshot-cli.ts` captures existing target credential
+natural-key hashes and selection flags in a private mode-600 file. Supply it as
+`--previous-credentials` when verifying. The library uses
+`captureCredentialTarget(target, scope)` and `credentialCopy.previousTarget`.
+The baseline contains no account ids, fingerprints or secret values. Unmatched
+target credentials without baseline evidence fail; pre-existing native selections
+must survive when this run copied no Cloud-selected row for that selector.
 
 For `--credential-copy-report`, set `CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR` to a
 local encrypted object snapshot using the Cloud-relative object keys. Files
@@ -145,20 +158,42 @@ auth type and keyed fingerprint/account identity, never Cloud row id. It
 derives expected keys from independently decrypted objects, reconciles the
 copy ledger, checks scope/organization and compares decrypted inline secrets
 or raw auth-file contents. Only counts and checksums enter reports. Copies
-that deduplicate/reassign row ids are valid; missing/extra natural keys,
+that deduplicate/reassign row ids are valid; missing copied natural keys,
 wrong fingerprints, unreadable blobs and unresolved input failures are not.
+Unmatched target credentials must be established by the pre-copy baseline;
+copied rows must all match their source-derived natural keys and contents.
+Suspended/non-members and unusable Cloud credentials are intentional exclusions.
+A shared legacy object is never read when multiple rows could own it; missing
+account objects in that case remain unresolved and block qualification.
 SQL-imported `relay_managed` rows retain their Cloud ids and are compared
 separately so the copier's additional rows cannot spoil those counts.
 
-Selection checks require exactly one model-active row when a group has an
-API key, setup token or relay-managed credential, and exactly one harness-active
-row when it has a setup token or provider login. A provider-login-only group
-has zero model-active rows by Control's store contract. Both selectors are
-checked per workspace/provider; zero active rows fail even when uniqueness holds.
+Selection checks require one model-active row when the group has model-call
+credentials, and at most one sandbox selection. With credential-copy evidence,
+the verifier independently derives Cloud's selected copied row by latest update
+and Cloud id tie-break, checks the exact natural key selected, and reconciles all
+six selection-report counters. A saved, unselected copy must stay inactive when
+another row carries the selection. Auto-activation fallback conflicts block
+qualification until reviewed and resolved. The copier can legitimately demote
+SQL-imported relay-managed rows, so in this phase their selection flags are
+checked by these group checks rather than the pre-copy SQL checksum shape.
+
+Staff grants are copied as revoked history. Beyond their shared table projection,
+the verifier requires revocation, the installation's operator organization, a
+fresh-shaped token hash, null use/revocation actor fields and exactly one matching
+import audit. Reruns preserve the hash and audit count. Missing source tables are
+explicitly reconciled with the importer's warning; missing target support or
+operator organization remains an unresolved skip.
+
+The main synthetic fixture uses UTC sessions. A separate audit on PostgreSQL's
+Europe/Oslo session timezone found that the importer's `created_at + interval
+'90 days'` staff-grant clamp shifts one hour across DST compared with the
+verifier's UTC snapshot. This is reported to the importer owner; qualification
+requires deterministic UTC source transforms. The verifier retains UTC checks.
 
 The library entry point is `verifyImport(source, target, scope, ledger, keyring,
 cloudKeyHex, {pepperVersions, previousOwnership, previousReport, canonicalOrigin,
-credentialCopy: {report, reader, targetBlobs}})`.
+credentialCopy: {report, reader, targetBlobs, previousTarget}})`.
 The copy option is optional: output explicitly marks this phase as
 `not_requested`, `verified` or `failed`. Identity-only verification does not
 qualify copied secrets. For standalone comparisons without an importer

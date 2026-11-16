@@ -17,6 +17,7 @@ import { CodingAgentStore } from "../src/admin/coding-agents.js";
 import { CredentialBlobStore,PostgresObjectBackend } from "../src/admin/credential-blobs.js";
 import { SubscriptionLoginStore } from "../src/admin/subscription-logins.js";
 import { copyCodingAgentCredentials } from "../scripts/cloud-import/credentials.js";
+import { captureCredentialTarget } from "../scripts/cloud-import-verify/credential-copy.js";
 import { captureOwnership } from "../scripts/cloud-import-verify/reconciliation.js";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -46,7 +47,8 @@ const scope = {orgIds:null};
 const apply = (selected:ImportScope=scope) => runImport(
   {source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},selected,"apply");
 async function copiedFixture() {
-  await source.query("DELETE FROM provider_credentials WHERE id=$1",[id(0x807)]);
+  await source.query("DELETE FROM provider_credentials WHERE id=ANY($1::uuid[])",[[id(0x807),id(0x80c)]]);
+  await source.query("UPDATE provider_credentials SET is_active=true WHERE id=ANY($1::uuid[])",[[id(0x80e),id(0x80f)]]);
   // Cloud object keys retain the pre-merge user id, while Control uses the survivor.
   await source.query("UPDATE provider_credentials SET user_id=$1 WHERE id=$2",[id(5),id(0x803)]);
   const ledger = await apply();
@@ -59,11 +61,15 @@ async function copiedFixture() {
     [`${id(5)}/${id(0x803)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-synthetic-openai-key-0000000000"}),cloudKeyHex))],
     [`${id(2)}/anthropic/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({token:"sk-ant-oat01-synthetic-token-00000000"}),cloudKeyHex))],
     [`${id(1)}/accounts/${id(0x806)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(auth,cloudKeyHex))],
+    [`${id(2)}/${id(0x80b)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-ant-api03-unselected-synthetic-00000"}),cloudKeyHex))],
+    [`${id(1)}/${id(0x80d)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-ant-api03-selected-synthetic-0000000"}),cloudKeyHex))],
+    [`${id(1)}/${id(0x80e)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"AIza-synthetic-google-key-000000000000"}),cloudKeyHex))],
+    [`${id(2)}/${id(0x80f)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-or-v1-synthetic-router-key-0000000"}),cloudKeyHex))],
     [`${id(2)}/${id(0x808)}/credentials.json.enc`,JSON.stringify(cloudEnvelope(JSON.stringify({key:"sk-synthetic-second-key-00000000000"}),cloudKeyHex))],
   ]);
   const reader = {get:async (key:string) => objects.get(key) ?? null};
   const blobs = new CredentialBlobStore(new PostgresObjectBackend(targetDb),fixtureKeyring);
-  const deps = {source:sourceDb,reader,cloudKeyHex,keyring:fixtureKeyring,
+  const deps = {source:sourceDb,target:targetDb,reader,cloudKeyHex,keyring:fixtureKeyring,
     codingAgents:new CodingAgentStore(targetDb,fixtureKeyring,undefined,blobs),
     logins:new SubscriptionLoginStore(targetDb,fixtureKeyring,blobs)};
   const copy = await copyCodingAgentCredentials(deps,scope,"apply");
@@ -81,6 +87,9 @@ before(async () => {
 after(async () => {if (enabled) {await source.end();await target.end();await admin.end();}});
 beforeEach(async () => {
   if (!enabled) return;
+  // Main fixtures use UTC. A separate session-timezone audit exposed the
+  // importer's DST-sensitive 90-day staff-grant clamp; tracked with its owner.
+  await source.query("SET TIME ZONE 'UTC'");await target.query("SET TIME ZONE 'UTC'");
   await source.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public");
   await target.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public");
   await source.query(CLOUD_FIXTURE_DDL);
@@ -89,7 +98,18 @@ beforeEach(async () => {
     UPDATE workspaces SET relay_workspace_id='rw_0000b202' WHERE relay_workspace_id='rw_legacy-01'`);
   await migrate(targetDb);
   // All checked-in migrations, including 0053/0054/0056/0057, ran above.
-  // Only the separate 0058 credential shape is still modeled.
+  // Pending 0061 is modeled as revoked staff-grant history; 0058 is also modeled.
+  await target.query(`CREATE TABLE staff_read_grants (
+    id uuid PRIMARY KEY,workspace_id uuid NOT NULL,organization_id uuid NOT NULL,
+    staff_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    staff_organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    reason text NOT NULL CHECK(length(btrim(reason)) > 0 AND length(reason) <= 500),
+    token_hash text NOT NULL UNIQUE,created_at timestamptz NOT NULL DEFAULT now(),expires_at timestamptz NOT NULL,
+    revoked_at timestamptz,revoked_by uuid,last_used_at timestamptz,
+    FOREIGN KEY(workspace_id,organization_id) REFERENCES workspaces(id,organization_id) ON DELETE CASCADE,
+    CHECK(expires_at > created_at AND expires_at <= created_at + interval '90 days'))`);
+  await target.query("INSERT INTO organizations(id,name) VALUES($1,'Synthetic operator')",[id(0xcafe)]);
+  await target.query("INSERT INTO installation_bootstrap(installation_slot,organization_id) VALUES(1,$1) ON CONFLICT(installation_slot) DO UPDATE SET organization_id=EXCLUDED.organization_id",[id(0xcafe)]);
   await target.query(`    ALTER TABLE coding_agent_credentials
       ALTER COLUMN secret_preview DROP NOT NULL,ALTER COLUMN key_fingerprint DROP NOT NULL,
       DROP CONSTRAINT IF EXISTS selfhost_coding_agent_auth_type,
@@ -109,6 +129,7 @@ fixtureTest("actual importer rollback, apply and rerun reconcile all mapped tabl
   assert.equal((await target.query("SELECT count(*)::int AS n FROM users")).rows[0].n,0);
   const first = await apply();
   assert.equal(first.ok,true,JSON.stringify(first));
+  assert.equal(first.tables.github_app_connections.skipped.duplicate_default_connection,1);
   const one = await verifyImport(source,target,scope,first,fixtureKeyring,cloudKeyHex);
   assert.equal(one.ok,true,JSON.stringify(one.findings.filter((f) => !f.ok)));
   assert.equal(one.findings.filter((f) => f.kind === "table").length,SOURCE_TABLES.length);
@@ -195,7 +216,7 @@ fixtureTest("persisted ownership revisions and keys must match the imported data
   await target.query("UPDATE cloud_import_ledger SET mapping_revision=$1",[MAPPING_REVISION]);
   await target.query("DELETE FROM cloud_import_ledger WHERE table_name='desktop_relay_identities' AND row_key=$1",[id(0x601)]);
   const missing=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
-  assert.equal(missing.findings.find((f) => f.kind === "table" && f.name === "desktop_relay_identities")!.ok,true);
+  assert.equal(missing.findings.find((f) => f.kind === "table" && f.name === "desktop_relay_identities")!.ok,false);
   assert.equal(missing.findings.find((f) => f.kind === "ownership_ledger")!.ok,false);
 });
 
@@ -208,7 +229,7 @@ fixtureTest("rerun never deletes or claims a Control row absent from the ownersh
   assert.equal((await target.query("SELECT count(*)::int AS n FROM cloud_import_ledger WHERE row_key=$1",[id(0xc0ffee)])).rows[0].n,0);
   const report=await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex,{previousReport:first,previousOwnership:ownership});
   assert.equal(report.findings.find((f) => f.kind === "ownership_ledger")!.ok,true);
-  assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "organization_invitations")!.ok,false);
+  assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "organization_invitations")!.ok,true);
 });
 
 fixtureTest("dedicated canonical-origin checks detect drift without printing private hosts",async () => {
@@ -220,6 +241,43 @@ fixtureTest("dedicated canonical-origin checks detect drift without printing pri
   assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "workspaces")!.ok,true);
   assert.equal(report.findings.find((f) => f.kind === "canonical_history_origins")!.ok,false);
   assert.ok(!JSON.stringify(report).includes(marker));
+});
+
+fixtureTest("staff grants are revoked history with a stable fresh hash and one import audit",async () => {
+  const first=await apply();assert.equal(first.ok,true);
+  const stored=(await target.query("SELECT token_hash,revoked_at,staff_user_id,staff_organization_id FROM staff_read_grants WHERE id=$1",[id(0xa01)])).rows[0];
+  assert.match(stored.token_hash,/^[0-9a-f]{64}$/);assert.ok(stored.revoked_at);
+  assert.equal(stored.staff_user_id,id(1));assert.equal(stored.staff_organization_id,id(0xcafe));
+  const second=await apply();
+  assert.deepEqual((await target.query("SELECT token_hash,revoked_at,staff_user_id,staff_organization_id FROM staff_read_grants WHERE id=$1",[id(0xa01)])).rows[0],stored);
+  assert.equal((await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex)).ok,true);
+  await target.query("UPDATE staff_read_grants SET revoked_at=NULL WHERE id=$1",[id(0xa01)]);
+  const report=await verifyImport(source,target,scope,second,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "staff_read_grants")!.ok,true);
+  assert.equal(report.findings.find((f) => f.kind === "staff_grant_history")!.ok,false);
+});
+
+fixtureTest("older source without staff grants reports explicit absence and verifies other tables",async () => {
+  await source.query("DROP TABLE staff_read_grants");
+  const ledger=await apply();assert.equal(ledger.warnings.source_lacks_staff_read_grants,1);
+  const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
+  assert.equal(report.findings.find((f) => f.kind === "source_availability")!.ok,true);
+});
+
+fixtureTest("staff grants require both target support and an operator organization",async () => {
+  await target.query("UPDATE installation_bootstrap SET organization_id=NULL");
+  const noOperator=await apply();
+  assert.equal(noOperator.tables.staff_read_grants.skipped.no_operator_organization,1);
+  const one=await verifyImport(source,target,scope,noOperator,fixtureKeyring,cloudKeyHex);
+  assert.equal(one.findings.find((f) => f.kind === "ledger" && f.name === "staff_read_grants")!.ok,true);
+  assert.equal(one.ok,false);
+  await target.query("DROP TABLE staff_read_grants");
+  const noSchema=await apply();
+  assert.equal(noSchema.tables.staff_read_grants.skipped.target_lacks_staff_read_grants,1);
+  const two=await verifyImport(source,target,scope,noSchema,fixtureKeyring,cloudKeyHex);
+  assert.equal(two.findings.find((f) => f.kind === "ledger" && f.name === "staff_read_grants")!.ok,true);
+  assert.equal(two.ok,false);
 });
 
 fixtureTest("unrecognized ledger annotations never enter a verification report",async () => {
@@ -248,9 +306,9 @@ fixtureTest("copied credential natural keys verify reminted IDs, encrypted blobs
   assert.equal(first.ok,true,JSON.stringify(first.findings.filter((f) => !f.ok)));
   assert.equal(first.credentialCopy,"verified");
   const copiedRows = (await target.query("SELECT id FROM coding_agent_credentials WHERE auth_type <> 'relay_managed'")).rows;
-  assert.equal(copiedRows.length,4);
+  assert.equal(copiedRows.length,8);
   assert.ok(copiedRows.every((row) => ![id(0x803),id(0x805),id(0x806),id(0x808)].includes(row.id)));
-  await target.query("UPDATE coding_agent_credentials SET id=$1 WHERE auth_type='byo_api_key' AND workspace_id=$2",[id(0xdeadbeef),id(0x201)]);
+  await target.query("UPDATE coding_agent_credentials SET id=$1 WHERE auth_type='byo_api_key' AND model_provider='openai' AND workspace_id=$2",[id(0xdeadbeef),id(0x201)]);
   assert.equal((await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,{credentialCopy:evidence})).ok,true);
   const again = await copyCodingAgentCredentials(fixture.deps,scope,"apply");
   const report = await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
@@ -273,14 +331,101 @@ fixtureTest("copied credential natural keys verify reminted IDs, encrypted blobs
     const url = new URL("postgresql:/");url.hostname=config.host;url.port=String(port);url.username=config.user;
     url.pathname="/cloud_import_source_fixture";const sourceUrl=url.toString();url.pathname="/cloud_import_target_fixture";
     const inherited=Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(SELFHOST_|CLOUD_IMPORT_|CLOUD_VERIFY_|CLOUD_CREDENTIAL_)/.test(name)));
+    const baselinePath=join(directory,"credential-baseline.json");await writeFile(baselinePath,"{}",{mode:0o644});
+    const captured=spawnSync(process.execPath,["--import","tsx",fileURLToPath(new URL("../scripts/cloud-import-verify/credential-snapshot-cli.ts",import.meta.url)),
+      baselinePath,"--all-organizations"],{encoding:"utf8",timeout:20000,env:{...inherited,CLOUD_VERIFY_TARGET_URL:url.toString()}});
+    assert.equal(captured.status,0,captured.stderr);assert.equal((await stat(baselinePath)).mode & 0o077,0);
+    const baseline=await readFile(baselinePath,"utf8");
+    assert.equal(JSON.parse(baseline).rows.length,8);assert.ok(!/acct-|sk-|fingerprint|account_email/.test(baseline));
     const child=spawnSync(process.execPath,["--import","tsx",fileURLToPath(new URL("../scripts/cloud-import-verify/import-cli.ts",import.meta.url)),
-      ledgerPath,"--all-organizations","--credential-copy-report",copyPath],{encoding:"utf8",timeout:20000,env:{...inherited,
+      ledgerPath,"--all-organizations","--credential-copy-report",copyPath,"--previous-credentials",baselinePath],{encoding:"utf8",timeout:20000,env:{...inherited,
       CLOUD_VERIFY_SOURCE_URL:sourceUrl,CLOUD_VERIFY_TARGET_URL:url.toString(),CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR:objectRoot,
       CLOUD_CREDENTIAL_ENCRYPTION_KEY:cloudKeyHex,SELFHOST_ENCRYPTION_KEY_ID:fixtureKeyring.active.id,
       SELFHOST_ENCRYPTION_KEY:fixtureKeyring.active.key.toString("base64")}});
     assert.equal(child.status,0,child.stderr);
     assert.equal(JSON.parse(child.stdout).ok,true);
   } finally {await rm(directory,{recursive:true,force:true});}
+});
+
+fixtureTest("latest Cloud selection wins across users and demotion counters reconcile",async () => {
+  const fixture=await copiedFixture();
+  await source.query("UPDATE provider_credentials SET is_active=true,updated_at='2027-01-01T00:00:00Z' WHERE id=$1",[id(0x80b)]);
+  const copy=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  assert.equal(copy.selection!.activeDemoted,1);
+  const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
+  copy.selection!.activeDemoted=0;
+  assert.equal((await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs}})).findings.find((f) => f.kind === "credential_cloud_selection")!.ok,false);
+});
+
+fixtureTest("wrong Cloud credential selection fails even with unchanged cardinality and content",async () => {
+  const fixture=await copiedFixture();
+  const rows=(await target.query("SELECT id,is_active FROM coding_agent_credentials WHERE workspace_id=$1 AND model_provider='anthropic' AND auth_type='byo_api_key'",[id(0x201)])).rows;
+  const inactive=rows.find((row) => !row.is_active)!;
+  await target.query("UPDATE coding_agent_credentials SET is_active=false WHERE workspace_id=$1 AND model_provider='anthropic'",[id(0x201)]);
+  await target.query("UPDATE coding_agent_credentials SET is_active=true WHERE id=$1",[inactive.id]);
+  const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.ok(report.findings.filter((f) => f.kind === "credential_selection").every((f) => f.ok));
+  assert.equal(report.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
+  assert.equal(report.findings.find((f) => f.kind === "credential_cloud_selection")!.ok,false);
+});
+
+fixtureTest("unselected copied credentials preserve native selections and report fallback conflicts",async () => {
+  const fixture=await copiedFixture();
+  await source.query("UPDATE provider_credentials SET is_active=false WHERE id=ANY($1::uuid[])",[[id(0x80e),id(0x80f)]]);
+  const native=await fixture.deps.codingAgents.putApiKey({workspaceId:id(0x201),organizationId:ORG_A,
+    modelProvider:"google",key:"AIza-native-synthetic-google-key-000000",label:"Synthetic native",actor:{kind:"user",userId:id(1)}});
+  await fixture.deps.codingAgents.activate({workspaceId:id(0x201),organizationId:ORG_A,id:native.record.id,
+    selection:"model",actor:{kind:"user",userId:id(1)}});
+  const previousTarget=await captureCredentialTarget(target,scope);
+  const copy=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  assert.equal(copy.selection!.selectionConflicts,1);
+  assert.equal((await target.query("SELECT is_active FROM coding_agent_credentials WHERE id=$1",[native.record.id])).rows[0].is_active,true);
+  const conflict=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs,previousTarget}});
+  assert.equal(conflict.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
+  assert.equal(conflict.findings.find((f) => f.kind === "credential_cloud_selection")!.ok,false);
+  await source.query("UPDATE provider_credentials SET is_active=true WHERE id=$1",[id(0x80f)]);
+  const resolved=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  const passed=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:resolved,reader:fixture.reader,targetBlobs:fixture.blobs,previousTarget}});
+  assert.equal(passed.ok,true,JSON.stringify(passed.findings.filter((f) => !f.ok)));
+  const withoutBaseline=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:resolved,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(withoutBaseline.findings.find((f) => f.kind === "credential_natural_keys")!.ok,false);
+  resolved.selection!.active++;
+  assert.equal((await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:resolved,reader:fixture.reader,targetBlobs:fixture.blobs,previousTarget}})).findings.find((f) => f.kind === "credential_cloud_selection")!.ok,false);
+});
+
+fixtureTest("ambiguous legacy objects are never used and cannot qualify a credential copy",async () => {
+  const fixture=await copiedFixture();
+  await source.query(`INSERT INTO provider_credentials SELECT $1,organization_id,workspace_id,user_id,harness,model_provider,
+    auth_type,label,key_fingerprint,display_name,account_email,$2,is_active,harness_active,status,refresh_exhausted,
+    last_authenticated_at,last_used_at,last_error,created_at,updated_at FROM provider_credentials WHERE id=$3`,[id(0x80c),"acct-synthetic-2",id(0x806)]);
+  const reads:string[]=[];
+  const reader={get:async (key:string) => {reads.push(key);return fixture.objects.get(key) ?? null;}};
+  const copy=await copyCodingAgentCredentials({...fixture.deps,reader},scope,"apply");
+  assert.equal(copy.rows[id(0x80c)],"skipped:legacy_key_ambiguous");
+  assert.ok(!reads.includes(`${id(1)}/openai/credentials.json.enc`));
+  const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:copy,reader,targetBlobs:fixture.blobs}});
+  assert.equal(report.findings.find((f) => f.kind === "credential_copy_ledger")!.ok,true);
+  assert.equal(report.credentialCopy,"failed");
+});
+
+fixtureTest("a copy with only intentional exclusions needs no selection report",async () => {
+  const fixture=await copiedFixture();
+  await source.query("UPDATE provider_credentials SET status='error' WHERE auth_type <> 'relay_managed'");
+  const copy=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  assert.equal(copy.selection,undefined);
+  const previousTarget=await captureCredentialTarget(target,scope);
+  const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:copy,reader:fixture.reader,targetBlobs:fixture.blobs,previousTarget}});
+  assert.equal(report.credentialCopy,"verified",JSON.stringify(report.findings.filter((f) => !f.ok)));
 });
 
 fixtureTest("zero active credentials fails exact model/harness selection cardinality",async () => {
@@ -300,7 +445,7 @@ fixtureTest("equal-count credential fingerprint or blob corruption fails natural
     {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
   assert.equal(backendMismatch.credentialCopy,"failed");
   await target.query("UPDATE coding_agent_credentials SET blob_backend='postgres' WHERE auth_type='provider_oauth'");
-  await target.query("UPDATE coding_agent_credentials SET key_fingerprint=repeat('0',64) WHERE auth_type='byo_api_key' AND workspace_id=$1",[id(0x201)]);
+  await target.query("UPDATE coding_agent_credentials SET key_fingerprint=repeat('0',64) WHERE auth_type='byo_api_key' AND model_provider='openai' AND workspace_id=$1",[id(0x201)]);
   await target.query("UPDATE coding_agent_credential_blobs SET envelope='{}'");
   const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});

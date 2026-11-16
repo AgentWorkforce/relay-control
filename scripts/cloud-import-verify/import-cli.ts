@@ -7,7 +7,7 @@ import type { ImportReport } from "../cloud-import/importer.js";
 import { assertScope,type ImportScope } from "../cloud-import/mapping.js";
 import { localDatabaseUrl } from "./local.js";
 import { verifyImport } from "./import-contract.js";
-import { readOnlyPostgresBlobs,type CredentialEvidence } from "./credential-copy.js";
+import { readOnlyPostgresBlobs,type CredentialEvidence,type CredentialTargetSnapshot } from "./credential-copy.js";
 import type { CredentialCopyReport } from "../cloud-import/credentials.js";
 import type { OwnershipSnapshot } from "./reconciliation.js";
 
@@ -35,6 +35,13 @@ try {
     if (!ownershipPath || ownershipPath.startsWith("--")) throw new Error("ownership_snapshot_path_required");
     args.splice(ownershipAt,2);
   }
+  const credentialBeforeAt=args.indexOf("--previous-credentials");let credentialBeforePath:string|undefined;
+  if (credentialBeforeAt >= 0) {
+    credentialBeforePath=args[credentialBeforeAt+1];
+    if (!credentialBeforePath || credentialBeforePath.startsWith("--")) throw new Error("credential_snapshot_path_required");
+    args.splice(credentialBeforeAt,2);
+  }
+  if (credentialBeforePath && !copyPath) throw new Error("credential_copy_report_required");
   const path = args[0];
   let scope:ImportScope;
   if (args.length === 2 && args[1] === "--all-organizations") scope = {orgIds:null};
@@ -56,6 +63,7 @@ try {
     if (!process.env.CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR) throw new Error("local_object_directory_required");
     const root = await realpath(process.env.CLOUD_VERIFY_CREDENTIAL_OBJECTS_DIR);
     credentialCopy = {
+      previousTarget:credentialBeforePath ? JSON.parse(await readFile(credentialBeforePath,"utf8")) as CredentialTargetSnapshot : undefined,
       report:JSON.parse(await readFile(copyPath,"utf8")) as CredentialCopyReport,
       targetBlobs:readOnlyPostgresBlobs(target,keyring),
       reader:{get:async (key) => {

@@ -60,7 +60,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     const columns = new Set<string>(metadata.rows.map((r) => `${r.table_name}.${r.column_name}`));
     const gatedPresent = new Set<ImportTable>(SOURCE_TABLES.filter((table) => {
       const spec = TARGETS[table];
-      return !spec.gate || [...spec.columns,...(spec.secret ? [spec.secret.target] : [])]
+      return !spec.gate || [...spec.columns,...(spec.secret ? [spec.secret.target] : []),...(spec.freshTokenHash ? [spec.freshTokenHash] : [])]
         .every((column) => columns.has(`${spec.table}.${column}`));
     }));
     const desktopUuid = metadata.rows.some((r) => r.table_name === "desktop_relay_identities" && r.column_name === "source_id" && r.udt_name === "uuid");
@@ -73,6 +73,8 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
       .filter((c) => columns.has(`${table}.${c}`)).map((c) => `${table}.${c}`)).sort();
     findings.push({kind:"ledger",name:"optional_columns",ok:JSON.stringify(actualOptional) === JSON.stringify([...(ledger.optionalColumns ?? [])].sort()),
       detail:{expected:actualOptional,reportedCount:Array.isArray(ledger.optionalColumns) ? ledger.optionalColumns.length : null}});
+    const operatorOrg=(await t.query("SELECT organization_id::text FROM public.installation_bootstrap WHERE organization_id IS NOT NULL LIMIT 1")).rows[0]?.organization_id;
+    const absentSources=new Set<ImportTable>();
     const perOrg = new Map<string,Partial<Record<ImportTable,number>>>();
     const perOrgKeys:OrgKeys = new Map();
     const canonicalOrigin=options.canonicalOrigin ?? interimCanonicalOrigin;
@@ -81,6 +83,14 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     const counts = new Map<ImportTable,number>();
     for (const table of SOURCE_TABLES) {
       const spec = TARGETS[table];
+      if (spec.sourceRelation && !(await s.query("SELECT to_regclass(format('public.%I',$1::text)) IS NOT NULL AS present",[spec.sourceRelation])).rows[0].present) {
+        absentSources.add(table);exclusions.set(table,[]);counts.set(table,0);
+        const reported=ledger.tables?.[table];
+        findings.push({kind:"source_availability",name:table,ok:reported?.candidates === 0 && reported.imported === 0
+          && Object.values(reported.skipped).every((n) => n === 0) && Object.values(reported.importerSkips).every((keys) => keys.length === 0)
+          && ledger.warnings?.[`source_lacks_${spec.sourceRelation}`] === 1,detail:"source_relation_absent"});
+        continue;
+      }
       const key = spec.primaryKey.map((c) => `q.${c}::text`).join(" || ':' || ");
       await s.query(`DECLARE import_ledger_cursor NO SCROLL CURSOR FOR SELECT ${key} AS key,skip_reason,
         ${table === "users" ? "NULL::text" : "q.organization_id::text"} AS org,
@@ -111,6 +121,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
         }
         if (reason === null && table === "desktop_relay_identities" && desktopUuid && !row.source_id_is_uuid) reason = "source_id_not_uuid";
         if (reason === null && spec.gate && !gatedPresent.has(table)) reason = spec.gate;
+        if (reason === null && table === "staff_read_grants" && !operatorOrg) reason = "no_operator_organization";
         if (reason === null && table === "coding_agent_credentials" && !relayManaged) reason = "target_lacks_relay_managed";
         if (reason !== null) {
           skipped[reason] = (skipped[reason] ?? 0)+1;
@@ -176,10 +187,27 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
         && JSON.stringify(distinctOrigins) === JSON.stringify([...ledger.relayhistoryOrigins].sort()),
       detail:{workspaces:origins.size,distinctOrigins:distinctOrigins.length,mismatches:originMismatches,
         reportedDistinctCount:Array.isArray(ledger.relayhistoryOrigins) ? ledger.relayhistoryOrigins.length : null}});
-    const tables = comparisons(scope,columns,gatedPresent).map((item) => {
+    const tables = comparisons(scope,columns,gatedPresent).filter((item) => !absentSources.has(item.name as ImportTable)).map((item) => {
       const keys = exclusions.get(item.name)!;
       return keys.length ? {...item,sourceSql:`SELECT p.* FROM (${item.sourceSql}) p WHERE __key::text <> ALL(ARRAY[${keys.map(literal).join(",")}]::text[])`} : item;
     });
+    if (options.credentialCopy) {
+      const coding=tables.find((item) => item.name === "coding_agent_credentials");
+      if (coding) for (const side of ["sourceSql","targetSql"] as const) coding[side]=`SELECT __key,__org,__workspace,
+        to_jsonb(p)-'__key'-'__org'-'__workspace'-'is_active'-'harness_active' AS payload FROM (${coding[side]}) p`;
+    }
+    if (gatedPresent.has("staff_read_grants")) {
+      const grants=await t.query(`SELECT count(*)::int AS imported,
+        count(*) FILTER(WHERE g.revoked_at IS NULL OR g.revoked_by IS NOT NULL OR g.last_used_at IS NOT NULL
+          OR g.staff_organization_id::text IS DISTINCT FROM $1::text OR g.token_hash !~ '^[0-9a-f]{64}$'
+          OR (SELECT count(*) FROM public.admin_audit_events a WHERE a.action='staff_read_grant.imported'
+            AND a.organization_id=g.organization_id AND a.workspace_id=g.workspace_id AND a.actor_kind='service'
+            AND a.actor_id='cloud-import' AND a.target=g.id::text || ' workspace ' || g.workspace_id::text) <> 1)::int AS invalid
+        FROM public.staff_read_grants g JOIN public.cloud_import_ledger l
+          ON l.table_name='staff_read_grants' AND l.row_key=g.id::text AND l.organization_id=g.organization_id
+        WHERE $2::uuid[] IS NULL OR g.organization_id=ANY($2::uuid[])`,[operatorOrg ?? null,scope.orgIds]);
+      findings.push({kind:"staff_grant_history",name:"staff_read_grants",ok:grants.rows[0].invalid === 0,detail:grants.rows[0]});
+    }
     const contract = contractFor(scope,columns,tables);
     contract.targetRelations = SOURCE_TABLES.filter((table) => gatedPresent.has(table)).map((table) => `public.${TARGETS[table].table}`);
     contract.targetRelations.push("public.cloud_import_ledger");

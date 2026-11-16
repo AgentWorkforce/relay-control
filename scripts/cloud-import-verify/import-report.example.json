@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "mappingRevision": "cloud-identity-2026-11-16.6",
+  "mappingRevision": "cloud-identity-2026-11-16.11",
   "ok": true,
   "findings": [
     {
@@ -8,7 +8,7 @@
       "name": "run",
       "ok": true,
       "detail": {
-        "expectedRevision": "cloud-identity-2026-11-16.6",
+        "expectedRevision": "cloud-identity-2026-11-16.11",
         "revisionMatches": true,
         "mode": "apply",
         "ok": true
@@ -283,20 +283,20 @@
       "ok": true,
       "detail": {
         "observed": {
-          "candidates": 7,
+          "candidates": 13,
           "imported": 2,
           "skipped": {
-            "secret_in_cloud_credential_store": 4,
+            "secret_in_cloud_credential_store": 10,
             "workspace_not_imported": 1
           },
           "importerSkips": {}
         },
         "reported": {
-          "candidates": 7,
+          "candidates": 13,
           "imported": 2,
           "deleted": 0,
           "skipped": {
-            "secret_in_cloud_credential_store": 4,
+            "secret_in_cloud_credential_store": 10,
             "workspace_not_imported": 1
           }
         }
@@ -327,23 +327,48 @@
       "ok": true,
       "detail": {
         "observed": {
-          "candidates": 4,
+          "candidates": 5,
           "imported": 1,
           "skipped": {
             "named_connection_needs_policy": 1,
+            "duplicate_default_connection": 1,
             "installation_claimed_by_other_org": 1,
             "invalid_installation_id": 1
           },
           "importerSkips": {}
         },
         "reported": {
-          "candidates": 4,
+          "candidates": 5,
           "imported": 1,
           "deleted": 0,
           "skipped": {
             "named_connection_needs_policy": 1,
+            "duplicate_default_connection": 1,
             "installation_claimed_by_other_org": 1,
             "invalid_installation_id": 1
+          }
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "staff_read_grants",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 2,
+          "imported": 1,
+          "skipped": {
+            "workspace_not_imported": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 2,
+          "imported": 1,
+          "deleted": 0,
+          "skipped": {
+            "workspace_not_imported": 1
           }
         }
       }
@@ -374,7 +399,8 @@
           "fleet_node_owners": 1,
           "coding_agent_credentials": 2,
           "github_app_installations": 1,
-          "github_app_connections": 1
+          "github_app_connections": 1,
+          "staff_read_grants": 1
         },
         "reported": {
           "status": "ok",
@@ -389,7 +415,8 @@
             "fleet_node_owners": 1,
             "coding_agent_credentials": 2,
             "github_app_installations": 1,
-            "github_app_connections": 1
+            "github_app_connections": 1,
+            "staff_read_grants": 1
           }
         }
       }
@@ -420,7 +447,8 @@
             "fleet_node_owners": 0,
             "coding_agent_credentials": 0,
             "github_app_installations": 0,
-            "github_app_connections": 0
+            "github_app_connections": 0,
+            "staff_read_grants": 0
           }
         }
       }
@@ -430,7 +458,7 @@
       "name": "cloud_import_ledger",
       "ok": true,
       "detail": {
-        "entries": 22,
+        "entries": 23,
         "keyMismatches": 0,
         "revisionMismatches": 0,
         "extraOrgs": 0
@@ -658,6 +686,26 @@
     },
     {
       "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000a1:staff_read_grants",
+      "ok": true,
+      "detail": {
+        "observed": 1,
+        "reported": 1
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000a1:staff_read_grants",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
       "name": "00000000-0000-4000-8000-0000000000b1:organizations",
       "ok": true,
       "detail": {
@@ -868,6 +916,26 @@
     {
       "kind": "deletions",
       "name": "00000000-0000-4000-8000-0000000000b1:github_app_connections",
+      "ok": true,
+      "detail": {
+        "expected": 0,
+        "reported": 0,
+        "remaining": 0,
+        "previousSupplied": false
+      }
+    },
+    {
+      "kind": "ledger_keys",
+      "name": "00000000-0000-4000-8000-0000000000b1:staff_read_grants",
+      "ok": true,
+      "detail": {
+        "observed": 0,
+        "reported": 0
+      }
+    },
+    {
+      "kind": "deletions",
+      "name": "00000000-0000-4000-8000-0000000000b1:staff_read_grants",
       "ok": true,
       "detail": {
         "expected": 0,
@@ -997,6 +1065,16 @@
       }
     },
     {
+      "kind": "deleted_total",
+      "name": "staff_read_grants",
+      "ok": true,
+      "detail": {
+        "orgTotal": 0,
+        "reported": 0,
+        "previousSupplied": false
+      }
+    },
+    {
       "kind": "canonical_history_origins",
       "name": "workspaces",
       "ok": true,
@@ -1008,13 +1086,35 @@
       }
     },
     {
+      "kind": "staff_grant_history",
+      "name": "staff_read_grants",
+      "ok": true,
+      "detail": {
+        "imported": 1,
+        "invalid": 0
+      }
+    },
+    {
       "kind": "credential_selection",
       "name": "00000000-0000-4000-8000-000000000201:anthropic",
       "ok": true,
       "detail": {
         "workspace_id": "00000000-0000-4000-8000-000000000201",
         "model_provider": "anthropic",
-        "model_eligible": 2,
+        "model_eligible": 4,
+        "harness_eligible": 0,
+        "model_active": 1,
+        "harness_active": 0
+      }
+    },
+    {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000201:google",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000201",
+        "model_provider": "google",
+        "model_eligible": 1,
         "harness_eligible": 0,
         "model_active": 1,
         "harness_active": 0
@@ -1060,14 +1160,27 @@
       }
     },
     {
+      "kind": "credential_selection",
+      "name": "00000000-0000-4000-8000-000000000205:openrouter",
+      "ok": true,
+      "detail": {
+        "workspace_id": "00000000-0000-4000-8000-000000000205",
+        "model_provider": "openrouter",
+        "model_eligible": 1,
+        "harness_eligible": 0,
+        "model_active": 1,
+        "harness_active": 0
+      }
+    },
+    {
       "kind": "credential_copy_ledger",
       "name": "run",
       "ok": true,
       "detail": {
-        "candidates": 4,
+        "candidates": 10,
         "sourceFailures": 0,
         "unresolvedSourceSkips": 0,
-        "reportedCandidates": 4
+        "reportedCandidates": 10
       }
     },
     {
@@ -1075,16 +1188,32 @@
       "name": "coding_agent_credentials",
       "ok": true,
       "detail": {
-        "expected": 4,
-        "target": 4,
+        "expected": 8,
+        "target": 8,
         "missing": 0,
-        "extra": 0,
+        "unmatchedTarget": 0,
+        "unexplainedTarget": 0,
         "duplicateKeys": 0,
         "contentFailures": 0,
         "sourceFailures": 0,
         "unresolvedSourceSkips": 0,
-        "sourceChecksum": "efa7243bb3d97220f5d50363b5bb443fae7e9f609a8b6867f452dc653954de47",
-        "targetChecksum": "efa7243bb3d97220f5d50363b5bb443fae7e9f609a8b6867f452dc653954de47"
+        "sourceChecksum": "79915a2c7412f90863412007ca2e643f6dde08f670673169d062a92f220db210",
+        "targetChecksum": "79915a2c7412f90863412007ca2e643f6dde08f670673169d062a92f220db210"
+      }
+    },
+    {
+      "kind": "credential_cloud_selection",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "groups": 6,
+        "active": 6,
+        "harness": 2,
+        "activeDemoted": 0,
+        "harnessDemoted": 0,
+        "selectionConflicts": 0,
+        "selectionMismatches": 0,
+        "reportMatches": true
       }
     },
     {
@@ -1728,37 +1857,21 @@
             "__key",
             "__org",
             "__workspace",
-            "account_email",
-            "auth_type",
-            "created_at",
-            "created_by_user_id",
-            "display_name",
-            "harness",
-            "harness_active",
-            "id",
-            "is_active",
-            "label",
-            "last_authenticated_at",
-            "last_error",
-            "last_used_at",
-            "model_provider",
-            "organization_id",
-            "status",
-            "workspace_id"
+            "payload"
           ],
           "count": 2,
-          "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5",
+          "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
               "count": 2,
-              "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5"
+              "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
             }
           },
           "workspaces": {
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 2,
-              "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5"
+              "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
             }
           },
           "invalidWorkspaceBindings": 0
@@ -1768,37 +1881,21 @@
             "__key",
             "__org",
             "__workspace",
-            "account_email",
-            "auth_type",
-            "created_at",
-            "created_by_user_id",
-            "display_name",
-            "harness",
-            "harness_active",
-            "id",
-            "is_active",
-            "label",
-            "last_authenticated_at",
-            "last_error",
-            "last_used_at",
-            "model_provider",
-            "organization_id",
-            "status",
-            "workspace_id"
+            "payload"
           ],
           "count": 2,
-          "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5",
+          "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e",
           "invalidKeys": 0,
           "orgs": {
             "\"00000000-0000-4000-8000-0000000000a1\"": {
               "count": 2,
-              "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5"
+              "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
             }
           },
           "workspaces": {
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 2,
-              "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5"
+              "checksum": "eb3b90123062402fe743b5e2e4513d195330e8d2ba550690700dd6d58836d41e"
             }
           },
           "invalidWorkspaceBindings": 0
@@ -1917,6 +2014,73 @@
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 1,
               "checksum": "9ec96ad7ceeaa05a0d75ef9698a78cbc9e21d3b129eb2bb7eddec098ae74df0a"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "staff_read_grants",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "created_at",
+            "expires_at",
+            "id",
+            "organization_id",
+            "reason",
+            "staff_user_id",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "created_at",
+            "expires_at",
+            "id",
+            "organization_id",
+            "reason",
+            "staff_user_id",
+            "workspace_id"
+          ],
+          "count": 1,
+          "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 1,
+              "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 1,
+              "checksum": "0db7835c50eabd5e5af904e4ee24fb3c7539997e49ad89f74ab7027d0d1aaad2"
             }
           },
           "invalidWorkspaceBindings": 0
@@ -2831,6 +2995,67 @@
     {
       "kind": "sequence",
       "name": "public.integration_connections",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.staff_read_grants",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.staff_read_grants.staff_read_grants_staff_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.staff_read_grants.staff_read_grants_staff_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.staff_read_grants.staff_read_grants_workspace_id_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.staff_read_grants.staff_read_grants_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.staff_read_grants.staff_read_grants_token_hash_key",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.staff_read_grants",
       "ok": true,
       "detail": "not_applicable"
     },
