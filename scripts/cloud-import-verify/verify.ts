@@ -1,3 +1,4 @@
+import { beginReadOnlySnapshot,type ReadOnlySettings } from "./read-only.js";
 import { createHash } from "node:crypto";
 import type { Client } from "pg";
 import { decryptSecret, type EncryptionKeyring } from "../../src/crypto.js";
@@ -35,6 +36,7 @@ type Snapshot = {
 export type Finding = { kind: string; name: string; ok: boolean; detail: unknown };
 export type Report = {
   evidenceKind: "contract-only";
+  sessionSafety: {source:ReadOnlySettings;target:ReadOnlySettings};
   version: 1;
   mappingRevision: string;
   ok: boolean;
@@ -246,15 +248,10 @@ export async function verify(source: Client, target: Client, contract: Contract,
   const findings: Finding[] = [];
   let active = contract;
   let halt=false;
+  const sessionSafety={} as {source:ReadOnlySettings;target:ReadOnlySettings};
   try {
-    for (const client of [source, target]) {
-      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-      await client.query("SET LOCAL statement_timeout='60s'");
-      await client.query("SET LOCAL TIME ZONE 'UTC'");
-      await client.query("SET LOCAL DateStyle='ISO, YMD'");
-      // A role that silently filters data must not produce a passing checksum.
-      await client.query("SET LOCAL row_security=off");
-    }
+    sessionSafety.source=await beginReadOnlySnapshot(source);
+    sessionSafety.target=await beginReadOnlySnapshot(target);
     if (options.prepare) {
       const prepared = await options.prepare(source,target);
       validateContract(prepared.contract); active = prepared.contract; findings.push(...prepared.findings);halt=prepared.halt === true;
@@ -289,7 +286,7 @@ export async function verify(source: Client, target: Client, contract: Contract,
     // PostgreSQL error details can contain rows and credentials.
     await Promise.allSettled([source.query("ROLLBACK"), target.query("ROLLBACK")]);
   }
-  return { evidenceKind:"contract-only", version: 1, mappingRevision: active.mappingRevision,
+  return { evidenceKind:"contract-only", sessionSafety, version: 1, mappingRevision: active.mappingRevision,
     ok: findings.every((f) => f.ok), findings,
     smoke: ["login", "workspace_list", "relaycast_key_resolve", "flows_run", "integration_token_refresh", "desktop_feed"]
       .map((name) => ({ name, status: "pending" })) };

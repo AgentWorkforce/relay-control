@@ -65,7 +65,6 @@ try {
     url.port = url.port || "5432";
     return new Client({connectionString: url.href, connectionTimeoutMillis: 10000,
       application_name: "cloud-import-readonly-verification",
-      options: "-c default_transaction_read_only=on",
       ssl: {ca, rejectUnauthorized: true, servername: host}});
   }
   source = await clientFor("SOURCE");
@@ -118,3 +117,11 @@ scope; this recipe performs no import, grant, refresh or schema mutation.
 For final matching-revision identity qualification, use
 [REMOTE_IMPORT_RUN.md](REMOTE_IMPORT_RUN.md). The contract runner above stays
 a lower-level evidence path even when its contract revision is current.
+
+Read-only and timeout guarantees use in-session `BEGIN ... READ ONLY` and
+`SET LOCAL`, followed by `SHOW transaction_read_only`, `SHOW transaction_isolation`,
+`SHOW statement_timeout` and `SHOW lock_timeout`. The returned `sessionSafety`
+records must show `on`, `repeatable read`, `1min` and `5s`. Libpq startup options
+are not used: Supavisor session poolers can silently drop them. A real pooler
+run must retain these returned settings as evidence; local tests alone do not
+prove pooler behavior. A mismatch aborts before row or credential reads.

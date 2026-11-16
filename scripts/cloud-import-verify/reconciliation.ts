@@ -1,3 +1,4 @@
+import { beginReadOnlySnapshot,type ReadOnlySettings } from "./read-only.js";
 import type { Client } from "pg";
 import type { ImportReport } from "../cloud-import/importer.js";
 import { ORG_TABLES,RECONCILED_TABLES,SOURCE_TABLES,TARGETS,IMPORT_LEDGER_TABLE,MAPPING_REVISION,assertScope,type ImportTable,type ImportScope } from "../cloud-import/mapping.js";
@@ -5,6 +6,7 @@ import type { Finding } from "./verify.js";
 
 export type OrgKeys = Map<string,Partial<Record<ImportTable,string[]>>>;
 export interface OwnershipSnapshot {
+  sessionSafety?:ReadOnlySettings;
   version:1;
   table:typeof IMPORT_LEDGER_TABLE;
   scope:ImportScope;
@@ -67,10 +69,9 @@ function snapshotKeys(snapshot:OwnershipSnapshot):OrgKeys {
 /** Capture immediately before the importer runs; it never authorizes writes.
  * The importer trusts only its own transactional database ledger. */
 export async function captureOwnership(target:Client,scope:ImportScope):Promise<OwnershipSnapshot> {
-  await target.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   try {
-    await target.query("SET LOCAL statement_timeout='60s'");await target.query("SET LOCAL row_security=off");
-    return await readOwnership(target,scope);
+    const sessionSafety=await beginReadOnlySnapshot(target);
+    return {...await readOwnership(target,scope),sessionSafety};
   } finally {await target.query("ROLLBACK");}
 }
 

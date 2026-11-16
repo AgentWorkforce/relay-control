@@ -245,3 +245,26 @@ fixtureTest("CLI emits JSON with useful exit codes and hides URL/SQL errors", as
     assert.equal(run({SELFHOST_PASSWORD_PEPPER_FILE:pepperPath}).status,2);
   } finally { await rm(directory,{recursive:true,force:true}); }
 });
+
+fixtureTest("read-only snapshots assert in-session settings without startup options and restore defaults", async () => {
+  for (const client of [source,target]) {
+    await client.query("SET default_transaction_read_only=off");
+    await client.query("SET statement_timeout=0");await client.query("SET lock_timeout=0");
+  }
+  const report=await verify(source,target,fixtureContract(),fixtureKeyring,{prepare:async (s,t) => {
+    for (const client of [s,t]) {
+      assert.equal((await client.query("SHOW transaction_read_only")).rows[0].transaction_read_only,"on");
+      assert.equal((await client.query("SHOW statement_timeout")).rows[0].statement_timeout,"1min");
+      assert.equal((await client.query("SHOW lock_timeout")).rows[0].lock_timeout,"5s");
+    }
+    return {contract:fixtureContract(),findings:[]};
+  }});
+  assert.equal(report.ok,true);
+  assert.deepEqual(report.sessionSafety.source,{transactionReadOnly:"on",isolation:"repeatable read",statementTimeout:"1min",lockTimeout:"5s"});
+  assert.deepEqual(report.sessionSafety.target,report.sessionSafety.source);
+  for (const client of [source,target]) {
+    assert.equal((await client.query("SHOW transaction_read_only")).rows[0].transaction_read_only,"off");
+    assert.equal((await client.query("SHOW statement_timeout")).rows[0].statement_timeout,"0");
+    assert.equal((await client.query("SHOW lock_timeout")).rows[0].lock_timeout,"0");
+  }
+});

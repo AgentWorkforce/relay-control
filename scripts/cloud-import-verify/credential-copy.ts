@@ -1,3 +1,4 @@
+import { beginReadOnlySnapshot,type ReadOnlySettings } from "./read-only.js";
 import { createHash,createHmac } from "node:crypto";
 import type { Client } from "pg";
 import { decryptSecret,type EncryptionKeyring } from "../../src/crypto.js";
@@ -33,6 +34,7 @@ const naturalKey = (workspace:string,provider:string,type:string,identity:string
 const digestKeys = (keys:Iterable<string>) => hash(JSON.stringify([...keys].sort()));
 
 export interface CredentialTargetSnapshot {
+  sessionSafety?:ReadOnlySettings;
   version:1;
   scope:ImportScope;
   rows:{key:string;group:string;org:string;active:boolean;harness:boolean}[];
@@ -46,9 +48,8 @@ const targetKey = (row:{workspace_id:string;model_provider:string;auth_type:stri
  * Account ids and fingerprints never leave this read-only transaction. */
 export async function captureCredentialTarget(target:Client,scope:ImportScope):Promise<CredentialTargetSnapshot> {
   assertScope(scope);
-  await target.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   try {
-    await target.query("SET LOCAL statement_timeout='60s'");await target.query("SET LOCAL row_security=off");
+    const sessionSafety=await beginReadOnlySnapshot(target);
     await target.query(`DECLARE credential_before_cursor NO SCROLL CURSOR FOR SELECT c.* FROM public.coding_agent_credentials c
       JOIN public.workspaces w ON w.id=c.workspace_id WHERE c.auth_type <> 'relay_managed'
         AND ($1::uuid[] IS NULL OR w.organization_id=ANY($1::uuid[])) ORDER BY c.id`,[scope.orgIds]);
@@ -61,7 +62,7 @@ export async function captureCredentialTarget(target:Client,scope:ImportScope):P
           active:row.is_active,harness:row.harness_active});
       }
     }
-    return {version:1,scope:{orgIds:scope.orgIds === null ? null : [...scope.orgIds]},rows};
+    return {version:1,sessionSafety,scope:{orgIds:scope.orgIds === null ? null : [...scope.orgIds]},rows};
   } finally {await target.query("ROLLBACK");}
 }
 

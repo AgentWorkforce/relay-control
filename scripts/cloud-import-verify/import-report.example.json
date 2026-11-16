@@ -1,5 +1,19 @@
 {
   "evidenceKind": "synthetic-local-postgres",
+  "sessionSafety": {
+    "source": {
+      "transactionReadOnly": "on",
+      "isolation": "repeatable read",
+      "statementTimeout": "1min",
+      "lockTimeout": "5s"
+    },
+    "target": {
+      "transactionReadOnly": "on",
+      "isolation": "repeatable read",
+      "statementTimeout": "1min",
+      "lockTimeout": "5s"
+    }
+  },
   "version": 1,
   "mappingRevision": "cloud-identity-2026-11-16.11",
   "ok": true,

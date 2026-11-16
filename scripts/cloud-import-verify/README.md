@@ -379,3 +379,12 @@ Schema and scope requirements are documented in [SCHEMA_MANIFEST.md](SCHEMA_MANI
 Qualified results always include normalized scope and the all-source org census.
 Cutover runners require all-source scope and the reviewed production schema;
 subset results and the proposed 0061 fixture profile are diagnostic evidence only.
+
+Verification and pre-import snapshots establish their own in-session repeatable-
+read, read-only transactions. They set a 60-second statement timeout and a
+5-second lock timeout, then `SHOW` read-only mode, isolation and both timeouts
+before reading data. Reports and new snapshots record the observed settings in
+`sessionSafety`; a mismatch aborts. Remote recipes do not rely on libpq startup
+options, which Supavisor can drop. The local harness proves these checks without
+startup options; the authorized remote rehearsal must retain the actual pooler
+settings as evidence.
