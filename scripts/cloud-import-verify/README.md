@@ -352,3 +352,8 @@ Use approved staging/local services and synthetic providers until authorized.
 
 The verifier emits all six as `pending`. A database `ok:true` is never evidence
 that these application smokes ran.
+
+The independently authorized rehearsal runner can integrate the library with
+direct provider DNS and full TLS verification using [REMOTE_RUN.md](REMOTE_RUN.md).
+That recipe leaves the loopback CLI unchanged and keeps older contract evidence
+distinct from full import qualification.
