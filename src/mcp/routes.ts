@@ -5,6 +5,7 @@ import { connectorKind } from "./oauth/connector-kind.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { ApiTokenStore } from "../admin/api-tokens.js";
+import { STAFF_READ_GRANT_PREFIX, StaffReadGrants } from "../admin/staff-read-grants.js";
 import { cookieRequestAllowed } from "../auth/device-approval.js";
 import { DesktopMcpCredentials } from "../auth/desktop-mcp-credentials.js";
 import type { SelfhostConfig } from "../config.js";
@@ -15,7 +16,7 @@ import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
 import { providerStatuses, type ProviderProbes } from "../providers/registry.js";
 import type { ControlPlaneStore } from "../store.js";
-import { MCP_FACADE, type McpAuthMode } from "./catalog.js";
+import { MCP_FACADE, STAFF_READ_GRANT_TOOLS, type McpAuthMode } from "./catalog.js";
 import { historyReader, type McpContext, type McpMember } from "./context.js";
 import { ClaudeAttestationError, claudeAttestationFor, type ClaudeAttestation } from "./claude-attestation.js";
 import { CopilotAttestationError, copilotAttestationFor, postgresAttestationStore, type CopilotAttestation } from "./copilot-attestation.js";
@@ -51,6 +52,27 @@ function rpcError(response: ServerResponse, status: number, code: number, messag
     ...headers,
   });
   response.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id }));
+}
+
+/**
+ * A staff read grant may send only initialize, ping, tools/list,
+ * notifications and tools/call of an allowlisted tool. Every message of a
+ * batch must qualify, so an allowed call cannot hide a forbidden one. A
+ * message without an id counts as a notification only under `notifications/`.
+ */
+export function staffReadGrantAllows(body: unknown): boolean {
+  const messages = Array.isArray(body) ? body : [body];
+  if (messages.length === 0) return false;
+  return messages.every((message) => {
+    if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+    const { method, params, id } = message as { method?: unknown; params?: unknown; id?: unknown };
+    if (typeof method !== "string") return false;
+    if (id === undefined) return method.startsWith("notifications/");
+    if (method === "initialize" || method === "ping" || method === "tools/list") return true;
+    if (method !== "tools/call" || !params || typeof params !== "object") return false;
+    const name = (params as { name?: unknown }).name;
+    return typeof name === "string" && STAFF_READ_GRANT_TOOLS.includes(name);
+  });
 }
 
 function withoutDesktopMarker(headers: Headers): Headers {
@@ -125,6 +147,7 @@ export function createMcpHandler(input: {
   const { config, store } = input;
   const apiTokens = new ApiTokenStore(store.database);
   const desktopCredentials = new DesktopMcpCredentials(store.database);
+  const staffReadGrants = new StaffReadGrants(store.database, store.tenancy);
   const attestations = postgresAttestationStore(store.database);
   const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.fetchImpl });
   // Citations open the dashboard's session page.
@@ -171,6 +194,21 @@ export function createMcpHandler(input: {
     if (headerToken?.startsWith("sh_wk_") && await apiTokens.authenticate(headerToken)) {
       forbidden();
       return null;
+    }
+    // A staff read grant: header bearer only, only on the shared-sessions
+    // facade, fenced (revocation, expiry, live staff rule) on every request.
+    // The holder and the pinned workspace come only from the grant row; it
+    // never falls back to a membership or a person session.
+    if (token.startsWith(STAFF_READ_GRANT_PREFIX)) {
+      const admission = headerToken && resourceFor(rawPath) === "/api/v1/mcp/shared-sessions"
+        ? await staffReadGrants.use(headerToken)
+        : null;
+      if (!admission) {
+        rpcError(response, 401, -32001, "Unauthorized", null, { "www-authenticate": challenge(rawPath, true) });
+        return null;
+      }
+      return { principal: admission.principal, workspace: admission.workspace, authMode: "staff_read_grant" as McpAuthMode,
+        token: headerToken!, provider: undefined as string | undefined, oauth: undefined as McpOAuthConnection | undefined };
     }
     if (headerToken?.startsWith("mcp_at_") && oauthSessions) {
       const resourcePath = resourceFor(rawPath);
@@ -269,8 +307,16 @@ export function createMcpHandler(input: {
       rpcError(response, 400, -32700, "Parse error");
       return true;
     }
-    const headers = webHeaders(request);
     const { principal, workspace, authMode, token, provider, oauth } = admitted;
+    // Before any server is built: a staff read grant reaches only its allowlist.
+    const staffGrant = authMode === "staff_read_grant";
+    if (staffGrant && !staffReadGrantAllows(body)) {
+      const parsed = JSONRPCRequestSchema.safeParse(body);
+      rpcError(response, 403, -32003, "Forbidden: a staff read grant reaches only the shared-session read tools.",
+        parsed.success ? parsed.data.id : null);
+      return true;
+    }
+    const headers = webHeaders(request);
     let desktopCall;
     try {
       // Always strips `_agent_relay_attestation` from the arguments; a proof
@@ -280,7 +326,7 @@ export function createMcpHandler(input: {
       const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider };
       // An OAuth grant acts only as its approved agent: the Desktop marker
       // never makes it managed, so its proofs are stripped and ignored.
-      const callHeaders = oauth ? withoutDesktopMarker(headers) : headers;
+      const callHeaders = oauth || staffGrant ? withoutDesktopMarker(headers) : headers;
       const attested: CopilotAttestation | ClaudeAttestation | undefined = provider === "copilot"
         ? await copilotAttestationFor(body, auth, attestations)
         : await claudeAttestationFor(body, callHeaders, auth, attestations);
@@ -299,7 +345,8 @@ export function createMcpHandler(input: {
       principal,
       workspace,
       authMode,
-      role: workspace.role,
+      // A grant holds no membership in the workspace it reads.
+      role: staffGrant ? "none" : workspace.role,
       origin: citationOrigin,
       endpointUrl: `${site}${rawPath}`,
       desktopCall,
@@ -324,11 +371,11 @@ export function createMcpHandler(input: {
         sessionId: typeof sessionId === "string" ? sessionId : undefined,
         relaycastPublicUrl: config.relaycastPublicUrl,
       },
-      ...(!oauth && input.amp ? { amp: input.amp } : {}),
-      ...(!oauth && input.factory ? { factory: input.factory } : {}),
-      ...(!oauth && !desktopCall.required && desktopCall.provider === undefined && input.capy ? { capy: input.capy } : {}),
+      ...(!oauth && !staffGrant && input.amp ? { amp: input.amp } : {}),
+      ...(!oauth && !staffGrant && input.factory ? { factory: input.factory } : {}),
+      ...(!oauth && !staffGrant && !desktopCall.required && desktopCall.provider === undefined && input.capy ? { capy: input.capy } : {}),
       ...(oauth && input.capyPermits ? { capyPermits: input.capyPermits } : {}),
-      ...(input.launch ? { launch: true } : {}),
+      ...(input.launch && !staffGrant ? { launch: true } : {}),
       readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
     };
     if (oauth && input.grokRoutines) {
@@ -338,7 +385,7 @@ export function createMcpHandler(input: {
         context.grokRoutines = input.grokRoutines;
       }
     }
-    if (config.customerSupport) context.customerSupport = {
+    if (config.customerSupport && !staffGrant) context.customerSupport = {
       origin: new URL(config.publicBaseUrl).origin,
       send: request => sendCustomerSupport(config.customerSupport!, request),
       notifyTarget: () => customerSupportDesktop(context),

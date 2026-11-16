@@ -1063,6 +1063,13 @@ Audit actions (all in the minting workspace's audit log, `GET /api/v1/workspaces
 - `enrollment_key.exchange`: actor the employee, target `<keyId> ip=<client address> host=<host name>`; never the key
 - `api_token.revoke`: target `<keyId> (desktop-enrollment: user <userId>) sessions=<n>`, with ` reason=member_removed` when a membership removal revoked it
 
+#### Staff read grants
+
+An owner of the operator organization (on its domains, when it has any) can
+mint a short-lived `sh_sr_` credential that reads one customer workspace's
+shared sessions over the shared-sessions MCP facade, without a membership.
+See [staff-read-grants.md](staff-read-grants.md).
+
 ## Who may sign in
 
 **Single mode (the default).** An email the provider did not mark unverified
@@ -1283,6 +1290,7 @@ adds one.
 | Device / CLI token | `POST /api/v1/auth/device/token` | `cli:auth rth:read rth:sync rth:acquire` |
 | Enrollment key session | `POST /api/v1/auth/enrollment/token` (one exchange of an `sh_ek_` key) | `cli:auth rth:read rth:sync rth:acquire` |
 | Refreshed token | `POST /api/v1/auth/token/refresh` | Unchanged from the session it refreshes |
+| Staff read grant (`sh_sr_`) | `POST /api/v1/workspaces/{id}/staff-read-grants`, staff only ([staff-read-grants.md](staff-read-grants.md)) | `rth:read`, on the shared-sessions MCP facade only; never refreshed |
 | MCP, workspace API, worker and service tokens | Their own routes | Never `account` or `desktop:workspaces` |
 
 Hosted MCP OAuth connectors (`mcp_at_`/`mcp_rt_`) are on by default and work only

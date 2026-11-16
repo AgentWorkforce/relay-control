@@ -67,6 +67,13 @@ import {
 } from "./store.js";
 import { createFlowsHandler } from "./flows/routes.js";
 import { isUuid, type FlowsStore } from "./flows/store.js";
+import {
+  grantJson,
+  parseMintRequest,
+  StaffReadGrantError,
+  StaffReadGrants,
+  type StaffPerson,
+} from "./admin/staff-read-grants.js";
 import type { TelemetryModule } from "./telemetry/module.js";
 import { identityErrorResponse, type IdentityModule } from "./identity/routes.js";
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
@@ -665,6 +672,51 @@ export function createApp(input: {
       throw new HttpError(403, "insufficient_scope", "Requires a cli:auth or account session");
     }
     return principal;
+  }
+
+  const staffReadGrants = new StaffReadGrants(store.database, store.tenancy, () => input.now?.() ?? new Date());
+  const STAFF_READ_GRANT_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
+
+  /**
+   * /api/v1/workspaces/{id}/staff-read-grants (docs/staff-read-grants.md):
+   * the staff rule, presented by a browser account session or an interactive
+   * CLI login. Not a Desktop session, an enrollment-key session, a handoff,
+   * a Desktop provider credential or any other credential kind. Every
+   * refusal after the CSRF check is the same 404, so the routes are no
+   * oracle for staff status or for workspace existence.
+   */
+  async function staffReadGrantCaller(
+    request: IncomingMessage,
+    workspaceId: string,
+  ): Promise<{ staff: StaffPerson; workspace: { id: string; organizationId: string } }> {
+    const notFound = () => new HttpError(404, "not_found", "Route not found");
+    if (request.method !== "GET" && !bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+      throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+    }
+    let auth: Auth;
+    try {
+      auth = await authenticate(request);
+    } catch (error) {
+      if (error instanceof HttpError) throw notFound();
+      throw error;
+    }
+    if (auth.kind !== "user") throw notFound();
+    const { principal } = auth;
+    const interactive = principal.scopes.includes(ACCOUNT_SCOPE) || principal.scopes.includes("cli:auth");
+    if (
+      !interactive || principal.scopes.includes(DESKTOP_WORKSPACES_SCOPE) || principal.scopes.includes("mcp:desktop") ||
+      principal.provisionedByTokenId || principal.pendingHandoff || principal.handoff
+    ) {
+      throw notFound();
+    }
+    const staff = await staffReadGrants.staff(principal.userId);
+    if (!staff || !isUuid(workspaceId)) throw notFound();
+    const workspace = (await store.database.query<{ id: string; organization_id: string }>(
+      "SELECT id, organization_id FROM workspaces WHERE id = $1",
+      [workspaceId],
+    )).rows[0];
+    if (!workspace) throw notFound();
+    return { staff, workspace: { id: workspace.id, organizationId: workspace.organization_id } };
   }
 
   // analytics lane: the client gateway. Authority comes only from the
@@ -2079,6 +2131,47 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           now: input.now?.() ?? new Date(),
         }),
       }, true);
+      return;
+    }
+
+    // Staff read grants (docs/staff-read-grants.md): list, mint, revoke.
+    const staffGrantsRoute = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/staff-read-grants$/);
+    if (staffGrantsRoute && (method === "GET" || method === "POST")) {
+      const { staff, workspace } = await staffReadGrantCaller(request, staffGrantsRoute[0]!);
+      if (method === "GET") {
+        const grants = await staffReadGrants.list(workspace.id);
+        json(response, 200, { workspace_id: workspace.id, grants: grants.map(grantJson) }, true);
+        return;
+      }
+      let parsed;
+      try {
+        parsed = parseMintRequest(await requestObject(request));
+      } catch (error) {
+        if (error instanceof StaffReadGrantError) throw new HttpError(error.status, error.code, error.message);
+        throw error;
+      }
+      rateLimit(response, `staff-read-grant-mint:${staff.userId}`, STAFF_READ_GRANT_MINT_RATE, "rate_limited",
+        "Too many staff read grants minted; try again later");
+      const minted = await staffReadGrants.mint({
+        workspaceId: workspace.id,
+        organizationId: workspace.organizationId,
+        staff,
+        reason: parsed.reason,
+        expiresInDays: parsed.expiresInDays,
+      });
+      json(response, 201, {
+        grant: grantJson(minted.grant),
+        token: { accessToken: minted.accessToken, workspaceId: workspace.id, expiresAt: minted.grant.expiresAt },
+      }, true);
+      return;
+    }
+    const staffGrantRoute = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/staff-read-grants\/([^/]+)$/);
+    if (staffGrantRoute && method === "DELETE") {
+      const { staff, workspace } = await staffReadGrantCaller(request, staffGrantRoute[0]!);
+      const grantId = staffGrantRoute[1]!;
+      const grant = isUuid(grantId) ? await staffReadGrants.revoke(workspace.id, grantId, staff.userId) : null;
+      if (!grant) throw new HttpError(404, "not_found", "Route not found");
+      json(response, 200, { grant: grantJson(grant) }, true);
       return;
     }
 

@@ -116,12 +116,17 @@ export function historyReader(
     // MCP admission authenticates the person; content reads additionally need
     // the issue-time read scope. Neither a handoff nor a service credential
     // may be promoted by the reader's Control handoff.
-    if (!principal.scopes.includes("rth:read") || principal.pendingHandoff || !callerToken.startsWith("sh_at_")) {
+    // A staff read grant (sh_sr_) was admitted by its own fence and pinned to
+    // this workspace; RelayHistory introspects it at Control like sh_at_.
+    const staffGrant = callerToken.startsWith("sh_sr_");
+    if (!principal.scopes.includes("rth:read") || principal.pendingHandoff || !(callerToken.startsWith("sh_at_") || staffGrant)) {
       throw new SharedSessionsToolError("Session reads require an exchanged user session with rth:read.");
     }
     const url = new URL(path, "https://relayhistory.invalid");
     try {
-      const result = await readViaSessionRead(config, identity, url.pathname, url.searchParams)
+      // The per-user session-read route is a dashboard route that refuses a
+      // grant by shape, so a grant always reads through the workspace reader.
+      const result = (staffGrant ? null : await readViaSessionRead(config, identity, url.pathname, url.searchParams))
         ?? await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
       if (result.status === "unsupported") {
         throw new SharedSessionsToolError("The selected backend does not support this view (unsupported_by_backend).");

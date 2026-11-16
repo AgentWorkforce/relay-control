@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { ApiTokenStore } from "../admin/api-tokens.js";
+import { STAFF_READ_GRANT_PREFIX, StaffReadGrants } from "../admin/staff-read-grants.js";
 import type { SelfhostConfig } from "../config.js";
 import type { CapturePolicy } from "../capture-policy.js";
 import { hashSecret } from "../crypto.js";
@@ -350,6 +351,54 @@ async function introspectFlowRunCredential(
   };
 }
 
+/**
+ * Staff read grants (`sh_sr_`, principal `desktop-user` for the staff person):
+ * active only while unrevoked, unexpired and the staff rule still holds; the
+ * workspace is the grant's own and no machine is ever owned through a grant.
+ */
+async function introspectStaffReadGrant(
+  config: SelfhostConfig,
+  store: ControlPlaneStore,
+  request: IntrospectionRequest,
+): Promise<IntrospectionResult> {
+  const grant = await new StaffReadGrants(store.database, store.tenancy).introspect(request.token);
+  if (!grant) return { active: false, reason: "unknown" };
+  if (grant.revoked) return { active: false, reason: "revoked" };
+  if (grant.expired) return { active: false, reason: "expired" };
+  // Losing the staff rule ends the grant as surely as revoking it.
+  if (!grant.staff) return { active: false, reason: "revoked" };
+  const requested = normalizedOrigin(request.aud);
+  const aud = requested === null
+    ? undefined
+    : [...(config.introspectAudiences ?? [config.relayhistoryPublicUrl]), grant.relayhistoryOrigin]
+      .filter((candidate): candidate is string => candidate !== null)
+      .find((configured) => normalizedOrigin(configured) === requested);
+  if (!aud) return { active: false, reason: "audience" };
+  if (request.workspace !== undefined && grant.workspaceId !== request.workspace) {
+    return { active: false, reason: "workspace" };
+  }
+  if (request.machine !== undefined) return { active: false, reason: "machine_not_owned" };
+  return {
+    active: true,
+    sub: grant.staffUserId,
+    email: grant.email,
+    principal_type: "desktop-user",
+    agent_name: null,
+    machine_id: null,
+    org: grant.organizationId,
+    workspace: grant.workspaceId,
+    cloud_relay_workspace_id: grant.cloudRelayWorkspaceId,
+    // Not a membership of the customer workspace: the least role.
+    role: "member",
+    scopes: ["rth:read"],
+    aud,
+    iat: epochSeconds(grant.createdAt),
+    exp: epochSeconds(grant.expiresAt),
+    token_id: tokenIdFor(grant.tokenHash),
+    capture_policy: grant.capturePolicy,
+  };
+}
+
 export async function introspect(
   config: SelfhostConfig,
   store: ControlPlaneStore,
@@ -363,6 +412,9 @@ export async function introspect(
   }
   if (request.token.startsWith(FLOW_RUN_CREDENTIAL_PREFIX)) {
     return introspectFlowRunCredential(config, flowRunCredentials, request);
+  }
+  if (request.token.startsWith(STAFF_READ_GRANT_PREFIX)) {
+    return introspectStaffReadGrant(config, store, request);
   }
   // Refresh, internal, bootstrap, worker, run and enrollment tokens are
   // never looked up as user tokens. That includes sh_ek_ desktop enrollment
