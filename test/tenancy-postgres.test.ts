@@ -134,3 +134,43 @@ test("lock order: single-mode bootstrap and create-organization race to one orga
   const orgs = await first.query<{ n: number }>("SELECT count(*)::int AS n FROM organizations");
   assert.equal(orgs.rows[0]!.n, 1);
 });
+
+test("lazy Relaycast binding: a two-connection first-use race provisions once", { skip, timeout: 60_000 }, async (t) => {
+  const first = new PostgresDatabase(url!);
+  const second = new PostgresDatabase(url!);
+  t.after(async () => {
+    await first.close();
+    await second.close();
+  });
+  await migrate(first);
+  await first.query("DELETE FROM organizations");
+  await first.query("DELETE FROM users WHERE email = 'lazy-race@control.test'");
+  const organizationId = "00000000-0000-4000-8000-000000000164";
+  const workspaceId = "00000000-0000-4000-8000-000000000264";
+  await first.query("INSERT INTO organizations (id, name) VALUES ($1, 'Lazy race')", [organizationId]);
+  await first.query(
+    "INSERT INTO workspaces (id, organization_id, name) VALUES ($1, $2, 'Imported')",
+    [workspaceId, organizationId],
+  );
+
+  let creates = 0;
+  const provisioner: RelaycastProvisioner = {
+    async create() {
+      creates += 1;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { id: "rw_postgres_race", apiKey: "rk_postgres_race" };
+    },
+    async remove() {},
+  };
+  const a = new ControlPlaneStore(first, KEYRING, 0, { relaycastProvisioner: provisioner });
+  const b = new ControlPlaneStore(second, KEYRING, 0, { relaycastProvisioner: provisioner });
+  const [left, right] = await Promise.all([
+    a.relaycastBinding(workspaceId),
+    b.relaycastBinding(workspaceId),
+  ]);
+
+  assert.equal(creates, 1);
+  assert.equal(left!.relaycastWorkspaceId, "rw_postgres_race");
+  assert.equal(right!.relaycastWorkspaceId, "rw_postgres_race");
+  assert.equal(Number(left!.provisioned) + Number(right!.provisioned), 1);
+});
