@@ -14,6 +14,8 @@ test("customer History origins canonicalize to one database identity", () => {
   assert.equal(canonicalRelayhistoryOrigin("https://bücher.example"), "https://xn--bcher-kva.example");
   assert.equal(canonicalRelayhistoryOrigin("https://[2001:0db8::1]:443"), "https://[2001:db8::1]");
   assert.equal(canonicalRelayhistoryOrigin("https://127.000.0.1"), "https://127.0.0.1");
+  assert.equal(canonicalRelayhistoryOrigin("https://0x7f.1"), "https://127.0.0.1");
+  assert.equal(canonicalRelayhistoryOrigin("https://0x7f000001"), "https://127.0.0.1");
   assert.equal(canonicalRelayhistoryOrigin("http://LOCALHOST:080"), "http://localhost");
 });
 
@@ -23,6 +25,8 @@ test("customer History origins reject unsafe destinations and non-origins", () =
     "ftp://history.customer.example",
     "https://user@history.customer.example",
     "https://history.customer.example/path",
+    "https://[::ffff:127.0.0.1]",
+    "https://[::ffff:7f00:1]",
     "not an origin",
   ]) {
     assert.equal(canonicalRelayhistoryOrigin(value), null, value);

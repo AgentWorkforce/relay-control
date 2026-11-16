@@ -5915,7 +5915,9 @@ paths:
         `revoked`, `expired`, `audience` (`aud` is not in the configured
         general-service or dedicated History audience lists; a History
         audience must also equal the token session workspace's own imported
-        origin, or the installation default), `workspace` (the token session
+        origin, or the installation default; the lists are disjoint and a
+        stored History origin never falls back to the general list),
+        `workspace` (the token session
         is bound to another workspace; only when `workspace` is supplied).
         Only then, when `machine` is
         supplied, it is matched against fleet node claims

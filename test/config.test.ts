@@ -241,7 +241,7 @@ test("startup refuses the removed RelayHistory and RelayAuth variables by name",
 test("token introspection is required and validates its secret and audiences", () => {
   const config = loadConfig(completeEnv);
   assert.equal(config.introspectSecret, completeEnv.RELAYCONTROL_INTROSPECT_SECRET);
-  assert.deepEqual(config.introspectAudiences, [completeEnv.SESSION_READ_API_PUBLIC_URL]);
+  assert.deepEqual(config.introspectAudiences, []);
   assert.deepEqual(config.relayhistoryAudiences, [completeEnv.SESSION_READ_API_PUBLIC_URL]);
   assert.throws(() => loadConfig({ ...completeEnv, RELAYCONTROL_INTROSPECT_SECRET: "" }), {
     message: "RELAYCONTROL_INTROSPECT_SECRET is required: the sessions pipeline verifies every History token through introspection",
@@ -255,13 +255,19 @@ test("token introspection is required and validates its secret and audiences", (
   const enabled = loadConfig({
     ...completeEnv,
     RELAYCONTROL_INTROSPECT_SECRET: secret,
-    SELFHOST_INTROSPECT_AUDIENCES: " https://history.selfhosted.company/ , http://relayfile.files.svc:8080 ",
+    SELFHOST_INTROSPECT_AUDIENCES: " http://relayfile.files.svc:8080 ",
   });
   assert.equal(enabled.introspectSecret, secret);
   assert.deepEqual(enabled.introspectAudiences, [
-    "https://history.selfhosted.company",
     "http://relayfile.files.svc:8080",
   ]);
+  assert.throws(
+    () => loadConfig({
+      ...completeEnv,
+      SELFHOST_INTROSPECT_AUDIENCES: completeEnv.SESSION_READ_API_PUBLIC_URL,
+    }),
+    /must not overlap/,
+  );
   const importedHistory = loadConfig({
     ...completeEnv,
     SELFHOST_RELAYHISTORY_AUDIENCES:

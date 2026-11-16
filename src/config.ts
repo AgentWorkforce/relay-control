@@ -63,8 +63,8 @@ export type SelfhostConfig = {
    */
   introspectSecret?: string | null;
   /**
-   * Origins accepted as the introspection `aud`, from
-   * SELFHOST_INTROSPECT_AUDIENCES. Defaults to [relayhistoryPublicUrl].
+   * General service origins accepted as the introspection `aud`, from
+   * SELFHOST_INTROSPECT_AUDIENCES. Defaults to []; History is separate.
    */
   introspectAudiences?: string[];
   /**
@@ -424,8 +424,14 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   refuseRemovedHistoryVariables(env);
   // One History origin, the read API's. Nothing may name a second one.
   const sessionReadApi = loadSessionReadApiConfig(env);
-  const introspection = loadIntrospectionConfig(env, sessionReadApi.publicUrl);
+  const introspection = loadIntrospectionConfig(env);
   const relayhistoryAudiences = loadRelayhistoryAudiences(env, sessionReadApi.publicUrl);
+  const overlap = introspection.introspectAudiences.find((audience) =>
+    relayhistoryAudiences.includes(new URL(audience).origin)
+  );
+  if (overlap !== undefined) {
+    throw new Error("SELFHOST_INTROSPECT_AUDIENCES and SELFHOST_RELAYHISTORY_AUDIENCES must not overlap");
+  }
   assertHistoryIntrospection(introspection, relayhistoryAudiences, sessionReadApi.publicUrl);
   return {
     databaseUrl: loadDatabaseUrl(env),
@@ -697,7 +703,7 @@ export function loadIntrospectOutageHoldMs(env: Env): number {
   return value;
 }
 
-function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
+function loadIntrospectionConfig(env: Env): {
   introspectSecret: string | null;
   introspectAudiences: string[];
   introspectOutageHoldMs: number;
@@ -710,8 +716,8 @@ function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
   const introspectAudiences = raw
     ? raw.split(",").map((value) => value.trim()).filter(Boolean).map((value) =>
       audienceOrigin(value, "each SELFHOST_INTROSPECT_AUDIENCES entry"))
-    : [relayhistoryPublicUrl];
-  if (introspectAudiences.length === 0) {
+    : [];
+  if (raw && introspectAudiences.length === 0) {
     throw new Error("SELFHOST_INTROSPECT_AUDIENCES must name at least one origin");
   }
   return { introspectSecret, introspectAudiences, introspectOutageHoldMs: loadIntrospectOutageHoldMs(env) };

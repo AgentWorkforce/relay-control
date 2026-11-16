@@ -22,6 +22,10 @@ export function canonicalRelayhistoryOrigin(value: string): string | null {
     return null;
   }
   if (url.hostname.endsWith(".")) url.hostname = url.hostname.slice(0, -1);
+  // PostgreSQL inet and WHATWG URL spell IPv4-mapped IPv6 differently. They
+  // are unnecessary for customer History and would create two DB identities
+  // for one routed destination, so both layers reject them.
+  if (url.hostname.startsWith("[::ffff:")) return null;
   if (url.protocol === "http:" && !LOOPBACK_HOSTS.has(url.hostname)) return null;
   return url.origin;
 }

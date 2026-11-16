@@ -439,9 +439,15 @@ test("an imported History origin does not bypass the operator audience allowlist
   const denied = await setup(t, { introspectAudiences: [HISTORY_PUBLIC, imported] });
   await denied.database.query("UPDATE workspaces SET relayhistory_origin = $2 WHERE id = $1", [denied.alpha, imported]);
   const deniedToken = await denied.login(denied.alpha);
+  const otherWorkspaceToken = await denied.login(denied.beta);
   assert.deepEqual(
     (await denied.introspect({ token: deniedToken.accessToken, aud: imported, workspace: denied.alpha })).body,
     { active: false, reason: "audience" },
+  );
+  assert.deepEqual(
+    (await denied.introspect({ token: otherWorkspaceToken.accessToken, aud: imported })).body,
+    { active: false, reason: "audience" },
+    "a legacy general-list origin is not accepted by another workspace",
   );
 
   const allowed = await setup(t, { relayhistoryAudiences: [HISTORY_PUBLIC, imported] });

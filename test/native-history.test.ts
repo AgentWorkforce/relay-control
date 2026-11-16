@@ -258,7 +258,7 @@ test("native config: resolves the History origin to the read API with the backen
     assert.equal(config.relayhistoryUrl, "http://read-api.svc.cluster.local");
     assert.equal(config.relayhistoryPublicUrl, ORIGIN);
     assert.deepEqual(config.sessionReadApi, { url: "http://read-api.svc.cluster.local", publicUrl: ORIGIN, secret: READ_SECRET });
-    assert.deepEqual(config.introspectAudiences, [ORIGIN]);
+    assert.deepEqual(config.introspectAudiences, []);
     assert.deepEqual(config.relayhistoryAudiences, [ORIGIN]);
   }
 });

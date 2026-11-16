@@ -32,6 +32,7 @@ BEGIN
     END;
     IF family(address) <> 6 THEN RETURN false; END IF;
     canonical_host := '[' || host(address) || ']';
+    IF canonical_host LIKE '[::ffff:%' THEN RETURN false; END IF;
     port_text := parts[3];
   ELSE
     parts := regexp_match(authority, '^([a-z0-9][a-z0-9.-]*[a-z0-9]|[a-z0-9])(:([0-9]+))?$');
@@ -47,6 +48,13 @@ BEGIN
       IF family(address) <> 4 THEN RETURN false; END IF;
       canonical_host := host(address);
     ELSE
+      -- WHATWG treats a hostname whose last label is decimal or 0x-hex as
+      -- IPv4. Refuse it here unless the whole host took the canonical inet
+      -- branch above, so 0x7f.1 cannot coexist with 127.0.0.1.
+      IF split_part(hostname, '.', array_length(string_to_array(hostname, '.'), 1))
+        ~ '^([0-9]+|0x[0-9a-f]+)$' THEN
+        RETURN false;
+      END IF;
       FOREACH label IN ARRAY string_to_array(hostname, '.') LOOP
         IF label !~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$' THEN RETURN false; END IF;
       END LOOP;

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { migrate } from "../src/migrations.js";
+import { canonicalRelayhistoryOrigin } from "../src/relayhistory-origin.js";
 import { PGliteDatabase } from "./support/harness.js";
 
 test("Cloud identity preservation columns match the import contract", async (t) => {
@@ -104,6 +105,10 @@ test("Cloud identity preservation columns match the import contract", async (t) 
     "https://history.customer.example:0443",
     "https://history.customer.example.",
     "https://bücher.example",
+    "https://0x7f.1",
+    "https://0x7f000001",
+    "https://[::ffff:127.0.0.1]",
+    "https://[::ffff:7f00:1]",
     "ftp://history.customer.example",
     "https://history.customer.example/",
     "https://history.customer.example/path",
@@ -115,6 +120,24 @@ test("Cloud identity preservation columns match the import contract", async (t) 
       /workspaces_relayhistory_origin_format/,
       invalid,
     );
+  }
+
+  for (const input of [
+    "https://history.customer.example",
+    "https://history.customer.example:8443",
+    "https://xn--bcher-kva.example",
+    "https://127.0.0.1",
+    "https://0x7f.1",
+    "https://0x7f000001",
+    "https://[2001:db8::1]",
+    "https://[::ffff:127.0.0.1]",
+    "https://[::ffff:7f00:1]",
+  ]) {
+    const pg = await database.query<{ accepted: boolean }>(
+      "SELECT relayhistory_origin_is_canonical($1) AS accepted",
+      [input],
+    );
+    assert.equal(pg.rows[0]!.accepted, canonicalRelayhistoryOrigin(input) === input, input);
   }
 
   await database.query("UPDATE organizations SET slug = 'Acme' WHERE id = $1", [organizationId]);
