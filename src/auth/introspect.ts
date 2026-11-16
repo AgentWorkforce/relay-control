@@ -423,13 +423,21 @@ async function introspectStaffReadGrant(
   if (grant.expired) return { active: false, reason: "expired" };
   // Losing the staff rule ends the grant as surely as revoking it.
   if (!grant.staff) return { active: false, reason: "revoked" };
-  const requested = normalizedOrigin(request.aud);
-  const aud = requested === null
-    ? undefined
-    : [...(config.introspectAudiences ?? [config.relayhistoryPublicUrl]), grant.relayhistoryOrigin]
-      .filter((candidate): candidate is string => candidate !== null)
-      .find((configured) => normalizedOrigin(configured) === requested);
-  if (!aud) return { active: false, reason: "audience" };
+  // A grant is a History read credential: only a History audience activates
+  // it, and only the workspace's own History origin (else the configured
+  // History URL), exactly as for user tokens. The general introspection list
+  // (Relayfile, acquisition, ...) is never consulted, so the legacy
+  // general-list History-origin fence of the user-token path is not needed.
+  const historyAudience = matchingRelayhistoryAudience(config, request.aud);
+  const requestedHistoryOrigin = canonicalRelayhistoryOrigin(request.aud);
+  const expectedHistoryOrigin = canonicalRelayhistoryOrigin(
+    grant.relayhistoryOrigin ?? config.relayhistoryPublicUrl,
+  );
+  if (historyAudience === undefined || expectedHistoryOrigin === null
+    || requestedHistoryOrigin !== expectedHistoryOrigin) {
+    return { active: false, reason: "audience" };
+  }
+  const aud = historyAudience;
   if (request.workspace !== undefined && grant.workspaceId !== request.workspace) {
     return { active: false, reason: "workspace" };
   }
