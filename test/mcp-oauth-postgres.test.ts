@@ -7,6 +7,7 @@ import { migrate } from "../src/migrations.js";
 import { createMcpOAuthProtocol,pkceS256 } from "../src/mcp/oauth/protocol.js";
 import { McpOAuthStore } from "../src/mcp/oauth/store.js";
 import { admitMcpOAuthBearer,McpOAuthAccessRefused } from "../src/mcp/oauth/admission.js";
+import { isolatedPostgresPool } from "./support/postgres.js";
 
 const postgresUrl=process.env.TEST_DATABASE_URL;
 const options={ skip:postgresUrl?false:"TEST_DATABASE_URL is not set (OAuth multi-connection proof)",timeout:60_000 };
@@ -16,13 +17,15 @@ async function fixture(t:test.TestContext) {
   const admin=new pg.Pool({ connectionString:postgresUrl,max:1 });
   const schema=`mcp_flow_${randomUUID().replaceAll("-","")}`;
   await admin.query(`CREATE SCHEMA "${schema}"`);
-  const pool=new pg.Pool({ connectionString:postgresUrl,max:4,options:`-c search_path=${schema},public` });
-  const database=new PostgresDatabase(pool);
+  let cleanupDatabase:PostgresDatabase|null=null;
   t.after(async()=>{
-    try { await database.close(); } finally {
+    try { await cleanupDatabase?.close(); } finally {
       try { await admin.query(`DROP SCHEMA "${schema}" CASCADE`); } finally { await admin.end(); }
     }
   });
+  const pool=await isolatedPostgresPool(postgresUrl!,schema,4);
+  const database=new PostgresDatabase(pool);
+  cleanupDatabase=database;
   await migrate(database);
   const owner={ userId:randomUUID(),organizationId:randomUUID(),workspaceId:randomUUID(),agentName:"fake-agent" };
   await database.query("INSERT INTO users(id,email,name) VALUES ($1,$2,'Fake User')",[owner.userId,`fake-${owner.userId}@example.test`]);
