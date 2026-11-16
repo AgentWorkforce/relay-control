@@ -9,6 +9,7 @@ import {
 } from "../crypto.js";
 import { iso, recordAudit, type AuditActor } from "./audit.js";
 import { maskValue } from "./env-policy.js";
+import { applyRefreshTransactionTimeouts } from "./refresh-transaction.js";
 import { GithubAppTokenError, mintGithubInstallationToken, type GithubAppConfig } from "./github-app.js";
 import {
   GITHUB_APP_PROVIDER,
@@ -923,6 +924,7 @@ export class ConnectionStore {
   }): Promise<RuntimeToken> {
     const provider = this.provider(input.provider);
     let token = await this.database.transaction(async (tx) => {
+      await applyRefreshTransactionTimeouts(tx);
       const result = await tx.query<ConnectionRow>(
         `SELECT ${CONNECTION_COLUMNS} FROM integration_connections
           WHERE workspace_id = $1 AND provider = $2 FOR UPDATE`,

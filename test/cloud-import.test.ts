@@ -21,10 +21,10 @@ import { PGliteDatabase } from "./support/harness.js";
 const CLOUD_KEY = randomBytes(32).toString("hex");
 const KEYRING: EncryptionKeyring = { active: { id: "import-test", key: randomBytes(32) } };
 
-// 0061 (staff read grants, #165) is not on main yet; the "current" target
-// adds it on top of the real migrations.
+// 0061 (staff read grants, #165) is a checked-in migration now; this copy
+// matches it and IF NOT EXISTS keeps it a no-op on the real migrations.
 const POST_0058_DDL = `
--- 0061 (#165, staff read grants), as proposed.
+-- 0061 (#165, staff read grants), same as the checked-in migration.
 CREATE TABLE IF NOT EXISTS staff_read_grants (
   id uuid PRIMARY KEY,
   workspace_id uuid NOT NULL,

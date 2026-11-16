@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ApiTokenStore } from "../admin/api-tokens.js";
+import type { RelayNodeCredentials } from "./credentials.js";
 
 /**
  * Relay node broker (docs/relay-node-credential.md). An agent-relay-node host
@@ -21,6 +22,14 @@ import type { ApiTokenStore } from "../admin/api-tokens.js";
  *   ownership) and passes through like any other status.
  * - Otherwise Relaycast's status and JSON body pass through.
  *
+ * Gate-only installs (`nodeCredentials` set): Control keeps the node token.
+ * POST nodes ignores the host's X-Relaycast-Node-Token, sends the stored token
+ * itself when the node enrolled before (so Relaycast rotates it), stores the
+ * token Relaycast answers sealed, and answers the host `{ok: true, data:
+ * {id, name}}` without it. A 2xx answer without a string token is 502
+ * relaycast_unavailable and nothing is stored. The node then connects to the
+ * GET /relay-node/v1/ws bridge (./socket.ts).
+ *
  * Request headers and response bodies carry node tokens: never log them.
  */
 export const RELAY_NODE_PREFIX = "/relay-node/v1";
@@ -40,6 +49,8 @@ export type RelayNodeDeps = {
   bodyText(request: IncomingMessage): Promise<string>;
   json(response: ServerResponse, status: number, body: unknown, noStore: boolean): void;
   fetch?: typeof fetch;
+  /** Set only on gate-only installs: Control holds the Relaycast node token. */
+  nodeCredentials?: Pick<RelayNodeCredentials, "find" | "save">;
 };
 
 type Plan =
@@ -133,8 +144,14 @@ export async function handleRelayNode(
     forwardBody = raw;
     headers["content-type"] = request.headers["content-type"] ?? "application/json";
     for (const header of FORWARDED_POST_HEADERS) {
+      // Gate-only: the host never holds the node token, so its header is ignored.
+      if (deps.nodeCredentials && header === "x-relaycast-node-token") continue;
       const value = request.headers[header];
       if (typeof value === "string") headers[header] = value;
+    }
+    if (deps.nodeCredentials) {
+      const stored = await deps.nodeCredentials.find({ workspaceId: principal.workspaceId, nodeName: principal.nodeName });
+      if (stored?.token) headers["x-relaycast-node-token"] = stored.token;
     }
   }
 
@@ -167,6 +184,26 @@ export async function handleRelayNode(
       const name = data?.name;
       if (typeof id !== "string" || typeof name !== "string") throw new Unavailable();
       send(200, { ok: true, data: { id, name } });
+      return true;
+    }
+    if (route.kind === "enroll" && deps.nodeCredentials && answer.status >= 200 && answer.status < 300) {
+      const envelope = answer.body as { data?: unknown } | null;
+      const data = envelope && typeof envelope.data === "object" && envelope.data !== null
+        ? envelope.data as Record<string, unknown>
+        : null;
+      const id = data?.id;
+      const token = data?.token;
+      if (typeof id !== "string" || typeof token !== "string") throw new Unavailable();
+      await deps.nodeCredentials.save({
+        workspaceId: principal.workspaceId,
+        organizationId: principal.organizationId,
+        nodeName: principal.nodeName,
+        relaycastNodeId: id,
+        apiTokenId: principal.tokenId,
+        token,
+      });
+      const name = typeof data?.name === "string" ? data.name : principal.nodeName;
+      send(answer.status, { ok: true, data: { id, name } });
       return true;
     }
     if (answer.retryAfter) response.setHeader("retry-after", answer.retryAfter);
