@@ -1,4 +1,6 @@
 import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
+
+import { credentialWriteCounts,readCredentialConvergence,compareCredentialConvergence,type CredentialConvergenceSnapshot } from "./convergence.js";
 import { beginReadOnlySnapshot,type ReadOnlySettings } from "./read-only.js";
 import { createHash,createHmac } from "node:crypto";
 import type { Client } from "pg";
@@ -16,6 +18,7 @@ export interface CredentialEvidence {
   reader:CloudObjectReader;
   targetBlobs:CredentialBlobStore;
   previousTarget?:CredentialTargetSnapshot;
+  convergenceBefore?:CredentialConvergenceSnapshot;
 }
 
 /** CLI backend deliberately exposes local Postgres GETs only. */
@@ -129,7 +132,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
     for (const row of batch.rows) {
       if (++candidates > 10000) throw new Error("Credential verification exceeds the bounded cohort size");
       sourceIds.add(row.id);
-      const outcome = report.rows?.[row.id];
+      const outcome:unknown = report.rows?.[row.id];
       if (typeof outcome === "string") expectedOutcomes[outcome] = (expectedOutcomes[outcome] ?? 0)+1;
       if (row.skip_reason) {
         rowOutcomesMatch &&= outcome === `skipped:${row.skip_reason}`;
@@ -178,7 +181,8 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
           org:row.organization_id,workspace:row.workspace_id,provider,authType:row.auth_type,identity,
           fingerprint:fp,contentHash:hash(content),
         });
-        rowOutcomesMatch &&= outcome === "copied" || outcome === "already_present";
+        rowOutcomesMatch &&= outcome === "copied" || outcome === "already_present"
+          || (outcome === "updated" && Boolean(credentialWriteCounts(report)?.updated));
       } catch {sourceFailures++;rowOutcomesMatch = false;}
     }
   }} finally {await source.query("CLOSE credential_copy_cursor");}
@@ -319,5 +323,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
   findings.push({kind:"credential_cloud_selection",name:"coding_agent_credentials",
     ok:matches && !selectionMismatches && !summary.selectionConflicts,
     detail:{...summary,selectionMismatches,reportMatches:matches}});
+  if (evidence.convergenceBefore) findings.push(compareCredentialConvergence(evidence.convergenceBefore,
+    await readCredentialConvergence(target,"after"),report));
   return findings;
 }

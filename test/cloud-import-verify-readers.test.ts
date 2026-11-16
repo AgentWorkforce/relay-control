@@ -1,4 +1,7 @@
 import { accountCredentialExclusion,exclusionAccounting } from "../scripts/cloud-import-verify/exclusions.js";
+
+import { credentialWriteCounts,compareCredentialConvergence,type CredentialConvergenceSnapshot } from "../scripts/cloud-import-verify/convergence.js";
+import { MAPPING_REVISION } from "../scripts/cloud-import/mapping.js";
 import { migrationFiles,sealManifest,type SchemaManifest } from "../scripts/cloud-import-verify/schema.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -111,4 +114,42 @@ test("exhausted API key cannot be accounted as a dead OAuth login",() => {
   assert.equal(accountCredentialExclusion(summary,{reason:"dead_login",provider:"openai",authType:"byo_api_key",
     status:"connected",refreshExhausted:true}),false);
   assert.deepEqual(summary.find((entry) => entry.reason === "dead_login"),{reason:"dead_login",accounted:0,unresolved:1});
+});
+
+const convergenceReport=() => ({version:1,mappingRevision:MAPPING_REVISION,mode:"apply",ok:true,outcomes:{} as Record<string,number>,
+  writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0}});
+const emptyCheckpoint=(phase:"before"|"after"):CredentialConvergenceSnapshot => ({version:1,kind:"credential-convergence",phase,
+  mappingRevision:MAPPING_REVISION,scope:{orgIds:null},sessionSafety:{transactionReadOnly:"on",isolation:"repeatable read",statementTimeout:"1min",lockTimeout:"5s"},
+  credentials:[],blobs:[]});
+
+test("convergence requires all five explicit valid write counters and bound report outcomes",() => {
+  const report=convergenceReport();assert.deepEqual(credentialWriteCounts(report),report.writes);
+  for (const key of Object.keys(report.writes)) {
+    const absent=structuredClone(report) as unknown as {writes:Record<string,unknown>};delete absent.writes[key];
+    assert.equal(credentialWriteCounts(absent),null);
+    for (const invalid of [-1,0.5,"0",null,Number.MAX_SAFE_INTEGER+1]) {
+      const malformed=structuredClone(report) as unknown as {writes:Record<string,unknown>};malformed.writes[key]=invalid;
+      assert.equal(credentialWriteCounts(malformed),null);
+    }
+  }
+  assert.equal(credentialWriteCounts({...report,writes:{...report.writes,unknownWrites:0}}),null);
+  assert.equal(credentialWriteCounts({...report,mappingRevision:"old-revision"}),null);
+  assert.equal(credentialWriteCounts({...report,mode:"plan"}),null);
+  assert.equal(credentialWriteCounts({...report,outcomes:{updated:1}}),null);
+  assert.equal(credentialWriteCounts({...report,selection:{writes:1}}),null);
+});
+
+test("nonzero counters fail convergence even when all independent target state is unchanged",() => {
+  const before=emptyCheckpoint("before"),after=emptyCheckpoint("after");
+  assert.equal(compareCredentialConvergence(before,after,convergenceReport()).ok,true);
+  assert.equal(compareCredentialConvergence(before,after,{}).ok,false);
+  for (const key of Object.keys(convergenceReport().writes) as (keyof ReturnType<typeof convergenceReport>["writes"])[]) {
+    const report=convergenceReport();report.writes[key]=1;
+    if (key === "inserted") report.outcomes.copied=1;
+    if (key === "updated") report.outcomes.updated=1;
+    const complete=key === "selectionWrites" ? {...report,selection:{writes:1}} : report;
+    assert.notEqual(credentialWriteCounts(complete),null);
+    assert.equal(compareCredentialConvergence(before,after,complete).ok,false,key);
+  }
+  assert.throws(() => compareCredentialConvergence(after,after,convergenceReport()),/baseline/);
 });

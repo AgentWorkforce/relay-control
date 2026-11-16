@@ -412,3 +412,19 @@ match the independently observed source reason and matching revision. Copy
 source status/exhaustion facts are read from the source table in the same frozen
 snapshot, never from a producer report. Older reports are not relabeled. This
 accounting never clears a copied-target content failure.
+
+Convergence is an explicit separate check: capture a genuine all-target
+checkpoint immediately before the rerun, then pass `--convergence-before` to
+the copy verifier using the rerun's own apply/copy reports. See
+[REMOTE_CONVERGENCE_RUN.md](REMOTE_CONVERGENCE_RUN.md). It requires all five
+`CredentialCopyReport.writes` counters to be explicit, valid and zero, as well
+as zero independent credential/blob tuple changes and zero `blob_version`
+changes. Tuple hashes include xmin/ctid, so same-value UPDATEs do not pass.
+All target credentials (including native/relay-managed) and all Postgres blobs
+are checked; other blob backends are refused. No source/object data or tuple
+identity is exposed in findings. Missing counters or a missing actual baseline
+cannot become proof of no writes. Snapshots hash state but are not signed
+attestations: the operator must preserve genuine capture-before provenance.
+Physical table rewrites or concurrent writers also fail; keep the target
+quiescent. This proves credential/blob state plus the copier's explicit
+statement-outcome accounting, not absence of unrelated service writes.

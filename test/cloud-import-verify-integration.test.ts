@@ -825,21 +825,79 @@ fixtureTest("convergence snapshots detect in-place OAuth rewrites and same-value
   const fixture=await copiedFixture();
   const before=await captureCredentialConvergence(target);
   const unchanged=await captureCredentialConvergence(target,"after");
-  assert.equal(compareCredentialConvergence(before,unchanged,{writeCount:0,blobWriteCount:0}).ok,true);
+  const zeroReport={version:1,mappingRevision:MAPPING_REVISION,mode:"apply",ok:true,outcomes:{},
+    writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0}};
+  assert.equal(compareCredentialConvergence(before,unchanged,zeroReport).ok,true);
   assert.equal(compareCredentialConvergence(before,unchanged,undefined).ok,false,"missing counters never mean zero");
   const sameId=fixture.copy.controlIds[id(0x803)]!;
   await target.query("UPDATE coding_agent_credentials SET status=status WHERE id=$1",[sameId]);
   const sameValue=await captureCredentialConvergence(target,"after");
-  const changed=compareCredentialConvergence(before,sameValue,{writeCount:0,blobWriteCount:0});
+  const changed=compareCredentialConvergence(before,sameValue,zeroReport);
   assert.equal(changed.ok,false,"same-value DML is independently detected despite a false zero-write claim");
   assert.equal((changed.detail as {credentialChanges:{changed:number}}).credentialChanges.changed,1);
   const beforeCopy=await captureCredentialConvergence(target);
   const rerun=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
   assert.equal(rerun.ok,true);
   const afterCopy=await captureCredentialConvergence(target,"after");
-  const nonConverged=compareCredentialConvergence(beforeCopy,afterCopy,{writeCount:0,blobWriteCount:0});
+  const nonConverged=compareCredentialConvergence(beforeCopy,afterCopy,zeroReport);
   assert.equal(nonConverged.ok,false);
   assert.ok((nonConverged.detail as {blobVersionChanges:number}).blobVersionChanges > 0);
   assert.ok(!JSON.stringify(before).includes(sameId));
   assert.ok(!JSON.stringify(before).includes("acct-synthetic"));
+});
+
+fixtureTest("qualified convergence binds the real checkpoint and rejects old copier mutations despite zero claims",async () => {
+  const fixture=await copiedFixture();
+  const before=await captureCredentialConvergence(target);
+  const rows=Object.fromEntries(Object.entries(fixture.copy.rows).map(([key,outcome]) => [key,outcome === "copied" ? "already_present" : outcome]));
+  const outcomes:Record<string,number>={};for (const outcome of Object.values(rows)) outcomes[outcome]=(outcomes[outcome] ?? 0)+1;
+  const noOp={...fixture.copy,rows,outcomes,writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0},
+    selection:fixture.copy.selection ? {...fixture.copy.selection,writes:0} : undefined};
+  const options={credentialCopy:{report:noOp,reader:fixture.reader,targetBlobs:fixture.blobs,convergenceBefore:before}};
+  const positive=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
+  assert.equal(positive.ok,true,JSON.stringify(positive.findings.filter((f) => !f.ok)));
+  assert.equal(positive.credentialConvergence,"verified");
+  await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  const changed=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,options);
+  assert.equal(changed.ok,false);assert.equal(changed.credentialConvergence,"failed");assert.equal(changed.credentialCopy,"failed");
+  assert.ok((changed.findings.find((f) => f.kind === "credential_convergence")!.detail as {blobVersionChanges:number}).blobVersionChanges > 0);
+  assert.ok(changed.findings.filter((f) => f.kind.startsWith("credential_") && f.kind !== "credential_convergence").every((f) => f.ok));
+  await assert.rejects(verifyImport(source,target,{orgIds:[ORG_A]},fixture.ledger,fixtureKeyring,cloudKeyHex,options),/all source organizations/);
+});
+
+fixtureTest("updated copy outcomes require valid explicit write receipts and exact target contents",async () => {
+  const fixture=await copiedFixture();
+  const row=id(0x806);
+  const outcomes={...fixture.copy.outcomes,copied:fixture.copy.outcomes.copied!-1,updated:1};
+  const report={...fixture.copy,rows:{...fixture.copy.rows,[row]:"updated"},outcomes,
+    writes:{inserted:outcomes.copied,updated:1,blobWrites:1,metadataWrites:0,selectionWrites:0},
+    selection:fixture.copy.selection ? {...fixture.copy.selection,writes:0} : undefined};
+  const checked=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:report as unknown as typeof fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(checked.credentialCopy,"verified",JSON.stringify(checked.findings.filter((f) => !f.ok)));
+  assert.equal(checked.credentialConvergence,"not_requested");
+  report.writes.updated=0;
+  const invalid=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:report as unknown as typeof fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(invalid.credentialCopy,"failed");
+});
+
+fixtureTest("convergence capture CLI requires all scope and creates a private non-overwritable checkpoint",async () => {
+  const directory=await mkdtemp(join(tmpdir(),"verify-convergence-cli-"));
+  try {
+    const output=join(directory,"before.json");
+    const url=new URL("postgresql:/");url.hostname="127.0.0.1";url.port=String(port);
+    url.username=config.user;url.pathname="/cloud_import_target_fixture";
+    const env:NodeJS.ProcessEnv={...process.env,CLOUD_VERIFY_TARGET_URL:url.href};
+    delete env.CLOUD_VERIFY_TARGET_URL_FILE;
+    const run=(args:string[]) => spawnSync(process.execPath,["--import","tsx",
+      fileURLToPath(new URL("../scripts/cloud-import-verify/convergence-snapshot-cli.ts",import.meta.url)),...args],
+      {env,encoding:"utf8",timeout:10000});
+    assert.equal(run([output,"--org-ids",ORG_A]).status,2);
+    const captured=run([output,"--all-organizations"]);assert.equal(captured.status,0,captured.stderr);
+    const body=await readFile(output,"utf8");assert.equal(JSON.parse(body).phase,"before");
+    assert.equal((await stat(output)).mode & 0o077,0);
+    assert.equal(run([output,"--all-organizations"]).status,2);
+    assert.equal(await readFile(output,"utf8"),body);
+  } finally {await rm(directory,{recursive:true,force:true});}
 });

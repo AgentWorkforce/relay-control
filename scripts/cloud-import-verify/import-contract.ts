@@ -51,6 +51,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
   keyring:EncryptionKeyring,cloudKeyHex:string,options:{pepperVersions?:readonly number[];credentialCopy?:CredentialEvidence;previousReport?:ImportReport;
     previousOwnership?:OwnershipSnapshot;canonicalOrigin?:(raw:string) => string|null} = {}) {
   scope=normalizedScope(scope);
+  if (options.credentialCopy?.convergenceBefore && scope.orgIds !== null) throw new Error("Convergence requires all source organizations");
   if (!/^[0-9a-f]{64}$/i.test(cloudKeyHex)) throw new Error("Cloud key must be 32 bytes of hex");
   const base = contractFor(scope,new Set());
   let sourceOrganizationCensus:Awaited<ReturnType<typeof organizationCensus>>|undefined;
@@ -247,6 +248,8 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
   }});
   const copyChecks=["credential_copy_ledger","credential_natural_keys","credential_control_ids","credential_cloud_selection"];
   return {...checked,evidenceKind:"identity-import" as const,scope,sourceOrganizationCensus:sourceOrganizationCensus!,targetSchema:targetSchema!,
+    credentialConvergence:options.credentialCopy?.convergenceBefore
+      ? checked.findings.some((f) => f.kind === "credential_convergence" && f.ok) ? "verified" : "failed" : "not_requested",
     credentialCopy:options.credentialCopy
     ? copyChecks.every((kind) => checked.findings.some((f) => f.kind === kind))
       && checked.findings.filter((f) => f.kind.startsWith("credential_")).every((f) => f.ok) ? "verified" : "failed"
