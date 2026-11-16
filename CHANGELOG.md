@@ -16,6 +16,16 @@ assigned at release.
   change. Audited as `relay_launch.credential.issued` and
   `relay_launch.credential.redeemed`. Unset, nothing changes. See
   docs/identity.md.
+- Added: GitHub App installation credentials with `SELFHOST_GITHUB_APP_ID`
+  and `SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`. Imported connections retain
+  their installation IDs and mint replacement tokens without reconnecting.
+  OAuth connect and callbacks remain available alongside imported App rows.
+  Tokens are cached encrypted; short database leases serialize App refreshes
+  without holding a transaction across GitHub requests. Installation ownership
+  is bound to one organization and can be shared by its workspaces.
+  See [GitHub App credentials](docs/github-app-connections.md).
+- Changed: connection edit versions include auth mode and installation ID;
+  existing clients must refresh their opaque connection version once after upgrading.
 - Added: `SELFHOST_RELAYGATE_PUBLIC_URL` (unset by default) for gate-only
   installs, where relaygate is the only public way into Relaycast. When set,
   `GET /api/v1/workspaces/{id}/resolve` answers `urls.relaygateUrl` (the

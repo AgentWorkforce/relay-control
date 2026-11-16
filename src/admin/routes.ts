@@ -163,6 +163,7 @@ export function createAdminModule(input: {
     config.oauthRedirectUrl,
     input.fetchImpl,
     config.operatorOAuthApps ?? {},
+    config.githubApp ?? null,
   );
 
   /** A same-origin dashboard URL to return to after the provider callback, or null. */
@@ -512,6 +513,11 @@ export function createAdminModule(input: {
           const configured = provider.authMode === "api_key" || operator || app !== null;
           return {
             ...catalogEntry(provider),
+            ...(provider.id === "github" ? {
+              supportedAuthModes: ["OAUTH2", "APP"],
+              githubAppConfigured: Boolean(config.githubApp),
+              githubAppSetup: "import",
+            } : {}),
             configured,
             configuredBy: provider.authMode === "api_key" ? null : operator ? "operator" : app ? "workspace" : null,
             ...(configured
