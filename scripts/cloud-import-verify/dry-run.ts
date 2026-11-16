@@ -63,7 +63,7 @@ try {
     await delay(100);
   }
   if (!ready) throw new Error("postgres_not_ready");
-  testProcess = spawn(process.execPath,["--import","tsx","--test","--test-concurrency=1",join(here,"fixtures.test.ts")], {
+  testProcess = spawn(process.execPath,["--import","tsx","--test","--test-concurrency=1",join(here,"../../test/cloud-import-verify.test.ts")], {
     cwd:join(here,"../.."), stdio:"inherit",
     env: { ...process.env, CLOUD_VERIFY_FIXTURE_CLUSTER:"synthetic-only", CLOUD_VERIFY_FIXTURE_PORT:String(port) },
   });

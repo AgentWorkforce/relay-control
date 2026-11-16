@@ -15,7 +15,7 @@ export const fixtureIds = {
 };
 
 /** Deliberately small reference shapes. This is not the production importer.
- * Contract projections will be finalized against tools/cloud-import/MAPPING.md.
+ * Contract projections will be finalized against scripts/cloud-import/mapping.ts.
  */
 export async function seedFixtures(client: Client): Promise<void> {
   await client.query(`DROP SCHEMA IF EXISTS cloud_fixture CASCADE;

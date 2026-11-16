@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { Client } from "pg";
 import { decryptSecret, type EncryptionKeyring } from "../../src/crypto.js";
 
-/** SQL is trusted operator configuration, reviewed alongside MAPPING.md.
+/** SQL is trusted operator configuration, reviewed alongside mapping.ts.
  * Each projection must expose __key (unique, non-null) and __org (nullable).
  * Project only like-for-like values; do not hash randomized ciphertexts.
  */

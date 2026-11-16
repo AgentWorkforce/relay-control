@@ -5,7 +5,7 @@ The importer and authoritative mapping belong in `../cloud-import/`.
 
 **Current scope:** the engine and its reference fixtures work independently of
 the importer. `synthetic-reference-v1-NOT-production-mapping` is an explicit
-placeholder revision. The importer has not yet published `MAPPING.md`; the
+placeholder revision. The importer has not yet published `mapping.ts`; the
 production table projections, skip rules and importer invocation must be wired
 and reviewed against that contract before this can qualify an import. Passing
 these tests proves the verifier's detection behavior, not an actual import.
@@ -21,9 +21,9 @@ database URLs or an existing server. PostgreSQL uses 16MB shared buffers,
 
 ```sh
 npm ci --no-audit --no-fund
-./node_modules/.bin/tsc -p tools/cloud-import-verify/tsconfig.json
+npm run typecheck
 CLOUD_VERIFY_PG_BIN=/opt/homebrew/opt/postgresql@15/bin \
-  node --import tsx tools/cloud-import-verify/dry-run.ts \
+  node --import tsx scripts/cloud-import-verify/dry-run.ts \
   --report /tmp/cloud-import-synthetic-report.json
 ```
 
@@ -32,6 +32,11 @@ through `PATH`. `--report` is optional. Only the synthetic fixtures are seeded;
 there is no Neon/Supabase connection and no production importer invocation.
 The fixtures include `rw_actual-text-01` and `rw_not_a_uuid_02` Cloud workspace
 identifiers alongside their distinct UUID identity column.
+
+The test file is `test/cloud-import-verify.test.ts`. Normal repository test
+runs skip its database cases with an explicit reason; only this harness starts
+their isolated cluster. Code under `scripts/` and tests under `test/` are both
+covered by the root `npm run typecheck`.
 
 The suite covers passing imports, equal-count payload corruption, per-org
 counts, missing rows, wrong orgs, wrong `rw_` mappings, FK orphans after trigger
@@ -51,7 +56,7 @@ Use two separate connected `pg.Client` instances. The CLI accepts a JSON file:
 # Supply both loopback database URLs through the environment, plus Control's
 # SELFHOST_ENCRYPTION_KEY_ID / SELFHOST_ENCRYPTION_KEY (or its existing _FILE
 # mechanism), and optional SELFHOST_ENCRYPTION_PREVIOUS_KEY_ID / _KEY.
-node --import tsx tools/cloud-import-verify/cli.ts /path/to/contract.json
+node --import tsx scripts/cloud-import-verify/cli.ts /path/to/contract.json
 ```
 
 URL variables are `CLOUD_VERIFY_SOURCE_URL` and `CLOUD_VERIFY_TARGET_URL`.
