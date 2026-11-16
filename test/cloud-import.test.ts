@@ -15,7 +15,7 @@ import {
   id,
 } from "../scripts/cloud-import/cloud-fixture.js";
 import { runImport, type ImportReport } from "../scripts/cloud-import/importer.js";
-import { SOURCE_TABLES, TARGETS, verifierComparisons } from "../scripts/cloud-import/mapping.js";
+import { IMPORT_LEDGER_DDL, SOURCE_TABLES, TARGETS, verifierComparisons } from "../scripts/cloud-import/mapping.js";
 import { PGliteDatabase } from "./support/harness.js";
 
 const CLOUD_KEY = randomBytes(32).toString("hex");
@@ -52,11 +52,13 @@ async function cloudSource(): Promise<PGliteDatabase> {
  * "0051": the baseline the importer gates down to (migrations <= 0051 only).
  * "current": every migration on this branch plus the 0058 approximation.
  */
-async function controlTarget(kind: "0051" | "current"): Promise<PGliteDatabase> {
+async function controlTarget(kind: "0051" | "current", ledger = true): Promise<PGliteDatabase> {
   const target = new PGliteDatabase();
   if (kind === "current") {
     await migrate(target);
     await target.exec(POST_0058_DDL);
+    // 0063 already created the ledger; ledger=false drops it to test refusal.
+    if (!ledger) await target.exec("DROP TABLE cloud_import_ledger");
     return target;
   }
   const directory = await mkdtemp(join(tmpdir(), "cloud-import-0051-"));
@@ -67,6 +69,7 @@ async function controlTarget(kind: "0051" | "current"): Promise<PGliteDatabase> 
       }
     }
     await migrate(target, directory);
+    if (ledger) await target.exec(IMPORT_LEDGER_DDL);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -123,6 +126,15 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   assert.equal(applied.warnings.fleet_node_name_filled_with_node_id, 1);
   assert.equal(applied.warnings.workspace_rw_id_not_rw_8hex, 1);
   assert.deepEqual(applied.optionalColumns, []);
+  // The ledger lists only rows actually written: target-side filters
+  // (pre-0057 source_id, pre-0058 relay_managed, pre-0054 GitHub) apply first.
+  assert.deepEqual(applied.orgs[ORG_A]!.keys.desktop_relay_identities, [id(0x601)]);
+  assert.deepEqual(applied.orgs[ORG_A]!.keys.coding_agent_credentials, []);
+  assert.deepEqual(applied.orgs[ORG_A]!.keys.github_app_connections, []);
+  for (const table of SOURCE_TABLES.filter((t) => t !== "users")) {
+    const keys = Object.values(applied.orgs).flatMap((org) => org.keys[table] ?? []);
+    assert.equal(keys.length, applied.tables[table].imported, `${table} ledger keys match imported`);
+  }
 
   // Emails are normalized, ids are the Cloud ids, last_* survive the FK pass.
   const alice = (await target.query<{ email: string; last_organization_id: string; last_workspace_id: string }>(
@@ -156,11 +168,10 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
     .filter((table) => !TARGETS[table].gate)
     .map(async (table) => [table, await count(target, TARGETS[table].table)] as const)));
   const before = await counts();
-  // A re-run without the previous ledger is refused: it could not reconcile.
-  const blind = await runImport(deps, scope, "apply");
-  assert.equal(blind.refused, "rerun_requires_previous_report");
-  assert.deepEqual(await counts(), before);
-  const rerun = await runImport(deps, scope, "apply", { previous: applied });
+  // The target ledger holds every written key, per org, beside the rows.
+  const ledgerRows = (await target.query<{ n: number }>("SELECT count(*)::int AS n FROM cloud_import_ledger")).rows[0]!.n;
+  assert.equal(ledgerRows, SOURCE_TABLES.filter((t) => t !== "users").reduce((n, t) => n + applied.tables[t].imported, 0));
+  const rerun = await runImport(deps, scope, "apply");
   assert.equal(rerun.ok, true);
   assert.deepEqual(await counts(), before);
   assert.equal(Object.values(rerun.tables).reduce((n, ledger) => n + ledger.deleted, 0), 0);
@@ -177,7 +188,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   `);
   // A Control-side row the import never wrote must survive the reconcile.
   await target.query("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'member')", [ORG_B, id(6)]);
-  const delta = await runImport(deps, scope, "apply", { previous: rerun });
+  const delta = await runImport(deps, scope, "apply");
   assert.equal(delta.ok, true, JSON.stringify(delta.orgs));
   assert.equal(delta.tables.organization_memberships.deleted, 1);
   assert.equal(delta.tables.organization_invitations.deleted, 1);
@@ -185,6 +196,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   // Carol (user 3) lost her membership, so her fleet node claim goes too (the
   // membership FK cascades before the explicit reconcile reaches it).
   assert.equal(delta.tables.fleet_node_owners.imported, 0);
+  assert.equal(delta.tables.fleet_node_owners.deleted, 1, "logical removal, even though the cascade got there first");
   assert.equal(await count(target, "fleet_node_owners"), 0);
   assert.equal((await target.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [ORG_A, id(3)])).rows.length, 0);
   assert.equal((await target.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [ORG_B, id(6)])).rows.length, 1);
@@ -193,6 +205,9 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   assert.deepEqual((await target.query<{ id: string }>("SELECT id FROM organization_invitations ORDER BY id")).rows.map((row) => row.id), [id(0x301), id(0x305)]);
   await target.query("DELETE FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [ORG_B, id(6)]);
   const finalReport = delta;
+  // The ledger shrank by exactly the reconciled rows.
+  assert.equal((await target.query<{ n: number }>("SELECT count(*)::int AS n FROM cloud_import_ledger")).rows[0]!.n,
+    SOURCE_TABLES.filter((t) => t !== "users").reduce((n, t) => n + delta.tables[t].imported, 0));
 
   // The verifier projections agree row for row with what was imported.
   for (const comparison of verifierComparisons(scope, new Set(), new Set())) {
@@ -222,6 +237,12 @@ test("cloud import: current target (0053-0057 + 0058) keeps rw_, slugs, History 
     "workspaces.slug",
   ]);
   assert.equal(report.tables.desktop_relay_identities.imported, 2);
+  // Canonical History origins are listed for SELFHOST_RELAYHISTORY_AUDIENCES.
+  assert.deepEqual(report.relayhistoryOrigins, ["https://history.example.test"]);
+  // A pluggable canonicaliser (Control's, once #163 merges) decides the value.
+  const strict = await runImport({ source, keyring: KEYRING, cloudKeyHex: CLOUD_KEY, canonicalOrigin: () => null }, { orgIds: null }, "plan");
+  assert.deepEqual(strict.relayhistoryOrigins, []);
+  assert.equal(strict.warnings.relayhistory_origin_invalid_dropped, 1);
   assert.equal(report.warnings.fleet_node_name_filled_with_node_id, undefined);
 
   const workspaces = (await target.query<{ id: string; cloud_relay_workspace_id: string | null; slug: string; relayhistory_origin: string | null }>(
@@ -307,4 +328,32 @@ test("cloud import: importer-side skips carry ids only", async (t) => {
   assert.deepEqual(keyless.tables.person_identities.importerSkips, {});
   assert.ok((keyless.warnings.secrets_not_checked ?? 0) > 0);
   await assert.rejects(runImport({ source, keyring: KEYRING }, { orgIds: null }, "dry-run"), /Cloud credential key/);
+});
+
+test("cloud import: ledger guards: no ledger table refuses; a Control-native org is refused alone", async (t) => {
+  const source = await cloudSource();
+  const bare = await controlTarget("0051", false);
+  const target = await controlTarget("0051");
+  t.after(async () => {
+    await source.close();
+    await bare.close();
+    await target.close();
+  });
+  const refused = await runImport({ source, target: bare, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(refused.refused, "target_lacks_import_ledger");
+  assert.equal(await count(bare, "organizations"), 0);
+
+  // Org B already exists in Control without a ledger entry: it was not
+  // imported, so it is refused (never merged into); org A still imports.
+  await target.query("INSERT INTO organizations (id, name) VALUES ($1, 'Native B')", [ORG_B]);
+  await target.query("INSERT INTO users (id, email, name) VALUES ($1, 'native@example.test', 'Native')", [id(0xeee)]);
+  await target.query("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')", [ORG_B, id(0xeee)]);
+  const report = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(report.ok, false);
+  assert.equal(report.orgs[ORG_A]!.status, "ok");
+  assert.deepEqual(report.orgs[ORG_B]!.error, { code: "org_exists_without_ledger" });
+  assert.equal((await target.query<{ name: string }>("SELECT name FROM organizations WHERE id = $1", [ORG_B])).rows[0]!.name, "Native B");
+  // Re-running never deletes the native membership: it is not in the ledger.
+  await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal((await target.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [ORG_B, id(0xeee)])).rows.length, 1);
 });

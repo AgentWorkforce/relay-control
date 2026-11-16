@@ -47,6 +47,31 @@ The CLI reads its settings from the environment. Each variable also accepts a `N
 - **Optional columns follow the target:** columns from migrations 0053, 0056 and 0057 are written only when the target has them (`optionalColumns` in the report). Before 0057, Desktop identities with a non-UUID `source_id` are skipped, and `node_name` falls back to the node id.
 - **Refusals:** the import refuses to run against a target whose migration ledger lacks `0051`, or where an imported email already belongs to a different Control user.
 
+## Re-runs and reconcile (freeze, delta, flip)
+
+Every org transaction also writes the **target ledger**, `cloud_import_ledger`: one entry per imported row key, plus the org's own entry.
+
+**What a re-run does, per org:**
+- Reads that org's ledger entries.
+- Deletes, before upserting, the rows that the ledger lists but this run no longer imports. This covers memberships, invites, agent identities, fleet claims, relay_managed agents and GitHub connections.
+- Then rewrites the ledger.
+
+**Safety rules:**
+- Reconcile never trusts a file. It can never delete a row the import did not write.
+- An org that exists in Control without a ledger entry is Control's own. It is refused alone (`org_exists_without_ledger`) and never merged into.
+- `report.tables[t].deleted` counts logical removals, whether made by the reconcile `DELETE` or by an FK cascade.
+
+**Never reconciled:**
+- Users, organizations, workspaces and GitHub installation claims. Their cascades would take Control-side data with them.
+- When these disappear from Cloud, the report counts `<table>_absent_in_source` and an operator decides.
+
+**After the flip:** do not run `apply` again. Upserts would overwrite edits made in Control.
+
+**Ledger table:** migration `0063_cloud_import_ledger.sql` creates it.
+- It is owner-only (`OWNER_ONLY_TABLES`) and gets no runtime grant, so run the importer with the migration/owner role.
+- `--init-ledger` exists only for a scratch target built from an older Control. Do not use it in production.
+- Without the ledger, `dry-run` and `apply` are refused (`target_lacks_import_ledger`).
+
 ## Deliberately not migrated
 
 | What | Consequence |

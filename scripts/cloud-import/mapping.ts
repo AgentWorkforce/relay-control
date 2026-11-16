@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.4";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.6";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -47,11 +47,6 @@ const normEmail = (expression: string) => `lower(btrim(${expression}))`;
 const ROLE_RANK = (expression: string) =>
   `(CASE ${expression} WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END)`;
 const RW_FORMAT = "'^rw_[0-9a-f]{8}$'";
-// 0056 workspaces_relayhistory_origin_format. Cloud stores a bare https
-// origin; it is lowercased and stripped of a trailing slash. A value that
-// still does not fit is dropped (NULL = Control default) and flagged.
-const ORIGIN_FORMAT = "'^https?://([[:alnum:].-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?$'";
-const ORIGIN = (expression: string) => `lower(rtrim(btrim(${expression}), '/'))`;
 
 /**
  * Shared CTEs. Order matters: later CTEs read earlier ones.
@@ -123,9 +118,9 @@ workspace_rows AS (
          w.default_runtime AS runtime_config,
          CASE WHEN w.relay_workspace_id ~ ${RW_FORMAT} THEN w.relay_workspace_id END AS cloud_relay_workspace_id,
          w.slug,
-         CASE WHEN ${ORIGIN("w.relayhistory_origin")} ~ ${ORIGIN_FORMAT}
-              THEN ${ORIGIN("w.relayhistory_origin")} END AS relayhistory_origin,
-         (w.relayhistory_origin IS NOT NULL AND ${ORIGIN("w.relayhistory_origin")} !~ ${ORIGIN_FORMAT}) AS origin_invalid,
+         -- Canonicalised in the importer (Control's canonicalRelayhistoryOrigin,
+         -- #163), which overrides this column on the target.
+         w.relayhistory_origin AS relayhistory_origin_raw,
          rw.relaycast_api_key_generation,
          (w.relayhistory_dashboard_url IS NOT NULL) AS has_dashboard_url,
          w.created_at, w.updated_at,
@@ -223,11 +218,12 @@ export const SOURCE_TABLES = [
 export type ImportTable = (typeof SOURCE_TABLES)[number];
 
 /**
- * Tables whose rows a re-run deletes when they were imported by an earlier
- * run (its ledger) but are no longer imported now: removed in Cloud, or now
- * skipped. Users, organizations and workspaces are never deleted (their
- * cascades are too wide); their disappearance is reported instead. GitHub
- * installation claims are kept on purpose (#146).
+ * Tables whose rows a re-run deletes when the target ledger says an earlier
+ * run imported them but this run does not: removed in Cloud, or now skipped.
+ * Never reconciled, by design: users (global), organizations and workspaces
+ * (their cascades would take Control-side data with them) and GitHub
+ * installation claims (#146). For those the report counts
+ * `<table>_absent_in_source` warnings and an operator decides.
  */
 export const RECONCILED_TABLES: readonly ImportTable[] = [
   "organization_memberships",
@@ -239,6 +235,27 @@ export const RECONCILED_TABLES: readonly ImportTable[] = [
   "coding_agent_credentials",
   "github_app_connections",
 ];
+
+/**
+ * The import ledger on the target: every row the import wrote, per org,
+ * written in the same per-org transaction as the rows. Reconcile reads only
+ * this table (never a report file), so it can delete nothing the import did
+ * not write. An imported org always has its own `organizations` entry, which
+ * distinguishes "imported, now empty" from "never imported".
+ * Shipped as Control migration 0063_cloud_import_ledger.sql. This copy (with
+ * IF NOT EXISTS) serves only `--init-ledger` on a scratch target built from
+ * an older Control, and the 0051-baseline tests.
+ */
+export const IMPORT_LEDGER_TABLE = "cloud_import_ledger";
+export const IMPORT_LEDGER_DDL = `
+CREATE TABLE IF NOT EXISTS cloud_import_ledger (
+  organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  table_name text NOT NULL,
+  row_key text NOT NULL,
+  mapping_revision text NOT NULL,
+  imported_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (organization_id, table_name, row_key)
+);`;
 
 /** Organisation-scoped tables are imported in one target transaction per org. */
 export const ORG_TABLES: readonly ImportTable[] = SOURCE_TABLES.filter((t) => t !== "users");
@@ -257,8 +274,8 @@ SELECT organization_id, user_id, cloud_user_id, role, created_at, updated_at, sk
   FROM member_rows`,
     workspaces: `
 SELECT id, organization_id, name, relaycast_workspace_id, relaycast_api_key AS secret_plaintext,
-       runtime_config, cloud_relay_workspace_id, slug, relayhistory_origin, relaycast_api_key_generation,
-       has_dashboard_url, origin_invalid, created_at, updated_at, skip_reason
+       runtime_config, cloud_relay_workspace_id, slug, relayhistory_origin_raw, relaycast_api_key_generation,
+       has_dashboard_url, created_at, updated_at, skip_reason
   FROM workspace_rows`,
     organization_invitations: `
 SELECT i.id, i.organization_id, ${normEmail("i.email")} AS email, i.role,
@@ -632,7 +649,7 @@ const PROJECTIONS: Record<ImportTable, Projection> = {
   },
   workspaces: {
     key: "id::text", org: "organization_id::text", workspace: "id::text",
-    columns: { id: "id::text", organization_id: "organization_id::text", name: "name", relaycast_workspace_id: "relaycast_workspace_id", cloud_relay_workspace_id: "cloud_relay_workspace_id", slug: "slug", relayhistory_origin: "relayhistory_origin", relaycast_api_key_generation: "relaycast_api_key_generation", runtime_config: "runtime_config::jsonb::text", created_at: ts("created_at"), updated_at: ts("updated_at") },
+    columns: { id: "id::text", organization_id: "organization_id::text", name: "name", relaycast_workspace_id: "relaycast_workspace_id", cloud_relay_workspace_id: "cloud_relay_workspace_id", slug: "slug", relaycast_api_key_generation: "relaycast_api_key_generation", runtime_config: "runtime_config::jsonb::text", created_at: ts("created_at"), updated_at: ts("updated_at") },
   },
   organization_invitations: {
     key: "id::text", org: "organization_id::text",

@@ -15,6 +15,7 @@ import { encryptSecret, hashSecret, opaqueToken, type EncryptionKeyring } from "
 import type { Database, SqlExecutor } from "../../src/database.js";
 import {
   MAPPING_REVISION,
+  IMPORT_LEDGER_TABLE,
   ORG_TABLES,
   RECONCILED_TABLES,
   REQUIRED_MIGRATION,
@@ -45,7 +46,22 @@ export type ImportDeps = {
   now?: () => Date;
   /** Rows per insert statement. */
   batchSize?: number;
+  /**
+   * Canonical relayhistory_origin for a Cloud value, or null when it cannot
+   * be one. Control's canonicalRelayhistoryOrigin (#163) once merged.
+   */
+  canonicalOrigin?: (raw: string) => string | null;
 };
+
+/**
+ * Interim stand-in until #163 merges: accepts only what 0056's CHECK accepts
+ * after lowercasing and stripping one trailing slash. Stricter than #163, so
+ * it can drop (flag) a value #163 would keep, never the reverse.
+ */
+export function interimCanonicalOrigin(raw: string): string | null {
+  const value = raw.trim().toLowerCase().replace(/\/$/, "");
+  return /^https:\/\/([a-z0-9.-]+|\[[0-9a-f:.]+\])(:[0-9]{1,5})?$/.test(value) ? value : null;
+}
 
 export type TableLedger = {
   candidates: number;
@@ -56,7 +72,11 @@ export type TableLedger = {
    * verifier can reconcile them: ids are Cloud UUIDs, never emails or values.
    */
   importerSkips: Record<string, string[]>;
-  /** Rows deleted because an earlier run imported them and this one did not. */
+  /**
+   * Logical removals: keys the target ledger held for this table that this
+   * run no longer imports. Each is absent afterwards, removed by the
+   * reconcile DELETE or by an FK cascade earlier in the same transaction.
+   */
   deleted: number;
 };
 
@@ -88,6 +108,8 @@ export type ImportReport = {
   /** Columns written beyond the 0051 baseline, as found on the target. */
   optionalColumns: string[];
   warnings: Record<string, number>;
+  /** Distinct canonical History origins imported (customer hosts; keep local). */
+  relayhistoryOrigins: string[];
 };
 
 type SourceRow = {
@@ -101,9 +123,11 @@ type SourceRow = {
   row: string;
   /** Row facts the importer acts on without parsing `row`. */
   flags: string[] | null;
+  /** workspaces: Cloud's raw relayhistory_origin. */
+  origin: string | null;
 };
 
-type PreparedRow = { key: string; org: string | null; email: string | null; row: string; secret: string | null; flags: string[] | null };
+type PreparedRow = { override?: string; key: string; org: string | null; email: string | null; row: string; secret: string | null; flags: string[] | null };
 
 type EncryptedEnvelope = { v: number; iv: string; tag: string; ciphertext: string };
 
@@ -135,7 +159,8 @@ async function readSource(tx: SqlExecutor, table: ImportTable, scope: ImportScop
             ${email} AS email,
             ${secret === "secret_plaintext" ? "q.secret_plaintext" : secret === "secret_envelope" ? "q.secret_envelope::text" : "NULL::text"} AS secret,
             ${ROW_FLAGS[table] ?? "NULL::text[]"} AS flags,
-            (to_jsonb(q) - 'skip_reason' - 'secret_plaintext' - 'secret_envelope' - 'cloud_user_id')::text AS row
+            ${table === "workspaces" ? "q.relayhistory_origin_raw" : "NULL::text"} AS origin,
+            (to_jsonb(q) - 'skip_reason' - 'secret_plaintext' - 'secret_envelope' - 'cloud_user_id' - 'relayhistory_origin_raw')::text AS row
        FROM (${sourceQuery(table, scope)}) q`,
   );
   return result.rows;
@@ -145,8 +170,7 @@ const ROW_FLAGS: Partial<Record<ImportTable, string>> = {
   workspaces: `array_remove(ARRAY[
       CASE WHEN q.cloud_relay_workspace_id IS NULL THEN 'workspace_rw_id_not_rw_8hex' END,
       CASE WHEN q.has_dashboard_url THEN 'relayhistory_dashboard_url_dropped' END,
-      CASE WHEN q.relayhistory_origin IS NOT NULL THEN 'relayhistory_origin_set' END,
-      CASE WHEN q.origin_invalid THEN 'relayhistory_origin_invalid_dropped' END
+      CASE WHEN q.relayhistory_origin_raw IS NOT NULL THEN 'relayhistory_origin_set' END
     ], NULL)`,
   desktop_relay_identities: `CASE WHEN NOT q.source_id_is_uuid THEN ARRAY['source_id_not_uuid'] END`,
   coding_agent_credentials: `CASE WHEN q.active_demoted THEN ARRAY['coding_agent_active_demoted'] END`,
@@ -193,10 +217,10 @@ function upsertSql(table: ImportTable, columns: string[], fill = "'{}'::jsonb"):
     .map((column) => `${quote(column)} = EXCLUDED.${quote(column)}`);
   return `INSERT INTO ${relation} (${columns.map(quote).join(", ")})
 SELECT ${columns.map((column) => `p.${quote(column)}`).join(", ")}
-  FROM unnest($1::text[], $2::text[]) AS u(r, s)
+  FROM unnest($1::text[], $2::text[], $3::text[]) AS u(r, s, o)
  CROSS JOIN LATERAL jsonb_populate_record(
    NULL::${relation},
-   u.r::jsonb || ${fill} || ${secretColumn ? `CASE WHEN u.s IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('${secretColumn}', u.s) END` : "'{}'::jsonb"}
+   u.r::jsonb || COALESCE(u.o::jsonb, '{}'::jsonb) || ${fill} || ${secretColumn ? `CASE WHEN u.s IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('${secretColumn}', u.s) END` : "'{}'::jsonb"}
  ) AS p
 ON CONFLICT (${spec.primaryKey.map(quote).join(", ")}) DO ${updates.length ? `UPDATE SET ${updates.join(", ")}` : "NOTHING"}`;
 }
@@ -240,14 +264,19 @@ function chunks<T>(items: T[], size: number): T[][] {
   return out;
 }
 
-export type ImportOptions = {
-  /**
-   * The report of the previous apply against this target. Required to re-run
-   * apply onto a target that already holds imported organizations: rows it
-   * imported that this run no longer imports are deleted (RECONCILED_TABLES).
-   */
-  previous?: ImportReport;
+/** A per-organization refusal: recorded as that org's failure, others go on. */
+class OrgRefused extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = "OrgRefused";
+  }
+}
+
+const KEY_FORMAT: Partial<Record<ImportTable, RegExp>> = {
+  organization_memberships: /^[0-9a-f-]{36}:[0-9a-f-]{36}$/,
+  github_app_installations: /^[1-9][0-9]{0,19}$/,
 };
+const UUID_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function deleteSql(table: ImportTable): string {
   switch (table) {
@@ -270,7 +299,7 @@ function deleteSql(table: ImportTable): string {
   }
 }
 
-export async function runImport(deps: ImportDeps, scope: ImportScope, mode: ImportMode, options: ImportOptions = {}): Promise<ImportReport> {
+export async function runImport(deps: ImportDeps, scope: ImportScope, mode: ImportMode): Promise<ImportReport> {
   assertScope(scope);
   const now = deps.now ?? (() => new Date());
   const log: ImportLogger = deps.log ?? (() => {});
@@ -289,6 +318,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     orgs: {},
     optionalColumns: [],
     warnings: {},
+    relayhistoryOrigins: [],
   };
   const skip = (table: ImportTable, reason: string, key?: string) => {
     const ledger = report.tables[table];
@@ -299,6 +329,8 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     report.warnings[name] = (report.warnings[name] ?? 0) + 1;
   };
 
+  const canonicalOrigin = deps.canonicalOrigin ?? interimCanonicalOrigin;
+  const origins = new Set<string>();
   // 1. Read and transform. Nothing is written before every row is prepared.
   const prepared = {} as Record<ImportTable, PreparedRow[]>;
   await deps.source.transaction(async (tx) => {
@@ -336,22 +368,42 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
           continue;
         }
         for (const flag of row.flags ?? []) if (flag !== "source_id_not_uuid") warn(flag);
-        kept.push({ key: row.key, org: row.org, email: row.email, row: row.row, secret, flags: row.flags });
+        let override: string | undefined;
+        if (table === "workspaces") {
+          const canonical = row.origin === null ? null : canonicalOrigin(row.origin);
+          if (row.origin !== null && canonical === null) warn("relayhistory_origin_invalid_dropped");
+          if (canonical !== null) origins.add(canonical);
+          override = JSON.stringify({ relayhistory_origin: canonical });
+        }
+        kept.push({ ...(override ? { override } : {}), key: row.key, org: row.org, email: row.email, row: row.row, secret, flags: row.flags });
       }
       prepared[table] = kept;
     }
   });
 
+  // Operators list these in SELFHOST_RELAYHISTORY_AUDIENCES (#163).
+  report.relayhistoryOrigins = [...origins].sort();
   const orgIds = [...new Set(prepared.organizations.map((row) => row.org!))].sort();
-  for (const org of orgIds) {
-    const keys: Partial<Record<ImportTable, string[]>> = {};
-    for (const table of ORG_TABLES) keys[table] = prepared[table].filter((row) => row.org === org).map((row) => row.key).sort();
-    report.orgs[org] = { status: "planned", imported: {}, keys, deleted: {} };
-  }
-  const previous = options.previous;
-  if (previous) {
-    if (previous.version !== 1 || previous.mode !== "apply") throw new Error("previous report must be an apply report");
-    for (const org of Object.keys(previous.orgs)) if (!report.orgs[org]) warn("org_absent_in_source");
+  // Keys are (re)computed from `prepared` after every filter has run, so the
+  // ledger lists exactly the rows this run writes.
+  const recordKeys = () => {
+    for (const org of orgIds) {
+      const keys: Partial<Record<ImportTable, string[]>> = {};
+      for (const table of ORG_TABLES) keys[table] = prepared[table].filter((row) => row.org === org).map((row) => row.key).sort();
+      report.orgs[org]!.keys = keys;
+    }
+  };
+  for (const org of orgIds) report.orgs[org] = { status: "planned", imported: {}, keys: {}, deleted: {} };
+  recordKeys();
+  // Every key is checked before anything is written: a malformed key fails
+  // the run cleanly instead of reaching SQL or the ledger.
+  for (const table of SOURCE_TABLES) {
+    const format = KEY_FORMAT[table] ?? UUID_KEY;
+    if (prepared[table].some((row) => !format.test(row.key))) {
+      report.refused = `invalid_row_key:${table}`;
+      report.finishedAt = now().toISOString();
+      return report;
+    }
   }
 
   if (mode === "plan") {
@@ -389,6 +441,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       prepared[table] = [];
     }
     const write = writable as Record<ImportTable, string[]>;
+    const finishFilters = () => recordKeys();
     // Before 0057 the target source_id is uuid: a Cloud text id cannot land.
     if (columns.get("desktop_relay_identities")?.get("source_id")?.udt === "uuid") {
       prepared.desktop_relay_identities = prepared.desktop_relay_identities.filter((row) => {
@@ -428,19 +481,16 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
         WHERE t.id::text <> (x.r::jsonb ->> 'id')`,
       [prepared.users.map((row) => row.row)],
     );
-    // A re-run must reconcile against the previous ledger; without it,
-    // rows removed in Cloud would silently survive in Control.
-    if (!previous && orgIds.length > 0) {
-      const existing = await target.query<{ n: string }>(
-        "SELECT count(*)::text AS n FROM public.organizations WHERE id::text = ANY($1::text[])",
-        [orgIds],
-      );
-      if (Number(existing.rows[0]?.n ?? 0) > 0) throw new ImportRefused("rerun_requires_previous_report");
-    }
+    const ledgerTable = await target.query<{ present: boolean }>(
+      "SELECT to_regclass('public.cloud_import_ledger') IS NOT NULL AS present",
+    );
+    if (ledgerTable.rows[0]?.present !== true) throw new ImportRefused("target_lacks_import_ledger");
     if (Number(conflicts.rows[0]?.n ?? 0) > 0) {
       report.tables.users.skipped.target_email_conflict = Number(conflicts.rows[0]!.n);
       throw new ImportRefused("target_email_conflict");
     }
+
+    finishFilters();
 
     // 3. Write. apply: users in batches, then one transaction per org.
     //    dry-run: the same units as savepoints inside one transaction that is
@@ -449,28 +499,63 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       if (rows.length === 0) return;
       const sql = upsertSql(table, write[table], fills[table]);
       for (const batch of chunks(rows, batchSize)) {
-        await tx.query(sql, [batch.map((row) => row.row), batch.map((row) => row.secret)]);
+        await tx.query(sql, [batch.map((row) => row.row), batch.map((row) => row.secret), batch.map((row) => row.override ?? null)]);
       }
     };
     const runOrg = async (tx: SqlExecutor, org: string) => {
+      // The target ledger is the only record of what earlier runs wrote.
+      const ledger = await tx.query<{ table_name: string; row_key: string }>(
+        `SELECT table_name, row_key FROM public.${IMPORT_LEDGER_TABLE} WHERE organization_id = $1 FOR UPDATE`,
+        [org],
+      );
+      if (ledger.rows.length === 0) {
+        // Never imported. An existing org with this id is Control's own:
+        // refuse it rather than merging into it.
+        const existing = await tx.query("SELECT 1 FROM public.organizations WHERE id = $1", [org]);
+        if (existing.rows[0]) throw new OrgRefused("org_exists_without_ledger");
+      }
+      const before = new Map<string, string[]>();
+      for (const row of ledger.rows) {
+        if (!before.has(row.table_name)) before.set(row.table_name, []);
+        before.get(row.table_name)!.push(row.row_key);
+      }
+      const keys = report.orgs[org]!.keys;
       // Deletes first: a replacement row (an invite re-sent to the same
       // email) must not collide with the row it replaces.
-      for (const table of RECONCILED_TABLES) {
-        const before = previous?.orgs[org]?.keys?.[table] ?? [];
-        if (before.length === 0) continue;
-        const now = new Set(report.orgs[org]!.keys[table] ?? []);
-        const gone = before.filter((key) => !now.has(key));
+      for (const table of ORG_TABLES) {
+        const now = new Set(keys[table] ?? []);
+        const gone = (before.get(table) ?? []).filter((key) => !now.has(key));
         if (gone.length === 0) continue;
-        const result = await tx.query<{ n: number }>(
-          `WITH d AS (${deleteSql(table)} RETURNING 1) SELECT count(*)::int AS n FROM d`,
-          [gone, org],
+        if (!RECONCILED_TABLES.includes(table)) {
+          // Kept in Control and in the ledger; an operator decides.
+          report.warnings[`${table}_absent_in_source`] = (report.warnings[`${table}_absent_in_source`] ?? 0) + gone.length;
+          continue;
+        }
+        // `deleted` counts logical removals: ledger keys reconciled away,
+        // whether this DELETE or an earlier FK cascade in this transaction
+        // (a removed membership takes its Desktop/fleet rows) removed them.
+        await tx.query(deleteSql(table), [gone, org]);
+        report.orgs[org]!.deleted[table] = gone.length;
+        await tx.query(
+          `DELETE FROM public.${IMPORT_LEDGER_TABLE} WHERE organization_id = $1 AND table_name = $2 AND row_key = ANY($3::text[])`,
+          [org, table, gone],
         );
-        report.orgs[org]!.deleted[table] = result.rows[0]?.n ?? 0;
       }
       for (const table of ORG_TABLES) {
         const rows = prepared[table].filter((row) => row.org === org);
         await writeRows(tx, table, rows);
         report.orgs[org]!.imported[table] = rows.length;
+      }
+      const tables = ORG_TABLES.flatMap((table) => (keys[table] ?? []).map(() => table));
+      const rowKeys = ORG_TABLES.flatMap((table) => keys[table] ?? []);
+      for (const batch of chunks(tables.map((table, index) => [table, rowKeys[index]!] as const), 1000)) {
+        await tx.query(
+          `INSERT INTO public.${IMPORT_LEDGER_TABLE} (organization_id, table_name, row_key, mapping_revision)
+           SELECT $1, t, k, $4 FROM unnest($2::text[], $3::text[]) AS u(t, k)
+           ON CONFLICT (organization_id, table_name, row_key)
+           DO UPDATE SET mapping_revision = EXCLUDED.mapping_revision, imported_at = now()`,
+          [org, batch.map(([table]) => table), batch.map(([, key]) => key), MAPPING_REVISION],
+        );
       }
     };
     const body = async (unit: (run: (tx: SqlExecutor) => Promise<void>) => Promise<void>) => {
@@ -488,7 +573,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
           }
           log("cloud_import.org", { org, status: "ok" });
         } catch (error) {
-          report.orgs[org] = { status: "failed", error: errorFields(error), imported: {}, keys: previous?.orgs[org]?.keys ?? {}, deleted: {} };
+          report.orgs[org] = { status: "failed", error: errorFields(error), imported: {}, keys: {}, deleted: {} };
           log("cloud_import.org", { org, status: "failed", ...errorFields(error) });
         }
       }

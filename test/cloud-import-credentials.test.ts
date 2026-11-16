@@ -39,7 +39,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   });
   await source.exec(CLOUD_FIXTURE_DDL);
   await source.exec(cloudFixtureSeed(CLOUD_KEY));
-  await migrate(target);
+  await migrate(target); // includes 0063 cloud_import_ledger
   const identity = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
   assert.equal(identity.ok, true);
 
