@@ -870,6 +870,15 @@ export class ControlPlaneStore {
     };
   }
 
+  /** Workspace owning one canonical imported History origin, if any. */
+  async workspaceIdForRelayhistoryOrigin(origin: string): Promise<string | null> {
+    const result = await this.database.query<{ id: string }>(
+      "SELECT id FROM workspaces WHERE relayhistory_origin = $1",
+      [origin],
+    );
+    return result.rows[0]?.id ?? null;
+  }
+
   async setRuntime(workspaceId: string, runtime: unknown): Promise<boolean> {
     const result = await this.database.query<{ id: string }>(
       `UPDATE workspaces SET runtime_config = $2::jsonb, updated_at = now()

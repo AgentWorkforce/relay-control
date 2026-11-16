@@ -12,6 +12,7 @@ import {
 
 import { loadDesktopReleasesRepo } from "./desktop-releases.js";
 import type { GithubAppConfig } from "./admin/github-app.js";
+import { canonicalRelayhistoryOrigin } from "./relayhistory-origin.js";
 
 export type SelfhostConfig = {
   githubApp?: GithubAppConfig | null;
@@ -62,10 +63,15 @@ export type SelfhostConfig = {
    */
   introspectSecret?: string | null;
   /**
-   * Origins accepted as the introspection `aud`, from
-   * SELFHOST_INTROSPECT_AUDIENCES. Defaults to [relayhistoryPublicUrl].
+   * General service origins accepted as the introspection `aud`, from
+   * SELFHOST_INTROSPECT_AUDIENCES. Defaults to []; History is separate.
    */
   introspectAudiences?: string[];
+  /**
+   * Canonical History origins allowed to receive a user bearer, from
+   * SELFHOST_RELAYHISTORY_AUDIENCES. Defaults to [relayhistoryPublicUrl].
+   */
+  relayhistoryAudiences?: string[];
   /**
    * SELFHOST_INTROSPECT_OUTAGE_HOLD_MS: how long an `sh_at_` token's last
    * ACTIVE introspection verdict may answer while the database is unreachable
@@ -418,8 +424,18 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   refuseRemovedHistoryVariables(env);
   // One History origin, the read API's. Nothing may name a second one.
   const sessionReadApi = loadSessionReadApiConfig(env);
-  const introspection = loadIntrospectionConfig(env, sessionReadApi.publicUrl);
-  assertHistoryIntrospection(introspection, sessionReadApi.publicUrl);
+  const loadedIntrospection = loadIntrospectionConfig(env);
+  const relayhistoryAudiences = loadRelayhistoryAudiences(env, sessionReadApi.publicUrl);
+  const introspectAudiences = loadedIntrospection.introspectAudiences.filter((audience) =>
+    !relayhistoryAudiences.includes(new URL(audience).origin)
+  );
+  if (introspectAudiences.length !== loadedIntrospection.introspectAudiences.length) {
+    console.warn(
+      "[selfhost-api] ignoring History origins in SELFHOST_INTROSPECT_AUDIENCES; configure them only in SELFHOST_RELAYHISTORY_AUDIENCES",
+    );
+  }
+  const introspection = { ...loadedIntrospection, introspectAudiences };
+  assertHistoryIntrospection(introspection, relayhistoryAudiences, sessionReadApi.publicUrl);
   return {
     databaseUrl: loadDatabaseUrl(env),
     publicBaseUrl: serviceUrl(env, "SELFHOST_PUBLIC_URL"),
@@ -435,6 +451,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     sessionReadMcpReads: loadSessionReadMcpReads(env),
     sessionSearchAgentTokens: loadSessionSearchAgentTokens(env),
     ...introspection,
+    relayhistoryAudiences,
     acquisitionIssuer: loadAcquisitionIssuerConfig(env, introspection),
     bootstrapToken,
     encryptionKeyring: loadEncryptionKeyring(env),
@@ -568,13 +585,14 @@ function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {
 /** The ingest edge authorizes every upload through introspection of this audience. */
 function assertHistoryIntrospection(
   introspection: { introspectSecret: string | null; introspectAudiences: string[] },
+  relayhistoryAudiences: string[],
   publicUrl: string,
 ): void {
   if (!introspection.introspectSecret) {
     throw new Error("RELAYCONTROL_INTROSPECT_SECRET is required: the sessions pipeline verifies every History token through introspection");
   }
-  if (!introspection.introspectAudiences.includes(publicUrl)) {
-    throw new Error("SELFHOST_INTROSPECT_AUDIENCES must include SESSION_READ_API_PUBLIC_URL");
+  if (!relayhistoryAudiences.includes(publicUrl)) {
+    throw new Error("SELFHOST_RELAYHISTORY_AUDIENCES must include SESSION_READ_API_PUBLIC_URL");
   }
 }
 
@@ -688,7 +706,7 @@ export function loadIntrospectOutageHoldMs(env: Env): number {
   return value;
 }
 
-function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
+function loadIntrospectionConfig(env: Env): {
   introspectSecret: string | null;
   introspectAudiences: string[];
   introspectOutageHoldMs: number;
@@ -701,11 +719,28 @@ function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
   const introspectAudiences = raw
     ? raw.split(",").map((value) => value.trim()).filter(Boolean).map((value) =>
       audienceOrigin(value, "each SELFHOST_INTROSPECT_AUDIENCES entry"))
-    : [relayhistoryPublicUrl];
-  if (introspectAudiences.length === 0) {
+    : [];
+  if (raw && introspectAudiences.length === 0) {
     throw new Error("SELFHOST_INTROSPECT_AUDIENCES must name at least one origin");
   }
   return { introspectSecret, introspectAudiences, introspectOutageHoldMs: loadIntrospectOutageHoldMs(env) };
+}
+
+function loadRelayhistoryAudiences(env: Env, relayhistoryPublicUrl: string): string[] {
+  const raw = env.SELFHOST_RELAYHISTORY_AUDIENCES?.trim();
+  const values = raw ? raw.split(",").map((value) => value.trim()).filter(Boolean) : [relayhistoryPublicUrl];
+  if (values.length === 0) {
+    throw new Error("SELFHOST_RELAYHISTORY_AUDIENCES must name at least one origin");
+  }
+  return values.map((value) => {
+    const canonical = canonicalRelayhistoryOrigin(value);
+    if (canonical === null) {
+      throw new Error(
+        "each SELFHOST_RELAYHISTORY_AUDIENCES entry must be an HTTPS origin, or HTTP on explicit loopback",
+      );
+    }
+    return canonical;
+  });
 }
 
 /**
