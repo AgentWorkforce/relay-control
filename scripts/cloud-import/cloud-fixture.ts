@@ -62,7 +62,7 @@ CREATE TABLE desktop_relay_identities (
 CREATE TABLE provider_credentials (
   id uuid PRIMARY KEY, organization_id uuid NOT NULL, workspace_id uuid NOT NULL, user_id uuid NOT NULL,
   harness text NOT NULL, model_provider text NOT NULL DEFAULT '', auth_type text NOT NULL DEFAULT 'provider_oauth',
-  label text, key_fingerprint text, display_name text NOT NULL, account_email text,
+  label text, key_fingerprint text, display_name text NOT NULL, account_email text, provider_account_id text,
   is_active boolean NOT NULL DEFAULT false, harness_active boolean NOT NULL DEFAULT false, status text NOT NULL,
   last_authenticated_at timestamptz, last_used_at timestamptz, last_error text,
   created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
@@ -158,7 +158,13 @@ INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, ha
   ('${id(0x801)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'claude', 'anthropic', 'relay_managed', 'Relay Claude', true, true, 'connected', ${t}, '2026-01-03T00:00:00Z'),
   ('${id(0x802)}', '${ORG_A}', '${id(0x201)}', '${id(2)}', 'claude', 'anthropic', 'relay_managed', 'Relay Claude (bob)', true, false, 'connected', ${t}, ${t}),
   ('${id(0x803)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'byo_api_key', 'My key', true, false, 'connected', ${t}, ${t}),
-  ('${id(0x804)}', '${ORG_A}', '${id(0x202)}', '${id(1)}', 'claude', 'anthropic', 'relay_managed', 'Unbound', false, false, 'connected', ${t}, ${t});
+  ('${id(0x804)}', '${ORG_A}', '${id(0x202)}', '${id(1)}', 'claude', 'anthropic', 'relay_managed', 'Unbound', false, false, 'connected', ${t}, ${t}),
+  ('${id(0x805)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'claude', 'anthropic', 'oauth_token', 'Bob token', true, true, 'connected', ${t}, ${t}),
+  ('${id(0x806)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT', false, true, 'connected', ${t}, ${t}),
+  ('${id(0x807)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'claude', 'anthropic', 'provider_oauth', 'Claude login', false, true, 'connected', ${t}, ${t}),
+  ('${id(0x808)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'codex', 'openai', 'byo_api_key', 'Lost key', false, false, 'connected', ${t}, ${t});
+UPDATE provider_credentials SET label = 'Bob token', account_email = 'bob@example.test' WHERE id = '${id(0x805)}';
+UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-1' WHERE id = '${id(0x806)}';
 INSERT INTO workspace_integrations (id, workspace_id, provider, name, created_by_user_id, connection_id, installation_id, created_at, updated_at) VALUES
   ('${id(0x901)}', 'rw_0000a201', 'github', NULL, '${id(5)}', 'nango-1', '12345', ${t}, ${t}),
   ('${id(0x902)}', 'rw_0000a201', 'github', 'second', '${id(1)}', 'nango-2', '12345', ${t}, ${t}),
@@ -197,7 +203,7 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
   // Pre-0058 target: the two relay_managed rows are refused by the importer.
   coding_agent_credentials: {
     imported: 0,
-    skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 1, target_lacks_relay_managed: 2 },
+    skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 5, target_lacks_relay_managed: 2 },
   },
   // Pre-0054 target: the GitHub App rows wait for the migration.
   github_app_installations: { imported: 0, skipped: { target_lacks_github_app: 1 } },

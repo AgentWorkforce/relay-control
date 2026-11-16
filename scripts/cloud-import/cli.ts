@@ -11,12 +11,24 @@
 //   SELFHOST_ENCRYPTION_KEY_ID / SELFHOST_ENCRYPTION_KEY
 //                                     Control's keyring, as the service loads it
 //
+// --copy-credentials (opt-in, after the identity import) also copies
+// coding-agent secrets from Cloud's credential store (Cloudflare R2, S3 API,
+// read-only) through Control's own stores. It additionally needs:
+//   CLOUD_CREDENTIAL_R2_ENDPOINT, CLOUD_CREDENTIAL_R2_BUCKET,
+//   CLOUD_CREDENTIAL_R2_ACCESS_KEY_ID, CLOUD_CREDENTIAL_R2_SECRET_ACCESS_KEY
+//   and Control's credential storage settings (SELFHOST_CREDENTIAL_STORAGE...)
+//
 // Exit 0: done, every organization ok. 1: refused, or an organization failed.
 // 2: usage or configuration error. Output is JSON lines without values.
 import { randomBytes } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { loadEncryptionKeyring, readSecret, type Env } from "../../src/config.js";
 import { PostgresDatabase } from "../../src/database.js";
+import { CodingAgentStore } from "../../src/admin/coding-agents.js";
+import { CredentialBlobStore, credentialBackendFromEnv, S3ObjectBackend } from "../../src/admin/credential-blobs.js";
+import { SubscriptionLoginStore } from "../../src/admin/subscription-logins.js";
+import type { EncryptionKeyring } from "../../src/crypto.js";
+import { copyCodingAgentCredentials, type CloudObjectReader } from "./credentials.js";
 import { runImport, type ImportMode } from "./importer.js";
 import { encryptedSamples, MAPPING_REVISION, TARGET_RELATIONS, verifierComparisons } from "./mapping.js";
 
@@ -25,17 +37,25 @@ export type CliArgs = {
   orgIds: string[] | null;
   report?: string;
   verifierContract?: string;
+  copyCredentials: boolean;
+  credentialsReport?: string;
 };
 
-export const USAGE = "usage: cloud-import --mode plan|dry-run|apply [--org <uuid>]... [--report <path>] [--verifier-contract <path>]";
+export const USAGE = "usage: cloud-import --mode plan|dry-run|apply [--org <uuid>]... [--report <path>] [--verifier-contract <path>] [--copy-credentials [--credentials-report <path>]]";
 
 export function parseArgs(argv: readonly string[]): CliArgs {
   let mode: ImportMode | undefined;
   const orgs: string[] = [];
   let report: string | undefined;
   let verifierContract: string | undefined;
+  let copyCredentials = false;
+  let credentialsReport: string | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
+    if (flag === "--copy-credentials") {
+      copyCredentials = true;
+      continue;
+    }
     const value = argv[index + 1];
     if (value === undefined || value.startsWith("--")) throw new Error(`${flag} needs a value`);
     index += 1;
@@ -45,10 +65,19 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     } else if (flag === "--org") orgs.push(value);
     else if (flag === "--report") report = value;
     else if (flag === "--verifier-contract") verifierContract = value;
+    else if (flag === "--credentials-report") credentialsReport = value;
     else throw new Error(`unknown flag ${flag}`);
   }
   if (!mode) throw new Error("--mode is required");
-  return { mode, orgIds: orgs.length ? orgs : null, ...(report ? { report } : {}), ...(verifierContract ? { verifierContract } : {}) };
+  if (copyCredentials && mode === "dry-run") throw new Error("--copy-credentials runs with plan or apply only (its stores commit)");
+  return {
+    mode,
+    orgIds: orgs.length ? orgs : null,
+    copyCredentials,
+    ...(report ? { report } : {}),
+    ...(verifierContract ? { verifierContract } : {}),
+    ...(credentialsReport ? { credentialsReport } : {}),
+  };
 }
 
 function required(env: Env, name: string): string {
@@ -108,7 +137,11 @@ async function main(argv: readonly string[], env: Env): Promise<number> {
       log: (event, fields) => console.log(JSON.stringify({ event, ...fields })),
     }, scope, args.mode);
     if (args.report) writeFileSync(args.report, JSON.stringify(report, null, 2), { mode: 0o600 });
-    return report.ok ? 0 : 1;
+    if (!args.copyCredentials) return report.ok ? 0 : 1;
+    if (args.mode === "apply" && !report.ok) return 1;
+    const copy = await copyCredentials(args, env, source, target, config.keyring, config.cloudKey);
+    if (args.credentialsReport) writeFileSync(args.credentialsReport, JSON.stringify(copy, null, 2), { mode: 0o600 });
+    return report.ok && copy.ok ? 0 : 1;
   } catch (error) {
     const code = (error as { code?: unknown } | null)?.code;
     console.error(JSON.stringify({
@@ -120,6 +153,48 @@ async function main(argv: readonly string[], env: Env): Promise<number> {
     await source.close();
     await target?.close();
   }
+}
+
+/** Cloud's credential store, read-only: only GET is reachable from here. */
+function cloudReader(env: Env): CloudObjectReader {
+  const backend = new S3ObjectBackend({
+    bucket: required(env, "CLOUD_CREDENTIAL_R2_BUCKET"),
+    region: "auto",
+    prefix: "credentials",
+    endpoint: required(env, "CLOUD_CREDENTIAL_R2_ENDPOINT"),
+    forcePathStyle: true,
+    credentials: {
+      accessKeyId: required(env, "CLOUD_CREDENTIAL_R2_ACCESS_KEY_ID"),
+      secretAccessKey: required(env, "CLOUD_CREDENTIAL_R2_SECRET_ACCESS_KEY"),
+    },
+  });
+  return { get: (key) => backend.get(key) };
+}
+
+async function copyCredentials(
+  args: CliArgs,
+  env: Env,
+  source: PostgresDatabase,
+  target: PostgresDatabase | undefined,
+  keyring: EncryptionKeyring,
+  cloudKey: string | undefined,
+) {
+  const scope = { orgIds: args.orgIds };
+  if (args.mode === "plan" || !target || !cloudKey) {
+    // Plan: candidates and skip reasons only; the object store is not touched.
+    const stub = undefined as unknown as never;
+    return copyCodingAgentCredentials({ source, reader: { get: async () => null }, cloudKeyHex: "", keyring, codingAgents: stub, logins: stub }, scope, "plan");
+  }
+  const blobs = new CredentialBlobStore(credentialBackendFromEnv(env, target), keyring);
+  return copyCodingAgentCredentials({
+    source,
+    reader: cloudReader(env),
+    cloudKeyHex: cloudKey,
+    keyring,
+    codingAgents: new CodingAgentStore(target, keyring, undefined, blobs),
+    logins: new SubscriptionLoginStore(target, keyring, blobs),
+    log: (event, fields) => console.log(JSON.stringify({ event, ...fields })),
+  }, scope, "apply");
 }
 
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {

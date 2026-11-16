@@ -393,6 +393,38 @@ SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS created_by_user_id,
   };
 }
 
+/**
+ * Coding-agent credentials whose secret lives in Cloud's credential store
+ * (S3/R2), for the opt-in copier (./credentials.ts). One row per Cloud
+ * provider_credentials row with a secret-bearing auth_type. `cloud_user_id`
+ * is the original Cloud user (the object key is keyed by it); `user_id` is
+ * the imported (merge-survivor) Control user used as the audit actor.
+ */
+export function credentialCopyQuery(scope: ImportScope): string {
+  return `WITH ${ctes(scope)}
+SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS cloud_user_id,
+       p.model_provider, p.harness, p.auth_type, p.label, p.account_email, p.provider_account_id,
+       p.is_active, p.harness_active,
+       CASE
+         WHEN iw.id IS NULL THEN 'workspace_not_imported'
+         WHEN iu.id IS NULL THEN 'user_not_imported'
+         WHEN p.model_provider NOT IN ('anthropic', 'openai', 'openrouter', 'xai', 'google') THEN 'unsupported_model_provider'
+         WHEN p.auth_type = 'oauth_token' AND p.model_provider <> 'anthropic' THEN 'unsupported_model_provider'
+         WHEN p.auth_type = 'provider_oauth' AND p.model_provider NOT IN ('anthropic', 'openai', 'xai') THEN 'unsupported_model_provider'
+         -- #150: an Anthropic login needs the Cloud account email as its identity.
+         WHEN p.auth_type = 'provider_oauth' AND p.model_provider = 'anthropic' AND NULLIF(btrim(p.account_email), '') IS NULL
+           THEN 'anthropic_login_without_account_email'
+       END AS skip_reason
+  FROM public.provider_credentials p
+  JOIN public.workspaces w ON w.id = p.workspace_id
+  JOIN scope_orgs s ON s.id = w.organization_id
+  LEFT JOIN imported_workspaces iw ON iw.id = p.workspace_id
+  LEFT JOIN user_map um ON um.cloud_user_id = p.user_id
+  LEFT JOIN imported_users iu ON iu.id = um.user_id
+ WHERE p.auth_type IN ('byo_api_key', 'oauth_token', 'provider_oauth')
+ ORDER BY p.id`;
+}
+
 /** The source query for one table: every candidate row with its skip_reason. */
 export function sourceQuery(table: ImportTable, scope: ImportScope): string {
   return `WITH ${ctes(scope)}\n${selects()[table]}`;
