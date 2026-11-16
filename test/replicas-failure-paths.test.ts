@@ -701,3 +701,72 @@ test("a revived release keeps an older policy-retired binding's release from re-
   assert.deepEqual(await tombstones(env), fence);
   assert.equal((await rpc(api, token(), "tools/list")).body.error.message, "replica_released");
 });
+
+const secondWorkspace = async (env: Env) => {
+  const created = await env.api(`/api/v1/organizations/${env.organizationId}/workspaces`, {
+    method: "POST", token: BOOTSTRAP, body: { name: "secondary", relaycastWorkspaceId: "rc-secondary", relaycastApiKey: "rk_live_secondary" },
+  });
+  assert.equal(created.status, 201, created.text);
+  const workspaceId = created.body.id as string;
+  return { workspaceId, ownerToken: await env.login(env.ownerId, workspaceId) };
+};
+
+test("workspace deletion tombstones a retired environment identity: the replica is refused in the next workspace", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, store } = env;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const binding = await liveBinding(env);
+  assert.ok(binding);
+  // Retired by policy: gone, no released marker, no tombstone.
+  await env.database.query("UPDATE replica_spawns SET state = 'gone' WHERE id = $1", [binding.id]);
+  assert.equal((await spawnRow(env, binding.id)).input.released, undefined);
+  assert.deepEqual(await tombstones(env), []);
+
+  const next = await secondWorkspace(env);
+  assert.equal(await store.deleteWorkspace({ organizationId: env.organizationId, workspaceId, allowLast: true, actor: { kind: "bootstrap" } }), "deleted");
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE id = $1", [binding.id]), 0);
+  assert.deepEqual(await tombstones(env), [{
+    issuer: ISSUER, provider_organization_id: PROVIDER_ORG, provider_workspace_id: WORKSPACE_1, workspace_id: null, reason: "workspace_deleted",
+  }]);
+  env.world.agents.clear();
+  env.roster.length = 0;
+
+  assert.equal((await connect(env, next.workspaceId, next.ownerToken)).status, 200);
+  await mapOwner(env, next.workspaceId, next.ownerToken);
+  const refused = await rpc(api, token(), "tools/list");
+  assert.equal(refused.status, 403, refused.text);
+  assert.equal(refused.body.error.message, "replica_released");
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE workspace_id = $1", [next.workspaceId]), 0);
+});
+
+test("a disconnected workspace keeps its replica: another workspace is refused replica_owned_elsewhere, a re-connect admits it", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken } = env;
+  const connection = (id: string) => `/api/v1/workspaces/${id}/remote-agent-connections/replicas`;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  assert.ok(await liveBinding(env));
+
+  assert.equal((await api(connection(workspaceId), { method: "DELETE", token: ownerToken })).status, 200);
+  assert.equal(await liveBinding(env), undefined, "the disconnect retires the binding");
+  assert.deepEqual(await tombstones(env), []);
+
+  const next = await secondWorkspace(env);
+  assert.equal((await connect(env, next.workspaceId, next.ownerToken)).status, 200);
+  await mapOwner(env, next.workspaceId, next.ownerToken);
+  const refused = await rpc(api, token(), "tools/list");
+  assert.equal(refused.status, 403, refused.text);
+  assert.equal(refused.body.error.message, "replica_owned_elsewhere");
+  assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE workspace_id = $1", [next.workspaceId]), 0);
+
+  // Back in the owning workspace, its own retired rows are not "elsewhere".
+  assert.equal((await api(connection(next.workspaceId), { method: "DELETE", token: next.ownerToken })).status, 200);
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  const admitted = await rpc(api, token(), "tools/list");
+  assert.equal(admitted.status, 200, admitted.text);
+  assert.equal((await liveBinding(env))?.user_id, env.ownerId);
+});

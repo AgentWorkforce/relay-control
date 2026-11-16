@@ -148,6 +148,10 @@ Each call is admitted in this order:
 2. A released replica (tombstone) is refused with 403 `replica_released`.
    Any tombstone for the token's issuer, organization and replica counts,
    including one whose workspace was deleted.
+   A replica enrolled in another Control workspace (an environment-identity
+   record in any state) is refused with 403 `replica_owned_elsewhere` once the
+   enabled candidate workspace is known (step 3), before its connection
+   and creator checks.
 3. The token's provider organization must not be connected in more than one
    Control workspace, otherwise 403 `organization_shared` (as Cloud). The
    token's environment must be enabled in exactly one Control workspace whose
@@ -172,7 +176,7 @@ Each call is admitted in this order:
 5. The first admitted call enrols the replica: one `replica_spawns` row with
    source `environment_identity`, `replica_id` = the Replicas workspace id and
    a Relay identity named `replicas-<16 hex>`. Later calls reuse it. A replica
-   with a live binding in another Control workspace answers 409
+   with a live launch or bind in another Control workspace answers 409
    `replica_already_bound`. A Relay agent left behind
    by this replica's own released binding (its cleanup failed after a
    disable, principal or mapping change) is not a conflict: enrolment retries
@@ -382,14 +386,18 @@ then removes the registered entries best effort.
 
 Policies, pending creators and the principal (migration 0067) are deleted
 with their workspace. Tombstones are not: deleting a workspace tombstones
-every live environment-enrolled replica of it (reason `workspace_deleted`)
+every environment-enrolled replica of it, live or retired (reason `workspace_deleted`)
 and removes its environment-identity bindings in the same transaction, and
 from migration 0069 a tombstone outlives its workspace with no workspace
 attached, so those replicas stay refused, also when the organization is
 connected in another workspace. A tombstone that outlived its workspace stays
 in force: there is no in-product revive for it, matching the hosted
 edition's tenant pin. A workspace with launch or bind records still answers
-409 `in_use` until those replicas are released.
+409 `in_use` until those replicas are released. A replica is never reassigned
+across workspaces: while any environment-identity record of it (in any state,
+for example retired by a disconnect) exists in another workspace, admission
+refuses it with 403 `replica_owned_elsewhere`; the workspace that enrolled it
+first admits it again once it is re-connected.
 
 ### Revoked provider access
 

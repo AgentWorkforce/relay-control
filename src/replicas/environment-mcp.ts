@@ -16,7 +16,8 @@ import { checkRelayInbox, listRelayAgents, sendRelayMessage } from "./tools.js";
  *
  * Admission order, nothing written until all pass: (1) token verification
  * 401 replica_identity_invalid, (2) release tombstone 403 replica_released,
- * (3) the provider organization connected in no other workspace, else 403
+ * (3) an enrolment of the same replica in another workspace, 403
+ * replica_owned_elsewhere, the provider organization connected in no other workspace, else 403
  * organization_shared, and an enabled environment policy, else 403
  * replica_environment_not_enabled, (4) a creator mapping to a current member,
  * else (no or unmapped creator) the workspace's VM principal when it is set

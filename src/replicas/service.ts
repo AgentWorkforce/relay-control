@@ -769,9 +769,10 @@ async function launchTombstoneKey(deps: ReplicasDeps, tx: SqlExecutor, row: Spaw
 }
 
 /**
- * Workspace deletion, inside the deletion transaction: every live
- * environment-identity binding of the workspace is tombstoned (reason
- * workspace_deleted), then its hosted Relay participant rows and the
+ * Workspace deletion, inside the deletion transaction: every
+ * environment-identity binding of the workspace, live or retired (gone), is
+ * tombstoned (reason workspace_deleted), so a replica never moves to another
+ * workspace once its tenant record is gone; then its hosted Relay participant rows and the
  * environment-identity spawn rows themselves are removed. Those rows are
  * Relay participants registered by a customer environment, not compute, so
  * the deletion retires them. Launch and bind rows (sources spawn/bind) are
@@ -784,7 +785,7 @@ export async function retireWorkspaceIdentitiesInTx(tx: SqlExecutor, workspaceId
     `INSERT INTO replica_identity_tombstones (issuer, provider_organization_id, provider_workspace_id, workspace_id, reason)
      SELECT DISTINCT ON (issuer, provider_organization_id, replica_id) issuer, provider_organization_id, replica_id, workspace_id, 'workspace_deleted'
        FROM replica_spawns
-      WHERE workspace_id = $1 AND source = $2 AND state <> 'gone'
+      WHERE workspace_id = $1 AND source = $2
         AND issuer IS NOT NULL AND provider_organization_id IS NOT NULL AND replica_id IS NOT NULL
      ON CONFLICT (issuer, provider_organization_id, provider_workspace_id)
        DO UPDATE SET workspace_id = EXCLUDED.workspace_id, reason = EXCLUDED.reason, released_at = now()`,

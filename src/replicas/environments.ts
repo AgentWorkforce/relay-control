@@ -51,6 +51,7 @@ export const IDENTITY_SERVER_NAME = "agent-relay-replica";
 export type IdentityRefusalCode =
   | "replica_identity_invalid"
   | "replica_released"
+  | "replica_owned_elsewhere"
   | "replica_environment_not_enabled"
   | "organization_shared"
   | "replica_creator_not_allowed"
@@ -141,6 +142,19 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
     [claims.issuer, claims.organizationId, claims.environmentId],
   );
   const candidate = policies.rows.length === 1 ? policies.rows[0]! : null;
+  // No reassignment across workspaces: the first workspace that enrolled this replica owns it
+  // for good, whatever state its row is in (live, retired or gone).
+  if (candidate) {
+    const elsewhere = await tx.query(
+      `SELECT 1 FROM replica_spawns
+        WHERE source = $1 AND issuer = $2 AND provider_organization_id = $3 AND lower(replica_id) = $4 AND workspace_id <> $5
+        LIMIT 1`,
+      [ENVIRONMENT_IDENTITY, claims.issuer, claims.organizationId, claims.workspaceId, candidate.workspace_id],
+    );
+    if (elsewhere.rows.length) {
+      throw new IdentityRefusal("replica_owned_elsewhere", 403, { workspaceId: candidate.workspace_id, organizationId: candidate.organization_id });
+    }
+  }
   // An organization connected in several workspaces has no single tenant: refuse before any creator check.
   if (await organizationShared(tx, claims.organizationId)) {
     throw new IdentityRefusal("organization_shared", 403,
