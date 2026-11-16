@@ -62,6 +62,11 @@ export type McpContext = {
     sessionId: string | undefined;
     /** Relaycast's public base URL; agent cards name `<it>/a2a/rpc` as their A2A endpoint. */
     relaycastPublicUrl: string;
+    /**
+     * SELFHOST_RELAYGATE_PUBLIC_URL, when set (a gate-only install): agent
+     * launches then mint a one-time relay launch credential.
+     */
+    relaygatePublicUrl?: string;
   };
   /** Amp control (SELFHOST_AMP_ENABLED); absent when the feature is off. */
   amp?: AmpDeps;

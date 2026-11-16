@@ -336,6 +336,7 @@ export function createMcpHandler(input: {
         client: relaycast,
         sessionId: typeof sessionId === "string" ? sessionId : undefined,
         relaycastPublicUrl: config.relaycastPublicUrl,
+        ...(config.relaygatePublicUrl ? { relaygatePublicUrl: config.relaygatePublicUrl } : {}),
       },
       ...(!oauth && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && input.factory ? { factory: input.factory } : {}),
