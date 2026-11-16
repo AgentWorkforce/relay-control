@@ -105,3 +105,10 @@ test("labels alone cannot waive unknown providers, live logins, API keys or ambi
   assert.ok(!JSON.stringify(summary).includes("synthetic-private-provider-marker"));
   assert.equal(summary.reduce((total,item) => total+item.accounted,0),0);
 });
+
+test("exhausted API key cannot be accounted as a dead OAuth login",() => {
+  const summary=exclusionAccounting();
+  assert.equal(accountCredentialExclusion(summary,{reason:"dead_login",provider:"openai",authType:"byo_api_key",
+    status:"connected",refreshExhausted:true}),false);
+  assert.deepEqual(summary.find((entry) => entry.reason === "dead_login"),{reason:"dead_login",accounted:0,unresolved:1});
+});

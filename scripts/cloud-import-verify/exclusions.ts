@@ -9,13 +9,12 @@ export function accountCredentialExclusion(summary:ExclusionAccounting,facts:Exc
   const entry=summary.find((item) => item.reason === facts.reason);
   if (!entry) return null;
   const provider=typeof facts.provider === "string" ? facts.provider.trim().toLowerCase() : "";
-  const secretBearing=["byo_api_key","oauth_token","provider_oauth"].includes(String(facts.authType));
+  const oauth=["oauth_token","provider_oauth"].includes(String(facts.authType));
   const accounted=facts.reason === "unsupported_dropped"
     ? facts.authType === "provider_oauth" && ["openrouter","daytona"].includes(provider)
       && facts.status === "connected" && facts.refreshExhausted === false
     : facts.reason === "dead_login"
-      ? secretBearing && (facts.refreshExhausted === true
-        || (["oauth_token","provider_oauth"].includes(String(facts.authType)) && facts.status === "refresh_failed"))
+      ? oauth && (facts.refreshExhausted === true || facts.status === "refresh_failed")
       : provider === "opencode" && facts.authType === "relay_managed";
   entry[accounted ? "accounted" : "unresolved"]++;
   return accounted;
