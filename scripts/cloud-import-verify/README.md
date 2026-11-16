@@ -428,3 +428,13 @@ attestations: the operator must preserve genuine capture-before provenance.
 Physical table rewrites or concurrent writers also fail; keep the target
 quiescent. This proves credential/blob state plus the copier's explicit
 statement-outcome accounting, not absence of unrelated service writes.
+
+The `.18` copier's exact `copier_login` ledger namespace is checked separately
+from identity ownership. Marker keys/revisions, duplicates and live references
+are validated and counted; stale pointers after credential deletion are reported
+as orphans rather than treated as write authority. New/updated copied logins
+with write receipts require exact marker links to the actual Control ID, org and
+blob version. Unknown ledger namespaces remain invalid. Convergence also
+requires zero marker insertions, deletions and tuple changes. `control_newer`
+and `blob_read_failed` outcomes do not qualify a copy, even with a producer
+`ok:true` or matching plaintext.

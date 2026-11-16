@@ -120,7 +120,7 @@ const convergenceReport=() => ({version:1,mappingRevision:MAPPING_REVISION,mode:
   writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0}});
 const emptyCheckpoint=(phase:"before"|"after"):CredentialConvergenceSnapshot => ({version:1,kind:"credential-convergence",phase,
   mappingRevision:MAPPING_REVISION,scope:{orgIds:null},sessionSafety:{transactionReadOnly:"on",isolation:"repeatable read",statementTimeout:"1min",lockTimeout:"5s"},
-  credentials:[],blobs:[]});
+  credentials:[],blobs:[],markers:[]});
 
 test("convergence requires all five explicit valid write counters and bound report outcomes",() => {
   const report=convergenceReport();assert.deepEqual(credentialWriteCounts(report),report.writes);

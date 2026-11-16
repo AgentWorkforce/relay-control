@@ -1,4 +1,5 @@
 import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
+import { readCopierMarkers } from "./copier-markers.js";
 import type { Client } from "pg";
 import { schemaFindings } from "./schema.js";
 import { normalizedScope,organizationCensus } from "./organization-scope.js";
@@ -63,6 +64,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
       detail:{scope,sourceOrganizationCensus}});
     const schema=await schemaFindings(t);targetSchema=schema.summary;findings.push(schema.finding);
     if (schema.halt) return {contract:base,findings,halt:true};
+    findings.push((await readCopierMarkers(t,scope)).finding);
     findings.push({kind:"ledger",name:"run",ok:ledger.version === 1 && ledger.mappingRevision === MAPPING_REVISION
       && ledger.mode === "apply" && ledger.ok === true && !ledger.refused && equalScope(scope,ledger.scope),
       detail:{expectedRevision:MAPPING_REVISION,revisionMatches:ledger.mappingRevision === MAPPING_REVISION,
@@ -246,7 +248,7 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     if (options.credentialCopy) findings.push(...await credentialCopyFindings(s,t,scope,options.credentialCopy,keyring,cloudKeyHex));
     return {contract,findings};
   }});
-  const copyChecks=["credential_copy_ledger","credential_natural_keys","credential_control_ids","credential_cloud_selection"];
+  const copyChecks=["credential_copy_ledger","credential_natural_keys","credential_control_ids","credential_cloud_selection","credential_copy_markers","credential_marker_links"];
   return {...checked,evidenceKind:"identity-import" as const,scope,sourceOrganizationCensus:sourceOrganizationCensus!,targetSchema:targetSchema!,
     credentialConvergence:options.credentialCopy?.convergenceBefore
       ? checked.findings.some((f) => f.kind === "credential_convergence" && f.ok) ? "verified" : "failed" : "not_requested",

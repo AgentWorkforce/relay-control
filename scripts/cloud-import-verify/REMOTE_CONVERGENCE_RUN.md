@@ -9,7 +9,7 @@ approved rerun using the fixed copier.
 Use the reviewed exact verifier/importer heads and matching mapping revision.
 Quiesce the target. Only Postgres credential blobs are supported. The checkpoint
 covers all target credentials (native, relay-managed and copied) and all rows
-in `coding_agent_credential_blobs`. It hashes complete row values and MVCC
+in `coding_agent_credential_blobs`, plus `copier_login` ledger markers. It hashes complete row values and MVCC
 xmin/ctid locally; checkpoint keys are hashed too. No plaintext is decrypted.
 The checkpoint is private mode 600; findings expose counts only. Physical table
 rewrites or other credential writers also cause failure.
@@ -65,7 +65,7 @@ try {
   const file = await open(args[0], "wx", 0o600);
   try { await file.writeFile(`${JSON.stringify(snapshot, null, 2)}\n`); }
   finally { await file.close(); }
-  process.stdout.write(`${JSON.stringify({ok: true, credentialRows: snapshot.credentials.length, blobRows: snapshot.blobs.length})}\n`);
+  process.stdout.write(`${JSON.stringify({ok: true, credentialRows: snapshot.credentials.length, blobRows: snapshot.blobs.length, markerRows: snapshot.markers.length})}\n`);
 } catch {
   process.stderr.write("Convergence capture could not complete. Check the approved target TLS inputs, all scope, Postgres blobs and a fresh private output path.\n");
   process.exitCode = 2;
@@ -101,7 +101,17 @@ write counters must agree with the write receipt. The existing source/content,
 selection, ledger, constraint and keyring checks still apply.
 
 The producer receipt covers its documented statement outcomes; the independent
-snapshot covers the two credential relations, not unrelated application writes.
+snapshot covers the credential/blob relations and copier-marker namespace, not unrelated application writes.
 Operator provenance is required: snapshots are evidence files, not signed
 attestations. Return only verdict/count summaries and the report digest; retain
 private artifacts locally. Application smoke evidence remains separate.
+
+The `.18` copier's exact `copier_login` ledger namespace is checked separately
+from identity ownership. Marker keys/revisions, duplicates and live references
+are validated and counted; stale pointers after credential deletion are reported
+as orphans rather than treated as write authority. New/updated copied logins
+with write receipts require exact marker links to the actual Control ID, org and
+blob version. Unknown ledger namespaces remain invalid. Convergence also
+requires zero marker insertions, deletions and tuple changes. `control_newer`
+and `blob_read_failed` outcomes do not qualify a copy, even with a producer
+`ok:true` or matching plaintext.

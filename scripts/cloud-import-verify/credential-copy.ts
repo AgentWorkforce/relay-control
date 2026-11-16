@@ -1,5 +1,6 @@
 import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
 
+import { readCopierMarkers } from "./copier-markers.js";
 import { credentialWriteCounts,readCredentialConvergence,compareCredentialConvergence,type CredentialConvergenceSnapshot } from "./convergence.js";
 import { beginReadOnlySnapshot,type ReadOnlySettings } from "./read-only.js";
 import { createHash,createHmac } from "node:crypto";
@@ -198,6 +199,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
       detail:{classes:deliberateExclusions,unresolvedSourceSkips}}];
   const seen = new Set<string>();
   const targetKeysById=new Map<string,string>();
+  const targetVersions=new Map<string,number>();
   let duplicateKeys = 0;
   let contentFailures = 0;
   // Fixed reason names and counts only: no target IDs, ciphertext, account
@@ -223,6 +225,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
       if (seen.size > 10000) throw new Error("Credential verification exceeds the bounded cohort size");
       const key = targetKey(row);
       targetKeysById.set(row.id,key);
+      if (row.auth_type === "provider_oauth") targetVersions.set(row.id,row.blob_version);
       if (seen.has(key)) duplicateKeys++;
       seen.add(key);
       const wanted = expected.get(key);
@@ -317,6 +320,23 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
       if (native[column] !== (chosen ? false : prior[column])) selectionMismatches++;
     }
   }
+  const markerState=await readCopierMarkers(target,scope);
+  const receipt=credentialWriteCounts(report);
+  const hasReceipt=Object.hasOwn(report,"writes");
+  let markerExpected=0,markerMissing=0,markerMismatches=0;
+  if (receipt) for (const [sourceId,key] of expectedBySourceId) {
+    const outcome:unknown=report.rows[sourceId];
+    const expectedRow=expected.get(key)!;
+    if (expectedRow.authType !== "provider_oauth" || (outcome !== "copied" && outcome !== "updated")) continue;
+    markerExpected++;
+    const controlId=report.controlIds?.[sourceId];const marker=markerState.markers.get(controlId!);
+    if (!marker) markerMissing++;
+    else if (marker.org !== expectedRow.org || marker.version !== targetVersions.get(controlId!)) markerMismatches++;
+  }
+  findings.push({kind:"credential_marker_links",name:"written_logins",
+    ok:(!hasReceipt || receipt !== null) && !markerMissing && !markerMismatches,
+    detail:{receiptStatus:hasReceipt ? receipt ? "valid" : "invalid" : "legacy_without_write_receipt",
+      expected:markerExpected,missing:markerMissing,mismatches:markerMismatches}});
   const reported=report.selection;
   const matches=reported === undefined ? selectionGroups.size === 0 : Object.entries(summary).every(([key,value]) =>
     reported[key as keyof typeof summary] === value);

@@ -7,24 +7,26 @@ import type { Finding } from "./verify.js";
 const hash=(value:string) => createHash("sha256").update(value).digest("hex");
 type StateRow={key:string;stateSha256:string;blobVersion:number|null};
 export type CredentialConvergenceSnapshot={version:1;kind:"credential-convergence";phase:"before"|"after";
-  mappingRevision:string;scope:{orgIds:null};sessionSafety:ReadOnlySettings;credentials:StateRow[];blobs:StateRow[]};
+  mappingRevision:string;scope:{orgIds:null};sessionSafety:ReadOnlySettings;credentials:StateRow[];blobs:StateRow[];markers:StateRow[]};
 
 /** All target credential rows, including native and relay-managed rows, and
- * all Postgres blob objects. Caller holds a quiescent read-only snapshot.
+ * all Postgres blob objects and copier markers. Caller holds a quiescent
+ * read-only snapshot.
  * Full tuple contents and MVCC identity are hashed locally, never serialized. */
 export async function readCredentialConvergence(target:Client,phase:"before"|"after"):Promise<CredentialConvergenceSnapshot> {
   const sessionSafety=await inspectReadOnlySnapshot(target);
   if ((await target.query(`SELECT EXISTS(SELECT 1 FROM public.coding_agent_credentials
     WHERE auth_type='provider_oauth' AND blob_backend IS DISTINCT FROM 'postgres') AS unsupported`)).rows[0].unsupported)
     throw new Error("Convergence capture requires Postgres credential blobs");
-  const credentials:StateRow[]=[],blobs:StateRow[]=[];
-  for (const [relation,key,version,rows,limit] of [
-    ["coding_agent_credentials","id::text","blob_version",credentials,10000],
-    ["coding_agent_credential_blobs","object_key","NULL::int",blobs,50000],
+  const credentials:StateRow[]=[],blobs:StateRow[]=[],markers:StateRow[]=[];
+  for (const [relation,key,version,rows,limit,where] of [
+    ["coding_agent_credentials","id::text","blob_version",credentials,10000,""],
+    ["coding_agent_credential_blobs","object_key","NULL::int",blobs,50000,""],
+    ["cloud_import_ledger","organization_id::text||':'||row_key","NULL::int",markers,10000,"WHERE table_name='copier_login'"],
   ] as const) {
     await target.query(`DECLARE convergence_cursor NO SCROLL CURSOR FOR SELECT ${key} AS key,${version} AS version,
       to_jsonb(t)::text AS state,t.xmin::text AS xmin,t.ctid::text AS ctid
-      FROM public.${relation} t ORDER BY ${key} COLLATE "C"`);
+      FROM public.${relation} t ${where} ORDER BY ${key} COLLATE "C"`);
     try {for (;;) {
       const batch=await target.query("FETCH FORWARD 25 FROM convergence_cursor");if (!batch.rows.length) break;
       for (const row of batch.rows) {
@@ -33,7 +35,7 @@ export async function readCredentialConvergence(target:Client,phase:"before"|"af
       }
     }} finally {await target.query("CLOSE convergence_cursor");}
   }
-  return {version:1,kind:"credential-convergence",phase,mappingRevision:MAPPING_REVISION,scope:{orgIds:null},sessionSafety,credentials,blobs};
+  return {version:1,kind:"credential-convergence",phase,mappingRevision:MAPPING_REVISION,scope:{orgIds:null},sessionSafety,credentials,blobs,markers};
 }
 
 /** Capture immediately before a convergence re-run, in a separate private
@@ -69,19 +71,21 @@ export function compareCredentialConvergence(before:CredentialConvergenceSnapsho
   }
   const previous=rowsByKey(before.credentials,10000),current=rowsByKey(after.credentials,10000);
   const previousBlobs=rowsByKey(before.blobs,50000),currentBlobs=rowsByKey(after.blobs,50000);
+  const previousMarkers=rowsByKey(before.markers,10000),currentMarkers=rowsByKey(after.markers,10000);
   const differences=(a:Map<string,StateRow>,b:Map<string,StateRow>) => ({
     inserted:[...b.keys()].filter((key) => !a.has(key)).length,removed:[...a.keys()].filter((key) => !b.has(key)).length,
     changed:[...a].filter(([key,row]) => b.has(key) && row.stateSha256 !== b.get(key)!.stateSha256).length});
   const credentialChanges=differences(previous,current),blobChanges=differences(previousBlobs,currentBlobs);
+  const markerChanges=differences(previousMarkers,currentMarkers);
   const blobVersionChanges=[...previous].filter(([key,row]) => current.has(key) && row.blobVersion !== current.get(key)!.blobVersion).length;
   const writes=credentialWriteCounts(report);
   const reportedWriteCount=writes ? writes.inserted+writes.updated+writes.metadataWrites+writes.selectionWrites : null;
   const reportedBlobWriteCount=writes?.blobWrites ?? null;
-  const noStateChanges=[...Object.values(credentialChanges),...Object.values(blobChanges),blobVersionChanges].every((n) => n === 0);
+  const noStateChanges=[...Object.values(credentialChanges),...Object.values(blobChanges),...Object.values(markerChanges),blobVersionChanges].every((n) => n === 0);
   return {kind:"credential_convergence",name:"no_writes_or_blob_version_changes",
     ok:noStateChanges && reportedWriteCount === 0 && reportedBlobWriteCount === 0,
-    detail:{credentialChanges,blobChanges,blobVersionChanges,reportedWrites:writes,reportedWriteCount,reportedBlobWriteCount,
-      evidenceScope:"all_target_credentials_and_postgres_blobs",physicalTupleIdentityIncluded:true}};
+    detail:{credentialChanges,blobChanges,markerChanges,blobVersionChanges,reportedWrites:writes,reportedWriteCount,reportedBlobWriteCount,
+      evidenceScope:"all_target_credentials_postgres_blobs_and_copier_markers",physicalTupleIdentityIncluded:true}};
 }
 
 const WRITE_KEYS=["inserted","updated","blobWrites","metadataWrites","selectionWrites"] as const;

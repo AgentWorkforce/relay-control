@@ -868,6 +868,9 @@ fixtureTest("qualified convergence binds the real checkpoint and rejects old cop
 fixtureTest("updated copy outcomes require valid explicit write receipts and exact target contents",async () => {
   const fixture=await copiedFixture();
   const row=id(0x806);
+  const controlId=fixture.copy.controlIds[row]!;
+  await target.query(`INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision)
+    SELECT organization_id,'copier_login',id::text||':'||blob_version::text,$2 FROM coding_agent_credentials WHERE id=$1`,[controlId,MAPPING_REVISION]);
   const outcomes={...fixture.copy.outcomes,copied:fixture.copy.outcomes.copied!-1,updated:1};
   const report={...fixture.copy,rows:{...fixture.copy.rows,[row]:"updated"},outcomes,
     writes:{inserted:outcomes.copied,updated:1,blobWrites:1,metadataWrites:0,selectionWrites:0},
@@ -880,6 +883,16 @@ fixtureTest("updated copy outcomes require valid explicit write receipts and exa
   const invalid=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{report:report as unknown as typeof fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
   assert.equal(invalid.credentialCopy,"failed");
+  for (const outcome of ["control_newer","blob_read_failed"]) {
+    report.rows[row]=outcome;
+    report.outcomes={...fixture.copy.outcomes,copied:outcomes.copied,[outcome]:1} as typeof report.outcomes;
+    report.writes={inserted:outcomes.copied,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0};
+    const refused=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+      {credentialCopy:{report:report as unknown as typeof fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+    assert.equal(refused.credentialCopy,"failed",outcome);
+    assert.equal(refused.findings.find((f) => f.kind === "credential_natural_keys")!.ok,true);
+    assert.equal(refused.findings.find((f) => f.kind === "credential_copy_ledger")!.ok,false);
+  }
 });
 
 fixtureTest("convergence capture CLI requires all scope and creates a private non-overwritable checkpoint",async () => {
@@ -900,4 +913,36 @@ fixtureTest("convergence capture CLI requires all scope and creates a private no
     assert.equal(run([output,"--all-organizations"]).status,2);
     assert.equal(await readFile(output,"utf8"),body);
   } finally {await rm(directory,{recursive:true,force:true});}
+});
+
+fixtureTest("copier marker namespace is accounted separately without hiding unknown or malformed ownership",async () => {
+  const fixture=await copiedFixture();const controlId=fixture.copy.controlIds[id(0x806)]!;
+  await target.query(`INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision)
+    SELECT organization_id,'copier_login',id::text||':'||blob_version::text,$2 FROM coding_agent_credentials WHERE id=$1`,[controlId,MAPPING_REVISION]);
+  const ownership=await captureOwnership(target,scope);
+  assert.ok(ownership.rows.every((row) => String(row.table_name) !== 'copier_login'));
+  const checked=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(checked.credentialCopy,"verified");
+  assert.equal((checked.findings.find((f) => f.kind === "credential_copy_markers")!.detail as {observed:number}).observed,1);
+  await target.query("UPDATE cloud_import_ledger SET row_key='synthetic-private-invalid-marker' WHERE table_name='copier_login'");
+  const invalid=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(invalid.ok,false);assert.ok(!JSON.stringify(invalid).includes('synthetic-private-invalid-marker'));
+  await target.query("DELETE FROM cloud_import_ledger WHERE table_name='copier_login'");
+  await target.query(`INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision) VALUES($1,'unknown-namespace',$2,$3)`,[ORG_A,id(0xbeef),MAPPING_REVISION]);
+  await assert.rejects(captureOwnership(target,scope),/Invalid ownership/);
+});
+
+fixtureTest("copier marker writes fail convergence independently of credential and blob state",async () => {
+  const fixture=await copiedFixture();const controlId=fixture.copy.controlIds[id(0x806)]!;
+  const before=await captureCredentialConvergence(target);
+  await target.query(`INSERT INTO cloud_import_ledger(organization_id,table_name,row_key,mapping_revision)
+    SELECT organization_id,'copier_login',id::text||':'||blob_version::text,$2 FROM coding_agent_credentials WHERE id=$1`,[controlId,MAPPING_REVISION]);
+  const after=await captureCredentialConvergence(target,"after");
+  const report={version:1,mappingRevision:MAPPING_REVISION,mode:'apply',ok:true,outcomes:{},
+    writes:{inserted:0,updated:0,blobWrites:0,metadataWrites:0,selectionWrites:0}};
+  const finding=compareCredentialConvergence(before,after,report);
+  assert.equal(finding.ok,false);
+  const detail=finding.detail as {credentialChanges:{changed:number};blobChanges:{changed:number};markerChanges:{inserted:number}};
+  assert.equal(detail.credentialChanges.changed,0);assert.equal(detail.blobChanges.changed,0);assert.equal(detail.markerChanges.inserted,1);
 });

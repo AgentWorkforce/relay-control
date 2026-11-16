@@ -13,7 +13,7 @@ try {
   const snapshot=await captureCredentialConvergence(target);
   const file=await open(args[0]!,"wx",0o600);
   try {await file.writeFile(`${JSON.stringify(snapshot,null,2)}\n`);} finally {await file.close();}
-  process.stdout.write(`${JSON.stringify({ok:true,credentialRows:snapshot.credentials.length,blobRows:snapshot.blobs.length})}\n`);
+  process.stdout.write(`${JSON.stringify({ok:true,credentialRows:snapshot.credentials.length,blobRows:snapshot.blobs.length,markerRows:snapshot.markers.length})}\n`);
 } catch {
   process.stderr.write("Convergence capture could not complete. Check all-org scope, local target, Postgres blob storage and a fresh private output path.\n");
   process.exitCode=2;
