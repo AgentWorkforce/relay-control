@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import { createAdminModule } from "../src/admin/routes.js";
-import { previewSecret } from "../src/admin/coding-agents.js";
+import { CODING_AGENT_PROVIDERS, previewSecret } from "../src/admin/coding-agents.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { decryptSecret } from "../src/crypto.js";
 import { defaultMigrationsDirectory, migrate } from "../src/migrations.js";
@@ -322,24 +322,62 @@ test("coding agents: imported relay-managed rows remain metadata-only and fail c
   const ctx = await setup(t);
   const base = `/api/v1/workspaces/${ctx.workspaceId}`;
   const managedId = "77777777-7777-4777-8777-777777777777";
-
-  const workspaceFallback = await request(ctx.origin, `${base}/secrets`, {
-    method: "POST",
-    token: ctx.owner,
-    body: { name: "ANTHROPIC_API_KEY", value: "workspace-fallback-must-not-impersonate-managed" },
-  });
-  assert.equal(workspaceFallback.status, 201);
-
-  await ctx.database.query(
-    `INSERT INTO coding_agent_credentials
-       (id, organization_id, workspace_id, created_by_user_id, model_provider, harness, auth_type,
-        display_name, label, account_email, secret_ciphertext, secret_preview, key_fingerprint,
-        is_active, harness_active, status, last_authenticated_at, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, 'anthropic', 'claude', 'relay_managed',
-             'Anthropic managed', NULL, NULL, NULL, NULL, NULL,
-             true, false, 'connected', now(), now(), now())`,
-    [managedId, ctx.organizationId, ctx.workspaceId, ctx.ownerId],
+  const expectedBlocked = {
+    anthropic: [
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_BASE_URL",
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "CLAUDE_CONFIG_DIR",
+      "CLAUDE_CODE_USE_BEDROCK",
+      "AWS_BEARER_TOKEN_BEDROCK",
+    ],
+    openai: ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CODEX_HOME"],
+    openrouter: ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE"],
+    xai: ["XAI_API_KEY", "GROK_XAI_API_BASE_URL", "GROK_HOME"],
+    google: ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_API_BASE", "GOOGLE_APPLICATION_CREDENTIALS"],
+  };
+  assert.deepEqual(
+    Object.fromEntries(CODING_AGENT_PROVIDERS.map((provider) => [provider.id, provider.managedBlockedEnv])),
+    expectedBlocked,
   );
+
+  for (const name of new Set(Object.values(expectedBlocked).flat())) {
+    const workspaceFallback = await request(ctx.origin, `${base}/secrets`, {
+      method: "POST",
+      token: ctx.owner,
+      body: { name, value: `workspace-bypass-${name.toLowerCase()}` },
+    });
+    assert.equal(workspaceFallback.status, 201, name);
+  }
+
+  const managedIds: Record<string, string> = {
+    anthropic: managedId,
+    openai: "66666666-6666-4666-8666-666666666666",
+    openrouter: "55555555-5555-4555-8555-555555555555",
+    xai: "44444444-4444-4444-8444-444444444444",
+    google: "33333333-3333-4333-8333-333333333333",
+  };
+  for (const provider of CODING_AGENT_PROVIDERS) {
+    await ctx.database.query(
+      `INSERT INTO coding_agent_credentials
+         (id, organization_id, workspace_id, created_by_user_id, model_provider, harness, auth_type,
+          display_name, label, account_email, secret_ciphertext, secret_preview, key_fingerprint,
+          is_active, harness_active, status, last_authenticated_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'relay_managed',
+               $7, NULL, NULL, NULL, NULL, NULL,
+               true, false, 'connected', now(), now(), now())`,
+      [
+        managedIds[provider.id],
+        ctx.organizationId,
+        ctx.workspaceId,
+        ctx.ownerId,
+        provider.id,
+        provider.harness,
+        `${provider.displayName} managed`,
+      ],
+    );
+  }
 
   const listed = await request(ctx.origin, `${base}/cloud-agents`, { token: ctx.owner });
   const managed = listed.body.agents.find((agent: { id: string }) => agent.id === managedId);
@@ -374,12 +412,15 @@ test("coding agents: imported relay-managed rows remain metadata-only and fail c
     `/internal/v1/workspaces/${ctx.workspaceId}/environment?includeIntegrations=1`,
     { token: SERVICE },
   );
-  assert.equal(runtime.body.env.ANTHROPIC_API_KEY, undefined, "managed selection blocks workspace-key fallback");
-  assert(!runtime.body.secretEnvNames.includes("ANTHROPIC_API_KEY"));
-  assert.deepEqual(runtime.body.skipped, [{
-    name: "ANTHROPIC_API_KEY",
-    reason: "relay_managed_unavailable",
-  }]);
+  for (const name of new Set(Object.values(expectedBlocked).flat())) {
+    assert.equal(runtime.body.env[name], undefined, `${name} cannot bypass a managed selection`);
+    assert(!runtime.body.secretEnvNames.includes(name), `${name} is not advertised to the run`);
+  }
+  for (const provider of CODING_AGENT_PROVIDERS) {
+    assert(runtime.body.skipped.some((entry: { name: string; reason: string }) =>
+      entry.name === provider.apiKeyEnv && entry.reason === "relay_managed_unavailable"
+    ), `${provider.id} reports the unavailable managed binding`);
+  }
 
   const probesBefore = ctx.probes.length;
   const checked = await request(ctx.origin, `${base}/cloud-agents/${managedId}/check`, {
