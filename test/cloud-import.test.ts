@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import test from "node:test";
-import { decryptSecret, type EncryptionKeyring } from "../src/crypto.js";
+import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../src/crypto.js";
 import { copyFile, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -153,7 +153,8 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
     .map(async (table) => [table, await count(target, TARGETS[table].table)] as const)));
   const before = await counts();
   // The target ledger holds every written key, per org, beside the rows.
-  const ledgerRows = (await target.query<{ n: number }>("SELECT count(*)::int AS n FROM cloud_import_ledger")).rows[0]!.n;
+  const ledgerRows = (await target.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM cloud_import_ledger WHERE table_name = ANY($1::text[])", [SOURCE_TABLES.filter((t) => t !== "users")])).rows[0]!.n;
   assert.equal(ledgerRows, SOURCE_TABLES.filter((t) => t !== "users").reduce((n, t) => n + applied.tables[t].imported, 0));
   const rerun = await runImport(deps, scope, "apply");
   assert.equal(rerun.ok, true);
@@ -190,7 +191,8 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   await target.query("DELETE FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [ORG_B, id(6)]);
   const finalReport = delta;
   // The ledger shrank by exactly the reconciled rows.
-  assert.equal((await target.query<{ n: number }>("SELECT count(*)::int AS n FROM cloud_import_ledger")).rows[0]!.n,
+  assert.equal((await target.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM cloud_import_ledger WHERE table_name = ANY($1::text[])", [SOURCE_TABLES.filter((t) => t !== "users")])).rows[0]!.n,
     SOURCE_TABLES.filter((t) => t !== "users").reduce((n, t) => n + delta.tables[t].imported, 0));
 
   // The verifier projections agree row for row with what was imported.
@@ -425,6 +427,136 @@ test("cloud import: a binding Control holds wins over a later Cloud binding and 
   assert.deepEqual(await pair(id(0x201)), a1, "a generation never goes backwards");
   assert.equal(again.warnings.workspaces_binding_conflict, 1);
   assert.equal(again.warnings.workspaces_generation_kept, 1);
+});
+
+// Every secret column the identity upsert writes, with what Control rewrites
+// alongside it on a rotation.
+const SECRET_CASES = [
+  { key: "workspaces", table: "workspaces", column: "relaycast_api_key_ciphertext", also: "" },
+  { key: "person_identities", table: "person_identities", column: "token_ciphertext", also: "" },
+  { key: "hosted_relay_participants", table: "hosted_relay_participants", column: "token_ciphertext", also: ", updated_at = now()" },
+  { key: "desktop_relay_identities", table: "desktop_relay_identities", column: "token_ciphertext", also: ", updated_at = now()" },
+  { key: "github_app_connections", table: "integration_connections", column: "credentials_ciphertext", also: ", token_type = 'control-refreshed', updated_at = now()" },
+] as const;
+const secretsOf = async (target: PGliteDatabase) => {
+  const all = new Map<string, Array<{ id: string; value: string }>>();
+  for (const c of SECRET_CASES) all.set(c.key, (await target.query<{ id: string; value: string }>(
+    `SELECT id::text AS id, ${c.column} AS value FROM ${c.table} WHERE ${c.column} IS NOT NULL ORDER BY id`)).rows);
+  return all;
+};
+const markerXmins = async (target: PGliteDatabase) => (await target.query<{ x: string | null }>(
+  "SELECT string_agg(row_key || '@' || xmin::text, ',' ORDER BY row_key) AS x FROM cloud_import_ledger WHERE table_name = 'secret_written'")).rows[0]!.x;
+
+test("cloud import: a re-run never replaces a secret Control rotated, and rewrites nothing unchanged", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  const deps = { source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY };
+  assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
+  const imported = await secretsOf(target);
+  for (const c of SECRET_CASES) assert.ok(imported.get(c.key)!.length > 0, `${c.table} has an imported secret`);
+
+  // Untouched re-runs: nothing kept, no secret rewritten, no marker written.
+  const markers = await markerXmins(target);
+  assert.ok(markers);
+  for (let run = 2; run <= 3; run += 1) {
+    const rerun = await runImport(deps, { orgIds: null }, "apply");
+    assert.equal(rerun.ok, true);
+    for (const c of SECRET_CASES) assert.equal(rerun.warnings[`${c.key}_secret_kept`] ?? 0, 0, `run ${run} ${c.key}: nothing kept`);
+    assert.deepEqual(await secretsOf(target), imported, `run ${run}: no secret re-encrypted`);
+    assert.equal(await markerXmins(target), markers, `run ${run}: no marker written`);
+  }
+
+  // Control rotates the first row's secret in every table.
+  const rotated = new Map<string, string>();
+  for (const c of SECRET_CASES) {
+    const value = encryptSecret(`control-rotated-${c.table}`, KEYRING.active);
+    await target.query(`UPDATE ${c.table} SET ${c.column} = $2${c.also} WHERE id::text = $1`, [imported.get(c.key)![0]!.id, value]);
+    rotated.set(c.key, value);
+  }
+  const companion = async () => (await target.query<{ token_type: string | null; updated_at: string }>(
+    "SELECT token_type, updated_at::text AS updated_at FROM integration_connections WHERE id::text = $1", [imported.get("github_app_connections")![0]!.id])).rows[0]!;
+  const companionBefore = await companion();
+  assert.equal(companionBefore.token_type, "control-refreshed");
+  for (let run = 2; run <= 3; run += 1) {
+    const rerun = await runImport(deps, { orgIds: null }, "apply");
+    assert.equal(rerun.ok, true, JSON.stringify(rerun.orgs));
+    const now = await secretsOf(target);
+    for (const c of SECRET_CASES) {
+      const [first, ...others] = now.get(c.key)!;
+      assert.equal(first!.value, rotated.get(c.key), `run ${run} ${c.table}: Control's rotated secret is kept`);
+      assert.equal(decryptSecret(first!.value, KEYRING), `control-rotated-${c.table}`);
+      assert.equal(rerun.warnings[`${c.key}_secret_kept`], 1, `run ${run} ${c.key}: counted once`);
+      // The other rows are untouched by Control: still exactly as imported.
+      assert.deepEqual(others, imported.get(c.key)!.slice(1), `run ${run} ${c.table}: untouched rows unchanged`);
+    }
+    assert.deepEqual(await companion(), companionBefore, `run ${run}: token_type and updated_at stay Control's`);
+  }
+});
+
+test("cloud import: a kept Control workspace key keeps its binding and generation (never torn)", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  const deps = { source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY };
+  assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
+  const row = async () => (await target.query<{ rc: string; key: string; generation: number }>(
+    "SELECT relaycast_workspace_id AS rc, relaycast_api_key_ciphertext AS key, relaycast_api_key_generation AS generation FROM workspaces WHERE id = $1",
+    [id(0x201)])).rows[0]!;
+  // Control rotates a1's key; then Cloud rotates the same workspace to generation 4.
+  const controlKey = encryptSecret("rk_control_rotated", KEYRING.active);
+  await target.query("UPDATE workspaces SET relaycast_api_key_ciphertext = $2 WHERE id = $1", [id(0x201), controlKey]);
+  const controlRow = await row();
+  await source.exec("UPDATE relay_workspaces SET relaycast_api_key = 'rk_cloud_gen4', relaycast_api_key_generation = 4 WHERE id = 'rw_0000a201'");
+  const again = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(again.ok, true, JSON.stringify(again.orgs));
+  assert.deepEqual(await row(), controlRow, "Control's key with its own binding and generation, not Cloud's generation 4");
+  assert.equal(again.warnings.workspaces_secret_kept, 1);
+});
+
+test("cloud import: secrets imported before markers are adopted when they still equal Cloud's", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  const deps = { source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY };
+  assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
+  // A target imported by .27 or earlier: no secret markers at all.
+  await target.query("DELETE FROM cloud_import_ledger WHERE table_name = 'secret_written'");
+  const imported = await secretsOf(target);
+  // Control had rotated one of them (a1's key) before the upgrade.
+  const controlKey = encryptSecret("rk_control_before_upgrade", KEYRING.active);
+  await target.query("UPDATE workspaces SET relaycast_api_key_ciphertext = $2, relaycast_api_key_generation = relaycast_api_key_generation + 1 WHERE id = $1", [id(0x201), controlKey]);
+  const total = [...imported.values()].reduce((n, rows) => n + rows.length, 0);
+
+  const adopted = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(adopted.ok, true, JSON.stringify(adopted.orgs));
+  const adoptedCount = SECRET_CASES.reduce((n, c) => n + (adopted.warnings[`${c.key}_secret_adopted`] ?? 0), 0);
+  assert.equal(adoptedCount, total - 1, "every secret still equal to Cloud's is adopted");
+  assert.equal(adopted.warnings.workspaces_secret_kept, 1, "the one Control rotated is kept");
+  const after = await secretsOf(target);
+  for (const c of SECRET_CASES) {
+    for (const row of after.get(c.key)!) {
+      const before = imported.get(c.key)!.find((r) => r.id === row.id)!;
+      if (c.key === "workspaces" && row.id === id(0x201)) assert.equal(row.value, controlKey);
+      else assert.equal(row.value, before.value, `${c.table} ${row.id}: adopted without a write`);
+    }
+  }
+  // Adopted secrets follow Cloud again: Cloud rotates b1's key.
+  await source.exec("UPDATE relay_workspaces SET relaycast_api_key = 'rk_cloud_after_adoption' WHERE id = 'rw_0000b201'");
+  const flowed = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(flowed.ok, true);
+  const b1 = (await target.query<{ key: string }>("SELECT relaycast_api_key_ciphertext AS key FROM workspaces WHERE id = $1", [id(0x205)])).rows[0]!.key;
+  assert.equal(decryptSecret(b1, KEYRING), "rk_cloud_after_adoption", "a Cloud rotation after adoption is imported");
+  assert.equal((await target.query<{ key: string }>("SELECT relaycast_api_key_ciphertext AS key FROM workspaces WHERE id = $1", [id(0x201)])).rows[0]!.key, controlKey);
 });
 
 test("cloud import: an existing Control user with an imported email under another id refuses the run", async (t) => {
