@@ -72,9 +72,36 @@ live workspace membership and `rth:read`, then calls the internal handoff
 `Bearer <SESSION_READ_API_SECRET>`. The body is `{ userId, orgId,
 workspaceId, audience, scopes: ["rth:read"], label? }`, with `refreshToken`
 instead of `label` on refresh. The caller's own token never reaches the read
-API. Control validates the reply's identity, audience, read-only scope, token
+API.
+
+On gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set) the body also
+carries `reader_kind`, taken from how the caller authenticated and never from
+the request body: `browser` for a cookie session with no bearer, `device` for
+an `sh_at_` bearer (a request with both a cookie and a bearer is `device`),
+and `mcp` for every MCP read made on the person's behalf. Relaygate records it
+and strips it before proxying, because the read API's internal schema is
+strict; on other installs the body is exactly as above. MCP reads that hop
+over Control's public session-read route prove themselves with the
+`x-relaycontrol-session-reader` header, an HMAC of a fixed string keyed by
+`SESSION_READ_API_SECRET`; a cookie request ignores the header, and a bearer
+without a matching header is `device`. Control validates the reply's identity, audience, read-only scope, token
 format (`rth_at_read_`/`rth_rt_read_`) and expiry, and sets `baseUrl` from
 configuration. Keep the internal routes off public ingress.
+
+`SESSION_READ_MINT_INCLUDE_ROLE=true` (default false) adds `role` to both
+bodies: `"owner"`, `"admin"` or `"member"`, the caller's organization role
+from the same live membership row Control authorizes the request with, read
+on every mint and refresh. A gateway in front of the read API can record it
+with the minted token's owner, so a later read token maps to a role. Every
+mint path sends it: the `session-read` routes, `relayhistory/session` read
+mode, dashboard and MCP reads, and usage reports.
+
+Read APIs that predate this field refuse a body with an unknown field, so the
+rollout order is: first deploy a read API that accepts `role` on
+`/internal/v1/session-read/sessions` and `/sessions/refresh`, then set
+`SESSION_READ_MINT_INCLUDE_ROLE=true` on Control. Turning it on against an
+older read API makes every mint and refresh fail with 502. To roll back, turn
+the flag off first.
 
 Dashboard reads cache one read token per caller token session (at most 5
 minutes, never past the upstream expiry minus 60 s) and renew it on its own

@@ -50,7 +50,7 @@ test("MCP obtains and refreshes through real Control HTTP admission, and parent 
     relayhistoryPublicUrl:"https://history.selfhosted.company",
     bootstrapToken:"fake-bootstrap-token-".repeat(3),encryptionKeyring:keyring,internalServiceToken:null,
     oauthRedirectUrl:`${controlUrl}/unused`,dashboardUrl:controlUrl,host:"127.0.0.1",port:3000,
-    sessionReadApi:{url:readerUrl,publicUrl:readerUrl,secret},sessionReadMcpReads:true};
+    sessionReadApi:{url:readerUrl,publicUrl:readerUrl,secret,mintReaderKind:true},sessionReadMcpReads:true};
   control.on("request",createApp({config,store}));
   t.after(async()=>{await close(control);await database.close();});
   const authorized=await store.workspaceForUser(workspace.id,principal.userId);assert.ok(authorized);
@@ -59,6 +59,8 @@ test("MCP obtains and refreshes through real Control HTTP admission, and parent 
   assert.deepEqual(await read("/v1/sessions"),{sessions:[]});
   assert.deepEqual(calls.map(call=>call.path),["/internal/v1/session-read/sessions","/v1/sessions",
     "/internal/v1/session-read/sessions/refresh","/v1/sessions"]);
+  // Behind relaygate: the hop carries the MCP reader marker, so Control names both mints mcp, not device.
+  assert.deepEqual(calls.filter(call=>call.path.startsWith("/internal/")).map(call=>call.body.reader_kind),["mcp","mcp"]);
   for(const call of calls.filter(call=>call.path==="/v1/sessions")) {
     assert.match(call.bearer!,/^Bearer rth_at_read_/);assert.ok(!call.bearer!.includes(secret));
     assert.notEqual(call.bearer,`Bearer ${pair.accessToken}`);

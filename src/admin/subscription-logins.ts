@@ -13,6 +13,7 @@ import { decryptSecret, encryptSecret, opaqueToken, type EncryptionKeyring } fro
 import { recordAudit, type AuditActor } from "./audit.js";
 import { CredentialBlobError, type CredentialBlobStore } from "./credential-blobs.js";
 import { CodingAgentError } from "./coding-agents.js";
+import { applyRefreshTransactionTimeouts } from "./refresh-transaction.js";
 import {
   exchangeOpenAIDeviceAuthorization,
   OPENAI_DEVICE_AUTH_LIFETIME_SECONDS,
@@ -831,6 +832,7 @@ export class SubscriptionLoginStore {
   async freshAuthFile(workspaceId: string, credentialId: string): Promise<string | null> {
     let staleLocation: string | null = null;
     const content = await this.database.transaction(async (tx) => {
+      await applyRefreshTransactionTimeouts(tx);
       await tx.query("SELECT pg_advisory_xact_lock(hashtext('selfhost-cli-credential-refresh'), hashtext($1))", [credentialId]);
       const row = await this.row(tx, workspaceId, credentialId);
       if (!row || row.status === "refresh_failed") return null;
@@ -893,6 +895,7 @@ export class SubscriptionLoginStore {
     }
     let staleLocation: string | null = null;
     const updated = await this.database.transaction(async (tx) => {
+      await applyRefreshTransactionTimeouts(tx);
       await tx.query("SELECT pg_advisory_xact_lock(hashtext('selfhost-cli-credential-refresh'), hashtext($1))", [credentialId]);
       const row = await this.row(tx, workspaceId, credentialId);
       if (!row) throw new CodingAgentError(404, "credential_not_found", "Credential not found");

@@ -46,6 +46,8 @@ export type AdminRouteHelpers = {
   organizationAccess(request: IncomingMessage, organizationId: string, admin: boolean): Promise<unknown>;
   requestObject(request: IncomingMessage): Promise<JsonObject>;
   bearer(request: IncomingMessage): string | null;
+  /** app.ts's shared limiter: throws 429 (with retry-after) once `key` passes `rule`. */
+  rateLimit(response: ServerResponse, key: string, rule: { limit: number; windowMs: number }): void;
 };
 
 /**
@@ -112,6 +114,9 @@ function html(value: string): string {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 }
+
+/** Member relay-node self-mint: mints per person per hour. */
+const SELF_MINT_RATE = { limit: 10, windowMs: 60 * 60 * 1_000 };
 
 function userActor(access: WorkspaceAccess): AuditActor & { kind: "user" } {
   return { kind: "user", userId: access.principal.userId };
@@ -781,6 +786,72 @@ export function createAdminModule(input: {
       if (!revoked) throw new AdminHttpError(404, "token_not_found", "Token not found");
       response.writeHead(204, { "cache-control": "no-store" });
       response.end();
+      return true;
+    }
+
+    // Member self-mint of a relay-node token (gate-only installs only;
+    // docs/relay-node-credential.md, "Member self-mint"). Any workspace
+    // member, but only from a redeemed Agent Relay Desktop session, and only
+    // for the caller's own relay-node tokens. Not gate-only: 404 not_found.
+    const selfTokens = rest === "relay-node/self-tokens";
+    const selfTokenItem = match(rest, /^relay-node\/self-tokens\/([^/]+)$/);
+    if (
+      (selfTokens && (method === "GET" || method === "POST")) ||
+      (selfTokenItem && method === "DELETE")
+    ) {
+      if (!config.relaygatePublicUrl) return false;
+      requireJsonWrite(request, helpers);
+      const access = await helpers.workspaceAccess(request, workspaceId, false);
+      const desktopHostName = access.principal.handoff ? undefined : access.principal.desktopHostName;
+      if (!desktopHostName) {
+        throw new AdminHttpError(
+          403,
+          "desktop_session_required",
+          "Relay-node self-mint needs a signed-in Agent Relay Desktop session",
+        );
+      }
+      if (config.relayNodeSelfMint === false) {
+        throw new AdminHttpError(
+          403,
+          "self_mint_disabled",
+          "Relay-node self-mint is turned off on this install; ask a workspace admin for a token",
+        );
+      }
+      if (selfTokenItem) {
+        const revoked = await apiTokens.revokeSelfMintedRelayNode({
+          workspaceId: access.workspace.id,
+          organizationId: access.workspace.organizationId,
+          tokenId: selfTokenItem[0]!,
+          desktopHostName,
+          actor: userActor(access),
+        });
+        if (!revoked) throw new AdminHttpError(404, "token_not_found", "Token not found");
+        response.writeHead(204, { "cache-control": "no-store" });
+        response.end();
+        return true;
+      }
+      if (method === "GET") {
+        json(response, 200, {
+          tokens: await apiTokens.listSelfMintedRelayNode({
+            workspaceId: access.workspace.id,
+            userId: access.principal.userId,
+          }),
+        });
+        return true;
+      }
+      helpers.rateLimit(response, `relay-node-self-mint:${access.principal.userId}`, SELF_MINT_RATE);
+      const body = await helpers.requestObject(request);
+      const token = await apiTokens.createSelfMintedRelayNode({
+        workspaceId: access.workspace.id,
+        organizationId: access.workspace.organizationId,
+        nodeName: body.nodeName,
+        label: body.label,
+        expiryDays: body.expiryDays,
+        neverExpires: body.neverExpires,
+        desktopHostName,
+        actor: userActor(access),
+      });
+      json(response, 201, token);
       return true;
     }
 

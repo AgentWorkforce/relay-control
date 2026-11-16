@@ -12,7 +12,7 @@ type Participant = {
   id:string; agent_name:string; agent_remote_id:string; relaycast_workspace_id:string;
   session_hash:string|null; token_ciphertext:string;
 };
-type Workspace = {relaycast_workspace_id:string;relaycast_api_key_ciphertext:string};
+type Workspace = {relaycast_workspace_id:string|null;relaycast_api_key_ciphertext:string|null};
 type Grant = {id:string;agent_remote_id:string|null;agent_name:string;created_at:Date|string};
 /** Local state a remote decision is made against. Ciphertexts only; never logged. */
 type Snapshot = {workspace:Workspace|null;row:Participant|null;grants:Grant[];activeLaunches:boolean};
@@ -261,8 +261,9 @@ export class McpOAuthTeardown {
     // can drain those launches; cleanup retries afterward with normal backoff.
     if (claim.snapshot.activeLaunches) return "pending";
     const {intent,snapshot:{workspace,row,grants}}=claim;
+    if(!workspace?.relaycast_workspace_id || !workspace.relaycast_api_key_ciphertext) return "pending";
     let key:string;
-    try {key=decryptSecret(workspace!.relaycast_api_key_ciphertext,this.deps.keyring);}
+    try {key=decryptSecret(workspace.relaycast_api_key_ciphertext,this.deps.keyring);}
     catch {
       if(intent.attempts>=MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS) return {outcome:"decrypt_failed"};
       // Retryable: the claim already scheduled the next attempt.

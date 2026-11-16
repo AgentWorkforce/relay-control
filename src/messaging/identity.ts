@@ -15,6 +15,14 @@ import {
 type PersonUser = Pick<Principal, "userId" | "name" | "email">;
 
 const MAX_NAME = 48;
+
+/**
+ * Name prefix for person identities this server registers on gate-only
+ * installs (SELFHOST_RELAYGATE_PUBLIC_URL set). relaygate reserves it at its
+ * /v1/register, so a desktop-enrolled name can never collide with one.
+ */
+export const GATE_ONLY_PERSON_IDENTITY_NAME_PREFIX = "control-";
+
 const STALE_CLAIM_MS = 15_000;
 
 export type PersonIdentity = {
@@ -35,6 +43,8 @@ export type MessagingDeps = {
   database: Database;
   keyring: EncryptionKeyring;
   relaycastUrl: string;
+  /** Set on gate-only installs: new person identities get GATE_ONLY_PERSON_IDENTITY_NAME_PREFIX. */
+  relaygatePublicUrl?: string | null;
   fetchImpl?: typeof fetch;
   now?: () => Date;
   /** Tests set this to 0 so a crashed pending claim can be reconciled immediately. */
@@ -60,7 +70,11 @@ function slug(value: string): string {
     .replace(/-{2,}/g, "-");
 }
 
-export function candidateNames(user: { userId: string; email: string; name: string }, randomSuffix = () => randomBytes(2).toString("hex")): string[] {
+export function candidateNames(
+  user: { userId: string; email: string; name: string },
+  randomSuffix = () => randomBytes(2).toString("hex"),
+  namePrefix = "",
+): string[] {
   const bases = [slug(user.name), slug(user.email.split("@", 1)[0] ?? "")]
     .map((base) => base.slice(0, 32).replace(/-+$/, ""))
     .filter((base) => base.length >= 2);
@@ -72,7 +86,7 @@ export function candidateNames(user: { userId: string; email: string; name: stri
     `${bases[0]}-${randomSuffix()}`,
     `${bases[0]}-${randomSuffix()}`,
   ];
-  return [...new Set(names.map((name) => name.slice(0, MAX_NAME)))];
+  return [...new Set(names.map((name) => `${namePrefix}${name}`.slice(0, MAX_NAME)))];
 }
 
 function ownerOf(workspaceId: string, user: PersonUser): PersonOwner {
@@ -164,7 +178,8 @@ async function createIdentity(
   executor: SqlExecutor,
 ): Promise<PersonIdentity> {
   const owner = ownerOf(access.workspaceId, access.user);
-  for (const name of candidateNames(access.user)) {
+  const namePrefix = deps.relaygatePublicUrl ? GATE_ONLY_PERSON_IDENTITY_NAME_PREFIX : "";
+  for (const name of candidateNames(access.user, undefined, namePrefix)) {
     try {
       const registered = await relaycast.registerHuman(access.relaycastApiKey, name, owner);
       const identity = {
@@ -340,7 +355,8 @@ export async function revokeRemovedMember(deps: MessagingDeps, organizationId: s
             identity.agent_remote_id, workspace.relaycast_api_key_ciphertext
        FROM person_identities identity
        JOIN workspaces workspace ON workspace.id = identity.workspace_id
-      WHERE workspace.organization_id = $1 AND identity.user_id = $2`,
+      WHERE workspace.organization_id = $1 AND identity.user_id = $2
+        AND workspace.relaycast_api_key_ciphertext IS NOT NULL`,
     [organizationId, userId],
   );
   for (const row of rows.rows) {
@@ -371,7 +387,8 @@ export async function sweepRevocations(deps: MessagingDeps, organizationId?: str
             revocation.user_id, workspace.relaycast_api_key_ciphertext
        FROM person_revocations revocation
        JOIN workspaces workspace ON workspace.id = revocation.workspace_id
-      WHERE ($1::uuid IS NULL OR workspace.organization_id = $1)
+      WHERE workspace.relaycast_api_key_ciphertext IS NOT NULL
+        AND ($1::uuid IS NULL OR workspace.organization_id = $1)
         AND ($2::uuid IS NULL OR revocation.user_id = $2)`,
     [organizationId ?? null, userId ?? null],
   );

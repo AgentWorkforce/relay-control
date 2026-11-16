@@ -31,14 +31,31 @@ export type SelfhostConfig = {
   relayfileControlBrokerSecret?: string | null;
   /** RELAYCHIEF_CONTROL_RELAY_SECRET: chief agent registration route. Unset: it 404s. */
   chiefRelaySecret?: string | null;
+  /**
+   * RELAYFILE_CONTROL_URL + RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: deleting
+   * a workspace queues the same delete for relayfile-control's Flows data.
+   * Unset: nothing is queued (the legacy local Flows rows still cascade).
+   */
+  flowsWorkspaceDelete?: { url: string; secret: string } | null;
   /** Dedicated relay-agent support HTTP connection; no customer allowlist. */
   customerSupport?: { url: string; token: string } | null;
-  /** Independent read service; owns issuance, rotation and verification of its tokens. Required. */
-  sessionReadApi: { url: string; publicUrl: string; secret: string };
+  /**
+   * Independent read service; owns issuance, rotation and verification of its tokens. Required.
+   * mintReaderKind: send `reader_kind` in the mint body. True only on gate-only
+   * installs (SELFHOST_RELAYGATE_PUBLIC_URL set): relaygate reads it and strips
+   * it before proxying, and the read API's strict mint schema rejects it.
+   * Absent means false.
+   */
+  sessionReadApi: { url: string; publicUrl: string; secret: string; mintReaderKind?: boolean };
   /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
   sessionErasureApi?: { url: string; secret: string } | null;
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
   sessionReadMcpReads?: boolean;
+  /**
+   * SESSION_READ_MINT_INCLUDE_ROLE: send the member's org role in the read API
+   * mint/refresh bodies. Default off; enable only after the read API accepts it.
+   */
+  sessionReadMintIncludeRole?: boolean;
   /** SESSION_SEARCH_AGENT_TOKENS: read `@name` tokens in search text as agent filters. Default off. */
   sessionSearchAgentTokens?: boolean;
   /** The read API's public origin (equal to sessionReadApi.publicUrl). */
@@ -123,6 +140,16 @@ export type SelfhostConfig = {
    * instead. Null or absent: resolve hands out the key as before.
    */
   relaygatePublicUrl?: string | null;
+  /**
+   * SELFHOST_RELAY_NODE_SELF_MINT (docs/relay-node-credential.md, "Member
+   * self-mint"): on a gate-only install, whether a member's signed-in Agent
+   * Relay Desktop may mint its own relay-node token at
+   * POST /api/v1/workspaces/{id}/relay-node/self-tokens. Default true;
+   * `false`, `0` or `off` turns it off (403 `self_mint_disabled`), and the
+   * owner/admin mint is unchanged either way. Absent means true. Ignored
+   * when relaygatePublicUrl is null: those routes are then 404.
+   */
+  relayNodeSelfMint?: boolean;
   /**
    * SELFHOST_IMAGE_VERSION: the image tag, set by the image (Dockerfile).
    * Null when run from source. Shown by GET /cloud/api/health and telemetry.
@@ -423,12 +450,15 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
 
   refuseRemovedHistoryVariables(env);
   // One History origin, the read API's. Nothing may name a second one.
-  const sessionReadApi = loadSessionReadApiConfig(env);
+  const relaygatePublicUrl = loadRelaygatePublicUrl(env);
+  const sessionReadApi = { ...loadSessionReadApiConfig(env), mintReaderKind: relaygatePublicUrl !== null };
   const loadedIntrospection = loadIntrospectionConfig(env);
   const relayhistoryAudiences = loadRelayhistoryAudiences(env, sessionReadApi.publicUrl);
-  const introspectAudiences = loadedIntrospection.introspectAudiences.filter((audience) =>
-    !relayhistoryAudiences.includes(new URL(audience).origin)
-  );
+  const relayhistoryAudienceSet = new Set(relayhistoryAudiences);
+  const introspectAudiences = loadedIntrospection.introspectAudiences.filter((audience) => {
+    const canonicalHistoryAudience = canonicalRelayhistoryOrigin(audience);
+    return canonicalHistoryAudience === null || !relayhistoryAudienceSet.has(canonicalHistoryAudience);
+  });
   if (introspectAudiences.length !== loadedIntrospection.introspectAudiences.length) {
     console.warn(
       "[selfhost-api] ignoring History origins in SELFHOST_INTROSPECT_AUDIENCES; configure them only in SELFHOST_RELAYHISTORY_AUDIENCES",
@@ -446,10 +476,12 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     sessionReadApi,
     relayfileControlBrokerSecret: loadBrokerSecret(env),
     chiefRelaySecret: loadChiefRelaySecret(env),
+    flowsWorkspaceDelete: loadFlowsWorkspaceDelete(env),
     customerSupport: loadCustomerSupportConfig(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
     sessionReadMcpReads: loadSessionReadMcpReads(env),
     sessionSearchAgentTokens: loadSessionSearchAgentTokens(env),
+    sessionReadMintIncludeRole: loadSessionReadMintIncludeRole(env),
     ...introspection,
     relayhistoryAudiences,
     acquisitionIssuer: loadAcquisitionIssuerConfig(env, introspection),
@@ -461,7 +493,8 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     historyUpload: loadHistoryUploadConfig(env),
     capturePolicyUploads: loadCapturePolicyUploads(env),
     eventsShimRelayOrigins: loadEventsShimRelayOrigins(env),
-    relaygatePublicUrl: loadRelaygatePublicUrl(env),
+    relaygatePublicUrl,
+    relayNodeSelfMint: loadRelayNodeSelfMint(env),
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
@@ -488,6 +521,13 @@ function loadSessionSearchAgentTokens(env: Env): boolean {
   const value = env.SESSION_SEARCH_AGENT_TOKENS?.trim();
   if (!value || value === "false") return false;
   if (value !== "true") throw new Error("SESSION_SEARCH_AGENT_TOKENS must be true or false");
+  return true;
+}
+
+function loadSessionReadMintIncludeRole(env: Env): boolean {
+  const value = env.SESSION_READ_MINT_INCLUDE_ROLE?.trim();
+  if (!value || value === "false") return false;
+  if (value !== "true") throw new Error("SESSION_READ_MINT_INCLUDE_ROLE must be true or false");
   return true;
 }
 
@@ -518,6 +558,22 @@ function loadChiefRelaySecret(env: Env): string | null {
     throw new Error("RELAYCHIEF_CONTROL_RELAY_SECRET must differ from RELAYFILE_CONTROL_BROKER_SECRET");
   }
   return secret;
+}
+
+function loadFlowsWorkspaceDelete(env: Env): SelfhostConfig["flowsWorkspaceDelete"] {
+  const secret = readSecret(env, "RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET");
+  if (!secret && !env.RELAYFILE_CONTROL_URL?.trim()) return null;
+  if (!secret) throw new Error("RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET (or _FILE) is required with RELAYFILE_CONTROL_URL");
+  if (Buffer.byteLength(secret) < 32) {
+    throw new Error("RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET (or _FILE) must be at least 32 bytes");
+  }
+  // relayfile-control holds the broker secret too: sharing it would let either side act in both directions.
+  const others = ["SELFHOST_BOOTSTRAP_TOKEN", "SELFHOST_INTERNAL_TOKEN", "RELAYCONTROL_INTROSPECT_SECRET",
+    "RELAYFILE_CONTROL_BROKER_SECRET", "RELAYCHIEF_CONTROL_RELAY_SECRET", "SESSION_ERASE_API_SECRET"];
+  if (others.some((name) => readSecret(env, name) === secret)) {
+    throw new Error("RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET must be a dedicated credential");
+  }
+  return { url: serviceUrl(env, "RELAYFILE_CONTROL_URL"), secret };
 }
 
 function loadBrokerSecret(env: Env): string | null {
@@ -1057,6 +1113,17 @@ export function loadRelaygatePublicUrl(env: Env = process.env): string | null {
   return publicServiceUrl(env, "SELFHOST_RELAYGATE_PUBLIC_URL");
 }
 
+/**
+ * SELFHOST_RELAY_NODE_SELF_MINT: unset, blank, `true`, `1` or `on`: true;
+ * `false`, `0` or `off`: false; anything else refuses startup.
+ */
+export function loadRelayNodeSelfMint(env: Env = process.env): boolean {
+  const value = env.SELFHOST_RELAY_NODE_SELF_MINT?.trim().toLowerCase();
+  if (!value || value === "true" || value === "1" || value === "on") return true;
+  if (value === "false" || value === "0" || value === "off") return false;
+  throw new Error("SELFHOST_RELAY_NODE_SELF_MINT must be true or false");
+}
+
 export function loadEventsShimRelayOrigins(env: Env = process.env): string[] | null {
   const raw = env.SELFHOST_EVENTS_SHIM_RELAY_ORIGINS?.trim();
   if (!raw) return null;
@@ -1204,6 +1271,7 @@ export function configFingerprint(config: SelfhostConfig): string {
       config.sessionReadApi.url,
       config.sessionReadApi.publicUrl,
       ...(config.sessionErasureApi ? [config.sessionErasureApi.url] : []),
+      ...(config.flowsWorkspaceDelete ? [config.flowsWorkspaceDelete.url] : []),
     ].join("\n"))
     .digest("hex")
     .slice(0, 12);

@@ -509,3 +509,34 @@ test("Claude auth files require a stable account email", () => {
     /does not match/,
   );
 });
+
+test("refresh transactions set local idle and lock timeouts before taking the credential lock", async (t) => {
+  const ctx = await setup(t);
+  const owner = (await ctx.database.query<{ id: string }>("SELECT id FROM users WHERE email = 'owner@acme.test'")).rows[0]!.id;
+  const credentialId = await ctx.admin.logins.storeLogin({
+    provider: "openai",
+    workspaceId: ctx.tenant.workspaceId,
+    organizationId: ctx.tenant.organizationId,
+    actor: { kind: "user", userId: owner },
+    authFile: codexAuth(Math.floor(Date.now() / 1000) + 30 * 86_400),
+  });
+  const transactions: string[][] = [];
+  const original = ctx.database.transaction.bind(ctx.database);
+  ctx.database.transaction = ((run: Parameters<typeof original>[0]) => original(async (tx) => {
+    const events: string[] = [];
+    transactions.push(events);
+    const watched = Object.create(tx) as typeof tx;
+    watched.exec = (sql: string) => { events.push(`exec:${sql}`); return tx.exec(sql); };
+    watched.query = ((sql: string, params?: unknown[]) => { events.push(`query:${sql}`); return tx.query(sql, params); }) as typeof tx.query;
+    return run(watched);
+  })) as typeof ctx.database.transaction;
+  assert.notEqual(await ctx.admin.logins.freshAuthFile(ctx.tenant.workspaceId, credentialId), null);
+  assert.equal(transactions.length, 1);
+  const events = transactions[0]!;
+  assert.deepEqual(events.slice(0, 2), [
+    "exec:SET LOCAL idle_in_transaction_session_timeout = '60s'",
+    "exec:SET LOCAL lock_timeout = '30s'",
+  ]);
+  assert.match(events[2]!, /^query:SELECT pg_advisory_xact_lock/);
+  assert.equal(events.filter((event) => event.startsWith("exec:")).length, 2);
+});
