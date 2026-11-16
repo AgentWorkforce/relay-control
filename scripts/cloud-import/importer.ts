@@ -18,6 +18,7 @@ import type { Database, SqlExecutor } from "../../src/database.js";
 import {
   MAPPING_REVISION,
   IMPORT_LEDGER_TABLE,
+  UNBOUND_WORKSPACE_MARKER,
   ORG_TABLES,
   RECONCILED_TABLES,
   REQUIRED_MIGRATION,
@@ -217,10 +218,14 @@ function upsertSql(table: ImportTable, columns: string[], fill = "'{}'::jsonb"):
   const spec = TARGETS[table];
   const secretColumn = spec.secret?.target ?? spec.inviteTokenHash ?? spec.freshTokenHash;
   const relation = `public.${quote(spec.table)}`;
+  const keep = spec.keepTargetBinding;
   const updates = columns
     .filter((column) => !spec.primaryKey.includes(column) && !(spec.insertOnly ?? []).includes(column))
-    .map((column) => `${quote(column)} = EXCLUDED.${quote(column)}`);
-  return `INSERT INTO ${relation} (${columns.map(quote).join(", ")})
+    .map((column) => keep?.columns.includes(column)
+      ? `${quote(column)} = CASE WHEN EXCLUDED.${quote(keep.when)} IS NULL AND __t.${quote(keep.when)} IS NOT NULL
+           THEN __t.${quote(column)} ELSE EXCLUDED.${quote(column)} END`
+      : `${quote(column)} = EXCLUDED.${quote(column)}`);
+  return `INSERT INTO ${relation} AS __t (${columns.map(quote).join(", ")})
 SELECT ${columns.map((column) => `p.${quote(column)}`).join(", ")}
   FROM unnest($1::text[], $2::text[], $3::text[]) AS u(r, s, o)
  CROSS JOIN LATERAL jsonb_populate_record(
@@ -666,6 +671,22 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
           [org, batch.map(([table]) => table), batch.map(([, key]) => key), MAPPING_REVISION],
         );
       }
+      // Which of this org's workspaces this run wrote unbound (see
+      // UNBOUND_WORKSPACE_MARKER): exactly the current set, every run.
+      const written = new Set(keys.workspaces ?? []);
+      const unbound = prepared.workspaces
+        .filter((row) => row.org === org && written.has(row.key) && (JSON.parse(row.row) as { relaycast_workspace_id?: unknown }).relaycast_workspace_id == null)
+        .map((row) => row.key);
+      await tx.query(
+        `DELETE FROM public.${IMPORT_LEDGER_TABLE} WHERE organization_id = $1 AND table_name = $2 AND NOT (row_key = ANY($3::text[]))`,
+        [org, UNBOUND_WORKSPACE_MARKER, unbound],
+      );
+      await tx.query(
+        `INSERT INTO public.${IMPORT_LEDGER_TABLE} (organization_id, table_name, row_key, mapping_revision)
+         SELECT $1, $2, k, $4 FROM unnest($3::text[]) AS u(k)
+         ON CONFLICT (organization_id, table_name, row_key) DO UPDATE SET mapping_revision = EXCLUDED.mapping_revision`,
+        [org, UNBOUND_WORKSPACE_MARKER, unbound, MAPPING_REVISION],
+      );
     };
     const body = async (unit: (run: (tx: SqlExecutor) => Promise<void>) => Promise<void>) => {
       for (const batch of chunks(prepared.users, batchSize)) {
