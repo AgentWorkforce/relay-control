@@ -21,8 +21,8 @@ import { PGliteDatabase } from "./support/harness.js";
 const CLOUD_KEY = randomBytes(32).toString("hex");
 const KEYRING: EncryptionKeyring = { active: { id: "import-test", key: randomBytes(32) } };
 
-// 0058 (relay_managed coding agents, control-relay-managed) is not on main
-// yet; the "current" target approximates it on top of the real migrations.
+// 0061 (staff read grants, #165) is not on main yet; the "current" target
+// adds it on top of the real migrations.
 const POST_0058_DDL = `
 -- 0061 (#165, staff read grants), as proposed.
 CREATE TABLE IF NOT EXISTS staff_read_grants (
@@ -42,21 +42,7 @@ CREATE TABLE IF NOT EXISTS staff_read_grants (
     REFERENCES workspaces(id, organization_id) ON DELETE CASCADE,
   CONSTRAINT staff_read_grant_lifetime CHECK (expires_at > created_at AND expires_at <= created_at + interval '90 days')
 );
--- 0058 (control-relay-managed), approximated: relay_managed rows carry no secret.
-ALTER TABLE coding_agent_credentials
-  ALTER COLUMN secret_preview DROP NOT NULL,
-  ALTER COLUMN key_fingerprint DROP NOT NULL,
-  DROP CONSTRAINT IF EXISTS selfhost_coding_agent_auth_type,
-  DROP CONSTRAINT IF EXISTS coding_agent_auth_type,
-  DROP CONSTRAINT IF EXISTS selfhost_coding_agent_secret_storage,
-  DROP CONSTRAINT IF EXISTS coding_agent_secret_storage,
-  ADD CONSTRAINT coding_agent_auth_type
-    CHECK (auth_type IN ('byo_api_key', 'oauth_token', 'provider_oauth', 'relay_managed')),
-  ADD CONSTRAINT coding_agent_secret_storage CHECK (
-    (auth_type = 'relay_managed' AND secret_ciphertext IS NULL AND NOT harness_active)
-    OR (auth_type = 'provider_oauth' AND secret_ciphertext IS NULL AND blob_location IS NOT NULL)
-    OR (auth_type IN ('byo_api_key', 'oauth_token') AND secret_ciphertext IS NOT NULL)
-  );
+-- 0058 (relay_managed coding agents) is a real migration now.
 `;
 
 async function cloudSource(): Promise<PGliteDatabase> {
@@ -68,7 +54,7 @@ async function cloudSource(): Promise<PGliteDatabase> {
 
 /**
  * "0051": the baseline the importer gates down to (migrations <= 0051 only).
- * "current": every migration on this branch plus the 0058 approximation.
+ * "current": every migration on this branch plus the proposed 0061.
  */
 async function controlTarget(kind: "0051" | "current", ledger = true): Promise<PGliteDatabase> {
   const target = new PGliteDatabase();
@@ -239,7 +225,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   }
 });
 
-test("cloud import: current target (0053-0057 + 0058) keeps rw_, slugs, History origin and text source ids", async (t) => {
+test("cloud import: current target (main + proposed 0061) keeps rw_, slugs, History origin and text source ids", async (t) => {
   const source = await cloudSource();
   const target = await controlTarget("current");
   t.after(async () => {

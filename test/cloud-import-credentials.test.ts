@@ -114,7 +114,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.doesNotMatch(JSON.stringify(report), /sk-|rt-synthetic|example\.test/);
 
   const rows = (await target.query<{ auth_type: string; model_provider: string; secret_ciphertext: string | null; blob_location: string | null; workspace_id: string }>(
-    "SELECT auth_type, model_provider, secret_ciphertext, blob_location, workspace_id FROM coding_agent_credentials ORDER BY auth_type")).rows;
+    "SELECT auth_type, model_provider, secret_ciphertext, blob_location, workspace_id FROM coding_agent_credentials WHERE auth_type <> 'relay_managed' ORDER BY auth_type")).rows;
   assert.deepEqual(rows.map((row) => `${row.auth_type} ${row.model_provider} ${row.workspace_id}`).sort(), [
     `byo_api_key anthropic ${id(0x201)}`,
     `byo_api_key anthropic ${id(0x201)}`,
@@ -133,6 +133,8 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   // and sandbox rows are exactly Cloud's, whatever the seams auto-activated.
   const flags = (await target.query<{ workspace_id: string; model_provider: string; auth_type: string; is_active: boolean; harness_active: boolean; secret_ciphertext: string | null }>(
     "SELECT workspace_id::text AS workspace_id, model_provider, auth_type, is_active, harness_active, secret_ciphertext FROM coding_agent_credentials")).rows;
+  // flags includes the identity import's relay_managed rows (0058): the
+  // invariants below hold across them too.
   const plain = (row: { secret_ciphertext: string | null }) => row.secret_ciphertext ? decryptSecret(row.secret_ciphertext, KEYRING) : null;
   const anthropicA = flags.filter((row) => row.workspace_id === id(0x201) && row.model_provider === "anthropic");
   assert.deepEqual(anthropicA.filter((row) => row.is_active).map(plain), ["sk-ant-api03-synthetic-selected-0000"],
@@ -174,7 +176,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.equal(again.rows[id(0x803)], "already_present");
   assert.equal(again.rows[id(0x805)], "already_present");
   assert.equal(again.rows[id(0x80b)], "already_present");
-  const count = (await target.query<{ n: number }>("SELECT count(*)::int AS n FROM coding_agent_credentials")).rows[0]!.n;
+  const count = (await target.query<{ n: number }>("SELECT count(*)::int AS n FROM coding_agent_credentials WHERE auth_type <> 'relay_managed'")).rows[0]!.n;
   assert.equal(count, 9);
   // The re-run re-applies the same selection.
   const activeAfter = (await target.query<{ secret_ciphertext: string }>(
