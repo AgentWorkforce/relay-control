@@ -5,7 +5,7 @@ visible diagnostics because selection belongs to Control after insertion;
 they do not waive failed written-selection, cardinality, content, ownership,
 ID-link, write-receipt or convergence checks. Missing/unlinked rows still fail.
 
-Copier follow-up field:
+Copier field (emitted on apply from revision `.29`):
 
 ```ts
 selectionDiverged: Record<string, { active: number; harness: number }>;
@@ -39,10 +39,12 @@ or writes. One credential can increment active and harness independently.
    workspace choice are visible differences even when selection is valid.
 
 The verifier recomputes counts inside its read-only source/target snapshots;
-the producer field never supplies the expectation. The current `.27` producer
-does not yet supply the field, which is explicitly `not_reported` rather than
-reported as zero. Once supplied, it must exactly match recomputed counts;
-mismatches fail the report and credential-copy qualification. The independent
+the producer field never supplies the expectation. The `.29` producer emits
+the field on apply; matching counters are explicitly `matched`. A supplied
+counter must exactly match recomputed counts; a `mismatched` counter fails the
+report and credential-copy qualification, including when the target changed
+after copy. An absent optional counter is explicitly `not_reported` rather
+than reported as zero, and never waives incorrect written selections. The independent
 finding is always emitted, including metadata-only runs (`not_requested` for
 the absent copier). This preserves diagnostics while the follow-up lands.
 
