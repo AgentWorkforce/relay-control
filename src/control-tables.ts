@@ -82,6 +82,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "session_erasures",
   "setup_keys",
   "shared_session_read_audit",
+  "staff_read_grants",
   "telemetry_counters",
   "telemetry_error_index",
   "telemetry_errors",

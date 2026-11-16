@@ -5947,6 +5947,101 @@ paths:
                         action: { type: string }
                         target: { type: [string, "null"] }
                         createdAt: { type: string, format: date-time }
+  /api/v1/workspaces/{workspaceId}/staff-read-grants:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listStaffReadGrants
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      description: |
+        Staff only (see `docs/staff-read-grants.md`): an owner of the operator
+        organization whose email is on one of its domains, signed in with a
+        CLI token or the browser session. Lists the workspace's staff read
+        grants, newest first. Never contains token material. Every other
+        caller, including a missing or invalid credential, gets 404.
+      responses:
+        "200":
+          description: Grants of the workspace
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [workspace_id, grants]
+                properties:
+                  workspace_id: { type: string, format: uuid }
+                  grants:
+                    type: array
+                    items: { $ref: "#/components/schemas/StaffReadGrant" }
+        "404": { description: "not_found: not staff, or no such workspace" }
+    post:
+      operationId: mintStaffReadGrant
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      description: |
+        Staff only. Mints an `sh_sr_` credential that reads this workspace's
+        shared sessions over `/api/v1/mcp/shared-sessions` (scope `rth:read`,
+        no refresh). The token is returned once; only its SHA-256 is stored.
+        Audited as `staff_read_grant.minted`. At most 10 mints per staff
+        person per hour.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 1, maxLength: 500, description: Trimmed before the length check }
+                expires_in_days: { type: integer, minimum: 1, maximum: 90, default: 90 }
+      responses:
+        "201":
+          description: Minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grant, token]
+                properties:
+                  grant: { $ref: "#/components/schemas/StaffReadGrant" }
+                  token:
+                    type: object
+                    required: [accessToken, workspaceId, expiresAt]
+                    properties:
+                      accessToken: { type: string, description: "sh_sr_..., shown once" }
+                      workspaceId: { type: string, format: uuid }
+                      expiresAt: { type: string, format: date-time }
+        "400": { description: "invalid_request: bad reason or expires_in_days" }
+        "403": { description: "csrf_rejected: a cookie write from another origin" }
+        "404": { description: "not_found: not staff, or no such workspace" }
+        "429": { description: rate_limited }
+  /api/v1/workspaces/{workspaceId}/staff-read-grants/{grantId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: grantId, in: path, required: true, schema: { type: string, format: uuid } }
+    delete:
+      operationId: revokeStaffReadGrant
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      description: |
+        Staff only. Revokes the grant; the credential stops working on its next
+        request. Idempotent: revoking a revoked grant answers it unchanged and
+        writes no second `staff_read_grant.revoked` audit row.
+      responses:
+        "200":
+          description: The revoked grant
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grant]
+                properties:
+                  grant: { $ref: "#/components/schemas/StaffReadGrant" }
+        "403": { description: "csrf_rejected: a cookie write from another origin" }
+        "404": { description: "not_found: not staff, or no such grant in this workspace" }
   /api/v1/workspaces/{workspaceId}/shared-session-read-audit:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -5992,7 +6087,7 @@ paths:
                         workspace_id: { type: string }
                         caller_user_id: { type: string }
                         identity_kind: { enum: [desktop, hosted, oauth] }
-                        auth_mode: { enum: [cli_login, session, oauth] }
+                        auth_mode: { enum: [cli_login, session, oauth, staff_read_grant] }
                         desktop_provider: { type: [string, "null"] }
                         oauth_client_id: { type: [string, "null"] }
                         oauth_grant_id: { type: [string, "null"] }
@@ -9892,6 +9987,22 @@ components:
         mcpConsent: { enum: [admin, null], description: desktop-enrollment only }
         exchangedAt: { type: [string, "null"], format: date-time, description: desktop-enrollment only; null until exchanged }
         exchangedHostName: { type: [string, "null"], description: desktop-enrollment only }
+    StaffReadGrant:
+      type: object
+      required: [id, workspace_id, organization_id, staff_user_id, staff_organization_id, reason, status, created_at, expires_at, revoked_at, revoked_by, last_used_at]
+      properties:
+        id: { type: string, format: uuid }
+        workspace_id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        staff_user_id: { type: string, format: uuid }
+        staff_organization_id: { type: string, format: uuid }
+        reason: { type: string }
+        status: { enum: [active, revoked, expired] }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        revoked_at: { type: [string, "null"], format: date-time }
+        revoked_by: { type: [string, "null"] }
+        last_used_at: { type: [string, "null"], format: date-time }
     EnrollmentKeySummary:
       type: object
       required: [id, label, status, mcpConsent, createdAt, expiresAt, exchangedAt, exchangedHostName, mintedBy]

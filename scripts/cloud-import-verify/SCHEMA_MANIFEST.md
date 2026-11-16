@@ -24,12 +24,12 @@ the copier verified. Column discovery uses pg_catalog, not privilege-filtered
 information_schema gating. Inaccessible data fails closed rather than becoming
 an empty target.
 
-There is one separately identified optional inventory: the synthetic proposed
-0061 staff-grant model. If present, all of its expected objects must match and
-the report profile is `main-plus-proposed-0061`. The cutover guard rejects that
-profile. On the actual b79cb5f target without 0061, the production profile is
-`main`; a source containing importable staff grants still fails its missing-
-target gate. The optional fixture is not evidence for the pending migration.
+The manifest keeps a generic map of separately identified optional inventories;
+it is currently empty. The staff-grant table from the checked-in 0061 migration
+is part of the required inventory like every other migration. If an optional
+inventory is ever present, all of its expected objects must match and the
+report profile is `main-plus-optional`, which the cutover guard rejects; the
+production profile is `main`.
 
 Qualified reports expose `targetSchema` with the baseline, committed manifest
 seal, expected/actual schema digests, object counts and missing/changed expected

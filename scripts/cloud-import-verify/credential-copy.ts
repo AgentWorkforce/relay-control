@@ -1,3 +1,4 @@
+import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
 import { beginReadOnlySnapshot,type ReadOnlySettings } from "./read-only.js";
 import { createHash,createHmac } from "node:crypto";
 import type { Client } from "pg";
@@ -118,7 +119,10 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
   let sourceFailures = 0;
   let unresolvedSourceSkips = 0;
   let rowOutcomesMatch = true;
-  await source.query(`DECLARE credential_copy_cursor NO SCROLL CURSOR FOR ${credentialCopyQuery(scope)}`);
+  const deliberateExclusions=exclusionAccounting();
+  await source.query(`DECLARE credential_copy_cursor NO SCROLL CURSOR FOR
+    SELECT q.*,p.status AS __source_status,p.refresh_exhausted AS __source_refresh_exhausted
+    FROM (${credentialCopyQuery(scope)}) q JOIN public.provider_credentials p ON p.id=q.id`);
   try {for (;;) {
     const batch = await source.query("FETCH FORWARD 250 FROM credential_copy_cursor");
     if (!batch.rows.length) break;
@@ -129,7 +133,10 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
       if (typeof outcome === "string") expectedOutcomes[outcome] = (expectedOutcomes[outcome] ?? 0)+1;
       if (row.skip_reason) {
         rowOutcomesMatch &&= outcome === `skipped:${row.skip_reason}`;
-        if (!["workspace_not_imported","user_not_imported","not_a_member","credential_not_usable"].includes(row.skip_reason)) unresolvedSourceSkips++;
+        const accounted=accountCredentialExclusion(deliberateExclusions,{reason:row.skip_reason,provider:row.model_provider,
+          authType:row.auth_type,status:row.__source_status,refreshExhausted:row.__source_refresh_exhausted});
+        if (accounted === false || (accounted === null
+          && !["workspace_not_imported","user_not_imported","not_a_member","credential_not_usable"].includes(row.skip_reason))) unresolvedSourceSkips++;
         continue;
       }
       let plaintext:string|undefined;
@@ -140,7 +147,7 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
           plaintext = decryptCloudEnvelope(JSON.parse(body),cloudKeyHex); break;
         }
         if (plaintext === undefined) {
-          sourceFailures++;rowOutcomesMatch &&= outcome === (row.auth_type !== "byo_api_key" && !row.legacy_allowed
+          sourceFailures++;rowOutcomesMatch &&= outcome === (Object.hasOwn(row,"legacy_allowed") && row.auth_type !== "byo_api_key" && !row.legacy_allowed
             ? "skipped:legacy_key_ambiguous" : "object_missing");continue;
         }
         const provider = canonicalProvider(row.model_provider);
@@ -182,11 +189,18 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
       && report.candidates === candidates && reportedIds.length === sourceIds.size
       && reportedIds.every((id) => sourceIds.has(id)) && rowOutcomesMatch
       && totals(report.outcomes) === totals(expectedOutcomes),
-    detail:{candidates,sourceFailures,unresolvedSourceSkips,reportedCandidates:Number.isSafeInteger(report.candidates) ? report.candidates : null}}];
+    detail:{candidates,sourceFailures,unresolvedSourceSkips,reportedCandidates:Number.isSafeInteger(report.candidates) ? report.candidates : null}},
+    {kind:"credential_exclusions",name:"credential_copy",ok:!unresolvedSourceSkips,
+      detail:{classes:deliberateExclusions,unresolvedSourceSkips}}];
   const seen = new Set<string>();
   const targetKeysById=new Map<string,string>();
   let duplicateKeys = 0;
   let contentFailures = 0;
+  // Fixed reason names and counts only: no target IDs, ciphertext, account
+  // values, plaintext, driver messages or object locations enter diagnostics.
+  // A row can have several reasons; contentFailures still counts rows once.
+  const contentFailureReasons={organizationMismatch:0,statusNotConnected:0,fingerprintMismatch:0,
+    contentMismatch:0,blobBackendMismatch:0,targetReadOrDecryptFailed:0};
   let extra = 0;
   let unexplainedTarget=0;
   const nativeFlags=new Map<string,{group:string;active:boolean;harness:boolean}>();
@@ -216,20 +230,27 @@ export async function credentialCopyFindings(source:Client,target:Client,scope:I
         continue;
       }
       flags.set(key,{group:`${row.workspace_id}:${row.model_provider}`,active:row.is_active,harness:row.harness_active});
-      try {
-        if (row.auth_type === "provider_oauth" && row.blob_backend !== evidence.targetBlobs.kind) throw new Error("blob_backend_mismatch");
-        const content = row.auth_type === "provider_oauth"
-          ? await evidence.targetBlobs.read(row.blob_location,row.id,Number(row.blob_version),targetExecutor)
-          : decryptSecret(row.secret_ciphertext,keyring);
-        if (row.organization_id !== wanted.org || row.status !== "connected"
-          || row.key_fingerprint !== wanted.fingerprint || hash(content) !== wanted.contentHash) contentFailures++;
-      } catch {contentFailures++;}
+      let failed=false;
+      if (row.organization_id !== wanted.org) {contentFailureReasons.organizationMismatch++;failed=true;}
+      if (row.status !== "connected") {contentFailureReasons.statusNotConnected++;failed=true;}
+      if (row.key_fingerprint !== wanted.fingerprint) {contentFailureReasons.fingerprintMismatch++;failed=true;}
+      if (row.auth_type === "provider_oauth" && row.blob_backend !== evidence.targetBlobs.kind) {
+        contentFailureReasons.blobBackendMismatch++;failed=true;
+      } else {
+        try {
+          const content = row.auth_type === "provider_oauth"
+            ? await evidence.targetBlobs.read(row.blob_location,row.id,Number(row.blob_version),targetExecutor)
+            : decryptSecret(row.secret_ciphertext,keyring);
+          if (hash(content) !== wanted.contentHash) {contentFailureReasons.contentMismatch++;failed=true;}
+        } catch {contentFailureReasons.targetReadOrDecryptFailed++;failed=true;}
+      }
+      if (failed) contentFailures++;
     }
   }} finally {await target.query("CLOSE credential_target_cursor");}
   const missing = [...expected.keys()].filter((key) => !seen.has(key)).length;
   findings.push({kind:"credential_natural_keys",name:"coding_agent_credentials",
     ok:!sourceFailures && !unresolvedSourceSkips && !duplicateKeys && !contentFailures && !missing && !unexplainedTarget,
-    detail:{expected:expected.size,target:seen.size,missing,unmatchedTarget:extra,unexplainedTarget,duplicateKeys,contentFailures,
+    detail:{expected:expected.size,target:seen.size,missing,unmatchedTarget:extra,unexplainedTarget,duplicateKeys,contentFailures,contentFailureReasons,
       sourceFailures,unresolvedSourceSkips,sourceChecksum:digestKeys(expected.keys()),targetChecksum:digestKeys(flags.keys())}});
   const controlIds=report.controlIds;
   const validMap=controlIds !== null && typeof controlIds === "object" && !Array.isArray(controlIds);

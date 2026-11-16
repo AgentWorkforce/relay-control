@@ -97,7 +97,12 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; staffReadGrant?: boolean } = {}): ToolPlanEntry[] {
+  // A staff read grant (docs/staff-read-grants.md) reaches the shared-session
+  // reads and capability discovery only, whatever else the server enables.
+  if (options.staffReadGrant) {
+    return (["shared_session_reads", "capability_discovery"] as const).map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
+  }
   const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relay_messaging", "customer_support"];
   // Launch tools exist only when SELFHOST_FEATURES selects launch; role and
   // connection kind are checked on every call.
@@ -128,12 +133,16 @@ export function registerToolPlan(plan: readonly ToolPlanEntry[], registrars: Too
 /** The owner/admin refusal shared by describe_capabilities and every launch tool. */
 export const LAUNCH_ROLE_REFUSAL = "Only current workspace owners and admins can manage agent launches. Call describe_capabilities for details.";
 
-export type McpAuthMode = "session" | "cli_login" | "oauth";
+export type McpAuthMode = "session" | "cli_login" | "oauth" | "staff_read_grant";
+
+/** The only tools a staff read grant may list or call; the MCP route refuses every other call before a server is built. */
+export const STAFF_READ_GRANT_TOOLS: readonly string[] = [...SHARED_SESSION_READ_TOOLS, CAPABILITY_DISCOVERY_TOOL];
 
 const AUTH_MODE_LABELS: Readonly<Record<McpAuthMode, string>> = {
   session: "browser session",
   cli_login: "Agent Relay CLI login",
   oauth: "workspace-bound OAuth connection",
+  staff_read_grant: "staff read grant (read-only, sessions-only, pinned to one workspace)",
 };
 
 export type WorkspaceRole = "owner" | "admin" | "member" | "none" | null;
@@ -183,12 +192,19 @@ export function describeCapabilities(input: {
   const launchRole = input.role === "owner" || input.role === "admin";
   const canLaunch = Boolean(input.launch) && launchRole;
   const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, replicas: input.replicas, launch: input.launch,
-    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines })
+    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines,
+    staffReadGrant: input.authMode === "staff_read_grant" })
     .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
     const definition = TOOL_GROUPS[id];
     const base = { id, title: definition.title };
     const item = planned.get(id);
+    if (input.authMode === "staff_read_grant") {
+      if (item) return { ...base, status: "available", tools: [...item.tools] };
+      return { ...base, status: "unavailable", tools: [...definition.tools],
+        reason: "This connection is a staff read grant: read-only access to one workspace's shared sessions and capability discovery, nothing else.",
+        how_to_enable: "Use your own Agent Relay sign-in as a member of a workspace for these tools." };
+    }
     if (id === "customer_support" && !input.customerSupport) return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "The customer support backend is not configured on this installation.",
       how_to_enable: "Configure SELFHOST_CUSTOMER_SUPPORT_URL and SELFHOST_CUSTOMER_SUPPORT_TOKEN for the support service." };
