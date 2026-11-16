@@ -65,7 +65,8 @@
     {"name":"0060_relay_launch_credentials.sql","sha256":"004bde8e76a9da5fe1d33fa5d188ddb883df7f56a4a41fc804e75a1847d04022"},
     {"name":"0061_staff_read_grants.sql","sha256":"a86116670dd62856fe027ea25d1f5a446c03b911d51f77f0b415eadf06dad860"},
     {"name":"0062_cloud_identity_security.sql","sha256":"89856c37785fd8ff3dbecf1263939626e1683650607eac974793f24501a97448"},
-    {"name":"0063_cloud_import_ledger.sql","sha256":"a6e432e4454b5cb6244cce4677a35601f7cb34a9b29be09ba12884843aee48ba"}
+    {"name":"0063_cloud_import_ledger.sql","sha256":"a6e432e4454b5cb6244cce4677a35601f7cb34a9b29be09ba12884843aee48ba"},
+    {"name":"0068_user_signup_source.sql","sha256":"aed4f6c0aee5aecbc8fca128219b4e6e68e7702c4aff04bf1d5a79cb17cc0224"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -998,6 +999,7 @@
     {"kind":"column","name":"public.users.last_organization_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":6,"type":"uuid"}},
     {"kind":"column","name":"public.users.last_workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":7,"type":"uuid"}},
     {"kind":"column","name":"public.users.name","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"text"}},
+    {"kind":"column","name":"public.users.signup_source","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"text"}},
     {"kind":"column","name":"public.users.updated_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":5,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.work_assignments.acked_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.work_assignments.assigned_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":7,"type":"timestamp with time zone"}},
@@ -1509,6 +1511,7 @@
     {"kind":"constraint","name":"public.users.users_last_organization_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (last_organization_id) REFERENCES organizations(id) ON DELETE SET NULL","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_setnull_del","table":"public.organizations","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.organizations","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.users","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.users","type":17}],"type":"f","validated":true}},
     {"kind":"constraint","name":"public.users.users_last_workspace_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (last_workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.users","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.users","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_setnull_del","table":"public.workspaces","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.workspaces","type":17}],"type":"f","validated":true}},
     {"kind":"constraint","name":"public.users.users_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
+    {"kind":"constraint","name":"public.users.users_signup_source_known","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((signup_source IS NULL) OR (signup_source = ANY (ARRAY['teams'::text, 'flows'::text, 'desktop'::text, 'mcp'::text]))))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.work_assignments.work_assignments_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.work_assignments.work_assignments_run_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (run_id) REFERENCES workflow_runs(id) ON DELETE CASCADE","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.work_assignments","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.work_assignments","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_cascade_del","table":"public.workflow_runs","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.workflow_runs","type":17}],"type":"f","validated":true}},
     {"kind":"constraint","name":"public.work_assignments.work_assignments_run_id_key","definition":{"deferrable":false,"deferred":false,"definition":"UNIQUE (run_id)","no_inherit":true,"triggers":[],"type":"u","validated":true}},
@@ -1915,5 +1918,5 @@
   "optional":{
 
   },
-  "sha256":"72b678444d73be19b4440d82d891e42ced7ba70df36216485a1ed6e2b29ecbda"
+  "sha256":"6823a2a09effda88f701f2c2f8db5adfa806797a66bcf337c3f93ac920e4cce7"
 }

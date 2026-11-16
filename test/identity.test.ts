@@ -14,6 +14,7 @@ import { bootstrapOnce, relaycastProvisioner, startBootstrap, type RelaycastProv
 import type { Mailer, OutgoingEmail } from "../src/identity/mailer.js";
 import { close, listen, PGliteDatabase } from "./support/harness.js";
 import { encryptSecret } from "../src/crypto.js";
+import { signupSourceFromNext } from "../src/identity/signup-source.js";
 
 const BOOTSTRAP = "bootstrap-token-that-is-at-least-32-bytes";
 const KEYRING = { active: { id: "test-key", key: Buffer.alloc(32, 7) } };
@@ -2126,4 +2127,42 @@ test("oidc e2e (entra-shaped Keycloak), multi mode: domain auto-join needs the n
       assert.equal(info.currentOrganization.role, trusted ? "member" : "owner");
     });
   }
+});
+
+// ---- signup source (0068) ----------------------------------------------------------
+
+test("signup source: only a same-origin return to MCP OAuth consent is attributed", () => {
+  assert.equal(signupSourceFromNext("/cloud/oauth/authorize?client_id=c&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fcb"), "mcp");
+  assert.equal(signupSourceFromNext("/cloud/oauth/authorize"), "mcp");
+  // The authorize route strips trailing slashes before matching.
+  assert.equal(signupSourceFromNext("/cloud/oauth/authorize/?client_id=c"), "mcp");
+  assert.equal(signupSourceFromNext("/cloud/oauth/authorize//"), "mcp");
+  for (const next of [null, undefined, "", "/", "/cloud", "/cloud/oauth/authorize/other", "/oauth/authorize",
+    "//evil.test/cloud/oauth/authorize", "/\\evil.test/cloud/oauth/authorize", "https://evil.test/cloud/oauth/authorize"]) {
+    assert.equal(signupSourceFromNext(next), null, String(next));
+  }
+});
+
+test("signup source: set when the account is created and never rewritten by a later sign-in", async (t) => {
+  const ctx = await setup(t, { multi: true });
+  await ctx.identityStore.signIn({ email: "connector@elsewhere.test", name: "Connector", inviteTokenHash: null, method: "oidc", emailVerified: true, signupSource: "mcp" });
+  const source = async () => (await ctx.database.query<{ signup_source: string | null }>(
+    "SELECT signup_source FROM users WHERE email = 'connector@elsewhere.test'")).rows[0]!.signup_source;
+  assert.equal(await source(), "mcp");
+  await ctx.identityStore.signIn({ email: "connector@elsewhere.test", name: "Connector", inviteTokenHash: null, method: "oidc", emailVerified: true, signupSource: null });
+  assert.equal(await source(), "mcp", "a later sign-in keeps where the account was created");
+});
+
+test("signup source: an OIDC sign-in returning to MCP OAuth consent records mcp", async (t) => {
+  const ctx = await setup(t, { multi: true });
+  const next = "/cloud/oauth/authorize?client_id=c&response_type=code";
+  const signedIn = await oidcSignIn(ctx, { email: "chatgpt-user@elsewhere.test" }, `?next=${encodeURIComponent(next)}`);
+  assert.equal(signedIn.callback.status, 303, signedIn.callback.text);
+  const row = (await ctx.database.query<{ signup_source: string | null }>(
+    "SELECT signup_source FROM users WHERE email = 'chatgpt-user@elsewhere.test'")).rows[0]!;
+  assert.equal(row.signup_source, "mcp");
+  const plain = await oidcSignIn(ctx, { email: "plain@elsewhere.test" });
+  assert.equal(plain.callback.status, 303, plain.callback.text);
+  assert.equal((await ctx.database.query<{ signup_source: string | null }>(
+    "SELECT signup_source FROM users WHERE email = 'plain@elsewhere.test'")).rows[0]!.signup_source, null);
 });
