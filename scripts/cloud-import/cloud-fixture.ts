@@ -64,7 +64,7 @@ CREATE TABLE provider_credentials (
   harness text NOT NULL, model_provider text NOT NULL DEFAULT '', auth_type text NOT NULL DEFAULT 'provider_oauth',
   label text, key_fingerprint text, display_name text NOT NULL, account_email text, provider_account_id text,
   is_active boolean NOT NULL DEFAULT false, harness_active boolean NOT NULL DEFAULT false, status text NOT NULL,
-  refresh_exhausted boolean NOT NULL DEFAULT false,
+  refresh_exhausted boolean NOT NULL DEFAULT false, refresh_attempts integer NOT NULL DEFAULT 0,
   last_authenticated_at timestamptz, last_used_at timestamptz, last_error text,
   created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
 );
@@ -202,6 +202,10 @@ UPDATE provider_credentials SET refresh_exhausted = true WHERE id = '${id(0x811)
 UPDATE provider_credentials SET label = 'Bob token', account_email = 'bob@example.test' WHERE id = '${id(0x805)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-1' WHERE id = '${id(0x806)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-2' WHERE id = '${id(0x80c)}';
+-- Cloud history the copier must keep rather than the store seams' defaults.
+UPDATE provider_credentials SET last_authenticated_at = '2026-01-05T10:00:00.123456Z', last_used_at = '2026-01-06T11:00:00.654321Z',
+  refresh_attempts = 2, last_error = 'transient refresh error' WHERE id = '${id(0x806)}';
+UPDATE provider_credentials SET last_authenticated_at = '2026-01-07T09:00:00.000001Z', last_used_at = '2026-01-08T09:30:00.5Z' WHERE id = '${id(0x803)}';
 INSERT INTO workspace_integrations (id, workspace_id, provider, name, created_by_user_id, connection_id, installation_id, created_at, updated_at) VALUES
   ('${id(0x901)}', 'rw_0000a201', 'github', NULL, '${id(5)}', 'nango-1', '12345', ${t}, ${t}),
   ('${id(0x902)}', 'rw_0000a201', 'github', 'second', '${id(1)}', 'nango-2', '12345', ${t}, ${t}),

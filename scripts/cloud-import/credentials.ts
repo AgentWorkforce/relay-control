@@ -21,9 +21,28 @@
 import type { EncryptionKeyring } from "../../src/crypto.js";
 import type { Database } from "../../src/database.js";
 import { CodingAgentError, type CodingAgentStore } from "../../src/admin/coding-agents.js";
-import type { SubscriptionLoginStore, SubscriptionProvider } from "../../src/admin/subscription-logins.js";
+import { describeAuthFile, type SubscriptionLoginStore, type SubscriptionProvider } from "../../src/admin/subscription-logins.js";
+import type { CredentialBlobStore } from "../../src/admin/credential-blobs.js";
 import { decryptCloudEnvelope } from "./importer.js";
 import { assertScope, credentialCopyQuery, MAPPING_REVISION, type ImportScope } from "./mapping.js";
+
+/**
+ * Cloud's status and history on a row the copier just wrote (the store seams
+ * reset them: status connected, last_authenticated_at now, no error).
+ * Control's status CHECK allows connected|error|refresh_failed.
+ */
+async function preserveCloudState(target: Database, id: string, row: Candidate): Promise<number> {
+  const status = row.status === "connected" || row.status === "error" || row.status === "refresh_failed" ? row.status : "error";
+  const result = await target.query<{ id: string }>(
+    `UPDATE coding_agent_credentials
+        SET status = $2, last_error = $3, refresh_attempts = $4,
+            last_authenticated_at = $5::timestamptz, last_used_at = $6::timestamptz
+      WHERE id = $1
+      RETURNING id`,
+    [id, status, row.last_error, row.refresh_attempts ?? 0, row.last_authenticated_at, row.last_used_at],
+  );
+  return result.rows.length;
+}
 
 /** Reads one Cloud credential object; null when it does not exist. */
 export interface CloudObjectReader {
@@ -38,12 +57,15 @@ export type CredentialCopyDeps = {
   cloudKeyHex: string;
   codingAgents: CodingAgentStore;
   logins: SubscriptionLoginStore;
+  /** Control's credential blobs, to tell an unchanged login from a changed one. */
+  blobs: CredentialBlobStore;
   keyring: EncryptionKeyring;
   log?: (event: string, fields: Record<string, unknown>) => void;
 };
 
 export type CredentialOutcome =
   | "copied"
+  | "updated"
   | "already_present"
   | "object_missing"
   | "decrypt_failed"
@@ -66,13 +88,25 @@ export type CredentialCopyReport = {
    * so this is what a rollback deletes by.
    */
   controlIds: Record<string, string>;
+  /**
+   * Writes this run actually made, counted from statement outcomes (store
+   * results and UPDATE ... RETURNING row counts), never inferred. A
+   * converged re-run reports zero for every field.
+   * - inserted: new Control credential rows (copied).
+   * - updated: existing login rows rewritten because the Cloud content
+   *   changed (updated).
+   * - blobWrites: subscription-login blobs written (storeLogin calls).
+   * - metadataWrites: rows whose Cloud status/history was written.
+   * - selectionWrites: rows whose is_active/harness_active changed.
+   */
+  writes: { inserted: number; updated: number; blobWrites: number; metadataWrites: number; selectionWrites: number };
   /** How Cloud's selection was applied (see applyCloudSelection). */
   /**
    * selectionConflicts: groups where Cloud selected no copied row, no other
    * Control row was active, and a copy had been auto-activated: it is kept
    * active (never zero) and counted here for review.
    */
-  selection?: { groups: number; active: number; harness: number; activeDemoted: number; harnessDemoted: number; selectionConflicts: number };
+  selection?: { groups: number; active: number; harness: number; activeDemoted: number; harnessDemoted: number; selectionConflicts: number; writes: number };
 };
 
 /**
@@ -93,7 +127,7 @@ export async function applyCloudSelection(
   target: Database,
   copied: Array<{ row: Candidate; controlId: string }>,
 ): Promise<NonNullable<CredentialCopyReport["selection"]>> {
-  const summary = { groups: 0, active: 0, harness: 0, activeDemoted: 0, harnessDemoted: 0, selectionConflicts: 0 };
+  const summary = { groups: 0, active: 0, harness: 0, activeDemoted: 0, harnessDemoted: 0, selectionConflicts: 0, writes: 0 };
   await target.transaction(async (tx) => {
     const ids = [...new Set(copied.map((entry) => entry.controlId))];
     const control = new Map((await tx.query<{ id: string; workspace_id: string; model_provider: string; auth_type: string }>(
@@ -124,12 +158,16 @@ export async function applyCloudSelection(
         if (chosen) {
           // Cloud's selection was copied in this run: it wins the group (the
           // partial unique index allows one), clearing first.
-          await tx.query(
+          summary.writes += (await tx.query(
             `UPDATE coding_agent_credentials SET ${column} = false, updated_at = now()
-              WHERE workspace_id = $1 AND model_provider = $2 AND id <> $3 AND ${column}`,
+              WHERE workspace_id = $1 AND model_provider = $2 AND id <> $3 AND ${column}
+              RETURNING id`,
             [workspaceId, provider, chosen.controlId],
-          );
-          await tx.query(`UPDATE coding_agent_credentials SET ${column} = true WHERE id = $1`, [chosen.controlId]);
+          )).rows.length;
+          summary.writes += (await tx.query(
+            `UPDATE coding_agent_credentials SET ${column} = true WHERE id = $1 AND NOT ${column} RETURNING id`,
+            [chosen.controlId],
+          )).rows.length;
           if (column === "is_active") summary.active += 1;
           else summary.harness += 1;
           const demoted = new Set(candidates.map((entry) => entry.controlId)).size - 1;
@@ -156,10 +194,11 @@ export async function applyCloudSelection(
           // Another row carries the selection, or (sandbox) none is required:
           // an empty sandbox selection is valid. The auto-selected copies go
           // back to inactive.
-          await tx.query(
-            `UPDATE coding_agent_credentials SET ${column} = false, updated_at = now() WHERE id::text = ANY($1::text[])`,
+          summary.writes += (await tx.query(
+            `UPDATE coding_agent_credentials SET ${column} = false, updated_at = now()
+              WHERE id::text = ANY($1::text[]) AND ${column} RETURNING id`,
             [copiedIds],
-          );
+          )).rows.length;
         } else {
           summary.selectionConflicts += 1;
         }
@@ -183,6 +222,11 @@ type Candidate = {
   provider_account_id: string | null;
   /** Cloud selected it for LLM calls or the sandbox. */
   selected: boolean;
+  status: string;
+  last_error: string | null;
+  refresh_attempts: number;
+  last_authenticated_at: string | null;
+  last_used_at: string | null;
   is_active: boolean;
   harness_active: boolean;
   updated_at: Date;
@@ -252,6 +296,7 @@ export async function copyCodingAgentCredentials(
     outcomes: {},
     rows: {},
     controlIds: {},
+    writes: { inserted: 0, updated: 0, blobWrites: 0, metadataWrites: 0, selectionWrites: 0 },
   };
   const record = (id: string, outcome: CredentialOutcome) => {
     report.rows[id] = outcome;
@@ -315,10 +360,33 @@ export async function copyCodingAgentCredentials(
           authFile: plaintext,
           accountEmail: row.account_email,
         };
+        // storeLogin always rewrites in place (new blob, version + 1, status
+        // reset), so it runs only when Control does not already hold this
+        // exact login: a re-run writes nothing and bumps no version.
+        const provider = canonicalProvider(row.model_provider) as SubscriptionProvider;
+        const accountId = describeAuthFile(provider, plaintext, row.account_email).accountId;
+        const existing = (await deps.target.query<{ id: string; blob_location: string | null; blob_version: number | null }>(
+          `SELECT id::text AS id, blob_location, blob_version FROM coding_agent_credentials
+            WHERE workspace_id = $1 AND model_provider = $2 AND auth_type = 'provider_oauth' AND provider_account_id = $3`,
+          [row.workspace_id, provider, accountId],
+        )).rows[0];
+        if (existing?.blob_location && existing.blob_version !== null) {
+          const stored = await deps.blobs.read(existing.blob_location, existing.id, existing.blob_version).catch(() => null);
+          if (stored === plaintext) {
+            copied.push({ row, controlId: existing.id });
+            report.controlIds[row.id] = existing.id;
+            record(row.id, "already_present");
+            continue;
+          }
+        }
         const id = await deps.logins.storeLogin(login);
+        report.writes.blobWrites += 1;
+        if (existing) report.writes.updated += 1;
+        else report.writes.inserted += 1;
+        report.writes.metadataWrites += await preserveCloudState(deps.target, id, row);
         copied.push({ row, controlId: id });
         report.controlIds[row.id] = id;
-        record(row.id, "copied");
+        record(row.id, existing ? "updated" : "copied");
         continue;
       }
       const payload = JSON.parse(plaintext) as { key?: unknown; token?: unknown };
@@ -332,6 +400,12 @@ export async function copyCodingAgentCredentials(
       if (!result) {
         record(row.id, "payload_invalid");
         continue;
+      }
+      // putApiKey/putSetupToken dedupe by fingerprint and write nothing for
+      // a key Control already holds; only a fresh row gets Cloud's state.
+      if (result.created) {
+        report.writes.inserted += 1;
+        report.writes.metadataWrites += await preserveCloudState(deps.target, result.record.id, row);
       }
       copied.push({ row, controlId: result.record.id });
       report.controlIds[row.id] = result.record.id;
@@ -347,11 +421,12 @@ export async function copyCodingAgentCredentials(
   }
   if (mode === "apply" && copied.length > 0) {
     report.selection = await applyCloudSelection(deps.target, copied);
+    report.writes.selectionWrites = report.selection.writes;
   }
   // A selection conflict needs a human choice per (workspace, provider)
   // before cutover sign-off, so it is never a clean run.
   report.ok = Object.keys(report.outcomes).every((outcome) =>
-    outcome === "copied" || outcome === "already_present" || outcome.startsWith("skipped:"))
+    outcome === "copied" || outcome === "updated" || outcome === "already_present" || outcome.startsWith("skipped:"))
     && (report.selection?.selectionConflicts ?? 0) === 0;
   deps.log?.("cloud_import.credentials", { mode, ok: report.ok, candidates: report.candidates, outcomes: report.outcomes });
   return report;

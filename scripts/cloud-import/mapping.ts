@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.16";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.17";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -516,6 +516,11 @@ export function credentialCopyQuery(scope: ImportScope): string {
 SELECT p.id, iw.organization_id, p.workspace_id, iu.id AS user_id, p.user_id AS cloud_user_id,
        ${PROVIDER("p.model_provider")} AS model_provider, p.harness, p.auth_type, p.label, p.account_email, p.provider_account_id,
        p.is_active, p.harness_active,
+       -- Preserved on the Control row the copier writes (status and history
+       -- are Cloud's, not the store seam's defaults). Timestamps as text so
+       -- microseconds survive (the source session is UTC).
+       p.status, p.last_error, p.refresh_attempts,
+       p.last_authenticated_at::text AS last_authenticated_at, p.last_used_at::text AS last_used_at,
        -- Saved but neither the LLM-call nor the sandbox selection: carried
        -- over, then left inactive in Control.
        (p.is_active OR p.harness_active) AS selected,

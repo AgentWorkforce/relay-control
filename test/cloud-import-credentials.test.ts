@@ -99,6 +99,7 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
     keyring: KEYRING,
     codingAgents: new CodingAgentStore(target, KEYRING, undefined, blobs),
     logins: new SubscriptionLoginStore(target, KEYRING, blobs),
+    blobs,
   };
 
   // S1 probe: Control already has a native, active Google key in workspace A.
@@ -208,15 +209,40 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   // active (never zero) and is reported as a conflict.
   const openrouter = flags.filter((row) => row.model_provider === "openrouter");
   assert.deepEqual(openrouter.map((row) => row.is_active), [true]);
-  assert.deepEqual(report.selection, { groups: 6, active: 4, harness: 2, activeDemoted: 1, harnessDemoted: 0, selectionConflicts: 1 });
+  assert.deepEqual(report.selection, { groups: 6, active: 4, harness: 2, activeDemoted: 1, harnessDemoted: 0, selectionConflicts: 1, writes: report.selection!.writes });
   assert.equal(await deps.logins.freshAuthFile(id(0x201), (await target.query<{ id: string }>(
     "SELECT id FROM coding_agent_credentials WHERE auth_type = 'provider_oauth'")).rows[0]!.id), codexAuth);
 
+  // Cloud's status and history survive on the rows the copier wrote.
+  const history = async (cloudId: string) => (await target.query<{ status: string; last_error: string | null; refresh_attempts: number; la: string | null; lu: string | null }>(
+    `SELECT status, last_error, refresh_attempts,
+            to_char(last_authenticated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') AS la,
+            to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') AS lu
+       FROM coding_agent_credentials WHERE id = $1`, [report.controlIds[cloudId]])).rows[0]!;
+  assert.deepEqual(await history(id(0x806)), { status: "connected", last_error: "transient refresh error", refresh_attempts: 2, la: "2026-01-05T10:00:00.123456", lu: "2026-01-06T11:00:00.654321" });
+  assert.deepEqual(await history(id(0x803)), { status: "connected", last_error: null, refresh_attempts: 0, la: "2026-01-07T09:00:00.000001", lu: "2026-01-08T09:30:00.500000" });
+
+  // A re-run writes nothing to rows Control already holds: no blob version,
+  // no updated_at, no status moves (storeLogin would rewrite every login).
+  const snapshot = async () => (await target.query<{ id: string; v: number | null; u: string; status: string }>(
+    "SELECT id::text AS id, blob_version AS v, updated_at::text AS u, status FROM coding_agent_credentials WHERE auth_type <> 'relay_managed' ORDER BY id")).rows;
+  const before = await snapshot();
   // Re-run converges on Control's own dedupe keys. The lost key is found
   // this time, so the only remaining problem is the selection conflict.
   objects.set(`${id(2)}/${id(0x808)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "openai", key: "sk-synthetic-openai-found-0000000000" }), CLOUD_KEY)));
   const again = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
   assert.equal(again.rows[id(0x808)], "copied");
+  // Unchanged logins are already_present, never a blanket "copied".
+  assert.equal(again.rows[id(0x806)], "already_present");
+  assert.equal(again.rows[id(0x810)], "already_present");
+  assert.ok(!Object.values(again.rows).includes("updated"));
+  const after = new Map((await snapshot()).map((row) => [row.id, row]));
+  for (const row of before) assert.deepEqual(after.get(row.id), row, `row ${row.id} unchanged by the re-run`);
+  // The report proves it: only the newly found 0x808 key was written.
+  assert.deepEqual(again.writes, { inserted: 1, updated: 0, blobWrites: 0, metadataWrites: 1, selectionWrites: again.writes.selectionWrites });
+  // A third run with nothing new writes nothing at all.
+  const third = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.deepEqual(third.writes, { inserted: 0, updated: 0, blobWrites: 0, metadataWrites: 0, selectionWrites: 0 });
   assert.equal(again.selection?.selectionConflicts, 1);
   assert.equal(again.ok, false, "a selection conflict is never a clean run");
   // Org A alone has no conflict (its Google group has a native active key).
