@@ -29,6 +29,12 @@ export type EventsShimRoutesInput = {
   relayOrigins: readonly string[];
   /** Relaycast's internal origin and admin secret, for each inbox's temporary workspace. */
   relaycast?: { url: string; internalSecret: string | null };
+  /**
+   * Gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL set): no temporary
+   * workspace is minted or handed out, because a laptop holding any Relaycast
+   * workspace key talks to Relaycast directly, around relaygate.
+   */
+  gateOnly?: boolean;
   fetchImpl?: typeof fetch;
   now?: () => Date;
   /**
@@ -64,7 +70,7 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
   ): Promise<boolean> {
     if (!isEventsShimPath(path)) return false;
     const relative = path.slice(EVENTS_SHIM_PREFIX.length) || "/";
-    const temp: TempWorkspaceDeps | null = input.relaycast
+    const temp: TempWorkspaceDeps | null = input.relaycast && !input.gateOnly
       ? {
         database: input.database,
         keyring: input.keyring,
@@ -77,7 +83,9 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
     const parts = relative.split("/").filter(Boolean);
     // POST /t/<mcp token>/workspace: the inbox's temporary Agent Relay workspace.
     if (method === "POST" && parts.length === 3 && parts[0] === "t" && parts[2] === "workspace") {
-      await send(response, await tempWorkspaceResponse(temp, parts[1]!, input.publicBaseUrl));
+      await send(response, input.gateOnly
+        ? gateOnlyTempWorkspace(input.publicBaseUrl)
+        : await tempWorkspaceResponse(temp, parts[1]!, input.publicBaseUrl));
       return true;
     }
     // Activity keeps that workspace alive: posts (/h/<token>…) and agent calls (/t/<token>/mcp).
@@ -143,6 +151,14 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
 }
 
 const NO_STORE = { "content-type": "application/json", "cache-control": "no-store" };
+
+/** The 404 a control plane that issues no temporary workspaces answers, with the gate-only reason. */
+function gateOnlyTempWorkspace(publicBaseUrl: string): Response {
+  return new Response(JSON.stringify({
+    error: "not_found",
+    message: `This control plane is gate-only and issues no temporary workspaces. Sign this machine's Agent Relay in to ${publicBaseUrl}.`,
+  }), { status: 404, headers: NO_STORE });
+}
 
 async function tempWorkspaceResponse(temp: TempWorkspaceDeps | null, mcpToken: string, publicBaseUrl: string): Promise<Response> {
   if (!temp) {

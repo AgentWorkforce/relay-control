@@ -11,8 +11,11 @@ import {
 } from "./acquisition/assertion.js";
 
 import { loadDesktopReleasesRepo } from "./desktop-releases.js";
+import type { GithubAppConfig } from "./admin/github-app.js";
+import { canonicalRelayhistoryOrigin } from "./relayhistory-origin.js";
 
 export type SelfhostConfig = {
+  githubApp?: GithubAppConfig | null;
   databaseUrl: string;
   publicBaseUrl: string;
   relaycastUrl: string;
@@ -36,8 +39,14 @@ export type SelfhostConfig = {
   flowsWorkspaceDelete?: { url: string; secret: string } | null;
   /** Dedicated relay-agent support HTTP connection; no customer allowlist. */
   customerSupport?: { url: string; token: string } | null;
-  /** Independent read service; owns issuance, rotation and verification of its tokens. Required. */
-  sessionReadApi: { url: string; publicUrl: string; secret: string };
+  /**
+   * Independent read service; owns issuance, rotation and verification of its tokens. Required.
+   * mintReaderKind: send `reader_kind` in the mint body. True only on gate-only
+   * installs (SELFHOST_RELAYGATE_PUBLIC_URL set): relaygate reads it and strips
+   * it before proxying, and the read API's strict mint schema rejects it.
+   * Absent means false.
+   */
+  sessionReadApi: { url: string; publicUrl: string; secret: string; mintReaderKind?: boolean };
   /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
   sessionErasureApi?: { url: string; secret: string } | null;
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
@@ -66,10 +75,15 @@ export type SelfhostConfig = {
    */
   introspectSecret?: string | null;
   /**
-   * Origins accepted as the introspection `aud`, from
-   * SELFHOST_INTROSPECT_AUDIENCES. Defaults to [relayhistoryPublicUrl].
+   * General service origins accepted as the introspection `aud`, from
+   * SELFHOST_INTROSPECT_AUDIENCES. Defaults to []; History is separate.
    */
   introspectAudiences?: string[];
+  /**
+   * Canonical History origins allowed to receive a user bearer, from
+   * SELFHOST_RELAYHISTORY_AUDIENCES. Defaults to [relayhistoryPublicUrl].
+   */
+  relayhistoryAudiences?: string[];
   /**
    * SELFHOST_INTROSPECT_OUTAGE_HOLD_MS: how long an `sh_at_` token's last
    * ACTIVE introspection verdict may answer while the database is unreachable
@@ -113,6 +127,25 @@ export type SelfhostConfig = {
    */
   eventsShimRelayOrigins?: string[] | null;
   /**
+   * SELFHOST_RELAYGATE_PUBLIC_URL: the public https origin of relaygate, the
+   * governance gateway that is the only public way into Relaycast on a
+   * gate-only install. Set: GET /api/v1/workspaces/{id}/resolve answers
+   * `urls.relaygateUrl` and never the workspace-wide Relaycast key
+   * (`relaycastApiKey` is omitted), so a device enrols through the gate
+   * instead. Null or absent: resolve hands out the key as before.
+   */
+  relaygatePublicUrl?: string | null;
+  /**
+   * SELFHOST_RELAY_NODE_SELF_MINT (docs/relay-node-credential.md, "Member
+   * self-mint"): on a gate-only install, whether a member's signed-in Agent
+   * Relay Desktop may mint its own relay-node token at
+   * POST /api/v1/workspaces/{id}/relay-node/self-tokens. Default true;
+   * `false`, `0` or `off` turns it off (403 `self_mint_disabled`), and the
+   * owner/admin mint is unchanged either way. Absent means true. Ignored
+   * when relaygatePublicUrl is null: those routes are then 404.
+   */
+  relayNodeSelfMint?: boolean;
+  /**
    * SELFHOST_IMAGE_VERSION: the image tag, set by the image (Dockerfile).
    * Null when run from source. Shown by GET /cloud/api/health and telemetry.
    */
@@ -154,7 +187,8 @@ export type DesktopFeedSignerConfig =
 
 export type DesktopFeedStorageConfig =
   | { kind: "memory" }
-  | { kind: "s3"; bucket: string; region: string; prefix: string };
+  | { kind: "s3"; bucket: string; region: string; prefix: string }
+  | { kind: "gcs"; bucket: string; prefix: string };
 
 export type DesktopFeedConfig = {
   signer: DesktopFeedSignerConfig;
@@ -199,6 +233,23 @@ export type FactoryConfig = {
 };
 
 export type OperatorOAuthApp = { clientId: string; clientSecret: string; scopes: string[] | null };
+
+/** The same App registration as Cloud/Nango; never resolve or copy Cloud secrets here. */
+export function loadGithubAppConfig(env: Env): GithubAppConfig | null {
+  const appId = env.SELFHOST_GITHUB_APP_ID?.trim();
+  const pem = readSecret(env, "SELFHOST_GITHUB_APP_PRIVATE_KEY");
+  if (!appId && !pem) return null;
+  if (!appId || !/^[1-9][0-9]*$/.test(appId) || !pem) {
+    throw new Error("SELFHOST_GITHUB_APP_ID and SELFHOST_GITHUB_APP_PRIVATE_KEY (or _FILE) are required together");
+  }
+  try {
+    const privateKey = createPrivateKey(pem);
+    if (privateKey.asymmetricKeyType !== "rsa" || (privateKey.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) throw new Error();
+    return { appId, privateKey };
+  } catch {
+    throw new Error("SELFHOST_GITHUB_APP_PRIVATE_KEY must be an RSA private key of at least 2048 bits");
+  }
+}
 
 /**
  * SELFHOST_OAUTH_GITHUB_CLIENT_ID + SELFHOST_OAUTH_GITHUB_CLIENT_SECRET (or
@@ -394,9 +445,22 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
 
   refuseRemovedHistoryVariables(env);
   // One History origin, the read API's. Nothing may name a second one.
-  const sessionReadApi = loadSessionReadApiConfig(env);
-  const introspection = loadIntrospectionConfig(env, sessionReadApi.publicUrl);
-  assertHistoryIntrospection(introspection, sessionReadApi.publicUrl);
+  const relaygatePublicUrl = loadRelaygatePublicUrl(env);
+  const sessionReadApi = { ...loadSessionReadApiConfig(env), mintReaderKind: relaygatePublicUrl !== null };
+  const loadedIntrospection = loadIntrospectionConfig(env);
+  const relayhistoryAudiences = loadRelayhistoryAudiences(env, sessionReadApi.publicUrl);
+  const relayhistoryAudienceSet = new Set(relayhistoryAudiences);
+  const introspectAudiences = loadedIntrospection.introspectAudiences.filter((audience) => {
+    const canonicalHistoryAudience = canonicalRelayhistoryOrigin(audience);
+    return canonicalHistoryAudience === null || !relayhistoryAudienceSet.has(canonicalHistoryAudience);
+  });
+  if (introspectAudiences.length !== loadedIntrospection.introspectAudiences.length) {
+    console.warn(
+      "[selfhost-api] ignoring History origins in SELFHOST_INTROSPECT_AUDIENCES; configure them only in SELFHOST_RELAYHISTORY_AUDIENCES",
+    );
+  }
+  const introspection = { ...loadedIntrospection, introspectAudiences };
+  assertHistoryIntrospection(introspection, relayhistoryAudiences, sessionReadApi.publicUrl);
   return {
     databaseUrl: loadDatabaseUrl(env),
     publicBaseUrl: serviceUrl(env, "SELFHOST_PUBLIC_URL"),
@@ -413,6 +477,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     sessionReadMcpReads: loadSessionReadMcpReads(env),
     sessionSearchAgentTokens: loadSessionSearchAgentTokens(env),
     ...introspection,
+    relayhistoryAudiences,
     acquisitionIssuer: loadAcquisitionIssuerConfig(env, introspection),
     bootstrapToken,
     encryptionKeyring: loadEncryptionKeyring(env),
@@ -422,6 +487,8 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     historyUpload: loadHistoryUploadConfig(env),
     capturePolicyUploads: loadCapturePolicyUploads(env),
     eventsShimRelayOrigins: loadEventsShimRelayOrigins(env),
+    relaygatePublicUrl,
+    relayNodeSelfMint: loadRelayNodeSelfMint(env),
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
@@ -561,13 +628,14 @@ function loadSessionReadApiConfig(env: Env): SelfhostConfig["sessionReadApi"] {
 /** The ingest edge authorizes every upload through introspection of this audience. */
 function assertHistoryIntrospection(
   introspection: { introspectSecret: string | null; introspectAudiences: string[] },
+  relayhistoryAudiences: string[],
   publicUrl: string,
 ): void {
   if (!introspection.introspectSecret) {
     throw new Error("RELAYCONTROL_INTROSPECT_SECRET is required: the sessions pipeline verifies every History token through introspection");
   }
-  if (!introspection.introspectAudiences.includes(publicUrl)) {
-    throw new Error("SELFHOST_INTROSPECT_AUDIENCES must include SESSION_READ_API_PUBLIC_URL");
+  if (!relayhistoryAudiences.includes(publicUrl)) {
+    throw new Error("SELFHOST_RELAYHISTORY_AUDIENCES must include SESSION_READ_API_PUBLIC_URL");
   }
 }
 
@@ -681,7 +749,7 @@ export function loadIntrospectOutageHoldMs(env: Env): number {
   return value;
 }
 
-function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
+function loadIntrospectionConfig(env: Env): {
   introspectSecret: string | null;
   introspectAudiences: string[];
   introspectOutageHoldMs: number;
@@ -694,11 +762,28 @@ function loadIntrospectionConfig(env: Env, relayhistoryPublicUrl: string): {
   const introspectAudiences = raw
     ? raw.split(",").map((value) => value.trim()).filter(Boolean).map((value) =>
       audienceOrigin(value, "each SELFHOST_INTROSPECT_AUDIENCES entry"))
-    : [relayhistoryPublicUrl];
-  if (introspectAudiences.length === 0) {
+    : [];
+  if (raw && introspectAudiences.length === 0) {
     throw new Error("SELFHOST_INTROSPECT_AUDIENCES must name at least one origin");
   }
   return { introspectSecret, introspectAudiences, introspectOutageHoldMs: loadIntrospectOutageHoldMs(env) };
+}
+
+function loadRelayhistoryAudiences(env: Env, relayhistoryPublicUrl: string): string[] {
+  const raw = env.SELFHOST_RELAYHISTORY_AUDIENCES?.trim();
+  const values = raw ? raw.split(",").map((value) => value.trim()).filter(Boolean) : [relayhistoryPublicUrl];
+  if (values.length === 0) {
+    throw new Error("SELFHOST_RELAYHISTORY_AUDIENCES must name at least one origin");
+  }
+  return values.map((value) => {
+    const canonical = canonicalRelayhistoryOrigin(value);
+    if (canonical === null) {
+      throw new Error(
+        "each SELFHOST_RELAYHISTORY_AUDIENCES entry must be an HTTPS origin, or HTTP on explicit loopback",
+      );
+    }
+    return canonical;
+  });
 }
 
 /**
@@ -814,6 +899,7 @@ function absoluteHttpUrl(env: Env, name: string, fallback: string): string {
 }
 
 function loadAdminConfig(env: Env, publicBaseUrl: string): {
+  githubApp: GithubAppConfig | null;
   internalServiceToken: string | null;
   oauthRedirectUrl: string;
   dashboardUrl: string;
@@ -835,6 +921,7 @@ function loadAdminConfig(env: Env, publicBaseUrl: string): {
   }
   return {
     internalServiceToken,
+    githubApp: loadGithubAppConfig(env),
     oauthRedirectUrl,
     dashboardUrl: absoluteHttpUrl(env, "SELFHOST_DASHBOARD_URL", `${publicBaseUrl}/`),
     operatorOAuthApps: loadOperatorOAuthApps(env),
@@ -863,8 +950,22 @@ function feedProfileMap(env: Env, name: string): Record<string, unknown> {
 }
 
 /**
+ * The object key prefix. Unset, empty or only slashes: the default. Segments
+ * use only characters that encodeURIComponent and the SigV4/V4 canonical
+ * encodings agree on.
+ */
+function feedStoragePrefix(env: Env, name: string): string {
+  const prefix = (env[name] ?? "").trim().replace(/^\/+|\/+$/g, "") || "desktop-feed";
+  if (!/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(prefix)
+    || prefix.split("/").some((segment) => segment === "." || segment === "..")) {
+    throw new Error(`${name} must be [A-Za-z0-9._-] segments separated by /`);
+  }
+  return prefix;
+}
+
+/**
  * SELFHOST_DESKTOP_FEED_SIGNER (awskms | file | memory) and
- * SELFHOST_DESKTOP_FEED_STORAGE (s3 | memory) together turn the feed on;
+ * SELFHOST_DESKTOP_FEED_STORAGE (s3 | gcs | memory) together turn the feed on;
  * with neither set it is off. Setting only one is a configuration error, so a
  * half-configured feed never starts silently disabled.
  */
@@ -920,18 +1021,18 @@ export function loadDesktopFeedConfig(env: Env = process.env): DesktopFeedConfig
     if (!region || !/^[a-z0-9-]+$/.test(region)) {
       throw new Error("SELFHOST_DESKTOP_FEED_S3_REGION (or AWS_REGION) is required for s3 feed storage");
     }
-    // Unset, empty or only slashes: the default. Segments use only characters
-    // that encodeURIComponent and SigV4 canonical encoding agree on.
-    const prefix = (env.SELFHOST_DESKTOP_FEED_S3_PREFIX ?? "").trim().replace(/^\/+|\/+$/g, "") || "desktop-feed";
-    if (!/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(prefix)
-      || prefix.split("/").some((segment) => segment === "." || segment === "..")) {
-      throw new Error("SELFHOST_DESKTOP_FEED_S3_PREFIX must be [A-Za-z0-9._-] segments separated by /");
+    storage = { kind: "s3", bucket, region, prefix: feedStoragePrefix(env, "SELFHOST_DESKTOP_FEED_S3_PREFIX") };
+  } else if (storageKind === "gcs") {
+    const bucket = required(env, "SELFHOST_DESKTOP_FEED_GCS_BUCKET");
+    // Requests and signed URLs are path-style on storage.googleapis.com, so dots are fine.
+    if (!/^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/.test(bucket) || bucket.includes("..")) {
+      throw new Error("SELFHOST_DESKTOP_FEED_GCS_BUCKET must be a GCS bucket name");
     }
-    storage = { kind: "s3", bucket, region, prefix };
+    storage = { kind: "gcs", bucket, prefix: feedStoragePrefix(env, "SELFHOST_DESKTOP_FEED_GCS_PREFIX") };
   } else if (storageKind === "memory") {
     storage = { kind: "memory" };
   } else {
-    throw new Error("SELFHOST_DESKTOP_FEED_STORAGE must be s3 or memory");
+    throw new Error("SELFHOST_DESKTOP_FEED_STORAGE must be s3, gcs or memory");
   }
   const publisherTokenHashes: Record<string, string[]> = {};
   if (env.SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES?.trim()) {
@@ -990,6 +1091,26 @@ function uploadEndpoint(env: Env, name: string): string | null {
  * SELFHOST_EVENTS_SHIM_RELAY_ORIGINS: comma list of https origins (no path,
  * query or credentials). Unset or empty: null (use RELAYCAST_PUBLIC_URL).
  */
+/**
+ * SELFHOST_RELAYGATE_PUBLIC_URL: optional; when set, a public https origin
+ * (validated like RELAYCAST_PUBLIC_URL). Unset or blank: null.
+ */
+export function loadRelaygatePublicUrl(env: Env = process.env): string | null {
+  if (!env.SELFHOST_RELAYGATE_PUBLIC_URL?.trim()) return null;
+  return publicServiceUrl(env, "SELFHOST_RELAYGATE_PUBLIC_URL");
+}
+
+/**
+ * SELFHOST_RELAY_NODE_SELF_MINT: unset, blank, `true`, `1` or `on`: true;
+ * `false`, `0` or `off`: false; anything else refuses startup.
+ */
+export function loadRelayNodeSelfMint(env: Env = process.env): boolean {
+  const value = env.SELFHOST_RELAY_NODE_SELF_MINT?.trim().toLowerCase();
+  if (!value || value === "true" || value === "1" || value === "on") return true;
+  if (value === "false" || value === "0" || value === "off") return false;
+  throw new Error("SELFHOST_RELAY_NODE_SELF_MINT must be true or false");
+}
+
 export function loadEventsShimRelayOrigins(env: Env = process.env): string[] | null {
   const raw = env.SELFHOST_EVENTS_SHIM_RELAY_ORIGINS?.trim();
   if (!raw) return null;

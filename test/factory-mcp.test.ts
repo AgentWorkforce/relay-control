@@ -178,6 +178,7 @@ test("send and read accept as=<own bound factory agent>; inbox, leave and channe
       return { message: { id: "1" }, conversationId: "conv-1" };
     },
     listConversations: async (used: string) => { read.push(used); return []; },
+    getMessageDeliveries: async (used: string, id: string) => { assert.equal(used, token); assert.equal(id, "1"); return []; },
   };
   const context = (factory = true) => mcpContext(env, env.ownerId, {
     relay: { database: env.database, keyring: env.config.encryptionKeyring, client, sessionId: undefined },
@@ -192,6 +193,10 @@ test("send and read accept as=<own bound factory agent>; inbox, leave and channe
   const conversation = await relayService(context()).read({ agent: "peer-agent", as: name, limit: 10 });
   assert.equal(conversation.you, name);
   assert.deepEqual(read, [token]);
+  const receipt = await relayService(context()).messageStatus({ message_id: "1", as: name });
+  assert.equal(receipt.you, name);
+  assert.equal(receipt.confirmation, "available");
+  await assert.rejects(relayService(context(false)).messageStatus({ message_id: "1", as: name }), { message: NO_PARTICIPANT });
 
   await assert.rejects(relayService(context()).inbox(name, []), { message: NO_PARTICIPANT });
   await assert.rejects(relayService(context()).leave(name), { message: NO_PARTICIPANT });

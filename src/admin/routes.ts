@@ -46,6 +46,8 @@ export type AdminRouteHelpers = {
   organizationAccess(request: IncomingMessage, organizationId: string, admin: boolean): Promise<unknown>;
   requestObject(request: IncomingMessage): Promise<JsonObject>;
   bearer(request: IncomingMessage): string | null;
+  /** app.ts's shared limiter: throws 429 (with retry-after) once `key` passes `rule`. */
+  rateLimit(response: ServerResponse, key: string, rule: { limit: number; windowMs: number }): void;
 };
 
 /**
@@ -113,6 +115,9 @@ function html(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+/** Member relay-node self-mint: mints per person per hour. */
+const SELF_MINT_RATE = { limit: 10, windowMs: 60 * 60 * 1_000 };
+
 function userActor(access: WorkspaceAccess): AuditActor & { kind: "user" } {
   return { kind: "user", userId: access.principal.userId };
 }
@@ -163,6 +168,7 @@ export function createAdminModule(input: {
     config.oauthRedirectUrl,
     input.fetchImpl,
     config.operatorOAuthApps ?? {},
+    config.githubApp ?? null,
   );
 
   /** A same-origin dashboard URL to return to after the provider callback, or null. */
@@ -247,12 +253,30 @@ export function createAdminModule(input: {
     // Here a selected coding-agent credential (Settings > Connections)
     // wins over a same-named workspace variable, and integration env wins
     // over both.
-    const env = { ...environment.env, ...agentEnvironment.env, ...integrationEnv };
+    const blocked = new Set(agentEnvironment.blockedNames);
+    const blockedPrefixes = agentEnvironment.blockedPrefixes;
+    const blockedWorkspaceNames: string[] = [];
+    const workspaceEnv: Record<string, string> = {};
+    for (const [name, value] of Object.entries(environment.env)) {
+      if (blocked.has(name) || blockedPrefixes.some((prefix) => name.startsWith(prefix))) {
+        blockedWorkspaceNames.push(name);
+      } else {
+        workspaceEnv[name] = value;
+      }
+    }
+    const skipped = new Map<string, { name: string; reason: string }>();
+    for (const name of blockedWorkspaceNames) {
+      skipped.set(name, { name, reason: "relay_managed_blocked" });
+    }
+    for (const entry of [...environment.skipped, ...agentEnvironment.skipped]) {
+      if (!skipped.has(entry.name)) skipped.set(entry.name, entry);
+    }
+    const env = { ...workspaceEnv, ...agentEnvironment.env, ...integrationEnv };
     return {
       workspaceId,
       env,
       secretEnvNames: Object.keys(env).sort(),
-      skipped: [...environment.skipped, ...agentEnvironment.skipped],
+      skipped: [...skipped.values()],
       integrationErrors: failed,
     };
   }
@@ -512,6 +536,11 @@ export function createAdminModule(input: {
           const configured = provider.authMode === "api_key" || operator || app !== null;
           return {
             ...catalogEntry(provider),
+            ...(provider.id === "github" ? {
+              supportedAuthModes: ["OAUTH2", "APP"],
+              githubAppConfigured: Boolean(config.githubApp),
+              githubAppSetup: "import",
+            } : {}),
             configured,
             configuredBy: provider.authMode === "api_key" ? null : operator ? "operator" : app ? "workspace" : null,
             ...(configured
@@ -619,6 +648,17 @@ export function createAdminModule(input: {
       }
     }
 
+    const integrationSettings = match(rest, /^integrations\/([^/]+)\/settings$/);
+    if (integrationSettings && method === "PATCH") {
+      requireJsonWrite(request, helpers);
+      const access = await helpers.workspaceAccess(request, workspaceId, true);
+      const body = await helpers.requestObject(request);
+      if (Object.keys(body).some((key) => !["connectionId", "displayName", "version"].includes(key))) throw new AdminHttpError(400, "invalid_request", "Only the connection display name can be edited here");
+      const updated = await connections.updateDisplayName({ workspaceId: access.workspace.id, organizationId: access.workspace.organizationId, provider: integrationSettings[0]!, connectionId: body.connectionId, displayName: body.displayName, version: body.version, actor: userActor(access) });
+      json(response, 200, updated);
+      return true;
+    }
+
     const integrationStatus = match(rest, /^integrations\/([^/]+)\/status$/);
     const integrationItem = match(rest, /^integrations\/([^/]+)$/);
     const providerId = integrationStatus?.[0] ?? integrationItem?.[0];
@@ -660,6 +700,8 @@ export function createAdminModule(input: {
           organizationId: access.workspace.organizationId,
           provider: providerId,
           actor: userActor(access),
+          ...(url.searchParams.get("connectionId") ? { connectionId: url.searchParams.get("connectionId")! } : {}),
+          ...(url.searchParams.has("version") ? { version: url.searchParams.get("version") } : {}),
         });
         json(response, 200, {
           success: true,
@@ -744,6 +786,72 @@ export function createAdminModule(input: {
       if (!revoked) throw new AdminHttpError(404, "token_not_found", "Token not found");
       response.writeHead(204, { "cache-control": "no-store" });
       response.end();
+      return true;
+    }
+
+    // Member self-mint of a relay-node token (gate-only installs only;
+    // docs/relay-node-credential.md, "Member self-mint"). Any workspace
+    // member, but only from a redeemed Agent Relay Desktop session, and only
+    // for the caller's own relay-node tokens. Not gate-only: 404 not_found.
+    const selfTokens = rest === "relay-node/self-tokens";
+    const selfTokenItem = match(rest, /^relay-node\/self-tokens\/([^/]+)$/);
+    if (
+      (selfTokens && (method === "GET" || method === "POST")) ||
+      (selfTokenItem && method === "DELETE")
+    ) {
+      if (!config.relaygatePublicUrl) return false;
+      requireJsonWrite(request, helpers);
+      const access = await helpers.workspaceAccess(request, workspaceId, false);
+      const desktopHostName = access.principal.handoff ? undefined : access.principal.desktopHostName;
+      if (!desktopHostName) {
+        throw new AdminHttpError(
+          403,
+          "desktop_session_required",
+          "Relay-node self-mint needs a signed-in Agent Relay Desktop session",
+        );
+      }
+      if (config.relayNodeSelfMint === false) {
+        throw new AdminHttpError(
+          403,
+          "self_mint_disabled",
+          "Relay-node self-mint is turned off on this install; ask a workspace admin for a token",
+        );
+      }
+      if (selfTokenItem) {
+        const revoked = await apiTokens.revokeSelfMintedRelayNode({
+          workspaceId: access.workspace.id,
+          organizationId: access.workspace.organizationId,
+          tokenId: selfTokenItem[0]!,
+          desktopHostName,
+          actor: userActor(access),
+        });
+        if (!revoked) throw new AdminHttpError(404, "token_not_found", "Token not found");
+        response.writeHead(204, { "cache-control": "no-store" });
+        response.end();
+        return true;
+      }
+      if (method === "GET") {
+        json(response, 200, {
+          tokens: await apiTokens.listSelfMintedRelayNode({
+            workspaceId: access.workspace.id,
+            userId: access.principal.userId,
+          }),
+        });
+        return true;
+      }
+      helpers.rateLimit(response, `relay-node-self-mint:${access.principal.userId}`, SELF_MINT_RATE);
+      const body = await helpers.requestObject(request);
+      const token = await apiTokens.createSelfMintedRelayNode({
+        workspaceId: access.workspace.id,
+        organizationId: access.workspace.organizationId,
+        nodeName: body.nodeName,
+        label: body.label,
+        expiryDays: body.expiryDays,
+        neverExpires: body.neverExpires,
+        desktopHostName,
+        actor: userActor(access),
+      });
+      json(response, 201, token);
       return true;
     }
 

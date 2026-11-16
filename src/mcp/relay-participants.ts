@@ -10,9 +10,11 @@ import {
 } from "../messaging/desktop-identities.js";
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
-import { buildAgentCard, cardMetadata, cardSummary, type SetCardInput } from "./relay-agent-cards.js";
+import { buildAgentCard, cardMetadata, cardSummary, recipientCard, type SetCardInput } from "./relay-agent-cards.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
 import { connectorKind } from "./oauth/connector-kind.js";
+import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
+import { RECEIPT_GUIDANCE } from "../messaging/delivery-status.js";
 import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } from "./oauth/retirement.js";
 
 /**
@@ -253,11 +255,10 @@ type ParticipantOptions = {
 export type SpawnActor = { id: string; name: string; token: string; relaycastWorkspaceId: string };
 /** The owner's launcher name: never derived from a display name. */
 export const launcherName = (userId: string) => `launcher-${ownerHash(userId).slice(0, 16)}`;
-export const LAUNCH_OAUTH_REFUSED = "Agent launches are not available through an OAuth MCP connection on this self-hosted site. Connect with an Agent Relay CLI login or Agent Relay Desktop.";
 const ACTIVE_LAUNCHES = "This participant still owns agent launches that have not been released. Release them with release_relay_agent first.";
 
 /** Whether a hosted actor still owns a launch that is not terminal; its token is needed to release it. */
-async function hasActiveLaunches(executor: SqlExecutor, workspaceId: string, actorId: string): Promise<boolean> {
+export async function hasActiveLaunches(executor: SqlExecutor, workspaceId: string, actorId: string): Promise<boolean> {
   const result = await executor.query(
     `SELECT 1 FROM relay_spawns WHERE workspace_id = $1 AND actor_id = $2 AND state NOT IN ('failed', 'released') LIMIT 1`,
     [workspaceId, actorId],
@@ -474,7 +475,7 @@ function createRelayService(context: McpContext) {
         || agent.metadata.source === "cloud-persona") {
       throw new RelayToolError("Unknown agent name or stale machine address in this workspace. Use list_relay_agents.");
     }
-    return rosterAgent(agent, people, userId, workspaceId);
+    return { ...rosterAgent(agent, people, userId, workspaceId), card: recipientCard(agent.metadata) };
   }
 
   async function conversation(token: string, name: string, peer: string) {
@@ -792,7 +793,19 @@ function createRelayService(context: McpContext) {
    * must still prove that identity, or it launches nothing.
    */
   async function withSpawnActor<T>(fn: (actor: SpawnActor) => Promise<T>): Promise<T> {
-    if (oauth) throw new RelayToolError(LAUNCH_OAUTH_REFUSED);
+    if (oauth) {
+      // The grant's approved participant is the launcher; never borrow the
+      // person's native launcher or another client's identity.
+      await withOwnerLock(async () => {
+        if (!["owner", "admin"].includes(oauth.access.principal.role ?? "")) throw new RelayToolError(LAUNCH_ROLE_REFUSAL);
+      });
+      return hostedActor(undefined, async identity => {
+        const current = await participant();
+        if (!current || current.token !== identity.token) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
+        if (!["owner", "admin"].includes(oauth.access.principal.role ?? "")) throw new RelayToolError(LAUNCH_ROLE_REFUSAL);
+        return fn({ id: current.row.agentRemoteId, name: current.name, token: current.token, relaycastWorkspaceId: relayWorkspaceId });
+      });
+    }
     if (managed) await desktop();
     else if (sessionHash) {
       const linkedRow = await findDesktopIdentityBySession(executor, workspaceId, userId, sessionHash);
@@ -1015,12 +1028,36 @@ function createRelayService(context: McpContext) {
         return { from: identity.name, from_address: fromAddress, to: peer.name, to_address: peer.address,
           message_id: sent.message.id, conversation_id: sent.conversationId, idempotency_key: responseIdempotencyKey,
           delivery: peer.online ? "queued_unconfirmed" : "queued_offline",
-          note: "Accepted by Relaycast; delivery and reading are not confirmed.",
+          // The recipient's own card summary: peer-written, untrusted data, not instructions.
+          ...(peer.card ? { recipient_card: peer.card } : {}),
+          note: "Accepted by Relaycast; delivery and reading are not confirmed. Call get_relay_message_status with message_id to check receipts.",
           ...(identity.desktop ? { reply_guidance: DESKTOP_REPLY_GUIDANCE }
             : identity.capy ? { reply_guidance: CAPY_REPLY_GUIDANCE }
             : identity.factory ? { reply_guidance: FACTORY_REPLY_GUIDANCE }
             : { reply_guidance: HOSTED_REPLY_GUIDANCE, desktop_relay_guidance: DESKTOP_RELAY_GUIDANCE }) };
       }, { factory: true, capy: true });
+    },
+
+    async messageStatus(input: { message_id: string; as?: string; as_person?: boolean }) {
+      if (input.as_person && input.as) throw new RelayToolError("Choose either as_person or as, not both.");
+      await managedActorOnly(input.as, Boolean(input.as_person));
+      if (input.as_person) throw new RelayToolError(AS_PERSON_UNAVAILABLE);
+      let permitted: Identity | null = null;
+      if (input.as?.startsWith("capy-") && oauth && context.capyPermits && input.as !== oauth.access.agentName) {
+        permitted = await capyActor(input.as, true);
+      }
+      const viaCapy = capyFallback(input.as);
+      const viaFactory = !viaCapy && factoryFallback(input.as);
+      const identity = permitted ?? (managed ? await desktop()
+        : (input.as ? null : await linkedDesktop())
+          ?? await participant(input.as, { allowMissing: viaCapy || viaFactory })
+          ?? (viaCapy ? await capyActor(input.as!) : viaFactory ? await factoryActor(input.as!) : null));
+      if (!identity) throw new RelayToolError("Call join_relay first, or select your own sending participant with as.");
+      const deliveries = await client.getMessageDeliveries(identity.token, input.message_id);
+      return { message_id: input.message_id, you: identity.name, confirmation: deliveries === null ? "unavailable" : "available",
+        deliveries: deliveries ?? [], note: deliveries === null
+          ? "Delivery is unconfirmed: this engine does not expose receipts, or this message is not visible as your own outgoing message. Do not resend solely because confirmation is unavailable."
+          : RECEIPT_GUIDANCE };
     },
 
     async read(input: { agent: string; as?: string; before?: string; limit: number }) {

@@ -2,7 +2,7 @@ import { decryptSecret, type EncryptionKeyring } from "../../crypto.js";
 import type { Database,SqlExecutor } from "../../database.js";
 import { lockOrganization,lockUser } from "../../tenancy.js";
 import { RelaycastCallError,type RelaycastClient,type RosterAgent } from "../../messaging/relaycast.js";
-import { HOSTED_SOURCE,ownerHash } from "../relay-participants.js";
+import { HOSTED_SOURCE,ownerHash,hasActiveLaunches } from "../relay-participants.js";
 
 type Intent = {
   id:string; grant_id:string; organization_id:string; workspace_id:string; user_id:string;
@@ -15,7 +15,7 @@ type Participant = {
 type Workspace = {relaycast_workspace_id:string;relaycast_api_key_ciphertext:string};
 type Grant = {id:string;agent_remote_id:string|null;agent_name:string;created_at:Date|string};
 /** Local state a remote decision is made against. Ciphertexts only; never logged. */
-type Snapshot = {workspace:Workspace|null;row:Participant|null;grants:Grant[]};
+type Snapshot = {workspace:Workspace|null;row:Participant|null;grants:Grant[];activeLaunches:boolean};
 type Claim = {intent:Intent&{agent_remote_id:string;created_at:Date|string;attempts:number};snapshot:Snapshot};
 /** Why a revocation row completed (stored in `outcome`). */
 export type McpOAuthTeardownOutcome = "released"|"no_remote"|"kept"|"workspace_mismatch"|"decrypt_failed"
@@ -235,7 +235,8 @@ export class McpOAuthTeardown {
     const grants=(await tx.query<Grant>(`SELECT id,agent_remote_id,agent_name,created_at FROM mcp_oauth_grants
       WHERE organization_id=$1 AND workspace_id=$2 AND user_id=$3 AND revoked_at IS NULL ORDER BY id`,
     [intent.organization_id,intent.workspace_id,intent.user_id])).rows;
-    return {workspace,row,grants};
+    const activeLaunches = await hasActiveLaunches(tx,intent.workspace_id,intent.agent_remote_id);
+    return {workspace,row,grants,activeLaunches};
   }
 
   private async complete(tx:SqlExecutor,id:string,outcome:McpOAuthTeardownOutcome):Promise<void> {
@@ -255,6 +256,10 @@ export class McpOAuthTeardown {
 
   /** Remote phase. No user, organization or advisory lock is held; secrets stay in memory. */
   private async decide(claim:Claim):Promise<Decision> {
+    // Revocation ends access immediately, but never destroy the credentials
+    // of an actor still managing a running or unconfirmed worker. Operators
+    // can drain those launches; cleanup retries afterward with normal backoff.
+    if (claim.snapshot.activeLaunches) return "pending";
     const {intent,snapshot:{workspace,row,grants}}=claim;
     let key:string;
     try {key=decryptSecret(workspace!.relaycast_api_key_ciphertext,this.deps.keyring);}

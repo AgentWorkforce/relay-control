@@ -13,6 +13,7 @@ import type { ControlPlaneStore, Principal } from "../store.js";
 import { ApiTokenStore } from "../admin/api-tokens.js";
 import { recordAudit, type AuditActor } from "../admin/audit.js";
 import { clientIp, cookieRequestAllowed, limiterKey, RateLimiter } from "../auth/device-approval.js";
+import { controlSessionToken } from "../auth/session-cookie.js";
 import { canonicalBytes, canonicalize } from "./canonical.js";
 import { strictParse } from "./strict-json.js";
 import { DRAFT_CREATE_SCHEMA, ENVELOPE_SCHEMA } from "./schemas.js";
@@ -183,19 +184,6 @@ function bearerToken(request: IncomingMessage): string | null {
   if (!header) return null;
   const match = /^Bearer\s+(.+)$/i.exec(header);
   return match?.[1]?.trim() || null;
-}
-
-function cookieValue(request: IncomingMessage, name: string): string | null {
-  for (const part of (request.headers.cookie ?? "").split(";")) {
-    const separator = part.indexOf("=");
-    if (separator < 0 || part.slice(0, separator).trim() !== name) continue;
-    try {
-      return decodeURIComponent(part.slice(separator + 1).trim()) || null;
-    } catch {
-      return null;
-    }
-  }
-  return null;
 }
 
 function decodeSegment(value: string): string | null {
@@ -373,7 +361,7 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
   /** Steps 1 and 2 of the check precedence; 401s also spend the per-IP budget. */
   async function resolveCredential(request: IncomingMessage, rawPath: string, ip: string): Promise<Credential> {
     const headerToken = bearerToken(request);
-    const cookieToken = rawPath.startsWith("/cloud/") ? cookieValue(request, SESSION_COOKIE) : null;
+    const cookieToken = rawPath.startsWith("/cloud/") ? controlSessionToken(request.headers.cookie) : null;
     if (headerToken && cookieToken) {
       throw new FeedError(400, "mixed_credentials", "Send exactly one credential");
     }
@@ -1004,7 +992,14 @@ export function createDesktopFeedHandler(input: DesktopFeedHandlerInput) {
     const noStorage = () => new FeedError(501, "no_object_storage", "This deployment streams assets; use GET /assets/{assetId}");
     if (!host || !signedHosts.includes(host)) throw noStorage();
     const issued = now();
-    const url = await storage.presignGet(found.storageKey!, DOWNLOAD_URL_SECONDS, issued);
+    let url: URL | null;
+    try {
+      url = await storage.presignGet(found.storageKey!, DOWNLOAD_URL_SECONDS, issued);
+    } catch (error) {
+      // For gcs this is IAM signBlob: a missing roles/iam.serviceAccountTokenCreator shows up here.
+      storageFailed("presign", found.storageKey!, error);
+      throw error;
+    }
     if (!url) throw noStorage();
     return {
       status: 200,

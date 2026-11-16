@@ -18,14 +18,17 @@ setting that enables it.
   dashboard session, or an Agent Relay Desktop provider credential. A
   managed Desktop chat, or a session linked with `join_relay desktop_address`,
   must still prove its Desktop identity or it launches nothing.
-- **Not** over an OAuth MCP connection: the tools are not registered there and
-  `describe_capabilities` says why. Workspace API tokens and service tokens are
-  refused at admission as before.
+- An **OAuth MCP connection** may launch as the agent approved for its exact
+  workspace grant, when the consenting person is currently an owner or admin.
+  Grant revocation, credential expiry and demotion are checked on every call.
+  Workspace API tokens and service tokens remain refused at admission.
 
-Every launch is sent as the owner's **launcher** participant, a hosted relay
+Native launches are sent as the owner's **launcher** participant, a hosted relay
 agent named `launcher-<hash of the user id>`. It is never a person, a Desktop
 identity or another chat's participant, so relinking or leaving a chat does
-not strand a launch. `leave_relay` refuses to remove a participant that still
+not strand a launch. OAuth launches use the grant's immutable approved agent
+instead; a different grant cannot inspect or release the old grant's launches.
+`leave_relay` refuses to remove a participant that still
 owns a launch that is not failed or released.
 
 ## Where a launch can go
@@ -35,7 +38,9 @@ workspace's own Relaycast key**. A node enrolled in another workspace or
 another installation is never listed and cannot be selected. Owners come from
 `fleet_node_owners` rows for this workspace and its Relaycast workspace
 (Agent Relay Desktop records them through `POST /api/v1/fleet/nodes/claim`
-when its person signs in).
+when its person signs in; on gate-only installs it claims by enrolled node
+name, see
+[relay-node-credential.md](relay-node-credential.md#claiming-the-node)).
 
 | Node | Allowed |
 |---|---|
@@ -56,14 +61,22 @@ before broker, then free capacity and measured load.
    stable `idempotency_key`. `accepted` means dispatch receipt, not readiness.
    Refusals (`spawn_target_not_allowed`, `spawn_target_offline`,
    `spawn_target_unavailable`, `spawn_harness_unavailable`,
-   `spawn_capacity_exceeded`) carry up to three allowed `alternatives`.
+   `spawn_capacity_exceeded`, and on gate-only installs `relaygate_denied`,
+   `relaygate_classified` and `relaygate_unavailable`) carry up to three
+   allowed `alternatives`. Only `relaygate_unavailable` of the relaygate
+   codes is retryable; see [identity.md](identity.md), "Launch check".
 3. `get_relay_spawn_status` until `ready` (with the agent's address),
    `failed` or `unknown`.
 4. `release_relay_agent` stops exactly that worker by its immutable id.
 
-Clients must retain `Mcp-Session-Id`: a launch belongs to the MCP session that
-started it, and another session (even the same person's) cannot read or
-release it.
+Native clients must retain `Mcp-Session-Id`: their launches belong to that
+session. OAuth launches belong to the exact grant and remain accessible after
+MCP reconnects within that grant. A new consent grant cannot recover them.
+Release workers before disconnecting. Revocation ends tool access immediately;
+cleanup retains the launcher credentials while its journal has active or
+unconfirmed launches. An operator must drain those workers and reconcile their
+journal rows before the deferred cleanup can finish; it never marks a live
+worker released merely because the grant was revoked.
 
 ## Journal and failure handling
 

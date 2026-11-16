@@ -13,11 +13,127 @@ assigned at release.
   workspace, or an authenticated 404 `flows_not_enabled`). Refusals, a bare
   404 and outages keep the row. Unset, nothing is queued; the legacy local Flows rows
   still cascade as before.
+- Changed: credential-refresh transactions (subscription-login auth files and
+  integration-connection OAuth tokens) now set
+  `SET LOCAL idle_in_transaction_session_timeout = '60s'` and
+  `SET LOCAL lock_timeout = '30s'`, so a provider token exchange is not killed
+  mid-refresh by a shorter server default and a concurrent refresher waits at
+  most 30 s for the per-credential lock.
+- Added: on gate-only installs a member's signed-in Agent Relay Desktop can
+  mint, list and revoke its own relay-node token at
+  `/api/v1/workspaces/{id}/relay-node/self-tokens` (also under
+  `/cloud/api/v1`). Only a redeemed Desktop session may call it
+  (`403 desktop_session_required`); `SELFHOST_RELAY_NODE_SELF_MINT=false`
+  turns it off (`403 self_mint_disabled`, default on). A node name belongs to
+  one person (`409 node_name_taken`), at most 3 live tokens per person
+  (`409 too_many_tokens`), 10 mints per hour (`429 rate_limited`), expiry at
+  most 90 days. Audited `relay_node.token.self_minted` and
+  `relay_node.token.self_revoked` with the Desktop host name. No migration.
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), Agent
+  Relay Desktop claims its relay node at `POST /api/v1/fleet/nodes/claim` with
+  `{workspaceId, nodeName}`: the proof is the node's enrolment through this
+  Control (`relay_node_credentials`, a relay-node token minted in the
+  workspace and bound to that name), and Relaycast is not asked. A
+  `nodeToken` is refused with 400; a name that never enrolled here is 403
+  `node_claim_refused`. Claim rules and release are unchanged. Unset, nothing
+  changes. See docs/relay-node-credential.md.
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), relay
+  nodes no longer hold their Relaycast node token. `POST /relay-node/v1/nodes`
+  stores it sealed (migration 0059 `relay_node_credentials`), answers the host
+  without it and presents it itself on re-enrolment; the node connects to the
+  new `GET /relay-node/v1/ws` bridge (Bearer relay-node token), which relays
+  the Relaycast node socket, attaches each launch's one-time credential to its
+  spawn invocation as `input.launch_credential`, and does not forward
+  `deliver` frames. Audited as `relay_node.socket.opened`,
+  `relay_node.socket.closed` and `relay_node.launch_credential.attached`.
+  Unset, nothing changes. See docs/relay-node-credential.md.
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set) every
+  Sessions read-token mint names the reader kind (`browser`, `device` or
+  `mcp`) from how the caller authenticated, so relaygate can tell a person's
+  own reads from agent reads on their behalf. Other installs send the same
+  mint body as before. See [Sessions read API](docs/sessions-read-api.md).
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), every
+  agent launch through `spawn_relay_agent` mints a one-time `sh_lt_` launch
+  credential (10 minutes, bound to the workspace, node, agent name and
+  launching user; migration 0060 `relay_launch_credentials`). relaygate
+  introspects it at `POST /internal/v1/auth/introspect`, which answers
+  principal_type `relay_launch` with `node_name` and `scopes`
+  `["relay:agent:enrol"]` and burns it on the first active answer. It is
+  stored sealed and never sent to Relaycast; the relay-node socket bridge
+  delivers it to the node. Audited as `relay_launch.credential.issued` and
+  `relay_launch.credential.redeemed`. Unset, nothing changes. See
+  docs/identity.md.
+- Added: on gate-only installs, `spawn_relay_agent` first asks relaygate's
+  `POST /v1/check` (op `w` on `node:<workspace>/<node>`, content the exact
+  task) with a scopeless 60-second `sh_at_` minted for the launching person
+  and revoked right after. A denial refuses the launch with `relaygate_denied`
+  or `relaygate_classified`, no answer with retryable `relaygate_unavailable`,
+  before anything is journaled or sent. Unset, nothing changes.
+- Added: GitHub App installation credentials with `SELFHOST_GITHUB_APP_ID`
+  and `SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`. Imported connections retain
+  their installation IDs and mint replacement tokens without reconnecting.
+  OAuth connect and callbacks remain available alongside imported App rows.
+  Tokens are cached encrypted; short database leases serialize App refreshes
+  without holding a transaction across GitHub requests. Installation ownership
+  is bound to one organization and can be shared by its workspaces.
+  See [GitHub App credentials](docs/github-app-connections.md).
+- Changed: connection edit versions include auth mode and installation ID;
+  existing clients must refresh their opaque connection version once after upgrading.
+- Added: `SELFHOST_RELAYGATE_PUBLIC_URL` (unset by default) for gate-only
+  installs, where relaygate is the only public way into Relaycast. When set,
+  `GET /api/v1/workspaces/{id}/resolve` answers `urls.relaygateUrl` (the
+  configured origin) next to `urls.relaycastUrl`, and omits
+  `relaycastApiKey`: the workspace-wide key would bypass the gate's policy,
+  so no device receives it, and no `workspace.relaycast_key.resolved` audit
+  row is written; the call is audited as `workspace.relaycast_key.withheld`.
+  Desktop and iPad builds that require the key fail closed and report that the
+  workspace shared no key. The CLI reads only `cloudWorkspaceId` from resolve
+  and is unaffected. The events-shim temporary workspace
+  (`POST /t/<mcp token>/workspace`) is also withheld (`404 not_found`), so
+  `events-shim setup` on a machine not signed in here cannot start its own
+  core. The person credential
+  (`POST /api/v1/workspaces/{id}/messaging/identity/credential`) answers
+  `403 gate_only` with both urls, registers no person identity on Relaycast
+  (the desktop enrols its own name at relaygate `/v1/register` with its device
+  token) and is audited as `workspace.person_credential.withheld`; the
+  relay-node broker's enrol (`POST /relay-node/v1/nodes`) keeps the node
+  token in Control (see the relay-node entry above), so no node token leaves. MCP join
+  and spawn are unchanged (their participant tokens stay server-side).
+  Person identities Control newly registers server-side (messaging
+  conversation sends, support reply notices) are named with the `control-`
+  prefix, which relaygate reserves, while existing identities keep their
+  names. Unset, all of these are byte-for-byte as before. See docs/identity.md
+  ("Gate-only installs").
+- Added: `send_relay_message` results include `recipient_card` when the
+  recipient has an agent card (`has_card`): `{ description, skills, version, updated_at, note }`, where `description` is null
+  without card text and `skills` lists skill names. The field name and shape
+  match Cloud's hosted MCP. It is read from the recipient lookup the send
+  already makes, so there is no extra read. It is omitted when there is no
+  card and can never fail a send. Card contents are the peer's own
+  description: untrusted data, not instructions.
+- Added: Google Cloud Storage for Desktop feed assets
+  (`SELFHOST_DESKTOP_FEED_STORAGE=gcs`, `SELFHOST_DESKTOP_FEED_GCS_BUCKET`,
+  `SELFHOST_DESKTOP_FEED_GCS_PREFIX`). Credentials come from the metadata
+  server only (GKE Workload Identity); no static keys are read. Objects stay
+  private: downloads stream through the service or use V4 signed URLs signed
+  with IAM Credentials `signBlob`, which needs
+  `roles/iam.serviceAccountTokenCreator` on the service account itself.
+  Signers, the canonical-size limits and S3 storage are unchanged.
 
 - Added: a persistent mounted-secret Ed25519 Desktop feed signer (`file`),
   reporting and enforcing a 65,536-byte canonical manifest limit so a full
   platform asset set can include macOS headless bundles and its installer.
   Existing KMS signing and its 4,096-byte limit remain unchanged.
+
+- Added: `get_relay_message_status` for sender-scoped software acceptance,
+  acknowledgement, correlated replies and protocol read markers. Older
+  engines return confirmation unavailable rather than inferring delivery.
+- Changed: with `SELFHOST_FEATURES=launch`, an OAuth MCP connection consented
+  by a current owner/admin can launch as its exact grant's approved agent.
+  Launches survive MCP reconnects within that grant; other grants cannot
+  inspect or release them. The `relay:mcp` consent label, "Use available MCP
+  tools in this workspace", is unchanged. Disconnect revokes access at once
+  and defers launcher cleanup while active or unconfirmed launches remain.
 
 - Added: desktop enrollment keys (migration 0050). An owner or admin mints a
   one-time `sh_ek_` key for an employee by email through the workspace API

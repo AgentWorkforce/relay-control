@@ -11,6 +11,7 @@ import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { createRelaycastWorld, type RelaycastWorld } from "./support/relaycast-world.js";
 import { PGliteDatabase } from "./support/harness.js";
+import { RECIPIENT_CARD_NOTE } from "../src/mcp/relay-agent-cards.js";
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -293,6 +294,7 @@ test("initialize advertises the self-host server and its tools on both paths", a
       "check_relay_inbox",
       "describe_capabilities",
       "get_relay_agent_card",
+      "get_relay_message_status",
       "get_session_summary",
       "get_shared_session",
       "get_shared_session_context",
@@ -436,7 +438,7 @@ test("describe_capabilities reports the served groups and the bound workspace", 
   assert.deepEqual(available.sort(), ["capability_discovery", "relay_messaging", "shared_session_reads", "team_activity"]);
   const messaging = data.groups.find((group: any) => group.id === "relay_messaging");
   assert.equal(messaging.status, "available");
-  assert.equal(messaging.tools.length, 14);
+  assert.equal(messaging.tools.length, 15);
   assert.deepEqual(messaging.tools.slice(0, 3), ["list_relay_agents", "get_relay_agent_card", "set_relay_agent_card"]);
   assert.equal(messaging.reason, undefined);
 });
@@ -824,6 +826,9 @@ test("send_relay_message auto-joins, sends, replies, and reads the conversation"
   assert.match(data.from, /^owner-mcp-[0-9a-f]{8}$/);
   assert.equal(data.to, "peer-bot");
   assert.equal(data.delivery, "queued_unconfirmed");
+  const receipt = structured(await client.callTool({ name: "get_relay_message_status", arguments: { message_id: data.message_id } }));
+  assert.equal(receipt.confirmation, "unavailable");
+  assert.deepEqual(receipt.deliveries, []);
   assert.match(data.idempotency_key, /^[0-9a-f]{32}$/);
   const peerInbox = env.relay.world.deliveries.filter(row => row.agent === "peer-bot");
   assert.deepEqual(peerInbox.map(row => row.message.text), ["hello peer"]);
@@ -846,6 +851,31 @@ test("send_relay_message auto-joins, sends, replies, and reads the conversation"
   assert.deepEqual(read.messages.map((message: any) => [message.text, message.mine, message.thread_id]),
     [["hello peer", true, null], ["hello back", false, null], ["thanks", true, answer.message.id]]);
   assert.equal(read.earlier, null);
+});
+
+test("send_relay_message returns the recipient's card summary only when it has one", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("carded-bot", {
+    card: { description: "Reviews pull requests", version: "2.1", updated_at: "2026-11-15T20:05:36.000Z" },
+    skills: [{ id: "review", name: "Review a PR", description: "Reads a diff" }, { id: "land", name: "Land a PR" }],
+  });
+  env.relay.world.addAgent("skills-bot", { skills: [{ name: "Triage issues" }] });
+  env.relay.world.addAgent("plain-bot", { objective: "No card" });
+  env.relay.world.addAgent("broken-bot", { card: "not an object", skills: "nope" });
+  const client = await relayClient(t, env);
+
+  const carded = structured(await client.callTool({ name: "send_relay_message", arguments: { to: "carded-bot", text: "please review" } }));
+  assert.deepEqual(carded.recipient_card, { description: "Reviews pull requests", skills: ["Review a PR", "Land a PR"],
+    version: "2.1", updated_at: "2026-11-15T20:05:36.000Z", note: RECIPIENT_CARD_NOTE });
+  const skillsOnly = structured(await client.callTool({ name: "send_relay_message", arguments: { to: "skills-bot", text: "hi" } }));
+  assert.deepEqual(skillsOnly.recipient_card, { description: null, skills: ["Triage issues"], version: "1", updated_at: null, note: RECIPIENT_CARD_NOTE });
+  for (const to of ["plain-bot", "broken-bot"]) {
+    const sent = structured(await client.callTool({ name: "send_relay_message", arguments: { to, text: "hi" } }));
+    assert.ok(!("recipient_card" in sent), to);
+    assert.ok(sent.message_id, to);
+  }
+  // No extra upstream read: the card comes from the recipient lookup the send already makes.
+  assert.equal(env.relay.calls.filter(call => /\/card/.test(call.path)).length, 0);
 });
 
 test("send_relay_message to an exact machine address sends address only and is delivered", async (t) => {

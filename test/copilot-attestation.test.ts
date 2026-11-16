@@ -50,6 +50,29 @@ test("the Desktop-generated fixture proof verifies and is stripped from the argu
   assert.deepEqual(body.params.arguments, fixture.args);
 });
 
+test("an uppercase UUID source resolves to the lowercase source identity sync stored", async () => {
+  const signer = await copilotSigner();
+  const sourceId = randomUUID();
+  const workspaceId = "workspace";
+  const userId = "user";
+  const sessionId = randomUUID();
+  const store = memoryStore({ [`${workspaceId}/${userId}/${sourceId}/${signer.kid}`]: signer.publicKey });
+  const proof = await signer.sign({
+    tool: "send_relay_message",
+    args: { text: "hi" },
+    user: userId,
+    workspace: workspaceId,
+    src: sourceId.toUpperCase(),
+    sid: sessionId,
+  });
+  const result = await copilotAttestationFor(
+    fixtureCall({ text: "hi" }, proof),
+    { workspaceId, userId, desktopMcpProvider: "copilot" },
+    store,
+  );
+  assert.deepEqual(result, { nativeSession: { kind: "copilot", id: sessionId }, sourceId });
+});
+
 test("a proof checked against a different registered key is refused", async () => {
   const other = await copilotSigner();
   const kid = attestationKeyId(decodeBase64Url(fixture.publicKey)!);

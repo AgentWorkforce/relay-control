@@ -54,8 +54,7 @@ export function buildMcpServer(context: McpContext): McpServer {
   // only supplies how each group registers.
   const amp = context.amp;
   const factory = context.factory;
-  // OAuth connections never get launch tools (describe_capabilities says why).
-  const launch = Boolean(context.launch) && !context.oauth;
+  const launch = Boolean(context.launch);
   const capyPermits = Boolean(context.oauth && context.capyPermits);
   registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines) }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),

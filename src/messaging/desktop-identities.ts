@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../crypto.js";
 import type { Database, SqlExecutor } from "../database.js";
+import { normalizeDesktopSourceId } from "../desktop-source-id.js";
 import { attestationKeyId, COPILOT_ATTESTATION_CAPABILITY, decodeBase64Url } from "../mcp/copilot-attestation.js";
 import { MessagingHttpError } from "./http.js";
 import { createRelaycastClient, RelaycastCallError, type RelaycastClient } from "./relaycast.js";
@@ -45,6 +46,7 @@ export const DESKTOP_IDENTITY_CAPABILITIES = {
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const uuid = z.string().regex(UUID).transform(value => value.toLowerCase());
+const sourceId = z.string().min(1).max(200).transform(normalizeDesktopSourceId);
 
 const nativeSession = z.union([
   z.object({ kind: z.enum(["codex", "grok", "pi", "claude", "copilot"]), id: uuid }).strict(),
@@ -71,7 +73,7 @@ const attestationKey = z.object({
 }, { message: "attestation key does not match kid" });
 
 const syncBody = z.object({
-  source_id: uuid,
+  source_id: sourceId,
   identities: z.array(identity).max(200),
   attestation_key: attestationKey.optional(),
 }).strict();
@@ -212,8 +214,9 @@ export async function syncDesktopIdentities(input: {
   attestationKey?: AttestationKey;
 }): Promise<{ synced: number; skipped?: Skipped[]; identities: DesktopIdentityLink[] }> {
   const { access } = input;
+  const source = normalizeDesktopSourceId(input.sourceId);
   if (input.identities.length === 0) {
-    await replace(input.database, input.keyring, access, input.sourceId, [], undefined);
+    await replace(input.database, input.keyring, access, source, [], undefined);
     return { synced: 0, identities: [] };
   }
   if (!access.workspace.relaycastWorkspaceId || !access.workspace.relaycastApiKey) {
@@ -225,8 +228,8 @@ export async function syncDesktopIdentities(input: {
     throw new SyncError(400, "invalid_request", "Desktop identities must have unique addresses and agent IDs.");
   }
   const { verified, skipped } = await verify(input.client, access, input.identities);
-  await replace(input.database, input.keyring, access, input.sourceId, verified, input.attestationKey);
-  const links = await desktopIdentityLinks(input.database, access.workspace.id, access.principal.userId, input.sourceId);
+  await replace(input.database, input.keyring, access, source, verified, input.attestationKey);
+  const links = await desktopIdentityLinks(input.database, access.workspace.id, access.principal.userId, source);
   return {
     synced: verified.length,
     ...(skipped.length > 0 ? { skipped } : {}),
@@ -245,7 +248,7 @@ async function desktopIdentityLinks(database: SqlExecutor, workspaceId: string, 
       WHERE b.workspace_id = $1 AND b.user_id = $2
         AND i.workspace_id = $1 AND i.user_id = $2 AND i.source_id = $3
       GROUP BY i.agent_remote_id`,
-    [workspaceId, userId, sourceId.toLowerCase()],
+    [workspaceId, userId, sourceId],
   );
   return new Map(rows.rows.map(row => [row.agent_remote_id, new Date(row.linked_at)] as const));
 }
@@ -293,18 +296,19 @@ export async function handleDesktopIdentityRoutes(
   }
 
   if (method === "GET") {
-    const sourceId = new URL(request.url ?? "/", "http://local").searchParams.get("source_id");
-    if (!sourceId || !UUID.test(sourceId)) {
-      throw new MessagingHttpError(400, "invalid_request", "source_id must be a UUID");
+    const parsedSourceId = sourceId.safeParse(new URL(request.url ?? "/", "http://local").searchParams.get("source_id"));
+    if (!parsedSourceId.success) {
+      throw new MessagingHttpError(400, "invalid_request", "source_id must be 1 to 200 characters");
     }
+    const source = parsedSourceId.data;
     try {
       const rows = await deps.database.query<{ agent_remote_id: string }>(
         `SELECT agent_remote_id FROM desktop_relay_identities
           WHERE workspace_id = $1 AND user_id = $2 AND source_id = $3 AND relaycast_workspace_id = $4
           ORDER BY created_at, agent_remote_id`,
-        [access.workspace.id, access.principal.userId, sourceId.toLowerCase(), access.workspace.relaycastWorkspaceId],
+        [access.workspace.id, access.principal.userId, source, access.workspace.relaycastWorkspaceId],
       );
-      const links = await desktopIdentityLinks(deps.database, access.workspace.id, access.principal.userId, sourceId);
+      const links = await desktopIdentityLinks(deps.database, access.workspace.id, access.principal.userId, source);
       deps.json(response, 200, {
         identities: reportLinks(rows.rows.map(row => row.agent_remote_id), links),
         capabilities: DESKTOP_IDENTITY_CAPABILITIES,
@@ -524,7 +528,8 @@ export async function linkedDesktopIdentity(input: {
   if (result.rows.length > 1) throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.duplicate);
   const row = result.rows[0] ? identityRow(result.rows[0]) : null;
   if (!row) throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.notSynced);
-  if (input.sourceId !== undefined && row.sourceId !== input.sourceId) {
+  if (input.sourceId !== undefined &&
+      normalizeDesktopSourceId(row.sourceId) !== normalizeDesktopSourceId(input.sourceId)) {
     throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.sourceMismatch);
   }
   return verifyDesktopIdentity({ keyring: input.keyring, client: input.client, userId: input.userId,

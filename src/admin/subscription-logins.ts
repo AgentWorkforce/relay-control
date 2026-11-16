@@ -1,7 +1,7 @@
 // Subscription logins for coding agents: hosted's provider_oauth credentials,
 // ported to self-host.
 //
-//   device login (start/status)  ->  auth file JSON  ->  envelope-encrypted
+//   device login or import  ->  auth file JSON  ->  envelope-encrypted
 //   object (CredentialBlobStore)  ->  run-scoped reference in the assignment
 //   payload  ->  worker reads it, writes the CLI's auth file 0600 into the
 //   run's private dir, and writes refreshed tokens back after the run.
@@ -13,6 +13,7 @@ import { decryptSecret, encryptSecret, opaqueToken, type EncryptionKeyring } fro
 import { recordAudit, type AuditActor } from "./audit.js";
 import { CredentialBlobError, type CredentialBlobStore } from "./credential-blobs.js";
 import { CodingAgentError } from "./coding-agents.js";
+import { applyRefreshTransactionTimeouts } from "./refresh-transaction.js";
 import {
   exchangeOpenAIDeviceAuthorization,
   OPENAI_DEVICE_AUTH_LIFETIME_SECONDS,
@@ -29,7 +30,8 @@ import {
   XaiDeviceAuthError,
 } from "./xai-device-auth.js";
 
-export type SubscriptionProvider = "openai" | "xai";
+export type SubscriptionProvider = "anthropic" | "openai" | "xai";
+export type DeviceSubscriptionProvider = Exclude<SubscriptionProvider, "anthropic">;
 
 type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
@@ -41,6 +43,7 @@ export const SUBSCRIPTION_CLI_FILES: Record<SubscriptionProvider, {
   file: string;
   displayName: string;
 }> = {
+  anthropic: { cli: "claude", homeEnv: "HOME", directory: ".claude", file: ".credentials.json", displayName: "Claude login" },
   openai: { cli: "codex", homeEnv: "CODEX_HOME", directory: ".codex", file: "auth.json", displayName: "Codex login" },
   xai: { cli: "grok", homeEnv: "GROK_HOME", directory: ".grok", file: "auth.json", displayName: "Grok login" },
 };
@@ -53,11 +56,17 @@ export const REFRESH_WINDOW_MS = 45 * 60_000;
 export const RUN_REFERENCE_TTL_MS = 6 * 60 * 60_000;
 const MAX_FAILED_REFRESHES = 3;
 const MAX_AUTH_FILE_BYTES = 64 * 1024;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const OPENAI_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token";
+// Verified against AgentWorkforce/cloud credential-refresher.ts and the
+// official @anthropic-ai/claude-code-darwin-arm64@2.1.325 npm binary.
+const ANTHROPIC_TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token";
 const XAI_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token";
+const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const DEFAULT_ANTHROPIC_EXPIRES_IN_SECONDS = 8 * 60 * 60;
 
-export const DEVICE_BINDING_COOKIES: Record<SubscriptionProvider, string> = {
+export const DEVICE_BINDING_COOKIES: Record<DeviceSubscriptionProvider, string> = {
   openai: "agent_relay_openai_device_session",
   xai: "agent_relay_xai_device_session",
 };
@@ -115,8 +124,32 @@ type GrokEntry = {
   [key: string]: unknown;
 };
 
+type AnthropicOauth = {
+  accessToken?: string;
+  refreshToken?: string;
+  expiresAt?: number | string;
+  emailAddress?: string;
+  email?: string;
+  [key: string]: unknown;
+};
+
+function anthropicExpiry(value: unknown): Date | null {
+  if (typeof value === "number") {
+    const date = new Date(value > 1e12 ? value : value * 1_000);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    const date = Number.isFinite(numeric)
+      ? new Date(numeric > 1e12 ? numeric : numeric * 1_000)
+      : new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  return null;
+}
+
 /** Identity, expiry and fingerprint input of a stored auth file. */
-export function describeAuthFile(provider: SubscriptionProvider, content: string): {
+export function describeAuthFile(provider: SubscriptionProvider, content: string, accountEmail?: string | null): {
   accountId: string;
   email: string | null;
   expiresAt: Date | null;
@@ -130,6 +163,37 @@ export function describeAuthFile(provider: SubscriptionProvider, content: string
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new CodingAgentError(422, "invalid_auth_file", "Auth file is not an object");
+  }
+  if (provider === "anthropic") {
+    const oauth = (parsed as { claudeAiOauth?: AnthropicOauth }).claudeAiOauth;
+    if (!oauth?.accessToken || !oauth.refreshToken) {
+      throw new CodingAgentError(422, "invalid_auth_file", "Not a Claude subscription login");
+    }
+    const embeddedEmail = typeof oauth.emailAddress === "string"
+      ? oauth.emailAddress
+      : typeof oauth.email === "string"
+        ? oauth.email
+        : null;
+    const suppliedEmail = accountEmail?.trim() || null;
+    for (const email of [embeddedEmail, suppliedEmail]) {
+      if (email !== null && !EMAIL_RE.test(email.trim())) {
+        throw new CodingAgentError(422, "invalid_auth_file", "Claude subscription login has an invalid account email");
+      }
+    }
+    if (embeddedEmail && suppliedEmail && embeddedEmail.trim().toLowerCase() !== suppliedEmail.toLowerCase()) {
+      throw new CodingAgentError(422, "invalid_auth_file", "Claude subscription login account email does not match the import record");
+    }
+    const email = embeddedEmail?.trim() || suppliedEmail;
+    const normalizedEmail = email?.toLowerCase() || null;
+    if (!normalizedEmail) {
+      throw new CodingAgentError(422, "invalid_auth_file", "Claude subscription login has no account email");
+    }
+    return {
+      accountId: normalizedEmail,
+      email,
+      expiresAt: anthropicExpiry(oauth.expiresAt),
+      refreshToken: oauth.refreshToken,
+    };
   }
   if (provider === "openai") {
     const codex = parsed as Partial<CodexAuthJson>;
@@ -166,6 +230,32 @@ export async function refreshAuthFile(
   now = new Date(),
 ): Promise<string> {
   const parsed = JSON.parse(content) as Record<string, unknown>;
+  if (provider === "anthropic") {
+    const oauth = (parsed as { claudeAiOauth?: AnthropicOauth }).claudeAiOauth;
+    if (!oauth?.refreshToken) throw new RefreshFailed(provider, 422);
+    const response = await fetchImpl(ANTHROPIC_TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: oauth.refreshToken,
+        client_id: ANTHROPIC_CLIENT_ID,
+      }).toString(),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) throw new RefreshFailed(provider, response.status);
+    const tokens = await response.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
+    if (!tokens.access_token || !tokens.refresh_token) throw new RefreshFailed(provider, 502);
+    return JSON.stringify({
+      ...parsed,
+      claudeAiOauth: {
+        ...oauth,
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        expiresAt: now.getTime() + (tokens.expires_in ?? DEFAULT_ANTHROPIC_EXPIRES_IN_SECONDS) * 1_000,
+      },
+    });
+  }
   if (provider === "openai") {
     const codex = parsed as unknown as CodexAuthJson;
     const response = await fetchImpl(OPENAI_TOKEN_ENDPOINT, {
@@ -232,6 +322,7 @@ type CredentialRow = {
   blob_location: string;
   blob_version: number;
   provider_account_id: string;
+  account_email: string | null;
   credential_expires_at: Date | string | null;
   status: string;
   refresh_attempts: number;
@@ -269,7 +360,7 @@ export class SubscriptionLoginStore {
   // --------------------------------------------------------- device login
 
   async startDevice(input: {
-    provider: SubscriptionProvider;
+    provider: DeviceSubscriptionProvider;
     workspaceId: string;
     organizationId: string;
     userId: string;
@@ -354,7 +445,7 @@ export class SubscriptionLoginStore {
   }
 
   async pollDevice(input: {
-    provider: SubscriptionProvider;
+    provider: DeviceSubscriptionProvider;
     transactionId: unknown;
     workspaceId: string;
     organizationId: string;
@@ -491,11 +582,13 @@ export class SubscriptionLoginStore {
     organizationId: string;
     actor: AuditActor & { kind: "user" };
     authFile: string;
+    /** Cloud stores Claude account identity beside the auth file, not inside it. */
+    accountEmail?: string | null;
   }): Promise<string> {
     if (Buffer.byteLength(input.authFile) > MAX_AUTH_FILE_BYTES) {
       throw new CodingAgentError(422, "invalid_auth_file", "Auth file is too large");
     }
-    const described = describeAuthFile(input.provider, input.authFile);
+    const described = describeAuthFile(input.provider, input.authFile, input.accountEmail);
     const files = SUBSCRIPTION_CLI_FILES[input.provider];
     const fingerprint = this.keyFingerprint(input.provider, described.refreshToken);
     let previousLocation: string | null = null;
@@ -671,7 +764,7 @@ export class SubscriptionLoginStore {
 
   private async row(executor: SqlExecutor, workspaceId: string, credentialId: string): Promise<CredentialRow | null> {
     const result = await executor.query<CredentialRow>(
-      `SELECT id, model_provider, blob_location, blob_version, provider_account_id,
+      `SELECT id, model_provider, blob_location, blob_version, provider_account_id, account_email,
               credential_expires_at, status, refresh_attempts
          FROM coding_agent_credentials
         WHERE workspace_id = $1 AND id = $2 AND auth_type = 'provider_oauth'`,
@@ -689,6 +782,7 @@ export class SubscriptionLoginStore {
   async freshAuthFile(workspaceId: string, credentialId: string): Promise<string | null> {
     let staleLocation: string | null = null;
     const content = await this.database.transaction(async (tx) => {
+      await applyRefreshTransactionTimeouts(tx);
       await tx.query("SELECT pg_advisory_xact_lock(hashtext('selfhost-cli-credential-refresh'), hashtext($1))", [credentialId]);
       const row = await this.row(tx, workspaceId, credentialId);
       if (!row || row.status === "refresh_failed") return null;
@@ -698,7 +792,7 @@ export class SubscriptionLoginStore {
       if (!expiresAt || expiresAt.getTime() - now.getTime() > REFRESH_WINDOW_MS) return current;
       try {
         const refreshed = await refreshAuthFile(row.model_provider, current, this.fetchImpl, now);
-        const described = describeAuthFile(row.model_provider, refreshed);
+        const described = describeAuthFile(row.model_provider, refreshed, row.account_email);
         const version = row.blob_version + 1;
         const location = await this.blobs.write(workspaceId, row.id, version, refreshed, tx);
         await tx.query(
@@ -751,10 +845,11 @@ export class SubscriptionLoginStore {
     }
     let staleLocation: string | null = null;
     const updated = await this.database.transaction(async (tx) => {
+      await applyRefreshTransactionTimeouts(tx);
       await tx.query("SELECT pg_advisory_xact_lock(hashtext('selfhost-cli-credential-refresh'), hashtext($1))", [credentialId]);
       const row = await this.row(tx, workspaceId, credentialId);
       if (!row) throw new CodingAgentError(404, "credential_not_found", "Credential not found");
-      const described = describeAuthFile(row.model_provider, content);
+      const described = describeAuthFile(row.model_provider, content, row.account_email);
       if (described.accountId !== row.provider_account_id) {
         throw new CodingAgentError(409, "account_mismatch", "Auth file belongs to a different account");
       }

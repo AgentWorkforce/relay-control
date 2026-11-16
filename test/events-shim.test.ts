@@ -27,7 +27,7 @@ type RelayCall = { url: string; authorization: string | null; body: Record<strin
 async function plane(
   t: TestContext,
   features: SelectedFeatures = { ...NO_FEATURES, events_shim: true },
-  options: { relaycastInternalSecret?: string | null } = {},
+  options: { relaycastInternalSecret?: string | null; relaygatePublicUrl?: string } = {},
 ) {
   const database = new PGliteDatabase();
   await migrate(database);
@@ -91,6 +91,7 @@ async function plane(
     dashboardUrl: `${origin}/`,
     port: 0,
     host: "127.0.0.1",
+    ...(options.relaygatePublicUrl ? { relaygatePublicUrl: options.relaygatePublicUrl } : {}),
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
   server.on("request", createApp({
@@ -695,6 +696,21 @@ test("each inbox gets one temporary Agent Relay workspace with a 7-day deadline,
   await p.database.query("UPDATE events_shims SET relay_workspace_expires_at = now() - interval '1 minute' WHERE id = $1", [shim.shim_id]);
   const next = await issue();
   assert.notEqual(next.body.workspace_id, first.body.workspace_id);
+});
+
+test("temporary workspaces: a gate-only control plane mints and hands out none", async (t) => {
+  const p = await plane(t, { ...NO_FEATURES, events_shim: true }, { relaygatePublicUrl: "https://gate.selfhosted.test" });
+  const shim = await p.create(await p.signIn());
+  const token = shim.mcp_url.split("/t/")[1]!.split("/")[0]!;
+  const refused = await request(p.origin, `${SHIM}/t/${token}/workspace`, { method: "POST" });
+  assert.equal(refused.status, 404);
+  assert.equal(refused.body.error, "not_found");
+  assert.match(refused.body.message, /gate-only/);
+  assert.ok(!refused.raw.includes("rk_live_"));
+  // The inbox itself still works; nothing reaches Relaycast's admin API.
+  assert.equal((await p.post(shim.webhook_url, { a: 1 })).status, 202);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(p.admin.calls.length, 0);
 });
 
 test("temporary workspaces: unknown inboxes, an old Relaycast, an unreachable one and no internal secret", async (t) => {
