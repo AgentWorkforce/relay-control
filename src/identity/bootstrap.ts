@@ -4,6 +4,17 @@ import type { FetchLike } from "./oidc.js";
 
 /** A cold durable-actors workspace create has taken ~100 s; leave headroom. */
 const RELAYCAST_CREATE_TIMEOUT_MS = 300_000;
+const RELAYCAST_CAPABILITIES_TIMEOUT_MS = 30_000;
+
+const DEFINITE_CREATE_ERROR_CODES = new Set([
+  "workspace_create_bootstrap_secret_invalid",
+  "workspace_create_idempotency_conflict",
+  "workspace_create_idempotency_digest_required",
+  "workspace_create_idempotency_key_too_weak",
+  "workspace_create_idempotency_owner_required",
+  "workspace_create_idempotency_terminalized",
+  "workspace_create_idempotency_unavailable",
+]);
 
 export type RelaycastWorkspace = { id: string; apiKey: string };
 
@@ -30,8 +41,61 @@ export function relaycastProvisioner(
 ): RelaycastProvisioner {
   const base = relaycastUrl.replace(/\/+$/, "");
   const headers = { authorization: `Bearer ${internalSecret}`, "content-type": "application/json", accept: "application/json" };
+  let idempotentCreateSupport: Promise<void> | null = null;
+
+  const requireIdempotentCreate = async (): Promise<void> => {
+    if (idempotentCreateSupport === null) {
+      idempotentCreateSupport = (async () => {
+        let response: Response;
+        try {
+          response = await fetchImpl(`${base}/internal/capabilities`, {
+            method: "GET",
+            headers,
+            signal: AbortSignal.timeout(RELAYCAST_CAPABILITIES_TIMEOUT_MS),
+          });
+        } catch {
+          throw new ProvisionError("Relaycast capability discovery is unreachable", true);
+        }
+        const body = await response.json().catch(() => null) as {
+          data?: { workspace_admin?: { create_idempotency?: unknown } };
+        } | null;
+        if (response.status === 401 || response.status === 404) {
+          throw new ProvisionError(
+            response.status === 401
+              ? "Relaycast refused RELAYCAST_INTERNAL_SECRET (it must equal relaycast's internal secret)"
+              : "Relaycast has no internal admin capability API",
+            true,
+          );
+        }
+        if (!response.ok) {
+          throw new ProvisionError(
+            `Relaycast capability discovery answered ${response.status}`,
+            response.status >= 500 || response.status === 429,
+          );
+        }
+        if (body?.data?.workspace_admin?.create_idempotency !== true) {
+          throw new ProvisionError(
+            "Relaycast does not advertise idempotent internal workspace creation",
+            true,
+          );
+        }
+      })();
+    }
+    try {
+      await idempotentCreateSupport;
+    } catch (error) {
+      // A rolling Relaycast upgrade may add the capability later. Fail this
+      // create before mutation, but let a later first-use retry discovery.
+      idempotentCreateSupport = null;
+      throw error;
+    }
+  };
+
   return {
     async create(name, idempotencyKey) {
+      // Lazy bindings recover an uncertain response by replaying this key.
+      // Refuse to mutate older engines which accept but ignore the header.
+      if (idempotencyKey) await requireIdempotentCreate();
       let response: Response;
       try {
         response = await fetchImpl(`${base}/internal/workspaces`, {
@@ -46,7 +110,10 @@ export function relaycastProvisioner(
         // creating under a new identity.
         throw new ProvisionError("Relaycast is unreachable", true, true);
       }
-      const body = await response.json().catch(() => null) as { data?: { workspace_id?: unknown; api_key?: unknown } } | null;
+      const body = await response.json().catch(() => null) as {
+        data?: { workspace_id?: unknown; api_key?: unknown };
+        error?: { code?: unknown };
+      } | null;
       if (response.status === 401 || response.status === 404) {
         throw new ProvisionError(
           response.status === 401
@@ -57,10 +124,13 @@ export function relaycastProvisioner(
         );
       }
       if (response.status !== 201 && response.status !== 200) {
+        const errorCode = typeof body?.error?.code === "string" ? body.error.code : null;
+        const outcomeUnknown = response.status >= 500
+          && (errorCode === null || !DEFINITE_CREATE_ERROR_CODES.has(errorCode));
         throw new ProvisionError(
-          `Relaycast workspace create answered ${response.status}`,
+          `Relaycast workspace create answered ${response.status}${errorCode ? ` (${errorCode})` : ""}`,
           response.status >= 500 || response.status === 429,
-          response.status >= 500,
+          outcomeUnknown,
         );
       }
       const id = body?.data?.workspace_id;

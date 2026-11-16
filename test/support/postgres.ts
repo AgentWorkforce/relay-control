@@ -11,7 +11,9 @@ export async function isolatedPostgresPool(
   schema: string,
   max: number,
 ): Promise<pg.Pool> {
-  const pool = new pg.Pool({ connectionString, max });
+  // Keep the configured sessions until pool.end(). pg-pool's default 10 s
+  // idle reap would replace them with unconfigured `public` sessions.
+  const pool = new pg.Pool({ connectionString, max, idleTimeoutMillis: 0 });
   const clients: pg.PoolClient[] = [];
   let failure: unknown;
   try {

@@ -13,6 +13,23 @@ const postgresUrl=process.env.TEST_DATABASE_URL;
 const options={ skip:postgresUrl?false:"TEST_DATABASE_URL is not set (OAuth multi-connection proof)",timeout:60_000 };
 const ORIGIN="https://relay.example.test",SHARED="/api/v1/mcp/shared-sessions",VERIFIER="a".repeat(43);
 
+test("isolated Postgres pool retains its in-session search_path beyond pg-pool's default idle window",options,async t=>{
+  const admin=new pg.Pool({ connectionString:postgresUrl,max:1 });
+  const schema=`pool_path_${randomUUID().replaceAll("-","")}`;
+  await admin.query(`CREATE SCHEMA "${schema}"`);
+  const pool=await isolatedPostgresPool(postgresUrl!,schema,1);
+  t.after(async()=>{
+    try { await pool.end(); } finally {
+      try { await admin.query(`DROP SCHEMA "${schema}" CASCADE`); } finally { await admin.end(); }
+    }
+  });
+  const before=await pool.query<{search_path:string}>("SHOW search_path");
+  assert(before.rows[0]!.search_path.includes(schema));
+  await new Promise(resolve=>setTimeout(resolve,11_000));
+  const after=await pool.query<{search_path:string}>("SHOW search_path");
+  assert(after.rows[0]!.search_path.includes(schema));
+});
+
 async function fixture(t:test.TestContext) {
   const admin=new pg.Pool({ connectionString:postgresUrl,max:1 });
   const schema=`mcp_flow_${randomUUID().replaceAll("-","")}`;

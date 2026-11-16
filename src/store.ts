@@ -60,7 +60,7 @@ const DESKTOP_SCOPES = [...DEVICE_SCOPES, DESKTOP_WORKSPACES_SCOPE];
 /** desktop-auth lane, browser flow: hosted Cloud's 15-minute loopback handoff. */
 const DESKTOP_HANDOFF_TTL_MS = 15 * 60 * 1_000;
 /** Longer than Relaycast's 300 s cold-create bound, with room to persist. */
-const RELAYCAST_BINDING_CLAIM_TTL_MS = 6 * 60_000;
+const RELAYCAST_BINDING_CLAIM_TTL_SQL = "interval '6 minutes'";
 
 class RelaycastBindingMoved extends Error {}
 /** The Desktop consent screen's single-use token lives as long as the screen. */
@@ -969,10 +969,10 @@ export class ControlPlaneStore {
           AND relaycast_api_key_ciphertext IS NULL
           AND (
             relaycast_binding_claim_id IS NULL
-            OR relaycast_binding_claimed_at < $3
+            OR relaycast_binding_claimed_at < now() - ${RELAYCAST_BINDING_CLAIM_TTL_SQL}
           )
         RETURNING relaycast_binding_claim_name AS claim_name`,
-      [workspaceId, claimId, new Date(Date.now() - RELAYCAST_BINDING_CLAIM_TTL_MS)],
+      [workspaceId, claimId],
     );
     if (!claimed.rows[0]) {
       const current = await this.database.query<{
@@ -1050,12 +1050,20 @@ export class ControlPlaneStore {
 
     // An operator may have installed an explicit pair while create() was in
     // flight. Prefer that pair and release this request's now-unused remote.
-    const current = await this.relaycastBindingRow(workspaceId);
-    if (current) {
-      if (current.relaycastWorkspaceId !== created.id || !secureEqual(current.relaycastApiKey, created.apiKey)) {
+    const current = await this.relaycastBindingState(workspaceId);
+    if (current?.binding) {
+      // Never delete a workspace which another writer bound, even if that
+      // writer rotated the key before this request observed the row.
+      if (current.binding.relaycastWorkspaceId !== created.id) {
         await this.removeUnusedRelaycastWorkspace(created.id, workspaceId);
       }
-      return { ...current, provisioned: false };
+      return { ...current.binding, provisioned: false };
+    }
+    // A stale-claim winner may be creating the same deterministic remote.
+    // Its fresh DB-clock lease owns cleanup; deleting here would terminalize
+    // the shared idempotency key and strand the winner.
+    if (current?.claimLive && current.claimId !== claimId) {
+      throw new RelaycastBindingUnavailableError("Agent Relay is provisioning this workspace. Try again shortly.");
     }
     await this.removeUnusedRelaycastWorkspace(created.id, workspaceId);
     throw new RelaycastBindingUnavailableError();
@@ -1088,6 +1096,40 @@ export class ControlPlaneStore {
     return {
       relaycastWorkspaceId: row.relaycast_workspace_id,
       relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring),
+    };
+  }
+
+  private async relaycastBindingState(workspaceId: string): Promise<{
+    binding: { relaycastWorkspaceId: string; relaycastApiKey: string } | null;
+    claimId: string | null;
+    claimLive: boolean;
+  } | null> {
+    const result = await this.database.query<{
+      relaycast_workspace_id: string | null;
+      relaycast_api_key_ciphertext: string | null;
+      relaycast_binding_claim_id: string | null;
+      claim_live: boolean;
+    }>(
+      `SELECT relaycast_workspace_id,
+              relaycast_api_key_ciphertext,
+              relaycast_binding_claim_id,
+              relaycast_binding_claim_id IS NOT NULL
+                AND relaycast_binding_claimed_at >= now() - ${RELAYCAST_BINDING_CLAIM_TTL_SQL} AS claim_live
+         FROM workspaces WHERE id = $1`,
+      [workspaceId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    const binding = row.relaycast_workspace_id !== null && row.relaycast_api_key_ciphertext !== null
+      ? {
+        relaycastWorkspaceId: row.relaycast_workspace_id,
+        relaycastApiKey: decryptSecret(row.relaycast_api_key_ciphertext, this.encryptionKeyring),
+      }
+      : null;
+    return {
+      binding,
+      claimId: row.relaycast_binding_claim_id,
+      claimLive: row.claim_live,
     };
   }
 

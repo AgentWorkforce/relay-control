@@ -152,6 +152,51 @@ test("a stale durable claim is reclaimed with the stable workspace idempotency k
   assert.deepEqual(keys, [`relay-control-${workspaceId}`]);
 });
 
+test("a stale-claim loser does not delete the keyed workspace owned by the live replacement claim", async (t) => {
+  let createAttempt = 0;
+  let enterFirst!: () => void;
+  let enterSecond!: () => void;
+  let releaseFirst!: () => void;
+  let releaseSecond!: () => void;
+  const firstEntered = new Promise<void>((resolve) => { enterFirst = resolve; });
+  const secondEntered = new Promise<void>((resolve) => { enterSecond = resolve; });
+  const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const secondRelease = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  const removed: string[] = [];
+  const provisioner: RelaycastProvisioner = {
+    async create() {
+      createAttempt += 1;
+      if (createAttempt === 1) {
+        enterFirst();
+        await firstRelease;
+      } else {
+        enterSecond();
+        await secondRelease;
+      }
+      // Idempotent Relaycast create replays the same remote pair.
+      return { id: "rw_shared_keyed", apiKey: "rk_shared_keyed" };
+    },
+    async remove(id) { removed.push(id); },
+  };
+  const { database, store, workspaceId } = await fixture(t, provisioner);
+  const first = store.relaycastBinding(workspaceId);
+  await firstEntered;
+  await database.query(
+    "UPDATE workspaces SET relaycast_binding_claimed_at = now() - interval '10 minutes' WHERE id = $1",
+    [workspaceId],
+  );
+  const second = store.relaycastBinding(workspaceId);
+  await secondEntered;
+
+  releaseFirst();
+  await assert.rejects(first, RelaycastBindingUnavailableError);
+  assert.deepEqual(removed, [], "the loser must not delete the live claimant's shared remote");
+
+  releaseSecond();
+  assert.equal((await second)!.relaycastWorkspaceId, "rw_shared_keyed");
+  assert.deepEqual(removed, []);
+});
+
 test("an explicit operator pair installs directly on an unbound row without provisioning an orphan", async (t) => {
   let creates = 0;
   const provisioner: RelaycastProvisioner = {
@@ -239,6 +284,12 @@ test("a lost create response retains its durable claim and reconciles with the s
 test("the Relaycast client forwards create idempotency and surfaces cleanup failures", async () => {
   let createHeaders: HeadersInit | undefined;
   const provisioner = relaycastProvisioner("https://relaycast.test", "internal-secret", async (_input, init) => {
+    if (init?.method === "GET") {
+      return new Response(JSON.stringify({ data: { workspace_admin: { create_idempotency: true } } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     if (init?.method === "POST") {
       createHeaders = init.headers;
       return new Response(JSON.stringify({ data: { workspace_id: "rw_http", api_key: "rk_http" } }), {
@@ -258,6 +309,57 @@ test("the Relaycast client forwards create idempotency and surfaces cleanup fail
     assert.equal(error.outcomeUnknown, true);
     return true;
   });
+});
+
+test("the Relaycast client fails before create when idempotency is not advertised", async () => {
+  let posts = 0;
+  const provisioner = relaycastProvisioner("https://relaycast.test", "internal-secret", async (_input, init) => {
+    if (init?.method === "POST") posts += 1;
+    return new Response(JSON.stringify({ data: { workspace_admin: { create: true } } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  });
+  await assert.rejects(
+    provisioner.create("Imported workspace", "relay-control-stable-key"),
+    (error: unknown) => {
+      assert(error instanceof ProvisionError);
+      assert.equal(error.outcomeUnknown, false);
+      assert.match(error.message, /does not advertise idempotent internal workspace creation/);
+      return true;
+    },
+  );
+  assert.equal(posts, 0);
+});
+
+test("a structured idempotency-unavailable response is definite and clears the durable claim", async (t) => {
+  const provisioner = relaycastProvisioner("https://relaycast.test", "internal-secret", async (_input, init) => {
+    if (init?.method === "GET") {
+      return new Response(JSON.stringify({ data: { workspace_admin: { create_idempotency: true } } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({
+      error: {
+        code: "workspace_create_idempotency_unavailable",
+        message: "Anonymous workspace create idempotency is not configured",
+      },
+    }), {
+      status: 503,
+      headers: { "content-type": "application/json" },
+    });
+  });
+  const { database, store, workspaceId } = await fixture(t, provisioner);
+  await assert.rejects(store.relaycastBinding(workspaceId), RelaycastBindingUnavailableError);
+  const claim = (await database.query<{
+    relaycast_binding_claim_id: string | null;
+    relaycast_binding_claimed_at: Date | null;
+  }>(
+    "SELECT relaycast_binding_claim_id, relaycast_binding_claimed_at FROM workspaces WHERE id = $1",
+    [workspaceId],
+  )).rows[0]!;
+  assert.deepEqual(claim, { relaycast_binding_claim_id: null, relaycast_binding_claimed_at: null });
 });
 
 test("GET /resolve lazily binds once and reports only the creating response as provisioned", async (t) => {
