@@ -286,6 +286,10 @@ opt-out flag and registration, but admits no token and is skipped by the
 sync default selection; the policy view reports status `discovery_missing`
 with `discoveryMissingSince`. Listing the environment again lifts the fence.
 A partial or failed listing changes nothing.
+A listing made for a connection that was replaced while it was in flight
+(disconnect and connect, to another organization or with a new key) is
+discarded: the discovery reports `failed`, records nothing and fences nothing;
+the new connection's own discovery is authoritative.
 
 An admin opts one environment out with `PUT .../environments/{id}` and
 `enabled: false`, or `DELETE .../environment-mcp` with `{environmentIds}`;

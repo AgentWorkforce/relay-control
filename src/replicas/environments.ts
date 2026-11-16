@@ -569,14 +569,15 @@ export type DiscoveryResult = {
 
 /**
  * Discovers the connected organization's environments and records each as a
- * policy (new ones disabled). Discovery never enables anything.
+ * policy (new ones disabled). Discovery never enables anything. A connection
+ * replaced while the listing was in flight makes the discovery fail without writes.
  */
 export async function discoverEnvironments(deps: ReplicasDeps, actor: ReplicasActor): Promise<DiscoveryResult> {
   const { issuer } = identityConfig(deps);
-  const { key, ciphertext } = await withReplicasLock(deps, actor, async (tx) => {
+  const { organization: listedOrganization, key, ciphertext } = await withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
-    await connectedOrganization(tx, actor.workspaceId);
-    return connectionKey(deps, tx, actor.workspaceId);
+    const organization = await connectedOrganization(tx, actor.workspaceId);
+    return { organization, ...await connectionKey(deps, tx, actor.workspaceId) };
   });
   let listed: Awaited<ReturnType<ReplicasDeps["replicas"]["allEnvironments"]>>;
   try {
@@ -590,6 +591,10 @@ export async function discoverEnvironments(deps: ReplicasDeps, actor: ReplicasAc
   return withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
     const organization = await connectedOrganization(tx, actor.workspaceId);
+    const current = await connectionKey(deps, tx, actor.workspaceId);
+    // The listing was made for a connection that has since been replaced; the
+    // replacing connect runs its own discovery, so nothing from this listing is recorded or fenced.
+    if (organization !== listedOrganization || current.ciphertext !== ciphertext) return { status: "failed", environments: [] };
     const environments: DiscoveryResult["environments"] = [];
     for (const environment of listed.environments) {
       const environmentId = environment.id.toLowerCase();
