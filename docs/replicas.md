@@ -148,10 +148,11 @@ Each call is admitted in this order:
 2. A released replica (tombstone) is refused with 403 `replica_released`.
    Any tombstone for the token's issuer, organization and replica counts,
    including one whose workspace was deleted.
-3. The token's environment must be enabled in exactly one Control workspace
-   whose Replicas connection belongs to the token's organization, and that
-   provider organization must not be connected in any other Control
-   workspace. Otherwise 403 `replica_environment_not_enabled`.
+3. The token's provider organization must not be connected in more than one
+   Control workspace, otherwise 403 `organization_shared` (as Cloud). The
+   token's environment must be enabled in exactly one Control workspace whose
+   Replicas connection belongs to the token's organization, otherwise 403
+   `replica_environment_not_enabled`.
 4. The replica acts as one Control person, who must still be a current member
    of the organization:
    - a creator mapped for the environment acts as the mapped person; a

@@ -28,7 +28,9 @@ assigned at release.
   the same workspace now acts as that binding and its owner instead of
   answering 409 `replica_already_bound`; when the owner leaves the
   organization it is refused with `replica_creator_not_allowed`, never moved
-  to the principal.
+  to the principal. An environment MCP call for a provider organization
+  connected in more than one workspace is refused with 403
+  `organization_shared` (was `replica_environment_not_enabled`), as Cloud.
 - Added: environment-level Replicas MCP. `POST /api/v1/replicas/mcp` accepts
   only a Replicas `workspace_identity` token (RS256, issuer
   `SELFHOST_REPLICAS_IDENTITY_ISSUER`, default `https://api.replicas.dev`) and

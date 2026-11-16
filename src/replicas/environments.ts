@@ -50,6 +50,7 @@ export type IdentityRefusalCode =
   | "replica_identity_invalid"
   | "replica_released"
   | "replica_environment_not_enabled"
+  | "organization_shared"
   | "replica_creator_not_allowed"
   | "replica_already_bound";
 
@@ -135,7 +136,7 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
   const candidate = policies.rows.length === 1 ? policies.rows[0]! : null;
   // An organization connected in several workspaces has no single tenant: refuse before any creator check.
   if (await organizationShared(tx, claims.organizationId)) {
-    throw new IdentityRefusal("replica_environment_not_enabled", 403,
+    throw new IdentityRefusal("organization_shared", 403,
       candidate ? { workspaceId: candidate.workspace_id, organizationId: candidate.organization_id } : null);
   }
   // The workspace must still hold a connection to the same provider organization.
