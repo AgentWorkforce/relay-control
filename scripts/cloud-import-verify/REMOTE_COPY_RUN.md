@@ -28,6 +28,10 @@ by the copier. A row pointing at another backend fails verification; do not
 silently substitute or migrate it. For an approved non-Postgres backend, supply
 a reviewed read-only `CredentialBlobStore` reader to the library instead.
 
+Before the approved apply/copy, use [REMOTE_SNAPSHOT_RUN.md](REMOTE_SNAPSHOT_RUN.md)
+for the exact strict-TLS, target-only capture command. On a fresh empty target,
+both snapshots should have zero rows.
+
 If native credentials already exist, capture `captureCredentialTarget(target,
 scope)` before the copier and write that metadata snapshot privately (mode 600).
 Pass it as `--previous-credentials`. It contains hashed natural keys and flags,

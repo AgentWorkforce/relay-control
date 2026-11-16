@@ -369,3 +369,7 @@ Cloud row must map to a real Control row with its independently derived natural
 key; missing, extra or mismatched links fail. Multiple Cloud rows may deduplicate
 to one Control ID when their natural key agrees. The map never authorizes a skip
 or excludes an unexplained target row.
+
+Before the approved apply/copy, [REMOTE_SNAPSHOT_RUN.md](REMOTE_SNAPSHOT_RUN.md)
+captures private credential and ownership before-state using the same strict
+TLS/read-only library connection, without source/R2/keyring inputs.
