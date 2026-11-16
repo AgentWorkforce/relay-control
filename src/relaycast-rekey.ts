@@ -351,7 +351,8 @@ async function rekeyWorkspaceKeys(
   const { rows: bindings } = await deps.database.query<{ relaycast_workspace_id: string }>(
     `SELECT DISTINCT relaycast_workspace_id
        FROM workspaces
-      ${workspaceId === undefined ? "" : "WHERE id = $1"}
+      WHERE relaycast_workspace_id IS NOT NULL
+        ${workspaceId === undefined ? "" : "AND id = $1"}
       ORDER BY relaycast_workspace_id`,
     workspaceId === undefined ? [] : [workspaceId],
   );

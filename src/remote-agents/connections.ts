@@ -3,6 +3,7 @@ import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../crypto.
 import type { Database, SqlExecutor } from "../database.js";
 import { recordAudit } from "../admin/audit.js";
 import { retireCapyBindingsInTx } from "../capy/lifecycle.js";
+import { revokeWorkspaceReplicas } from "../replicas/service.js";
 
 /** Connection checks ported from Cloud main 8865fe718, not generic API-key storage.
  * Fixed provider origins, no redirects, no provider bodies/errors in public replies.
@@ -80,11 +81,30 @@ async function providerJson(response: Response, signal: AbortSignal): Promise<un
   }
 }
 
+export type RemoteAgentConnectionOptions = {
+  /** SELFHOST_REPLICAS_ENABLED: Replicas connections can bind agents to Relay. */
+  replicasEnabled?: boolean;
+  /**
+   * Revokes and retires every Replicas binding before the key is deleted
+   * (the key is needed to sleep compute). Throws to keep the connection.
+   */
+  replicasCleanup?: (actor: ConnectionActor) => Promise<void>;
+  /**
+   * After a Replicas connect. A fresh connect turns the all-environments
+   * default on, discovers the account's environments, enables them and
+   * registers their MCP entries; a re-connect over an existing connection
+   * (`reconnect`, a key rotation) keeps the flag and every opt-out and runs
+   * the sync semantics. Its failure never fails the connect.
+   */
+  replicasSetup?: (actor: ConnectionActor, options: { reconnect: boolean }) => Promise<{ discovery: unknown; allEnvironments: boolean; environments: unknown[] }>;
+};
+
 export class RemoteAgentConnections {
   constructor(
     readonly database: Database,
     readonly keyring: EncryptionKeyring,
     readonly fetchImpl: typeof fetch = fetch,
+    readonly options: RemoteAgentConnectionOptions = {},
   ) {}
 
   async list(workspaceId: string) {
@@ -96,7 +116,11 @@ export class RemoteAgentConnections {
       ...provider,
       connection: rows.find(row => row.provider === provider.id)
         ? view(rows.find(row => row.provider === provider.id)!) : null,
-      capabilities: { connectionManagement: true, relayBinding: false, historySync: false },
+      capabilities: {
+        connectionManagement: true,
+        relayBinding: provider.id === "replicas" && Boolean(this.options.replicasEnabled),
+        historySync: false,
+      },
     }));
   }
 
@@ -120,6 +144,13 @@ export class RemoteAgentConnections {
   }
 
   async connect(actor: ConnectionActor, provider: RemoteAgentId, input: Record<string, unknown>): Promise<RemoteConnection> {
+    return (await this.connectReporting(actor, provider, input)).connection;
+  }
+
+  /** connect, also reporting whether it replaced a connection that already existed (a re-connect). */
+  async connectReporting(actor: ConnectionActor, provider: RemoteAgentId, input: Record<string, unknown>): Promise<{
+    connection: RemoteConnection; replaced: boolean;
+  }> {
     const prior = await this.authorized(actor, async tx => {
       const existing = await tx.query<{ key_ciphertext: string }>(
         "SELECT key_ciphertext FROM remote_agent_connections WHERE workspace_id=$1 AND provider=$2", [actor.workspaceId, provider],
@@ -219,12 +250,33 @@ export class RemoteAgentConnections {
       );
       await recordAudit(tx, { workspaceId: actor.workspaceId, organizationId: actor.organizationId,
         actor: { kind: "user", userId: actor.userId }, action: "remote_agent.connect", target: provider });
-      return view(saved.rows[0]!);
+      return { connection: view(saved.rows[0]!), replaced: existing.rows.length > 0 };
     });
   }
 
+  /**
+   * Environment setup after a Replicas connect: the discovery report (or
+   * `{status: "failed"}`) and the per-environment enable results. Never
+   * throws; when the setup could not start, the default is reported as not
+   * confirmed (allEnvironments false) and a sync or enable retries it.
+   */
+  async replicasSetup(actor: ConnectionActor, options: { reconnect: boolean }): Promise<{
+    environmentDiscovery: unknown; environmentSetup: { allEnvironments: boolean; environments: unknown[] };
+  } | undefined> {
+    if (!this.options.replicasSetup) return undefined;
+    try {
+      const { discovery, allEnvironments, environments } = await this.options.replicasSetup(actor, options);
+      return { environmentDiscovery: discovery, environmentSetup: { allEnvironments, environments } };
+    } catch {
+      return { environmentDiscovery: { status: "failed", environments: [] }, environmentSetup: { allEnvironments: false, environments: [] } };
+    }
+  }
+
   async disconnect(actor: ConnectionActor, provider: RemoteAgentId): Promise<void> {
+    if (provider === "replicas" && this.options.replicasCleanup) await this.options.replicasCleanup(actor);
     await this.authorized(actor, async tx => {
+      // A binding created after the cleanup above loses its capability with the key.
+      if (provider === "replicas") await revokeWorkspaceReplicas(tx, actor.workspaceId);
       if (provider === "capy") await retireCapyBindingsInTx(tx,{organizationId:actor.organizationId,workspaceId:actor.workspaceId},"capy_disconnected");
       await tx.query("DELETE FROM remote_agent_connections WHERE workspace_id=$1 AND provider=$2", [actor.workspaceId, provider]);
       await recordAudit(tx, { workspaceId: actor.workspaceId, organizationId: actor.organizationId,

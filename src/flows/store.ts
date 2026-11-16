@@ -1105,8 +1105,8 @@ export class FlowsStore {
       resume_run_id: string | null;
       start_from: string | null;
       previous_run_id: string | null;
-      relaycast_workspace_id: string;
-      relaycast_api_key_ciphertext: string;
+      relaycast_workspace_id: string | null;
+      relaycast_api_key_ciphertext: string | null;
     }>(
       `SELECT r.id, r.workspace_id, r.workflow, r.file_type, r.workflow_file_name, r.flow_id,
               r.env_secrets_ciphertext, r.code_object_key, r.resume_run_id, r.start_from,
@@ -1117,6 +1117,9 @@ export class FlowsStore {
     );
     const row = result.rows[0];
     if (!row) throw new FlowsError(404, "run_not_found", "Run not found");
+    if (row.relaycast_workspace_id === null || row.relaycast_api_key_ciphertext === null) {
+      throw new FlowsError(503, "relaycast_not_ready", "Agent Relay is provisioning this workspace");
+    }
     const runSecrets = row.env_secrets_ciphertext
       ? JSON.parse(decryptSecret(row.env_secrets_ciphertext, this.keyring)) as Record<string, string>
       : undefined;

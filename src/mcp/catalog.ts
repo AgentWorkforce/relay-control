@@ -97,7 +97,12 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; staffReadGrant?: boolean } = {}): ToolPlanEntry[] {
+  // A staff read grant (docs/staff-read-grants.md) reaches the shared-session
+  // reads and capability discovery only, whatever else the server enables.
+  if (options.staffReadGrant) {
+    return (["shared_session_reads", "capability_discovery"] as const).map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
+  }
   const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relay_messaging", "customer_support"];
   // Launch tools exist only when SELFHOST_FEATURES selects launch; role and
   // connection kind are checked on every call.
@@ -106,6 +111,8 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; laun
   if (options.amp) groups.push("amp");
   // Factory tools exist only when SELFHOST_FACTORY_ENABLED is on.
   if (options.factory) groups.push("factory");
+  // Replicas tools exist only when SELFHOST_REPLICAS_ENABLED is on.
+  if (options.replicas) groups.push("replicas");
   if (options.capyPermits) groups.push("capy_binding");
   if (options.grokRoutines) groups.push("grok_routines");
   groups.push("capability_discovery");
@@ -126,12 +133,16 @@ export function registerToolPlan(plan: readonly ToolPlanEntry[], registrars: Too
 /** The owner/admin refusal shared by describe_capabilities and every launch tool. */
 export const LAUNCH_ROLE_REFUSAL = "Only current workspace owners and admins can manage agent launches. Call describe_capabilities for details.";
 
-export type McpAuthMode = "session" | "cli_login" | "oauth";
+export type McpAuthMode = "session" | "cli_login" | "oauth" | "staff_read_grant";
+
+/** The only tools a staff read grant may list or call; the MCP route refuses every other call before a server is built. */
+export const STAFF_READ_GRANT_TOOLS: readonly string[] = [...SHARED_SESSION_READ_TOOLS, CAPABILITY_DISCOVERY_TOOL];
 
 const AUTH_MODE_LABELS: Readonly<Record<McpAuthMode, string>> = {
   session: "browser session",
   cli_login: "Agent Relay CLI login",
   oauth: "workspace-bound OAuth connection",
+  staff_read_grant: "staff read grant (read-only, sessions-only, pinned to one workspace)",
 };
 
 export type WorkspaceRole = "owner" | "admin" | "member" | "none" | null;
@@ -171,6 +182,7 @@ export function describeCapabilities(input: {
   role: WorkspaceRole;
   amp?: boolean;
   factory?: boolean;
+  replicas?: boolean;
   launch?: boolean;
   capyPermits?: boolean;
   customerSupport?: boolean;
@@ -179,13 +191,20 @@ export function describeCapabilities(input: {
 }): CapabilityReport {
   const launchRole = input.role === "owner" || input.role === "admin";
   const canLaunch = Boolean(input.launch) && launchRole;
-  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, launch: input.launch,
-    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines })
+  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, replicas: input.replicas, launch: input.launch,
+    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines,
+    staffReadGrant: input.authMode === "staff_read_grant" })
     .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {
     const definition = TOOL_GROUPS[id];
     const base = { id, title: definition.title };
     const item = planned.get(id);
+    if (input.authMode === "staff_read_grant") {
+      if (item) return { ...base, status: "available", tools: [...item.tools] };
+      return { ...base, status: "unavailable", tools: [...definition.tools],
+        reason: "This connection is a staff read grant: read-only access to one workspace's shared sessions and capability discovery, nothing else.",
+        how_to_enable: "Use your own Agent Relay sign-in as a member of a workspace for these tools." };
+    }
     if (id === "customer_support" && !input.customerSupport) return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "The customer support backend is not configured on this installation.",
       how_to_enable: "Configure SELFHOST_CUSTOMER_SUPPORT_URL and SELFHOST_CUSTOMER_SUPPORT_TOKEN for the support service." };
@@ -199,6 +218,11 @@ export function describeCapabilities(input: {
         reason: LAUNCH_ROLE_REFUSAL,
         how_to_enable: "Ask a workspace owner to make you an owner or admin." };
     }
+    if (item && id === "replicas" && !launchRole) {
+      return { ...base, status: "restricted", tools: [...item.tools],
+        reason: "Only current workspace owners and admins with a person connection can manage Replicas.",
+        how_to_enable: "Ask a workspace owner to make you an owner or admin." };
+    }
     if (item) return { ...base, status: "available", tools: [...item.tools], ...(id === "customer_support"
       ? { call_requirements: "Available to all signed-in customers. Current credentials and workspace membership are checked before sending and before returning an answer." } : {}) };
     if (id === "grok_routines") return { ...base, status: "unavailable", tools: [...definition.tools],
@@ -207,6 +231,9 @@ export function describeCapabilities(input: {
     if (id === "events") return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "The MCP Events endpoint is not available here. Self-hosted Grok Bot webhook wake-ups use the grok_routines group on this connection.",
       how_to_enable: "Use connect_grok_bot_routine from a Grok Bot OAuth connection to this server's /cloud/api/v1/mcp/shared-sessions endpoint." };
+    if (id === "replicas") return { ...base, status: "unavailable", tools: [...definition.tools],
+      reason: "Replicas agents are not enabled on this self-hosted installation.",
+      how_to_enable: "An operator sets SELFHOST_REPLICAS_ENABLED=true and an owner or admin connects Replicas in Settings → Connections." };
     if (id === "hosted_launch") {
       return { ...base, status: "unavailable", tools: [...definition.tools],
         reason: "Agent launches are not enabled on this self-hosted installation.",

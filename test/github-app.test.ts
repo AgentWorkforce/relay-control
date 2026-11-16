@@ -374,3 +374,37 @@ test("App refresh leases preserve valid tokens on transient failures and fence r
   assert.equal((await disconnecting).error?.code, "connection_changed");
   assert.equal(await store.get(workspaceId, "github"), null, "a late mint cannot recreate a disconnected row");
 });
+
+test("OAuth runtime token transaction sets local idle and lock timeouts before the row lock", async (t) => {
+  const db = new PGliteDatabase();
+  t.after(() => db.close());
+  await migrate(db);
+  const control = new ControlPlaneStore(db, keyring);
+  const organization = await control.createOrganization({ name: "Test", ownerEmail: "owner@example.test", ownerName: "Owner" });
+  const workspaceId = await seedWorkspace(db, organization.id);
+  const config = testConfig();
+  config.operatorOAuthApps = { github: { clientId: "oauth-client", clientSecret: "oauth-secret", scopes: null } };
+  const fetchImpl: FetchLike = async () => json({ access_token: "oauth-1", refresh_token: "oauth-refresh", expires_in: 3600 });
+  const admin = createAdminModule({ config, database: db, keyring, fetchImpl });
+  const started = await admin.connections.startOAuth({ workspaceId, provider: "github", userId: organization.owner.id });
+  await admin.connections.completeOAuth({
+    state: new URL(started.connectLink).searchParams.get("state")!, code: "test-code", error: null,
+  });
+  const transactions: string[][] = [];
+  const original = db.transaction.bind(db);
+  db.transaction = ((run: Parameters<typeof original>[0]) => original(async (tx) => {
+    const events: string[] = [];
+    transactions.push(events);
+    const watched = Object.create(tx) as typeof tx;
+    watched.exec = (sql: string) => { events.push(`exec:${sql}`); return tx.exec(sql); };
+    watched.query = ((sql: string, params?: unknown[]) => { events.push(`query:${sql}`); return tx.query(sql, params); }) as typeof tx.query;
+    return run(watched);
+  })) as typeof db.transaction;
+  assert.equal((await admin.connections.runtimeToken({ workspaceId, provider: "github", actor })).accessToken, "oauth-1");
+  const events = transactions[0]!;
+  assert.deepEqual(events.slice(0, 2), [
+    "exec:SET LOCAL idle_in_transaction_session_timeout = '60s'",
+    "exec:SET LOCAL lock_timeout = '30s'",
+  ]);
+  assert.match(events[2]!, /^query:SELECT .* FOR UPDATE/s);
+});

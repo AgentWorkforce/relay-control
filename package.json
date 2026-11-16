@@ -2,7 +2,7 @@
   "name": "relay-control",
   "version": "0.5.20",
   "private": true,
-  "license": "Apache-2.0",
+  "license": "FSL-1.1-ALv2",
   "type": "module",
   "description": "Minimal self-hosted Agent Relay sessions control plane",
   "bin": {
@@ -17,7 +17,8 @@
     "openapi.yaml",
     "README.md",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    "LICENSES"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -33,6 +34,7 @@
     "@node-rs/argon2": "^2.2.2",
     "nodemailer": "^8.0.11",
     "pg": "^8.16.3",
+    "ws": "^8.23.0",
     "yaml": "^2.9.1",
     "zod": "^4.6.7"
   },
@@ -41,6 +43,7 @@
     "@types/node": "^22.0.0",
     "@types/nodemailer": "^8.0.2",
     "@types/pg": "^8.15.4",
+    "@types/ws": "^8.18.2",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "tsx": "^4.21.0",

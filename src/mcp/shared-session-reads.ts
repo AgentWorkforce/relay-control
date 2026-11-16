@@ -125,6 +125,13 @@ const ToolEventSchema = z.object({
   tool_name: z.string().nullable(),
   tool_status: z.string().nullable(),
   citation_url: z.string().url(),
+  /** Twin rows of the same utterance recorded by another ingestion path; see groupTwinEvents. */
+  also_recorded_as: z.array(z.object({
+    event_id: z.string(),
+    kind: z.string(),
+    type: z.string(),
+    timestamp: z.string(),
+  })).optional(),
 });
 
 const SearchOutputSchema = z.object({
@@ -140,6 +147,8 @@ const SearchOutputSchema = z.object({
   ignored_agents: z.array(z.string()).optional(),
   next_cursor: z.string().nullable(),
   correlation_id: z.string(),
+  /** Wall time of the RelayHistory read, in milliseconds. */
+  history_ms: z.number().int().nonnegative().optional(),
 });
 
 const AgentSessionsPageSchema = z.object({
@@ -213,7 +222,68 @@ export function boundedContent(content: string | null | undefined, maxContent: n
   };
 }
 
-function toToolEvent(event: RecallEvent, origin: string, maxContent: number) {
+export type TwinRef = { eventId: string; kind: string; type: string; ts: string };
+export type GroupedRecallEvent = RecallEvent & { alsoRecordedAs?: TwinRef[] };
+
+/** Window inside which two ingestion paths record the same utterance. */
+const TWIN_WINDOW_MS = 2_000;
+const TWIN_KINDS = new Set(["tool_call", "history"]);
+
+function isTwinPair(kept: RecallEvent, other: RecallEvent): boolean {
+  return other.source === kept.source
+    && other.sessionId === kept.sessionId
+    && (other.machineId ?? null) === (kept.machineId ?? null)
+    && other.content != null
+    && other.content === kept.content
+    && TWIN_KINDS.has(other.kind);
+}
+
+/**
+ * Presentation-only grouping of rows that record one utterance twice: a
+ * `session_event` row plus a `tool_call` or `history` row from another
+ * ingestion path, with the same source, session, machine and byte-identical
+ * content, within 2 s. The `session_event` row is kept and lists each folded
+ * twin in `alsoRecordedAs`; nothing else is touched, so repeated prompts at
+ * different times or two `session_event` rows stay separate. Page order is
+ * otherwise preserved. O(n log n) on a page of at most 100 rows.
+ */
+export function groupTwinEvents(events: RecallEvent[]): GroupedRecallEvent[] {
+  const times = events.map((event) => Date.parse(event.ts));
+  const order = events.map((_, index) => index)
+    .filter((index) => Number.isFinite(times[index]))
+    .sort((left, right) => times[left]! - times[right]! || left - right);
+  const folded = new Set<number>();
+  const twins = new Map<number, TwinRef[]>();
+  for (let position = 0; position < order.length; position += 1) {
+    const keptIndex = order[position]!;
+    const kept = events[keptIndex]!;
+    if (kept.kind !== "session_event" || kept.content == null) continue;
+    const keptTime = times[keptIndex]!;
+    // Scan neighbours on both sides inside the window.
+    for (const step of [-1, 1]) {
+      for (let cursor = position + step; cursor >= 0 && cursor < order.length; cursor += step) {
+        const otherIndex = order[cursor]!;
+        if (Math.abs(times[otherIndex]! - keptTime) > TWIN_WINDOW_MS) break;
+        if (folded.has(otherIndex)) continue;
+        const other = events[otherIndex]!;
+        if (!isTwinPair(kept, other)) continue;
+        folded.add(otherIndex);
+        const list = twins.get(keptIndex) ?? [];
+        list.push({ eventId: other.eventId, kind: other.kind, type: other.type, ts: other.ts });
+        twins.set(keptIndex, list);
+      }
+    }
+  }
+  const grouped: GroupedRecallEvent[] = [];
+  events.forEach((event, index) => {
+    if (folded.has(index)) return;
+    const list = twins.get(index);
+    grouped.push(list ? { ...event, alsoRecordedAs: list } : event);
+  });
+  return grouped;
+}
+
+function toToolEvent(event: GroupedRecallEvent, origin: string, maxContent: number) {
   const normalizedContent = boundedContent(event.content, maxContent);
   return {
     event_id: event.eventId,
@@ -234,7 +304,16 @@ function toToolEvent(event: RecallEvent, origin: string, maxContent: number) {
     tool_name: event.toolName ?? null,
     tool_status: event.toolStatus ?? null,
     citation_url: sessionCitation(origin, event.sessionId, event.source),
+    ...(event.alsoRecordedAs ? {
+      also_recorded_as: event.alsoRecordedAs.map((twin) => ({
+        event_id: twin.eventId, kind: twin.kind, type: twin.type, timestamp: twin.ts,
+      })),
+    } : {}),
   };
+}
+
+function elapsedMs(started: number): number {
+  return Math.max(0, Math.round(performance.now() - started));
 }
 
 function sourceForEvents(requestedSource: string | undefined, events: RecallEvent[]) {
@@ -331,13 +410,14 @@ export function registerSharedSessionReads(mcpServer: McpServer, context: McpCon
   server.registerTool("search_shared_sessions", {
     title: "Search shared session transcripts",
     description:
-      "Search the actual transcript event content shared in an authorized workspace. Returns bounded matching excerpts and source-session citation links, not merely session metadata. Set agent to instead list one agent's sessions, newest first, returned in sessions.",
+      "Search the actual transcript event content shared in an authorized workspace. Returns bounded matching excerpts and source-session citation links, not merely session metadata. Set agent to instead list one agent's sessions, newest first, returned in sessions. Narrowing with since makes searches markedly faster.",
     inputSchema: {
       query: z.string().trim().min(1).max(500).optional().describe("Case-insensitive transcript text to find. Required unless agent is set."),
       agent: z.string().trim().min(1).max(MAX_AGENT_LENGTH).regex(AGENT_VALUE).optional().describe("One agent's Relay name, without a leading @, to list that agent's sessions. Exact and case-insensitive. Cannot be combined with query text."),
       workspace_id: WorkspaceIdSchema,
       source: SourceSchema,
-      project: z.string().trim().min(1).max(512).optional(),
+      project: z.string().trim().min(1).max(512).optional()
+        .describe("Case-insensitive substring of the session's project id, such as relay-control."),
       since: IsoDateSchema.optional(),
       until: IsoDateSchema.optional(),
       limit: z.number().int().min(1).max(20).default(10),
@@ -357,12 +437,14 @@ export function registerSharedSessionReads(mcpServer: McpServer, context: McpCon
         if (agent.endsWith("*") || agentPrefixTooShort(agent)) throw new SharedSessionsToolError("Agent prefix search is not available through this tool yet. Use the exact agent name.");
         const list = new URLSearchParams({ agent, limit: String(input.limit) });
         if (input.source) list.set("source", input.source);
-        if (input.project) list.set("project", input.project);
+        if (input.project) list.set("projectContains", input.project);
         if (input.since) list.set("since", input.since);
         if (input.until) list.set("until", input.until);
         if (input.cursor) list.set("cursor", input.cursor);
-        const sessions = parsePage(AgentSessionsPageSchema,
-          await context.readHistory(`/v1/sessions?${list.toString()}`, { timeoutMessage: SEARCH_TIMEOUT_MESSAGE }));
+        const listStarted = performance.now();
+        const listBody = await context.readHistory(`/v1/sessions?${list.toString()}`, { timeoutMessage: SEARCH_TIMEOUT_MESSAGE });
+        const listMs = elapsedMs(listStarted);
+        const sessions = parsePage(AgentSessionsPageSchema, listBody);
         const listed = toolSuccess({
           workspace_id: workspaceId,
           matches: [],
@@ -375,6 +457,7 @@ export function registerSharedSessionReads(mcpServer: McpServer, context: McpCon
           ignored_agents: ignored,
           next_cursor: sessions.nextCursor ?? null,
           correlation_id: correlationId,
+          history_ms: listMs,
         });
         noteResultOwners(listed, sessions.sessions.map((row) => ({
           sessionId: row.sessionId, source: row.source ?? null, userIds: row.userIds ?? [],
@@ -384,17 +467,20 @@ export function registerSharedSessionReads(mcpServer: McpServer, context: McpCon
       if (!input.query) throw new SharedSessionsToolError("Provide query text or an agent.");
       const params = new URLSearchParams({ q: input.query, limit: String(input.limit), order: "desc", maxContent: String(input.max_content) });
       if (input.source) params.set("source", input.source);
-      if (input.project) params.set("project", input.project);
+      if (input.project) params.set("projectContains", input.project);
       if (input.since) params.set("since", input.since);
       if (input.until) params.set("until", input.until);
       if (input.cursor) params.set("cursor", input.cursor);
-      const page = parsePage(EventsPageSchema,
-        await context.readHistory(`/v1/events?${params.toString()}`, { timeoutMessage: SEARCH_TIMEOUT_MESSAGE }));
+      const searchStarted = performance.now();
+      const searchBody = await context.readHistory(`/v1/events?${params.toString()}`, { timeoutMessage: SEARCH_TIMEOUT_MESSAGE });
+      const searchMs = elapsedMs(searchStarted);
+      const page = parsePage(EventsPageSchema, searchBody);
       return toolSuccess({
         workspace_id: workspaceId,
-        matches: page.events.map((event) => toToolEvent(event, origin, input.max_content)),
+        matches: groupTwinEvents(page.events).map((event) => toToolEvent(event, origin, input.max_content)),
         next_cursor: page.nextCursor,
         correlation_id: page.correlationId,
+        history_ms: searchMs,
       });
     } catch (error) {
       console.error("[selfhost-mcp] Search failed", { correlationId });
@@ -429,13 +515,14 @@ export function registerSharedSessionReads(mcpServer: McpServer, context: McpCon
       assertEventScope(page.events, input.session_id, input.source);
       if (page.events.length === 0 && !input.cursor) throw new SharedSessionsToolError(NOT_FOUND_MESSAGE);
       const source = sourceForEvents(input.source, page.events);
+      const grouped = groupTwinEvents(page.events);
       return toolSuccess({
         workspace_id: workspaceId,
         session_id: input.session_id,
         source,
         citation_url: sessionCitation(origin, input.session_id, source ?? undefined),
-        page_overview: pageOverview(page.events, input.max_content),
-        events: page.events.map((event) => toToolEvent(event, origin, input.max_content)),
+        page_overview: pageOverview(grouped, input.max_content),
+        events: grouped.map((event) => toToolEvent(event, origin, input.max_content)),
         next_cursor: page.nextCursor,
         correlation_id: page.correlationId,
       });
