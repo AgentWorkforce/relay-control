@@ -394,3 +394,22 @@ test("cloud import: ledger guards: no ledger table refuses; a Control-native org
   await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
   assert.equal((await target.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [ORG_B, id(0xeee)])).rows.length, 1);
 });
+
+test("cloud import: transforms are time-zone independent (90-day clamp across DST)", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  // A session zone with a DST change inside the 90-day window (late March).
+  await source.exec("SET TIME ZONE 'Europe/Oslo'");
+  const OPS = id(0xc0ffee);
+  await target.query("INSERT INTO organizations (id, name) VALUES ($1, 'Operator')", [OPS]);
+  await target.query("INSERT INTO installation_bootstrap (installation_slot, organization_id) VALUES (1, $1) ON CONFLICT (installation_slot) DO UPDATE SET organization_id = EXCLUDED.organization_id", [OPS]);
+  const report = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(report.ok, true, JSON.stringify(report.orgs));
+  const grant = (await target.query<{ expires_at: string }>(
+    "SELECT to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') AS expires_at FROM staff_read_grants WHERE id = $1", [id(0xa01)])).rows[0]!;
+  assert.equal(grant.expires_at, "2026-04-01T00:00:00.123456", "created_at + 90 days in UTC, not in the session zone");
+});

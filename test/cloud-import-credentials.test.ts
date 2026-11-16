@@ -111,6 +111,11 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   // Alice's legacy object was never read: it could belong to either login.
   assert.ok(!reads.includes(`${id(1)}/openai/credentials.json.enc`));
   assert.equal(report.ok, false, "a missing object is not a clean copy");
+  // Rollback handle: every written Cloud row maps to its Control row.
+  assert.equal(Object.keys(report.controlIds).length, 7); // 0x808 object missing
+  const mapped = (await target.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM coding_agent_credentials WHERE id::text = ANY($1::text[])", [Object.values(report.controlIds)])).rows[0]!.n;
+  assert.equal(mapped, 7);
   assert.doesNotMatch(JSON.stringify(report), /sk-|rt-synthetic|example\.test/);
 
   const rows = (await target.query<{ auth_type: string; model_provider: string; secret_ciphertext: string | null; blob_location: string | null; workspace_id: string }>(
@@ -162,13 +167,22 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   assert.equal(await deps.logins.freshAuthFile(id(0x201), (await target.query<{ id: string }>(
     "SELECT id FROM coding_agent_credentials WHERE auth_type = 'provider_oauth'")).rows[0]!.id), codexAuth);
 
-  // Re-run converges on Control's own dedupe keys.
+  // Re-run converges on Control's own dedupe keys. The lost key is found
+  // this time, so the only remaining problem is the selection conflict.
+  objects.set(`${id(2)}/${id(0x808)}/credentials.json.enc`, JSON.stringify(cloudEnvelope(JSON.stringify({ type: "api_key", modelProvider: "openai", key: "sk-synthetic-openai-found-0000000000" }), CLOUD_KEY)));
   const again = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.equal(again.rows[id(0x808)], "copied");
+  assert.equal(again.selection?.selectionConflicts, 1);
+  assert.equal(again.ok, false, "a selection conflict is never a clean run");
+  // Org A alone has no conflict (its Google group has a native active key).
+  const orgA = await copyCodingAgentCredentials(deps, { orgIds: [ORG_A] }, "apply");
+  assert.equal(orgA.selection?.selectionConflicts, 0);
+  assert.equal(orgA.ok, true);
   assert.equal(again.rows[id(0x803)], "already_present");
   assert.equal(again.rows[id(0x805)], "already_present");
   assert.equal(again.rows[id(0x80b)], "already_present");
   const count = (await target.query<{ n: number }>("SELECT count(*)::int AS n FROM coding_agent_credentials WHERE auth_type <> 'relay_managed'")).rows[0]!.n;
-  assert.equal(count, 8);
+  assert.equal(count, 9);
   // The re-run re-applies the same selection.
   const activeAfter = (await target.query<{ secret_ciphertext: string }>(
     "SELECT secret_ciphertext FROM coding_agent_credentials WHERE workspace_id = $1 AND model_provider = 'anthropic' AND is_active", [id(0x201)])).rows;
