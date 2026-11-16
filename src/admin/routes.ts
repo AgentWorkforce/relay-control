@@ -248,12 +248,30 @@ export function createAdminModule(input: {
     // Here a selected coding-agent credential (Settings > Connections)
     // wins over a same-named workspace variable, and integration env wins
     // over both.
-    const env = { ...environment.env, ...agentEnvironment.env, ...integrationEnv };
+    const blocked = new Set(agentEnvironment.blockedNames);
+    const blockedPrefixes = agentEnvironment.blockedPrefixes;
+    const blockedWorkspaceNames: string[] = [];
+    const workspaceEnv: Record<string, string> = {};
+    for (const [name, value] of Object.entries(environment.env)) {
+      if (blocked.has(name) || blockedPrefixes.some((prefix) => name.startsWith(prefix))) {
+        blockedWorkspaceNames.push(name);
+      } else {
+        workspaceEnv[name] = value;
+      }
+    }
+    const skipped = new Map<string, { name: string; reason: string }>();
+    for (const name of blockedWorkspaceNames) {
+      skipped.set(name, { name, reason: "relay_managed_blocked" });
+    }
+    for (const entry of [...environment.skipped, ...agentEnvironment.skipped]) {
+      if (!skipped.has(entry.name)) skipped.set(entry.name, entry);
+    }
+    const env = { ...workspaceEnv, ...agentEnvironment.env, ...integrationEnv };
     return {
       workspaceId,
       env,
       secretEnvNames: Object.keys(env).sort(),
-      skipped: [...environment.skipped, ...agentEnvironment.skipped],
+      skipped: [...skipped.values()],
       integrationErrors: failed,
     };
   }
