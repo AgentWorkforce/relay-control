@@ -5,6 +5,11 @@ assigned at release.
 
 ## Unreleased
 
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set) every
+  Sessions read-token mint names the reader kind (`browser`, `device` or
+  `mcp`) from how the caller authenticated, so relaygate can tell a person's
+  own reads from agent reads on their behalf. Other installs send the same
+  mint body as before. See [Sessions read API](docs/sessions-read-api.md).
 - Added: GitHub App installation credentials with `SELFHOST_GITHUB_APP_ID`
   and `SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`. Imported connections retain
   their installation IDs and mint replacement tokens without reconnecting.

@@ -32,7 +32,8 @@ import { listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError }
 import {
   PeopleInputError, PersonNotFoundError, peopleAudit, peopleReport, personSessions, recordPeopleView, UsagePeopleStore,
 } from "./usage/people.js";
-import { readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
+import { mcpReaderMarker, readerKindOf, readSessionRequest, readRefreshRequest, requestReadSession, SessionReadError } from "./session-read.js";
+import { bearer } from "./auth/bearer.js";
 import { z } from "zod";
 import { acceptedAudiences, handleIntrospection, introspect, INTROSPECT_PATH } from "./auth/introspect.js";
 import { IntrospectionHold } from "./auth/introspection-hold.js";
@@ -183,13 +184,6 @@ function json(response: ServerResponse, status: number, body: unknown, noStore =
 function text(response: ServerResponse, status: number, body: string, type = "text/plain"): void {
   response.writeHead(status, { "content-type": `${type}; charset=utf-8` });
   response.end(body);
-}
-
-function bearer(request: IncomingMessage): string | null {
-  const header = request.headers.authorization;
-  if (!header) return null;
-  const match = /^Bearer\s+(.+)$/i.exec(header);
-  return match?.[1]?.trim() || null;
 }
 
 function cookie(request: IncomingMessage, name: string): string | null {
@@ -953,8 +947,11 @@ export function createApp(input: {
       if (!parsed.success) throw new HttpError(400, "invalid_request", "Invalid session read request");
       rateLimit(response, `session-read:${principal.userId}:${workspace.id}`,
         { limit: 30, windowMs: 60_000 }, "rate_limited", "Too many session read credential requests");
+      // Same facts as `browser` above: cookie -> browser, bearer -> device
+      // (or mcp with the MCP reader's marker; see readerKindOf).
       const session = await requestReadSession(api, {
         userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
+        readerKind: readerKindOf(request, mcpReaderMarker(api.secret)),
       }, parsed.data);
       const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
       return browser ? accessOnly : session;
@@ -2004,7 +2001,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       requireFeature("usage_people");
       const sub = peopleRoute[2];
-      const owner = { userId: auth.principal.userId, token: auth.token };
+      const owner = { userId: auth.principal.userId, token: auth.token, readerKind: readerKindOf(request) };
       const now = input.now?.() ?? new Date();
       if (sub === "audit") {
         if ([...url.searchParams.keys()].length > 0) throw new HttpError(400, "invalid_request", "No parameters are accepted");
@@ -2074,7 +2071,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           store,
           usage,
           organizationId: usageRoute[0]!,
-          owner: { userId: auth.principal.userId, token: auth.token },
+          owner: { userId: auth.principal.userId, token: auth.token, readerKind: readerKindOf(request) },
           days,
           now: input.now?.() ?? new Date(),
         }),
@@ -2557,8 +2554,12 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (!parsed.success) throw new HttpError(400, "invalid_request", "Invalid session read request");
       rateLimit(response, `session-read:${principal.userId}:${workspace.id}`,
         { limit: 30, windowMs: 60_000 }, "rate_limited", "Too many session read credential requests");
+      // Cookie -> browser, bearer -> device, bearer plus the MCP reader's
+      // marker (src/mcp/session-read-reader.ts) -> mcp. The marker is never
+      // logged or echoed.
       const session = await requestReadSession(config.sessionReadApi, {
         userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
+        readerKind: readerKindOf(request, mcpReaderMarker(config.sessionReadApi.secret)),
       }, parsed.data);
       // Page scripts get a short-lived access token only. Renew by requesting
       // a new session through the cookie path, which rechecks live membership.

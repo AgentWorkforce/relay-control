@@ -5,6 +5,7 @@ import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { readWorkspaceHistory } from "../sessions/history.js";
 import { readViaSessionRead } from "./session-read-reader.js";
+import { mcpReaderMarker } from "../session-read.js";
 import type { EncryptionKeyring } from "../crypto.js";
 import type { Database, SqlExecutor } from "../database.js";
 import type { RelaycastClient, RosterAgent, PresenceRow } from "../messaging/relaycast.js";
@@ -111,7 +112,12 @@ export function historyReader(
     organizationId: workspace.organizationId,
     workspaceId: workspace.id,
     callerToken,
+    // Every MCP read is on the person's behalf, in both read modes.
+    readerKind: "mcp" as const,
   };
+  // Proves the flagged mode's hop to the public session-read route is this
+  // reader (see readerKindOf). Derived from the secret; never logged.
+  const marker = mcpReaderMarker(config.sessionReadApi.secret);
   return async (path: string, options: { timeoutMessage?: string } = {}): Promise<unknown> => {
     // MCP admission authenticates the person; content reads additionally need
     // the issue-time read scope. Neither a handoff nor a service credential
@@ -121,7 +127,7 @@ export function historyReader(
     }
     const url = new URL(path, "https://relayhistory.invalid");
     try {
-      const result = await readViaSessionRead(config, identity, url.pathname, url.searchParams)
+      const result = await readViaSessionRead(config, identity, url.pathname, url.searchParams, marker)
         ?? await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
       if (result.status === "unsupported") {
         throw new SharedSessionsToolError("The selected backend does not support this view (unsupported_by_backend).");
