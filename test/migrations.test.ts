@@ -3,7 +3,7 @@ import test from "node:test";
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { CONTROL_SEQUENCES, CONTROL_TABLES } from "../src/control-tables.js";
+import { CONTROL_SEQUENCES, CONTROL_TABLES, OWNER_ONLY_TABLES } from "../src/control-tables.js";
 import type { Database, SqlExecutor, SqlResult } from "../src/database.js";
 import { defaultMigrationsDirectory, grantRuntimeDatabaseRole, migrate } from "../src/migrations.js";
 import { PGliteDatabase } from "./support/harness.js";
@@ -295,9 +295,46 @@ test("runtime grant lists cover every table and sequence the migrations create",
   t.after(() => database.close());
   await migrate(database);
   const { tables } = await schemaObjects(database);
-  assert.deepEqual([...CONTROL_TABLES].sort(), tables.filter((name) => name !== LEDGER).sort());
+  assert.deepEqual([...CONTROL_TABLES].sort(), tables.filter((name) => name !== LEDGER && !OWNER_ONLY_TABLES.includes(name)).sort());
+  // Owner-only tables exist and are never in the runtime grant list.
+  for (const name of OWNER_ONLY_TABLES) {
+    assert.ok(tables.includes(name), `${name} is created by a migration`);
+    assert.ok(!CONTROL_TABLES.includes(name), `${name} must not be granted to the runtime role`);
+  }
   const sequences = await database.query<{ name: string }>(
     "SELECT sequencename AS name FROM pg_sequences WHERE schemaname = 'public' ORDER BY 1",
   );
   assert.deepEqual([...CONTROL_SEQUENCES].sort(), sequences.rows.map((row) => row.name));
+});
+
+test("every table is granted to the runtime role or listed owner-only, never both", async (t) => {
+  const database = new PGliteDatabase();
+  t.after(() => database.close());
+  await migrate(database);
+  const { tables } = await schemaObjects(database);
+  for (const name of tables.filter((table) => table !== LEDGER)) {
+    const listed = Number(CONTROL_TABLES.includes(name)) + Number(OWNER_ONLY_TABLES.includes(name));
+    assert.equal(listed, 1, `${name} must be in exactly one of CONTROL_TABLES or OWNER_ONLY_TABLES`);
+  }
+});
+
+test("the runtime role cannot read or write owner-only tables", async (t) => {
+  const database = new PGliteDatabase();
+  t.after(() => database.close());
+  await migrate(database);
+  await database.exec("CREATE ROLE import_test_runtime NOLOGIN");
+  await grantRuntimeDatabaseRole(database, "import_test_runtime");
+  await database.exec("SET ROLE import_test_runtime");
+  try {
+    await database.query("SELECT count(*) FROM users");
+    for (const name of OWNER_ONLY_TABLES) {
+      await assert.rejects(database.query(`SELECT count(*) FROM public.${name}`), /permission denied/);
+      await assert.rejects(
+        database.query(`DELETE FROM public.${name}`),
+        /permission denied/,
+      );
+    }
+  } finally {
+    await database.exec("RESET ROLE");
+  }
 });
