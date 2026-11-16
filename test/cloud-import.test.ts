@@ -237,6 +237,12 @@ test("cloud import: current target (0053-0057 + 0058) keeps rw_, slugs, History 
     "workspaces.slug",
   ]);
   assert.equal(report.tables.desktop_relay_identities.imported, 2);
+  // Canonical History origins are listed for SELFHOST_RELAYHISTORY_AUDIENCES.
+  assert.deepEqual(report.relayhistoryOrigins, ["https://history.example.test"]);
+  // A pluggable canonicaliser (Control's, once #163 merges) decides the value.
+  const strict = await runImport({ source, keyring: KEYRING, cloudKeyHex: CLOUD_KEY, canonicalOrigin: () => null }, { orgIds: null }, "plan");
+  assert.deepEqual(strict.relayhistoryOrigins, []);
+  assert.equal(strict.warnings.relayhistory_origin_invalid_dropped, 1);
   assert.equal(report.warnings.fleet_node_name_filled_with_node_id, undefined);
 
   const workspaces = (await target.query<{ id: string; cloud_relay_workspace_id: string | null; slug: string; relayhistory_origin: string | null }>(

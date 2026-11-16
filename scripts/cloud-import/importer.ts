@@ -46,7 +46,22 @@ export type ImportDeps = {
   now?: () => Date;
   /** Rows per insert statement. */
   batchSize?: number;
+  /**
+   * Canonical relayhistory_origin for a Cloud value, or null when it cannot
+   * be one. Control's canonicalRelayhistoryOrigin (#163) once merged.
+   */
+  canonicalOrigin?: (raw: string) => string | null;
 };
+
+/**
+ * Interim stand-in until #163 merges: accepts only what 0056's CHECK accepts
+ * after lowercasing and stripping one trailing slash. Stricter than #163, so
+ * it can drop (flag) a value #163 would keep, never the reverse.
+ */
+export function interimCanonicalOrigin(raw: string): string | null {
+  const value = raw.trim().toLowerCase().replace(/\/$/, "");
+  return /^https:\/\/([a-z0-9.-]+|\[[0-9a-f:.]+\])(:[0-9]{1,5})?$/.test(value) ? value : null;
+}
 
 export type TableLedger = {
   candidates: number;
@@ -93,6 +108,8 @@ export type ImportReport = {
   /** Columns written beyond the 0051 baseline, as found on the target. */
   optionalColumns: string[];
   warnings: Record<string, number>;
+  /** Distinct canonical History origins imported (customer hosts; keep local). */
+  relayhistoryOrigins: string[];
 };
 
 type SourceRow = {
@@ -106,9 +123,11 @@ type SourceRow = {
   row: string;
   /** Row facts the importer acts on without parsing `row`. */
   flags: string[] | null;
+  /** workspaces: Cloud's raw relayhistory_origin. */
+  origin: string | null;
 };
 
-type PreparedRow = { key: string; org: string | null; email: string | null; row: string; secret: string | null; flags: string[] | null };
+type PreparedRow = { override?: string; key: string; org: string | null; email: string | null; row: string; secret: string | null; flags: string[] | null };
 
 type EncryptedEnvelope = { v: number; iv: string; tag: string; ciphertext: string };
 
@@ -140,7 +159,8 @@ async function readSource(tx: SqlExecutor, table: ImportTable, scope: ImportScop
             ${email} AS email,
             ${secret === "secret_plaintext" ? "q.secret_plaintext" : secret === "secret_envelope" ? "q.secret_envelope::text" : "NULL::text"} AS secret,
             ${ROW_FLAGS[table] ?? "NULL::text[]"} AS flags,
-            (to_jsonb(q) - 'skip_reason' - 'secret_plaintext' - 'secret_envelope' - 'cloud_user_id')::text AS row
+            ${table === "workspaces" ? "q.relayhistory_origin_raw" : "NULL::text"} AS origin,
+            (to_jsonb(q) - 'skip_reason' - 'secret_plaintext' - 'secret_envelope' - 'cloud_user_id' - 'relayhistory_origin_raw')::text AS row
        FROM (${sourceQuery(table, scope)}) q`,
   );
   return result.rows;
@@ -150,8 +170,7 @@ const ROW_FLAGS: Partial<Record<ImportTable, string>> = {
   workspaces: `array_remove(ARRAY[
       CASE WHEN q.cloud_relay_workspace_id IS NULL THEN 'workspace_rw_id_not_rw_8hex' END,
       CASE WHEN q.has_dashboard_url THEN 'relayhistory_dashboard_url_dropped' END,
-      CASE WHEN q.relayhistory_origin IS NOT NULL THEN 'relayhistory_origin_set' END,
-      CASE WHEN q.origin_invalid THEN 'relayhistory_origin_invalid_dropped' END
+      CASE WHEN q.relayhistory_origin_raw IS NOT NULL THEN 'relayhistory_origin_set' END
     ], NULL)`,
   desktop_relay_identities: `CASE WHEN NOT q.source_id_is_uuid THEN ARRAY['source_id_not_uuid'] END`,
   coding_agent_credentials: `CASE WHEN q.active_demoted THEN ARRAY['coding_agent_active_demoted'] END`,
@@ -198,10 +217,10 @@ function upsertSql(table: ImportTable, columns: string[], fill = "'{}'::jsonb"):
     .map((column) => `${quote(column)} = EXCLUDED.${quote(column)}`);
   return `INSERT INTO ${relation} (${columns.map(quote).join(", ")})
 SELECT ${columns.map((column) => `p.${quote(column)}`).join(", ")}
-  FROM unnest($1::text[], $2::text[]) AS u(r, s)
+  FROM unnest($1::text[], $2::text[], $3::text[]) AS u(r, s, o)
  CROSS JOIN LATERAL jsonb_populate_record(
    NULL::${relation},
-   u.r::jsonb || ${fill} || ${secretColumn ? `CASE WHEN u.s IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('${secretColumn}', u.s) END` : "'{}'::jsonb"}
+   u.r::jsonb || COALESCE(u.o::jsonb, '{}'::jsonb) || ${fill} || ${secretColumn ? `CASE WHEN u.s IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('${secretColumn}', u.s) END` : "'{}'::jsonb"}
  ) AS p
 ON CONFLICT (${spec.primaryKey.map(quote).join(", ")}) DO ${updates.length ? `UPDATE SET ${updates.join(", ")}` : "NOTHING"}`;
 }
@@ -299,6 +318,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     orgs: {},
     optionalColumns: [],
     warnings: {},
+    relayhistoryOrigins: [],
   };
   const skip = (table: ImportTable, reason: string, key?: string) => {
     const ledger = report.tables[table];
@@ -309,6 +329,8 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     report.warnings[name] = (report.warnings[name] ?? 0) + 1;
   };
 
+  const canonicalOrigin = deps.canonicalOrigin ?? interimCanonicalOrigin;
+  const origins = new Set<string>();
   // 1. Read and transform. Nothing is written before every row is prepared.
   const prepared = {} as Record<ImportTable, PreparedRow[]>;
   await deps.source.transaction(async (tx) => {
@@ -346,12 +368,21 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
           continue;
         }
         for (const flag of row.flags ?? []) if (flag !== "source_id_not_uuid") warn(flag);
-        kept.push({ key: row.key, org: row.org, email: row.email, row: row.row, secret, flags: row.flags });
+        let override: string | undefined;
+        if (table === "workspaces") {
+          const canonical = row.origin === null ? null : canonicalOrigin(row.origin);
+          if (row.origin !== null && canonical === null) warn("relayhistory_origin_invalid_dropped");
+          if (canonical !== null) origins.add(canonical);
+          override = JSON.stringify({ relayhistory_origin: canonical });
+        }
+        kept.push({ ...(override ? { override } : {}), key: row.key, org: row.org, email: row.email, row: row.row, secret, flags: row.flags });
       }
       prepared[table] = kept;
     }
   });
 
+  // Operators list these in SELFHOST_RELAYHISTORY_AUDIENCES (#163).
+  report.relayhistoryOrigins = [...origins].sort();
   const orgIds = [...new Set(prepared.organizations.map((row) => row.org!))].sort();
   // Keys are (re)computed from `prepared` after every filter has run, so the
   // ledger lists exactly the rows this run writes.
@@ -468,7 +499,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       if (rows.length === 0) return;
       const sql = upsertSql(table, write[table], fills[table]);
       for (const batch of chunks(rows, batchSize)) {
-        await tx.query(sql, [batch.map((row) => row.row), batch.map((row) => row.secret)]);
+        await tx.query(sql, [batch.map((row) => row.row), batch.map((row) => row.secret), batch.map((row) => row.override ?? null)]);
       }
     };
     const runOrg = async (tx: SqlExecutor, org: string) => {

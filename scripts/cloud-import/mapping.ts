@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.5";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.6";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -47,11 +47,6 @@ const normEmail = (expression: string) => `lower(btrim(${expression}))`;
 const ROLE_RANK = (expression: string) =>
   `(CASE ${expression} WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END)`;
 const RW_FORMAT = "'^rw_[0-9a-f]{8}$'";
-// 0056 workspaces_relayhistory_origin_format. Cloud stores a bare https
-// origin; it is lowercased and stripped of a trailing slash. A value that
-// still does not fit is dropped (NULL = Control default) and flagged.
-const ORIGIN_FORMAT = "'^https?://([[:alnum:].-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?$'";
-const ORIGIN = (expression: string) => `lower(rtrim(btrim(${expression}), '/'))`;
 
 /**
  * Shared CTEs. Order matters: later CTEs read earlier ones.
@@ -123,9 +118,9 @@ workspace_rows AS (
          w.default_runtime AS runtime_config,
          CASE WHEN w.relay_workspace_id ~ ${RW_FORMAT} THEN w.relay_workspace_id END AS cloud_relay_workspace_id,
          w.slug,
-         CASE WHEN ${ORIGIN("w.relayhistory_origin")} ~ ${ORIGIN_FORMAT}
-              THEN ${ORIGIN("w.relayhistory_origin")} END AS relayhistory_origin,
-         (w.relayhistory_origin IS NOT NULL AND ${ORIGIN("w.relayhistory_origin")} !~ ${ORIGIN_FORMAT}) AS origin_invalid,
+         -- Canonicalised in the importer (Control's canonicalRelayhistoryOrigin,
+         -- #163), which overrides this column on the target.
+         w.relayhistory_origin AS relayhistory_origin_raw,
          rw.relaycast_api_key_generation,
          (w.relayhistory_dashboard_url IS NOT NULL) AS has_dashboard_url,
          w.created_at, w.updated_at,
@@ -279,8 +274,8 @@ SELECT organization_id, user_id, cloud_user_id, role, created_at, updated_at, sk
   FROM member_rows`,
     workspaces: `
 SELECT id, organization_id, name, relaycast_workspace_id, relaycast_api_key AS secret_plaintext,
-       runtime_config, cloud_relay_workspace_id, slug, relayhistory_origin, relaycast_api_key_generation,
-       has_dashboard_url, origin_invalid, created_at, updated_at, skip_reason
+       runtime_config, cloud_relay_workspace_id, slug, relayhistory_origin_raw, relaycast_api_key_generation,
+       has_dashboard_url, created_at, updated_at, skip_reason
   FROM workspace_rows`,
     organization_invitations: `
 SELECT i.id, i.organization_id, ${normEmail("i.email")} AS email, i.role,
@@ -654,7 +649,7 @@ const PROJECTIONS: Record<ImportTable, Projection> = {
   },
   workspaces: {
     key: "id::text", org: "organization_id::text", workspace: "id::text",
-    columns: { id: "id::text", organization_id: "organization_id::text", name: "name", relaycast_workspace_id: "relaycast_workspace_id", cloud_relay_workspace_id: "cloud_relay_workspace_id", slug: "slug", relayhistory_origin: "relayhistory_origin", relaycast_api_key_generation: "relaycast_api_key_generation", runtime_config: "runtime_config::jsonb::text", created_at: ts("created_at"), updated_at: ts("updated_at") },
+    columns: { id: "id::text", organization_id: "organization_id::text", name: "name", relaycast_workspace_id: "relaycast_workspace_id", cloud_relay_workspace_id: "cloud_relay_workspace_id", slug: "slug", relaycast_api_key_generation: "relaycast_api_key_generation", runtime_config: "runtime_config::jsonb::text", created_at: ts("created_at"), updated_at: ts("updated_at") },
   },
   organization_invitations: {
     key: "id::text", org: "organization_id::text",
