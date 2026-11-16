@@ -152,7 +152,10 @@ Each call is admitted in this order:
    Control workspace, otherwise 403 `organization_shared` (as Cloud). The
    token's environment must be enabled in exactly one Control workspace whose
    Replicas connection belongs to the token's organization, otherwise 403
-   `replica_environment_not_enabled`.
+   `replica_environment_not_enabled`. The same refusal applies while that
+   connection's access-revoked latch is set (the provider refused the stored
+   key, see "Revoked provider access") and while the environment is fenced by
+   discovery (a complete listing no longer showed it, see below).
 4. The replica acts as one Control person, who must still be a current member
    of the organization:
    - a creator mapped for the environment acts as the mapped person; a
@@ -216,7 +219,8 @@ environment). Setup failures are reported there and never fail the connect:
 the connection is saved and a sync, a re-connect or an enable retries them
 (a failed or refused default enable is not an opt-out). When discovery failed
 or any environment ends in `registration_failed`, `registration_unconfirmed`,
-`enabled_elsewhere`, `organization_shared` or `stale_connection`, the 200
+`enabled_elsewhere`, `organization_shared`, `stale_connection` or
+`access_revoked`, the 200
 response also carries `provisioning_error: {code:
 "replica_environment_setup_failed", stage: "environment_setup", retryable,
 environments: [ids]}`: `environments` lists the failing environments (empty
@@ -243,9 +247,26 @@ the periodic sync Control runs at startup and then every
 `SELFHOST_REPLICAS_SYNC_INTERVAL_SECONDS` (default 60) for every Replicas
 connection whose all-environments default is on (a workspace without a
 settings row counts as on). The periodic sync has the same semantics as the
-route, never overlaps a running sync, logs a failing connection and goes on
-with the next, never sets or infers the VM principal, and is audited as the
-`replicas-sync` service. It stops on shutdown.
+route except for unconfirmed creates (below), never overlaps a running sync,
+logs a failing connection and goes on with the next, never sets or infers the
+VM principal, and is audited as the `replicas-sync` service. It stops on
+shutdown.
+
+Each sweep tick then retries unfinished cleanup for every Replicas
+connection: a released binding whose Relay identity or compute could not be
+retired (for example Relay answered 5xx during a disable) is retired again.
+Each attempt is counted on the row (`cleanup_attempts`,
+`cleanup_last_attempt_at`) and a failing row backs off exponentially, from
+one minute doubling per attempt up to one hour. A failing row is logged
+(`replicas_cleanup_failed` with the launch id) and the sweep goes on.
+
+Discovery fencing: a complete discovery listing (every page read) that no
+longer shows an enabled environment records `discovery_missing_since` on its
+policy (the first time only). The environment stays enabled and keeps its
+opt-out flag and registration, but admits no token and is skipped by the
+sync default selection; the policy view reports status `discovery_missing`
+with `discoveryMissingSince`. Listing the environment again lifts the fence.
+A partial or failed listing changes nothing.
 
 An admin opts one environment out with `PUT .../environments/{id}` and
 `enabled: false`, or `DELETE .../environment-mcp` with `{environmentIds}`;
@@ -285,8 +306,9 @@ the principal (no tombstone): those replicas enrol again under the new
 principal on their next call, or are refused when it was cleared. Mapping a
 creator releases that creator's bindings that act as the principal or as a
 different person, so they enrol again as the mapped member. Removing a
-mapping releases nothing: a binding keeps acting for its person and its calls
-are refused unless the rules above still select that person.
+mapping releases, in the same transaction, the environment's bindings that
+acted as that creator (no tombstone): each replica enrols again on its next
+call as the principal, or is refused when no principal is set.
 
 Each policy lists `pendingCreators`: `[{creatorId, emailHint, lastSeenAt,
 count}]`, newest first: creators seen without a mapping (admitted as the
@@ -304,8 +326,8 @@ All are owner/admin only. The registered entry is:
 
 Registration and removal report a status per environment (`registered`,
 `registration_failed`, `registration_unconfirmed`, `enabled_elsewhere`,
-`organization_shared`, `disabled`, `removal_failed`) with `retryable` on
-failures. Registration first reads the environment's MCP entries: a single
+`organization_shared`, `access_revoked`, `disabled`, `removal_failed`) with
+`retryable` on failures. Registration first reads the environment's MCP entries: a single
 matching `agent-relay-replica` entry is reused; two or more entries with that
 name, or one with another transport or config, are never overwritten and
 report `registration_failed` with `retryable: false`. Otherwise the entry is
@@ -315,7 +337,18 @@ entries could not be read or the provider rejected the create (HTTP 400, 401,
 create was sent but the entry could not be confirmed by reading it back
 (timeout, provider 5xx, unreadable response, or the result could not be
 stored); a retry reads the entries again and reuses one that landed. A 409 on
-create is resolved by the read-back. An environment can be enabled in only
+create is resolved by the read-back. `access_revoked` (`retryable: false`)
+means the provider answered 401 or 403 to the listing or the create.
+
+The create intent is persisted (`create_unconfirmed` on the policy, migration
+0070) before a create is sent, and the policy view reports such a policy as
+`registration_unconfirmed`. A matching entry found by any later listing is
+recorded as registered and clears the intent; a definite provider rejection
+clears it too. While it is set, automatic runs (the startup run and the
+periodic sync) only list the entries again and never send another create. A
+person-driven run (`POST .../environments/sync`, `POST .../environment-mcp`
+or `PUT .../environments/{id}`) may create again, and only after a complete
+listing showed no entry. A failed listing leaves the intent as it was. An environment can be enabled in only
 one Control workspace; a concurrent enable elsewhere reports
 `enabled_elsewhere`.
 
@@ -351,6 +384,22 @@ connected in another workspace. A tombstone that outlived its workspace stays
 in force: there is no in-product revive for it, matching the hosted
 edition's tenant pin. A workspace with launch or bind records still answers
 409 `in_use` until those replicas are released.
+
+### Revoked provider access
+
+When the provider answers 401 or 403 to any call made with the workspace's
+Replicas key (discovery, the environment list, MCP entry listing or create,
+replica get, create or history, sleep), Control sets an access-revoked latch
+on the connection (migration 0070: `access_revoked_at`, kept from the first
+refusal, and a Control-authored `access_error`; no provider body is stored).
+A 5xx, a timeout or an unreadable answer proves nothing and changes nothing.
+While the latch is set every token of the workspace is refused with 403
+`replica_environment_not_enabled`. The latch clears on the next 2xx answer to
+an environments list (a sync or `GET .../environments`) or on a successful
+re-connect. The connection list (`GET .../remote-agent-connections`) and the
+policy view report it as `accessRevoked: {since, error}`, and the policy view
+shows each enabled environment as `access_revoked`, distinct from
+`stale_connection` (a policy recorded for an earlier provider organization).
 
 ## Not yet covered
 

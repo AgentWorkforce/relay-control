@@ -5,6 +5,18 @@ assigned at release.
 
 ## Unreleased
 
+- Added: Replicas failure paths (migration 0070). The environment MCP create
+  intent is persisted on the policy, so an unconfirmed create is never sent
+  again by the startup run or the periodic sync; a person-driven sync or
+  enable creates again only after a complete listing shows no entry. Removing
+  a creator mapping releases that creator's creator-acting bindings, and the
+  periodic sync retries unfinished cleanup of released bindings with
+  exponential backoff (1 minute to 1 hour). A 401 or 403 from Replicas on the
+  stored key sets an access-revoked latch on the connection that refuses
+  admission until an environments list succeeds or the connection is
+  re-connected (`accessRevoked` on the connection list and policy view). A
+  complete discovery listing that no longer shows an enabled environment
+  fences it (`discovery_missing`) until it is listed again.
 - Added: Replicas tombstone retention, periodic sync and setup errors.
   Releasing a per-launch replica (`release_replica`, `DELETE
   .../replicas/spawns/{id}`) now writes a tombstone in the revoke
