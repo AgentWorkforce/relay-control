@@ -5,6 +5,12 @@ assigned at release.
 
 ## Unreleased
 
+- Added: GitHub App installation credentials with `SELFHOST_GITHUB_APP_ID`
+  and `SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`. Imported connections retain
+  their installation IDs and mint replacement tokens without reconnecting.
+  Tokens are cached encrypted and refreshed under the connection row lock.
+  See [GitHub App credentials](docs/github-app-connections.md).
+
 - Added: `SELFHOST_RELAYGATE_PUBLIC_URL` (unset by default) for gate-only
   installs, where relaygate is the only public way into Relaycast. When set,
   `GET /api/v1/workspaces/{id}/resolve` answers `urls.relaygateUrl` (the
