@@ -41,8 +41,20 @@ export function remoteAgentRoutes(connections: RemoteAgentConnections) {
       const actor = { userId: access.principal.userId, workspaceId: access.workspace.id, organizationId: access.workspace.organizationId };
       const provider = id as RemoteAgentId;
       if (method === "DELETE") {
-        await connections.disconnect(actor, provider);
-        send(200, { connection: null });
+        // The body is optional: an empty one is no options, and only then is no content type needed.
+        const body = await helpers.requestObject(request);
+        if (Object.keys(body).length
+          && request.headers["content-type"]?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
+          throw new RemoteAgentError(415, "unsupported_media_type", "Use application/json.");
+        }
+        // Replicas only: owners and admins may abandon the provider environment cleanup.
+        if (Object.keys(body).some(key => key !== "abandon_environment_cleanup" || provider !== "replicas")
+          || (body.abandon_environment_cleanup !== undefined && typeof body.abandon_environment_cleanup !== "boolean")) {
+          throw new RemoteAgentError(400, "invalid_request", "Unsupported disconnect field.");
+        }
+        const { environmentCleanupAbandoned } = await connections.disconnect(actor, provider,
+          { abandonEnvironmentCleanup: body.abandon_environment_cleanup === true });
+        send(200, { connection: null, ...(environmentCleanupAbandoned ? { environment_cleanup_abandoned: true } : {}) });
       } else {
         if (request.headers["content-type"]?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
           throw new RemoteAgentError(415, "unsupported_media_type", "Use application/json.");

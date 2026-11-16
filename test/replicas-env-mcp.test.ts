@@ -107,7 +107,8 @@ function relaycastFetch(world: RelaycastWorld, roster: unknown[]): typeof fetch 
   }) as typeof fetch;
 }
 
-async function start(t: TestContext, enabled = true, issuerFetch: typeof fetch = identityFetch()) {
+async function start(t: TestContext, enabled = true, issuerFetch: typeof fetch = identityFetch(),
+  rateLimits?: Parameters<typeof createReplicasModule>[0]["rateLimits"]) {
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -133,6 +134,7 @@ async function start(t: TestContext, enabled = true, issuerFetch: typeof fetch =
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
   const replicas = createReplicasModule({
     replicas: { enabled }, config, database, relaycastFetch: messagingFetch, runtime: provider.runtime, identityFetch: issuerFetch,
+    ...(rateLimits ? { rateLimits } : {}),
   });
   const remoteAgentFetch = (async (input: string | URL | Request) => {
     if (String(input).endsWith("/whoami")) return Response.json({ organization: { id: PROVIDER_ORG, name: "Org" } });
@@ -303,6 +305,13 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     const policyId = (await database.query<{ id: string }>("SELECT id FROM replica_environment_policies WHERE environment_id = $1", [ENV_A])).rows[0]!.id;
     await database.query(`INSERT INTO replica_environment_creator_requests (policy_id, creator_id, last_seen_at)
       SELECT $1, 'old-' || n, now() - interval '1 day' - n * interval '1 minute' FROM generate_series(1, 50) n`, [policyId]);
+    // A pending creator is written at most once per minute: a refusal within the minute writes nothing.
+    await rpc(api, token(), "tools/list");
+    view = await api(`${base}/environment-policies`, { token: ownerToken });
+    pending = view.body.environments.find((item: any) => item.environmentId === ENV_A).pendingCreators;
+    assert.equal(pending.length, 51);
+    assert.equal(pending[0].count, 1);
+    await database.query("UPDATE replica_environment_creator_requests SET last_seen_at = now() - interval '2 minutes' WHERE creator_id = 'creator-owner'");
     await rpc(api, token(), "tools/list");
     view = await api(`${base}/environment-policies`, { token: ownerToken });
     pending = view.body.environments.find((item: any) => item.environmentId === ENV_A).pendingCreators;
@@ -535,15 +544,31 @@ test("a concurrent enable in another workspace is enabled_elsewhere, not a 500",
   assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE workspace_id = $1 AND enabled", [workspaceId]), 1);
 });
 
-test("the environment-level MCP is rate limited per source IP", async (t) => {
-  const env = await start(t);
-  for (let index = 0; index < 120; index++) {
-    assert.equal((await rpc(env.api, null, "tools/list")).status, 401);
+test("the environment-level MCP is rate limited per verified identity, with a coarse per-IP guard", async (t) => {
+  const minute = 60_000;
+  // Per identity: the organization and the VM. Another VM of the same organization from the same IP still answers.
+  const env = await start(t, true, identityFetch(), { ip: { limit: 1_000, windowMs: minute }, identity: { limit: 3, windowMs: minute } });
+  const first = token();
+  const second = token({ workspace_id: WORKSPACE_2 });
+  for (let index = 0; index < 3; index++) {
+    const answered = await rpc(env.api, first, "tools/list");
+    assert.notEqual(answered.status, 429, answered.text);
   }
-  const limited = await rpc(env.api, token(), "tools/list");
+  const limited = await rpc(env.api, first, "tools/list");
   assert.equal(limited.status, 429, limited.text);
   assert.deepEqual(limited.body.error, { code: -32000, message: "rate_limited" });
   assert.ok(Number(limited.headers.get("retry-after")) >= 1);
+  const other = await rpc(env.api, second, "tools/list");
+  assert.notEqual(other.status, 429, other.text);
+  // An unverified caller never reaches the identity quota; the IP guard holds a flood.
+  const guarded = await start(t, true, identityFetch(), { ip: { limit: 5, windowMs: minute } });
+  for (let index = 0; index < 5; index++) {
+    assert.equal((await rpc(guarded.api, null, "tools/list")).status, 401);
+  }
+  const flooded = await rpc(guarded.api, token(), "tools/list");
+  assert.equal(flooded.status, 429, flooded.text);
+  assert.deepEqual(flooded.body.error, { code: -32000, message: "rate_limited" });
+  assert.ok(Number(flooded.headers.get("retry-after")) >= 1);
 });
 
 async function connectAndEnable(env: Awaited<ReturnType<typeof start>>) {
@@ -824,30 +849,38 @@ test("all environments by default: sync enables new ones, opt-outs stick, the de
   assert.equal(await count(env, "SELECT 1 FROM replica_environment_settings WHERE all_environments"), 1);
 });
 
-test("connect with the organization already connected in another workspace enables nothing and still saves the connection", async (t) => {
+test("connect with the organization already connected in another workspace is refused and saves nothing", async (t) => {
   const env = await start(t);
   const { api, workspaceId, ownerToken, provider, database } = env;
+  const connection = `/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`;
   const other = await api(`/api/v1/organizations/${env.organizationId}/workspaces`, {
     method: "POST", token: BOOTSTRAP, body: { name: "secondary", relaycastWorkspaceId: "rc-secondary", relaycastApiKey: "rk_live_secondary" },
   });
   assert.equal(other.status, 201, other.text);
   await database.query(`INSERT INTO remote_agent_connections (workspace_id, provider, key_ciphertext, key_hint, provider_account)
     VALUES ($1, 'replicas', 'x', 'x', $2)`, [other.body.id, PROVIDER_ORG]);
-  const saved = await api(`/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  const refused = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.equal(refused.status, 403, refused.text);
+  assert.equal(refused.body.error, "organization_shared");
+  assert.equal(await count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'", [workspaceId]), 0);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE workspace_id = $1", [workspaceId]), 0);
+  assert.equal(provider.registered.length, 0);
+  // A re-connect in the losing workspace (a row saved before this rule) is refused the same way and keeps the old row.
+  await database.query(`INSERT INTO remote_agent_connections (workspace_id, provider, key_ciphertext, key_hint, provider_account)
+    VALUES ($1, 'replicas', 'x', 'x', $2)`, [workspaceId, PROVIDER_ORG]);
+  const reconnect = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
+  assert.equal(reconnect.status, 403, reconnect.text);
+  assert.equal(reconnect.body.error, "organization_shared");
+  assert.equal(await count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND key_ciphertext = 'x'", [workspaceId]), 1);
+  assert.equal(provider.registered.length, 0);
+  await database.query("DELETE FROM remote_agent_connections WHERE workspace_id = $1", [workspaceId]);
+  // Once the other workspace disconnects, the connect succeeds and enables both.
+  await database.query("DELETE FROM remote_agent_connections WHERE workspace_id = $1", [other.body.id]);
+  const saved = await api(connection, { method: "POST", token: ownerToken, body: { key: REPLICAS_KEY } });
   assert.equal(saved.status, 200, saved.text);
   assert.equal(saved.body.connection.providerAccount, PROVIDER_ORG);
-  assert.deepEqual(saved.body.environmentSetup.environments, [
-    { environmentId: ENV_A, status: "organization_shared", retryable: false },
-    { environmentId: ENV_B, status: "organization_shared", retryable: false },
-  ]);
-  assert.equal(provider.registered.length, 0);
-  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE enabled"), 0);
-  assert.equal(await count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'", [workspaceId]), 1);
-  // A refusal is not an opt-out: once the other workspace disconnects, sync enables both.
-  await database.query("DELETE FROM remote_agent_connections WHERE workspace_id = $1", [other.body.id]);
-  const synced = await api(`/api/v1/workspaces/${workspaceId}/replicas/environments/sync`, { method: "POST", token: ownerToken });
-  assert.equal(synced.status, 200, synced.text);
-  assert.deepEqual(synced.body.environments, [{ environmentId: ENV_A, status: "registered" }, { environmentId: ENV_B, status: "registered" }]);
+  assert.deepEqual(saved.body.environmentSetup.environments, [{ environmentId: ENV_A, status: "registered" }, { environmentId: ENV_B, status: "registered" }]);
+  assert.deepEqual(provider.registered.map((item) => item.environmentId).sort(), [ENV_A, ENV_B]);
 });
 
 test("a re-connect (key rotation) keeps per-environment opt-outs and a default turned off", async (t) => {

@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { SELFHOST_API_VERSION, type SelfhostConfig } from "./config.js";
 import { secureEqual } from "./crypto.js";
+import type { SqlExecutor } from "./database.js";
 import { adminErrorResponse, type AdminModule } from "./admin/routes.js";
 import { ApiTokenStore, ENROLLMENT_KEY_PREFIX } from "./admin/api-tokens.js";
 import { recordAudit } from "./admin/audit.js";
@@ -98,7 +99,7 @@ import { createCustomerSupportNoticeHandler } from "./mcp/customer-support-notic
 import type { AmpModule } from "./amp/module.js";
 import type { ReplicasModule } from "./replicas/module.js";
 import { isReplicasPath } from "./replicas/routes.js";
-import { disconnectEnvironments, setupEnvironments } from "./replicas/environments.js";
+import { abandonEnvironmentCleanup, disconnectEnvironments, setupEnvironments } from "./replicas/environments.js";
 import { disconnectReplicas, purgeMemberReplicas, releaseMemberReplicas, ReplicasError } from "./replicas/service.js";
 import { isAmpPath } from "./amp/routes.js";
 import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
@@ -578,16 +579,21 @@ export function createApp(input: {
   const remoteAgents = remoteAgentRoutes(new RemoteAgentConnections(store.database, config.encryptionKeyring, input.remoteAgentFetch, {
     replicasEnabled: Boolean(replicas),
     // Bindings are revoked and retired while the key still exists to sleep their compute.
-    ...(replicas ? { replicasCleanup: async (actor: { userId: string; workspaceId: string; organizationId: string }) => {
+    ...(replicas ? { replicasCleanup: async (actor: { userId: string; workspaceId: string; organizationId: string },
+      options: { abandonEnvironmentCleanup?: boolean }) => {
       try {
-        // Stop environment-level admission and remove provider MCP entries first, then retire bindings.
-        await disconnectEnvironments(replicas.deps, actor);
-        await disconnectReplicas(replicas.deps, actor);
+        // Stop environment-level admission (the fence), then retire bindings (the compute check and
+        // Relay retirement always run, also on an abandon request), and only then confirm and remove
+        // provider MCP entries (skipped on an abandon request): an entry that cannot be removed never
+        // keeps compute running.
+        await disconnectEnvironments(replicas.deps, actor, { ...options, afterFence: () => disconnectReplicas(replicas.deps, actor) });
       } catch (error) {
         if (error instanceof ReplicasError) throw new RemoteAgentError(error.status, "replicas_cleanup_failed", error.message);
         throw new RemoteAgentError(502, "replicas_cleanup_failed", "Replicas cleanup could not finish. Retry the disconnect.");
       }
     },
+    replicasAbandon: (tx: SqlExecutor, actor: { userId: string; workspaceId: string; organizationId: string }) =>
+      abandonEnvironmentCleanup(tx, actor),
     replicasSetup: (actor: { userId: string; workspaceId: string; organizationId: string }, options: { reconnect: boolean }) =>
       setupEnvironments(replicas.deps, actor, options) } : {}),
   }));
