@@ -15,7 +15,7 @@ import {
   id,
 } from "../scripts/cloud-import/cloud-fixture.js";
 import { runImport, type ImportReport } from "../scripts/cloud-import/importer.js";
-import { IMPORT_LEDGER_DDL, SOURCE_TABLES, TARGETS, verifierComparisons } from "../scripts/cloud-import/mapping.js";
+import { IMPORT_LEDGER_DDL, SOURCE_TABLES, TARGET_RELATIONS, TARGETS, verifierComparisons } from "../scripts/cloud-import/mapping.js";
 import { PGliteDatabase } from "./support/harness.js";
 
 const CLOUD_KEY = randomBytes(32).toString("hex");
@@ -584,6 +584,33 @@ test("cloud import: a secret Control re-encrypted unchanged (keyring rotation) i
   await source.exec("UPDATE relay_workspaces SET relaycast_api_key = 'rk_cloud_after_readopt' WHERE id = 'rw_0000a201'");
   assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
   assert.equal(decryptSecret(await key(), KEYRING), "rk_cloud_after_readopt");
+});
+
+test("cloud import: a converged re-run writes no row in any imported table or ledger namespace", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  const deps = { source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY };
+  assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
+  // Physical tuple identity of every row the import owns or touches.
+  const tuples = async () => {
+    const all: Record<string, string[]> = {};
+    for (const relation of [...new Set([...TARGET_RELATIONS, "public.cloud_import_ledger"])]) {
+      all[relation] = (await target.query<{ t: string }>(
+        `SELECT to_jsonb(x)::text || '@' || x.xmin::text || '/' || x.ctid::text AS t FROM ${relation} x ORDER BY 1`)).rows.map((row) => row.t);
+    }
+    return all;
+  };
+  // The very next run after the first apply must already write nothing.
+  const before = await tuples();
+  assert.ok(before["public.users"]!.length > 0 && before["public.cloud_import_ledger"]!.length > 0);
+  const again = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(again.ok, true, JSON.stringify(again.orgs));
+  const after = await tuples();
+  for (const relation of Object.keys(before)) assert.deepEqual(after[relation], before[relation], `${relation}: no tuple rewritten`);
 });
 
 test("cloud import: an existing Control user with an imported email under another id refuses the run", async (t) => {

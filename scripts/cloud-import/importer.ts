@@ -271,20 +271,29 @@ async function newKeys(tx: SqlExecutor, table: ImportTable, rows: PreparedRow[])
   return new Set(rows.map((row) => row.key).filter((key) => !present.has(key)));
 }
 
+// Resolved first, then written only where it differs: a converged re-run
+// rewrites no user row (xmin unchanged).
 const USERS_LAST_SQL = `
+WITH resolved AS (
+  SELECT u.id,
+         CASE WHEN EXISTS (
+           SELECT 1 FROM public.organization_memberships m
+            WHERE m.user_id = u.id AND m.organization_id = p.last_organization_id
+         ) THEN p.last_organization_id END AS last_organization_id,
+         CASE WHEN EXISTS (
+           SELECT 1 FROM public.workspaces w
+             JOIN public.organization_memberships m ON m.organization_id = w.organization_id AND m.user_id = u.id
+            WHERE w.id = p.last_workspace_id
+         ) THEN p.last_workspace_id END AS last_workspace_id
+    FROM unnest($1::text[]) AS x(r)
+   CROSS JOIN LATERAL jsonb_populate_record(NULL::public.users, x.r::jsonb) AS p
+    JOIN public.users u ON u.id = p.id
+)
 UPDATE public.users u
-   SET last_organization_id = CASE WHEN EXISTS (
-         SELECT 1 FROM public.organization_memberships m
-          WHERE m.user_id = u.id AND m.organization_id = p.last_organization_id
-       ) THEN p.last_organization_id END,
-       last_workspace_id = CASE WHEN EXISTS (
-         SELECT 1 FROM public.workspaces w
-           JOIN public.organization_memberships m ON m.organization_id = w.organization_id AND m.user_id = u.id
-          WHERE w.id = p.last_workspace_id
-       ) THEN p.last_workspace_id END
-  FROM unnest($1::text[]) AS x(r)
- CROSS JOIN LATERAL jsonb_populate_record(NULL::public.users, x.r::jsonb) AS p
- WHERE u.id = p.id`;
+   SET last_organization_id = r.last_organization_id, last_workspace_id = r.last_workspace_id
+  FROM resolved r
+ WHERE u.id = r.id
+   AND (u.last_organization_id, u.last_workspace_id) IS DISTINCT FROM (r.last_organization_id, r.last_workspace_id)`;
 
 class ImportRefused extends Error {
   constructor(readonly reason: string) {
@@ -847,7 +856,8 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
           `INSERT INTO public.${IMPORT_LEDGER_TABLE} (organization_id, table_name, row_key, mapping_revision)
            SELECT $1, t, k, $4 FROM unnest($2::text[], $3::text[]) AS u(t, k)
            ON CONFLICT (organization_id, table_name, row_key)
-           DO UPDATE SET mapping_revision = EXCLUDED.mapping_revision, imported_at = now()`,
+           DO UPDATE SET mapping_revision = EXCLUDED.mapping_revision, imported_at = now()
+           WHERE ${IMPORT_LEDGER_TABLE}.mapping_revision IS DISTINCT FROM EXCLUDED.mapping_revision`,
           [org, batch.map(([table]) => table), batch.map(([, key]) => key), MAPPING_REVISION],
         );
       }
@@ -864,7 +874,8 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       await tx.query(
         `INSERT INTO public.${IMPORT_LEDGER_TABLE} (organization_id, table_name, row_key, mapping_revision)
          SELECT $1, $2, k, $4 FROM unnest($3::text[]) AS u(k)
-         ON CONFLICT (organization_id, table_name, row_key) DO UPDATE SET mapping_revision = EXCLUDED.mapping_revision`,
+         ON CONFLICT (organization_id, table_name, row_key) DO UPDATE SET mapping_revision = EXCLUDED.mapping_revision
+         WHERE ${IMPORT_LEDGER_TABLE}.mapping_revision IS DISTINCT FROM EXCLUDED.mapping_revision`,
         [org, UNBOUND_WORKSPACE_MARKER, unbound, MAPPING_REVISION],
       );
     };
