@@ -7,6 +7,10 @@ ALTER TABLE workspaces
   ADD COLUMN relaycast_binding_claim_id uuid,
   ADD COLUMN relaycast_binding_claimed_at timestamptz,
   ADD COLUMN relaycast_binding_claim_name text,
+  -- Relaycast's keyed create replays the workspace API key. This is therefore
+  -- a credential-recovery capability, not a predictable request identifier.
+  -- Control generates it once with a CSPRNG and encrypts it under the keyring.
+  ADD COLUMN relaycast_binding_idempotency_key_ciphertext text,
   ADD CONSTRAINT workspaces_relaycast_binding_pair
     CHECK (
       (relaycast_workspace_id IS NULL AND relaycast_api_key_ciphertext IS NULL)

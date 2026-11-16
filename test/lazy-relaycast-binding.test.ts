@@ -11,6 +11,14 @@ import { close, listen, PGliteDatabase, request } from "./support/harness.js";
 
 const KEYRING = { active: { id: "lazy-binding", key: Buffer.alloc(32, 23) } };
 
+function opaqueIdempotencyKey(value: string | undefined, workspaceId: string): string {
+  assert(value);
+  assert.match(value, /^[A-Za-z0-9_-]{43}$/);
+  assert.notEqual(value, `relay-control-${workspaceId}`);
+  assert.equal(value.includes(workspaceId), false);
+  return value;
+}
+
 async function fixture(t: test.TestContext, provisioner: RelaycastProvisioner | null) {
   const database = new PGliteDatabase();
   t.after(() => database.close());
@@ -122,12 +130,20 @@ test("a concurrent waiter gets retryable not-ready without holding a transaction
   });
   releaseCreate();
   assert.equal((await first)!.relaycastWorkspaceId, "rw_waiter");
-  assert.deepEqual(idempotencyKeys, [`relay-control-${workspaceId}`]);
+  assert.equal(idempotencyKeys.length, 1);
+  const idempotencyKey = opaqueIdempotencyKey(idempotencyKeys[0], workspaceId);
   const claim = (await database.query<{
     relaycast_binding_claim_id: string | null;
     relaycast_binding_claimed_at: Date | null;
-  }>("SELECT relaycast_binding_claim_id, relaycast_binding_claimed_at FROM workspaces WHERE id = $1", [workspaceId])).rows[0]!;
-  assert.deepEqual(claim, { relaycast_binding_claim_id: null, relaycast_binding_claimed_at: null });
+    relaycast_binding_idempotency_key_ciphertext: string;
+  }>(`SELECT relaycast_binding_claim_id,
+             relaycast_binding_claimed_at,
+             relaycast_binding_idempotency_key_ciphertext
+        FROM workspaces WHERE id = $1`, [workspaceId])).rows[0]!;
+  assert.equal(claim.relaycast_binding_claim_id, null);
+  assert.equal(claim.relaycast_binding_claimed_at, null);
+  assert.notEqual(claim.relaycast_binding_idempotency_key_ciphertext, idempotencyKey);
+  assert.equal(decryptSecret(claim.relaycast_binding_idempotency_key_ciphertext, KEYRING), idempotencyKey);
 });
 
 test("a stale durable claim is reclaimed with the stable workspace idempotency key", async (t) => {
@@ -149,7 +165,8 @@ test("a stale durable claim is reclaimed with the stable workspace idempotency k
     [workspaceId],
   );
   assert.equal((await store.relaycastBinding(workspaceId))!.relaycastWorkspaceId, "rw_reconciled");
-  assert.deepEqual(keys, [`relay-control-${workspaceId}`]);
+  assert.equal(keys.length, 1);
+  opaqueIdempotencyKey(keys[0], workspaceId);
 });
 
 test("a stale-claim loser does not delete the keyed workspace owned by the live replacement claim", async (t) => {
@@ -163,8 +180,10 @@ test("a stale-claim loser does not delete the keyed workspace owned by the live 
   const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
   const secondRelease = new Promise<void>((resolve) => { releaseSecond = resolve; });
   const removed: string[] = [];
+  const keys: Array<string | undefined> = [];
   const provisioner: RelaycastProvisioner = {
-    async create() {
+    async create(_name, idempotencyKey) {
+      keys.push(idempotencyKey);
       createAttempt += 1;
       if (createAttempt === 1) {
         enterFirst();
@@ -195,6 +214,43 @@ test("a stale-claim loser does not delete the keyed workspace owned by the live 
   releaseSecond();
   assert.equal((await second)!.relaycastWorkspaceId, "rw_shared_keyed");
   assert.deepEqual(removed, []);
+  assert.equal(keys.length, 2);
+  assert.equal(opaqueIdempotencyKey(keys[0], workspaceId), keys[1]);
+});
+
+test("a creator whose claim vanished atomically binds the canonical workspace instead of terminalizing its key", async (t) => {
+  let enteredCreate!: () => void;
+  let releaseCreate!: () => void;
+  const entered = new Promise<void>((resolve) => { enteredCreate = resolve; });
+  const release = new Promise<void>((resolve) => { releaseCreate = resolve; });
+  const removed: string[] = [];
+  const provisioner: RelaycastProvisioner = {
+    async create() {
+      enteredCreate();
+      await release;
+      return { id: "rw_canonical_recovery", apiKey: "rk_canonical_recovery" };
+    },
+    async remove(id) { removed.push(id); },
+  };
+  const { database, store, workspaceId } = await fixture(t, provisioner);
+  const binding = store.relaycastBinding(workspaceId);
+  await entered;
+  await database.query(
+    `UPDATE workspaces
+        SET relaycast_binding_claim_id = NULL,
+            relaycast_binding_claimed_at = NULL,
+            relaycast_binding_claim_name = NULL
+      WHERE id = $1`,
+    [workspaceId],
+  );
+  releaseCreate();
+
+  const recovered = await binding;
+  assert.equal(recovered!.relaycastWorkspaceId, "rw_canonical_recovery");
+  assert.equal(recovered!.relaycastApiKey, "rk_canonical_recovery");
+  assert.equal(recovered!.provisioned, true);
+  assert.deepEqual(removed, []);
+  assert.equal((await store.relaycastBinding(workspaceId))!.relaycastWorkspaceId, "rw_canonical_recovery");
 });
 
 test("an explicit operator pair installs directly on an unbound row without provisioning an orphan", async (t) => {
@@ -277,7 +333,8 @@ test("a lost create response retains its durable claim and reconciles with the s
     [workspaceId],
   );
   assert.equal((await store.relaycastBinding(workspaceId))!.relaycastWorkspaceId, "rw_after_lost_response");
-  assert.deepEqual(keys, [`relay-control-${workspaceId}`, `relay-control-${workspaceId}`]);
+  assert.equal(keys.length, 2);
+  assert.equal(opaqueIdempotencyKey(keys[0], workspaceId), keys[1]);
   assert.deepEqual(names, ["Imported workspace", "Imported workspace"], "the retried request digest is stable across a rename");
 });
 
