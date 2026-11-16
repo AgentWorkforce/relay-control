@@ -31,3 +31,48 @@ jobs:
 
       - name: Test
         run: npm test
+
+  cloud-import-harness:
+    # The cloud-import verifier's real-Postgres harness (scripts/cloud-import-verify/dry-run.ts).
+    # `npm test` skips those suites without it, so importer, copier and verifier drift would go
+    # unnoticed. Runs on every push to main, and on pull requests that touch the import,
+    # the verifier, their tests, the credential stores or migrations.
+    name: Cloud import verifier harness (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether the harness applies
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          if echo "$changed" | grep -Eq '^(scripts/cloud-import|test/cloud-import|src/admin/(coding-agents|subscription-logins|credential-blobs)\.ts|migrations/|package(-lock)?\.json)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js
+        if: steps.scope.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.scope.outputs.run == 'true'
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run the verifier harness on a disposable PostgreSQL cluster
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          export CLOUD_VERIFY_PG_BIN="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)"
+          "$CLOUD_VERIFY_PG_BIN/postgres" --version
+          node --import tsx scripts/cloud-import-verify/dry-run.ts
