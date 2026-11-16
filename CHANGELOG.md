@@ -5,6 +5,10 @@ assigned at release.
 
 ## Unreleased
 
+- Added: the dashboard session catalog route passes relaygate's owning-group
+  label (`relaygate: {gid, label}`, from relaygate's `groupLabels` policy)
+  through when the session read API is relaygate; only those two validated
+  fields pass. Session list items already carried it unchanged.
 - Added: Replicas failure paths (migration 0070). The environment MCP create
   intent is persisted on the policy and, while it is set, every sync or
   enable (startup run, periodic sync, the sync and enable routes, a plain

@@ -9766,6 +9766,23 @@ components:
             type: object
         truncated:
           type: boolean
+        relaygate:
+          $ref: "#/components/schemas/RelaygateGroupLabel"
+    RelaygateGroupLabel:
+      type: object
+      description: |
+        Present only when the session read API is relaygate and its policy
+        labels the session's owning group (relaygate `groupLabels`). Display
+        only; passed through from the read API with just these two fields.
+        Session list items carry the same field unchanged.
+      required: [gid, label]
+      properties:
+        gid:
+          type: integer
+          minimum: 0
+        label:
+          type: string
+          maxLength: 24
     RunStatus:
       enum: [pending, running, completed, failed, cancelled]
     EnrollmentTokenSummary:
