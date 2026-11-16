@@ -588,6 +588,12 @@ export type TargetSpec = {
   /** Invites: a fresh sh_inv_ token hash, generated on insert only. */
   inviteTokenHash?: string;
   insertOnly?: readonly string[];
+  /**
+   * Columns updated as one unit, and never from a NULL source onto a bound
+   * target: when the source's `when` column is NULL and the target's is
+   * not, a re-run keeps all of `columns` as the target has them.
+   */
+  keepTargetBinding?: { when: string; columns: readonly string[] };
   /** Row key expression for the ledger (default id). */
   key?: string;
   /**
@@ -667,6 +673,13 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
     // Control column; rows that set it are counted as a warning.
     optional: ["cloud_relay_workspace_id", "slug", "relayhistory_origin", "relaycast_api_key_generation"],
     secret: { source: "secret_plaintext", target: "relaycast_api_key_ciphertext" },
+    // An unbound import that Control later bound lazily (0064) keeps its
+    // binding: a re-run must never reset it to NULL/NULL (that orphans the
+    // Relaycast workspace and creates a second one on next use).
+    keepTargetBinding: {
+      when: "relaycast_workspace_id",
+      columns: ["relaycast_workspace_id", "relaycast_api_key_ciphertext", "relaycast_api_key_generation"],
+    },
   },
   organization_invitations: {
     table: "organization_invitations",
@@ -733,7 +746,20 @@ export type ComparisonSpec = {
  */
 const ts = (column: string) => `to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US')`;
 
-type Projection = { key: string; org: string; workspace?: string; columns: Record<string, string> };
+type Projection = {
+  key: string; org: string; workspace?: string; columns: Record<string, string>;
+  /** Target-side expressions where they differ from the source side's. */
+  targetColumns?: Record<string, string>;
+};
+
+/**
+ * Ledger namespace marking workspaces this import wrote unbound (NULL/NULL
+ * Relaycast pair). Control may bind them lazily later; the verifier compares
+ * those as unbound, the state Cloud has. The importer's reconcile reads only
+ * ORG_TABLES, so this never reaches it.
+ */
+export const UNBOUND_WORKSPACE_MARKER = "workspace_unbound";
+const importedUnbound = `EXISTS (SELECT 1 FROM public.${IMPORT_LEDGER_TABLE} l WHERE l.table_name = '${UNBOUND_WORKSPACE_MARKER}' AND l.row_key = id::text)`;
 
 const PROJECTIONS: Record<ImportTable, Projection> = {
   staff_read_grants: {
@@ -767,6 +793,11 @@ const PROJECTIONS: Record<ImportTable, Projection> = {
   workspaces: {
     key: "id::text", org: "organization_id::text", workspace: "id::text",
     columns: { id: "id::text", organization_id: "organization_id::text", name: "name", relaycast_workspace_id: "relaycast_workspace_id", cloud_relay_workspace_id: "cloud_relay_workspace_id", slug: "slug", relaycast_api_key_generation: "relaycast_api_key_generation", runtime_config: "runtime_config::jsonb::text", created_at: ts("created_at"), updated_at: ts("updated_at") },
+    // Imported unbound and since bound by Control: expected, not drift.
+    targetColumns: {
+      relaycast_workspace_id: `CASE WHEN ${importedUnbound} THEN NULL ELSE relaycast_workspace_id END`,
+      relaycast_api_key_generation: `CASE WHEN ${importedUnbound} THEN 1 ELSE relaycast_api_key_generation END`,
+    },
   },
   organization_invitations: {
     key: "id::text", org: "organization_id::text",
@@ -835,6 +866,7 @@ export function verifierComparisons(
     const names = Object.keys(projection.columns).filter((column) =>
       !(TARGETS[table].optional ?? []).includes(column) || targetHasColumns.has(`${table}.${column}`));
     const list = names.map((name) => `${projection.columns[name]} AS ${name}`).join(", ");
+    const targetList = names.map((name) => `${projection.targetColumns?.[name] ?? projection.columns[name]} AS ${name}`).join(", ");
     const target = targetScope(table, scope);
     const workspace = projection.workspace ? `, ${projection.workspace} AS __workspace` : "";
     return {
@@ -844,8 +876,8 @@ export function verifierComparisons(
       // Control-native rows (the operator org, natively minted grants) never
       // count as drift. Users are global and compared in full.
       targetSql: table === "users"
-        ? `SELECT ${list}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}`
-        : `SELECT v.* FROM (SELECT ${list}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}) v
+        ? `SELECT ${targetList}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}`
+        : `SELECT v.* FROM (SELECT ${targetList}, ${projection.key} AS __key, ${target.org} AS __org${workspace} FROM ${target.from}) v
             WHERE EXISTS (SELECT 1 FROM public.${IMPORT_LEDGER_TABLE} l WHERE l.table_name = '${table}' AND l.row_key = v.__key)`,
       ...(projection.workspace ? { workspaceScoped: true } : {}),
     };
