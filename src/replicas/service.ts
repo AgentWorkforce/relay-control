@@ -78,6 +78,8 @@ export type SpawnInput = {
   cleanup_last_attempt_at?: string;
   /** Set by an explicit release (it wrote the tombstone); a repeat of that release is a no-op. */
   released?: true;
+  /** Set (ISO) when an admin revived this row's release: like a live row, it keeps an older row's release from re-fencing. */
+  revived_at?: string;
   relay_mcp_version?: number;
   /** Environment-identity bindings: how the binding was admitted (a mapped creator or the workspace principal). */
   acts_as?: "creator" | "principal";
@@ -685,10 +687,14 @@ export async function releaseReplica(deps: ReplicasDeps, actor: ReplicasActor, i
     // removal) is still tombstoned by its first explicit release.
     if (current.state === "gone" && current.input.released) return current;
     // An explicit release is final for its provider workspace until an admin
-    // revives it, unless a newer live row of the same replica (same tombstone
-    // key) still runs: releasing the older row must not fence that operation.
+    // revives it, unless a newer row of the same replica (same tombstone key)
+    // owns the fence: a live one, or one whose release was explicitly revived.
+    // Releasing an older row must not re-fence. Releasing the newest row still
+    // tombstones; a repeat release of a revived row stays the no-op above, so
+    // after a revive the replica is fenced again only by releasing the row the
+    // next admitted call enrols.
     const key = await tombstoneKey(deps, tx, current);
-    if (key && !await newerLiveRow(deps, tx, current, key)) {
+    if (key && !await newerRowKeepsReplica(deps, tx, current, key)) {
       await writeTombstone(tx, key.issuer, key.organization, key.providerWorkspaceId, current.workspace_id, "released");
     }
     return patch(tx, current.id, { state: "gone", helper_hash: null, input: { ...current.input, released: true } });
@@ -713,16 +719,16 @@ async function tombstoneKey(deps: ReplicasDeps, tx: SqlExecutor, row: SpawnRow):
 }
 
 /**
- * Whether a newer live row (any source) of the same workspace has the same
+ * Whether a newer row (any source) that is live or whose release was revived of the same workspace has the same
  * tombstone key: environment-identity rows by their issuer, provider
  * organization and replica id; launch rows by the configured issuer, the
  * workspace's connected organization (lowercased) and their lowercased replica id.
  */
-async function newerLiveRow(deps: ReplicasDeps, tx: SqlExecutor, row: SpawnRow, key: TombstoneKey): Promise<boolean> {
+async function newerRowKeepsReplica(deps: ReplicasDeps, tx: SqlExecutor, row: SpawnRow, key: TombstoneKey): Promise<boolean> {
   const result = await tx.query(
     `SELECT 1 FROM replica_spawns s
        LEFT JOIN remote_agent_connections c ON c.workspace_id = s.workspace_id AND c.provider = 'replicas'
-      WHERE s.workspace_id = $1 AND s.id <> $2 AND s.state <> 'gone'
+      WHERE s.workspace_id = $1 AND s.id <> $2 AND (s.state <> 'gone' OR s.input->>'revived_at' IS NOT NULL)
         AND s.created_at > (SELECT created_at FROM replica_spawns WHERE id = $2)
         AND CASE WHEN s.source = '${ENVIRONMENT_IDENTITY}'
                  THEN s.issuer = $3 AND s.provider_organization_id = $4 AND s.replica_id = $5
@@ -1004,8 +1010,9 @@ export async function recoverReplica(deps: ReplicasDeps, actor: ReplicasActor, i
 /**
  * Explicit admin revival of a released binding (environment identity or a
  * per-launch spawn/bind): removes its tombstone so the provider workspace can
- * enrol again on its next call. The released row stays released; a new
- * binding is enrolled.
+ * enrol again on its next call. The released row stays released (and
+ * gone); it is stamped revived_at so an older row's release cannot re-fence
+ * the replica before the next call enrols a new binding.
  */
 async function reviveIdentity(deps: ReplicasDeps, actor: ReplicasActor, id: string, replicaId: string) {
   return withReplicasLock(deps, actor, async (tx) => {
@@ -1028,8 +1035,10 @@ async function reviveIdentity(deps: ReplicasDeps, actor: ReplicasActor, id: stri
           RETURNING provider_workspace_id`,
         [deps.identity?.issuer ?? null, replicaId.toLowerCase(), actor.workspaceId],
       );
-    if (removed.rows.length) await audit(tx, row, actor, "replicas.identity.revived");
-    return { ...spawnView(row), revived: removed.rows.length > 0 };
+    if (!removed.rows.length) return { ...spawnView(row), revived: false };
+    await audit(tx, row, actor, "replicas.identity.revived");
+    const revived = await patch(tx, row.id, { input: { ...row.input, revived_at: new Date().toISOString() } });
+    return { ...spawnView(revived), revived: true };
   });
 }
 

@@ -374,6 +374,9 @@ tombstoned by its first explicit release.
 Releasing an older row while a newer live row of the same replica (same
 tombstone key) exists in the workspace writes no tombstone, so it does not
 fence that newer operation; releasing the newest row tombstones as usual.
+A newer row whose release an admin revived counts the same way (the revive
+stamps `revived_at` on it), so releasing an older row cannot undo the revive;
+the replica is fenced again by releasing the row its next admitted call enrols.
 Disconnecting Replicas disables every policy and releases its bindings first,
 then removes the registered entries best effort.
 

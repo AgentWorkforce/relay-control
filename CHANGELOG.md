@@ -17,7 +17,8 @@ assigned at release.
   re-connected (`accessRevoked` on the connection list and policy view). A
   complete discovery listing that no longer shows an enabled environment
   fences it (`discovery_missing`) until it is listed again, and releasing an
-  older row no longer fences a newer live operation of the same replica.
+  older row no longer fences a newer live operation of the same replica, or
+  one whose release was revived.
 - Added: Replicas tombstone retention, periodic sync and setup errors.
   Releasing a per-launch replica (`release_replica`, `DELETE
   .../replicas/spawns/{id}`) now writes a tombstone in the revoke

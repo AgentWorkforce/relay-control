@@ -652,3 +652,52 @@ test("releasing an older environment-identity binding keeps a newer bind row of 
   }]);
   assert.equal((await rpc(api, token(), "tools/list")).body.error.message, "replica_released");
 });
+
+test("a revived release keeps an older policy-retired binding's release from re-fencing the replica", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerId } = env;
+  assert.equal((await connect(env)).status, 200);
+  await mapOwner(env);
+  const actor = { userId: ownerId, workspaceId, organizationId: env.organizationId };
+  const fence = [{
+    issuer: ISSUER, provider_organization_id: PROVIDER_ORG, provider_workspace_id: WORKSPACE_1, workspace_id: workspaceId, reason: "released",
+  }];
+
+  // A: an environment-identity binding, then retired by policy (gone, no released marker).
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const older = await liveBinding(env);
+  assert.ok(older);
+  await env.database.query("UPDATE replica_spawns SET state = 'gone' WHERE id = $1", [older.id]);
+  assert.equal((await spawnRow(env, older.id)).input.released, undefined);
+
+  // B: a newer bind of the same replica, explicitly released, then explicitly revived.
+  const bound = await launchRow(env, "bind", WORKSPACE_1);
+  await backdate(env, older.id, bound);
+  await releaseReplica(env.replicas.deps, actor, bound);
+  assert.deepEqual(await tombstones(env), fence);
+  const revived = await recoverReplica(env.replicas.deps, actor, bound, WORKSPACE_1, { revive: true });
+  assert.equal((revived as { revived?: boolean }).revived, true);
+  assert.deepEqual(await tombstones(env), []);
+  const revivedRow = await spawnRow(env, bound);
+  assert.equal(revivedRow.state, "gone");
+  assert.equal(revivedRow.input.released, true);
+  assert.ok(revivedRow.input.revived_at, "the revive is persisted on the row");
+
+  // Releasing A before the next call re-enrols must not undo the revive.
+  await releaseReplica(env.replicas.deps, actor, older.id);
+  assert.equal((await spawnRow(env, older.id)).state, "gone");
+  assert.equal((await spawnRow(env, older.id)).input.released, true);
+  assert.deepEqual(await tombstones(env), [], "the older release writes no tombstone");
+  await releaseReplica(env.replicas.deps, actor, older.id);
+  assert.deepEqual(await tombstones(env), [], "a repeat release of A stays a no-op");
+
+  // The next admitted call enrols C; releasing C fences the replica again.
+  assert.equal((await rpc(api, token(), "tools/list")).status, 200);
+  const enrolled = await liveBinding(env);
+  assert.ok(enrolled);
+  assert.notEqual(enrolled.id, older.id);
+  assert.notEqual(enrolled.id, bound);
+  await releaseReplica(env.replicas.deps, actor, enrolled.id);
+  assert.deepEqual(await tombstones(env), fence);
+  assert.equal((await rpc(api, token(), "tools/list")).body.error.message, "replica_released");
+});
