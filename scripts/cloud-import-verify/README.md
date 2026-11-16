@@ -224,7 +224,8 @@ node --import tsx scripts/cloud-import-verify/cli.ts /path/to/contract.json
 The importer's `--verifier-contract` JSON is accepted directly, including its
 empty `identities` array: identity keys remain part of the table checksums.
 This lower-level command does not reconcile the importer ledger or apply the
-additional continuity gates. Use `import-cli.ts` for full import qualification.
+additional continuity gates. Use `import-cli.ts` for verification of its declared scope. All-source cutover
+evidence requires the copier-enabled runner and its scope/schema guard.
 
 URL variables are `CLOUD_VERIFY_SOURCE_URL` and `CLOUD_VERIFY_TARGET_URL`.
 The CLI currently accepts only literal `127.0.0.1` / `::1` hosts and refuses
@@ -373,3 +374,8 @@ or excludes an unexplained target row.
 Before the approved apply/copy, [REMOTE_SNAPSHOT_RUN.md](REMOTE_SNAPSHOT_RUN.md)
 captures private credential and ownership before-state using the same strict
 TLS/read-only library connection, without source/R2/keyring inputs.
+
+Schema and scope requirements are documented in [SCHEMA_MANIFEST.md](SCHEMA_MANIFEST.md).
+Qualified results always include normalized scope and the all-source org census.
+Cutover runners require all-source scope and the reviewed production schema;
+subset results and the proposed 0061 fixture profile are diagnostic evidence only.

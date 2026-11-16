@@ -35,6 +35,7 @@ try {
   const localImport = (path) => import(pathToFileURL(resolve(path)).href);
   const { verifyImport } = await localImport("scripts/cloud-import-verify/import-contract.ts");
   const { assertScope, MAPPING_REVISION } = await localImport("scripts/cloud-import/mapping.ts");
+  const { requireAllSourceScope, cutoverScopeFinding } = await localImport("scripts/cloud-import-verify/organization-scope.ts");
   const { loadEncryptionKeyring, readSecret } = await localImport("src/config.ts");
   const { parsePepperFile, readPepperFile } = await localImport("src/identity/config.ts");
   const args = process.argv.slice(2);
@@ -47,9 +48,9 @@ try {
   }
   let scope;
   if (args.length === 2 && args[1] === "--all-organizations") scope = {orgIds: null};
-  else if (args.length === 3 && args[1] === "--org-ids") scope = {orgIds: args[2].split(",")};
   else throw new Error("explicit_scope_required");
   assertScope(scope);
+  requireAllSourceScope(scope);
   const ledger = JSON.parse(await readFile(args[0], "utf8"));
   if (ledger.version !== 1 || ledger.mappingRevision !== MAPPING_REVISION
     || ledger.mode !== "apply" || ledger.ok !== true) throw new Error("matching_apply_required");
@@ -88,6 +89,9 @@ try {
   await target.connect();
   const report = await verifyImport(source, target, scope, ledger, keyring, cloudKeyHex,
     {pepperVersions, previousOwnership});
+  const scopeCheck = cutoverScopeFinding(report);
+  report.findings.push(scopeCheck);
+  report.ok = report.ok && scopeCheck.ok;
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   process.exitCode = report.ok ? 0 : 1;
 } catch {
@@ -105,8 +109,9 @@ umask 077
 node --import tsx /path/to/private/run-import.mjs /path/to/private/final-apply.json --all-organizations > /path/to/private/final-verification.json
 ```
 
-For an explicitly approved subset, replace `--all-organizations` with
-`--org-ids UUID,UUID`; the apply report must have the same scope. With positive
+Final qualification requires `--all-organizations`; explicit subsets are rejected
+before any report/secret read or connection. Diagnostic subsets use the library
+and remain explicitly scope-labeled. With positive
 `deleted` totals, append `--previous-ownership /path/to/private/before.json`.
 That ownership snapshot must have been captured before the corresponding import
 using `captureOwnership(target, scope)`. A snapshot taken afterward cannot prove
@@ -126,3 +131,9 @@ A passing identity-only report is not a completed cutover approval.
 
 When the final scope includes copying credentials, use [REMOTE_COPY_RUN.md](REMOTE_COPY_RUN.md)
 instead; this identity-only command cannot sign off the copier.
+
+The result includes normalized `scope`, a streaming all-source organization
+census/count/digest and selected census, plus the committed target schema
+manifest identity/digests. The cutover guard requires all-source scope, matching
+nonempty census and the production `main` schema profile. The synthetic proposed
+0061 profile and contract-only/unbound reports cannot satisfy that guard.

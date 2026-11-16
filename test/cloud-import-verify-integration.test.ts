@@ -18,6 +18,8 @@ import { CodingAgentStore } from "../src/admin/coding-agents.js";
 import { CredentialBlobStore,PostgresObjectBackend } from "../src/admin/credential-blobs.js";
 import { SubscriptionLoginStore } from "../src/admin/subscription-logins.js";
 import { copyCodingAgentCredentials } from "../scripts/cloud-import/credentials.js";
+import { normalizedScope,cutoverScopeFinding,requireAllSourceScope } from "../scripts/cloud-import-verify/organization-scope.js";
+import { schemaCatalog,migrationFiles,sealManifest,manifestJson,type SchemaEntry } from "../scripts/cloud-import-verify/schema.js";
 import { captureCredentialTarget } from "../scripts/cloud-import-verify/credential-copy.js";
 import { captureOwnership } from "../scripts/cloud-import-verify/reconciliation.js";
 import { mkdir } from "node:fs/promises";
@@ -86,6 +88,7 @@ before(async () => {
   await source.connect();await target.connect();
 });
 after(async () => {if (enabled) {await source.end();await target.end();await admin.end();}});
+let manifestWritten=false;
 beforeEach(async () => {
   if (!enabled) return;
   // Main fixtures use UTC; the dedicated regression switches the source to Oslo.
@@ -97,6 +100,11 @@ beforeEach(async () => {
   await source.query(`UPDATE relay_workspaces SET id='rw_0000b202' WHERE id='rw_legacy-01';
     UPDATE workspaces SET relay_workspace_id='rw_0000b202' WHERE relay_workspace_id='rw_legacy-01'`);
   await migrate(targetDb);
+  let required:SchemaEntry[]|undefined;
+  if (process.env.CLOUD_VERIFY_SCHEMA_MANIFEST_PATH && !manifestWritten) {
+    await target.query("BEGIN READ ONLY");
+    try {required=await schemaCatalog(target);} finally {await target.query("ROLLBACK");}
+  }
   // All checked-in migrations, including 0053/0054/0056/0057, ran above.
   // Only pending 0061 is modeled as revoked staff-grant history; 0058 is real.
   await target.query(`CREATE TABLE staff_read_grants (
@@ -108,6 +116,14 @@ beforeEach(async () => {
     revoked_at timestamptz,revoked_by uuid,last_used_at timestamptz,
     FOREIGN KEY(workspace_id,organization_id) REFERENCES workspaces(id,organization_id) ON DELETE CASCADE,
     CHECK(expires_at > created_at AND expires_at <= created_at + interval '90 days'))`);
+  if (required) {
+    await target.query("BEGIN READ ONLY");
+    let optional:SchemaEntry[];
+    try {optional=await schemaCatalog(target,["staff_read_grants"]);} finally {await target.query("ROLLBACK");}
+    const manifest=sealManifest({version:1,baseline:"control-main-c13c294",migrations:await migrationFiles(),required,
+      optional:{staff_read_grants:optional}});
+    await writeFile(process.env.CLOUD_VERIFY_SCHEMA_MANIFEST_PATH!,manifestJson(manifest));manifestWritten=true;
+  }
   await target.query("INSERT INTO organizations(id,name) VALUES($1,'Synthetic operator')",[id(0xcafe)]);
   await target.query("INSERT INTO installation_bootstrap(installation_slot,organization_id) VALUES(1,$1) ON CONFLICT(installation_slot) DO UPDATE SET organization_id=EXCLUDED.organization_id",[id(0xcafe)]);
 });
@@ -517,10 +533,8 @@ fixtureTest("target without relay_managed support accounts for coding credential
   assert.equal(ledger.tables.coding_agent_credentials.skipped.target_lacks_relay_managed,2);
   assert.equal(ledger.tables.coding_agent_credentials.importerSkips.target_lacks_relay_managed!.length,2);
   const report = await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
-  assert.equal(report.findings.find((f) => f.kind === "ledger" && f.name === "coding_agent_credentials")!.ok,true);
-  assert.ok(report.findings.filter((f) => f.kind === "ledger_keys").every((f) => f.ok));
-  assert.equal(report.findings.find((f) => f.kind === "ownership_ledger")!.ok,true);
-  assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "coding_agent_credentials")!.ok,true);
+  assert.equal(report.findings.find((f) => f.kind === "schema_manifest")!.ok,false);
+  assert.ok(report.targetSchema.changed.some((name) => name.includes("coding_agent_auth_type")));
   assert.equal(report.ok,false);
 });
 
@@ -549,12 +563,13 @@ fixtureTest("pre-0057 non-UUID Desktop source IDs remain visible as unresolved i
   const ledger = await apply();
   assert.equal(ledger.tables.desktop_relay_identities.skipped.source_id_not_uuid,1);
   const report = await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
-  assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "desktop_relay_identities")!.ok,true);
-  assert.ok(report.findings.filter((f) => f.kind === "ledger_keys").every((f) => f.ok));
+  assert.equal(report.findings.find((f) => f.kind === "schema_manifest")!.ok,false);
+  assert.ok(report.targetSchema.changed.includes("column:public.desktop_relay_identities.source_id"));
   assert.equal(report.ok,false);
 });
 
 fixtureTest("cohort scope counts and encrypted samples exclude another org's corrupt key",async () => {
+  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
   const first=await apply();assert.equal(first.ok,true);
   const ownership=await captureOwnership(target,scope);
   await target.query("UPDATE workspaces SET relaycast_api_key_ciphertext='synthetic-corrupt' WHERE organization_id=$1",[ORG_B]);
@@ -565,14 +580,124 @@ fixtureTest("cohort scope counts and encrypted samples exclude another org's cor
   assert.ok(report.findings.some((f) => f.kind === "decrypt" && f.detail === "not_applicable_no_imported_rows"));
 });
 
+fixtureTest("zero-source gated tables still require the committed target schema",async () => {
+  await source.query("DELETE FROM workspace_integrations WHERE provider='github'");
+  const ledger=await apply();
+  const before=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(before.ok,true);assert.equal(ledger.tables.github_app_installations.candidates,0);
+  await target.query("DROP TABLE github_app_installations CASCADE");
+  const after=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(after.ok,false);assert.equal(after.findings.find((f) => f.kind === "schema_manifest")!.ok,false);
+  assert.ok(after.targetSchema.missing.includes("table:public.github_app_installations"));
+  assert.ok(!after.findings.some((f) => f.kind === "table"),"unsafe data checks stop after missing table");
+});
+
+fixtureTest("missing and weakened selector indexes fail independently of credential rows",async () => {
+  await source.query("DELETE FROM provider_credentials");
+  const ledger=await apply();
+  assert.equal((await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex)).ok,true);
+  await target.query("DROP INDEX coding_agent_one_llm");
+  const missing=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(missing.ok,false);
+  assert.ok(missing.targetSchema.missing.includes("index:public.coding_agent_credentials.coding_agent_one_llm"));
+  await target.query("CREATE UNIQUE INDEX coding_agent_one_llm ON coding_agent_credentials(workspace_id,model_provider) WHERE false");
+  const weakened=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(weakened.ok,false);
+  assert.ok(weakened.targetSchema.changed.includes("index:public.coding_agent_credentials.coding_agent_one_llm"));
+});
+
+fixtureTest("missing constraints fail with empty tables",async () => {
+  await source.query("DELETE FROM workspace_integrations WHERE provider='github'");
+  const ledger=await apply();
+  await target.query("ALTER TABLE github_app_installations DROP CONSTRAINT github_app_installations_pkey CASCADE");
+  const missing=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(missing.ok,false);
+  assert.ok(missing.targetSchema.missing.includes("constraint:public.github_app_installations.github_app_installations_pkey"));
+});
+
+fixtureTest("disabled FK triggers fail independently of row counts",async () => {
+  await source.query("DELETE FROM organization_invites");const ledger=await apply();
+  assert.equal((await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex)).ok,true);
+  await target.query("ALTER TABLE organization_invitations DISABLE TRIGGER ALL");
+  const triggers=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(triggers.ok,false);
+  assert.ok(triggers.targetSchema.changed.some((name) => name.startsWith("constraint:public.organization_invitations.")));
+});
+
+fixtureTest("weakened column definitions fail with zero source rows",async () => {
+  await source.query("DELETE FROM workspace_integrations WHERE provider='github'");const ledger=await apply();
+  assert.equal((await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex)).ok,true);
+  await target.query("ALTER TABLE github_app_installations ALTER COLUMN organization_id DROP NOT NULL");
+  const after=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(after.ok,false);assert.ok(after.targetSchema.changed.includes("column:public.github_app_installations.organization_id"));
+});
+
+fixtureTest("changed CHECK validator functions fail without leaking their bodies",async () => {
+  const ledger=await apply();assert.equal((await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex)).ok,true);
+  await target.query("CREATE OR REPLACE FUNCTION relayhistory_origin_is_canonical(origin text) RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS 'SELECT true /* private-schema-definition-must-not-echo */'");
+  const after=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(after.ok,false);assert.ok(after.targetSchema.changed.some((name) => name.startsWith("function:") && name.includes("relayhistory_origin_is_canonical")));
+  assert.ok(!JSON.stringify(after).includes("private-schema-definition-must-not-echo"));
+});
+
+fixtureTest("unexpected non-extension schema objects fail without exposing their names",async () => {
+  const ledger=await apply();assert.equal((await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex)).ok,true);
+  await target.query('CREATE TABLE "private-unreviewed-schema-object"(value text)');
+  const after=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(after.ok,false);assert.ok(after.targetSchema.unexpectedCount > 0);
+  assert.ok(!JSON.stringify(after).includes("private-unreviewed-schema-object"));
+});
+
+fixtureTest("subset reports bind normalized scope and a census outside that scope",async () => {
+  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
+  const selected={orgIds:[ORG_A]};const ledger=await apply(selected);
+  const one=await verifyImport(source,target,{orgIds:[ORG_A.toUpperCase(),ORG_A]},ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(one.ok,true,JSON.stringify(one.findings.filter((f) => !f.ok)));
+  assert.deepEqual(one.scope,normalizedScope(selected));
+  assert.equal(one.sourceOrganizationCensus.all.count,2);assert.equal(one.sourceOrganizationCensus.selected.count,1);
+  await source.query("INSERT INTO organizations(id,slug,name,created_by_user_id,created_at,updated_at) VALUES($1,'unselected-census','Synthetic outside scope',$2,now(),now())",[id(0xc3),id(1)]);
+  const two=await verifyImport(source,target,selected,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(two.ok,true);assert.equal(two.sourceOrganizationCensus.all.count,3);
+  assert.notEqual(two.sourceOrganizationCensus.all.sha256,one.sourceOrganizationCensus.all.sha256);
+  assert.equal(two.sourceOrganizationCensus.selected.sha256,one.sourceOrganizationCensus.selected.sha256);
+  assert.equal(cutoverScopeFinding(two).ok,false);
+});
+
+fixtureTest("gated-table visibility cannot hide absent SELECT privileges",async () => {
+  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
+  await source.query("DELETE FROM workspace_integrations WHERE provider='github'");
+  const ledger=await apply();
+  await grantRuntimeDatabaseRole(targetDb,"cloud_verify_runtime");
+  await target.query("GRANT SELECT ON cloud_import_ledger TO cloud_verify_runtime");
+  await target.query("REVOKE ALL ON github_app_installations FROM cloud_verify_runtime");
+  await target.query("SET ROLE cloud_verify_runtime");
+  try {await assert.rejects(verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex),(error:Error & {code?:string}) => {
+    assert.equal(error.code,"42501");assert.match(error.message,/github_app_installations/);return true;
+  });}
+  finally {await target.query("RESET ROLE");}
+});
+
+fixtureTest("all-source scope and the production manifest bind successful copier evidence",async () => {
+  await source.query("DROP TABLE staff_read_grants");await target.query("DROP TABLE staff_read_grants");
+  const fixture=await copiedFixture();
+  const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
+  assert.equal(report.targetSchema.profile,"main");assert.equal(report.targetSchema.ok,true);
+  assert.deepEqual(report.scope,{orgIds:null});
+  assert.deepEqual(report.sourceOrganizationCensus.all,report.sourceOrganizationCensus.selected);
+  assert.equal(report.credentialCopy,"verified");assert.equal(cutoverScopeFinding(report).ok,true);
+});
+
 fixtureTest("missing rw_ target column and a rollback-mode ledger cannot qualify",async () => {
   await target.query("ALTER TABLE workspaces DROP COLUMN cloud_relay_workspace_id");
   const ledger = await apply();
   const report = await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
   assert.equal(report.ok,false);
-  assert.equal(report.findings.find((f) => f.name === "rw_column_present")!.ok,false);
+  assert.equal(report.findings.find((f) => f.kind === "schema_manifest")!.ok,false);
+  assert.ok(report.targetSchema.missing.includes("column:public.workspaces.cloud_relay_workspace_id"));
   ledger.mode="dry-run";
-  assert.equal((await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex)).findings.find((f) => f.name === "run")!.ok,false);
+  assert.equal((await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex)).ok,false);
 });
 
 fixtureTest("missing GitHub installation storage reconciles decimal keys and blocks qualification",async () => {
@@ -580,7 +705,8 @@ fixtureTest("missing GitHub installation storage reconciles decimal keys and blo
   const ledger=await apply();
   assert.deepEqual(ledger.tables.github_app_installations.importerSkips.target_lacks_github_app,["12345"]);
   const report=await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
-  assert.equal(report.findings.find((f) => f.kind === "ledger" && f.name === "github_app_installations")!.ok,true);
+  assert.equal(report.findings.find((f) => f.kind === "schema_manifest")!.ok,false);
+  assert.ok(report.targetSchema.missing.includes("table:public.github_app_installations"));
   assert.equal(report.ok,false);
 });
 

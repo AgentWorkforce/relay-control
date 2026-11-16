@@ -1,9 +1,11 @@
 import type { Client } from "pg";
+import { schemaFindings } from "./schema.js";
+import { normalizedScope,organizationCensus } from "./organization-scope.js";
 import { canonicalRelayhistoryOrigin } from "../../src/relayhistory-origin.js";
 import type { EncryptionKeyring } from "../../src/crypto.js";
 import { decryptCloudEnvelope,type ImportReport } from "../cloud-import/importer.js";
 import { MAPPING_REVISION, ORG_TABLES, SOURCE_TABLES, TARGETS, TARGET_RELATIONS,IMPORTER_SKIP_REASONS,
-  assertScope, encryptedSamples, sourceQuery, verifierComparisons, type ImportScope, type ImportTable } from "../cloud-import/mapping.js";
+  encryptedSamples, sourceQuery, verifierComparisons, type ImportScope, type ImportTable } from "../cloud-import/mapping.js";
 import { verify, type Comparison, type Contract, type Finding } from "./verify.js";
 import { credentialCopyFindings,credentialSelections,type CredentialEvidence } from "./credential-copy.js";
 import { reconciliationFindings,validImportKey,type OrgKeys,type OwnershipSnapshot } from "./reconciliation.js";
@@ -13,8 +15,7 @@ const safeCount = (value:unknown) => typeof value === "number" && Number.isSafeI
 const sorted = (values:Record<string,number>) => JSON.stringify(Object.entries(values).filter(([,n]) => n !== 0).sort(([a],[b]) => a.localeCompare(b)));
 const sortedKeys = (values:Record<string,string[]>) => JSON.stringify(Object.entries(values).filter(([,keys]) => keys.length)
   .sort(([a],[b]) => a.localeCompare(b)).map(([reason,keys]) => [reason,[...keys].sort()]));
-const equalScope = (a:ImportScope,b:ImportScope) => JSON.stringify(a.orgIds?.map((s) => s.toLowerCase()).sort() ?? null)
-  === JSON.stringify(b.orgIds?.map((s) => s.toLowerCase()).sort() ?? null);
+const equalScope = (a:ImportScope,b:ImportScope) => JSON.stringify(normalizedScope(a)) === JSON.stringify(normalizedScope(b));
 
 function comparisons(scope:ImportScope,columns:ReadonlySet<string>,gated:ReadonlySet<ImportTable>|null = null): Comparison[] {
   return verifierComparisons(scope,columns,gated).map((item) => item.name === "coding_agent_credentials"
@@ -48,16 +49,26 @@ function contractFor(scope:ImportScope,columns:ReadonlySet<string>,tables=compar
 export async function verifyImport(source:Client,target:Client,scope:ImportScope,ledger:ImportReport,
   keyring:EncryptionKeyring,cloudKeyHex:string,options:{pepperVersions?:readonly number[];credentialCopy?:CredentialEvidence;previousReport?:ImportReport;
     previousOwnership?:OwnershipSnapshot;canonicalOrigin?:(raw:string) => string|null} = {}) {
-  assertScope(scope);
+  scope=normalizedScope(scope);
   if (!/^[0-9a-f]{64}$/i.test(cloudKeyHex)) throw new Error("Cloud key must be 32 bytes of hex");
   const base = contractFor(scope,new Set());
+  let sourceOrganizationCensus:Awaited<ReturnType<typeof organizationCensus>>|undefined;
+  let targetSchema:Awaited<ReturnType<typeof schemaFindings>>["summary"]|undefined;
   const checked = await verify(source,target,base,keyring,{...options,prepare:async (s,t) => {
     const findings:Finding[] = [];
+    sourceOrganizationCensus=await organizationCensus(s,scope);
+    findings.push({kind:"scope_coverage",name:"source_organizations",ok:sourceOrganizationCensus.unknownRequested === 0,
+      detail:{scope,sourceOrganizationCensus}});
+    const schema=await schemaFindings(t);targetSchema=schema.summary;findings.push(schema.finding);
+    if (schema.halt) return {contract:base,findings,halt:true};
     findings.push({kind:"ledger",name:"run",ok:ledger.version === 1 && ledger.mappingRevision === MAPPING_REVISION
       && ledger.mode === "apply" && ledger.ok === true && !ledger.refused && equalScope(scope,ledger.scope),
       detail:{expectedRevision:MAPPING_REVISION,revisionMatches:ledger.mappingRevision === MAPPING_REVISION,
         mode:["plan","dry-run","apply"].includes(ledger.mode) ? ledger.mode : "invalid",ok:ledger.ok === true}});
-    const metadata = await t.query(`SELECT table_name,column_name,udt_name FROM information_schema.columns WHERE table_schema='public'`);
+    const metadata = await t.query(`SELECT c.relname AS table_name,a.attname AS column_name,ty.typname AS udt_name
+      FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+      JOIN pg_type ty ON ty.oid=a.atttypid WHERE n.nspname='public' AND c.relkind IN ('r','p')
+      AND a.attnum>0 AND NOT a.attisdropped`);
     const columns = new Set<string>(metadata.rows.map((r) => `${r.table_name}.${r.column_name}`));
     const gatedPresent = new Set<ImportTable>(SOURCE_TABLES.filter((table) => {
       const spec = TARGETS[table];
@@ -226,7 +237,10 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     if (options.credentialCopy) findings.push(...await credentialCopyFindings(s,t,scope,options.credentialCopy,keyring,cloudKeyHex));
     return {contract,findings};
   }});
-  return {...checked,credentialCopy:options.credentialCopy
-    ? checked.findings.filter((f) => f.kind.startsWith("credential_")).every((f) => f.ok) ? "verified" : "failed"
+  const copyChecks=["credential_copy_ledger","credential_natural_keys","credential_control_ids","credential_cloud_selection"];
+  return {...checked,evidenceKind:"identity-import" as const,scope,sourceOrganizationCensus:sourceOrganizationCensus!,targetSchema:targetSchema!,
+    credentialCopy:options.credentialCopy
+    ? copyChecks.every((kind) => checked.findings.some((f) => f.kind === kind))
+      && checked.findings.filter((f) => f.kind.startsWith("credential_")).every((f) => f.ok) ? "verified" : "failed"
     : "not_requested"};
 }

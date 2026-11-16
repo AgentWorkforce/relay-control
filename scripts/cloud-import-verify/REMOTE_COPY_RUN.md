@@ -59,6 +59,7 @@ try {
   const { readOnlyCloudCredentials } = await localImport("scripts/cloud-import-verify/credential-readers.ts");
   const { readOnlyPostgresBlobs } = await localImport("scripts/cloud-import-verify/credential-copy.ts");
   const { assertScope, MAPPING_REVISION } = await localImport("scripts/cloud-import/mapping.ts");
+  const { requireAllSourceScope, cutoverScopeFinding } = await localImport("scripts/cloud-import-verify/organization-scope.ts");
   const { loadEncryptionKeyring, readSecret } = await localImport("src/config.ts");
   const { parsePepperFile, readPepperFile } = await localImport("src/identity/config.ts");
   const args = process.argv.slice(2);
@@ -84,9 +85,9 @@ try {
   }
   let scope;
   if (args.length === 2 && args[1] === "--all-organizations") scope = {orgIds: null};
-  else if (args.length === 3 && args[1] === "--org-ids") scope = {orgIds: args[2].split(",")};
   else throw new Error("explicit_scope_required");
   assertScope(scope);
+  requireAllSourceScope(scope);
   const ledger = JSON.parse(await readFile(args[0], "utf8"));
   if (ledger.version !== 1 || ledger.mappingRevision !== MAPPING_REVISION
     || ledger.mode !== "apply" || ledger.ok !== true) throw new Error("matching_apply_required");
@@ -133,6 +134,12 @@ try {
     targetBlobs: readOnlyPostgresBlobs(target, keyring), previousTarget};
   const report = await verifyImport(source, target, scope, ledger, keyring, cloudKeyHex,
     {pepperVersions, previousOwnership, credentialCopy});
+  const scopeCheck = cutoverScopeFinding(report);
+  report.findings.push(scopeCheck);
+  report.ok = report.ok && scopeCheck.ok;
+  const copierVerified = report.credentialCopy === "verified";
+  report.findings.push({kind: "cutover_credential_copy", name: "copier_required", ok: copierVerified, detail: {status: report.credentialCopy}});
+  report.ok = report.ok && copierVerified;
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   process.exitCode = report.ok ? 0 : 1;
 } catch {
@@ -148,8 +155,9 @@ umask 077
 node --import tsx /path/to/private/run-copy-verify.mjs /path/to/private/final-apply.json --all-organizations --credential-copy-report /path/to/private/final-copy.json > /path/to/private/final-verification.json
 ```
 
-Use `--org-ids UUID,UUID` instead of `--all-organizations` only for a matching
-approved cohort. Append `--previous-credentials /path/to/private/before-copy.json`
+Cutover qualification accepts only `--all-organizations`; explicit subsets are
+rejected before report/secret reads or connection. Use the library separately
+for scope-labeled diagnostic cohorts, never as all-source evidence. Append `--previous-credentials /path/to/private/before-copy.json`
 when needed, and `--previous-ownership /path/to/private/before-import.json` for
 positive declared removals. These are evidence snapshots, never write authority.
 
@@ -163,3 +171,9 @@ Return exact verifier/importer heads, original revisions, exit code, counts and
 check summaries, report digest/size and a redacted report. Keep all private
 inputs, object bodies and driver logs on the runner. Application smoke proof
 and any production action remain separate from this database/copy evidence.
+
+The result includes normalized `scope`, a streaming all-source organization
+census/count/digest and selected census, plus the committed target schema
+manifest identity/digests. The cutover guard requires all-source scope, matching
+nonempty census and the production `main` schema profile. The synthetic proposed
+0061 profile and contract-only/unbound reports cannot satisfy that guard.

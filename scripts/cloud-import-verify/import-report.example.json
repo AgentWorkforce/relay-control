@@ -1,8 +1,54 @@
 {
+  "evidenceKind": "synthetic-local-postgres",
   "version": 1,
   "mappingRevision": "cloud-identity-2026-11-16.11",
   "ok": true,
   "findings": [
+    {
+      "kind": "scope_coverage",
+      "name": "source_organizations",
+      "ok": true,
+      "detail": {
+        "scope": {
+          "orgIds": null
+        },
+        "sourceOrganizationCensus": {
+          "algorithm": "sha256-length-framed-uuid-c-order-v1",
+          "all": {
+            "count": 2,
+            "sha256": "8aaccf8cdc676f175e5ed3fad082a383407bc68a785f97e7ac459d78669b44ac"
+          },
+          "selected": {
+            "count": 2,
+            "sha256": "8aaccf8cdc676f175e5ed3fad082a383407bc68a785f97e7ac459d78669b44ac"
+          },
+          "requestedCount": null,
+          "unknownRequested": 0
+        }
+      }
+    },
+    {
+      "kind": "schema_manifest",
+      "name": "control-main-c13c294",
+      "ok": true,
+      "detail": {
+        "baseline": "control-main-c13c294",
+        "manifestSha256": "aa2379731cb02efbbd3494d5c4b34892ff8d5f73ef0d9d32f8b1a2a02ff50928",
+        "expectedSchemaSha256": "f174593f8209b7546e744f24997fb5771eef14854065984c2dcd1c28227a81f7",
+        "actualSchemaSha256": "f174593f8209b7546e744f24997fb5771eef14854065984c2dcd1c28227a81f7",
+        "profile": "main-plus-proposed-0061",
+        "optionalRelations": [
+          "staff_read_grants"
+        ],
+        "expectedObjects": 1799,
+        "actualObjects": 1799,
+        "missing": [],
+        "changed": [],
+        "unexpectedCount": 0,
+        "migrationsMatch": true,
+        "ok": true
+      }
+    },
     {
       "kind": "ledger",
       "name": "run",
@@ -3225,7 +3271,39 @@
       "status": "pending"
     }
   ],
+  "scope": {
+    "orgIds": null
+  },
+  "sourceOrganizationCensus": {
+    "algorithm": "sha256-length-framed-uuid-c-order-v1",
+    "all": {
+      "count": 2,
+      "sha256": "8aaccf8cdc676f175e5ed3fad082a383407bc68a785f97e7ac459d78669b44ac"
+    },
+    "selected": {
+      "count": 2,
+      "sha256": "8aaccf8cdc676f175e5ed3fad082a383407bc68a785f97e7ac459d78669b44ac"
+    },
+    "requestedCount": null,
+    "unknownRequested": 0
+  },
+  "targetSchema": {
+    "baseline": "control-main-c13c294",
+    "manifestSha256": "aa2379731cb02efbbd3494d5c4b34892ff8d5f73ef0d9d32f8b1a2a02ff50928",
+    "expectedSchemaSha256": "f174593f8209b7546e744f24997fb5771eef14854065984c2dcd1c28227a81f7",
+    "actualSchemaSha256": "f174593f8209b7546e744f24997fb5771eef14854065984c2dcd1c28227a81f7",
+    "profile": "main-plus-proposed-0061",
+    "optionalRelations": [
+      "staff_read_grants"
+    ],
+    "expectedObjects": 1799,
+    "actualObjects": 1799,
+    "missing": [],
+    "changed": [],
+    "unexpectedCount": 0,
+    "migrationsMatch": true,
+    "ok": true
+  },
   "credentialCopy": "verified",
-  "evidenceKind": "synthetic-local-postgres",
   "credentialCopyVerified": true
 }

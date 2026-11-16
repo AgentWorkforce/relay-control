@@ -33,8 +33,14 @@ async function unusedPort(): Promise<number> {
 }
 
 try {
-  if (process.argv.length !== 2 && !(process.argv.length === 4 && process.argv[2] === "--report")) {
-    throw new Error("usage_dry-run.ts_--report_PATH");
+  const args=process.argv.slice(2);
+  let reportPath:string|undefined,manifestPath:string|undefined;
+  while (args.length) {
+    const flag=args.shift(),value=args.shift();
+    if (!value || value.startsWith("--")) throw new Error("output_path_required");
+    if (flag === "--report" && !reportPath) reportPath=value;
+    else if (flag === "--write-schema-manifest" && !manifestPath) manifestPath=value;
+    else throw new Error("unknown_or_duplicate_argument");
   }
   // No Docker, shared databases, npm installs or parallel test workers.
   const init = spawnSync(pgBinary("initdb"), ["-D",data,"-U","cloud_verify_fixture","--auth-local=trust","--auth-host=trust","--no-locale","--encoding=UTF8"],
@@ -66,16 +72,16 @@ try {
     join(here,"../../test/cloud-import-verify-readers.test.ts")], {
     cwd:join(here,"../.."), stdio:"inherit",
     env: { ...process.env, CLOUD_VERIFY_FIXTURE_CLUSTER:"synthetic-only", CLOUD_VERIFY_FIXTURE_PORT:String(port),
-      CLOUD_VERIFY_IMPORT_REPORT_PATH:process.argv[3] ?? "" },
+      CLOUD_VERIFY_IMPORT_REPORT_PATH:reportPath ?? "",CLOUD_VERIFY_SCHEMA_MANIFEST_PATH:manifestPath ?? "" },
   });
   process.exitCode = await new Promise<number>((resolve,reject) => {
     testProcess!.once("error",reject);
     testProcess!.once("exit",(code) => resolve(code ?? 1));
   });
-  if (process.exitCode === 0 && process.argv[3]) {
-    const report = JSON.parse(await readFile(process.argv[3],"utf8"));
+  if (process.exitCode === 0 && reportPath) {
+    const report = JSON.parse(await readFile(reportPath,"utf8"));
     if (!report.ok) throw new Error("synthetic_receipt_failed");
-    process.stdout.write(`Actual importer synthetic receipt: ${process.argv[3]}\n`);
+    process.stdout.write(`Actual importer synthetic receipt: ${reportPath}\n`);
   }
 } catch (error) {
   // Only synthetic data is ever put into this cluster. Log stays local on failure.

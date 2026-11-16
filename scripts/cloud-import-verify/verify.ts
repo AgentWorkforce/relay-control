@@ -34,6 +34,7 @@ type Snapshot = {
 };
 export type Finding = { kind: string; name: string; ok: boolean; detail: unknown };
 export type Report = {
+  evidenceKind: "contract-only";
   version: 1;
   mappingRevision: string;
   ok: boolean;
@@ -239,11 +240,12 @@ export function validateContract(contract: Contract): void {
  */
 export async function verify(source: Client, target: Client, contract: Contract, keyring: EncryptionKeyring,
   options: {pepperVersions?: readonly number[];
-    prepare?: (source:Client,target:Client) => Promise<{contract:Contract;findings:Finding[]}>} = {}): Promise<Report> {
+    prepare?: (source:Client,target:Client) => Promise<{contract:Contract;findings:Finding[];halt?:boolean}>} = {}): Promise<Report> {
   if (source === target) throw new Error("Separate source and target clients required");
   validateContract(contract);
   const findings: Finding[] = [];
   let active = contract;
+  let halt=false;
   try {
     for (const client of [source, target]) {
       await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -255,8 +257,9 @@ export async function verify(source: Client, target: Client, contract: Contract,
     }
     if (options.prepare) {
       const prepared = await options.prepare(source,target);
-      validateContract(prepared.contract); active = prepared.contract; findings.push(...prepared.findings);
+      validateContract(prepared.contract); active = prepared.contract; findings.push(...prepared.findings);halt=prepared.halt === true;
     }
+    if (!halt) {
     for (const item of active.tables) findings.push(await compare(source, target, item, "table"));
     for (const item of active.identities) findings.push(await compare(source, target, item, "identity"));
     for (const relation of active.targetRelations) findings.push(...await relationChecks(target, relation));
@@ -280,12 +283,13 @@ export async function verify(source: Client, target: Client, contract: Contract,
         ok: rows.rows.length >= sample.minimum && failures === 0,
         detail: { sampled: rows.rows.length, minimum: sample.minimum, failures } });
     }
+    }
   } finally {
     // Release snapshots even on a failed statement. Never serialize SQL errors:
     // PostgreSQL error details can contain rows and credentials.
     await Promise.allSettled([source.query("ROLLBACK"), target.query("ROLLBACK")]);
   }
-  return { version: 1, mappingRevision: active.mappingRevision,
+  return { evidenceKind:"contract-only", version: 1, mappingRevision: active.mappingRevision,
     ok: findings.every((f) => f.ok), findings,
     smoke: ["login", "workspace_list", "relaycast_key_resolve", "flows_run", "integration_token_refresh", "desktop_feed"]
       .map((name) => ({ name, status: "pending" })) };

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { mkdtemp,writeFile,rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { requireAllSourceScope,cutoverScopeFinding,normalizedScope } from "../scripts/cloud-import-verify/organization-scope.js";
 import { readOnlyCloudCredentials } from "../scripts/cloud-import-verify/credential-readers.js";
 
 const inputs={CLOUD_CREDENTIAL_R2_ENDPOINT:"https://objects.example.test",CLOUD_CREDENTIAL_R2_BUCKET:"synthetic-fixtures",
@@ -52,4 +53,19 @@ test("Cloud credential reader reports HTTP status without object body or endpoin
     assert.match(error.message,/503/);assert.ok(!error.message.includes(marker));
     assert.ok(!error.message.includes("example.test"));return true;
   });
+});
+
+test("cutover scope rejects subsets and unbound or incomplete global census",() => {
+  const id="00000000-0000-4000-8000-0000000000a1";
+  assert.deepEqual(normalizedScope({orgIds:[id.toUpperCase(),id]}),{orgIds:[id]});
+  assert.throws(() => requireAllSourceScope({orgIds:[id]}),/all source/);
+  assert.doesNotThrow(() => requireAllSourceScope({orgIds:null}));
+  const record={evidenceKind:"identity-import",scope:{orgIds:null},targetSchema:{profile:"main",ok:true},
+    sourceOrganizationCensus:{algorithm:"sha256-length-framed-uuid-c-order-v1",all:{count:2,sha256:"a".repeat(64)},
+      selected:{count:2,sha256:"a".repeat(64)},requestedCount:null,unknownRequested:0}};
+  assert.equal(cutoverScopeFinding(record).ok,true);
+  assert.equal(cutoverScopeFinding({...record,scope:{orgIds:[id]}}).ok,false);
+  assert.equal(cutoverScopeFinding({...record,evidenceKind:"contract-only"}).ok,false);
+  assert.equal(cutoverScopeFinding({...record,targetSchema:{profile:"main-plus-proposed-0061",ok:true}}).ok,false);
+  assert.equal(cutoverScopeFinding({...record,sourceOrganizationCensus:{...record.sourceOrganizationCensus,selected:{count:1,sha256:"other"}}}).ok,false);
 });
