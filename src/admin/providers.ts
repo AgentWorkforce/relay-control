@@ -7,7 +7,7 @@
 // need authorize/token URLs, scopes, and (only if the provider deviates from
 // RFC 6749) a `parseTokenResponse` or `tokenRequest` override.
 
-export type AuthMode = "oauth2" | "api_key";
+export type AuthMode = "oauth2" | "api_key" | "github_app";
 
 export type ParsedToken = {
   accessToken: string;
@@ -74,7 +74,8 @@ export type ApiKeyProvider = BaseProvider & {
   credentialFields: CredentialField[];
 };
 
-export type ProviderDefinition = OAuthProvider | ApiKeyProvider;
+export type GithubAppProvider = BaseProvider & { authMode: "github_app" };
+export type ProviderDefinition = OAuthProvider | ApiKeyProvider | GithubAppProvider;
 
 function str(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
@@ -126,6 +127,12 @@ const github: OAuthProvider = {
   tokenBody: "form",
   pkce: true,
   appSetupUrl: "https://github.com/settings/applications/new",
+};
+
+export const GITHUB_APP_PROVIDER: GithubAppProvider = {
+  ...github,
+  authMode: "github_app",
+  docs: "https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app",
 };
 
 const slack: OAuthProvider = {
@@ -355,7 +362,7 @@ export function catalogEntry(provider: ProviderDefinition): Record<string, unkno
     backend: "selfhost",
     backends: ["selfhost"],
     sources: ["selfhost"],
-    authMode: provider.authMode === "oauth2" ? "OAUTH2" : "API_KEY",
+    authMode: provider.authMode === "oauth2" ? "OAUTH2" : provider.authMode === "github_app" ? "APP" : "API_KEY",
     categories: provider.categories,
     docs: provider.docs,
     ...(provider.authMode === "oauth2"
@@ -363,8 +370,8 @@ export function catalogEntry(provider: ProviderDefinition): Record<string, unkno
           defaultScopes: provider.defaultScopes,
           appSetupUrl: provider.appSetupUrl,
         }
-      : {
+      : provider.authMode === "api_key" ? {
           credentialFields: provider.credentialFields,
-        }),
+        } : {}),
   };
 }

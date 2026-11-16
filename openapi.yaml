@@ -9483,7 +9483,13 @@ components:
         configKey: { type: string }
         vfsRoot: { type: string }
         backend: { const: selfhost }
-        authMode: { enum: [OAUTH2, API_KEY] }
+        authMode: { enum: [OAUTH2, API_KEY, APP] }
+        supportedAuthModes:
+          type: array
+          items: { enum: [OAUTH2, APP] }
+          description: GitHub supports OAuth connections and imported App installations concurrently.
+        githubAppConfigured: { type: boolean, description: Whether the GitHub App signing key is configured; independent of OAuth setup. }
+        githubAppSetup: { const: import, description: GitHub App installation bindings use the trusted import seam. }
         categories:
           type: array
           items: { type: string }
@@ -9525,7 +9531,8 @@ components:
         provider: { type: string }
         providerConfigKey: { type: string }
         displayName: { type: string }
-        authMode: { enum: [oauth2, api_key] }
+        authMode: { enum: [oauth2, api_key, github_app] }
+        installationId: { type: [string, "null"], description: GitHub App installation routing imported from Cloud }
         status: { enum: [ready, error] }
         ready: { type: boolean }
         scopes:
@@ -9604,7 +9611,8 @@ components:
       properties:
         connectionId: { type: string }
         provider: { type: string }
-        authMode: { enum: [oauth2, api_key] }
+        authMode: { enum: [oauth2, api_key, github_app] }
+        installationId: { type: [string, "null"] }
         accessToken: { type: string }
         tokenType: { type: string }
         expiresAt: { type: [string, "null"], format: date-time }

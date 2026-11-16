@@ -826,6 +826,14 @@ OAuth apps are operator configuration, not a per-user action:
 | `SELFHOST_OAUTH_<PROVIDER>_CLIENT_SECRET_FILE` (or `_CLIENT_SECRET`) | the client secret, mounted from a Secret |
 | `SELFHOST_OAUTH_<PROVIDER>_SCOPES` | optional scope override |
 
+Existing Cloud GitHub App installations can use direct installation token
+minting with `SELFHOST_GITHUB_APP_ID` and
+`SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`, using the same App registration as
+Cloud. The trusted importer retains the installation ID; users do not need
+to reconnect. OAuth connect and callbacks continue to work; credential mode
+is selected per connection row. See [GitHub App credentials](docs/github-app-connections.md)
+for the import contract, encrypted token cache, and refresh behavior.
+
 Register this callback URL in every provider app:
 `$SELFHOST_PUBLIC_URL/api/v1/integrations/oauth/callback` (or
 `SELFHOST_OAUTH_REDIRECT_URL`). An operator app wins over a per-workspace app
