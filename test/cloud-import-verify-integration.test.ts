@@ -88,8 +88,7 @@ before(async () => {
 after(async () => {if (enabled) {await source.end();await target.end();await admin.end();}});
 beforeEach(async () => {
   if (!enabled) return;
-  // Main fixtures use UTC. A separate session-timezone audit exposed the
-  // importer's DST-sensitive 90-day staff-grant clamp; tracked with its owner.
+  // Main fixtures use UTC; the dedicated regression switches the source to Oslo.
   await source.query("SET TIME ZONE 'UTC'");await target.query("SET TIME ZONE 'UTC'");
   await source.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public");
   await target.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public");
@@ -624,4 +623,19 @@ fixtureTest("import-ledger CLI requires explicit scope and emits a complete actu
       {env,encoding:"utf8",timeout:20000});
     assert.equal(generic.status,0,generic.stderr);
   } finally {await rm(directory,{recursive:true,force:true});}
+});
+
+fixtureTest("source Oslo sessions retain UTC expiry and conflicts fail copy",async () => {
+  await source.query("SET TIME ZONE 'Europe/Oslo'");
+  const fixture=await copiedFixture();
+  const expiry=(await target.query("SELECT to_char(expires_at AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS.US') AS expiry FROM staff_read_grants WHERE id=$1",[id(0xa01)])).rows[0].expiry;
+  assert.equal(expiry,"2026-04-01 00:00:00.123456");
+  const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
+    {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
+  assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));
+  assert.equal((await source.query("SELECT current_setting('TimeZone') AS zone")).rows[0].zone,"Europe/Oslo");
+  await source.query("UPDATE provider_credentials SET is_active=false WHERE id=$1",[id(0x80f)]);
+  const conflict=await copyCodingAgentCredentials(fixture.deps,scope,"apply");
+  assert.equal(conflict.selection!.selectionConflicts,1);assert.equal(conflict.ok,false);
+  assert.equal((await source.query("SELECT current_setting('TimeZone') AS zone")).rows[0].zone,"Europe/Oslo");
 });

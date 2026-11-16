@@ -65,6 +65,7 @@ try {
     url.port = url.port || "5432";
     return new Client({connectionString: url.href, connectionTimeoutMillis: 10000,
       application_name: "cloud-import-readonly-verification",
+      options: "-c default_transaction_read_only=on",
       ssl: {ca, rejectUnauthorized: true, servername: host}});
   }
   source = await clientFor("SOURCE");
@@ -113,3 +114,7 @@ execute the six application smokes, which remain pending. `verifyImport` require
 matching report, database ledger and mapping revisions; `.7` artifacts cannot be
 relabeled as `.11` qualification. Any new import/rerun needs its own approved
 scope; this recipe performs no import, grant, refresh or schema mutation.
+
+For final matching-revision identity qualification, use
+[REMOTE_IMPORT_RUN.md](REMOTE_IMPORT_RUN.md). The contract runner above stays
+a lower-level evidence path even when its contract revision is current.

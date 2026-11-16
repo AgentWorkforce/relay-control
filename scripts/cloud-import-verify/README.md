@@ -187,12 +187,10 @@ operator organization remains an unresolved skip.
 The main synthetic fixture uses UTC sessions. A separate audit on PostgreSQL's
 Europe/Oslo session timezone found that the importer's `created_at + interval
 '90 days'` staff-grant clamp shifts one hour across DST compared with the
-verifier's UTC snapshot. The fix on `feat/cloud-import-followups` at `6b338a5` sets both importer source
-transactions to UTC and gates selection conflicts. It is fixed pending merge;
-qualification requires that follow-up. A temporary local merge of that exact
-follow-up passed the 53-case suite plus an independent source-Oslo regression
-that also checks session restoration and conflict failure (54 checks total).
-The temporary merge was undone; the follow-up remains in its owner's branch.
+verifier's UTC snapshot. The fix merged in #168 at `c13c294`: both importer source transactions use
+UTC, the default canonicalizer is Control's, and selection conflicts fail the
+copy report. The dedicated PostgreSQL regression switches the source to Oslo,
+proves UTC expiry and session restoration, and checks conflict failure.
 The verifier retains UTC checks.
 
 The library entry point is `verifyImport(source, target, scope, ledger, keyring,
@@ -357,3 +355,6 @@ The independently authorized rehearsal runner can integrate the library with
 direct provider DNS and full TLS verification using [REMOTE_RUN.md](REMOTE_RUN.md).
 That recipe leaves the loopback CLI unchanged and keeps older contract evidence
 distinct from full import qualification.
+
+Use [REMOTE_IMPORT_RUN.md](REMOTE_IMPORT_RUN.md) for matching-revision identity
+qualification; the contract-only runner remains lower-level evidence.
