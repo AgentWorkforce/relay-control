@@ -71,7 +71,8 @@
     {"name":"0065_replica_spawns.sql","sha256":"555ea60fa7dd4e1416866c14e3a4f98cef950a29f6dbf5c2da8954ef68aebee5"},
     {"name":"0067_replica_environment_policies.sql","sha256":"94234299d57c6e983c4c8f148e934406804fe4bb152db610621fbdcbe31cabac"},
     {"name":"0068_user_signup_source.sql","sha256":"aed4f6c0aee5aecbc8fca128219b4e6e68e7702c4aff04bf1d5a79cb17cc0224"},
-    {"name":"0069_replica_tombstone_retention.sql","sha256":"680c7bad610a70bc98caf8cdf6ce8e4ecb5f3667a0e5513f098ac47e755fe2a6"}
+    {"name":"0069_replica_tombstone_retention.sql","sha256":"680c7bad610a70bc98caf8cdf6ce8e4ecb5f3667a0e5513f098ac47e755fe2a6"},
+    {"name":"0070_replica_failure_paths.sql","sha256":"1f05ac223c07d9a3f37d83d9eeffa4ce295abce0efe04f0460bd139d96cc9271"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -826,6 +827,8 @@
     {"kind":"column","name":"public.relaycast_rekey_backups.run_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
     {"kind":"column","name":"public.relaycast_rekey_backups.table_name","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"text"}},
     {"kind":"column","name":"public.relaycast_rekey_backups.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":7,"type":"uuid"}},
+    {"kind":"column","name":"public.remote_agent_connections.access_error","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":9,"type":"text"}},
+    {"kind":"column","name":"public.remote_agent_connections.access_revoked_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.remote_agent_connections.created_by_user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":6,"type":"uuid"}},
     {"kind":"column","name":"public.remote_agent_connections.key_ciphertext","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"text"}},
     {"kind":"column","name":"public.remote_agent_connections.key_hint","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"text"}},
@@ -851,7 +854,10 @@
     {"kind":"column","name":"public.replica_environment_creators.creator_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"text"}},
     {"kind":"column","name":"public.replica_environment_creators.policy_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
     {"kind":"column","name":"public.replica_environment_creators.user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"uuid"}},
+    {"kind":"column","name":"public.replica_environment_policies.create_attempt","definition":{"collation":null,"default":"0","generated":"","identity":"","not_null":true,"position":14,"type":"bigint"}},
+    {"kind":"column","name":"public.replica_environment_policies.create_unconfirmed","definition":{"collation":null,"default":"false","generated":"","identity":"","not_null":true,"position":12,"type":"boolean"}},
     {"kind":"column","name":"public.replica_environment_policies.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":10,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.replica_environment_policies.discovery_missing_since","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":13,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.replica_environment_policies.enabled","definition":{"collation":null,"default":"false","generated":"","identity":"","not_null":true,"position":7,"type":"boolean"}},
     {"kind":"column","name":"public.replica_environment_policies.environment_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"text"}},
     {"kind":"column","name":"public.replica_environment_policies.environment_name","definition":{"collation":"pg_catalog.default","default":"''::text","generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -2047,5 +2053,5 @@
   "optional":{
 
   },
-  "sha256":"b9880619eaf56a6f67b921f3292e374d0f0a83675cd74d7455f4483802d5a8a8"
+  "sha256":"29650657f52eafe7cacaa8c957baa8800da97364092c26f041c08495cbf783c1"
 }

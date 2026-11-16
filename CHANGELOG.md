@@ -5,6 +5,45 @@ assigned at release.
 
 ## Unreleased
 
+- Added: Replicas failure paths (migration 0070). The environment MCP create
+  intent is persisted on the policy and, while it is set, every sync or
+  enable (startup run, periodic sync, the sync and enable routes, a plain
+  `PUT .../environments/{id}`) is read-only and never sends the create again;
+  it clears when a complete listing finds the entry or a create is definitely
+  rejected. Operator recovery is the explicit, admin-only `retry_registration:
+  true` flag on `PUT .../environments/{id}`: it retries the unresolved write
+  (a create whose outcome is unknown) once a complete listing shows no entry,
+  which is the precondition for re-sending, not proof that the earlier create
+  failed; the operator accepts a possible duplicate entry the provider may
+  surface later (audited `replicas.environment.registration_retried`). A replica with an owned
+  launch or bind in the workspace is reused before a creator mapping or VM
+  principal is required. Removing
+  a creator mapping releases that creator's creator-acting bindings, and the
+  periodic sync retries unfinished cleanup of released bindings with
+  exponential backoff (1 minute to 1 hour). A 401 or 403 from Replicas on the
+  stored key sets an access-revoked latch on the connection that refuses
+  admission until an environments list succeeds or the connection is
+  re-connected (`accessRevoked` on the connection list and policy view). A
+  complete discovery listing that no longer shows an enabled environment
+  fences it (`discovery_missing`) until it is listed again, and releasing an
+  older row no longer fences a newer live operation of the same replica, or
+  one whose release was revived; workspace deletion tombstones retired
+  environment identities too, and an identity enrolled in another workspace
+  is refused `replica_owned_elsewhere`; an API launch or bind reused by a
+  verified environment-MCP call is pinned to its workspace the same way (the
+  first call stamps its issuer and organization on the row), and a repeat
+  launch with the same request id after a release and revive, or after that
+  stamp, returns the original operation instead of a 409 or a new create.
+  - A creator mapped to a former member no longer blocks a replica with an
+    owned launch or bind in the workspace: that launch or bind is reused as
+    its owner first; without one the call is still refused
+    `replica_creator_not_allowed` (never moved to the principal, never
+    recorded as a pending creator).
+  - The create intent carries a generation (`create_attempt`, migration
+    0070): a run clears only the intent it set itself, so a registration
+    whose relist fails after an operator recovery sent its own create in
+    between keeps that recovery's intent (`registration_unconfirmed`) and
+    never creates again.
 - Changed: storing a subscription login (device-login completion and
   operator imports) takes the per-credential refresh lock before the
   workspace lock, so it no longer deadlocks with a concurrent write-back.

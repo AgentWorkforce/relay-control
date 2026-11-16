@@ -14,6 +14,8 @@ import {
   isUuid,
   keyFor,
   patch,
+  accessRevoked,
+  recordProviderAccess,
   rejectedByProvider,
   relayFor,
   ReplicasError,
@@ -49,6 +51,7 @@ export const IDENTITY_SERVER_NAME = "agent-relay-replica";
 export type IdentityRefusalCode =
   | "replica_identity_invalid"
   | "replica_released"
+  | "replica_owned_elsewhere"
   | "replica_environment_not_enabled"
   | "organization_shared"
   | "replica_creator_not_allowed"
@@ -77,11 +80,27 @@ type PolicyRow = {
   enabled: boolean;
   registered_mcp_id: string | null;
   opted_out: boolean;
+  /** A create was (or was about to be) sent with an unknown outcome: every run only relists until it clears (retry_registration excepted). */
+  create_unconfirmed: boolean;
+  /** Generation of the create intent: bumped each time the intent is set, so a run clears only its own intent. */
+  create_attempt: string | number | bigint;
+  /** Set when a complete discovery listing no longer showed this enabled environment; fences admission. */
+  discovery_missing_since: Date | string | null;
 };
-const POLICY = "id, workspace_id, issuer, provider_organization_id, environment_id, environment_name, enabled, registered_mcp_id, opted_out";
+const POLICY = "id, workspace_id, issuer, provider_organization_id, environment_id, environment_name, enabled, registered_mcp_id, opted_out, create_unconfirmed, create_attempt, discovery_missing_since";
 
-/** actsAs: "creator" for a mapped creator, "principal" for the workspace VM principal. */
-type Admission = { policy: PolicyRow; organizationId: string; userId: string; actsAs: "creator" | "principal" };
+/**
+ * actsAs: "creator" for a mapped creator, "principal" for the workspace VM
+ * principal (both with the member's userId). With userId null nothing acts
+ * by itself and only an owned launch or bind of the same replica can admit it
+ * (liveBinding): "none" when there is no mapping and no principal, and
+ * "refused_creator" when the creator is mapped to a former member (never
+ * moved to the principal, never recorded as a pending creator).
+ */
+type ActingAdmission = { policy: PolicyRow; organizationId: string; userId: string; actsAs: "creator" | "principal" };
+type Admission = ActingAdmission | { policy: PolicyRow; organizationId: string; userId: null; actsAs: "none" | "refused_creator" };
+/** Whether the admission acts for a person by itself (a mapped creator or the principal). */
+const acting = (admission: Admission): admission is ActingAdmission => admission.actsAs === "creator" || admission.actsAs === "principal";
 const scopeOf = (admission: Admission) => ({ workspaceId: admission.policy.workspace_id, organizationId: admission.organizationId });
 
 function identityConfig(deps: ReplicasDeps) {
@@ -108,7 +127,11 @@ async function organizationShared(tx: SqlExecutor, organization: string | null):
  * Checks 2-4 of the admission order (1 = token verification, done by the
  * caller). Reads only; every refusal is a typed IdentityRefusal. A mapped
  * creator acts as its member; otherwise (no creator, or an unmapped one) the
- * workspace's VM principal is used when it is set and still a member.
+ * workspace's VM principal is used when it is set and still a member. A
+ * creator mapped to a former member is not refused here but returned as
+ * "refused_creator": an owned launch or bind of the same replica is still
+ * reused first (owner before creator mapping), and liveBinding refuses it
+ * replica_creator_not_allowed without one.
  */
 async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): Promise<Admission> {
   // Any matching tombstone refuses, also one whose workspace was deleted (workspace_id NULL).
@@ -122,29 +145,47 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
     throw new IdentityRefusal("replica_released", 403, released.workspace_id && released.organization_id
       ? { workspaceId: released.workspace_id, organizationId: released.organization_id } : null);
   }
-  const policies = await tx.query<PolicyRow & { organization_id: string; provider_account: string | null; principal_member: string | null }>(
+  const policies = await tx.query<PolicyRow & { organization_id: string; provider_account: string | null;
+    access_revoked_at: Date | string | null; principal_member: string | null }>(
     `SELECT ${POLICY.split(", ").map((column) => `p.${column}`).join(", ")}, w.organization_id, c.provider_account,
-            pm.user_id AS principal_member
+            c.access_revoked_at, pm.user_id AS principal_member
        FROM replica_environment_policies p
        JOIN workspaces w ON w.id = p.workspace_id
        LEFT JOIN remote_agent_connections c ON c.workspace_id = p.workspace_id AND c.provider = 'replicas'
        LEFT JOIN replica_environment_settings s ON s.workspace_id = p.workspace_id
        LEFT JOIN organization_memberships pm ON pm.user_id = s.principal_user_id AND pm.organization_id = w.organization_id
-      WHERE p.enabled AND p.issuer = $1 AND p.provider_organization_id = $2 AND p.environment_id = $3`,
+      WHERE p.enabled AND p.discovery_missing_since IS NULL AND p.issuer = $1 AND p.provider_organization_id = $2 AND p.environment_id = $3`,
     [claims.issuer, claims.organizationId, claims.environmentId],
   );
   const candidate = policies.rows.length === 1 ? policies.rows[0]! : null;
+  // No reassignment across workspaces: the first workspace that enrolled this replica owns it
+  // for good, whatever state its row is in (live, retired or gone).
+  if (candidate) {
+    // An API launch or bind pinned by its first environment admission (identity_admitted) counts the same.
+    const elsewhere = await tx.query(
+      `SELECT 1 FROM replica_spawns
+        WHERE lower(replica_id) = $4 AND workspace_id <> $5
+          AND ((source = $1 AND issuer = $2 AND lower(provider_organization_id) = $3)
+            OR (input->'identity_admitted'->>'issuer' = $2 AND lower(input->'identity_admitted'->>'organization_id') = $3))
+        LIMIT 1`,
+      [ENVIRONMENT_IDENTITY, claims.issuer, claims.organizationId, claims.workspaceId, candidate.workspace_id],
+    );
+    if (elsewhere.rows.length) {
+      throw new IdentityRefusal("replica_owned_elsewhere", 403, { workspaceId: candidate.workspace_id, organizationId: candidate.organization_id });
+    }
+  }
   // An organization connected in several workspaces has no single tenant: refuse before any creator check.
   if (await organizationShared(tx, claims.organizationId)) {
     throw new IdentityRefusal("organization_shared", 403,
       candidate ? { workspaceId: candidate.workspace_id, organizationId: candidate.organization_id } : null);
   }
-  // The workspace must still hold a connection to the same provider organization.
-  if (!candidate || candidate.provider_account?.toLowerCase() !== claims.organizationId) {
+  // The workspace must still hold a connection to the same provider
+  // organization, one the provider has not refused (the access-revoked latch).
+  if (!candidate || candidate.provider_account?.toLowerCase() !== claims.organizationId || candidate.access_revoked_at) {
     throw new IdentityRefusal("replica_environment_not_enabled", 403);
   }
-  const { organization_id: organizationId, provider_account: _account, principal_member: principal, ...policy } = candidate;
-  const scope = { workspaceId: policy.workspace_id, organizationId };
+  const { organization_id: organizationId, provider_account: _account, access_revoked_at: _revoked,
+    principal_member: principal, ...policy } = candidate;
   if (claims.creatorId !== null) {
     const mapping = await tx.query<{ user_id: string; member: string | null }>(
       `SELECT c.user_id, m.user_id AS member FROM replica_environment_creators c
@@ -155,14 +196,23 @@ async function admissionChecks(tx: SqlExecutor, claims: ReplicaIdentityClaims): 
     const mapped = mapping.rows[0];
     if (mapped) {
       // A mapping to a former member is the admin's own choice: refused, never moved to the principal.
-      if (!mapped.member) throw new IdentityRefusal("replica_creator_not_allowed", 403, scope);
+      // The refusal is left to liveBinding, so an owned launch or bind is still reused before it.
+      if (!mapped.member) return { policy, organizationId, userId: null, actsAs: "refused_creator" };
       return { policy, organizationId, userId: mapped.user_id, actsAs: "creator" };
     }
   }
   if (principal) return { policy, organizationId, userId: principal, actsAs: "principal" };
-  // Only an unmapped creator becomes a pending request.
-  throw new IdentityRefusal("replica_creator_not_allowed", 403, scope, claims.creatorId === null ? null : policy.id);
+  // No creator mapping and no principal: liveBinding refuses unless an owned launch or bind exists.
+  return { policy, organizationId, userId: null, actsAs: "none" };
 }
+
+/**
+ * No mapped creator and no principal; only an unmapped creator becomes a
+ * pending request (a creator mapped to a former member is already mapped).
+ */
+const unadmitted = (claims: ReplicaIdentityClaims, admission: Admission) =>
+  new IdentityRefusal("replica_creator_not_allowed", 403, scopeOf(admission),
+    claims.creatorId !== null && admission.actsAs === "none" ? admission.policy.id : null);
 
 async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admission: Admission): Promise<SpawnRow | null> {
   const live = await tx.query<SpawnRow>(
@@ -170,16 +220,34 @@ async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admis
     [claims.workspaceId],
   );
   const row = live.rows[0];
-  if (!row) return null;
+  if (!row) {
+    if (!acting(admission)) throw unadmitted(claims, admission);
+    return null;
+  }
   // A launch or bind of the same replica in this workspace is reused as is: the identity acts as
-  // that binding and its owner (never the principal or a creator mapping) while the owner is a member.
+  // that binding and its owner (never the principal or a creator mapping, also one to a former
+  // member) while the owner is a member.
   // A rejected launch binds nothing by itself, so it stays a conflict until recovered or released.
   if (row.source !== ENVIRONMENT_IDENTITY && row.workspace_id === admission.policy.workspace_id && row.state !== "rejected") {
     const owner = await tx.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
       [admission.organizationId, row.user_id]);
     if (!owner.rows.length) throw new IdentityRefusal("replica_creator_not_allowed", 403, scopeOf(admission));
+    // The first verified admission pins the reused row to this tenant. Written under the admission
+    // lock (withReplicasLock), before the call is served, and only while unset: the first verified
+    // issuer and organization stay immutable, and release or revive never clear them.
+    if (!row.input.identity_admitted) {
+      const stamped = await tx.query<SpawnRow>(
+        `UPDATE replica_spawns SET input = input || jsonb_build_object('identity_admitted',
+           jsonb_build_object('issuer', $2::text, 'organization_id', $3::text, 'at', now()))
+          WHERE id = $1 AND input->>'identity_admitted' IS NULL RETURNING ${COLUMNS}`,
+        [row.id, claims.issuer, claims.organizationId],
+      );
+      return stamped.rows[0] ?? row;
+    }
     return row;
   }
+  // Without an owned launch or bind, a creator mapping to a current member or the principal is required.
+  if (!acting(admission)) throw unadmitted(claims, admission);
   // A live binding in another workspace (for example under an earlier policy) is a bound replica, not a creator problem.
   if (row.source !== ENVIRONMENT_IDENTITY || row.workspace_id !== admission.policy.workspace_id) {
     throw new IdentityRefusal("replica_already_bound", 409, scopeOf(admission));
@@ -261,7 +329,8 @@ async function underAdmission<T>(deps: ReplicasDeps, claims: ReplicaIdentityClai
   work: (tx: SqlExecutor, admission: Admission) => Promise<T>): Promise<T> {
   return audited(deps, claims, async () => {
     const first = await deps.database.transaction((tx) => admissionChecks(tx, claims));
-    // An unmapped creator admitted as the principal still shows up for mapping.
+    // An unmapped creator admitted as the principal still shows up for mapping (a creator mapped
+    // to a former member, "refused_creator", is already mapped and never recorded).
     if (first.actsAs === "principal" && claims.creatorId !== null) await recordCreatorRequest(deps, first.policy.id, claims);
     return withReplicasLock(deps, scopeOf(first), async (tx) => {
       const admission = await admissionChecks(tx, claims);
@@ -291,13 +360,16 @@ async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIde
   let row = await liveBinding(tx, claims, admission);
   // A reused launch or bind is never enrolled: its own lifecycle binds it (admitIdentity 503s until then).
   if (row && row.source !== ENVIRONMENT_IDENTITY) return row;
+  // An environment-identity binding always acts for a mapped creator or the principal.
+  if (!acting(admission)) throw unadmitted(claims, admission);
+  const { userId, actsAs } = admission;
   const hint = emailHint(claims.creatorEmail);
   if (hint) {
     await tx.query("UPDATE replica_environment_creators SET creator_email_hint = $3 WHERE policy_id = $1 AND creator_id = $2 AND creator_email_hint IS DISTINCT FROM $3",
       [admission.policy.id, claims.creatorId, hint]);
   }
   if (row?.state === "bound" && row.token_ciphertext) return row;
-  const relay = await relayFor(deps, tx, { workspaceId: admission.policy.workspace_id, userId: admission.userId }, row?.relay_workspace_id);
+  const relay = await relayFor(deps, tx, { workspaceId: admission.policy.workspace_id, userId }, row?.relay_workspace_id);
   const name = identityAgentName(claims.workspaceId);
   const ownId = row?.id;
   // A replica already bridged by another binding (a PR A spawn or bind) is never enrolled twice.
@@ -321,12 +393,12 @@ async function enrolStep(deps: ReplicasDeps, tx: SqlExecutor, claims: ReplicaIde
   if (!row) {
     const id = randomUUID();
     const input: SpawnInput = { environment_id: claims.environmentId, name, task: "", coding_agent: "replicas",
-      origin: ENVIRONMENT_IDENTITY, acts_as: admission.actsAs, creator_id: claims.creatorId };
+      origin: ENVIRONMENT_IDENTITY, acts_as: actsAs, creator_id: claims.creatorId };
     const inserted = await tx.query<SpawnRow>(
       `INSERT INTO replica_spawns (id, workspace_id, organization_id, user_id, client_request_id, source, input, replica_id, state,
          relay_workspace_id, agent_name, environment_id, provider_organization_id, issuer)
        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, 'binding', $9, $10, $11, $12, $13) RETURNING ${COLUMNS}`,
-      [id, admission.policy.workspace_id, admission.organizationId, admission.userId, `environment-identity:${id}`, ENVIRONMENT_IDENTITY,
+      [id, admission.policy.workspace_id, admission.organizationId, userId, `environment-identity:${id}`, ENVIRONMENT_IDENTITY,
         JSON.stringify(input), claims.workspaceId, relay.relaycastWorkspaceId, name, claims.environmentId, claims.organizationId, claims.issuer],
     );
     // Committed before registration: the name is the cleanup locator.
@@ -463,7 +535,10 @@ export async function setEnvironmentPrincipal(deps: ReplicasDeps, actor: Replica
   return listEnvironmentPolicies(deps, actor);
 }
 
-const policyStatus = (policy: PolicyRow) => !policy.enabled ? "disabled" : policy.registered_mcp_id ? "registered" : "enabled";
+/** An enabled policy without an entry whose last create has an unknown outcome is registration_unconfirmed. */
+const policyStatus = (policy: PolicyRow) => !policy.enabled ? "disabled"
+  : policy.discovery_missing_since ? "discovery_missing" : policy.registered_mcp_id ? "registered"
+  : policy.create_unconfirmed ? "registration_unconfirmed" : "enabled";
 
 export type DiscoveryResult = {
   status: "ok" | "partial" | "failed";
@@ -484,9 +559,11 @@ export async function discoverEnvironments(deps: ReplicasDeps, actor: ReplicasAc
   let listed: Awaited<ReturnType<ReplicasDeps["replicas"]["allEnvironments"]>>;
   try {
     listed = await deps.replicas.allEnvironments(key);
-  } catch {
+  } catch (error) {
+    await recordProviderAccess(deps.database, actor.workspaceId, error);
     return { status: "failed", environments: [] };
   }
+  await recordProviderAccess(deps.database, actor.workspaceId, "granted");
   return withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
     const organization = await connectedOrganization(tx, actor.workspaceId);
@@ -499,7 +576,9 @@ export async function discoverEnvironments(deps: ReplicasDeps, actor: ReplicasAc
         [actor.workspaceId, environmentId],
       );
       if (existing.rows[0]) {
-        await tx.query("UPDATE replica_environment_policies SET environment_name = $2, updated_at = now() WHERE id = $1",
+        // Listed again: the discovery fence (if any) is lifted.
+        await tx.query(
+          "UPDATE replica_environment_policies SET environment_name = $2, discovery_missing_since = NULL, updated_at = now() WHERE id = $1",
           [existing.rows[0].id, name]);
         environments.push({ environmentId, name, status: "known" });
         continue;
@@ -511,6 +590,14 @@ export async function discoverEnvironments(deps: ReplicasDeps, actor: ReplicasAc
       );
       environments.push({ environmentId, name, status: "discovered" });
     }
+    // Only a complete listing proves absence: fence each enabled policy it
+    // no longer shows (first timestamp kept). opted_out is never touched.
+    if (listed.complete) {
+      await tx.query(
+        `UPDATE replica_environment_policies SET discovery_missing_since = now(), updated_at = now()
+          WHERE workspace_id = $1 AND enabled AND discovery_missing_since IS NULL AND NOT (environment_id = ANY($2::text[]))`,
+        [actor.workspaceId, environments.map((item) => item.environmentId)]);
+    }
     return { status: listed.complete ? "ok" : "partial", environments };
   });
 }
@@ -520,8 +607,8 @@ export async function listEnvironmentPolicies(deps: ReplicasDeps, actor: Replica
   const { mcpUrl } = identityConfig(deps);
   return withReplicasLock(deps, actor, async (tx) => {
     await requireAdmin(tx, actor);
-    const connection = (await tx.query<{ provider_account: string | null }>(
-      "SELECT provider_account FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'",
+    const connection = (await tx.query<{ provider_account: string | null; access_revoked_at: Date | string | null; access_error: string | null }>(
+      "SELECT provider_account, access_revoked_at, access_error FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'",
       [actor.workspaceId])).rows[0];
     const policies = (await tx.query<PolicyRow>(
       `SELECT ${POLICY} FROM replica_environment_policies WHERE workspace_id = $1 ORDER BY environment_name, environment_id`,
@@ -548,6 +635,9 @@ export async function listEnvironmentPolicies(deps: ReplicasDeps, actor: Replica
     return {
       mcpUrl,
       organizationId: connection?.provider_account ?? null,
+      // The provider refused the stored key (401/403): nothing is admitted until a 2xx environments list or a re-connect.
+      accessRevoked: connection?.access_revoked_at
+        ? { since: new Date(connection.access_revoked_at).toISOString(), error: connection.access_error } : null,
       allEnvironments: await allEnvironmentsFlag(tx, actor.workspaceId),
       // The VM principal; member false means it left the organization and admits nobody.
       principal: principal?.principal_user_id ? { userId: principal.principal_user_id, member: Boolean(principal.member) } : null,
@@ -557,7 +647,9 @@ export async function listEnvironmentPolicies(deps: ReplicasDeps, actor: Replica
         environmentId: policy.environment_id,
         name: policy.environment_name,
         enabled: policy.enabled,
-        status: policyStatus(policy),
+        status: policy.enabled && connection?.access_revoked_at ? "access_revoked" : policyStatus(policy),
+        // When a complete discovery listing stopped showing this enabled environment (admission refused until listed again).
+        discoveryMissingSince: policy.discovery_missing_since ? new Date(policy.discovery_missing_since).toISOString() : null,
         // An admin opt-out: sync and re-connect leave it disabled; a disabled policy without it is retried.
         optedOut: policy.opted_out,
         // A policy recorded for an earlier connection never admits a token.
@@ -669,13 +761,23 @@ async function disablePolicy(tx: SqlExecutor, actor: ReplicasActor, policy: Poli
 const putInput = z.object({
   enabled: z.boolean().optional(),
   creators: z.array(z.object({ creatorId: z.string().min(1).max(256), userId: z.string().uuid() }).strict()).max(100).optional(),
+  retry_registration: z.literal(true).optional(),
 }).strict();
 
-/** Sets an environment's admission switch and/or replaces its creator mappings. */
+/**
+ * Sets an environment's admission switch and/or replaces its creator
+ * mappings. retry_registration (owner/admin, enabled environment only)
+ * retries an unresolved write: after the enable it registers the
+ * environment's provider MCP entry with recover set, so a create whose
+ * outcome is unknown is sent again. A complete listing with no entry is the
+ * precondition for re-sending, not proof that the earlier create failed: the
+ * flag is an operator decision that accepts a possible duplicate entry the
+ * provider may surface later. No sync does that.
+ */
 export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: ReplicasActor, environmentId: string, raw: unknown) {
   const parsed = putInput.safeParse(raw);
-  if (!parsed.success) throw new ReplicasError("Send enabled and/or creators [{creatorId, userId}].");
-  const { enabled, creators } = parsed.data;
+  if (!parsed.success) throw new ReplicasError("Send enabled and/or creators [{creatorId, userId}], optionally retry_registration: true.");
+  const { enabled, creators, retry_registration: retry } = parsed.data;
   if (creators && new Set(creators.map((item) => item.creatorId)).size !== creators.length) {
     throw new ReplicasError("Each creator is mapped once.");
   }
@@ -684,6 +786,9 @@ export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: Replica
     await requireAdmin(tx, actor);
     let policy = await policyFor(tx, actor.workspaceId, environmentId);
     if (!policy) throw new ReplicasError("Unknown environment. Sync environments first.", 404);
+    if (retry && (enabled === false || (enabled !== true && !policy.enabled))) {
+      throw new ReplicasError("retry_registration needs an enabled environment.");
+    }
     if (creators) {
       for (const { userId } of creators) {
         const member = await tx.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
@@ -699,9 +804,20 @@ export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: Replica
           [policy.id, creatorId, userId.toLowerCase()],
         );
       }
+      // A binding acting as a creator whose mapping was removed is released
+      // (no tombstone): it enrols again as the principal when one is set and
+      // is refused otherwise; its Relay agent is retired after commit.
+      const unmapped = await tx.query<{ id: string }>(
+        `UPDATE replica_spawns SET state = 'gone', helper_hash = NULL, updated_at = now()
+          WHERE source = '${ENVIRONMENT_IDENTITY}' AND workspace_id = $1 AND environment_id = $2 AND state <> 'gone'
+            AND input->>'acts_as' = 'creator' AND NOT (COALESCE(input->>'creator_id', '') = ANY($3::text[]))
+          RETURNING id`,
+        [actor.workspaceId, policy.environment_id, creators.map((item) => item.creatorId)],
+      );
+      released.push(...unmapped.rows.map((row) => row.id));
       // A binding of a newly mapped creator that acts as the principal or as
       // another member is released (no tombstone) and enrols again as the
-      // mapped member. Removing a mapping releases nothing: admission refuses.
+      // mapped member.
       for (const { creatorId, userId } of creators) {
         const revoked = await tx.query<{ id: string }>(
           `UPDATE replica_spawns SET state = 'gone', helper_hash = NULL, updated_at = now()
@@ -725,6 +841,11 @@ export async function updateEnvironmentPolicy(deps: ReplicasDeps, actor: Replica
     if (enabled === false) policy = await disablePolicy(tx, actor, policy, released, true);
   });
   await retireIdentityBindings(deps, actor, released);
+  if (retry) {
+    const { mcpUrl } = identityConfig(deps);
+    await registerPolicy(deps, actor, environmentId.toLowerCase(),
+      { url: mcpUrl, headers: {}, auth: { type: "workspace_identity", audience: mcpUrl } }, true);
+  }
   const view = await listEnvironmentPolicies(deps, actor);
   return { environment: view.environments.find((item) => item.environmentId === environmentId.toLowerCase()) ?? null };
 }
@@ -744,7 +865,7 @@ type EnableSelection = z.infer<typeof enableInput>;
 export type EnvironmentMcpResult = {
   environmentId: string;
   status: "registered" | "registration_failed" | "registration_unconfirmed" | "not_found" | "enabled_elsewhere"
-    | "organization_shared" | "stale_connection" | "disabled" | "removal_failed";
+    | "organization_shared" | "stale_connection" | "access_revoked" | "disabled" | "removal_failed";
   retryable?: boolean;
 };
 
@@ -808,12 +929,13 @@ function matchEntry(entries: EnvironmentMcp[], policy: PolicyRow, config: unknow
  * (connect): every one that is not enabled and registered. sync (under the
  * all-environments flag only): every disabled one that is not opted out (new,
  * or a default enable that failed or was refused earlier) plus enabled ones
- * whose registration is missing; an opted-out policy is never re-enabled here.
+ * whose registration is missing; an opted-out policy is never re-enabled here,
+ * and a policy fenced by discovery (discovery_missing_since) is skipped.
  */
 type DefaultSelection = { defaults: "setup" | "sync" };
 const DEFAULTS = {
   setup: "NOT (enabled AND registered_mcp_id IS NOT NULL)",
-  sync: "(NOT enabled AND NOT opted_out) OR (enabled AND registered_mcp_id IS NULL)",
+  sync: "discovery_missing_since IS NULL AND ((NOT enabled AND NOT opted_out) OR (enabled AND registered_mcp_id IS NULL))",
 };
 
 async function defaultPolicies(tx: SqlExecutor, workspaceId: string, organization: string, defaults: DefaultSelection["defaults"]) {
@@ -822,6 +944,7 @@ async function defaultPolicies(tx: SqlExecutor, workspaceId: string, organizatio
       ORDER BY environment_id FOR UPDATE`, [workspaceId, organization])).rows;
 }
 
+/** Enables a selection and registers each enabled policy; never replays an unconfirmed create (registerPolicy). */
 async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
   selection: Selection | EnableSelection | DefaultSelection): Promise<EnvironmentMcpResult[]> {
   const { mcpUrl } = identityConfig(deps);
@@ -871,65 +994,157 @@ async function enableSelected(deps: ReplicasDeps, actor: ReplicasActor,
   await retireIdentityBindings(deps, actor, released);
   const config = { url: mcpUrl, headers: {}, auth: { type: "workspace_identity" as const, audience: mcpUrl } };
   for (const policy of toRegister) {
-    // Once a create was sent, only a definite rejection proves no entry was
-    // created; anything else (timeout, 5xx, unreadable answer, our own
-    // UPDATE or commit failing) leaves the outcome unknown.
-    let asked = false;
-    try {
-      results.push(await withReplicasLock(deps, actor, async (tx): Promise<EnvironmentMcpResult> => {
-        await requireAdmin(tx, actor);
-        const current = await policyFor(tx, actor.workspaceId, policy.environment_id);
-        if (!current || !current.enabled) return { environmentId: policy.environment_id, status: "disabled" };
-        if (current.registered_mcp_id) return { environmentId: current.environment_id, status: "registered" };
-        let key: string;
-        try {
-          key = await keyFor(deps, tx, actor.workspaceId);
-        } catch {
-          return { environmentId: current.environment_id, status: "registration_failed", retryable: true };
-        }
-        const failed = (retryable: boolean): EnvironmentMcpResult => ({ environmentId: current.environment_id, status: "registration_failed", retryable });
-        const unconfirmed: EnvironmentMcpResult = { environmentId: current.environment_id, status: "registration_unconfirmed", retryable: true };
-        // Read first: reuse a matching entry, never overwrite a foreign or duplicated one.
-        let found: EntryMatch;
-        try {
-          found = matchEntry(await deps.replicas.listEnvironmentMcps(key, current.environment_id), current, config);
-        } catch {
-          return failed(true);
-        }
-        if (found.kind === "conflict") return failed(false);
-        if (found.kind === "none") {
-          asked = true;
-          let createdId: string | null = null;
-          try {
-            createdId = (await deps.replicas.registerEnvironmentMcp(key, current.environment_id,
-              { name: IDENTITY_SERVER_NAME, transport: "http", config })).id;
-          } catch (error) {
-            // A 409 or a lost answer may still have created the entry: read it back below.
-            if (rejectedByProvider(error)) {
-              asked = false;
-              return failed(true);
-            }
-          }
-          try {
-            found = matchEntry(await deps.replicas.listEnvironmentMcps(key, current.environment_id), current, config);
-          } catch {
-            return unconfirmed;
-          }
-          if (found.kind === "conflict") return failed(false);
-          if (found.kind !== "match" || (createdId !== null && found.id !== createdId)) return unconfirmed;
-        }
-        const entry = { id: found.id };
-        await tx.query("UPDATE replica_environment_policies SET registered_mcp_id = $2, updated_at = now() WHERE id = $1", [current.id, entry.id]);
-        await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-          actor: auditActor(actor), action: "replicas.environment.mcp_registered", target: current.id });
-        return { environmentId: current.environment_id, status: "registered" };
-      }));
-    } catch (error) {
-      if (!asked) throw error;
-      results.push({ environmentId: policy.environment_id, status: "registration_unconfirmed", retryable: true });
-    }
+    results.push(await registerPolicy(deps, actor, policy.environment_id, config));
   }
   return results;
+}
+
+type IdentityMcpConfig = { url: string; headers: Record<string, never>; auth: { type: "workspace_identity"; audience: string } };
+type RegistrationTarget = { current: PolicyRow; key: string };
+
+/** Re-reads one policy under the lock: still enabled, not yet registered, and the key is readable. */
+async function registrationTarget(deps: ReplicasDeps, tx: SqlExecutor, actor: ReplicasActor,
+  environmentId: string): Promise<EnvironmentMcpResult | RegistrationTarget> {
+  await requireAdmin(tx, actor);
+  const current = await policyFor(tx, actor.workspaceId, environmentId);
+  if (!current || !current.enabled) return { environmentId, status: "disabled" };
+  if (current.registered_mcp_id) return { environmentId: current.environment_id, status: "registered" };
+  try {
+    return { current, key: await keyFor(deps, tx, actor.workspaceId) };
+  } catch {
+    return { environmentId: current.environment_id, status: "registration_failed", retryable: true };
+  }
+}
+
+/** Sets the create intent and starts a new generation of it; returns that generation. */
+async function setCreateIntent(tx: SqlExecutor, policyId: string): Promise<string> {
+  const result = await tx.query<{ create_attempt: string | number | bigint }>(
+    `UPDATE replica_environment_policies SET create_unconfirmed = true, create_attempt = create_attempt + 1, updated_at = now()
+      WHERE id = $1 RETURNING create_attempt`, [policyId]);
+  return String(result.rows[0]!.create_attempt);
+}
+
+/**
+ * Clears the create intent only while it is still the generation this run
+ * set: a newer intent (a recovery run that sent its own create in between)
+ * is kept. Returns whether it was cleared.
+ */
+async function clearCreateIntent(tx: SqlExecutor, policyId: string, attempt: string): Promise<boolean> {
+  const result = await tx.query(
+    "UPDATE replica_environment_policies SET create_unconfirmed = false, updated_at = now() WHERE id = $1 AND create_attempt = $2::bigint RETURNING id",
+    [policyId, attempt]);
+  return result.rows.length > 0;
+}
+
+async function markRegistered(tx: SqlExecutor, actor: ReplicasActor, policy: PolicyRow, mcpId: string): Promise<EnvironmentMcpResult> {
+  await tx.query(
+    "UPDATE replica_environment_policies SET registered_mcp_id = $2, create_unconfirmed = false, updated_at = now() WHERE id = $1",
+    [policy.id, mcpId]);
+  await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
+    actor: auditActor(actor), action: "replicas.environment.mcp_registered", target: policy.id });
+  return { environmentId: policy.environment_id, status: "registered" };
+}
+
+/**
+ * Registers one enabled policy's provider MCP entry in two locked steps.
+ * Step 1 lists the environment's entries: a matching entry is recorded as
+ * registered (and the create intent cleared); otherwise the create intent
+ * (create_unconfirmed) is committed before any create is sent. While the
+ * intent is set from an earlier attempt, every run (startup, sweep, the sync
+ * and enable routes, a plain enable) is read-only: it only relists and
+ * reports registration_unconfirmed. The intent clears only when a complete
+ * listing finds the entry or a create sent by this run is definitely
+ * rejected. recover (the admin-only retry_registration flag) is the one
+ * exception: an operator decision to retry the unresolved write. It creates
+ * again only after a complete listing in step 1 and the relisting in step 2
+ * both showed no entry; that is the precondition for re-sending, not proof
+ * of the earlier outcome, so a duplicate entry may still surface later. Step 2 relists (another
+ * run may have created it meanwhile), then creates and reads the entry back.
+ * A timeout, 5xx, unreadable answer or a failed listing leaves the intent set.
+ * Setting the intent bumps its generation (create_attempt), and step 2 clears
+ * it only while that generation is still the one step 1 set, so a run never
+ * forgets the unresolved create of a recovery run that ran between its steps.
+ */
+async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environmentId: string,
+  config: IdentityMcpConfig, recover = false): Promise<EnvironmentMcpResult> {
+  const failed = (retryable: boolean): EnvironmentMcpResult => ({ environmentId, status: "registration_failed", retryable });
+  const unconfirmed: EnvironmentMcpResult = { environmentId, status: "registration_unconfirmed", retryable: true };
+  // The provider refused the key itself: retrying with it cannot succeed, a re-connect can.
+  const revoked: EnvironmentMcpResult = { environmentId, status: "access_revoked", retryable: false };
+  const list = (target: RegistrationTarget) => deps.replicas.listEnvironmentMcps(target.key, target.current.environment_id)
+    .then((entries) => matchEntry(entries, target.current, config));
+  const intent = await withReplicasLock(deps, actor, async (tx): Promise<EnvironmentMcpResult | { previous: boolean; attempt: string }> => {
+    const target = await registrationTarget(deps, tx, actor, environmentId);
+    if (!("current" in target)) return target;
+    let found: EntryMatch;
+    try {
+      found = await list(target);
+    } catch (error) {
+      await recordProviderAccess(tx, actor.workspaceId, error);
+      return target.current.create_unconfirmed ? unconfirmed : accessRevoked(error) ? revoked : failed(true);
+    }
+    if (found.kind === "conflict") return failed(false);
+    if (found.kind === "match") return markRegistered(tx, actor, target.current, found.id);
+    if (target.current.create_unconfirmed && !recover) return unconfirmed;
+    return { previous: target.current.create_unconfirmed, attempt: await setCreateIntent(tx, target.current.id) };
+  });
+  if ("status" in intent) return intent;
+  // Once a create was sent, only a definite rejection proves no entry was
+  // created; anything else (timeout, 5xx, unreadable answer, our own
+  // UPDATE or commit failing) leaves the outcome unknown.
+  let asked = false;
+  try {
+    return await withReplicasLock(deps, actor, async (tx): Promise<EnvironmentMcpResult> => {
+      const target = await registrationTarget(deps, tx, actor, environmentId);
+      if (!("current" in target)) return target;
+      let found: EntryMatch;
+      try {
+        found = await list(target);
+      } catch (error) {
+        await recordProviderAccess(tx, actor.workspaceId, error);
+        // Nothing was sent in this attempt: restore the intent it found, unless a newer
+        // attempt set it since (then that attempt's create is unresolved: unconfirmed).
+        if (intent.previous || !await clearCreateIntent(tx, target.current.id, intent.attempt)) return unconfirmed;
+        return accessRevoked(error) ? revoked : failed(true);
+      }
+      if (found.kind === "conflict") return failed(false);
+      if (found.kind === "match") return markRegistered(tx, actor, target.current, found.id);
+      // A newer attempt (a recovery run between the two steps) owns the intent and its create is
+      // unresolved: this run only relists, as any run does while an earlier intent is set.
+      if (String(target.current.create_attempt) !== intent.attempt) return unconfirmed;
+      asked = true;
+      if (recover) {
+        await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
+          actor: auditActor(actor), action: "replicas.environment.registration_retried", target: target.current.id });
+      }
+      let createdId: string | null = null;
+      try {
+        createdId = (await deps.replicas.registerEnvironmentMcp(target.key, target.current.environment_id,
+          { name: IDENTITY_SERVER_NAME, transport: "http", config })).id;
+      } catch (error) {
+        // A 409 or a lost answer may still have created the entry: read it back below.
+        await recordProviderAccess(tx, actor.workspaceId, error);
+        if (rejectedByProvider(error)) {
+          asked = false;
+          // Only this attempt's intent is cleared; a newer one stays unresolved.
+          if (!await clearCreateIntent(tx, target.current.id, intent.attempt)) return unconfirmed;
+          return accessRevoked(error) ? revoked : failed(true);
+        }
+      }
+      try {
+        found = await list(target);
+      } catch (error) {
+        await recordProviderAccess(tx, actor.workspaceId, error);
+        return unconfirmed;
+      }
+      if (found.kind === "conflict") return failed(false);
+      if (found.kind !== "match" || (createdId !== null && found.id !== createdId)) return unconfirmed;
+      return markRegistered(tx, actor, target.current, found.id);
+    });
+  } catch (error) {
+    if (!asked) throw error;
+    return unconfirmed;
+  }
 }
 
 /**
@@ -988,7 +1203,8 @@ async function removeEntry(deps: ReplicasDeps, actor: ReplicasActor, policy: Pol
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
         actor: auditActor(actor), action: "replicas.environment.mcp_removed", target: current.id });
       return { environmentId: current.environment_id, status: "disabled" };
-    } catch {
+    } catch (error) {
+      await recordProviderAccess(tx, actor.workspaceId, error);
       return { environmentId: current.environment_id, status: "removal_failed", retryable: true };
     }
   });

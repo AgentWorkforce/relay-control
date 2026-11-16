@@ -383,7 +383,7 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     assert.equal(refused.body.error.message, "replica_creator_not_allowed");
   });
 
-  await t.test("a live binding in another workspace is replica_already_bound", async () => {
+  await t.test("an environment-identity binding in another workspace is replica_owned_elsewhere", async () => {
     const other = await api(`/api/v1/organizations/${env.organizationId}/workspaces`, {
       method: "POST", token: BOOTSTRAP, body: { name: "secondary", relaycastWorkspaceId: "rc-secondary", relaycastApiKey: "rk_live_secondary" },
     });
@@ -391,8 +391,8 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     const row = (await database.query<{ id: string }>("SELECT id FROM replica_spawns WHERE replica_id = $1 AND state <> 'gone'", [WORKSPACE_1])).rows[0]!;
     await database.query("UPDATE replica_spawns SET workspace_id = $2 WHERE id = $1", [row.id, other.body.id]);
     const refused = await callTool(api, token(), "list_relay_agents");
-    assert.equal(refused.status, 409, refused.text);
-    assert.equal(refused.body.error.message, "replica_already_bound");
+    assert.equal(refused.status, 403, refused.text);
+    assert.equal(refused.body.error.message, "replica_owned_elsewhere");
     await database.query("UPDATE replica_spawns SET workspace_id = $2 WHERE id = $1", [row.id, workspaceId]);
   });
 
@@ -455,10 +455,14 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     assert.equal(synced.status, 200, synced.text);
     // A timeout leaves the provider outcome unknown.
     assert.deepEqual(synced.body.environments, [{ environmentId: ENV_C, status: "registration_unconfirmed", retryable: true }]);
-    // A definite provider rejection created nothing.
+    // While the outcome is unknown every enable is read-only: nothing is sent again.
     provider.mode.register = "reject";
-    const rejected = await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { environmentIds: [ENV_C] } });
-    assert.deepEqual(rejected.body.environments, [{ environmentId: ENV_C, status: "registration_failed", retryable: true }]);
+    const readOnly = await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { environmentIds: [ENV_C] } });
+    assert.deepEqual(readOnly.body.environments, [{ environmentId: ENV_C, status: "registration_unconfirmed", retryable: true }]);
+    // The explicit retry sends it again; a definite provider rejection created nothing and clears the intent.
+    const rejected = await api(`${base}/environments/${ENV_C}`, { method: "PUT", token: ownerToken, body: { retry_registration: true } });
+    assert.equal(rejected.status, 200, rejected.text);
+    assert.equal(rejected.body.environment.status, "enabled");
     provider.mode.register = "ok";
     const retried = await api(`${base}/environment-mcp`, { method: "POST", token: ownerToken, body: { environmentIds: [ENV_C] } });
     assert.deepEqual(retried.body.environments, [{ environmentId: ENV_C, status: "registered" }]);
