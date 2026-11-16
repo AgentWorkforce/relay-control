@@ -101,6 +101,7 @@ async function setup(t: test.TestContext) {
     origin,
     probes,
     setProbeStatus: (status: number) => { probeStatus = status; },
+    organizationId: org.body.id as string,
     workspaceId,
     otherWorkspaceId: workspaces[1]!,
     ownerId: org.body.owner.id as string,
@@ -315,6 +316,109 @@ test("coding agents: setup tokens, sandbox and LLM selection, runtime env", asyn
     token: ctx.owner,
   });
   assert.equal(unauthenticated.status, 401, "user sessions cannot read runtime env");
+});
+
+test("coding agents: imported relay-managed rows remain metadata-only and fail closed at runtime", async (t) => {
+  const ctx = await setup(t);
+  const base = `/api/v1/workspaces/${ctx.workspaceId}`;
+  const managedId = "77777777-7777-4777-8777-777777777777";
+
+  const workspaceFallback = await request(ctx.origin, `${base}/secrets`, {
+    method: "POST",
+    token: ctx.owner,
+    body: { name: "ANTHROPIC_API_KEY", value: "workspace-fallback-must-not-impersonate-managed" },
+  });
+  assert.equal(workspaceFallback.status, 201);
+
+  await ctx.database.query(
+    `INSERT INTO coding_agent_credentials
+       (id, organization_id, workspace_id, created_by_user_id, model_provider, harness, auth_type,
+        display_name, label, account_email, secret_ciphertext, secret_preview, key_fingerprint,
+        is_active, harness_active, status, last_authenticated_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, 'anthropic', 'claude', 'relay_managed',
+             'Anthropic managed', NULL, NULL, NULL, NULL, NULL,
+             true, false, 'connected', now(), now(), now())`,
+    [managedId, ctx.organizationId, ctx.workspaceId, ctx.ownerId],
+  );
+
+  const listed = await request(ctx.origin, `${base}/cloud-agents`, { token: ctx.owner });
+  const managed = listed.body.agents.find((agent: { id: string }) => agent.id === managedId);
+  assert.equal(managed.authType, "relay_managed");
+  assert.equal(managed.secretPreview, "Managed by Agent Relay");
+  assert.equal(managed.isActive, true);
+  assert.equal(managed.harnessActive, false);
+  const anthropic = listed.body.providers.find((provider: { id: string }) => provider.id === "anthropic");
+  assert(anthropic.authTypes.includes("relay_managed"));
+
+  const stored = await ctx.database.query<{
+    secret_ciphertext: string | null;
+    secret_preview: string | null;
+    key_fingerprint: string | null;
+    blob_location: string | null;
+    refresh_attempts: number;
+  }>(
+    `SELECT secret_ciphertext, secret_preview, key_fingerprint, blob_location, refresh_attempts
+       FROM coding_agent_credentials WHERE id = $1`,
+    [managedId],
+  );
+  assert.deepEqual(stored.rows[0], {
+    secret_ciphertext: null,
+    secret_preview: null,
+    key_fingerprint: null,
+    blob_location: null,
+    refresh_attempts: 0,
+  });
+
+  const runtime = await request(
+    ctx.origin,
+    `/internal/v1/workspaces/${ctx.workspaceId}/environment?includeIntegrations=1`,
+    { token: SERVICE },
+  );
+  assert.equal(runtime.body.env.ANTHROPIC_API_KEY, undefined, "managed selection blocks workspace-key fallback");
+  assert(!runtime.body.secretEnvNames.includes("ANTHROPIC_API_KEY"));
+  assert.deepEqual(runtime.body.skipped, [{
+    name: "ANTHROPIC_API_KEY",
+    reason: "relay_managed_unavailable",
+  }]);
+
+  const probesBefore = ctx.probes.length;
+  const checked = await request(ctx.origin, `${base}/cloud-agents/${managedId}/check`, {
+    method: "POST",
+    token: ctx.owner,
+    body: {},
+  });
+  assert.equal(checked.status, 200);
+  assert.equal(checked.body.status, "unsupported");
+  assert.match(checked.body.message, /hosted Agent Relay model gateway/);
+  assert.equal(ctx.probes.length, probesBefore, "metadata-only rows never make a provider request");
+
+  const model = await request(ctx.origin, `${base}/cloud-agents/${managedId}/activate`, {
+    method: "POST",
+    token: ctx.owner,
+    body: { selection: "model" },
+  });
+  assert.equal(model.status, 200);
+  assert.equal(model.body.agent.authType, "relay_managed");
+
+  const harness = await request(ctx.origin, `${base}/cloud-agents/${managedId}/activate`, {
+    method: "POST",
+    token: ctx.owner,
+    body: { selection: "harness" },
+  });
+  assert.equal(harness.status, 409);
+  assert.equal(harness.body.error, "sandbox_not_supported");
+
+  await assert.rejects(
+    ctx.database.query(
+      `INSERT INTO coding_agent_credentials
+         (id, organization_id, workspace_id, model_provider, harness, auth_type, display_name,
+          secret_ciphertext, secret_preview, key_fingerprint, is_active)
+       VALUES ('88888888-8888-4888-8888-888888888888', $1, $2, 'openai', 'codex',
+               'relay_managed', 'OpenAI managed', $3, NULL, NULL, false)`,
+      [ctx.organizationId, ctx.workspaceId, encryptSecret("must-not-store", KEYRING.active)],
+    ),
+    "relay-managed rows cannot carry copied or invented secret material",
+  );
 });
 
 test("coding agents: check probes the provider and records failures", async (t) => {

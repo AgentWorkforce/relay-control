@@ -279,9 +279,13 @@ test("Codex device login: start, poll, store encrypted, sandbox access, no secre
   assert.equal(agent.isActive, false);
   assert.equal(agent.accountEmail, "dev@acme.test");
   const openai = listed.body.providers.find((item: { id: string }) => item.id === "openai");
-  assert.deepEqual(openai.authTypes, ["provider_oauth", "byo_api_key"]);
+  assert.deepEqual(openai.authTypes, ["provider_oauth", "relay_managed", "byo_api_key"]);
   const anthropic = listed.body.providers.find((item: { id: string }) => item.id === "anthropic");
-  assert.deepEqual(anthropic.authTypes, ["oauth_token", "byo_api_key"], "imports do not advertise a missing device route");
+  assert.deepEqual(
+    anthropic.authTypes,
+    ["oauth_token", "relay_managed", "byo_api_key"],
+    "imports do not advertise a missing device route",
+  );
   const anthropicCapabilities = CODING_AGENT_PROVIDERS.find((provider) => provider.id === "anthropic")!;
   assert.equal(anthropicCapabilities.providerOauth, true, "operator imports may store Claude login files");
   assert.equal(anthropicCapabilities.deviceLogin, false, "Claude has no interactive Control device flow");

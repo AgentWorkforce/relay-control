@@ -5,8 +5,9 @@
 // - Credentials belong to the workspace (created_by is recorded), not to one
 //   member. Owners/admins write; every member sees metadata. Hosted shows an
 //   owner every member's rows, so the owner view is the same.
-// - No Agent Relay house key ("Agent Relay API key", "OpenCode managed"):
-//   self-host has no Agent Relay-paid model access.
+// - Imported Agent Relay-managed rows are retained as credential metadata, but
+//   self-host has no hosted house-proxy issuer. They never contain or deliver
+//   an upstream secret; runs report the unavailable managed binding instead.
 // - Secrets are AES-256-GCM ciphertext under SELFHOST_ENCRYPTION_KEY in
 //   Postgres instead of hosted's R2 credential store. Plaintext only leaves
 //   relaycontrol through the internal runtime environment read.
@@ -22,7 +23,7 @@ import { iso, recordAudit, type AuditActor } from "./audit.js";
 import type { CredentialBlobStore } from "./credential-blobs.js";
 
 /** byo_api_key = API key; oauth_token = Claude setup token; provider_oauth = a CLI login file. */
-export type CodingAgentAuthType = "byo_api_key" | "oauth_token" | "provider_oauth";
+export type CodingAgentAuthType = "byo_api_key" | "oauth_token" | "provider_oauth" | "relay_managed";
 
 export type CodingAgentProvider = {
   id: string;
@@ -158,7 +159,7 @@ type Row = {
   display_name: string;
   label: string | null;
   account_email: string | null;
-  secret_preview: string;
+  secret_preview: string | null;
   is_active: boolean;
   harness_active: boolean;
   status: "connected" | "error" | "refresh_failed";
@@ -193,7 +194,7 @@ function toRecord(row: Row): CodingAgentRecord {
     authType: row.auth_type,
     label: row.label,
     accountEmail: row.account_email,
-    secretPreview: row.secret_preview,
+    secretPreview: row.secret_preview ?? "Managed by Agent Relay",
     isActive: row.is_active,
     harnessActive: row.harness_active,
     defaultModel: null,
@@ -256,7 +257,9 @@ function validateEmail(value: unknown): string | null {
 
 export type RuntimeCodingAgentEnvironment = {
   env: Record<string, string>;
-  skipped: Array<{ name: string; reason: "undecryptable" }>;
+  /** Workspace variables with these names must not impersonate a selected credential. */
+  blockedNames: string[];
+  skipped: Array<{ name: string; reason: "undecryptable" | "relay_managed_unavailable" }>;
 };
 
 export type ProbeResult = {
@@ -495,7 +498,7 @@ export class CodingAgentStore {
     if (existing.status !== "connected") {
       throw new CodingAgentError(409, "credential_not_connected", "Reconnect this credential before selecting it");
     }
-    if (selection === "harness" && existing.authType === "byo_api_key") {
+    if (selection === "harness" && existing.authType !== "oauth_token" && existing.authType !== "provider_oauth") {
       throw new CodingAgentError(409, "sandbox_not_supported", "Only a subscription login can be used for sandbox access");
     }
     if (selection === "model" && existing.authType === "provider_oauth") {
@@ -615,6 +618,13 @@ export class CodingAgentStore {
         message: "Subscription logins refresh when a run starts. No provider request was made.",
       };
     }
+    if (existing.authType === "relay_managed") {
+      return {
+        status: "unsupported",
+        checkedAt,
+        message: "Managed credentials require the hosted Agent Relay model gateway. No provider request was made.",
+      };
+    }
     if (existing.authType === "oauth_token" || !probe) {
       result = {
         status: "unsupported",
@@ -663,7 +673,9 @@ export class CodingAgentStore {
    * Internal runtime read: the env a flow run receives for the workspace's
    * selected credentials. LLM-call credentials map to the provider's API-key
    * variable (a selected setup token maps to CLAUDE_CODE_OAUTH_TOKEN); the
-   * sandbox credential maps to CLAUDE_CODE_OAUTH_TOKEN.
+   * sandbox credential maps to CLAUDE_CODE_OAUTH_TOKEN. An imported
+   * relay_managed row has no stored value and no self-host issuer, so it blocks
+   * a same-named workspace variable and produces a run warning instead.
    */
   async readRuntimeEnvironment(
     workspaceId: string,
@@ -675,26 +687,33 @@ export class CodingAgentStore {
       auth_type: CodingAgentAuthType;
       is_active: boolean;
       harness_active: boolean;
-      secret_ciphertext: string;
+      secret_ciphertext: string | null;
     }>(
       `SELECT id, model_provider, auth_type, is_active, harness_active, secret_ciphertext
          FROM coding_agent_credentials
-        WHERE workspace_id = $1 AND status = 'connected' AND (is_active OR harness_active)
+        WHERE workspace_id = $1 AND (is_active OR harness_active)
+          AND (status = 'connected' OR auth_type = 'relay_managed')
           AND auth_type <> 'provider_oauth'
         ORDER BY harness_active DESC, model_provider, id`,
       [workspaceId],
     );
     const env: Record<string, string> = Object.create(null) as Record<string, string>;
+    const blockedNames = new Set<string>();
     const skipped: RuntimeCodingAgentEnvironment["skipped"] = [];
     const used: string[] = [];
     for (const row of result.rows) {
       const provider = PROVIDERS_BY_ID.get(row.model_provider);
       if (!provider) continue;
+      if (row.auth_type === "relay_managed") {
+        blockedNames.add(provider.apiKeyEnv);
+        skipped.push({ name: provider.apiKeyEnv, reason: "relay_managed_unavailable" });
+        continue;
+      }
       const name = row.auth_type === "oauth_token" ? SETUP_TOKEN_ENV : provider.apiKeyEnv;
       // The sandbox selection is read first, so it owns CLAUDE_CODE_OAUTH_TOKEN.
       if (name in env) continue;
       try {
-        env[name] = decryptSecret(row.secret_ciphertext, this.keyring);
+        env[name] = decryptSecret(row.secret_ciphertext!, this.keyring);
         used.push(row.id);
       } catch (error) {
         if (!(error instanceof EncryptedSecretError)) throw error;
@@ -718,6 +737,6 @@ export class CodingAgentStore {
         target: `${used.length} credentials`,
       });
     }
-    return { env: { ...env }, skipped };
+    return { env: { ...env }, blockedNames: [...blockedNames], skipped };
   }
 }

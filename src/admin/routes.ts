@@ -248,7 +248,11 @@ export function createAdminModule(input: {
     // Here a selected coding-agent credential (Settings > Connections)
     // wins over a same-named workspace variable, and integration env wins
     // over both.
-    const env = { ...environment.env, ...agentEnvironment.env, ...integrationEnv };
+    const blocked = new Set(agentEnvironment.blockedNames);
+    const workspaceEnv = Object.fromEntries(
+      Object.entries(environment.env).filter(([name]) => !blocked.has(name)),
+    );
+    const env = { ...workspaceEnv, ...agentEnvironment.env, ...integrationEnv };
     return {
       workspaceId,
       env,

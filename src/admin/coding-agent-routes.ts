@@ -47,6 +47,7 @@ export function codingAgentCatalog() {
     authTypes: [
       ...(provider.setupToken ? ["oauth_token"] : []),
       ...(provider.deviceLogin ? ["provider_oauth"] : []),
+      "relay_managed",
       "byo_api_key",
     ],
     keyPlaceholder: provider.keyPlaceholder,
