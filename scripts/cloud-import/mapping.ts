@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.23";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.27";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -588,6 +588,8 @@ export type TargetSpec = {
   /** Invites: a fresh sh_inv_ token hash, generated on insert only. */
   inviteTokenHash?: string;
   insertOnly?: readonly string[];
+  /** Timestamps a re-run only ever moves forward (GREATEST of target and source). */
+  monotonic?: readonly string[];
   /**
    * Columns updated as one unit. Once the target is bound (`when` not NULL)
    * a re-run keeps all of `columns` as the target has them when the source
@@ -644,6 +646,14 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
     table: "coding_agent_credentials",
     primaryKey: ["id"],
     columns: ["id", "organization_id", "workspace_id", "created_by_user_id", "model_provider", "harness", "auth_type", "display_name", "label", "account_email", "is_active", "harness_active", "status", "last_error", "last_authenticated_at", "last_used_at", "created_at", "updated_at"],
+    // Selection is Cloud's on insert only. After that it is Control's (the
+    // copier's selection pass, an operator): a re-run must not re-activate a
+    // relay_managed row the copier demoted, which would also violate
+    // coding_agent_one_llm against the key the copier selected.
+    insertOnly: ["is_active", "harness_active"],
+    // Control's own writes (the selection pass) bump updated_at; a re-run
+    // never moves it back to Cloud's older value.
+    monotonic: ["updated_at"],
   },
   users: {
     table: "users",
@@ -779,8 +789,11 @@ const PROJECTIONS: Record<ImportTable, Projection> = {
     columns: { id: "id::text", workspace_id: "workspace_id::text", provider: "provider", auth_mode: "auth_mode", status: "status", token_type: "token_type", installation_id: "installation_id", github_app_organization_id: "github_app_organization_id::text", created_by_user_id: "created_by_user_id::text", created_at: ts("created_at") },
   },
   coding_agent_credentials: {
+    // is_active/harness_active are Cloud's on insert and Control's after
+    // (TARGETS insertOnly), so they are not compared here; the credential
+    // copy verifier checks selection.
     key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
-    columns: { id: "id::text", organization_id: "organization_id::text", workspace_id: "workspace_id::text", created_by_user_id: "created_by_user_id::text", model_provider: "model_provider", harness: "harness", auth_type: "auth_type", display_name: "display_name", label: "label", account_email: "account_email", is_active: "is_active", harness_active: "harness_active", status: "status", last_error: "last_error", last_authenticated_at: ts("last_authenticated_at"), last_used_at: ts("last_used_at"), created_at: ts("created_at") },
+    columns: { id: "id::text", organization_id: "organization_id::text", workspace_id: "workspace_id::text", created_by_user_id: "created_by_user_id::text", model_provider: "model_provider", harness: "harness", auth_type: "auth_type", display_name: "display_name", label: "label", account_email: "account_email", status: "status", last_error: "last_error", last_authenticated_at: ts("last_authenticated_at"), last_used_at: ts("last_used_at"), created_at: ts("created_at") },
   },
   users: {
     key: "id::text", org: "NULL::text",

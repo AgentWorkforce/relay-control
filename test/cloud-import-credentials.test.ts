@@ -230,6 +230,33 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   // no updated_at, no status moves (storeLogin would rewrite every login).
   const snapshot = async () => (await target.query<{ id: string; v: number | null; u: string; status: string }>(
     "SELECT id::text AS id, blob_version AS v, updated_at::text AS u, status FROM coding_agent_credentials WHERE auth_type <> 'relay_managed' ORDER BY id")).rows;
+  // The identity import re-runs after the copy (every convergence rerun
+  // does): it must not re-impose Cloud's flags on the relay_managed rows the
+  // copier's selection demoted (one active LLM credential per workspace and
+  // provider, coding_agent_one_llm), and it must write no credential row.
+  const flagsOf = async () => (await target.query<{ id: string; a: boolean; h: boolean }>(
+    "SELECT id::text AS id, is_active AS a, harness_active AS h FROM coding_agent_credentials ORDER BY id")).rows;
+  const flagsBefore = await flagsOf();
+  const xminBefore = (await target.query<{ x: string }>("SELECT string_agg(xmin::text, ',' ORDER BY id) AS x FROM coding_agent_credentials")).rows[0]!.x;
+  const identityAgain = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(identityAgain.ok, true, JSON.stringify(identityAgain.orgs));
+  assert.deepEqual(await flagsOf(), flagsBefore, "the identity re-run keeps Control's selection");
+  assert.equal((await target.query<{ x: string }>("SELECT string_agg(xmin::text, ',' ORDER BY id) AS x FROM coding_agent_credentials")).rows[0]!.x,
+    xminBefore, "and writes no credential row");
+  // A relay_managed credential NEW to Control, active in Cloud, for a group
+  // where Control already has an active key: it enters inactive, counted,
+  // instead of failing the org on coding_agent_one_llm.
+  await source.exec(`INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, harness, model_provider, auth_type, display_name, is_active, harness_active, status, created_at, updated_at)
+    VALUES ('${id(0x8f1)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'claude', 'anthropic', 'relay_managed', 'Relay Claude (new)', true, false, 'connected', '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')`);
+  const newRelay = await runImport({ source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY }, { orgIds: null }, "apply");
+  assert.equal(newRelay.ok, true, JSON.stringify(newRelay.orgs));
+  assert.equal(newRelay.warnings.coding_agent_credentials_control_active_kept, 1);
+  const anthropicActive = (await target.query<{ id: string }>(
+    "SELECT id::text AS id FROM coding_agent_credentials WHERE workspace_id = $1 AND model_provider = 'anthropic' AND is_active", [id(0x201)])).rows;
+  assert.equal(anthropicActive.length, 1);
+  assert.notEqual(anthropicActive[0]!.id, id(0x8f1), "Control's selected key stays the active one");
+  assert.equal((await target.query<{ a: boolean }>("SELECT is_active AS a FROM coding_agent_credentials WHERE id = $1", [id(0x8f1)])).rows[0]!.a, false);
+  await source.exec(`DELETE FROM provider_credentials WHERE id = '${id(0x8f1)}'`);
   const before = await snapshot();
   // Re-run converges on Control's own dedupe keys. The lost key is found
   // this time, so the only remaining problem is the selection conflict.
@@ -247,12 +274,26 @@ test("credential copier: store seams, fallbacks, missing objects and re-run", as
   // A third run with nothing new writes nothing at all.
   const third = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
   assert.deepEqual(third.writes, { inserted: 0, updated: 0, blobWrites: 0, metadataWrites: 0, selectionWrites: 0 });
-  assert.equal(again.selection?.selectionConflicts, 1);
-  assert.equal(again.ok, false, "a selection conflict is never a clean run");
+  // Cloud's selection is applied only to rows a run writes: the first run
+  // reported the conflict, and rows Control already holds keep Control's
+  // own choice (the operator resolves the conflict there), so the re-run
+  // re-evaluates only the newly written 0x808.
+  assert.deepEqual(again.selection, { groups: 1, active: 1, harness: 0, activeDemoted: 0, harnessDemoted: 0, selectionConflicts: 0, writes: 0 });
+  assert.equal(again.ok, false, "0x80c's object is still missing");
   // Org A alone has no conflict (its Google group has a native active key).
   const orgA = await copyCodingAgentCredentials(deps, { orgIds: [ORG_A] }, "apply");
-  assert.equal(orgA.selection?.selectionConflicts, 0);
+  assert.equal(orgA.selection, undefined, "nothing written, so no selection pass");
   assert.equal(orgA.ok, true);
+  // A login Control turned off stays off: a re-run never re-activates it.
+  const login806 = again.controlIds[id(0x806)]!;
+  const harness = async () => (await target.query<{ h: boolean }>("SELECT harness_active AS h FROM coding_agent_credentials WHERE id = $1", [login806])).rows[0]!.h;
+  assert.equal(await harness(), true);
+  await target.query("UPDATE coding_agent_credentials SET harness_active = false WHERE id = $1", [login806]);
+  const deactivated = await copyCodingAgentCredentials(deps, { orgIds: null }, "apply");
+  assert.equal(deactivated.rows[id(0x806)], "already_present");
+  assert.equal(await harness(), false, "Control's deselection survives a re-run");
+  assert.equal(deactivated.writes.selectionWrites, 0);
+  await target.query("UPDATE coding_agent_credentials SET harness_active = true WHERE id = $1", [login806]);
   assert.equal(again.rows[id(0x803)], "already_present");
   assert.equal(again.rows[id(0x805)], "already_present");
   assert.equal(again.rows[id(0x80b)], "already_present");

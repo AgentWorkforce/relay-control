@@ -302,9 +302,8 @@ export const canonicalProvider = (value: string) => {
  *   (lib/auth/credential-store-backend.ts hasAccountScopedSubscriptionCredential)
  *   is true whenever such a row exists, so provider_account_id decides.
  */
-/** Winner order for Cloud rows naming one Control login: selected, newest, lowest id. */
+/** Winner order for Cloud rows naming one Control login: newest, then lowest id. */
 function compareLoginRows(a: Candidate, b: Candidate): number {
-  if (a.selected !== b.selected) return a.selected ? -1 : 1;
   const at = new Date(a.updated_at).getTime();
   const bt = new Date(b.updated_at).getTime();
   if (at !== bt) return bt - at;
@@ -359,6 +358,9 @@ export async function copyCodingAgentCredentials(
   });
   report.candidates = candidates.length;
 
+  // Rows this run wrote. Cloud's selection is applied to these only: a row
+  // Control already holds (already_present, control_newer) keeps Control's
+  // own selection, so a re-run never re-activates a login Control turned off.
   const copied: Array<{ row: Candidate; controlId: string }> = [];
   const ready: Array<{ row: Candidate; plaintext: string }> = [];
   for (const row of candidates) {
@@ -402,8 +404,9 @@ export async function copyCodingAgentCredentials(
 
   // Several Cloud rows can name one Control login (workspace, provider,
   // provider account): writing each would overwrite the others on every run
-  // and never converge. One deterministic winner per login: Cloud's
-  // selected row, then the most recently updated, then the lowest id.
+  // and never converge. One deterministic winner per login, the freshest
+  // (most recently updated, then lowest id), carrying the group's Cloud
+  // selection so an older selected duplicate never wins over a newer token.
   const loginKey = (row: Candidate, plaintext: string): string | null => {
     if (row.auth_type !== "provider_oauth") return null;
     try {
@@ -422,12 +425,24 @@ export async function copyCodingAgentCredentials(
     if (!best || compareLoginRows(row, best) < 0) winners.set(key, row);
   }
 
+  const carried = new Map<string, Candidate>();
   for (const { row, plaintext } of ready) {
     const key = loginKey(row, plaintext);
-    if (key !== null && winners.get(key) !== row) {
-      record(row.id, "duplicate_login");
+    if (key === null) continue;
+    const winner = carried.get(key) ?? { ...winners.get(key)! };
+    winner.is_active ||= row.is_active;
+    winner.harness_active ||= row.harness_active;
+    winner.selected ||= row.selected;
+    carried.set(key, winner);
+  }
+
+  for (const { row: original, plaintext } of ready) {
+    const key = loginKey(original, plaintext);
+    if (key !== null && winners.get(key) !== original) {
+      record(original.id, "duplicate_login");
       continue;
     }
+    const row = key === null ? original : carried.get(key)!;
     const actor = { kind: "user" as const, userId: row.user_id! };
     const base = { workspaceId: row.workspace_id, organizationId: row.organization_id!, actor };
     try {
@@ -458,7 +473,6 @@ export async function copyCodingAgentCredentials(
           }
           report.controlIds[row.id] = existing.id;
           if (stored === plaintext) {
-            copied.push({ row, controlId: existing.id });
             record(row.id, "already_present");
             continue;
           }
@@ -469,7 +483,6 @@ export async function copyCodingAgentCredentials(
           // created), means Control owns newer state: never clobber it.
           const marker = await loginMarker(deps.target, row.organization_id!, existing.id);
           if (marker === null || marker !== existing.blob_version) {
-            copied.push({ row, controlId: existing.id });
             record(row.id, "control_newer");
             continue;
           }
@@ -494,7 +507,6 @@ export async function copyCodingAgentCredentials(
           });
         } catch (error) {
           if (error instanceof CodingAgentError && error.code === "login_version_conflict") {
-            if (existing) copied.push({ row, controlId: existing.id });
             record(row.id, "control_newer");
             continue;
           }
@@ -527,7 +539,7 @@ export async function copyCodingAgentCredentials(
         report.writes.inserted += 1;
         report.writes.metadataWrites += await preserveCloudState(deps.target, result.record.id, row);
       }
-      copied.push({ row, controlId: result.record.id });
+      if (result.created) copied.push({ row, controlId: result.record.id });
       report.controlIds[row.id] = result.record.id;
       record(row.id, result.created ? "copied" : "already_present");
     } catch (error) {

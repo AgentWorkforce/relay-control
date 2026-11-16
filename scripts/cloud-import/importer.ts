@@ -223,11 +223,21 @@ function upsertSql(table: ImportTable, columns: string[], fill = "'{}'::jsonb"):
     ? `__t.${quote(keep.when)} IS NOT NULL AND (EXCLUDED.${quote(keep.when)} IS NULL OR EXCLUDED.${quote(keep.when)} <> __t.${quote(keep.when)}${
       keep.generation && columns.includes(keep.generation) ? ` OR EXCLUDED.${quote(keep.generation)} < __t.${quote(keep.generation)}` : ""})`
     : "";
-  const updates = columns
+  const assigned = columns
     .filter((column) => !spec.primaryKey.includes(column) && !(spec.insertOnly ?? []).includes(column))
-    .map((column) => keep?.columns.includes(column)
-      ? `${quote(column)} = CASE WHEN ${keepWhen} THEN __t.${quote(column)} ELSE EXCLUDED.${quote(column)} END`
-      : `${quote(column)} = EXCLUDED.${quote(column)}`);
+    .map((column) => [column, keep?.columns.includes(column)
+      ? `CASE WHEN ${keepWhen} THEN __t.${quote(column)} ELSE EXCLUDED.${quote(column)} END`
+      : (spec.monotonic ?? []).includes(column)
+        ? `GREATEST(__t.${quote(column)}, EXCLUDED.${quote(column)})`
+        : `EXCLUDED.${quote(column)}`] as const);
+  const updates = assigned.map(([column, value]) => `${quote(column)} = ${value}`);
+  // No same-value UPDATE: a re-run rewrites a row only when a value differs,
+  // so unchanged rows keep their versions (xmin) and convergence checkpoints
+  // can prove it. A re-encrypted secret column (fresh IV every run, e.g.
+  // workspaces.relaycast_api_key_ciphertext) always differs and is rewritten.
+  const changed = assigned.length
+    ? ` WHERE ROW(${assigned.map(([column]) => `__t.${quote(column)}`).join(", ")}) IS DISTINCT FROM ROW(${assigned.map(([, value]) => value).join(", ")})`
+    : "";
   return `INSERT INTO ${relation} AS __t (${columns.map(quote).join(", ")})
 SELECT ${columns.map((column) => `p.${quote(column)}`).join(", ")}
   FROM unnest($1::text[], $2::text[], $3::text[]) AS u(r, s, o)
@@ -235,7 +245,7 @@ SELECT ${columns.map((column) => `p.${quote(column)}`).join(", ")}
    NULL::${relation},
    u.r::jsonb || COALESCE(u.o::jsonb, '{}'::jsonb) || ${fill} || ${secretColumn ? `CASE WHEN u.s IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('${secretColumn}', u.s) END` : "'{}'::jsonb"}
  ) AS p
-ON CONFLICT (${spec.primaryKey.map(quote).join(", ")}) DO ${updates.length ? `UPDATE SET ${updates.join(", ")}` : "NOTHING"}`;
+ON CONFLICT (${spec.primaryKey.map(quote).join(", ")}) DO ${updates.length ? `UPDATE SET ${updates.join(", ")}${changed}` : "NOTHING"}`;
 }
 
 /** Keys of `rows` not yet present on the target (first import). */
@@ -597,10 +607,35 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       if (rows.length === 0) return;
       const keep = TARGETS[table].keepTargetBinding;
       if (keep) await countKeptBindings(tx, table, keep, rows);
+      if (table === "coding_agent_credentials") rows = await keepActiveCredential(tx, rows);
       const sql = upsertSql(table, write[table], fills[table]);
       for (const batch of chunks(rows, batchSize)) {
         await tx.query(sql, [batch.map((row) => row.row), batch.map((row) => row.secret), batch.map((row) => row.override ?? null)]);
       }
+    };
+    // A credential new to Control enters inactive when its (workspace,
+    // provider) already has an active row on the target (a copied or native
+    // key Control selected): one LLM credential per group
+    // (coding_agent_one_llm), and Control's selection stands. Counted.
+    const keepActiveCredential = async (tx: SqlExecutor, rows: PreparedRow[]): Promise<PreparedRow[]> => {
+      const incoming = rows.map((row) => ({ row, value: JSON.parse(row.row) as { workspace_id?: string; model_provider?: string; is_active?: boolean } }));
+      const candidates = incoming.filter(({ value }) => value.is_active === true);
+      if (!candidates.length) return rows;
+      const existing = new Set((await tx.query<{ id: string }>(
+        "SELECT id::text AS id FROM public.coding_agent_credentials WHERE id::text = ANY($1::text[])",
+        [candidates.map(({ row }) => row.key)])).rows.map((row) => row.id));
+      const fresh = candidates.filter(({ row }) => !existing.has(row.key));
+      if (!fresh.length) return rows;
+      const active = new Set((await tx.query<{ g: string }>(
+        `SELECT workspace_id::text || '|' || model_provider AS g FROM public.coding_agent_credentials
+          WHERE is_active AND workspace_id::text = ANY($1::text[])`,
+        [[...new Set(fresh.map(({ value }) => String(value.workspace_id)))]])).rows.map((row) => row.g));
+      const demote = new Set(fresh.filter(({ value }) => active.has(`${value.workspace_id}|${value.model_provider}`)).map(({ row }) => row));
+      if (!demote.size) return rows;
+      report.warnings.coding_agent_credentials_control_active_kept = (report.warnings.coding_agent_credentials_control_active_kept ?? 0) + demote.size;
+      return rows.map((row) => demote.has(row)
+        ? { ...row, override: JSON.stringify({ ...(row.override ? JSON.parse(row.override) as object : {}), is_active: false }) }
+        : row);
     };
     // Target rows a re-run leaves bound as they are (keepTargetBinding),
     // counted so an operator sees them: a binding Cloud made after Control's
