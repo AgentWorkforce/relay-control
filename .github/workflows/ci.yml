@@ -37,6 +37,8 @@ jobs:
     # `npm test` skips those suites without it, so importer, copier and verifier drift would go
     # unnoticed. Runs on every push to main, and on pull requests that touch src/, scripts/,
     # migrations/, the cloud-import tests, the package files or this workflow.
+    # The harness runs on PostgreSQL 15 because the committed schema manifest is a PostgreSQL 15
+    # catalog fingerprint and newer majors catalog objects differently.
     name: Cloud import verifier harness (PostgreSQL)
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -74,9 +76,15 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      - name: Install PostgreSQL 15 (the schema manifest's catalog version)
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends postgresql-15
+
       - name: Run the verifier harness on a disposable PostgreSQL cluster
         if: steps.scope.outputs.run == 'true'
         run: |
-          export CLOUD_VERIFY_PG_BIN="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)"
+          export CLOUD_VERIFY_PG_BIN=/usr/lib/postgresql/15/bin
           "$CLOUD_VERIFY_PG_BIN/postgres" --version
           node --import tsx scripts/cloud-import-verify/dry-run.ts
