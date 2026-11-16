@@ -122,6 +122,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `RELAYHISTORY_BACKEND` | Optional; unset or `native` (the only backend). Any other value refuses startup |
 | `RELAYCONTROL_INTROSPECT_SECRET` | At least 32 bytes (`_FILE` supported). Bearer for `POST /internal/v1/auth/introspect`, shared only with the sessions pipeline ingest edge (and relayfile) |
 | `RELAYCHIEF_CONTROL_RELAY_SECRET` | Optional, at least 32 bytes, `_FILE` supported, must differ from the broker secret. Enables `POST /internal/v1/chief/workspaces/{id}/relay-agents`, which registers a chief as a Relaycast agent for relaychief-control. A repeat call rotates that chief's live token. Requires the `chief` feature. Unset, it answers 404. |
+| `RELAYFILE_CONTROL_URL`, `RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET` | Optional, set together. The secret is at least 32 bytes, `_FILE` supported, and must differ from every other service secret, the broker secret included. Deleting a workspace then queues the same delete for relayfile-control's Flows data (`DELETE /internal/v1/flows/workspaces/{id}`), retried until it confirms; see [docs/flows-workspace-delete.md](docs/flows-workspace-delete.md). Unset, nothing is queued. |
 | `RELAYFILE_CONTROL_BROKER_SECRET` | Optional, at least 32 bytes, `_FILE` supported. Enables the internal credential routes under `/internal/v1/flows/credentials/` for relayfile-control's Flows service. Unset, they answer 404. Its `relayfile` action mints the per-run path-scoped `sh_fr_` Relayfile credential a Flows worker uses; see [docs/flows-relayfile-credential.md](docs/flows-relayfile-credential.md). |
 | `SELFHOST_INTROSPECT_AUDIENCES` | Optional comma-separated general service origins a token may be introspected for, default empty. Acquisition and Relayfile origins belong here; customer History origins use the dedicated variable below. The two lists must not overlap. Matched as normalized origins; `GET /readyz` lists the union under `introspection.audiences` |
 | `SELFHOST_RELAYHISTORY_AUDIENCES` | Optional comma-separated History origins allowed to receive user bearers; default `SESSION_READ_API_PUBLIC_URL` and must include it. Add every imported workspace History origin. Values canonicalize to lowercase ASCII/punycode with no DNS trailing dot or default port; HTTPS is required except explicit loopback. A stored History origin is refused through the general list even for legacy configuration |
@@ -197,6 +198,9 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_TELEMETRY_LEVEL` | Telemetry: `off` (default when unset), `errors`, or `full`. See [docs/telemetry.md](docs/telemetry.md) for this and the other `SELFHOST_TELEMETRY_*` settings |
 | `PORT` | Listener port, default `3000` |
 | `SELFHOST_AMP_ENABLED` | Optional `true` turns on Amp control (default `false`). Off: every Amp route answers 404 `{"error":"Not found"}` before authentication and no outbox worker runs. See [docs/amp.md](docs/amp.md) |
+| `SELFHOST_REPLICAS_ENABLED` | Optional `true` turns on the Replicas agent bridge (default `false`). Off: every Replicas bridge route answers 404 `{"error":"Not found"}` before authentication and no Replicas MCP tool is registered. See [docs/replicas.md](docs/replicas.md) |
+| `SELFHOST_REPLICAS_IDENTITY_ISSUER` | Optional https issuer for Replicas `workspace_identity` tokens accepted by `POST /api/v1/replicas/mcp` (default `https://api.replicas.dev`, no trailing slash, query or credentials). Keys come from its discovery document on the same origin. See [docs/replicas.md](docs/replicas.md) |
+| `SELFHOST_REPLICAS_SYNC_INTERVAL_SECONDS` | Optional seconds between periodic Replicas environment syncs (default `60`, minimum `30`, lower values are raised to 30, `0` turns it off). Runs at startup and then on the interval for every Replicas connection whose all-environments default is on. See [docs/replicas.md](docs/replicas.md) |
 | `SELFHOST_MCP_OAUTH` | Optional, default on. Hosted MCP OAuth connectors; `off`, `false` or `0` disables them (`on`/`true`/`1` enables; other spellings fail start-up). A missing or partial signing-key set, invalid key material or an unreadable MCP OIDC `_FILE` leaves the server running (routes answer 501 `mcp_oauth_unavailable`); a value supplied both directly and via `_FILE` still fails start-up. See [docs/mcp-oauth.md](docs/mcp-oauth.md) |
 | `SELFHOST_MCP_EVENTS` | Optional, default off (`on`/`true`/`1` or `off`/`false`/`0`). Setting for the separate MCP Events module, which this server does not mount. See [docs/mcp-oauth.md](docs/mcp-oauth.md) |
 | `SELFHOST_MCP_EVENTS_PUMP` | Optional, default off, same spellings. Events pump setting; `on` requires `SELFHOST_MCP_EVENTS=on` or start-up fails |
@@ -290,6 +294,9 @@ The internal reader contract is `POST /internal/v1/session-read/sessions` or
 `/internal/v1/session-read/sessions/refresh`, authenticated by the dedicated
 secret. Control supplies `{ userId, orgId, workspaceId, audience, scopes:
 ["rth:read"], label? }`, with `refreshToken` instead of `label` on refresh.
+With `SESSION_READ_MINT_INCLUDE_ROLE=true` (default false) the body also
+carries `role: "owner" | "admin" | "member"`, the caller's live organization
+role ([docs/sessions-read-api.md](docs/sessions-read-api.md#read-credentials)).
 The reader returns the bearer response above without `baseUrl`; Control sets
 that from configuration. Keep these internal routes off public ingress.
 

@@ -36,7 +36,7 @@ function config(on = true) {
   } as SelfhostConfig;
 }
 const principal = (userId: string) => ({ userId,scopes:["rth:read"] }) as Principal;
-const workspace = (id: string, organizationId: string) => ({ id, organizationId }) as never;
+const workspace = (id: string, organizationId: string, role = "member") => ({ id, organizationId, role }) as never;
 
 function fake(t: TestContext, options: Options = {}) {
   const issues: Issue[] = [];
@@ -164,6 +164,20 @@ test("the same person in another org gets a separate session", async (t) => {
 
   assert.deepEqual(seen.issues.map(({ path }) => path),["/api/v1/workspaces/ws-a/session-read/session","/api/v1/workspaces/ws-c/session-read/session"]);
   assert.notEqual(seen.reads[0]!.bearer, seen.reads[1]!.bearer);
+});
+
+test("a role change issues a fresh read session instead of reusing the old role's token", async (t) => {
+  const seen = fake(t);
+  const cfg = config();
+  t.after(() => forgetSessionReadTokens(cfg));
+
+  await historyReader(cfg, principal("user-a"), workspace("ws-a", "org-a", "member"), "sh_at_user_a")("/v1/sessions");
+  await historyReader(cfg, principal("user-a"), workspace("ws-a", "org-a", "member"), "sh_at_user_a")("/v1/sessions");
+  await historyReader(cfg, principal("user-a"), workspace("ws-a", "org-a", "admin"), "sh_at_user_a")("/v1/sessions");
+
+  assert.equal(seen.issues.length, 2, "the same role reuses its session; a new role mints again");
+  assert.equal(seen.reads[0]!.bearer, seen.reads[1]!.bearer);
+  assert.notEqual(seen.reads[1]!.bearer, seen.reads[2]!.bearer);
 });
 
 test("a tool path cannot widen the read to another workspace", async (t) => {

@@ -166,7 +166,11 @@ export async function collectRelaycastUsage(deps: CollectorDeps, salt: string): 
   let rows: Array<{ id: string; relaycast_api_key_ciphertext: string }>;
   try {
     rows = (await deps.store.database.query<{ id: string; relaycast_api_key_ciphertext: string }>(
-      "SELECT id, relaycast_api_key_ciphertext FROM workspaces ORDER BY created_at LIMIT 50",
+      `SELECT id, relaycast_api_key_ciphertext
+         FROM workspaces
+        WHERE relaycast_api_key_ciphertext IS NOT NULL
+        ORDER BY created_at
+        LIMIT 50`,
     )).rows;
   } catch {
     return null;

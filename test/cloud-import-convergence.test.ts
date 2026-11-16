@@ -87,8 +87,20 @@ test("convergence rerun: the receipt is the digest the run computed and the chec
   const { source, target, deps } = await setup(t);
   const checkpoint = await beforeCheckpoint(target);
   assert.ok(checkpoint.credentials.length > 0);
+  // Outside the checkpoint but part of a converged rerun: the identity
+  // secrets and their secret_written markers (#191) are not rewritten either.
+  const secrets = async () => (await target.query<{ x: string | null }>(
+    `SELECT string_agg(k, ',' ORDER BY k) AS x FROM (
+       SELECT 'ledger:' || row_key || '@' || xmin::text AS k FROM cloud_import_ledger WHERE table_name = 'secret_written'
+       UNION ALL SELECT 'ws:' || id::text || '@' || xmin::text FROM workspaces WHERE relaycast_api_key_ciphertext IS NOT NULL
+       UNION ALL SELECT 'pi:' || id::text || '@' || xmin::text FROM person_identities
+       UNION ALL SELECT 'hp:' || id::text || '@' || xmin::text FROM hosted_relay_participants
+       UNION ALL SELECT 'dr:' || id::text || '@' || xmin::text FROM desktop_relay_identities) s`)).rows[0]!.x;
+  const secretsBefore = await secrets();
+  assert.match(secretsBefore ?? "", /ledger:/, "the import recorded secret markers");
   const { run, written } = producer(source, target, deps, checkpoint);
   await run();
+  assert.equal(await secrets(), secretsBefore, "no secret row or secret_written marker rewritten");
   const copy = written.get("copy.json") as { convergence?: unknown; writes: Record<string, number> };
   assert.deepEqual(copy.convergence, { beforeDigest: checkpoint.digest, nonce: checkpoint.nonce });
   assert.deepEqual(copy.writes, { inserted: 0, updated: 0, blobWrites: 0, metadataWrites: 0, selectionWrites: 0 });

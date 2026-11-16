@@ -1123,7 +1123,7 @@ test("read API: callers without an sh_at_ token read through the same handoff", 
   const env = await setup(t);
   const read = await readWorkspaceHistory(env.config, {
     userId: env.ownerId, organizationId: env.organizationId,
-    workspaceId: env.alpha, callerToken: "synthetic-admitted-oauth-token", readerKind: "mcp",
+    workspaceId: env.alpha, role: "owner", callerToken: "synthetic-admitted-oauth-token", readerKind: "mcp",
   }, "/v1/sessions", new URLSearchParams());
   assert.equal(read.status, "ok");
   if (read.status === "ok") assert.equal((read.body.sessions as any[])[0].sessionId, "alpha-1");

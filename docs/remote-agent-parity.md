@@ -11,7 +11,7 @@ durable deliveries and history uploads. No route here forwards to Cloud.
 | Factory | Existing webapp #117 adds keys and explicit existing-computer/chat binding controls | Existing Control Factory module; separate #75/#76 extend MCP/enrollment | Deferred; no transcript-upload proof from the connection card |
 | Amp | Webapp card, connect, discover threads, bind/unbind, inspect deliveries, disconnect | Existing `src/amp`, gated by `SELFHOST_AMP_ENABLED` and the Amp process transport | Existing scheduler/parser, **inactive** without a push-only sessions-pipeline credential issuer; see `amp.md` |
 | Capy | Validate projects access, encrypted workspace key, masked summary, replace/disconnect | Not ported: thread bindings, subscriptions, injection and spawn | Not ported |
-| Replicas | Validate organization identity, encrypted workspace key, masked summary, replace/disconnect | Not ported: durable launches, helper capabilities, delivery reconciliation and cleanup | Not ported |
+| Replicas | Validate organization identity, encrypted workspace key, masked summary, replace/disconnect | `src/replicas`, gated by `SELFHOST_REPLICAS_ENABLED`: durable launches, recover/bind/release, scoped MCP + helper capability, signed delivery; see `replicas.md` | Not ported |
 | Devin | Validate org/session read and management permission, encrypted workspace key, masked summary, replace/disconnect | Not ported: session message adapter | Not ported |
 | Cursor Cloud | Validate key identity, encrypted workspace key, masked summary, replace/disconnect | Not ported: principal-bound agent bindings, launch and cleanup | Not ported |
 

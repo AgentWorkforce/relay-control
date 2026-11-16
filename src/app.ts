@@ -73,6 +73,7 @@ import {
   OrganizationBoundaryError,
   OrganizationConflictError,
   ReservedClientNameError,
+  RelaycastBindingUnavailableError,
   type ControlPlaneStore,
   type Principal,
 } from "./store.js";
@@ -95,6 +96,10 @@ import { createFactoryModule, mountFactoryRoutes, type FactoryModule } from "./f
 import { createMcpHandler } from "./mcp/routes.js";
 import { createCustomerSupportNoticeHandler } from "./mcp/customer-support-notice.js";
 import type { AmpModule } from "./amp/module.js";
+import type { ReplicasModule } from "./replicas/module.js";
+import { isReplicasPath } from "./replicas/routes.js";
+import { disconnectEnvironments, setupEnvironments } from "./replicas/environments.js";
+import { disconnectReplicas, purgeMemberReplicas, releaseMemberReplicas, ReplicasError } from "./replicas/service.js";
 import { isAmpPath } from "./amp/routes.js";
 import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
 import { purgeMemberAmp, releaseMemberAmp } from "./amp/service.js";
@@ -108,7 +113,7 @@ import {
 import { handleDesktopIdentityRoutes } from "./messaging/desktop-identities.js";
 import { handleChiefRoutes, type ChiefBackend } from "./chief/routes.js";
 import { handleProviderRoutes } from "./providers/routes.js";
-import { RemoteAgentConnections } from "./remote-agents/connections.js";
+import { RemoteAgentConnections, RemoteAgentError } from "./remote-agents/connections.js";
 import { remoteAgentRoutes } from "./remote-agents/routes.js";
 import type { ProviderProbes } from "./providers/registry.js";
 import {
@@ -403,6 +408,8 @@ export function createApp(input: {
   features?: SelectedFeatures;
   /** Amp control (src/amp). Absent or disabled: every Amp route answers 404 before auth. */
   amp?: AmpModule;
+  /** Replicas agents (src/replicas). Absent or disabled: every Replicas bridge route answers 404 before auth. */
+  replicas?: ReplicasModule;
   /** Server-owned worker; absent tests use the same on-demand cleanup without a timer. */
   mcpOAuthTeardown?: McpOAuthTeardown;
   grokRoutines?: GrokRoutines;
@@ -567,7 +574,23 @@ export function createApp(input: {
   // Hosted MCP (shared-sessions facade): reads, team activity, capabilities.
   const amp = input.amp?.config.enabled ? input.amp : null;
   const providerProbes: ProviderProbes = input.providerProbes ?? {};
-  const remoteAgents = remoteAgentRoutes(new RemoteAgentConnections(store.database, config.encryptionKeyring, input.remoteAgentFetch));
+  const replicas = input.replicas?.config.enabled ? input.replicas : null;
+  const remoteAgents = remoteAgentRoutes(new RemoteAgentConnections(store.database, config.encryptionKeyring, input.remoteAgentFetch, {
+    replicasEnabled: Boolean(replicas),
+    // Bindings are revoked and retired while the key still exists to sleep their compute.
+    ...(replicas ? { replicasCleanup: async (actor: { userId: string; workspaceId: string; organizationId: string }) => {
+      try {
+        // Stop environment-level admission and remove provider MCP entries first, then retire bindings.
+        await disconnectEnvironments(replicas.deps, actor);
+        await disconnectReplicas(replicas.deps, actor);
+      } catch (error) {
+        if (error instanceof ReplicasError) throw new RemoteAgentError(error.status, "replicas_cleanup_failed", error.message);
+        throw new RemoteAgentError(502, "replicas_cleanup_failed", "Replicas cleanup could not finish. Retry the disconnect.");
+      }
+    },
+    replicasSetup: (actor: { userId: string; workspaceId: string; organizationId: string }, options: { reconnect: boolean }) =>
+      setupEnvironments(replicas.deps, actor, options) } : {}),
+  }));
   const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
   const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({
     database:store.database,keyring:config.encryptionKeyring,
@@ -597,10 +620,10 @@ export function createApp(input: {
     },
     workspaceAccess:async principal=>{
       if(!(await store.readiness()).ready) return false;
-      const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
+      const workspace=await store.workspaceMembershipForUser(principal.workspaceId,principal.userId);
       return workspace?.organizationId===principal.organizationId;
     },
-    workspaceLabel:async principal=>(await store.workspaceForUser(principal.workspaceId,principal.userId))?.name??principal.workspaceId,
+    workspaceLabel:async principal=>(await store.workspaceMembershipForUser(principal.workspaceId,principal.userId))?.name??principal.workspaceId,
     checkAgentNameAvailability:async(principal,name)=>{
       const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
       if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
@@ -617,6 +640,7 @@ export function createApp(input: {
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
     ...(amp ? { amp: amp.deps } : {}),
+    ...(replicas ? { replicas: replicas.deps } : {}),
     ...(factory.enabled ? { factory: factory.mcp } : {}),
     ...(input.capy ? { capy: input.capy } : {}),
     ...(features.launch ? { launch: true } : {}),
@@ -713,7 +737,8 @@ export function createApp(input: {
   /**
    * /api/v1/workspaces/{id}/staff-read-grants (docs/staff-read-grants.md):
    * the staff rule, presented by a browser account session or an interactive
-   * CLI login. Not a Desktop session, an enrollment-key session, a handoff,
+   * CLI login. Not a Desktop session (including a device code Desktop
+   * started), an enrollment-key session, a handoff,
    * a Desktop provider credential or any other credential kind. Every
    * refusal after the CSRF check is the same 404, so the routes are no
    * oracle for staff status or for workspace existence.
@@ -738,10 +763,17 @@ export function createApp(input: {
     const interactive = principal.scopes.includes(ACCOUNT_SCOPE) || principal.scopes.includes("cli:auth");
     if (
       !interactive || principal.scopes.includes(DESKTOP_WORKSPACES_SCOPE) || principal.scopes.includes("mcp:desktop") ||
-      principal.provisionedByTokenId || principal.pendingHandoff || principal.handoff
+      principal.provisionedByTokenId || principal.pendingHandoff || principal.handoff || principal.desktopHostName
     ) {
       throw notFound();
     }
+    // Agent Relay Desktop also signs in by device code, naming its host; such
+    // a session carries no Desktop marker, so look at the device code itself.
+    const desktopDeviceCode = await store.database.query(
+      "SELECT 1 FROM device_authorizations WHERE api_token_session_id = $1 AND desktop_host_name IS NOT NULL",
+      [principal.sessionId],
+    );
+    if (desktopDeviceCode.rows.length > 0) throw notFound();
     const staff = await staffReadGrants.staff(principal.userId);
     if (!staff || !isUuid(workspaceId)) throw notFound();
     const workspace = (await store.database.query<{ id: string; organization_id: string }>(
@@ -1095,9 +1127,9 @@ export function createApp(input: {
       // Same facts as `browser` above: cookie -> browser, bearer -> device
       // (or mcp with the MCP reader's marker; see readerKindOf).
       const session = await requestReadSession(api, {
-        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
+        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id, role: workspace.role,
         readerKind: readerKindOf(request, mcpReaderMarker(api.secret)),
-      }, parsed.data);
+      }, parsed.data, { includeRole: config.sessionReadMintIncludeRole });
       const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
       return browser ? accessOnly : session;
     }
@@ -1331,6 +1363,14 @@ export function createApp(input: {
         return;
       }
       if (await amp.handle(request, response, path, publicPath, method, { workspaceAccess, bearer, json })) return;
+    }
+    // Replicas agents: gated before any authentication (off answers 404).
+    if (isReplicasPath(path)) {
+      if (!replicas) {
+        json(response, 404, { error: "Not found" }, true);
+        return;
+      }
+      if (await replicas.handle(request, response, path, method, { workspaceAccess, bearer, json })) return;
     }
     // Events shim: 404 before any authentication while the feature is off.
     if (isEventsShimPath(path)) {
@@ -2386,6 +2426,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           workspaceId,
           allowLast: auth.kind === "bootstrap",
           actor: auth.kind === "bootstrap" ? { kind: "bootstrap" } : { kind: "user", userId: auth.principal.userId },
+          queueFlowsDelete: Boolean(config.flowsWorkspaceDelete),
         })
         : "not_found";
       if (outcome === "not_found") throw new HttpError(404, "workspace_not_found", "Workspace not found");
@@ -2488,6 +2529,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         userId,
         async (tx, member) => {
           await purgeMemberAmp(tx, member);
+          await purgeMemberReplicas(tx, { organizationId, userId });
           await factory.purgeMemberInTx(tx, organizationId, userId);
           await revokeOrganizationMcpOAuthGrants(tx, member, input.now?.() ?? new Date());
           // The member's desktop enrollment keys, exchanged ones included,
@@ -2509,6 +2551,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       await identity?.auditMembership({ organizationId, auth, action: "membership.remove", target: userId });
       await revokeRemovedMember(messagingDeps, organizationId, userId);
       if (amp) await releaseMemberAmp(amp.deps, { organizationId, userId }).catch(() => undefined);
+      if (replicas) await releaseMemberReplicas(replicas.deps, { organizationId, userId }).catch(() => undefined);
       await factory.afterMemberRemoved(organizationId, userId);
       oauthTeardown?.kick();
       response.writeHead(204);
@@ -2660,7 +2703,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         json(response, 200, {
           ...identity,
           urls: { relaycastUrl: config.relaycastPublicUrl, relaygateUrl: config.relaygatePublicUrl },
-          provisioned: false,
+          provisioned: workspace.relaycastProvisioned,
         }, true);
         return;
       }
@@ -2676,7 +2719,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         ...identity,
         relaycastApiKey: workspace.relaycastApiKey,
         urls: { relaycastUrl: config.relaycastPublicUrl },
-        provisioned: false,
+        provisioned: workspace.relaycastProvisioned,
       }, true);
       return;
     }
@@ -2744,9 +2787,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // marker (src/mcp/session-read-reader.ts) -> mcp. The marker is never
       // logged or echoed.
       const session = await requestReadSession(config.sessionReadApi, {
-        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id,
+        userId: principal.userId, orgId: workspace.organizationId, workspaceId: workspace.id, role: workspace.role,
         readerKind: readerKindOf(request, mcpReaderMarker(config.sessionReadApi.secret)),
-      }, parsed.data);
+      }, parsed.data, { includeRole: config.sessionReadMintIncludeRole });
       // Page scripts get a short-lived access token only. Renew by requesting
       // a new session through the cookie path, which rechecks live membership.
       const { refreshToken: _refresh, refreshTokenExpiresAt: _expiry, ...accessOnly } = session;
@@ -3072,6 +3115,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       if (error instanceof NodeClaimError) {
         json(response, error.status, { error: "node_claim_refused", message: error.message }, true);
+        return;
+      }
+      if (error instanceof RelaycastBindingUnavailableError) {
+        response.setHeader("retry-after", String(error.retryAfterSeconds));
+        json(response, error.status, { error: error.code, message: error.message }, true);
         return;
       }
       if (error instanceof MembershipConflictError) {

@@ -6,7 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createAdminModule } from "../src/admin/routes.js";
 import { createApp } from "../src/app.js";
-import type { SelfhostConfig } from "../src/config.js";
+import { loadConfig, type SelfhostConfig } from "../src/config.js";
 import { STAFF_READ_GRANT_TOOLS } from "../src/mcp/catalog.js";
 import { staffReadGrantAllows } from "../src/mcp/routes.js";
 import { migrate } from "../src/migrations.js";
@@ -25,16 +25,43 @@ const SERVICE = "internal-service-token-that-is-at-least-32-bytes";
 const INTROSPECT_SECRET = "introspect-secret-that-is-at-least-32-bytes";
 const KEYRING = { active: { id: "test-key", key: Buffer.alloc(32, 7) } };
 const HISTORY = "https://history.selfhosted.test";
+// loadConfig accepts only public DNS names for public origins.
+const LIVE_HISTORY = "https://history.selfhosted.company";
+const TENANT_HISTORY = "https://history.tenant.selfhosted.company";
+const RELAYFILE = "https://relayfile.selfhosted.company";
 const MCP_PATH = "/api/v1/mcp/shared-sessions";
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
-async function setup(t: TestContext) {
+/**
+ * `env` builds the config through loadConfig, as a deployment does: History
+ * origins live only in relayhistoryAudiences, never in introspectAudiences.
+ */
+async function setup(t: TestContext, env?: Record<string, string>) {
   const database = new PGliteDatabase();
   await migrate(database);
   const control = createServer();
   const origin = await listen(control);
-  const config: SelfhostConfig = {
+  const config: SelfhostConfig = env ? {
+    ...loadConfig({
+      DATABASE_URL: "postgres://unused",
+      SELFHOST_PUBLIC_URL: origin,
+      RELAYCAST_URL: "http://relaycast.invalid",
+      RELAYCAST_PUBLIC_URL: "https://relaycast.selfhosted.company",
+      SESSION_READ_API_URL: "http://relayhistory.invalid",
+      SESSION_READ_API_PUBLIC_URL: LIVE_HISTORY,
+      RELAYHISTORY_PUBLIC_URL: LIVE_HISTORY,
+      SESSION_READ_API_SECRET: "r".repeat(32),
+      RELAYCONTROL_INTROSPECT_SECRET: INTROSPECT_SECRET,
+      SELFHOST_BOOTSTRAP_TOKEN: BOOTSTRAP,
+      SELFHOST_INTERNAL_TOKEN: SERVICE,
+      SELFHOST_ENCRYPTION_KEY_ID: KEYRING.active.id,
+      SELFHOST_ENCRYPTION_KEY: KEYRING.active.key.toString("base64"),
+      ...env,
+    }),
+    port: 0,
+    host: "127.0.0.1",
+  } : {
     databaseUrl: "unused",
     publicBaseUrl: origin,
     relaycastUrl: "http://relaycast.invalid",
@@ -43,7 +70,9 @@ async function setup(t: TestContext) {
     relayhistoryPublicUrl: HISTORY,
     sessionReadApi: { url: "http://relayhistory.invalid", publicUrl: HISTORY, secret: "r".repeat(32) },
     introspectSecret: INTROSPECT_SECRET,
-    introspectAudiences: [HISTORY],
+    // What loadConfig produces: History only in its own audience list.
+    introspectAudiences: [],
+    relayhistoryAudiences: [HISTORY],
     bootstrapToken: BOOTSTRAP,
     encryptionKeyring: KEYRING,
     internalServiceToken: SERVICE,
@@ -82,8 +111,11 @@ async function setup(t: TestContext) {
     assert.equal(added.status, 200);
     return added.body.userId as string;
   };
-  const deviceToken = async (userId: string, workspaceId: string) => {
-    const started = await request(origin, "/api/v1/auth/device/start", { method: "POST", body: {} });
+  const deviceToken = async (userId: string, workspaceId: string, desktopHostName?: string) => {
+    const started = await request(origin, "/api/v1/auth/device/start", {
+      method: "POST", body: desktopHostName ? { desktop_host_name: desktopHostName } : {},
+    });
+    assert.equal(started.status, 201);
     const approved = await request(origin, "/api/v1/auth/device/approve", {
       method: "POST", token: BOOTSTRAP,
       body: { action: "approve", user_code: started.body.user_code, user_id: userId, workspace_id: workspaceId },
@@ -233,6 +265,9 @@ test("only an owner of the operator organization on its domain reaches the route
     [randomUUID(), env.operator.ownerId, env.operator.id, env.operatorWorkspace,
       ["cli:auth", "rth:read", "rth:sync", "rth:acquire", "desktop:workspaces"], sha256(desktop), sha256(`${desktop}-refresh`)],
   );
+  // A device-code session Agent Relay Desktop started for the staff person
+  // (DEVICE_SCOPES, the same as a CLI login, but the code names its host).
+  const desktopDeviceCode = await env.deviceToken(env.operator.ownerId, env.operatorWorkspace, "build-01");
   // An enrollment-key session of the staff person.
   const key = await request(env.origin, `/api/v1/workspaces/${env.operatorWorkspace}/deployment-api-tokens`, {
     method: "POST", token: env.staffToken,
@@ -253,7 +288,8 @@ test("only an owner of the operator organization on its domain reaches the route
 
   const refused: Array<[string, string]> = [
     ["outsider", outsider], ["operator member", operatorMember], ["customer owner", customerOwner],
-    ["customer member", customerMember], ["desktop session", desktop], ["enrollment session", enrolled.body.access_token],
+    ["customer member", customerMember], ["desktop session", desktop],
+    ["desktop device-code session", desktopDeviceCode], ["enrollment session", enrolled.body.access_token],
     ["runtime token", runtime.body.accessToken], ["the grant itself", grant], ["bootstrap", BOOTSTRAP],
     ["service token", SERVICE], ["garbage", "sh_at_not-a-token"],
     ["launch-check shape", `sh_lt_${randomUUID().replaceAll("-", "")}`],
@@ -461,4 +497,40 @@ test("forged rows, spoofed transports, revocation, expiry and a lost staff rule 
   assert.equal((await request(env.origin, `${env.grantsPath()}/${grant.id}`, { method: "DELETE", token: env.staffToken })).status, 200);
   assert.equal((await list(credential)).status, 401);
   assert.equal((await env.introspect({ token: credential, aud: HISTORY })).body.active, false);
+});
+
+test("introspection activates a grant only through the History audience fence", async (t) => {
+  // A deployment's config: Relayfile is a general introspection audience,
+  // History and a tenant's own History origin are History audiences.
+  const env = await setup(t, {
+    SELFHOST_INTROSPECT_AUDIENCES: RELAYFILE,
+    SELFHOST_RELAYHISTORY_AUDIENCES: `${LIVE_HISTORY},${TENANT_HISTORY}`,
+  });
+  const credential = (await env.mintGrant()).token.accessToken;
+
+  // A non-History service never sees the grant as active.
+  const relayfile = await env.introspect({ token: credential, aud: RELAYFILE });
+  assert.equal(relayfile.status, 200);
+  assert.equal(relayfile.body.active, false);
+  assert.equal(relayfile.body.reason, "audience");
+  // History does, with History as the audience.
+  const history = await env.introspect({ token: credential, aud: LIVE_HISTORY });
+  assert.equal(history.body.active, true);
+  assert.equal(history.body.aud, LIVE_HISTORY);
+  assert.equal(history.body.workspace, env.customerWorkspace);
+  // A tenant History origin is not the global workspace's History.
+  const elsewhere = await env.introspect({ token: credential, aud: TENANT_HISTORY });
+  assert.equal(elsewhere.body.active, false);
+  assert.equal(elsewhere.body.reason, "audience");
+
+  // A workspace with its own History origin: that origin only, never the global one.
+  await env.database.query("UPDATE workspaces SET relayhistory_origin = $1 WHERE id = $2", [TENANT_HISTORY, env.customerWorkspace]);
+  const tenant = await env.introspect({ token: credential, aud: TENANT_HISTORY });
+  assert.equal(tenant.body.active, true);
+  assert.equal(tenant.body.aud, TENANT_HISTORY);
+  for (const aud of [LIVE_HISTORY, RELAYFILE]) {
+    const refused = await env.introspect({ token: credential, aud });
+    assert.equal(refused.body.active, false, aud);
+    assert.equal(refused.body.reason, "audience", aud);
+  }
 });

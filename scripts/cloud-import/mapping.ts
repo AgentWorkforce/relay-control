@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.25";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.28";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -588,6 +588,13 @@ export type TargetSpec = {
   /** Invites: a fresh sh_inv_ token hash, generated on insert only. */
   inviteTokenHash?: string;
   insertOnly?: readonly string[];
+  /** Timestamps a re-run only ever moves forward (GREATEST of target and source). */
+  monotonic?: readonly string[];
+  /**
+   * Columns Control rewrites together with the secret (a token refresh):
+   * kept with it whenever a re-run keeps Control's secret.
+   */
+  secretGroup?: readonly string[];
   /**
    * Columns updated as one unit. Once the target is bound (`when` not NULL)
    * a re-run keeps all of `columns` as the target has them when the source
@@ -638,12 +645,22 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
     columns: ["id", "workspace_id", "provider", "auth_mode", "status", "token_type", "scopes", "metadata", "created_by_user_id", "updated_by_user_id", "installation_id", "github_app_organization_id", "created_at", "updated_at"],
     secret: { source: "secret_plaintext", target: "credentials_ciphertext" },
     secretConstant: "{}",
+    // Control's refresh (admin/connections.ts) writes these with the token.
+    secretGroup: ["status", "token_type", "scopes", "updated_by_user_id", "updated_at"],
     gate: "target_lacks_github_app",
   },
   coding_agent_credentials: {
     table: "coding_agent_credentials",
     primaryKey: ["id"],
     columns: ["id", "organization_id", "workspace_id", "created_by_user_id", "model_provider", "harness", "auth_type", "display_name", "label", "account_email", "is_active", "harness_active", "status", "last_error", "last_authenticated_at", "last_used_at", "created_at", "updated_at"],
+    // Selection is Cloud's on insert only. After that it is Control's (the
+    // copier's selection pass, an operator): a re-run must not re-activate a
+    // relay_managed row the copier demoted, which would also violate
+    // coding_agent_one_llm against the key the copier selected.
+    insertOnly: ["is_active", "harness_active"],
+    // Control's own writes (the selection pass) bump updated_at; a re-run
+    // never moves it back to Cloud's older value.
+    monotonic: ["updated_at"],
   },
   users: {
     table: "users",
@@ -684,6 +701,8 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
       generation: "relaycast_api_key_generation",
       columns: ["relaycast_workspace_id", "relaycast_api_key_ciphertext", "relaycast_api_key_generation"],
     },
+    // A kept Control key keeps its own binding and generation (never torn).
+    secretGroup: ["relaycast_workspace_id", "relaycast_api_key_generation"],
   },
   organization_invitations: {
     table: "organization_invitations",
@@ -703,12 +722,14 @@ export const TARGETS: Record<ImportTable, TargetSpec> = {
     primaryKey: ["id"],
     columns: ["id", "workspace_id", "user_id", "relaycast_workspace_id", "session_hash", "agent_name", "agent_remote_id", "created_at", "updated_at"],
     secret: { source: "secret_envelope", target: "token_ciphertext" },
+    secretGroup: ["updated_at"],
   },
   desktop_relay_identities: {
     table: "desktop_relay_identities",
     primaryKey: ["id"],
     columns: ["id", "workspace_id", "organization_id", "user_id", "relaycast_workspace_id", "source_id", "agent_name", "agent_remote_id", "address", "native_session_kind", "native_session_id", "created_at", "updated_at"],
     secret: { source: "secret_envelope", target: "token_ciphertext" },
+    secretGroup: ["updated_at"],
   },
   fleet_node_owners: {
     table: "fleet_node_owners",
@@ -763,6 +784,21 @@ type Projection = {
  * ORG_TABLES, so this never reaches it.
  */
 export const UNBOUND_WORKSPACE_MARKER = "workspace_unbound";
+
+/**
+ * Ledger namespace for secrets the import wrote: row_key
+ * "<table>:<id>:<sha256 hex of the stored ciphertext>". A re-run replaces a
+ * target secret only while it is still exactly the one recorded here (or
+ * NULL); a secret Control rotated since (a token refresh, a re-issued
+ * participant token, a rekey) is kept, with its secretGroup, and counted
+ * as <table>_secret_kept. A row with no marker (imported before .28, or
+ * pre-seeded) is adopted when its decrypted value equals Cloud's plaintext
+ * (marker recorded, nothing written; <table>_secret_adopted), else kept.
+ * An unchanged plaintext reuses the stored ciphertext: a converged re-run
+ * rewrites no secret and writes no marker.
+ * Reconcile reads only ORG_TABLES.
+ */
+export const SECRET_MARKER = "secret_written";
 const importedUnbound = `EXISTS (SELECT 1 FROM public.${IMPORT_LEDGER_TABLE} l WHERE l.table_name = '${UNBOUND_WORKSPACE_MARKER}' AND l.row_key = id::text)`;
 
 const PROJECTIONS: Record<ImportTable, Projection> = {
@@ -779,8 +815,11 @@ const PROJECTIONS: Record<ImportTable, Projection> = {
     columns: { id: "id::text", workspace_id: "workspace_id::text", provider: "provider", auth_mode: "auth_mode", status: "status", token_type: "token_type", installation_id: "installation_id", github_app_organization_id: "github_app_organization_id::text", created_by_user_id: "created_by_user_id::text", created_at: ts("created_at") },
   },
   coding_agent_credentials: {
+    // is_active/harness_active are Cloud's on insert and Control's after
+    // (TARGETS insertOnly), so they are not compared here; the credential
+    // copy verifier checks selection.
     key: "id::text", org: "organization_id::text", workspace: "workspace_id::text",
-    columns: { id: "id::text", organization_id: "organization_id::text", workspace_id: "workspace_id::text", created_by_user_id: "created_by_user_id::text", model_provider: "model_provider", harness: "harness", auth_type: "auth_type", display_name: "display_name", label: "label", account_email: "account_email", is_active: "is_active", harness_active: "harness_active", status: "status", last_error: "last_error", last_authenticated_at: ts("last_authenticated_at"), last_used_at: ts("last_used_at"), created_at: ts("created_at") },
+    columns: { id: "id::text", organization_id: "organization_id::text", workspace_id: "workspace_id::text", created_by_user_id: "created_by_user_id::text", model_provider: "model_provider", harness: "harness", auth_type: "auth_type", display_name: "display_name", label: "label", account_email: "account_email", status: "status", last_error: "last_error", last_authenticated_at: ts("last_authenticated_at"), last_used_at: ts("last_used_at"), created_at: ts("created_at") },
   },
   users: {
     key: "id::text", org: "NULL::text",

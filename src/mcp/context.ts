@@ -1,5 +1,6 @@
 import type { CapyBindings } from "../capy/bindings.js";
 import type { AmpDeps } from "../amp/service.js";
+import type { ReplicasDeps } from "../replicas/service.js";
 import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
@@ -74,6 +75,8 @@ export type McpContext = {
   };
   /** Amp control (SELFHOST_AMP_ENABLED); absent when the feature is off. */
   amp?: AmpDeps;
+  /** Replicas agents (SELFHOST_REPLICAS_ENABLED); absent when the feature is off. */
+  replicas?: ReplicasDeps;
   /** Agent launch tools (SELFHOST_FEATURES launch); false or absent when the feature is off. */
   launch?: boolean;
   /** Factory sessions (SELFHOST_FACTORY_ENABLED); absent when the feature is off. */
@@ -119,6 +122,7 @@ export function historyReader(
     userId: principal.userId,
     organizationId: workspace.organizationId,
     workspaceId: workspace.id,
+    role: workspace.role,
     callerToken,
     // Every MCP read is on the person's behalf, in both read modes.
     readerKind: "mcp" as const,
