@@ -16,6 +16,12 @@ assigned at release.
   change. Audited as `relay_launch.credential.issued` and
   `relay_launch.credential.redeemed`. Unset, nothing changes. See
   docs/identity.md.
+- Added: on gate-only installs, `spawn_relay_agent` first asks relaygate's
+  `POST /v1/check` (op `w` on `node:<workspace>/<node>`, content the exact
+  task) with a scopeless 60-second `sh_at_` minted for the launching person
+  and revoked right after. A denial refuses the launch with `relaygate_denied`
+  or `relaygate_classified`, no answer with retryable `relaygate_unavailable`,
+  before anything is journaled or sent. Unset, nothing changes.
 - Added: `SELFHOST_RELAYGATE_PUBLIC_URL` (unset by default) for gate-only
   installs, where relaygate is the only public way into Relaycast. When set,
   `GET /api/v1/workspaces/{id}/resolve` answers `urls.relaygateUrl` (the

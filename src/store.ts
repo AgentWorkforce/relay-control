@@ -56,6 +56,14 @@ export { DASHBOARD_DEVICE_CLIENT };
 const ACCOUNT_SCOPES = [...BROWSER_SESSION_SCOPES, ACCOUNT_SCOPE];
 /** Desktop sessions: device scopes (with rth:acquire) plus "desktop:workspaces". */
 const DESKTOP_SCOPES = [...DEVICE_SCOPES, DESKTOP_WORKSPACES_SCOPE];
+/**
+ * Control's own short-lived token for relaygate's POST /v1/check on a gate-only
+ * launch: no scopes at all (relaygate's check needs none, so the token is
+ * useless for /v1/register, uploads or reads even while a cached introspection
+ * outlives the revoke).
+ */
+const LAUNCH_CHECK_SCOPES: string[] = [];
+const LAUNCH_CHECK_TTL_MS = 60 * 1_000;
 /** desktop-auth lane, browser flow: hosted Cloud's 15-minute loopback handoff. */
 const DESKTOP_HANDOFF_TTL_MS = 15 * 60 * 1_000;
 
@@ -1761,6 +1769,26 @@ export class ControlPlaneStore {
     input: { userId: string; organizationId: string; workspaceId: string; label: string },
   ): Promise<IssuedTokens> {
     return this.issueTokens(tx, input, { scopes: ACCOUNT_SCOPES });
+  }
+
+  /**
+   * A one-use, ~60 s access token with which Control itself asks relaygate to
+   * check a launch on the launching person's behalf (POST /v1/check). Revoked
+   * right after the check. Only the access token is returned.
+   */
+  async issueLaunchCheckSession(input: {
+    userId: string;
+    organizationId: string;
+    workspaceId: string;
+  }): Promise<{ accessToken: string }> {
+    const issued = await this.database.transaction((tx) =>
+      this.issueTokens(tx, { ...input, label: "relay-launch-check" }, {
+        scopes: LAUNCH_CHECK_SCOPES,
+        accessTtlMs: LAUNCH_CHECK_TTL_MS,
+        refreshTtlMs: LAUNCH_CHECK_TTL_MS,
+      }),
+    );
+    return { accessToken: issued.accessToken };
   }
 
   private async issueTokens(

@@ -15,6 +15,7 @@ import type { DesktopCallContext } from "./desktop-call.js";
 import type { McpOAuthConnection } from "./oauth/admission.js";
 import type { CustomerSupportConnection } from "./customer-support.js";
 import type { GrokRoutines } from "./grok-routines.js";
+import type { RelayLaunchCheck } from "./relay-launch-check.js";
 
 export type McpWorkspace = {
   id: string;
@@ -67,6 +68,8 @@ export type McpContext = {
      * launches then mint a one-time relay launch credential.
      */
     relaygatePublicUrl?: string;
+    /** Gate-only installs only: relaygate's pre-spawn POST /v1/check (./relay-launch-check.ts). */
+    launchCheck?: RelayLaunchCheck;
   };
   /** Amp control (SELFHOST_AMP_ENABLED); absent when the feature is off. */
   amp?: AmpDeps;

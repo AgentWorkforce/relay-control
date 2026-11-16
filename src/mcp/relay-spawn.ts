@@ -7,6 +7,7 @@ import {
 } from "../messaging/relaycast.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
 import type { McpContext } from "./context.js";
+import type { RelayLaunchCheck } from "./relay-launch-check.js";
 import { relayLaunchCredentials, type RelayLaunchCredentials } from "./relay-launch-credentials.js";
 import { ownerHash, relayFailure, relayService, RelayToolError, type SpawnActor } from "./relay-participants.js";
 import {
@@ -30,7 +31,9 @@ import {
  * On a gate-only install (SELFHOST_RELAYGATE_PUBLIC_URL) each new journal row
  * also gets a one-time `sh_lt_` launch credential
  * (./relay-launch-credentials.ts), minted before the launch is sent. It is
- * never part of the invocation body sent to Relaycast.
+ * never part of the invocation body sent to Relaycast. Before any of that,
+ * relaygate checks the launch (./relay-launch-check.ts): a denied, classified
+ * or unanswered check refuses the launch before a row is reserved.
  */
 
 export const spawnInput = z.object({
@@ -178,6 +181,9 @@ function failureMessage(code: string, node: string, harness: string, advertised?
     : code === "spawn_harness_unavailable" ? `Node "${node}" does not provide spawn:${harness}` +
       (advertised?.length ? `; it advertises ${advertised.join(", ")}` : "")
     : code === "spawn_target_unavailable" ? `Node "${node}" is unavailable for spawn`
+    : code === "relaygate_denied" ? "relaygate denied this launch"
+    : code === "relaygate_classified" ? "relaygate classified the task; it cannot be sent to a node"
+    : code === "relaygate_unavailable" ? "relaygate is unavailable; retry later"
     : `Agent launch on "${node}" failed`;
 }
 const SPAWN_CODES = new Set(["spawn_failed", "spawn_capacity_exceeded", "spawn_target_unavailable", "spawn_target_offline",
@@ -228,6 +234,8 @@ export type RelaySpawnDeps = {
   withActor<T>(fn: (actor: SpawnActor) => Promise<T>): Promise<T>;
   /** Gate-only installs only: one-time `sh_lt_` credential per launch. */
   launchCredentials?: RelayLaunchCredentials;
+  /** Gate-only installs only: relaygate's POST /v1/check before anything is reserved or sent. */
+  launchCheck?: RelayLaunchCheck;
 };
 
 export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" | "principal" | "workspace" | "relay" | "oauth">,
@@ -337,7 +345,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
             ...(code === "spawn_target_not_allowed" ? { owner: placed?.owner ?? null } : {}),
             active: refused?.activeAgents ?? null, reserved: refused?.reservedAgents ?? null, max: refused?.maxAgents ?? null,
             observed_at: new Date().toISOString(),
-            retryable: !["spawn_harness_unavailable", "spawn_target_not_allowed"].includes(code),
+            retryable: !["spawn_harness_unavailable", "spawn_target_not_allowed", "relaygate_denied", "relaygate_classified"].includes(code),
             alternatives: alternativesFor(ranked, input.cli, { id: input.target_node,
               repositories: placed?.repositories }),
           });
@@ -351,6 +359,13 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         if (!target.handlersLive || target.stale || target.name === "self") throw refuse("spawn_target_unavailable", target, placed);
         if (!target.capabilities.includes(`spawn:${input.cli}`)) throw refuse("spawn_harness_unavailable", target, placed);
         if (!eligible(target)) throw refuse("spawn_capacity_exceeded", target, placed);
+        // Gate-only installs: relaygate sees the exact task first. Refused before reserve, so nothing is journaled or cached.
+        if (deps.launchCheck) {
+          const outcome = await deps.launchCheck.check({ userId, organizationId: context.workspace.organizationId,
+            workspaceId: context.workspace.id, nodeName: target.name, task: input.task });
+          if (outcome.decision === "deny") throw refuse(outcome.code, target, placed);
+          if (outcome.decision === "unavailable") throw refuse("relaygate_unavailable", target, placed);
+        }
 
         const now = new Date().toISOString();
         const reserved = await deps.store.reserve({ ...owned, id: randomUUID(), idempotencyHash, requestHash,
@@ -467,6 +482,7 @@ export function relaySpawnDeps(context: McpContext): RelaySpawnDeps {
     },
     withActor: fn => relayService(context).withSpawnActor(fn),
     ...(context.relay.relaygatePublicUrl ? { launchCredentials: relayLaunchCredentials(database, context.relay.keyring) } : {}),
+    ...(context.relay.launchCheck ? { launchCheck: context.relay.launchCheck } : {}),
   };
 }
 

@@ -59,7 +59,10 @@ before broker, then free capacity and measured load.
    stable `idempotency_key`. `accepted` means dispatch receipt, not readiness.
    Refusals (`spawn_target_not_allowed`, `spawn_target_offline`,
    `spawn_target_unavailable`, `spawn_harness_unavailable`,
-   `spawn_capacity_exceeded`) carry up to three allowed `alternatives`.
+   `spawn_capacity_exceeded`, and on gate-only installs `relaygate_denied`,
+   `relaygate_classified` and `relaygate_unavailable`) carry up to three
+   allowed `alternatives`. Only `relaygate_unavailable` of the relaygate
+   codes is retryable; see [identity.md](identity.md), "Launch check".
 3. `get_relay_spawn_status` until `ready` (with the agent's address),
    `failed` or `unknown`.
 4. `release_relay_agent` stops exactly that worker by its immutable id.
