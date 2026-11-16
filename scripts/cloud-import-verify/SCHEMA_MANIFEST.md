@@ -1,12 +1,12 @@
 # Reviewed target schema and verification scope
 
-`schema-manifest.json` is a committed reference built from all 64 checked-in
-Control migrations (main `b79cb5f` plus 0068), in a fresh disposable local PostgreSQL
+`schema-manifest.json` is a committed reference built from all 67 checked-in
+Control migrations (main `b79cb5f` plus 0061, 0064, 0065 and 0068), in a fresh disposable local PostgreSQL
 cluster. It is never generated from the target being qualified. Its seal covers
 all expected entries and migration file hashes; verification also checks the
 migration files in the verifier checkout still match those hashes.
 
-The mandatory inventory has 99 tables and 1,822 logical catalogue objects.
+The mandatory inventory has 102 tables and 1,898 logical catalogue objects.
 It covers tables/relation kind and RLS flags, column types/positions/nullability/
 defaults/identity/generated/collation, constraints and definitions/validation/
 deferral/FK-trigger state, indexes and definitions/predicates/validity/readiness/

@@ -337,11 +337,12 @@ export function createFactoryService(deps: FactoryServiceDeps) {
    * secret-free tombstone; failure keeps the remote id and a cleanup code
    * for the cleanup loop. Never throws.
    */
-  async function release(rows: Array<FactoryRelease & { relaycast_api_key_ciphertext?: string }>, workspaceKey?: string) {
+  async function release(rows: Array<FactoryRelease & { relaycast_api_key_ciphertext?: string | null }>, workspaceKey?: string) {
     let pending = 0;
     for (const row of rows) {
       if (!row.relay_agent_id) continue;
       try {
+        if (!workspaceKey && !row.relaycast_api_key_ciphertext) throw new Error("Relaycast binding is not ready");
         const key = workspaceKey ?? decryptSecret(row.relaycast_api_key_ciphertext!, keyring);
         try {
           // Exact release of this row's own agent id, never by name alone: a

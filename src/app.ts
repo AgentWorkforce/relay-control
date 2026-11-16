@@ -73,6 +73,7 @@ import {
   OrganizationBoundaryError,
   OrganizationConflictError,
   ReservedClientNameError,
+  RelaycastBindingUnavailableError,
   type ControlPlaneStore,
   type Principal,
 } from "./store.js";
@@ -97,6 +98,7 @@ import { createCustomerSupportNoticeHandler } from "./mcp/customer-support-notic
 import type { AmpModule } from "./amp/module.js";
 import type { ReplicasModule } from "./replicas/module.js";
 import { isReplicasPath } from "./replicas/routes.js";
+import { disconnectEnvironments, setupEnvironments } from "./replicas/environments.js";
 import { disconnectReplicas, purgeMemberReplicas, releaseMemberReplicas, ReplicasError } from "./replicas/service.js";
 import { isAmpPath } from "./amp/routes.js";
 import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
@@ -578,12 +580,16 @@ export function createApp(input: {
     // Bindings are revoked and retired while the key still exists to sleep their compute.
     ...(replicas ? { replicasCleanup: async (actor: { userId: string; workspaceId: string; organizationId: string }) => {
       try {
+        // Stop environment-level admission and remove provider MCP entries first, then retire bindings.
+        await disconnectEnvironments(replicas.deps, actor);
         await disconnectReplicas(replicas.deps, actor);
       } catch (error) {
         if (error instanceof ReplicasError) throw new RemoteAgentError(error.status, "replicas_cleanup_failed", error.message);
         throw new RemoteAgentError(502, "replicas_cleanup_failed", "Replicas cleanup could not finish. Retry the disconnect.");
       }
-    } } : {}),
+    },
+    replicasSetup: (actor: { userId: string; workspaceId: string; organizationId: string }, options: { reconnect: boolean }) =>
+      setupEnvironments(replicas.deps, actor, options) } : {}),
   }));
   const oauthRelay = createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:input.messagingFetch});
   const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({
@@ -614,10 +620,10 @@ export function createApp(input: {
     },
     workspaceAccess:async principal=>{
       if(!(await store.readiness()).ready) return false;
-      const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
+      const workspace=await store.workspaceMembershipForUser(principal.workspaceId,principal.userId);
       return workspace?.organizationId===principal.organizationId;
     },
-    workspaceLabel:async principal=>(await store.workspaceForUser(principal.workspaceId,principal.userId))?.name??principal.workspaceId,
+    workspaceLabel:async principal=>(await store.workspaceMembershipForUser(principal.workspaceId,principal.userId))?.name??principal.workspaceId,
     checkAgentNameAvailability:async(principal,name)=>{
       const workspace=await store.workspaceForUser(principal.workspaceId,principal.userId);
       if(!workspace || workspace.organizationId!==principal.organizationId) return "unknown";
@@ -731,7 +737,8 @@ export function createApp(input: {
   /**
    * /api/v1/workspaces/{id}/staff-read-grants (docs/staff-read-grants.md):
    * the staff rule, presented by a browser account session or an interactive
-   * CLI login. Not a Desktop session, an enrollment-key session, a handoff,
+   * CLI login. Not a Desktop session (including a device code Desktop
+   * started), an enrollment-key session, a handoff,
    * a Desktop provider credential or any other credential kind. Every
    * refusal after the CSRF check is the same 404, so the routes are no
    * oracle for staff status or for workspace existence.
@@ -756,10 +763,17 @@ export function createApp(input: {
     const interactive = principal.scopes.includes(ACCOUNT_SCOPE) || principal.scopes.includes("cli:auth");
     if (
       !interactive || principal.scopes.includes(DESKTOP_WORKSPACES_SCOPE) || principal.scopes.includes("mcp:desktop") ||
-      principal.provisionedByTokenId || principal.pendingHandoff || principal.handoff
+      principal.provisionedByTokenId || principal.pendingHandoff || principal.handoff || principal.desktopHostName
     ) {
       throw notFound();
     }
+    // Agent Relay Desktop also signs in by device code, naming its host; such
+    // a session carries no Desktop marker, so look at the device code itself.
+    const desktopDeviceCode = await store.database.query(
+      "SELECT 1 FROM device_authorizations WHERE api_token_session_id = $1 AND desktop_host_name IS NOT NULL",
+      [principal.sessionId],
+    );
+    if (desktopDeviceCode.rows.length > 0) throw notFound();
     const staff = await staffReadGrants.staff(principal.userId);
     if (!staff || !isUuid(workspaceId)) throw notFound();
     const workspace = (await store.database.query<{ id: string; organization_id: string }>(
@@ -2689,7 +2703,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         json(response, 200, {
           ...identity,
           urls: { relaycastUrl: config.relaycastPublicUrl, relaygateUrl: config.relaygatePublicUrl },
-          provisioned: false,
+          provisioned: workspace.relaycastProvisioned,
         }, true);
         return;
       }
@@ -2705,7 +2719,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         ...identity,
         relaycastApiKey: workspace.relaycastApiKey,
         urls: { relaycastUrl: config.relaycastPublicUrl },
-        provisioned: false,
+        provisioned: workspace.relaycastProvisioned,
       }, true);
       return;
     }
@@ -3101,6 +3115,11 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       if (error instanceof NodeClaimError) {
         json(response, error.status, { error: "node_claim_refused", message: error.message }, true);
+        return;
+      }
+      if (error instanceof RelaycastBindingUnavailableError) {
+        response.setHeader("retry-after", String(error.retryAfterSeconds));
+        json(response, error.status, { error: error.code, message: error.message }, true);
         return;
       }
       if (error instanceof MembershipConflictError) {
