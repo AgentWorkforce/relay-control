@@ -5,6 +5,11 @@ assigned at release.
 
 ## Unreleased
 
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set) every
+  Sessions read-token mint names the reader kind (`browser`, `device` or
+  `mcp`) from how the caller authenticated, so relaygate can tell a person's
+  own reads from agent reads on their behalf. Other installs send the same
+  mint body as before. See [Sessions read API](docs/sessions-read-api.md).
 - Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), every
   agent launch through `spawn_relay_agent` mints a one-time `sh_lt_` launch
   credential (10 minutes, bound to the workspace, node, agent name and

@@ -39,6 +39,10 @@ test("customer support uses an optional complete dedicated service connection, n
 
 test("SELFHOST_RELAYGATE_PUBLIC_URL is optional and must be a public https origin", () => {
   assert.equal(loadConfig(completeEnv).relaygatePublicUrl, null);
+  // reader_kind goes into the read-token mint body only behind relaygate.
+  assert.equal(loadConfig(completeEnv).sessionReadApi.mintReaderKind, false);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: "https://cast.selfhosted.company" })
+    .sessionReadApi.mintReaderKind, true);
   assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: "  " }).relaygatePublicUrl, null);
   assert.equal(loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: " https://cast.selfhosted.company/ " }).relaygatePublicUrl,
     "https://cast.selfhosted.company");
@@ -86,6 +90,7 @@ test("the read API handoff is required and must be fully configured", () => {
     url: reader.SESSION_READ_API_URL,
     publicUrl: "https://history.selfhosted.company",
     secret: reader.SESSION_READ_API_SECRET,
+    mintReaderKind: false,
   });
   // History is the read API: its URLs are the History URLs.
   assert.equal(config.relayhistoryUrl, reader.SESSION_READ_API_URL);

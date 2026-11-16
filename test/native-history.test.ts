@@ -257,7 +257,7 @@ test("native config: resolves the History origin to the read API with the backen
     const config = loadConfig({ ...nativeEnv, RELAYHISTORY_BACKEND: backend });
     assert.equal(config.relayhistoryUrl, "http://read-api.svc.cluster.local");
     assert.equal(config.relayhistoryPublicUrl, ORIGIN);
-    assert.deepEqual(config.sessionReadApi, { url: "http://read-api.svc.cluster.local", publicUrl: ORIGIN, secret: READ_SECRET });
+    assert.deepEqual(config.sessionReadApi, { url: "http://read-api.svc.cluster.local", publicUrl: ORIGIN, secret: READ_SECRET, mintReaderKind: false });
     assert.deepEqual(config.introspectAudiences, []);
     assert.deepEqual(config.relayhistoryAudiences, [ORIGIN]);
   }

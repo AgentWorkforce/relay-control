@@ -33,8 +33,14 @@ export type SelfhostConfig = {
   chiefRelaySecret?: string | null;
   /** Dedicated relay-agent support HTTP connection; no customer allowlist. */
   customerSupport?: { url: string; token: string } | null;
-  /** Independent read service; owns issuance, rotation and verification of its tokens. Required. */
-  sessionReadApi: { url: string; publicUrl: string; secret: string };
+  /**
+   * Independent read service; owns issuance, rotation and verification of its tokens. Required.
+   * mintReaderKind: send `reader_kind` in the mint body. True only on gate-only
+   * installs (SELFHOST_RELAYGATE_PUBLIC_URL set): relaygate reads it and strips
+   * it before proxying, and the read API's strict mint schema rejects it.
+   * Absent means false.
+   */
+  sessionReadApi: { url: string; publicUrl: string; secret: string; mintReaderKind?: boolean };
   /** Session pipeline per-session erase; null keeps the hard-delete routes at 501. */
   sessionErasureApi?: { url: string; secret: string } | null;
   /** SESSION_READ_API_MCP_READS: MCP session reads use the read API. Default off. */
@@ -423,7 +429,8 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
 
   refuseRemovedHistoryVariables(env);
   // One History origin, the read API's. Nothing may name a second one.
-  const sessionReadApi = loadSessionReadApiConfig(env);
+  const relaygatePublicUrl = loadRelaygatePublicUrl(env);
+  const sessionReadApi = { ...loadSessionReadApiConfig(env), mintReaderKind: relaygatePublicUrl !== null };
   const loadedIntrospection = loadIntrospectionConfig(env);
   const relayhistoryAudiences = loadRelayhistoryAudiences(env, sessionReadApi.publicUrl);
   const relayhistoryAudienceSet = new Set(relayhistoryAudiences);
@@ -463,7 +470,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     historyUpload: loadHistoryUploadConfig(env),
     capturePolicyUploads: loadCapturePolicyUploads(env),
     eventsShimRelayOrigins: loadEventsShimRelayOrigins(env),
-    relaygatePublicUrl: loadRelaygatePublicUrl(env),
+    relaygatePublicUrl,
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
