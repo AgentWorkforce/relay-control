@@ -24,8 +24,10 @@ import { loadAmpConfig } from "./amp/config.js";
 import { createAmpModule } from "./amp/module.js";
 import { loadReplicasConfig } from "./replicas/config.js";
 import { createReplicasModule } from "./replicas/module.js";
+import { ReplicasSyncSweep } from "./replicas/sync-sweep.js";
 import { CapyBindings } from "./capy/bindings.js";
 import { CapyCleanup,capyCleanupFetch } from "./capy/cleanup.js";
+import { FlowsWorkspaceDeletions } from "./flows-workspace-delete.js";
 import { PostgresEventsShimStore } from "./events-shim/store.js";
 import { EventsShimWakeSweeper } from "./events-shim/sweeper.js";
 import { createCapyRuntime } from "./capy/runtime.js";
@@ -51,14 +53,16 @@ const database = new PostgresDatabase(config.databaseUrl);
 
 // bootstrap-signup lane: first-boot org/workspace, OIDC/email sign-in, invites.
 const identityConfig = loadIdentityConfig();
-const store = new ControlPlaneStore(database, config.encryptionKeyring, undefined, {
-  tenancy: identityConfig.tenancy.mode,
-});
 // Creates Relaycast workspaces for the bootstrap and (multi mode) personal
-// and self-serve organizations; null without RELAYCAST_INTERNAL_SECRET.
+// and self-serve organizations, plus lazy bindings for imported Cloud
+// workspaces; null without RELAYCAST_INTERNAL_SECRET.
 const provisioner = identityConfig.relaycastInternalSecret
   ? relaycastProvisioner(config.relaycastUrl, identityConfig.relaycastInternalSecret)
   : null;
+const store = new ControlPlaneStore(database, config.encryptionKeyring, undefined, {
+  tenancy: identityConfig.tenancy.mode,
+  relaycastProvisioner: provisioner,
+});
 const identityStore = new IdentityStore(database, config.encryptionKeyring, {
   inviteTtlMs: identityConfig.inviteTtlMs,
   autoJoinDomains: identityConfig.autoJoinDomains,
@@ -122,13 +126,29 @@ const telemetry = createTelemetryModule({
 });
 // Amp control: off unless SELFHOST_AMP_ENABLED=true; off starts no worker.
 const amp = createAmpModule({ amp: loadAmpConfig(process.env), config, database });
-// Replicas agents: off unless SELFHOST_REPLICAS_ENABLED=true; no worker either way.
+// Replicas agents: off unless SELFHOST_REPLICAS_ENABLED=true.
 const replicas = createReplicasModule({ replicas: loadReplicasConfig(process.env), config, database });
+// Environment sync sweep: only with Replicas on and SELFHOST_REPLICAS_SYNC_INTERVAL_SECONDS > 0.
+const replicasSync = replicas.config.enabled && (replicas.config.syncIntervalSeconds ?? 0) > 0
+  ? new ReplicasSyncSweep({
+      replicas: replicas.deps,
+      intervalSeconds: replicas.config.syncIntervalSeconds!,
+      log: (event) => console.warn("[replicas] environment sync deferred", event),
+    })
+  : null;
 // Cleanup runs with new Capy work still off; it has no provider dispatch path.
 const capyCleanup=new CapyCleanup({database,bindings:new CapyBindings({
   database,keyring:config.encryptionKeyring,runtime:createCapyRuntime(),
   relaycast:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:capyCleanupFetch()}),
 }),log:event=>console.warn("[capy] cleanup deferred",event)});
+// relayfile-control Flows data: deletes queued with each workspace delete. Unset queues nothing.
+const flowsWorkspaceDeletions = config.flowsWorkspaceDelete
+  ? new FlowsWorkspaceDeletions({
+      database,
+      endpoint: config.flowsWorkspaceDelete,
+      log: (event) => console.warn("[flows] workspace delete deferred", event),
+    })
+  : null;
 // Events shim: recover webhook wakes a Relaycast outage left pending. Off with the feature.
 const eventsShimSweeper = features.events_shim
   ? new EventsShimWakeSweeper({
@@ -196,6 +216,8 @@ async function start(): Promise<void> {
   identity.start();
   amp.start();
   capyCleanup.start();
+  flowsWorkspaceDeletions?.start();
+  replicasSync?.start();
   eventsShimSweeper?.start();
   if(mcpOAuthActive(config)) {
     console.log("[selfhost-api] hosted MCP OAuth active", mcpOAuthActiveNotice());
@@ -217,6 +239,8 @@ async function start(): Promise<void> {
         smtp: identityConfig.smtp !== null,
         autoJoinDomains: identityConfig.autoJoinDomains.length,
       },
+      // Off: deleting a workspace leaves any relayfile-control Flows data in place.
+      flowsWorkspaceDelete: config.flowsWorkspaceDelete !== null && config.flowsWorkspaceDelete !== undefined,
       amp: {
         enabled: amp.config.enabled,
         transport: amp.config.transport !== null,
@@ -263,6 +287,8 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   await telemetry.stop();
   await amp.stop();
   await capyCleanup.stop();
+  await flowsWorkspaceDeletions?.stop();
+  await replicasSync?.stop();
   await eventsShimSweeper?.stop();
   await mcpOAuthTeardown.stop();
   await grokRoutines.stop();

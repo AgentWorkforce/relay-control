@@ -36,6 +36,10 @@ function createProvider() {
       calls.push("environments");
       return { environments: [{ id: ENVIRONMENT, name: "default" }] };
     },
+    allEnvironments: async (key: string) => {
+      assert.equal(key, REPLICAS_KEY);
+      return { environments: [{ id: ENVIRONMENT, name: "default" }], complete: true };
+    },
     create: async (key: string, input: { coding_agent: string; message: string }) => {
       assert.equal(key, REPLICAS_KEY);
       calls.push("create");

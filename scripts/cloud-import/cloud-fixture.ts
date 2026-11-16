@@ -7,7 +7,7 @@ import { createCipheriv, randomBytes } from "node:crypto";
 export const CLOUD_FIXTURE_DDL = `
 CREATE TABLE users (
   id uuid PRIMARY KEY, primary_email text, name text, avatar_url text,
-  last_organization_id uuid, last_workspace_id uuid,
+  last_organization_id uuid, last_workspace_id uuid, signup_source text,
   created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
 );
 CREATE TABLE auth_identities (
@@ -64,7 +64,7 @@ CREATE TABLE provider_credentials (
   harness text NOT NULL, model_provider text NOT NULL DEFAULT '', auth_type text NOT NULL DEFAULT 'provider_oauth',
   label text, key_fingerprint text, display_name text NOT NULL, account_email text, provider_account_id text,
   is_active boolean NOT NULL DEFAULT false, harness_active boolean NOT NULL DEFAULT false, status text NOT NULL,
-  refresh_exhausted boolean NOT NULL DEFAULT false,
+  refresh_exhausted boolean NOT NULL DEFAULT false, refresh_attempts integer NOT NULL DEFAULT 0,
   last_authenticated_at timestamptz, last_used_at timestamptz, last_error text,
   created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
 );
@@ -183,10 +183,31 @@ INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, ha
   -- S1: an unselected Google key where Control already has a native active
   -- one, and an unselected OpenRouter key with nothing else in its group.
   ('${id(0x80e)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'gemini', 'google', 'byo_api_key', 'Cloud Google', false, false, 'connected', ${t}, ${t}),
-  ('${id(0x80f)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'opencode', 'openrouter', 'byo_api_key', 'Cloud OpenRouter', false, false, 'connected', ${t}, ${t});
+  ('${id(0x80f)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'opencode', 'openrouter', 'byo_api_key', 'Cloud OpenRouter', false, false, 'connected', ${t}, ${t}),
+  -- Cloud-exact reads: a login WITHOUT provider_account_id reads only the
+  -- legacy object; a refresh-exhausted login is dead in Cloud.
+  ('${id(0x810)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT legacy', false, false, 'connected', ${t}, ${t}),
+  ('${id(0x811)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'provider_oauth', 'ChatGPT dead', false, false, 'refresh_failed', ${t}, ${t});
+INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, harness, model_provider, auth_type, display_name, is_active, harness_active, status, created_at, updated_at) VALUES
+  -- On a2, which is unbound: a pre-0064 target never gets that workspace.
+  ('${id(0x812)}', '${ORG_A}', '${id(0x202)}', '${id(1)}', 'codex', 'openai', 'byo_api_key', 'On unbound a2', true, false, 'connected', '2026-01-01T00:00:00.123456Z', '2026-01-01T00:00:00.123456Z'),
+  -- A subscription login for a provider Control has no login for: dropped.
+  ('${id(0x813)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'opencode', 'openrouter', 'provider_oauth', 'OpenRouter login', true, false, 'connected', '2026-01-01T00:00:00.123456Z', '2026-01-01T00:00:00.123456Z'),
+  -- Aliases Cloud normalises (canonicalConnectionProvider) and still serves.
+  ('${id(0x814)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'claude', ' Claude ', 'byo_api_key', 'Alias key', true, false, 'connected', '2026-01-01T00:00:00.123456Z', '2026-01-01T00:00:00.123456Z'),
+  ('${id(0x816)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'claude', 'claude', 'relay_managed', 'Alias relay', true, false, 'connected', '2026-01-01T00:00:00.123456Z', '2026-01-01T00:00:00.123456Z'),
+  -- gemini -> google (normalizeModelProvider).
+  ('${id(0x817)}', '${ORG_B}', '${id(0x205)}', '${id(2)}', 'gemini', 'Gemini', 'byo_api_key', 'Gemini key', true, false, 'connected', '2026-01-01T00:00:00.123456Z', '2026-01-01T00:00:00.123456Z');
+UPDATE provider_credentials SET refresh_exhausted = true WHERE id = '${id(0x811)}';
+-- A connected API key with a stray exhausted flag is not a dead login.
+UPDATE provider_credentials SET refresh_exhausted = true WHERE id = '${id(0x80d)}';
 UPDATE provider_credentials SET label = 'Bob token', account_email = 'bob@example.test' WHERE id = '${id(0x805)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-1' WHERE id = '${id(0x806)}';
 UPDATE provider_credentials SET provider_account_id = 'acct-synthetic-2' WHERE id = '${id(0x80c)}';
+-- Cloud history the copier must keep rather than the store seams' defaults.
+UPDATE provider_credentials SET last_authenticated_at = '2026-01-05T10:00:00.123456Z', last_used_at = '2026-01-06T11:00:00.654321Z',
+  refresh_attempts = 2, last_error = 'transient refresh error' WHERE id = '${id(0x806)}';
+UPDATE provider_credentials SET last_authenticated_at = '2026-01-07T09:00:00.000001Z', last_used_at = '2026-01-08T09:30:00.5Z' WHERE id = '${id(0x803)}';
 INSERT INTO workspace_integrations (id, workspace_id, provider, name, created_by_user_id, connection_id, installation_id, created_at, updated_at) VALUES
   ('${id(0x901)}', 'rw_0000a201', 'github', NULL, '${id(5)}', 'nango-1', '12345', ${t}, ${t}),
   ('${id(0x902)}', 'rw_0000a201', 'github', 'second', '${id(1)}', 'nango-2', '12345', ${t}, ${t}),
@@ -223,17 +244,19 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
     imported: 2,
     skipped: { superseded_open_invite: 1, already_member: 1, canceled: 1 },
   },
-  person_identities: { imported: 1, skipped: { workspace_not_imported: 1, cloud_decrypt_failed: 1, not_a_member: 1 } },
+  // 0x402's workspace (a2) is unbound: Relaycast identities need a binding.
+  person_identities: { imported: 1, skipped: { workspace_unbound: 1, cloud_decrypt_failed: 1, not_a_member: 1 } },
   hosted_relay_participants: { imported: 1, skipped: { duplicate_after_merge: 1, stale_relay_workspace: 1, not_a_member: 1 } },
   desktop_relay_identities: { imported: 1, skipped: { source_id_not_uuid: 1, not_a_member: 1 } },
-  fleet_node_owners: { imported: 1, skipped: { workspace_not_imported: 1 } },
+  fleet_node_owners: { imported: 1, skipped: { workspace_unbound: 1 } },
   // Pre-0058 target: the two relay_managed rows are refused by the importer.
   coding_agent_credentials: {
     imported: 0,
-    skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 12, target_lacks_relay_managed: 2 },
+    // Pre-0064: 0x804's workspace (a2, unbound) is skipped, so 0x804 follows it.
+    skipped: { workspace_unbound_pre_0064: 1, secret_in_cloud_credential_store: 18, target_lacks_relay_managed: 3 },
   },
   // Pre-0061 target: grants wait for the migration.
-  staff_read_grants: { imported: 0, skipped: { workspace_not_imported: 1, target_lacks_staff_read_grants: 1 } },
+  staff_read_grants: { imported: 0, skipped: { target_lacks_staff_read_grants: 2 } },
   // Pre-0054 target: the GitHub App rows wait for the migration.
   github_app_installations: { imported: 0, skipped: { target_lacks_github_app: 1 } },
   github_app_connections: {

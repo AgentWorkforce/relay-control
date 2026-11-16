@@ -13,11 +13,13 @@
 import { createDecipheriv, randomBytes } from "node:crypto";
 import { recordAudit } from "../../src/admin/audit.js";
 import { canonicalRelayhistoryOrigin } from "../../src/relayhistory-origin.js";
-import { encryptSecret, hashSecret, opaqueToken, type EncryptionKeyring } from "../../src/crypto.js";
+import { decryptSecret, encryptSecret, hashSecret, opaqueToken, type EncryptionKeyring } from "../../src/crypto.js";
 import type { Database, SqlExecutor } from "../../src/database.js";
 import {
   MAPPING_REVISION,
   IMPORT_LEDGER_TABLE,
+  UNBOUND_WORKSPACE_MARKER,
+  SECRET_MARKER,
   ORG_TABLES,
   RECONCILED_TABLES,
   REQUIRED_MIGRATION,
@@ -170,7 +172,9 @@ async function readSource(tx: SqlExecutor, table: ImportTable, scope: ImportScop
 
 const ROW_FLAGS: Partial<Record<ImportTable, string>> = {
   workspaces: `array_remove(ARRAY[
-      CASE WHEN q.cloud_relay_workspace_id IS NULL THEN 'workspace_rw_id_not_rw_8hex' END,
+      CASE WHEN q.cloud_relay_workspace_id IS NULL AND q.unbound_reason IS DISTINCT FROM 'no_relay_workspace'
+           THEN 'workspace_rw_id_not_rw_8hex' END,
+      CASE WHEN q.unbound_reason IS NOT NULL THEN 'unbound:' || q.unbound_reason END,
       CASE WHEN q.has_dashboard_url THEN 'relayhistory_dashboard_url_dropped' END,
       CASE WHEN q.relayhistory_origin_raw IS NOT NULL THEN 'relayhistory_origin_set' END
     ], NULL)`,
@@ -215,17 +219,46 @@ function upsertSql(table: ImportTable, columns: string[], fill = "'{}'::jsonb"):
   const spec = TARGETS[table];
   const secretColumn = spec.secret?.target ?? spec.inviteTokenHash ?? spec.freshTokenHash;
   const relation = `public.${quote(spec.table)}`;
-  const updates = columns
+  const keep = spec.keepTargetBinding;
+  const keepWhen = keep
+    ? `__t.${quote(keep.when)} IS NOT NULL AND (EXCLUDED.${quote(keep.when)} IS NULL OR EXCLUDED.${quote(keep.when)} <> __t.${quote(keep.when)}${
+      keep.generation && columns.includes(keep.generation) ? ` OR EXCLUDED.${quote(keep.generation)} < __t.${quote(keep.generation)}` : ""})`
+    : "";
+  // Control rotated the secret since the import last wrote it (SECRET_MARKER):
+  // keep Control's secret and the columns it rewrites with it.
+  const secret = spec.secret?.target;
+  const keepSecret = secret
+    ? `(__t.${quote(secret)} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM public.${IMPORT_LEDGER_TABLE} __l
+         WHERE __l.organization_id = $4::uuid AND __l.table_name = '${SECRET_MARKER}'
+           AND __l.row_key = '${spec.table}:' || __t.id::text || ':' || encode(sha256(convert_to(__t.${quote(secret)}, 'UTF8')), 'hex')))`
+    : "";
+  const secretOwned = secret ? [secret, ...(spec.secretGroup ?? [])] : [];
+  const assigned = columns
     .filter((column) => !spec.primaryKey.includes(column) && !(spec.insertOnly ?? []).includes(column))
-    .map((column) => `${quote(column)} = EXCLUDED.${quote(column)}`);
-  return `INSERT INTO ${relation} (${columns.map(quote).join(", ")})
+    .map((column) => {
+      const incoming = keep?.columns.includes(column)
+        ? `CASE WHEN ${keepWhen} THEN __t.${quote(column)} ELSE EXCLUDED.${quote(column)} END`
+        : (spec.monotonic ?? []).includes(column)
+          ? `GREATEST(__t.${quote(column)}, EXCLUDED.${quote(column)})`
+          : `EXCLUDED.${quote(column)}`;
+      return [column, secretOwned.includes(column) ? `CASE WHEN ${keepSecret} THEN __t.${quote(column)} ELSE ${incoming} END` : incoming] as const;
+    });
+  const updates = assigned.map(([column, value]) => `${quote(column)} = ${value}`);
+  // No same-value UPDATE: a re-run rewrites a row only when a value differs,
+  // so unchanged rows keep their versions (xmin) and convergence checkpoints
+  // can prove it. A re-encrypted secret column (fresh IV every run, e.g.
+  // workspaces.relaycast_api_key_ciphertext) always differs and is rewritten.
+  const changed = assigned.length
+    ? ` WHERE ROW(${assigned.map(([column]) => `__t.${quote(column)}`).join(", ")}) IS DISTINCT FROM ROW(${assigned.map(([, value]) => value).join(", ")})`
+    : "";
+  return `INSERT INTO ${relation} AS __t (${columns.map(quote).join(", ")})
 SELECT ${columns.map((column) => `p.${quote(column)}`).join(", ")}
   FROM unnest($1::text[], $2::text[], $3::text[]) AS u(r, s, o)
  CROSS JOIN LATERAL jsonb_populate_record(
    NULL::${relation},
    u.r::jsonb || COALESCE(u.o::jsonb, '{}'::jsonb) || ${fill} || ${secretColumn ? `CASE WHEN u.s IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('${secretColumn}', u.s) END` : "'{}'::jsonb"}
  ) AS p
-ON CONFLICT (${spec.primaryKey.map(quote).join(", ")}) DO ${updates.length ? `UPDATE SET ${updates.join(", ")}` : "NOTHING"}`;
+ON CONFLICT (${spec.primaryKey.map(quote).join(", ")}) DO ${updates.length ? `UPDATE SET ${updates.join(", ")}${changed}` : "NOTHING"}`;
 }
 
 /** Keys of `rows` not yet present on the target (first import). */
@@ -276,6 +309,17 @@ function chunks<T>(items: T[], size: number): T[][] {
   for (let index = 0; index < items.length; index += size) out.push(items.slice(index, index + size));
   return out;
 }
+
+/** Tables whose rows carry workspace_id and follow their workspace's skip. */
+const WORKSPACE_DEPENDENT_TABLES: readonly ImportTable[] = [
+  "person_identities",
+  "hosted_relay_participants",
+  "desktop_relay_identities",
+  "fleet_node_owners",
+  "github_app_connections",
+  "coding_agent_credentials",
+  "staff_read_grants",
+];
 
 /** A per-organization refusal: recorded as that org's failure, others go on. */
 class OrgRefused extends Error {
@@ -379,7 +423,8 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
           if (spec.secretConstant !== undefined) {
             secret = encryptSecret(spec.secretConstant, deps.keyring.active);
           } else if (spec.secret?.source === "secret_plaintext") {
-            secret = encryptSecret(row.secret ?? "", deps.keyring.active);
+            // NULL for an unbound workspace: its Relaycast pair stays NULL (0064).
+            secret = row.secret === null ? null : encryptSecret(row.secret, deps.keyring.active);
           } else if (spec.secret?.source === "secret_envelope" && !deps.cloudKeyHex) {
             warn("secrets_not_checked");
           } else if (spec.secret?.source === "secret_envelope") {
@@ -399,7 +444,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
           skip(table, "cloud_decrypt_failed", row.key);
           continue;
         }
-        for (const flag of row.flags ?? []) if (flag !== "source_id_not_uuid") warn(flag);
+        for (const flag of row.flags ?? []) if (flag !== "source_id_not_uuid" && !flag.startsWith("unbound:")) warn(flag);
         let override: string | undefined;
         if (table === "workspaces") {
           const canonical = row.origin === null ? null : canonicalOrigin(row.origin);
@@ -482,6 +527,35 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
         return false;
       });
     }
+    // Before 0064 a Control workspace needs a Relaycast binding: an unbound
+    // Cloud workspace is skipped under its unbound reason, and so is every
+    // row that would reference it. From 0064 it imports with the pair NULL.
+    const workspaceColumns = columns.get("workspaces");
+    const unboundAllowed = workspaceColumns?.get("relaycast_workspace_id")?.nullable === true
+      && workspaceColumns?.get("relaycast_api_key_ciphertext")?.nullable === true;
+    const unboundReason = (row: PreparedRow) => row.flags?.find((flag) => flag.startsWith("unbound:"))?.slice("unbound:".length);
+    if (!unboundAllowed) {
+      const dropped = new Set<string>();
+      prepared.workspaces = prepared.workspaces.filter((row) => {
+        const reason = unboundReason(row);
+        if (!reason) return true;
+        skip("workspaces", reason, row.key);
+        dropped.add(row.key);
+        return false;
+      });
+      if (dropped.size > 0) {
+        for (const table of WORKSPACE_DEPENDENT_TABLES) {
+          prepared[table] = prepared[table].filter((row) => {
+            const { workspace_id: workspaceId } = JSON.parse(row.row) as { workspace_id?: string };
+            if (!workspaceId || !dropped.has(workspaceId)) return true;
+            skip(table, "workspace_unbound_pre_0064", row.key);
+            return false;
+          });
+        }
+      }
+    } else {
+      for (const row of prepared.workspaces) if (unboundReason(row)) warn("workspace_imported_unbound");
+    }
     // Before 0058 Control cannot hold a relay_managed credential.
     const relayManaged = await target.query<{ ok: boolean }>(
       `SELECT EXISTS (
@@ -544,16 +618,170 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     //    rolled back at the end.
     const writeRows = async (tx: SqlExecutor, table: ImportTable, rows: PreparedRow[]) => {
       if (rows.length === 0) return;
+      const keep = TARGETS[table].keepTargetBinding;
+      if (keep) await countKeptBindings(tx, table, keep, rows);
+      if (table === "coding_agent_credentials") rows = await keepActiveCredential(tx, rows);
       const sql = upsertSql(table, write[table], fills[table]);
+      const secret = TARGETS[table].secret?.target;
+      const org = rows[0]!.org;
       for (const batch of chunks(rows, batchSize)) {
-        await tx.query(sql, [batch.map((row) => row.row), batch.map((row) => row.secret), batch.map((row) => row.override ?? null)]);
+        const params: unknown[] = [batch.map((row) => row.row), batch.map((row) => row.secret), batch.map((row) => row.override ?? null)];
+        if (secret) params.push(org);
+        if (secret && org) {
+          const settled = await settleSecrets(tx, table, secret, org, batch);
+          params[1] = batch.map((row) => settled.get(row.key) ?? row.secret);
+          await tx.query(sql, params);
+          await recordSecrets(tx, table, secret, org, batch, settled);
+        } else {
+          await tx.query(sql, params);
+        }
+      }
+    };
+    // After the upsert: a row now holding the ciphertext this run sent was
+    // written by the import, so its marker moves to that ciphertext; a row
+    // holding anything else kept Control's secret (counted).
+    // Before the upsert, per row whose target already holds a secret T:
+    // - T is the import's own (its marker) and decrypts to Cloud's plaintext:
+    //   send T back unchanged, so nothing is rewritten and the marker stays
+    //   (no fresh-IV churn on a converged re-run);
+    // - no marker at all (imported before .28, or pre-seeded): when T decrypts
+    //   to Cloud's plaintext, adopt it (record the marker, no write) so later
+    //   Cloud rotations flow; otherwise it is Control's and the upsert keeps it;
+    // - a marker for another value: Control rotated it; the upsert keeps it.
+    // Returns the ciphertext to send for rows whose target value is reused.
+    const settleSecrets = async (tx: SqlExecutor, table: ImportTable, secret: string, org: string, rows: PreparedRow[]) => {
+      const relation = TARGETS[table].table;
+      const current = (await tx.query<{ id: string; value: string; digest: string; marker: string | null }>(
+        `SELECT t.id::text AS id, t.${quote(secret)} AS value,
+                encode(sha256(convert_to(t.${quote(secret)}, 'UTF8')), 'hex') AS digest,
+                (SELECT l.row_key FROM public.${IMPORT_LEDGER_TABLE} l WHERE l.organization_id = $2::uuid AND l.table_name = $3
+                   AND starts_with(l.row_key, $4 || ':' || t.id::text || ':') LIMIT 1) AS marker
+           FROM public.${quote(relation)} t
+          WHERE t.id::text = ANY($1::text[]) AND t.${quote(secret)} IS NOT NULL`,
+        [rows.map((row) => row.key), org, SECRET_MARKER, relation])).rows;
+      const incoming = new Map(rows.map((row) => [row.key, row]));
+      const plain = (ciphertext: string | null) => {
+        if (ciphertext === null) return null;
+        try { return decryptSecret(ciphertext, deps.keyring); } catch { return null; }
+      };
+      const reuse = new Map<string, string>();
+      const adopt: string[] = [];
+      for (const target of current) {
+        const row = incoming.get(target.id);
+        const cloud = plain(row?.secret ?? null);
+        if (!row || cloud === null) continue;
+        const ownMarker = `${relation}:${target.id}:${target.digest}`;
+        if (target.marker === ownMarker) {
+          if (plain(target.value) === cloud) reuse.set(target.id, target.value);
+        } else if (target.marker === null && plain(target.value) === cloud) {
+          reuse.set(target.id, target.value);
+          adopt.push(ownMarker);
+        }
+      }
+      if (adopt.length) {
+        await tx.query(
+          `INSERT INTO public.${IMPORT_LEDGER_TABLE} (organization_id, table_name, row_key, mapping_revision)
+           SELECT $1::uuid, $2, k, $4 FROM unnest($3::text[]) AS u(k) ON CONFLICT DO NOTHING`,
+          [org, SECRET_MARKER, adopt, MAPPING_REVISION]);
+        report.warnings[`${table}_secret_adopted`] = (report.warnings[`${table}_secret_adopted`] ?? 0) + adopt.length;
+      }
+      return reuse;
+    };
+    // After the upsert: a row now holding the ciphertext this run sent carries
+    // the import's value, so its marker names that ciphertext (written only
+    // when it changed); a row holding anything else kept Control's secret.
+    const recordSecrets = async (tx: SqlExecutor, table: ImportTable, secret: string, org: string, rows: PreparedRow[], sent: Map<string, string>) => {
+      const relation = TARGETS[table].table;
+      const stored = new Map((await tx.query<{ id: string; value: string | null; digest: string | null; markers: string[] }>(
+        `SELECT t.id::text AS id, t.${quote(secret)} AS value, encode(sha256(convert_to(t.${quote(secret)}, 'UTF8')), 'hex') AS digest,
+                ARRAY(SELECT l.row_key FROM public.${IMPORT_LEDGER_TABLE} l WHERE l.organization_id = $2::uuid AND l.table_name = $3
+                        AND starts_with(l.row_key, $4 || ':' || t.id::text || ':')) AS markers
+           FROM public.${quote(relation)} t WHERE t.id::text = ANY($1::text[])`,
+        [rows.map((row) => row.key), org, SECRET_MARKER, relation])).rows.map((row) => [row.id, row]));
+      const moved: Array<[string, string]> = [];
+      for (const row of rows) {
+        const now = stored.get(row.key);
+        const value = sent.get(row.key) ?? row.secret;
+        if (!now?.value) continue;
+        if (value !== null && now.value === value) {
+          const key = `${relation}:${row.key}:${now.digest}`;
+          if (now.markers.length !== 1 || now.markers[0] !== key) moved.push([row.key, key]);
+        } else {
+          report.warnings[`${table}_secret_kept`] = (report.warnings[`${table}_secret_kept`] ?? 0) + 1;
+        }
+      }
+      if (!moved.length) return;
+      await tx.query(
+        `DELETE FROM public.${IMPORT_LEDGER_TABLE} l USING unnest($3::text[], $4::text[]) AS u(id, k)
+          WHERE l.organization_id = $1::uuid AND l.table_name = $2
+            AND starts_with(l.row_key, $5 || ':' || u.id || ':') AND l.row_key <> u.k`,
+        [org, SECRET_MARKER, moved.map(([id]) => id), moved.map(([, key]) => key), relation],
+      );
+      await tx.query(
+        `INSERT INTO public.${IMPORT_LEDGER_TABLE} (organization_id, table_name, row_key, mapping_revision)
+         SELECT $1::uuid, $2, k, $4 FROM unnest($3::text[]) AS u(k)
+         ON CONFLICT (organization_id, table_name, row_key) DO NOTHING`,
+        [org, SECRET_MARKER, moved.map(([, key]) => key), MAPPING_REVISION],
+      );
+    };
+    // A credential new to Control enters inactive when its (workspace,
+    // provider) already has an active row on the target (a copied or native
+    // key Control selected): one LLM credential per group
+    // (coding_agent_one_llm), and Control's selection stands. Counted.
+    const keepActiveCredential = async (tx: SqlExecutor, rows: PreparedRow[]): Promise<PreparedRow[]> => {
+      const incoming = rows.map((row) => ({ row, value: JSON.parse(row.row) as { workspace_id?: string; model_provider?: string; is_active?: boolean } }));
+      const candidates = incoming.filter(({ value }) => value.is_active === true);
+      if (!candidates.length) return rows;
+      const existing = new Set((await tx.query<{ id: string }>(
+        "SELECT id::text AS id FROM public.coding_agent_credentials WHERE id::text = ANY($1::text[])",
+        [candidates.map(({ row }) => row.key)])).rows.map((row) => row.id));
+      const fresh = candidates.filter(({ row }) => !existing.has(row.key));
+      if (!fresh.length) return rows;
+      const active = new Set((await tx.query<{ g: string }>(
+        `SELECT workspace_id::text || '|' || model_provider AS g FROM public.coding_agent_credentials
+          WHERE is_active AND workspace_id::text = ANY($1::text[])`,
+        [[...new Set(fresh.map(({ value }) => String(value.workspace_id)))]])).rows.map((row) => row.g));
+      const demote = new Set(fresh.filter(({ value }) => active.has(`${value.workspace_id}|${value.model_provider}`)).map(({ row }) => row));
+      if (!demote.size) return rows;
+      report.warnings.coding_agent_credentials_control_active_kept = (report.warnings.coding_agent_credentials_control_active_kept ?? 0) + demote.size;
+      return rows.map((row) => demote.has(row)
+        ? { ...row, override: JSON.stringify({ ...(row.override ? JSON.parse(row.override) as object : {}), is_active: false }) }
+        : row);
+    };
+    // Target rows a re-run leaves bound as they are (keepTargetBinding),
+    // counted so an operator sees them: a binding Cloud made after Control's
+    // (binding_conflict), or Control's newer key generation (generation_kept).
+    const countKeptBindings = async (
+      tx: SqlExecutor, table: ImportTable, keep: { when: string; generation?: string }, rows: PreparedRow[],
+    ) => {
+      const generation = keep.generation && write[table]!.includes(keep.generation) ? keep.generation : null;
+      const current = new Map((await tx.query<{ key: string; bound: string | null; generation: number | null }>(
+        `SELECT id::text AS key, ${quote(keep.when)}::text AS bound, ${generation ? `${quote(generation)}::int` : "NULL::int"} AS generation
+           FROM public.${quote(TARGETS[table].table)} WHERE id::text = ANY($1::text[])`,
+        [rows.map((row) => row.key)],
+      )).rows.map((row) => [row.key, row]));
+      for (const row of rows) {
+        const target = current.get(row.key);
+        if (!target?.bound) continue;
+        const incoming = JSON.parse(row.row) as Record<string, unknown>;
+        const bound = incoming[keep.when];
+        if (bound !== null && bound !== undefined && String(bound) !== target.bound) {
+          report.warnings[`${table}_binding_conflict`] = (report.warnings[`${table}_binding_conflict`] ?? 0) + 1;
+        } else if (bound !== null && bound !== undefined && generation && target.generation !== null
+          && Number(incoming[generation]) < target.generation) {
+          report.warnings[`${table}_generation_kept`] = (report.warnings[`${table}_generation_kept`] ?? 0) + 1;
+        }
       }
     };
     const runOrg = async (tx: SqlExecutor, org: string) => {
       // The target ledger is the only record of what earlier runs wrote.
       const ledger = await tx.query<{ table_name: string; row_key: string }>(
-        `SELECT table_name, row_key FROM public.${IMPORT_LEDGER_TABLE} WHERE organization_id = $1 FOR UPDATE`,
-        [org],
+        // Only the importer's own tables: the credential copier keeps its
+        // markers here too (copier_login), and they must not make an org
+        // look imported.
+        `SELECT table_name, row_key FROM public.${IMPORT_LEDGER_TABLE}
+          WHERE organization_id = $1 AND table_name = ANY($2::text[]) FOR UPDATE`,
+        [org, [...ORG_TABLES]],
       );
       if (ledger.rows.length === 0) {
         // Never imported. An existing org with this id is Control's own:
@@ -619,6 +847,22 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
           [org, batch.map(([table]) => table), batch.map(([, key]) => key), MAPPING_REVISION],
         );
       }
+      // Which of this org's workspaces this run wrote unbound (see
+      // UNBOUND_WORKSPACE_MARKER): exactly the current set, every run.
+      const written = new Set(keys.workspaces ?? []);
+      const unbound = prepared.workspaces
+        .filter((row) => row.org === org && written.has(row.key) && (JSON.parse(row.row) as { relaycast_workspace_id?: unknown }).relaycast_workspace_id == null)
+        .map((row) => row.key);
+      await tx.query(
+        `DELETE FROM public.${IMPORT_LEDGER_TABLE} WHERE organization_id = $1 AND table_name = $2 AND NOT (row_key = ANY($3::text[]))`,
+        [org, UNBOUND_WORKSPACE_MARKER, unbound],
+      );
+      await tx.query(
+        `INSERT INTO public.${IMPORT_LEDGER_TABLE} (organization_id, table_name, row_key, mapping_revision)
+         SELECT $1, $2, k, $4 FROM unnest($3::text[]) AS u(k)
+         ON CONFLICT (organization_id, table_name, row_key) DO UPDATE SET mapping_revision = EXCLUDED.mapping_revision`,
+        [org, UNBOUND_WORKSPACE_MARKER, unbound, MAPPING_REVISION],
+      );
     };
     const body = async (unit: (run: (tx: SqlExecutor) => Promise<void>) => Promise<void>) => {
       for (const batch of chunks(prepared.users, batchSize)) {

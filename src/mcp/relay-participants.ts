@@ -678,10 +678,10 @@ function createRelayService(context: McpContext) {
     if (!found || found.name !== as || !found.token) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
     // agentFor resolves current custody. The recipient was resolved using this
     // request's admitted route: never mix it with a newly rebound workspace.
-    const route = (await database.query<{ relaycast_workspace_id: string; relaycast_api_key_ciphertext: string }>(
+    const route = (await database.query<{ relaycast_workspace_id: string | null; relaycast_api_key_ciphertext: string | null }>(
       "SELECT relaycast_workspace_id,relaycast_api_key_ciphertext FROM workspaces WHERE id=$1 AND organization_id=$2",
       [workspaceId,organizationId])).rows[0];
-    if (!route || route.relaycast_workspace_id !== relayWorkspaceId ||
+    if (!route || !route.relaycast_api_key_ciphertext || route.relaycast_workspace_id !== relayWorkspaceId ||
         decryptSecret(route.relaycast_api_key_ciphertext,keyring) !== key) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
     return { name: found.name, token: found.token, capy: true, ...(grant ? { capyGrant:true } : {}) };
   }
