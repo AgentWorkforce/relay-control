@@ -19,6 +19,7 @@ import {
   MAPPING_REVISION,
   IMPORT_LEDGER_TABLE,
   UNBOUND_WORKSPACE_MARKER,
+  SECRET_MARKER,
   ORG_TABLES,
   RECONCILED_TABLES,
   REQUIRED_MIGRATION,
@@ -223,13 +224,25 @@ function upsertSql(table: ImportTable, columns: string[], fill = "'{}'::jsonb"):
     ? `__t.${quote(keep.when)} IS NOT NULL AND (EXCLUDED.${quote(keep.when)} IS NULL OR EXCLUDED.${quote(keep.when)} <> __t.${quote(keep.when)}${
       keep.generation && columns.includes(keep.generation) ? ` OR EXCLUDED.${quote(keep.generation)} < __t.${quote(keep.generation)}` : ""})`
     : "";
+  // Control rotated the secret since the import last wrote it (SECRET_MARKER):
+  // keep Control's secret and the columns it rewrites with it.
+  const secret = spec.secret?.target;
+  const keepSecret = secret
+    ? `(__t.${quote(secret)} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM public.${IMPORT_LEDGER_TABLE} __l
+         WHERE __l.organization_id = $4::uuid AND __l.table_name = '${SECRET_MARKER}'
+           AND __l.row_key = '${spec.table}:' || __t.id::text || ':' || encode(sha256(convert_to(__t.${quote(secret)}, 'UTF8')), 'hex')))`
+    : "";
+  const secretOwned = secret ? [secret, ...(spec.secretGroup ?? [])] : [];
   const assigned = columns
     .filter((column) => !spec.primaryKey.includes(column) && !(spec.insertOnly ?? []).includes(column))
-    .map((column) => [column, keep?.columns.includes(column)
-      ? `CASE WHEN ${keepWhen} THEN __t.${quote(column)} ELSE EXCLUDED.${quote(column)} END`
-      : (spec.monotonic ?? []).includes(column)
-        ? `GREATEST(__t.${quote(column)}, EXCLUDED.${quote(column)})`
-        : `EXCLUDED.${quote(column)}`] as const);
+    .map((column) => {
+      const incoming = keep?.columns.includes(column)
+        ? `CASE WHEN ${keepWhen} THEN __t.${quote(column)} ELSE EXCLUDED.${quote(column)} END`
+        : (spec.monotonic ?? []).includes(column)
+          ? `GREATEST(__t.${quote(column)}, EXCLUDED.${quote(column)})`
+          : `EXCLUDED.${quote(column)}`;
+      return [column, secretOwned.includes(column) ? `CASE WHEN ${keepSecret} THEN __t.${quote(column)} ELSE ${incoming} END` : incoming] as const;
+    });
   const updates = assigned.map(([column, value]) => `${quote(column)} = ${value}`);
   // No same-value UPDATE: a re-run rewrites a row only when a value differs,
   // so unchanged rows keep their versions (xmin) and convergence checkpoints
@@ -609,9 +622,43 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       if (keep) await countKeptBindings(tx, table, keep, rows);
       if (table === "coding_agent_credentials") rows = await keepActiveCredential(tx, rows);
       const sql = upsertSql(table, write[table], fills[table]);
+      const secret = TARGETS[table].secret?.target;
+      const org = rows[0]!.org;
       for (const batch of chunks(rows, batchSize)) {
-        await tx.query(sql, [batch.map((row) => row.row), batch.map((row) => row.secret), batch.map((row) => row.override ?? null)]);
+        const params: unknown[] = [batch.map((row) => row.row), batch.map((row) => row.secret), batch.map((row) => row.override ?? null)];
+        if (secret) params.push(org);
+        await tx.query(sql, params);
+        if (secret && org) await recordSecrets(tx, table, secret, org, batch);
       }
+    };
+    // After the upsert: a row now holding the ciphertext this run sent was
+    // written by the import, so its marker moves to that ciphertext; a row
+    // holding anything else kept Control's secret (counted).
+    const recordSecrets = async (tx: SqlExecutor, table: ImportTable, secret: string, org: string, rows: PreparedRow[]) => {
+      const relation = TARGETS[table].table;
+      const stored = new Map((await tx.query<{ id: string; value: string | null; digest: string | null }>(
+        `SELECT id::text AS id, ${quote(secret)} AS value, encode(sha256(convert_to(${quote(secret)}, 'UTF8')), 'hex') AS digest
+           FROM public.${quote(relation)} WHERE id::text = ANY($1::text[])`,
+        [rows.map((row) => row.key)])).rows.map((row) => [row.id, row]));
+      const written: Array<[string, string]> = [];
+      for (const row of rows) {
+        const now = stored.get(row.key);
+        if (!now?.value) continue;
+        if (row.secret !== null && now.value === row.secret) written.push([row.key, `${relation}:${row.key}:${now.digest}`]);
+        else report.warnings[`${table}_secret_kept`] = (report.warnings[`${table}_secret_kept`] ?? 0) + 1;
+      }
+      if (!written.length) return;
+      await tx.query(
+        `DELETE FROM public.${IMPORT_LEDGER_TABLE} l USING unnest($3::text[], $4::text[]) AS u(id, k)
+          WHERE l.organization_id = $1::uuid AND l.table_name = $2 AND l.row_key LIKE $5 || ':' || u.id || ':%' AND l.row_key <> u.k`,
+        [org, SECRET_MARKER, written.map(([id]) => id), written.map(([, key]) => key), relation],
+      );
+      await tx.query(
+        `INSERT INTO public.${IMPORT_LEDGER_TABLE} (organization_id, table_name, row_key, mapping_revision)
+         SELECT $1::uuid, $2, k, $4 FROM unnest($3::text[]) AS u(k)
+         ON CONFLICT (organization_id, table_name, row_key) DO UPDATE SET mapping_revision = EXCLUDED.mapping_revision`,
+        [org, SECRET_MARKER, written.map(([, key]) => key), MAPPING_REVISION],
+      );
     };
     // A credential new to Control enters inactive when its (workspace,
     // provider) already has an active row on the target (a copied or native

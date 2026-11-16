@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import test from "node:test";
-import { decryptSecret, type EncryptionKeyring } from "../src/crypto.js";
+import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../src/crypto.js";
 import { copyFile, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -186,7 +186,8 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
     .map(async (table) => [table, await count(target, TARGETS[table].table)] as const)));
   const before = await counts();
   // The target ledger holds every written key, per org, beside the rows.
-  const ledgerRows = (await target.query<{ n: number }>("SELECT count(*)::int AS n FROM cloud_import_ledger")).rows[0]!.n;
+  const ledgerRows = (await target.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM cloud_import_ledger WHERE table_name = ANY($1::text[])", [SOURCE_TABLES.filter((t) => t !== "users")])).rows[0]!.n;
   assert.equal(ledgerRows, SOURCE_TABLES.filter((t) => t !== "users").reduce((n, t) => n + applied.tables[t].imported, 0));
   const rerun = await runImport(deps, scope, "apply");
   assert.equal(rerun.ok, true);
@@ -223,7 +224,8 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   await target.query("DELETE FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [ORG_B, id(6)]);
   const finalReport = delta;
   // The ledger shrank by exactly the reconciled rows.
-  assert.equal((await target.query<{ n: number }>("SELECT count(*)::int AS n FROM cloud_import_ledger")).rows[0]!.n,
+  assert.equal((await target.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM cloud_import_ledger WHERE table_name = ANY($1::text[])", [SOURCE_TABLES.filter((t) => t !== "users")])).rows[0]!.n,
     SOURCE_TABLES.filter((t) => t !== "users").reduce((n, t) => n + delta.tables[t].imported, 0));
 
   // The verifier projections agree row for row with what was imported.
@@ -461,6 +463,64 @@ test("cloud import: a binding Control holds wins over a later Cloud binding and 
   assert.deepEqual(await pair(id(0x201)), a1, "a generation never goes backwards");
   assert.equal(again.warnings.workspaces_binding_conflict, 1);
   assert.equal(again.warnings.workspaces_generation_kept, 1);
+});
+
+test("cloud import: a re-run never replaces a secret Control rotated since the import", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  const deps = { source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY };
+  assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
+  // Every secret column the identity upsert writes, with the columns Control
+  // rewrites alongside it.
+  const cases = [
+    { key: "workspaces", table: "workspaces", column: "relaycast_api_key_ciphertext", also: "" },
+    { key: "person_identities", table: "person_identities", column: "token_ciphertext", also: "" },
+    { key: "hosted_relay_participants", table: "hosted_relay_participants", column: "token_ciphertext", also: ", updated_at = now()" },
+    { key: "desktop_relay_identities", table: "desktop_relay_identities", column: "token_ciphertext", also: ", updated_at = now()" },
+    { key: "github_app_connections", table: "integration_connections", column: "credentials_ciphertext", also: ", token_type = 'control-refreshed', updated_at = now()" },
+  ] as const;
+  const rotated = new Map<string, { id: string; value: string; other: { id: string; value: string } | null }>();
+  for (const c of cases) {
+    const rows = (await target.query<{ id: string; value: string }>(
+      `SELECT id::text AS id, ${c.column} AS value FROM ${c.table} WHERE ${c.column} IS NOT NULL ORDER BY id`)).rows;
+    assert.ok(rows.length > 0, `${c.table} has an imported secret`);
+    // Control rotates the first row's secret (a refresh, a re-issued token).
+    const value = encryptSecret(`control-rotated-${c.table}`, KEYRING.active);
+    await target.query(`UPDATE ${c.table} SET ${c.column} = $2${c.also} WHERE id::text = $1`, [rows[0]!.id, value]);
+    rotated.set(c.key, { id: rows[0]!.id, value, other: rows[1] ?? null });
+  }
+  const companion = async () => (await target.query<{ token_type: string | null; updated_at: string }>(
+    "SELECT token_type, updated_at::text AS updated_at FROM integration_connections WHERE id::text = $1", [rotated.get("github_app_connections")!.id])).rows[0]!;
+  const companionBefore = await companion();
+  assert.equal(companionBefore.token_type, "control-refreshed");
+
+  const again = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(again.ok, true, JSON.stringify(again.orgs));
+  for (const c of cases) {
+    const { id: rotatedId, value, other } = rotated.get(c.key)!;
+    const now = (await target.query<{ value: string }>(`SELECT ${c.column} AS value FROM ${c.table} WHERE id::text = $1`, [rotatedId])).rows[0]!.value;
+    assert.equal(now, value, `${c.table}: Control's rotated secret is kept`);
+    assert.equal(decryptSecret(now, KEYRING), `control-rotated-${c.table}`);
+    assert.ok((again.warnings[`${c.key}_secret_kept`] ?? 0) >= 1, `${c.key}: counted`);
+    if (other) {
+      // A secret Control never touched still follows Cloud (re-encrypted).
+      const otherNow = (await target.query<{ value: string }>(`SELECT ${c.column} AS value FROM ${c.table} WHERE id::text = $1`, [other.id])).rows[0]!.value;
+      assert.equal(decryptSecret(otherNow, KEYRING), decryptSecret(other.value, KEYRING), `${c.table}: untouched secret still imported`);
+    }
+  }
+  // The refresh's companion columns stay Control's too.
+  assert.deepEqual(await companion(), companionBefore, "token_type and updated_at stay Control's");
+  // A third run is stable: still kept, nothing reverted.
+  const third = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(third.ok, true);
+  for (const c of cases) {
+    const { id: rotatedId, value } = rotated.get(c.key)!;
+    assert.equal((await target.query<{ value: string }>(`SELECT ${c.column} AS value FROM ${c.table} WHERE id::text = $1`, [rotatedId])).rows[0]!.value, value);
+  }
 });
 
 test("cloud import: an existing Control user with an imported email under another id refuses the run", async (t) => {
