@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAmpTools } from "../amp/mcp-tools.js";
 import { registerReplicasTools } from "../replicas/mcp-tools.js";
+import { registerWebhookInboxTools } from "../events-shim/agent-link-tools.js";
 import { registerFactoryTools } from "../factory/mcp-tools.js";
 import { registerCapyPermitTools } from "../capy/mcp-permits.js";
 import { SELFHOST_API_VERSION } from "../config.js";
@@ -59,9 +60,10 @@ export function buildMcpServer(context: McpContext): McpServer {
   const amp = context.amp;
   const factory = context.factory;
   const replicas = context.replicas;
+  const webhookInbox = context.webhookInbox;
   const launch = Boolean(context.launch);
   const capyPermits = Boolean(context.oauth && context.capyPermits);
-  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines),
+  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), webhookInbox: Boolean(webhookInbox), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines),
     staffReadGrant: context.authMode === "staff_read_grant" }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),
     team_activity: () => registerTeamActivity(server, context),
@@ -73,6 +75,7 @@ export function buildMcpServer(context: McpContext): McpServer {
     ...(amp ? { amp: () => registerAmpTools(server, context, amp) } : {}),
     ...(factory ? { factory: () => registerFactoryTools(server, context, factory) } : {}),
     ...(replicas ? { replicas: () => registerReplicasTools(server, context, replicas) } : {}),
+    ...(webhookInbox ? { webhook_inbox: () => registerWebhookInboxTools(server, context, webhookInbox) } : {}),
     ...(capyPermits ? { capy_binding: () => registerCapyPermitTools(server,context) } : {}),
   });
   return server;

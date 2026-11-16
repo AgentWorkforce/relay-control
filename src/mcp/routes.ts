@@ -13,6 +13,7 @@ import { mcpOAuthActive } from "./oauth/config.js";
 import { secureEqual } from "../crypto.js";
 import type { AmpDeps } from "../amp/service.js";
 import type { ReplicasDeps } from "../replicas/service.js";
+import type { AgentLinkDeps } from "../events-shim/agent-link.js";
 import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
 import { relayLaunchCheck } from "./relay-launch-check.js";
@@ -132,6 +133,8 @@ export function createMcpHandler(input: {
   amp?: AmpDeps;
   /** Replicas dependencies, only when SELFHOST_REPLICAS_ENABLED is on. */
   replicas?: ReplicasDeps;
+  /** Webhook inbox links to bound agents, only when the events_shim feature is selected. */
+  webhookInbox?: AgentLinkDeps;
   /** Factory tools and resolver hook, only when SELFHOST_FACTORY_ENABLED is on. */
   factory?: FactoryMcpDeps;
   /** Internal native send resolver, never supplied to OAuth or managed calls. */
@@ -384,6 +387,7 @@ export function createMcpHandler(input: {
       },
       ...(!oauth && !staffGrant && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && !staffGrant && input.replicas ? { replicas: input.replicas } : {}),
+      ...(!oauth && !staffGrant && input.webhookInbox ? { webhookInbox: input.webhookInbox } : {}),
       ...(!oauth && !staffGrant && input.factory ? { factory: input.factory } : {}),
       ...(!oauth && !staffGrant && !desktopCall.required && desktopCall.provider === undefined && input.capy ? { capy: input.capy } : {}),
       ...(oauth && input.capyPermits ? { capyPermits: input.capyPermits } : {}),

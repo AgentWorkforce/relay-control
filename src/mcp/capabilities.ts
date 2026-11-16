@@ -24,6 +24,7 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       amp: Boolean(context.amp),
       factory: Boolean(context.factory),
       replicas: Boolean(context.replicas),
+      webhookInbox: Boolean(context.webhookInbox),
       launch: Boolean(context.launch),
       capyPermits: Boolean(context.oauth && context.capyPermits),
       customerSupport: Boolean(context.customerSupport),

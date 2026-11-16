@@ -45,6 +45,7 @@ export const RELAY_TOOLS = ["list_relay_agents", "get_relay_agent_card", "set_re
   "post_relay_channel", "read_relay_channel"] as const;
 const RELAY_SPAWN_TOOLS = ["list_relay_spawn_targets", "spawn_relay_agent", "get_relay_spawn_status", "release_relay_agent"] as const;
 const AMP_TOOLS = ["list_amp_threads", "bind_amp_thread", "unbind_amp_thread"] as const;
+const WEBHOOK_INBOX_TOOLS = ["link_webhook_inbox", "unlink_webhook_inbox"] as const;
 const FACTORY_TOOLS = ["list_factory_sessions", "bind_factory_session", "unbind_factory_session"] as const;
 const REPLICAS_TOOLS = ["list_replicas_environments", "spawn_replica", "get_replica_spawn", "recover_replica_spawn",
   "bind_replica", "release_replica"] as const;
@@ -63,7 +64,7 @@ const CONNECT_TOOLS = ["create_connect", "host_connect_agent", "join_connect", "
 export const CAPABILITY_DISCOVERY_TOOL = "describe_capabilities";
 
 export type ToolGroupId =
-  | "shared_session_reads" | "team_activity" | "relay_messaging" | "hosted_launch" | "replicas" | "amp" | "factory" | "capy_binding"
+  | "shared_session_reads" | "team_activity" | "relay_messaging" | "hosted_launch" | "replicas" | "amp" | "factory" | "webhook_inbox" | "capy_binding"
   | "customer_support" | "capy_launch" | "connect" | "events" | "grok_routines" | "relay_inbox_app" | "screens" | "events_settings" | "capability_discovery";
 
 type GroupDefinition = {
@@ -83,6 +84,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
   amp: { title: "Amp threads", tools: AMP_TOOLS },
   factory: { title: "Factory Droid sessions", tools: FACTORY_TOOLS },
   replicas: { title: "Replicas agents", tools: REPLICAS_TOOLS },
+  webhook_inbox: { title: "Webhook inboxes for bound agents", tools: WEBHOOK_INBOX_TOOLS },
   capy_binding: { title: "Capy thread binding", tools: CAPY_BINDING_TOOLS },
   capy_launch: { title: "Capy thread launches", tools: CAPY_SPAWN_TOOLS },
   connect: { title: "Relay Connect rooms", tools: CONNECT_TOOLS },
@@ -97,7 +99,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; staffReadGrant?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; staffReadGrant?: boolean } = {}): ToolPlanEntry[] {
   // A staff read grant (docs/staff-read-grants.md) reaches the shared-session
   // reads and capability discovery only, whatever else the server enables.
   if (options.staffReadGrant) {
@@ -113,6 +115,8 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; repl
   if (options.factory) groups.push("factory");
   // Replicas tools exist only when SELFHOST_REPLICAS_ENABLED is on.
   if (options.replicas) groups.push("replicas");
+  // Webhook inbox links exist only while the events_shim feature is selected.
+  if (options.webhookInbox) groups.push("webhook_inbox");
   if (options.capyPermits) groups.push("capy_binding");
   if (options.grokRoutines) groups.push("grok_routines");
   groups.push("capability_discovery");
@@ -183,6 +187,7 @@ export function describeCapabilities(input: {
   amp?: boolean;
   factory?: boolean;
   replicas?: boolean;
+  webhookInbox?: boolean;
   launch?: boolean;
   capyPermits?: boolean;
   customerSupport?: boolean;
@@ -191,7 +196,7 @@ export function describeCapabilities(input: {
 }): CapabilityReport {
   const launchRole = input.role === "owner" || input.role === "admin";
   const canLaunch = Boolean(input.launch) && launchRole;
-  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, replicas: input.replicas, launch: input.launch,
+  const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, replicas: input.replicas, webhookInbox: input.webhookInbox, launch: input.launch,
     capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines,
     staffReadGrant: input.authMode === "staff_read_grant" })
     .map(item => [item.group, item]));
@@ -223,6 +228,18 @@ export function describeCapabilities(input: {
         reason: "Only current workspace owners and admins with a person connection can manage Replicas.",
         how_to_enable: "Ask a workspace owner to make you an owner or admin." };
     }
+    if (item && id === "webhook_inbox" && !launchRole) {
+      return { ...base, status: "restricted", tools: [...item.tools],
+        reason: "Only current workspace owners and admins with a person connection can link webhook inboxes.",
+        how_to_enable: "Ask a workspace owner to make you an owner or admin." };
+    }
+    if (id === "webhook_inbox" && !item) return { ...base, status: "unavailable", tools: [...definition.tools],
+      reason: input.authMode === "oauth"
+        ? "Webhook inbox links need a person connection; this OAuth connection acts only as its approved agent."
+        : "Webhook inboxes are not enabled on this self-hosted installation.",
+      how_to_enable: input.authMode === "oauth"
+        ? "Use your own Agent Relay sign-in (a person connection) for these tools."
+        : "An operator adds events_shim to SELFHOST_FEATURES (chart selectedFeatures)." };
     if (item) return { ...base, status: "available", tools: [...item.tools], ...(id === "customer_support"
       ? { call_requirements: "Available to all signed-in customers. Current credentials and workspace membership are checked before sending and before returning an answer." } : {}) };
     if (id === "grok_routines") return { ...base, status: "unavailable", tools: [...definition.tools],

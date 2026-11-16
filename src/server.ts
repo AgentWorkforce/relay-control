@@ -30,6 +30,7 @@ import { CapyCleanup,capyCleanupFetch } from "./capy/cleanup.js";
 import { FlowsWorkspaceDeletions } from "./flows-workspace-delete.js";
 import { PostgresEventsShimStore } from "./events-shim/store.js";
 import { EventsShimWakeSweeper } from "./events-shim/sweeper.js";
+import { agentDmFetch, releaseOrphanedAgentLinks, type AgentLinkDeps } from "./events-shim/agent-link.js";
 import { createCapyRuntime } from "./capy/runtime.js";
 import { buildProviderProbes } from "./providers/probes.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
@@ -150,9 +151,20 @@ const flowsWorkspaceDeletions = config.flowsWorkspaceDelete
     })
   : null;
 // Events shim: recover webhook wakes a Relaycast outage left pending. Off with the feature.
-const eventsShimSweeper = features.events_shim
-  ? new EventsShimWakeSweeper({
+// Agent links (docs/events-shim.md): their forwards become relay DMs, and deleted inboxes' senders are released.
+const eventsShimAgentLinks: AgentLinkDeps | null = features.events_shim
+  ? {
+      database,
+      keyring: config.encryptionKeyring,
+      relaycast: createRelaycastClient({ internalOrigin: config.relaycastUrl }),
       store: new PostgresEventsShimStore(database, config.encryptionKeyring),
+    }
+  : null;
+const eventsShimSweeper = eventsShimAgentLinks
+  ? new EventsShimWakeSweeper({
+      store: eventsShimAgentLinks.store,
+      fetchImpl: agentDmFetch(eventsShimAgentLinks),
+      releaseOrphans: () => releaseOrphanedAgentLinks(eventsShimAgentLinks),
       log: (event) => console.warn("[events-shim] wake sweep deferred", event),
     })
   : null;

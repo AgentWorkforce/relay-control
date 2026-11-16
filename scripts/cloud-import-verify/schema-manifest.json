@@ -72,7 +72,8 @@
     {"name":"0067_replica_environment_policies.sql","sha256":"94234299d57c6e983c4c8f148e934406804fe4bb152db610621fbdcbe31cabac"},
     {"name":"0068_user_signup_source.sql","sha256":"aed4f6c0aee5aecbc8fca128219b4e6e68e7702c4aff04bf1d5a79cb17cc0224"},
     {"name":"0069_replica_tombstone_retention.sql","sha256":"680c7bad610a70bc98caf8cdf6ce8e4ecb5f3667a0e5513f098ac47e755fe2a6"},
-    {"name":"0070_replica_failure_paths.sql","sha256":"1f05ac223c07d9a3f37d83d9eeffa4ce295abce0efe04f0460bd139d96cc9271"}
+    {"name":"0070_replica_failure_paths.sql","sha256":"1f05ac223c07d9a3f37d83d9eeffa4ce295abce0efe04f0460bd139d96cc9271"},
+    {"name":"0071_events_shim_agent_links.sql","sha256":"10c1a662c437801f2724a4ac63681dc0eed1c418a19c2117996227af18f695e3"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -379,6 +380,21 @@
     {"kind":"column","name":"public.email_login_tokens.invite_token_hash","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":4,"type":"text"}},
     {"kind":"column","name":"public.email_login_tokens.next_path","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":5,"type":"text"}},
     {"kind":"column","name":"public.email_login_tokens.token_hash","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_agent_links.agent_kind","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":7,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_agent_links.agent_name","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_agent_links.agent_remote_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":10,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_agent_links.binding_generation","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":9,"type":"integer"}},
+    {"kind":"column","name":"public.events_shim_agent_links.binding_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":8,"type":"uuid"}},
+    {"kind":"column","name":"public.events_shim_agent_links.id","definition":{"collation":null,"default":"shim_id","generated":"s","identity":"","not_null":true,"position":2,"type":"uuid"}},
+    {"kind":"column","name":"public.events_shim_agent_links.linked_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":15,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.events_shim_agent_links.relaycast_workspace_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_agent_links.secret_hash","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":14,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_agent_links.sender_name","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":11,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_agent_links.sender_remote_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":12,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_agent_links.sender_token_ciphertext","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":13,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_agent_links.shim_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
+    {"kind":"column","name":"public.events_shim_agent_links.user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"uuid"}},
+    {"kind":"column","name":"public.events_shim_agent_links.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"uuid"}},
     {"kind":"column","name":"public.events_shim_events.body","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":9,"type":"text"}},
     {"kind":"column","name":"public.events_shim_events.content_type","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":8,"type":"text"}},
     {"kind":"column","name":"public.events_shim_events.delivered_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":12,"type":"timestamp with time zone"}},
@@ -1337,6 +1353,9 @@
     {"kind":"constraint","name":"public.email_login_tokens.email_login_email_normalized","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((email = lower(email)))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.email_login_tokens.email_login_tokens_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.email_login_tokens.email_login_tokens_token_hash_key","definition":{"deferrable":false,"deferred":false,"definition":"UNIQUE (token_hash)","no_inherit":true,"triggers":[],"type":"u","validated":true}},
+    {"kind":"constraint","name":"public.events_shim_agent_links.events_shim_agent_links_agent_kind_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((agent_kind = ANY (ARRAY['capy'::text, 'replica'::text, 'amp'::text])))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
+    {"kind":"constraint","name":"public.events_shim_agent_links.events_shim_agent_links_id_key","definition":{"deferrable":false,"deferred":false,"definition":"UNIQUE (id)","no_inherit":true,"triggers":[],"type":"u","validated":true}},
+    {"kind":"constraint","name":"public.events_shim_agent_links.events_shim_agent_links_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (shim_id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.events_shim_events.events_shim_events_delivery_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((delivery = ANY (ARRAY['pending'::text, 'sending'::text, 'woken'::text, 'read'::text])))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.events_shim_events.events_shim_events_mode_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((mode = ANY (ARRAY['open'::text, 'github'::text, 'stripe'::text, 'linear'::text, 'bearer'::text])))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.events_shim_events.events_shim_events_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
@@ -1754,6 +1773,8 @@
     {"kind":"index","name":"public.email_login_tokens.email_login_expiry_idx","definition":{"definition":"CREATE INDEX email_login_expiry_idx ON public.email_login_tokens USING btree (expires_at) WHERE (consumed_at IS NULL)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.email_login_tokens.email_login_tokens_pkey","definition":{"definition":"CREATE UNIQUE INDEX email_login_tokens_pkey ON public.email_login_tokens USING btree (id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.email_login_tokens.email_login_tokens_token_hash_key","definition":{"definition":"CREATE UNIQUE INDEX email_login_tokens_token_hash_key ON public.email_login_tokens USING btree (token_hash)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":true,"valid":true}},
+    {"kind":"index","name":"public.events_shim_agent_links.events_shim_agent_links_id_key","definition":{"definition":"CREATE UNIQUE INDEX events_shim_agent_links_id_key ON public.events_shim_agent_links USING btree (id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":true,"valid":true}},
+    {"kind":"index","name":"public.events_shim_agent_links.events_shim_agent_links_pkey","definition":{"definition":"CREATE UNIQUE INDEX events_shim_agent_links_pkey ON public.events_shim_agent_links USING btree (shim_id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.events_shim_events.events_shim_events_delivery","definition":{"definition":"CREATE INDEX events_shim_events_delivery ON public.events_shim_events USING btree (shim_id, delivery, seq)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.events_shim_events.events_shim_events_pkey","definition":{"definition":"CREATE UNIQUE INDEX events_shim_events_pkey ON public.events_shim_events USING btree (id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.events_shim_events.events_shim_events_shim_id_seq_key","definition":{"definition":"CREATE UNIQUE INDEX events_shim_events_shim_id_seq_key ON public.events_shim_events USING btree (shim_id, seq)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":true,"valid":true}},
@@ -1971,6 +1992,7 @@
     {"kind":"table","name":"public.desktop_relay_session_bindings","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.device_authorizations","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.email_login_tokens","definition":{"force_row_security":false,"kind":"r","row_security":false}},
+    {"kind":"table","name":"public.events_shim_agent_links","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.events_shim_events","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.events_shim_idempotency_keys","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.events_shim_posts","definition":{"force_row_security":false,"kind":"r","row_security":false}},
@@ -2053,5 +2075,5 @@
   "optional":{
 
   },
-  "sha256":"29650657f52eafe7cacaa8c957baa8800da97364092c26f041c08495cbf783c1"
+  "sha256":"8b5ab42dbf5032053ffeded356e64d2712630394931f07d892af6aeadff94a89"
 }
