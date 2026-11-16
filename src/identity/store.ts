@@ -13,6 +13,7 @@ import {
   type TenancyConfig,
 } from "../tenancy.js";
 import type { RelaycastProvisioner } from "./bootstrap.js";
+import type { SignupSource } from "./signup-source.js";
 
 export type Role = "owner" | "admin" | "member";
 const ROLE_RANK: Record<Role, number> = { member: 0, admin: 1, owner: 2 };
@@ -103,6 +104,11 @@ export type SignInMethod = "oidc" | "microsoft" | "email" | "password";
 
 type SignInInput = {
   /**
+   * Where this account is being created (users.signup_source, 0068), when the
+   * sign-in names it. Written only when the user row is created.
+   */
+  signupSource?: SignupSource | null;
+  /**
    * Runs inside the transaction that issues the session, after the user row
    * exists; throwing rolls the whole sign-in back (password set-up uses it
    * to spend its token and write the credential atomically).
@@ -125,6 +131,7 @@ type SignInInput = {
 /** What one sign-in has learned and changed so far (single transaction). */
 type SignInContext = {
   email: string;
+  signupSource: SignupSource | null;
   name: string | null;
   inviteTokenHash: string | null;
   method: SignInMethod;
@@ -140,6 +147,18 @@ type SignInContext = {
   lastJoined: string | null;
   role(organizationId: string): Role | null;
 };
+
+/**
+ * `remove` throws so the bootstrap retry loop can retry; these callers must
+ * not mask the original error or fail a completed sign-in over a cleanup.
+ */
+async function releaseUnused(provisioner: RelaycastProvisioner, id: string): Promise<void> {
+  try {
+    await provisioner.remove(id);
+  } catch {
+    /* best effort: the workspace stays orphaned, reconciled later */
+  }
+}
 
 export class IdentityStore {
   constructor(
@@ -303,7 +322,7 @@ export class IdentityStore {
         return created;
       });
     } catch (error) {
-      if (!bodyCompleted) await provisioner.remove(relaycast.id);
+      if (!bodyCompleted) await releaseUnused(provisioner, relaycast.id);
       else await this.reconcileUnknownCommit(provisioner, relaycast.id, error);
       throw error;
     }
@@ -332,7 +351,7 @@ export class IdentityStore {
     error: unknown,
   ): Promise<void> {
     if (isDefiniteAbort(error)) {
-      await provisioner.remove(relaycastWorkspaceId);
+      await releaseUnused(provisioner, relaycastWorkspaceId);
       return;
     }
     const reason = error instanceof Error ? error.message : String(error);
@@ -906,13 +925,13 @@ export class IdentityStore {
     } catch (error) {
       // Rolled back before COMMIT, or the body never bound the workspace:
       // it is unused. Otherwise release only on a proven abort.
-      if (!bodyCompleted || !inserted) await provisioner.remove(relaycast.id);
+      if (!bodyCompleted || !inserted) await releaseUnused(provisioner, relaycast.id);
       else await this.reconcileUnknownCommit(provisioner, relaycast.id, error);
       throw error;
     }
     // Another sign-in or invite resolved the person meanwhile: release the
     // unused Relaycast workspace.
-    if (!inserted) await provisioner.remove(relaycast.id);
+    if (!inserted) await releaseUnused(provisioner, relaycast.id);
     return signedIn;
   }
 
@@ -925,7 +944,7 @@ export class IdentityStore {
     // The email lock comes first (a new person has no user id yet), then the
     // user row and its lock; the caller rolls back when sign-in is refused.
     await lockIdentity(tx, email);
-    const user = await this.upsertUser(tx, email, input.name ?? email.slice(0, email.indexOf("@")), input.name !== null);
+    const user = await this.upsertUser(tx, email, input.name ?? email.slice(0, email.indexOf("@")), input.name !== null, input.signupSource ?? null);
     await lockUser(tx, user.id);
     const context = await this.signInContext(tx, email, input);
     if (input.inviteTokenHash) {
@@ -1003,6 +1022,7 @@ export class IdentityStore {
     }
     return {
       email,
+      signupSource: input.signupSource ?? null,
       name: input.name,
       inviteTokenHash: input.inviteTokenHash,
       method: input.method,
@@ -1023,7 +1043,7 @@ export class IdentityStore {
   private async acceptInvites(tx: SqlExecutor, context: SignInContext, organizationId: string): Promise<void> {
     const { email } = context;
     const accept = async (invite: InvitationRow) => {
-      const user = await this.upsertUser(tx, email, context.name ?? email.slice(0, email.indexOf("@")), context.name !== null);
+      const user = await this.upsertUser(tx, email, context.name ?? email.slice(0, email.indexOf("@")), context.name !== null, context.signupSource);
       context.userId = user.id;
       if (context.role(organizationId) === null) {
         await tx.query(
@@ -1100,7 +1120,7 @@ export class IdentityStore {
       [organizationId],
     );
     const role: Role = owners.rows[0]!.n === 0 ? "owner" : "admin";
-    const user = await this.upsertUser(tx, email, context.name ?? email.slice(0, email.indexOf("@")), context.name !== null);
+    const user = await this.upsertUser(tx, email, context.name ?? email.slice(0, email.indexOf("@")), context.name !== null, context.signupSource);
     context.userId = user.id;
     const current = context.role(organizationId);
     if (current === null || ROLE_RANK[current] < ROLE_RANK[role]) {
@@ -1144,7 +1164,7 @@ export class IdentityStore {
     // bootstrap pass copies it into organization_domains.
     if (!matches && this.tenancy.mode === "single") matches = this.options.autoJoinDomains.includes(domain);
     if (!matches) return;
-    const user = await this.upsertUser(tx, email, context.name ?? email.slice(0, email.indexOf("@")), context.name !== null);
+    const user = await this.upsertUser(tx, email, context.name ?? email.slice(0, email.indexOf("@")), context.name !== null, context.signupSource);
     context.userId = user.id;
     const inserted = await tx.query<{ role: Role }>(
       `INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1, $2, 'member')
@@ -1331,15 +1351,23 @@ export class IdentityStore {
     return result.rows[0] ?? null;
   }
 
-  private async upsertUser(tx: SqlExecutor, email: string, name: string, overwriteName: boolean): Promise<{ id: string }> {
+  private async upsertUser(
+    tx: SqlExecutor,
+    email: string,
+    name: string,
+    overwriteName: boolean,
+    signupSource: SignupSource | null = null,
+  ): Promise<{ id: string }> {
     const cleaned = cleanName(name) || email;
+    // signup_source is set only by the insert: a later sign-in through another
+    // path never rewrites where the account was created.
     const result = await tx.query<{ id: string }>(
-      `INSERT INTO users (id, email, name) VALUES ($1, $2, $3)
+      `INSERT INTO users (id, email, name, signup_source) VALUES ($1, $2, $3, $5)
        ON CONFLICT (email) DO UPDATE
          SET name = CASE WHEN $4::boolean THEN EXCLUDED.name ELSE users.name END,
              updated_at = now()
        RETURNING id`,
-      [randomUUID(), email, cleaned, overwriteName],
+      [randomUUID(), email, cleaned, overwriteName, signupSource],
     );
     return result.rows[0]!;
   }

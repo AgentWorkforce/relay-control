@@ -172,7 +172,8 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_DESKTOP_RELEASES_REPO` | Optional `owner/repository` of a public GitHub releases repo the downloads card shows when the signed Desktop feed has nothing. Unset: `GET /api/v1/desktop/releases` is 404. See [docs/desktop-feed.md](docs/desktop-feed.md#github-releases-source) |
 | `SELFHOST_FEATURES` | Comma list of optional components to serve: `flows`, `relayfile`, `chief`, `usage`, `launch`, `usage_people`, `events_shim`. Unset selects `usage,usage_people`; `""` selects nothing. Unselected routes answer 403 `feature_not_enabled` (`events_shim` routes answer 404). See [docs/features.md](docs/features.md) |
 | `SELFHOST_EVENTS_SHIM_RELAY_ORIGINS` | Optional comma list of https origins (no path) an events-shim inbox may forward wake posts to (`link_relay_wake`). Default: the `RELAYCAST_PUBLIC_URL` origin. Set it, e.g. to `https://cast.agentrelay.com`, when your agents' Agent Relay uses another Relaycast. See [docs/events-shim.md](docs/events-shim.md) |
-| `SELFHOST_RELAYGATE_PUBLIC_URL` | Optional public https origin of relaygate on a gate-only install (relaygate is the only public way into Relaycast), e.g. `https://cast.example.com` when that host routes to relaygate. Set: `GET /api/v1/workspaces/{id}/resolve` answers `urls.relaygateUrl` and omits `relaycastApiKey`, so no device receives the workspace-wide Relaycast key; desktops enrol at the gate with their Control token. Clients that need the key fail closed with "no key". The events-shim temporary workspace is not issued either. Unset: both are unchanged. See [docs/identity.md](docs/identity.md#gate-only-installs-relaygate) |
+| `SELFHOST_RELAYGATE_PUBLIC_URL` | Optional public https origin of relaygate on a gate-only install (relaygate is the only public way into Relaycast), e.g. `https://cast.example.com` when that host routes to relaygate. Set: `GET /api/v1/workspaces/{id}/resolve` answers `urls.relaygateUrl` and omits `relaycastApiKey`, so no device receives the workspace-wide Relaycast key; desktops enrol at the gate with their Control token. Clients that need the key fail closed with "no key". The events-shim temporary workspace is not issued either. It also withholds the person credential and relay-node enrol token (both `403 gate_only`; the person credential refusal is audited as `workspace.person_credential.withheld`). Unset: all are unchanged. See [docs/identity.md](docs/identity.md#gate-only-installs-relaygate) |
+| `SELFHOST_RELAY_NODE_SELF_MINT` | Gate-only installs only. Optional `true`/`false` (also `1`/`0`, `on`/`off`), default `true`: a member's signed-in Agent Relay Desktop may mint its own relay-node token at `POST /api/v1/workspaces/{id}/relay-node/self-tokens`. Off: those routes answer 403 `self_mint_disabled`; the admin mint is unchanged. Any other value refuses startup. See [docs/relay-node-credential.md](docs/relay-node-credential.md#member-self-mint) |
 | `SELFHOST_FACTORY_ENABLED` | Optional `true`/`false`, default `false`. Factory sessions: when off every Factory route is 404 and the worker does not start. See [docs/factory-sessions.md](docs/factory-sessions.md) |
 | `SELFHOST_FACTORY_API_URL` | Factory API origin, default `https://api.factory.ai`; absolute https only |
 | `SELFHOST_FACTORY_HISTORY_INTERVAL_MS` | Dormant Factory history loop cadence, default 300000, minimum 60000 |
@@ -196,6 +197,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_TELEMETRY_LEVEL` | Telemetry: `off` (default when unset), `errors`, or `full`. See [docs/telemetry.md](docs/telemetry.md) for this and the other `SELFHOST_TELEMETRY_*` settings |
 | `PORT` | Listener port, default `3000` |
 | `SELFHOST_AMP_ENABLED` | Optional `true` turns on Amp control (default `false`). Off: every Amp route answers 404 `{"error":"Not found"}` before authentication and no outbox worker runs. See [docs/amp.md](docs/amp.md) |
+| `SELFHOST_REPLICAS_ENABLED` | Optional `true` turns on the Replicas agent bridge (default `false`). Off: every Replicas bridge route answers 404 `{"error":"Not found"}` before authentication and no Replicas MCP tool is registered. See [docs/replicas.md](docs/replicas.md) |
 | `SELFHOST_MCP_OAUTH` | Optional, default on. Hosted MCP OAuth connectors; `off`, `false` or `0` disables them (`on`/`true`/`1` enables; other spellings fail start-up). A missing or partial signing-key set, invalid key material or an unreadable MCP OIDC `_FILE` leaves the server running (routes answer 501 `mcp_oauth_unavailable`); a value supplied both directly and via `_FILE` still fails start-up. See [docs/mcp-oauth.md](docs/mcp-oauth.md) |
 | `SELFHOST_MCP_EVENTS` | Optional, default off (`on`/`true`/`1` or `off`/`false`/`0`). Setting for the separate MCP Events module, which this server does not mount. See [docs/mcp-oauth.md](docs/mcp-oauth.md) |
 | `SELFHOST_MCP_EVENTS_PUMP` | Optional, default off, same spellings. Events pump setting; `on` requires `SELFHOST_MCP_EVENTS=on` or start-up fails |
@@ -289,6 +291,9 @@ The internal reader contract is `POST /internal/v1/session-read/sessions` or
 `/internal/v1/session-read/sessions/refresh`, authenticated by the dedicated
 secret. Control supplies `{ userId, orgId, workspaceId, audience, scopes:
 ["rth:read"], label? }`, with `refreshToken` instead of `label` on refresh.
+With `SESSION_READ_MINT_INCLUDE_ROLE=true` (default false) the body also
+carries `role: "owner" | "admin" | "member"`, the caller's live organization
+role ([docs/sessions-read-api.md](docs/sessions-read-api.md#read-credentials)).
 The reader returns the bearer response above without `baseUrl`; Control sets
 that from configuration. Keep these internal routes off public ingress.
 
@@ -528,6 +533,10 @@ workspace Relaycast key to a person credential with the `cli:auth` scope
 `403`; the bootstrap token gets `401`; another or departed tenant gets `404`.
 Each disclosure is audited as `workspace.relaycast_key.resolved` with the
 session id, never the key or token.
+On a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set) the key is never
+returned: the answer adds `urls.relaygateUrl`, omits `relaycastApiKey`, and is
+audited as `workspace.relaycast_key.withheld`. See
+[docs/identity.md](docs/identity.md#gate-only-installs-relaygate).
 
 ### Replacing a workspace's Relaycast key
 

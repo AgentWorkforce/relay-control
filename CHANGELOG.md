@@ -5,6 +5,91 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `users.signup_source` (migration 0068), where an account was
+  created: `teams`, `flows` or `desktop` (hosted Cloud's values; the
+  identity import's carry lands in a follow-up) or `mcp`. Control records `mcp` when a new person
+  signs in (OIDC or email link) on the way back to MCP OAuth consent
+  (`/cloud/oauth/authorize`, e.g. ChatGPT's Agent Relay app). Set once at
+  creation; a later sign-in never rewrites it. Password sign-ups have no
+  return path and stay unattributed. Nullable; existing accounts are NULL.
+
+- Added: Replicas agent bridge behind `SELFHOST_REPLICAS_ENABLED` (default
+  off). Owners and admins spawn, recover, bind and release Replicas agents
+  through six MCP tools or the `/api/v1/workspaces/{ws}/replicas` routes. Each
+  bound replica gets its own Relay identity, a scoped Agent Relay MCP server
+  and reply helper installed through the provider exec API, and signed
+  delivery of messages addressed to it. Release revokes the capability before
+  cleanup. Migration 0065 `replica_spawns`. See [Replicas](docs/replicas.md).
+- Added: staff read grants (migration 0061, table `staff_read_grants`). An
+  owner of the operator organization, on its domains when it has any, mints a
+  short-lived `sh_sr_` credential (scope `rth:read`, at most 90 days, no
+  refresh) for one customer workspace with
+  `POST /api/v1/workspaces/{id}/staff-read-grants`, lists grants with `GET`
+  and revokes with `DELETE .../{grantId}`; every non-staff caller gets `404`.
+  The credential works only as a bearer on `/api/v1/mcp/shared-sessions`,
+  reaches only the shared-session read tools and `describe_capabilities` of
+  that workspace, and re-checks revocation, expiry and the staff rule on every
+  request. Mint and revoke are audited (`staff_read_grant.minted`,
+  `staff_read_grant.revoked`); reads appear in the shared-session read audit
+  with `auth_mode` `staff_read_grant`. Introspection answers it as a
+  `desktop-user` pinned to the workspace. See
+  [Staff read grants](docs/staff-read-grants.md).
+- Changed: credential-refresh transactions (subscription-login auth files and
+  integration-connection OAuth tokens) now set
+  `SET LOCAL idle_in_transaction_session_timeout = '60s'` and
+  `SET LOCAL lock_timeout = '30s'`, so a provider token exchange is not killed
+  mid-refresh by a shorter server default and a concurrent refresher waits at
+  most 30 s for the per-credential lock.
+- Added: on gate-only installs a member's signed-in Agent Relay Desktop can
+  mint, list and revoke its own relay-node token at
+  `/api/v1/workspaces/{id}/relay-node/self-tokens` (also under
+  `/cloud/api/v1`). Only a redeemed Desktop session may call it
+  (`403 desktop_session_required`); `SELFHOST_RELAY_NODE_SELF_MINT=false`
+  turns it off (`403 self_mint_disabled`, default on). A node name belongs to
+  one person (`409 node_name_taken`), at most 3 live tokens per person
+  (`409 too_many_tokens`), 10 mints per hour (`429 rate_limited`), expiry at
+  most 90 days. Audited `relay_node.token.self_minted` and
+  `relay_node.token.self_revoked` with the Desktop host name. No migration.
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), Agent
+  Relay Desktop claims its relay node at `POST /api/v1/fleet/nodes/claim` with
+  `{workspaceId, nodeName}`: the proof is the node's enrolment through this
+  Control (`relay_node_credentials`, a relay-node token minted in the
+  workspace and bound to that name), and Relaycast is not asked. A
+  `nodeToken` is refused with 400; a name that never enrolled here is 403
+  `node_claim_refused`. Claim rules and release are unchanged. Unset, nothing
+  changes. See docs/relay-node-credential.md.
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), relay
+  nodes no longer hold their Relaycast node token. `POST /relay-node/v1/nodes`
+  stores it sealed (migration 0059 `relay_node_credentials`), answers the host
+  without it and presents it itself on re-enrolment; the node connects to the
+  new `GET /relay-node/v1/ws` bridge (Bearer relay-node token), which relays
+  the Relaycast node socket, attaches each launch's one-time credential to its
+  spawn invocation as `input.launch_credential`, and does not forward
+  `deliver` frames. Audited as `relay_node.socket.opened`,
+  `relay_node.socket.closed` and `relay_node.launch_credential.attached`.
+  Unset, nothing changes. See docs/relay-node-credential.md.
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set) every
+  Sessions read-token mint names the reader kind (`browser`, `device` or
+  `mcp`) from how the caller authenticated, so relaygate can tell a person's
+  own reads from agent reads on their behalf. Other installs send the same
+  mint body as before. See [Sessions read API](docs/sessions-read-api.md).
+- Added: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), every
+  agent launch through `spawn_relay_agent` mints a one-time `sh_lt_` launch
+  credential (10 minutes, bound to the workspace, node, agent name and
+  launching user; migration 0060 `relay_launch_credentials`). relaygate
+  introspects it at `POST /internal/v1/auth/introspect`, which answers
+  principal_type `relay_launch` with `node_name` and `scopes`
+  `["relay:agent:enrol"]` and burns it on the first active answer. It is
+  stored sealed and never sent to Relaycast; the relay-node socket bridge
+  delivers it to the node. Audited as `relay_launch.credential.issued` and
+  `relay_launch.credential.redeemed`. Unset, nothing changes. See
+  docs/identity.md.
+- Added: on gate-only installs, `spawn_relay_agent` first asks relaygate's
+  `POST /v1/check` (op `w` on `node:<workspace>/<node>`, content the exact
+  task) with a scopeless 60-second `sh_at_` minted for the launching person
+  and revoked right after. A denial refuses the launch with `relaygate_denied`
+  or `relaygate_classified`, no answer with retryable `relaygate_unavailable`,
+  before anything is journaled or sent. Unset, nothing changes.
 - Added: GitHub App installation credentials with `SELFHOST_GITHUB_APP_ID`
   and `SELFHOST_GITHUB_APP_PRIVATE_KEY_FILE`. Imported connections retain
   their installation IDs and mint replacement tokens without reconnecting.
@@ -15,7 +100,6 @@ assigned at release.
   See [GitHub App credentials](docs/github-app-connections.md).
 - Changed: connection edit versions include auth mode and installation ID;
   existing clients must refresh their opaque connection version once after upgrading.
-
 - Added: `SELFHOST_RELAYGATE_PUBLIC_URL` (unset by default) for gate-only
   installs, where relaygate is the only public way into Relaycast. When set,
   `GET /api/v1/workspaces/{id}/resolve` answers `urls.relaygateUrl` (the
@@ -28,7 +112,18 @@ assigned at release.
   and is unaffected. The events-shim temporary workspace
   (`POST /t/<mcp token>/workspace`) is also withheld (`404 not_found`), so
   `events-shim setup` on a machine not signed in here cannot start its own
-  core. Unset, both are byte-for-byte as before. See docs/identity.md
+  core. The person credential
+  (`POST /api/v1/workspaces/{id}/messaging/identity/credential`) answers
+  `403 gate_only` with both urls, registers no person identity on Relaycast
+  (the desktop enrols its own name at relaygate `/v1/register` with its device
+  token) and is audited as `workspace.person_credential.withheld`; the
+  relay-node broker's enrol (`POST /relay-node/v1/nodes`) keeps the node
+  token in Control (see the relay-node entry above), so no node token leaves. MCP join
+  and spawn are unchanged (their participant tokens stay server-side).
+  Person identities Control newly registers server-side (messaging
+  conversation sends, support reply notices) are named with the `control-`
+  prefix, which relaygate reserves, while existing identities keep their
+  names. Unset, all of these are byte-for-byte as before. See docs/identity.md
   ("Gate-only installs").
 - Added: `send_relay_message` results include `recipient_card` when the
   recipient has an agent card (`has_card`): `{ description, skills, version, updated_at, note }`, where `description` is null

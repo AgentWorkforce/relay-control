@@ -3,6 +3,7 @@ import { decryptSecret, encryptSecret, type EncryptionKeyring } from "../crypto.
 import type { Database, SqlExecutor } from "../database.js";
 import { recordAudit } from "../admin/audit.js";
 import { retireCapyBindingsInTx } from "../capy/lifecycle.js";
+import { revokeWorkspaceReplicas } from "../replicas/service.js";
 
 /** Connection checks ported from Cloud main 8865fe718, not generic API-key storage.
  * Fixed provider origins, no redirects, no provider bodies/errors in public replies.
@@ -80,11 +81,22 @@ async function providerJson(response: Response, signal: AbortSignal): Promise<un
   }
 }
 
+export type RemoteAgentConnectionOptions = {
+  /** SELFHOST_REPLICAS_ENABLED: Replicas connections can bind agents to Relay. */
+  replicasEnabled?: boolean;
+  /**
+   * Revokes and retires every Replicas binding before the key is deleted
+   * (the key is needed to sleep compute). Throws to keep the connection.
+   */
+  replicasCleanup?: (actor: ConnectionActor) => Promise<void>;
+};
+
 export class RemoteAgentConnections {
   constructor(
     readonly database: Database,
     readonly keyring: EncryptionKeyring,
     readonly fetchImpl: typeof fetch = fetch,
+    readonly options: RemoteAgentConnectionOptions = {},
   ) {}
 
   async list(workspaceId: string) {
@@ -96,7 +108,11 @@ export class RemoteAgentConnections {
       ...provider,
       connection: rows.find(row => row.provider === provider.id)
         ? view(rows.find(row => row.provider === provider.id)!) : null,
-      capabilities: { connectionManagement: true, relayBinding: false, historySync: false },
+      capabilities: {
+        connectionManagement: true,
+        relayBinding: provider.id === "replicas" && Boolean(this.options.replicasEnabled),
+        historySync: false,
+      },
     }));
   }
 
@@ -224,7 +240,10 @@ export class RemoteAgentConnections {
   }
 
   async disconnect(actor: ConnectionActor, provider: RemoteAgentId): Promise<void> {
+    if (provider === "replicas" && this.options.replicasCleanup) await this.options.replicasCleanup(actor);
     await this.authorized(actor, async tx => {
+      // A binding created after the cleanup above loses its capability with the key.
+      if (provider === "replicas") await revokeWorkspaceReplicas(tx, actor.workspaceId);
       if (provider === "capy") await retireCapyBindingsInTx(tx,{organizationId:actor.organizationId,workspaceId:actor.workspaceId},"capy_disconnected");
       await tx.query("DELETE FROM remote_agent_connections WHERE workspace_id=$1 AND provider=$2", [actor.workspaceId, provider]);
       await recordAudit(tx, { workspaceId: actor.workspaceId, organizationId: actor.organizationId,

@@ -72,7 +72,7 @@ export class CapyBindings {
 
   private async access(tx: SqlExecutor, actor: CapyActor, needKey = true): Promise<Access> {
     const found = (await tx.query<{
-      role: string; relaycast_workspace_id: string; relaycast_api_key_ciphertext: string;
+      role: string; relaycast_workspace_id: string | null; relaycast_api_key_ciphertext: string | null;
       key_ciphertext: string | null; created_by_user_id: string | null;
     }>(`SELECT m.role,w.relaycast_workspace_id,w.relaycast_api_key_ciphertext,c.key_ciphertext,c.created_by_user_id
       FROM workspaces w JOIN organization_memberships m ON m.organization_id=w.organization_id AND m.user_id=$3
@@ -80,6 +80,9 @@ export class CapyBindings {
       WHERE w.id=$1 AND w.organization_id=$2 FOR SHARE OF w,m`,
     [actor.workspaceId,actor.organizationId,actor.userId])).rows[0];
     if (!found || !["owner", "admin"].includes(found.role)) throw new CapyBindingError(403, "capy_forbidden");
+    if (!found.relaycast_workspace_id || !found.relaycast_api_key_ciphertext) {
+      throw new CapyBindingError(503, "relaycast_not_ready");
+    }
     if (needKey && !found.key_ciphertext) throw new CapyBindingError(409, "capy_not_connected");
     if (needKey && found.created_by_user_id !== actor.userId) throw new CapyBindingError(403, "capy_key_owner_required");
     return { key: needKey && found.key_ciphertext ? decryptSecret(found.key_ciphertext, this.deps.keyring) : "",

@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import test, { type TestContext } from "node:test";
 import { createApp } from "../src/app.js";
 import { createAdminModule } from "../src/admin/routes.js";
+import { decryptSecret } from "../src/crypto.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
@@ -40,7 +41,7 @@ async function deviceToken(origin: string, userId: string, workspaceId: string):
   return issued.body.access_token as string;
 }
 
-async function setup(t: TestContext) {
+async function setup(t: TestContext, options: { gate?: boolean } = {}) {
   // Fake Relaycast: records every call; `reply` picks the answer per call.
   const calls: RelaycastCall[] = [];
   let reply: (call: RelaycastCall) => Reply = () => ({ status: 200, body: { ok: true, data: {} } });
@@ -83,6 +84,7 @@ async function setup(t: TestContext) {
     dashboardUrl: `${origin}/dashboard/`,
     port: 0,
     host: "127.0.0.1",
+    ...(options.gate ? { relaygatePublicUrl: "https://gate.selfhosted.test" } : {}),
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
   const admin = createAdminModule({ config, database, keyring: KEYRING });
@@ -121,6 +123,7 @@ async function setup(t: TestContext) {
     origin,
     base,
     owner,
+    orgId: org.body.id as string,
     workspaceId,
     calls,
     stopRelaycast,
@@ -367,6 +370,8 @@ test("broker POST nodes enrolls only the token's own node and forwards node head
   assert.equal(call.headers["x-relaycast-node-token"], "rn_existing");
   assert.equal(call.headers["content-type"], "application/json");
   assert.equal(call.headers["x-other"], undefined);
+  // Not gate-only: the token goes back to the host and Control keeps nothing.
+  assert.equal((await ctx.database.query("SELECT 1 FROM relay_node_credentials")).rows.length, 0);
 
   // A 409 from Relaycast passes through.
   ctx.setReply(() => ({ status: 409, body: { ok: false, error: { code: "conflict" } } }));
@@ -378,6 +383,61 @@ test("broker POST nodes enrolls only the token's own node and forwards node head
   const before = ctx.calls.length;
   assert.equal((await ctx.broker("/relay-node/v1/nodes", node.accessToken, { method: "POST", body: "{" })).status, 400);
   assert.equal(ctx.calls.length, before);
+});
+
+test("gate-only: POST nodes keeps the node token sealed in Control and rotates it on re-enrolment", async (t) => {
+  const ctx = await setup(t, { gate: true });
+  const node = await ctx.mintNode("node-a");
+  const raw = JSON.stringify({ name: "node-a" });
+  const enrol = (headers: Record<string, string> = {}) => ctx.broker("/relay-node/v1/nodes", node.accessToken, {
+    method: "POST", body: raw, headers: { "content-type": "application/json", ...headers },
+  });
+  const stored = async () => (await ctx.database.query<Record<string, any>>(
+    "SELECT * FROM relay_node_credentials WHERE workspace_id = $1 AND node_name = 'node-a'", [ctx.workspaceId])).rows;
+
+  // A 2xx answer without a string token: 502, nothing stored.
+  ctx.setReply(() => ({ status: 201, body: { ok: true, data: { id: "n-1", name: "node-a" } } }));
+  const missing = await enrol();
+  assert.equal(missing.status, 502);
+  assert.equal(missing.body.error.code, "relaycast_unavailable");
+  assert.equal((await stored()).length, 0);
+
+  // First enrolment: the host's node-token header is ignored and the answer carries no token.
+  ctx.calls.length = 0;
+  ctx.setReply(() => ({ status: 201, body: { ok: true, data: { id: "n-1", name: "node-a", token: "nt_live_first" } } }));
+  const first = await enrol({ "idempotency-key": "idem-1", "x-relaycast-node-token": "nt_live_from_host" });
+  assert.equal(first.status, 201);
+  assert.deepEqual(first.body, { ok: true, data: { id: "n-1", name: "node-a" } });
+  assert(!first.raw.includes("nt_live_"));
+  assert.equal(first.headers.get("cache-control"), "no-store");
+  assert.equal(ctx.calls[0]!.headers["x-relaycast-node-token"], undefined);
+  assert.equal(ctx.calls[0]!.headers["idempotency-key"], "idem-1");
+  let rows = await stored();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.relaycast_node_id, "n-1");
+  assert.equal(rows[0]!.api_token_id, node.id);
+  assert.notEqual(rows[0]!.token_ciphertext, "nt_live_first");
+  assert(!String(rows[0]!.token_ciphertext).includes("nt_live_first"));
+  assert.equal(decryptSecret(rows[0]!.token_ciphertext, KEYRING), "nt_live_first");
+
+  // Re-enrolment: Control presents the stored token itself, never the host's, and rotates the row.
+  ctx.calls.length = 0;
+  ctx.setReply(() => ({ status: 200, body: { ok: true, data: { id: "n-2", name: "node-a", token: "nt_live_second" } } }));
+  const second = await enrol({ "x-relaycast-node-token": "nt_live_from_host" });
+  assert.equal(second.status, 200);
+  assert.deepEqual(second.body, { ok: true, data: { id: "n-2", name: "node-a" } });
+  assert.equal(ctx.calls[0]!.headers["x-relaycast-node-token"], "nt_live_first");
+  rows = await stored();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.relaycast_node_id, "n-2");
+  assert.equal(decryptSecret(rows[0]!.token_ciphertext, KEYRING), "nt_live_second");
+
+  // Non-2xx answers pass through and leave the row alone.
+  ctx.setReply(() => ({ status: 409, body: { ok: false, error: { code: "conflict" } } }));
+  const conflict = await enrol();
+  assert.equal(conflict.status, 409);
+  assert.deepEqual(conflict.body, { ok: false, error: { code: "conflict" } });
+  assert.equal(decryptSecret((await stored())[0]!.token_ciphertext, KEYRING), "nt_live_second");
 });
 
 test("broker refuses everything outside the allowlist with 403 scope_denied", async (t) => {
@@ -457,4 +517,76 @@ test("broker maps Relaycast failures: refused stored key and outages are 502, ot
   assert.equal(down.status, 502);
   assert.equal(down.body.error.code, "relaycast_unavailable");
   assert(!down.raw.includes(WORKSPACE_KEY));
+});
+
+// ------------------------------------------------------------ node claim
+
+test("gate-only: the Desktop claims an enrolled node by name, never with a node token or Relaycast", async (t) => {
+  const ctx = await setup(t, { gate: true });
+  const claim = (body: unknown, token = ctx.owner, method = "POST") =>
+    request(ctx.origin, "/cloud/api/v1/fleet/nodes/claim", { method, token, body });
+
+  // A node token is refused outright and never forwarded.
+  ctx.calls.length = 0;
+  const withToken = await claim({ workspaceId: ctx.workspaceId, nodeToken: "nt_live_desktop_token_abc" });
+  assert.equal(withToken.status, 400);
+  assert.equal(withToken.body.error, "invalid_request");
+  assert.match(withToken.body.message, /relaygate; send workspaceId and nodeName/);
+  assert(!withToken.raw.includes("nt_live_desktop_token_abc"));
+  for (const nodeName of [undefined, "", "bad name", 7, "x".repeat(201)]) {
+    const bad = await claim({ workspaceId: ctx.workspaceId, nodeName });
+    assert.equal(bad.status, 400, String(nodeName));
+    assert.equal(bad.body.message, "Send workspaceId and nodeName.");
+  }
+
+  // A name that never enrolled through this Control is refused.
+  const unknown = await claim({ workspaceId: ctx.workspaceId, nodeName: "node-a" });
+  assert.equal(unknown.status, 403);
+  assert.equal(unknown.body.error, "node_claim_refused");
+  assert.equal(unknown.body.message, "That node has not enrolled through this installation.");
+  assert.equal(ctx.calls.length, 0, "Relaycast is never asked");
+
+  // Enrol node-a through the broker; the claim then names it.
+  const node = await ctx.mintNode("node-a");
+  ctx.setReply(() => ({ status: 201, body: { ok: true, data: { id: "n-1", name: "node-a", token: "nt_live_sealed" } } }));
+  const enrolled = await ctx.broker("/relay-node/v1/nodes", node.accessToken, {
+    method: "POST", body: JSON.stringify({ name: "node-a" }), headers: { "content-type": "application/json" },
+  });
+  assert.equal(enrolled.status, 201);
+  ctx.calls.length = 0;
+  const first = await claim({ workspaceId: ctx.workspaceId, nodeName: "node-a" });
+  assert.equal(first.status, 200, first.raw);
+  assert.deepEqual(first.body, { nodeId: "n-1", claimed: true, owner: "you" });
+  assert(!first.raw.includes("nt_live_sealed"));
+  const again = await claim({ workspaceId: ctx.workspaceId, nodeName: "node-a" });
+  assert.deepEqual(again.body, { nodeId: "n-1", claimed: false, owner: "you" });
+
+  // Another member of the organization cannot take it (first claim wins).
+  const added = await request(ctx.origin, `/api/v1/organizations/${ctx.orgId}/memberships`, {
+    method: "POST", token: BOOTSTRAP, body: { email: "member@acme.test", name: "Member", role: "member" },
+  });
+  assert.equal(added.status, 200, added.raw);
+  const member = await deviceToken(ctx.origin, added.body.userId ?? added.body.user?.id, ctx.workspaceId);
+  const taken = await claim({ workspaceId: ctx.workspaceId, nodeName: "node-a" }, member);
+  assert.equal(taken.status, 409);
+  assert.equal(taken.body.error, "node_claim_refused");
+
+  // A row whose sealed token no longer opens still proves the enrolment.
+  await ctx.database.query("UPDATE relay_node_credentials SET token_ciphertext = 'unreadable'");
+  const released = await claim({ workspaceId: ctx.workspaceId, nodeId: "n-1" }, ctx.owner, "DELETE");
+  assert.deepEqual(released.body, { released: true });
+  const unsealable = await claim({ workspaceId: ctx.workspaceId, nodeName: "node-a" }, member);
+  assert.deepEqual(unsealable.body, { nodeId: "n-1", claimed: true, owner: "you" });
+  assert.equal(ctx.calls.length, 0, "the only Relaycast call was the enrolment");
+});
+
+test("not gate-only: the claim still requires a node token; nodeName alone is refused", async (t) => {
+  const ctx = await setup(t);
+  ctx.calls.length = 0;
+  const refused = await request(ctx.origin, "/cloud/api/v1/fleet/nodes/claim", {
+    method: "POST", token: ctx.owner, body: { workspaceId: ctx.workspaceId, nodeName: "node-a" },
+  });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.message, "Send workspaceId and the node's token (nt_live_... or ar_nd_...).");
+  assert.equal(ctx.calls.length, 0);
 });

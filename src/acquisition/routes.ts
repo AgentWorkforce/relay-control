@@ -150,7 +150,7 @@ async function resolveCaller(
   if (principal.pendingHandoff || principal.handoff || principal.userId !== result.sub) {
     throw notAuthorized();
   }
-  if (!await store.workspaceForUser(result.workspace, result.sub)) throw notAuthorized();
+  if (!await store.workspaceMembershipForUser(result.workspace, result.sub)) throw notAuthorized();
   return { kind: "desktop-user", userId: result.sub, organizationId: result.org, workspaceId: result.workspace };
 }
 
