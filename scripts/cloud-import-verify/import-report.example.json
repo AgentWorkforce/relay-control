@@ -47,15 +47,13 @@
       "ok": true,
       "detail": {
         "baseline": "control-main-b79cb5f",
-        "manifestSha256": "8a9af68db47188be01ed88b966cfb73fea01e18190b59f1b3b744654a93275a0",
-        "expectedSchemaSha256": "d6c22ca7c1cdaf9d08076cc348be075eb8e3f431c43fa0d4a82fce8b83df9ed6",
-        "actualSchemaSha256": "d6c22ca7c1cdaf9d08076cc348be075eb8e3f431c43fa0d4a82fce8b83df9ed6",
-        "profile": "main-plus-proposed-0061",
-        "optionalRelations": [
-          "staff_read_grants"
-        ],
-        "expectedObjects": 1842,
-        "actualObjects": 1842,
+        "manifestSha256": "72b678444d73be19b4440d82d891e42ced7ba70df36216485a1ed6e2b29ecbda",
+        "expectedSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
+        "actualSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
+        "profile": "main",
+        "optionalRelations": [],
+        "expectedObjects": 1843,
+        "actualObjects": 1843,
         "missing": [],
         "changed": [],
         "unexpectedCount": 0,
@@ -3089,6 +3087,15 @@
     },
     {
       "kind": "foreign_key",
+      "name": "public.staff_read_grants.staff_read_grant_workspace",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
       "name": "public.staff_read_grants.staff_read_grants_staff_organization_id_fkey",
       "ok": true,
       "detail": {
@@ -3099,15 +3106,6 @@
     {
       "kind": "foreign_key",
       "name": "public.staff_read_grants.staff_read_grants_staff_user_id_fkey",
-      "ok": true,
-      "detail": {
-        "validated": true,
-        "violations": 0
-      }
-    },
-    {
-      "kind": "foreign_key",
-      "name": "public.staff_read_grants.staff_read_grants_workspace_id_organization_id_fkey",
       "ok": true,
       "detail": {
         "validated": true,
@@ -3303,15 +3301,13 @@
   },
   "targetSchema": {
     "baseline": "control-main-b79cb5f",
-    "manifestSha256": "8a9af68db47188be01ed88b966cfb73fea01e18190b59f1b3b744654a93275a0",
-    "expectedSchemaSha256": "d6c22ca7c1cdaf9d08076cc348be075eb8e3f431c43fa0d4a82fce8b83df9ed6",
-    "actualSchemaSha256": "d6c22ca7c1cdaf9d08076cc348be075eb8e3f431c43fa0d4a82fce8b83df9ed6",
-    "profile": "main-plus-proposed-0061",
-    "optionalRelations": [
-      "staff_read_grants"
-    ],
-    "expectedObjects": 1842,
-    "actualObjects": 1842,
+    "manifestSha256": "72b678444d73be19b4440d82d891e42ced7ba70df36216485a1ed6e2b29ecbda",
+    "expectedSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
+    "actualSchemaSha256": "6d7494304a2010b9eb6f93c3d210d7af4898db72c2fd89b98cea5e8fba00b47f",
+    "profile": "main",
+    "optionalRelations": [],
+    "expectedObjects": 1843,
+    "actualObjects": 1843,
     "missing": [],
     "changed": [],
     "unexpectedCount": 0,

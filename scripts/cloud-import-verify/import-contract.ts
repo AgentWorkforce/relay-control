@@ -1,3 +1,4 @@
+import { accountCredentialExclusion,exclusionAccounting } from "./exclusions.js";
 import type { Client } from "pg";
 import { schemaFindings } from "./schema.js";
 import { normalizedScope,organizationCensus } from "./organization-scope.js";
@@ -111,9 +112,12 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
         ${table === "workspaces" ? "q.cloud_relay_workspace_id IS NOT NULL" : "true"} AS preserves_rw,
         ${table === "workspaces" ? "q.has_dashboard_url" : "false"} AS loses_history_route,
         ${table === "workspaces" ? "q.relayhistory_origin_raw" : "NULL::text"} AS history_origin_raw,
-        ${table === "workspaces" ? "q.relaycast_api_key_generation IS NOT NULL" : "false"} AS has_generation
+        ${table === "workspaces" ? "q.relaycast_api_key_generation IS NOT NULL" : "false"} AS has_generation,
+        ${table === "coding_agent_credentials" ? "q.model_provider" : "NULL::text"} AS credential_provider,
+        ${table === "coding_agent_credentials" ? "q.auth_type" : "NULL::text"} AS credential_auth_type
         FROM (${sourceQuery(table,scope)}) q`);
       const skipped:Record<string,number> = {};
+      const deliberateExclusions=exclusionAccounting();
       const dynamicKeys:string[] = [];
       const dynamicReasons:Record<string,string[]> = {};
       let imported = 0;
@@ -136,6 +140,8 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
         if (reason === null && table === "staff_read_grants" && !operatorOrg) reason = "no_operator_organization";
         if (reason === null && table === "coding_agent_credentials" && !relayManaged) reason = "target_lacks_relay_managed";
         if (reason !== null) {
+          if (table === "coding_agent_credentials") accountCredentialExclusion(deliberateExclusions,
+            {reason,provider:row.credential_provider,authType:row.credential_auth_type});
           skipped[reason] = (skipped[reason] ?? 0)+1;
           if (row.skip_reason === null) {
             if (dynamicKeys.length >= 10000) throw new Error("Excessive unresolved dynamic skips; repair source/keys before qualification");
@@ -159,6 +165,8 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
         }
       }}} finally {await s.query("CLOSE import_ledger_cursor");}
       exclusions.set(table,dynamicKeys); counts.set(table,imported);
+      if (table === "coding_agent_credentials") findings.push({kind:"credential_exclusions",name:"identity_metadata",
+        ok:deliberateExclusions.every((entry) => entry.unresolved === 0),detail:{classes:deliberateExclusions}});
       if (table === "workspaces") findings.push({kind:"identity",name:"all_rw_bindings_preserved",ok:missingRw === 0,detail:{missing:missingRw}});
       if (table === "workspaces") findings.push({kind:"continuity",name:"workspace_metadata_preserved",
         ok:historyLoss === 0 && metadataLoss === 0,detail:{historyRoutesDropped:historyLoss,optionalMetadataDropped:metadataLoss}});

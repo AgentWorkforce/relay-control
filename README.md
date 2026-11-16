@@ -292,6 +292,9 @@ The internal reader contract is `POST /internal/v1/session-read/sessions` or
 `/internal/v1/session-read/sessions/refresh`, authenticated by the dedicated
 secret. Control supplies `{ userId, orgId, workspaceId, audience, scopes:
 ["rth:read"], label? }`, with `refreshToken` instead of `label` on refresh.
+With `SESSION_READ_MINT_INCLUDE_ROLE=true` (default false) the body also
+carries `role: "owner" | "admin" | "member"`, the caller's live organization
+role ([docs/sessions-read-api.md](docs/sessions-read-api.md#read-credentials)).
 The reader returns the bearer response above without `baseUrl`; Control sets
 that from configuration. Keep these internal routes off public ingress.
 
@@ -531,6 +534,10 @@ workspace Relaycast key to a person credential with the `cli:auth` scope
 `403`; the bootstrap token gets `401`; another or departed tenant gets `404`.
 Each disclosure is audited as `workspace.relaycast_key.resolved` with the
 session id, never the key or token.
+On a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set) the key is never
+returned: the answer adds `urls.relaygateUrl`, omits `relaycastApiKey`, and is
+audited as `workspace.relaycast_key.withheld`. See
+[docs/identity.md](docs/identity.md#gate-only-installs-relaygate).
 
 ### Replacing a workspace's Relaycast key
 

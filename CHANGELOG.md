@@ -43,6 +43,13 @@ assigned at release.
   when the issuer cannot be read. Migration 0067 (`all_environments`
   defaults to true; `opted_out` per policy). See
   [Replicas](docs/replicas.md).
+- Added: `users.signup_source` (migration 0068), where an account was
+  created: `teams`, `flows` or `desktop` (hosted Cloud's values; the
+  identity import's carry lands in a follow-up) or `mcp`. Control records `mcp` when a new person
+  signs in (OIDC or email link) on the way back to MCP OAuth consent
+  (`/cloud/oauth/authorize`, e.g. ChatGPT's Agent Relay app). Set once at
+  creation; a later sign-in never rewrites it. Password sign-ups have no
+  return path and stay unattributed. Nullable; existing accounts are NULL.
 - Added: Replicas agent bridge behind `SELFHOST_REPLICAS_ENABLED` (default
   off). Owners and admins spawn, recover, bind and release Replicas agents
   through six MCP tools or the `/api/v1/workspaces/{ws}/replicas` routes. Each
@@ -50,6 +57,20 @@ assigned at release.
   and reply helper installed through the provider exec API, and signed
   delivery of messages addressed to it. Release revokes the capability before
   cleanup. Migration 0065 `replica_spawns`. See [Replicas](docs/replicas.md).
+- Added: staff read grants (migration 0061, table `staff_read_grants`). An
+  owner of the operator organization, on its domains when it has any, mints a
+  short-lived `sh_sr_` credential (scope `rth:read`, at most 90 days, no
+  refresh) for one customer workspace with
+  `POST /api/v1/workspaces/{id}/staff-read-grants`, lists grants with `GET`
+  and revokes with `DELETE .../{grantId}`; every non-staff caller gets `404`.
+  The credential works only as a bearer on `/api/v1/mcp/shared-sessions`,
+  reaches only the shared-session read tools and `describe_capabilities` of
+  that workspace, and re-checks revocation, expiry and the staff rule on every
+  request. Mint and revoke are audited (`staff_read_grant.minted`,
+  `staff_read_grant.revoked`); reads appear in the shared-session read audit
+  with `auth_mode` `staff_read_grant`. Introspection answers it as a
+  `desktop-user` pinned to the workspace. See
+  [Staff read grants](docs/staff-read-grants.md).
 - Changed: credential-refresh transactions (subscription-login auth files and
   integration-connection OAuth tokens) now set
   `SET LOCAL idle_in_transaction_session_timeout = '60s'` and

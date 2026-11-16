@@ -1,12 +1,12 @@
 # Reviewed target schema and verification scope
 
-`schema-manifest.json` is a committed reference built from all 63 checked-in
-Control migrations at main `b79cb5f`, in a fresh disposable local PostgreSQL
+`schema-manifest.json` is a committed reference built from all 64 checked-in
+Control migrations (main `b79cb5f` plus 0068), in a fresh disposable local PostgreSQL
 cluster. It is never generated from the target being qualified. Its seal covers
 all expected entries and migration file hashes; verification also checks the
 migration files in the verifier checkout still match those hashes.
 
-The mandatory inventory has 99 tables and 1,820 logical catalogue objects.
+The mandatory inventory has 99 tables and 1,822 logical catalogue objects.
 It covers tables/relation kind and RLS flags, column types/positions/nullability/
 defaults/identity/generated/collation, constraints and definitions/validation/
 deferral/FK-trigger state, indexes and definitions/predicates/validity/readiness/
@@ -24,12 +24,12 @@ the copier verified. Column discovery uses pg_catalog, not privilege-filtered
 information_schema gating. Inaccessible data fails closed rather than becoming
 an empty target.
 
-There is one separately identified optional inventory: the synthetic proposed
-0061 staff-grant model. If present, all of its expected objects must match and
-the report profile is `main-plus-proposed-0061`. The cutover guard rejects that
-profile. On the actual b79cb5f target without 0061, the production profile is
-`main`; a source containing importable staff grants still fails its missing-
-target gate. The optional fixture is not evidence for the pending migration.
+The manifest keeps a generic map of separately identified optional inventories;
+it is currently empty. The staff-grant table from the checked-in 0061 migration
+is part of the required inventory like every other migration. If an optional
+inventory is ever present, all of its expected objects must match and the
+report profile is `main-plus-optional`, which the cutover guard rejects; the
+production profile is `main`.
 
 Qualified reports expose `targetSchema` with the baseline, committed manifest
 seal, expected/actual schema digests, object counts and missing/changed expected
@@ -73,4 +73,7 @@ the committed manifest, so a newly merged or changed migration fails CI until
 its inventory update is reviewed. This check does not require PostgreSQL and
 cannot silently skip with the integration tests. Baseline b79cb5f adds only the
 43 catalogue objects from 0059 relay-node credentials and 0060 relay-launch
-credentials; the earlier 1,777 required definitions remain identical.
+credentials; the earlier 1,777 required definitions remain identical. 0068
+(users.signup_source) adds exactly 2 more: the nullable text column and the
+validated `users_signup_source_known` CHECK; the 1,820 prior definitions are
+unchanged.

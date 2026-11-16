@@ -134,8 +134,8 @@ instead; this identity-only command cannot sign off the copier.
 The result includes normalized `scope`, a streaming all-source organization
 census/count/digest and selected census, plus the committed target schema
 manifest identity/digests. The cutover guard requires all-source scope, matching
-nonempty census and the production `main` schema profile. The synthetic proposed
-0061 profile and contract-only/unbound reports cannot satisfy that guard.
+nonempty census and the production `main` schema profile. An optional-inventory
+profile and contract-only/unbound reports cannot satisfy that guard.
 
 Read-only and timeout guarantees use in-session `BEGIN ... READ ONLY` and
 `SET LOCAL`, followed by `SHOW transaction_read_only`, `SHOW transaction_isolation`,

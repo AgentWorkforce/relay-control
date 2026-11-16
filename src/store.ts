@@ -1134,6 +1134,10 @@ export class ControlPlaneStore {
   }
 
   private async lookupAccessToken(token: string): Promise<Principal | null> {
+    // A staff read grant (sh_sr_) is a credential only on the shared-sessions
+    // MCP facade and at introspection; every person-session gate refuses it
+    // by shape (docs/staff-read-grants.md).
+    if (token.startsWith("sh_sr_")) return null;
     const result = await this.database.query<TokenContextRow>(
       `SELECT s.id AS session_id, s.token_family_id, s.user_id, u.email,
               u.name AS user_name, s.organization_id, o.name AS organization_name,
