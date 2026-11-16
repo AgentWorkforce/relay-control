@@ -67,6 +67,12 @@ CREATE TABLE provider_credentials (
   last_authenticated_at timestamptz, last_used_at timestamptz, last_error text,
   created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
 );
+CREATE TABLE workspace_integrations (
+  id uuid PRIMARY KEY, workspace_id text NOT NULL, provider text NOT NULL, adapter text NOT NULL DEFAULT 'nango',
+  name text, created_by_user_id uuid, connection_id text, provider_config_key text, installation_id text,
+  metadata_json text NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
+);
 CREATE TABLE fleet_node_owners (
   id uuid PRIMARY KEY, workspace_id uuid NOT NULL, relay_workspace_id text NOT NULL, node_id text NOT NULL,
   user_id uuid NOT NULL, source text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
@@ -153,6 +159,12 @@ INSERT INTO provider_credentials (id, organization_id, workspace_id, user_id, ha
   ('${id(0x802)}', '${ORG_A}', '${id(0x201)}', '${id(2)}', 'claude', 'anthropic', 'relay_managed', 'Relay Claude (bob)', true, false, 'connected', ${t}, ${t}),
   ('${id(0x803)}', '${ORG_A}', '${id(0x201)}', '${id(1)}', 'codex', 'openai', 'byo_api_key', 'My key', true, false, 'connected', ${t}, ${t}),
   ('${id(0x804)}', '${ORG_A}', '${id(0x202)}', '${id(1)}', 'claude', 'anthropic', 'relay_managed', 'Unbound', false, false, 'connected', ${t}, ${t});
+INSERT INTO workspace_integrations (id, workspace_id, provider, name, created_by_user_id, connection_id, installation_id, created_at, updated_at) VALUES
+  ('${id(0x901)}', 'rw_0000a201', 'github', NULL, '${id(5)}', 'nango-1', '12345', ${t}, ${t}),
+  ('${id(0x902)}', 'rw_0000a201', 'github', 'second', '${id(1)}', 'nango-2', '12345', ${t}, ${t}),
+  ('${id(0x903)}', 'rw_0000b201', 'github', NULL, '${id(2)}', 'nango-3', '12345', '2026-02-01T00:00:00Z', ${t}),
+  ('${id(0x904)}', '${id(0x206)}', 'github', NULL, '${id(2)}', 'nango-4', 'abc', ${t}, ${t}),
+  ('${id(0x905)}', 'rw_0000a201', 'slack', NULL, '${id(1)}', 'nango-5', NULL, ${t}, ${t});
 INSERT INTO fleet_node_owners (id, workspace_id, relay_workspace_id, node_id, user_id, source, created_at) VALUES
   ('${id(0x701)}', '${id(0x201)}', 'rw_0000a201', 'node-1', '${id(3)}', 'claim', ${t}),
   ('${id(0x702)}', '${id(0x203)}', 'rw_0000a203', 'node-2', '${id(1)}', 'claim', ${t});
@@ -186,5 +198,16 @@ export const EXPECTED_FULL: Record<string, { imported: number; skipped: Record<s
   coding_agent_credentials: {
     imported: 0,
     skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 1, target_lacks_relay_managed: 2 },
+  },
+  // Pre-0054 target: the GitHub App rows wait for the migration.
+  github_app_installations: { imported: 0, skipped: { target_lacks_github_app: 1 } },
+  github_app_connections: {
+    imported: 0,
+    skipped: {
+      named_connection_needs_policy: 1,
+      installation_claimed_by_other_org: 1,
+      invalid_installation_id: 1,
+      target_lacks_github_app: 1,
+    },
   },
 };

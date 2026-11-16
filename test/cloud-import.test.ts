@@ -12,7 +12,7 @@ import {
   id,
 } from "../scripts/cloud-import/cloud-fixture.js";
 import { runImport, type ImportReport } from "../scripts/cloud-import/importer.js";
-import { SOURCE_TABLES, verifierComparisons } from "../scripts/cloud-import/mapping.js";
+import { SOURCE_TABLES, TARGETS, verifierComparisons } from "../scripts/cloud-import/mapping.js";
 import { PGliteDatabase } from "./support/harness.js";
 
 const CLOUD_KEY = randomBytes(32).toString("hex");
@@ -36,6 +36,26 @@ CREATE UNIQUE INDEX workspaces_org_slug_unique ON workspaces (organization_id, s
 ALTER TABLE desktop_relay_identities ALTER COLUMN source_id TYPE text USING source_id::text;
 ALTER TABLE desktop_attestation_keys ALTER COLUMN source_id TYPE text USING source_id::text;
 ALTER TABLE fleet_node_owners ALTER COLUMN node_name DROP NOT NULL;
+-- 0054 (#146) GitHub App connections.
+CREATE TABLE github_app_installations (
+  installation_id text PRIMARY KEY CHECK (installation_id ~ '^[1-9][0-9]{0,19}$'),
+  organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  UNIQUE (installation_id, organization_id)
+);
+ALTER TABLE integration_connections ADD COLUMN installation_id text;
+ALTER TABLE integration_connections ADD COLUMN github_app_organization_id uuid;
+ALTER TABLE integration_connections ADD COLUMN github_app_refresh_id uuid;
+ALTER TABLE integration_connections ADD COLUMN github_app_refresh_until timestamptz;
+ALTER TABLE integration_connections DROP CONSTRAINT IF EXISTS selfhost_connection_auth_mode;
+ALTER TABLE integration_connections DROP CONSTRAINT IF EXISTS connection_auth_mode;
+ALTER TABLE integration_connections ADD CONSTRAINT connection_auth_mode
+  CHECK (auth_mode IN ('oauth2', 'api_key', 'github_app'));
+ALTER TABLE integration_connections ADD CONSTRAINT connection_github_installation_owner
+  FOREIGN KEY (installation_id, github_app_organization_id)
+  REFERENCES github_app_installations (installation_id, organization_id);
+ALTER TABLE integration_connections ADD CONSTRAINT connection_github_workspace_owner
+  FOREIGN KEY (workspace_id, github_app_organization_id)
+  REFERENCES workspaces (id, organization_id);
 -- 0058 (control-relay-managed), approximated: relay_managed rows carry no secret.
 ALTER TABLE coding_agent_credentials
   ALTER COLUMN secret_preview DROP NOT NULL,
@@ -95,6 +115,11 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   assert.equal(plan.ok, true);
   const expectedPlan = structuredClone(EXPECTED_FULL);
   expectedPlan.coding_agent_credentials = { imported: 2, skipped: { workspace_not_imported: 1, secret_in_cloud_credential_store: 1 } };
+  expectedPlan.github_app_installations = { imported: 1, skipped: {} };
+  expectedPlan.github_app_connections = {
+    imported: 1,
+    skipped: { named_connection_needs_policy: 1, installation_claimed_by_other_org: 1, invalid_installation_id: 1 },
+  };
   expectedPlan.desktop_relay_identities = { imported: 2, skipped: { not_a_member: 1 } };
   assert.deepEqual(ledger(plan), expectedPlan);
 
@@ -141,7 +166,9 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   assert.deepEqual({ ...invite, token_hash: undefined }, { token_hash: undefined, invited_by_user_id: id(1), email: "new@example.test", role: "admin" });
 
   // Re-run converges: same counts, invite hash kept, nothing duplicated.
-  const counts = async () => Object.fromEntries(await Promise.all(SOURCE_TABLES.map(async (table) => [table, await count(target, table)] as const)));
+  const counts = async () => Object.fromEntries(await Promise.all(SOURCE_TABLES
+    .filter((table) => !TARGETS[table].gate)
+    .map(async (table) => [table, await count(target, TARGETS[table].table)] as const)));
   const before = await counts();
   const rerun = await runImport(deps, scope, "apply");
   assert.equal(rerun.ok, true);
@@ -151,7 +178,7 @@ test("cloud import: plan, dry-run, apply, re-run and verifier projections (0051 
   assert.equal(inviteAfter.token_hash, invite.token_hash);
 
   // The verifier projections agree row for row with what was imported.
-  for (const comparison of verifierComparisons(scope, new Set())) {
+  for (const comparison of verifierComparisons(scope, new Set(), new Set())) {
     const excluded = new Set(Object.values(applied.tables[comparison.name as keyof typeof applied.tables].importerSkips).flat());
     const sourceRows = (await source.query<{ __key: string }>(comparison.sourceSql)).rows
       .filter((row) => !excluded.has(row.__key)).map((row) => JSON.stringify(row)).sort();
@@ -200,6 +227,15 @@ test("cloud import: post-0057 target keeps rw_, slugs, History origin and text s
     { id: id(0x802), is_active: false, harness_active: false, secret_ciphertext: null },
   ]);
   assert.equal(report.warnings.coding_agent_active_demoted, 1);
+  const github = (await target.query<{ id: string; installation_id: string; github_app_organization_id: string; credentials_ciphertext: string; created_by_user_id: string }>(
+    "SELECT id, installation_id, github_app_organization_id, credentials_ciphertext, created_by_user_id FROM integration_connections WHERE auth_mode = 'github_app'")).rows;
+  assert.equal(github.length, 1);
+  assert.deepEqual({ ...github[0], credentials_ciphertext: undefined }, {
+    id: id(0x901), installation_id: "12345", github_app_organization_id: ORG_A, credentials_ciphertext: undefined, created_by_user_id: id(1),
+  });
+  assert.equal(decryptSecret(github[0]!.credentials_ciphertext, KEYRING), "{}");
+  assert.deepEqual((await target.query("SELECT installation_id, organization_id FROM github_app_installations")).rows,
+    [{ installation_id: "12345", organization_id: ORG_A }]);
   const fleet = (await target.query<{ node_name: string | null }>("SELECT node_name FROM fleet_node_owners")).rows;
   assert.deepEqual(fleet, [{ node_name: null }]);
 

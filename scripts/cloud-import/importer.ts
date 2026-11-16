@@ -120,7 +120,7 @@ async function readSource(tx: SqlExecutor, table: ImportTable, scope: ImportScop
   const secret = TARGETS[table].secret?.source;
   const email = table === "users" ? "q.email" : "NULL::text";
   const result = await tx.query<SourceRow>(
-    `SELECT ${table === "organization_memberships" ? "q.organization_id::text || ':' || q.user_id::text" : "q.id::text"} AS key,
+    `SELECT ${table === "organization_memberships" ? "q.organization_id::text || ':' || q.user_id::text" : `q.${TARGETS[table].key ?? "id"}::text`} AS key,
             q.skip_reason AS skip,
             ${table === "users" ? "NULL::text" : "q.organization_id::text"} AS org,
             ${email} AS email,
@@ -161,14 +161,17 @@ async function targetColumns(target: SqlExecutor): Promise<TargetColumns> {
   return columns;
 }
 
-function writeColumns(table: ImportTable, columns: TargetColumns): string[] {
+function writeColumns(table: ImportTable, columns: TargetColumns): string[] | null {
   const spec = TARGETS[table];
   const present = columns.get(spec.table) ?? new Map<string, ColumnInfo>();
   const list = [...spec.columns, ...(spec.optional ?? []).filter((column) => present.has(column))];
   if (spec.secret) list.push(spec.secret.target);
   if (spec.inviteTokenHash) list.push(spec.inviteTokenHash);
   const missing = list.filter((column) => !present.has(column));
-  if (missing.length) throw new ImportRefused(`target_missing_columns:${spec.table}`);
+  if (missing.length) {
+    if (spec.gate) return null;
+    throw new ImportRefused(`target_missing_columns:${spec.table}`);
+  }
   return list;
 }
 
@@ -273,7 +276,9 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
         let secret: string | null = null;
         const spec = TARGETS[table];
         try {
-          if (spec.secret?.source === "secret_plaintext") {
+          if (spec.secretConstant !== undefined) {
+            secret = encryptSecret(spec.secretConstant, deps.keyring.active);
+          } else if (spec.secret?.source === "secret_plaintext") {
             secret = encryptSecret(row.secret ?? "", deps.keyring.active);
           } else if (spec.secret?.source === "secret_envelope" && !deps.cloudKeyHex) {
             warn("secrets_not_checked");
@@ -328,7 +333,14 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     );
     if (!ledger.rows[0]) throw new ImportRefused("target_schema_too_old");
     const columns = await targetColumns(target);
-    const write = Object.fromEntries(SOURCE_TABLES.map((table) => [table, writeColumns(table, columns)])) as Record<ImportTable, string[]>;
+    const writable = Object.fromEntries(SOURCE_TABLES.map((table) => [table, writeColumns(table, columns)])) as Record<ImportTable, string[] | null>;
+    // Tables from later migrations the target lacks: skip their rows by gate.
+    for (const table of SOURCE_TABLES) {
+      if (writable[table] !== null) continue;
+      for (const row of prepared[table]) skip(table, TARGETS[table].gate!, row.key);
+      prepared[table] = [];
+    }
+    const write = writable as Record<ImportTable, string[]>;
     // Before 0057 the target source_id is uuid: a Cloud text id cannot land.
     if (columns.get("desktop_relay_identities")?.get("source_id")?.udt === "uuid") {
       prepared.desktop_relay_identities = prepared.desktop_relay_identities.filter((row) => {
@@ -358,7 +370,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
       warn("fleet_node_name_filled_with_node_id");
     }
     report.optionalColumns = SOURCE_TABLES.flatMap((table) =>
-      (TARGETS[table].optional ?? []).filter((column) => write[table].includes(column)).map((column) => `${TARGETS[table].table}.${column}`));
+      (TARGETS[table].optional ?? []).filter((column) => write[table]?.includes(column)).map((column) => `${TARGETS[table].table}.${column}`));
 
     // A Control user that already owns an imported email under another id
     // would make the upsert fail mid-way; refuse up front instead.
@@ -377,6 +389,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
     //    dry-run: the same units as savepoints inside one transaction that is
     //    rolled back at the end.
     const writeRows = async (tx: SqlExecutor, table: ImportTable, rows: PreparedRow[]) => {
+      if (rows.length === 0) return;
       const sql = upsertSql(table, write[table], fills[table]);
       for (const batch of chunks(rows, batchSize)) {
         await tx.query(sql, [batch.map((row) => row.row), batch.map((row) => row.secret)]);
