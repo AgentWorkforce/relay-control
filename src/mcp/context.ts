@@ -119,6 +119,7 @@ export function historyReader(
     userId: principal.userId,
     organizationId: workspace.organizationId,
     workspaceId: workspace.id,
+    role: workspace.role,
     callerToken,
     // Every MCP read is on the person's behalf, in both read modes.
     readerKind: "mcp" as const,

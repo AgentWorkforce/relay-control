@@ -110,8 +110,10 @@ export async function usageReport(input: {
   const identities: HistoryIdentity[] = [];
   for (const workspace of await store.listWorkspaces(organizationId)) {
     const workspaceId = String(workspace.id);
-    if (!await store.workspaceForUser(workspaceId, owner.userId)) continue;
-    identities.push({ userId: owner.userId, organizationId, workspaceId, callerToken: owner.token, readerKind: owner.readerKind });
+    const membership = await store.workspaceForUser(workspaceId, owner.userId);
+    if (!membership) continue;
+    identities.push({ userId: owner.userId, organizationId, workspaceId, role: membership.role, callerToken: owner.token,
+      readerKind: owner.readerKind });
   }
   const [counters, sessions, summaries] = await Promise.all([
     usage.read(organizationId, dates),
