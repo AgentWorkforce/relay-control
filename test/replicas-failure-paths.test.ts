@@ -58,8 +58,10 @@ function createProvider() {
   const entriesOf = (environmentId: string) => entries.get(environmentId) ?? (entries.set(environmentId, []), entries.get(environmentId)!);
   // fail: a timeout with nothing created; lost: created, then the answer is lost; conflict: 409 (the entry may exist).
   // discover: revoked = 401, unavailable = 503, partial = an incomplete listing (more pages than the bound).
+  // list / remove: fail = a timeout (the entry listing or the removal outcome is unknown).
   const mode = { register: "ok" as "ok" | "fail" | "reject" | "lost" | "conflict",
-    discover: "ok" as "ok" | "fail" | "revoked" | "unavailable" | "partial" };
+    discover: "ok" as "ok" | "fail" | "revoked" | "unavailable" | "partial",
+    list: "ok" as "ok" | "fail", remove: "ok" as "ok" | "fail" };
   const runtime = {
     identity: async () => ({ organization: { id: PROVIDER_ORG, name: "Org" } }),
     environments: async () => ({ environments }),
@@ -72,6 +74,7 @@ function createProvider() {
     },
     listEnvironmentMcps: async (key: string, environmentId: string) => {
       assert.equal(key, REPLICAS_KEY);
+      if (mode.list === "fail") throw new ReplicasRuntimeError("unknown", "replicas_timeout");
       return entriesOf(environmentId).map((entry) => structuredClone(entry));
     },
     registerEnvironmentMcp: async (key: string, environmentId: string, body: any) => {
@@ -86,6 +89,7 @@ function createProvider() {
       return { id };
     },
     removeEnvironmentMcp: async (_key: string, environmentId: string, id: string) => {
+      if (mode.remove === "fail") throw new ReplicasRuntimeError("unknown", "replicas_timeout");
       removed.push(id);
       entries.set(environmentId, entriesOf(environmentId).filter((entry) => entry.id !== id));
       return null;
@@ -443,6 +447,34 @@ test("an owned bind is reused before a principal is required; without one an unm
   assert.equal(unmapped.body.error.message, "replica_creator_not_allowed");
   assert.equal(await count(env, "SELECT 1 FROM replica_environment_creator_requests WHERE creator_id = 'creator-owner'"), 1);
   assert.equal(await count(env, "SELECT 1 FROM replica_spawns WHERE source = 'environment_identity'"), 0);
+});
+
+test("a pending creator is written at most once per minute: a refusal within the minute writes nothing", async (t) => {
+  const env = await start(t);
+  const { api } = env;
+  assert.equal((await connect(env)).status, 200);
+  const seen = async () => (await env.database.query<{ count: number; seen: string }>(
+    "SELECT count, last_seen_at::text AS seen FROM replica_environment_creator_requests WHERE creator_id = 'creator-owner'")).rows;
+  const refused = async () => {
+    const result = await rpc(api, token({ workspace_id: WORKSPACE_2 }), "tools/list");
+    assert.equal(result.status, 403, result.text);
+    assert.equal(result.body.error.message, "replica_creator_not_allowed");
+  };
+  await refused();
+  const [first] = await seen();
+  assert.equal(first!.count, 1);
+
+  // Seen again within the minute: count and last_seen_at keep their value.
+  await refused();
+  assert.deepEqual(await seen(), [first]);
+
+  // Once the last write is older than a minute the next refusal counts again.
+  await env.database.query("UPDATE replica_environment_creator_requests SET last_seen_at = now() - interval '2 minutes'");
+  await refused();
+  const [later] = await seen();
+  assert.equal(later!.count, 2);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_creator_requests WHERE last_seen_at > $1::timestamptz",
+    [first!.seen]), 1, "last_seen_at moves forward");
 });
 
 /** Maps the default token's creator to a member, then removes that member from the organization. */
@@ -1064,6 +1096,189 @@ test("disconnect reads back an unconfirmed create: no entry fails retryably and 
   assert.deepEqual(provider.entriesOf(ENV_C), []);
   assert.equal(await connected(), 0);
   assert.deepEqual(creates, []);
+});
+
+test("a disable lists the entry first: an entry someone edited is retained, only its recorded id is cleared", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider } = env;
+  const path = `/api/v1/workspaces/${workspaceId}/replicas/environment-mcp`;
+  assert.equal((await connect(env)).status, 200);
+  const edited = provider.entriesOf(ENV_A)[0]!;
+  const editedId = edited.id as string;
+  edited.config = { ...structuredClone(IDENTITY_CONFIG), headers: { "x-edited": "yes" } };
+  const policyId = (await policyRow(env, ENV_A)).id as string;
+
+  const disabled = await api(path, { method: "DELETE", token: ownerToken, body: { environmentIds: [ENV_A] } });
+  assert.equal(disabled.status, 200, disabled.text);
+  assert.deepEqual(disabled.body.environments, [{ environmentId: ENV_A, status: "disabled" }]);
+  assert.ok(!provider.removed.includes(editedId), "an edited entry is never deleted");
+  assert.deepEqual(provider.entriesOf(ENV_A).map((entry) => entry.id), [editedId]);
+  assert.equal((await policyRow(env, ENV_A)).registered_mcp_id, null);
+  assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.environment.mcp_retained' AND target = $1",
+    [policyId]), 1);
+  assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.environment.mcp_removed' AND target = $1",
+    [policyId]), 0);
+
+  // A failed listing is an unknown outcome: the id stays for a retry and nothing is removed.
+  const registeredB = (await policyRow(env, ENV_B)).registered_mcp_id as string;
+  provider.mode.list = "fail";
+  const unlisted = await api(path, { method: "DELETE", token: ownerToken, body: { environmentIds: [ENV_B] } });
+  assert.equal(unlisted.status, 200, unlisted.text);
+  assert.deepEqual(unlisted.body.environments, [{ environmentId: ENV_B, status: "removal_failed", retryable: true }]);
+  assert.equal((await policyRow(env, ENV_B)).registered_mcp_id, registeredB);
+  assert.ok(!provider.removed.includes(registeredB));
+
+  // An unchanged entry is removed as before.
+  provider.mode.list = "ok";
+  const retried = await api(path, { method: "DELETE", token: ownerToken, body: { environmentIds: [ENV_B] } });
+  assert.deepEqual(retried.body.environments, [{ environmentId: ENV_B, status: "disabled" }]);
+  assert.ok(provider.removed.includes(registeredB));
+  assert.deepEqual(provider.entriesOf(ENV_B), []);
+});
+
+test("an entry someone edited does not block disconnect: it is retained and the connection is removed", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider } = env;
+  const connection = `/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`;
+  assert.equal((await connect(env)).status, 200);
+  const edited = provider.entriesOf(ENV_A)[0]!;
+  const editedId = edited.id as string;
+  edited.name = "someone-elses-mcp";
+  const registeredB = (await policyRow(env, ENV_B)).registered_mcp_id as string;
+
+  const disconnected = await api(connection, { method: "DELETE", token: ownerToken });
+  assert.equal(disconnected.status, 200, disconnected.text);
+  assert.deepEqual(disconnected.body, { connection: null });
+  assert.deepEqual(provider.removed, [registeredB]);
+  assert.deepEqual(provider.entriesOf(ENV_A).map((entry) => entry.id), [editedId]);
+  assert.equal(await count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'", [workspaceId]), 0);
+  assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.environment.mcp_retained'"), 1);
+});
+
+test("abandon_environment_cleanup: an unconfirmed create no longer blocks disconnect; nothing is created or removed", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider } = env;
+  const connection = `/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`;
+  const connected = () => count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'", [workspaceId]);
+  assert.equal((await connect(env)).status, 200);
+  provider.environments.push({ id: ENV_C, name: "gamma" });
+  provider.mode.register = "fail";
+  await syncEnvironments(env.replicas.deps, serviceActor(env));
+  assert.equal((await policyRow(env, ENV_C)).create_unconfirmed, true);
+  provider.mode.register = "ok";
+  const creates = countCreates(env);
+
+  const failed = await api(connection, { method: "DELETE", token: ownerToken });
+  assert.equal(failed.status, 503, failed.text);
+  assert.equal(failed.body.error, "replicas_cleanup_failed");
+  assert.equal(await connected(), 1);
+  // The plain retry removed what it could before it stopped at the unknown create.
+  const removedBefore = [...provider.removed];
+
+  // Only the abandon field is accepted, and only as a boolean.
+  const unknown = await api(connection, { method: "DELETE", token: ownerToken, body: { abandon: true } });
+  assert.equal(unknown.status, 400, unknown.text);
+  assert.equal(unknown.body.error, "invalid_request");
+  const notBoolean = await api(connection, { method: "DELETE", token: ownerToken, body: { abandon_environment_cleanup: "yes" } });
+  assert.equal(notBoolean.status, 400, notBoolean.text);
+  // A member never reaches the abandon step.
+  const member = await api(connection, { method: "DELETE", token: env.memberToken, body: { abandon_environment_cleanup: true } });
+  assert.equal(member.status, 403, member.text);
+  assert.equal(await connected(), 1);
+
+  const abandoned = await api(connection, { method: "DELETE", token: ownerToken, body: { abandon_environment_cleanup: true } });
+  assert.equal(abandoned.status, 200, abandoned.text);
+  assert.deepEqual(abandoned.body, { connection: null, environment_cleanup_abandoned: true });
+  assert.equal(await connected(), 0);
+  assert.deepEqual(creates, [], "abandon never sends a create");
+  assert.deepEqual(provider.removed, removedBefore, "abandon never sends a remove");
+  const row = await policyRow(env, ENV_C);
+  assert.equal(row.create_unconfirmed, false);
+  assert.equal(row.registered_mcp_id, null);
+  assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.environment.cleanup_abandoned' AND target = $1",
+    [row.id]), 1);
+});
+
+test("abandon_environment_cleanup: a failed compute retirement clears nothing; the fence holds and a retry abandons", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider } = env;
+  const connection = `/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`;
+  const connected = () => count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'", [workspaceId]);
+  assert.equal((await connect(env)).status, 200);
+  provider.environments.push({ id: ENV_C, name: "gamma" });
+  provider.mode.register = "fail";
+  await syncEnvironments(env.replicas.deps, serviceActor(env));
+  provider.mode.register = "ok";
+  const registeredA = (await policyRow(env, ENV_A)).registered_mcp_id as string;
+  const creates = countCreates(env);
+  // A launch whose create outcome is unknown and has no launch marker at the provider: compute retirement refuses (409).
+  (env.replicas.deps.replicas as unknown as Record<string, unknown>).list = async () => ({ replicas: [], total_pages: 1 });
+  const unknown = randomUUID();
+  await env.database.query(
+    `INSERT INTO replica_spawns (id, workspace_id, organization_id, user_id, client_request_id, source, input, state)
+     VALUES ($1, $2, $3, $4, $5, 'spawn', '{"name":"worker"}'::jsonb, 'creating')`,
+    [unknown, workspaceId, env.organizationId, env.ownerId, `request-${unknown}`],
+  );
+
+  const refused = await api(connection, { method: "DELETE", token: ownerToken, body: { abandon_environment_cleanup: true } });
+  assert.equal(refused.status, 409, refused.text);
+  assert.equal(refused.body.error, "replicas_cleanup_failed");
+  assert.equal(await connected(), 1, "the connection stays");
+  assert.equal((await policyRow(env, ENV_A)).registered_mcp_id, registeredA, "nothing is cleared before retirement succeeded");
+  assert.equal((await policyRow(env, ENV_C)).create_unconfirmed, true);
+  assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.environment.cleanup_abandoned'"), 0);
+  // The disconnect fence is committed: nothing is enabled and the all-environments default is off.
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE workspace_id = $1 AND enabled", [workspaceId]), 0);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_settings WHERE workspace_id = $1 AND all_environments", [workspaceId]), 0);
+  assert.deepEqual(provider.removed, []);
+  assert.deepEqual(creates, []);
+
+  // Once the unknown create is resolved, the retry abandons with the connection delete.
+  await env.database.query("DELETE FROM replica_spawns WHERE id = $1", [unknown]);
+  const abandoned = await api(connection, { method: "DELETE", token: ownerToken, body: { abandon_environment_cleanup: true } });
+  assert.equal(abandoned.status, 200, abandoned.text);
+  assert.deepEqual(abandoned.body, { connection: null, environment_cleanup_abandoned: true });
+  assert.equal(await connected(), 0);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE registered_mcp_id IS NOT NULL OR create_unconfirmed"), 0);
+  assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.environment.cleanup_abandoned'"), 3);
+  assert.deepEqual(provider.removed, []);
+  assert.deepEqual(creates, []);
+  assert.deepEqual(provider.entriesOf(ENV_A).map((entry) => entry.id), [registeredA], "the entry stays at the provider");
+});
+
+test("abandon_environment_cleanup: an entry that cannot be removed stays at the provider; nothing pending answers without the marker", async (t) => {
+  const env = await start(t);
+  const { api, workspaceId, ownerToken, provider } = env;
+  const connection = `/api/v1/workspaces/${workspaceId}/remote-agent-connections/replicas`;
+  const connected = () => count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND provider = 'replicas'", [workspaceId]);
+  assert.equal((await connect(env)).status, 200);
+  const registeredA = (await policyRow(env, ENV_A)).registered_mcp_id as string;
+  provider.mode.remove = "fail";
+
+  const failed = await api(connection, { method: "DELETE", token: ownerToken });
+  assert.equal(failed.status, 503, failed.text);
+  assert.equal(failed.body.error, "replicas_cleanup_failed");
+  assert.equal(await connected(), 1);
+
+  const abandoned = await api(connection, { method: "DELETE", token: ownerToken, body: { abandon_environment_cleanup: true } });
+  assert.equal(abandoned.status, 200, abandoned.text);
+  assert.equal(abandoned.body.environment_cleanup_abandoned, true);
+  assert.equal(await connected(), 0);
+  assert.deepEqual(provider.removed, []);
+  assert.deepEqual(provider.entriesOf(ENV_A).map((entry) => entry.id), [registeredA]);
+  assert.equal(await count(env, "SELECT 1 FROM replica_environment_policies WHERE registered_mcp_id IS NOT NULL OR create_unconfirmed"), 0);
+  assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.environment.cleanup_abandoned'"), 2);
+
+  // Nothing pending: the abandon option is accepted and the response carries no marker.
+  provider.mode.remove = "ok";
+  assert.equal((await connect(env)).status, 200);
+  provider.entriesOf(ENV_A).length = 0;
+  provider.entriesOf(ENV_B).length = 0;
+  await env.database.query("UPDATE replica_environment_policies SET registered_mcp_id = NULL WHERE workspace_id = $1", [workspaceId]);
+  const clean = await api(connection, { method: "DELETE", token: ownerToken, body: { abandon_environment_cleanup: true } });
+  assert.equal(clean.status, 200, clean.text);
+  assert.deepEqual(clean.body, { connection: null });
+  assert.equal(await connected(), 0);
 });
 
 test("an environment move: the binding follows the current environment, creator and mode, so the right change retires it", async (t) => {

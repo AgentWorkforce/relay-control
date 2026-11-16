@@ -92,8 +92,17 @@ export type RemoteAgentConnectionOptions = {
   /**
    * Revokes and retires every Replicas binding before the key is deleted
    * (the key is needed to sleep compute). Throws to keep the connection.
+   * With abandonEnvironmentCleanup no provider environment entry is
+   * confirmed or removed (and nothing is cleared yet; see replicasAbandon).
    */
-  replicasCleanup?: (actor: ConnectionActor) => Promise<void>;
+  replicasCleanup?: (actor: ConnectionActor, options: { abandonEnvironmentCleanup?: boolean }) => Promise<void>;
+  /**
+   * The abandon bookkeeping, inside the transaction that deletes the
+   * connection (so only after replicasCleanup succeeded): forgets every
+   * recorded environment entry and unconfirmed create. Returns the
+   * abandoned environment ids.
+   */
+  replicasAbandon?: (tx: SqlExecutor, actor: ConnectionActor) => Promise<{ environmentIds: string[] }>;
   /**
    * After a Replicas connect. A fresh connect turns the all-environments
    * default on, discovers the account's environments, enables them and
@@ -282,15 +291,20 @@ export class RemoteAgentConnections {
     return provisioningError ? { ...report, provisioning_error: provisioningError } : report;
   }
 
-  async disconnect(actor: ConnectionActor, provider: RemoteAgentId): Promise<void> {
-    if (provider === "replicas" && this.options.replicasCleanup) await this.options.replicasCleanup(actor);
-    await this.authorized(actor, async tx => {
+  async disconnect(actor: ConnectionActor, provider: RemoteAgentId,
+    options: { abandonEnvironmentCleanup?: boolean } = {}): Promise<{ environmentCleanupAbandoned: boolean }> {
+    if (provider === "replicas" && this.options.replicasCleanup) await this.options.replicasCleanup(actor, options);
+    return this.authorized(actor, async tx => {
       // A binding created after the cleanup above loses its capability with the key.
       if (provider === "replicas") await revokeWorkspaceReplicas(tx, actor.workspaceId);
+      // Abandoned entries are forgotten only together with the connection, after every retirement succeeded.
+      const abandoned = provider === "replicas" && options.abandonEnvironmentCleanup && this.options.replicasAbandon
+        ? (await this.options.replicasAbandon(tx, actor)).environmentIds : [];
       if (provider === "capy") await retireCapyBindingsInTx(tx,{organizationId:actor.organizationId,workspaceId:actor.workspaceId},"capy_disconnected");
       await tx.query("DELETE FROM remote_agent_connections WHERE workspace_id=$1 AND provider=$2", [actor.workspaceId, provider]);
       await recordAudit(tx, { workspaceId: actor.workspaceId, organizationId: actor.organizationId,
         actor: { kind: "user", userId: actor.userId }, action: "remote_agent.disconnect", target: provider });
+      return { environmentCleanupAbandoned: abandoned.length > 0 };
     });
   }
 

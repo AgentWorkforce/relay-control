@@ -3119,13 +3119,33 @@ paths:
       security:
         - bearerAuth: []
         - cookieAuth: []
+      requestBody:
+        required: false
+        description: Optional. An empty body needs no content type; a non-empty one must be application/json.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                abandon_environment_cleanup:
+                  type: boolean
+                  description: Replicas only. Completes the disconnect without confirming or removing the provider environment MCP entries, which stay at the provider. Compute and Relay retirement still run first; the recorded entries are forgotten (audited as replicas.environment.cleanup_abandoned) in the transaction that deletes the connection.
       responses:
         "200":
-          description: Connection removed; does not revoke the API key at the external provider
+          description: "{connection: null}, plus environment_cleanup_abandoned: true when abandon_environment_cleanup was given and recorded Replicas environment entries were abandoned. Does not revoke the API key at the external provider"
+        "400":
+          description: Unsupported disconnect field
         "403":
           description: Owner/admin person required or cross-origin write refused
         "404":
           description: Workspace or provider not found
+        "409":
+          description: Replicas cleanup refused (replicas_cleanup_failed), for example an unknown launch create to recover first; the connection stays
+        "415":
+          description: A non-empty body that is not application/json
+        "503":
+          description: Replicas cleanup could not confirm or remove an environment entry (replicas_cleanup_failed, retryable); the connection stays
   /api/v1/workspaces/{workspaceId}/providers:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"

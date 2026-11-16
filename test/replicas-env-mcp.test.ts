@@ -303,6 +303,13 @@ test("environment-level MCP: discovery, policies, admission order, enrolment, to
     const policyId = (await database.query<{ id: string }>("SELECT id FROM replica_environment_policies WHERE environment_id = $1", [ENV_A])).rows[0]!.id;
     await database.query(`INSERT INTO replica_environment_creator_requests (policy_id, creator_id, last_seen_at)
       SELECT $1, 'old-' || n, now() - interval '1 day' - n * interval '1 minute' FROM generate_series(1, 50) n`, [policyId]);
+    // A pending creator is written at most once per minute: a refusal within the minute writes nothing.
+    await rpc(api, token(), "tools/list");
+    view = await api(`${base}/environment-policies`, { token: ownerToken });
+    pending = view.body.environments.find((item: any) => item.environmentId === ENV_A).pendingCreators;
+    assert.equal(pending.length, 51);
+    assert.equal(pending[0].count, 1);
+    await database.query("UPDATE replica_environment_creator_requests SET last_seen_at = now() - interval '2 minutes' WHERE creator_id = 'creator-owner'");
     await rpc(api, token(), "tools/list");
     view = await api(`${base}/environment-policies`, { token: ownerToken });
     pending = view.body.environments.find((item: any) => item.environmentId === ENV_A).pendingCreators;

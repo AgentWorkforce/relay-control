@@ -39,7 +39,10 @@ All paths also accept the `/cloud` prefix. All replies are `no-store`.
   owner/admin person token (`cli:auth`) or same-origin cookie; JSON `{key}`,
   plus `{orgId}` for Devin. Check the actual provider before storing.
 - `DELETE` on that item removes the key. No key or encrypted envelope is
-  returned by any public operation.
+  returned by any public operation. The body is optional; for `replicas`
+  only, JSON `{"abandon_environment_cleanup": true}` completes the disconnect
+  without removing provider environment entries (see docs/replicas.md). Any
+  other field is 400 `invalid_request`.
 
 Providers are exactly `capy`, `replicas`, `devin`, `cursor-cloud`. Origins are
 fixed in server source. Redirects and arbitrary origin/body overrides are

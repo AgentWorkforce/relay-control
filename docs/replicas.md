@@ -211,7 +211,8 @@ environment cannot fill the audit log), `replicas.identity.revived`,
 `replicas.environment.enabled`, `replicas.environment.disabled`,
 `replicas.environment.creators_updated`, `replicas.environment.principal_updated`,
 `replicas.environment.mcp_registered`, `replicas.environment.registration_retried`,
-`replicas.environment.mcp_removed`, `replicas.environment.all_enabled` and `replicas.environment.all_disabled`.
+`replicas.environment.mcp_removed`, `replicas.environment.mcp_retained`,
+`replicas.environment.cleanup_abandoned`, `replicas.environment.all_enabled` and `replicas.environment.all_disabled`.
 
 ### Policies and registration
 
@@ -322,8 +323,11 @@ call as the principal, or is refused when no principal is set.
 Each policy lists `pendingCreators`: `[{creatorId, emailHint, lastSeenAt,
 count}]`, newest first: creators seen without a mapping (admitted as the
 principal when one is set, refused otherwise). The 50 most recent are kept per
-environment; a token without a creator is not recorded. Mapping a creator with
-`PUT` removes its pending entry.
+environment; a token without a creator is not recorded. A creator is written
+at most once per minute: a call seen again within a minute of its
+`lastSeenAt` writes nothing (`count` and `lastSeenAt` keep their value), so a
+replica retrying in a loop does not turn every call into a write. Mapping a
+creator with `PUT` removes its pending entry.
 
 All are owner/admin only. The registered entry is:
 
@@ -399,6 +403,44 @@ retryable 503 `replicas_cleanup_failed` before the connection is deleted; the
 released bindings are retired either way. Disable keeps reporting
 `removal_failed` per environment instead.
 
+The removal lists the environment's entries first and deletes the recorded
+entry only when it is still exactly this edition's: same name, transport
+`http`, the same config and (when the provider reports them) the same
+environment and organization. A recorded entry that is no longer listed is
+already removed. An entry someone else edited (name, transport, config,
+environment or organization changed) is theirs now: it is retained at the
+provider, only the recorded id is cleared, and the step is audited as
+`replicas.environment.mcp_retained` (the environment reports `disabled`; it
+does not block a disconnect). A failed listing is a failed removal: the id
+stays and the step is retried later.
+
+When that cleanup can never succeed (for example the provider key was
+revoked, so no entry can be read back or removed), an owner or admin
+completes the disconnect explicitly with `DELETE
+.../remote-agent-connections/replicas` and the JSON body
+`{"abandon_environment_cleanup": true}` (any other field is 400
+`invalid_request`). The order is:
+
+1. the disable and the disconnect fence are committed as on every
+   disconnect: every policy is disabled, the all-environments default is off
+   and the bindings are released, so neither the sync sweep nor an identity
+   call can register or admit anything while the disconnect is half done;
+2. no entry is confirmed or removed and no create or remove is sent;
+   compute and Relay retirement then run as on every disconnect (an unknown
+   launch create still answers 409 `replicas_cleanup_failed`; nothing is
+   bypassed);
+3. only when that retirement succeeded, every recorded entry id and
+   unconfirmed create is cleared, audited as
+   `replicas.environment.cleanup_abandoned` (one per environment), in the
+   same transaction that deletes the connection.
+
+A failed retirement in step 2 keeps the connection and leaves the recorded
+entries and intents untouched for a later retry. The abandoned entries stay
+at the provider; the response is `{connection: null,
+environment_cleanup_abandoned: true}` (the marker is omitted when nothing
+was pending). A later connect reuses a matching entry it finds there instead
+of creating another one.
+
 An enrolled binding follows the replica's current environment, creator and
 mode (`creator` or `principal`): when a replica of the same owner presents a
 token for another enabled environment of the workspace, or its creator or
@@ -426,7 +468,8 @@ A newer row whose release an admin revived counts the same way (the revive
 stamps `revived_at` on it), so releasing an older row cannot undo the revive;
 the replica is fenced again by releasing the row its next admitted call enrols.
 Disconnecting Replicas disables every policy and releases its bindings first,
-then removes the registered entries best effort.
+then removes the registered entries best effort (or, on an explicit abandon,
+leaves them at the provider; see above).
 
 Policies, pending creators and the principal (migration 0067) are deleted
 with their workspace. Tombstones are not: deleting a workspace tombstones

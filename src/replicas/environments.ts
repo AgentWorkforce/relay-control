@@ -299,17 +299,24 @@ const MAX_CREATOR_REQUESTS = 50;
 /**
  * Records an unmapped creator on an enabled policy so an admin can learn which
  * creator_id to map. Masked email hint only; bounded per policy. Best effort.
+ * At most one write per creator per minute: a creator seen again within a
+ * minute writes nothing (count and last_seen_at keep their value), so a
+ * refused replica retrying in a loop cannot turn every call into a write.
  */
 async function recordCreatorRequest(deps: ReplicasDeps, policyId: string, claims: ReplicaIdentityClaims): Promise<void> {
   if (claims.creatorId === null) return;
   await deps.database.transaction(async (tx) => {
-    await tx.query(
+    const written = await tx.query<{ policy_id: string }>(
       `INSERT INTO replica_environment_creator_requests (policy_id, creator_id, creator_email_hint) VALUES ($1, $2, $3)
        ON CONFLICT (policy_id, creator_id) DO UPDATE
          SET creator_email_hint = COALESCE(EXCLUDED.creator_email_hint, replica_environment_creator_requests.creator_email_hint),
-             count = LEAST(replica_environment_creator_requests.count, 2147483646) + 1, last_seen_at = now()`,
+             count = LEAST(replica_environment_creator_requests.count, 2147483646) + 1, last_seen_at = now()
+         WHERE replica_environment_creator_requests.last_seen_at < now() - interval '1 minute'
+       RETURNING policy_id`,
       [policyId, claims.creatorId, emailHint(claims.creatorEmail)],
     );
+    // Nothing written (seen within the minute): the bound already holds.
+    if (written.rows.length === 0) return;
     await tx.query(
       `DELETE FROM replica_environment_creator_requests WHERE policy_id = $1 AND creator_id NOT IN (
          SELECT creator_id FROM replica_environment_creator_requests WHERE policy_id = $1
@@ -925,16 +932,19 @@ function sameValue(left: unknown, right: unknown): boolean {
     && leftKeys.every((key) => Object.hasOwn(rightRecord, key) && sameValue((left as Record<string, unknown>)[key], rightRecord[key]));
 }
 
+/** Whether an entry is still exactly this edition's entry for the policy: name, transport, config and (when present) environment and organization. */
+function entryIsOurs(entry: EnvironmentMcp, policy: PolicyRow, config: unknown): boolean {
+  return entry.name === IDENTITY_SERVER_NAME && entry.transport === "http" && sameValue(entry.config, config)
+    && (entry.environment_id === undefined || entry.environment_id.toLowerCase() === policy.environment_id)
+    && (entry.organization_id === undefined || entry.organization_id.toLowerCase() === policy.provider_organization_id);
+}
+
 /** Finds this edition's entry among an environment's MCP entries; anything ambiguous or different is a conflict. */
 function matchEntry(entries: EnvironmentMcp[], policy: PolicyRow, config: unknown): EntryMatch {
   const named = entries.filter((entry) => entry.name === IDENTITY_SERVER_NAME);
   if (!named.length) return { kind: "none" };
   const entry = named[0]!;
-  if (named.length > 1 || entry.transport !== "http" || !sameValue(entry.config, config)
-    || (entry.environment_id !== undefined && entry.environment_id.toLowerCase() !== policy.environment_id)
-    || (entry.organization_id !== undefined && entry.organization_id.toLowerCase() !== policy.provider_organization_id)) {
-    return { kind: "conflict" };
-  }
+  if (named.length > 1 || !entryIsOurs(entry, policy, config)) return { kind: "conflict" };
   return { kind: "match", id: entry.id };
 }
 
@@ -1164,7 +1174,8 @@ async function registerPolicy(deps: ReplicasDeps, actor: ReplicasActor, environm
  * Disables the selected environments first (admission stops and their
  * bindings are revoked at commit), then removes their provider MCP entries
  * best effort and retires the released Relay identities. A failed removal keeps the
- * entry id so a later disable or disconnect retries it.
+ * entry id so a later disable or disconnect retries it. An entry someone
+ * edited at the provider is retained, not deleted (removeEntry).
  */
 export async function disableEnvironmentMcp(deps: ReplicasDeps, actor: ReplicasActor, raw: unknown) {
   const selection = parseSelection(raw);
@@ -1198,6 +1209,15 @@ export async function disableEnvironmentMcp(deps: ReplicasDeps, actor: ReplicasA
   return { environments: results };
 }
 
+/**
+ * Removes the recorded provider entry after reading it back: the
+ * environment's entries are listed first and only an entry that is still
+ * exactly this edition's (entryIsOurs) is deleted. A missing entry is already
+ * removed; an entry someone edited (name, transport, config, environment or
+ * organization changed) is retained at the provider and only the recorded id
+ * is cleared (replicas.environment.mcp_retained). A failed listing or removal
+ * keeps the id and is removal_failed, retryable.
+ */
 async function removeEntry(deps: ReplicasDeps, actor: ReplicasActor, policy: PolicyRow, admin: boolean): Promise<EnvironmentMcpResult> {
   if (!policy.registered_mcp_id) return { environmentId: policy.environment_id, status: "disabled" };
   return withReplicasLock(deps, actor, async (tx): Promise<EnvironmentMcpResult> => {
@@ -1210,15 +1230,22 @@ async function removeEntry(deps: ReplicasDeps, actor: ReplicasActor, policy: Pol
       const stored = await connectionKey(deps, tx, actor.workspaceId);
       const key = stored.key;
       ciphertext = stored.ciphertext;
-      try {
-        await deps.replicas.removeEnvironmentMcp(key, current.environment_id, current.registered_mcp_id);
-      } catch (error) {
-        // Already gone provider-side is a completed removal.
-        if (!(error instanceof ReplicasRuntimeError) || ![404, 410].includes(error.status)) throw error;
+      const entries = await deps.replicas.listEnvironmentMcps(key, current.environment_id);
+      const entry = entries.find((item) => item.id === current.registered_mcp_id);
+      // An entry no longer ours was edited by someone else: it is theirs now, never deleted.
+      const retained = entry !== undefined && !entryIsOurs(entry, current, identityMcpConfig(deps));
+      if (entry && !retained) {
+        try {
+          await deps.replicas.removeEnvironmentMcp(key, current.environment_id, current.registered_mcp_id);
+        } catch (error) {
+          // Already gone provider-side is a completed removal.
+          if (!(error instanceof ReplicasRuntimeError) || ![404, 410].includes(error.status)) throw error;
+        }
       }
       await tx.query("UPDATE replica_environment_policies SET registered_mcp_id = NULL, updated_at = now() WHERE id = $1", [current.id]);
       await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
-        actor: auditActor(actor), action: "replicas.environment.mcp_removed", target: current.id });
+        actor: auditActor(actor), action: retained ? "replicas.environment.mcp_retained" : "replicas.environment.mcp_removed",
+        target: current.id });
       return { environmentId: current.environment_id, status: "disabled" };
     } catch (error) {
       await recordProviderAccess(tx, actor.workspaceId, error, ciphertext);
@@ -1346,8 +1373,23 @@ async function confirmCreate(deps: ReplicasDeps, actor: ReplicasActor, policy: P
  * that cannot be confirmed or removed fails the disconnect with a retryable
  * 503, so the connection and its key stay for the retry instead of leaving an
  * orphaned provider entry. Called before the provider connection is deleted.
+ *
+ * The first step is also the disconnect fence: every policy is disabled and
+ * the all-environments flag is off (committed), so neither the sync sweep
+ * nor an identity call can register or admit anything while a disconnect is
+ * half done.
+ *
+ * abandonEnvironmentCleanup (owners and admins, checked under the lock like
+ * every step) is the explicit way out when that cleanup can never succeed,
+ * for example after the provider key was revoked: the first step is the
+ * same, then no entry is confirmed or removed and no provider call is made.
+ * Nothing is cleared here: the recorded entry ids and unconfirmed creates
+ * stay until compute and Relay retirement succeeded, and are then forgotten
+ * by abandonEnvironmentCleanup in the transaction that deletes the
+ * connection.
  */
-export async function disconnectEnvironments(deps: ReplicasDeps, actor: ReplicasActor): Promise<void> {
+export async function disconnectEnvironments(deps: ReplicasDeps, actor: ReplicasActor,
+  options: { abandonEnvironmentCleanup?: boolean } = {}): Promise<void> {
   const released: string[] = [];
   try {
     const pending = await withReplicasLock(deps, actor, async (tx) => {
@@ -1360,6 +1402,7 @@ export async function disconnectEnvironments(deps: ReplicasDeps, actor: Replicas
       for (const policy of policies) disabled.push(await disablePolicy(tx, actor, policy, released));
       return disabled.filter((policy) => policy.registered_mcp_id || policy.create_unconfirmed);
     });
+    if (options.abandonEnvironmentCleanup) return;
     for (const policy of pending) {
       const registered = policy.registered_mcp_id ? policy : await confirmCreate(deps, actor, policy);
       if (!registered) throw new ReplicasError(CLEANUP_UNCONFIRMED, 503);
@@ -1371,4 +1414,28 @@ export async function disconnectEnvironments(deps: ReplicasDeps, actor: Replicas
   } finally {
     await retireIdentityBindings(deps, actor, released);
   }
+}
+
+/**
+ * The abandon bookkeeping of a disconnect with abandonEnvironmentCleanup.
+ * Runs inside the caller's transaction, the one that deletes the connection,
+ * after compute and Relay retirement succeeded: every policy with a recorded
+ * entry id or an unconfirmed create forgets it (its provider entry, if any,
+ * stays at the provider), one replicas.environment.cleanup_abandoned audit
+ * per policy. Talks to no provider. Returns the abandoned environment ids;
+ * none writes nothing.
+ */
+export async function abandonEnvironmentCleanup(tx: SqlExecutor, actor: ReplicasActor): Promise<{ environmentIds: string[] }> {
+  const pending = (await tx.query<PolicyRow>(
+    `SELECT ${POLICY} FROM replica_environment_policies WHERE workspace_id = $1 AND (registered_mcp_id IS NOT NULL OR create_unconfirmed)
+      ORDER BY environment_id FOR UPDATE`, [actor.workspaceId])).rows;
+  if (!pending.length) return { environmentIds: [] };
+  await tx.query(
+    "UPDATE replica_environment_policies SET registered_mcp_id = NULL, create_unconfirmed = false, updated_at = now() WHERE id = ANY($1::uuid[])",
+    [pending.map((policy) => policy.id)]);
+  for (const policy of pending) {
+    await recordAudit(tx, { organizationId: actor.organizationId, workspaceId: actor.workspaceId,
+      actor: auditActor(actor), action: "replicas.environment.cleanup_abandoned", target: policy.id });
+  }
+  return { environmentIds: pending.map((policy) => policy.environment_id) };
 }
