@@ -397,6 +397,35 @@ test("cloud import: a re-run keeps a binding Control made lazily on an unbound i
   assert.notDeepEqual(drifted, sourceRows);
 });
 
+test("cloud import: a binding Control holds wins over a later Cloud binding and an older key generation", async (t) => {
+  const source = await cloudSource();
+  const target = await controlTarget("current");
+  t.after(async () => {
+    await source.close();
+    await target.close();
+  });
+  const deps = { source, target, keyring: KEYRING, cloudKeyHex: CLOUD_KEY };
+  assert.equal((await runImport(deps, { orgIds: null }, "apply")).ok, true);
+  const pair = async (workspace: string) => (await target.query<{ rc: string | null; key: string | null; generation: number }>(
+    "SELECT relaycast_workspace_id AS rc, relaycast_api_key_ciphertext AS key, relaycast_api_key_generation AS generation FROM workspaces WHERE id = $1",
+    [workspace])).rows[0]!;
+  // Control binds a2 lazily, and rotates a1's key (generation 1 -> 5).
+  await target.query(
+    "UPDATE workspaces SET relaycast_workspace_id = 'rc_lazy_a202', relaycast_api_key_ciphertext = 'control-ciphertext', relaycast_api_key_generation = 2 WHERE id = $1",
+    [id(0x202)]);
+  await target.query("UPDATE workspaces SET relaycast_api_key_ciphertext = 'control-rotated', relaycast_api_key_generation = 5 WHERE id = $1", [id(0x201)]);
+  const a1 = await pair(id(0x201));
+  // Then Cloud binds a2 too, to a different Relaycast workspace.
+  await source.exec("UPDATE relay_workspaces SET relaycast_api_key = 'rk_cloud_late', relaycast_workspace_id = 'rc-ws-a2-cloud', relaycast_api_key_generation = 3 WHERE id = 'rw_0000a202'");
+
+  const again = await runImport(deps, { orgIds: null }, "apply");
+  assert.equal(again.ok, true, JSON.stringify(again.orgs));
+  assert.deepEqual(await pair(id(0x202)), { rc: "rc_lazy_a202", key: "control-ciphertext", generation: 2 }, "Control's binding is kept");
+  assert.deepEqual(await pair(id(0x201)), a1, "a generation never goes backwards");
+  assert.equal(again.warnings.workspaces_binding_conflict, 1);
+  assert.equal(again.warnings.workspaces_generation_kept, 1);
+});
+
 test("cloud import: an existing Control user with an imported email under another id refuses the run", async (t) => {
   const source = await cloudSource();
   const target = await controlTarget("0051");
