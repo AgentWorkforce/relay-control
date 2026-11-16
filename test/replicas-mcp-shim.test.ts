@@ -11,13 +11,13 @@ import { helperInstall } from "../src/replicas/service.js";
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
 // The replica-side MCP server and its installer are vendored byte for byte
-// from the hosted control plane (Cloud 34fd4016e, mcp.ts sha256 d5721532).
+// from the hosted control plane (Cloud 6145d69, mcp.ts sha256 e3669cf4).
 // A change here must be a deliberate re-vendor: update the hosted copy and
 // these pins together.
 test("vendored replica MCP shim matches the pinned hosted source", () => {
   assert.equal(sha256(replicaMcpSource), "1624e788afb02435b2e0bd9b18d84eda474ae318bba74ca218a4f5dd720913a8");
-  assert.equal(sha256(mcpInstall("claude")), "cea60a8fc222870d3396177375e2fab54fb5c8312f82a9e1dac74d8f25ff8c5c");
-  assert.equal(sha256(mcpInstall("codex")), "f469b9ce5d87b291ad487a8671e6ea17cb251c428666442a130bd2da08c58ab5");
+  assert.equal(sha256(mcpInstall("claude")), "13144798088bc6a7cb323c9a9d5f3ad8e6f55516de169c8544e91afcb0c73fb0");
+  assert.equal(sha256(mcpInstall("codex")), "5bc2c4b68dc07e24b405cee2c9bfeef03864a17573067f7f2227071ccb402431");
   assert.ok(replicaMcpSource.includes("stop retrying until binding access is restored"));
   assert.equal(REPLICA_MCP_READY, "agent-relay-mcp-ready-v1");
   assert.match(REPLICA_MCP_FAILURE, /^Agent Relay MCP provisioning failed\./);
@@ -54,7 +54,7 @@ function sandbox(t: TestContext, harness: string) {
   const bin = join(home, "bin");
   mkdirSync(bin);
   writeFileSync(join(bin, harness), `#!/usr/bin/env python3
-import json,pathlib,sys
+import json,pathlib,sys,time
 p=pathlib.Path.home()/'registrations.json'
 registry=json.loads(p.read_text()) if p.exists() else {}
 operation=sys.argv[2]
@@ -66,7 +66,9 @@ elif operation=='get':
  name=sys.argv[3]
  if name not in registry: print('No MCP server named '+name,file=sys.stderr);sys.exit(1)
  entry=registry[name]
- if '--json' in sys.argv: print(json.dumps({'name':name,'transport':entry}))
+ if entry.get('slow_get'): time.sleep(10)
+ if entry.get('fail_get'): print('private-provider-output');sys.exit(1)
+ if '--json' in sys.argv: print(json.dumps({'name':name,'transport':entry,'enabled':entry.get('enabled',True)}))
  else: print('Scope: '+('User config' if entry.get('scope')=='user' else 'Local config')+'\\nType: '+entry['type']+'\\nCommand: '+entry['command']+'\\nArgs: '+' '.join(entry['args']))
 elif operation=='remove':
  name=sys.argv[-1]
@@ -80,6 +82,17 @@ p.write_text(json.dumps(registry))
   const server = join(home, ".local/share/agent-relay-replicas/mcp.py");
   return { env, registry, server, read: () => JSON.parse(readFileSync(registry, "utf8")) };
 }
+
+test("the installer caps the legacy names at the eight it is given first", () => {
+  const ids = Array.from({ length: 12 }, (_, i) => `id${i}`);
+  assert.deepEqual(decode(mcpInstall("claude", ids)).legacy_names, ids.slice(0, 8).map((id) => `agent-relay-${id}`));
+});
+
+test("a disabled Codex stable registration is refused", (t) => {
+  const box = sandbox(t, "codex");
+  writeFileSync(box.registry, JSON.stringify({ "agent-relay-replica": { type: "stdio", command: "python3", args: [box.server], scope: "user", enabled: false } }));
+  assert.throws(() => execFileSync("sh", ["-c", mcpInstall("codex")], { env: box.env, stdio: "pipe" }));
+});
 
 for (const harness of ["claude", "codex"]) {
   test(`${harness}: a foreign stable-name registration fails the install and is left untouched`, (t) => {
@@ -111,6 +124,25 @@ for (const harness of ["claude", "codex"]) {
       assert.deepEqual(remaining[name], registry[name]);
     }
     assert.deepEqual(remaining["agent-relay-replica"], owned);
+  });
+
+  test(`${harness}: slow legacy lookups are bounded and keep the stable entry usable`, (t) => {
+    const box = sandbox(t, harness);
+    const ids = Array.from({ length: 40 }, (_, i) => String(i));
+    const owned = { type: "stdio", command: "python3", args: [box.server], scope: "user", slow_get: true };
+    writeFileSync(box.registry, JSON.stringify(Object.fromEntries(ids.map((id) => [`agent-relay-${id}`, owned]))));
+    const started = Date.now();
+    assert.equal(execFileSync("sh", ["-c", mcpInstall(harness, ids)], { env: box.env, encoding: "utf8", timeout: 15000 }).trim(), REPLICA_MCP_READY);
+    assert.ok(Date.now() - started < 12000);
+    const registry = box.read();
+    assert.ok(registry["agent-relay-replica"]);
+    assert.deepEqual(registry["agent-relay-0"], owned);
+  });
+
+  test(`${harness}: a failed legacy lookup is skipped without exposing CLI output`, (t) => {
+    const box = sandbox(t, harness);
+    writeFileSync(box.registry, JSON.stringify({ "agent-relay-old": { fail_get: true } }));
+    assert.equal(execFileSync("sh", ["-c", mcpInstall(harness, ["old"])], { env: box.env, encoding: "utf8" }).trim(), REPLICA_MCP_READY);
   });
 
   test(`${harness}: a failed removal of a verified legacy entry fails without leaking CLI output`, (t) => {
