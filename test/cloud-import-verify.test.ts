@@ -151,6 +151,9 @@ fixtureTest("unique indexes include expression, predicate and NULLS NOT DISTINCT
   const report = await verify(source,target,contract,fixtureKeyring);
   assert.equal(report.ok, true);
   assert.equal(report.findings.filter((f) => f.kind === "unique" && f.name.includes("unique_probe")).length, 2);
+  await admin.query("ALTER TABLE control_fixture.unique_probe ADD CONSTRAINT probe_check CHECK(v IS NOT NULL OR active=false) NOT VALID");
+  const unvalidated = await verify(source,target,contract,fixtureKeyring);
+  assert.ok(unvalidated.findings.some((f) => f.kind === "constraint_validation" && !f.ok));
 });
 
 fixtureTest("stale sequence fails without consuming a sequence value", async () => {

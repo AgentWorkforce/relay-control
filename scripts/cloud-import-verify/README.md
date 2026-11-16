@@ -10,18 +10,17 @@ sample definitions. PR #148 is stacked on the importer branch.
 
 The harness executes the actual importer against its synthetic Cloud fixture
 and separate source/target databases. It checks rollback mode, committed apply
-and a second apply, reconciles all nine tables and per-org ledgers, preserves
+and a second apply, reconciles all ten mapped tables and per-org ledgers, preserves
 invite hashes and proves sessions/reconnect state stay empty. The checked-in
 `import-report.example.json` is that synthetic receipt; application smokes are
 pending and no real-data import has run.
 
 The target uses all checked-in Control migrations (through 0051 at the initial
-integration) plus test-only models of the optional 0053/0056/0057 column shapes
+integration) plus test-only models of the optional 0053/0056/0057/0058 shapes
 from separate schema PRs. These models exercise the new columns/types; they
 do not prove those pending migration files themselves. The shared Cloud fixture
-at importer head `240e84d` also needs a test-only generation-column guard because
-its mapping reads a column omitted from that initial fixture. The importer
-owner has been notified. The smaller fixtures in `fixtures.ts` independently
+now includes the generation column, so there is no verifier-owned source guard.
+The smaller fixtures in `fixtures.ts` independently
 stress the engine and are explicitly labeled as reference shapes.
 
 ## Run focused checks
@@ -78,7 +77,7 @@ node --import tsx scripts/cloud-import-verify/import-cli.ts /path/to/import-ledg
 ```
 
 Supply `CLOUD_VERIFY_SOURCE_URL`, `CLOUD_VERIFY_TARGET_URL`,
-`CLOUD_IMPORT_CREDENTIAL_ENCRYPTION_KEY` (Cloud's 64-hex AES key) and Control's
+`CLOUD_CREDENTIAL_ENCRYPTION_KEY` (Cloud's 64-hex AES key, shared with the importer) and Control's
 usual keyring variables through the environment or their `_FILE` variants.
 Pepper coverage uses `SELFHOST_PASSWORD_PEPPER_FILE`. The explicit scope must
 match the ledger; a plan or rollback-mode ledger cannot qualify committed data.
@@ -87,14 +86,23 @@ The adapter discovers optional target columns instead of trusting the ledger.
 It independently reconstructs source-query skips, decrypt failures and legacy
 Desktop source-ID exclusions inside the same read-only snapshots as the
 checksums. It checks candidate/import/skip totals and every per-org import
-count. Ledger counts alone never authorize excluding a row. Dynamic exclusions
+count, and compares the exact `importerSkips` key sets by reason against those
+independently derived from source rows. Ledger counts alone never authorize excluding a row. Dynamic exclusions
 use independently derived keys and still block qualification as unresolved
 data-loss cases. Missing `rw_` storage and legacy `rw_` values normalized away
 by the importer also block continuity qualification, even if checksums match.
+Dropped History route fields or populated origin/generation metadata omitted
+by an older target schema also block qualification; normalization to NULL must
+not silently redirect a workspace to the default History service.
 Source metadata streams in batches of 250, with a 10,000-key exclusion cap that
 refuses excessive unresolved skips. Encrypted samples stay within the cohort;
 empty mapped secret tables are explicitly not applicable based on observed
 source/import counts.
+
+The shared mapping supplies workspace projections and scoped encrypted samples
+directly. Coding-agent `relay_managed` rows are also checked; a target lacking
+0058 support accounts for their excluded keys and blocks qualification. No
+external coding-agent credential-store secrets are read or copied.
 
 The library entry point is `verifyImport(source, target, scope, ledger, keyring,
 cloudKeyHex, {pepperVersions})`. For standalone comparisons without an importer
@@ -111,6 +119,11 @@ Use two separate connected `pg.Client` instances. The CLI accepts a JSON file:
 # mechanism), and optional SELFHOST_ENCRYPTION_PREVIOUS_KEY_ID / _KEY.
 node --import tsx scripts/cloud-import-verify/cli.ts /path/to/contract.json
 ```
+
+The importer's `--verifier-contract` JSON is accepted directly, including its
+empty `identities` array: identity keys remain part of the table checksums.
+This lower-level command does not reconcile the importer ledger or apply the
+additional continuity gates. Use `import-cli.ts` for full import qualification.
 
 URL variables are `CLOUD_VERIFY_SOURCE_URL` and `CLOUD_VERIFY_TARGET_URL`.
 The CLI currently accepts only literal `127.0.0.1` / `::1` hosts and refuses

@@ -7,6 +7,7 @@ import { runImport } from "../scripts/cloud-import/importer.js";
 import { CLOUD_FIXTURE_DDL,cloudFixtureSeed,cloudEnvelope,id,ORG_A,ORG_B } from "../scripts/cloud-import/cloud-fixture.js";
 import { fixtureKeyring } from "../scripts/cloud-import-verify/fixtures.js";
 import { verifyImport } from "../scripts/cloud-import-verify/import-contract.js";
+import { SOURCE_TABLES,MAPPING_REVISION,TARGET_RELATIONS,verifierComparisons,encryptedSamples } from "../scripts/cloud-import/mapping.js";
 import { writeFile,mkdtemp,rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,25 +50,33 @@ beforeEach(async () => {
   await source.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public");
   await target.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public");
   await source.query(CLOUD_FIXTURE_DDL);
-  // The shared fixture at #155/240e84d omitted a column its mapping reads.
-  // Harmless once the owning importer adds it; no owned source file is edited.
-  await source.query("ALTER TABLE relay_workspaces ADD COLUMN IF NOT EXISTS relaycast_api_key_generation integer DEFAULT 1");
   await source.query(cloudFixtureSeed(cloudKeyHex,cloudKeyHex));
   await source.query(`UPDATE relay_workspaces SET id='rw_0000b202' WHERE id='rw_legacy-01';
     UPDATE workspaces SET relay_workspace_id='rw_0000b202' WHERE relay_workspace_id='rw_legacy-01'`);
   await migrate(targetDb);
   // Run actual checked-in migrations first. Model the published optional
-  // 0053/0056/0057 column shapes until those separate schema PRs land.
+  // 0053/0056/0057/0058 shapes until those separate schema PRs land.
   await target.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS cloud_relay_workspace_id text UNIQUE;
     ALTER TABLE organizations ADD COLUMN IF NOT EXISTS slug text;
     ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS slug text;
     ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS relayhistory_origin text;
     ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS relaycast_api_key_generation integer;
     ALTER TABLE desktop_relay_identities ALTER COLUMN source_id TYPE text USING source_id::text;
-    ALTER TABLE fleet_node_owners ALTER COLUMN node_name DROP NOT NULL`);
+    ALTER TABLE fleet_node_owners ALTER COLUMN node_name DROP NOT NULL;
+    ALTER TABLE coding_agent_credentials
+      ALTER COLUMN secret_preview DROP NOT NULL,ALTER COLUMN key_fingerprint DROP NOT NULL,
+      DROP CONSTRAINT IF EXISTS selfhost_coding_agent_auth_type,
+      DROP CONSTRAINT IF EXISTS coding_agent_auth_type,
+      DROP CONSTRAINT IF EXISTS selfhost_coding_agent_secret_storage,
+      DROP CONSTRAINT IF EXISTS coding_agent_secret_storage,
+      ADD CONSTRAINT coding_agent_auth_type CHECK(auth_type IN ('byo_api_key','oauth_token','provider_oauth','relay_managed')),
+      ADD CONSTRAINT coding_agent_secret_storage CHECK(
+        (auth_type='relay_managed' AND secret_ciphertext IS NULL AND NOT harness_active)
+        OR (auth_type='provider_oauth' AND secret_ciphertext IS NULL AND blob_location IS NOT NULL)
+        OR (auth_type IN ('byo_api_key','oauth_token') AND secret_ciphertext IS NOT NULL))`);
 });
 
-fixtureTest("actual importer rollback, apply and rerun reconcile all nine tables and keep invite hashes",async () => {
+fixtureTest("actual importer rollback, apply and rerun reconcile all mapped tables and keep invite hashes",async () => {
   const dry = await runImport({source:sourceDb,target:targetDb,keyring:fixtureKeyring,cloudKeyHex,batchSize:2},scope,"dry-run");
   assert.equal(dry.ok,true,JSON.stringify(dry));
   assert.equal((await target.query("SELECT count(*)::int AS n FROM users")).rows[0].n,0);
@@ -75,7 +84,7 @@ fixtureTest("actual importer rollback, apply and rerun reconcile all nine tables
   assert.equal(first.ok,true,JSON.stringify(first));
   const one = await verifyImport(source,target,scope,first,fixtureKeyring,cloudKeyHex);
   assert.equal(one.ok,true,JSON.stringify(one.findings.filter((f) => !f.ok)));
-  assert.equal(one.findings.filter((f) => f.kind === "table").length,9);
+  assert.equal(one.findings.filter((f) => f.kind === "table").length,SOURCE_TABLES.length);
   assert.equal(one.findings.filter((f) => f.kind === "decrypt").length,4);
   const hashes = (await target.query("SELECT id,token_hash FROM organization_invitations ORDER BY id")).rows;
   const second = await apply();
@@ -87,6 +96,7 @@ fixtureTest("actual importer rollback, apply and rerun reconcile all nine tables
   const rw = (await target.query("SELECT cloud_relay_workspace_id,relaycast_workspace_id FROM workspaces WHERE id=$1",[id(0x201)])).rows[0];
   assert.deepEqual(rw,{cloud_relay_workspace_id:"rw_0000a201",relaycast_workspace_id:"rc-ws-a1"});
   assert.ok(one.smoke.every((s) => s.status === "pending"));
+  assert.equal((await target.query("SELECT count(*)::int AS n FROM coding_agent_credentials WHERE secret_ciphertext IS NOT NULL OR harness_active")).rows[0].n,0);
   for (const table of ["token_sessions","device_authorizations","workspace_api_tokens","mcp_oauth_grants","desktop_relay_session_bindings","desktop_attestation_keys"]) {
     assert.equal((await target.query(`SELECT count(*)::int AS n FROM public.${table}`)).rows[0].n,0,`${table} remains empty`);
   }
@@ -115,6 +125,45 @@ fixtureTest("undecryptable Cloud envelopes reconcile by independent keys but blo
   assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "person_identities")!.ok,true);
   assert.equal(report.ok,false);
   assert.ok(report.findings.some((f) => f.kind === "importer_skip_policy" && !f.ok));
+  ledger.tables.person_identities.importerSkips.cloud_decrypt_failed = [id(0x401)];
+  const tampered = await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(tampered.findings.find((f) => f.kind === "ledger" && f.name === "person_identities")!.ok,false);
+  assert.equal(tampered.findings.find((f) => f.kind === "table" && f.name === "person_identities")!.ok,true);
+});
+
+fixtureTest("target without relay_managed support accounts for coding credential keys and blocks qualification",async () => {
+  await target.query(`ALTER TABLE coding_agent_credentials
+    DROP CONSTRAINT coding_agent_auth_type,DROP CONSTRAINT coding_agent_secret_storage,
+    ADD CONSTRAINT coding_agent_auth_type CHECK(auth_type IN ('byo_api_key','oauth_token','provider_oauth')),
+    ADD CONSTRAINT coding_agent_secret_storage CHECK(
+      (auth_type='provider_oauth' AND secret_ciphertext IS NULL AND blob_location IS NOT NULL)
+      OR (auth_type <> 'provider_oauth' AND secret_ciphertext IS NOT NULL))`);
+  const ledger = await apply();
+  assert.equal(ledger.tables.coding_agent_credentials.skipped.target_lacks_relay_managed,2);
+  assert.equal(ledger.tables.coding_agent_credentials.importerSkips.target_lacks_relay_managed!.length,2);
+  const report = await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.findings.find((f) => f.kind === "ledger" && f.name === "coding_agent_credentials")!.ok,true);
+  assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "coding_agent_credentials")!.ok,true);
+  assert.equal(report.ok,false);
+});
+
+fixtureTest("opaque Desktop source IDs preserve case and a lowercase target corruption fails",async () => {
+  await source.query("UPDATE desktop_relay_identities SET source_id='Opaque-Case-Source' WHERE id=$1",[id(0x602)]);
+  const ledger = await apply();
+  assert.equal((await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex)).ok,true);
+  await target.query("UPDATE desktop_relay_identities SET source_id=lower(source_id) WHERE id=$1",[id(0x602)]);
+  const report = await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "desktop_relay_identities")!.ok,false);
+});
+
+fixtureTest("history origins dropped by normalization cannot silently qualify a workspace",async () => {
+  await source.query("UPDATE workspaces SET relayhistory_origin='https://history.example.test/path' WHERE id=$1",[id(0x201)]);
+  const ledger = await apply();
+  const report = await verifyImport(source,target,scope,ledger,fixtureKeyring,cloudKeyHex);
+  assert.equal(ledger.warnings.relayhistory_origin_invalid_dropped,1);
+  assert.equal(report.findings.find((f) => f.kind === "table" && f.name === "workspaces")!.ok,true);
+  assert.equal(report.findings.find((f) => f.name === "workspace_metadata_preserved")!.ok,false);
+  assert.equal(report.ok,false);
 });
 
 fixtureTest("pre-0057 non-UUID Desktop source IDs remain visible as unresolved importer skips",async () => {
@@ -168,9 +217,9 @@ fixtureTest("import-ledger CLI requires explicit scope and emits a complete actu
     url.hostname=config.host;url.port=String(port);url.username=config.user;
     url.pathname="/cloud_import_source_fixture";
     const sourceUrl = url.toString();url.pathname="/cloud_import_target_fixture";
-    const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(SELFHOST_|CLOUD_IMPORT_|CLOUD_VERIFY_)/.test(name)));
+    const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(SELFHOST_|CLOUD_IMPORT_|CLOUD_VERIFY_|CLOUD_CREDENTIAL_)/.test(name)));
     const env = {...inherited,CLOUD_VERIFY_SOURCE_URL:sourceUrl,CLOUD_VERIFY_TARGET_URL:url.toString(),
-      CLOUD_IMPORT_CREDENTIAL_ENCRYPTION_KEY:cloudKeyHex,
+      CLOUD_CREDENTIAL_ENCRYPTION_KEY:cloudKeyHex,
       SELFHOST_ENCRYPTION_KEY_ID:fixtureKeyring.active.id,SELFHOST_ENCRYPTION_KEY:fixtureKeyring.active.key.toString("base64"),
       SELFHOST_ENCRYPTION_PREVIOUS_KEY_ID:"",SELFHOST_ENCRYPTION_PREVIOUS_KEY:"",SELFHOST_PASSWORD_PEPPER_FILE:""};
     const run = (args:string[]) => spawnSync(process.execPath,["--import","tsx",
@@ -181,5 +230,13 @@ fixtureTest("import-ledger CLI requires explicit scope and emits a complete actu
     assert.equal(JSON.parse(passed.stdout).mappingRevision,ledger.mappingRevision);
     assert.equal(run([]).status,2);
     assert.equal(run(["--org-ids",ORG_A]).status,1);
+    const contractPath = join(directory,"contract.json");
+    await writeFile(contractPath,JSON.stringify({version:1,mappingRevision:MAPPING_REVISION,
+      tables:verifierComparisons(scope,new Set(ledger.optionalColumns)),identities:[],
+      targetRelations:TARGET_RELATIONS,encryptedSamples:encryptedSamples(20,scope)}));
+    const generic = spawnSync(process.execPath,["--import","tsx",
+      fileURLToPath(new URL("../scripts/cloud-import-verify/cli.ts",import.meta.url)),contractPath],
+      {env,encoding:"utf8",timeout:20000});
+    assert.equal(generic.status,0,generic.stderr);
   } finally {await rm(directory,{recursive:true,force:true});}
 });

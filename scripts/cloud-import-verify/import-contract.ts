@@ -6,22 +6,14 @@ import { MAPPING_REVISION, ORG_TABLES, SOURCE_TABLES, TARGETS, TARGET_RELATIONS,
 import { verify, type Comparison, type Contract, type Finding } from "./verify.js";
 
 const literal = (s:string) => `'${s.replaceAll("'","''")}'`;
-const workspaceTables = new Set<ImportTable>(["workspaces","person_identities","hosted_relay_participants","desktop_relay_identities","fleet_node_owners"]);
 const sorted = (values:Record<string,number>) => JSON.stringify(Object.entries(values).filter(([,n]) => n !== 0).sort(([a],[b]) => a.localeCompare(b)));
+const sortedKeys = (values:Record<string,string[]>) => JSON.stringify(Object.entries(values).filter(([,keys]) => keys.length)
+  .sort(([a],[b]) => a.localeCompare(b)).map(([reason,keys]) => [reason,[...keys].sort()]));
 const equalScope = (a:ImportScope,b:ImportScope) => JSON.stringify(a.orgIds?.map((s) => s.toLowerCase()).sort() ?? null)
   === JSON.stringify(b.orgIds?.map((s) => s.toLowerCase()).sort() ?? null);
 
 function comparisons(scope:ImportScope,columns:ReadonlySet<string>): Comparison[] {
-  return verifierComparisons(scope,columns).map((item) => {
-    if ((item as Comparison).workspaceScoped) return item;
-    const workspaceScoped = workspaceTables.has(item.name as ImportTable);
-    // Compatible with the contract's initial __key/__org-only version; the
-    // shared mapping owner is adding this same __workspace projection.
-    const workspace = item.name === "workspaces" ? "id" : "workspace_id";
-    return workspaceScoped ? {...item,workspaceScoped,
-      sourceSql:`SELECT p.*,p.${workspace}::text AS __workspace FROM (${item.sourceSql}) p`,
-      targetSql:`SELECT p.*,p.${workspace}::text AS __workspace FROM (${item.targetSql}) p`} : item;
-  });
+  return verifierComparisons(scope,columns);
 }
 
 function contractFor(scope:ImportScope,columns:ReadonlySet<string>,tables=comparisons(scope,columns)):Contract {
@@ -33,7 +25,7 @@ function contractFor(scope:ImportScope,columns:ReadonlySet<string>,tables=compar
       targetSql:`SELECT __key,__org,id${extra} FROM (${item.targetSql}) p`};
   });
   return {version:1,mappingRevision:MAPPING_REVISION,tables,identities,targetRelations:TARGET_RELATIONS,
-    encryptedSamples:encryptedSamples(20),
+    encryptedSamples:encryptedSamples(20,scope),
     standaloneSequences:[{name:"desktop_feed_publish_seq",relation:"public.desktop_feed_publish_seq",
       // Desktop release state is Control-owned, has no Cloud source and is
       // deliberately not imported. Compare against its existing target data.
@@ -61,6 +53,9 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
     const metadata = await t.query(`SELECT table_name,column_name,udt_name FROM information_schema.columns WHERE table_schema='public'`);
     const columns = new Set<string>(metadata.rows.map((r) => `${r.table_name}.${r.column_name}`));
     const desktopUuid = metadata.rows.some((r) => r.table_name === "desktop_relay_identities" && r.column_name === "source_id" && r.udt_name === "uuid");
+    const relayManaged = (await t.query(`SELECT EXISTS (SELECT 1 FROM pg_constraint c
+      WHERE c.conrelid='public.coding_agent_credentials'::regclass AND c.contype='c'
+      AND pg_get_constraintdef(c.oid) LIKE '%auth_type%' AND pg_get_constraintdef(c.oid) LIKE '%relay_managed%') AS ok`)).rows[0].ok;
     findings.push({kind:"identity",name:"rw_column_present",ok:columns.has("workspaces.cloud_relay_workspace_id"),
       detail:columns.has("workspaces.cloud_relay_workspace_id") ? "present" : "missing_required_mapping_column"});
     const actualOptional = SOURCE_TABLES.flatMap((table) => (TARGETS[table].optional ?? [])
@@ -77,13 +72,19 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
         ${table === "users" ? "NULL::text" : "q.organization_id::text"} AS org,
         ${spec.secret?.source === "secret_envelope" ? "q.secret_envelope::text" : "NULL::text"} AS envelope,
         ${table === "desktop_relay_identities" ? "q.source_id_is_uuid" : "true"} AS source_id_is_uuid,
-        ${table === "workspaces" ? "q.cloud_relay_workspace_id IS NOT NULL" : "true"} AS preserves_rw
+        ${table === "workspaces" ? "q.cloud_relay_workspace_id IS NOT NULL" : "true"} AS preserves_rw,
+        ${table === "workspaces" ? "q.origin_invalid OR q.has_dashboard_url" : "false"} AS loses_history_route,
+        ${table === "workspaces" ? "q.relayhistory_origin IS NOT NULL" : "false"} AS has_history_origin,
+        ${table === "workspaces" ? "q.relaycast_api_key_generation IS NOT NULL" : "false"} AS has_generation
         FROM (${sourceQuery(table,scope)}) q`);
       const skipped:Record<string,number> = {};
       const dynamicKeys:string[] = [];
+      const dynamicReasons:Record<string,string[]> = {};
       let imported = 0;
       let candidates = 0;
       let missingRw = 0;
+      let historyLoss = 0;
+      let metadataLoss = 0;
       try {for (;;) {
         const batch = await s.query("FETCH FORWARD 250 FROM import_ledger_cursor");
         if (!batch.rows.length) break;
@@ -95,15 +96,20 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
           catch { reason = "cloud_decrypt_failed"; }
         }
         if (reason === null && table === "desktop_relay_identities" && desktopUuid && !row.source_id_is_uuid) reason = "source_id_not_uuid";
+        if (reason === null && table === "coding_agent_credentials" && !relayManaged) reason = "target_lacks_relay_managed";
         if (reason !== null) {
           skipped[reason] = (skipped[reason] ?? 0)+1;
           if (row.skip_reason === null) {
             if (dynamicKeys.length >= 10000) throw new Error("Excessive unresolved dynamic skips; repair source/keys before qualification");
             dynamicKeys.push(row.key);
+            (dynamicReasons[reason] ??= []).push(row.key);
           }
         } else {
           imported++;
           if (!row.preserves_rw) missingRw++;
+          if (row.loses_history_route) historyLoss++;
+          if ((row.has_history_origin && !columns.has("workspaces.relayhistory_origin"))
+            || (row.has_generation && !columns.has("workspaces.relaycast_api_key_generation"))) metadataLoss++;
           if (row.org) {
             const group = perOrg.get(row.org) ?? {};
             group[table] = (group[table] ?? 0)+1; perOrg.set(row.org,group);
@@ -112,12 +118,20 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
       }}} finally {await s.query("CLOSE import_ledger_cursor");}
       exclusions.set(table,dynamicKeys); counts.set(table,imported);
       if (table === "workspaces") findings.push({kind:"identity",name:"all_rw_bindings_preserved",ok:missingRw === 0,detail:{missing:missingRw}});
+      if (table === "workspaces") findings.push({kind:"continuity",name:"workspace_metadata_preserved",
+        ok:historyLoss === 0 && metadataLoss === 0,detail:{historyRoutesDropped:historyLoss,optionalMetadataDropped:metadataLoss}});
       if (dynamicKeys.length) findings.push({kind:"importer_skip_policy",name:table,ok:false,
         detail:{unresolvedDynamicSkips:dynamicKeys.length}});
       const reported = ledger.tables?.[table];
+      const keyFormat = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$/i;
+      for (const keys of Object.values(reported?.importerSkips ?? {})) {
+        if (!Array.isArray(keys) || keys.some((key) => typeof key !== "string" || !keyFormat.test(key))) {
+          throw new Error("Importer skip keys must be UUIDs or org:user UUID pairs");
+        }
+      }
       findings.push({kind:"ledger",name:table,ok:reported?.candidates === candidates && reported.imported === imported
-        && sorted(reported.skipped) === sorted(skipped),
-        detail:{observed:{candidates,imported,skipped},reported}});
+        && sorted(reported.skipped) === sorted(skipped) && sortedKeys(reported.importerSkips) === sortedKeys(dynamicReasons),
+        detail:{observed:{candidates,imported,skipped,importerSkips:dynamicReasons},reported}});
     }
     const expectedOrgs = [...perOrg.keys()].sort();
     findings.push({kind:"ledger",name:"organization_set",ok:JSON.stringify(expectedOrgs) === JSON.stringify(Object.keys(ledger.orgs ?? {}).sort()),detail:{expected:expectedOrgs}});
@@ -131,15 +145,12 @@ export async function verifyImport(source:Client,target:Client,scope:ImportScope
       return keys.length ? {...item,sourceSql:`SELECT p.* FROM (${item.sourceSql}) p WHERE __key::text <> ALL(ARRAY[${keys.map(literal).join(",")}]::text[])`} : item;
     });
     const contract = contractFor(scope,columns,tables);
-    contract.encryptedSamples = encryptedSamples(20).flatMap((sample) => {
+    contract.encryptedSamples = encryptedSamples(20,scope).flatMap((sample) => {
       const table = sample.name.split(".")[0] as ImportTable;
       if (counts.get(table) === 0) {
         findings.push({kind:"decrypt",name:sample.name,ok:true,detail:"not_applicable_no_imported_rows"}); return [];
       }
-      const projection = tables.find((item) => item.name === table)!;
-      const secret = TARGETS[table].secret!;
-      return [{...sample,sql:`SELECT x.${secret.target} AS ciphertext FROM public.${table} x
-        JOIN (${projection.targetSql}) p ON x.id::text=p.__key::text ORDER BY x.id`}];
+      return [sample];
     });
     // Preserve fail-closed sampling if the entire cohort lacks an importable
     // workspace: an empty cohort cannot qualify the credential migration.

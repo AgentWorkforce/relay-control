@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "mappingRevision": "cloud-identity-2026-11-15.1",
+  "mappingRevision": "cloud-identity-2026-11-15.2",
   "ok": true,
   "findings": [
     {
@@ -8,8 +8,8 @@
       "name": "run",
       "ok": true,
       "detail": {
-        "expectedRevision": "cloud-identity-2026-11-15.1",
-        "actualRevision": "cloud-identity-2026-11-15.1",
+        "expectedRevision": "cloud-identity-2026-11-15.2",
+        "actualRevision": "cloud-identity-2026-11-15.2",
         "mode": "apply",
         "ok": true
       }
@@ -52,7 +52,8 @@
           "skipped": {
             "merged_into_survivor": 1,
             "no_valid_email": 1
-          }
+          },
+          "importerSkips": {}
         },
         "reported": {
           "candidates": 6,
@@ -60,7 +61,8 @@
           "skipped": {
             "merged_into_survivor": 1,
             "no_valid_email": 1
-          }
+          },
+          "importerSkips": {}
         }
       }
     },
@@ -72,12 +74,14 @@
         "observed": {
           "candidates": 2,
           "imported": 2,
-          "skipped": {}
+          "skipped": {},
+          "importerSkips": {}
         },
         "reported": {
           "candidates": 2,
           "imported": 2,
-          "skipped": {}
+          "skipped": {},
+          "importerSkips": {}
         }
       }
     },
@@ -94,7 +98,8 @@
             "user_not_imported": 1,
             "merged_duplicate_membership": 1,
             "unsupported_role": 1
-          }
+          },
+          "importerSkips": {}
         },
         "reported": {
           "candidates": 9,
@@ -104,7 +109,8 @@
             "user_not_imported": 1,
             "merged_duplicate_membership": 1,
             "unsupported_role": 1
-          }
+          },
+          "importerSkips": {}
         }
       }
     },
@@ -114,6 +120,15 @@
       "ok": true,
       "detail": {
         "missing": 0
+      }
+    },
+    {
+      "kind": "continuity",
+      "name": "workspace_metadata_preserved",
+      "ok": true,
+      "detail": {
+        "historyRoutesDropped": 0,
+        "optionalMetadataDropped": 0
       }
     },
     {
@@ -128,7 +143,8 @@
             "workspace_being_deleted": 1,
             "no_relaycast_key": 1,
             "no_relay_workspace": 1
-          }
+          },
+          "importerSkips": {}
         },
         "reported": {
           "candidates": 6,
@@ -137,7 +153,8 @@
             "workspace_being_deleted": 1,
             "no_relaycast_key": 1,
             "no_relay_workspace": 1
-          }
+          },
+          "importerSkips": {}
         }
       }
     },
@@ -153,7 +170,8 @@
             "already_member": 1,
             "canceled": 1,
             "superseded_open_invite": 1
-          }
+          },
+          "importerSkips": {}
         },
         "reported": {
           "candidates": 5,
@@ -162,7 +180,8 @@
             "already_member": 1,
             "canceled": 1,
             "superseded_open_invite": 1
-          }
+          },
+          "importerSkips": {}
         }
       }
     },
@@ -176,14 +195,16 @@
           "imported": 2,
           "skipped": {
             "workspace_not_imported": 1
-          }
+          },
+          "importerSkips": {}
         },
         "reported": {
           "candidates": 3,
           "imported": 2,
           "skipped": {
             "workspace_not_imported": 1
-          }
+          },
+          "importerSkips": {}
         }
       }
     },
@@ -198,7 +219,8 @@
           "skipped": {
             "stale_relay_workspace": 1,
             "duplicate_after_merge": 1
-          }
+          },
+          "importerSkips": {}
         },
         "reported": {
           "candidates": 3,
@@ -206,7 +228,8 @@
           "skipped": {
             "stale_relay_workspace": 1,
             "duplicate_after_merge": 1
-          }
+          },
+          "importerSkips": {}
         }
       }
     },
@@ -220,14 +243,16 @@
           "imported": 2,
           "skipped": {
             "not_a_member": 1
-          }
+          },
+          "importerSkips": {}
         },
         "reported": {
           "candidates": 3,
           "imported": 2,
           "skipped": {
             "not_a_member": 1
-          }
+          },
+          "importerSkips": {}
         }
       }
     },
@@ -241,14 +266,41 @@
           "imported": 1,
           "skipped": {
             "workspace_not_imported": 1
-          }
+          },
+          "importerSkips": {}
         },
         "reported": {
           "candidates": 2,
           "imported": 1,
           "skipped": {
             "workspace_not_imported": 1
-          }
+          },
+          "importerSkips": {}
+        }
+      }
+    },
+    {
+      "kind": "ledger",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "observed": {
+          "candidates": 4,
+          "imported": 2,
+          "skipped": {
+            "secret_in_cloud_credential_store": 1,
+            "workspace_not_imported": 1
+          },
+          "importerSkips": {}
+        },
+        "reported": {
+          "candidates": 4,
+          "imported": 2,
+          "skipped": {
+            "secret_in_cloud_credential_store": 1,
+            "workspace_not_imported": 1
+          },
+          "importerSkips": {}
         }
       }
     },
@@ -275,7 +327,8 @@
           "organization_invitations": 1,
           "person_identities": 1,
           "desktop_relay_identities": 2,
-          "fleet_node_owners": 1
+          "fleet_node_owners": 1,
+          "coding_agent_credentials": 2
         },
         "reported": {
           "status": "ok",
@@ -287,7 +340,8 @@
             "person_identities": 1,
             "hosted_relay_participants": 0,
             "desktop_relay_identities": 2,
-            "fleet_node_owners": 1
+            "fleet_node_owners": 1,
+            "coding_agent_credentials": 2
           }
         }
       }
@@ -315,7 +369,8 @@
             "person_identities": 1,
             "hosted_relay_participants": 1,
             "desktop_relay_identities": 0,
-            "fleet_node_owners": 0
+            "fleet_node_owners": 0,
+            "coding_agent_credentials": 0
           }
         }
       }
@@ -947,6 +1002,93 @@
             "\"00000000-0000-4000-8000-000000000201\"": {
               "count": 1,
               "checksum": "480f6a4611de6ce2e210ca059f1f0105e1e21e3d4573ab08aa3d94e071c4e355"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        }
+      }
+    },
+    {
+      "kind": "table",
+      "name": "coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "source": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "account_email",
+            "auth_type",
+            "created_at",
+            "created_by_user_id",
+            "display_name",
+            "harness",
+            "harness_active",
+            "id",
+            "is_active",
+            "label",
+            "last_authenticated_at",
+            "last_error",
+            "last_used_at",
+            "model_provider",
+            "organization_id",
+            "status",
+            "workspace_id"
+          ],
+          "count": 2,
+          "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 2,
+              "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 2,
+              "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5"
+            }
+          },
+          "invalidWorkspaceBindings": 0
+        },
+        "target": {
+          "columns": [
+            "__key",
+            "__org",
+            "__workspace",
+            "account_email",
+            "auth_type",
+            "created_at",
+            "created_by_user_id",
+            "display_name",
+            "harness",
+            "harness_active",
+            "id",
+            "is_active",
+            "label",
+            "last_authenticated_at",
+            "last_error",
+            "last_used_at",
+            "model_provider",
+            "organization_id",
+            "status",
+            "workspace_id"
+          ],
+          "count": 2,
+          "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5",
+          "invalidKeys": 0,
+          "orgs": {
+            "\"00000000-0000-4000-8000-0000000000a1\"": {
+              "count": 2,
+              "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5"
+            }
+          },
+          "workspaces": {
+            "\"00000000-0000-4000-8000-000000000201\"": {
+              "count": 2,
+              "checksum": "8bfcbde6d95106a878c39d26c04a8d9ffbb7dfb623c50b724b91c94c03874bf5"
             }
           },
           "invalidWorkspaceBindings": 0
@@ -1103,6 +1245,14 @@
       }
     },
     {
+      "kind": "constraint_validation",
+      "name": "public.users",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
       "kind": "foreign_key",
       "name": "public.users.users_last_organization_id_fkey",
       "ok": true,
@@ -1147,6 +1297,14 @@
       "detail": "not_applicable"
     },
     {
+      "kind": "constraint_validation",
+      "name": "public.organizations",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
       "kind": "unique",
       "name": "public.organizations.organizations_pkey",
       "ok": true,
@@ -1161,6 +1319,14 @@
       "name": "public.organizations",
       "ok": true,
       "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.organization_memberships",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
     },
     {
       "kind": "foreign_key",
@@ -1195,6 +1361,14 @@
       "name": "public.organization_memberships",
       "ok": true,
       "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.workspaces",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
     },
     {
       "kind": "foreign_key",
@@ -1250,6 +1424,14 @@
       "name": "public.workspaces",
       "ok": true,
       "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.organization_invitations",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
     },
     {
       "kind": "foreign_key",
@@ -1324,6 +1506,14 @@
       "detail": "not_applicable"
     },
     {
+      "kind": "constraint_validation",
+      "name": "public.person_identities",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
       "kind": "foreign_key",
       "name": "public.person_identities.person_identities_user_id_fkey",
       "ok": true,
@@ -1376,6 +1566,14 @@
       "name": "public.person_identities",
       "ok": true,
       "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.hosted_relay_participants",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
     },
     {
       "kind": "foreign_key",
@@ -1442,6 +1640,14 @@
       "detail": "not_applicable"
     },
     {
+      "kind": "constraint_validation",
+      "name": "public.desktop_relay_identities",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
       "kind": "foreign_key",
       "name": "public.desktop_relay_identities.desktop_relay_identi_workspace_id_organization_id_fkey",
       "ok": true,
@@ -1506,6 +1712,14 @@
       "detail": "not_applicable"
     },
     {
+      "kind": "constraint_validation",
+      "name": "public.fleet_node_owners",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
       "kind": "foreign_key",
       "name": "public.fleet_node_owners.fleet_node_owners_organization_id_user_id_fkey",
       "ok": true,
@@ -1556,6 +1770,97 @@
     {
       "kind": "sequence",
       "name": "public.fleet_node_owners",
+      "ok": true,
+      "detail": "not_applicable"
+    },
+    {
+      "kind": "constraint_validation",
+      "name": "public.coding_agent_credentials",
+      "ok": true,
+      "detail": {
+        "unvalidated": []
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.coding_agent_credentials.coding_agent_credentials_created_by_user_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.coding_agent_credentials.coding_agent_credentials_organization_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "foreign_key",
+      "name": "public.coding_agent_credentials.coding_agent_credentials_workspace_id_fkey",
+      "ok": true,
+      "detail": {
+        "validated": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.coding_agent_credentials.coding_agent_credentials_pkey",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.coding_agent_credentials.coding_agent_one_llm",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.coding_agent_credentials.coding_agent_one_sandbox",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.coding_agent_credentials.coding_agent_fingerprint",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "unique",
+      "name": "public.coding_agent_credentials.coding_agent_oauth_account",
+      "ok": true,
+      "detail": {
+        "valid": true,
+        "ready": true,
+        "violations": 0
+      }
+    },
+    {
+      "kind": "sequence",
+      "name": "public.coding_agent_credentials",
       "ok": true,
       "detail": "not_applicable"
     },

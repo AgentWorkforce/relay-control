@@ -136,6 +136,10 @@ async function relationChecks(client: Client, relation: string): Promise<Finding
   const table = found.rows[0];
   const tableSql = qualified(table.schema, table.name);
   const findings: Finding[] = [];
+  const unvalidated = await client.query(`SELECT conname,contype FROM pg_constraint
+    WHERE conrelid=$1::oid AND NOT convalidated ORDER BY conname`,[table.oid]);
+  findings.push({kind:"constraint_validation",name:relation,ok:unvalidated.rows.length === 0,
+    detail:{unvalidated:unvalidated.rows}});
   const fks = await client.query(`SELECT con.conname, con.convalidated, con.confmatchtype,
     rn.nspname AS ref_schema, rc.relname AS ref_table,
     ARRAY(SELECT a.attname::text FROM unnest(con.conkey) WITH ORDINALITY k(attnum, ord)
@@ -207,7 +211,7 @@ async function relationChecks(client: Client, relation: string): Promise<Finding
 
 export function validateContract(contract: Contract): void {
   if (contract.version !== 1 || !contract.mappingRevision || !contract.tables?.length
-    || !contract.identities?.length || !contract.targetRelations?.length || !contract.encryptedSamples?.length) {
+    || !Array.isArray(contract.identities) || !contract.targetRelations?.length || !contract.encryptedSamples?.length) {
     throw new Error("Contract must name its mapping revision, tables, identities, target relations and encrypted samples");
   }
   const names = new Set<string>();

@@ -19,7 +19,7 @@ try {
   assertScope(scope);
   const ledger = JSON.parse(await readFile(path!,"utf8")) as ImportReport;
   const keyring = loadEncryptionKeyring();
-  const cloudKeyHex = readSecret(process.env,"CLOUD_IMPORT_CREDENTIAL_ENCRYPTION_KEY") ?? "";
+  const cloudKeyHex = readSecret(process.env,"CLOUD_CREDENTIAL_ENCRYPTION_KEY") ?? "";
   const pepperPath = process.env.SELFHOST_PASSWORD_PEPPER_FILE?.trim();
   const pepperVersions = pepperPath ? parsePepperFile(readPepperFile(pepperPath)).map((p) => p.version) : [];
   source = new Client({connectionString:localDatabaseUrl(readSecret(process.env,"CLOUD_VERIFY_SOURCE_URL"))});
