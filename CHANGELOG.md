@@ -5,6 +5,22 @@ assigned at release.
 
 ## Unreleased
 
+- Security: on a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set), every
+  hosted MCP participant now enrols at relaygate and its traffic, reads
+  included, goes through relaygate. That covers native MCP sessions and OAuth
+  connectors such as ChatGPT, Grok Bot, Muse and Cursor cloud agents. Before,
+  they were registered in Relaycast with the workspace key and messaged
+  around relaygate's policy (migration 0078). Control mints a one-time `sh_ht_`
+  hosted credential that relaygate introspects as `relay_hosted` with the
+  participant's client. relaygate admits hosted participants only through
+  rules naming the hosted kind, so **operators must add a relaygate
+  `controlPrincipals` rule per allowed client** (relaygate's "Hosted
+  participants"). Without one, `join_relay` fails and names the rule. Existing
+  participants are re-enrolled through relaygate on next use and keep their
+  upstream agent, so OAuth connections keep working. OAuth connections can no
+  longer launch agents on a gate-only install. A session with no relay
+  identity must `join_relay` before listing agents or channels there. See
+  docs/identity.md, "Hosted participants on gate-only installs".
 - Added: MCP `get_session_summary` can read recorded short or long summaries
   of the requested kind and return validated optional provenance. It enforces
   320/16000 Unicode code-point bounds, preserves empty/unsupported responses,

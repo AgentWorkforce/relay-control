@@ -22,8 +22,13 @@ const escape = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<",
   .replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 
 /** One encrypted routine per grant. User -> organization -> grant locks fence every delivery against revocation. */
+/** A gated participant's rg_ token (24 h at relaygate) is renewed once it is this old. */
+const GATE_TOKEN_REFRESH_AFTER_MS = 12 * 3_600_000;
+
 export class GrokRoutines {
   constructor(readonly options: { database: Database; keyring: EncryptionKeyring; client: RelaycastClient;
+    /** Gate-only installs: participants enrolled through relaygate (relaygate_agent_id set) are read through it. */
+    gate?: RelaycastClient;
     publicOrigin: string; tenancyMode: TenancyMode; fetchImpl?: typeof fetch; now?: () => Date; requestTimeoutMs?: number }) {}
 
   private now() { return this.options.now?.() ?? new Date(); }
@@ -142,19 +147,32 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
           // while the revocation fence is held. stop() aborts the same requests.
           const deadline = AbortSignal.timeout(this.options.requestTimeoutMs ?? 5_000);
           const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
-          const participant = (await tx.query<{ token_ciphertext: string; relaycast_workspace_id: string }>(`SELECT p.token_ciphertext,p.relaycast_workspace_id
+          const participant = (await tx.query<{ id: string; token_ciphertext: string; relaycast_workspace_id: string;
+            relaygate_agent_id: string | null; stale: boolean }>(`SELECT p.id,p.token_ciphertext,p.relaycast_workspace_id,p.relaygate_agent_id,
+              p.updated_at < $5 AS stale
             FROM hosted_relay_participants p JOIN workspaces w ON w.id=p.workspace_id AND w.organization_id=$4
             WHERE p.workspace_id=$1 AND p.user_id=$2 AND p.agent_remote_id=$3
               AND p.relaycast_workspace_id=w.relaycast_workspace_id`,
-          [candidate.workspace_id, candidate.user_id, grant.agent_remote_id, candidate.organization_id])).rows[0];
+          [candidate.workspace_id, candidate.user_id, grant.agent_remote_id, candidate.organization_id,
+            new Date(this.now().getTime() - GATE_TOKEN_REFRESH_AFTER_MS)])).rows[0];
           if (!participant) throw new Error("identity_unavailable");
-          const token = decryptSecret(participant.token_ciphertext, this.options.keyring);
-          const remote = await this.options.client.authenticatedAgent(token, requestSignal);
+          // A participant enrolled through relaygate holds an rg_ token: it reads through relaygate only.
+          const gated = participant.relaygate_agent_id !== null;
+          if (gated && !this.options.gate) throw new Error("identity_unavailable");
+          const via = gated ? this.options.gate! : this.options.client;
+          let token = decryptSecret(participant.token_ciphertext, this.options.keyring);
+          if (gated && participant.stale) {
+            // rg_ tokens last 24 hours; a routine may poll an idle participant for longer, so renew it at half-life.
+            token = await via.refreshGateToken(token);
+            await tx.query("UPDATE hosted_relay_participants SET token_ciphertext=$2, updated_at=now() WHERE id=$1",
+              [participant.id, encryptSecret(token, this.options.keyring.active)]);
+          }
+          const remote = await via.authenticatedAgent(token, requestSignal);
           if (remote.id !== grant.agent_remote_id || remote.workspaceId !== participant.relaycast_workspace_id || remote.status === "released" ||
               isBindingOwnedIdentity(remote.metadata) ||
               remote.metadata.source !== HOSTED_SOURCE || remote.metadata.owner_hash !== ownerHash(candidate.user_id) ||
               remote.metadata.cloud_workspace_id !== candidate.workspace_id) throw new Error("identity_unavailable");
-          const inbox = (await this.options.client.readHostedInbox(token, requestSignal)).slice(0, 100).filter(message => message.sender_id !== remote.id);
+          const inbox = (await via.readHostedInbox(token, requestSignal)).slice(0, 100).filter(message => message.sender_id !== remote.id);
           const ids = inbox.map(message => message.delivery_id).sort();
           const fresh = ids.filter(id => !routine.notified_delivery_ids.includes(id));
           if (fresh.length) {

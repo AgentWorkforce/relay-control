@@ -266,3 +266,42 @@ test("routine credentials refuse alternate origins, redirects, URL credentials, 
   assert.throws(() => parseGrokRoutineCredentials(URL, "secret-invalid"), error => error instanceof Error && !error.message.includes("secret-invalid"));
   assert.deepEqual(parseGrokRoutineCredentials(URL, `Authorization: Bearer ${KEY}`), { url: URL, key: KEY });
 });
+
+test("gate-only: a routine reads a gated participant through relaygate and renews its rg_ token at half-life", async t => {
+  const f = await fixture(t, "/mcp");
+  await f.tool("connect_grok_bot_routine"); await f.save();
+  const agent = f.world.agents.get("fake-grok")!;
+  // The participant as a gate-only install stores it: relaygate's agent id and an rg_ token, written 13 hours ago.
+  const tokens = new Map<string, string>([["rg_old", agent.token]]);
+  const refreshed: string[] = [];
+  await f.database.query(`UPDATE hosted_relay_participants SET relaygate_agent_id='rga_fake', token_ciphertext=$1,
+    updated_at=now() - interval '13 hours' WHERE agent_remote_id=$2`, [encryptSecret("rg_old", KEYRING.active), agent.id]);
+  const gate = createRelaycastClient({ internalOrigin: "https://gate.example.test", fetchImpl: async (input, init) => {
+    const url = new globalThis.URL(input instanceof Request ? input.url : String(input));
+    const bearer = (new Headers(init?.headers).get("authorization") ?? "").replace(/^Bearer /, "");
+    const upstream = tokens.get(bearer);
+    if (!upstream) return Response.json({ error: "relaygate_unauthenticated" }, { status: 401 });
+    if (url.pathname === "/v1/token/refresh") {
+      tokens.delete(bearer); refreshed.push(bearer);
+      tokens.set("rg_new", upstream);
+      return Response.json({ token: "rg_new", expires_at: new Date(Date.now() + 86_400_000).toISOString() });
+    }
+    const result = await f.world.handle(init?.method ?? "GET", url.pathname, url.searchParams, upstream, null, null);
+    if (url.pathname === "/v1/agent" && result?.status === 200) (result.body as any).data.workspace_id = "fake-workspace";
+    return Response.json(result?.body ?? { ok: false }, { status: result?.status ?? 404 });
+  } });
+  // Relaycast refuses rg_ tokens: anything sent there directly would fail the wake.
+  const routines = new GrokRoutines({ ...f.routines.options, gate });
+  await f.message();
+  await routines.tick();
+  assert.deepEqual(refreshed, ["rg_old"]);
+  const row = (await f.database.query<{ token_ciphertext: string; fresh: boolean }>(
+    "SELECT token_ciphertext, updated_at > now() - interval '1 minute' AS fresh FROM hosted_relay_participants WHERE agent_remote_id=$1", [agent.id])).rows[0]!;
+  assert.equal(decryptSecret(row.token_ciphertext, KEYRING), "rg_new");
+  assert.equal(row.fresh, true);
+  assert.equal(f.calls.length, 1, "the pending inbox, read through relaygate, woke the routine");
+  // Without a relaygate client a gated participant is never read with Relaycast.
+  await f.message(); f.advance();
+  await new GrokRoutines(f.routines.options).tick();
+  assert.equal(f.calls.length, 1);
+});
