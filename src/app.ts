@@ -126,7 +126,13 @@ import {
   uploadPolicyVerdict,
   writeCapturePolicy,
 } from "./capture-policy.js";
-import { parseWorkspacePolicyInput, readWorkspacePolicy, UNSET_WORKSPACE_POLICY, writeWorkspacePolicy } from "./workspace-policy.js";
+import {
+  parseWorkspacePolicyInput,
+  readWorkspacePolicy,
+  sessionManagedByEnrollmentKey,
+  UNSET_WORKSPACE_POLICY,
+  writeWorkspacePolicy,
+} from "./workspace-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
 import { createRelaycastClient, type RosterAgent } from "./messaging/relaycast.js";
 import { isListedRelayAgent } from "./mcp/team-activity.js";
@@ -2054,7 +2060,12 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (desktopHostName === null) {
         throw new HttpError(400, "invalid_request", "desktop_host_name must be 1-80 characters");
       }
-      const result = await store.exchangeEnrollmentKey({ key, clientName, desktopHostName, clientIp: ip });
+      // The Desktop's version, for the audit row only (never trusted for anything else).
+      const userAgent = request.headers["user-agent"];
+      const clientVersion = typeof userAgent === "string"
+        ? /^AgentRelayDesktop\/([0-9A-Za-z.+_-]{1,40})(?:[\s;(]|$)/.exec(userAgent)?.[1] ?? null
+        : null;
+      const result = await store.exchangeEnrollmentKey({ key, clientName, desktopHostName, clientIp: ip, clientVersion });
       // One line, key id only (never the key; null for an unknown key).
       console.info("[selfhost-api] enrollment key exchange", {
         keyId: result.keyId,
@@ -2075,6 +2086,16 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         refresh_token_expires_at: result.tokens.refreshTokenExpiresAt,
         scope: result.tokens.scopes.join(" "),
         api_url: `${siteBaseUrl(request)}/cloud`,
+        // Workspace policy (docs/workspace-policy.md): whether this session is
+        // managed (the key carries admin policy consent), the revision to
+        // compare a cached policy against, and the document itself so the
+        // first launch is right before the first access/me refresh.
+        managed: result.managed,
+        policy_revision: result.policyRevision,
+        workspace_policy: await readWorkspacePolicy(store.database, result.organizationId, {
+          workspaceId: result.workspaceId,
+          managed: result.managed,
+        }),
       }, true);
       return;
     }
@@ -2592,12 +2613,19 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     // organization owner/admin writes them.
     const accessMe = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/access\/me$/);
     if (accessMe && method === "GET") {
-      const { workspace } = await workspaceAccess(request, accessMe[0]!);
+      const { principal, workspace } = await workspaceAccess(request, accessMe[0]!);
+      // Managed: the session was provisioned by an enrollment key carrying admin policy consent.
+      const managed = principal.provisionedByTokenId
+        ? await sessionManagedByEnrollmentKey(store.database, principal.provisionedByTokenId)
+        : false;
       json(response, 200, {
         workspace: { id: workspace.id, name: workspace.name },
         role: workspace.role,
         policy: await readCapturePolicy(store.database, workspace.organizationId),
-        workspace_policy: await readWorkspacePolicy(store.database, workspace.organizationId, { workspaceId: workspace.id }),
+        workspace_policy: await readWorkspacePolicy(store.database, workspace.organizationId, {
+          workspaceId: workspace.id,
+          managed,
+        }),
       }, true);
       return;
     }

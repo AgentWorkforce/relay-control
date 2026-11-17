@@ -357,6 +357,19 @@ export function createMcpHandler(input: {
       if (!(error instanceof CopilotAttestationError) && !(error instanceof ClaudeAttestationError) &&
           !(error instanceof DesktopCallContextError)) throw error;
       const parsed = JSONRPCRequestSchema.safeParse(body);
+      // The response stays generic; the operator log names the check that
+      // failed (never the proof, the token or the arguments).
+      const call = body as { method?: unknown; params?: { name?: unknown } } | null;
+      console.warn("[selfhost-mcp] native chat context refused", {
+        check: error.name,
+        reason: error.message,
+        method: typeof call?.method === "string" ? call.method : null,
+        tool: typeof call?.params?.name === "string" ? call.params.name : null,
+        provider: provider ?? null,
+        auth_mode: authMode,
+        workspace_id: workspace.id,
+        user_id: principal.userId,
+      });
       rpcError(response, 400, -32602, "Invalid native chat context.", parsed.success ? parsed.data.id : null);
       return true;
     }

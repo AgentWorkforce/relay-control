@@ -299,10 +299,13 @@ function deliveryNamesInbound(sections: StoredWorkspaceSections): boolean {
  * The served document for a stored row (absent: unset). `adminSenders` is
  * given only on a workspace read (access/me); it is served in
  * `delivery.locked.admin_senders` while delivery sets `inbound_default`.
+ * `managed` is per session, never stored: true only on access/me for a
+ * session provisioned by an enrollment key with admin policy consent.
  */
 export function workspacePolicyFromRow(
   row: WorkspacePolicyRow | null | undefined,
   adminSenders?: string[],
+  managed = false,
 ): WorkspacePolicy {
   const sections = storedSections(row?.workspace_settings);
   if (adminSenders !== undefined && deliveryNamesInbound(sections)) {
@@ -313,8 +316,7 @@ export function workspacePolicyFromRow(
   return {
     version: 2,
     revision: stored === null || stored === undefined ? 1 : Number(stored),
-    // Always false until enrollment-key consent lands (the key will decide it).
-    managed: false,
+    managed,
     consent: Array.isArray(consent) ? [...consent].sort() : [],
     sections: {
       capture: { locked: projectSettings(storedCapture(row?.settings)), defaults: {} },
@@ -342,13 +344,29 @@ async function adminSendersFor(executor: SqlExecutor, organizationId: string, wo
 }
 
 /**
+ * Whether a session provisioned by enrollment key `tokenId`
+ * (token_sessions.provisioned_by_token_id) is managed: the key carries
+ * `policy_consent = 'admin'` (migration 0074). One primary-key lookup.
+ */
+export async function sessionManagedByEnrollmentKey(executor: SqlExecutor, tokenId: string): Promise<boolean> {
+  const result = await executor.query<{ managed: boolean }>(
+    `SELECT policy_consent = 'admin' AS managed
+       FROM workspace_api_tokens
+      WHERE id = $1 AND purpose = 'desktop-enrollment'`,
+    [tokenId],
+  );
+  return result.rows[0]?.managed === true;
+}
+
+/**
  * The served workspace policy. With `workspaceId` (access/me) admin senders
  * are resolved for that workspace; the organization route omits them.
+ * `managed` (access/me only) is the presenting session's managed state.
  */
 export async function readWorkspacePolicy(
   database: Database,
   organizationId: string,
-  options: { workspaceId?: string } = {},
+  options: { workspaceId?: string; managed?: boolean } = {},
 ): Promise<WorkspacePolicy> {
   const row = (await database.query<WorkspacePolicyRow>(
     `SELECT ${ROW_COLUMNS} FROM capture_policies WHERE organization_id = $1`,
@@ -359,7 +377,7 @@ export async function readWorkspacePolicy(
   const senders = deliveryNamesInbound(stored)
     ? await adminSendersFor(database, organizationId, options.workspaceId)
     : [];
-  return workspacePolicyFromRow(row, senders);
+  return workspacePolicyFromRow(row, senders, options.managed === true);
 }
 
 /** Order-independent comparison of two capture settings objects. */

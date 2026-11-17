@@ -830,6 +830,8 @@ export function createAdminModule(input: {
           scopes: body.scopes,
           email: body.email,
           mcpConsent: body.mcpConsent,
+          maxUses: body.maxUses,
+          policyConsent: body.policyConsent,
           ...(caller.operatorTokenId !== null ? { mintedByTokenId: caller.operatorTokenId } : {}),
           actor: caller.actor,
         });
