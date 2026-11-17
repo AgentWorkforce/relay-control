@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { type McpContext, SharedSessionsToolError, sessionCitation, toolError } from "./context.js";
 import { noteResultOwners } from "./read-audit.js";
-import { recordedSummary } from "../sessions/summary.js";
+import { recordedSummaryResponse } from "../sessions/summary.js";
 
 const timestamp = z.iso.datetime({ offset: true });
 const id = z.string().trim().min(1).max(512);
@@ -91,24 +91,22 @@ export function registerSessionSummaries(server: McpServer, context: McpContext)
 
   server.registerTool("get_session_summary", {
     title: "Get a recorded session summary",
-    description: "Read the recorded short summary for one shared session, with model/time provenance and a citation. Long summaries are unsupported until the selected backend provides a recorded long-summary route. Does not generate a summary or read the transcript.",
+    description: "Read a recorded short or long summary for one shared session, with model/time provenance and a citation. The selected backend must support the requested kind. Does not generate a summary or read the transcript.",
     inputSchema: { session_id: id.refine(value => value !== "." && value !== "..", "Invalid session ID"),
       source: id.optional().describe("Pass the source from a list result. The summary reader requires it; no source is inferred."),
       kind: z.enum(["short", "long"]).default("short") },
     annotations,
   }, async input => {
     try {
-      if (input.kind === "long") throw new SharedSessionsToolError("Long session summaries are not available yet (unsupported_by_backend). Use get_shared_session for a bounded transcript page.");
       if (!input.source) throw new SharedSessionsToolError("Pass the session source from list_session_summaries (for example codex or claude). A summary source cannot be inferred.");
       const params = new URLSearchParams({ kind: input.kind, source: input.source });
       const body = await context.readHistory(`/v1/sessions/${encodeURIComponent(input.session_id)}/summary?${params}`);
-      const summary = body !== null && typeof body === "object" && !Array.isArray(body)
-        ? recordedSummary(body as Record<string, unknown>) : null;
-      if (!summary || summary.status === "unsupported" || (summary.status === "ready" && summary.summary.length > 16_384)) {
+      const recorded = recordedSummaryResponse(body, input.kind);
+      if (!recorded || recorded.summary.status === "unsupported") {
         throw new SharedSessionsToolError(unsupported);
       }
       return success({ workspace_id: context.workspace.id, session_id: input.session_id, source: input.source ?? null,
-        summary, citation_url: sessionCitation(context.origin, input.session_id, input.source) });
+        ...recorded, citation_url: sessionCitation(context.origin, input.session_id, input.source) });
     } catch (error) { return toolError(error); }
   });
 }
