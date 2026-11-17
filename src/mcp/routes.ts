@@ -154,6 +154,10 @@ export function createMcpHandler(input: {
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy);
   const attestations = postgresAttestationStore(store.database);
   const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.fetchImpl });
+  // Gate-only installs only: desktop identities hold rg_ tokens that only relaygate accepts.
+  const gateClient = config.relaygatePublicUrl
+    ? createRelaycastClient({ internalOrigin: config.relaygatePublicUrl, fetchImpl: input.fetchImpl })
+    : undefined;
   // Gate-only installs only: relaygate checks every agent launch before it is reserved or sent.
   const launchCheck = config.relaygatePublicUrl
     ? relayLaunchCheck({ relaygatePublicUrl: config.relaygatePublicUrl, store, database: store.database,
@@ -402,6 +406,7 @@ export function createMcpHandler(input: {
         relaycastPublicUrl: config.relaycastPublicUrl,
         ...(config.relaygatePublicUrl ? { relaygatePublicUrl: config.relaygatePublicUrl } : {}),
         ...(launchCheck ? { launchCheck } : {}),
+        ...(gateClient ? { gateClient } : {}),
       },
       ...(!oauth && !staffGrant && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && !staffGrant && input.replicas ? { replicas: input.replicas } : {}),

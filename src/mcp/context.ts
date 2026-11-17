@@ -74,6 +74,11 @@ export type McpContext = {
     relaygatePublicUrl?: string;
     /** Gate-only installs only: relaygate's pre-spawn POST /v1/check (./relay-launch-check.ts). */
     launchCheck?: RelayLaunchCheck;
+    /**
+     * Gate-only installs: the Relaycast client bound to relaygate's origin;
+     * desktop identities hold rg_ tokens that only relaygate accepts.
+     */
+    gateClient?: RelaycastClient;
   };
   /** Amp control (SELFHOST_AMP_ENABLED); absent when the feature is off. */
   amp?: AmpDeps;
