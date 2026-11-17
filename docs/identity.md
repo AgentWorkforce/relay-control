@@ -1029,7 +1029,8 @@ only):
   - The ceilings are read from the environment on every mint. Each is a
     positive integer; any other value (empty, `0`, `abc`, `5.5`) means the
     default. Day ceilings never exceed 365. `SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS`
-    (default 7) is reserved for member self-minted keys and not used yet.
+    (default 7) applies to member self-minted keys only (see "Member
+    self-mint" below), never to an admin mint.
 - `GET /api/v1/workspaces/{id}/deployment-api-tokens` lists the keys with
   `userId`, `userEmail`, `mcpConsent`, `policyConsent`, `exchangedAt`,
   `exchangedHostName` and `mintedByTokenId` (these are `null` on other
@@ -1050,17 +1051,62 @@ only):
   not by session, so they are not deleted; they cannot be used without a
   live session.
 
-The employee can see and revoke their own keys with a signed-in user token
-(`cli:auth` or `account` scope) in the token's organization:
+The employee can see, mint and revoke their own keys with a signed-in user
+token (`cli:auth` or `account` scope) in the token's organization:
 
 - `GET /api/v1/me/enrollment-keys` answers
-  `{keys: [{id, label, status, mcpConsent, createdAt, expiresAt, exchangedAt,
-  exchangedHostName, mintedBy}]}`, `status` as above.
+  `{keys: [{id, label, status, mcpConsent, policyConsent, maxUses, useCount,
+  createdAt, expiresAt, exchangedAt, exchangedHostName, mintedBy}]}`,
+  `status` as above.
+- `POST /api/v1/me/enrollment-keys` mints a key for the caller's next
+  machine; see "Member self-mint" below.
 - `DELETE /api/v1/me/enrollment-keys/{id}` (a bearer token, or the `/cloud`
   session cookie from a same-origin page; otherwise `403 csrf_rejected`)
   answers `204` with the same
   cascade as the admin revoke, or `404 token_not_found` for a key that is
   not theirs.
+
+##### Member self-mint
+
+A member who is already signed in can mint a key for their own next machine,
+without an admin:
+
+```http
+POST /api/v1/me/enrollment-keys
+{ "label": "new laptop", "expiryDays": 3 }
+```
+
+- The caller is the session's user (a bearer `cli:auth` or `account` token,
+  or the `/cloud` session cookie from a same-origin page; otherwise
+  `403 csrf_rejected`). The key is minted in the session's workspace, for the
+  caller's own user and email; the body cannot name anyone else.
+- The body accepts only `label` (1-128 characters, default
+  `Desktop self-renewal`) and `expiryDays`. Any other key (`email`,
+  `maxUses`, `mcpConsent`, `policyConsent`, `purpose`, ...) is refused with
+  `400 invalid_request`.
+- `maxUses` is always 1.
+- `expiryDays` defaults to, and may not exceed,
+  `SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS` (default 7), or
+  `SELFHOST_ENROLLMENT_MAX_DAYS` when that is lower. A longer or non-integer
+  value is `400 invalid_request`.
+- Consent is inherited, never raised: when the calling session was
+  provisioned by one of the caller's own enrollment keys, the new key copies
+  that key's `mcpConsent` and `policyConsent`. Any other session (device
+  flow, browser sign-in) mints a key with both `null`.
+- A person may hold at most 5 unexchanged keys in the organization (not
+  used, not revoked, not expired; admin-minted keys count). The sixth
+  self-mint answers `409 self_mint_limit`; exchange or revoke one first. The
+  cap does not apply to admin mints.
+- At most 10 self-mints per person per hour; then `429 rate_limited` with
+  `Retry-After`.
+- `SELFHOST_ENROLLMENT_SELF_RENEWAL=false` turns the route off with
+  `403 self_mint_disabled` (listing and revoking stay available).
+
+The answer is `201` with the same shape as the admin mint: the key record
+(`purpose: "desktop-enrollment"`, `maxUses: 1`, `useCount: 0`, the inherited
+consent) plus `accessToken`, shown once. The mint is audited
+`api_token.create` and `enrollment_key.self_mint`, both with the member as
+actor.
 
 The installer exchanges the key, once per use, at
 `POST /api/v1/auth/enrollment/token` (also under `/cloud`):
@@ -1122,7 +1168,9 @@ those sessions; mint a new key.
 
 Discovery: `GET /api/v1/capabilities` answers `enrollment_keys: true` and
 `GET /api/v1/auth/login-config` answers `enrollment_keys: true`; an installer
-falls back to the device flow when the field is absent.
+falls back to the device flow when the field is absent. Both also answer
+`enrollment_self_mint`, `false` when `SELFHOST_ENROLLMENT_SELF_RENEWAL=false`
+turns member self-mint off, else `true`.
 
 The key is not a bearer. Every workspace API token gate, the relay node
 broker and the admin routes treat `sh_ek_` as no credential (`401`), and
@@ -1131,6 +1179,7 @@ introspection answers `wrong-kind`. Only the exchange route accepts it.
 Audit actions (all in the minting workspace's audit log, `GET /api/v1/workspaces/{id}/admin/audit`):
 - `api_token.create`: target `<keyId> (desktop-enrollment: user <userId>[ mcpConsent=admin])`
 - `membership.provision`: actor the minting admin, target `<userId> <email> role member`
+- `enrollment_key.self_mint`: actor the member, target `<keyId> (desktop-enrollment: user <userId>[ mcpConsent=admin][ policyConsent=admin][ from=<source key id>])`
 - `enrollment_key.exchange`: actor the employee, target `<keyId> ip=<client address> host=<host name>`; never the key
 - `api_token.revoke`: target `<keyId> (desktop-enrollment: user <userId>) sessions=<n>`, with ` reason=member_removed` when a membership removal revoked it
 

@@ -18,7 +18,7 @@ else is core and always on.
 ## Reading it
 
 - `GET /api/v1/capabilities` (also `/cloud/api/v1/capabilities`): any signed-in
-  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool, "usage": bool, "launch": bool, "usage_people": bool, "events_shim": bool, "session_delete": bool, "enrollment_keys": true } }` (`enrollment_keys` is always true; see [identity.md](identity.md#desktop-enrollment-keys)).
+  member. Returns `{ "capabilities": { "flows": bool, "relayfile": bool, "chief": bool, "usage": bool, "launch": bool, "usage_people": bool, "events_shim": bool, "session_delete": bool, "enrollment_keys": true, "enrollment_self_mint": bool } }` (`enrollment_keys` is always true; `enrollment_self_mint` is false only when `SELFHOST_ENROLLMENT_SELF_RENEWAL=false`; see [identity.md](identity.md#desktop-enrollment-keys)).
 - `/readyz` includes the same `capabilities` object.
 
 `session_delete` is derived from configuration, not selected by `SELFHOST_FEATURES`:

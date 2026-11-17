@@ -13,6 +13,25 @@ assigned at release.
   engines without the filter keep working, and never fall back to a
   full-roster read when the lookup fails. The bound takes effect with Relaycast
   engine 12.4.0 or later; older engines still answer with the roster.
+- Added: `GET /api/v1/organizations/{org}/fleet` (docs/fleet.md) for owners
+  and admins: members, 200 per page, with their Desktop machines (host name,
+  client version, platform, enrollment key, managed, last seen, status) and
+  each machine's `policyMatch` (`current`, `stale`, `unknown` or `mismatch`)
+  against the workspace policy revision, page totals and, with
+  `usage_people`, per-member usage. Every read writes a `fleet.viewed` audit
+  row. No migration.
+- Added: member self-mint of desktop enrollment keys at
+  `POST /api/v1/me/enrollment-keys` (also under `/cloud`). A signed-in member
+  mints a single-use key for their own next machine; the body takes only
+  `label` and `expiryDays` (default and ceiling
+  `SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS`, 7). `mcpConsent` and
+  `policyConsent` are inherited from the key that provisioned the calling
+  session and never raised. At most 5 unexchanged keys per person
+  (`409 self_mint_limit`) and 10 self-mints per hour (`429 rate_limited`).
+  `SELFHOST_ENROLLMENT_SELF_RENEWAL=false` turns it off
+  (`403 self_mint_disabled`); capabilities and login-config answer
+  `enrollment_self_mint`. Audited `enrollment_key.self_mint`. The member's
+  key list adds `maxUses`, `useCount` and `policyConsent`.
 - Fixed: gate-only desktop identity sync no longer skips an identity whose
   upstream Relaycast card lacks `metadata.relaygate.agent_id` (relaygate only
   stamps it on first registration); the field is compared only when present
