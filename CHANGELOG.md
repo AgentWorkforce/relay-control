@@ -25,8 +25,8 @@ assigned at release.
   and Copilot attestation keys are stored. Desktop identity sync and every MCP
   call check the identity's `rg_` token with relaygate's `GET /v1/whoami`
   (agent id and name, plus the enrolling user once relaygate reports
-  `user_id`) and require the upstream Relaycast agent of that name to carry
-  the same `metadata.relaygate.agent_id`. MCP messaging as a desktop identity
+  `user_id`) and compare the upstream Relaycast agent's
+  `metadata.relaygate.agent_id` when present. MCP messaging as a desktop identity
   goes through relaygate. Before, Relaycast refused the `rg_` token, every
   identity was skipped `unverified`, the attestation key was dropped and
   attested MCP calls failed with "unknown key". No migration.
