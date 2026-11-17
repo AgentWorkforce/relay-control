@@ -259,7 +259,14 @@ type ParticipantOptions = {
   executor?: SqlExecutor;
 };
 /** The hosted participant every agent launch of one owner is sent as (src/mcp/relay-spawn.ts). */
-export type SpawnActor = { id: string; name: string; token: string; relaycastWorkspaceId: string };
+export type SpawnActor = {
+  id: string; name: string; token: string; relaycastWorkspaceId: string;
+  /**
+   * The verified desktop identity that asked for the launch; the node treats
+   * its DMs as native input. Absent for OAuth and unlinked hosted sessions.
+   */
+  requester?: { agentId: string; name: string };
+};
 /** The owner's launcher name: never derived from a display name. */
 export const launcherName = (userId: string) => `launcher-${ownerHash(userId).slice(0, 16)}`;
 const ACTIVE_LAUNCHES = "This participant still owns agent launches that have not been released. Release them with release_relay_agent first.";
@@ -815,10 +822,16 @@ function createRelayService(context: McpContext) {
         return fn({ id: current.row.agentRemoteId, name: current.name, token: current.token, relaycastWorkspaceId: relayWorkspaceId });
       });
     }
-    if (managed) await desktop();
-    else if (sessionHash) {
+    let requester: SpawnActor["requester"];
+    if (managed) {
+      const desktopIdentity = await desktop();
+      requester = { agentId: desktopIdentity.agentId, name: desktopIdentity.name };
+    } else if (sessionHash) {
       const linkedRow = await findDesktopIdentityBySession(executor, workspaceId, userId, sessionHash);
-      if (linkedRow) await verifiedDesktop(linkedRow);
+      if (linkedRow) {
+        const desktopIdentity = await verifiedDesktop(linkedRow);
+        requester = { agentId: desktopIdentity.agentId, name: desktopIdentity.name };
+      }
     }
     const name = launcherName(userId);
     const actor = await withOwnerLock(async (tx) => {
@@ -829,7 +842,8 @@ function createRelayService(context: McpContext) {
         if (!hosted) throw new RelayToolError("Could not create the launcher participant. Retry.");
       }
       const token = hosted.tokenUsable ? hosted.token : await recoverToken(tx, hosted);
-      return { id: hosted.row.agentRemoteId, name: hosted.name, token, relaycastWorkspaceId: relayWorkspaceId };
+      return { id: hosted.row.agentRemoteId, name: hosted.name, token, relaycastWorkspaceId: relayWorkspaceId,
+        ...(requester ? { requester } : {}) };
     });
     return fn(actor);
   }

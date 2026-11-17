@@ -128,7 +128,14 @@ export function createRelaycastWorld(roster: unknown[]) {
       const node = [...nodes.values()].flat().find(item => item.name === input.target_node);
       if (!node) return fail(404, "spawn_target_unavailable");
       const id = `inv_${next()}`;
-      const invocation: Record<string, any> = { id, status: "running", caller_id: caller.id, dispatched_node_id: node.id, input };
+      // Relaycast records the optional requester beside the caller and echoes it on reads.
+      // Relaycast takes the optional requester beside `input` (an agent of the workspace), records it next to the caller and echoes it on reads.
+      if (body!.requester_agent_id !== undefined) {
+        const requester = [...agents.values()].find(agent => agent.id === body!.requester_agent_id);
+        if (!requester) return fail(400, "requester_not_found");
+      }
+      const invocation: Record<string, any> = { id, status: "running", caller_id: caller.id, dispatched_node_id: node.id, input,
+        ...(body!.requester_agent_id ? { requester_agent_id: body!.requester_agent_id, requester_name: body!.requester_name } : {}) };
       if (spawnOutcome.mode === "ready") {
         const worker = addAgent(input.name, { fleet: { invocation_id: id, node_id: node.id } });
         invocation.status = "completed";

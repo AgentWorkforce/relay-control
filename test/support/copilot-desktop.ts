@@ -37,7 +37,7 @@ function relaycastFetch(roster: unknown[], world: RelaycastWorld): typeof fetch 
   }) as typeof fetch;
 }
 
-export async function copilotDesktopSetup(t: TestContext, modules: Pick<Parameters<typeof createApp>[0], "capy"> = {}) {
+export async function copilotDesktopSetup(t: TestContext, modules: Pick<Parameters<typeof createApp>[0], "capy" | "features"> = {}) {
   const database = new PGliteDatabase();
   await migrate(database);
   const roster: unknown[] = [];

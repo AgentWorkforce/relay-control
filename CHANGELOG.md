@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `spawn_relay_agent` launches made by a verified desktop-linked chat
+  (a managed desktop call, or a session linked with `join_relay`
+  `desktop_address`) send `requester_agent_id` and `requester_name` (the
+  chat's own Relaycast identity) on the spawn invocation beside the launcher
+  caller, so the node treats that chat's DMs to the worker as native input.
+  OAuth and unlinked hosted sessions omit both. The requester is not stored
+  and does not change the launch's idempotency.
 - Added: per-person desktop enrollment keys (migration 0074). A
   `desktop-enrollment` key takes `maxUses` (default 1, ceiling
   `SELFHOST_ENROLLMENT_MAX_USES`, default 50) and is exchanged once per
