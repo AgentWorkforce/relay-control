@@ -201,6 +201,12 @@ export type IntrospectedToken = {
    * that build tokens by hand need not set it.
    */
   workspacePolicyRevision?: number;
+  /**
+   * Whether the session is managed (docs/workspace-policy.md): it was
+   * provisioned by a desktop-enrollment key carrying admin policy consent
+   * (migration 0074), read in the same query. Optional like the revision.
+   */
+  managed?: boolean;
 };
 
 type TokenContextRow = {
@@ -1612,6 +1618,7 @@ export class ControlPlaneStore {
       policy_settings: unknown;
       policy_sharing_mode_since: Date | string | null;
       policy_workspace_revision: number | null;
+      managed: boolean | null;
     }>(
       `SELECT s.user_id, u.email, s.organization_id, s.workspace_id,
               w.cloud_relay_workspace_id, w.relayhistory_origin, m.role, s.scopes,
@@ -1630,7 +1637,8 @@ export class ControlPlaneStore {
               s.access_token_expires_at AS expires_at,
               cp.revision AS policy_revision, cp.settings AS policy_settings,
               cp.sharing_mode_since AS policy_sharing_mode_since,
-              cp.workspace_revision AS policy_workspace_revision
+              cp.workspace_revision AS policy_workspace_revision,
+              (ek.policy_consent = 'admin') AS managed
          FROM token_sessions s
          JOIN users u ON u.id = s.user_id
          JOIN workspaces w
@@ -1638,6 +1646,7 @@ export class ControlPlaneStore {
          JOIN organization_memberships m
            ON m.organization_id = s.organization_id AND m.user_id = s.user_id
          LEFT JOIN capture_policies cp ON cp.organization_id = s.organization_id
+         LEFT JOIN workspace_api_tokens ek ON ek.id = s.provisioned_by_token_id
         WHERE s.access_token_hash = $1
           AND NOT (s.desktop_exchange_challenge IS NOT NULL AND s.desktop_exchanged_at IS NULL)
           AND ($2::text = 'multi' OR NOT EXISTS (
@@ -1675,6 +1684,7 @@ export class ControlPlaneStore {
         },
       ),
       workspacePolicyRevision: row.policy_workspace_revision === null ? 1 : Number(row.policy_workspace_revision),
+      managed: row.managed === true,
     };
   }
 
@@ -1840,22 +1850,42 @@ export class ControlPlaneStore {
 
   /**
    * POST /api/v1/auth/enrollment/token (docs/identity.md, "Desktop enrollment
-   * keys"): spends a desktop-enrollment key once for a device session of its
-   * bound member. The key row is locked first, so two exchanges of one key
-   * serialize and the second finds it spent. Every refusal (unknown, revoked,
-   * expired, spent, or the member left: issueTokens re-checks membership) is
-   * the same `{ ok: false }`; `keyId` is only for the caller's log line.
+   * keys"): spends one use of a desktop-enrollment key for a device session
+   * of its bound member (the user_id bound at mint, on every use). The key
+   * row is locked first, so two exchanges of one key serialize and the one
+   * that finds use_count = max_uses finds it spent. Each exchange increments
+   * use_count and records itself in exchanged_at / exchanged_session_id /
+   * exchanged_host_name, so once the key is spent they name the last
+   * exchange. Every refusal (unknown, revoked, expired, spent, or the member
+   * left: issueTokens re-checks membership) is the same `{ ok: false }`;
+   * `keyId` is only for the caller's log line.
    * The session carries the device scopes, label = client name and the host
    * name; it is Desktop-verified only when the minting admin granted MCP
-   * consent (`mcp_consent = 'admin'`). Audited `enrollment_key.exchange` as
-   * the bound member, with the client IP and host, never the key.
+   * consent (`mcp_consent = 'admin'`), and managed only when the key carries
+   * policy consent (`policy_consent = 'admin'`). `policyRevision` is the
+   * organization's workspace policy revision (1 when unset). Audited
+   * `enrollment_key.exchange` as the bound member, with the client IP, host,
+   * use number and Desktop client version, never the key.
    */
   async exchangeEnrollmentKey(input: {
     key: string;
     clientName: string;
     desktopHostName: string;
     clientIp: string;
-  }): Promise<{ ok: true; keyId: string; tokens: IssuedTokens } | { ok: false; keyId: string | null }> {
+    /** From `User-Agent: AgentRelayDesktop/<version>`; null when absent. */
+    clientVersion?: string | null;
+  }): Promise<
+    | {
+        ok: true;
+        keyId: string;
+        tokens: IssuedTokens;
+        organizationId: string;
+        workspaceId: string;
+        managed: boolean;
+        policyRevision: number;
+      }
+    | { ok: false; keyId: string | null }
+  > {
     return this.database.transaction(async (tx) => {
       const found = await tx.query<{
         id: string;
@@ -1863,10 +1893,14 @@ export class ControlPlaneStore {
         organization_id: string;
         user_id: string | null;
         mcp_consent: string | null;
+        policy_consent: string | null;
+        max_uses: number;
+        use_count: number;
         usable: boolean;
       }>(
         `SELECT t.id, t.workspace_id, w.organization_id, t.user_id, t.mcp_consent,
-                (t.revoked_at IS NULL AND t.exchanged_at IS NULL
+                t.policy_consent, t.max_uses, t.use_count,
+                (t.revoked_at IS NULL AND t.use_count < t.max_uses
                   AND t.expires_at IS NOT NULL AND t.expires_at > now()) AS usable
            FROM workspace_api_tokens t
            JOIN workspaces w ON w.id = t.workspace_id
@@ -1893,21 +1927,37 @@ export class ControlPlaneStore {
         if (error instanceof OrganizationBoundaryError) return { ok: false as const, keyId: row.id };
         throw error;
       }
-      await tx.query(
+      const used = await tx.query<{ use_count: number }>(
         `UPDATE workspace_api_tokens
             SET exchanged_at = now(), exchanged_session_id = $2, exchanged_host_name = $3,
-                last_used_at = now()
-          WHERE id = $1`,
+                last_used_at = now(), use_count = use_count + 1
+          WHERE id = $1
+          RETURNING use_count`,
         [row.id, tokens.sessionId, input.desktopHostName],
       );
+      const useCount = Number(used.rows[0]?.use_count ?? Number(row.use_count) + 1);
+      const policy = await tx.query<{ workspace_revision: number | string }>(
+        "SELECT workspace_revision FROM capture_policies WHERE organization_id = $1",
+        [row.organization_id],
+      );
+      const policyRevision = policy.rows[0] ? Number(policy.rows[0].workspace_revision) : 1;
       await recordAudit(tx, {
         organizationId: row.organization_id,
         workspaceId: row.workspace_id,
         actor: { kind: "user", userId: row.user_id },
         action: "enrollment_key.exchange",
-        target: `${row.id} ip=${input.clientIp} host=${input.desktopHostName}`,
+        target: `${row.id} ip=${input.clientIp} host=${input.desktopHostName}`
+          + ` use=${useCount}/${Number(row.max_uses)} client=${input.clientVersion ?? "unknown"}`,
       });
-      return { ok: true as const, keyId: row.id, tokens };
+      return {
+        ok: true as const,
+        keyId: row.id,
+        tokens,
+        organizationId: row.organization_id,
+        workspaceId: row.workspace_id,
+        managed: row.policy_consent === "admin",
+        policyRevision,
+      };
     });
   }
 
