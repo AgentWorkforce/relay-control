@@ -698,6 +698,7 @@ export async function ensureRelaySubscriptions(deps: ReplicasDeps, tx: SqlExecut
   relay: WorkspaceRelay): Promise<SpawnRow> {
   let row = start;
   if (!row.agent_name) throw new ReplicasError("The replica's relay identity is not registered yet.", 409);
+  const agentName = row.agent_name;
   if (!row.hook_ciphertext) row = await patch(tx, row.id, { hook_ciphertext: encrypt(deps, `whsec_${randomBytes(32).toString("base64")}`) });
   const hookSecret = decrypt(deps, row.hook_ciphertext!);
   const saved = async (subscriptionId: string, values: Partial<SpawnRow>): Promise<SpawnRow> => {
@@ -715,7 +716,7 @@ export async function ensureRelaySubscriptions(deps: ReplicasDeps, tx: SqlExecut
   }
   if (!row.mention_subscription_id) {
     const mentionSubscriptionId = await deps.relaycast.createSubscription(relay.key, { events: ["message.created"],
-      url: relayEventsUrl(deps, row.id), secret: hookSecret, filter: { mentions: row.agent_name } });
+      url: relayEventsUrl(deps, row.id), secret: hookSecret, filter: { mentions: agentName } });
     row = await saved(mentionSubscriptionId, { mention_subscription_id: mentionSubscriptionId });
   }
   return row;

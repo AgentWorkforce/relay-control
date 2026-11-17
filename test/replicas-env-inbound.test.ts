@@ -371,6 +371,7 @@ test("a sole chat is selected automatically and pushes reach it once", async (t)
   await t.test("release deletes both subscriptions and leaves the compute alone", async () => {
     row = await spawnRow(env, row.id);
     assert.equal(subscriptionsOf(env, row.id).length, 2);
+    const secret = subscriptionsOf(env, row.id).find((item) => item.events.includes("dm.received"))!.secret;
     const released = await releaseReplica(env.deps, env.owner, row.id);
     assert.equal(released.released, true);
     assert.equal(subscriptionsOf(env, row.id).length, 0);
@@ -378,9 +379,12 @@ test("a sole chat is selected automatically and pushes reach it once", async (t)
     assert.equal(gone.state, "gone");
     assert.equal(gone.hook_ciphertext, null);
     assert.equal(env.provider.calls.includes("wake"), false);
-    // A push after release finds no binding.
+    // A push after release, signed with the old secret, finds no binding.
     const event = JSON.stringify({ type: "dm.received", data: { to: row.agent_name, message: { id: "9201", agent_name: "peer", text: "x" } } });
-    const late = await env.api(`/api/v1/replicas/relay-events/${row.id}`, { method: "POST", raw: event });
+    const id = `msg_${randomUUID()}`;
+    const ts = Math.floor(Date.now() / 1000);
+    const late = await env.api(`/api/v1/replicas/relay-events/${row.id}`, { method: "POST", raw: event,
+      headers: { "webhook-id": id, "webhook-timestamp": String(ts), "webhook-signature": signWebhook(secret, id, ts, event) } });
     assert.equal(late.status, 410);
   });
 });
