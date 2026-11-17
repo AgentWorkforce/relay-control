@@ -363,6 +363,8 @@ test("a Desktop provider grant (cld_at_, mcp:desktop) reads through the workspac
     assert.equal(seen.issues.length,0);
     assert.equal(seen.handoffs.length,1);
     assert.equal(seen.handoffs[0]!.bearer,`Bearer ${SECRET}`);
+    const minted=seen.handoffs[0]!.body;
+    assert.deepEqual([minted.userId,minted.orgId,minted.workspaceId],["user-a","org-a","ws-a"]);
     assert.equal(JSON.stringify([seen.handoffs,seen.history,seen.reads]).includes(grant),false);
   }
   // The grant shape alone, or the scope without rth:read, is not enough.

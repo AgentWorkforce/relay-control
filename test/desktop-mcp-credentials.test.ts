@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import test from "node:test";
+import { introspect } from "../src/auth/introspect.js";
 import { hashSecret } from "../src/crypto.js";
 import { request } from "./support/harness.js";
 import { copilotDesktopSetup, desktopSecret, installationId, MCP_PATH, tokensPath } from "./support/copilot-desktop.js";
@@ -271,8 +272,9 @@ test("revoke removes the credential and the child stops working", async (t) => {
   assert.equal((await mcp(env.origin, secret)).status, 401);
   assert.equal((await request(env.origin, tokensPath(env.workspaceId, id), { method: "DELETE", token: parent.accessToken })).status, 404);
   assert.deepEqual((await request(env.origin, tokensPath(env.workspaceId), { token: parent.accessToken })).body.tokens, []);
-  const introspected = await request(env.origin, "/api/v1/auth/introspect", { method: "POST", body: { token: secret } });
-  assert.notEqual(introspected.body.active, true);
+  assert.deepEqual(
+    await introspect(env.config, env.store, { token: secret, aud: env.config.relayhistoryPublicUrl, workspace: env.workspaceId }),
+    { active: false, reason: "wrong-kind" });
 });
 
 test("a revoked parent takes its children with it; a refreshed parent keeps them", async (t) => {
@@ -339,8 +341,9 @@ test("the child works only at the MCP endpoint", async (t) => {
   const refresh = await request(env.origin, "/api/v1/auth/token/refresh", { method: "POST", body: { refreshToken: secret } });
   assert.notEqual(refresh.status, 200);
   // Introspection (RelayHistory, relaygate, sessions pipeline) never accepts it.
-  const introspected = await request(env.origin, "/api/v1/auth/introspect", { method: "POST", body: { token: secret } });
-  assert.notEqual(introspected.body.active, true);
+  assert.deepEqual(
+    await introspect(env.config, env.store, { token: secret, aud: env.config.relayhistoryPublicUrl, workspace: env.workspaceId }),
+    { active: false, reason: "wrong-kind" });
   // Nor the session-read handoff route the MCP reader's flagged mode uses.
   const readSession = await request(env.origin, `/api/v1/workspaces/${env.workspaceId}/session-read/session`,
     { method: "POST", token: secret, body: { label: "mcp" } });
