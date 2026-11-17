@@ -132,11 +132,15 @@ forwards of one post reuse its idempotency key.
 
 `unlink_webhook_inbox` clears the link and releases the identity. A sender is
 always released, by exact id, on the Relaycast workspace it was registered on.
-When an expired inbox is deleted, its link row stays (no foreign key) until
-the minute sweep releases its identity and deletes the row. A release that
-fails or takes longer than 10 seconds keeps the row for the next sweep. A sender
-whose release fails after unlink or a relink is queued in
-`events_shim_sender_releases`, which the same sweep retries.
+An identity whose link row is removed or replaced (unlink, relink, a failed
+link) is queued in `events_shim_sender_releases` in the same transaction, then
+released; it leaves the queue only once released or its Relaycast workspace is
+gone. When an expired inbox is deleted, its link row stays (no foreign key)
+until the minute sweep moves it into that queue. The sweep retries queued
+releases, never-attempted first, then the least recently attempted
+(`attempted_at`, migration 0077), so one failing Relaycast workspace cannot
+hold up the rest. A release that fails or takes longer than 10 seconds stays
+queued.
 
 A DM wakes the agent only where that agent's delivery runs on this control
 plane: Amp and Replicas do. Native Capy bindings have no delivery path here

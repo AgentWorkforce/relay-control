@@ -60,7 +60,8 @@ async function fixture(t: TestContext) {
     /** `<workspace key>:<sender name>` per release, so the relay it happened on is checked too. */
     released: [] as string[],
     sendFails: null as { status: number } | null,
-    releaseFails: null as "error" | "stall" | null,
+    releaseFails: null as "error" | "stall" | ((name: string) => boolean) | null,
+    onRelease: undefined as ((name: string) => Promise<void>) | undefined,
     pending: [] as Promise<unknown>[],
     /** Who holds each relay name now (the relay's agent id). */
     holders: new Map<string, string>(),
@@ -78,6 +79,8 @@ async function fixture(t: TestContext) {
       return { id: `agent-${name}`, name, token: `ar_token_${name}` };
     },
     releaseHosted: async (key, name) => {
+      await state.onRelease?.(name);
+      if (typeof state.releaseFails === "function" && state.releaseFails(name)) throw Object.assign(new Error("relaycast down"), { status: 503 });
       if (state.releaseFails === "error") throw Object.assign(new Error("relaycast down"), { status: 503 });
       if (state.releaseFails === "stall") return new Promise<void>(() => undefined);
       state.released.push(`${key}:${name}`);
@@ -487,14 +490,15 @@ test("the webhook_inbox group is planned only with the events_shim deps, and the
   assert.equal(released, 1);
 });
 
-test("an orphan whose release fails or stalls keeps its row for the next sweep", async (t) => {
+test("an orphan whose release fails or stalls stays queued for the next sweep", async (t) => {
   const f = await fixture(t);
   const deps: AgentLinkDeps = { ...f.deps, releaseTimeoutMs: 50 };
   const shim = await f.inbox();
   const linked = await linkInboxToAgent(deps, f.owner, { inbox: shim.shim_id, agent: "capy-a" });
   await f.settle();
   await f.database.query("DELETE FROM events_shims WHERE id = $1", [shim.shim_id]);
-  const rows = async () => (await f.database.query("SELECT 1 FROM events_shim_agent_links WHERE shim_id = $1", [shim.shim_id])).rows.length;
+  // The link row moves into the release queue; the queue entry is what a failed release keeps.
+  const rows = async () => (await f.database.query("SELECT 1 FROM events_shim_sender_releases WHERE sender_name = $1", [linked.sender])).rows.length;
   f.state.releaseFails = "error";
   assert.equal(await releaseOrphanedAgentLinks(deps), 0);
   assert.equal(await rows(), 1);
@@ -504,6 +508,7 @@ test("an orphan whose release fails or stalls keeps its row for the next sweep",
   f.state.releaseFails = null;
   assert.equal(await releaseOrphanedAgentLinks(deps), 1);
   assert.equal(await rows(), 0);
+  assert.deepEqual((await f.database.query("SELECT 1 FROM events_shim_agent_links WHERE shim_id = $1", [shim.shim_id])).rows, []);
   assert.deepEqual(f.state.released, [`rk_${RELAY}:${linked.sender}`]);
 });
 
@@ -625,4 +630,57 @@ test("a failed release after unlink or relink is queued and retried by the sweep
   assert.equal(await releaseOrphanedAgentLinks(f.deps), 1);
   assert.deepEqual(await queued(), []);
   assert.deepEqual(f.state.released, [`rk_${RELAY}:${linked.sender}`]);
+});
+
+test("a sender is queued in the same transaction that removes its link, before any release is attempted", async (t) => {
+  const f = await fixture(t);
+  const shim = await f.inbox();
+  const linked = await linkInboxToAgent(f.deps, f.owner, { inbox: shim.shim_id, agent: "capy-a" });
+  await f.settle();
+  const queuedAtRelease: string[][] = [];
+  // If the server stopped during the release, the queue must already hold the sender.
+  f.state.onRelease = async () => {
+    queuedAtRelease.push((await f.database.query<{ sender_name: string }>("SELECT sender_name FROM events_shim_sender_releases")).rows
+      .map((row) => row.sender_name));
+  };
+  await unlinkInboxFromAgent(f.deps, f.owner, { inbox: shim.shim_id });
+  assert.deepEqual(queuedAtRelease, [[linked.sender]]);
+  assert.deepEqual((await f.database.query("SELECT 1 FROM events_shim_sender_releases")).rows, []);
+});
+
+test("failing releases rotate behind others, so one failing relay cannot hold up the queue", async (t) => {
+  const f = await fixture(t);
+  const add = (name: string, at: string) => f.database.query(
+    "INSERT INTO events_shim_sender_releases (sender_remote_id, sender_name, relaycast_workspace_id, created_at) VALUES ($1, $2, $3, $4)",
+    [`agent-${name}`, name, RELAY, at]);
+  await add("stuck-1", "2026-01-01T00:00:00Z");
+  await add("stuck-2", "2026-01-01T00:00:01Z");
+  await add("healthy", "2026-01-01T00:00:02Z");
+  f.state.releaseFails = (name) => name.startsWith("stuck-");
+  await releaseOrphanedAgentLinks(f.deps, 2);
+  assert.deepEqual(f.state.released, []);
+  await releaseOrphanedAgentLinks(f.deps, 2);
+  assert.deepEqual(f.state.released, [`rk_${RELAY}:healthy`]);
+  assert.deepEqual((await f.database.query<{ sender_name: string }>("SELECT sender_name FROM events_shim_sender_releases ORDER BY sender_name")).rows
+    .map((row) => row.sender_name), ["stuck-1", "stuck-2"]);
+});
+
+test("unlink queues the sender in the same transaction: a failed queue write leaves the link and wake target in place", async (t) => {
+  const f = await fixture(t);
+  const shim = await f.inbox();
+  await linkInboxToAgent(f.deps, f.owner, { inbox: shim.shim_id, agent: "capy-a" });
+  await f.settle();
+  const before = await f.wake(shim.shim_id);
+  const failing: AgentLinkDeps = { ...f.deps, database: Object.assign(Object.create(f.database), {
+    transaction: <T>(work: Parameters<typeof f.database.transaction<T>>[0]) => f.database.transaction((tx) => work({
+      query: async (sql: string, params?: unknown[]) => {
+        if (sql.trimStart().startsWith("INSERT INTO events_shim_sender_releases")) throw new Error("queue write failed");
+        return tx.query(sql, params as never);
+      },
+    } as never)),
+  }) };
+  await assert.rejects(unlinkInboxFromAgent(failing, f.owner, { inbox: shim.shim_id }), /queue write failed/u);
+  assert.equal((await f.database.query("SELECT 1 FROM events_shim_agent_links WHERE shim_id = $1", [shim.shim_id])).rows.length, 1);
+  assert.deepEqual(await f.wake(shim.shim_id), before);
+  assert.deepEqual(f.state.released, []);
 });
