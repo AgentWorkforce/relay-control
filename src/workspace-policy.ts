@@ -86,7 +86,7 @@ export const INBOUND_DEFAULT_VALUES = ["deliver", "hold"] as const;
 export const SPAWN_MAX_AGENTS_MAX = 32;
 const MAX_LIST_ENTRIES = 200;
 const MAX_LIST_ENTRY_LENGTH = 200;
-const REPOSITORY = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+const REPOSITORY = /^[A-Za-z0-9_.-]{1,100}\/(?:[A-Za-z0-9_.-]{1,100}|\*)$/;
 
 function invalid(message: string): CapturePolicyError {
   return new CapturePolicyError(400, "invalid_policy", message);
@@ -127,7 +127,11 @@ const stringList: Validator = (key, value) => {
   return [...value] as string[];
 };
 
-/** `owner/name`, lower-cased so matching is stable; duplicates after lower-casing collapse. */
+/**
+ * `owner/name`, or `owner/*` for every repository under an owner; lower-cased so matching is
+ * stable and duplicates after lower-casing collapse. A client matches locally and reports only the
+ * matched `owner/name`.
+ */
 const repositoryList: Validator = (key, value) => {
   if (!Array.isArray(value) || value.length > MAX_LIST_ENTRIES) {
     throw invalid(`${key} must be an array of at most ${MAX_LIST_ENTRIES} repositories`);
@@ -135,7 +139,7 @@ const repositoryList: Validator = (key, value) => {
   const repositories: string[] = [];
   for (const entry of value) {
     if (typeof entry !== "string" || !REPOSITORY.test(entry)) {
-      throw invalid(`${key} entries must be owner/name repositories`);
+      throw invalid(`${key} entries must be owner/name repositories or owner/* for a whole owner`);
     }
     const lower = entry.toLowerCase();
     if (!repositories.includes(lower)) repositories.push(lower);

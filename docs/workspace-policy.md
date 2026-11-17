@@ -50,7 +50,7 @@ and `consent`). The capture section is the row's existing `settings`.
 | spawn | `spawn_billing_claude` | `subscription` \| `api` \| `unspecified` | locked or defaults | no |
 | spawn | `spawn_billing_codex` | `subscription` \| `api` \| `unspecified` | locked or defaults | no |
 | join | `auto_join_general` | boolean | locked or defaults | no |
-| join | `auto_join_repositories` | array of up to 200 `owner/name` (`[A-Za-z0-9_.-]{1,100}` each part), stored lower-cased, duplicates collapsed | locked or defaults | no |
+| join | `auto_join_repositories` | array of up to 200 entries, each `owner/name` or `owner/*` for every repository under that owner (`[A-Za-z0-9_.-]{1,100}` per part), stored lower-cased, duplicates collapsed; the client matches locally and reports only the matched `owner/name` | locked or defaults | no |
 | join | `trust_workspace_members` | boolean | locked or defaults | no |
 | delivery | `inbound_default` | `deliver` \| `hold` | locked or defaults | no |
 | delivery | `trusted_relay_senders` | array of 0..200 strings, each 1..200 characters | locked or defaults | no |

@@ -87,7 +87,7 @@ test("workspace policy: owner PUT with every section populated", async (t) => {
       },
     },
     join: {
-      locked: { auto_join_repositories: ["Acme/Web", "acme/web", "acme/api"] },
+      locked: { auto_join_repositories: ["Acme/Web", "acme/web", "acme/api", "Acme/*"] },
       defaults: { auto_join_general: true, trust_workspace_members: false },
     },
     delivery: { locked: { trusted_relay_senders: ["lead"] }, defaults: { inbound_default: "deliver" } },
@@ -108,7 +108,7 @@ test("workspace policy: owner PUT with every section populated", async (t) => {
       capture: { locked: {}, defaults: {} },
       spawn: sections.spawn,
       join: {
-        locked: { auto_join_repositories: ["acme/web", "acme/api"] },
+        locked: { auto_join_repositories: ["acme/web", "acme/api", "acme/*"] },
         defaults: sections.join.defaults,
       },
       delivery: sections.delivery,
@@ -252,6 +252,9 @@ test("workspace policy: validation", async (t) => {
     [{ sections: { spawn: { locked: { spawn_repositories: Array.from({ length: 201 }, (_, i) => `r${i}`) } } } }, /spawn_repositories/],
     [{ sections: { join: { locked: { auto_join_repositories: ["no-slash"] } } } }, /auto_join_repositories/],
     [{ sections: { join: { locked: { auto_join_repositories: ["a/b/c"] } } } }, /auto_join_repositories/],
+    [{ sections: { join: { locked: { auto_join_repositories: ["*/web"] } } } }, /auto_join_repositories/],
+    [{ sections: { join: { locked: { auto_join_repositories: ["acme/*x"] } } } }, /auto_join_repositories/],
+    [{ sections: { join: { locked: { auto_join_repositories: ["*"] } } } }, /auto_join_repositories/],
     [{ sections: { delivery: { locked: { inbound_default: "drop" } } } }, /inbound_default/],
     [{ sections: { delivery: { locked: { trusted_relay_senders: [1] } } } }, /trusted_relay_senders/],
     [{ sections: { analytics: { locked: { analytics_enabled: 1 } } } }, /analytics_enabled/],
