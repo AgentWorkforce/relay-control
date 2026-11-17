@@ -65,6 +65,19 @@ test("SELFHOST_RELAY_NODE_SELF_MINT defaults on and is strictly boolean", () => 
   }
 });
 
+test("SELFHOST_ENROLLMENT_SELF_RENEWAL defaults on and is strictly boolean", () => {
+  assert.equal(loadConfig(completeEnv).enrollmentSelfRenewal, true);
+  for (const on of ["", "  ", "true", "1", "on", "TRUE"]) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_ENROLLMENT_SELF_RENEWAL: on }).enrollmentSelfRenewal, true, on);
+  }
+  for (const off of ["false", "0", "off", " Off "]) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_ENROLLMENT_SELF_RENEWAL: off }).enrollmentSelfRenewal, false, off);
+  }
+  for (const bad of ["yes", "no", "disabled", "2"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_ENROLLMENT_SELF_RENEWAL: bad }), /SELFHOST_ENROLLMENT_SELF_RENEWAL/, bad);
+  }
+});
+
 test("the image version is read from SELFHOST_IMAGE_VERSION and null from source", () => {
   assert.equal(loadConfig(completeEnv).imageVersion, null);
   assert.equal(loadConfig({ ...completeEnv, SELFHOST_IMAGE_VERSION: "  " }).imageVersion, null);
