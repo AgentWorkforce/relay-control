@@ -1466,10 +1466,20 @@ per-identity handouts stop too:
   identity with relaygate instead, at sync and again on every MCP call:
   relaygate's `GET /v1/whoami` must answer with the same `agent_id` and
   `name` (and, once relaygate reports `user_id`, the syncing user, else the
-  identity is skipped `not_owned`), and the upstream Relaycast agent of that
-  name, read with the workspace key, must carry the same id in
-  `metadata.relaygate.agent_id`. `metadata.source` and `owner_hash` are not
-  required, and the address is stored as the desktop sent it. The stored
+  identity is skipped `not_owned`). whoami is the proof. The upstream
+  Relaycast agent card of that name, read with the workspace key, is
+  advisory: relaygate stamps `metadata.relaygate.agent_id` only when it first
+  registers the upstream agent (a takeover or a metadata update can leave it
+  missing), so the field is compared only when present, and only a
+  different id there skips the identity `unverified`; a missing card or
+  field does not. `metadata.source` and `owner_hash` are not required, and
+  the address is stored as the desktop sent it. Each skipped identity logs
+  `[selfhost-api] desktop identity skipped` with `workspace_id`, `user_id`,
+  `source_id` (sync only), `agent_name`, `agent_id`, `reason`, `check` (the
+  failed check, for example `whoami_refused:401`, `whoami_agent_id`,
+  `whoami_name`, `whoami_user_id` or `card_relaygate_agent_id`) and, for a
+  refused token, the upstream HTTP `status`; never the token or the whoami
+  body. The sync response itself is unchanged (`{agent_id, reason}`). The stored
   `agent_remote_id` is relaygate's agent id. MCP messaging as a desktop
   identity (DMs, channels, conversation reads) goes through relaygate with
   that token. Routes relaygate does not proxy answer an error there:
