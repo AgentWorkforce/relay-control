@@ -228,6 +228,8 @@ export async function linkInboxToAgent(
   try {
     sender = await deps.database.transaction(async (tx) => {
       const previous = (await lockInbox(tx, shim.id)).rows[0];
+      // Deleted (expired and pruned) since it was checked: refuse before any side effect.
+      if (!previous) throw new AgentLinkError(404, "No webhook inbox of yours has that id or URL in this workspace.");
       // The package fences a stale delivery's failure by wake_linked_at alone, so each link
       // gets a time strictly after the one it replaces, even within one millisecond.
       const at = Math.max(clock(deps).getTime(), previous?.wake_linked_at ? new Date(previous.wake_linked_at).getTime() + 1 : 0);

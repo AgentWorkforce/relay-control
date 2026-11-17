@@ -546,3 +546,17 @@ test("a relink reusing the sender keeps a token relaycast-rekey upgraded meanwhi
     "SELECT sender_token_ciphertext FROM events_shim_agent_links WHERE shim_id = $1", [shim.shim_id])).rows[0]!.sender_token_ciphertext;
   assert.equal(decryptSecret(token, KEYRING), "ar_upgraded_token");
 });
+
+test("an inbox deleted between the ownership check and the lock is refused before a sender is registered", async (t) => {
+  const f = await fixture(t);
+  const shim = await f.inbox();
+  const deleting: AgentLinkDeps = { ...f.deps, database: Object.assign(Object.create(f.database), {
+    transaction: async <T>(work: Parameters<typeof f.database.transaction<T>>[0]) => {
+      await f.database.query("DELETE FROM events_shims WHERE id = $1", [shim.shim_id]);
+      return f.database.transaction(work);
+    },
+  }) };
+  assert.equal(await refusal(linkInboxToAgent(deleting, f.owner, { inbox: shim.shim_id, agent: "capy-a" })), 404);
+  assert.deepEqual(f.state.registered, []);
+  assert.deepEqual((await f.database.query("SELECT 1 FROM events_shim_agent_links WHERE shim_id = $1", [shim.shim_id])).rows, []);
+});
