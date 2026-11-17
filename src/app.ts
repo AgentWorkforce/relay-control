@@ -134,7 +134,8 @@ import {
   writeWorkspacePolicy,
 } from "./workspace-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
-import { createRelaycastClient, type RosterAgent } from "./messaging/relaycast.js";
+import { createRelaycastClient, RelaycastCallError, type RosterAgent, type WorkspaceLeaders } from "./messaging/relaycast.js";
+import { LeaderPatternsError, parseLeaderPatterns } from "./workspace-leaders.js";
 import { isListedRelayAgent } from "./mcp/team-activity.js";
 import {
   erasureTarget,
@@ -2605,6 +2606,58 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       const names = roster.filter(isListedRelayAgent).map((agent) => agent.name).filter(Boolean);
       json(response, 200, { names: [...new Set(names)].sort() }, true);
+      return;
+    }
+
+    // Workspace leaders (docs/workspace-leaders.md): stored by the Relaycast
+    // engine; Control proxies with the workspace key and stores nothing.
+    // Any member reads, workspace owner/admin writes.
+    const workspaceLeaders = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/leaders$/);
+    if (workspaceLeaders && (method === "GET" || method === "PUT")) {
+      const { principal, workspace } = await workspaceAccess(request, workspaceLeaders[0]!, method === "PUT");
+      if (principal.pendingHandoff) {
+        throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      }
+      if (method === "PUT" && !bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      let patterns: string[] = [];
+      if (method === "PUT") {
+        try {
+          patterns = parseLeaderPatterns(await requestObject(request));
+        } catch (error) {
+          if (error instanceof LeaderPatternsError) throw new HttpError(error.status, error.code, error.message);
+          throw error;
+        }
+      }
+      // Each call spends the workspace's server-side Relaycast key.
+      rateLimit(response, `workspace-leaders:${principal.userId}`, AGENT_NAMES_RATE, "rate_limited", "Too many requests. Try again shortly.");
+      const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch });
+      let leaders: WorkspaceLeaders;
+      try {
+        leaders = method === "PUT"
+          ? await relaycast.setWorkspaceLeaders(workspace.relaycastApiKey, patterns)
+          : await relaycast.getWorkspaceLeaders(workspace.relaycastApiKey);
+      } catch (error) {
+        if (error instanceof RelaycastCallError && error.status === 400) {
+          throw new HttpError(400, "invalid_request", "The Relaycast engine refused the leader patterns");
+        }
+        throw new HttpError(502, "workspace_leaders_unavailable", "The workspace leaders setting is unavailable");
+      }
+      if (method === "PUT") {
+        // Agent-name patterns are not secret; the engine's normalised list is recorded.
+        await recordAudit(store.database, {
+          organizationId: workspace.organizationId,
+          workspaceId: workspace.id,
+          actor: { kind: "user", userId: principal.userId },
+          action: "workspace_leaders.set",
+          target: `${workspace.id} patterns=${leaders.patterns.length} ${JSON.stringify(leaders.patterns)}`,
+        });
+      }
+      json(response, 200, {
+        leaders: leaders.leaders.map((leader) => ({ name: leader.name, agent_id: leader.agentId })),
+        patterns: leaders.patterns,
+      }, true);
       return;
     }
 
