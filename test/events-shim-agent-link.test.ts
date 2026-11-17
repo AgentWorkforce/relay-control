@@ -74,6 +74,7 @@ async function fixture(t: TestContext) {
       state.registered.push(name);
       // Yield, as a real registration does, so overlapping links interleave.
       await new Promise((resolve) => setTimeout(resolve, 5));
+      state.holders.set(name, `agent-${name}`);
       return { id: `agent-${name}`, name, token: `ar_token_${name}` };
     },
     releaseHosted: async (key, name) => {
@@ -319,7 +320,7 @@ test("forwards ordinary wakes through globalThis.fetch with its receiver", async
   assert.deepEqual(calls, ["https://cast.agentrelay.com/v1/hooks/wh_1"]);
 });
 
-test("overlapping links of one inbox leave a working link and one sender", async (t) => {
+test("overlapping links of one inbox leave a working link, and every other sender they registered is released", async (t) => {
   const f = await fixture(t);
   const shim = await f.inbox();
   await Promise.all([
@@ -328,7 +329,10 @@ test("overlapping links of one inbox leave a working link and one sender", async
     linkInboxToAgent(f.deps, f.owner, { inbox: shim.shim_id, agent: "replicas-b" }),
   ]);
   await f.settle();
-  assert.equal(f.state.registered.length, 1);
+  const kept = (await f.database.query<{ sender_name: string }>("SELECT sender_name FROM events_shim_agent_links WHERE shim_id = $1", [shim.shim_id])).rows[0]!.sender_name;
+  // Registration happens before the lock, so overlapping first links each register one; only the saved one is kept.
+  assert.deepEqual(f.state.released.map((entry) => entry.split(":")[1]).sort(),
+    f.state.registered.filter((name) => name !== kept).sort());
   await f.post(shim.webhook_url, { n: 1 });
   await f.settle();
   assert.equal(f.state.sent.length, 1);
@@ -547,7 +551,7 @@ test("a relink reusing the sender keeps a token relaycast-rekey upgraded meanwhi
   assert.equal(decryptSecret(token, KEYRING), "ar_upgraded_token");
 });
 
-test("an inbox deleted between the ownership check and the lock is refused before a sender is registered", async (t) => {
+test("an inbox deleted between the ownership check and the lock is refused and the sender it registered is released", async (t) => {
   const f = await fixture(t);
   const shim = await f.inbox();
   const deleting: AgentLinkDeps = { ...f.deps, database: Object.assign(Object.create(f.database), {
@@ -557,6 +561,68 @@ test("an inbox deleted between the ownership check and the lock is refused befor
     },
   }) };
   assert.equal(await refusal(linkInboxToAgent(deleting, f.owner, { inbox: shim.shim_id, agent: "capy-a" })), 404);
-  assert.deepEqual(f.state.registered, []);
+  assert.deepEqual(f.state.released, f.state.registered.map((name) => `rk_${RELAY}:${name}`));
   assert.deepEqual((await f.database.query("SELECT 1 FROM events_shim_agent_links WHERE shim_id = $1", [shim.shim_id])).rows, []);
+});
+
+test("a saved sender Relaycast no longer has is replaced on relink, so the link can recover", async (t) => {
+  const f = await fixture(t);
+  const shim = await f.inbox();
+  const first = await linkInboxToAgent(f.deps, f.owner, { inbox: shim.shim_id, agent: "capy-a" });
+  await f.settle();
+  // Relaycast deleted the inbox's identity.
+  f.state.holders.delete(first.sender);
+  const second = await linkInboxToAgent(f.deps, f.owner, { inbox: shim.shim_id, agent: "capy-a" });
+  await f.settle();
+  assert.notEqual(second.sender, first.sender);
+  // Nothing is left to release for the lost identity.
+  assert.deepEqual(f.state.released, []);
+  await f.post(shim.webhook_url, { n: 1 });
+  await f.settle();
+  assert.equal(f.state.sent.at(-1)?.token, `ar_token_${second.sender}`);
+});
+
+test("no Relaycast call runs while the inbox row is locked", async (t) => {
+  const f = await fixture(t);
+  const shim = await f.inbox();
+  let locked = false;
+  const calls: string[] = [];
+  const watch = <A extends unknown[], R>(name: string, fn: (...args: A) => Promise<R>) => async (...args: A) => {
+    if (locked) calls.push(name);
+    return fn(...args);
+  };
+  const relaycast = {
+    ...f.deps.relaycast,
+    getAgent: watch("getAgent", f.deps.relaycast.getAgent),
+    registerHosted: watch("registerHosted", f.deps.relaycast.registerHosted),
+    releaseHosted: watch("releaseHosted", f.deps.relaycast.releaseHosted),
+  } as AgentLinkDeps["relaycast"];
+  const tracking: AgentLinkDeps = { ...f.deps, relaycast, database: Object.assign(Object.create(f.database), {
+    transaction: async <T>(work: Parameters<typeof f.database.transaction<T>>[0]) => {
+      locked = true;
+      try { return await f.database.transaction(work); } finally { locked = false; }
+    },
+  }) };
+  await linkInboxToAgent(tracking, f.owner, { inbox: shim.shim_id, agent: "capy-a" });
+  await linkInboxToAgent(tracking, f.owner, { inbox: shim.shim_id, agent: "amp-c" });
+  await unlinkInboxFromAgent(tracking, f.owner, { inbox: shim.shim_id });
+  await f.settle();
+  assert.deepEqual(calls, []);
+});
+
+test("a failed release after unlink or relink is queued and retried by the sweep", async (t) => {
+  const f = await fixture(t);
+  const shim = await f.inbox();
+  const linked = await linkInboxToAgent(f.deps, f.owner, { inbox: shim.shim_id, agent: "capy-a" });
+  await f.settle();
+  f.state.releaseFails = "error";
+  assert.deepEqual(await unlinkInboxFromAgent(f.deps, f.owner, { inbox: shim.shim_id }), { inbox_id: shim.shim_id, unlinked: true });
+  const queued = async () => (await f.database.query<{ sender_name: string }>("SELECT sender_name FROM events_shim_sender_releases")).rows.map((row) => row.sender_name);
+  assert.deepEqual(await queued(), [linked.sender]);
+  assert.equal(await releaseOrphanedAgentLinks(f.deps), 0);
+  assert.deepEqual(await queued(), [linked.sender]);
+  f.state.releaseFails = null;
+  assert.equal(await releaseOrphanedAgentLinks(f.deps), 1);
+  assert.deepEqual(await queued(), []);
+  assert.deepEqual(f.state.released, [`rk_${RELAY}:${linked.sender}`]);
 });

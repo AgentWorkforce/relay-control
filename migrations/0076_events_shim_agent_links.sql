@@ -23,3 +23,13 @@ CREATE TABLE events_shim_agent_links (
   secret_hash text NOT NULL,
   linked_at timestamptz NOT NULL
 );
+
+-- Senders whose link row is gone (unlinked, replaced by a relink, or a link that failed) and whose
+-- release did not succeed yet; the wake sweeper retries each until it is released or its Relaycast
+-- workspace is no longer held by any workspace.
+CREATE TABLE events_shim_sender_releases (
+  sender_remote_id text PRIMARY KEY,
+  sender_name text NOT NULL,
+  relaycast_workspace_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);

@@ -78,7 +78,7 @@
     {"name":"0073_enrollment_operator_purpose.sql","sha256":"595406e7afc8ba3393946bc5fe00224e13af10af69aae7223829703ccec599bb"},
     {"name":"0074_enrollment_key_uses.sql","sha256":"7deea130fead087f8522a5d5862aeacf7476eab5787f62796087978f3fa72036"},
     {"name":"0075_token_session_client_telemetry.sql","sha256":"6c9ce658602d7a5eebad9b7c13a2e2ddca6c1a22f6a3e4ee0be8b3357fafd479"},
-    {"name":"0076_events_shim_agent_links.sql","sha256":"10c1a662c437801f2724a4ac63681dc0eed1c418a19c2117996227af18f695e3"}
+    {"name":"0076_events_shim_agent_links.sql","sha256":"3f1441ca8cd33613c585c4c725de0a8e88df457e070ec6fb1756214aa7c3e821"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -423,6 +423,10 @@
     {"kind":"column","name":"public.events_shim_idempotency_keys.shim_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
     {"kind":"column","name":"public.events_shim_posts.at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.events_shim_posts.shim_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
+    {"kind":"column","name":"public.events_shim_sender_releases.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":4,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.events_shim_sender_releases.relaycast_workspace_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_sender_releases.sender_name","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_sender_releases.sender_remote_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"text"}},
     {"kind":"column","name":"public.events_shims.agent_seen_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":14,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.events_shims.created_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":12,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.events_shims.hook_token_ciphertext","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"text"}},
@@ -1381,6 +1385,7 @@
     {"kind":"constraint","name":"public.events_shim_idempotency_keys.events_shim_idempotency_keys_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (shim_id, key)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.events_shim_idempotency_keys.events_shim_idempotency_keys_shim_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (shim_id) REFERENCES events_shims(id) ON DELETE CASCADE","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.events_shim_idempotency_keys","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.events_shim_idempotency_keys","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_cascade_del","table":"public.events_shims","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.events_shims","type":17}],"type":"f","validated":true}},
     {"kind":"constraint","name":"public.events_shim_posts.events_shim_posts_shim_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (shim_id) REFERENCES events_shims(id) ON DELETE CASCADE","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.events_shim_posts","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.events_shim_posts","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_cascade_del","table":"public.events_shims","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.events_shims","type":17}],"type":"f","validated":true}},
+    {"kind":"constraint","name":"public.events_shim_sender_releases.events_shim_sender_releases_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (sender_remote_id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.events_shims.events_shims_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((wake_url IS NULL) = (wake_secret_ciphertext IS NULL)))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.events_shims.events_shims_hook_token_hash_key","definition":{"deferrable":false,"deferred":false,"definition":"UNIQUE (hook_token_hash)","no_inherit":true,"triggers":[],"type":"u","validated":true}},
     {"kind":"constraint","name":"public.events_shims.events_shims_manage_token_hash_key","definition":{"deferrable":false,"deferred":false,"definition":"UNIQUE (manage_token_hash)","no_inherit":true,"triggers":[],"type":"u","validated":true}},
@@ -1804,6 +1809,7 @@
     {"kind":"index","name":"public.events_shim_idempotency_keys.events_shim_idempotency_keys_created","definition":{"definition":"CREATE INDEX events_shim_idempotency_keys_created ON public.events_shim_idempotency_keys USING btree (created_at)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.events_shim_idempotency_keys.events_shim_idempotency_keys_pkey","definition":{"definition":"CREATE UNIQUE INDEX events_shim_idempotency_keys_pkey ON public.events_shim_idempotency_keys USING btree (shim_id, key)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.events_shim_posts.events_shim_posts_shim_at","definition":{"definition":"CREATE INDEX events_shim_posts_shim_at ON public.events_shim_posts USING btree (shim_id, at)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
+    {"kind":"index","name":"public.events_shim_sender_releases.events_shim_sender_releases_pkey","definition":{"definition":"CREATE UNIQUE INDEX events_shim_sender_releases_pkey ON public.events_shim_sender_releases USING btree (sender_remote_id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.events_shims.events_shims_creator","definition":{"definition":"CREATE INDEX events_shims_creator ON public.events_shims USING btree (user_id, workspace_id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.events_shims.events_shims_hook_token_hash_key","definition":{"definition":"CREATE UNIQUE INDEX events_shims_hook_token_hash_key ON public.events_shims USING btree (hook_token_hash)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.events_shims.events_shims_last_used","definition":{"definition":"CREATE INDEX events_shims_last_used ON public.events_shims USING btree (last_used_at)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
@@ -2020,6 +2026,7 @@
     {"kind":"table","name":"public.events_shim_events","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.events_shim_idempotency_keys","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.events_shim_posts","definition":{"force_row_security":false,"kind":"r","row_security":false}},
+    {"kind":"table","name":"public.events_shim_sender_releases","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.events_shims","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.factory_acquisition_operators","definition":{"force_row_security":false,"kind":"r","row_security":false}},
     {"kind":"table","name":"public.factory_bindings","definition":{"force_row_security":false,"kind":"r","row_security":false}},
@@ -2099,5 +2106,5 @@
   "optional":{
 
   },
-  "sha256":"33773d36990429f14bc7daaa93a4c28a9b82ef28d5fb6427b9b3a00fc8847b28"
+  "sha256":"b40514fbddb54e7398493838dcb8229104d3afd145cb97ab4f98771265b36972"
 }

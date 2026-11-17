@@ -102,9 +102,10 @@ write the link and the wake target in one transaction, so overlapping calls
 apply one at a time. Each link's wake time is later than the one it replaces,
 so a late failure under an older link cannot mark the new one broken. A
 reused identity keeps the token stored at that moment, which
-`relaycast-rekey` may have upgraded. Relinking keeps the identity unless the workspace moved
-to another Relaycast workspace; then a new one is registered and the old one
-released.
+`relaycast-rekey` may have upgraded. Relinking keeps the identity while Relaycast still has it on the
+workspace's current Relaycast workspace; otherwise a new one is registered and
+the old one released. Registration and every other Relaycast call happen
+before or after the locked transaction, never while the inbox row is locked.
 
 Delivery is the package's own (leases, retries, the minute sweep). The
 events-shim routes and the sweeper wrap the package's `fetch`
@@ -133,7 +134,9 @@ forwards of one post reuse its idempotency key.
 always released, by exact id, on the Relaycast workspace it was registered on.
 When an expired inbox is deleted, its link row stays (no foreign key) until
 the minute sweep releases its identity and deletes the row. A release that
-fails or takes longer than 10 seconds keeps the row for the next sweep.
+fails or takes longer than 10 seconds keeps the row for the next sweep. A sender
+whose release fails after unlink or a relink is queued in
+`events_shim_sender_releases`, which the same sweep retries.
 
 A DM wakes the agent only where that agent's delivery runs on this control
 plane: Amp and Replicas do. Native Capy bindings have no delivery path here

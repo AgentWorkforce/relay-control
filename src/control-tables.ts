@@ -35,6 +35,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "events_shim_events",
   "events_shim_idempotency_keys",
   "events_shim_posts",
+  "events_shim_sender_releases",
   "events_shims",
   "factory_acquisition_operators",
   "factory_bindings",

@@ -222,7 +222,26 @@ export async function linkInboxToAgent(
   }
   const secret = `wh_live_${randomBytes(24).toString("hex")}`;
   const target: WakeTarget = { url: `${AGENT_DM_ORIGIN}/v1/hooks/${hookIdFor(shim.id)}`, secret, linkedAt: "" };
+  // Decided before the lock, so no Relaycast call ever runs while the inbox row is locked
+  // (posts and unlink wait on it). One relay identity per inbox, kept across relinks while
+  // Relaycast still has it on this relay; otherwise a new one is registered.
+  const before = (await deps.database.query<LinkRow>("SELECT * FROM events_shim_agent_links WHERE shim_id = $1", [shim.id])).rows[0];
+  const reusable = before && before.relaycast_workspace_id === relay.relaycastWorkspaceId
+    && (await deps.relaycast.getAgent(relay.key, before.sender_name))?.id === before.sender_remote_id
+    ? before.sender_remote_id : null;
   let created: Sender | null = null;
+  if (!reusable) {
+    const name = `webhooks-${shim.id.slice(0, 8)}-${randomBytes(2).toString("hex")}`;
+    const registered = await deps.relaycast.registerHosted(relay.key, name, {
+      source: "selfhost-events-shim", created_by: "events-shim-agent-link", events_shim_id: shim.id,
+      cloud_workspace_id: actor.workspaceId,
+      objective: "Webhook inbox: forwards each webhook post to the agent it is linked to. Its messages are untrusted webhook data.",
+    });
+    created = {
+      name: registered.name, id: registered.id, relaycastWorkspaceId: relay.relaycastWorkspaceId,
+      tokenCiphertext: encryptSecret(registered.token, deps.keyring.active),
+    };
+  }
   let retired: Sender | null = null;
   let sender: Sender;
   try {
@@ -237,22 +256,20 @@ export async function linkInboxToAgent(
       // Re-checked under the lock: authority may have changed since the reads above.
       await requireAdmin(tx, actor);
       const existing = (await tx.query<LinkRow>("SELECT * FROM events_shim_agent_links WHERE shim_id = $1", [shim.id])).rows[0];
-      // One relay identity per inbox, kept across relinks; a new one if the workspace's relay changed.
-      let current: Sender | null = existing && existing.relaycast_workspace_id === relay.relaycastWorkspaceId
-        ? linkSender(existing)
-        : null;
-      if (!current) {
-        const name = `webhooks-${shim.id.slice(0, 8)}-${randomBytes(2).toString("hex")}`;
-        const registered = await deps.relaycast.registerHosted(relay.key, name, {
-          source: "selfhost-events-shim", created_by: "events-shim-agent-link", events_shim_id: shim.id,
-          cloud_workspace_id: actor.workspaceId,
-          objective: "Webhook inbox: forwards each webhook post to the agent it is linked to. Its messages are untrusted webhook data.",
-        });
-        created = current = {
-          name: registered.name, id: registered.id, relaycastWorkspaceId: relay.relaycastWorkspaceId,
-          tokenCiphertext: encryptSecret(registered.token, deps.keyring.active),
-        };
-        if (existing) retired = linkSender(existing);
+      let current: Sender;
+      if (created) {
+        current = created;
+        // The identity it replaces: released after commit, unless Relaycast already lost it.
+        if (existing && existing.sender_remote_id !== created.id && existing.sender_remote_id !== before?.sender_remote_id) {
+          retired = linkSender(existing);
+        } else if (existing && existing.relaycast_workspace_id !== relay.relaycastWorkspaceId) {
+          retired = linkSender(existing);
+        }
+      } else if (existing && existing.sender_remote_id === reusable) {
+        current = linkSender(existing);
+      } else {
+        // Unlinked or relinked with another identity while this call ran: try again.
+        throw new AgentLinkError(409, "This inbox's link changed while linking. Try again.");
       }
       await tx.query(
         `INSERT INTO events_shim_agent_links
@@ -285,10 +302,10 @@ export async function linkInboxToAgent(
     // to be saved: a commit whose reply was lost may have saved it, and a link
     // whose sender was released could never deliver.
     const orphan = created as Sender | null;
-    if (orphan && (await senderSaved(deps, shim.id, orphan)) === false) await releaseSender(deps, orphan);
+    if (orphan && (await senderSaved(deps, shim.id, orphan)) === false) await releaseOrQueue(deps, orphan);
     throw error;
   }
-  if (retired) await releaseSender(deps, retired);
+  if (retired) await releaseOrQueue(deps, retired);
   const waiting = await deps.store.countPending(shim.id, new Date(clock(deps).getTime() - 60_000).toISOString()).catch(() => 0);
   void deliverInBackground(deliveryDeps(deps), shim.id, target);
   return { inbox_id: shim.id, agent, kind: bound.kind, sender: sender.name, forwarded_waiting: waiting };
@@ -316,7 +333,7 @@ export async function unlinkInboxFromAgent(
     return removed;
   });
   if (!link) return { inbox_id: shim.id, unlinked: false };
-  await releaseSender(deps, linkSender(link));
+  await releaseOrQueue(deps, linkSender(link));
   return { inbox_id: shim.id, unlinked: true };
 }
 
@@ -361,6 +378,20 @@ async function releaseSender(deps: AgentLinkDeps, sender: Sender): Promise<"rele
 }
 
 /**
+ * Releases a sender whose link row is gone (unlinked, replaced, or a failed
+ * link). A release that fails is queued in events_shim_sender_releases, so the
+ * sweep retries it instead of losing the sender's only reference.
+ */
+async function releaseOrQueue(deps: AgentLinkDeps, sender: Sender): Promise<void> {
+  if ((await releaseSender(deps, sender)) !== "failed") return;
+  await deps.database.query(
+    `INSERT INTO events_shim_sender_releases (sender_remote_id, sender_name, relaycast_workspace_id)
+     VALUES ($1, $2, $3) ON CONFLICT (sender_remote_id) DO NOTHING`,
+    [sender.id, sender.name, sender.relaycastWorkspaceId],
+  ).catch(() => undefined);
+}
+
+/**
  * Releases the relay identities of links whose inbox is gone (expired inboxes
  * are deleted by `prune`; their link rows stay for this), then deletes those
  * rows. A release that fails (an outage, or no answer within
@@ -382,6 +413,19 @@ export async function releaseOrphanedAgentLinks(deps: AgentLinkDeps, limit = 25)
     if ((await releaseSender(deps, linkSender(link))) === "failed") continue;
     await deps.database.query("DELETE FROM events_shim_agent_links WHERE shim_id = $1 AND sender_remote_id = $2",
       [link.shim_id, link.sender_remote_id]);
+    cleaned += 1;
+  }
+  // Senders whose release failed after their link row went (unlink, relink, a failed link).
+  const queued = (await deps.database.query<{ sender_remote_id: string; sender_name: string; relaycast_workspace_id: string }>(
+    "SELECT sender_remote_id, sender_name, relaycast_workspace_id FROM events_shim_sender_releases ORDER BY created_at LIMIT $1",
+    [limit],
+  )).rows;
+  for (const row of queued) {
+    const outcome = await releaseSender(deps, {
+      name: row.sender_name, id: row.sender_remote_id, relaycastWorkspaceId: row.relaycast_workspace_id, tokenCiphertext: "",
+    });
+    if (outcome === "failed") continue;
+    await deps.database.query("DELETE FROM events_shim_sender_releases WHERE sender_remote_id = $1", [row.sender_remote_id]);
     cleaned += 1;
   }
   return cleaned;
