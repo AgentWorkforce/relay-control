@@ -107,6 +107,8 @@ import { abandonEnvironmentCleanup, disconnectEnvironments, setupEnvironments } 
 import { disconnectReplicas, purgeMemberReplicas, releaseMemberReplicas, ReplicasError } from "./replicas/service.js";
 import { isAmpPath } from "./amp/routes.js";
 import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
+import type { AgentLinkDeps } from "./events-shim/agent-link.js";
+import { PostgresEventsShimStore } from "./events-shim/store.js";
 import { purgeMemberAmp, releaseMemberAmp } from "./amp/service.js";
 import {
   DESKTOP_MCP_TOKEN,
@@ -657,8 +659,17 @@ export function createApp(input: {
     },
     now:input.now,afterMutation:()=>oauthTeardown?.kick(),
   });
+  // Webhook inbox links to bound agents (docs/events-shim.md): with the events_shim feature only.
+  const agentLinks: AgentLinkDeps | null = features.events_shim ? {
+    database: store.database,
+    keyring: config.encryptionKeyring,
+    relaycast: createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch }),
+    store: new PostgresEventsShimStore(store.database, config.encryptionKeyring),
+    ...(input.now ? { now: input.now } : {}),
+  } : null;
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
+    ...(agentLinks ? { webhookInbox: agentLinks } : {}),
     ...(amp ? { amp: amp.deps } : {}),
     ...(replicas ? { replicas: replicas.deps } : {}),
     ...(factory.enabled ? { factory: factory.mcp } : {}),
@@ -681,6 +692,7 @@ export function createApp(input: {
     relaycast: { url: config.relaycastUrl, internalSecret: input.relaycastInternalSecret ?? null },
     gateOnly: Boolean(config.relaygatePublicUrl),
     fetchImpl: input.messagingFetch,
+    ...(agentLinks ? { agentLinks } : {}),
     now: input.now,
     authorizeCreate: async (request, response) => {
       const auth = await authenticate(request);

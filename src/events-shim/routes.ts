@@ -8,6 +8,7 @@ import {
 } from "@agent-relay/events-shim";
 import type { EncryptionKeyring } from "../crypto.js";
 import type { Database } from "../database.js";
+import { agentDmFetch, type AgentLinkDeps } from "./agent-link.js";
 import { PostgresEventsShimStore, type EventsShimCreator } from "./store.js";
 import { inboxTempWorkspace, keepTempWorkspaceAlive, TempWorkspaceError, type TempWorkspaceDeps } from "./temp-workspace.js";
 
@@ -36,6 +37,8 @@ export type EventsShimRoutesInput = {
    */
   gateOnly?: boolean;
   fetchImpl?: typeof fetch;
+  /** Inbox links to bound agents: when set, wake forwards to an agent link become relay DMs (agent-link.ts). */
+  agentLinks?: AgentLinkDeps;
   now?: () => Date;
   /**
    * Admits `POST /shims`: authenticates a signed-in person, applies the
@@ -126,7 +129,13 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
     let creator: EventsShimCreator | undefined;
     const store = new PostgresEventsShimStore(input.database, input.keyring, () => creator);
     const options: EventsShimHttpOptions = {
-      deps: { store, now: clock, ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}) },
+      deps: {
+        store,
+        now: clock,
+        ...(input.agentLinks
+          ? { fetchImpl: agentDmFetch(input.agentLinks, input.fetchImpl) }
+          : input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
+      },
       urls,
       relayOrigins: input.relayOrigins,
       ...(input.pollIntervalMs ? { pollIntervalMs: input.pollIntervalMs } : {}),
