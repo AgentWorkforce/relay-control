@@ -12,6 +12,16 @@ assigned at release.
   caller, so the node treats that chat's DMs to the worker as native input.
   OAuth and unlinked hosted sessions omit both. The requester is not stored
   and does not change the launch's idempotency.
+- Fixed: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), desktop
+  identities enrolled at relaygate now verify and sync, so Cursor, Claude Code
+  and Copilot attestation keys are stored. Desktop identity sync and every MCP
+  call check the identity's `rg_` token with relaygate's `GET /v1/whoami`
+  (agent id and name, plus the enrolling user once relaygate reports
+  `user_id`) and require the upstream Relaycast agent of that name to carry
+  the same `metadata.relaygate.agent_id`. MCP messaging as a desktop identity
+  goes through relaygate. Before, Relaycast refused the `rg_` token, every
+  identity was skipped `unverified`, the attestation key was dropped and
+  attested MCP calls failed with "unknown key". No migration.
 - Added: per-person desktop enrollment keys (migration 0074). A
   `desktop-enrollment` key takes `maxUses` (default 1, ceiling
   `SELFHOST_ENROLLMENT_MAX_USES`, default 50) and is exchanged once per
