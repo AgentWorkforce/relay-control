@@ -28,6 +28,12 @@ export function createReplicasModule(input: {
   now?: () => Date;
   /** Test hook: environment MCP limits (ip guard, per-identity quota). Production leaves this unset. */
   rateLimits?: Parameters<typeof createReplicasHandler>[0]["rateLimits"];
+  /**
+   * The canonical lazy Relay binding (the store's): provisions an unbound
+   * workspace once. Absent: an unbound workspace cannot be provisioned from here.
+   */
+  relaycastBinding?: ReplicasDeps["relaycastBinding"];
+  log?: ReplicasDeps["log"];
 }): ReplicasModule {
   const issuer = input.replicas.identityIssuer ?? DEFAULT_REPLICAS_IDENTITY_ISSUER;
   const mcpUrl = environmentMcpUrl(input.config.publicBaseUrl);
@@ -43,6 +49,8 @@ export function createReplicasModule(input: {
       mcpUrl,
       verifier: createReplicaIdentityVerifier({ issuer, audience: mcpUrl, fetchImpl: input.identityFetch, now: input.now }),
     },
+    ...(input.relaycastBinding ? { relaycastBinding: input.relaycastBinding } : {}),
+    ...(input.log ? { log: input.log } : {}),
   };
   const handle = createReplicasHandler({
     enabled: input.replicas.enabled,
