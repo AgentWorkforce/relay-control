@@ -3161,6 +3161,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       keyring: config.encryptionKeyring,
       fetchImpl: input.messagingFetch,
       relaycastUrl: config.relaycastUrl,
+      relaygatePublicUrl: config.relaygatePublicUrl,
       csrfAllowed: (incoming) => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
     })) return;
 

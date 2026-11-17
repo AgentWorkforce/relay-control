@@ -12,6 +12,16 @@ assigned at release.
   against the workspace policy revision, page totals and, with
   `usage_people`, per-member usage. Every read writes a `fleet.viewed` audit
   row. No migration.
+- Fixed: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), desktop
+  identities enrolled at relaygate now verify and sync, so Cursor, Claude Code
+  and Copilot attestation keys are stored. Desktop identity sync and every MCP
+  call check the identity's `rg_` token with relaygate's `GET /v1/whoami`
+  (agent id and name, plus the enrolling user once relaygate reports
+  `user_id`) and require the upstream Relaycast agent of that name to carry
+  the same `metadata.relaygate.agent_id`. MCP messaging as a desktop identity
+  goes through relaygate. Before, Relaycast refused the `rg_` token, every
+  identity was skipped `unverified`, the attestation key was dropped and
+  attested MCP calls failed with "unknown key". No migration.
 - Added: per-person desktop enrollment keys (migration 0074). A
   `desktop-enrollment` key takes `maxUses` (default 1, ceiling
   `SELFHOST_ENROLLMENT_MAX_USES`, default 50) and is exchanged once per
