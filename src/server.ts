@@ -80,6 +80,7 @@ const identity = createIdentityModule({
   keyring: config.encryptionKeyring,
   dashboardUrl: config.dashboardUrl,
   mailer: identityConfig.smtp ? smtpMailer(identityConfig.smtp) : null,
+  enrollmentSelfMint: config.enrollmentSelfRenewal !== false,
 });
 const flows = lazyFlowsStore(() => {
   const flowsConfig = loadFlowsConfig();

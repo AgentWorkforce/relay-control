@@ -497,6 +497,8 @@ export function createApp(input: {
     session_delete: Boolean(config.sessionErasureApi) && operatorControlsEntitled(),
     // Desktop enrollment keys (docs/identity.md): always served.
     enrollment_keys: true,
+    // Member self-mint at POST /api/v1/me/enrollment-keys (SELFHOST_ENROLLMENT_SELF_RENEWAL).
+    enrollment_self_mint: config.enrollmentSelfRenewal !== false,
   });
   // Usage page counters: written only while the `usage` feature is selected.
   const usage = new UsageStore(store.database, () => input.now?.() ?? new Date());
@@ -745,6 +747,9 @@ export function createApp(input: {
     }
     return principal;
   }
+
+  /** POST /api/v1/me/enrollment-keys: self-minted enrollment keys per person per hour. */
+  const ENROLLMENT_SELF_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
 
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy, () => input.now?.() ?? new Date());
   const STAFF_READ_GRANT_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
@@ -2166,6 +2171,41 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       json(response, 200, {
         keys: await apiTokens.listForUser({ organizationId: principal.organizationId, userId: principal.userId }),
       }, true);
+      return;
+    }
+    // Member self-mint (docs/identity.md, "Member self-mint"): a single-use
+    // key for the caller's own next machine, consent inherited from the key
+    // that provisioned this session and never raised.
+    if (path === "/api/v1/me/enrollment-keys" && method === "POST") {
+      const principal = await enrollmentKeyOwner(request);
+      if (config.enrollmentSelfRenewal === false) {
+        throw new HttpError(
+          403,
+          "self_mint_disabled",
+          "Enrollment key self-renewal is turned off on this install; ask an admin for a key",
+        );
+      }
+      const body = await requestObject(request);
+      const unknown = Object.keys(body).filter((key) => key !== "label" && key !== "expiryDays");
+      if (unknown.length > 0) {
+        throw new HttpError(
+          400,
+          "invalid_request",
+          `Only label and expiryDays are accepted; refused: ${unknown.sort().join(", ")}`,
+        );
+      }
+      rateLimit(response, `enrollment-self-mint:${principal.userId}`, ENROLLMENT_SELF_MINT_RATE, "rate_limited",
+        "Too many enrollment keys minted; try again later");
+      const key = await apiTokens.selfMint({
+        organizationId: principal.organizationId,
+        workspaceId: principal.workspaceId,
+        userId: principal.userId,
+        email: principal.email,
+        provisionedByTokenId: principal.provisionedByTokenId ?? null,
+        label: body.label,
+        expiryDays: body.expiryDays,
+      });
+      json(response, 201, key, true);
       return;
     }
     const ownEnrollmentKey = routeMatch(path, /^\/api\/v1\/me\/enrollment-keys\/([^/]+)$/);
