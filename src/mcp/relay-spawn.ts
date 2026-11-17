@@ -386,7 +386,9 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
           }
         }
         try {
-          const invocation = await deps.client.spawnRelayAgent(actor.token, { ...launch, target_node: target.name }, `selfhost-spawn:${row.id}`);
+          // A verified desktop chat rides along as the requester (never hashed or stored): the node treats its DMs as native input.
+          const invocation = await deps.client.spawnRelayAgent(actor.token, { ...launch, target_node: target.name },
+            `selfhost-spawn:${row.id}`, actor.requester);
           row = await deps.store.update(row, { state: "accepted", invocationId: invocation.id });
         } catch (error) {
           // Never send a second launch, even when the response is lost.

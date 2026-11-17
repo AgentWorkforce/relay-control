@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import test, { type TestContext } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -10,8 +10,9 @@ import { NO_FEATURES } from "../src/features.js";
 import { migrate } from "../src/migrations.js";
 import { launcherName } from "../src/mcp/relay-participants.js";
 import { ControlPlaneStore } from "../src/store.js";
+import { copilotDesktopSetup, identitiesPath } from "./support/copilot-desktop.js";
 import { createRelaycastWorld } from "./support/relaycast-world.js";
-import { PGliteDatabase } from "./support/harness.js";
+import { PGliteDatabase, request } from "./support/harness.js";
 
 /** SELFHOST_FEATURES=launch: the agent launch MCP tools (docs/agent-launch.md). */
 
@@ -247,6 +248,9 @@ test("spawn, status and release: journaled before send, ready only when correlat
   assert.ok(launcher);
   const invocation = env.world.invocations.get([...env.world.invocations.keys()][0]!)!;
   assert.equal(invocation.caller_id, launcher.id);
+  // A plain hosted session names no requester: the keys are absent, not null.
+  assert.equal("requester_agent_id" in invocation, false);
+  assert.equal("requester_name" in invocation, false);
 
   // Same key, same request: the receipt, never a second launch.
   assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("node-1") })).spawn_id, receipt.spawn_id);
@@ -273,6 +277,36 @@ test("spawn, status and release: journaled before send, ready only when correlat
   assert.equal(data(await client.callTool({ name: "release_relay_agent", arguments: { spawn_id: receipt.spawn_id } })).status, "released");
   const rows = await env.database.query<{ state: string; workspace_id: string }>("SELECT state, workspace_id FROM relay_spawns");
   assert.deepEqual(rows.rows.map(row => [row.state, row.workspace_id]), [["released", env.workspaceId]]);
+});
+
+test("a desktop-linked chat's launch names it as the requester; the launcher stays the caller", async (t) => {
+  const env = await copilotDesktopSetup(t, { features: { ...NO_FEATURES, launch: true } });
+  // Desktop signs in and syncs the chat's own relay identity; a native MCP session links to it.
+  const parent = await env.desktopSignIn();
+  const chat = env.world.addAgent("desk-chat", {
+    source: "relay-desktop", owner_hash: createHash("sha256").update(env.ownerId).digest("hex") });
+  const address = `desk-chat@cloud-${chat.id}`;
+  const synced = await request(env.origin, identitiesPath(env.workspaceId), { method: "PUT", token: parent.accessToken,
+    body: { source_id: randomUUID(), identities: [{ name: chat.name, address, agent_id: chat.id, token: chat.token }] } });
+  assert.equal(synced.status, 200, synced.raw);
+  env.world.nodes.set("rk_primary", [node("node-1", "studio-desktop")]);
+  await env.database.query(
+    `INSERT INTO fleet_node_owners (id, workspace_id, organization_id, relaycast_workspace_id, node_id, node_name, user_id)
+     VALUES ($1, $2, $3, 'rw_primary', 'node-1', 'node-1', $4)`, [randomUUID(), env.workspaceId, env.orgId, env.ownerId]);
+  const client = new Client({ name: "mcp-test", version: "1.0.0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${env.origin}${MCP_PATH}`),
+    { requestInit: { headers: { authorization: `Bearer ${await env.deviceLogin()}` } } }));
+  t.after(() => client.close());
+  assert.equal(data(await client.callTool({ name: "join_relay", arguments: { desktop_address: address } })).linked, "desktop");
+
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("node-1") })).status, "accepted");
+  const invocation = [...env.world.invocations.values()][0]!;
+  assert.equal(invocation.requester_agent_id, chat.id);
+  assert.equal(invocation.requester_name, "desk-chat");
+  assert.equal("requester_agent_id" in invocation.input, false);
+  // Still sent as the owner's launcher participant, never as the chat.
+  assert.equal(invocation.caller_id, env.world.agents.get(launcherName(env.ownerId))!.id);
+  assert.notEqual(invocation.caller_id, chat.id);
 });
 
 test("another connection cannot read or release a launch, even for the same user", async (t) => {

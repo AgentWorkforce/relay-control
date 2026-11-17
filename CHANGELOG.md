@@ -6,6 +6,19 @@ assigned at release.
 ## Unreleased
 
 - Fixed: a Replicas launch or bind that never got a Relay identity no longer sits in `preparing`/`binding` forever. After 7 days the sync sweep abandons it (`gone`, audited `replicas.spawn.abandoned`). A replica Relay launched is put to sleep first; an existing chat is left awake. Rows with a Relay identity and environment identities are untouched.
+- Added: MCP `get_session_summary` can read recorded short or long summaries
+  of the requested kind and return validated optional provenance. It enforces
+  320/16000 Unicode code-point bounds, preserves empty/unsupported responses,
+  and never substitutes another kind, reader or transcript after refusal.
+  Reader selection and authorization are unchanged; the selected backend must
+  support the requested kind. See docs/session-summaries.md.
+- Added: `spawn_relay_agent` launches made by a verified desktop-linked chat
+  (a managed desktop call, or a session linked with `join_relay`
+  `desktop_address`) send `requester_agent_id` and `requester_name` (the
+  chat's own Relaycast identity) on the spawn invocation beside the launcher
+  caller, so the node treats that chat's DMs to the worker as native input.
+  OAuth and unlinked hosted sessions omit both. The requester is not stored
+  and does not change the launch's idempotency.
 - Fixed: a webhook inbox's relay identity is no longer lost when releasing it fails or the server stops mid-release (migration 0077). Unlinking, relinking or the sweep now queues the identity in the same transaction that removes or replaces its link, and it leaves the queue only once released. The sweep retries the least recently attempted releases first, so one failing Relaycast workspace cannot hold up the others.
 - Added: a webhook inbox can wake a bound cloud agent (migration 0076). With `events_shim` selected, the Agent Relay MCP's `link_webhook_inbox` lets a current owner or admin link an inbox they created to their own bound Amp thread, Replica or Capy binding. Each post then reaches that agent as a relay DM from the inbox's own relay identity, framed as untrusted webhook data with `@mentions` neutralised. `unlink_webhook_inbox` undoes it. Every forward re-checks the inbox, the binding row and generation, the relay agent id, the name's current holder and the Relaycast workspace, and marks the link broken if any changed. The minute sweep releases a deleted inbox's identity on the Relaycast workspace it was registered on. Capy links wake the thread once native Capy delivery is mounted. See docs/events-shim.md.
 - Fixed: Desktop identity sync no longer drops the installation's attestation

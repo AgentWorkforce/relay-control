@@ -112,6 +112,9 @@ export type RelaySpawnInvocation = {
   id: string;
   status: string;
   callerId: string | null;
+  /** The verified desktop identity that asked for the launch, echoed by Relaycast beside the caller. */
+  requesterAgentId: string | null;
+  requesterName: string | null;
   nodeId: string | null;
   name: string | null;
   spawned: boolean;
@@ -302,6 +305,7 @@ export function createRelaycastClient(input: {
     const warning = output?.warning;
     return {
       id, status, callerId: text(data?.caller_id),
+      requesterAgentId: text(data?.requester_agent_id), requesterName: text(data?.requester_name),
       nodeId: text(data?.dispatched_node_id) ?? text(data?.handler_node_id),
       name: text(output?.name), spawned: output?.spawned === true, ready: output?.ready === true,
       taskUnconfirmed: warning === "spawn_task_unconfirmed" || record(warning)?.code === "spawn_task_unconfirmed",
@@ -822,11 +826,16 @@ export function createRelaycastClient(input: {
       });
     },
 
-    /** Sends one native spawn as the hosted actor (agent token); never retried. */
+    /**
+     * Sends one native spawn as the hosted actor (agent token); never retried. The optional
+     * requester (sent beside `input`, not inside it) is the verified desktop chat behind the
+     * launch: Relaycast echoes it next to the caller and the node treats its DMs as native input.
+     */
     async spawnRelayAgent(token: string, input: { name: string; cli: string; task: string; target_node: string; worker_cwd?: string },
-      idempotencyKey: string): Promise<RelaySpawnInvocation> {
+      idempotencyKey: string, requester?: { agentId: string; name: string }): Promise<RelaySpawnInvocation> {
       const data = await labeled("spawn_agent", () => call("POST", "/v1/actions/spawn/invoke", token,
-        { input: { ...input, verify_ready: true } }, idempotencyKey));
+        { input: { ...input, verify_ready: true },
+          ...(requester ? { requester_agent_id: requester.agentId, requester_name: requester.name } : {}) }, idempotencyKey));
       return invocationFrom(data, true);
     },
 
