@@ -498,7 +498,7 @@ test("readyz lists exactly the audiences introspection accepts, never the secret
       outageHoldMs: 0,
     },
     // No features wired: core only.
-    capabilities: { flows: false, relayfile: false, chief: false, usage: false, launch: false, usage_people: false, events_shim: false, session_delete: false, enrollment_keys: true },
+    capabilities: { flows: false, relayfile: false, chief: false, usage: false, launch: false, usage_people: false, events_shim: false, session_delete: false, enrollment_keys: true, enrollment_self_mint: true },
   });
   assert.equal(JSON.stringify(ready.body).includes(INTROSPECT_SECRET), false);
   const { accessToken } = await env.login(env.alpha);

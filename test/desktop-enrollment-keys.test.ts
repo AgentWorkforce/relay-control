@@ -396,10 +396,14 @@ test("/api/v1/me/enrollment-keys: the employee lists and revokes only their own 
   assert.equal(listed.body.keys.length, 1);
   const summary = listed.body.keys[0];
   assert.deepEqual(Object.keys(summary).sort(), [
-    "createdAt", "exchangedAt", "exchangedHostName", "expiresAt", "id", "label", "mcpConsent", "mintedBy", "status",
+    "createdAt", "exchangedAt", "exchangedHostName", "expiresAt", "id", "label", "maxUses", "mcpConsent", "mintedBy",
+    "policyConsent", "status", "useCount",
   ]);
   assert.equal(summary.id, mine.id);
   assert.equal(summary.mcpConsent, "admin");
+  assert.equal(summary.policyConsent, null);
+  assert.equal(summary.maxUses, 1);
+  assert.equal(summary.useCount, 1);
   assert.equal(summary.exchangedHostName, "build-01");
   assert.equal(summary.status, "exchanged");
   assert.equal(summary.mintedBy.id, env.ownerId);

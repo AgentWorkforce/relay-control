@@ -109,6 +109,8 @@ export async function setup(t: test.TestContext, options: {
   dashboardUrl?: string;
   /** false: no SMTP and no mailer (SELFHOST_SIGNIN_METHODS=password). */
   smtp?: boolean;
+  /** SELFHOST_ENROLLMENT_SELF_RENEWAL as loaded (absent: on). */
+  enrollmentSelfRenewal?: boolean;
 } = {}) {
   // The tests stand behind one proxy (they send X-Forwarded-For) unless a
   // test asks otherwise; the variable is read per request.
@@ -141,6 +143,7 @@ export async function setup(t: test.TestContext, options: {
     dashboardUrl: options.dashboardUrl ?? `${origin}/`,
     port: 0,
     host: "127.0.0.1",
+    ...(options.enrollmentSelfRenewal === undefined ? {} : { enrollmentSelfRenewal: options.enrollmentSelfRenewal }),
   };
   const identityConfig = loadIdentityConfig({
     SELFHOST_BOOTSTRAP_ORG_NAME: "Acme",
@@ -174,6 +177,7 @@ export async function setup(t: test.TestContext, options: {
     mailer: options.smtp === false ? null : mailer,
     now: () => clock.now,
     log: () => undefined,
+    ...(options.enrollmentSelfRenewal === undefined ? {} : { enrollmentSelfMint: options.enrollmentSelfRenewal }),
     ...(options.hibpFetch ? { hibpFetch: options.hibpFetch } : {}),
     ...(options.passwordHasher ? { passwordHasher: options.passwordHasher } : {}),
   });

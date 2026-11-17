@@ -151,6 +151,14 @@ export type SelfhostConfig = {
    */
   relayNodeSelfMint?: boolean;
   /**
+   * SELFHOST_ENROLLMENT_SELF_RENEWAL (docs/identity.md, "Member self-mint"):
+   * whether a signed-in person may mint a single-use desktop enrollment key
+   * for themselves at POST /api/v1/me/enrollment-keys. Default true; `false`,
+   * `0` or `off` turns it off (403 `self_mint_disabled`); the owner/admin
+   * mint and the list/revoke routes are unchanged either way. Absent means true.
+   */
+  enrollmentSelfRenewal?: boolean;
+  /**
    * SELFHOST_IMAGE_VERSION: the image tag, set by the image (Dockerfile).
    * Null when run from source. Shown by GET /cloud/api/health and telemetry.
    */
@@ -495,6 +503,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     eventsShimRelayOrigins: loadEventsShimRelayOrigins(env),
     relaygatePublicUrl,
     relayNodeSelfMint: loadRelayNodeSelfMint(env),
+    enrollmentSelfRenewal: loadEnrollmentSelfRenewal(env),
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
@@ -1122,6 +1131,17 @@ export function loadRelayNodeSelfMint(env: Env = process.env): boolean {
   if (!value || value === "true" || value === "1" || value === "on") return true;
   if (value === "false" || value === "0" || value === "off") return false;
   throw new Error("SELFHOST_RELAY_NODE_SELF_MINT must be true or false");
+}
+
+/**
+ * SELFHOST_ENROLLMENT_SELF_RENEWAL: unset, blank, `true`, `1` or `on`: true;
+ * `false`, `0` or `off`: false; anything else refuses startup.
+ */
+export function loadEnrollmentSelfRenewal(env: Env = process.env): boolean {
+  const value = env.SELFHOST_ENROLLMENT_SELF_RENEWAL?.trim().toLowerCase();
+  if (!value || value === "true" || value === "1" || value === "on") return true;
+  if (value === "false" || value === "0" || value === "off") return false;
+  throw new Error("SELFHOST_ENROLLMENT_SELF_RENEWAL must be true or false");
 }
 
 export function loadEventsShimRelayOrigins(env: Env = process.env): string[] | null {

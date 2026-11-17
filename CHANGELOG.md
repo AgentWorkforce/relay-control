@@ -5,6 +5,18 @@ assigned at release.
 
 ## Unreleased
 
+- Added: member self-mint of desktop enrollment keys at
+  `POST /api/v1/me/enrollment-keys` (also under `/cloud`). A signed-in member
+  mints a single-use key for their own next machine; the body takes only
+  `label` and `expiryDays` (default and ceiling
+  `SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS`, 7). `mcpConsent` and
+  `policyConsent` are inherited from the key that provisioned the calling
+  session and never raised. At most 5 unexchanged keys per person
+  (`409 self_mint_limit`) and 10 self-mints per hour (`429 rate_limited`).
+  `SELFHOST_ENROLLMENT_SELF_RENEWAL=false` turns it off
+  (`403 self_mint_disabled`); capabilities and login-config answer
+  `enrollment_self_mint`. Audited `enrollment_key.self_mint`. The member's
+  key list adds `maxUses`, `useCount` and `policyConsent`.
 - Added: per-person desktop enrollment keys (migration 0074). A
   `desktop-enrollment` key takes `maxUses` (default 1, ceiling
   `SELFHOST_ENROLLMENT_MAX_USES`, default 50) and is exchanged once per
