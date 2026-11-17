@@ -305,7 +305,9 @@ wake paid compute; only the person's status read retries it. An abandoned row
 becomes `gone` with an error asking to spawn or bind again, and is audited as
 `replicas.spawn.abandoned`. A replica Relay launched is put to sleep first, as
 release does; an existing chat the person bound is left awake. A failed sleep
-keeps the row for the next tick. Rows that got a relay identity are left for
+keeps the row for the next tick, stamped so it rotates behind rows not yet
+tried (its age is not reset); a 401/403 latches the connection as refused,
+like every provider refusal. Rows that got a relay identity are left for
 `release_replica`, and environment identities are never touched.
 
 Discovery fencing: a complete discovery listing (every page read) that no

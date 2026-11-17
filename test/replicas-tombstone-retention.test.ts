@@ -615,3 +615,24 @@ test("stale-binding cleanup never touches recent rows, rows with a relay identit
   await sweep.tick();
   assert.equal((await spawnRow(env, launch.id)).state, "gone");
 });
+
+test("stale-binding cleanup rotates failing launches behind the rest and latches a refused provider key", async (t) => {
+  const env = await start(t);
+  assert.equal((await connect(env)).status, 200);
+  const first = await staleRow(env, "spawn", { ageDays: 9 });
+  const second = await staleRow(env, "spawn", { ageDays: 8 });
+  const sleep = env.provider.runtime.sleep;
+  const tried: string[] = [];
+  env.provider.runtime.sleep = async (_key: string, replicaId: string) => { tried.push(replicaId); throw new ReplicasRuntimeError("unknown", "unavailable", 503); };
+  // One row per tick: a failing row must not be picked again before the other gets a turn.
+  assert.equal(await abandonStaleBindings(env.replicas.deps, actorOf(env), Date.now, 1), 0);
+  assert.equal(await abandonStaleBindings(env.replicas.deps, actorOf(env), Date.now, 1), 0);
+  assert.deepEqual(tried, [first.replicaId, second.replicaId]);
+  const old = (await env.database.query<{ old: boolean }>("SELECT updated_at < now() - interval '7 days' AS old FROM replica_spawns WHERE id = $1", [first.id])).rows[0]!.old;
+  assert.equal(old, true, "a failed attempt does not reset the row's age");
+
+  env.provider.runtime.sleep = async () => { throw new ReplicasRuntimeError("rejected", "replicas_http_401", 401); };
+  assert.equal(await abandonStaleBindings(env.replicas.deps, actorOf(env)), 0);
+  assert.equal(await count(env, "SELECT 1 FROM remote_agent_connections WHERE workspace_id = $1 AND access_revoked_at IS NOT NULL", [env.workspaceId]), 1);
+  env.provider.runtime.sleep = sleep;
+});

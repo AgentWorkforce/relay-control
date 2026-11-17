@@ -120,6 +120,8 @@ export type SpawnInput = {
   creator_id?: string | null;
   /** API launches and binds: set once by the first verified environment admission that reused the row (tenant pin). */
   identity_admitted?: { issuer: string; organization_id: string; at: string };
+  /** Stale-binding cleanup: when its last failed sleep was (ISO); failed rows rotate behind the rest. */
+  abandon_attempted_at?: string;
 };
 export type SpawnRow = {
   id: string;
@@ -1051,13 +1053,16 @@ export const STALE_BINDING_ERROR = "Binding did not finish within 7 days and was
  *
  * @returns How many rows were abandoned.
  */
-export async function abandonStaleBindings(deps: ReplicasDeps, actor: ReplicasActor, now: () => number = Date.now): Promise<number> {
+export async function abandonStaleBindings(deps: ReplicasDeps, actor: ReplicasActor, now: () => number = Date.now, limit = 25): Promise<number> {
   const before = new Date(now() - STALE_BINDING_MS);
   const where = `state IN ('preparing', 'binding') AND updated_at < $2 AND relay_workspace_id IS NULL AND agent_name IS NULL
     AND subscription_id IS NULL AND mention_subscription_id IS NULL AND COALESCE(source, '') <> '${ENVIRONMENT_IDENTITY}'`;
   const rows = await deps.database.query<{ id: string }>(
-    `SELECT id FROM replica_spawns WHERE workspace_id = $1 AND ${where} ORDER BY updated_at, id LIMIT 25`,
-    [actor.workspaceId, before],
+    // Never-attempted rows first, then the least recently attempted, so rows whose sleep keeps
+    // failing rotate behind the rest (existing-chat binds need no provider call at all).
+    `SELECT id FROM replica_spawns WHERE workspace_id = $1 AND ${where}
+      ORDER BY input->>'abandon_attempted_at' ASC NULLS FIRST, updated_at, id LIMIT $3`,
+    [actor.workspaceId, before, limit],
   );
   let abandoned = 0;
   for (const { id } of rows.rows) {
@@ -1071,7 +1076,16 @@ export async function abandonStaleBindings(deps: ReplicasDeps, actor: ReplicasAc
           const { key, ciphertext } = await connectionKey(deps, tx, row.workspace_id);
           await underKey(ciphertext, () => deps.replicas.sleep(key, row.replica_id!));
         } catch (error) {
-          if (!(error instanceof ReplicasRuntimeError) || ![404, 410].includes(error.status)) return 0;
+          if (!(error instanceof ReplicasRuntimeError) || ![404, 410].includes(error.status)) {
+            // A refused key is latched like every other provider refusal (this transaction commits),
+            // so admission stops trusting it.
+            const refused = refusedKey(error);
+            if (refused) await recordProviderAccess(tx, row.workspace_id, error, refused);
+            // Stamp the attempt without touching updated_at (that would reset its age).
+            await tx.query("UPDATE replica_spawns SET input = input || jsonb_build_object('abandon_attempted_at', $2::text) WHERE id = $1",
+              [row.id, new Date(now()).toISOString()]);
+            return 0;
+          }
         }
       }
       const gone = await patch(tx, row.id, { state: "gone", helper_hash: null, helper_ciphertext: null, hook_ciphertext: null,
