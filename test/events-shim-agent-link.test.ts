@@ -664,3 +664,23 @@ test("failing releases rotate behind others, so one failing relay cannot hold up
   assert.deepEqual((await f.database.query<{ sender_name: string }>("SELECT sender_name FROM events_shim_sender_releases ORDER BY sender_name")).rows
     .map((row) => row.sender_name), ["stuck-1", "stuck-2"]);
 });
+
+test("unlink queues the sender in the same transaction: a failed queue write leaves the link and wake target in place", async (t) => {
+  const f = await fixture(t);
+  const shim = await f.inbox();
+  await linkInboxToAgent(f.deps, f.owner, { inbox: shim.shim_id, agent: "capy-a" });
+  await f.settle();
+  const before = await f.wake(shim.shim_id);
+  const failing: AgentLinkDeps = { ...f.deps, database: Object.assign(Object.create(f.database), {
+    transaction: <T>(work: Parameters<typeof f.database.transaction<T>>[0]) => f.database.transaction((tx) => work({
+      query: async (sql: string, params?: unknown[]) => {
+        if (sql.trimStart().startsWith("INSERT INTO events_shim_sender_releases")) throw new Error("queue write failed");
+        return tx.query(sql, params as never);
+      },
+    } as never)),
+  }) };
+  await assert.rejects(unlinkInboxFromAgent(failing, f.owner, { inbox: shim.shim_id }), /queue write failed/u);
+  assert.equal((await f.database.query("SELECT 1 FROM events_shim_agent_links WHERE shim_id = $1", [shim.shim_id])).rows.length, 1);
+  assert.deepEqual(await f.wake(shim.shim_id), before);
+  assert.deepEqual(f.state.released, []);
+});
