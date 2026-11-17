@@ -5,6 +5,12 @@ assigned at release.
 
 ## Unreleased
 
+- Added: MCP `get_session_summary` can read recorded short or long summaries
+  of the requested kind and return validated optional provenance. It enforces
+  320/16000 Unicode code-point bounds, preserves empty/unsupported responses,
+  and never substitutes another kind, reader or transcript after refusal.
+  Reader selection and authorization are unchanged; the selected backend must
+  support the requested kind. See docs/session-summaries.md.
 - Added: `spawn_relay_agent` launches made by a verified desktop-linked chat
   (a managed desktop call, or a session linked with `join_relay`
   `desktop_address`) send `requester_agent_id` and `requester_name` (the

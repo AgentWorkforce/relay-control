@@ -1187,11 +1187,13 @@ test("recorded summaries preserve provenance and workspace isolation through the
   const token = await env.login(env.ownerId, env.alpha);
   const upstream = "/v1/sessions/alpha-1/summary";
   const path = `/api/v1/workspaces/${env.alpha}/sessions/alpha-1/summary?source=codex&kind=short`;
-  const ready = { status: "ready", kind: "short", summary: "Recorded model-written description", model: "recorded-model", builtAt: "2026-11-02T18:00:00Z", state: null };
+  // The dashboard retains its existing projection, independent of MCP's 320-code-point bound.
+  const ready = { status: "ready", kind: "short", summary: "Recorded model-written description. ".repeat(15), model: "recorded-model", builtAt: "2026-11-02T18:00:00Z", state: null };
   env.history.overrides.set(upstream, () => ({ body: { summary: ready } }));
   const response = await call(env.origin, path, { token });
   assert.equal(response.status, 200);
   assert.deepEqual(response.body, { summary: ready });
+  assert.ok(ready.summary.length > 320);
   assert.equal(response.headers.get("cache-control"), "no-store");
   const request = env.history.requests.at(-1)!;
   assert.equal(request.path, upstream);
@@ -1503,8 +1505,10 @@ test("usage people: drill-down lists a member's sessions with recorded summaries
   }));
   rows.push({ sessionId: "other", workspaceId: env.alpha, userIds: [env.ownerId], lastTs: "2026-11-02T18:30:00.000Z", title: "Owner work", projectId: "relay" });
   peopleSessions(env, rows);
+  const recordedText = "Fixed the login flow. ".repeat(25);
+  assert.ok(recordedText.length > 320, "People keeps its existing short-summary projection");
   env.history.overrides.set("/v1/sessions/s0/summary", () => ({
-    body: { summary: { status: "ready", kind: "short", summary: "Fixed the login flow", model: "m", builtAt: "2026-11-02T19:05:00.000Z", state: null } },
+    body: { summary: { status: "ready", kind: "short", summary: recordedText, model: "m", builtAt: "2026-11-02T19:05:00.000Z", state: null } },
   }));
   const owner = await env.login(env.ownerId, env.alpha);
   const base = `/cloud/api/v1/organizations/${env.organizationId}/usage/people/${env.memberId}/sessions?days=7`;
@@ -1514,7 +1518,7 @@ test("usage people: drill-down lists a member's sessions with recorded summaries
   assert.equal(first.body.sessions.length, 20);
   assert.deepEqual(first.body.sessions[0], {
     sessionId: "s0", source: "claude", workspaceId: env.alpha, title: "Task 0", project: "relay", agentName: "reviewer",
-    firstTs: rows[0]!.lastTs, lastTs: rows[0]!.lastTs, summary: "Fixed the login flow",
+    firstTs: rows[0]!.lastTs, lastTs: rows[0]!.lastTs, summary: recordedText,
   });
   assert.equal(first.body.sessions[1].summary, null);
   assert.ok(first.body.sessions.every((session: any) => session.sessionId !== "other"));

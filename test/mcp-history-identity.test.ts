@@ -233,24 +233,30 @@ test("every selected-reader501 stays unsupported with zero History calls regardl
 });
 
 test("summary reads use the per-user reader and never fall back after refusal or missing attestation", async t => {
-  const path="/v1/sessions/fake-session/summary?source=codex&kind=short&workspace=other";
-  for(const status of [200,401,403,404,501,503]) {
-    const seen=fake(t,{readStatus:()=>status}),cfg=config();
-    const read=historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a");
-    if(status===200) assert.deepEqual(await read(path),{from:"read-api"});
-    else await assert.rejects(read(path));
-    assert.ok(seen.reads.length>0);
-    for(const request of seen.reads) {
-      assert.equal(request.url.origin,PUBLIC);
-      assert.equal(request.url.pathname,"/v1/sessions/fake-session/summary");
-      assert.equal(request.url.searchParams.get("workspace"),"ws-a");
-      assert.match(request.bearer!,/^Bearer rth_at_read_/);
+  for (const kind of ["short", "long"]) {
+    const path=`/v1/sessions/fake-session/summary?source=codex&kind=${kind}&workspace=other`;
+    for(const status of [200,401,403,404,501,503]) {
+      const seen=fake(t,{readStatus:()=>status}),cfg=config();
+      const read=historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a");
+      if(status===200) assert.deepEqual(await read(path),{from:"read-api"});
+      else await assert.rejects(read(path));
+      assert.ok(seen.reads.length>0);
+      for(const request of seen.reads) {
+        assert.equal(request.url.origin,PUBLIC);
+        assert.equal(request.url.pathname,"/v1/sessions/fake-session/summary");
+        assert.equal(request.url.searchParams.get("workspace"),"ws-a");
+        assert.equal(request.url.searchParams.get("source"),"codex");
+        assert.equal(request.url.searchParams.get("kind"),kind);
+        assert.match(request.bearer!,/^Bearer rth_at_read_/);
+      }
+      assert.equal(seen.history.length,0);assert.equal(seen.handoffs.length,0);
     }
-    assert.equal(seen.history.length,0);assert.equal(seen.handoffs.length,0);
+    for (const attested of [null, "another-workspace"]) {
+      const seen=fake(t,{attest:()=>attested}),cfg=config();
+      await assert.rejects(historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")(path));
+      assert.equal(seen.history.length,0);
+    }
   }
-  const seen=fake(t,{attest:()=>null}),cfg=config();
-  await assert.rejects(historyReader(cfg,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")(path));
-  assert.equal(seen.history.length,0);
 });
 
 test("a disabled recorded-summary opt-in never retries without the parameter or on History", async t => {
