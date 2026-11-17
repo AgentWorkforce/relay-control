@@ -74,7 +74,8 @@
     {"name":"0069_replica_tombstone_retention.sql","sha256":"680c7bad610a70bc98caf8cdf6ce8e4ecb5f3667a0e5513f098ac47e755fe2a6"},
     {"name":"0070_replica_failure_paths.sql","sha256":"1f05ac223c07d9a3f37d83d9eeffa4ce295abce0efe04f0460bd139d96cc9271"},
     {"name":"0071_mcp_oauth_history_scope.sql","sha256":"2c47638bb6066acdfbd92f75a6bc95b2382b0db924e77f379acfa851fe173fff"},
-    {"name":"0072_workspace_policy.sql","sha256":"24564fb8d73c86fbd66841b64839d7185916b1e793125748775d6aaa98623f9c"}
+    {"name":"0072_workspace_policy.sql","sha256":"24564fb8d73c86fbd66841b64839d7185916b1e793125748775d6aaa98623f9c"},
+    {"name":"0075_token_session_client_telemetry.sql","sha256":"6c9ce658602d7a5eebad9b7c13a2e2ddca6c1a22f6a3e4ee0be8b3357fafd479"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -1046,6 +1047,8 @@
     {"kind":"column","name":"public.temporary_passwords.used_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":9,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.token_sessions.access_token_expires_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":10,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.token_sessions.access_token_hash","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":8,"type":"text"}},
+    {"kind":"column","name":"public.token_sessions.client_platform","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":23,"type":"text"}},
+    {"kind":"column","name":"public.token_sessions.client_version","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":22,"type":"text"}},
     {"kind":"column","name":"public.token_sessions.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":14,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.token_sessions.desktop_exchange_challenge","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":17,"type":"text"}},
     {"kind":"column","name":"public.token_sessions.desktop_exchanged_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":18,"type":"timestamp with time zone"}},
@@ -1055,6 +1058,8 @@
     {"kind":"column","name":"public.token_sessions.label","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":6,"type":"text"}},
     {"kind":"column","name":"public.token_sessions.last_refreshed_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":16,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.token_sessions.organization_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"uuid"}},
+    {"kind":"column","name":"public.token_sessions.policy_revision_applied","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":24,"type":"integer"}},
+    {"kind":"column","name":"public.token_sessions.policy_seen_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":25,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.token_sessions.provisioned_by_token_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":21,"type":"uuid"}},
     {"kind":"column","name":"public.token_sessions.refresh_token_expires_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":11,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.token_sessions.refresh_token_hash","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":9,"type":"text"}},
@@ -2059,5 +2064,5 @@
   "optional":{
 
   },
-  "sha256":"ec8711964bfa08bb7331061fc7f36fa95e3f5985b3a7959ab68b61ff92e635ef"
+  "sha256":"9f05017011c1236904b399e63fe43ddbf2e8dd180951d1e12e61367c71952816"
 }
