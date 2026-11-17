@@ -29,7 +29,7 @@ import {
  * points Cursor at its own stdio helper (`agent-relay-probe cursor-mcp`), which
  * attaches the proof and forwards the call. Cursor sends no per-call metadata
  * to check `tuid` against, so the hook's tool_use_id is only single-use, spent
- * as `cursor:<src>:<tuid>`, and the proof signs the exact forwarded `args`,
+ * once per source (`cursor:["<src>","<tuid>"]`), and the proof signs the exact forwarded `args`,
  * which must equal the call's arguments.
  */
 
@@ -56,7 +56,7 @@ export type ClaudeAttestation = { nativeSession: { kind: AttestedKind; id: strin
 const UUID_LOWER = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const KID = /^[A-Za-z0-9_-]{22}$/;
 const TOOL_USE_ID = /^[A-Za-z0-9_-]{1,200}$/;
-/** Cursor's per-call tool_use_id, issued to the proof by Desktop (it may contain `:`, so it is namespaced when spent). */
+/** Cursor's per-call tool_use_id, issued to the proof by Desktop (it may contain `:`, so the spent key is a JSON tuple). */
 const CURSOR_TICKET = /^[A-Za-z0-9_.:-]{1,256}$/;
 const CLAUDE_CLAIMS = ["v", "kind", "sid", "src", "tuid", "tool", "iat", "exp"];
 const TOOL_NAME = /^[A-Za-z0-9_.-]{1,128}$/;
@@ -163,7 +163,9 @@ export async function verifyClaudeAttestation(input: {
   if (!await webcrypto.subtle.verify({ name: "Ed25519" }, key, signature, signed)) return fail("bad signature");
 
   const spent = await store.spend({
-    workspaceId: input.workspaceId, userId: input.userId, toolUseId: kind === "claude" ? tuid : `cursor:${src}:${tuid}`,
+    workspaceId: input.workspaceId, userId: input.userId, // Self-host source ids and Cursor tickets may both contain `:`, so the
+    // Cursor key encodes the pair unambiguously (never `:`-free, unlike Claude's).
+    toolUseId: kind === "claude" ? tuid : `cursor:${JSON.stringify([src, tuid])}`,
     expiresAt: new Date((exp + CLAUDE_ATTESTATION_SPENT_RETENTION_SECONDS) * 1000),
   });
   if (!spent) return fail("replayed tool use");

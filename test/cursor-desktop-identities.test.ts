@@ -118,7 +118,8 @@ test("a signed Cursor call on a cursor credential joins, sends and reads as the 
   const hosted = await env.database.query("SELECT 1 FROM hosted_relay_participants");
   assert.equal(hosted.rows.length, 0, "no hosted participant was created");
   const spent = await env.database.query<{ tool_use_id: string }>("SELECT tool_use_id FROM mcp_attestation_tool_uses");
-  assert.ok(spent.rows.every((row) => row.tool_use_id.startsWith("cursor:desktop-source-cursor:")), JSON.stringify(spent.rows));
+  assert.ok(spent.rows.length > 0 && spent.rows.every((row) => row.tool_use_id.startsWith('cursor:["desktop-source-cursor",')),
+    JSON.stringify(spent.rows));
 });
 
 test("an unsigned Cursor call is refused with what to do, not to wait, and sends nothing", async (t) => {

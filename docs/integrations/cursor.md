@@ -41,7 +41,7 @@ It is verified like a Claude Code proof (exact members, registered `kid` for
 
 - `tuid` is the hook's per-call `tool_use_id` (`^[A-Za-z0-9_.:-]{1,256}$`),
   not matched against `_meta`, because Cursor sends none. It is single-use:
-  spent as `cursor:<src>:<tuid>` in `mcp_attestation_tool_uses` until two
+  spent as `cursor:["<src>","<tuid>"]` (a JSON pair: self-host source ids may contain `:`) in `mcp_attestation_tool_uses` until two
   minutes past `exp`.
 - `args` is required: the forwarded arguments without the proof (Desktop
   signs canonical JSON, sorted keys, no whitespace, at most 32 KB). They must
