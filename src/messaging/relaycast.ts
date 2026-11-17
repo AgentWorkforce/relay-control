@@ -561,6 +561,20 @@ export function createRelaycastClient(input: {
         call("DELETE", `/v1/subscriptions/${encodeURIComponent(id)}`, workspaceKey, undefined, undefined, true));
     },
 
+    /**
+     * relaygate only (a client bound to relaygate's origin): the agent an rg_
+     * token controls, from GET /v1/whoami. The body is not wrapped in
+     * { ok, data }. userId is the Control user that enrolled the agent when
+     * relaygate reports one, otherwise null.
+     */
+    async whoami(token: string, signal?: AbortSignal): Promise<{ agentId: string; name: string; userId: string | null }> {
+      const data = record(await labeled("whoami", () => call("GET", "/v1/whoami", token, undefined, undefined, false, signal)));
+      const agentId = text(data?.agent_id);
+      const name = text(data?.name);
+      if (!agentId || !name) throw new RelaycastCallError(502, "", true);
+      return { agentId, name, userId: text(data?.user_id) };
+    },
+
     /** The agent a token controls, with its channel memberships. */
     async authenticatedAgent(token: string, signal?: AbortSignal): Promise<RosterAgent & { channels: Array<{ id: string; name: string }>; workspaceId: string | null }> {
       const data = await labeled("authenticated_agent", () => call("GET", "/v1/agent", token, undefined, undefined, false, signal));
