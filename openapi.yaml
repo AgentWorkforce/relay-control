@@ -2850,6 +2850,60 @@ paths:
                   workspace_policy: { $ref: "#/components/schemas/WorkspacePolicy" }
         "401": { description: Missing, invalid, bootstrap or non-user token }
         "404": { description: Workspace not found or not the token's workspace }
+  /api/v1/workspaces/{workspaceId}/leaders:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getWorkspaceLeaders
+      description: |
+        Any member of the workspace (bearer, or the `/cloud` session cookie). The
+        setting is stored by the Relaycast engine; Control proxies with the
+        workspace's server-side Relaycast key and stores nothing. `leaders` are the
+        registered workspace agents whose name matches any pattern. Never 404 for
+        an unset value: both lists are empty. See docs/workspace-leaders.md.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Current patterns and the agents they match
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceLeaders" }
+        "401": { description: Missing, invalid, bootstrap or non-user token }
+        "403": { description: "`handoff_not_exchanged`" }
+        "404": { description: Workspace not found or not the token's workspace }
+        "429": { description: "`rate_limited`" }
+        "502": { description: "`workspace_leaders_unavailable`: the Relaycast engine is unreachable or failed" }
+    put:
+      operationId: putWorkspaceLeaders
+      description: |
+        Workspace owner/admin. Full replace of the patterns; `{"patterns": []}`
+        clears. Patterns are trimmed, deduplicated (first occurrence wins) and
+        validated before the engine is called. Not gated by
+        SELFHOST_OPERATOR_CONTROLS. Audited as `workspace_leaders.set` with the
+        pattern count and the stored patterns. Cookie callers must send JSON from
+        an allowed Origin. See docs/workspace-leaders.md.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WorkspaceLeadersInput" }
+      responses:
+        "200":
+          description: Stored patterns and the agents they match
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceLeaders" }
+        "400": { description: "`invalid_request`: unknown field, not a string array, more than 64 patterns, a pattern empty or longer than 128 characters after trimming, or a control character" }
+        "401": { description: Missing, invalid, bootstrap or non-user token }
+        "403": { description: "Owner/admin role required, cross-origin cookie request (`csrf_rejected`), or `handoff_not_exchanged`" }
+        "404": { description: Workspace not found or not the token's workspace }
+        "429": { description: "`rate_limited`" }
+        "502": { description: "`workspace_leaders_unavailable`: the Relaycast engine is unreachable or failed" }
   /api/v1/organizations/{organizationId}/capture-policy:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -9380,6 +9434,36 @@ components:
             join: { $ref: "#/components/schemas/WorkspacePolicySection" }
             delivery: { $ref: "#/components/schemas/WorkspacePolicySection" }
             analytics: { $ref: "#/components/schemas/WorkspacePolicySection" }
+    WorkspaceLeaders:
+      type: object
+      additionalProperties: false
+      required: [leaders, patterns]
+      properties:
+        leaders:
+          type: array
+          description: Registered workspace agents whose whole name matches any pattern (case-sensitive)
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, agent_id]
+            properties:
+              name: { type: string }
+              agent_id: { type: string }
+        patterns:
+          type: array
+          maxItems: 64
+          description: Agent-name patterns; `*` and `?` are the only wildcards, a pattern without one is an exact name
+          items: { type: string, minLength: 1, maxLength: 128 }
+    WorkspaceLeadersInput:
+      type: object
+      additionalProperties: false
+      required: [patterns]
+      properties:
+        patterns:
+          type: array
+          maxItems: 64
+          description: Replaces the stored patterns; `[]` clears. Each entry is trimmed, then 1 to 128 characters with no control characters.
+          items: { type: string }
     WorkspacePolicyInput:
       type: object
       additionalProperties: false

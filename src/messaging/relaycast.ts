@@ -66,6 +66,9 @@ export type RosterAgent = RemoteAgent & {
   lastSeen: string | null;
 };
 
+/** The engine's workspace leaders setting: patterns plus the registered agents they match. */
+export type WorkspaceLeaders = { leaders: Array<{ name: string; agentId: string }>; patterns: string[] };
+
 export type PresenceRow = { agentId: string | null; agentName: string | null; status: string | null };
 
 export type RegisteredHuman = {
@@ -283,6 +286,24 @@ export function createRelaycastClient(input: {
       errorCode: error ? (/^([a-z_]{1,64})(?::|$)/.exec(error)?.[1] ?? "spawn_failed") : null,
       errorDetailsCode: text(details?.code),
     };
+  }
+
+  function leadersFrom(value: unknown): WorkspaceLeaders {
+    const data = record(value);
+    // Not a document at all is a broken answer; missing lists are just unset.
+    if (!data) throw new RelaycastCallError(200, "", true);
+    const rawLeaders: unknown = data.leaders;
+    const rawPatterns: unknown = data.patterns;
+    const leaders = Array.isArray(rawLeaders) ? rawLeaders.flatMap((item: unknown) => {
+      const leader = record(item);
+      const name = text(leader?.name);
+      const agentId = text(leader?.agent_id);
+      return name && agentId ? [{ name, agentId }] : [];
+    }) : [];
+    const patterns = Array.isArray(rawPatterns)
+      ? rawPatterns.filter((item: unknown): item is string => typeof item === "string" && item.length > 0)
+      : [];
+    return { leaders, patterns };
   }
 
   return {
@@ -786,6 +807,16 @@ export function createRelaycastClient(input: {
       const agent = rosterFrom(data);
       if (!agent) throw new RelaycastCallError(502, "", true);
       return { ...agent, originNodeId: text(record(data)?.origin_node_id) };
+    },
+
+    /** The workspace leaders setting (workspace key); never 404, empty lists when unset. */
+    async getWorkspaceLeaders(workspaceKey: string): Promise<WorkspaceLeaders> {
+      return leadersFrom(await labeled("get_workspace_leaders", () => call("GET", "/v1/workspace/leaders", workspaceKey)));
+    },
+
+    /** Replaces the workspace leaders patterns (workspace key); `[]` clears. */
+    async setWorkspaceLeaders(workspaceKey: string, patterns: string[]): Promise<WorkspaceLeaders> {
+      return leadersFrom(await labeled("set_workspace_leaders", () => call("PUT", "/v1/workspace/leaders", workspaceKey, { patterns })));
     },
 
     /** Fresh presence from expiring broker keys, independent of roster status. */

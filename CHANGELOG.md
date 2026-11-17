@@ -5,6 +5,15 @@ assigned at release.
 
 ## Unreleased
 
+- Added: workspace leaders. `GET /api/v1/workspaces/{id}/leaders` (any
+  member) and `PUT` (workspace owner/admin, `{"patterns": [...]}`, `[]`
+  clears) proxy the Relaycast engine's `/v1/workspace/leaders` setting with the
+  workspace key and answer `{leaders: [{name, agent_id}], patterns}`. At most
+  64 patterns, each trimmed to 1..128 characters with no control characters,
+  duplicates collapsed; `*` and `?` are the only wildcards. Writes are audited
+  as `workspace_leaders.set`; an unreachable or failing engine is `502
+  workspace_leaders_unavailable`. Not gated by `SELFHOST_OPERATOR_CONTROLS`;
+  nothing is stored and no migration. See docs/workspace-leaders.md.
 - Fixed: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), desktop
   identities enrolled at relaygate now verify and sync, so Cursor, Claude Code
   and Copilot attestation keys are stored. Desktop identity sync and every MCP
