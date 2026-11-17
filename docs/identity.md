@@ -962,6 +962,27 @@ refresh keeps the session's scopes, so a session issued before `rth:acquire`
 existed gains it only at the next sign-in. Introspection returns the scopes
 verbatim.
 
+#### Desktop client telemetry
+
+On every `GET /api/v1/workspaces/{id}/access/me` (Desktop reads it at
+sign-in, on workspace refresh and every 15 minutes) Control records what a
+device-client session reports about itself on its `token_sessions` row:
+`client_version` and `client_platform` from the `User-Agent`
+`AgentRelayDesktop/<version>` or `AgentRelayDesktop/<version> (<platform>)`,
+`policy_revision_applied` from the `X-Agent-Relay-Policy-Revision` header
+(the workspace policy revision the client applied, a non-negative integer),
+and `policy_seen_at`. Only sessions from the device flow, the Desktop
+browser sign-in exchange and enrollment-key exchanges record it; browser
+account sessions, unredeemed handoffs and every other credential never do.
+Values are parsed strictly (version up to 64 characters of `[0-9A-Za-z.+-]`,
+platform up to 32 characters of `[a-z0-9_-]` after lower-casing, revision
+0 to 2147483647); anything else is ignored and the read answers as usual. A
+missing value leaves its column as it was, and the row is written only when
+a value changed or `policy_seen_at` is null or older than 10 minutes. The
+uploader's `X-Agent-Relay-Capture-Policy-Revision` header is unrelated.
+Whether the applied revision matches the current policy is computed by the
+fleet read model from these columns, not stored.
+
 #### Desktop enrollment keys
 
 An organization owner or admin can sign an employee's Desktop in without a

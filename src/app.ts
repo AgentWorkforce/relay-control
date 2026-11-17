@@ -30,6 +30,7 @@ import { handleFlowsBroker } from "./flows-broker.js";
 import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
 import { relayLaunchCredentials } from "./mcp/relay-launch-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
+import { parseClientTelemetry, recordClientTelemetry, recordsClientTelemetry } from "./sessions/client-telemetry.js";
 import { UsageRangeError, usageDays, usageReport } from "./usage/routes.js";
 import { UsageStore } from "./usage/store.js";
 import { GitHubDesktopReleases } from "./desktop-releases.js";
@@ -2654,6 +2655,17 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
     const accessMe = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/access\/me$/);
     if (accessMe && method === "GET") {
       const { principal, workspace } = await workspaceAccess(request, accessMe[0]!);
+      // Fleet rollout C1: a device-client session records the Desktop version,
+      // platform and applied policy revision it presents here. Never fails the read.
+      if (recordsClientTelemetry(principal)) {
+        try {
+          await recordClientTelemetry(store.database, principal.sessionId, parseClientTelemetry(request.headers));
+        } catch (error) {
+          console.warn("[selfhost-api] client telemetry write failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       // Managed: the session was provisioned by an enrollment key carrying admin policy consent.
       const managed = principal.provisionedByTokenId
         ? await sessionManagedByEnrollmentKey(store.database, principal.provisionedByTokenId)
