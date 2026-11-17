@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `GET /api/v1/organizations/{org}/fleet` (docs/fleet.md) for owners
+  and admins: members, 200 per page, with their Desktop machines (host name,
+  client version, platform, enrollment key, managed, last seen, status) and
+  each machine's `policyMatch` (`current`, `stale`, `unknown` or `mismatch`)
+  against the workspace policy revision, page totals and, with
+  `usage_people`, per-member usage. Every read writes a `fleet.viewed` audit
+  row. No migration.
 - Added: member self-mint of desktop enrollment keys at
   `POST /api/v1/me/enrollment-keys` (also under `/cloud`). A signed-in member
   mints a single-use key for their own next machine; the body takes only
