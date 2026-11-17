@@ -138,7 +138,8 @@ import {
   writeWorkspacePolicy,
 } from "./workspace-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
-import { createRelaycastClient, type RosterAgent } from "./messaging/relaycast.js";
+import { createRelaycastClient, RelaycastCallError, type RosterAgent, type WorkspaceLeaders } from "./messaging/relaycast.js";
+import { LeaderPatternsError, parseLeaderPatterns } from "./workspace-leaders.js";
 import { isListedRelayAgent } from "./mcp/team-activity.js";
 import {
   erasureTarget,
@@ -499,6 +500,8 @@ export function createApp(input: {
     session_delete: Boolean(config.sessionErasureApi) && operatorControlsEntitled(),
     // Desktop enrollment keys (docs/identity.md): always served.
     enrollment_keys: true,
+    // Member self-mint at POST /api/v1/me/enrollment-keys (SELFHOST_ENROLLMENT_SELF_RENEWAL).
+    enrollment_self_mint: config.enrollmentSelfRenewal !== false,
   });
   // Usage page counters: written only while the `usage` feature is selected.
   const usage = new UsageStore(store.database, () => input.now?.() ?? new Date());
@@ -747,6 +750,9 @@ export function createApp(input: {
     }
     return principal;
   }
+
+  /** POST /api/v1/me/enrollment-keys: self-minted enrollment keys per person per hour. */
+  const ENROLLMENT_SELF_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
 
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy, () => input.now?.() ?? new Date());
   const STAFF_READ_GRANT_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
@@ -2170,6 +2176,41 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }, true);
       return;
     }
+    // Member self-mint (docs/identity.md, "Member self-mint"): a single-use
+    // key for the caller's own next machine, consent inherited from the key
+    // that provisioned this session and never raised.
+    if (path === "/api/v1/me/enrollment-keys" && method === "POST") {
+      const principal = await enrollmentKeyOwner(request);
+      if (config.enrollmentSelfRenewal === false) {
+        throw new HttpError(
+          403,
+          "self_mint_disabled",
+          "Enrollment key self-renewal is turned off on this install; ask an admin for a key",
+        );
+      }
+      const body = await requestObject(request);
+      const unknown = Object.keys(body).filter((key) => key !== "label" && key !== "expiryDays");
+      if (unknown.length > 0) {
+        throw new HttpError(
+          400,
+          "invalid_request",
+          `Only label and expiryDays are accepted; refused: ${unknown.sort().join(", ")}`,
+        );
+      }
+      rateLimit(response, `enrollment-self-mint:${principal.userId}`, ENROLLMENT_SELF_MINT_RATE, "rate_limited",
+        "Too many enrollment keys minted; try again later");
+      const key = await apiTokens.selfMint({
+        organizationId: principal.organizationId,
+        workspaceId: principal.workspaceId,
+        userId: principal.userId,
+        email: principal.email,
+        provisionedByTokenId: principal.provisionedByTokenId ?? null,
+        label: body.label,
+        expiryDays: body.expiryDays,
+      });
+      json(response, 201, key, true);
+      return;
+    }
     const ownEnrollmentKey = routeMatch(path, /^\/api\/v1\/me\/enrollment-keys\/([^/]+)$/);
     if (ownEnrollmentKey && method === "DELETE") {
       const principal = await enrollmentKeyOwner(request);
@@ -2687,6 +2728,58 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       const names = roster.filter(isListedRelayAgent).map((agent) => agent.name).filter(Boolean);
       json(response, 200, { names: [...new Set(names)].sort() }, true);
+      return;
+    }
+
+    // Workspace leaders (docs/workspace-leaders.md): stored by the Relaycast
+    // engine; Control proxies with the workspace key and stores nothing.
+    // Any member reads, workspace owner/admin writes.
+    const workspaceLeaders = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/leaders$/);
+    if (workspaceLeaders && (method === "GET" || method === "PUT")) {
+      const { principal, workspace } = await workspaceAccess(request, workspaceLeaders[0]!, method === "PUT");
+      if (principal.pendingHandoff) {
+        throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      }
+      if (method === "PUT" && !bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      let patterns: string[] = [];
+      if (method === "PUT") {
+        try {
+          patterns = parseLeaderPatterns(await requestObject(request));
+        } catch (error) {
+          if (error instanceof LeaderPatternsError) throw new HttpError(error.status, error.code, error.message);
+          throw error;
+        }
+      }
+      // Each call spends the workspace's server-side Relaycast key.
+      rateLimit(response, `workspace-leaders:${principal.userId}`, AGENT_NAMES_RATE, "rate_limited", "Too many requests. Try again shortly.");
+      const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch });
+      let leaders: WorkspaceLeaders;
+      try {
+        leaders = method === "PUT"
+          ? await relaycast.setWorkspaceLeaders(workspace.relaycastApiKey, patterns)
+          : await relaycast.getWorkspaceLeaders(workspace.relaycastApiKey);
+      } catch (error) {
+        if (error instanceof RelaycastCallError && error.status === 400) {
+          throw new HttpError(400, "invalid_request", "The Relaycast engine refused the leader patterns");
+        }
+        throw new HttpError(502, "workspace_leaders_unavailable", "The workspace leaders setting is unavailable");
+      }
+      if (method === "PUT") {
+        // Agent-name patterns are not secret; the engine's normalised list is recorded.
+        await recordAudit(store.database, {
+          organizationId: workspace.organizationId,
+          workspaceId: workspace.id,
+          actor: { kind: "user", userId: principal.userId },
+          action: "workspace_leaders.set",
+          target: `${workspace.id} patterns=${leaders.patterns.length} ${JSON.stringify(leaders.patterns)}`,
+        });
+      }
+      json(response, 200, {
+        leaders: leaders.leaders.map((leader) => ({ name: leader.name, agent_id: leader.agentId })),
+        patterns: leaders.patterns,
+      }, true);
       return;
     }
 

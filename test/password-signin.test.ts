@@ -253,6 +253,7 @@ test("login-config: public, lists methods, logo and domain hint, never secrets",
     password_self_service: true,
     setup_key: false,
     enrollment_keys: true,
+    enrollment_self_mint: true,
   });
   assert.ok(!res.text.includes("sss"), "no pepper");
   assert.ok(!res.text.includes("acme.test"), "the hint is a boolean, not the domain list");

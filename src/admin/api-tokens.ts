@@ -31,8 +31,9 @@ export const ENROLLMENT_KEY_MAX_USES_LIMIT = 500;
  *   single-use key (max_uses = 1).
  * - SELFHOST_ENROLLMENT_MULTI_USE_MAX_DAYS (default 90): the longest
  *   `expiryDays` of a multi-use key (max_uses > 1).
- * - SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS (default 7): reserved for member
- *   self-minted keys; not read by any route yet.
+ * - SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS (default 7): the default and
+ *   longest `expiryDays` of a member self-minted key (POST
+ *   /api/v1/me/enrollment-keys), never above SELFHOST_ENROLLMENT_MAX_DAYS.
  * Day ceilings are clamped to MAX_API_TOKEN_EXPIRY_DAYS.
  */
 export type EnrollmentLimits = {
@@ -58,6 +59,15 @@ export function enrollmentLimits(env: NodeJS.ProcessEnv = process.env): Enrollme
     selfMintMaxDays: positiveIntegerEnv(env.SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS, 7, MAX_API_TOKEN_EXPIRY_DAYS),
   };
 }
+
+/**
+ * Member self-mint of desktop enrollment keys (POST /api/v1/me/enrollment-keys):
+ * unexchanged keys (use_count 0, live, unexpired) one person may hold in an
+ * organization, admin- and self-minted keys together.
+ */
+export const MAX_UNEXCHANGED_ENROLLMENT_KEYS = 5;
+/** The label of a self-minted enrollment key when the body names none. */
+export const SELF_MINTED_ENROLLMENT_KEY_LABEL = "Desktop self-renewal";
 
 /** Member self-mint (gate-only): longest and default relay-node token lifetime. */
 export const MAX_SELF_MINTED_RELAY_NODE_EXPIRY_DAYS = 90;
@@ -288,6 +298,11 @@ export type EnrollmentKeySummary = {
   label: string;
   status: ApiTokenRecord["status"];
   mcpConsent: "admin" | null;
+  /** "admin" when the sessions the key provisions are managed; else null. */
+  policyConsent: "admin" | null;
+  /** Exchanges the key allows (1 = single-use) and exchanges so far. */
+  maxUses: number;
+  useCount: number;
   createdAt: string;
   expiresAt: string | null;
   exchangedAt: string | null;
@@ -301,6 +316,9 @@ function toEnrollmentKeySummary(record: ApiTokenRecord): EnrollmentKeySummary {
     label: record.label,
     status: record.status,
     mcpConsent: record.mcpConsent,
+    policyConsent: record.policyConsent,
+    maxUses: record.maxUses,
+    useCount: record.useCount,
     createdAt: record.createdAt,
     expiresAt: record.accessTokenExpiresAt,
     exchangedAt: record.exchangedAt,
@@ -715,6 +733,114 @@ export class ApiTokenStore {
       [input.userId, input.organizationId],
     );
     return result.rows.map((row) => toEnrollmentKeySummary(toRecord(row)));
+  }
+
+  /**
+   * POST /api/v1/me/enrollment-keys (docs/identity.md, "Member self-mint"):
+   * a signed-in person mints a single-use desktop-enrollment key for
+   * themselves, in their session's workspace. The key inherits mcpConsent
+   * and policyConsent from the key that provisioned the calling session
+   * (`provisionedByTokenId`) and never more: a session no key provisioned,
+   * or whose key row is gone or bound to someone else, gets neither.
+   * expiryDays defaults to and is capped at enrollmentLimits().selfMintMaxDays
+   * (never above maxDays). One transaction under the same identity and
+   * organization locks createIn takes, so the cap check (409
+   * `self_mint_limit` at MAX_UNEXCHANGED_ENROLLMENT_KEYS unexchanged keys,
+   * admin-minted ones included) and the insert cannot interleave with
+   * another mint for this person. Audited `api_token.create` (by createIn)
+   * and `enrollment_key.self_mint`.
+   */
+  async selfMint(input: {
+    organizationId: string;
+    workspaceId: string;
+    userId: string;
+    email: string;
+    provisionedByTokenId: string | null;
+    label: unknown;
+    expiryDays: unknown;
+  }): Promise<ApiTokenRecord & { accessToken: string }> {
+    const limits = enrollmentLimits();
+    const ceiling = Math.min(limits.selfMintMaxDays, limits.maxDays);
+    const days = input.expiryDays ?? ceiling;
+    if (!Number.isInteger(days) || (days as number) < 1 || (days as number) > ceiling) {
+      throw new ApiTokenError(
+        400,
+        "invalid_request",
+        `expiryDays must be an integer from 1 to ${ceiling} for self-minted desktop-enrollment keys`,
+      );
+    }
+    const email = normalizeEmailAddress(input.email);
+    if (email === null) {
+      throw new ApiTokenError(400, "invalid_request", "Your account has no usable email address");
+    }
+    const label = input.label === undefined ? SELF_MINTED_ENROLLMENT_KEY_LABEL : input.label;
+    const actor = { kind: "user" as const, userId: input.userId };
+    return this.database.transaction(async (tx) => {
+      // createIn takes the same locks again (advisory locks are re-entrant
+      // within a transaction); taking them first covers the count below.
+      await lockIdentity(tx, email);
+      await lockOrganization(tx, input.organizationId);
+      let mcpConsent: "admin" | null = null;
+      let policyConsent: "admin" | null = null;
+      if (input.provisionedByTokenId) {
+        const source = await tx.query<{ mcp_consent: "admin" | null; policy_consent: "admin" | null }>(
+          `SELECT t.mcp_consent, t.policy_consent
+             FROM workspace_api_tokens t
+             JOIN workspaces w ON w.id = t.workspace_id
+            WHERE t.id = $1 AND t.purpose = '${DESKTOP_ENROLLMENT_PURPOSE}'
+              AND t.user_id = $2 AND w.organization_id = $3`,
+          [input.provisionedByTokenId, input.userId, input.organizationId],
+        );
+        const row = source.rows[0];
+        if (row) {
+          mcpConsent = row.mcp_consent === ENROLLMENT_MCP_CONSENT_ADMIN ? ENROLLMENT_MCP_CONSENT_ADMIN : null;
+          policyConsent = row.policy_consent === ENROLLMENT_POLICY_CONSENT_ADMIN ? ENROLLMENT_POLICY_CONSENT_ADMIN : null;
+        }
+      }
+      const held = await tx.query<{ count: number | string }>(
+        `SELECT count(*) AS count
+           FROM workspace_api_tokens t
+           JOIN workspaces w ON w.id = t.workspace_id
+          WHERE t.user_id = $1 AND t.purpose = '${DESKTOP_ENROLLMENT_PURPOSE}' AND w.organization_id = $2
+            AND t.use_count = 0 AND t.revoked_at IS NULL
+            AND (t.expires_at IS NULL OR t.expires_at > now())`,
+        [input.userId, input.organizationId],
+      );
+      if (Number(held.rows[0]?.count ?? 0) >= MAX_UNEXCHANGED_ENROLLMENT_KEYS) {
+        throw new ApiTokenError(
+          409,
+          "self_mint_limit",
+          `You already hold ${MAX_UNEXCHANGED_ENROLLMENT_KEYS} unexchanged enrollment keys; use or revoke one first`,
+        );
+      }
+      const created = await this.createIn(tx, {
+        workspaceId: input.workspaceId,
+        organizationId: input.organizationId,
+        label,
+        purpose: DESKTOP_ENROLLMENT_PURPOSE,
+        expiryDays: days,
+        neverExpires: undefined,
+        email,
+        mcpConsent,
+        maxUses: 1,
+        policyConsent,
+        actor,
+      });
+      if (created.userId !== input.userId) {
+        // users.email is unique, so this cannot happen; refuse (and roll back) rather than mint for someone else.
+        throw new Error("enrollment self-mint resolved a different user");
+      }
+      await recordAudit(tx, {
+        organizationId: input.organizationId,
+        workspaceId: input.workspaceId,
+        actor,
+        action: "enrollment_key.self_mint",
+        target: `${created.id} (desktop-enrollment: user ${input.userId}${mcpConsent ? ` mcpConsent=${mcpConsent}` : ""}${
+          policyConsent ? ` policyConsent=${policyConsent}` : ""}${
+          input.provisionedByTokenId ? ` from=${input.provisionedByTokenId}` : ""})`,
+      });
+      return created;
+    });
   }
 
   /**
