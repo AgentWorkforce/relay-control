@@ -239,10 +239,12 @@ export function createMcpHandler(input: {
         provider:undefined as string|undefined,oauth:access.connection};
     }
     const principal = await store.authenticateAccessToken(token);
-    // A Desktop provider credential (mcp:desktop child token) is honoured only
-    // here, only as a header bearer, and only while its verified parent and
-    // the membership are live (resolve re-checks both on every request).
-    const provider = !principal && headerToken ? await desktopCredentials.resolve(headerToken) : null;
+    // A Desktop provider credential (cld_at_ mcp:desktop child token) is
+    // honoured only here, only as a header bearer on the shared-sessions
+    // facade, and only while its verified parent and the membership are live
+    // (resolve re-checks both on every request).
+    const provider = !principal && headerToken && resourceFor(rawPath) === "/api/v1/mcp/shared-sessions"
+      ? await desktopCredentials.resolve(headerToken) : null;
     if (provider) {
       const workspace = await store.workspaceForUser(provider.principal.workspaceId, provider.principal.userId);
       if (!workspace) {

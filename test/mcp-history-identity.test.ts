@@ -353,6 +353,31 @@ test("session reads require rth:read and an exchanged Control user credential be
 });
 
 
+test("a Desktop provider grant (cld_at_, mcp:desktop) reads through the workspace reader in both modes",async t=>{
+  const grant=`cld_at_${"G".repeat(43)}`;
+  const desktop={...principal("user-a"),scopes:["rth:read","mcp:desktop"]} as Principal;
+  for(const on of [false,true]) {
+    const seen=fake(t),cfg=config(on);
+    assert.deepEqual(await historyReader(cfg,desktop,workspace("ws-a","org-a"),grant)("/v1/sessions"),{from:"history"});
+    // Never the session-read hop that would present the grant to Control.
+    assert.equal(seen.issues.length,0);
+    assert.equal(seen.handoffs.length,1);
+    assert.equal(seen.handoffs[0]!.bearer,`Bearer ${SECRET}`);
+    const minted=seen.handoffs[0]!.body;
+    assert.deepEqual([minted.userId,minted.orgId,minted.workspaceId],["user-a","org-a","ws-a"]);
+    assert.equal(JSON.stringify([seen.handoffs,seen.history,seen.reads]).includes(grant),false);
+  }
+  // The grant shape alone, or the scope without rth:read, is not enough.
+  const seen=fake(t),cfg=config();
+  for(const [who,token] of [[principal("user-a"),grant],
+    [{...principal("user-a"),scopes:["mcp:desktop"]},grant],
+    [desktop,"cld_at_short"],
+    [{...desktop,pendingHandoff:true},grant]] as const) {
+    await assert.rejects(historyReader(cfg,who as Principal,workspace("ws-a","org-a"),token)("/v1/sessions"),/rth:read/);
+  }
+  assert.equal(seen.issues.length+seen.reads.length+seen.history.length+seen.handoffs.length,0);
+});
+
 test("missing attestation and malformed reader bodies never trigger another backend",async t=>{
   for(const options of [{attest:()=>null},{readBody:[]}]) {
     const seen=fake(t,options),cfg=config();

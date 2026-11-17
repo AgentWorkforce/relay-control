@@ -5,13 +5,25 @@ import type { Principal } from "../store.js";
 
 /**
  * Desktop-provider MCP credentials, ported from Cloud's
- * `packages/web/lib/auth/desktop-provider-credentials.ts` onto the self-host
- * token class. Agent Relay Desktop mints a secret (`sh_at_` + 43 base64url),
- * saves it before any I/O, and registers it here with its own verified
- * sign-in. The secret becomes a child token session: scopes `rth:read` and
- * `mcp:desktop`, a 15-minute lease Desktop renews, never longer than the
- * parent's refresh lifetime, and usable only at the shared-sessions MCP
- * endpoint. Only the hash is stored; no route ever returns a secret.
+ * `packages/web/lib/auth/desktop-provider-credentials.ts`. Agent Relay
+ * Desktop mints the provider grant itself, in Cloud's token class: `cld_at_`
+ * + 43 base64url characters (32 random bytes, unpadded). It saves the secret
+ * before any I/O and registers it here with its own verified sign-in, exactly
+ * as it does against Cloud. The secret becomes a child token session: scopes
+ * `rth:read` and `mcp:desktop`, a 15-minute lease Desktop renews (PUT) or
+ * revokes (DELETE), never longer than the parent's refresh lifetime.
+ *
+ * The grant is usable only as a header bearer at the shared-sessions MCP
+ * endpoint (`resolve`, called from src/mcp/routes.ts). Every other
+ * authenticator refuses it: `store.authenticateAccessToken` excludes
+ * `mcp:desktop` sessions, introspection answers `wrong-kind` for anything
+ * that is not `sh_at_`, the session cookie reader takes only `sh_at_`, and
+ * MCP OAuth admission takes only `mcp_at_`. Its session reads go through the
+ * workspace history reader on the person's behalf (src/mcp/context.ts), never
+ * by presenting the grant to another route. Self-host no longer accepts an
+ * `sh_at_` secret here: no Desktop build sends one, and a person-token-shaped
+ * child would be visible to the `sh_at_` authenticators. Only the hash is
+ * stored; no route ever returns a secret.
  */
 
 export const DESKTOP_MCP_SCOPE = "mcp:desktop";
@@ -19,7 +31,8 @@ export const DESKTOP_MCP_SCOPES = ["rth:read", DESKTOP_MCP_SCOPE] as const;
 export const DESKTOP_MCP_CAPABILITY = "com.agentrelay/desktop-provider-credentials";
 export const DESKTOP_MCP_LEASE_SECONDS = 15 * 60;
 export const MAX_CREDENTIALS_PER_PARENT = 128;
-export const DESKTOP_MCP_TOKEN = /^sh_at_[A-Za-z0-9_-]{43}$/;
+export const DESKTOP_MCP_TOKEN_PREFIX = "cld_at_";
+export const DESKTOP_MCP_TOKEN = /^cld_at_[A-Za-z0-9_-]{43}$/;
 export const PROVIDER = /^[a-z][a-z0-9-]{0,63}$/;
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

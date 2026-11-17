@@ -6,6 +6,7 @@ import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { readWorkspaceHistory } from "../sessions/history.js";
 import { readViaSessionRead } from "./session-read-reader.js";
+import { DESKTOP_MCP_SCOPE, DESKTOP_MCP_TOKEN } from "../auth/desktop-mcp-credentials.js";
 import { mcpReaderMarker } from "../session-read.js";
 import type { EncryptionKeyring } from "../crypto.js";
 import type { Database, SqlExecutor } from "../database.js";
@@ -137,14 +138,21 @@ export function historyReader(
     // A staff read grant (sh_sr_) was admitted by its own fence and pinned to
     // this workspace; RelayHistory introspects it at Control like sh_at_.
     const staffGrant = callerToken.startsWith("sh_sr_");
-    if (!principal.scopes.includes("rth:read") || principal.pendingHandoff || !(callerToken.startsWith("sh_at_") || staffGrant)) {
+    // A Desktop provider grant (cld_at_, mcp:desktop) was admitted by
+    // DesktopMcpCredentials.resolve, which re-checks its lease, verified
+    // parent and membership on every request. It authenticates nowhere else,
+    // so it reads through the workspace reader, never the session-read hop.
+    const desktopGrant = DESKTOP_MCP_TOKEN.test(callerToken) && principal.scopes.includes(DESKTOP_MCP_SCOPE);
+    if (!principal.scopes.includes("rth:read") || principal.pendingHandoff
+      || !(callerToken.startsWith("sh_at_") || staffGrant || desktopGrant)) {
       throw new SharedSessionsToolError("Session reads require an exchanged user session with rth:read.");
     }
     const url = new URL(path, "https://relayhistory.invalid");
     try {
       // The per-user session-read route is a dashboard route that refuses a
-      // grant by shape, so a grant always reads through the workspace reader.
-      const result = (staffGrant ? null : await readViaSessionRead(config, identity, url.pathname, url.searchParams, marker))
+      // grant (staff or Desktop provider) by shape, so a grant always reads
+      // through the workspace reader.
+      const result = (staffGrant || desktopGrant ? null : await readViaSessionRead(config, identity, url.pathname, url.searchParams, marker))
         ?? await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
       if (result.status === "unsupported") {
         throw new SharedSessionsToolError("The selected backend does not support this view (unsupported_by_backend).");

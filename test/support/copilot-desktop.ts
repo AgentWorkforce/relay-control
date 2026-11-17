@@ -174,7 +174,7 @@ export async function copilotDesktopSetup(t: TestContext, modules: Pick<Paramete
 }
 
 /** The secret Agent Relay Desktop mints and saves before registering it. */
-export const desktopSecret = () => `sh_at_${randomBytes(32).toString("base64url")}`;
+export const desktopSecret = () => `cld_at_${randomBytes(32).toString("base64url")}`;
 export const installationId = () => randomUUID();
 
 export const tokensPath = (workspaceId: string, tokenId?: string) =>
