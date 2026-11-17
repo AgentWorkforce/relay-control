@@ -12,7 +12,8 @@ so a change can take that long to reach every host.
 ## Routes
 
 `GET /api/v1/workspaces/{workspaceId}/leaders`: any workspace member (bearer, or the session cookie under
-`/cloud`). Never 404: an unset setting answers empty lists.
+`/cloud`). Never 404: an unset setting answers empty lists. `leaders` holds the agents whose names match a pattern,
+skipping released agents, one entry per agent id, sorted by name then id.
 
 ```json
 {
