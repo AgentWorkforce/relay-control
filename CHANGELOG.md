@@ -15,6 +15,14 @@ assigned at release.
   exchange response adds `policy_revision` and the `workspace_policy`
   document. Token records list `maxUses`, `useCount` and `policyConsent`;
   the exchange audit target adds the use number and Desktop client version.
+- Added: workspace API token purpose `enrollment-operator` (`sh_wk_`, scope
+  `enrollment:mint`, migration 0073). An owner or admin mints one; an MDM
+  script presents it to mint `desktop-enrollment` keys, list them
+  (`?purpose=desktop-enrollment`, its own keys only) and revoke its own keys,
+  without a device sign-in. Any other purpose is `403
+  enrollment_operator_scope`, another key is `404`, every other admin route
+  still answers `401`, and introspection still answers `wrong-kind`. Keys
+  record `mintedByTokenId`; audit rows use actor kind `token`.
 - Added: workspace policy v2 (migration 0072, docs/workspace-policy.md). One
   versioned document with `capture`, `spawn`, `join`, `delivery` and
   `analytics` sections, each with `locked` and `defaults` tiers, plus a

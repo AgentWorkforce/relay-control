@@ -1010,11 +1010,12 @@ only):
     default. Day ceilings never exceed 365. `SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS`
     (default 7) is reserved for member self-minted keys and not used yet.
 - `GET /api/v1/workspaces/{id}/deployment-api-tokens` lists the keys with
-  `userId`, `userEmail`, `mcpConsent`, `policyConsent`, `exchangedAt` and
-  `exchangedHostName` (these are `null` on other purposes), and `maxUses`
-  and `useCount` (`1` and `0` on other purposes). `exchangedAt` and
-  `exchangedHostName` name the latest exchange; once the key is spent, the
-  last one. The list is the
+  `userId`, `userEmail`, `mcpConsent`, `policyConsent`, `exchangedAt`,
+  `exchangedHostName` and `mintedByTokenId` (these are `null` on other
+  purposes; `mintedByTokenId` is also `null` on a key a person minted), and
+  `maxUses` and `useCount` (`1` and `0` on other purposes). `exchangedAt`
+  and `exchangedHostName` name the latest exchange; once the key is spent,
+  the last one. The list is the
   newest 100 tokens of the workspace; add `?purpose=desktop-enrollment` (or
   any other purpose) to list one purpose only, so many keys never hide the
   other tokens. An unknown purpose is `400 invalid_request`.
@@ -1111,6 +1112,48 @@ Audit actions (all in the minting workspace's audit log, `GET /api/v1/workspaces
 - `membership.provision`: actor the minting admin, target `<userId> <email> role member`
 - `enrollment_key.exchange`: actor the employee, target `<keyId> ip=<client address> host=<host name>`; never the key
 - `api_token.revoke`: target `<keyId> (desktop-enrollment: user <userId>) sessions=<n>`, with ` reason=member_removed` when a membership removal revoked it
+
+An action taken with an enrollment-operator token (below) is recorded with
+actor kind `token` and the operator token's id as the actor id.
+
+##### Enrollment operator tokens
+
+A fleet rollout mints keys from an MDM script, not from a signed-in admin.
+For that an owner or admin mints one workspace API token of purpose
+`enrollment-operator` (`sh_wk_`, scope `enrollment:mint`) with the usual
+`POST /api/v1/workspaces/{id}/deployment-api-tokens` and
+`{label, purpose: "enrollment-operator", expiryDays?}`. It expires like
+other workspace API tokens (default 90 days, at most 365);
+`neverExpires: true` is refused with `400`.
+
+Keep the token in the MDM's secret store and hand it to the rollout script
+from there. Never send it over Relay, paste it into a chat or commit it to
+git: it mints sign-in keys for any address the organization may provision.
+
+The token is accepted on exactly three routes, and only for its own
+workspace:
+
+- `POST /api/v1/workspaces/{id}/deployment-api-tokens` with
+  `purpose: "desktop-enrollment"` and the same body as an admin mint.
+  Any other purpose is `403 enrollment_operator_scope`. The key records the
+  operator as `mintedByTokenId`; its `createdBy` is `null`, and so is
+  `provisioning.mintedBy` in the employee's `GET /api/v1/auth/whoami` and
+  `mintedBy` in their `GET /api/v1/me/enrollment-keys`.
+- `GET /api/v1/workspaces/{id}/deployment-api-tokens?purpose=desktop-enrollment`
+  lists only the keys this operator minted. No filter, or any other
+  purpose, is `403 enrollment_operator_scope`.
+- `DELETE /api/v1/workspaces/{id}/deployment-api-tokens/{tokenId}` revokes
+  a key this operator minted, with the same session cascade as an admin
+  revoke. Any other id (another operator's key, an admin-minted key, a
+  token of another purpose, the operator itself) is `404 token_not_found`.
+
+A revoked or expired operator token, or one of another workspace, is
+`401 unauthorized` on these routes. Every other admin and runtime route
+answers `401` for it, as for an unknown `sh_wk_` token; introspection
+answers `wrong-kind`. An
+owner or admin sees the operator's keys in the full list and can revoke
+them. Revoking the operator token stops further mints but leaves the keys
+it minted, and their sessions, alive; revoke those keys separately.
 
 #### Staff read grants
 
