@@ -27,6 +27,21 @@ assigned at release.
   exchange response adds `policy_revision` and the `workspace_policy`
   document. Token records list `maxUses`, `useCount` and `policyConsent`;
   the exchange audit target adds the use number and Desktop client version.
+- Changed: when the MCP route refuses a `tools/call` with `Invalid native
+  chat context.` (a Claude Code, Cursor or Copilot call proof that does not
+  verify, or conflicting desktop call headers), the server log now names
+  the failed check (`[selfhost-mcp] native chat context refused` with
+  `check`, `reason`, `method`, `tool`, `provider`, `auth_mode`,
+  `workspace_id`, `user_id`). The response is unchanged and the log never
+  carries the proof, the token or the arguments.
+- Added: workspace API token purpose `enrollment-operator` (`sh_wk_`, scope
+  `enrollment:mint`, migration 0073). An owner or admin mints one; an MDM
+  script presents it to mint `desktop-enrollment` keys, list them
+  (`?purpose=desktop-enrollment`, its own keys only) and revoke its own keys,
+  without a device sign-in. Any other purpose is `403
+  enrollment_operator_scope`, another key is `404`, every other admin route
+  still answers `401`, and introspection still answers `wrong-kind`. Keys
+  record `mintedByTokenId`; audit rows use actor kind `token`.
 - Added: workspace policy v2 (migration 0072, docs/workspace-policy.md). One
   versioned document with `capture`, `spawn`, `join`, `delivery` and
   `analytics` sections, each with `locked` and `defaults` tiers, plus a

@@ -8,7 +8,15 @@ import type { EncryptionKeyring } from "../crypto.js";
 import { secureEqual } from "../crypto.js";
 import type { Database } from "../database.js";
 import type { Principal } from "../store.js";
-import { API_TOKEN_PURPOSE_SCOPES, ApiTokenError, ApiTokenStore, type ApiTokenPurpose } from "./api-tokens.js";
+import {
+  API_TOKEN_PREFIX,
+  API_TOKEN_PURPOSE_SCOPES,
+  ApiTokenError,
+  ApiTokenStore,
+  DESKTOP_ENROLLMENT_PURPOSE,
+  type ApiTokenPurpose,
+  type MintActor,
+} from "./api-tokens.js";
 import { acceptedAudiences } from "../auth/introspect.js";
 import { listAudit, recordAudit, type AuditActor } from "./audit.js";
 import { ConnectionError, ConnectionStore, type FetchLike } from "./connections.js";
@@ -193,6 +201,42 @@ export function createAdminModule(input: {
   );
   const codingAgents = new CodingAgentStore(database, input.keyring, input.fetchImpl, blobs);
   const logins = new SubscriptionLoginStore(database, input.keyring, blobs, input.fetchImpl);
+
+  /**
+   * The caller of the deployment-api-tokens routes: an owner/admin user
+   * session, or a live enrollment-operator token (`sh_wk_`) of the path
+   * workspace, which the routes then confine to desktop-enrollment keys it
+   * minted. Any other `sh_wk_` bearer stays a 401, as on every admin route.
+   */
+  async function apiTokenRouteCaller(
+    request: IncomingMessage,
+    helpers: AdminRouteHelpers,
+    workspaceId: string,
+  ): Promise<{
+    workspace: { id: string; organizationId: string };
+    actor: MintActor;
+    operatorTokenId: string | null;
+  }> {
+    const token = helpers.bearer(request);
+    if (token?.startsWith(API_TOKEN_PREFIX)) {
+      const operator = await apiTokens.authenticateEnrollmentOperator(token, workspaceId);
+      if (!operator) throw new AdminHttpError(401, "unauthorized", "Invalid or expired token");
+      return {
+        workspace: { id: operator.workspaceId, organizationId: operator.organizationId },
+        actor: { kind: "token", tokenId: operator.tokenId },
+        operatorTokenId: operator.tokenId,
+      };
+    }
+    const access = await helpers.workspaceAccess(request, workspaceId, true);
+    return { workspace: access.workspace, actor: userActor(access), operatorTokenId: null };
+  }
+
+  const enrollmentOperatorScope = () =>
+    new AdminHttpError(
+      403,
+      "enrollment_operator_scope",
+      "An enrollment-operator token manages only desktop-enrollment keys",
+    );
 
   async function workspaceOrganization(workspaceId: string): Promise<string | null> {
     if (!/^[0-9a-f-]{36}$/i.test(workspaceId)) return null;
@@ -740,28 +784,41 @@ export function createAdminModule(input: {
       }
     }
 
-    // Workspace API tokens (hosted: deployment-api-tokens). Owner/admin only.
+    // Workspace API tokens (hosted: deployment-api-tokens). Owner/admin
+    // only, except that an enrollment-operator token may mint, list and
+    // revoke its own desktop-enrollment keys here (docs/identity.md,
+    // "Desktop enrollment keys").
     if (rest === "deployment-api-tokens") {
       if (method === "GET") {
-        const access = await helpers.workspaceAccess(request, workspaceId, true);
+        const caller = await apiTokenRouteCaller(request, helpers, workspaceId);
         // Optional ?purpose= filter: the list is the newest 100, so a purpose
         // with many tokens (desktop-enrollment) must not hide the others.
         const purpose = url.searchParams.get("purpose");
+        if (caller.operatorTokenId !== null && purpose !== DESKTOP_ENROLLMENT_PURPOSE) {
+          throw enrollmentOperatorScope();
+        }
         if (purpose !== null && !Object.hasOwn(API_TOKEN_PURPOSE_SCOPES, purpose)) {
           throw new ApiTokenError(400, "invalid_request", "purpose is not a workspace API token purpose");
         }
         json(response, 200, {
-          tokens: await apiTokens.list(access.workspace.id, (purpose ?? undefined) as ApiTokenPurpose | undefined),
+          tokens: await apiTokens.list(
+            caller.workspace.id,
+            (purpose ?? undefined) as ApiTokenPurpose | undefined,
+            caller.operatorTokenId ?? undefined,
+          ),
         });
         return true;
       }
       if (method === "POST") {
         requireJsonWrite(request, helpers);
-        const access = await helpers.workspaceAccess(request, workspaceId, true);
+        const caller = await apiTokenRouteCaller(request, helpers, workspaceId);
         const body = await helpers.requestObject(request);
+        if (caller.operatorTokenId !== null && body.purpose !== DESKTOP_ENROLLMENT_PURPOSE) {
+          throw enrollmentOperatorScope();
+        }
         const token = await apiTokens.create({
-          workspaceId: access.workspace.id,
-          organizationId: access.workspace.organizationId,
+          workspaceId: caller.workspace.id,
+          organizationId: caller.workspace.organizationId,
           label: body.label,
           purpose: body.purpose,
           expiryDays: body.expiryDays,
@@ -775,7 +832,8 @@ export function createAdminModule(input: {
           mcpConsent: body.mcpConsent,
           maxUses: body.maxUses,
           policyConsent: body.policyConsent,
-          actor: userActor(access),
+          ...(caller.operatorTokenId !== null ? { mintedByTokenId: caller.operatorTokenId } : {}),
+          actor: caller.actor,
         });
         json(response, 201, token);
         return true;
@@ -783,12 +841,13 @@ export function createAdminModule(input: {
     }
     const tokenItem = match(rest, /^deployment-api-tokens\/([^/]+)$/);
     if (tokenItem && method === "DELETE") {
-      const access = await helpers.workspaceAccess(request, workspaceId, true);
+      const caller = await apiTokenRouteCaller(request, helpers, workspaceId);
       const revoked = await apiTokens.revoke({
-        workspaceId: access.workspace.id,
-        organizationId: access.workspace.organizationId,
+        workspaceId: caller.workspace.id,
+        organizationId: caller.workspace.organizationId,
         tokenId: tokenItem[0]!,
-        actor: userActor(access),
+        ...(caller.operatorTokenId !== null ? { mintedByTokenId: caller.operatorTokenId } : {}),
+        actor: caller.actor,
       });
       if (!revoked) throw new AdminHttpError(404, "token_not_found", "Token not found");
       response.writeHead(204, { "cache-control": "no-store" });

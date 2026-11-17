@@ -110,6 +110,13 @@ export const API_TOKEN_PURPOSE_SCOPES = {
    * device scopes.
    */
   "desktop-enrollment": [],
+  /**
+   * An `sh_wk_` token an MDM script or admin terminal presents to mint,
+   * list and revoke its own desktop-enrollment keys without a device
+   * sign-in. Accepted only by the three deployment-api-tokens routes
+   * (authenticateEnrollmentOperator); every other gate refuses it.
+   */
+  "enrollment-operator": ["enrollment:mint"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type ApiTokenPurpose = keyof typeof API_TOKEN_PURPOSE_SCOPES;
@@ -118,6 +125,7 @@ export const RELAYFILE_AGENT_PURPOSE = "relayfile-agent" satisfies ApiTokenPurpo
 export const ACQUISITION_OPERATOR_PURPOSE = "acquisition-operator" satisfies ApiTokenPurpose;
 export const RELAY_NODE_PURPOSE = "relay-node" satisfies ApiTokenPurpose;
 export const DESKTOP_ENROLLMENT_PURPOSE = "desktop-enrollment" satisfies ApiTokenPurpose;
+export const ENROLLMENT_OPERATOR_PURPOSE = "enrollment-operator" satisfies ApiTokenPurpose;
 /** The one desktop-enrollment consent value (docs/identity.md, "MCP consent"). */
 export const ENROLLMENT_MCP_CONSENT_ADMIN = "admin";
 /** The one desktop-enrollment policy consent value: sessions it provisions are managed. */
@@ -172,6 +180,8 @@ export type ApiTokenRecord = {
   useCount: number;
   /** desktop-enrollment only: "admin" when its sessions are managed; else null. */
   policyConsent: "admin" | null;
+  /** desktop-enrollment only: the enrollment-operator token that minted the key; else null. */
+  mintedByTokenId: string | null;
 };
 
 export type ApiTokenPrincipal = {
@@ -179,6 +189,13 @@ export type ApiTokenPrincipal = {
   workspaceId: string;
   organizationId: string;
   scopes: string[];
+};
+
+/** A live enrollment-operator token, as the deployment-api-tokens routes see it. */
+export type EnrollmentOperatorPrincipal = {
+  tokenId: string;
+  workspaceId: string;
+  organizationId: string;
 };
 
 /** A live relay-node token, as the /relay-node/v1 broker sees it. */
@@ -212,6 +229,7 @@ type Row = {
   max_uses: number;
   use_count: number;
   policy_consent: "admin" | null;
+  minted_by_token_id: string | null;
 };
 
 /** What introspection needs to judge a presented sh_wk_ token. */
@@ -261,6 +279,7 @@ function toRecord(row: Row): ApiTokenRecord {
     maxUses: Number(row.max_uses),
     useCount: Number(row.use_count),
     policyConsent: row.policy_consent,
+    mintedByTokenId: row.minted_by_token_id,
   };
 }
 
@@ -268,7 +287,7 @@ const SELECT = `SELECT t.id, t.label, t.purpose, t.scopes, t.token_prefix, t.cre
          u.name AS creator_name, u.email AS creator_email, t.created_at, t.expires_at,
          t.last_used_at, t.revoked_at, t.agent_name, t.aud, t.user_id, bu.email AS user_email,
          t.mcp_consent, t.exchanged_at, t.exchanged_host_name,
-         t.max_uses, t.use_count, t.policy_consent
+         t.max_uses, t.use_count, t.policy_consent, t.minted_by_token_id
     FROM workspace_api_tokens t
     LEFT JOIN users u ON u.id = t.created_by_user_id
     LEFT JOIN users bu ON bu.id = t.user_id`;
@@ -330,8 +349,16 @@ export type CreateApiTokenInput = {
   maxUses?: unknown;
   /** desktop-enrollment only: "admin" makes every session the key provisions managed. */
   policyConsent?: unknown;
-  actor: AuditActor & { kind: "user" };
+  /**
+   * desktop-enrollment only: the enrollment-operator token minting the key
+   * (its actor is then `{kind: "token"}`); refused for every other purpose.
+   */
+  mintedByTokenId?: string;
+  actor: MintActor;
 };
+
+/** Who mints or revokes: a signed-in owner/admin, or an enrollment-operator token. */
+export type MintActor = AuditActor & { kind: "user" | "token" };
 
 export class ApiTokenStore {
   /**
@@ -346,13 +373,19 @@ export class ApiTokenStore {
 
   /**
    * The newest 100 tokens of a workspace, optionally of one purpose (so
-   * mass-minted enrollment keys cannot push other tokens off the list).
+   * mass-minted enrollment keys cannot push other tokens off the list) and
+   * optionally only those one enrollment-operator token minted.
    */
-  async list(workspaceId: string, purpose?: ApiTokenPurpose): Promise<ApiTokenRecord[]> {
+  async list(
+    workspaceId: string,
+    purpose?: ApiTokenPurpose,
+    mintedByTokenId?: string,
+  ): Promise<ApiTokenRecord[]> {
     const result = await this.database.query<Row>(
       `${SELECT} WHERE t.workspace_id = $1 AND ($2::text IS NULL OR t.purpose = $2)
+          AND ($3::uuid IS NULL OR t.minted_by_token_id = $3)
         ORDER BY t.created_at DESC LIMIT 100`,
-      [workspaceId, purpose ?? null],
+      [workspaceId, purpose ?? null, mintedByTokenId ?? null],
     );
     return result.rows.map(toRecord);
   }
@@ -444,6 +477,12 @@ export class ApiTokenStore {
       );
     }
     const enrollment = purpose === DESKTOP_ENROLLMENT_PURPOSE;
+    if (input.mintedByTokenId !== undefined && !enrollment) {
+      throw new ApiTokenError(400, "invalid_request", "Only desktop-enrollment keys record a minting token");
+    }
+    if ((input.actor.kind === "token") !== (input.mintedByTokenId !== undefined)) {
+      throw new Error("A token actor mints only through mintedByTokenId, and only a token actor sets it");
+    }
     let email: string | null = null;
     let mcpConsent: "admin" | null = null;
     if (enrollment) {
@@ -567,8 +606,8 @@ export class ApiTokenStore {
         `INSERT INTO workspace_api_tokens
            (id, workspace_id, label, purpose, scopes, token_hash, token_prefix,
             created_by_user_id, expires_at, agent_name, aud, user_id, mcp_consent,
-            max_uses, policy_consent)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+            max_uses, policy_consent, minted_by_token_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
         [
           id,
           input.workspaceId,
@@ -577,7 +616,7 @@ export class ApiTokenStore {
           scopes,
           hashSecret(accessToken),
           accessToken.slice(0, prefix.length + 4),
-          input.actor.userId,
+          input.actor.kind === "user" ? input.actor.userId : null,
           expiresAt?.toISOString() ?? null,
           agentName,
           aud,
@@ -585,6 +624,7 @@ export class ApiTokenStore {
           mcpConsent,
           maxUses,
           policyConsent,
+          input.mintedByTokenId ?? null,
         ],
       );
     } catch (error) {
@@ -629,7 +669,7 @@ export class ApiTokenStore {
       organizationId: string;
       workspaceId: string;
       email: string;
-      actor: AuditActor & { kind: "user" };
+      actor: MintActor;
     },
   ): Promise<string> {
     await lockIdentity(tx, input.email);
@@ -1041,14 +1081,32 @@ export class ApiTokenStore {
     });
   }
 
+  /**
+   * DELETE .../deployment-api-tokens/{id}. With `mintedByTokenId` (an
+   * enrollment-operator caller) only a desktop-enrollment key that token
+   * minted is revoked; any other id reads as absent.
+   */
   async revoke(input: {
     workspaceId: string;
     organizationId: string;
     tokenId: string;
-    actor: AuditActor & { kind: "user" };
+    mintedByTokenId?: string;
+    actor: MintActor;
   }): Promise<boolean> {
     if (!/^[0-9a-f-]{36}$/i.test(input.tokenId)) return false;
-    return this.database.transaction((tx) => this.revokeIn(tx, input));
+    return this.database.transaction(async (tx) => {
+      if (input.mintedByTokenId !== undefined) {
+        const own = await tx.query(
+          `SELECT 1 FROM workspace_api_tokens
+            WHERE id = $1 AND workspace_id = $2 AND purpose = '${DESKTOP_ENROLLMENT_PURPOSE}'
+              AND minted_by_token_id = $3
+            FOR UPDATE`,
+          [input.tokenId, input.workspaceId, input.mintedByTokenId],
+        );
+        if (own.rows.length === 0) return false;
+      }
+      return this.revokeIn(tx, input);
+    });
   }
 
   /**
@@ -1113,7 +1171,9 @@ export class ApiTokenStore {
   /**
    * The /api/v1 gate (and every "workspace tokens are not a person" check):
    * a live token of any purpose except relay-node, which is valid only at
-   * the /relay-node/v1 broker (authenticateRelayNode).
+   * the /relay-node/v1 broker (authenticateRelayNode), and enrollment-operator
+   * tokens are refused here outright: only authenticateEnrollmentOperator, on
+   * the deployment-api-tokens routes, accepts them.
    */
   async authenticate(token: string): Promise<ApiTokenPrincipal | null> {
     if (!token.startsWith(API_TOKEN_PREFIX)) return null;
@@ -1129,7 +1189,7 @@ export class ApiTokenStore {
         WHERE t.token_hash = $1
           AND t.revoked_at IS NULL
           AND (t.expires_at IS NULL OR t.expires_at > now())
-          AND t.purpose <> 'relay-node'
+          AND t.purpose NOT IN ('relay-node', '${ENROLLMENT_OPERATOR_PURPOSE}')
           AND w.id = t.workspace_id
         RETURNING t.id, t.workspace_id, w.organization_id, t.scopes`,
       [hashSecret(token)],
@@ -1142,6 +1202,35 @@ export class ApiTokenStore {
           organizationId: row.organization_id,
           scopes: row.scopes,
         }
+      : null;
+  }
+
+  /**
+   * A live enrollment-operator token (not revoked, not expired) of the given
+   * workspace, recording its use; else null. Only the deployment-api-tokens
+   * routes call this.
+   */
+  async authenticateEnrollmentOperator(
+    token: string,
+    workspaceId: string,
+  ): Promise<EnrollmentOperatorPrincipal | null> {
+    if (!token.startsWith(API_TOKEN_PREFIX) || !/^[0-9a-f-]{36}$/i.test(workspaceId)) return null;
+    const result = await this.database.query<{ id: string; workspace_id: string; organization_id: string }>(
+      `UPDATE workspace_api_tokens t
+          SET last_used_at = now()
+         FROM workspaces w
+        WHERE t.token_hash = $1
+          AND t.workspace_id = $2
+          AND t.revoked_at IS NULL
+          AND (t.expires_at IS NULL OR t.expires_at > now())
+          AND t.purpose = '${ENROLLMENT_OPERATOR_PURPOSE}'
+          AND w.id = t.workspace_id
+        RETURNING t.id, t.workspace_id, w.organization_id`,
+      [hashSecret(token), workspaceId],
+    );
+    const row = result.rows[0];
+    return row
+      ? { tokenId: row.id, workspaceId: row.workspace_id, organizationId: row.organization_id }
       : null;
   }
 
