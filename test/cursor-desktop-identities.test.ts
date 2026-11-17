@@ -202,3 +202,21 @@ test("the app bearer with the desktop marker also accepts a Cursor proof; withou
   const spent = await env.database.query("SELECT 1 FROM mcp_attestation_tool_uses");
   assert.equal(spent.rows.length, 0);
 });
+
+test("a large signed Cursor message fits on both desktop auth modes; an oversized body is still refused", async (t) => {
+  const { env, parent, secret, call } = await cursorDesktop(t);
+  // 16,000 three-byte characters: within the tool's limit, but with the
+  // arguments signed into the proof the request is over 64 KiB.
+  const text = "\u6f22".repeat(16_000);
+  const viaBearer = await call("send_relay_message", { to: "peer", text });
+  assert.ok(Buffer.byteLength(JSON.stringify(viaBearer)) > 64 * 1024);
+  const bearer = await rpc(env.origin, parent.accessToken, viaBearer, { desktop: true });
+  assert.equal(bearer.status, 200, JSON.stringify(bearer.body).slice(0, 300));
+  assert.notEqual(bearer.body.result.isError, true, JSON.stringify(bearer.body.result).slice(0, 300));
+  const credential = await rpc(env.origin, secret, await call("send_relay_message", { to: "peer", text }));
+  assert.equal(credential.status, 200, JSON.stringify(credential.body).slice(0, 300));
+  assert.notEqual(credential.body.result.isError, true);
+  const oversized = await rpc(env.origin, secret,
+    await call("send_relay_message", { to: "peer", text, pad: "x".repeat(40_000) }));
+  assert.equal(oversized.status, 413);
+});

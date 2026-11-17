@@ -302,8 +302,12 @@ export function createMcpHandler(input: {
     }
     let raw: string;
     try {
-      // Copilot and Cursor proofs sign the call's arguments, so their requests may be larger.
-      raw = await boundedBody(request, admitted.provider === "copilot" || admitted.provider === "cursor"
+      // Copilot and Cursor proofs sign the call's arguments, so their requests
+      // may be larger. A Cursor proof may also arrive on the app bearer with
+      // the Desktop marker, which binds no provider (never an OAuth or staff grant).
+      const desktopMarked = admitted.provider === undefined && !admitted.oauth &&
+        admitted.authMode !== "staff_read_grant" && request.headers["x-agent-relay-desktop"] === "1";
+      raw = await boundedBody(request, admitted.provider === "copilot" || admitted.provider === "cursor" || desktopMarked
         ? COPILOT_MAX_BODY_BYTES : MAX_BODY_BYTES);
     } catch (error) {
       if (error instanceof BodyTooLarge) {
