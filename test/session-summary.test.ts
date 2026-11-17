@@ -32,6 +32,14 @@ test("recorded summaries preserve the requested kind and never widen the dashboa
   }
 });
 
+test("dashboard and People retain their existing short projection independently of MCP bounds", () => {
+  const body = ready("short", "x".repeat(500));
+  body.summary.model = "m".repeat(129);
+  assert.deepEqual(recordedSummary({ ...body, legacyMetadata: "retained compatibility" }), body.summary);
+  assert.equal(recordedSummaryResponse(body), null, "MCP still enforces its Reader contract");
+  assert.equal(recordedSummary(ready("long")), null);
+});
+
 test("recorded envelope accepts optional provenance only when it describes a ready summary of the same kind", () => {
   const body = ready("long");
   assert.deepEqual(recordedSummaryResponse(body, "long"), body, "older Reader envelopes remain valid");

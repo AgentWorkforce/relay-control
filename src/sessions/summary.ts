@@ -21,6 +21,19 @@ const summary = z.discriminatedUnion("status", [
   z.strictObject({ status: z.literal("unsupported") }),
 ]);
 
+// Dashboard and People already consume this short-only projection. Keep its
+// existing text/model limits and outer-field handling independent of the MCP
+// Reader envelope so the new bounds do not change those consumers.
+const shortProjection = z.object({ summary: z.discriminatedUnion("status", [
+  z.strictObject({
+    status: z.literal("ready"), kind: z.literal("short"),
+    summary: nonBlank, model: nonBlank,
+    builtAt: z.iso.datetime({ offset: true }), state: recordedState,
+  }),
+  z.strictObject({ status: z.literal("empty"), kind: z.literal("short"), state: recordedState }),
+  z.strictObject({ status: z.literal("unsupported") }),
+]) });
+
 const response = z.strictObject({
   summary,
   provenance: z.strictObject({
@@ -45,7 +58,8 @@ export function recordedSummaryResponse(body: unknown, requestedKind: z.infer<ty
   return parsed.data;
 }
 
-/** The dashboard's existing short-summary projection remains short-only. */
+/** Preserve the existing dashboard/People short-summary contract. */
 export function recordedSummary(body: Record<string, unknown>) {
-  return recordedSummaryResponse(body)?.summary ?? null;
+  const parsed = shortProjection.safeParse(body);
+  return parsed.success ? parsed.data.summary : null;
 }
