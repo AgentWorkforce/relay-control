@@ -468,21 +468,21 @@ function createRelayService(context: McpContext) {
 
   async function addressFor(name: string, bestEffort = false): Promise<string | null> {
     try {
-      return (await listedAgents("all")).find(agent => agent.name === name)?.address ?? null;
+      // Bounded lookup: one name, never the whole roster.
+      const agent = await client.findAgentByName(key, name);
+      return agent && isListedRelayAgent(agent) ? agent.address : null;
     } catch (error) {
       if (bestEffort) return null;
       throw error;
     }
   }
 
+  /** A name or `name@machine` address, resolved by name without listing the roster. */
   async function explicitAgent(target: string): Promise<RosterAgent | null> {
     const separator = target.lastIndexOf("@");
-    const recent = (await client.listAgents(key, "all"))
-      .find(agent => separator < 0 ? agent.name === target : agent.address === target);
-    if (recent) return recent;
     const name = separator < 0 ? target : target.slice(0, separator);
     if (!name) return null;
-    const agent = await client.getRosterAgent(key, name);
+    const agent = await client.findAgentByName(key, name) ?? await client.getRosterAgent(key, name);
     return agent?.name === name && (separator < 0 || agent.address === target) ? agent : null;
   }
 
@@ -963,9 +963,12 @@ function createRelayService(context: McpContext) {
       await touchPresence(hosted.token);
       // Every fallible read finishes before any acknowledgement, so a failed
       // enrichment leaves the deliveries pending for a retry.
-      const [messages, agents, conversations] = await Promise.all([
-        client.readHostedInbox(hosted.token), listedAgents("all"), client.listConversations(hosted.token),
+      const [messages, conversations] = await Promise.all([
+        client.readHostedInbox(hosted.token), client.listConversations(hosted.token),
       ]);
+      // Sender addresses come from one bounded lookup of the senders' names.
+      const senders = [...new Set(messages.flatMap(message => message.sender ? [message.sender] : []))];
+      const agents = senders.length ? (await client.findAgentsByNames(key, senders)).filter(isListedRelayAgent) : [];
       const addresses = new Map(agents.map(agent => [agent.name, agent.address]));
       const channelNames = new Map<string, string>();
       if (messages.some(isChannelDelivery)) {
