@@ -65,6 +65,11 @@ before broker, then free capacity and measured load.
    `relaygate_classified` and `relaygate_unavailable`) carry up to three
    allowed `alternatives`. Only `relaygate_unavailable` of the relaygate
    codes is retryable; see [identity.md](identity.md), "Launch check".
+   A launch made by a verified desktop-linked chat (a managed desktop call,
+   or a session linked with `join_relay` `desktop_address`) also carries
+   `requester_agent_id` and `requester_name`, the chat's own Relaycast
+   identity, so the node treats that chat's DMs to the worker as native
+   input alongside the launcher's; OAuth and unlinked sessions omit both.
 3. `get_relay_spawn_status` until `ready` (with the agent's address),
    `failed` or `unknown`.
 4. `release_relay_agent` stops exactly that worker by its immutable id.
