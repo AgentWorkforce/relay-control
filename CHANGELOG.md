@@ -10,6 +10,14 @@ assigned at release.
   and that joining a public hosted Connect invite from Agent Relay Desktop is
   separate; it no longer files them under "not part of the self-hosted
   edition". No tools or routes change.
+- Fixed: MCP relay sends, inbox polls, `relay_status` and agent card reads no
+  longer list the whole Relaycast roster to resolve one agent name or address.
+  They use the engine's bounded `GET /v1/agents?names=` lookup (one call per
+  send for the recipient, one for the sender's own address, one batch per inbox
+  poll for the senders), keep only rows with the exact requested name so
+  engines without the filter keep working, and never fall back to a
+  full-roster read when the lookup fails. The bound takes effect with Relaycast
+  engine 12.4.0 or later; older engines still answer with the roster.
 - Added: `GET /api/v1/organizations/{org}/fleet` (docs/fleet.md) for owners
   and admins: members, 200 per page, with their Desktop machines (host name,
   client version, platform, enrollment key, managed, last seen, status) and

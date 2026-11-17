@@ -43,6 +43,10 @@ async function setup(t: TestContext) {
   const writes: any[] = [];
   let recoveries = 0, registrations = 0, lookups = 0;
   let onAddress: (() => Promise<void>) | undefined;
+  // The bounded names lookup; each call is one roster read for the race hook.
+  const findAgentsByNames = async (_key:string,names:string[]) => {
+    await onAddress?.();return [peer,...[...agents.values()].map(roster)].filter(a=>names.includes(a.name));
+  };
   const client = {
     getRosterAgent: async (_key:string,name:string) => { const a=agents.get(name);return a?roster(a):null; },
     getAgent: async (_key:string,name:string) => { const a=agents.get(name);return a?roster(a):null; },
@@ -58,6 +62,8 @@ async function setup(t: TestContext) {
     },
     releaseHosted: async () => undefined,
     listAgents: async () => { await onAddress?.();return [peer,...[...agents.values()].map(roster)]; },
+    findAgentsByNames,
+    findAgentByName: async (key:string,name:string) => (await findAgentsByNames(key,[name]))[0] ?? null,
     heartbeat: async () => undefined,
     sendDirectMessage: async (input:any) => { writes.push(input);return { message:{id:"12"},conversationId:"dm" }; },
     replyToMessage: async (input:any) => { writes.push(input);return { message:{id:"13"},conversationId:"dm" }; },

@@ -137,6 +137,8 @@ type RelaycastCall = { path: string; authorization: string | null };
 /** Relaycast served through the injected messaging fetch: roster and presence, and the relay world. */
 function fakeRelaycast(state: {
   agents: unknown[]; presence: unknown[] | "fail"; calls: RelaycastCall[]; world: RelaycastWorld;
+  /** The bounded `names` lookup: "fail" answers 503; "roster" plays an older engine that ignores `names`. */
+  namesLookup?: "fail" | "roster";
 }): typeof fetch {
   return (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input instanceof Request ? input.url : input));
@@ -146,7 +148,13 @@ function fakeRelaycast(state: {
       status,
       headers: { "content-type": "application/json" },
     });
-    if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") return json(200, { ok: true, data: state.agents });
+    if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") {
+      const names = url.searchParams.getAll("names");
+      if (state.namesLookup === "fail" && names.length) return json(503, { ok: false, error: { code: "unavailable" } });
+      if (names.length === 0 || state.namesLookup === "roster") return json(200, { ok: true, data: state.agents });
+      // The engine's bounded lookup: only the requested names.
+      return json(200, { ok: true, data: state.agents.filter(row => names.includes((row as { name?: string }).name ?? "")) });
+    }
     if (url.pathname === "/v1/agents/presence") {
       return state.presence === "fail" ? json(503, { ok: false, error: { code: "unavailable" } }) : json(200, { ok: true, data: state.presence });
     }
@@ -164,7 +172,8 @@ async function setup(t: TestContext) {
   const historyAudience = "https://history.selfhosted.test";
   const history = await startHistory(t);
   const agents: unknown[] = [];
-  const relay = { agents, presence: [] as unknown[] | "fail", calls: [] as RelaycastCall[], world: createRelaycastWorld(agents) };
+  const relay = { agents, presence: [] as unknown[] | "fail", calls: [] as RelaycastCall[], world: createRelaycastWorld(agents),
+    namesLookup: undefined as "fail" | "roster" | undefined };
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -1314,6 +1323,102 @@ test("an addressed MCP send pins one machine and retains its retry receipt", asy
   const refused = await client.callTool({ name: "send_relay_message", arguments: { ...args, to: "machine-peer@another-machine" } });
   assert.match(toolError(refused), /Unknown agent name or stale machine address/);
   assert.equal(env.relay.world.bodies.filter(call => call.path === "/v1/dm").length, beforeRefusal);
+});
+
+// Bounded agent lookup: one name (or one inbox batch) per lookup, never the roster.
+
+/** The `names` of each bounded lookup, and every roster listing, among the calls after `from`. */
+function agentLookups(env: Awaited<ReturnType<typeof setup>>, from: number) {
+  const paths = env.relay.calls.slice(from).map(call => new URL(call.path, "http://relaycast.test"))
+    .filter(url => url.pathname === "/v1/agents" && url.search);
+  return {
+    names: paths.filter(url => url.searchParams.has("names")).map(url => url.searchParams.getAll("names")),
+    listings: paths.filter(url => !url.searchParams.has("names")).map(url => `${url.pathname}${url.search}`),
+  };
+}
+
+test("send_relay_message resolves the recipient and the sender's address by name only", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-bot");
+  env.relay.world.addAgent("bystander-bot");
+  const client = await relayClient(t, env);
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-sender" } }));
+  const from = env.relay.calls.length;
+  const sent = structured(await client.callTool({ name: "send_relay_message", arguments: { to: "peer-bot", text: "bounded" } }));
+  assert.equal(sent.to, "peer-bot");
+  assert.match(sent.to_address, /^peer-bot@/);
+  assert.match(sent.from_address, /^owner-sender@/);
+  const lookups = agentLookups(env, from);
+  assert.deepEqual(lookups.listings, []);
+  assert.equal(env.relay.calls.slice(from).some(call => call.path.startsWith("/v1/agents?status=")), false);
+  assert.deepEqual(lookups.names, [["peer-bot"], ["owner-sender"]]);
+});
+
+test("a stale machine address is refused without listing the roster", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-bot");
+  const client = await relayClient(t, env);
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-sender" } }));
+  const from = env.relay.calls.length;
+  const refused = await client.callTool({ name: "send_relay_message", arguments: { to: "peer-bot@another-machine", text: "x" } });
+  assert.match(toolError(refused), /Unknown agent name or stale machine address/);
+  const lookups = agentLookups(env, from);
+  assert.deepEqual(lookups.listings, []);
+  assert.deepEqual(lookups.names, [["peer-bot"]]);
+  assert.equal(env.relay.world.bodies.filter(call => call.path === "/v1/dm").length, 0);
+});
+
+test("rows for other names are filtered out, so an engine that ignores names still resolves exactly", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-bot");
+  const client = await relayClient(t, env);
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-sender" } }));
+  env.relay.namesLookup = "roster";
+  const from = env.relay.calls.length;
+  // The answer lists peer-bot and owner-sender, never ghost-bot: unknown, with no fallback listing.
+  assert.match(toolError(await client.callTool({ name: "send_relay_message", arguments: { to: "ghost-bot", text: "x" } })),
+    /Unknown agent name or stale machine address/);
+  assert.deepEqual(agentLookups(env, from).listings, []);
+  assert.deepEqual(agentLookups(env, from).names, [["ghost-bot"]]);
+  // The exact name in the same roster answer still resolves.
+  const sent = structured(await client.callTool({ name: "send_relay_message", arguments: { to: "peer-bot", text: "old engine" } }));
+  assert.equal(sent.to, "peer-bot");
+  assert.match(sent.from_address, /^owner-sender@/);
+  assert.equal(env.relay.world.bodies.filter(call => call.path === "/v1/dm").length, 1);
+});
+
+test("a failed bounded lookup fails the send and never falls back to the roster", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-bot");
+  const client = await relayClient(t, env);
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-sender" } }));
+  env.relay.namesLookup = "fail";
+  const from = env.relay.calls.length;
+  assert.match(toolError(await client.callTool({ name: "send_relay_message", arguments: { to: "peer-bot", text: "x" } })),
+    /operation=find_agents status=503/);
+  assert.deepEqual(agentLookups(env, from).listings, []);
+  assert.equal(env.relay.calls.slice(from).some(call => call.path.startsWith("/v1/agents?status=")), false);
+  assert.equal(env.relay.world.bodies.filter(call => call.path === "/v1/dm").length, 0);
+});
+
+test("check_relay_inbox resolves sender addresses with one bounded lookup", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-a");
+  env.relay.world.addAgent("peer-b");
+  env.relay.world.addAgent("bystander-bot");
+  const client = await relayClient(t, env);
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-inbox" } }));
+  env.relay.world.sendAs("peer-a", "owner-inbox", "from a");
+  env.relay.world.sendAs("peer-b", "owner-inbox", "from b");
+  env.relay.world.sendAs("peer-a", "owner-inbox", "again from a");
+  const from = env.relay.calls.length;
+  const inbox = structured(await client.callTool({ name: "check_relay_inbox", arguments: {} }));
+  assert.deepEqual(inbox.messages.map((message: any) => message.sender), ["peer-a", "peer-b", "peer-a"]);
+  for (const message of inbox.messages) assert.match(message.sender_address, new RegExp(`^${message.sender}@`));
+  const lookups = agentLookups(env, from);
+  assert.deepEqual(lookups.listings, []);
+  assert.equal(lookups.names.length, 1);
+  assert.deepEqual([...lookups.names[0]!].sort(), ["peer-a", "peer-b"]);
 });
 
 type AuditRow = Record<string, any>;
