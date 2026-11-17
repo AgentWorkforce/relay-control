@@ -183,6 +183,10 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_FACTORY_API_URL` | Factory API origin, default `https://api.factory.ai`; absolute https only |
 | `SELFHOST_FACTORY_HISTORY_INTERVAL_MS` | Dormant Factory history loop cadence, default 300000, minimum 60000 |
 | `SELFHOST_OPERATOR_CONTROLS` | Operator-control writes (capture policy PUT/DELETE, session hard delete): `always` (default) or `off`; an unrecognised value is treated as `off`. Reads are never gated. See [docs/capture-policy.md](capture-policy.md) and [docs/session-erasure.md](session-erasure.md) |
+| `SELFHOST_ENROLLMENT_MAX_USES` | Largest `maxUses` a desktop enrollment key may be minted with: positive integer, default `50`, clamped to 500. See [docs/identity.md](identity.md), "Desktop enrollment keys" |
+| `SELFHOST_ENROLLMENT_MAX_DAYS` | Longest `expiryDays` of a single-use desktop enrollment key: positive integer, default `30` (at most 365) |
+| `SELFHOST_ENROLLMENT_MULTI_USE_MAX_DAYS` | Longest `expiryDays` of a multi-use desktop enrollment key (`maxUses` above 1): positive integer, default `90` (at most 365) |
+| `SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS` | Reserved for member self-minted enrollment keys (not used yet): positive integer, default `7` |
 | `SESSION_ERASE_API_URL`, `SESSION_ERASE_API_SECRET` (or `_FILE`) | Internal origin and dedicated secret (at least 32 bytes) of the session pipeline's per-session erase. Unset, the session hard-delete routes answer 501. See [docs/session-erasure.md](session-erasure.md) |
 | `SELFHOST_DESKTOP_FEED_SIGNER` / `SELFHOST_DESKTOP_FEED_STORAGE` | Optional, set together: turn on the signed Desktop release feed (`/api/v1/desktop/feed/*`). Signer `awskms` (or `memory`, tests and development only), storage `s3`, `gcs` (or `memory`). Unset: the feed routes answer 404. See [docs/desktop-feed.md](desktop-feed.md) |
 | `SELFHOST_DESKTOP_FEED_KMS_REGION` / `SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES` | `awskms`: region (default `AWS_REGION`) and a JSON object of profile id to KMS alias, one Ed25519 key per profile. Credentials: the standard AWS chain: static `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, container credentials (EKS Pod Identity, ECS task role), web identity (EKS IRSA), then the EC2 instance role via IMDSv2 |
@@ -518,8 +522,10 @@ employee with `POST /api/v1/workspaces/{id}/deployment-api-tokens`
 `{label, purpose: "desktop-enrollment", email, mcpConsent?, expiryDays?}`
 (1-30 days, default 7). The installer exchanges it once at
 `POST /cloud/api/v1/auth/enrollment/token` for the device/token response.
-The key is never a bearer anywhere else. Contract, consent, revocation and
-audit: [docs/identity.md](identity.md#desktop-enrollment-keys).
+The key is never a bearer anywhere else. An MDM script can mint, list and
+revoke its own keys with an `enrollment-operator` workspace API token
+(`enrollment:mint`) instead of a signed-in admin. Contract, consent,
+revocation and audit: [docs/identity.md](identity.md#desktop-enrollment-keys).
 
 ### Fleet node claims
 
@@ -947,7 +953,10 @@ as a `service` principal, and `relay-node` (`relay:workspace:read`,
 `relay:nodes:read`, `relay:nodes:enroll`, `relay:agents:read`; requires
 `nodeName`; expires within 365 days; several per node), accepted only by the
 `/relay-node/v1` Relaycast broker
-([docs/relay-node-credential.md](relay-node-credential.md)). Scopes are fixed by purpose (`scope`/`scopes` in the
+([docs/relay-node-credential.md](relay-node-credential.md)), and
+`enrollment-operator` (`enrollment:mint`; expires within 365 days), the one
+workspace API token these routes accept as a bearer, only to mint, list and
+revoke its own `desktop-enrollment` keys. Scopes are fixed by purpose (`scope`/`scopes` in the
 body is a 400). Minted and revoked only through these owner/admin user-token
 routes, also served at `/cloud/api/v1`. Desktop-issued sessions (device flow,
 Desktop browser handoff and exchange) carry `cli:auth rth:read rth:sync

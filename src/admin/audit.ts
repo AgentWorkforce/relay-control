@@ -4,7 +4,9 @@ import type { SqlExecutor } from "../database.js";
 export type AuditActor =
   | { kind: "user"; userId: string }
   | { kind: "service"; subject: string }
-  | { kind: "bootstrap" };
+  | { kind: "bootstrap" }
+  /** A workspace API token acting on its own (an enrollment-operator); actorId is the token id. */
+  | { kind: "token"; tokenId: string };
 
 export type AuditEvent = {
   id: string;
@@ -30,7 +32,9 @@ export async function recordAudit(
     ? input.actor.userId
     : input.actor.kind === "service"
       ? input.actor.subject
-      : null;
+      : input.actor.kind === "token"
+        ? input.actor.tokenId
+        : null;
   await executor.query(
     `INSERT INTO admin_audit_events
        (id, organization_id, workspace_id, actor_kind, actor_id, action, target)

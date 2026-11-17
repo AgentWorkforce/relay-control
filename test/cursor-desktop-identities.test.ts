@@ -139,9 +139,21 @@ test("an unsigned Cursor call is refused with what to do, not to wait, and sends
 
 test("bad Cursor proofs are refused: replay, wrong key, changed or unsigned args, other tool, expired, other source, wrong kind", async (t) => {
   const { env, secret, signer, call } = await cursorDesktop(t);
+  const warn = t.mock.method(console, "warn", () => {});
   const once = await call("relay_status", {});
   assert.equal((await rpc(env.origin, secret, once)).status, 200);
+  assert.equal(warn.mock.callCount(), 0, "an accepted proof logs nothing");
   invalid(await rpc(env.origin, secret, once), "replayed ticket");
+  // The operator log names the failed check; the response never does and
+  // the log never carries the proof or the arguments.
+  assert.equal(warn.mock.callCount(), 1);
+  const [message, fields] = warn.mock.calls[0]!.arguments as [string, Record<string, unknown>];
+  assert.equal(message, "[selfhost-mcp] native chat context refused");
+  assert.deepEqual(fields, { check: "ClaudeAttestationError", reason: "replayed tool use", method: "tools/call",
+    tool: "relay_status", provider: "cursor", auth_mode: "cli_login", workspace_id: env.workspaceId,
+    user_id: fields.user_id });
+  assert.equal(typeof fields.user_id, "string");
+  assert.doesNotMatch(JSON.stringify(fields), /eyJ|_agent_relay_attestation/, "no proof in the log");
 
   invalid(await rpc(env.origin, secret, await call("relay_status", {}, { signWith: await claudeSigner() })), "other installation key");
   invalid(await rpc(env.origin, secret, await call("relay_status", {}, { signWith: await claudeSigner(), kid: signer.kid })), "forged kid");
