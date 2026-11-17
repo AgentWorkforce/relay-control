@@ -19,7 +19,11 @@ import { createRelaycastClient, RelaycastCallError, type RelaycastClient } from 
  * only after Relaycast confirms the token controls exactly the named agent
  * and that the agent belongs to the caller. Tokens are encrypted at rest and
  * never returned. The optional Ed25519 attestation key verifies Claude Code
- * and Copilot tool-call proofs for that Desktop source.
+ * and Copilot tool-call proofs for that Desktop source. It is the
+ * installation's key, so a sync that omits `attestation_key` leaves the
+ * registered key as it is (the Desktop syncs identities before its key slot
+ * is loaded); an explicit key replaces it, an explicit null removes it and an
+ * empty identity list clears the source, key included.
  *
  * Gate-only installs (relaygatePublicUrl set): the Desktop enrols each chat
  * at relaygate and holds an rg_ token. relaygate's GET /v1/whoami then
@@ -90,7 +94,8 @@ const attestationKey = z.object({
 const syncBody = z.object({
   source_id: sourceId,
   identities: z.array(identity).max(200),
-  attestation_key: attestationKey.optional(),
+  // Omitted: the registered key is unchanged. null: removed. A key: replaced.
+  attestation_key: attestationKey.nullable().optional(),
 }).strict();
 
 type Identity = z.infer<typeof identity>;
@@ -243,7 +248,7 @@ async function replace(
   access: Access,
   sourceId: string,
   rows: Verified[],
-  key: AttestationKey | undefined,
+  key: AttestationKey | null | undefined,
 ): Promise<void> {
   const { workspace, principal } = access;
   await database.transaction(async (tx: SqlExecutor) => {
@@ -288,16 +293,23 @@ async function replace(
         ],
       );
     }
-    await tx.query(
-      `DELETE FROM desktop_attestation_keys WHERE workspace_id = $1 AND user_id = $2 AND source_id = $3`,
-      [workspace.id, principal.userId, sourceId],
-    );
-    if (key && rows.length > 0) {
+    // The attestation key is the installation's, not the sync's: only an
+    // explicit key (rotation), an explicit null (removal) or an empty identity
+    // list (the caller passes null) touches it. A sync without the field keeps
+    // the registered key, so the chats the Desktop syncs before its key slot
+    // is loaded stay verifiable.
+    if (key !== undefined) {
       await tx.query(
-        `INSERT INTO desktop_attestation_keys (workspace_id, organization_id, user_id, source_id, kid, public_key)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [workspace.id, workspace.organizationId, principal.userId, sourceId, key.kid, key.public_key],
+        `DELETE FROM desktop_attestation_keys WHERE workspace_id = $1 AND user_id = $2 AND source_id = $3`,
+        [workspace.id, principal.userId, sourceId],
       );
+      if (key && rows.length > 0) {
+        await tx.query(
+          `INSERT INTO desktop_attestation_keys (workspace_id, organization_id, user_id, source_id, kid, public_key)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [workspace.id, workspace.organizationId, principal.userId, sourceId, key.kid, key.public_key],
+        );
+      }
     }
   });
 }
@@ -311,14 +323,16 @@ export async function syncDesktopIdentities(input: {
   access: Access;
   sourceId: string;
   identities: Identity[];
-  attestationKey?: AttestationKey;
+  /** Omitted: the registered key stays. null: it is removed. A key: it is replaced. Ignored with no identities (cleared). */
+  attestationKey?: AttestationKey | null;
   /** Logs each skipped identity ("desktop identity skipped"); never given the token. */
   log?: DesktopIdentityLog;
 }): Promise<{ synced: number; skipped?: Skipped[]; identities: DesktopIdentityLink[] }> {
   const { access } = input;
   const source = normalizeDesktopSourceId(input.sourceId);
   if (input.identities.length === 0) {
-    await replace(input.database, input.keyring, access, source, [], undefined);
+    // An empty list clears the source, its attestation key included.
+    await replace(input.database, input.keyring, access, source, [], null);
     return { synced: 0, identities: [] };
   }
   if (!access.workspace.relaycastWorkspaceId || !access.workspace.relaycastApiKey) {
