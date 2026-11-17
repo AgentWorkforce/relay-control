@@ -466,20 +466,30 @@ function createRelayService(context: McpContext) {
       .filter(agent => status === "all" || (status === "live" ? agent.online : !agent.online));
   }
 
+  /** One agent's machine address, read by name: never the whole roster (see explicitAgent). */
   async function addressFor(name: string, bestEffort = false): Promise<string | null> {
     try {
-      return (await listedAgents("all")).find(agent => agent.name === name)?.address ?? null;
+      const agent = await client.getRosterAgent(key, name);
+      // The by-name read can return a released tombstone; it has no live address.
+      return agent?.name === name && agent.status !== "released" && isListedRelayAgent(agent) ? agent.address ?? null : null;
     } catch (error) {
       if (bestEffort) return null;
       throw error;
     }
   }
 
+  /**
+   * One agent by name or exact machine address, read by name alone
+   * (`GET /v1/agents/:name`). It never fetches the whole roster: on a large
+   * workspace that read took about 31 s and timed every send out at the
+   * recipient step (cloud#6384 fixed the same path in Cloud). The by-name read
+   * returns retained identities too, as the roster fallback here always did,
+   * and can return a released tombstone, which recipient() refuses. It is used
+   * instead of `?names=` because that needs Relaycast v12.12.0, and
+   * self-hosted installs may run older gateways.
+   */
   async function explicitAgent(target: string): Promise<RosterAgent | null> {
     const separator = target.lastIndexOf("@");
-    const recent = (await client.listAgents(key, "all"))
-      .find(agent => separator < 0 ? agent.name === target : agent.address === target);
-    if (recent) return recent;
     const name = separator < 0 ? target : target.slice(0, separator);
     if (!name) return null;
     const agent = await client.getRosterAgent(key, name);

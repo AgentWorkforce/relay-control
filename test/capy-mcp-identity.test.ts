@@ -44,7 +44,8 @@ async function setup(t: TestContext) {
   let recoveries = 0, registrations = 0, lookups = 0;
   let onAddress: (() => Promise<void>) | undefined;
   const client = {
-    getRosterAgent: async (_key:string,name:string) => { const a=agents.get(name);return a?roster(a):null; },
+    // Relay sends read the recipient and the sender's address by name.
+    getRosterAgent: async (_key:string,name:string) => { await onAddress?.();if(name==="peer")return peer;const a=agents.get(name);return a?roster(a):null; },
     getAgent: async (_key:string,name:string) => { const a=agents.get(name);return a?roster(a):null; },
     registerHosted: async (_key:string,name:string,metadata:Record<string,unknown>) => {
       registrations++;const a={id:`ag_${randomUUID()}`,name,token:`native-${randomUUID()}`,metadata};agents.set(name,a);return a;

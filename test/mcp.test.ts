@@ -876,7 +876,9 @@ test("send_relay_message returns the recipient's card summary only when it has o
     assert.ok(sent.message_id, to);
   }
   // No extra upstream read: the card comes from the recipient lookup the send already makes.
-  assert.equal(env.relay.calls.filter(call => /\/card/.test(call.path)).length, 0);
+  assert.equal(env.relay.calls.filter(call => /\/card(?:$|\?)/.test(call.path)).length, 0);
+  // The recipient is read by name, never through the whole roster.
+  assert.equal(env.relay.calls.filter(call => call.path === "/v1/agents?status=all").length, 0);
 });
 
 test("send_relay_message to an exact machine address sends address only and is delivered", async (t) => {

@@ -38,7 +38,8 @@ async function fixture(t:TestContext) {
   let unavailable=false;
   const roster=(a:any)=>({...a,address:null,kind:"agent",persona:null,status:"active",lastSeen:null});
   const client={
-    getRosterAgent:async(_key:string,name:string)=>agents.has(name)?roster(agents.get(name)):null,
+    // Relay sends read the recipient and the sender's address by name.
+    getRosterAgent:async(_key:string,name:string)=>{await onAddress?.();if(name==="peer")return roster({id:"ag_peer",name:"peer",metadata:{}});return agents.has(name)?roster(agents.get(name)):null;},
     getAgent:async(_key:string,name:string)=>agents.has(name)?roster(agents.get(name)):null,
     registerHosted:async(_key:string,name:string,metadata:Record<string,unknown>)=>{
       registrations++;const a={id:`ag_${randomUUID()}`,name,metadata,token:`native-${randomUUID()}`};agents.set(name,a);return a;
