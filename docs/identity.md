@@ -986,15 +986,18 @@ fleet read model from these columns, not stored.
 #### Desktop enrollment keys
 
 An organization owner or admin can sign an employee's Desktop in without a
-browser: mint a one-time enrollment key for the employee, hand it to the
+browser: mint an enrollment key for the employee, hand it to the
 installer, and the installer exchanges it for a normal device session bound
-to that employee. The API is the only surface; there is no dashboard page.
+to that employee. A key is single-use by default; a per-person key may sign
+in several of the employee's machines (`maxUses`). The API is the only
+surface; there is no dashboard page.
 
 Mint, list and revoke use the workspace API token routes (owner or admin
 only):
 
 - `POST /api/v1/workspaces/{id}/deployment-api-tokens` with
-  `{label, purpose: "desktop-enrollment", email, mcpConsent?, expiryDays?}`.
+  `{label, purpose: "desktop-enrollment", email, mcpConsent?, policyConsent?,
+  maxUses?, expiryDays?}`.
   The answer carries the key (`sh_ek_...`) once, like every other workspace
   API token.
   - `email` names the employee. An existing member of the organization is
@@ -1006,17 +1009,39 @@ only):
     invite that person instead.
   - `mcpConsent` is `"admin"` or absent. With `"admin"` the admin consents
     to Desktop MCP access on the employee's behalf (below).
-  - `expiryDays` is 1 to 30, default 7. Keys always expire;
-    `neverExpires: true` is refused with `400`.
-  - `email` and `mcpConsent` are refused with `400` for every other purpose.
+  - `policyConsent` is `"admin"` or absent. With `"admin"` the admin
+    consents to the workspace policy on the employee's behalf: every session
+    the key provisions is a managed session (below, and
+    [workspace-policy.md](workspace-policy.md)).
+  - `maxUses` is an integer from 1 to the `SELFHOST_ENROLLMENT_MAX_USES`
+    ceiling (default 50, never above 500); default 1, a single-use key. The
+    key signs in up to that many machines of the same employee; every
+    exchange signs in the member bound at mint (the installer never names
+    anyone).
+  - `expiryDays` is 1 to the ceiling, default 7 (or the ceiling, if lower).
+    The ceiling is `SELFHOST_ENROLLMENT_MAX_DAYS` (default 30) for a
+    single-use key and `SELFHOST_ENROLLMENT_MULTI_USE_MAX_DAYS` (default 90)
+    for a key with `maxUses` above 1; a longer request is refused with
+    `400 invalid_request`. Keys always expire; `neverExpires: true` is
+    refused with `400`.
+  - `email`, `mcpConsent`, `policyConsent` and `maxUses` are refused with
+    `400` for every other purpose.
+  - The ceilings are read from the environment on every mint. Each is a
+    positive integer; any other value (empty, `0`, `abc`, `5.5`) means the
+    default. Day ceilings never exceed 365. `SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS`
+    (default 7) is reserved for member self-minted keys and not used yet.
 - `GET /api/v1/workspaces/{id}/deployment-api-tokens` lists the keys with
-  `userId`, `userEmail`, `mcpConsent`, `exchangedAt` and
-  `exchangedHostName` (these are `null` on other purposes). The list is the
+  `userId`, `userEmail`, `mcpConsent`, `policyConsent`, `exchangedAt` and
+  `exchangedHostName` (these are `null` on other purposes), and `maxUses`
+  and `useCount` (`1` and `0` on other purposes). `exchangedAt` and
+  `exchangedHostName` name the latest exchange; once the key is spent, the
+  last one. The list is the
   newest 100 tokens of the workspace; add `?purpose=desktop-enrollment` (or
   any other purpose) to list one purpose only, so many keys never hide the
   other tokens. An unknown purpose is `400 invalid_request`.
-- A key's `status` is `revoked`, else `exchanged` once it has been spent,
-  else `expired` past its expiry, else `active`.
+- A key's `status` is `revoked`, else `exchanged` once it has been spent
+  (`useCount` reached `maxUses`), else `expired` past its expiry, else
+  `active`.
 - `DELETE /api/v1/workspaces/{id}/deployment-api-tokens/{tokenId}` revokes
   the key and, if it was exchanged, every session it provisioned (including
   refreshed sessions and their MCP child sessions), with revoked reason
@@ -1036,7 +1061,7 @@ The employee can see and revoke their own keys with a signed-in user token
   cascade as the admin revoke, or `404 token_not_found` for a key that is
   not theirs.
 
-The installer exchanges the key once at
+The installer exchanges the key, once per use, at
 `POST /api/v1/auth/enrollment/token` (also under `/cloud`):
 
 ```json
@@ -1047,12 +1072,31 @@ The installer exchanges the key once at
 names refused); `desktop_host_name` is required (1 to 80 characters). The
 `200` body is the `POST /api/v1/auth/device/token` body: `access_token`,
 `refresh_token`, `token_type`, `access_token_expires_at`,
-`refresh_token_expires_at`, `scope` and `api_url`. The session carries the
-device scopes, is labelled with `client_name` and stores the host name. A
-missing, expired, revoked or already exchanged key gets one answer,
+`refresh_token_expires_at`, `scope` and `api_url`, plus `managed` (boolean:
+the key carries `policyConsent: "admin"`) and `policy_revision` (the
+organization's workspace policy revision, 1 when unset; compare it with a
+cached policy) and `workspace_policy` (the served document, as on
+`access/me`, with this session's `managed`). The session carries the
+device scopes, is labelled with `client_name` and stores the host name. Each
+exchange uses the key once, under a lock on the key row, so concurrent
+exchanges never exceed `maxUses`. A
+missing, expired, revoked or spent (every use taken) key gets one answer,
 `400 {"error": "invalid_grant", "error_description": "..."}`, whatever the
 reason. The route allows 30 exchanges per client address per 5 minutes and
 then answers `429 slow_down`.
+
+Every exchange is audited `enrollment_key.exchange` as the employee, target
+`<key id> ip=<client address> host=<desktop_host_name> use=<n>/<maxUses>
+client=<version>`, where `<version>` comes from a
+`User-Agent: AgentRelayDesktop/<version>` header (`unknown` without one).
+The key itself is never logged or audited.
+
+Managed sessions: a session provisioned by a key with
+`policyConsent: "admin"` is managed. `GET /api/v1/workspaces/{id}/access/me`
+serves its `workspace_policy` with `managed: true` (every other session:
+`false`), and introspection answers `managed: true` for its access token
+(see [workspace-policy.md](workspace-policy.md)). A refresh keeps it managed,
+like the provisioning link.
 
 Consent: a key minted with `mcpConsent: "admin"` yields a Desktop-verified
 session, exactly like a Desktop browser-consent handoff, so the Desktop can

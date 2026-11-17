@@ -64,11 +64,19 @@ window serves `oops_window_seconds: 900`).
 
 `consent` lists the person-only keys whose operator value applies only after the person on that computer agrees.
 It may name only the keys marked person-only above; it is stored sorted and deduplicated. A person-only key that is
-set but not named in `consent` is still served; the client decides how to ask.
+set but not named in `consent` is still served; the client decides how to ask. The Desktop client applies a
+widening operator value for a person-only key (turning it on, adding entries) only on a `managed` session whose
+`consent` names the key, and reports the key as mismatched otherwise; a narrowing value (turning it off, removing
+entries) applies on every session, managed or not. Defaults are gated the same way as locks.
 
 ## managed
 
-Always `false` on this server until enrollment-key consent lands; then the enrollment decides it.
+`managed` is per session, never stored and never written. It is `true` only for a session provisioned by a desktop
+enrollment key minted with `policyConsent: "admin"` (docs/identity.md, "Desktop enrollment keys"): the admin
+consented to the workspace policy on the person's behalf when minting the key. Every other session (device code,
+browser sign-in, a key without policy consent) and the organization route read `false`. `consent` is served the same
+for every session. The enrollment key exchange answers `managed`, `policy_revision` and the `workspace_policy`
+document too, so a first launch is right before its first `access/me` refresh.
 
 ## admin_senders
 
@@ -125,8 +133,8 @@ appear as `consent.<key>`.
 ## Introspection
 
 Active user-token answers from `POST /internal/v1/auth/introspect` carry `workspace_policy: {revision}` (the
-workspace revision, 1 when unset, read in the same query as the token) and `managed: false`, next to
-`capture_policy`. Agent, service and staff read grant answers carry neither.
+workspace revision, 1 when unset, read in the same query as the token) and `managed` (boolean, as above, read in
+the same query), next to `capture_policy`. Agent, service and staff read grant answers carry neither.
 
 ## Operator switch
 

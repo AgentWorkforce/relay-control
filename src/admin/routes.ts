@@ -773,6 +773,8 @@ export function createAdminModule(input: {
           scopes: body.scopes,
           email: body.email,
           mcpConsent: body.mcpConsent,
+          maxUses: body.maxUses,
+          policyConsent: body.policyConsent,
           actor: userActor(access),
         });
         json(response, 201, token);
