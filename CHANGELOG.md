@@ -5,6 +5,12 @@ assigned at release.
 
 ## Unreleased
 
+- Fixed: gate-only desktop identity sync no longer skips an identity whose
+  upstream Relaycast card lacks `metadata.relaygate.agent_id` (relaygate only
+  stamps it on first registration); the field is compared only when present
+  and relaygate's whoami remains the proof. Each skipped identity now logs
+  `desktop identity skipped` with the agent name, reason and failed check
+  (never the token).
 - Added: workspace leaders. `GET /api/v1/workspaces/{id}/leaders` (any
   member) and `PUT` (workspace owner/admin, `{"patterns": [...]}`, `[]`
   clears) proxy the Relaycast engine's `/v1/workspace/leaders` setting with the
