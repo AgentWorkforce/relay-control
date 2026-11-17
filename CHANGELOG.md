@@ -5,6 +5,11 @@ assigned at release.
 
 ## Unreleased
 
+- Fixed: `describe_capabilities` now says that Relay Connect rooms are not
+  available on this self-hosted installation, that no setting enables them
+  and that joining a public hosted Connect invite from Agent Relay Desktop is
+  separate; it no longer files them under "not part of the self-hosted
+  edition". No tools or routes change.
 - Added: `GET /api/v1/organizations/{org}/fleet` (docs/fleet.md) for owners
   and admins: members, 200 per page, with their Desktop machines (host name,
   client version, platform, enrollment key, managed, last seen, status) and
