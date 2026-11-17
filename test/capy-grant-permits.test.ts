@@ -37,6 +37,9 @@ async function fixture(t:TestContext) {
   let onAddress:(()=>Promise<void>)|undefined,onAuthenticated:(()=>Promise<void>)|undefined;
   let unavailable=false;
   const roster=(a:any)=>({...a,address:null,kind:"agent",persona:null,status:"active",lastSeen:null});
+  // The bounded names lookup; each call is one roster read for the race hook.
+  const findAgentsByNames=async(_key:string,names:string[])=>{await onAddress?.();
+    return [roster({id:"ag_peer",name:"peer",metadata:{}}),...[...agents.values()].map(roster)].filter(a=>names.includes(a.name));};
   const client={
     getRosterAgent:async(_key:string,name:string)=>agents.has(name)?roster(agents.get(name)):null,
     getAgent:async(_key:string,name:string)=>agents.has(name)?roster(agents.get(name)):null,
@@ -48,6 +51,8 @@ async function fixture(t:TestContext) {
       const a=[...agents.values()].find(a=>a.token===token);assert.ok(a);await onAuthenticated?.();return {...roster(a),workspaceId:"rc-primary",channels:[]};},
     releaseHosted:async()=>undefined,
     listAgents:async()=>{await onAddress?.();return [roster({id:"ag_peer",name:"peer",metadata:{}}),...[...agents.values()].map(roster)];},
+    findAgentsByNames,
+    findAgentByName:async(key:string,name:string)=>(await findAgentsByNames(key,[name]))[0]??null,
     heartbeat:async()=>undefined,
     getMessageDeliveries:async(token:string,id:string)=>{assert.ok([...agents.values()].some(a=>a.token===token));assert.equal(id,"12");return [];},
     sendDirectMessage:async(input:any)=>{writes.push(input);return {message:{id:"12"},conversationId:"dm"};},

@@ -221,6 +221,12 @@ export function createRelaycastWorld(roster: unknown[]) {
       agent.token = `at_${agent.name}_${next()}`;
       return ok({ agent_id: agent.id, token: agent.token });
     }
+    if (method === "GET" && path === "/v1/agents" && workspace) {
+      // The roster; with `names`, the engine's bounded lookup of those names only.
+      const names = query.getAll("names");
+      const entries = [...agents.values()].map(rosterEntry);
+      return ok(names.length ? entries.filter(entry => names.includes(entry.name)) : entries);
+    }
     if ((match = /^\/v1\/agents\/([^/]+)$/.exec(path)) && method === "GET" && workspace) {
       const agent = agents.get(decodeURIComponent(match[1]!));
       return agent ? ok(rosterEntry(agent)) : fail(404, "agent_not_found");
