@@ -6,6 +6,13 @@ assigned at release.
 ## Unreleased
 
 - Added: a webhook inbox can wake a bound cloud agent (migration 0076). With `events_shim` selected, the Agent Relay MCP's `link_webhook_inbox` lets a current owner or admin link an inbox they created to their own bound Amp thread, Replica or Capy binding. Each post then reaches that agent as a relay DM from the inbox's own relay identity, framed as untrusted webhook data with `@mentions` neutralised. `unlink_webhook_inbox` undoes it. Every forward re-checks the inbox, the binding row and generation, the relay agent id, the name's current holder and the Relaycast workspace, and marks the link broken if any changed. The minute sweep releases a deleted inbox's identity on the Relaycast workspace it was registered on. Capy links wake the thread once native Capy delivery is mounted. See docs/events-shim.md.
+- Added: `GET /api/v1/organizations/{org}/fleet` (docs/fleet.md) for owners
+  and admins: members, 200 per page, with their Desktop machines (host name,
+  client version, platform, enrollment key, managed, last seen, status) and
+  each machine's `policyMatch` (`current`, `stale`, `unknown` or `mismatch`)
+  against the workspace policy revision, page totals and, with
+  `usage_people`, per-member usage. Every read writes a `fleet.viewed` audit
+  row. No migration.
 - Added: member self-mint of desktop enrollment keys at
   `POST /api/v1/me/enrollment-keys` (also under `/cloud`). A signed-in member
   mints a single-use key for their own next machine; the body takes only

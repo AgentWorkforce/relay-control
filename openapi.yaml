@@ -1834,6 +1834,32 @@ paths:
       responses:
         "200": { description: "`{ events: [{ viewerUserId, viewerName, subjectUserId, subjectName, days, page, createdAt }] }`" }
         "403": { description: "`forbidden` or `feature_not_enabled`" }
+  /api/v1/organizations/{organizationId}/fleet:
+    get:
+      operationId: getOrganizationFleet
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: |
+        Owners and admins (docs/fleet.md): members, 200 per page ordered by
+        email then user id, each with their Agent Relay Desktop machines
+        (device-client sessions that are live or ended in the last 30 days),
+        what each machine last reported and whether it runs the current
+        workspace policy. With `usage_people` each member also carries usage
+        from the People report; without it `usage` is null. Every read writes
+        a `fleet.viewed` audit row.
+      parameters:
+        - { name: organizationId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: days, in: query, required: false, schema: { type: integer, enum: [7, 30, 90], default: 30 } }
+        - { name: cursor, in: query, required: false, description: "`next_cursor` of the previous page", schema: { type: string } }
+      responses:
+        "200":
+          description: One page of the fleet view
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FleetView" }
+        "400": { description: "`invalid_request`: `days` is not 7, 30 or 90, the cursor is malformed or given twice, or another query parameter was given" }
+        "401": { description: Missing, invalid, or expired token }
+        "403": { description: "`forbidden`: not an owner or admin of the organization" }
+        "404": { description: Organization not found for this token }
   /api/v1/desktop/releases:
     get:
       operationId: getDesktopGitHubReleases
@@ -8937,6 +8963,95 @@ components:
       description: A declared `expected_assets[].name`; one path segment.
       schema: { type: string, maxLength: 255, pattern: "^[A-Za-z0-9][A-Za-z0-9_+-]*(?:\\.[A-Za-z0-9_+-]+)*$" }
   schemas:
+    FleetView:
+      type: object
+      required: [policy_revision, range, totals, members, usage_unavailable, truncated, next_cursor]
+      properties:
+        policy_revision: { type: integer, description: Current workspace policy revision (1 when unset). }
+        range:
+          type: object
+          required: [days, from, to]
+          properties:
+            days: { type: integer, enum: [7, 30, 90] }
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+        totals:
+          type: object
+          description: Counts over the members and machines of this page.
+          required: [members, machines, managed, policy, clientVersions]
+          properties:
+            members: { type: integer }
+            machines: { type: integer }
+            managed: { type: integer }
+            policy:
+              type: object
+              required: [current, stale, unknown, mismatch]
+              properties:
+                current: { type: integer }
+                stale: { type: integer }
+                unknown: { type: integer }
+                mismatch: { type: integer }
+            clientVersions:
+              type: array
+              items:
+                type: object
+                required: [version, machines]
+                properties:
+                  version: { type: [string, "null"] }
+                  machines: { type: integer }
+        members: { type: array, items: { $ref: "#/components/schemas/FleetMember" } }
+        usage_unavailable:
+          type: array
+          description: "`[\"usage\"]` when `usage_people` is off; `[\"sessionsUploaded\"]` when the session read API could not be read."
+          items: { type: string, enum: [usage, sessionsUploaded] }
+        truncated: { type: boolean, description: Usage counts are lower bounds. }
+        next_cursor: { type: [string, "null"] }
+    FleetMember:
+      type: object
+      required: [user, role, machines, usage]
+      properties:
+        user:
+          type: object
+          required: [id, email, name]
+          properties:
+            id: { type: string, format: uuid }
+            email: { type: string }
+            name: { type: [string, "null"] }
+        role: { type: string, enum: [owner, admin, member] }
+        machines: { type: array, items: { $ref: "#/components/schemas/FleetMachine" } }
+        usage:
+          type: [object, "null"]
+          required: [sessionsUploaded, lastSessionAt, topProjects]
+          properties:
+            sessionsUploaded: { type: [integer, "null"] }
+            lastSessionAt: { type: [string, "null"], format: date-time }
+            topProjects:
+              type: array
+              items:
+                type: object
+                required: [name, sessions]
+                properties:
+                  name: { type: string }
+                  sessions: { type: integer }
+    FleetMachine:
+      type: object
+      required: [sessionId, hostName, clientVersion, platform, enrolledVia, policyRevision, policyMatch, managed, lastSeenAt, status]
+      properties:
+        sessionId: { type: string, format: uuid }
+        hostName: { type: [string, "null"] }
+        clientVersion: { type: [string, "null"] }
+        platform: { type: [string, "null"] }
+        enrolledVia:
+          type: [object, "null"]
+          required: [keyId, label]
+          properties:
+            keyId: { type: string, format: uuid }
+            label: { type: string }
+        policyRevision: { type: [integer, "null"], description: Last workspace policy revision the machine reported applying. }
+        policyMatch: { type: string, enum: [current, stale, unknown, mismatch] }
+        managed: { type: boolean }
+        lastSeenAt: { type: string, format: date-time }
+        status: { type: string, enum: [active, revoked, expired] }
     RelayNodeError:
       type: object
       required: [error, message]
