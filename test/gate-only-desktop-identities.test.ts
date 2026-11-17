@@ -10,9 +10,9 @@ import { claudeSigner } from "./support/claude-signer.js";
 // Gate-only installs (relaygatePublicUrl set): Agent Relay Desktop enrols each
 // chat at relaygate and holds an rg_ token that only relaygate accepts, and
 // agent_id is relaygate's agent id. Identity sync and every MCP call made with
-// that token are verified through relaygate's GET /v1/whoami plus the upstream
-// Relaycast agent card (metadata.relaygate.agent_id), and the chat's own
-// messaging goes through relaygate.
+// that token are verified through relaygate's GET /v1/whoami (the proof); the
+// upstream Relaycast agent card's metadata.relaygate.agent_id is compared only
+// when present, and the chat's own messaging goes through relaygate.
 
 const GATE = "https://gate.selfhosted.test";
 const PROOF = "_agent_relay_attestation";
@@ -124,7 +124,7 @@ test("gate-only sync verifies rg_ identities through relaygate whoami and the up
   assert.deepEqual(state.leaked, [], "no rg_ token was sent to Relaycast");
 });
 
-test("gate-only sync skips an identity relaygate refuses, or whose whoami or upstream card does not match, as unverified and keeps no attestation key", async (t) => {
+test("gate-only sync skips an identity relaygate refuses, or whose whoami or upstream card relaygate id does not match, as unverified and keeps no attestation key", async (t) => {
   const { state, enrol, sync, stored, keys } = await gateDesktop(t);
   const refused = enrol("refused-chat");
   state.tokens.delete(refused.token);
@@ -132,9 +132,8 @@ test("gate-only sync skips an identity relaygate refuses, or whose whoami or ups
   state.tokens.set(renamed.token, { ...state.tokens.get(renamed.token)!, name: "someone-else" });
   const otherId = enrol("other-id-chat");
   state.tokens.set(otherId.token, { ...state.tokens.get(otherId.token)!, agent_id: "rga_other" });
-  const uncarded = enrol("uncarded-chat", { card: { source: "relay-desktop" } });
   const miscarded = enrol("miscarded-chat", { card: { relaygate: { agent_id: "rga_someone_else" } } });
-  const all = [refused, renamed, otherId, uncarded, miscarded];
+  const all = [refused, renamed, otherId, miscarded];
   const synced = await sync(all);
   assert.equal(synced.status, 200, synced.raw);
   assert.equal(synced.body.synced, 0);
@@ -238,4 +237,58 @@ test("a gate-only desktop identity whose rg_ token relaygate no longer accepts f
   assert.match(sent.body.result.content[0].text as string, /no longer available\. Open Agent Relay Desktop to re-sync it/);
   assert.equal(env.world.bodies.some((row) => row.method === "POST" && row.path === "/v1/dm"), false, "nothing was sent");
   assert.deepEqual(state.leaked, []);
+});
+
+test("gate-only sync verifies by whoami when the upstream card lacks metadata.relaygate or is missing", async (t) => {
+  const { env, state, enrol, sync, stored, keys, signer } = await gateDesktop(t);
+  // relaygate's takeover path and agent metadata updates leave the card without metadata.relaygate.
+  const uncarded = enrol("uncarded-chat", { card: { source: "relay-desktop" } });
+  // No upstream card at all (Relaycast answers 404).
+  const cardless = enrol("cardless-chat");
+  env.world.agents.delete("cardless-chat");
+  const synced = await sync([uncarded, cardless]);
+  assert.equal(synced.status, 200, synced.raw);
+  assert.equal(synced.body.synced, 2);
+  assert.equal(synced.body.skipped, undefined);
+  assert.deepEqual((await stored()).map((row) => row.agent_remote_id), [cardless.agent_id, uncarded.agent_id]);
+  assert.deepEqual(await keys(), [{ kid: signer.kid }]);
+  assert.deepEqual(state.leaked, []);
+});
+
+test("gate-only sync skips an identity whose upstream card names another relaygate agent id", async (t) => {
+  const { enrol, sync, stored } = await gateDesktop(t);
+  const miscarded = enrol("miscarded-chat", { card: { relaygate: { agent_id: "rga_someone_else" } } });
+  const synced = await sync([miscarded]);
+  assert.equal(synced.status, 200, synced.raw);
+  assert.equal(synced.body.synced, 0);
+  assert.deepEqual(synced.body.skipped, [{ agent_id: miscarded.agent_id, reason: "unverified" }]);
+  assert.deepEqual(await stored(), []);
+});
+
+test("each skipped gate identity logs one 'desktop identity skipped' line with reason and check, never the token", async (t) => {
+  const { env, state, enrol, sync } = await gateDesktop(t);
+  const refused = enrol("refused-chat");
+  state.tokens.delete(refused.token);
+  const theirs = enrol("their-chat", { userId: randomUUID() });
+  const warn = t.mock.method(console, "warn", () => {});
+  const synced = await sync([refused, theirs]);
+  assert.equal(synced.status, 200, synced.raw);
+  assert.equal(synced.body.synced, 0);
+  // The HTTP response keeps its shape: no check field.
+  for (const row of synced.body.skipped) assert.deepEqual(Object.keys(row).sort(), ["agent_id", "reason"]);
+  const lines = warn.mock.calls.filter((call) => call.arguments[0] === "[selfhost-api] desktop identity skipped");
+  assert.equal(lines.length, 2, JSON.stringify(warn.mock.calls.map((call) => call.arguments[0])));
+  const fields = lines.map((call) => call.arguments[1] as Record<string, unknown>)
+    .sort((a, b) => String(a.agent_name).localeCompare(String(b.agent_name)));
+  assert.deepEqual(fields[0], {
+    workspace_id: env.workspaceId, user_id: env.ownerId, source_id: "desktop-source-gate",
+    agent_name: "refused-chat", agent_id: refused.agent_id, reason: "unverified", check: "whoami_refused:401", status: 401,
+  });
+  assert.deepEqual(fields[1], {
+    workspace_id: env.workspaceId, user_id: env.ownerId, source_id: "desktop-source-gate",
+    agent_name: "their-chat", agent_id: theirs.agent_id, reason: "not_owned", check: "whoami_user_id",
+  });
+  for (const [index, item] of [refused, theirs].entries()) {
+    assert.equal(JSON.stringify(fields).includes(item.token), false, `token ${index} leaked into the log`);
+  }
 });

@@ -6,6 +6,12 @@ assigned at release.
 ## Unreleased
 
 - Added: a webhook inbox can wake a bound cloud agent (migration 0076). With `events_shim` selected, the Agent Relay MCP's `link_webhook_inbox` lets a current owner or admin link an inbox they created to their own bound Amp thread, Replica or Capy binding. Each post then reaches that agent as a relay DM from the inbox's own relay identity, framed as untrusted webhook data with `@mentions` neutralised. `unlink_webhook_inbox` undoes it. Every forward re-checks the inbox, the binding row and generation, the relay agent id, the name's current holder and the Relaycast workspace, and marks the link broken if any changed. The minute sweep releases a deleted inbox's identity on the Relaycast workspace it was registered on. Capy links wake the thread once native Capy delivery is mounted. See docs/events-shim.md.
+- Fixed: gate-only desktop identity sync no longer skips an identity whose
+  upstream Relaycast card lacks `metadata.relaygate.agent_id` (relaygate only
+  stamps it on first registration); the field is compared only when present
+  and relaygate's whoami remains the proof. Each skipped identity now logs
+  `desktop identity skipped` with the agent name, reason and failed check
+  (never the token).
 - Added: workspace leaders. `GET /api/v1/workspaces/{id}/leaders` (any
   member) and `PUT` (workspace owner/admin, `{"patterns": [...]}`, `[]`
   clears) proxy the Relaycast engine's `/v1/workspace/leaders` setting with the
@@ -20,8 +26,8 @@ assigned at release.
   and Copilot attestation keys are stored. Desktop identity sync and every MCP
   call check the identity's `rg_` token with relaygate's `GET /v1/whoami`
   (agent id and name, plus the enrolling user once relaygate reports
-  `user_id`) and require the upstream Relaycast agent of that name to carry
-  the same `metadata.relaygate.agent_id`. MCP messaging as a desktop identity
+  `user_id`) and compare the upstream Relaycast agent's
+  `metadata.relaygate.agent_id` when present. MCP messaging as a desktop identity
   goes through relaygate. Before, Relaycast refused the `rg_` token, every
   identity was skipped `unverified`, the attestation key was dropped and
   attested MCP calls failed with "unknown key". No migration.

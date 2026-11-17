@@ -24,9 +24,15 @@ import { createRelaycastClient, RelaycastCallError, type RelaycastClient } from 
  * Gate-only installs (relaygatePublicUrl set): the Desktop enrols each chat
  * at relaygate and holds an rg_ token. relaygate's GET /v1/whoami then
  * confirms the token (agent id, name and, when relaygate reports it, the
- * enrolling user), and the upstream Relaycast agent of that name must carry
- * the same id in metadata.relaygate.agent_id. The stored agent_remote_id is
- * relaygate's agent id.
+ * enrolling user); whoami is the proof. The upstream Relaycast agent card of
+ * that name is advisory: relaygate stamps metadata.relaygate.agent_id only
+ * when it first registers the upstream agent (a takeover or a metadata
+ * update can leave it missing), so the card may be absent or lack the field,
+ * and only a field naming a different agent id rejects the identity. The
+ * stored agent_remote_id is relaygate's agent id.
+ *
+ * Every skipped or rejected identity logs "desktop identity skipped" with
+ * the agent name, reason and failed check; never the token.
  *
  * A hosted MCP session links to one synced identity with join_relay
  * desktop_address (table desktop_relay_session_bindings, migration 0035);
@@ -110,6 +116,22 @@ class SyncError extends Error {
 
 type Verified = Identity & { remoteId: string };
 type Skipped = { agent_id: string; reason: "unverified" | "not_owned" };
+/** Why one identity was skipped: the public reason plus the failed check (logged only, never returned). */
+type SkipCause = { reason: Skipped["reason"]; check: string; status?: number };
+
+/** Operator log sink; fields never carry a token, a whoami body or any secret. */
+export type DesktopIdentityLog = (message: string, fields: Record<string, unknown>) => void;
+export const DESKTOP_IDENTITY_SKIPPED = "desktop identity skipped";
+const defaultLog: DesktopIdentityLog = (message, fields) => console.warn(`[selfhost-api] ${message}`, fields);
+
+/** The first failing check of an ordered [failed, check] list, or null. */
+function firstFailed(checks: Array<readonly [boolean, string]>): string | null {
+  for (const [failed, check] of checks) if (failed) return check;
+  return null;
+}
+
+/** The upstream HTTP status of a refused Relaycast or relaygate call, else undefined. */
+const refusedStatus = (error: unknown) => (error instanceof RelaycastCallError ? error.status : undefined);
 
 /** The relaygate agent id on an upstream Relaycast agent card (metadata.relaygate.agent_id), or null. */
 export function relaygateAgentId(metadata: Record<string, unknown>): string | null {
@@ -132,38 +154,54 @@ function unavailable(outcomes: PromiseSettledResult<unknown>[]): void {
 
 /**
  * Gate-only installs: the Desktop enrolled the chat at relaygate and holds an
- * rg_ token Relaycast does not accept. relaygate's whoami must name the same
- * agent id and name (and the caller, once relaygate reports user_id), and
- * the upstream Relaycast agent of that name must carry the same relaygate
- * agent id in metadata.relaygate.agent_id.
+ * rg_ token Relaycast does not accept. relaygate's whoami is the proof: it
+ * must name the same agent id and name (and the caller, once relaygate
+ * reports user_id). The upstream Relaycast agent card is checked only when it
+ * carries metadata.relaygate.agent_id: a different id there rejects the
+ * identity; a missing card or field does not (relaygate stamps it only on
+ * first registration).
  */
 async function verifyGated(
   gate: RelaycastClient, client: RelaycastClient, access: Access, item: Identity,
-): Promise<Skipped["reason"] | null> {
+): Promise<SkipCause | null> {
   const [whoami, remote] = await Promise.allSettled([
     gate.whoami(item.token),
     client.getAgent(access.workspace.relaycastApiKey, item.name),
   ]);
-  if (whoami.status === "rejected" && refused(whoami.reason)) return "unverified";
+  if (whoami.status === "rejected" && refused(whoami.reason)) {
+    const status = refusedStatus(whoami.reason);
+    return { reason: "unverified", check: `whoami_refused:${status}`, ...(status !== undefined ? { status } : {}) };
+  }
   unavailable([whoami, remote]);
   const who = (whoami as PromiseFulfilledResult<Awaited<ReturnType<RelaycastClient["whoami"]>>>).value;
   const named = (remote as PromiseFulfilledResult<Awaited<ReturnType<RelaycastClient["getAgent"]>>>).value;
-  if (who.agentId !== item.agent_id || who.name !== item.name) return "unverified";
-  if (who.userId !== null && who.userId !== access.principal.userId) return "not_owned";
-  if (!named || relaygateAgentId(named.metadata) !== item.agent_id) return "unverified";
+  if (who.agentId !== item.agent_id) return { reason: "unverified", check: "whoami_agent_id" };
+  if (who.name !== item.name) return { reason: "unverified", check: "whoami_name" };
+  if (who.userId !== null && who.userId !== access.principal.userId) return { reason: "not_owned", check: "whoami_user_id" };
+  const carded = named ? relaygateAgentId(named.metadata) : null;
+  if (carded !== null && carded !== item.agent_id) return { reason: "unverified", check: "card_relaygate_agent_id" };
   return null;
 }
 
 async function verify(
-  client: RelaycastClient, access: Access, items: Identity[], gate?: RelaycastClient,
+  client: RelaycastClient, access: Access, items: Identity[], gate: RelaycastClient | undefined,
+  log: DesktopIdentityLog | undefined, sourceId: string,
 ): Promise<{ verified: Verified[]; skipped: Skipped[] }> {
   const owner = ownerHash(access.principal.userId);
   const verified: Verified[] = [];
   const skipped: Skipped[] = [];
+  const skip = (item: Identity, cause: SkipCause) => {
+    skipped.push({ agent_id: item.agent_id, reason: cause.reason });
+    log?.(DESKTOP_IDENTITY_SKIPPED, {
+      workspace_id: access.workspace.id, user_id: access.principal.userId, source_id: sourceId,
+      agent_name: item.name, agent_id: item.agent_id, reason: cause.reason, check: cause.check,
+      ...(cause.status !== undefined ? { status: cause.status } : {}),
+    });
+  };
   for (const item of items) {
     if (gate) {
-      const reason = await verifyGated(gate, client, access, item);
-      if (reason) skipped.push({ agent_id: item.agent_id, reason });
+      const cause = await verifyGated(gate, client, access, item);
+      if (cause) skip(item, cause);
       else verified.push({ ...item, remoteId: item.agent_id });
       continue;
     }
@@ -172,19 +210,26 @@ async function verify(
       client.getAgent(access.workspace.relaycastApiKey, item.name),
     ]);
     if (authenticated.status === "rejected" && refused(authenticated.reason)) {
-      skipped.push({ agent_id: item.agent_id, reason: "unverified" });
+      const status = refusedStatus(authenticated.reason);
+      skip(item, { reason: "unverified", check: `authenticated_refused:${status}`, ...(status !== undefined ? { status } : {}) });
       continue;
     }
     unavailable([authenticated, remote]);
     const auth = (authenticated as PromiseFulfilledResult<Awaited<ReturnType<RelaycastClient["authenticatedAgent"]>>>).value;
     const named = (remote as PromiseFulfilledResult<Awaited<ReturnType<RelaycastClient["getAgent"]>>>).value;
-    if (!named || auth.id !== item.agent_id || auth.name !== item.name || auth.address !== item.address ||
-        named.id !== item.agent_id || auth.metadata.source !== DESKTOP_SOURCE || named.metadata.source !== DESKTOP_SOURCE) {
-      skipped.push({ agent_id: item.agent_id, reason: "unverified" });
+    const unverified = firstFailed([
+      [!named, "card_missing"],
+      [auth.id !== item.agent_id || named?.id !== item.agent_id, "agent_id"],
+      [auth.name !== item.name, "name"],
+      [auth.address !== item.address, "address"],
+      [auth.metadata.source !== DESKTOP_SOURCE || named?.metadata.source !== DESKTOP_SOURCE, "source"],
+    ]);
+    if (unverified) {
+      skip(item, { reason: "unverified", check: unverified });
       continue;
     }
     if (auth.metadata.owner_hash !== owner) {
-      skipped.push({ agent_id: item.agent_id, reason: "not_owned" });
+      skip(item, { reason: "not_owned", check: "owner_hash" });
       continue;
     }
     verified.push({ ...item, remoteId: auth.id });
@@ -267,6 +312,8 @@ export async function syncDesktopIdentities(input: {
   sourceId: string;
   identities: Identity[];
   attestationKey?: AttestationKey;
+  /** Logs each skipped identity ("desktop identity skipped"); never given the token. */
+  log?: DesktopIdentityLog;
 }): Promise<{ synced: number; skipped?: Skipped[]; identities: DesktopIdentityLink[] }> {
   const { access } = input;
   const source = normalizeDesktopSourceId(input.sourceId);
@@ -282,7 +329,7 @@ export async function syncDesktopIdentities(input: {
   if (addresses.size !== input.identities.length || ids.size !== input.identities.length) {
     throw new SyncError(400, "invalid_request", "Desktop identities must have unique addresses and agent IDs.");
   }
-  const { verified, skipped } = await verify(input.client, access, input.identities, input.gate);
+  const { verified, skipped } = await verify(input.client, access, input.identities, input.gate, input.log, source);
   await replace(input.database, input.keyring, access, source, verified, input.attestationKey);
   const links = await desktopIdentityLinks(input.database, access.workspace.id, access.principal.userId, source);
   return {
@@ -334,6 +381,8 @@ export async function handleDesktopIdentityRoutes(
     relaygatePublicUrl?: string | null;
     /** True for a header bearer, or a /cloud cookie request from an allowed origin. */
     csrfAllowed: (request: IncomingMessage) => boolean;
+    /** Logs each skipped identity; defaults to console.warn with the [selfhost-api] prefix. */
+    log?: DesktopIdentityLog;
   },
 ): Promise<boolean> {
   const match = /^\/api\/v1\/workspaces\/([^/]+)\/messaging\/desktop-identities$/.exec(path);
@@ -395,6 +444,7 @@ export async function handleDesktopIdentityRoutes(
       sourceId: parsed.data.source_id,
       identities: parsed.data.identities,
       attestationKey: parsed.data.attestation_key,
+      log: deps.log ?? defaultLog,
     });
     deps.json(response, 200, result, true);
   } catch (error) {
@@ -540,8 +590,10 @@ export async function unbindDesktopSession(database: SqlExecutor, input: {
  * Re-checks a stored identity with Relaycast: on this workspace's current
  * relay, and its token still controls the same relay-desktop agent owned by
  * this user. With `gate` (gate-only installs) the stored rg_ token is checked
- * with relaygate's whoami instead, and the upstream Relaycast agent of that
- * name must carry the same relaygate agent id. Throws DesktopIdentityUnavailable.
+ * with relaygate's whoami instead (the proof); the upstream Relaycast agent
+ * card is compared only when it carries metadata.relaygate.agent_id, and a
+ * missing card or field is accepted. Throws DesktopIdentityUnavailable; on
+ * the gate path each rejection is logged ("desktop identity skipped").
  */
 export async function verifyDesktopIdentity(input: {
   keyring: EncryptionKeyring;
@@ -553,6 +605,10 @@ export async function verifyDesktopIdentity(input: {
   userId: string;
   relaycastWorkspaceId: string;
   row: DesktopIdentityRow;
+  /** Self-host workspace id, logged with a rejected gate identity when known. */
+  workspaceId?: string;
+  /** Logs each rejected gate identity ("desktop identity skipped"); never given the token. */
+  log?: DesktopIdentityLog;
 }): Promise<LinkedDesktopIdentity> {
   const { row } = input;
   if (row.relaycastWorkspaceId !== input.relaycastWorkspaceId) {
@@ -565,22 +621,42 @@ export async function verifyDesktopIdentity(input: {
     throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
   }
   if (input.gate) {
-    if (!input.relaycastApiKey) throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.unverified);
+    const reject = (message: string, cause: SkipCause): never => {
+      input.log?.(DESKTOP_IDENTITY_SKIPPED, {
+        ...(input.workspaceId !== undefined ? { workspace_id: input.workspaceId } : {}),
+        user_id: input.userId, agent_name: row.agentName, agent_id: row.agentRemoteId,
+        reason: cause.reason, check: cause.check, ...(cause.status !== undefined ? { status: cause.status } : {}),
+      });
+      throw new DesktopIdentityUnavailable(message);
+    };
+    if (!input.relaycastApiKey) {
+      return reject(DESKTOP_IDENTITY_MESSAGES.unverified, { reason: "unverified", check: "relaycast_api_key_missing" });
+    }
     const [whoami, remote] = await Promise.allSettled([
       input.gate.whoami(token),
       input.client.getAgent(input.relaycastApiKey, row.agentName),
     ]);
     if (whoami.status === "rejected") {
-      if (refused(whoami.reason)) throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
-      throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.unverified);
+      if (refused(whoami.reason)) {
+        const status = refusedStatus(whoami.reason);
+        return reject(DESKTOP_IDENTITY_MESSAGES.gone,
+          { reason: "unverified", check: `whoami_refused:${status}`, ...(status !== undefined ? { status } : {}) });
+      }
+      return reject(DESKTOP_IDENTITY_MESSAGES.unverified, { reason: "unverified", check: "whoami_unavailable" });
     }
-    if (remote.status === "rejected") throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.unverified);
+    if (remote.status === "rejected") {
+      return reject(DESKTOP_IDENTITY_MESSAGES.unverified, { reason: "unverified", check: "card_unavailable" });
+    }
     const who = whoami.value;
-    const named = remote.value;
-    if (who.agentId !== row.agentRemoteId || who.name !== row.agentName ||
-        (who.userId !== null && who.userId !== input.userId) ||
-        !named || relaygateAgentId(named.metadata) !== row.agentRemoteId) {
-      throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
+    const carded = remote.value ? relaygateAgentId(remote.value.metadata) : null;
+    const failed = firstFailed([
+      [who.agentId !== row.agentRemoteId, "whoami_agent_id"],
+      [who.name !== row.agentName, "whoami_name"],
+      [who.userId !== null && who.userId !== input.userId, "whoami_user_id"],
+      [carded !== null && carded !== row.agentRemoteId, "card_relaygate_agent_id"],
+    ]);
+    if (failed) {
+      return reject(DESKTOP_IDENTITY_MESSAGES.gone, { reason: failed === "whoami_user_id" ? "not_owned" : "unverified", check: failed });
     }
     return { id: row.id, name: row.agentName, address: row.address, agentId: row.agentRemoteId, token };
   }
@@ -617,6 +693,8 @@ export async function linkedDesktopIdentity(input: {
   relaycastWorkspaceId: string;
   nativeSession: { kind: string; id: string };
   sourceId?: string;
+  /** Logs each rejected gate identity; passed to verifyDesktopIdentity. */
+  log?: DesktopIdentityLog;
 }): Promise<LinkedDesktopIdentity> {
   const result = await input.database.query(
     `SELECT ${IDENTITY_COLUMNS} FROM desktop_relay_identities i
@@ -633,7 +711,8 @@ export async function linkedDesktopIdentity(input: {
   return verifyDesktopIdentity({ keyring: input.keyring, client: input.client,
     ...(input.gate ? { gate: input.gate } : {}),
     ...(input.relaycastApiKey !== undefined ? { relaycastApiKey: input.relaycastApiKey } : {}),
-    userId: input.userId, relaycastWorkspaceId: input.relaycastWorkspaceId, row });
+    ...(input.log ? { log: input.log } : {}),
+    userId: input.userId, workspaceId: input.workspaceId, relaycastWorkspaceId: input.relaycastWorkspaceId, row });
 }
 
 export { COPILOT_ATTESTATION_CAPABILITY };
