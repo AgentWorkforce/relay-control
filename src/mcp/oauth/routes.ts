@@ -161,7 +161,9 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
     const suggested=requestValue.requestedAgentName??"";
     const destination=redirectDestination(requestValue.redirectUri);
     const labels:Record<string,string>={"relay:mcp":"Use available MCP tools in this workspace","relay:agents":"Request supported agent actions",
-      "relay:events":"Receive subscribed workspace events",openid:"Share a stable identifier specific to this client"};
+      "relay:events":"Receive subscribed workspace events",openid:"Share a stable identifier specific to this client",
+      // Its own line, shown only when the client asked for it: approving relay:mcp never implies transcript reads.
+      "relay:history":"Read this workspace's shared session history on your behalf"};
     const connectionSelect=existing.length?`<label>Existing connection <select id="connection"><option value="">New connection</option>${existing.map(row=>`<option value="${escaped(row.id)}">${escaped(row.agentName)}</option>`).join("")}</select></label>`:"";
     const heading=client!.clientName?`Connect an app calling itself &quot;${escaped(client!.clientName)}&quot;`:"Connect an unnamed app";
     const caution=destination.loopback?"":`<p id="caution"><strong>Caution:</strong> the app chose its own name, and nobody has verified it. Connect only if you trust ${escaped(destination.label)}.</p>`;

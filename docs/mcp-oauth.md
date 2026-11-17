@@ -126,7 +126,10 @@ issued.
 An omitted scope receives the resource's baseline. A supplied scope that
 contains no resource permission is refused with `invalid_scope`. The shared
 and root resources require `relay:mcp`. Optional `relay:agents` does not grant
-native API, desktop or transcript-history authority.
+native API, desktop or transcript-history authority. Optional `relay:history`
+is offered only by the shared-sessions resource, is never part of the baseline
+and is refused with `invalid_scope` unless `relay:mcp` is requested with it
+(see Session reads).
 
 Access tokens last one hour; refresh tokens last 30 days. Refresh rotates the
 pair and preserves its issued scope limit. Retired refresh tokens are always
@@ -139,9 +142,29 @@ its previous name cannot take over the connection. MCP session IDs identify
 chats, so multiple chats using the connection share the approved agent.
 The connection cannot act as the person or another owned agent.
 
-Transcript history is unavailable through this OAuth credential. Capability
-discovery reports that restriction; an authorized native Agent Relay session
-is required for transcript reads.
+### Session reads
+
+An OAuth connection reads shared sessions only when the client explicitly
+requested `relay:history` on the shared-sessions resource and the person
+approved it. The consent page lists it as its own line ("Read this
+workspace's shared session history on your behalf"); approving `relay:mcp`
+never implies it, and an omitted scope never includes it. The root and
+relay-events resources never carry it.
+
+Reads run on the person's behalf through the server-side History reader: a
+read session is minted for exactly that person, organization and workspace
+with reader kind `mcp`, in both read API modes. The OAuth access token is
+never forwarded to History or the session-read route and never gains
+`rth:read`. Without the scope every shared-session tool answers "Session reads
+need the relay:history scope on this OAuth connection.", and capability
+discovery reports `shared_session_reads` as restricted with how to enable it.
+Relay messaging on the same connection is unaffected either way.
+
+Admission narrows each request to the scopes of both the session and the live
+grant, so revoking the connection, or the grant losing `relay:history`, refuses
+further reads. Every read is audited with `auth_mode` `oauth` and the OAuth
+client and grant ids. There is no installation switch: the operator control is
+OAuth client and grant revocation.
 
 ## OpenID Connect
 
