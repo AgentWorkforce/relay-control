@@ -63,7 +63,13 @@ are distinct from a ready recorded summary and from consumer test success.
 Both tools use the existing shared-session reader: a native user session with
 `rth:read`, live workspace admission, per-user reader credentials, forced
 workspace query and matching workspace response attestation. OAuth messaging
-credentials gain no history authority. Neither tool issues service/operator
+credentials gain no history authority. On a self-hosted install an OAuth
+connection (`mcp_at_`) therefore cannot use these tools: every call answers
+"Session reads require an exchanged user session with rth:read.", in both read
+API modes, and no installation setting changes that. Read through a client
+connected with a CLI login credential (`sh_at_`) or a Desktop credential
+instead; the hosted edition reads on the person's behalf for OAuth connections
+(see [mcp-oauth.md](mcp-oauth.md#session-reads)). Neither tool issues service/operator
 credentials, generates summaries, changes privacy settings or selects a
 different backend after a reader refusal. `401`, `403`, `404`, `501`, transient
 errors and missing attestation preserve existing fail-closed behavior.

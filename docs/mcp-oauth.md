@@ -128,6 +128,22 @@ contains no resource permission is refused with `invalid_scope`. The shared
 and root resources require `relay:mcp`. Optional `relay:agents` does not grant
 native API, desktop or transcript-history authority.
 
+### Session reads
+
+An OAuth connection cannot read shared sessions on a self-hosted install.
+Every shared-session tool (`search_shared_sessions`,
+`list_session_summaries`, `get_session_summary`, `get_shared_session` and the
+others on the sessions resource) answers "Session reads require an exchanged
+user session with rth:read." for an `mcp_at_` bearer, in both read API modes,
+because an OAuth principal never carries `rth:read` and the reader never
+forwards or promotes the OAuth credential (see
+[session-summaries.md](session-summaries.md#authority-and-failures)). Relay
+messaging on the same connection is unaffected. To read session history
+through MCP, connect the client with a CLI login credential (`sh_at_`, which
+carries `rth:read`) or a Desktop credential instead. The hosted edition reads
+on the person's behalf for OAuth connections; no installation setting changes
+this on self-host.
+
 Access tokens last one hour; refresh tokens last 30 days. Refresh rotates the
 pair and preserves its issued scope limit. Retired refresh tokens are always
 refused. Verified reuse within 30 seconds leaves the family live to tolerate
