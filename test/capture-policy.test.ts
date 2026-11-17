@@ -19,6 +19,13 @@ test("capture policy: member read, owner/admin write, revisions, audit and CSRF"
     workspace: { id: tenant.workspaceId, name: "primary" },
     role: "member",
     policy: { version: 1, revision: 1, settings: {} },
+    workspace_policy: {
+      version: 2, revision: 1, managed: false, consent: [],
+      sections: {
+        capture: { locked: {}, defaults: {} }, spawn: { locked: {}, defaults: {} }, join: { locked: {}, defaults: {} },
+        delivery: { locked: {}, defaults: {} }, analytics: { locked: {}, defaults: {} },
+      },
+    },
   });
   assert.equal(unset.headers.get("cache-control"), "no-store");
 

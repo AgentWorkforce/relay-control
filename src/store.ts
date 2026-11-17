@@ -195,6 +195,12 @@ export type IntrospectedToken = {
    * same query, so the sessions pipeline can enforce it without its own copy.
    */
   capturePolicy: CapturePolicy;
+  /**
+   * The workspace policy revision (docs/workspace-policy.md) read in the same
+   * query; 1 when the organization never wrote a policy. Optional so callers
+   * that build tokens by hand need not set it.
+   */
+  workspacePolicyRevision?: number;
 };
 
 type TokenContextRow = {
@@ -1605,6 +1611,7 @@ export class ControlPlaneStore {
       policy_revision: number | null;
       policy_settings: unknown;
       policy_sharing_mode_since: Date | string | null;
+      policy_workspace_revision: number | null;
     }>(
       `SELECT s.user_id, u.email, s.organization_id, s.workspace_id,
               w.cloud_relay_workspace_id, w.relayhistory_origin, m.role, s.scopes,
@@ -1622,7 +1629,8 @@ export class ControlPlaneStore {
               COALESCE(s.last_refreshed_at, s.created_at) AS issued_at,
               s.access_token_expires_at AS expires_at,
               cp.revision AS policy_revision, cp.settings AS policy_settings,
-              cp.sharing_mode_since AS policy_sharing_mode_since
+              cp.sharing_mode_since AS policy_sharing_mode_since,
+              cp.workspace_revision AS policy_workspace_revision
          FROM token_sessions s
          JOIN users u ON u.id = s.user_id
          JOIN workspaces w
@@ -1666,6 +1674,7 @@ export class ControlPlaneStore {
           sharing_mode_since: row.policy_sharing_mode_since,
         },
       ),
+      workspacePolicyRevision: row.policy_workspace_revision === null ? 1 : Number(row.policy_workspace_revision),
     };
   }
 
