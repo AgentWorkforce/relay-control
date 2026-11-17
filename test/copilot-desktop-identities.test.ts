@@ -68,7 +68,7 @@ test("desktop identities round-trip and advertise copilot_session_attestation", 
     assert.equal(listed.status, 200);
     assert.deepEqual(listed.body, {
       identities: [{ agent_id: chat.id, linked_mcp: null, linked_at: null }],
-      capabilities: { native_session_identity: 1, claude_session_attestation: 1, copilot_session_attestation: 1 },
+      capabilities: { native_session_identity: 1, claude_session_attestation: 1, copilot_session_attestation: 1, cursor_session_attestation: 1 },
     });
   }
   const initialized = await rpc(env.origin, parent.accessToken, {

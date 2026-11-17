@@ -71,6 +71,10 @@ Included:
   hook proofs (`claude_session_attestation`) verified on the hosted MCP
   endpoint, so a Claude Code chat sends as its own Desktop identity; see
   [docs/integrations/claude-code.md](integrations/claude-code.md)
+- Cursor chat identity through Agent Relay Desktop: Desktop's Cursor MCP
+  helper signs each call (`cursor_session_attestation`, kind `cursor` on the
+  Claude proof path, arguments signed and bound), so a Cursor chat sends as its own
+  Desktop identity; see [docs/integrations/cursor.md](integrations/cursor.md)
 - events shim (`SELFHOST_FEATURES=events_shim`, off by default): a webhook
   inbox that wakes an agent. A signed-in person creates one and gets an MCP
   URL (`claude mcp add --transport http webhooks <mcp_url>`) and a webhook

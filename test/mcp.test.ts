@@ -282,6 +282,7 @@ test("initialize advertises the self-host server and its tools on both paths", a
       "com.agentrelay/native-session-identity": { version: 1 },
       "com.agentrelay/claude-session-attestation": { version: 1 },
       "com.agentrelay/copilot-session-attestation": { version: 1 },
+      "com.agentrelay/cursor-session-attestation": { version: 1 },
       "com.agentrelay/desktop-provider-credentials": { version: 1, leaseSeconds: 900 },
     });
     assert.equal(typeof raw.body.result.instructions, "string");

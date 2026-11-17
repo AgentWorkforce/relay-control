@@ -32,6 +32,7 @@ export const LINKED_MCP = "agent-relay-sessions";
 export const NATIVE_SESSION_IDENTITY_CAPABILITY_VERSION = 1;
 export const CLAUDE_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
 export const COPILOT_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
+export const CURSOR_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
 
 /**
  * What GET advertises. Each attestation flag exists because MCP verifies and
@@ -41,6 +42,7 @@ export const DESKTOP_IDENTITY_CAPABILITIES = {
   native_session_identity: NATIVE_SESSION_IDENTITY_CAPABILITY_VERSION,
   claude_session_attestation: CLAUDE_SESSION_ATTESTATION_CAPABILITY_VERSION,
   copilot_session_attestation: COPILOT_SESSION_ATTESTATION_CAPABILITY_VERSION,
+  cursor_session_attestation: CURSOR_SESSION_ATTESTATION_CAPABILITY_VERSION,
 } as const;
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -49,7 +51,7 @@ const uuid = z.string().regex(UUID).transform(value => value.toLowerCase());
 const sourceId = z.string().min(1).max(200).transform(normalizeDesktopSourceId);
 
 const nativeSession = z.union([
-  z.object({ kind: z.enum(["codex", "grok", "pi", "claude", "copilot"]), id: uuid }).strict(),
+  z.object({ kind: z.enum(["codex", "grok", "pi", "claude", "copilot", "cursor"]), id: uuid }).strict(),
   z.object({ kind: z.literal("opencode"), id: z.string().regex(/^ses_[A-Za-z0-9]{4,128}$/) }).strict(),
 ]);
 
@@ -351,12 +353,19 @@ export class DesktopIdentityUnavailable extends Error {
 }
 
 export const DESKTOP_IDENTITY_MESSAGES = {
-  unverified: "Agent Relay cannot verify this chat's desktop identity. Keep the app open and retry after session registration.",
+  unverified: "Agent Relay cannot verify this chat's desktop identity. This call does not say which registered chat made it. "
+    + "Relay tools act as a chat only after Agent Relay Desktop has registered that chat on this computer and the chat calls "
+    + "through Desktop's integration for its client. Turn that integration on in Agent Relay Desktop (or reconnect it), then retry from this chat.",
+  cursorUnverified: "Agent Relay cannot verify this chat's desktop identity. This Cursor call carried no signed chat proof. "
+    + "A Cursor chat sends and reads relay messages as its own agent only through Agent Relay Desktop's Cursor helper: turn on "
+    + "the Cursor integration in Agent Relay Desktop so Cursor's agent-relay MCP server runs the helper and the chat is registered, "
+    + "then retry from this chat.",
   duplicate: "This chat is synced by multiple desktops. Resolve the duplicate before using relay tools.",
   sourceMismatch: "The native chat does not match this desktop identity.",
   otherRelay: "The desktop identity does not belong to this workspace's current relay.",
   gone: "The synced desktop identity is no longer available. Open Agent Relay Desktop to re-sync it.",
-  notSynced: "This native chat is not synced to your desktop account and workspace.",
+  notSynced: "This native chat is not synced to your desktop account and workspace. Agent Relay Desktop registers and syncs a chat "
+    + "when the chat starts through its integration; check the app is signed in to this workspace, then retry.",
 } as const;
 
 export type LinkedDesktopIdentity = { id: string; name: string; address: string; agentId: string; token: string };
