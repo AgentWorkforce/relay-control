@@ -56,7 +56,7 @@ test("GET /api/v1/capabilities: exact shape, any member, cookie alias, 401 witho
   const read = await cp.api("/api/v1/capabilities", { token: cp.tenant.memberToken });
   assert.equal(read.status, 200);
   assert.equal(read.headers.get("cache-control"), "no-store");
-  assert.deepEqual(read.body, { capabilities: { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false, events_shim: false, session_delete: false, enrollment_keys: true } });
+  assert.deepEqual(read.body, { capabilities: { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false, events_shim: false, session_delete: false, enrollment_keys: true, enrollment_self_mint: true } });
 
   const cookie = await cp.api("/cloud/api/v1/capabilities", {
     headers: { cookie: `agent_relay_session=${cp.tenant.ownerToken}` },
@@ -185,7 +185,7 @@ test("/readyz reports capabilities and no licence field", async (t) => {
   const ready = await cp.api("/readyz");
   assert.equal(ready.status, 200);
   assert.equal("license" in ready.body, false);
-  assert.deepEqual(ready.body.capabilities, { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false, events_shim: false, session_delete: false, enrollment_keys: true });
+  assert.deepEqual(ready.body.capabilities, { flows: true, relayfile: false, chief: true, usage: false, launch: false, usage_people: false, events_shim: false, session_delete: false, enrollment_keys: true, enrollment_self_mint: true });
 });
 
 

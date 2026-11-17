@@ -92,3 +92,7 @@ recorded titles and summaries.
 Erased sessions are removed by the session pipeline and never appear here.
 Admin, member and the bootstrap bearer are 403 `forbidden` on all three
 routes; with `usage_people` off they are 403 `feature_not_enabled`.
+
+The fleet view (docs/fleet.md) shows each member's `sessionsUploaded`,
+`lastSessionAt` and `topProjects` from this report next to their machines,
+for owners and admins.

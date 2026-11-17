@@ -1353,6 +1353,47 @@ paths:
                     items: { $ref: "#/components/schemas/EnrollmentKeySummary" }
         "401": { description: No user token }
         "403": { description: "insufficient_scope or handoff_not_exchanged" }
+    post:
+      operationId: selfMintMyEnrollmentKey
+      description: |
+        Member self-mint (docs/identity.md, "Member self-mint"): a single-use
+        desktop-enrollment key for the caller's own next machine, in the session's
+        workspace, bound to the caller's own user (user token with cli:auth or
+        account scope; the /cloud session cookie needs a same-origin request).
+        maxUses is always 1. expiryDays defaults to and may not exceed
+        SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS (default 7; never above
+        SELFHOST_ENROLLMENT_MAX_DAYS). mcpConsent and policyConsent are inherited
+        from the caller's own enrollment key that provisioned the calling session
+        (null for any other session) and can never be raised. At most 5
+        unexchanged keys per person in the organization; 10 self-mints per person
+        per hour. Audited api_token.create and enrollment_key.self_mint. Also
+        served at /cloud/api/v1.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                label: { type: string, minLength: 1, maxLength: 128, description: "default \"Desktop self-renewal\"" }
+                expiryDays: { type: integer, minimum: 1, maximum: 365, description: "default and ceiling SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS (default 7)" }
+      responses:
+        "201":
+          description: Created; same shape as the admin mint, accessToken shown once
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/WorkspaceApiToken"
+                  - type: object
+                    properties:
+                      accessToken: { type: string }
+        "400": { description: "invalid_request: a body key other than label or expiryDays, a bad label, or expiryDays outside 1 to the self-mint ceiling" }
+        "401": { description: No user token }
+        "403": { description: "self_mint_disabled (SELFHOST_ENROLLMENT_SELF_RENEWAL=false), csrf_rejected, insufficient_scope or handoff_not_exchanged" }
+        "409": { description: "self_mint_limit: the caller already holds 5 unexchanged (unused, unrevoked, unexpired) enrollment keys" }
+        "429": { description: "rate_limited: more than 10 self-mints by this person in an hour; Retry-After set" }
   /api/v1/me/enrollment-keys/{keyId}:
     parameters:
       - { name: keyId, in: path, required: true, schema: { type: string, format: uuid } }
@@ -1793,6 +1834,32 @@ paths:
       responses:
         "200": { description: "`{ events: [{ viewerUserId, viewerName, subjectUserId, subjectName, days, page, createdAt }] }`" }
         "403": { description: "`forbidden` or `feature_not_enabled`" }
+  /api/v1/organizations/{organizationId}/fleet:
+    get:
+      operationId: getOrganizationFleet
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      description: |
+        Owners and admins (docs/fleet.md): members, 200 per page ordered by
+        email then user id, each with their Agent Relay Desktop machines
+        (device-client sessions that are live or ended in the last 30 days),
+        what each machine last reported and whether it runs the current
+        workspace policy. With `usage_people` each member also carries usage
+        from the People report; without it `usage` is null. Every read writes
+        a `fleet.viewed` audit row.
+      parameters:
+        - { name: organizationId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: days, in: query, required: false, schema: { type: integer, enum: [7, 30, 90], default: 30 } }
+        - { name: cursor, in: query, required: false, description: "`next_cursor` of the previous page", schema: { type: string } }
+      responses:
+        "200":
+          description: One page of the fleet view
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FleetView" }
+        "400": { description: "`invalid_request`: `days` is not 7, 30 or 90, the cursor is malformed or given twice, or another query parameter was given" }
+        "401": { description: Missing, invalid, or expired token }
+        "403": { description: "`forbidden`: not an owner or admin of the organization" }
+        "404": { description: Organization not found for this token }
   /api/v1/desktop/releases:
     get:
       operationId: getDesktopGitHubReleases
@@ -2850,6 +2917,60 @@ paths:
                   workspace_policy: { $ref: "#/components/schemas/WorkspacePolicy" }
         "401": { description: Missing, invalid, bootstrap or non-user token }
         "404": { description: Workspace not found or not the token's workspace }
+  /api/v1/workspaces/{workspaceId}/leaders:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getWorkspaceLeaders
+      description: |
+        Any member of the workspace (bearer, or the `/cloud` session cookie). The
+        setting is stored by the Relaycast engine; Control proxies with the
+        workspace's server-side Relaycast key and stores nothing. `leaders` are the
+        registered workspace agents whose name matches any pattern. Never 404 for
+        an unset value: both lists are empty. See docs/workspace-leaders.md.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Current patterns and the agents they match
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceLeaders" }
+        "401": { description: Missing, invalid, bootstrap or non-user token }
+        "403": { description: "`handoff_not_exchanged`" }
+        "404": { description: Workspace not found or not the token's workspace }
+        "429": { description: "`rate_limited`" }
+        "502": { description: "`workspace_leaders_unavailable`: the Relaycast engine is unreachable or failed" }
+    put:
+      operationId: putWorkspaceLeaders
+      description: |
+        Workspace owner/admin. Full replace of the patterns; `{"patterns": []}`
+        clears. Patterns are trimmed, deduplicated (first occurrence wins) and
+        validated before the engine is called. Not gated by
+        SELFHOST_OPERATOR_CONTROLS. Audited as `workspace_leaders.set` with the
+        pattern count and the stored patterns. Cookie callers must send JSON from
+        an allowed Origin. See docs/workspace-leaders.md.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WorkspaceLeadersInput" }
+      responses:
+        "200":
+          description: Stored patterns and the agents they match
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceLeaders" }
+        "400": { description: "`invalid_request`: unknown field, not a string array, more than 64 patterns, a pattern empty or longer than 128 characters after trimming, or a control character" }
+        "401": { description: Missing, invalid, bootstrap or non-user token }
+        "403": { description: "Owner/admin role required, cross-origin cookie request (`csrf_rejected`), or `handoff_not_exchanged`" }
+        "404": { description: Workspace not found or not the token's workspace }
+        "429": { description: "`rate_limited`" }
+        "502": { description: "`workspace_leaders_unavailable`: the Relaycast engine is unreachable or failed" }
   /api/v1/organizations/{organizationId}/capture-policy:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -8842,6 +8963,95 @@ components:
       description: A declared `expected_assets[].name`; one path segment.
       schema: { type: string, maxLength: 255, pattern: "^[A-Za-z0-9][A-Za-z0-9_+-]*(?:\\.[A-Za-z0-9_+-]+)*$" }
   schemas:
+    FleetView:
+      type: object
+      required: [policy_revision, range, totals, members, usage_unavailable, truncated, next_cursor]
+      properties:
+        policy_revision: { type: integer, description: Current workspace policy revision (1 when unset). }
+        range:
+          type: object
+          required: [days, from, to]
+          properties:
+            days: { type: integer, enum: [7, 30, 90] }
+            from: { type: string, format: date }
+            to: { type: string, format: date }
+        totals:
+          type: object
+          description: Counts over the members and machines of this page.
+          required: [members, machines, managed, policy, clientVersions]
+          properties:
+            members: { type: integer }
+            machines: { type: integer }
+            managed: { type: integer }
+            policy:
+              type: object
+              required: [current, stale, unknown, mismatch]
+              properties:
+                current: { type: integer }
+                stale: { type: integer }
+                unknown: { type: integer }
+                mismatch: { type: integer }
+            clientVersions:
+              type: array
+              items:
+                type: object
+                required: [version, machines]
+                properties:
+                  version: { type: [string, "null"] }
+                  machines: { type: integer }
+        members: { type: array, items: { $ref: "#/components/schemas/FleetMember" } }
+        usage_unavailable:
+          type: array
+          description: "`[\"usage\"]` when `usage_people` is off; `[\"sessionsUploaded\"]` when the session read API could not be read."
+          items: { type: string, enum: [usage, sessionsUploaded] }
+        truncated: { type: boolean, description: Usage counts are lower bounds. }
+        next_cursor: { type: [string, "null"] }
+    FleetMember:
+      type: object
+      required: [user, role, machines, usage]
+      properties:
+        user:
+          type: object
+          required: [id, email, name]
+          properties:
+            id: { type: string, format: uuid }
+            email: { type: string }
+            name: { type: [string, "null"] }
+        role: { type: string, enum: [owner, admin, member] }
+        machines: { type: array, items: { $ref: "#/components/schemas/FleetMachine" } }
+        usage:
+          type: [object, "null"]
+          required: [sessionsUploaded, lastSessionAt, topProjects]
+          properties:
+            sessionsUploaded: { type: [integer, "null"] }
+            lastSessionAt: { type: [string, "null"], format: date-time }
+            topProjects:
+              type: array
+              items:
+                type: object
+                required: [name, sessions]
+                properties:
+                  name: { type: string }
+                  sessions: { type: integer }
+    FleetMachine:
+      type: object
+      required: [sessionId, hostName, clientVersion, platform, enrolledVia, policyRevision, policyMatch, managed, lastSeenAt, status]
+      properties:
+        sessionId: { type: string, format: uuid }
+        hostName: { type: [string, "null"] }
+        clientVersion: { type: [string, "null"] }
+        platform: { type: [string, "null"] }
+        enrolledVia:
+          type: [object, "null"]
+          required: [keyId, label]
+          properties:
+            keyId: { type: string, format: uuid }
+            label: { type: string }
+        policyRevision: { type: [integer, "null"], description: Last workspace policy revision the machine reported applying. }
+        policyMatch: { type: string, enum: [current, stale, unknown, mismatch] }
+        managed: { type: boolean }
+        lastSeenAt: { type: string, format: date-time }
+        status: { type: string, enum: [active, revoked, expired] }
     RelayNodeError:
       type: object
       required: [error, message]
@@ -8889,7 +9099,7 @@ components:
         created_at: {type: string, format: date-time}
     LoginConfig:
       type: object
-      required: [methods, oidc, microsoft, logo_url, org_name, allowed_domain_hint, password_policy, password_self_service, setup_key, enrollment_keys]
+      required: [methods, oidc, microsoft, logo_url, org_name, allowed_domain_hint, password_policy, password_self_service, setup_key, enrollment_keys, enrollment_self_mint]
       properties:
         methods:
           type: array
@@ -8922,6 +9132,9 @@ components:
         enrollment_keys:
           type: boolean
           description: Always true. An installer can exchange a desktop enrollment key at POST /api/v1/auth/enrollment/token; it falls back to the device flow when absent.
+        enrollment_self_mint:
+          type: boolean
+          description: True unless SELFHOST_ENROLLMENT_SELF_RENEWAL=false. A signed-in member may mint a single-use enrollment key for their own next machine at POST /api/v1/me/enrollment-keys.
     TemporaryPasswordRequest:
       type: object
       additionalProperties: false
@@ -9380,6 +9593,36 @@ components:
             join: { $ref: "#/components/schemas/WorkspacePolicySection" }
             delivery: { $ref: "#/components/schemas/WorkspacePolicySection" }
             analytics: { $ref: "#/components/schemas/WorkspacePolicySection" }
+    WorkspaceLeaders:
+      type: object
+      additionalProperties: false
+      required: [leaders, patterns]
+      properties:
+        leaders:
+          type: array
+          description: Registered workspace agents whose whole name matches any pattern (case-sensitive)
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, agent_id]
+            properties:
+              name: { type: string }
+              agent_id: { type: string }
+        patterns:
+          type: array
+          maxItems: 64
+          description: Agent-name patterns; `*` and `?` are the only wildcards, a pattern without one is an exact name
+          items: { type: string, minLength: 1, maxLength: 128 }
+    WorkspaceLeadersInput:
+      type: object
+      additionalProperties: false
+      required: [patterns]
+      properties:
+        patterns:
+          type: array
+          maxItems: 64
+          description: Replaces the stored patterns; `[]` clears. Each entry is trimmed, then 1 to 128 characters with no control characters.
+          items: { type: string }
     WorkspacePolicyInput:
       type: object
       additionalProperties: false
@@ -9459,7 +9702,7 @@ components:
               description: SELFHOST_INTROSPECT_OUTAGE_HOLD_MS in effect (0 = off); how long a Desktop token's last active verdict may answer during a database outage.
     FeatureCapabilities:
       type: object
-      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, session_delete, enrollment_keys]
+      required: [flows, relayfile, chief, usage, launch, usage_people, events_shim, session_delete, enrollment_keys, enrollment_self_mint]
       additionalProperties: false
       description: Optional features selected by SELFHOST_FEATURES, plus configured operator capabilities. session_delete is derived from erase wiring and the operator-controls gate, not SELFHOST_FEATURES.
       properties:
@@ -9476,6 +9719,9 @@ components:
         enrollment_keys:
           type: boolean
           description: Always true. POST /api/v1/auth/enrollment/token exchanges desktop enrollment keys.
+        enrollment_self_mint:
+          type: boolean
+          description: True unless SELFHOST_ENROLLMENT_SELF_RENEWAL=false. POST /api/v1/me/enrollment-keys mints a member's own single-use enrollment key.
     UsageCounts:
       type: object
       required: [activeUsers, sessionsUploaded, searches, summaries]
@@ -10422,12 +10668,15 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
     EnrollmentKeySummary:
       type: object
-      required: [id, label, status, mcpConsent, createdAt, expiresAt, exchangedAt, exchangedHostName, mintedBy]
+      required: [id, label, status, mcpConsent, policyConsent, maxUses, useCount, createdAt, expiresAt, exchangedAt, exchangedHostName, mintedBy]
       properties:
         id: { type: string, format: uuid }
         label: { type: string }
         status: { enum: [active, expired, revoked, exchanged], description: "exchanged: a spent desktop-enrollment key (revoked wins over it, it wins over expired)" }
         mcpConsent: { enum: [admin, null] }
+        policyConsent: { enum: [admin, null] }
+        maxUses: { type: integer, minimum: 1, description: "Exchanges the key allows (1 = single-use)" }
+        useCount: { type: integer, minimum: 0, description: "Exchanges so far" }
         createdAt: { type: string, format: date-time }
         expiresAt: { type: [string, "null"], format: date-time }
         exchangedAt: { type: [string, "null"], format: date-time }

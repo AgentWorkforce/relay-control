@@ -7,7 +7,11 @@
  * is an agent token.
  */
 
-type Agent = { id: string; name: string; type: string; metadata: Record<string, unknown>; token: string; status: string };
+type Agent = {
+  id: string; name: string; type: string; metadata: Record<string, unknown>; token: string; status: string;
+  /** The workspace key that registered it through POST /v1/agents, when it did. */
+  workspaceKey?: string;
+};
 type Message = {
   id: string; agent_name: string; agent_id: string; text: string; created_at: string;
   conversation_id: string | null; channel_id: string | null; thread_id: string | null;
@@ -48,6 +52,8 @@ export function createRelaycastWorld(roster: unknown[]) {
   const spawnOutcome = { mode: "ready" as "ready" | "pending" | "failed" | "rejected" };
   /** How the next agent-token exact release ends: stop the worker, or fail and leave it running. */
   const releaseOutcome = { mode: "completed" as "completed" | "failed" };
+  /** Workspace leaders patterns per workspace key (PUT/GET /v1/workspace/leaders). */
+  const leaderPatterns = new Map<string, string[]>();
 
   const rosterEntry = (agent: Agent) => ({
     id: agent.id, name: agent.name, type: agent.type, metadata: agent.metadata,
@@ -61,6 +67,16 @@ export function createRelaycastWorld(roster: unknown[]) {
     agents.set(name, agent);
     syncRoster();
     return agent;
+  }
+  /** The engine's leader rules: `*` and `?` wildcards, everything else literal, whole name, case-sensitive. */
+  const leaderMatcher = (pattern: string) => new RegExp(`^${[...pattern].map(char =>
+    char === "*" ? ".*" : char === "?" ? "." : char.replace(/[.+^$()|[\]{}\\]/, "\\$&")).join("")}$`, "su");
+  function leadersDocument(workspaceKey: string | undefined) {
+    const patterns = workspaceKey ? leaderPatterns.get(workspaceKey) ?? [] : [];
+    const matchers = patterns.map(leaderMatcher);
+    const leaders = [...agents.values()].filter(agent => matchers.some(matcher => matcher.test(agent.name)))
+      .map(agent => ({ name: agent.name, agent_id: agent.id }));
+    return { leaders, patterns };
   }
   const byToken = (token: string) => [...agents.values()].find(agent => agent.token === token) ?? null;
   function message(sender: Agent, text: string, place: { conversation_id?: string; channel_id?: string; thread_id?: string }): Message {
@@ -116,7 +132,24 @@ export function createRelaycastWorld(roster: unknown[]) {
       if (agents.has(body!.name)) return fail(409, "agent_already_exists");
       const agent = addAgent(body!.name, body!.metadata ?? {});
       agent.type = body!.type;
+      agent.workspaceKey = bearer;
       return ok({ id: agent.id, name: agent.name, token: agent.token }, 201);
+    }
+    if (method === "PUT" && path === "/v1/workspace/leaders" && workspace) {
+      const given = body?.patterns;
+      if (!Array.isArray(given) || given.length > 64) return fail(400, "invalid_request");
+      const patterns: string[] = [];
+      for (const entry of given) {
+        if (typeof entry !== "string") return fail(400, "invalid_request");
+        const pattern = entry.trim();
+        if (pattern.length < 1 || pattern.length > 128 || /\p{Cc}/u.test(pattern)) return fail(400, "invalid_request");
+        if (!patterns.includes(pattern)) patterns.push(pattern);
+      }
+      leaderPatterns.set(bearer, patterns);
+      return ok(leadersDocument(bearer));
+    }
+    if (method === "GET" && path === "/v1/workspace/leaders") {
+      return ok(leadersDocument(workspace ? bearer : caller!.workspaceKey));
     }
     if (method === "GET" && path === "/v1/nodes" && workspace) {
       const listed = (nodes.get(bearer) ?? []).filter(node => query.get("status") !== "online" || node.live === true);
@@ -193,6 +226,12 @@ export function createRelaycastWorld(roster: unknown[]) {
       if (!agent || agent.id !== body!.expected_agent_id) return fail(409, "agent_identity_conflict");
       agent.token = `at_${agent.name}_${next()}`;
       return ok({ agent_id: agent.id, token: agent.token });
+    }
+    if (method === "GET" && path === "/v1/agents" && workspace) {
+      // The roster; with `names`, the engine's bounded lookup of those names only.
+      const names = query.getAll("names");
+      const entries = [...agents.values()].map(rosterEntry);
+      return ok(names.length ? entries.filter(entry => names.includes(entry.name)) : entries);
     }
     if ((match = /^\/v1\/agents\/([^/]+)$/.exec(path)) && method === "GET" && workspace) {
       const agent = agents.get(decodeURIComponent(match[1]!));
@@ -319,7 +358,7 @@ export function createRelaycastWorld(roster: unknown[]) {
 
   return {
     agents, conversations, messages, deliveries, channels, subscriptions, bodies, handle, addAgent,
-    nodes, invocations, spawnOutcome, releaseOutcome,
+    nodes, invocations, spawnOutcome, releaseOutcome, leaderPatterns,
     /** An agent's unacknowledged deliveries. */
     pending(agent: string) {
       return deliveries.filter(row => row.agent === agent && !row.acked);

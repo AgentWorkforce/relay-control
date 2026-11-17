@@ -1,6 +1,7 @@
 import type { CapyBindings } from "../capy/bindings.js";
 import type { AmpDeps } from "../amp/service.js";
 import type { ReplicasDeps } from "../replicas/service.js";
+import type { AgentLinkDeps } from "../events-shim/agent-link.js";
 import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
@@ -84,6 +85,8 @@ export type McpContext = {
   amp?: AmpDeps;
   /** Replicas agents (SELFHOST_REPLICAS_ENABLED); absent when the feature is off. */
   replicas?: ReplicasDeps;
+  /** Webhook inbox links to bound agents (events_shim feature, person connections only); absent otherwise. */
+  webhookInbox?: AgentLinkDeps;
   /** Agent launch tools (SELFHOST_FEATURES launch); false or absent when the feature is off. */
   launch?: boolean;
   /** Factory sessions (SELFHOST_FACTORY_ENABLED); absent when the feature is off. */

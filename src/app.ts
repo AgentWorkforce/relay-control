@@ -31,7 +31,10 @@ import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
 import { relayLaunchCredentials } from "./mcp/relay-launch-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
 import { parseClientTelemetry, recordClientTelemetry, recordsClientTelemetry } from "./sessions/client-telemetry.js";
-import { UsageRangeError, usageDays, usageReport } from "./usage/routes.js";
+import { UsageRangeError, usageDates, usageDays, usageReport } from "./usage/routes.js";
+import {
+  decodeFleetCursor, FLEET_AUDIT_ACTION, FleetInputError, fleetView, type FleetCursor, type FleetUsageInput,
+} from "./fleet/view.js";
 import { UsageStore } from "./usage/store.js";
 import { GitHubDesktopReleases } from "./desktop-releases.js";
 import { listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError } from "./mcp/read-audit.js";
@@ -104,6 +107,8 @@ import { abandonEnvironmentCleanup, disconnectEnvironments, setupEnvironments } 
 import { disconnectReplicas, purgeMemberReplicas, releaseMemberReplicas, ReplicasError } from "./replicas/service.js";
 import { isAmpPath } from "./amp/routes.js";
 import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
+import type { AgentLinkDeps } from "./events-shim/agent-link.js";
+import { PostgresEventsShimStore } from "./events-shim/store.js";
 import { purgeMemberAmp, releaseMemberAmp } from "./amp/service.js";
 import {
   DESKTOP_MCP_TOKEN,
@@ -135,7 +140,8 @@ import {
   writeWorkspacePolicy,
 } from "./workspace-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
-import { createRelaycastClient, type RosterAgent } from "./messaging/relaycast.js";
+import { createRelaycastClient, RelaycastCallError, type RosterAgent, type WorkspaceLeaders } from "./messaging/relaycast.js";
+import { LeaderPatternsError, parseLeaderPatterns } from "./workspace-leaders.js";
 import { isListedRelayAgent } from "./mcp/team-activity.js";
 import {
   erasureTarget,
@@ -496,6 +502,8 @@ export function createApp(input: {
     session_delete: Boolean(config.sessionErasureApi) && operatorControlsEntitled(),
     // Desktop enrollment keys (docs/identity.md): always served.
     enrollment_keys: true,
+    // Member self-mint at POST /api/v1/me/enrollment-keys (SELFHOST_ENROLLMENT_SELF_RENEWAL).
+    enrollment_self_mint: config.enrollmentSelfRenewal !== false,
   });
   // Usage page counters: written only while the `usage` feature is selected.
   const usage = new UsageStore(store.database, () => input.now?.() ?? new Date());
@@ -651,8 +659,17 @@ export function createApp(input: {
     },
     now:input.now,afterMutation:()=>oauthTeardown?.kick(),
   });
+  // Webhook inbox links to bound agents (docs/events-shim.md): with the events_shim feature only.
+  const agentLinks: AgentLinkDeps | null = features.events_shim ? {
+    database: store.database,
+    keyring: config.encryptionKeyring,
+    relaycast: createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch }),
+    store: new PostgresEventsShimStore(store.database, config.encryptionKeyring),
+    ...(input.now ? { now: input.now } : {}),
+  } : null;
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
+    ...(agentLinks ? { webhookInbox: agentLinks } : {}),
     ...(amp ? { amp: amp.deps } : {}),
     ...(replicas ? { replicas: replicas.deps } : {}),
     ...(factory.enabled ? { factory: factory.mcp } : {}),
@@ -675,6 +692,7 @@ export function createApp(input: {
     relaycast: { url: config.relaycastUrl, internalSecret: input.relaycastInternalSecret ?? null },
     gateOnly: Boolean(config.relaygatePublicUrl),
     fetchImpl: input.messagingFetch,
+    ...(agentLinks ? { agentLinks } : {}),
     now: input.now,
     authorizeCreate: async (request, response) => {
       const auth = await authenticate(request);
@@ -744,6 +762,9 @@ export function createApp(input: {
     }
     return principal;
   }
+
+  /** POST /api/v1/me/enrollment-keys: self-minted enrollment keys per person per hour. */
+  const ENROLLMENT_SELF_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
 
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy, () => input.now?.() ?? new Date());
   const STAFF_READ_GRANT_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
@@ -2167,6 +2188,41 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }, true);
       return;
     }
+    // Member self-mint (docs/identity.md, "Member self-mint"): a single-use
+    // key for the caller's own next machine, consent inherited from the key
+    // that provisioned this session and never raised.
+    if (path === "/api/v1/me/enrollment-keys" && method === "POST") {
+      const principal = await enrollmentKeyOwner(request);
+      if (config.enrollmentSelfRenewal === false) {
+        throw new HttpError(
+          403,
+          "self_mint_disabled",
+          "Enrollment key self-renewal is turned off on this install; ask an admin for a key",
+        );
+      }
+      const body = await requestObject(request);
+      const unknown = Object.keys(body).filter((key) => key !== "label" && key !== "expiryDays");
+      if (unknown.length > 0) {
+        throw new HttpError(
+          400,
+          "invalid_request",
+          `Only label and expiryDays are accepted; refused: ${unknown.sort().join(", ")}`,
+        );
+      }
+      rateLimit(response, `enrollment-self-mint:${principal.userId}`, ENROLLMENT_SELF_MINT_RATE, "rate_limited",
+        "Too many enrollment keys minted; try again later");
+      const key = await apiTokens.selfMint({
+        organizationId: principal.organizationId,
+        workspaceId: principal.workspaceId,
+        userId: principal.userId,
+        email: principal.email,
+        provisionedByTokenId: principal.provisionedByTokenId ?? null,
+        label: body.label,
+        expiryDays: body.expiryDays,
+      });
+      json(response, 201, key, true);
+      return;
+    }
     const ownEnrollmentKey = routeMatch(path, /^\/api\/v1\/me\/enrollment-keys\/([^/]+)$/);
     if (ownEnrollmentKey && method === "DELETE") {
       const principal = await enrollmentKeyOwner(request);
@@ -2261,6 +2317,84 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         if (error instanceof PeopleInputError) throw new HttpError(400, "invalid_request", error.message);
         throw error;
       }
+      return;
+    }
+
+    // Fleet view (docs/fleet.md): owners and admins, members with their
+    // Desktop machines, policy state and (with usage_people) usage.
+    const fleetRoute = /^\/api\/v1\/organizations\/([^/]+)\/fleet$/.exec(path);
+    if (fleetRoute && method === "GET") {
+      let organizationId: string;
+      try {
+        organizationId = decodeURIComponent(fleetRoute[1]!);
+      } catch {
+        throw new HttpError(400, "invalid_request", "Invalid organization id");
+      }
+      const auth = await organizationAccess(request, organizationId);
+      const role = auth.kind === "user" ? await store.memberRole(organizationId, auth.principal.userId) : null;
+      if (auth.kind !== "user" || (role !== "owner" && role !== "admin")) {
+        throw new HttpError(403, "forbidden", "Organization owner or admin role required");
+      }
+      for (const name of new Set(url.searchParams.keys())) {
+        if (name !== "days" && name !== "cursor") throw new HttpError(400, "invalid_request", `Unknown parameter ${name}`);
+      }
+      if (url.searchParams.getAll("cursor").length > 1) throw new HttpError(400, "invalid_request", "cursor must be given once");
+      const rawCursor = url.searchParams.get("cursor");
+      let after: FleetCursor | null = null;
+      if (rawCursor !== null) {
+        try {
+          after = decodeFleetCursor(rawCursor);
+        } catch (error) {
+          if (error instanceof FleetInputError) throw new HttpError(400, "invalid_request", error.message);
+          throw error;
+        }
+      }
+      const query = new URL(url);
+      query.searchParams.delete("cursor");
+      let days: number;
+      try {
+        days = usageDays(query);
+      } catch (error) {
+        if (error instanceof UsageRangeError) throw new HttpError(400, "invalid_request", error.message);
+        throw error;
+      }
+      const now = input.now?.() ?? new Date();
+      const dates = usageDates(days, now);
+      let usage: FleetUsageInput = null;
+      if (features.usage_people) {
+        // peopleReport reads with the caller's own authority: it resolves the
+        // caller's membership per workspace and has no owner check of its own.
+        const report = await peopleReport({
+          config, store, people, organizationId, days, now,
+          owner: { userId: auth.principal.userId, token: auth.token, readerKind: readerKindOf(request) },
+        });
+        usage = {
+          byUser: new Map(report.members.map((member) => [member.userId, {
+            sessionsUploaded: member.sessionsUploaded,
+            lastSessionAt: member.lastSessionAt,
+            topProjects: member.topProjects,
+          }])),
+          unavailable: report.unavailable,
+          truncated: report.truncated,
+        };
+      }
+      const view = await fleetView({
+        executor: store.database,
+        organizationId,
+        policy: await readWorkspacePolicy(store.database, organizationId),
+        days,
+        range: { from: dates[0]!, to: dates[dates.length - 1]! },
+        after,
+        usage,
+        now,
+      });
+      await recordAudit(store.database, {
+        organizationId,
+        actor: { kind: "user", userId: auth.principal.userId },
+        action: FLEET_AUDIT_ACTION,
+        target: organizationId,
+      });
+      json(response, 200, view, true);
       return;
     }
 
@@ -2606,6 +2740,58 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       }
       const names = roster.filter(isListedRelayAgent).map((agent) => agent.name).filter(Boolean);
       json(response, 200, { names: [...new Set(names)].sort() }, true);
+      return;
+    }
+
+    // Workspace leaders (docs/workspace-leaders.md): stored by the Relaycast
+    // engine; Control proxies with the workspace key and stores nothing.
+    // Any member reads, workspace owner/admin writes.
+    const workspaceLeaders = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/leaders$/);
+    if (workspaceLeaders && (method === "GET" || method === "PUT")) {
+      const { principal, workspace } = await workspaceAccess(request, workspaceLeaders[0]!, method === "PUT");
+      if (principal.pendingHandoff) {
+        throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      }
+      if (method === "PUT" && !bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      let patterns: string[] = [];
+      if (method === "PUT") {
+        try {
+          patterns = parseLeaderPatterns(await requestObject(request));
+        } catch (error) {
+          if (error instanceof LeaderPatternsError) throw new HttpError(error.status, error.code, error.message);
+          throw error;
+        }
+      }
+      // Each call spends the workspace's server-side Relaycast key.
+      rateLimit(response, `workspace-leaders:${principal.userId}`, AGENT_NAMES_RATE, "rate_limited", "Too many requests. Try again shortly.");
+      const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch });
+      let leaders: WorkspaceLeaders;
+      try {
+        leaders = method === "PUT"
+          ? await relaycast.setWorkspaceLeaders(workspace.relaycastApiKey, patterns)
+          : await relaycast.getWorkspaceLeaders(workspace.relaycastApiKey);
+      } catch (error) {
+        if (error instanceof RelaycastCallError && error.status === 400) {
+          throw new HttpError(400, "invalid_request", "The Relaycast engine refused the leader patterns");
+        }
+        throw new HttpError(502, "workspace_leaders_unavailable", "The workspace leaders setting is unavailable");
+      }
+      if (method === "PUT") {
+        // Agent-name patterns are not secret; the engine's normalised list is recorded.
+        await recordAudit(store.database, {
+          organizationId: workspace.organizationId,
+          workspaceId: workspace.id,
+          actor: { kind: "user", userId: principal.userId },
+          action: "workspace_leaders.set",
+          target: `${workspace.id} patterns=${leaders.patterns.length} ${JSON.stringify(leaders.patterns)}`,
+        });
+      }
+      json(response, 200, {
+        leaders: leaders.leaders.map((leader) => ({ name: leader.name, agent_id: leader.agentId })),
+        patterns: leaders.patterns,
+      }, true);
       return;
     }
 

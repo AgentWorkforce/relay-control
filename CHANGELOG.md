@@ -12,13 +12,69 @@ assigned at release.
   caller, so the node treats that chat's DMs to the worker as native input.
   OAuth and unlinked hosted sessions omit both. The requester is not stored
   and does not change the launch's idempotency.
+- Fixed: a webhook inbox's relay identity is no longer lost when releasing it fails or the server stops mid-release (migration 0077). Unlinking, relinking or the sweep now queues the identity in the same transaction that removes or replaces its link, and it leaves the queue only once released. The sweep retries the least recently attempted releases first, so one failing Relaycast workspace cannot hold up the others.
+- Added: a webhook inbox can wake a bound cloud agent (migration 0076). With `events_shim` selected, the Agent Relay MCP's `link_webhook_inbox` lets a current owner or admin link an inbox they created to their own bound Amp thread, Replica or Capy binding. Each post then reaches that agent as a relay DM from the inbox's own relay identity, framed as untrusted webhook data with `@mentions` neutralised. `unlink_webhook_inbox` undoes it. Every forward re-checks the inbox, the binding row and generation, the relay agent id, the name's current holder and the Relaycast workspace, and marks the link broken if any changed. The minute sweep releases a deleted inbox's identity on the Relaycast workspace it was registered on. Capy links wake the thread once native Capy delivery is mounted. See docs/events-shim.md.
+- Fixed: Desktop identity sync no longer drops the installation's attestation
+  key when the `attestation_key` field is omitted. Agent Relay Desktop syncs
+  its chats on launch before its key is loaded, and that sync deleted the
+  registered key, so Claude Code, Copilot and Cursor chat calls failed with an
+  unknown key until the next sync re-added it about a minute later. An omitted
+  key now means unchanged; an explicit key replaces it and an explicit `null`
+  removes it. An empty identity list still clears the source, key included.
+- Fixed: `describe_capabilities` now says that Relay Connect rooms are not
+  available on this self-hosted installation, that no setting enables them
+  and that joining a public hosted Connect invite from Agent Relay Desktop is
+  separate; it no longer files them under "not part of the self-hosted
+  edition". No tools or routes change.
+- Fixed: MCP relay sends, inbox polls, `relay_status` and agent card reads no
+  longer list the whole Relaycast roster to resolve one agent name or address.
+  They use the engine's bounded `GET /v1/agents?names=` lookup (one call per
+  send for the recipient, one for the sender's own address, one batch per inbox
+  poll for the senders), keep only rows with the exact requested name so
+  engines without the filter keep working, and never fall back to a
+  full-roster read when the lookup fails. The bound takes effect with Relaycast
+  engine 12.4.0 or later; older engines still answer with the roster.
+- Added: `GET /api/v1/organizations/{org}/fleet` (docs/fleet.md) for owners
+  and admins: members, 200 per page, with their Desktop machines (host name,
+  client version, platform, enrollment key, managed, last seen, status) and
+  each machine's `policyMatch` (`current`, `stale`, `unknown` or `mismatch`)
+  against the workspace policy revision, page totals and, with
+  `usage_people`, per-member usage. Every read writes a `fleet.viewed` audit
+  row. No migration.
+- Added: member self-mint of desktop enrollment keys at
+  `POST /api/v1/me/enrollment-keys` (also under `/cloud`). A signed-in member
+  mints a single-use key for their own next machine; the body takes only
+  `label` and `expiryDays` (default and ceiling
+  `SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS`, 7). `mcpConsent` and
+  `policyConsent` are inherited from the key that provisioned the calling
+  session and never raised. At most 5 unexchanged keys per person
+  (`409 self_mint_limit`) and 10 self-mints per hour (`429 rate_limited`).
+  `SELFHOST_ENROLLMENT_SELF_RENEWAL=false` turns it off
+  (`403 self_mint_disabled`); capabilities and login-config answer
+  `enrollment_self_mint`. Audited `enrollment_key.self_mint`. The member's
+  key list adds `maxUses`, `useCount` and `policyConsent`.
+- Fixed: gate-only desktop identity sync no longer skips an identity whose
+  upstream Relaycast card lacks `metadata.relaygate.agent_id` (relaygate only
+  stamps it on first registration); the field is compared only when present
+  and relaygate's whoami remains the proof. Each skipped identity now logs
+  `desktop identity skipped` with the agent name, reason and failed check
+  (never the token).
+- Added: workspace leaders. `GET /api/v1/workspaces/{id}/leaders` (any
+  member) and `PUT` (workspace owner/admin, `{"patterns": [...]}`, `[]`
+  clears) proxy the Relaycast engine's `/v1/workspace/leaders` setting with the
+  workspace key and answer `{leaders: [{name, agent_id}], patterns}`. At most
+  64 patterns, each trimmed to 1..128 characters with no control characters,
+  duplicates collapsed; `*` and `?` are the only wildcards. Writes are audited
+  as `workspace_leaders.set`; an unreachable or failing engine is `502
+  workspace_leaders_unavailable`. Not gated by `SELFHOST_OPERATOR_CONTROLS`;
+  nothing is stored and no migration. See docs/workspace-leaders.md.
 - Fixed: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), desktop
   identities enrolled at relaygate now verify and sync, so Cursor, Claude Code
   and Copilot attestation keys are stored. Desktop identity sync and every MCP
   call check the identity's `rg_` token with relaygate's `GET /v1/whoami`
   (agent id and name, plus the enrolling user once relaygate reports
-  `user_id`) and require the upstream Relaycast agent of that name to carry
-  the same `metadata.relaygate.agent_id`. MCP messaging as a desktop identity
+  `user_id`) and compare the upstream Relaycast agent's
+  `metadata.relaygate.agent_id` when present. MCP messaging as a desktop identity
   goes through relaygate. Before, Relaycast refused the `rg_` token, every
   identity was skipped `unverified`, the attestation key was dropped and
   attested MCP calls failed with "unknown key". No migration.

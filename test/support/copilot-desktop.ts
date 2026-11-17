@@ -28,7 +28,12 @@ function relaycastFetch(roster: unknown[], world: RelaycastWorld): typeof fetch 
     const json = (status: number, body: unknown) => new Response(JSON.stringify(body), {
       status, headers: { "content-type": "application/json" },
     });
-    if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") return json(200, { ok: true, data: roster });
+    if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") {
+      // The engine's bounded `names` lookup answers only the requested names.
+      const names = url.searchParams.getAll("names");
+      return json(200, { ok: true, data: names.length
+        ? roster.filter(row => names.includes((row as { name?: string }).name ?? "")) : roster });
+    }
     if (url.pathname === "/v1/agents/presence") return json(200, { ok: true, data: [] });
     const body = typeof init?.body === "string" && init.body ? JSON.parse(init.body) as Record<string, any> : null;
     const handled = await world.handle(init?.method ?? "GET", url.pathname, url.searchParams,
