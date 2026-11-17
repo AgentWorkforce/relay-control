@@ -68,6 +68,7 @@ set but not named in `consent` is still served; the client decides how to ask. T
 widening operator value for a person-only key (turning it on, adding entries) only on a `managed` session whose
 `consent` names the key, and reports the key as mismatched otherwise; a narrowing value (turning it off, removing
 entries) applies on every session, managed or not. Defaults are gated the same way as locks.
+The fleet view (docs/fleet.md) reports `policyMatch: "mismatch"` for an unmanaged machine while such a widening value is set.
 
 ## managed
 

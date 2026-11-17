@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `GET /api/v1/organizations/{org}/fleet` (docs/fleet.md) for owners
+  and admins: members, 200 per page, with their Desktop machines (host name,
+  client version, platform, enrollment key, managed, last seen, status) and
+  each machine's `policyMatch` (`current`, `stale`, `unknown` or `mismatch`)
+  against the workspace policy revision, page totals and, with
+  `usage_people`, per-member usage. Every read writes a `fleet.viewed` audit
+  row. No migration.
 - Added: per-person desktop enrollment keys (migration 0074). A
   `desktop-enrollment` key takes `maxUses` (default 1, ceiling
   `SELFHOST_ENROLLMENT_MAX_USES`, default 50) and is exchanged once per
