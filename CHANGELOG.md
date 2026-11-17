@@ -5,6 +5,7 @@ assigned at release.
 
 ## Unreleased
 
+- Fixed: a webhook inbox's relay identity is no longer lost when releasing it fails or the server stops mid-release (migration 0077). Unlinking, relinking or the sweep now queues the identity in the same transaction that removes or replaces its link, and it leaves the queue only once released. The sweep retries the least recently attempted releases first, so one failing Relaycast workspace cannot hold up the others.
 - Added: a webhook inbox can wake a bound cloud agent (migration 0076). With `events_shim` selected, the Agent Relay MCP's `link_webhook_inbox` lets a current owner or admin link an inbox they created to their own bound Amp thread, Replica or Capy binding. Each post then reaches that agent as a relay DM from the inbox's own relay identity, framed as untrusted webhook data with `@mentions` neutralised. `unlink_webhook_inbox` undoes it. Every forward re-checks the inbox, the binding row and generation, the relay agent id, the name's current holder and the Relaycast workspace, and marks the link broken if any changed. The minute sweep releases a deleted inbox's identity on the Relaycast workspace it was registered on. Capy links wake the thread once native Capy delivery is mounted. See docs/events-shim.md.
 - Fixed: `describe_capabilities` now says that Relay Connect rooms are not
   available on this self-hosted installation, that no setting enables them

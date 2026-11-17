@@ -260,10 +260,11 @@ export async function linkInboxToAgent(
       if (created) {
         current = created;
         // The identity it replaces: released after commit, unless Relaycast already lost it.
-        if (existing && existing.sender_remote_id !== created.id && existing.sender_remote_id !== before?.sender_remote_id) {
+        if (existing && ((existing.sender_remote_id !== created.id && existing.sender_remote_id !== before?.sender_remote_id)
+          || existing.relaycast_workspace_id !== relay.relaycastWorkspaceId)) {
           retired = linkSender(existing);
-        } else if (existing && existing.relaycast_workspace_id !== relay.relaycastWorkspaceId) {
-          retired = linkSender(existing);
+          // Queued in the same transaction that replaces its link row, so it is never lost.
+          await queueRelease(tx, retired);
         }
       } else if (existing && existing.sender_remote_id === reusable) {
         current = linkSender(existing);
@@ -302,10 +303,13 @@ export async function linkInboxToAgent(
     // to be saved: a commit whose reply was lost may have saved it, and a link
     // whose sender was released could never deliver.
     const orphan = created as Sender | null;
-    if (orphan && (await senderSaved(deps, shim.id, orphan)) === false) await releaseOrQueue(deps, orphan);
+    if (orphan && (await senderSaved(deps, shim.id, orphan)) === false) {
+      await queueRelease(deps.database, orphan);
+      await releaseQueued(deps, orphan);
+    }
     throw error;
   }
-  if (retired) await releaseOrQueue(deps, retired);
+  if (retired) await releaseQueued(deps, retired);
   const waiting = await deps.store.countPending(shim.id, new Date(clock(deps).getTime() - 60_000).toISOString()).catch(() => 0);
   void deliverInBackground(deliveryDeps(deps), shim.id, target);
   return { inbox_id: shim.id, agent, kind: bound.kind, sender: sender.name, forwarded_waiting: waiting };
@@ -324,6 +328,8 @@ export async function unlinkInboxFromAgent(
     const removed = (await tx.query<LinkRow>("DELETE FROM events_shim_agent_links WHERE shim_id = $1 RETURNING *", [shim.id])).rows[0];
     // Only clear the wake link if it is still this agent link, not a session webhook linked since.
     if (removed) {
+      // Queued in the same transaction that deletes the link row, so the sender is never lost.
+      await queueRelease(tx, linkSender(removed));
       await tx.query(
         `UPDATE events_shims SET wake_url = NULL, wake_secret_ciphertext = NULL, wake_linked_at = NULL,
            wake_broken_at = NULL, wake_broken_reason = NULL WHERE id = $1 AND wake_url LIKE $2`,
@@ -333,7 +339,7 @@ export async function unlinkInboxFromAgent(
     return removed;
   });
   if (!link) return { inbox_id: shim.id, unlinked: false };
-  await releaseOrQueue(deps, linkSender(link));
+  await releaseQueued(deps, linkSender(link));
   return { inbox_id: shim.id, unlinked: true };
 }
 
@@ -378,27 +384,45 @@ async function releaseSender(deps: AgentLinkDeps, sender: Sender): Promise<"rele
 }
 
 /**
- * Releases a sender whose link row is gone (unlinked, replaced, or a failed
- * link). A release that fails is queued in events_shim_sender_releases, so the
- * sweep retries it instead of losing the sender's only reference.
+ * Records a sender whose link row is going away, in the same transaction that
+ * removes or replaces that row: it stays queued in events_shim_sender_releases
+ * until a release succeeds or its Relaycast workspace is gone, so a stop
+ * mid-release or a failed release never loses the sender.
  */
-async function releaseOrQueue(deps: AgentLinkDeps, sender: Sender): Promise<void> {
-  if ((await releaseSender(deps, sender)) !== "failed") return;
-  await deps.database.query(
+async function queueRelease(executor: SqlExecutor, sender: Sender): Promise<void> {
+  await executor.query(
     `INSERT INTO events_shim_sender_releases (sender_remote_id, sender_name, relaycast_workspace_id)
      VALUES ($1, $2, $3) ON CONFLICT (sender_remote_id) DO NOTHING`,
     [sender.id, sender.name, sender.relaycastWorkspaceId],
-  ).catch(() => undefined);
+  );
 }
 
 /**
- * Releases the relay identities of links whose inbox is gone (expired inboxes
- * are deleted by `prune`; their link rows stay for this), then deletes those
- * rows. A release that fails (an outage, or no answer within
- * `releaseTimeoutMs`) keeps its row for the next sweep; a Relaycast workspace
- * no workspace holds any more is final. The wake sweeper runs it.
+ * Tries a queued release. Released (or its Relaycast workspace gone): the
+ * queue row is deleted. Failed: the row stays, stamped with this attempt, so
+ * the sweep moves on to entries attempted longer ago and one failing relay
+ * cannot hold up the rest.
+ */
+async function releaseQueued(deps: AgentLinkDeps, sender: Sender): Promise<boolean> {
+  if ((await releaseSender(deps, sender)) === "failed") {
+    await deps.database.query("UPDATE events_shim_sender_releases SET attempted_at = $2 WHERE sender_remote_id = $1",
+      [sender.id, clock(deps)]);
+    return false;
+  }
+  await deps.database.query("DELETE FROM events_shim_sender_releases WHERE sender_remote_id = $1", [sender.id]);
+  return true;
+}
+
+/**
+ * Moves the links whose inbox is gone (expired inboxes are deleted by
+ * `prune`; their link rows stay for this) into the release queue, deleting
+ * each link row in the same transaction, then tries queued releases: never
+ * attempted first, then the least recently attempted. A release that fails
+ * (an outage, or no answer within `releaseTimeoutMs`) stays queued; a
+ * Relaycast workspace no workspace holds any more is final. The wake sweeper
+ * runs it.
  *
- * @returns How many links were cleaned up.
+ * @returns How many senders were released (or found to have no relay left).
  */
 export async function releaseOrphanedAgentLinks(deps: AgentLinkDeps, limit = 25): Promise<number> {
   const orphans = (await deps.database.query<LinkRow>(
@@ -407,26 +431,24 @@ export async function releaseOrphanedAgentLinks(deps: AgentLinkDeps, limit = 25)
       WHERE s.id IS NULL LIMIT $1`,
     [limit],
   )).rows;
-  let cleaned = 0;
   for (const link of orphans) {
-    // A failed release keeps the row (its sender id and token) for the next sweep.
-    if ((await releaseSender(deps, linkSender(link))) === "failed") continue;
-    await deps.database.query("DELETE FROM events_shim_agent_links WHERE shim_id = $1 AND sender_remote_id = $2",
-      [link.shim_id, link.sender_remote_id]);
-    cleaned += 1;
+    await deps.database.transaction(async (tx) => {
+      await queueRelease(tx, linkSender(link));
+      await tx.query("DELETE FROM events_shim_agent_links WHERE shim_id = $1 AND sender_remote_id = $2",
+        [link.shim_id, link.sender_remote_id]);
+    });
   }
-  // Senders whose release failed after their link row went (unlink, relink, a failed link).
   const queued = (await deps.database.query<{ sender_remote_id: string; sender_name: string; relaycast_workspace_id: string }>(
-    "SELECT sender_remote_id, sender_name, relaycast_workspace_id FROM events_shim_sender_releases ORDER BY created_at LIMIT $1",
+    `SELECT sender_remote_id, sender_name, relaycast_workspace_id FROM events_shim_sender_releases
+      ORDER BY attempted_at ASC NULLS FIRST, created_at LIMIT $1`,
     [limit],
   )).rows;
+  let cleaned = 0;
   for (const row of queued) {
-    const outcome = await releaseSender(deps, {
+    const released = await releaseQueued(deps, {
       name: row.sender_name, id: row.sender_remote_id, relaycastWorkspaceId: row.relaycast_workspace_id, tokenCiphertext: "",
     });
-    if (outcome === "failed") continue;
-    await deps.database.query("DELETE FROM events_shim_sender_releases WHERE sender_remote_id = $1", [row.sender_remote_id]);
-    cleaned += 1;
+    if (released) cleaned += 1;
   }
   return cleaned;
 }
