@@ -5,6 +5,17 @@ assigned at release.
 
 ## Unreleased
 
+- Added: workspace policy v2 (migration 0072, docs/workspace-policy.md). One
+  versioned document with `capture`, `spawn`, `join`, `delivery` and
+  `analytics` sections, each with `locked` and `defaults` tiers, plus a
+  person-only `consent` list and `managed: false`. Served on access/me as
+  `workspace_policy` (with server-computed `delivery.locked.admin_senders`
+  while `inbound_default` is set) and on
+  `GET|PUT|DELETE /api/v1/organizations/{org}/workspace-policy` behind the
+  operator controls switch. A separate `workspace_revision` moves on every
+  write; the capture policy `revision` moves only when capture settings
+  change. User-token introspection answers carry `workspace_policy.revision`
+  and `managed: false`.
 - Added: opt-in OAuth scope `relay:history` on the shared-sessions MCP
   resource. A connection whose person approved it (its own consent line, never
   in the baseline grant, refused without `relay:mcp`) reads shared sessions

@@ -2812,6 +2812,9 @@ paths:
         Bootstrap and workspace API tokens are refused (401). `policy` is the
         organization capture policy, or the unset default
         `{version: 1, revision: 1, settings: {}}`. See docs/capture-policy.md.
+        `workspace_policy` is the v2 workspace policy for this workspace, with
+        `delivery.locked.admin_senders` resolved while `inbound_default` is set.
+        See docs/workspace-policy.md.
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -2822,7 +2825,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [workspace, role, policy]
+                required: [workspace, role, policy, workspace_policy]
                 properties:
                   workspace:
                     type: object
@@ -2834,6 +2837,7 @@ paths:
                     type: string
                     enum: [owner, admin, member]
                   policy: { $ref: "#/components/schemas/CapturePolicy" }
+                  workspace_policy: { $ref: "#/components/schemas/WorkspacePolicy" }
         "401": { description: Missing, invalid, bootstrap or non-user token }
         "404": { description: Workspace not found or not the token's workspace }
   /api/v1/organizations/{organizationId}/capture-policy:
@@ -2900,6 +2904,73 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CapturePolicy" }
         "403": { description: Owner/admin role required, or cross-origin cookie request }
+        "404": { description: Organization not found }
+        "409": { description: "`revision_mismatch`" }
+  /api/v1/organizations/{organizationId}/workspace-policy:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    get:
+      operationId: getWorkspacePolicy
+      description: |
+        Organization owner/admin or bootstrap bearer (members 403). Never gated by
+        SELFHOST_OPERATOR_CONTROLS. Never includes `admin_senders` (no workspace).
+        See docs/workspace-policy.md.
+      responses:
+        "200":
+          description: Current workspace policy, or the unset default
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspacePolicy" }
+        "403": { description: Owner/admin role required }
+        "404": { description: Organization not found }
+    put:
+      operationId: putWorkspacePolicy
+      description: |
+        Organization owner/admin or bootstrap bearer. Full replace: sections absent
+        from the body are stored empty, `consent` defaults to `[]`. The workspace
+        revision becomes previous + 1; the capture policy revision moves only when
+        `sections.capture.locked` differs from the stored capture settings. Audited
+        as `workspace_policy.set` (keys only, never values). Cookie callers must send
+        JSON from an allowed Origin.
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          description: Expected current workspace revision (`7` or `"7"`); 409 when stale.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WorkspacePolicyInput" }
+      responses:
+        "200":
+          description: Stored workspace policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspacePolicy" }
+        "400": { description: "`invalid_policy` (unknown field, section, tier or key; bad type or range; key in both tiers; capture key in defaults; `admin_senders`; non person-only consent key) or malformed If-Match" }
+        "403": { description: "Owner/admin role required, cross-origin cookie request, or `operator_controls_not_entitled`" }
+        "404": { description: Organization not found }
+        "409": { description: "`revision_mismatch`: If-Match is not the current workspace revision" }
+    delete:
+      operationId: clearWorkspacePolicy
+      description: |
+        Organization owner/admin or bootstrap bearer. Clears every section (capture
+        included) and consent; the row is kept and the workspace revision becomes
+        previous + 1. Audited as `workspace_policy.cleared`. Optional If-Match as for PUT.
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Cleared workspace policy (empty sections, higher revision)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspacePolicy" }
+        "403": { description: "Owner/admin role required, cross-origin cookie request, or `operator_controls_not_entitled`" }
         "404": { description: Organization not found }
         "409": { description: "`revision_mismatch`" }
   /api/v1/organizations/{organizationId}/sessions/{sessionId}:
@@ -6295,6 +6366,16 @@ paths:
                           same query as the token. The sessions pipeline enforces it from here
                           (docs/capture-policy.md). A held answer carries the policy as of the
                           held verdict.
+                      workspace_policy:
+                        type: object
+                        additionalProperties: false
+                        required: [revision]
+                        description: The workspace policy revision (docs/workspace-policy.md), 1 when unset. User tokens only.
+                        properties:
+                          revision: { type: integer, minimum: 1 }
+                      managed:
+                        const: false
+                        description: Always false on self-host. User tokens only.
                       held:
                         const: true
                         description: Present and true only when the answer was served from Control's last authoritative verification during a database outage; `exp` is then clamped to the end of the hold.
@@ -9204,6 +9285,85 @@ components:
           type: string
           format: date-time
           description: When `sharing_mode` last became `new`; present only while it is `new`. The sessions pipeline refuses a session that started earlier (when enforcing).
+    WorkspacePolicyTier:
+      type: object
+      description: Key/value pairs from the allowlist in docs/workspace-policy.md.
+      additionalProperties:
+        oneOf:
+          - type: boolean
+          - type: integer
+          - type: string
+          - type: array
+            items: { type: string }
+    WorkspacePolicySection:
+      type: object
+      additionalProperties: false
+      required: [locked, defaults]
+      properties:
+        locked: { $ref: "#/components/schemas/WorkspacePolicyTier" }
+        defaults: { $ref: "#/components/schemas/WorkspacePolicyTier" }
+    WorkspacePolicyCaptureSection:
+      type: object
+      additionalProperties: false
+      required: [locked, defaults]
+      properties:
+        locked: { $ref: "#/components/schemas/CaptureSettings" }
+        defaults:
+          type: object
+          maxProperties: 0
+          description: Always empty; capture keys are lock-only.
+    WorkspacePolicy:
+      type: object
+      additionalProperties: false
+      required: [version, revision, managed, consent, sections]
+      properties:
+        version: { type: integer, enum: [2] }
+        revision: { type: integer, minimum: 1, description: "The workspace revision: moves on every write through either policy route; 1 when never set" }
+        managed: { const: false, description: Always false until enrollment consent lands }
+        consent:
+          type: array
+          description: Person-only key names, sorted and deduplicated
+          items: { type: string }
+        sections:
+          type: object
+          additionalProperties: false
+          required: [capture, spawn, join, delivery, analytics]
+          properties:
+            capture: { $ref: "#/components/schemas/WorkspacePolicyCaptureSection" }
+            spawn: { $ref: "#/components/schemas/WorkspacePolicySection" }
+            join: { $ref: "#/components/schemas/WorkspacePolicySection" }
+            delivery: { $ref: "#/components/schemas/WorkspacePolicySection" }
+            analytics: { $ref: "#/components/schemas/WorkspacePolicySection" }
+    WorkspacePolicyInput:
+      type: object
+      additionalProperties: false
+      required: [sections]
+      properties:
+        sections:
+          type: object
+          additionalProperties: false
+          properties:
+            capture:
+              type: object
+              additionalProperties: false
+              properties:
+                locked: { $ref: "#/components/schemas/CaptureSettings" }
+                defaults: { type: object, maxProperties: 0 }
+            spawn: { $ref: "#/components/schemas/WorkspacePolicyInputSection" }
+            join: { $ref: "#/components/schemas/WorkspacePolicyInputSection" }
+            delivery: { $ref: "#/components/schemas/WorkspacePolicyInputSection" }
+            analytics: { $ref: "#/components/schemas/WorkspacePolicyInputSection" }
+        consent:
+          type: array
+          items:
+            type: string
+            enum: [accept_spawns, spawn_allow_teammates, spawn_full_access_claude, spawn_full_access_codex, spawn_native_input, spawn_requester_approvals, spawn_repositories]
+    WorkspacePolicyInputSection:
+      type: object
+      additionalProperties: false
+      properties:
+        locked: { $ref: "#/components/schemas/WorkspacePolicyTier" }
+        defaults: { $ref: "#/components/schemas/WorkspacePolicyTier" }
     TelemetryIssueInput:
       type: object
       additionalProperties: false

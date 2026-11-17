@@ -155,12 +155,16 @@ export async function writeCapturePolicy(database: Database, input: {
     // becomes `new`, cleared otherwise. clock_timestamp(), not now(): now() is
     // the transaction start, before the organization lock wait above, so it
     // could predate the moment `new` takes effect and admit older sessions.
+    // The workspace policy revision (docs/workspace-policy.md) also advances:
+    // the capture section is part of that document.
     const written = await tx.query<{ sharing_mode_since: Date | string | null }>(
-      `INSERT INTO capture_policies (organization_id, revision, settings, set_by_user_id, updated_at, sharing_mode_since)
-       VALUES ($1, $2, $3::jsonb, $4, now(), CASE WHEN $3::jsonb->>'sharing_mode' = 'new' THEN clock_timestamp() END)
+      `INSERT INTO capture_policies
+         (organization_id, revision, settings, set_by_user_id, updated_at, sharing_mode_since, workspace_revision)
+       VALUES ($1, $2, $3::jsonb, $4, now(), CASE WHEN $3::jsonb->>'sharing_mode' = 'new' THEN clock_timestamp() END, 2)
        ON CONFLICT (organization_id) DO UPDATE
          SET revision = EXCLUDED.revision, settings = EXCLUDED.settings,
              set_by_user_id = EXCLUDED.set_by_user_id, updated_at = now(),
+             workspace_revision = capture_policies.workspace_revision + 1,
              sharing_mode_since = CASE
                WHEN EXCLUDED.settings->>'sharing_mode' IS DISTINCT FROM 'new' THEN NULL
                WHEN capture_policies.settings->>'sharing_mode' = 'new'

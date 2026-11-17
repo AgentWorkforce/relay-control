@@ -53,6 +53,12 @@ from there rather than storing a copy:
   writes that keep it). In enforce mode the ingest edge refuses (422 `capture_policy_session_predates_policy`) a
   batch carrying a session record whose first activity is earlier.
 
+**Workspace policy (v2)**: [workspace-policy.md](workspace-policy.md) serves this policy as the `capture` section of a
+larger document (spawn, join, delivery, analytics) on `access/me` as `workspace_policy` and on
+`/api/v1/organizations/{org}/workspace-policy`. Writes through either route land in the same row. This policy's
+`revision` moves only when the capture settings change, so writes that touch only the other sections never make an
+upload stale; the v2 document has its own `workspace_revision`, which every write through either route moves.
+
 **Desktop semantics**: a key present in `settings` locks that choice; Desktop hides the matching user control
 (hidden, not disabled). An absent key means the user chooses. Desktop reads the policy at sign-in, token refresh
 and every 15 minutes.

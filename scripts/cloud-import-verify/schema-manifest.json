@@ -73,7 +73,8 @@
     {"name":"0068_user_signup_source.sql","sha256":"aed4f6c0aee5aecbc8fca128219b4e6e68e7702c4aff04bf1d5a79cb17cc0224"},
     {"name":"0069_replica_tombstone_retention.sql","sha256":"680c7bad610a70bc98caf8cdf6ce8e4ecb5f3667a0e5513f098ac47e755fe2a6"},
     {"name":"0070_replica_failure_paths.sql","sha256":"1f05ac223c07d9a3f37d83d9eeffa4ce295abce0efe04f0460bd139d96cc9271"},
-    {"name":"0071_mcp_oauth_history_scope.sql","sha256":"2c47638bb6066acdfbd92f75a6bc95b2382b0db924e77f379acfa851fe173fff"}
+    {"name":"0071_mcp_oauth_history_scope.sql","sha256":"2c47638bb6066acdfbd92f75a6bc95b2382b0db924e77f379acfa851fe173fff"},
+    {"name":"0072_workspace_policy.sql","sha256":"24564fb8d73c86fbd66841b64839d7185916b1e793125748775d6aaa98623f9c"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -139,12 +140,15 @@
     {"kind":"column","name":"public.amp_history_syncs.thread_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"text"}},
     {"kind":"column","name":"public.amp_history_syncs.versions","definition":{"collation":null,"default":"'{}'::jsonb","generated":"","identity":"","not_null":true,"position":3,"type":"jsonb"}},
     {"kind":"column","name":"public.amp_history_syncs.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
+    {"kind":"column","name":"public.capture_policies.consent","definition":{"collation":"pg_catalog.default","default":"'{}'::text[]","generated":"","identity":"","not_null":true,"position":9,"type":"text[]"}},
     {"kind":"column","name":"public.capture_policies.organization_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
     {"kind":"column","name":"public.capture_policies.revision","definition":{"collation":null,"default":"1","generated":"","identity":"","not_null":true,"position":2,"type":"integer"}},
     {"kind":"column","name":"public.capture_policies.set_by_user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":4,"type":"uuid"}},
     {"kind":"column","name":"public.capture_policies.settings","definition":{"collation":null,"default":"'{}'::jsonb","generated":"","identity":"","not_null":true,"position":3,"type":"jsonb"}},
     {"kind":"column","name":"public.capture_policies.sharing_mode_since","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":6,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.capture_policies.updated_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":5,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.capture_policies.workspace_revision","definition":{"collation":null,"default":"1","generated":"","identity":"","not_null":true,"position":8,"type":"integer"}},
+    {"kind":"column","name":"public.capture_policies.workspace_settings","definition":{"collation":null,"default":"'{}'::jsonb","generated":"","identity":"","not_null":true,"position":7,"type":"jsonb"}},
     {"kind":"column","name":"public.capy_bindings.agent_name","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":10,"type":"text"}},
     {"kind":"column","name":"public.capy_bindings.agent_remote_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":11,"type":"text"}},
     {"kind":"column","name":"public.capy_bindings.cleanup_pending","definition":{"collation":null,"default":"false","generated":"","identity":"","not_null":true,"position":16,"type":"boolean"}},
@@ -1224,6 +1228,7 @@
     {"kind":"constraint","name":"public.capture_policies.capture_policies_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (organization_id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.capture_policies.capture_policies_revision_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((revision >= 1))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.capture_policies.capture_policies_set_by_user_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (set_by_user_id) REFERENCES users(id) ON DELETE SET NULL","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.capture_policies","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.capture_policies","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_setnull_del","table":"public.users","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.users","type":17}],"type":"f","validated":true}},
+    {"kind":"constraint","name":"public.capture_policies.capture_policies_workspace_revision_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((workspace_revision >= 1))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.capy_bindings.capy_bindings_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((state <> 'bound'::text) OR ((agent_remote_id IS NOT NULL) AND (token_ciphertext IS NOT NULL))))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.capy_bindings.capy_bindings_check1","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((state <> 'preparing'::text) OR (token_ciphertext IS NULL)))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.capy_bindings.capy_bindings_check2","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((state <> 'retired'::text) OR (token_ciphertext IS NULL)))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
@@ -2054,5 +2059,5 @@
   "optional":{
 
   },
-  "sha256":"1afb483684e43646dfbab16f2828b3ca578b1db551712b6fb0d45bed30f3e70f"
+  "sha256":"ec8711964bfa08bb7331061fc7f36fa95e3f5985b3a7959ab68b61ff92e635ef"
 }

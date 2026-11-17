@@ -221,6 +221,8 @@ test("introspection describes an active access token and rotates token_id on ref
     exp: Math.floor(new Date(session.access_token_expires_at).getTime() / 1_000),
     token_id: expectedTokenId,
     capture_policy: { version: 1, revision: 1, settings: {} },
+    workspace_policy: { revision: 1 },
+    managed: false,
   });
   assert.equal("product_id" in active.body, false);
   assert.match(active.body.token_id, /^[0-9a-f]{32}$/);
