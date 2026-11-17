@@ -127,6 +127,7 @@ import {
   uploadPolicyVerdict,
   writeCapturePolicy,
 } from "./capture-policy.js";
+import { parseWorkspacePolicyInput, readWorkspacePolicy, UNSET_WORKSPACE_POLICY, writeWorkspacePolicy } from "./workspace-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
 import { createRelaycastClient, type RosterAgent } from "./messaging/relaycast.js";
 import { isListedRelayAgent } from "./mcp/team-activity.js";
@@ -2587,8 +2588,9 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
-    // Capture policy (docs/capture-policy.md): any member reads it through
-    // access/me; organization owner/admin writes it.
+    // Capture policy (docs/capture-policy.md) and workspace policy
+    // (docs/workspace-policy.md): any member reads both through access/me;
+    // organization owner/admin writes them.
     const accessMe = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/access\/me$/);
     if (accessMe && method === "GET") {
       const { principal, workspace } = await workspaceAccess(request, accessMe[0]!);
@@ -2607,6 +2609,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         workspace: { id: workspace.id, name: workspace.name },
         role: workspace.role,
         policy: await readCapturePolicy(store.database, workspace.organizationId),
+        workspace_policy: await readWorkspacePolicy(store.database, workspace.organizationId, { workspaceId: workspace.id }),
       }, true);
       return;
     }
@@ -2646,6 +2649,41 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         expectedRevision,
         actor: auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" },
         action: method === "PUT" ? "capture_policy.set" : "capture_policy.cleared",
+      });
+      json(response, 200, policy, true);
+      return;
+    }
+
+    const workspacePolicy = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/workspace-policy$/);
+    if (workspacePolicy && (method === "GET" || method === "PUT" || method === "DELETE")) {
+      const organizationId = workspacePolicy[0]!;
+      const auth = await organizationAccess(request, organizationId, true);
+      if (method === "GET") {
+        // No workspace here, so admin_senders is never resolved.
+        json(response, 200, await readWorkspacePolicy(store.database, organizationId), true);
+        return;
+      }
+      if (!operatorControlsEntitled()) {
+        throw new HttpError(403, "operator_controls_not_entitled", "Operator controls are not enabled for this installation");
+      }
+      // Cookie writes: same rules as the capture policy route.
+      if (!bearer(request)) {
+        const allowed = method === "DELETE"
+          ? cookieDeleteAllowed(request, browserOrigins)
+          : cookieRequestAllowed(request, browserOrigins);
+        if (!allowed) throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      const expectedRevision = parseIfMatch(request.headers["if-match"]);
+      const input = method === "PUT"
+        ? parseWorkspacePolicyInput(await requestObject(request))
+        : { sections: UNSET_WORKSPACE_POLICY.sections, consent: [] };
+      const policy = await writeWorkspacePolicy(store.database, {
+        organizationId,
+        sections: input.sections,
+        consent: input.consent,
+        expectedRevision,
+        actor: auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" },
+        action: method === "PUT" ? "workspace_policy.set" : "workspace_policy.cleared",
       });
       json(response, 200, policy, true);
       return;
