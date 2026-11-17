@@ -17,6 +17,48 @@ export const ENROLLMENT_KEY_PREFIX = "sh_ek_";
 export const MAX_API_TOKEN_EXPIRY_DAYS = 365;
 export const MAX_ENROLLMENT_KEY_EXPIRY_DAYS = 30;
 export const DEFAULT_ENROLLMENT_KEY_EXPIRY_DAYS = 7;
+/** The database bound on workspace_api_tokens.max_uses (migration 0074). */
+export const ENROLLMENT_KEY_MAX_USES_LIMIT = 500;
+
+/**
+ * Operator ceilings on desktop-enrollment keys (docs/identity.md, "Desktop
+ * enrollment keys"), read from the environment on every mint so tests can
+ * override them through process.env. Each value is parsed strictly: anything
+ * but a positive decimal integer falls back to the default.
+ * - SELFHOST_ENROLLMENT_MAX_USES (default 50, clamped to 1..500): the largest
+ *   `maxUses` a mint may ask for.
+ * - SELFHOST_ENROLLMENT_MAX_DAYS (default 30): the longest `expiryDays` of a
+ *   single-use key (max_uses = 1).
+ * - SELFHOST_ENROLLMENT_MULTI_USE_MAX_DAYS (default 90): the longest
+ *   `expiryDays` of a multi-use key (max_uses > 1).
+ * - SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS (default 7): reserved for member
+ *   self-minted keys; not read by any route yet.
+ * Day ceilings are clamped to MAX_API_TOKEN_EXPIRY_DAYS.
+ */
+export type EnrollmentLimits = {
+  maxUses: number;
+  maxDays: number;
+  multiUseMaxDays: number;
+  selfMintMaxDays: number;
+};
+
+function positiveIntegerEnv(value: string | undefined, fallback: number, max: number): number {
+  const trimmed = value?.trim();
+  if (!trimmed || !/^[0-9]+$/.test(trimmed)) return fallback;
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) return fallback;
+  return Math.min(parsed, max);
+}
+
+export function enrollmentLimits(env: NodeJS.ProcessEnv = process.env): EnrollmentLimits {
+  return {
+    maxUses: positiveIntegerEnv(env.SELFHOST_ENROLLMENT_MAX_USES, 50, ENROLLMENT_KEY_MAX_USES_LIMIT),
+    maxDays: positiveIntegerEnv(env.SELFHOST_ENROLLMENT_MAX_DAYS, 30, MAX_API_TOKEN_EXPIRY_DAYS),
+    multiUseMaxDays: positiveIntegerEnv(env.SELFHOST_ENROLLMENT_MULTI_USE_MAX_DAYS, 90, MAX_API_TOKEN_EXPIRY_DAYS),
+    selfMintMaxDays: positiveIntegerEnv(env.SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS, 7, MAX_API_TOKEN_EXPIRY_DAYS),
+  };
+}
+
 /** Member self-mint (gate-only): longest and default relay-node token lifetime. */
 export const MAX_SELF_MINTED_RELAY_NODE_EXPIRY_DAYS = 90;
 /** Member self-mint: live relay-node tokens one person may hold in a workspace. */
@@ -52,8 +94,8 @@ export const API_TOKEN_PURPOSE_SCOPES = {
    */
   "relay-node": ["relay:workspace:read", "relay:nodes:read", "relay:nodes:enroll", "relay:agents:read"],
   /**
-   * A single-use `sh_ek_` key bound to one member, exchanged once for a
-   * device session (POST /api/v1/auth/enrollment/token). The key is never a
+   * An `sh_ek_` key bound to one member, exchanged up to its max_uses times
+   * for device sessions (POST /api/v1/auth/enrollment/token). The key is never a
    * bearer, so it carries no scopes; the session it yields carries the
    * device scopes.
    */
@@ -76,6 +118,8 @@ export const DESKTOP_ENROLLMENT_PURPOSE = "desktop-enrollment" satisfies ApiToke
 export const ENROLLMENT_OPERATOR_PURPOSE = "enrollment-operator" satisfies ApiTokenPurpose;
 /** The one desktop-enrollment consent value (docs/identity.md, "MCP consent"). */
 export const ENROLLMENT_MCP_CONSENT_ADMIN = "admin";
+/** The one desktop-enrollment policy consent value: sessions it provisions are managed. */
+export const ENROLLMENT_POLICY_CONSENT_ADMIN = "admin";
 
 export class ApiTokenError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -95,7 +139,10 @@ export type ApiTokenRecord = {
   accessTokenExpiresAt: string | null;
   lastUsedAt: string | null;
   revokedAt: string | null;
-  /** `exchanged`: a spent desktop-enrollment key (revoked wins over it, it wins over expired). */
+  /**
+   * `exchanged`: a spent desktop-enrollment key, i.e. useCount reached
+   * maxUses (revoked wins over it, it wins over expired).
+   */
   status: "active" | "expired" | "revoked" | "exchanged";
   /**
    * relayfile-agent: the agent the token speaks for; relay-node: the node
@@ -111,9 +158,18 @@ export type ApiTokenRecord = {
   userEmail: string | null;
   /** desktop-enrollment only: "admin" when the minting admin granted MCP consent; else null. */
   mcpConsent: "admin" | null;
-  /** desktop-enrollment only: when the single exchange happened, and for which host. */
+  /**
+   * desktop-enrollment only: when the latest exchange happened, and for which
+   * host; once the key is spent, the last exchange.
+   */
   exchangedAt: string | null;
   exchangedHostName: string | null;
+  /** desktop-enrollment: exchanges the key allows (1 = single-use); 1 on other purposes. */
+  maxUses: number;
+  /** desktop-enrollment: exchanges so far; 0 on other purposes. */
+  useCount: number;
+  /** desktop-enrollment only: "admin" when its sessions are managed; else null. */
+  policyConsent: "admin" | null;
   /** desktop-enrollment only: the enrollment-operator token that minted the key; else null. */
   mintedByTokenId: string | null;
 };
@@ -160,6 +216,9 @@ type Row = {
   mcp_consent: "admin" | null;
   exchanged_at: Date | string | null;
   exchanged_host_name: string | null;
+  max_uses: number;
+  use_count: number;
+  policy_consent: "admin" | null;
   minted_by_token_id: string | null;
 };
 
@@ -196,7 +255,7 @@ function toRecord(row: Row): ApiTokenRecord {
     revokedAt: row.revoked_at ? iso(row.revoked_at) : null,
     status: row.revoked_at
       ? "revoked"
-      : row.purpose === DESKTOP_ENROLLMENT_PURPOSE && row.exchanged_at
+      : row.purpose === DESKTOP_ENROLLMENT_PURPOSE && Number(row.use_count) >= Number(row.max_uses)
         ? "exchanged"
         : expired ? "expired" : "active",
     agent_name: row.agent_name,
@@ -207,6 +266,9 @@ function toRecord(row: Row): ApiTokenRecord {
     mcpConsent: row.mcp_consent,
     exchangedAt: row.exchanged_at ? iso(row.exchanged_at) : null,
     exchangedHostName: row.exchanged_host_name,
+    maxUses: Number(row.max_uses),
+    useCount: Number(row.use_count),
+    policyConsent: row.policy_consent,
     mintedByTokenId: row.minted_by_token_id,
   };
 }
@@ -214,7 +276,8 @@ function toRecord(row: Row): ApiTokenRecord {
 const SELECT = `SELECT t.id, t.label, t.purpose, t.scopes, t.token_prefix, t.created_by_user_id,
          u.name AS creator_name, u.email AS creator_email, t.created_at, t.expires_at,
          t.last_used_at, t.revoked_at, t.agent_name, t.aud, t.user_id, bu.email AS user_email,
-         t.mcp_consent, t.exchanged_at, t.exchanged_host_name, t.minted_by_token_id
+         t.mcp_consent, t.exchanged_at, t.exchanged_host_name,
+         t.max_uses, t.use_count, t.policy_consent, t.minted_by_token_id
     FROM workspace_api_tokens t
     LEFT JOIN users u ON u.id = t.created_by_user_id
     LEFT JOIN users bu ON bu.id = t.user_id`;
@@ -264,6 +327,10 @@ export type CreateApiTokenInput = {
   email?: unknown;
   /** desktop-enrollment only: "admin" makes the exchanged session Desktop-verified. */
   mcpConsent?: unknown;
+  /** desktop-enrollment only: exchanges allowed, 1 (default) to enrollmentLimits().maxUses. */
+  maxUses?: unknown;
+  /** desktop-enrollment only: "admin" makes every session the key provisions managed. */
+  policyConsent?: unknown;
   /**
    * desktop-enrollment only: the enrollment-operator token minting the key
    * (its actor is then `{kind: "token"}`); refused for every other purpose.
@@ -418,17 +485,47 @@ export class ApiTokenStore {
         "email and mcpConsent are only accepted for desktop-enrollment keys",
       );
     }
+    // Per-person keys (migration 0074): several machines, policy consent.
+    let maxUses = 1;
+    let policyConsent: "admin" | null = null;
+    const limits = enrollment ? enrollmentLimits() : null;
+    if (enrollment) {
+      if (input.maxUses !== undefined && input.maxUses !== null) {
+        const ceiling = limits!.maxUses;
+        if (!Number.isInteger(input.maxUses) || (input.maxUses as number) < 1 || (input.maxUses as number) > ceiling) {
+          throw new ApiTokenError(
+            400,
+            "invalid_request",
+            `maxUses must be an integer from 1 to ${ceiling} for desktop-enrollment keys`,
+          );
+        }
+        maxUses = input.maxUses as number;
+      }
+      if (input.policyConsent !== undefined && input.policyConsent !== null) {
+        if (input.policyConsent !== ENROLLMENT_POLICY_CONSENT_ADMIN) {
+          throw new ApiTokenError(400, "invalid_request", "policyConsent must be \"admin\" or absent");
+        }
+        policyConsent = ENROLLMENT_POLICY_CONSENT_ADMIN;
+      }
+    } else if (input.maxUses !== undefined || input.policyConsent !== undefined) {
+      throw new ApiTokenError(
+        400,
+        "invalid_request",
+        "maxUses and policyConsent are only accepted for desktop-enrollment keys",
+      );
+    }
     let expiresAt: Date | null;
     if (enrollment) {
       if (input.neverExpires !== undefined && input.neverExpires !== false) {
         throw new ApiTokenError(400, "invalid_request", "desktop-enrollment keys always expire");
       }
-      const days = input.expiryDays ?? DEFAULT_ENROLLMENT_KEY_EXPIRY_DAYS;
-      if (!Number.isInteger(days) || (days as number) < 1 || (days as number) > MAX_ENROLLMENT_KEY_EXPIRY_DAYS) {
+      const maxDays = maxUses > 1 ? limits!.multiUseMaxDays : limits!.maxDays;
+      const days = input.expiryDays ?? Math.min(DEFAULT_ENROLLMENT_KEY_EXPIRY_DAYS, maxDays);
+      if (!Number.isInteger(days) || (days as number) < 1 || (days as number) > maxDays) {
         throw new ApiTokenError(
           400,
           "invalid_request",
-          `expiryDays must be an integer from 1 to ${MAX_ENROLLMENT_KEY_EXPIRY_DAYS} for desktop-enrollment keys`,
+          `expiryDays must be an integer from 1 to ${maxDays} for ${maxUses > 1 ? "multi-use " : ""}desktop-enrollment keys`,
         );
       }
       expiresAt = new Date(Date.now() + (days as number) * 24 * 60 * 60 * 1_000);
@@ -491,8 +588,8 @@ export class ApiTokenStore {
         `INSERT INTO workspace_api_tokens
            (id, workspace_id, label, purpose, scopes, token_hash, token_prefix,
             created_by_user_id, expires_at, agent_name, aud, user_id, mcp_consent,
-            minted_by_token_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+            max_uses, policy_consent, minted_by_token_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
         [
           id,
           input.workspaceId,
@@ -507,6 +604,8 @@ export class ApiTokenStore {
           aud,
           userId,
           mcpConsent,
+          maxUses,
+          policyConsent,
           input.mintedByTokenId ?? null,
         ],
       );
@@ -521,7 +620,8 @@ export class ApiTokenStore {
       actor: input.actor,
       action: "api_token.create",
       target: enrollment
-        ? `${id} (desktop-enrollment: user ${userId}${mcpConsent ? ` mcpConsent=${mcpConsent}` : ""})`
+        ? `${id} (desktop-enrollment: user ${userId}${mcpConsent ? ` mcpConsent=${mcpConsent}` : ""}${
+            maxUses > 1 ? ` maxUses=${maxUses}` : ""}${policyConsent ? ` policyConsent=${policyConsent}` : ""})`
         : purpose === RELAY_NODE_PURPOSE
         ? `${id} (relay-node: ${agentName})`
         : agentName !== null
