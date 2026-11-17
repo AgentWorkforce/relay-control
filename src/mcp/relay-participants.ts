@@ -65,6 +65,13 @@ const AS_PERSON_UNAVAILABLE =
 
 /** Contract section 4, verbatim (shared with Cloud's hosted MCP). */
 export const RELAY_AGENT_CARD_GUIDANCE = "Before delegating to a peer, read its card with get_relay_agent_card to see what it does and what to send it. Keep your own card current with set_relay_agent_card: a description of your purpose and one skill per kind of work you take on, with example requests.";
+/**
+ * Said plainly so a Desktop-managed chat (Claude Code, Cursor, Codex, ...) does
+ * not go looking for a socket or a separate login before it sends. As Cloud.
+ */
+export const DESKTOP_CHAT_RELAY_GUIDANCE =
+  "Once Agent Relay Desktop has registered this chat on this computer, you can send and read relay messages with these tools as the chat's own agent: send_relay_message, post_relay_channel, check_relay_inbox, read_relay_conversation and relay_status act as that chat, with no socket or extra login.";
+
 export const RELAY_COORDINATION_GUIDANCE = "DM a specific agent by default. Use channels only to coordinate a larger swarm or broadcast to many agents, and subscribe only to channels you need. Reply to a channel post in that channel with post_relay_channel (thread_id for its thread), not by DM, unless the reply is private. At task start, check list_relay_agents and DM peers whose work your task affects, without waiting to be asked. "
   + RELAY_AGENT_CARD_GUIDANCE;
 export const HOSTED_REPLY_GUIDANCE = "replies arrive in check_relay_inbox; poll it";
@@ -302,7 +309,9 @@ function createRelayService(context: McpContext) {
   /** The synced Desktop identity of this call's verified native chat; throws when there is none. */
   function desktop() {
     linked ??= (async () => {
-      if (!desktopCall.nativeSession) throw new RelayToolError(DESKTOP_IDENTITY_MESSAGES.unverified);
+      if (!desktopCall.nativeSession) {
+        throw new RelayToolError(desktopCall.provider === "cursor" ? DESKTOP_IDENTITY_MESSAGES.cursorUnverified : DESKTOP_IDENTITY_MESSAGES.unverified);
+      }
       try {
         return { ...await linkedDesktopIdentity({
           database, keyring, client, workspaceId, userId, relaycastWorkspaceId: relayWorkspaceId,

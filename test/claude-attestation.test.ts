@@ -142,3 +142,21 @@ test("an uppercase source id resolves to the lowercase source identity sync stor
   const result = await claudeAttestationFor(await call({ src: src.toUpperCase() }), desktopHeaders, auth, store);
   assert.deepEqual(result, { nativeSession: { kind: "claude", id: sid }, sourceId: src });
 });
+
+test("Cursor replay keys cannot collide across source/ticket pairs that share a `:` join", async () => {
+  // Source `desk` + ticket `one:two` and source `desk:one` + ticket `two` are distinct calls.
+  const signer = await claudeSigner();
+  const sid = randomUUID();
+  const store = memoryStore({
+    [`${auth.workspaceId}/${auth.userId}/desk/${signer.kid}`]: signer.publicKey,
+    [`${auth.workspaceId}/${auth.userId}/desk:one/${signer.kid}`]: signer.publicKey,
+  });
+  const args = { to: "peer", text: "hi" };
+  for (const [src, tuid] of [["desk", "one:two"], ["desk:one", "two"]] as const) {
+    const proof = await signer.sign({ kind: "cursor", tool: "send_relay_message", src, sid, tuid, extra: { args } });
+    const result = await verifyClaudeAttestation({ proof, ...auth, toolUseId: undefined, toolName: "send_relay_message",
+      args, provider: "cursor" }, store);
+    assert.deepEqual(result, { nativeSession: { kind: "cursor", id: sid }, sourceId: src });
+  }
+  assert.equal(store.spent.size, 2);
+});

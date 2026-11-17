@@ -302,7 +302,13 @@ export function createMcpHandler(input: {
     }
     let raw: string;
     try {
-      raw = await boundedBody(request, admitted.provider === "copilot" ? COPILOT_MAX_BODY_BYTES : MAX_BODY_BYTES);
+      // Copilot and Cursor proofs sign the call's arguments, so their requests
+      // may be larger. A Cursor proof may also arrive on the app bearer with
+      // the Desktop marker, which binds no provider (never an OAuth or staff grant).
+      const desktopMarked = admitted.provider === undefined && !admitted.oauth &&
+        admitted.authMode !== "staff_read_grant" && request.headers["x-agent-relay-desktop"] === "1";
+      raw = await boundedBody(request, admitted.provider === "copilot" || admitted.provider === "cursor" || desktopMarked
+        ? COPILOT_MAX_BODY_BYTES : MAX_BODY_BYTES);
     } catch (error) {
       if (error instanceof BodyTooLarge) {
         response.setHeader("connection", "close");
@@ -333,7 +339,7 @@ export function createMcpHandler(input: {
       // Always strips `_agent_relay_attestation` from the arguments; a proof
       // that does not verify refuses the call (no unattested fallback).
       // Copilot credentials carry a Copilot proof; every other call may carry
-      // a Claude Code proof, which counts only on desktop-managed calls (as Cloud).
+      // a Claude Code or Cursor proof, which counts only on desktop-managed calls (as Cloud).
       const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider };
       // An OAuth grant acts only as its approved agent: the Desktop marker
       // never makes it managed, so its proofs are stripped and ignored.

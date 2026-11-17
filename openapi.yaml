@@ -10312,7 +10312,12 @@ components:
       required: [native_session_identity, copilot_session_attestation]
       properties:
         native_session_identity: { type: integer, const: 1 }
+        claude_session_attestation: { type: integer, const: 1 }
         copilot_session_attestation: { type: integer, const: 1 }
+        cursor_session_attestation:
+          type: integer
+          const: 1
+          description: Cursor chats may sync native_session kind cursor (the Cursor conversation_id) and send kind cursor call proofs.
     DesktopIdentitySync:
       type: object
       additionalProperties: false
@@ -10337,7 +10342,7 @@ components:
                 additionalProperties: false
                 required: [kind, id]
                 properties:
-                  kind: { type: string, enum: [codex, grok, pi, claude, copilot, opencode] }
+                  kind: { type: string, enum: [codex, grok, pi, claude, copilot, cursor, opencode] }
                   id: { type: string, description: A UUID, or `ses_...` for opencode. }
         attestation_key:
           type: object
