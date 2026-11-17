@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Added: opt-in OAuth scope `relay:history` on the shared-sessions MCP
+  resource. A connection whose person approved it (its own consent line, never
+  in the baseline grant, refused without `relay:mcp`) reads shared sessions
+  through the server-side History reader with reader kind `mcp`; the OAuth
+  token is never forwarded and never gains `rth:read`. Admission narrows to the
+  live grant on every request, so revocation or losing the scope ends reads.
+  Reads are audited with `auth_mode` `oauth`.
 - Added: the dashboard session catalog route passes relaygate's owning-group
   label (`relaygate: {gid, label}`, from relaygate's `groupLabels` policy)
   through when the session read API is relaygate; only those two validated

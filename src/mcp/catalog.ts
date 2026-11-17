@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ProviderStatus } from "../providers/registry.js";
 import { GROK_ROUTINE_TOOLS } from "./grok-routine.js";
+import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
 
 /**
  * The shared-sessions MCP tool catalog, ported from Cloud's
@@ -208,10 +209,12 @@ export function describeCapabilities(input: {
     if (id === "customer_support" && !input.customerSupport) return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "The customer support backend is not configured on this installation.",
       how_to_enable: "Configure SELFHOST_CUSTOMER_SUPPORT_URL and SELFHOST_CUSTOMER_SUPPORT_TOKEN for the support service." };
-    if (item && id === "shared_session_reads" && input.authMode === "oauth") {
+    // OAuth reads need the opt-in relay:history scope (never in the baseline
+    // grant); with it the group is available as for a native session.
+    if (item && id === "shared_session_reads" && input.authMode === "oauth" && !input.scopes.includes(MCP_HISTORY_SCOPE)) {
       return { ...base, status: "restricted", tools: [...item.tools],
-        reason: "This OAuth connection does not grant transcript-history access.",
-        how_to_enable: "Use an authorized native Agent Relay session for transcript reads." };
+        reason: "This OAuth connection was not granted relay:history.",
+        how_to_enable: "Reconnect and request the relay:history scope on the sessions resource; the consent page lists it as a separate line." };
     }
     if (item && id === "hosted_launch" && !launchRole) {
       return { ...base, status: "restricted", tools: [...item.tools],

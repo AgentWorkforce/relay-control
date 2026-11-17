@@ -17,7 +17,15 @@ export const MCP_OIDC_SCOPE = "openid" as const;
  * never replaces the live owner/admin role check in tool admission.
  */
 export const MCP_AGENTS_SCOPE = "relay:agents" as const;
-export const MCP_OAUTH_SCOPES = [MCP_RELAY_SCOPE, MCP_EVENTS_SCOPE, MCP_AGENTS_SCOPE] as const;
+/**
+ * Shared-session reads on the person's behalf. Offered only by the
+ * shared-sessions resource and only when explicitly requested: it is never in
+ * the baseline grant, so an existing or default connection never gains
+ * transcript access. It is not `rth:read`; the reader mints its own History
+ * credential server-side and never forwards the OAuth token.
+ */
+export const MCP_HISTORY_SCOPE = "relay:history" as const;
+export const MCP_OAUTH_SCOPES = [MCP_RELAY_SCOPE, MCP_EVENTS_SCOPE, MCP_AGENTS_SCOPE, MCP_HISTORY_SCOPE] as const;
 export type McpOAuthScope = (typeof MCP_OAUTH_SCOPES)[number];
 export type McpAuthorizationScope = McpOAuthScope | typeof MCP_OIDC_SCOPE;
 
@@ -26,7 +34,7 @@ type McpOAuthResource = { name: string; scopes: readonly McpOAuthScope[]; public
 
 const MCP_OAUTH_RESOURCES: Readonly<Record<McpOAuthResourcePath, McpOAuthResource>> = {
   "/mcp": { name: "Agent Relay", scopes: [MCP_RELAY_SCOPE, MCP_AGENTS_SCOPE], publicPath: "/mcp" },
-  "/api/v1/mcp/shared-sessions": { name: "Agent Relay Sessions", scopes: [MCP_RELAY_SCOPE, MCP_AGENTS_SCOPE] },
+  "/api/v1/mcp/shared-sessions": { name: "Agent Relay Sessions", scopes: [MCP_RELAY_SCOPE, MCP_AGENTS_SCOPE, MCP_HISTORY_SCOPE] },
   "/api/v1/mcp/relay-events": { name: "Agent Relay events", scopes: [MCP_EVENTS_SCOPE, MCP_RELAY_SCOPE, MCP_AGENTS_SCOPE] },
 };
 export const APP_BASE_PATH = "/cloud";
@@ -467,10 +475,18 @@ export function createMcpOAuthProtocol(config: McpOAuthProtocolConfig) {
     const supported = requireResource(resourcePath).scopes;
     // Only omission grants the baseline. An explicit request must retain a
     // resource permission; OIDC identity alone cannot authorize MCP access.
-    if (requested === undefined || requested === null) return supported.filter(scope => scope !== MCP_AGENTS_SCOPE);
+    // Opt-in scopes (agents, history) are never part of that baseline.
+    if (requested === undefined || requested === null) {
+      return supported.filter(scope => scope !== MCP_AGENTS_SCOPE && scope !== MCP_HISTORY_SCOPE);
+    }
     const wanted = requested.split(/\s+/u).filter(Boolean);
     const granted = supported.filter((scope) => wanted.includes(scope));
     if (granted.length === 0) throw new McpOAuthScopeError();
+    // History reads ride on resource access: a history-only grant could never
+    // be admitted (admission requires relay:mcp), so refuse it at issue time.
+    if (granted.includes(MCP_HISTORY_SCOPE) && !granted.some(scope => scope === MCP_RELAY_SCOPE || scope === MCP_EVENTS_SCOPE)) {
+      throw new McpOAuthScopeError();
+    }
     return granted;
   }
 

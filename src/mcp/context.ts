@@ -8,6 +8,7 @@ import { readWorkspaceHistory } from "../sessions/history.js";
 import { readViaSessionRead } from "./session-read-reader.js";
 import { DESKTOP_MCP_SCOPE, DESKTOP_MCP_TOKEN } from "../auth/desktop-mcp-credentials.js";
 import { mcpReaderMarker } from "../session-read.js";
+import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
 import type { EncryptionKeyring } from "../crypto.js";
 import type { Database, SqlExecutor } from "../database.js";
 import type { RelaycastClient, RosterAgent, PresenceRow } from "../messaging/relaycast.js";
@@ -112,6 +113,14 @@ const ATTESTATION_MESSAGE =
  * or the caller token for an explicitly configured direct list/turns reader,
  * `workspace=` forced on every query, and the response's workspace
  * attestation header required. Failures become public tool messages only.
+ *
+ * Who may read: an exchanged user session (`sh_at_`) or a staff or Desktop
+ * grant, each with `rth:read`; or an OAuth connection (`mcp_at_`) whose
+ * admitted scopes include the opt-in `relay:history`. Admission narrows those
+ * scopes to the live grant on every request, so revoking the connection or
+ * dropping the scope from its grant ends reads. An OAuth read is minted
+ * server-side (reader kind mcp) through the workspace reader in both read API
+ * modes; the OAuth token is never forwarded and never gains `rth:read`.
  */
 export function historyReader(
   config: SelfhostConfig,
@@ -143,16 +152,24 @@ export function historyReader(
     // parent and membership on every request. It authenticates nowhere else,
     // so it reads through the workspace reader, never the session-read hop.
     const desktopGrant = DESKTOP_MCP_TOKEN.test(callerToken) && principal.scopes.includes(DESKTOP_MCP_SCOPE);
-    if (!principal.scopes.includes("rth:read") || principal.pendingHandoff
-      || !(callerToken.startsWith("sh_at_") || staffGrant || desktopGrant)) {
-      throw new SharedSessionsToolError("Session reads require an exchanged user session with rth:read.");
+    // An OAuth connection reads only with the opt-in relay:history scope its
+    // person approved as a separate consent line; relay:mcp alone never does.
+    const oauthToken = callerToken.startsWith("mcp_at_");
+    const oauthGrant = oauthToken && principal.scopes.includes(MCP_HISTORY_SCOPE);
+    const nativeGrant = principal.scopes.includes("rth:read") && (callerToken.startsWith("sh_at_") || staffGrant || desktopGrant);
+    // A pending handoff is refused at OAuth admission too; checked here again.
+    if (principal.pendingHandoff || !(nativeGrant || oauthGrant)) {
+      throw new SharedSessionsToolError(oauthToken && !principal.pendingHandoff
+        ? "Session reads need the relay:history scope on this OAuth connection."
+        : "Session reads require an exchanged user session with rth:read.");
     }
     const url = new URL(path, "https://relayhistory.invalid");
     try {
       // The per-user session-read route is a dashboard route that refuses a
       // grant (staff or Desktop provider) by shape, so a grant always reads
-      // through the workspace reader.
-      const result = (staffGrant || desktopGrant ? null : await readViaSessionRead(config, identity, url.pathname, url.searchParams, marker))
+      // through the workspace reader. So does OAuth: that hop presents the
+      // caller token to Control, and an mcp_at_ token must never leave here.
+      const result = (staffGrant || desktopGrant || oauthGrant ? null : await readViaSessionRead(config, identity, url.pathname, url.searchParams, marker))
         ?? await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
       if (result.status === "unsupported") {
         throw new SharedSessionsToolError("The selected backend does not support this view (unsupported_by_backend).");

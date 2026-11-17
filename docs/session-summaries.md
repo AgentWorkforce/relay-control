@@ -62,8 +62,14 @@ are distinct from a ready recorded summary and from consumer test success.
 
 Both tools use the existing shared-session reader: a native user session with
 `rth:read`, live workspace admission, per-user reader credentials, forced
-workspace query and matching workspace response attestation. OAuth messaging
-credentials gain no history authority. Neither tool issues service/operator
+workspace query and matching workspace response attestation. An OAuth
+connection (`mcp_at_`) reads only with the opt-in `relay:history` scope its
+person approved on the shared-sessions resource; it reads through the
+server-side reader (reader kind `mcp`), its token is never forwarded and never
+gains `rth:read`, revocation or losing the scope refuses further reads at
+admission, and reads are audited with `auth_mode` `oauth` and the client and
+grant ids. Without that scope OAuth credentials gain no history authority.
+Neither tool issues service/operator
 credentials, generates summaries, changes privacy settings or selects a
 different backend after a reader refusal. `401`, `403`, `404`, `501`, transient
 errors and missing attestation preserve existing fail-closed behavior.

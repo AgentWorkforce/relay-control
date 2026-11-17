@@ -199,6 +199,39 @@ test("explicit scope requires resource access; omitted scope alone gets the base
   assert.deepEqual(protocol.grantedScopesFor(SHARED, "cli:auth relay:mcp"), ["relay:mcp"]);
 });
 
+test("relay:history is opt-in, offered only by the sessions resource and never granted without resource access", () => {
+  const sharedOnly = createMcpOAuthProtocol({ publicOrigin: ORIGIN, enabledResources: [SHARED], mountedEndpoints: ["authorization", "token"] });
+  assert.ok(sharedOnly.authorizationServerMetadata().scopes_supported.includes("relay:history"));
+  assert.ok(sharedOnly.protectedResourceMetadata(SHARED).scopes_supported.includes("relay:history"));
+  const rootOnly = createMcpOAuthProtocol({ publicOrigin: ORIGIN, enabledResources: ["/mcp"], mountedEndpoints: ["authorization", "token"] });
+  assert.deepEqual(rootOnly.authorizationServerMetadata().scopes_supported, ["relay:mcp", "relay:agents"]);
+  assert.equal(protocol.protectedResourceMetadata("/mcp").scopes_supported.includes("relay:history"), false);
+  assert.equal(protocol.protectedResourceMetadata(EVENTS).scopes_supported.includes("relay:history"), false);
+  // Omission never grants it, so the default challenge never advertises it either.
+  assert.deepEqual(protocol.grantedScopesFor(SHARED, undefined), ["relay:mcp"]);
+  assert.ok(!protocol.mcpOAuthChallenge(SHARED_URL).includes("relay:history"));
+  assert.deepEqual(protocol.grantedScopesFor(SHARED, "relay:history relay:mcp"), ["relay:mcp", "relay:history"]);
+  assert.deepEqual(protocol.grantedScopesFor(SHARED, "relay:mcp relay:agents relay:history"), ["relay:mcp", "relay:agents", "relay:history"]);
+  for (const scope of ["relay:history", "openid relay:history", "relay:agents relay:history"]) {
+    assert.throws(() => protocol.grantedScopesFor(SHARED, scope), /invalid_scope/, scope);
+    const result = protocol.validateAuthorizationRequest(params({ scope }), client);
+    assert.ok(!result.ok && result.redirect && result.error.error === "invalid_scope", scope);
+  }
+  // Existing behaviour kept: relay:agents alone is still accepted as before.
+  assert.deepEqual(protocol.grantedScopesFor(SHARED, "relay:agents"), ["relay:agents"]);
+  // Root and Events resources never carry it, even when requested.
+  assert.deepEqual(protocol.grantedScopesFor("/mcp", "relay:mcp relay:history"), ["relay:mcp"]);
+  assert.deepEqual(protocol.grantedScopesFor(EVENTS, "relay:events relay:history"), ["relay:events"]);
+  assert.throws(() => protocol.grantedScopesFor("/mcp", "relay:history"), /invalid_scope/);
+  const requested = protocol.validateAuthorizationRequest(params({ scope: "relay:mcp relay:history" }), client);
+  assert.ok(requested.ok);
+  assert.deepEqual(requested.value.scopes, ["relay:mcp", "relay:history"]);
+  // Events launch consent still names its own three scopes and nothing else.
+  const launch = { resource: EVENTS_URL, scopes: ["relay:events", "relay:mcp", "relay:agents"], redirectUri: REDIRECT };
+  assert.equal(protocol.isEventsLaunchConsent(launch), true);
+  assert.equal(protocol.isEventsLaunchConsent({ ...launch, resource: SHARED_URL, scopes: ["relay:mcp", "relay:history"] }), false);
+});
+
 test("relative IncomingMessage URLs and malformed URLs produce safe bearer denials", () => {
   const relative = `/cloud${EVENTS}?agent_name=fake-bot`;
   const response = protocol.mcpOAuthUnauthorized({ url: relative }, true);
@@ -228,7 +261,7 @@ test("discovery advertises only mounted endpoints and separately enabled OIDC", 
   assert.equal(Object.hasOwn(tokenOnly, "authorization_endpoint"), false);
   assert.equal(Object.hasOwn(tokenOnly, "revocation_endpoint_auth_methods_supported"), false);
   const oauth = createMcpOAuthProtocol({ publicOrigin: ORIGIN, enabledResources: [SHARED], mountedEndpoints: ["authorization", "token"] });
-  assert.deepEqual(oauth.authorizationServerMetadata().scopes_supported, ["relay:mcp", "relay:agents"]);
+  assert.deepEqual(oauth.authorizationServerMetadata().scopes_supported, ["relay:mcp", "relay:agents", "relay:history"]);
   assert.equal(Object.hasOwn(oauth.authorizationServerMetadata(), "jwks_uri"), false);
   const narrowed = oauth.validateAuthorizationRequest(params({ scope: "openid relay:mcp" }), client);
   assert.ok(narrowed.ok);
