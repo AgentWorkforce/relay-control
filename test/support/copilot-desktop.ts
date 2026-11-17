@@ -45,8 +45,8 @@ function relaycastFetch(roster: unknown[], world: RelaycastWorld): typeof fetch 
 /** A gate-only install: relaygate's public URL, and a fetch that serves it in front of the Relaycast world. */
 export type DesktopGate = { url: string; fetch: (relaycast: typeof fetch, world: RelaycastWorld) => typeof fetch };
 
-export async function copilotDesktopSetup(t: TestContext, modules: Pick<Parameters<typeof createApp>[0], "capy"> = {},
-  gate?: DesktopGate) {
+export async function copilotDesktopSetup(t: TestContext,
+  modules: Pick<Parameters<typeof createApp>[0], "capy" | "features"> = {}, gate?: DesktopGate) {
   const database = new PGliteDatabase();
   await migrate(database);
   const roster: unknown[] = [];
