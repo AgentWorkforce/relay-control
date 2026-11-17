@@ -1131,6 +1131,70 @@ test("relaycast client creates and deletes outbound subscriptions with the works
     (error: unknown) => error instanceof RelaycastCallError && error.status === 503 && error.operation === "delete_subscription");
 });
 
+test("relaycast client looks agents up by name with the bounded names query", async () => {
+  const key = "rk_live_names_key";
+  const calls: Array<{ method: string; url: URL; authorization: string | null }> = [];
+  const row = (name: string, address = `${name}@cloud-1`) => ({ id: `ag_${name}`, name, type: "agent", address, metadata: {} });
+  let reply: (url: URL) => Response = (url) =>
+    Response.json({ ok: true, data: url.searchParams.getAll("names").map(name => row(name)) });
+  const client = createRelaycastClient({
+    internalOrigin: "http://relaycast.test/",
+    fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      calls.push({ method: init?.method ?? "GET", url, authorization: new Headers(init?.headers).get("authorization") });
+      return reply(url);
+    }) as typeof fetch,
+  });
+
+  // Repeated names params, trimmed and deduplicated, with the workspace key and no status filter.
+  const found = await client.findAgentsByNames(key, [" alpha ", "beta", "alpha", "", "  "]);
+  assert.deepEqual(found.map(agent => agent.name), ["alpha", "beta"]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.method, "GET");
+  assert.equal(calls[0]!.url.pathname, "/v1/agents");
+  assert.deepEqual(calls[0]!.url.searchParams.getAll("names"), ["alpha", "beta"]);
+  assert.deepEqual([...calls[0]!.url.searchParams.keys()].filter(name => name !== "names"), []);
+  assert.equal(calls[0]!.authorization, `Bearer ${key}`);
+
+  // No names: no call.
+  assert.deepEqual(await client.findAgentsByNames(key, []), []);
+  assert.deepEqual(await client.findAgentsByNames(key, ["", " "]), []);
+  assert.equal(await client.findAgentByName(key, "  "), null);
+  assert.equal(calls.length, 1);
+
+  // An engine without the names filter answers with its roster: only exact requested names survive.
+  reply = () => Response.json({ ok: true, data: [row("alpha"), row("alphabet"), row("gamma"), { id: "ag_bad" }] });
+  assert.deepEqual((await client.findAgentsByNames(key, ["alpha"])).map(agent => agent.name), ["alpha"]);
+  assert.equal(await client.findAgentByName(key, "delta"), null);
+
+  // More than the engine limit of 100 names is split into sequential calls.
+  calls.length = 0;
+  reply = (url) => Response.json({ ok: true, data: url.searchParams.getAll("names").map(name => row(name)) });
+  const many = Array.from({ length: 101 }, (_, index) => `agent-${index}`);
+  assert.equal((await client.findAgentsByNames(key, many)).length, 101);
+  assert.deepEqual(calls.map(call => call.url.searchParams.getAll("names").length), [100, 1]);
+  assert.deepEqual(calls.flatMap(call => call.url.searchParams.getAll("names")), many);
+
+  // findAgentByName: none, one, or a duplicate name that fails closed.
+  reply = () => Response.json({ ok: true, data: [] });
+  assert.equal(await client.findAgentByName(key, "alpha"), null);
+  reply = () => Response.json({ ok: true, data: [row("alpha", "alpha@machine")] });
+  assert.equal((await client.findAgentByName(key, "alpha"))?.address, "alpha@machine");
+  reply = () => Response.json({ ok: true, data: [row("alpha", "alpha@one"), row("alpha", "alpha@two")] });
+  await assert.rejects(client.findAgentByName(key, "alpha"),
+    (error: unknown) => error instanceof RelaycastCallError && error.status === 502 && error.outcomeUnknown);
+
+  // A non-list answer is a broken answer (unknown outcome, like listAgents); an upstream failure is labeled find_agents.
+  reply = () => Response.json({ ok: true, data: { name: "alpha" } });
+  await assert.rejects(client.findAgentsByNames(key, ["alpha"]),
+    (error: unknown) => error instanceof RelaycastCallError && error.status === 200 && error.outcomeUnknown);
+  reply = () => Response.json({ ok: false, error: { code: "unavailable" } }, { status: 503 });
+  calls.length = 0;
+  await assert.rejects(client.findAgentByName(key, "alpha"),
+    (error: unknown) => error instanceof RelaycastCallError && error.status === 503 && error.operation === "find_agents");
+  assert.equal(calls.length, 1, "no fallback roster read");
+});
+
 // ---- GET /resolve: the workspace-wide Relaycast key (Cloud parity) ----------
 
 function resolvePath(workspaceId: string, cloud = false): string {

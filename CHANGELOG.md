@@ -6,6 +6,19 @@ assigned at release.
 ## Unreleased
 
 - Added: a webhook inbox can wake a bound cloud agent (migration 0076). With `events_shim` selected, the Agent Relay MCP's `link_webhook_inbox` lets a current owner or admin link an inbox they created to their own bound Amp thread, Replica or Capy binding. Each post then reaches that agent as a relay DM from the inbox's own relay identity, framed as untrusted webhook data with `@mentions` neutralised. `unlink_webhook_inbox` undoes it. Every forward re-checks the inbox, the binding row and generation, the relay agent id, the name's current holder and the Relaycast workspace, and marks the link broken if any changed. The minute sweep releases a deleted inbox's identity on the Relaycast workspace it was registered on. Capy links wake the thread once native Capy delivery is mounted. See docs/events-shim.md.
+- Fixed: `describe_capabilities` now says that Relay Connect rooms are not
+  available on this self-hosted installation, that no setting enables them
+  and that joining a public hosted Connect invite from Agent Relay Desktop is
+  separate; it no longer files them under "not part of the self-hosted
+  edition". No tools or routes change.
+- Fixed: MCP relay sends, inbox polls, `relay_status` and agent card reads no
+  longer list the whole Relaycast roster to resolve one agent name or address.
+  They use the engine's bounded `GET /v1/agents?names=` lookup (one call per
+  send for the recipient, one for the sender's own address, one batch per inbox
+  poll for the senders), keep only rows with the exact requested name so
+  engines without the filter keep working, and never fall back to a
+  full-roster read when the lookup fails. The bound takes effect with Relaycast
+  engine 12.4.0 or later; older engines still answer with the roster.
 - Added: `GET /api/v1/organizations/{org}/fleet` (docs/fleet.md) for owners
   and admins: members, 200 per page, with their Desktop machines (host name,
   client version, platform, enrollment key, managed, last seen, status) and

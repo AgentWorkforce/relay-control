@@ -259,6 +259,14 @@ export function describeCapabilities(input: {
         reason: "Agent launches are not enabled on this self-hosted installation.",
         how_to_enable: "An operator adds launch to SELFHOST_FEATURES (chart selectedFeatures)." };
     }
+    if (id === "connect") {
+      // Connect rooms have no self-host implementation yet. The hosted edition
+      // serves them; a public hosted invite is joined from Agent Relay Desktop,
+      // which never goes through this server.
+      return { ...base, status: "unavailable", tools: [...definition.tools],
+        reason: "Relay Connect rooms are not available on this self-hosted installation.",
+        how_to_enable: "There is no setting for this on the self-hosted server. Joining a public hosted Connect invite from Agent Relay Desktop is separate and does not use this server." };
+    }
     return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: `${definition.title} are not part of the self-hosted Agent Relay edition.`,
       how_to_enable: "Use the hosted Agent Relay Cloud for these tools." };

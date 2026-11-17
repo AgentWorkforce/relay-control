@@ -129,6 +129,8 @@ export function isRelayHarnessCapability(capability: string): boolean {
   return capability.startsWith("spawn:") && RELAY_HARNESS_ID_PATTERN.test(capability.slice("spawn:".length));
 }
 
+/** Most names per bounded `GET /v1/agents?names=` call; mirrors the Relaycast engine limit. */
+const AGENT_NAME_LOOKUP_MAX = 100;
 const INVOCATION_STATUSES = new Set(["pending", "dispatched", "running", "completed", "failed"]);
 
 type FetchImpl = typeof fetch;
@@ -258,6 +260,27 @@ export function createRelaycastClient(input: {
       status: text(agent.status),
       lastSeen: text(agent.last_seen),
     };
+  }
+
+  /** Bounded name lookup behind findAgentsByNames and findAgentByName. */
+  async function agentsByNames(workspaceKey: string, names: string[]): Promise<RosterAgent[]> {
+    const wanted = [...new Set(names.map(name => name.trim()).filter(Boolean))];
+    const found: RosterAgent[] = [];
+    for (let start = 0; start < wanted.length; start += AGENT_NAME_LOOKUP_MAX) {
+      const chunk = wanted.slice(start, start + AGENT_NAME_LOOKUP_MAX);
+      const query = new URLSearchParams();
+      for (const name of chunk) query.append("names", name);
+      const data = await labeled("find_agents", () => call("GET", `/v1/agents?${query}`, workspaceKey));
+      if (!Array.isArray(data)) throw new RelaycastCallError(200, "", true);
+      const requested = new Set(chunk);
+      for (const item of data) {
+        const agent = rosterFrom(item);
+        // An engine without the `names` filter returns its roster; exact-name
+        // filtering keeps the result bounded and correct.
+        if (agent && requested.has(agent.name)) found.push(agent);
+      }
+    }
+    return found;
   }
 
   function agentFrom(value: unknown): RemoteAgent {
@@ -455,6 +478,31 @@ export function createRelaycastClient(input: {
         const agent = rosterFrom(item);
         return agent ? [agent] : [];
       });
+    },
+
+    /**
+     * Roster rows for the given agent names only, via the engine's bounded
+     * `GET /v1/agents?names=` lookup (one repeated `names` param per name, at
+     * most AGENT_NAME_LOOKUP_MAX per call). The engine answers with matching
+     * rows whatever their status or age, excluding released agents. An engine
+     * without the `names` filter returns its roster instead; exact-name
+     * filtering keeps the result bounded and correct there too. Errors are not
+     * retried with a full-roster read.
+     */
+    async findAgentsByNames(workspaceKey: string, names: string[]): Promise<RosterAgent[]> {
+      return agentsByNames(workspaceKey, names);
+    },
+
+    /**
+     * One agent by exact name through the bounded `names` lookup, or null.
+     * Several rows with that name is a broken answer and fails closed.
+     */
+    async findAgentByName(workspaceKey: string, name: string): Promise<RosterAgent | null> {
+      const wanted = name.trim();
+      if (!wanted) return null;
+      const rows = (await agentsByNames(workspaceKey, [wanted])).filter(agent => agent.name === wanted);
+      if (rows.length > 1) throw new RelaycastCallError(502, "", true);
+      return rows[0] ?? null;
     },
 
     /** One agent by name with roster fields (address, status), or null. */
