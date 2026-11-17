@@ -6,6 +6,15 @@ assigned at release.
 ## Unreleased
 
 - Added: a webhook inbox can wake a bound cloud agent (migration 0076). With `events_shim` selected, the Agent Relay MCP's `link_webhook_inbox` lets a current owner or admin link an inbox they created to their own bound Amp thread, Replica or Capy binding. Each post then reaches that agent as a relay DM from the inbox's own relay identity, framed as untrusted webhook data with `@mentions` neutralised. `unlink_webhook_inbox` undoes it. Every forward re-checks the inbox, the binding row and generation, the relay agent id, the name's current holder and the Relaycast workspace, and marks the link broken if any changed. The minute sweep releases a deleted inbox's identity on the Relaycast workspace it was registered on. Capy links wake the thread once native Capy delivery is mounted. See docs/events-shim.md.
+- Added: workspace leaders. `GET /api/v1/workspaces/{id}/leaders` (any
+  member) and `PUT` (workspace owner/admin, `{"patterns": [...]}`, `[]`
+  clears) proxy the Relaycast engine's `/v1/workspace/leaders` setting with the
+  workspace key and answer `{leaders: [{name, agent_id}], patterns}`. At most
+  64 patterns, each trimmed to 1..128 characters with no control characters,
+  duplicates collapsed; `*` and `?` are the only wildcards. Writes are audited
+  as `workspace_leaders.set`; an unreachable or failing engine is `502
+  workspace_leaders_unavailable`. Not gated by `SELFHOST_OPERATOR_CONTROLS`;
+  nothing is stored and no migration. See docs/workspace-leaders.md.
 - Fixed: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), desktop
   identities enrolled at relaygate now verify and sync, so Cursor, Claude Code
   and Copilot attestation keys are stored. Desktop identity sync and every MCP

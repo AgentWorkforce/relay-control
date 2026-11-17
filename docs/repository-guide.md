@@ -29,6 +29,9 @@ Included:
   (`/auth/enrollment/token`); see
   [docs/identity.md](identity.md#desktop-enrollment-keys)
 - opaque per-workspace runtime configuration
+- workspace leaders: owners and admins set the agent-name patterns the
+  Relaycast engine treats as workspace leaders, proxied with the workspace key
+  and stored nothing here ([docs/workspace-leaders.md](workspace-leaders.md))
 - liveness/readiness and an OpenAPI contract
 - opt-in, aggregate-only telemetry with a "what we send" preview, an
   air-gapped export, and a customer "report an issue" API
