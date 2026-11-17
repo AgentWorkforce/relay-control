@@ -5592,13 +5592,18 @@ paths:
       - $ref: "#/components/parameters/WorkspaceId"
     get:
       operationId: listWorkspaceApiTokens
-      description: Owner/admin. The newest 100 tokens, optionally of one purpose.
+      description: |
+        Owner/admin. The newest 100 tokens, optionally of one purpose. An
+        enrollment-operator token (sh_wk_) of this workspace may call it only
+        with purpose=desktop-enrollment and sees only the keys it minted;
+        without the filter, or with another purpose, it gets 403
+        enrollment_operator_scope.
       parameters:
         - name: purpose
           in: query
           required: false
           description: Only tokens of this purpose (400 invalid_request for an unknown purpose).
-          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment] }
+          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
       responses:
         "200":
           description: Tokens (never the token value)
@@ -5632,13 +5637,14 @@ paths:
         coexist for one nodeName (rotation: mint a successor, place it,
         revoke the predecessor). See docs/relay-node-credential.md. These routes
         (also served at /cloud/api/v1) are the only way to mint or revoke
-        one: a workspace owner/admin user token, never a workspace API token,
+        one: a workspace owner/admin user token, never a workspace API token
+        (except an enrollment-operator token, below),
         the internal service token or the bootstrap token (401). agent_name
         is a 400 for any purpose but relayfile-agent, nodeName a 400 for any
         purpose but relay-node, aud a 400 for any
         purpose but relayfile-agent and acquisition-operator, and scope or
         scopes a 400 for every purpose (scopes are fixed by purpose).
-        neverExpires is a 400 for agent-runtime, deployment and relay-node. expiryDays
+        neverExpires is a 400 for agent-runtime, deployment, relay-node and enrollment-operator. expiryDays
         1-365, default 90. accessToken (sh_wk_...) is returned only here.
         desktop-enrollment grants no scopes and returns an sh_ek_ key: a one-time
         Desktop enrollment key for the employee named by email (required; email
@@ -5647,6 +5653,14 @@ paths:
         expiryDays 1-30, default 7; neverExpires is a 400. Revoking it also
         revokes the sessions it provisioned. See docs/identity.md "Desktop
         enrollment keys".
+        enrollment-operator grants exactly enrollment:mint, refuses
+        neverExpires (expiryDays 1-365, default 90) and is the one workspace
+        API token these routes accept as a bearer: a live one of this
+        workspace may mint desktop-enrollment keys here (the key records
+        mintedByTokenId and has createdBy null; audit actor kind token).
+        Any other purpose from it is 403 enrollment_operator_scope; a
+        revoked, expired or other-workspace one is 401. Every other admin
+        route refuses it (401) and introspection reports `wrong-kind`.
       requestBody:
         required: true
         content:
@@ -5656,7 +5670,7 @@ paths:
               required: [label]
               properties:
                 label: { type: string, maxLength: 128 }
-                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment] }
+                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
                 expiryDays: { type: integer, minimum: 1, maximum: 365, description: "desktop-enrollment: 1-30, default 7" }
                 email:
                   type: string
@@ -5712,6 +5726,7 @@ paths:
                     properties:
                       accessToken: { type: string }
         "400": { description: "invalid_request: bad label, purpose, expiry, agent_name, aud, email or mcpConsent, or a scope/scopes field (scopes are fixed by purpose)" }
+        "403": { description: "enrollment_operator_scope: an enrollment-operator token asked for a purpose other than desktop-enrollment" }
         "409": { description: "agent_name_conflict: a non-revoked relayfile-agent token already uses this agent_name; invitation_required: the desktop-enrollment email belongs to an account outside this organization" }
   /api/v1/workspaces/{workspaceId}/deployment-api-tokens/{tokenId}:
     parameters:
@@ -5719,7 +5734,10 @@ paths:
       - { name: tokenId, in: path, required: true, schema: { type: string, format: uuid } }
     delete:
       operationId: revokeWorkspaceApiToken
-      description: Owner/admin.
+      description: |
+        Owner/admin. An enrollment-operator token of this workspace may revoke
+        only the desktop-enrollment keys it minted; any other id is 404
+        token_not_found.
       responses:
         "204": { description: Revoked }
         "404": { description: token_not_found }
@@ -5962,7 +5980,7 @@ paths:
                       type: object
                       properties:
                         id: { type: string }
-                        actorKind: { enum: [user, service, bootstrap] }
+                        actorKind: { enum: [user, service, bootstrap, token], description: "token: an enrollment-operator token; actorId is its id" }
                         actorId: { type: [string, "null"] }
                         action: { type: string }
                         target: { type: [string, "null"] }
@@ -10170,7 +10188,7 @@ components:
       properties:
         id: { type: string }
         label: { type: string }
-        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment] }
+        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
         agent_name: { type: [string, "null"], description: "relayfile-agent: the agent name; relay-node: the node name (same as nodeName); null for other purposes" }
         nodeName: { type: [string, "null"], description: relay-node only; null for other purposes }
         aud: { type: [string, "null"], description: "relayfile-agent and acquisition-operator: the normalized audience origin; null for other purposes" }
@@ -10194,6 +10212,7 @@ components:
         mcpConsent: { enum: [admin, null], description: desktop-enrollment only }
         exchangedAt: { type: [string, "null"], format: date-time, description: desktop-enrollment only; null until exchanged }
         exchangedHostName: { type: [string, "null"], description: desktop-enrollment only }
+        mintedByTokenId: { type: [string, "null"], format: uuid, description: "desktop-enrollment only: the enrollment-operator token that minted the key; null when a person minted it" }
     StaffReadGrant:
       type: object
       required: [id, workspace_id, organization_id, staff_user_id, staff_organization_id, reason, status, created_at, expires_at, revoked_at, revoked_by, last_used_at]
