@@ -6,6 +6,13 @@ assigned at release.
 ## Unreleased
 
 - Added: a webhook inbox can wake a bound cloud agent (migration 0076). With `events_shim` selected, the Agent Relay MCP's `link_webhook_inbox` lets a current owner or admin link an inbox they created to their own bound Amp thread, Replica or Capy binding. Each post then reaches that agent as a relay DM from the inbox's own relay identity, framed as untrusted webhook data with `@mentions` neutralised. `unlink_webhook_inbox` undoes it. Every forward re-checks the inbox, the binding row and generation, the relay agent id, the name's current holder and the Relaycast workspace, and marks the link broken if any changed. The minute sweep releases a deleted inbox's identity on the Relaycast workspace it was registered on. Capy links wake the thread once native Capy delivery is mounted. See docs/events-shim.md.
+- Fixed: Desktop identity sync no longer drops the installation's attestation
+  key when the `attestation_key` field is omitted. Agent Relay Desktop syncs
+  its chats on launch before its key is loaded, and that sync deleted the
+  registered key, so Claude Code, Copilot and Cursor chat calls failed with an
+  unknown key until the next sync re-added it about a minute later. An omitted
+  key now means unchanged; an explicit key replaces it and an explicit `null`
+  removes it. An empty identity list still clears the source, key included.
 - Fixed: `describe_capabilities` now says that Relay Connect rooms are not
   available on this self-hosted installation, that no setting enables them
   and that joining a public hosted Connect invite from Agent Relay Desktop is
