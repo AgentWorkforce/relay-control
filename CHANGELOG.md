@@ -5,6 +5,11 @@ assigned at release.
 
 ## Unreleased
 
+- Fixed: `describe_capabilities` now says that Relay Connect rooms are not
+  available on this self-hosted installation, that no setting enables them
+  and that joining a public hosted Connect invite from Agent Relay Desktop is
+  separate; it no longer files them under "not part of the self-hosted
+  edition". No tools or routes change.
 - Fixed: MCP relay sends, inbox polls, `relay_status` and agent card reads no
   longer list the whole Relaycast roster to resolve one agent name or address.
   They use the engine's bounded `GET /v1/agents?names=` lookup (one call per

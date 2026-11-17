@@ -451,6 +451,13 @@ test("describe_capabilities reports the served groups and the bound workspace", 
   assert.equal(messaging.tools.length, 15);
   assert.deepEqual(messaging.tools.slice(0, 3), ["list_relay_agents", "get_relay_agent_card", "set_relay_agent_card"]);
   assert.equal(messaging.reason, undefined);
+  const connectRooms = data.groups.find((group: any) => group.id === "connect");
+  assert.equal(connectRooms.status, "unavailable");
+  assert.equal(connectRooms.tools.length, 11);
+  assert.equal(connectRooms.reason, "Relay Connect rooms are not available on this self-hosted installation.");
+  assert.match(connectRooms.how_to_enable, /no setting for this on the self-hosted server/);
+  assert.match(connectRooms.how_to_enable, /Joining a public hosted Connect invite from Agent Relay Desktop is separate/);
+  assert(!connectRooms.reason.includes("edition"));
 });
 
 test("session reads go to RelayHistory for the bound workspace only", async (t) => {
