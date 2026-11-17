@@ -518,8 +518,10 @@ employee with `POST /api/v1/workspaces/{id}/deployment-api-tokens`
 `{label, purpose: "desktop-enrollment", email, mcpConsent?, expiryDays?}`
 (1-30 days, default 7). The installer exchanges it once at
 `POST /cloud/api/v1/auth/enrollment/token` for the device/token response.
-The key is never a bearer anywhere else. Contract, consent, revocation and
-audit: [docs/identity.md](identity.md#desktop-enrollment-keys).
+The key is never a bearer anywhere else. An MDM script can mint, list and
+revoke its own keys with an `enrollment-operator` workspace API token
+(`enrollment:mint`) instead of a signed-in admin. Contract, consent,
+revocation and audit: [docs/identity.md](identity.md#desktop-enrollment-keys).
 
 ### Fleet node claims
 
@@ -947,7 +949,10 @@ as a `service` principal, and `relay-node` (`relay:workspace:read`,
 `relay:nodes:read`, `relay:nodes:enroll`, `relay:agents:read`; requires
 `nodeName`; expires within 365 days; several per node), accepted only by the
 `/relay-node/v1` Relaycast broker
-([docs/relay-node-credential.md](relay-node-credential.md)). Scopes are fixed by purpose (`scope`/`scopes` in the
+([docs/relay-node-credential.md](relay-node-credential.md)), and
+`enrollment-operator` (`enrollment:mint`; expires within 365 days), the one
+workspace API token these routes accept as a bearer, only to mint, list and
+revoke its own `desktop-enrollment` keys. Scopes are fixed by purpose (`scope`/`scopes` in the
 body is a 400). Minted and revoked only through these owner/admin user-token
 routes, also served at `/cloud/api/v1`. Desktop-issued sessions (device flow,
 Desktop browser handoff and exchange) carry `cli:auth rth:read rth:sync
