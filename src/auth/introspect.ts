@@ -87,6 +87,11 @@ import type { HeldAudienceVerdict, IntrospectionHold } from "./introspection-hol
  *   (e.g. `user_retroactive_delete: false` refuses a member's own session
  *   delete) instead of keeping a copy. A held answer carries the policy as it
  *   was when the held verdict was checked. Agent and service tokens carry none.
+ * - User tokens also carry `workspace_policy: {revision}` and `managed`
+ *   (docs/workspace-policy.md): the workspace policy revision read in the
+ *   same query, so a client can tell its cached policy is stale without a
+ *   fetch, and whether the session was provisioned by an enrollment key with
+ *   admin policy consent (same query). Staff read grant answers carry neither.
  * - No caching here: the token session row is the truth on every call.
  *   The one exception is the opt-in database outage hold
  *   (SELFHOST_INTROSPECT_OUTAGE_HOLD_MS, docs/identity.md): only when the
@@ -138,6 +143,13 @@ export type IntrospectionResult =
     token_id: string;
     /** The organization's served capture policy (v1.5). */
     capture_policy: CapturePolicy;
+    /** The workspace policy revision (docs/workspace-policy.md); user tokens only. */
+    workspace_policy?: { revision: number };
+    /**
+     * Whether the session is managed: provisioned by a desktop-enrollment key
+     * with admin policy consent (docs/workspace-policy.md); user tokens only.
+     */
+    managed?: boolean;
     /** Present (true) only for a database-outage hold answer. */
     held?: true;
   }
@@ -635,6 +647,9 @@ export async function introspect(
     exp: epochSeconds(held ? new Date(heldAudience!.validUntil) : session.expiresAt),
     token_id: tokenId,
     capture_policy: session.capturePolicy,
+    workspace_policy: { revision: session.workspacePolicyRevision ?? 1 },
+    // The only managed source on self-host: an enrollment key's admin policy consent.
+    managed: session.managed === true,
     ...(held ? { held: true as const } : {}),
   };
 }

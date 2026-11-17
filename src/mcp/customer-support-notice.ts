@@ -19,8 +19,9 @@ export const SupportReplyNotice = z.object({
 /** Identical ownership checks to relay messaging, without creating or joining a participant. */
 export async function customerSupportDesktop(context: McpContext): Promise<string | null> {
   if (context.oauth) return null;
-  const { database, keyring, client, sessionId } = context.relay;
-  const common = { keyring, client, userId: context.principal.userId, relaycastWorkspaceId: context.workspace.relaycastWorkspaceId };
+  const { database, keyring, client, sessionId, gateClient } = context.relay;
+  const common = { keyring, client, ...(gateClient ? { gate: gateClient } : {}), relaycastApiKey: context.workspace.relaycastApiKey,
+    userId: context.principal.userId, relaycastWorkspaceId: context.workspace.relaycastWorkspaceId };
   if (context.desktopCall.required || context.desktopCall.provider !== undefined) {
     const nativeSession = context.desktopCall.nativeSession;
     if (!nativeSession) return null;
@@ -42,8 +43,12 @@ export async function deliverCustomerSupportNotice(store: ControlPlaneStore, dep
   const row = await findDesktopIdentityByAddress(store.database, notice.workspaceId, notice.userId, notice.desktopAddress);
   if (!row || row.relaycastWorkspaceId !== workspace.relaycastWorkspaceId) return "no_desktop";
   const client = createRelaycastClient({ internalOrigin: deps.relaycastUrl, fetchImpl: deps.fetchImpl });
-  const desktop = await verifyDesktopIdentity({ keyring: deps.keyring, client, userId: notice.userId,
-    relaycastWorkspaceId: workspace.relaycastWorkspaceId, row });
+  // Gate-only installs: desktop identities hold rg_ tokens that only relaygate accepts.
+  const gate = deps.relaygatePublicUrl
+    ? createRelaycastClient({ internalOrigin: deps.relaygatePublicUrl, fetchImpl: deps.fetchImpl })
+    : undefined;
+  const desktop = await verifyDesktopIdentity({ keyring: deps.keyring, client, ...(gate ? { gate } : {}),
+    relaycastApiKey: workspace.relaycastApiKey, userId: notice.userId, relaycastWorkspaceId: workspace.relaycastWorkspaceId, row });
   const users = await store.database.query<{ email: string; name: string }>("SELECT email, name FROM users WHERE id = $1", [notice.userId]);
   if (!users.rows[0]) return "not_authorized";
   const identity = await ensurePersonIdentity(deps, { workspaceId: workspace.id, organizationId: workspace.organizationId,

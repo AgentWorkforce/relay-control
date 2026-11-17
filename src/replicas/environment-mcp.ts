@@ -5,7 +5,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { z } from "zod";
 import { admitIdentity, IDENTITY_SERVER_NAME, IdentityRefusal, withIdentityBinding } from "./environments.js";
 import { ReplicaIdentityError, ReplicaIdentityUnavailable, type ReplicaIdentityClaims } from "./identity.js";
-import { ReplicasError, type ReplicasDeps } from "./service.js";
+import { ReplicaProvisioningError, ReplicasError, type ReplicasDeps } from "./service.js";
 import { checkRelayInbox, listRelayAgents, sendRelayMessage } from "./tools.js";
 
 /**
@@ -77,7 +77,7 @@ function buildServer(deps: ReplicasDeps, claims: ReplicaIdentityClaims): McpServ
       const data = await work();
       return { content: [{ type: "text" as const, text: JSON.stringify(data) }], structuredContent: data as Record<string, unknown> };
     } catch (error) {
-      const text = error instanceof IdentityRefusal ? error.code
+      const text = error instanceof IdentityRefusal || error instanceof ReplicaProvisioningError ? error.code
         : error instanceof ReplicasError ? error.message : "Agent Relay could not complete this call. Retry it.";
       return { isError: true, content: [{ type: "text" as const, text }] };
     }
@@ -162,6 +162,10 @@ export async function handleEnvironmentMcp(deps: ReplicasDeps, request: Incoming
     await admitIdentity(deps, claims);
   } catch (error) {
     if (error instanceof IdentityRefusal) return rpcError(response, error.status, error.status === 409 ? -32009 : -32003, error.code, id);
+    // The workspace's Relay binding could not be provisioned: the reserved row is kept, the replica retries.
+    if (error instanceof ReplicaProvisioningError) {
+      return rpcError(response, 503, -32000, error.code, id, { "retry-after": String(error.retryAfterSeconds) });
+    }
     if (error instanceof ReplicasError && error.status < 500) return rpcError(response, error.status, -32000, error.message, id);
     return rpcError(response, 503, -32000, "Agent Relay could not admit this replica. Retry the call.", id);
   }

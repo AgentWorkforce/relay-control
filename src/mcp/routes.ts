@@ -157,6 +157,10 @@ export function createMcpHandler(input: {
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy);
   const attestations = postgresAttestationStore(store.database);
   const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.fetchImpl });
+  // Gate-only installs only: desktop identities hold rg_ tokens that only relaygate accepts.
+  const gateClient = config.relaygatePublicUrl
+    ? createRelaycastClient({ internalOrigin: config.relaygatePublicUrl, fetchImpl: input.fetchImpl })
+    : undefined;
   // Gate-only installs only: relaygate checks every agent launch before it is reserved or sent.
   const launchCheck = config.relaygatePublicUrl
     ? relayLaunchCheck({ relaygatePublicUrl: config.relaygatePublicUrl, store, database: store.database,
@@ -242,10 +246,12 @@ export function createMcpHandler(input: {
         provider:undefined as string|undefined,oauth:access.connection};
     }
     const principal = await store.authenticateAccessToken(token);
-    // A Desktop provider credential (mcp:desktop child token) is honoured only
-    // here, only as a header bearer, and only while its verified parent and
-    // the membership are live (resolve re-checks both on every request).
-    const provider = !principal && headerToken ? await desktopCredentials.resolve(headerToken) : null;
+    // A Desktop provider credential (cld_at_ mcp:desktop child token) is
+    // honoured only here, only as a header bearer on the shared-sessions
+    // facade, and only while its verified parent and the membership are live
+    // (resolve re-checks both on every request).
+    const provider = !principal && headerToken && resourceFor(rawPath) === "/api/v1/mcp/shared-sessions"
+      ? await desktopCredentials.resolve(headerToken) : null;
     if (provider) {
       const workspace = await store.workspaceForUser(provider.principal.workspaceId, provider.principal.userId);
       if (!workspace) {
@@ -303,7 +309,13 @@ export function createMcpHandler(input: {
     }
     let raw: string;
     try {
-      raw = await boundedBody(request, admitted.provider === "copilot" ? COPILOT_MAX_BODY_BYTES : MAX_BODY_BYTES);
+      // Copilot and Cursor proofs sign the call's arguments, so their requests
+      // may be larger. A Cursor proof may also arrive on the app bearer with
+      // the Desktop marker, which binds no provider (never an OAuth or staff grant).
+      const desktopMarked = admitted.provider === undefined && !admitted.oauth &&
+        admitted.authMode !== "staff_read_grant" && request.headers["x-agent-relay-desktop"] === "1";
+      raw = await boundedBody(request, admitted.provider === "copilot" || admitted.provider === "cursor" || desktopMarked
+        ? COPILOT_MAX_BODY_BYTES : MAX_BODY_BYTES);
     } catch (error) {
       if (error instanceof BodyTooLarge) {
         response.setHeader("connection", "close");
@@ -334,7 +346,7 @@ export function createMcpHandler(input: {
       // Always strips `_agent_relay_attestation` from the arguments; a proof
       // that does not verify refuses the call (no unattested fallback).
       // Copilot credentials carry a Copilot proof; every other call may carry
-      // a Claude Code proof, which counts only on desktop-managed calls (as Cloud).
+      // a Claude Code or Cursor proof, which counts only on desktop-managed calls (as Cloud).
       const auth = { workspaceId: workspace.id, userId: principal.userId, desktopMcpProvider: provider };
       // An OAuth grant acts only as its approved agent: the Desktop marker
       // never makes it managed, so its proofs are stripped and ignored.
@@ -348,6 +360,19 @@ export function createMcpHandler(input: {
       if (!(error instanceof CopilotAttestationError) && !(error instanceof ClaudeAttestationError) &&
           !(error instanceof DesktopCallContextError)) throw error;
       const parsed = JSONRPCRequestSchema.safeParse(body);
+      // The response stays generic; the operator log names the check that
+      // failed (never the proof, the token or the arguments).
+      const call = body as { method?: unknown; params?: { name?: unknown } } | null;
+      console.warn("[selfhost-mcp] native chat context refused", {
+        check: error.name,
+        reason: error.message,
+        method: typeof call?.method === "string" ? call.method : null,
+        tool: typeof call?.params?.name === "string" ? call.params.name : null,
+        provider: provider ?? null,
+        auth_mode: authMode,
+        workspace_id: workspace.id,
+        user_id: principal.userId,
+      });
       rpcError(response, 400, -32602, "Invalid native chat context.", parsed.success ? parsed.data.id : null);
       return true;
     }
@@ -384,6 +409,7 @@ export function createMcpHandler(input: {
         relaycastPublicUrl: config.relaycastPublicUrl,
         ...(config.relaygatePublicUrl ? { relaygatePublicUrl: config.relaygatePublicUrl } : {}),
         ...(launchCheck ? { launchCheck } : {}),
+        ...(gateClient ? { gateClient } : {}),
       },
       ...(!oauth && !staffGrant && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && !staffGrant && input.replicas ? { replicas: input.replicas } : {}),

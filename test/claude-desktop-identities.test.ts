@@ -62,7 +62,7 @@ test("desktop identities advertise claude_session_attestation and MCP initialize
   assert.deepEqual(synced.body, { synced: 1, identities: [{ agent_id: chat.id, linked_mcp: null, linked_at: null }] });
   const listed = await request(env.origin, `/cloud${identitiesPath(env.workspaceId)}?source_id=${sourceId}`, { token: parent.accessToken });
   assert.equal(listed.status, 200);
-  assert.deepEqual(listed.body.capabilities, { native_session_identity: 1, claude_session_attestation: 1, copilot_session_attestation: 1 });
+  assert.deepEqual(listed.body.capabilities, { native_session_identity: 1, claude_session_attestation: 1, copilot_session_attestation: 1, cursor_session_attestation: 1 });
   const stored = await env.database.query<{ native_session_kind: string }>(
     "SELECT native_session_kind FROM desktop_relay_identities WHERE agent_remote_id = $1", [chat.id]);
   assert.equal(stored.rows[0]!.native_session_kind, "claude");

@@ -512,6 +512,39 @@ test("members: names for the dashboard without a History read", async (t) => {
   assert.equal(anonymous.status, 401);
 });
 
+test("relaygate group labels reach the dashboard on the list and the catalog, and nothing else of it", async (t) => {
+  const env = await setup(t);
+  const token = await env.login(env.ownerId, env.alpha);
+  const base = `/cloud/api/v1/workspaces/${env.alpha}`;
+  env.history.overrides.set("/v1/sessions", () => ({
+    body: {
+      sessions: [
+        { sessionId: "alpha-1", source: "codex", relaygate: { gid: 22, label: "pit" } },
+        { sessionId: "alpha-2", source: "codex" },
+      ],
+      nextCursor: null,
+    },
+  }));
+  const list = await call(env.origin, `${base}/sessions?metadata=deferred`, { token });
+  assert.equal(list.status, 200);
+  assert.deepEqual(list.body.items[0].relaygate, { gid: 22, label: "pit" });
+  assert(!("relaygate" in list.body.items[1]));
+
+  const catalogBody = (relaygate: unknown) => ({
+    body: { sessionId: "alpha-1", workspaceId: env.alpha, catalog: { title: "t" }, parents: [], children: [], relaygate },
+  });
+  env.history.overrides.set("/v1/sessions/alpha-1/catalog", () => catalogBody({ gid: 22, label: "pit", owner: "someone" }));
+  const labeled = await call(env.origin, `${base}/sessions/alpha-1/catalog?source=codex`, { token });
+  assert.equal(labeled.status, 200);
+  assert.deepEqual(labeled.body.relaygate, { gid: 22, label: "pit" });
+  for (const bad of [{ gid: "22", label: "pit" }, { gid: 22, label: "<b>pit</b>" }, { gid: -1, label: "pit" }, "pit"]) {
+    env.history.overrides.set("/v1/sessions/alpha-1/catalog", () => catalogBody(bad));
+    const refused = await call(env.origin, `${base}/sessions/alpha-1/catalog?source=codex`, { token });
+    assert.equal(refused.status, 200);
+    assert(!("relaygate" in refused.body), JSON.stringify(bad));
+  }
+});
+
 test("list, search, transcript, timing, and subagent catalog for the dashboard", async (t) => {
   const env = await setup(t);
   const token = await env.login(env.ownerId, env.alpha);

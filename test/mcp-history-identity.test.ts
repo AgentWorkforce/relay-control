@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import type { SelfhostConfig } from "../src/config.js";
-import { historyReader } from "../src/mcp/context.js";
+import { historyReader, type McpContext } from "../src/mcp/context.js";
+import { buildReadAuditRecord } from "../src/mcp/read-audit.js";
+import { describeCapabilities } from "../src/mcp/catalog.js";
 import { forgetSessionReadTokens } from "../src/mcp/session-read-reader.js";
 import { mcpReaderMarker } from "../src/session-read.js";
 import type { Principal } from "../src/store.js";
@@ -346,12 +348,103 @@ test("session reads require rth:read and an exchanged Control user credential be
   const seen=fake(t),cfg=config();
   for(const [who,token] of [[{...principal("user-a"),scopes:["cli:auth"]},"sh_at_user_a"],
     [{...principal("user-a"),pendingHandoff:true},"sh_at_user_a"],
-    [principal("user-a"),`rth_st_read_${padded("fake-service")}`],[principal("user-a"),"mcp_at_fake"]] as const) {
+    [principal("user-a"),`rth_st_read_${padded("fake-service")}`]] as const) {
     await assert.rejects(historyReader(cfg,who as Principal,workspace("ws-a","org-a"),token)("/v1/sessions"),/rth:read/);
   }
   assert.equal(seen.issues.length,0);assert.equal(seen.reads.length,0);assert.equal(seen.history.length,0);
 });
 
+const OAUTH_TOKEN=`mcp_at_${"O".repeat(43)}`;
+const oauth=(scopes:string[],extra:Partial<Principal>={})=>({userId:"user-a",scopes,...extra}) as Principal;
+
+test("an OAuth connection without relay:history is refused before any upstream call",async t=>{
+  const seen=fake(t),cfg=config();
+  // rth:read on an mcp_at_ principal is never a native path: that scope cannot reach an OAuth session.
+  for(const who of [oauth(["relay:mcp"]),oauth(["relay:mcp","relay:agents"]),oauth(["relay:mcp","rth:read"])]) {
+    await assert.rejects(historyReader(cfg,who,workspace("ws-a","org-a"),OAUTH_TOKEN)("/v1/sessions"),
+      {message:"Session reads need the relay:history scope on this OAuth connection."});
+  }
+  // relay:history on any other credential shape grants nothing.
+  for(const token of ["sh_at_user_a",`cld_at_${"G".repeat(43)}`,`rth_st_read_${padded("fake-service")}`]) {
+    await assert.rejects(historyReader(cfg,oauth(["relay:mcp","relay:history"]),workspace("ws-a","org-a"),token)("/v1/sessions"),
+      {message:"Session reads require an exchanged user session with rth:read."});
+  }
+  assert.equal(seen.issues.length+seen.reads.length+seen.history.length+seen.handoffs.length,0);
+});
+
+test("a pending handoff refuses an OAuth relay:history read before any upstream call",async t=>{
+  const seen=fake(t),cfg=config();
+  await assert.rejects(historyReader(cfg,oauth(["relay:mcp","relay:history"],{pendingHandoff:true}),workspace("ws-a","org-a"),OAUTH_TOKEN)("/v1/sessions"),
+    {message:"Session reads require an exchanged user session with rth:read."});
+  assert.equal(seen.issues.length+seen.reads.length+seen.history.length+seen.handoffs.length,0);
+});
+
+test("an OAuth relay:history read is minted server-side as an mcp reader and never forwards the OAuth token",async t=>{
+  for(const on of [false,true]) for(const kind of [false,true]) {
+    const seen=fake(t),cfg=config(on);
+    cfg.sessionReadApi.mintReaderKind=kind;
+    const who=oauth(["relay:mcp","relay:history"]);
+    assert.deepEqual(await historyReader(cfg,who,workspace("ws-a","org-a"),OAUTH_TOKEN)("/v1/sessions"),{from:"history"});
+    // Never the session-read hop, which would present the caller token to Control.
+    assert.equal(seen.issues.length,0,`mode ${on}`);
+    assert.equal(seen.handoffs.length,1);
+    assert.equal(seen.handoffs[0]!.bearer,`Bearer ${SECRET}`);
+    const minted=seen.handoffs[0]!.body;
+    assert.deepEqual([minted.userId,minted.orgId,minted.workspaceId],["user-a","org-a","ws-a"]);
+    if(kind) assert.equal(minted.reader_kind,"mcp");
+    else assert.equal("reader_kind" in minted,false);
+    assert.match(seen.history[0]!.bearer!,/^Bearer rth_at_read_/);
+    assert.equal(JSON.stringify([seen.handoffs,seen.history,seen.reads,seen.issues]).includes(OAUTH_TOKEN),false);
+    assert.deepEqual(who.scopes,["relay:mcp","relay:history"],"the OAuth principal never gains rth:read");
+  }
+});
+
+test("capability discovery restricts OAuth session reads exactly when relay:history is missing",()=>{
+  const reads=(authMode:"oauth"|"cli_login",scopes:string[])=>describeCapabilities({endpointUrl:"https://relay.example.test/mcp",
+    authMode,scopes,workspaceId:"ws-a",role:"member",providers:[]}).groups.find(group=>group.id==="shared_session_reads")!;
+  const restricted=reads("oauth",["relay:mcp","relay:agents"]) as {status:string;reason?:string;how_to_enable?:string};
+  assert.equal(restricted.status,"restricted");
+  assert.equal(restricted.reason,"This OAuth connection was not granted relay:history.");
+  assert.match(restricted.how_to_enable!,/request the relay:history scope on the sessions resource/);
+  assert.equal(reads("oauth",["relay:mcp","relay:history"]).status,"available");
+  assert.equal(reads("cli_login",["rth:read"]).status,"available");
+});
+
+test("an OAuth session read is audited with auth_mode oauth and its client and grant ids",()=>{
+  const context={workspace:{id:"ws-a",organizationId:"org-a"},principal:oauth(["relay:mcp","relay:history"]),
+    authMode:"oauth",desktopCall:{required:false},relay:{sessionId:undefined},
+    oauth:{access:{clientId:"mcpc_fake",grantId:"grant-fake"}}} as unknown as McpContext;
+  const record=buildReadAuditRecord({context,toolName:"search_shared_sessions",args:{query:"fake"},
+    result:{content:[{type:"text",text:"ok"}],structuredContent:{}} as never,startedAt:Date.now(),now:null});
+  assert.equal(record.outcome,"ok");
+  assert.deepEqual([record.identityKind,record.authMode,record.oauthClientId,record.oauthGrantId,record.callerUserId],
+    ["oauth","oauth","mcpc_fake","grant-fake","user-a"]);
+});
+
+test("a Desktop provider grant (cld_at_, mcp:desktop) reads through the workspace reader in both modes",async t=>{
+  const grant=`cld_at_${"G".repeat(43)}`;
+  const desktop={...principal("user-a"),scopes:["rth:read","mcp:desktop"]} as Principal;
+  for(const on of [false,true]) {
+    const seen=fake(t),cfg=config(on);
+    assert.deepEqual(await historyReader(cfg,desktop,workspace("ws-a","org-a"),grant)("/v1/sessions"),{from:"history"});
+    // Never the session-read hop that would present the grant to Control.
+    assert.equal(seen.issues.length,0);
+    assert.equal(seen.handoffs.length,1);
+    assert.equal(seen.handoffs[0]!.bearer,`Bearer ${SECRET}`);
+    const minted=seen.handoffs[0]!.body;
+    assert.deepEqual([minted.userId,minted.orgId,minted.workspaceId],["user-a","org-a","ws-a"]);
+    assert.equal(JSON.stringify([seen.handoffs,seen.history,seen.reads]).includes(grant),false);
+  }
+  // The grant shape alone, or the scope without rth:read, is not enough.
+  const seen=fake(t),cfg=config();
+  for(const [who,token] of [[principal("user-a"),grant],
+    [{...principal("user-a"),scopes:["mcp:desktop"]},grant],
+    [desktop,"cld_at_short"],
+    [{...desktop,pendingHandoff:true},grant]] as const) {
+    await assert.rejects(historyReader(cfg,who as Principal,workspace("ws-a","org-a"),token)("/v1/sessions"),/rth:read/);
+  }
+  assert.equal(seen.issues.length+seen.reads.length+seen.history.length+seen.handoffs.length,0);
+});
 
 test("missing attestation and malformed reader bodies never trigger another backend",async t=>{
   for(const options of [{attest:()=>null},{readBody:[]}]) {

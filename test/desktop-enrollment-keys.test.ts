@@ -231,7 +231,8 @@ test("exchange: device/token shape and scopes; consent decides Desktop verificat
   assert.equal(exchanged.status, 200);
   assert.equal(exchanged.headers.get("cache-control"), "no-store");
   assert.deepEqual(Object.keys(exchanged.body).sort(), [
-    "access_token", "access_token_expires_at", "api_url", "refresh_token", "refresh_token_expires_at", "scope", "token_type",
+    "access_token", "access_token_expires_at", "api_url", "managed", "policy_revision", "refresh_token",
+    "refresh_token_expires_at", "scope", "token_type", "workspace_policy",
   ]);
   assert.equal(exchanged.body.token_type, "Bearer");
   assert.equal(exchanged.body.api_url, `${env.origin}/cloud`);
@@ -329,7 +330,7 @@ test("exchange audit: actor is the employee, target has key id, ip and host, nev
   assert.ok(exchange);
   assert.equal(exchange.actorKind, "user");
   assert.equal(exchange.actorId, memberId);
-  assert.match(exchange.target ?? "", new RegExp(`^${key.id} ip=\\S+ host=build-01$`));
+  assert.match(exchange.target ?? "", new RegExp(`^${key.id} ip=\\S+ host=build-01 use=1/1 client=unknown$`));
   assert.ok(/ip=(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)/.test(exchange.target ?? ""), "loopback client address");
   const secret = key.accessToken.slice("sh_ek_".length);
   const everything = JSON.stringify(events);

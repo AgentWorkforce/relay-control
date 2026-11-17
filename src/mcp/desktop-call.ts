@@ -6,10 +6,10 @@
  * `provider` is the Desktop provider bound to the admitted credential (a
  * `mcp:desktop` child token), never a model argument or header. Any provider
  * makes the call managed: actor tools then need a verified native chat and
- * never fall back to a hosted participant. `attested` is a Claude or Copilot call proof
+ * never fall back to a hosted participant. `attested` is a Claude, Cursor or Copilot call proof
  * the route already verified (`claudeAttestationFor` / `copilotAttestationFor`).
  */
-export type NativeSession = { kind: "codex" | "grok" | "pi" | "opencode" | "claude" | "copilot"; id: string };
+export type NativeSession = { kind: "codex" | "grok" | "pi" | "opencode" | "claude" | "copilot" | "cursor"; id: string };
 /** `nativeSourceId` is set when a signed proof names the desktop source that must own the chat. */
 export type DesktopCallContext = { required: boolean; nativeSession?: NativeSession; nativeSourceId?: string; provider?: string };
 export const NATIVE_SESSION_CAPABILITY = "com.agentrelay/native-session-identity";

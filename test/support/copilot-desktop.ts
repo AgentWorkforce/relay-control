@@ -37,7 +37,11 @@ function relaycastFetch(roster: unknown[], world: RelaycastWorld): typeof fetch 
   }) as typeof fetch;
 }
 
-export async function copilotDesktopSetup(t: TestContext, modules: Pick<Parameters<typeof createApp>[0], "capy"> = {}) {
+/** A gate-only install: relaygate's public URL, and a fetch that serves it in front of the Relaycast world. */
+export type DesktopGate = { url: string; fetch: (relaycast: typeof fetch, world: RelaycastWorld) => typeof fetch };
+
+export async function copilotDesktopSetup(t: TestContext, modules: Pick<Parameters<typeof createApp>[0], "capy"> = {},
+  gate?: DesktopGate) {
   const database = new PGliteDatabase();
   await migrate(database);
   const roster: unknown[] = [];
@@ -59,9 +63,11 @@ export async function copilotDesktopSetup(t: TestContext, modules: Pick<Paramete
     dashboardUrl: `${origin}/`,
     port: 0,
     host: "127.0.0.1",
+    ...(gate ? { relaygatePublicUrl: gate.url } : {}),
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
-  control.on("request", createApp({ config, store, messagingFetch: relaycastFetch(roster, world), ...modules }));
+  const messagingFetch = gate ? gate.fetch(relaycastFetch(roster, world), world) : relaycastFetch(roster, world);
+  control.on("request", createApp({ config, store, messagingFetch, ...modules }));
   t.after(async () => {
     await close(control);
     await database.close();
@@ -174,7 +180,7 @@ export async function copilotDesktopSetup(t: TestContext, modules: Pick<Paramete
 }
 
 /** The secret Agent Relay Desktop mints and saves before registering it. */
-export const desktopSecret = () => `sh_at_${randomBytes(32).toString("base64url")}`;
+export const desktopSecret = () => `cld_at_${randomBytes(32).toString("base64url")}`;
 export const installationId = () => randomUUID();
 
 export const tokensPath = (workspaceId: string, tokenId?: string) =>

@@ -5,7 +5,64 @@ assigned at release.
 
 ## Unreleased
 
-- Added: a webhook inbox can wake a bound cloud agent (migration 0071). With `events_shim` selected, the Agent Relay MCP's `link_webhook_inbox` lets a current owner or admin link an inbox they created to their own bound Amp thread, Replica or Capy binding. Each post then reaches that agent as a relay DM from the inbox's own relay identity, framed as untrusted webhook data with `@mentions` neutralised. `unlink_webhook_inbox` undoes it. Every forward re-checks the inbox, the binding row and generation, the relay agent id, the name's current holder and the Relaycast workspace, and marks the link broken if any changed. The minute sweep releases a deleted inbox's identity on the Relaycast workspace it was registered on. Capy links wake the thread once native Capy delivery is mounted. See docs/events-shim.md.
+- Added: a webhook inbox can wake a bound cloud agent (migration 0076). With `events_shim` selected, the Agent Relay MCP's `link_webhook_inbox` lets a current owner or admin link an inbox they created to their own bound Amp thread, Replica or Capy binding. Each post then reaches that agent as a relay DM from the inbox's own relay identity, framed as untrusted webhook data with `@mentions` neutralised. `unlink_webhook_inbox` undoes it. Every forward re-checks the inbox, the binding row and generation, the relay agent id, the name's current holder and the Relaycast workspace, and marks the link broken if any changed. The minute sweep releases a deleted inbox's identity on the Relaycast workspace it was registered on. Capy links wake the thread once native Capy delivery is mounted. See docs/events-shim.md.
+- Fixed: on gate-only installs (`SELFHOST_RELAYGATE_PUBLIC_URL` set), desktop
+  identities enrolled at relaygate now verify and sync, so Cursor, Claude Code
+  and Copilot attestation keys are stored. Desktop identity sync and every MCP
+  call check the identity's `rg_` token with relaygate's `GET /v1/whoami`
+  (agent id and name, plus the enrolling user once relaygate reports
+  `user_id`) and require the upstream Relaycast agent of that name to carry
+  the same `metadata.relaygate.agent_id`. MCP messaging as a desktop identity
+  goes through relaygate. Before, Relaycast refused the `rg_` token, every
+  identity was skipped `unverified`, the attestation key was dropped and
+  attested MCP calls failed with "unknown key". No migration.
+- Added: per-person desktop enrollment keys (migration 0074). A
+  `desktop-enrollment` key takes `maxUses` (default 1, ceiling
+  `SELFHOST_ENROLLMENT_MAX_USES`, default 50) and is exchanged once per
+  machine until spent; expiry ceilings `SELFHOST_ENROLLMENT_MAX_DAYS` (30,
+  single-use) and `SELFHOST_ENROLLMENT_MULTI_USE_MAX_DAYS` (90). A key minted
+  with `policyConsent: "admin"` provisions managed sessions: the exchange
+  response, `access/me` and introspection answer `managed: true`, and the
+  exchange response adds `policy_revision` and the `workspace_policy`
+  document. Token records list `maxUses`, `useCount` and `policyConsent`;
+  the exchange audit target adds the use number and Desktop client version.
+- Changed: when the MCP route refuses a `tools/call` with `Invalid native
+  chat context.` (a Claude Code, Cursor or Copilot call proof that does not
+  verify, or conflicting desktop call headers), the server log now names
+  the failed check (`[selfhost-mcp] native chat context refused` with
+  `check`, `reason`, `method`, `tool`, `provider`, `auth_mode`,
+  `workspace_id`, `user_id`). The response is unchanged and the log never
+  carries the proof, the token or the arguments.
+- Added: workspace API token purpose `enrollment-operator` (`sh_wk_`, scope
+  `enrollment:mint`, migration 0073). An owner or admin mints one; an MDM
+  script presents it to mint `desktop-enrollment` keys, list them
+  (`?purpose=desktop-enrollment`, its own keys only) and revoke its own keys,
+  without a device sign-in. Any other purpose is `403
+  enrollment_operator_scope`, another key is `404`, every other admin route
+  still answers `401`, and introspection still answers `wrong-kind`. Keys
+  record `mintedByTokenId`; audit rows use actor kind `token`.
+- Added: workspace policy v2 (migration 0072, docs/workspace-policy.md). One
+  versioned document with `capture`, `spawn`, `join`, `delivery` and
+  `analytics` sections, each with `locked` and `defaults` tiers, plus a
+  person-only `consent` list and `managed: false`. Served on access/me as
+  `workspace_policy` (with server-computed `delivery.locked.admin_senders`
+  while `inbound_default` is set) and on
+  `GET|PUT|DELETE /api/v1/organizations/{org}/workspace-policy` behind the
+  operator controls switch. A separate `workspace_revision` moves on every
+  write; the capture policy `revision` moves only when capture settings
+  change. User-token introspection answers carry `workspace_policy.revision`
+  and `managed: false`.
+- Added: opt-in OAuth scope `relay:history` on the shared-sessions MCP
+  resource. A connection whose person approved it (its own consent line, never
+  in the baseline grant, refused without `relay:mcp`) reads shared sessions
+  through the server-side History reader with reader kind `mcp`; the OAuth
+  token is never forwarded and never gains `rth:read`. Admission narrows to the
+  live grant on every request, so revocation or losing the scope ends reads.
+  Reads are audited with `auth_mode` `oauth`.
+- Added: the dashboard session catalog route passes relaygate's owning-group
+  label (`relaygate: {gid, label}`, from relaygate's `groupLabels` policy)
+  through when the session read API is relaygate; only those two validated
+  fields pass. Session list items already carried it unchanged.
 - Added: Replicas failure paths (migration 0070). The environment MCP create
   intent is persisted on the policy and, while it is set, every sync or
   enable (startup run, periodic sync, the sync and enable routes, a plain

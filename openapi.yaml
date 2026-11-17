@@ -1284,12 +1284,14 @@ paths:
       security: []
       operationId: exchangeEnrollmentKey
       description: |
-        Exchanges a one-time desktop enrollment key (sh_ek_, minted by an owner or
-        admin as a desktop-enrollment workspace API token) for a device session of
-        the bound employee: device scopes, labelled client_name, desktop host name
-        stored, Desktop-verified only when the key carries mcpConsent admin. Also
-        served at /cloud/api/v1/auth/enrollment/token. Audited
-        enrollment_key.exchange with the client address and host.
+        Exchanges one use of a desktop enrollment key (sh_ek_, minted by an owner or
+        admin as a desktop-enrollment workspace API token; maxUses exchanges, 1 by
+        default) for a device session of the bound employee: device scopes,
+        labelled client_name, desktop host name stored, Desktop-verified only when
+        the key carries mcpConsent admin, managed only when it carries
+        policyConsent admin. Also served at /cloud/api/v1/auth/enrollment/token.
+        Audited enrollment_key.exchange with the client address, host, use number
+        and the AgentRelayDesktop User-Agent version.
       requestBody:
         required: true
         content:
@@ -1303,15 +1305,23 @@ paths:
                 desktop_host_name: { type: string, minLength: 1, maxLength: 80 }
       responses:
         "200":
-          description: Renewable token pair issued; the key is spent
+          description: Renewable token pair issued; one use of the key is spent
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/OAuthTokenPair"
+                allOf:
+                  - $ref: "#/components/schemas/OAuthTokenPair"
+                  - type: object
+                    required: [managed, policy_revision, workspace_policy]
+                    properties:
+                      managed: { type: boolean, description: The key carries policyConsent admin; the session is managed (docs/workspace-policy.md). }
+                      policy_revision: { type: integer, description: The organization's workspace policy revision, 1 when unset. }
+                      workspace_policy:
+                        $ref: "#/components/schemas/WorkspacePolicy"
         "400":
           description: |
             invalid_request for a malformed body; invalid_grant (one body for every
-            reason) when the key is unknown, expired, revoked or already exchanged.
+            reason) when the key is unknown, expired, revoked or spent (useCount reached maxUses).
           content:
             application/json:
               schema:
@@ -2812,6 +2822,9 @@ paths:
         Bootstrap and workspace API tokens are refused (401). `policy` is the
         organization capture policy, or the unset default
         `{version: 1, revision: 1, settings: {}}`. See docs/capture-policy.md.
+        `workspace_policy` is the v2 workspace policy for this workspace, with
+        `delivery.locked.admin_senders` resolved while `inbound_default` is set.
+        See docs/workspace-policy.md.
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -2822,7 +2835,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [workspace, role, policy]
+                required: [workspace, role, policy, workspace_policy]
                 properties:
                   workspace:
                     type: object
@@ -2834,6 +2847,7 @@ paths:
                     type: string
                     enum: [owner, admin, member]
                   policy: { $ref: "#/components/schemas/CapturePolicy" }
+                  workspace_policy: { $ref: "#/components/schemas/WorkspacePolicy" }
         "401": { description: Missing, invalid, bootstrap or non-user token }
         "404": { description: Workspace not found or not the token's workspace }
   /api/v1/organizations/{organizationId}/capture-policy:
@@ -2900,6 +2914,73 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CapturePolicy" }
         "403": { description: Owner/admin role required, or cross-origin cookie request }
+        "404": { description: Organization not found }
+        "409": { description: "`revision_mismatch`" }
+  /api/v1/organizations/{organizationId}/workspace-policy:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    get:
+      operationId: getWorkspacePolicy
+      description: |
+        Organization owner/admin or bootstrap bearer (members 403). Never gated by
+        SELFHOST_OPERATOR_CONTROLS. Never includes `admin_senders` (no workspace).
+        See docs/workspace-policy.md.
+      responses:
+        "200":
+          description: Current workspace policy, or the unset default
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspacePolicy" }
+        "403": { description: Owner/admin role required }
+        "404": { description: Organization not found }
+    put:
+      operationId: putWorkspacePolicy
+      description: |
+        Organization owner/admin or bootstrap bearer. Full replace: sections absent
+        from the body are stored empty, `consent` defaults to `[]`. The workspace
+        revision becomes previous + 1; the capture policy revision moves only when
+        `sections.capture.locked` differs from the stored capture settings. Audited
+        as `workspace_policy.set` (keys only, never values). Cookie callers must send
+        JSON from an allowed Origin.
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          description: Expected current workspace revision (`7` or `"7"`); 409 when stale.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WorkspacePolicyInput" }
+      responses:
+        "200":
+          description: Stored workspace policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspacePolicy" }
+        "400": { description: "`invalid_policy` (unknown field, section, tier or key; bad type or range; key in both tiers; capture key in defaults; `admin_senders`; non person-only consent key) or malformed If-Match" }
+        "403": { description: "Owner/admin role required, cross-origin cookie request, or `operator_controls_not_entitled`" }
+        "404": { description: Organization not found }
+        "409": { description: "`revision_mismatch`: If-Match is not the current workspace revision" }
+    delete:
+      operationId: clearWorkspacePolicy
+      description: |
+        Organization owner/admin or bootstrap bearer. Clears every section (capture
+        included) and consent; the row is kept and the workspace revision becomes
+        previous + 1. Audited as `workspace_policy.cleared`. Optional If-Match as for PUT.
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Cleared workspace policy (empty sections, higher revision)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspacePolicy" }
+        "403": { description: "Owner/admin role required, cross-origin cookie request, or `operator_controls_not_entitled`" }
         "404": { description: Organization not found }
         "409": { description: "`revision_mismatch`" }
   /api/v1/organizations/{organizationId}/sessions/{sessionId}:
@@ -5592,13 +5673,18 @@ paths:
       - $ref: "#/components/parameters/WorkspaceId"
     get:
       operationId: listWorkspaceApiTokens
-      description: Owner/admin. The newest 100 tokens, optionally of one purpose.
+      description: |
+        Owner/admin. The newest 100 tokens, optionally of one purpose. An
+        enrollment-operator token (sh_wk_) of this workspace may call it only
+        with purpose=desktop-enrollment and sees only the keys it minted;
+        without the filter, or with another purpose, it gets 403
+        enrollment_operator_scope.
       parameters:
         - name: purpose
           in: query
           required: false
           description: Only tokens of this purpose (400 invalid_request for an unknown purpose).
-          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment] }
+          schema: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
       responses:
         "200":
           description: Tokens (never the token value)
@@ -5632,21 +5718,34 @@ paths:
         coexist for one nodeName (rotation: mint a successor, place it,
         revoke the predecessor). See docs/relay-node-credential.md. These routes
         (also served at /cloud/api/v1) are the only way to mint or revoke
-        one: a workspace owner/admin user token, never a workspace API token,
+        one: a workspace owner/admin user token, never a workspace API token
+        (except an enrollment-operator token, below),
         the internal service token or the bootstrap token (401). agent_name
         is a 400 for any purpose but relayfile-agent, nodeName a 400 for any
         purpose but relay-node, aud a 400 for any
         purpose but relayfile-agent and acquisition-operator, and scope or
         scopes a 400 for every purpose (scopes are fixed by purpose).
-        neverExpires is a 400 for agent-runtime, deployment and relay-node. expiryDays
+        neverExpires is a 400 for agent-runtime, deployment, relay-node and enrollment-operator. expiryDays
         1-365, default 90. accessToken (sh_wk_...) is returned only here.
-        desktop-enrollment grants no scopes and returns an sh_ek_ key: a one-time
-        Desktop enrollment key for the employee named by email (required; email
-        and mcpConsent are a 400 for every other purpose), exchanged once at
+        desktop-enrollment grants no scopes and returns an sh_ek_ key: a Desktop
+        enrollment key for the employee named by email (required; email,
+        mcpConsent, maxUses and policyConsent are a 400 for every other purpose),
+        exchanged up to maxUses times (default 1, ceiling
+        SELFHOST_ENROLLMENT_MAX_USES, default 50) at
         POST /api/v1/auth/enrollment/token and never a bearer anywhere else.
-        expiryDays 1-30, default 7; neverExpires is a 400. Revoking it also
-        revokes the sessions it provisioned. See docs/identity.md "Desktop
+        expiryDays default 7; ceiling SELFHOST_ENROLLMENT_MAX_DAYS (default 30)
+        for a single-use key, SELFHOST_ENROLLMENT_MULTI_USE_MAX_DAYS (default 90)
+        for maxUses above 1; neverExpires is a 400. Revoking it also revokes
+        every session it provisioned. See docs/identity.md "Desktop
         enrollment keys".
+        enrollment-operator grants exactly enrollment:mint, refuses
+        neverExpires (expiryDays 1-365, default 90) and is the one workspace
+        API token these routes accept as a bearer: a live one of this
+        workspace may mint desktop-enrollment keys here (the key records
+        mintedByTokenId and has createdBy null; audit actor kind token).
+        Any other purpose from it is 403 enrollment_operator_scope; a
+        revoked, expired or other-workspace one is 401. Every other admin
+        route refuses it (401) and introspection reports `wrong-kind`.
       requestBody:
         required: true
         content:
@@ -5656,8 +5755,8 @@ paths:
               required: [label]
               properties:
                 label: { type: string, maxLength: 128 }
-                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment] }
-                expiryDays: { type: integer, minimum: 1, maximum: 365, description: "desktop-enrollment: 1-30, default 7" }
+                purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
+                expiryDays: { type: integer, minimum: 1, maximum: 365, description: "desktop-enrollment: default 7, ceiling 30 single-use / 90 multi-use (operator-configurable)" }
                 email:
                   type: string
                   format: email
@@ -5672,6 +5771,20 @@ paths:
                   description: >-
                     desktop-enrollment only. The admin consents to Desktop MCP access
                     for the employee: the exchanged session is Desktop-verified.
+                maxUses:
+                  type: integer
+                  minimum: 1
+                  maximum: 500
+                  description: >-
+                    desktop-enrollment only. How many machines the key may sign in
+                    (one exchange each); default 1. Above SELFHOST_ENROLLMENT_MAX_USES
+                    (default 50) is a 400.
+                policyConsent:
+                  enum: [admin]
+                  description: >-
+                    desktop-enrollment only. The admin consents to the workspace policy
+                    on the employee's behalf: every session the key provisions is
+                    managed (docs/workspace-policy.md).
                 neverExpires:
                   type: boolean
                   description: >-
@@ -5711,7 +5824,8 @@ paths:
                   - type: object
                     properties:
                       accessToken: { type: string }
-        "400": { description: "invalid_request: bad label, purpose, expiry, agent_name, aud, email or mcpConsent, or a scope/scopes field (scopes are fixed by purpose)" }
+        "400": { description: "invalid_request: bad label, purpose, expiry, agent_name, aud, email, mcpConsent, maxUses or policyConsent, or a scope/scopes field (scopes are fixed by purpose)" }
+        "403": { description: "enrollment_operator_scope: an enrollment-operator token asked for a purpose other than desktop-enrollment" }
         "409": { description: "agent_name_conflict: a non-revoked relayfile-agent token already uses this agent_name; invitation_required: the desktop-enrollment email belongs to an account outside this organization" }
   /api/v1/workspaces/{workspaceId}/deployment-api-tokens/{tokenId}:
     parameters:
@@ -5719,7 +5833,10 @@ paths:
       - { name: tokenId, in: path, required: true, schema: { type: string, format: uuid } }
     delete:
       operationId: revokeWorkspaceApiToken
-      description: Owner/admin.
+      description: |
+        Owner/admin. An enrollment-operator token of this workspace may revoke
+        only the desktop-enrollment keys it minted; any other id is 404
+        token_not_found.
       responses:
         "204": { description: Revoked }
         "404": { description: token_not_found }
@@ -5962,7 +6079,7 @@ paths:
                       type: object
                       properties:
                         id: { type: string }
-                        actorKind: { enum: [user, service, bootstrap] }
+                        actorKind: { enum: [user, service, bootstrap, token], description: "token: an enrollment-operator token; actorId is its id" }
                         actorId: { type: [string, "null"] }
                         action: { type: string }
                         target: { type: [string, "null"] }
@@ -6295,6 +6412,16 @@ paths:
                           same query as the token. The sessions pipeline enforces it from here
                           (docs/capture-policy.md). A held answer carries the policy as of the
                           held verdict.
+                      workspace_policy:
+                        type: object
+                        additionalProperties: false
+                        required: [revision]
+                        description: The workspace policy revision (docs/workspace-policy.md), 1 when unset. User tokens only.
+                        properties:
+                          revision: { type: integer, minimum: 1 }
+                      managed:
+                        const: false
+                        description: Always false on self-host. User tokens only.
                       held:
                         const: true
                         description: Present and true only when the answer was served from Control's last authoritative verification during a database outage; `exp` is then clamped to the end of the hold.
@@ -9204,6 +9331,85 @@ components:
           type: string
           format: date-time
           description: When `sharing_mode` last became `new`; present only while it is `new`. The sessions pipeline refuses a session that started earlier (when enforcing).
+    WorkspacePolicyTier:
+      type: object
+      description: Key/value pairs from the allowlist in docs/workspace-policy.md.
+      additionalProperties:
+        oneOf:
+          - type: boolean
+          - type: integer
+          - type: string
+          - type: array
+            items: { type: string }
+    WorkspacePolicySection:
+      type: object
+      additionalProperties: false
+      required: [locked, defaults]
+      properties:
+        locked: { $ref: "#/components/schemas/WorkspacePolicyTier" }
+        defaults: { $ref: "#/components/schemas/WorkspacePolicyTier" }
+    WorkspacePolicyCaptureSection:
+      type: object
+      additionalProperties: false
+      required: [locked, defaults]
+      properties:
+        locked: { $ref: "#/components/schemas/CaptureSettings" }
+        defaults:
+          type: object
+          maxProperties: 0
+          description: Always empty; capture keys are lock-only.
+    WorkspacePolicy:
+      type: object
+      additionalProperties: false
+      required: [version, revision, managed, consent, sections]
+      properties:
+        version: { type: integer, enum: [2] }
+        revision: { type: integer, minimum: 1, description: "The workspace revision: moves on every write through either policy route; 1 when never set" }
+        managed: { const: false, description: Always false until enrollment consent lands }
+        consent:
+          type: array
+          description: Person-only key names, sorted and deduplicated
+          items: { type: string }
+        sections:
+          type: object
+          additionalProperties: false
+          required: [capture, spawn, join, delivery, analytics]
+          properties:
+            capture: { $ref: "#/components/schemas/WorkspacePolicyCaptureSection" }
+            spawn: { $ref: "#/components/schemas/WorkspacePolicySection" }
+            join: { $ref: "#/components/schemas/WorkspacePolicySection" }
+            delivery: { $ref: "#/components/schemas/WorkspacePolicySection" }
+            analytics: { $ref: "#/components/schemas/WorkspacePolicySection" }
+    WorkspacePolicyInput:
+      type: object
+      additionalProperties: false
+      required: [sections]
+      properties:
+        sections:
+          type: object
+          additionalProperties: false
+          properties:
+            capture:
+              type: object
+              additionalProperties: false
+              properties:
+                locked: { $ref: "#/components/schemas/CaptureSettings" }
+                defaults: { type: object, maxProperties: 0 }
+            spawn: { $ref: "#/components/schemas/WorkspacePolicyInputSection" }
+            join: { $ref: "#/components/schemas/WorkspacePolicyInputSection" }
+            delivery: { $ref: "#/components/schemas/WorkspacePolicyInputSection" }
+            analytics: { $ref: "#/components/schemas/WorkspacePolicyInputSection" }
+        consent:
+          type: array
+          items:
+            type: string
+            enum: [accept_spawns, spawn_allow_teammates, spawn_full_access_claude, spawn_full_access_codex, spawn_native_input, spawn_requester_approvals, spawn_repositories]
+    WorkspacePolicyInputSection:
+      type: object
+      additionalProperties: false
+      properties:
+        locked: { $ref: "#/components/schemas/WorkspacePolicyTier" }
+        defaults: { $ref: "#/components/schemas/WorkspacePolicyTier" }
     TelemetryIssueInput:
       type: object
       additionalProperties: false
@@ -9766,6 +9972,23 @@ components:
             type: object
         truncated:
           type: boolean
+        relaygate:
+          $ref: "#/components/schemas/RelaygateGroupLabel"
+    RelaygateGroupLabel:
+      type: object
+      description: |
+        Present only when the session read API is relaygate and its policy
+        labels the session's owning group (relaygate `groupLabels`). Display
+        only; passed through from the read API with just these two fields.
+        Session list items carry the same field unchanged.
+      required: [gid, label]
+      properties:
+        gid:
+          type: integer
+          minimum: 0
+        label:
+          type: string
+          maxLength: 24
     RunStatus:
       enum: [pending, running, completed, failed, cancelled]
     EnrollmentTokenSummary:
@@ -10153,7 +10376,7 @@ components:
       properties:
         id: { type: string }
         label: { type: string }
-        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment] }
+        purpose: { enum: [agent-runtime, workflow, deployment, relayfile-agent, acquisition-operator, relay-node, desktop-enrollment, enrollment-operator] }
         agent_name: { type: [string, "null"], description: "relayfile-agent: the agent name; relay-node: the node name (same as nodeName); null for other purposes" }
         nodeName: { type: [string, "null"], description: relay-node only; null for other purposes }
         aud: { type: [string, "null"], description: "relayfile-agent and acquisition-operator: the normalized audience origin; null for other purposes" }
@@ -10171,12 +10394,16 @@ components:
         accessTokenExpiresAt: { type: [string, "null"], format: date-time }
         lastUsedAt: { type: [string, "null"], format: date-time }
         revokedAt: { type: [string, "null"], format: date-time }
-        status: { enum: [active, expired, revoked, exchanged], description: "exchanged: a spent desktop-enrollment key (revoked wins over it, it wins over expired)" }
+        status: { enum: [active, expired, revoked, exchanged], description: "exchanged: a spent desktop-enrollment key, useCount reached maxUses (revoked wins over it, it wins over expired)" }
         userId: { type: [string, "null"], description: desktop-enrollment only; the bound employee }
         userEmail: { type: [string, "null"], description: desktop-enrollment only }
         mcpConsent: { enum: [admin, null], description: desktop-enrollment only }
-        exchangedAt: { type: [string, "null"], format: date-time, description: desktop-enrollment only; null until exchanged }
-        exchangedHostName: { type: [string, "null"], description: desktop-enrollment only }
+        exchangedAt: { type: [string, "null"], format: date-time, description: desktop-enrollment only; the latest exchange, null until the first }
+        exchangedHostName: { type: [string, "null"], description: desktop-enrollment only; the host of the latest exchange }
+        maxUses: { type: integer, minimum: 1, maximum: 500, description: desktop-enrollment; exchanges allowed (1 on every other purpose) }
+        useCount: { type: integer, minimum: 0, description: desktop-enrollment; exchanges so far (0 on every other purpose) }
+        policyConsent: { enum: [admin, null], description: desktop-enrollment only; admin when its sessions are managed }
+        mintedByTokenId: { type: [string, "null"], format: uuid, description: "desktop-enrollment only: the enrollment-operator token that minted the key; null when a person minted it" }
     StaffReadGrant:
       type: object
       required: [id, workspace_id, organization_id, staff_user_id, staff_organization_id, reason, status, created_at, expires_at, revoked_at, revoked_by, last_used_at]
@@ -10295,7 +10522,12 @@ components:
       required: [native_session_identity, copilot_session_attestation]
       properties:
         native_session_identity: { type: integer, const: 1 }
+        claude_session_attestation: { type: integer, const: 1 }
         copilot_session_attestation: { type: integer, const: 1 }
+        cursor_session_attestation:
+          type: integer
+          const: 1
+          description: Cursor chats may sync native_session kind cursor (the Cursor conversation_id) and send kind cursor call proofs.
     DesktopIdentitySync:
       type: object
       additionalProperties: false
@@ -10320,7 +10552,7 @@ components:
                 additionalProperties: false
                 required: [kind, id]
                 properties:
-                  kind: { type: string, enum: [codex, grok, pi, claude, copilot, opencode] }
+                  kind: { type: string, enum: [codex, grok, pi, claude, copilot, cursor, opencode] }
                   id: { type: string, description: A UUID, or `ses_...` for opencode. }
         attestation_key:
           type: object

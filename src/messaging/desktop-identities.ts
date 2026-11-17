@@ -21,6 +21,13 @@ import { createRelaycastClient, RelaycastCallError, type RelaycastClient } from 
  * never returned. The optional Ed25519 attestation key verifies Claude Code
  * and Copilot tool-call proofs for that Desktop source.
  *
+ * Gate-only installs (relaygatePublicUrl set): the Desktop enrols each chat
+ * at relaygate and holds an rg_ token. relaygate's GET /v1/whoami then
+ * confirms the token (agent id, name and, when relaygate reports it, the
+ * enrolling user), and the upstream Relaycast agent of that name must carry
+ * the same id in metadata.relaygate.agent_id. The stored agent_remote_id is
+ * relaygate's agent id.
+ *
  * A hosted MCP session links to one synced identity with join_relay
  * desktop_address (table desktop_relay_session_bindings, migration 0035);
  * sync reports that link back to the Desktop as linked_mcp / linked_at.
@@ -32,6 +39,7 @@ export const LINKED_MCP = "agent-relay-sessions";
 export const NATIVE_SESSION_IDENTITY_CAPABILITY_VERSION = 1;
 export const CLAUDE_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
 export const COPILOT_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
+export const CURSOR_SESSION_ATTESTATION_CAPABILITY_VERSION = 1;
 
 /**
  * What GET advertises. Each attestation flag exists because MCP verifies and
@@ -41,6 +49,7 @@ export const DESKTOP_IDENTITY_CAPABILITIES = {
   native_session_identity: NATIVE_SESSION_IDENTITY_CAPABILITY_VERSION,
   claude_session_attestation: CLAUDE_SESSION_ATTESTATION_CAPABILITY_VERSION,
   copilot_session_attestation: COPILOT_SESSION_ATTESTATION_CAPABILITY_VERSION,
+  cursor_session_attestation: CURSOR_SESSION_ATTESTATION_CAPABILITY_VERSION,
 } as const;
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -49,7 +58,7 @@ const uuid = z.string().regex(UUID).transform(value => value.toLowerCase());
 const sourceId = z.string().min(1).max(200).transform(normalizeDesktopSourceId);
 
 const nativeSession = z.union([
-  z.object({ kind: z.enum(["codex", "grok", "pi", "claude", "copilot"]), id: uuid }).strict(),
+  z.object({ kind: z.enum(["codex", "grok", "pi", "claude", "copilot", "cursor"]), id: uuid }).strict(),
   z.object({ kind: z.literal("opencode"), id: z.string().regex(/^ses_[A-Za-z0-9]{4,128}$/) }).strict(),
 ]);
 
@@ -102,11 +111,62 @@ class SyncError extends Error {
 type Verified = Identity & { remoteId: string };
 type Skipped = { agent_id: string; reason: "unverified" | "not_owned" };
 
-async function verify(client: RelaycastClient, access: Access, items: Identity[]): Promise<{ verified: Verified[]; skipped: Skipped[] }> {
+/** The relaygate agent id on an upstream Relaycast agent card (metadata.relaygate.agent_id), or null. */
+export function relaygateAgentId(metadata: Record<string, unknown>): string | null {
+  const gate = metadata.relaygate;
+  if (!gate || typeof gate !== "object" || Array.isArray(gate)) return null;
+  const id = (gate as Record<string, unknown>).agent_id;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+function unavailable(outcomes: PromiseSettledResult<unknown>[]): void {
+  for (const outcome of outcomes) {
+    if (outcome.status === "rejected") {
+      if (transient(outcome.reason)) {
+        throw new SyncError(503, "upstream_unavailable", "Agent Relay could not verify desktop identities right now. Try again shortly.");
+      }
+      throw outcome.reason;
+    }
+  }
+}
+
+/**
+ * Gate-only installs: the Desktop enrolled the chat at relaygate and holds an
+ * rg_ token Relaycast does not accept. relaygate's whoami must name the same
+ * agent id and name (and the caller, once relaygate reports user_id), and
+ * the upstream Relaycast agent of that name must carry the same relaygate
+ * agent id in metadata.relaygate.agent_id.
+ */
+async function verifyGated(
+  gate: RelaycastClient, client: RelaycastClient, access: Access, item: Identity,
+): Promise<Skipped["reason"] | null> {
+  const [whoami, remote] = await Promise.allSettled([
+    gate.whoami(item.token),
+    client.getAgent(access.workspace.relaycastApiKey, item.name),
+  ]);
+  if (whoami.status === "rejected" && refused(whoami.reason)) return "unverified";
+  unavailable([whoami, remote]);
+  const who = (whoami as PromiseFulfilledResult<Awaited<ReturnType<RelaycastClient["whoami"]>>>).value;
+  const named = (remote as PromiseFulfilledResult<Awaited<ReturnType<RelaycastClient["getAgent"]>>>).value;
+  if (who.agentId !== item.agent_id || who.name !== item.name) return "unverified";
+  if (who.userId !== null && who.userId !== access.principal.userId) return "not_owned";
+  if (!named || relaygateAgentId(named.metadata) !== item.agent_id) return "unverified";
+  return null;
+}
+
+async function verify(
+  client: RelaycastClient, access: Access, items: Identity[], gate?: RelaycastClient,
+): Promise<{ verified: Verified[]; skipped: Skipped[] }> {
   const owner = ownerHash(access.principal.userId);
   const verified: Verified[] = [];
   const skipped: Skipped[] = [];
   for (const item of items) {
+    if (gate) {
+      const reason = await verifyGated(gate, client, access, item);
+      if (reason) skipped.push({ agent_id: item.agent_id, reason });
+      else verified.push({ ...item, remoteId: item.agent_id });
+      continue;
+    }
     const [authenticated, remote] = await Promise.allSettled([
       client.authenticatedAgent(item.token),
       client.getAgent(access.workspace.relaycastApiKey, item.name),
@@ -115,14 +175,7 @@ async function verify(client: RelaycastClient, access: Access, items: Identity[]
       skipped.push({ agent_id: item.agent_id, reason: "unverified" });
       continue;
     }
-    for (const outcome of [authenticated, remote]) {
-      if (outcome.status === "rejected") {
-        if (transient(outcome.reason)) {
-          throw new SyncError(503, "upstream_unavailable", "Agent Relay could not verify desktop identities right now. Try again shortly.");
-        }
-        throw outcome.reason;
-      }
-    }
+    unavailable([authenticated, remote]);
     const auth = (authenticated as PromiseFulfilledResult<Awaited<ReturnType<RelaycastClient["authenticatedAgent"]>>>).value;
     const named = (remote as PromiseFulfilledResult<Awaited<ReturnType<RelaycastClient["getAgent"]>>>).value;
     if (!named || auth.id !== item.agent_id || auth.name !== item.name || auth.address !== item.address ||
@@ -208,6 +261,8 @@ export async function syncDesktopIdentities(input: {
   database: Database;
   keyring: EncryptionKeyring;
   client: RelaycastClient;
+  /** Gate-only installs: the client bound to relaygate's origin; identities then hold rg_ tokens. */
+  gate?: RelaycastClient;
   access: Access;
   sourceId: string;
   identities: Identity[];
@@ -227,7 +282,7 @@ export async function syncDesktopIdentities(input: {
   if (addresses.size !== input.identities.length || ids.size !== input.identities.length) {
     throw new SyncError(400, "invalid_request", "Desktop identities must have unique addresses and agent IDs.");
   }
-  const { verified, skipped } = await verify(input.client, access, input.identities);
+  const { verified, skipped } = await verify(input.client, access, input.identities, input.gate);
   await replace(input.database, input.keyring, access, source, verified, input.attestationKey);
   const links = await desktopIdentityLinks(input.database, access.workspace.id, access.principal.userId, source);
   return {
@@ -275,6 +330,8 @@ export async function handleDesktopIdentityRoutes(
     keyring: EncryptionKeyring;
     fetchImpl?: typeof fetch;
     relaycastUrl: string;
+    /** Gate-only installs: relaygate's public URL; desktop identities are then verified through it. */
+    relaygatePublicUrl?: string | null;
     /** True for a header bearer, or a /cloud cookie request from an allowed origin. */
     csrfAllowed: (request: IncomingMessage) => boolean;
   },
@@ -325,11 +382,15 @@ export async function handleDesktopIdentityRoutes(
   const parsed = syncBody.safeParse(await deps.requestObject(request));
   if (!parsed.success) throw new MessagingHttpError(400, "invalid_request", "Invalid desktop identity sync");
   const client = createRelaycastClient({ internalOrigin: deps.relaycastUrl, fetchImpl: deps.fetchImpl });
+  const gate = deps.relaygatePublicUrl
+    ? createRelaycastClient({ internalOrigin: deps.relaygatePublicUrl, fetchImpl: deps.fetchImpl })
+    : undefined;
   try {
     const result = await syncDesktopIdentities({
       database: deps.database,
       keyring: deps.keyring,
       client,
+      ...(gate ? { gate } : {}),
       access,
       sourceId: parsed.data.source_id,
       identities: parsed.data.identities,
@@ -351,12 +412,19 @@ export class DesktopIdentityUnavailable extends Error {
 }
 
 export const DESKTOP_IDENTITY_MESSAGES = {
-  unverified: "Agent Relay cannot verify this chat's desktop identity. Keep the app open and retry after session registration.",
+  unverified: "Agent Relay cannot verify this chat's desktop identity. This call does not say which registered chat made it. "
+    + "Relay tools act as a chat only after Agent Relay Desktop has registered that chat on this computer and the chat calls "
+    + "through Desktop's integration for its client. Turn that integration on in Agent Relay Desktop (or reconnect it), then retry from this chat.",
+  cursorUnverified: "Agent Relay cannot verify this chat's desktop identity. This Cursor call carried no signed chat proof. "
+    + "A Cursor chat sends and reads relay messages as its own agent only through Agent Relay Desktop's Cursor helper: turn on "
+    + "the Cursor integration in Agent Relay Desktop so Cursor's agent-relay MCP server runs the helper and the chat is registered, "
+    + "then retry from this chat.",
   duplicate: "This chat is synced by multiple desktops. Resolve the duplicate before using relay tools.",
   sourceMismatch: "The native chat does not match this desktop identity.",
   otherRelay: "The desktop identity does not belong to this workspace's current relay.",
   gone: "The synced desktop identity is no longer available. Open Agent Relay Desktop to re-sync it.",
-  notSynced: "This native chat is not synced to your desktop account and workspace.",
+  notSynced: "This native chat is not synced to your desktop account and workspace. Agent Relay Desktop registers and syncs a chat "
+    + "when the chat starts through its integration; check the app is signed in to this workspace, then retry.",
 } as const;
 
 export type LinkedDesktopIdentity = { id: string; name: string; address: string; agentId: string; token: string };
@@ -471,11 +539,17 @@ export async function unbindDesktopSession(database: SqlExecutor, input: {
 /**
  * Re-checks a stored identity with Relaycast: on this workspace's current
  * relay, and its token still controls the same relay-desktop agent owned by
- * this user. Throws DesktopIdentityUnavailable.
+ * this user. With `gate` (gate-only installs) the stored rg_ token is checked
+ * with relaygate's whoami instead, and the upstream Relaycast agent of that
+ * name must carry the same relaygate agent id. Throws DesktopIdentityUnavailable.
  */
 export async function verifyDesktopIdentity(input: {
   keyring: EncryptionKeyring;
   client: RelaycastClient;
+  /** Gate-only installs: the client bound to relaygate's origin. */
+  gate?: RelaycastClient;
+  /** The workspace Relaycast key; required with `gate` for the upstream agent card. */
+  relaycastApiKey?: string;
   userId: string;
   relaycastWorkspaceId: string;
   row: DesktopIdentityRow;
@@ -489,6 +563,26 @@ export async function verifyDesktopIdentity(input: {
     token = decryptSecret(row.tokenCiphertext, input.keyring);
   } catch {
     throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
+  }
+  if (input.gate) {
+    if (!input.relaycastApiKey) throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.unverified);
+    const [whoami, remote] = await Promise.allSettled([
+      input.gate.whoami(token),
+      input.client.getAgent(input.relaycastApiKey, row.agentName),
+    ]);
+    if (whoami.status === "rejected") {
+      if (refused(whoami.reason)) throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
+      throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.unverified);
+    }
+    if (remote.status === "rejected") throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.unverified);
+    const who = whoami.value;
+    const named = remote.value;
+    if (who.agentId !== row.agentRemoteId || who.name !== row.agentName ||
+        (who.userId !== null && who.userId !== input.userId) ||
+        !named || relaygateAgentId(named.metadata) !== row.agentRemoteId) {
+      throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.gone);
+    }
+    return { id: row.id, name: row.agentName, address: row.address, agentId: row.agentRemoteId, token };
   }
   let agent;
   try {
@@ -514,6 +608,10 @@ export async function linkedDesktopIdentity(input: {
   database: SqlExecutor;
   keyring: EncryptionKeyring;
   client: RelaycastClient;
+  /** Gate-only installs: the client bound to relaygate's origin. */
+  gate?: RelaycastClient;
+  /** The workspace Relaycast key; required with `gate`. */
+  relaycastApiKey?: string;
   workspaceId: string;
   userId: string;
   relaycastWorkspaceId: string;
@@ -532,8 +630,10 @@ export async function linkedDesktopIdentity(input: {
       normalizeDesktopSourceId(row.sourceId) !== normalizeDesktopSourceId(input.sourceId)) {
     throw new DesktopIdentityUnavailable(DESKTOP_IDENTITY_MESSAGES.sourceMismatch);
   }
-  return verifyDesktopIdentity({ keyring: input.keyring, client: input.client, userId: input.userId,
-    relaycastWorkspaceId: input.relaycastWorkspaceId, row });
+  return verifyDesktopIdentity({ keyring: input.keyring, client: input.client,
+    ...(input.gate ? { gate: input.gate } : {}),
+    ...(input.relaycastApiKey !== undefined ? { relaycastApiKey: input.relaycastApiKey } : {}),
+    userId: input.userId, relaycastWorkspaceId: input.relaycastWorkspaceId, row });
 }
 
 export { COPILOT_ATTESTATION_CAPABILITY };

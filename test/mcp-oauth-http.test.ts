@@ -361,6 +361,20 @@ test("consent page names where the code goes, labels the client name as self-rep
   assert.ok(!html.includes('id="caution"'));
 });
 
+test("consent page lists relay:history as its own line only when the client requested it",async()=>{
+  const line="<li>Read this workspace&#39;s shared session history on your behalf</li>";
+  const baseline=await (await harness({resources:[SHARED]}).module.handle(web(pagePath)))!.text();
+  assert.match(baseline,/<li>Use available MCP tools in this workspace<\/li>/);
+  assert.ok(!baseline.includes("shared session history"),"approving relay:mcp never shows or implies transcript reads");
+  const asked=new URL(pagePath,ORIGIN);asked.searchParams.set("scope","relay:mcp relay:history");
+  const html=await (await harness({resources:[SHARED]}).module.handle(new Request(asked)))!.text();
+  assert.ok(html.includes("<li>Use available MCP tools in this workspace</li>"+line),html);
+  const alone=new URL(pagePath,ORIGIN);alone.searchParams.set("scope","relay:history");
+  const refused=(await harness({resources:[SHARED]}).module.handle(new Request(alone)))!;
+  assert.equal(refused.status,302);
+  assert.equal(new URL(refused.headers.get("location")!).searchParams.get("error"),"invalid_scope");
+});
+
 test("authorization errors redirect only a signed-in account to the registered callback",async()=>{
   const bad=new URL(pagePath,ORIGIN);bad.searchParams.set("response_type","nope");
   for(const session of [null,{transport:"bearer",principal},{transport:"cookie",principal:{...principal,pendingHandoff:true}}] as Array<McpConsentSession|null>) {

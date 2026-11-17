@@ -98,7 +98,7 @@ export const TOKEN_SOURCES: readonly TokenSource[] = [
   { table: "capy_bindings", column: "token_ciphertext", kind: "agent", hasUpdatedAt: true },
   // Events-shim wake link: a Relaycast inbound webhook wh_live_ token (0047).
   { table: "events_shims", column: "wake_secret_ciphertext", kind: "webhook", hasUpdatedAt: false, originColumn: "wake_url" },
-  // Events-shim agent links: the inbox's hosted relay identity that sends each post as a DM (0071).
+  // Events-shim agent links: the inbox's hosted relay identity that sends each post as a DM (0076).
   { table: "events_shim_agent_links", column: "sender_token_ciphertext", kind: "agent", hasUpdatedAt: false },
 ];
 

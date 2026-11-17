@@ -93,7 +93,7 @@ Postgres:
   agent id the binding holds.
 
 Linking registers one hosted relay identity per inbox
-(`webhooks-<id>-<hex>`). The link (migration 0071, `events_shim_agent_links`)
+(`webhooks-<id>-<hex>`). The link (migration 0076, `events_shim_agent_links`)
 records it with its token encrypted, the binding row, its generation (Capy,
 Amp) and the relay agent id. The inbox's wake target becomes
 `https://agent-dm.events-shim.invalid/v1/hooks/esdm_<inbox id>`, with a fresh
@@ -181,7 +181,7 @@ Stripe event id) are stored once and still count toward the limits.
 ## Storage
 
 Migration 0047 adds `events_shims`, `events_shim_posts` and
-`events_shim_events`; 0071 adds `events_shim_agent_links` (see "Linking an
+`events_shim_events`; 0076 adds `events_shim_agent_links` (see "Linking an
 inbox to a bound agent").
 
 - MCP, webhook and manage tokens are stored as SHA-256 hashes. The webhook

@@ -8,7 +8,7 @@ import { admitMcpOAuthBearer, McpOAuthAccessRefused, McpOAuthActorRefused } from
 import { PGliteDatabase } from "./support/harness.js";
 import { encryptSecret } from "../src/crypto.js";
 import { createRelaycastClient } from "../src/messaging/relaycast.js";
-import type { McpContext } from "../src/mcp/context.js";
+import { historyReader, type McpContext } from "../src/mcp/context.js";
 import { desktopCallContext } from "../src/mcp/desktop-call.js";
 import { HOSTED_SOURCE, ownerHash, relayService } from "../src/mcp/relay-participants.js";
 import { createRelaycastWorld } from "./support/relaycast-world.js";
@@ -269,6 +269,37 @@ test("the relay fence rechecks exact credential after rotation and live grant sc
   await f.database.query("UPDATE mcp_oauth_grants SET scopes=$2 WHERE id=$1",[f.owner.grantId,["relay:mcp","openid"]]);
   assert.ok(await f.database.transaction(tx=>f.sessions.rotate(tx,f.pair.refreshToken,f.owner)));
   await assert.rejects(f.database.transaction(tx=>f.connection.lock(tx)),McpOAuthAccessRefused);
+});
+
+test("relay:history follows the live grant: losing the scope or revoking the grant ends reads before any History call",async t=>{
+  const f=await fixture(t);
+  await f.database.query("UPDATE mcp_oauth_grants SET scopes=$2 WHERE id=$1",[f.owner.grantId,["relay:mcp","relay:history","openid"]]);
+  const pair=await f.issue(["relay:mcp","relay:history"]);
+  const admit=()=>admitMcpOAuthBearer({sessions:f.sessions,token:pair.accessToken,resourcePath:SHARED});
+  const first=await admit();
+  assert.ok(first.ok);
+  const principal=first.connection.access.principal;
+  assert.deepEqual([...principal.scopes].sort(),["relay:history","relay:mcp"]);
+  assert.equal(principal.scopes.includes("rth:read"),false,"an OAuth session never carries rth:read");
+  const original=globalThis.fetch;t.after(()=>{globalThis.fetch=original;});
+  globalThis.fetch=(async()=>assert.fail("no upstream call after the scope is gone")) as typeof fetch;
+  const read=(who:typeof principal)=>historyReader(appConfig(),who,
+    {id:f.owner.workspaceId,organizationId:f.owner.organizationId,role:"member"} as never,pair.accessToken)("/v1/sessions");
+  // The grant drops relay:history: the already-admitted connection is narrowed by its relay fence,
+  // and the next request is admitted without it.
+  await f.database.query("UPDATE mcp_oauth_grants SET scopes=$2 WHERE id=$1",[f.owner.grantId,["relay:mcp","openid"]]);
+  await f.database.transaction(tx=>first.connection.lock(tx));
+  assert.deepEqual(principal.scopes,["relay:mcp"]);
+  const narrowed=await admit();
+  assert.ok(narrowed.ok);
+  assert.deepEqual(narrowed.connection.access.principal.scopes,["relay:mcp"]);
+  for(const who of [principal,narrowed.connection.access.principal]) {
+    await assert.rejects(read(who),{message:"Session reads need the relay:history scope on this OAuth connection."});
+  }
+  // Revoking the connection refuses admission itself.
+  await f.database.query("UPDATE mcp_oauth_grants SET revoked_at=now() WHERE id=$1",[f.owner.grantId]);
+  assert.deepEqual(await admit(),{ok:false,status:401});
+  await assert.rejects(f.database.transaction(tx=>first.connection.lock(tx)),McpOAuthAccessRefused);
 });
 
 test("a pin accepts only its owner's participant and never switches immutable ids, including after a rename",async t=>{

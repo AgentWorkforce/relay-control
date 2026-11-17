@@ -62,7 +62,11 @@ the membership deletes the caller's sessions, which deletes every child.
 - `provider` matches `^[a-z][a-z0-9-]{0,63}$` (Copilot uses `copilot`).
   `installationId` is a UUID (case-insensitive, stored lowercase).
   `accessToken` is the secret Desktop generated and saved before calling:
-  `sh_at_` followed by 43 base64url characters (32 random bytes).
+  `cld_at_` followed by 43 base64url characters (32 random bytes, unpadded),
+  the same token class Cloud accepts. Any other shape, including `sh_at_`,
+  is 400 `invalid_request`. The grant authenticates only as a header bearer
+  at the shared-sessions MCP endpoint (`/api/v1/mcp/shared-sessions`, also
+  under `/cloud`); app routes, introspection, cookies and MCP OAuth refuse it.
 - Only `sha256(accessToken)` is stored, as the child session's access hash.
   No response ever contains a secret; POST does not echo `accessToken`.
 - `DesktopMcpCredential` is `{id, workspaceId, provider, installationId,
@@ -188,9 +192,8 @@ provider credential routes.
 - Error body: relaycontrol returns `{error: <code>, message}`; Cloud returns
   `{error: <message>}` with no code. Desktop must treat `error` as the code
   and `message` as the text.
-- Secret prefix: relaycontrol accepts `sh_at_` + 43; Cloud accepts `cld_at_`
-  + 43. Desktop must mint the self-host prefix for a self-host server. There
-  is no exchange between the two token classes.
+- Secret prefix: none. Both accept `cld_at_` + 43, which is what every
+  Desktop build mints.
 - POST does not echo `accessToken`; Cloud's provider POST returns it.
 - No dashboard personal tokens on these routes (no-body POST, dashboard list).
 - A parent from another workspace gets 404 `workspace_not_found`, not 403.

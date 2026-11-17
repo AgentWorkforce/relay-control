@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import test from "node:test";
+import { introspect } from "../src/auth/introspect.js";
 import { hashSecret } from "../src/crypto.js";
 import { request } from "./support/harness.js";
 import { copilotDesktopSetup, desktopSecret, installationId, MCP_PATH, tokensPath } from "./support/copilot-desktop.js";
@@ -62,6 +64,83 @@ test("only a verified Desktop parent registers a credential; it is a 15-minute c
   assert.equal(listed.raw.includes(secret), false);
 });
 
+test("Desktop's cld_at_ grant mints with the fields Desktop validates and authenticates at the shared-sessions MCP", async (t) => {
+  const env = await copilotDesktopSetup(t);
+  const parent = await env.desktopSignIn({ hostName: "sf-mini" });
+  // Exactly what Desktop sends: "cld_at_" + 32 random bytes, base64url unpadded.
+  const secret = `cld_at_${randomBytes(32).toString("base64url")}`;
+  assert.match(secret, /^cld_at_[A-Za-z0-9_-]{43}$/);
+  for (const prefix of ["", "/cloud"]) {
+    const provider = prefix ? "cursor" : "copilot";
+    const token = prefix ? `cld_at_${randomBytes(32).toString("base64url")}` : secret;
+    const before = Date.now();
+    const minted = await request(env.origin, `${prefix}${tokensPath(env.workspaceId)}`, {
+      method: "POST", token: parent.accessToken, body: { provider, installationId: installationId(), accessToken: token },
+    });
+    assert.equal(minted.status, 201, minted.raw);
+    assert.equal(typeof minted.body.id, "string");
+    assert.notEqual(minted.body.id, "");
+    assert.equal(minted.body.workspaceId, env.workspaceId);
+    assert.equal(minted.body.provider, provider);
+    assert.match(minted.body.leaseExpiresAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    const lease = Date.parse(minted.body.leaseExpiresAt);
+    assert(lease > before && lease <= Date.now() + 15.5 * 60_000, `lease ${minted.body.leaseExpiresAt}`);
+    // accessToken is optional for Desktop; never echoed here.
+    assert.equal("accessToken" in minted.body, false);
+    assert.equal(minted.raw.includes(token), false);
+    const initialized = await mcp(env.origin, token, INITIALIZE, `${prefix}${MCP_PATH}`);
+    assert.equal(initialized.status, 200, JSON.stringify(initialized.body));
+  }
+});
+
+test("a cld_at_ grant reads shared sessions (rth:read) through the workspace reader, never presenting the grant", async (t) => {
+  const env = await copilotDesktopSetup(t);
+  const parent = await env.desktopSignIn({ hostName: "sf-mini" });
+  const { secret } = await register(env.origin, env.workspaceId, parent.accessToken, { provider: "cursor" });
+  const upstream: Array<{ url: string; authorization: string | null; body: string }> = [];
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  globalThis.fetch = (async (input: string | URL | Request, init: RequestInit = {}) => {
+    const url = new URL(String(input instanceof Request ? input.url : input));
+    if (url.hostname !== "relayhistory.invalid") return original(input, init);
+    upstream.push({ url: url.toString(), authorization: new Headers(init.headers).get("authorization"), body: String(init.body ?? "") });
+    if (url.pathname === "/internal/v1/session-read/sessions") {
+      const body = JSON.parse(String(init.body)) as Record<string, string>;
+      const token = `rth_at_read_${"a".repeat(43)}`;
+      return Response.json({
+        sessionId: "read-1", userId: body.userId, orgId: body.orgId, workspaceId: body.workspaceId,
+        audience: body.audience, scopes: ["rth:read"], accessToken: token, tokenType: "Bearer",
+        accessTokenExpiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+        refreshToken: `rth_rt_read_${"a".repeat(43)}`,
+        refreshTokenExpiresAt: new Date(Date.now() + 24 * 3_600_000).toISOString(),
+      });
+    }
+    const attested = { headers: { "x-relayhistory-workspace-id": url.searchParams.get("workspace") ?? "" } };
+    if (url.pathname === "/v1/sessions") return Response.json({ sessions: [], nextCursor: null }, attested);
+    if (url.pathname === "/v1/events") {
+      return Response.json({
+        events: [{ eventId: "e1", sessionId: "sess-1", source: "codex", kind: "prompt", type: "user_message",
+          ts: "2026-11-07T10:00:00.000Z", content: "Fix the deploy pipeline" }],
+        nextCursor: null,
+        correlationId: "corr-search",
+      }, attested);
+    }
+    return Response.json({ error: { code: "not_found" } }, { status: 404 });
+  }) as typeof fetch;
+
+  const called = await mcp(env.origin, secret, {
+    jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "search_shared_sessions", arguments: { query: "deploy" } },
+  }, `/cloud${MCP_PATH}`);
+  assert.equal(called.status, 200);
+  assert.notEqual(called.body.result.isError, true, JSON.stringify(called.body));
+  assert.equal(called.body.result.structuredContent.workspace_id, env.workspaceId);
+  assert.deepEqual(called.body.result.structuredContent.matches.map((match: any) => match.event_id), ["e1"]);
+  const read = upstream.find((row) => new URL(row.url).pathname === "/v1/events");
+  assert(read);
+  assert.equal(new URL(read.url).searchParams.get("workspace"), env.workspaceId);
+  assert.equal(JSON.stringify(upstream).includes(secret), false, "the grant never leaves Control");
+});
+
 test("unverified parents are refused: device flow, a handoff without consent, the pending handoff and a child", async (t) => {
   const env = await copilotDesktopSetup(t);
   const device = await env.deviceLogin();
@@ -93,12 +172,25 @@ test("unverified parents are refused: device flow, a handoff without consent, th
   });
   assert.equal(cookie.status, 401);
 
-  // A malformed body.
-  const bad = await request(env.origin, tokensPath(env.workspaceId), {
-    method: "POST", token: verified.accessToken, body: { provider: "copilot", installationId: installationId(), accessToken: "sh_at_short" },
-  });
-  assert.equal(bad.status, 400);
-  assert.equal(bad.body.error, "invalid_request");
+  // Malformed secrets: wrong length, wrong alphabet, padding, and the
+  // person-token class (Desktop mints only cld_at_, as Cloud does).
+  for (const accessToken of [
+    "cld_at_short",
+    `cld_at_${"A".repeat(42)}`,
+    `cld_at_${"A".repeat(44)}`,
+    `cld_at_${"A".repeat(42)}=`,
+    `cld_at_${"A".repeat(42)}+`,
+    `CLD_AT_${"A".repeat(43)}`,
+    `sh_at_${"A".repeat(43)}`,
+    "sh_at_short",
+    `mcp_at_${"A".repeat(43)}`,
+  ]) {
+    const bad = await request(env.origin, tokensPath(env.workspaceId), {
+      method: "POST", token: verified.accessToken, body: { provider: "copilot", installationId: installationId(), accessToken },
+    });
+    assert.equal(bad.status, 400, accessToken);
+    assert.deepEqual(bad.body, { error: "invalid_request", message: "Invalid provider credential request" });
+  }
 });
 
 test("Desktop's retry with the same secret is idempotent; a different secret conflicts", async (t) => {
@@ -180,8 +272,9 @@ test("revoke removes the credential and the child stops working", async (t) => {
   assert.equal((await mcp(env.origin, secret)).status, 401);
   assert.equal((await request(env.origin, tokensPath(env.workspaceId, id), { method: "DELETE", token: parent.accessToken })).status, 404);
   assert.deepEqual((await request(env.origin, tokensPath(env.workspaceId), { token: parent.accessToken })).body.tokens, []);
-  const introspected = await request(env.origin, "/api/v1/auth/introspect", { method: "POST", body: { token: secret } });
-  assert.notEqual(introspected.body.active, true);
+  assert.deepEqual(
+    await introspect(env.config, env.store, { token: secret, aud: env.config.relayhistoryPublicUrl, workspace: env.workspaceId }),
+    { active: false, reason: "wrong-kind" });
 });
 
 test("a revoked parent takes its children with it; a refreshed parent keeps them", async (t) => {
@@ -247,6 +340,17 @@ test("the child works only at the MCP endpoint", async (t) => {
   }
   const refresh = await request(env.origin, "/api/v1/auth/token/refresh", { method: "POST", body: { refreshToken: secret } });
   assert.notEqual(refresh.status, 200);
+  // Introspection (RelayHistory, relaygate, sessions pipeline) never accepts it.
+  assert.deepEqual(
+    await introspect(env.config, env.store, { token: secret, aud: env.config.relayhistoryPublicUrl, workspace: env.workspaceId }),
+    { active: false, reason: "wrong-kind" });
+  // Nor the session-read handoff route the MCP reader's flagged mode uses.
+  const readSession = await request(env.origin, `/api/v1/workspaces/${env.workspaceId}/session-read/session`,
+    { method: "POST", token: secret, body: { label: "mcp" } });
+  assert.equal(readSession.status, 401);
+  // Nor the OAuth-only /mcp resource.
+  assert.notEqual((await mcp(env.origin, secret, INITIALIZE, "/mcp")).status, 200);
+  assert.notEqual((await mcp(env.origin, secret, INITIALIZE, "/cloud/mcp")).status, 200);
   assert.equal((await mcp(env.origin, secret)).status, 200);
   // A cookie carrying the child is not admitted at /cloud MCP either.
   const cookie = await fetch(`${env.origin}/cloud${MCP_PATH}`, {

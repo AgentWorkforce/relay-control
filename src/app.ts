@@ -30,6 +30,7 @@ import { handleFlowsBroker } from "./flows-broker.js";
 import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
 import { relayLaunchCredentials } from "./mcp/relay-launch-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
+import { parseClientTelemetry, recordClientTelemetry, recordsClientTelemetry } from "./sessions/client-telemetry.js";
 import { UsageRangeError, usageDays, usageReport } from "./usage/routes.js";
 import { UsageStore } from "./usage/store.js";
 import { GitHubDesktopReleases } from "./desktop-releases.js";
@@ -128,6 +129,13 @@ import {
   uploadPolicyVerdict,
   writeCapturePolicy,
 } from "./capture-policy.js";
+import {
+  parseWorkspacePolicyInput,
+  readWorkspacePolicy,
+  sessionManagedByEnrollmentKey,
+  UNSET_WORKSPACE_POLICY,
+  writeWorkspacePolicy,
+} from "./workspace-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
 import { createRelaycastClient, type RosterAgent } from "./messaging/relaycast.js";
 import { isListedRelayAgent } from "./mcp/team-activity.js";
@@ -2065,7 +2073,12 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (desktopHostName === null) {
         throw new HttpError(400, "invalid_request", "desktop_host_name must be 1-80 characters");
       }
-      const result = await store.exchangeEnrollmentKey({ key, clientName, desktopHostName, clientIp: ip });
+      // The Desktop's version, for the audit row only (never trusted for anything else).
+      const userAgent = request.headers["user-agent"];
+      const clientVersion = typeof userAgent === "string"
+        ? /^AgentRelayDesktop\/([0-9A-Za-z.+_-]{1,40})(?:[\s;(]|$)/.exec(userAgent)?.[1] ?? null
+        : null;
+      const result = await store.exchangeEnrollmentKey({ key, clientName, desktopHostName, clientIp: ip, clientVersion });
       // One line, key id only (never the key; null for an unknown key).
       console.info("[selfhost-api] enrollment key exchange", {
         keyId: result.keyId,
@@ -2086,6 +2099,16 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         refresh_token_expires_at: result.tokens.refreshTokenExpiresAt,
         scope: result.tokens.scopes.join(" "),
         api_url: `${siteBaseUrl(request)}/cloud`,
+        // Workspace policy (docs/workspace-policy.md): whether this session is
+        // managed (the key carries admin policy consent), the revision to
+        // compare a cached policy against, and the document itself so the
+        // first launch is right before the first access/me refresh.
+        managed: result.managed,
+        policy_revision: result.policyRevision,
+        workspace_policy: await readWorkspacePolicy(store.database, result.organizationId, {
+          workspaceId: result.workspaceId,
+          managed: result.managed,
+        }),
       }, true);
       return;
     }
@@ -2598,15 +2621,35 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
-    // Capture policy (docs/capture-policy.md): any member reads it through
-    // access/me; organization owner/admin writes it.
+    // Capture policy (docs/capture-policy.md) and workspace policy
+    // (docs/workspace-policy.md): any member reads both through access/me;
+    // organization owner/admin writes them.
     const accessMe = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/access\/me$/);
     if (accessMe && method === "GET") {
-      const { workspace } = await workspaceAccess(request, accessMe[0]!);
+      const { principal, workspace } = await workspaceAccess(request, accessMe[0]!);
+      // Fleet rollout C1: a device-client session records the Desktop version,
+      // platform and applied policy revision it presents here. Never fails the read.
+      if (recordsClientTelemetry(principal)) {
+        try {
+          await recordClientTelemetry(store.database, principal.sessionId, parseClientTelemetry(request.headers));
+        } catch (error) {
+          console.warn("[selfhost-api] client telemetry write failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      // Managed: the session was provisioned by an enrollment key carrying admin policy consent.
+      const managed = principal.provisionedByTokenId
+        ? await sessionManagedByEnrollmentKey(store.database, principal.provisionedByTokenId)
+        : false;
       json(response, 200, {
         workspace: { id: workspace.id, name: workspace.name },
         role: workspace.role,
         policy: await readCapturePolicy(store.database, workspace.organizationId),
+        workspace_policy: await readWorkspacePolicy(store.database, workspace.organizationId, {
+          workspaceId: workspace.id,
+          managed,
+        }),
       }, true);
       return;
     }
@@ -2646,6 +2689,41 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         expectedRevision,
         actor: auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" },
         action: method === "PUT" ? "capture_policy.set" : "capture_policy.cleared",
+      });
+      json(response, 200, policy, true);
+      return;
+    }
+
+    const workspacePolicy = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/workspace-policy$/);
+    if (workspacePolicy && (method === "GET" || method === "PUT" || method === "DELETE")) {
+      const organizationId = workspacePolicy[0]!;
+      const auth = await organizationAccess(request, organizationId, true);
+      if (method === "GET") {
+        // No workspace here, so admin_senders is never resolved.
+        json(response, 200, await readWorkspacePolicy(store.database, organizationId), true);
+        return;
+      }
+      if (!operatorControlsEntitled()) {
+        throw new HttpError(403, "operator_controls_not_entitled", "Operator controls are not enabled for this installation");
+      }
+      // Cookie writes: same rules as the capture policy route.
+      if (!bearer(request)) {
+        const allowed = method === "DELETE"
+          ? cookieDeleteAllowed(request, browserOrigins)
+          : cookieRequestAllowed(request, browserOrigins);
+        if (!allowed) throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      const expectedRevision = parseIfMatch(request.headers["if-match"]);
+      const input = method === "PUT"
+        ? parseWorkspacePolicyInput(await requestObject(request))
+        : { sections: UNSET_WORKSPACE_POLICY.sections, consent: [] };
+      const policy = await writeWorkspacePolicy(store.database, {
+        organizationId,
+        sections: input.sections,
+        consent: input.consent,
+        expectedRevision,
+        actor: auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" },
+        action: method === "PUT" ? "workspace_policy.set" : "workspace_policy.cleared",
       });
       json(response, 200, policy, true);
       return;
@@ -3014,6 +3092,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       keyring: config.encryptionKeyring,
       fetchImpl: input.messagingFetch,
       relaycastUrl: config.relaycastUrl,
+      relaygatePublicUrl: config.relaygatePublicUrl,
       csrfAllowed: (incoming) => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
     })) return;
 
