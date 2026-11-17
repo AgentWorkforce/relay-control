@@ -9,7 +9,7 @@ import { createReplicasModule } from "../src/replicas/module.js";
 import { ReplicasRuntimeError, type ReplicasRuntime } from "../src/replicas/runtime.js";
 import { loadReplicasConfig } from "../src/replicas/config.js";
 import { admitIdentity, IdentityRefusal } from "../src/replicas/environments.js";
-import { encrypt, releaseReplica, recoverReplica } from "../src/replicas/service.js";
+import { abandonStaleBindings, encrypt, releaseReplica, recoverReplica, STALE_BINDING_ERROR } from "../src/replicas/service.js";
 import { ReplicasSyncSweep } from "../src/replicas/sync-sweep.js";
 import { ControlPlaneStore } from "../src/store.js";
 import { apiClient, BOOTSTRAP, close, listen, PGliteDatabase, type Api } from "./flows-helpers.js";
@@ -560,4 +560,58 @@ test("connect reports provisioning_error when environment setup failed and keeps
     assert.equal(saved.status, 200, saved.text);
     assert.equal("provisioning_error" in saved.body, false);
   });
+});
+
+async function staleRow(env: Env, source: "spawn" | "bind" | "environment_identity", extra: { agentName?: string; ageDays?: number } = {}) {
+  const id = randomUUID(), replicaId = randomUUID();
+  await env.database.query(
+    `INSERT INTO replica_spawns (id, workspace_id, organization_id, user_id, client_request_id, source, input, replica_id, chat_id, state,
+       relay_workspace_id, agent_name, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'binding', $10, $11, now() - ($12 || ' days')::interval)`,
+    [id, env.workspaceId, env.organizationId, env.ownerId, `request-${id}`, source,
+      JSON.stringify(source === "bind" ? { origin: "existing" } : source === "environment_identity" ? { origin: "environment_identity" } : {}),
+      replicaId, randomUUID(), extra.agentName ? "rc-primary" : null, extra.agentName ?? null, String(extra.ageDays ?? 8)],
+  );
+  return { id, replicaId };
+}
+const spawnRow = async (env: Env, id: string) => (await env.database.query<{ state: string; last_error: string | null; input: Record<string, unknown> }>(
+  "SELECT state, last_error, input FROM replica_spawns WHERE id = $1", [id])).rows[0]!;
+const actorOf = (env: Env) => ({ userId: "", workspaceId: env.workspaceId, organizationId: env.organizationId, service: "replicas-sync" });
+
+test("stale launches and binds without a relay identity are abandoned; a Relay launch's compute is put to sleep, an existing chat is left awake", async (t) => {
+  const env = await start(t);
+  assert.equal((await connect(env)).status, 200);
+  const launch = await staleRow(env, "spawn");
+  const bound = await staleRow(env, "bind");
+  assert.equal(await abandonStaleBindings(env.replicas.deps, actorOf(env)), 2);
+  for (const id of [launch.id, bound.id]) {
+    const row = await spawnRow(env, id);
+    assert.equal(row.state, "gone");
+    assert.equal(row.last_error, STALE_BINDING_ERROR);
+    assert.equal(row.input.cleanup_complete, true);
+  }
+  assert.deepEqual(env.provider.slept, [launch.replicaId]);
+  assert.equal(await count(env, "SELECT 1 FROM admin_audit_events WHERE action = 'replicas.spawn.abandoned'"), 2);
+});
+
+test("stale-binding cleanup never touches recent rows, rows with a relay identity or environment identities, and retries a failed sleep", async (t) => {
+  const env = await start(t);
+  assert.equal((await connect(env)).status, 200);
+  const recent = await staleRow(env, "spawn", { ageDays: 1 });
+  const identity = await staleRow(env, "spawn", { agentName: "replicas-abc" });
+  const environment = await staleRow(env, "environment_identity");
+  assert.equal(await abandonStaleBindings(env.replicas.deps, actorOf(env)), 0);
+  for (const row of [recent, identity, environment]) assert.equal((await spawnRow(env, row.id)).state, "binding");
+  assert.deepEqual(env.provider.slept, []);
+
+  const launch = await staleRow(env, "spawn");
+  const sleep = env.provider.runtime.sleep;
+  env.provider.runtime.sleep = async () => { throw new ReplicasRuntimeError("unknown", "unavailable", 503); };
+  assert.equal(await abandonStaleBindings(env.replicas.deps, actorOf(env)), 0);
+  assert.equal((await spawnRow(env, launch.id)).state, "binding");
+  env.provider.runtime.sleep = sleep;
+  const sweep = new ReplicasSyncSweep({ replicas: env.replicas.deps, intervalSeconds: 30 });
+  t.after(() => sweep.stop());
+  await sweep.tick();
+  assert.equal((await spawnRow(env, launch.id)).state, "gone");
 });

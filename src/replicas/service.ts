@@ -1033,6 +1033,56 @@ export const cleanupBackoffMs = (attempts: number) =>
  * has elapsed; each attempt is recorded (committed) before it runs, so a
  * failing row backs off. One row's failure is reported and never blocks the rest.
  */
+/** How long a launch or bind may sit unfinished before the sync sweep abandons it. */
+export const STALE_BINDING_MS = 7 * 24 * 60 * 60 * 1000;
+export const STALE_BINDING_ERROR = "Binding did not finish within 7 days and was abandoned. Spawn or bind the replica again.";
+
+/**
+ * Abandons this workspace's launches and binds stuck in `preparing` or
+ * `binding` for STALE_BINDING_MS that never got a relay identity (no relay
+ * workspace, agent name or subscriptions), so they stop counting as live work.
+ * No Relay cleanup is needed for them. A replica Relay launched (not an
+ * existing chat the person bound) is put to sleep first, as release does, so an
+ * abandoned launch stops costing compute; if that fails the row stays for the
+ * next sweep. Nothing is ever woken. Rows that got a relay identity are left
+ * for release_replica; environment identities are never touched. Not retried
+ * automatically: advancing a stuck row may wake paid compute, so only the
+ * person's status read (get_replica_spawn) retries one.
+ *
+ * @returns How many rows were abandoned.
+ */
+export async function abandonStaleBindings(deps: ReplicasDeps, actor: ReplicasActor, now: () => number = Date.now): Promise<number> {
+  const before = new Date(now() - STALE_BINDING_MS);
+  const where = `state IN ('preparing', 'binding') AND updated_at < $2 AND relay_workspace_id IS NULL AND agent_name IS NULL
+    AND subscription_id IS NULL AND mention_subscription_id IS NULL AND COALESCE(source, '') <> '${ENVIRONMENT_IDENTITY}'`;
+  const rows = await deps.database.query<{ id: string }>(
+    `SELECT id FROM replica_spawns WHERE workspace_id = $1 AND ${where} ORDER BY updated_at, id LIMIT 25`,
+    [actor.workspaceId, before],
+  );
+  let abandoned = 0;
+  for (const { id } of rows.rows) {
+    abandoned += await withReplicasLock(deps, actor, async (tx) => {
+      // Re-read under the workspace lock: a status read may have advanced it meanwhile.
+      const row = (await tx.query<SpawnRow>(`SELECT ${COLUMNS} FROM replica_spawns WHERE id = $1 AND workspace_id = $3 AND ${where} FOR UPDATE`,
+        [id, before, actor.workspaceId])).rows[0];
+      if (!row) return 0;
+      if (row.replica_id && row.input.origin !== "existing" && row.source !== "bind") {
+        try {
+          const { key, ciphertext } = await connectionKey(deps, tx, row.workspace_id);
+          await underKey(ciphertext, () => deps.replicas.sleep(key, row.replica_id!));
+        } catch (error) {
+          if (!(error instanceof ReplicasRuntimeError) || ![404, 410].includes(error.status)) return 0;
+        }
+      }
+      const gone = await patch(tx, row.id, { state: "gone", helper_hash: null, helper_ciphertext: null, hook_ciphertext: null,
+        token_ciphertext: null, last_error: STALE_BINDING_ERROR, input: { ...row.input, cleanup_complete: true } });
+      await audit(tx, gone, null, "replicas.spawn.abandoned");
+      return 1;
+    }).catch(() => 0);
+  }
+  return abandoned;
+}
+
 export async function retirePendingCleanup(deps: ReplicasDeps, actor: ReplicasActor,
   onError: (id: string) => void = () => undefined, now: () => number = Date.now): Promise<void> {
   const rows = await deps.database.query<{ id: string }>(
