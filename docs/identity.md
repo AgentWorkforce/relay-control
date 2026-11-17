@@ -1345,6 +1345,22 @@ per-identity handouts stop too:
   relaygate reserves that prefix at `/v1/register`, so a desktop-enrolled name
   never collides with one. Only new registrations get it: identities that
   already exist keep their stored names and are not renamed.
+- Desktop identities
+  (`PUT /api/v1/workspaces/{id}/messaging/desktop-identities`) carry the
+  `rg_` token relaygate issued at enrolment and relaygate's own agent id as
+  `agent_id`. Relaycast does not accept that token, so Control verifies each
+  identity with relaygate instead, at sync and again on every MCP call:
+  relaygate's `GET /v1/whoami` must answer with the same `agent_id` and
+  `name` (and, once relaygate reports `user_id`, the syncing user, else the
+  identity is skipped `not_owned`), and the upstream Relaycast agent of that
+  name, read with the workspace key, must carry the same id in
+  `metadata.relaygate.agent_id`. `metadata.source` and `owner_hash` are not
+  required, and the address is stored as the desktop sent it. The stored
+  `agent_remote_id` is relaygate's agent id. MCP messaging as a desktop
+  identity (DMs, channels, conversation reads) goes through relaygate with
+  that token. Routes relaygate does not proxy answer an error there:
+  `get_relay_message_status` reports delivery confirmation as unavailable
+  because relaygate does not proxy `/v1/messages/{id}/deliveries`.
 
 Unset, nothing changes.
 
