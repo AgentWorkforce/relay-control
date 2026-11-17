@@ -5,6 +5,13 @@ assigned at release.
 
 ## Unreleased
 
+- Changed: when the MCP route refuses a `tools/call` with `Invalid native
+  chat context.` (a Claude Code, Cursor or Copilot call proof that does not
+  verify, or conflicting desktop call headers), the server log now names
+  the failed check (`[selfhost-mcp] native chat context refused` with
+  `check`, `reason`, `method`, `tool`, `provider`, `auth_mode`,
+  `workspace_id`, `user_id`). The response is unchanged and the log never
+  carries the proof, the token or the arguments.
 - Added: workspace policy v2 (migration 0072, docs/workspace-policy.md). One
   versioned document with `capture`, `spawn`, `join`, `delivery` and
   `analytics` sections, each with `locked` and `defaults` tiers, plus a
