@@ -73,10 +73,17 @@ response is exactly the stored policy.
   grant is served as a member; an answer held through a database outage is projected the same way as a live one).
 - The organization `capture-policy` and `workspace-policy` routes, the fleet view and the audit log show only what is
   stored; a deployment default never appears there and saving the policy never writes it.
-- `revision` and `workspace_revision` do not move when either variable is set, changed or removed; Desktop picks up the
-  change on its next policy read (sign-in, token refresh or every 15 minutes).
+- `revision` and `workspace_revision` do not move when either variable is set, changed or removed, or when a
+  person's role changes (for example an owner made a member). Desktop applies the new document on its next policy
+  read (sign-in, token refresh or every 15 minutes). The upload revision check cannot see such a change, so until
+  that read the computer keeps the mode it last read.
 - A deployment default `new` has no `sharing_mode_since` (it was never stored with a time), so the ingest edge
-  `capture_policy_session_predates_policy` check has no time to compare against and does not apply. The organization saving `new` sets the time.
+  `capture_policy_session_predates_policy` check has no time to compare against and does not apply. The
+  organization saving `new` sets the time.
+- Agent Relay Desktop keeps the last policy it read per workspace and operating-system account. People with
+  different roles who share one operating-system account share that copy until the next successful read.
+- A Desktop build that carries its own compiled policy defaults applies them until its first policy read; give it
+  the same sharing mode as the deployment default.
 - An invalid value in either variable stops Control at start. The upload check (`SELFHOST_CAPTURE_POLICY_UPLOADS`)
   treats a served deployment default like any other setting: a locked caller must name a revision (1 when the
   organization never saved a policy).
