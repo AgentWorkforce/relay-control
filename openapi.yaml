@@ -2894,7 +2894,12 @@ paths:
         `{version: 1, revision: 1, settings: {}}`. See docs/capture-policy.md.
         `workspace_policy` is the v2 workspace policy for this workspace, with
         `delivery.locked.admin_senders` resolved while `inbound_default` is set.
-        See docs/workspace-policy.md.
+        See docs/workspace-policy.md. Both are served per caller: with
+        SELFHOST_DEFAULT_SHARING_MODE or SELFHOST_SHARING_MODE_OVERRIDE_ROLES set,
+        the sharing mode is projected by the caller's `role` (a deployment default
+        when none is stored; for an override role, no lock and
+        `sections.capture.defaults.sharing_mode` instead). Both unset, they equal
+        the organization routes' answers.
       security:
         - bearerAuth: []
         - cookieAuth: []
@@ -6533,9 +6538,11 @@ paths:
                         description: >-
                           Contract v1.5. The organization's served capture policy, exactly as
                           GET /api/v1/organizations/{org}/capture-policy answers it, read in the
-                          same query as the token. The sessions pipeline enforces it from here
-                          (docs/capture-policy.md). A held answer carries the policy as of the
-                          held verdict.
+                          same query as the token, then projected by `role` when
+                          SELFHOST_DEFAULT_SHARING_MODE or SELFHOST_SHARING_MODE_OVERRIDE_ROLES is
+                          set (staff read grants as a member; see CapturePolicy). The sessions
+                          pipeline enforces it from here (docs/capture-policy.md). A held answer
+                          carries the policy as of the held verdict, projected the same way.
                       workspace_policy:
                         type: object
                         additionalProperties: false
@@ -9538,6 +9545,14 @@ components:
     CapturePolicy:
       type: object
       additionalProperties: false
+      description: >-
+        The organization routes return the stored policy. Per-caller responses
+        (access/me, introspection `capture_policy`) are served by role when
+        SELFHOST_DEFAULT_SHARING_MODE or SELFHOST_SHARING_MODE_OVERRIDE_ROLES is
+        set: a locked caller gets the deployment default as `settings.sharing_mode`
+        when none is stored (without `sharing_mode_since`); an override-role caller
+        gets neither `settings.sharing_mode` nor `sharing_mode_since`. `revision`
+        is unchanged. See docs/capture-policy.md.
       required: [version, revision, settings]
       properties:
         version: { type: integer, enum: [1] }
@@ -9572,11 +9587,24 @@ components:
         locked: { $ref: "#/components/schemas/CaptureSettings" }
         defaults:
           type: object
-          maxProperties: 0
-          description: Always empty; capture keys are lock-only.
+          additionalProperties: false
+          description: >-
+            Empty on the organization route; capture keys are lock-only on write.
+            On access/me and the enrollment key exchange, a caller whose role is in
+            SELFHOST_SHARING_MODE_OVERRIDE_ROLES is served the effective sharing mode
+            (stored, else SELFHOST_DEFAULT_SHARING_MODE) here instead of in `locked`.
+            Read only: PUT refuses it.
+          properties:
+            sharing_mode: { type: string, enum: [all, new, selected] }
     WorkspacePolicy:
       type: object
       additionalProperties: false
+      description: >-
+        The organization route returns the stored document. access/me and the
+        enrollment key exchange serve `sections.capture` per caller role when
+        SELFHOST_DEFAULT_SHARING_MODE or SELFHOST_SHARING_MODE_OVERRIDE_ROLES is
+        set (see WorkspacePolicyCaptureSection); `revision` is unchanged.
+        See docs/workspace-policy.md.
       required: [version, revision, managed, consent, sections]
       properties:
         version: { type: integer, enum: [2] }

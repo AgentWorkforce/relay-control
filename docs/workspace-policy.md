@@ -27,7 +27,8 @@ and `consent`). The capture section is the row's existing `settings`.
 ```
 
 - `locked`: an operator value the person cannot change. `defaults`: an initial value the person may change.
-  A key that is absent leaves the client's own behaviour unchanged. Nothing is ever defaulted server-side.
+  A key that is absent leaves the client's own behaviour unchanged. Nothing is defaulted in storage; the only
+  server-side default is the deployment sharing mode (see "Deployment default and override roles").
 - All five sections are always present, each with both tiers (empty when unset).
 - Unset policy: `{version: 2, revision: 1, managed: false, consent: [], sections: {...every tier empty}}`.
 
@@ -35,7 +36,7 @@ and `consent`). The capture section is the row's existing `settings`.
 
 | section | key | type / values | tier allowed | person-only |
 | --- | --- | --- | --- | --- |
-| capture | `sharing_mode` | `all` \| `new` \| `selected` | locked only | no |
+| capture | `sharing_mode` | `all` \| `new` \| `selected` | locked only (may be served in defaults, read only) | no |
 | capture | `upload_control` | `operator` \| `user` | locked only | no |
 | capture | `oops_window_seconds` | integer 0..86400 | locked only | no |
 | capture | `user_retroactive_delete` | boolean | locked only | no |
@@ -59,6 +60,24 @@ and `consent`). The capture section is the row's existing `settings`.
 
 Capture keys keep the capture policy's validation and served projection (an `operator` upload control without a
 window serves `oops_window_seconds: 900`).
+
+## Deployment default and override roles
+
+`SELFHOST_DEFAULT_SHARING_MODE` (`all` | `new` | `selected`) and `SELFHOST_SHARING_MODE_OVERRIDE_ROLES` (comma list of
+`owner` and/or `admin`) shape the capture section per caller, the same way as the v1 policy
+([capture-policy.md](capture-policy.md), "Deployment default and override roles"). Both unset: the document is
+exactly what is stored.
+
+- Effective sharing mode: the organization's stored `capture.locked.sharing_mode`, else the deployment default, else
+  none. The organization-saved mode always wins.
+- A caller whose organization role is in the override list never gets `sharing_mode` in `capture.locked`; when an
+  effective mode exists it is served in `capture.defaults.sharing_mode`, the initial value the person may change.
+- Every other caller (members, roles not listed, missing or unknown roles) gets the effective mode in
+  `capture.locked.sharing_mode`, and `capture.defaults` stays empty.
+- Served on `access/me` and the enrollment key exchange (by the bound user's role). The organization route shows only
+  what is stored, and `PUT` still refuses any capture key in `defaults`, including a served
+  `defaults.sharing_mode`: drop it before writing a document back.
+- `revision` (here and the capture `revision`) does not move when either variable changes.
 
 ## Consent
 

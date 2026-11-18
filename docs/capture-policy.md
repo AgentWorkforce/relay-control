@@ -12,8 +12,9 @@ Storage: `capture_policies` (migration 0019), one row per organization.
 | `oops_window_seconds` | integer 0..86400 | no window (upload immediately) |
 | `user_retroactive_delete` | boolean | user chooses |
 
-- Unset policy is `{version:1, revision:1, settings:{}}`. Nothing is ever defaulted server-side
-  (in particular never `sharing_mode: all`). Unknown keys, bad enums and out-of-range values: 400 `invalid_policy`.
+- Unset policy is `{version:1, revision:1, settings:{}}`. Nothing is defaulted in storage. The only server-side
+  default is a deployment default sharing mode, served only when `SELFHOST_DEFAULT_SHARING_MODE` is set (see
+  "Deployment default and override roles" below). Unknown keys, bad enums and out-of-range values: 400 `invalid_policy`.
 - Served projection: when stored settings have `upload_control: operator` and no `oops_window_seconds`, responses
   carry `oops_window_seconds: 900` (15 min). Storage keeps exactly what was written.
 - `revision` is monotonic per organization. The first write is revision 2. `DELETE` keeps the row with empty
@@ -23,7 +24,8 @@ Storage: `capture_policies` (migration 0019), one row per organization.
 cookie `DELETE` needs an allowed Origin or `Sec-Fetch-Site: same-origin`):
 
 - `GET /api/v1/workspaces/{ws}/access/me`: any workspace member (user token or cookie; bootstrap and `sh_wk_` 401)
-  returns `{ workspace: {id, name}, role, policy }`.
+  returns `{ workspace: {id, name}, role, policy }`. `policy` is the policy as served to the caller's role (the
+  same as the organization route unless a deployment default or override role applies, see below).
 - `GET|PUT|DELETE /api/v1/organizations/{org}/capture-policy`: owner/admin (or bootstrap bearer); members 403, other
   organizations 404. `PUT` body `{ settings }` is a full replace; optional `If-Match: <revision>` gives 409
   `revision_mismatch` when stale. Writes audit `capture_policy.set` / `capture_policy.cleared` with target
@@ -52,6 +54,32 @@ from there rather than storing a copy:
 - `sharing_mode_since`: served with the policy while `sharing_mode` is `new`, the time it became `new` (kept across
   writes that keep it). In enforce mode the ingest edge refuses (422 `capture_policy_session_predates_policy`) a
   batch carrying a session record whose first activity is earlier.
+
+**Deployment default and override roles**: two optional environment variables set a sharing mode for the whole
+deployment and let organization owners and/or admins keep choosing their own. Both are unset by default; unset, every
+response is exactly the stored policy.
+
+- `SELFHOST_DEFAULT_SHARING_MODE` = `all` | `new` | `selected`: the sharing mode served when the organization has not
+  saved one. The effective mode is the organization's stored `sharing_mode`, else this default, else none. The
+  organization-saved mode always wins.
+- `SELFHOST_SHARING_MODE_OVERRIDE_ROLES` = a comma-separated list of `owner` and/or `admin`: callers with one of these
+  organization roles are never locked on sharing mode. `settings.sharing_mode` and `sharing_mode_since` are left out
+  of the policy served to them, so Agent Relay Desktop shows them the control. The v2 document serves them the
+  effective mode as the initial value `sections.capture.defaults.sharing_mode` instead (workspace-policy.md).
+- Every other caller (members, roles not listed, and a missing or unknown role) is locked: under a deployment default
+  with no stored mode, `settings.sharing_mode` is the default. Role names are compared exactly (lower case).
+- Applied on `access/me`, the enrollment key exchange, the direct-upload credentials check (the upload check runs on
+  the policy as served to that caller), and introspection `capture_policy` by the token's live role (a staff read
+  grant is served as a member; an answer held through a database outage is projected the same way as a live one).
+- The organization `capture-policy` and `workspace-policy` routes, the fleet view and the audit log show only what is
+  stored; a deployment default never appears there and saving the policy never writes it.
+- `revision` and `workspace_revision` do not move when either variable is set, changed or removed; Desktop picks up the
+  change on its next policy read (sign-in, token refresh or every 15 minutes).
+- A deployment default `new` has no `sharing_mode_since` (it was never stored with a time), so the ingest edge
+  `capture_policy_session_predates_policy` check has no time to compare against and does not apply. The organization saving `new` sets the time.
+- An invalid value in either variable stops Control at start. The upload check (`SELFHOST_CAPTURE_POLICY_UPLOADS`)
+  treats a served deployment default like any other setting: a locked caller must name a revision (1 when the
+  organization never saved a policy).
 
 **Workspace policy (v2)**: [workspace-policy.md](workspace-policy.md) serves this policy as the `capture` section of a
 larger document (spawn, join, delivery, analytics) on `access/me` as `workspace_policy` and on

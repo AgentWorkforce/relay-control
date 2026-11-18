@@ -7,8 +7,10 @@ import {
   configFingerprint,
   loadConfig,
   loadDatabaseUrl,
+  loadDefaultSharingMode,
   loadMigrationsDatabaseUrl,
   loadRuntimeDatabaseRole,
+  loadSharingModeOverrideRoles,
 } from "../src/config.js";
 
 const completeEnv = {
@@ -49,6 +51,39 @@ test("SELFHOST_RELAYGATE_PUBLIC_URL is optional and must be a public https origi
   for (const bad of ["http://cast.selfhosted.company", "https://cast.selfhosted.company/v1", "https://u:p@cast.selfhosted.company",
     "https://localhost", "https://10.0.0.1", "not a url"]) {
     assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_RELAYGATE_PUBLIC_URL: bad }), /SELFHOST_RELAYGATE_PUBLIC_URL/, bad);
+  }
+});
+
+test("SELFHOST_DEFAULT_SHARING_MODE is optional and one of all, new or selected", () => {
+  const unset = loadConfig(completeEnv);
+  assert.equal(unset.defaultSharingMode, undefined);
+  assert.equal(Object.hasOwn(unset, "defaultSharingMode"), false, "unset adds no key");
+  for (const empty of ["", "   "]) {
+    assert.equal(Object.hasOwn(loadConfig({ ...completeEnv, SELFHOST_DEFAULT_SHARING_MODE: empty }), "defaultSharingMode"), false);
+    assert.equal(loadDefaultSharingMode({ SELFHOST_DEFAULT_SHARING_MODE: empty }), undefined);
+  }
+  for (const mode of ["all", "new", "selected"] as const) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_DEFAULT_SHARING_MODE: mode }).defaultSharingMode, mode);
+    assert.equal(loadDefaultSharingMode({ SELFHOST_DEFAULT_SHARING_MODE: ` ${mode} ` }), mode);
+  }
+  for (const bad of ["ALL", "none", "selected,all", "off"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_DEFAULT_SHARING_MODE: bad }),
+      /SELFHOST_DEFAULT_SHARING_MODE must be all, new or selected/, bad);
+  }
+});
+
+test("SELFHOST_SHARING_MODE_OVERRIDE_ROLES is optional and lists only owner and admin", () => {
+  const unset = loadConfig(completeEnv);
+  assert.equal(Object.hasOwn(unset, "sharingModeOverrideRoles"), false, "unset adds no key");
+  for (const empty of ["", "  ", ",", " , "]) {
+    assert.equal(loadSharingModeOverrideRoles({ SELFHOST_SHARING_MODE_OVERRIDE_ROLES: empty }), undefined, empty);
+  }
+  assert.deepEqual(loadConfig({ ...completeEnv, SELFHOST_SHARING_MODE_OVERRIDE_ROLES: "owner" }).sharingModeOverrideRoles, ["owner"]);
+  assert.deepEqual(loadSharingModeOverrideRoles({ SELFHOST_SHARING_MODE_OVERRIDE_ROLES: " owner , admin " }), ["owner", "admin"]);
+  assert.deepEqual(loadSharingModeOverrideRoles({ SELFHOST_SHARING_MODE_OVERRIDE_ROLES: "admin,owner,admin,owner" }), ["admin", "owner"]);
+  for (const bad of ["member", "owner,member", "Owner", "owner;admin", "root"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_SHARING_MODE_OVERRIDE_ROLES: bad }),
+      /SELFHOST_SHARING_MODE_OVERRIDE_ROLES must list only owner and\/or admin/, bad);
   }
 });
 

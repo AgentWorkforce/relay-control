@@ -125,16 +125,19 @@ import { remoteAgentRoutes } from "./remote-agents/routes.js";
 import type { ProviderProbes } from "./providers/registry.js";
 import {
   CapturePolicyError,
+  capturePolicyForCaller,
   parseCaptureSettings,
   parseIfMatch,
   readCapturePolicy,
   CAPTURE_POLICY_REVISION_HEADER,
+  sharingDeployment,
   uploadPolicyVerdict,
   writeCapturePolicy,
 } from "./capture-policy.js";
 import {
   parseWorkspacePolicyInput,
   readWorkspacePolicy,
+  workspacePolicyForCaller,
   sessionManagedByEnrollmentKey,
   UNSET_WORKSPACE_POLICY,
   writeWorkspacePolicy,
@@ -1033,6 +1036,10 @@ export function createApp(input: {
     }
     return { principal: auth.principal, workspace, token: auth.token };
   }
+
+  // Deployment sharing-mode values (docs/capture-policy.md), applied per caller.
+  const sharing = sharingDeployment(config);
+  const sharingConfigured = sharing.defaultSharingMode !== undefined || sharing.overrideRoles !== undefined;
 
   // Desktop feed (docs/desktop-feed.md): off, so every route 404s, unless
   // both SELFHOST_DESKTOP_FEED_SIGNER and _STORAGE are configured.
@@ -2114,10 +2121,17 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         // first launch is right before the first access/me refresh.
         managed: result.managed,
         policy_revision: result.policyRevision,
-        workspace_policy: await readWorkspacePolicy(store.database, result.organizationId, {
-          workspaceId: result.workspaceId,
-          managed: result.managed,
-        }),
+        // Served to the bound user (SELFHOST_DEFAULT_SHARING_MODE and
+        // SELFHOST_SHARING_MODE_OVERRIDE_ROLES); the role is read only when
+        // one of them is configured.
+        workspace_policy: workspacePolicyForCaller(
+          await readWorkspacePolicy(store.database, result.organizationId, {
+            workspaceId: result.workspaceId,
+            managed: result.managed,
+          }),
+          sharingConfigured ? await store.memberRole(result.organizationId, result.userId) : null,
+          sharing,
+        ),
       }, true);
       return;
     }
@@ -2819,11 +2833,21 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       json(response, 200, {
         workspace: { id: workspace.id, name: workspace.name },
         role: workspace.role,
-        policy: await readCapturePolicy(store.database, workspace.organizationId),
-        workspace_policy: await readWorkspacePolicy(store.database, workspace.organizationId, {
-          workspaceId: workspace.id,
-          managed,
-        }),
+        // Served per caller (docs/capture-policy.md, "Deployment default and
+        // override roles"); the organization routes below serve what is stored.
+        policy: capturePolicyForCaller(
+          await readCapturePolicy(store.database, workspace.organizationId),
+          workspace.role,
+          sharing,
+        ),
+        workspace_policy: workspacePolicyForCaller(
+          await readWorkspacePolicy(store.database, workspace.organizationId, {
+            workspaceId: workspace.id,
+            managed,
+          }),
+          workspace.role,
+          sharing,
+        ),
       }, true);
       return;
     }
@@ -3159,7 +3183,12 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // Capture policy revision (docs/capture-policy.md): Desktop names the policy it applies. Report mode logs a
       // missing or older one; enforce refuses it so Desktop reads the policy again (its POST fallback is checked
       // the same way by the sessions pipeline).
-      const capturePolicy = await readCapturePolicy(store.database, workspace.organizationId);
+      // Checked against the policy as served to this caller (its access/me).
+      const capturePolicy = capturePolicyForCaller(
+        await readCapturePolicy(store.database, workspace.organizationId),
+        workspace.role,
+        sharing,
+      );
       const verdict = uploadPolicyVerdict(capturePolicy, request.headers[CAPTURE_POLICY_REVISION_HEADER]);
       if (verdict === "missing" || verdict === "stale") {
         const mode = config.capturePolicyUploads ?? "report";
