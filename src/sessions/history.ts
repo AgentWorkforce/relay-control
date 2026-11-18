@@ -148,7 +148,7 @@ export type HistoryRead =
 
 export const UNSUPPORTED_BY_BACKEND = "unsupported_by_backend";
 
-async function unsupportedReason(response: Response): Promise<string> {
+export async function unsupportedReason(response: Response): Promise<string> {
   const body: unknown = await response.json().catch(() => null);
   if (isRecord(body)) {
     if (nonEmptyString(body.reason)) return body.reason;

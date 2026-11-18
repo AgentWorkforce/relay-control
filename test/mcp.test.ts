@@ -320,6 +320,8 @@ test("initialize advertises the self-host server and its tools on both paths", a
       "read_relay_channel",
       "read_relay_conversation",
       "relay_status",
+      "relayfacts_get",
+      "relayfacts_list",
       "search_shared_sessions",
       "send_relay_message",
       "set_relay_agent_card",
@@ -445,7 +447,7 @@ test("describe_capabilities reports the served groups and the bound workspace", 
   assert.equal(data.endpoint.url, `${PUBLIC_ORIGIN}${MCP_PATH}`);
   assert.equal(data.other_endpoint, undefined);
   const available = data.groups.filter((group: any) => group.status === "available").map((group: any) => group.id);
-  assert.deepEqual(available.sort(), ["capability_discovery", "relay_messaging", "shared_session_reads", "team_activity"]);
+  assert.deepEqual(available.sort(), ["capability_discovery", "relay_messaging", "relayfacts", "shared_session_reads", "team_activity"]);
   const messaging = data.groups.find((group: any) => group.id === "relay_messaging");
   assert.equal(messaging.status, "available");
   assert.equal(messaging.tools.length, 15);

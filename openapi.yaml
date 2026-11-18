@@ -609,7 +609,10 @@ paths:
         `get_shared_session_context`, `list_session_timings`,
         `list_session_summaries`, `get_session_summary`), team activity
         (`list_team_activity`, from the Relaycast roster and presence plus
-        RelayHistory; running flows are not listed), relay messaging
+        RelayHistory; running flows are not listed), relayfacts
+        (`relayfacts_list`, `relayfacts_get`: read-only proxies for the read
+        API's `/v1/relayfacts` routes; status `disabled` until the read API
+        serves them), relay messaging
         (`list_relay_agents`, `get_relay_agent_card`, `set_relay_agent_card`,
         `send_relay_message`, `get_relay_message_status`, `read_relay_conversation`,
         `join_relay`, `leave_relay`, `relay_status`, `check_relay_inbox`,

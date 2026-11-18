@@ -54,6 +54,8 @@ const CAPY_BINDING_TOOLS = ["bind_capy_thread", "unbind_capy_thread"] as const;
 const CAPY_SPAWN_TOOLS = ["list_capy_projects", "spawn_capy_thread", "get_capy_thread_spawn"] as const;
 export const SHARED_SESSION_READ_TOOLS = ["open_shared_sessions", "search_shared_sessions", "get_shared_session",
   "get_shared_session_context", "list_session_timings", "list_session_summaries", "get_session_summary"] as const;
+/** Read-only proxies for the read API's /v1/relayfacts routes (relayfacts.ts). */
+export const RELAYFACTS_TOOLS = ["relayfacts_list", "relayfacts_get"] as const;
 const SCREEN_TOOLS = ["show_ui", "show_ui_guide"] as const;
 const EVENT_TOOLS = ["get_event", "get_recent_events",
   "connect_muse_polling", "disconnect_muse_polling",
@@ -65,7 +67,7 @@ const CONNECT_TOOLS = ["create_connect", "host_connect_agent", "join_connect", "
 export const CAPABILITY_DISCOVERY_TOOL = "describe_capabilities";
 
 export type ToolGroupId =
-  | "shared_session_reads" | "team_activity" | "relay_messaging" | "hosted_launch" | "replicas" | "amp" | "factory" | "webhook_inbox" | "capy_binding"
+  | "shared_session_reads" | "team_activity" | "relayfacts" | "relay_messaging" | "hosted_launch" | "replicas" | "amp" | "factory" | "webhook_inbox" | "capy_binding"
   | "customer_support" | "capy_launch" | "connect" | "events" | "grok_routines" | "relay_inbox_app" | "screens" | "events_settings" | "capability_discovery";
 
 type GroupDefinition = {
@@ -79,6 +81,7 @@ type GroupDefinition = {
 export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
   shared_session_reads: { title: "Shared session search and transcripts", tools: SHARED_SESSION_READ_TOOLS },
   team_activity: { title: "Workspace team activity", tools: ["list_team_activity"] },
+  relayfacts: { title: "Relayfacts topics", tools: RELAYFACTS_TOOLS },
   relay_messaging: { title: "Relay messaging and channels", tools: RELAY_TOOLS },
   customer_support: { title: "Private customer support", tools: ["ask_customer_support"] },
   hosted_launch: { title: "Agent launches", tools: RELAY_SPAWN_TOOLS },
@@ -106,7 +109,7 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; repl
   if (options.staffReadGrant) {
     return (["shared_session_reads", "capability_discovery"] as const).map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
   }
-  const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relay_messaging", "customer_support"];
+  const groups: ToolGroupId[] = ["shared_session_reads", "team_activity", "relayfacts", "relay_messaging", "customer_support"];
   // Launch tools exist only when SELFHOST_FEATURES selects launch; role and
   // connection kind are checked on every call.
   if (options.launch) groups.push("hosted_launch");
@@ -216,7 +219,7 @@ export function describeCapabilities(input: {
       how_to_enable: "Configure SELFHOST_CUSTOMER_SUPPORT_URL and SELFHOST_CUSTOMER_SUPPORT_TOKEN for the support service." };
     // OAuth reads need the opt-in relay:history scope (never in the baseline
     // grant); with it the group is available as for a native session.
-    if (item && id === "shared_session_reads" && input.authMode === "oauth" && !input.scopes.includes(MCP_HISTORY_SCOPE)) {
+    if (item && (id === "shared_session_reads" || id === "relayfacts") && input.authMode === "oauth" && !input.scopes.includes(MCP_HISTORY_SCOPE)) {
       return { ...base, status: "restricted", tools: [...item.tools],
         reason: "This OAuth connection was not granted relay:history.",
         how_to_enable: "Reconnect and request the relay:history scope on the sessions resource; the consent page lists it as a separate line." };
