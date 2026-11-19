@@ -13,6 +13,8 @@ import { createRelaycastWorld, type RelaycastWorld } from "./support/relaycast-w
 import { PGliteDatabase } from "./support/harness.js";
 import { RECIPIENT_CARD_NOTE } from "../src/mcp/relay-agent-cards.js";
 import { describeCapabilities } from "../src/mcp/catalog.js";
+import { registerCapabilityDiscovery } from "../src/mcp/capabilities.js";
+import type { McpContext } from "../src/mcp/context.js";
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -477,6 +479,29 @@ test("describe_capabilities does not advertise managed relay tools without a syn
   const messaging = report.groups.find(group => group.id === "relay_messaging");
   assert.equal(messaging?.status, "restricted");
   assert.match(messaging?.reason ?? "", /could not verify/);
+});
+
+test("the capability handler verifies managed native identity and skips unmanaged connections", async () => {
+  const baseContext = {
+    endpointUrl: "https://relay.example.test/mcp", authMode: "cli_login", role: "owner",
+    principal: { scopes: ["cli:auth"] }, workspace: { id: "workspace" }, providers: async () => [],
+  };
+  async function call(required: boolean, nativeStatus: () => Promise<unknown>) {
+    let handler: (() => Promise<{ structuredContent: Record<string, unknown> }>) | undefined;
+    registerCapabilityDiscovery({ registerTool: (_name: string, _definition: unknown, run: typeof handler) => { handler = run; } } as never,
+      { ...baseContext, desktopCall: { required, nativeSession: required ? { kind: "codex", id: "native" } : undefined } } as unknown as McpContext,
+      { nativeStatus });
+    return (await handler!()).structuredContent as { groups: Array<{ id: string; status: string }> };
+  }
+  let checks = 0;
+  const refused = await call(true, async () => { checks += 1; throw new Error("unsynced"); });
+  assert.equal(checks, 1);
+  assert.equal(refused.groups.find(group => group.id === "relay_messaging")?.status, "restricted");
+  const available = await call(true, async () => { checks += 1; });
+  assert.equal(checks, 2);
+  assert.equal(available.groups.find(group => group.id === "relay_messaging")?.status, "available");
+  await call(false, async () => { checks += 1; });
+  assert.equal(checks, 2, "unmanaged capability discovery does not probe native identity");
 });
 
 test("session reads go to RelayHistory for the bound workspace only", async (t) => {

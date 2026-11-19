@@ -8,7 +8,8 @@ import type { McpContext } from "./context.js";
  * mode, scopes, workspace role and every tool group, with the reason for each
  * one it cannot use. Read-only; the role was read at admission.
  */
-export function registerCapabilityDiscovery(server: McpServer, context: McpContext): void {
+export function registerCapabilityDiscovery(server: McpServer, context: McpContext,
+  options: { nativeStatus?: () => Promise<unknown> } = {}): void {
   server.registerTool(CAPABILITY_DISCOVERY_TOOL, {
     title: "Describe this connection's capabilities",
     description: "Use when an expected Agent Relay capability is missing or an operation is refused. Returns this MCP connection's endpoint, authentication mode, granted scopes, current workspace role and tool groups; unavailable or restricted groups include the exact reason and enablement requirements. Read-only.",
@@ -19,8 +20,11 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
     let nativeAuthorityAvailable: boolean | undefined;
     if (managed) {
       try {
-        const { relayService } = await import("./relay-participants.js");
-        await relayService(context).status();
+        if (options.nativeStatus) await options.nativeStatus();
+        else {
+          const { relayService } = await import("./relay-participants.js");
+          await relayService(context).status();
+        }
         nativeAuthorityAvailable = true;
       } catch {
         nativeAuthorityAvailable = false;
