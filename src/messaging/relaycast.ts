@@ -614,6 +614,50 @@ export function createRelaycastClient(input: {
     },
 
     /**
+     * relaygate only: enrols one hosted participant with a single-use hosted
+     * credential (`sh_ht_`) at POST /v1/register. The answer is not wrapped in
+     * { ok, data }. agentId is relaygate's agent id; the rg_ token is valid
+     * only at relaygate.
+     */
+    async registerAtGate(credential: string, name: string): Promise<{ agentId: string; gid: number | null; token: string; expiresAt: string | null; userId: string | null }> {
+      const data = record(await labeled("gate_register", () => call("POST", "/v1/register", credential, { name })));
+      const agentId = text(data?.agent_id);
+      const token = text(data?.token);
+      if (!agentId || !token?.startsWith("rg_")) throw new RelaycastCallError(502, "", true);
+      return { agentId, gid: typeof data?.gid === "number" ? data.gid : null, token,
+        expiresAt: text(data?.expires_at), userId: text(data?.user_id) };
+    },
+
+    /**
+     * relaygate only: merges metadata into the token's own agent card
+     * (PATCH /v1/agent; relaygate keeps its own `relaygate` stamp).
+     */
+    async mergeOwnAgentMetadata(token: string, metadata: Record<string, unknown>): Promise<void> {
+      await labeled("gate_update_agent", () => call("PATCH", "/v1/agent", token, { metadata }));
+    },
+
+    /**
+     * relaygate only: renews an unexpired rg_ token of a launched or hosted
+     * agent (POST /v1/token/refresh); the presented token is revoked.
+     * `signal` aborts the request (a caller's deadline or shutdown).
+     */
+    async refreshGateToken(token: string, signal?: AbortSignal): Promise<string> {
+      const data = record(await labeled("gate_refresh", () => call("POST", "/v1/token/refresh", token, {}, undefined, false, signal)));
+      const renewed = text(data?.token);
+      if (!renewed?.startsWith("rg_")) throw new RelaycastCallError(502, "", true);
+      return renewed;
+    },
+
+    /**
+     * relaygate only: deletes the token's own agent upstream (DELETE
+     * /v1/agent). relaygate revokes its tokens; the name stays reserved for
+     * its owner. An agent already gone upstream (404) is fine.
+     */
+    async releaseOwnAgent(token: string): Promise<void> {
+      await labeled("gate_release_agent", () => call("DELETE", "/v1/agent", token, undefined, undefined, true));
+    },
+
+    /**
      * relaygate only (a client bound to relaygate's origin): the agent an rg_
      * token controls, from GET /v1/whoami. The body is not wrapped in
      * { ok, data }. userId is the Control user that enrolled the agent when

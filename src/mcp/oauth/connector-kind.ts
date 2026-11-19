@@ -39,3 +39,31 @@ export function connectorKind(client: { clientName: string | null; redirectUris:
   if (hosts.some(({ scheme, host }) => scheme === "https" && (under(host, "muse.ai") || under(host, "agent.meta.ai")))) return "muse";
   return "mcp";
 }
+
+/**
+ * The kind an OAuth grant is admitted as: relaygate enrolment of its hosted
+ * participant and Grok routines. `used` holds the redirect URIs the grant's
+ * authorization codes were delivered to; the kind is the provider all of them
+ * name, so only a grant whose codes went to a provider's own callback is that
+ * provider's. A client that registers its own callback beside a provider's
+ * receives its codes at its own callback and is "mcp". A grant with no
+ * recorded delivery falls back to the registration, and then every
+ * registered URI must name the same provider. Unlike connectorKind's display
+ * precedence, any mix is no provider at all.
+ */
+export function admissionConnectorKind(
+  client: { clientName: string | null; redirectUris: string[] },
+  used: readonly string[] = [],
+): ConnectorKind {
+  const uris = used.length > 0 ? used : client.redirectUris;
+  const kinds = new Set(uris.map((uri) => connectorKind({ clientName: client.clientName, redirectUris: [uri] })));
+  return kinds.size === 1 ? [...kinds][0]! : "mcp";
+}
+
+/**
+ * SQL for `used` above: the redirect URIs of the consumed authorization codes
+ * of the grant in `grantId` (a SQL expression) issued to `clientId`.
+ */
+export const usedRedirectUrisSql = (grantId: string, clientId: string) =>
+  `ARRAY(SELECT DISTINCT a.redirect_uri FROM mcp_oauth_authorization_codes a
+    WHERE a.grant_id = ${grantId} AND a.client_id = ${clientId} AND a.consumed_at IS NOT NULL)`;
