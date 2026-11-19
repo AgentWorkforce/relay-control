@@ -403,7 +403,7 @@ export function createMcpHandler(input: {
         ? { ...provider, mcpGroupsRegistered: Boolean(context.grokRoutines) } : provider),
       relaycast: {
         listAgents: (status) => relaycast.listAgents(workspace.relaycastApiKey, status),
-        listPresence: signal => relaycast.listPresence(workspace.relaycastApiKey, signal),
+        listPresence: () => relaycast.listPresence(workspace.relaycastApiKey),
       },
       relay: {
         database: store.database,

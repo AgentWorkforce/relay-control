@@ -174,9 +174,7 @@ export type TeamAgent = ReturnType<typeof rosterAgent> & { liveness: AgentLivene
 async function readTeam(context: McpContext, status: "live" | "all"): Promise<{ agents: TeamAgent[]; presenceAvailable: boolean }> {
   const [rosterResult, presenceResult, people] = await Promise.all([
     Promise.allSettled([context.relaycast.listAgents(status === "live" ? "active" : "all")]).then(([result]) => result!),
-    // Optional presence must not hold a good roster behind a hung service.
-    // The signal also aborts a stalled response body.
-    Promise.allSettled([context.relaycast.listPresence(AbortSignal.timeout(2_000))]).then(([result]) => result!),
+    Promise.allSettled([context.relaycast.listPresence()]).then(([result]) => result!),
     context.members(),
   ]);
   if (rosterResult.status === "rejected") {

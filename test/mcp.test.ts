@@ -144,7 +144,7 @@ type RelaycastCall = { path: string; authorization: string | null };
 
 /** Relaycast served through the injected messaging fetch: roster and presence, and the relay world. */
 function fakeRelaycast(state: {
-  agents: unknown[]; presence: unknown[] | "fail" | "hang"; presenceAborted?: boolean; calls: RelaycastCall[]; world: RelaycastWorld;
+  agents: unknown[]; presence: unknown[] | "fail"; calls: RelaycastCall[]; world: RelaycastWorld;
   /** The bounded `names` lookup: "fail" answers 503; "roster" plays an older engine that ignores `names`. */
   namesLookup?: "fail" | "roster";
 }): typeof fetch {
@@ -164,12 +164,6 @@ function fakeRelaycast(state: {
       return json(200, { ok: true, data: state.agents.filter(row => names.includes((row as { name?: string }).name ?? "")) });
     }
     if (url.pathname === "/v1/agents/presence") {
-      if (state.presence === "hang") return new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => {
-          state.presenceAborted = true;
-          reject(init?.signal?.reason);
-        }, { once: true });
-      });
       return state.presence === "fail" ? json(503, { ok: false, error: { code: "unavailable" } }) : json(200, { ok: true, data: state.presence });
     }
     const body = typeof init?.body === "string" && init.body ? JSON.parse(init.body) as Record<string, any> : null;
@@ -186,7 +180,7 @@ async function setup(t: TestContext) {
   const historyAudience = "https://history.selfhosted.test";
   const history = await startHistory(t);
   const agents: unknown[] = [];
-  const relay = { agents, presence: [] as unknown[] | "fail" | "hang", presenceAborted: false, calls: [] as RelaycastCall[], world: createRelaycastWorld(agents),
+  const relay = { agents, presence: [] as unknown[] | "fail", calls: [] as RelaycastCall[], world: createRelaycastWorld(agents),
     namesLookup: undefined as "fail" | "roster" | undefined };
   const database = new PGliteDatabase();
   await migrate(database);
@@ -368,25 +362,6 @@ test("MCP admission storage failures return a useful correlated error", async t 
   assert.equal(response.status, 500);
   assertCorrelatedRpcError(response, -32603, "The MCP service is temporarily unavailable. Please try again.");
   assert.equal(JSON.stringify(response.body).includes("SECRET"), false);
-});
-
-test("list_team_activity returns a usable roster when optional presence hangs", async t => {
-  const env = await setup(t);
-  env.relay.agents = [{ id: "a1", name: "builder", type: "agent", status: "active", metadata: {} }];
-  env.relay.presence = "hang";
-  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const result = await Promise.race([client.callTool({ name: "list_team_activity", arguments: { max_agents: 1 } }),
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error("Optional presence blocked the roster past three seconds")), 3_000);
-      })]);
-    const data = structured(result);
-    assert.equal(data.presence_source, "unavailable");
-    assert.equal(data.agents[0].name, "builder");
-    assert.equal(data.agents[0].presence.liveness, "unknown");
-    assert.equal(env.relay.presenceAborted, true);
-  } finally { clearTimeout(timer); }
 });
 
 test("admission refuses foreign credentials, origins, methods, and oversized bodies", async (t) => {
