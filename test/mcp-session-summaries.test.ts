@@ -53,7 +53,7 @@ test("list reads one bounded directory page and preserves recorded provenance, o
   assert.equal(f.paths.length, 1, "no per-session reads or transcript scan");
   assert.deepEqual(value.sessions[0], { session_id: "fake/session", source: "codex", owner: [{ user_id: "user-a", name: "Example User" }, { user_id: "former-user", name: null }],
     project: "fake-project", repo: "https://example.test/org/repo", branch: "feature/test", last_active: ts,
-    short_summary: row().shortSummary, short_summary_status: "available", short_summary_generated_at: ts,
+    short_summary: row().shortSummary, short_summary_status: "available", transcript_status: "not_verified", short_summary_generated_at: ts,
     citation_url: "https://relay.example.test/dashboard/sessions/fake%2Fsession?source=codex" });
   assert.equal(value.next_cursor, "b96l1:opaque-page");
   assert.deepEqual(resultSessionsOf("list_session_summaries", value), { count: 1, truncated: false,
@@ -117,14 +117,17 @@ test("short summary uses the exact session route and retains recorded model/time
   assert.equal(resultSessionsOf("get_session_summary", value).sessions[0]!.session_id, "fake/session");
 });
 
-test("empty summaries stay empty; malformed provenance and unsupported responses are refused", async t => {
-  for (const summary of [{ status: "ready", kind: "short", summary: "Recorded", builtAt: ts, state: null }, { status: "unsupported" }]) {
+test("empty summaries stay empty; malformed provenance is refused and unsupported is data", async t => {
+  for (const summary of [{ status: "ready", kind: "short", summary: "Recorded", builtAt: ts, state: null }]) {
     const f = await fixture(t, { body: { summary } });
     assert.equal((await call(f.client, "get_session_summary", { session_id: "fake", source: "codex" })).isError, true);
   }
   const summary = { status: "empty", kind: "short", state: null };
   const f = await fixture(t, { body: { summary } });
   assert.deepEqual(data(await call(f.client, "get_session_summary", { session_id: "fake", source: "codex" })).summary, summary);
+  const unavailable = await fixture(t, { body: { summary: { status: "unsupported" } } });
+  assert.deepEqual(data(await call(unavailable.client, "get_session_summary", { session_id: "fake", source: "codex" })).summary,
+    { status: "unsupported" });
 });
 
 test("missing summary source gives actionable guidance without inferring a harness or calling the reader", async t => {
@@ -169,13 +172,15 @@ test("wrong-kind summaries and invalid provenance refuse after one read without 
     { summary: { ...ready, summary: "x".repeat(16_001) } },
     { summary: { ...ready, model: "" } },
     { summary: { ...ready, builtAt: undefined } },
-    { summary: { status: "unsupported" } },
   ]) {
     const f = await fixture(t, { body });
     const result = await call(f.client, "get_session_summary", { session_id: "fake", source: "codex", kind: "long" });
     assert.equal(result.isError, true); assert.match(JSON.stringify(result), /unsupported_by_backend/);
     assert.deepEqual(f.paths, ["/v1/sessions/fake/summary?kind=long&source=codex"]);
   }
+  const unsupportedResult = data(await call((await fixture(t, { body: { summary: { status: "unsupported" } } })).client,
+    "get_session_summary", { session_id: "fake", source: "codex", kind: "long" }));
+  assert.deepEqual(unsupportedResult.summary, { status: "unsupported" });
 });
 
 test("long reader refusals and outages never trigger another kind, backend or transcript read", async t => {

@@ -15,6 +15,17 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
     inputSchema: {},
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async () => {
+    const managed = !context.oauth && (context.desktopCall.required || context.desktopCall.provider !== undefined);
+    let nativeAuthorityAvailable: boolean | undefined;
+    if (managed) {
+      try {
+        const { relayService } = await import("./relay-participants.js");
+        await relayService(context).status();
+        nativeAuthorityAvailable = true;
+      } catch {
+        nativeAuthorityAvailable = false;
+      }
+    }
     const report = describeCapabilities({
       endpointUrl: context.endpointUrl,
       authMode: context.authMode,
@@ -29,6 +40,7 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       capyPermits: Boolean(context.oauth && context.capyPermits),
       customerSupport: Boolean(context.customerSupport),
       grokRoutines: Boolean(context.grokRoutines),
+      nativeAuthorityAvailable,
       providers: await context.providers(),
     });
     return {

@@ -12,6 +12,7 @@ import { ControlPlaneStore } from "../src/store.js";
 import { createRelaycastWorld, type RelaycastWorld } from "./support/relaycast-world.js";
 import { PGliteDatabase } from "./support/harness.js";
 import { RECIPIENT_CARD_NOTE } from "../src/mcp/relay-agent-cards.js";
+import { describeCapabilities } from "../src/mcp/catalog.js";
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -470,6 +471,14 @@ test("describe_capabilities reports the served groups and the bound workspace", 
   assert(!connectRooms.reason.includes("edition"));
 });
 
+test("describe_capabilities does not advertise managed relay tools without a synced native identity", () => {
+  const report = describeCapabilities({ endpointUrl: "https://relay.example.test/mcp", authMode: "cli_login", scopes: ["cli:auth"],
+    workspaceId: "workspace", role: "owner", providers: [], nativeAuthorityAvailable: false });
+  const messaging = report.groups.find(group => group.id === "relay_messaging");
+  assert.equal(messaging?.status, "restricted");
+  assert.match(messaging?.reason ?? "", /could not verify/);
+});
+
 test("session reads go to RelayHistory for the bound workspace only", async (t) => {
   const env = await setup(t);
   env.history.events.push(
@@ -751,6 +760,9 @@ test("every listed Desktop and spawned agent has an inferred card and trusted ow
     assert.equal(agent.is_mine, true);
   }
   assert.doesNotMatch(structured(result).description, /truncated spawn prompt/i);
+  env.relay.world.addAgent("second-peer", { description: "Second" });
+  const bounded = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all", limit: 1 } }));
+  assert.equal(bounded.agents.length, 1); assert.equal(bounded.total_matching, 3); assert.equal(bounded.truncated, true);
   assert.ok(client.getInstructions()?.includes(CARD_GUIDANCE));
   const channels = structured(await client.callTool({ name: "list_relay_channels", arguments: {} }));
   assert.ok(channels.guidance.endsWith(CARD_GUIDANCE));

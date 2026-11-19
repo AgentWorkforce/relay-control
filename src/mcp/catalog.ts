@@ -196,6 +196,8 @@ export function describeCapabilities(input: {
   capyPermits?: boolean;
   customerSupport?: boolean;
   grokRoutines?: boolean;
+  /** Whether a managed native call resolves to its synced Desktop identity. */
+  nativeAuthorityAvailable?: boolean;
   providers: ProviderStatus[];
 }): CapabilityReport {
   const launchRole = input.role === "owner" || input.role === "admin";
@@ -246,6 +248,11 @@ export function describeCapabilities(input: {
       how_to_enable: input.authMode === "oauth"
         ? "Use your own Agent Relay sign-in (a person connection) for these tools."
         : "An operator adds events_shim to SELFHOST_FEATURES (chart selectedFeatures)." };
+    if (item && id === "relay_messaging" && input.nativeAuthorityAvailable === false) {
+      return { ...base, status: "restricted", tools: [...item.tools],
+        reason: "Agent Relay could not verify this chat's synced Desktop identity.",
+        how_to_enable: "Reconnect this chat from Agent Relay Desktop and wait for its identity to sync, then retry." };
+    }
     if (item) return { ...base, status: "available", tools: [...item.tools], ...(id === "customer_support"
       ? { call_requirements: "Available to all signed-in customers. Current credentials and workspace membership are checked before sending and before returning an answer." } : {}) };
     if (id === "grok_routines") return { ...base, status: "unavailable", tools: [...definition.tools],
