@@ -44,6 +44,8 @@ export function ensureToolTitles(server: McpServer): void {
 export const RELAY_TOOLS = ["list_relay_agents", "get_relay_agent_card", "set_relay_agent_card", "send_relay_message", "get_relay_message_status", "read_relay_conversation", "join_relay", "leave_relay",
   "relay_status", "check_relay_inbox", "list_relay_channels", "subscribe_relay_channel", "unsubscribe_relay_channel",
   "post_relay_channel", "read_relay_channel"] as const;
+/** Directory reads do not act as the managed chat, so they survive a missing synced Desktop identity. */
+const RELAY_DIRECTORY_TOOLS = ["list_relay_agents", "get_relay_agent_card"] as const;
 const RELAY_SPAWN_TOOLS = ["list_relay_spawn_targets", "spawn_relay_agent", "get_relay_spawn_status", "release_relay_agent"] as const;
 const AMP_TOOLS = ["list_amp_threads", "bind_amp_thread", "unbind_amp_thread"] as const;
 const WEBHOOK_INBOX_TOOLS = ["link_webhook_inbox", "unlink_webhook_inbox"] as const;
@@ -160,6 +162,8 @@ export type CapabilityGroup = {
   title: string;
   status: "available" | "restricted" | "unavailable";
   tools: string[];
+  /** Listed tools whose calls are refused while the rest of the group remains usable. */
+  restricted_tools?: Array<{ name: string; reason: string }>;
   reason?: string;
   how_to_enable?: string;
   call_requirements?: string;
@@ -256,9 +260,12 @@ export function describeCapabilities(input: {
         ? "Use your own Agent Relay sign-in (a person connection) for these tools."
         : "An operator adds events_shim to SELFHOST_FEATURES (chart selectedFeatures)." };
     if (item && id === "relay_messaging" && input.nativeAuthorityAvailable === false) {
-      return { ...base, status: "restricted", tools: [...item.tools],
-        reason: input.nativeAuthorityReason ?? "Agent Relay could not verify this chat's synced Desktop identity.",
-        how_to_enable: input.nativeAuthorityHowToEnable ?? "Reconnect this chat from Agent Relay Desktop and wait for its identity to sync, then retry." };
+      const reason = input.nativeAuthorityReason ?? "Agent Relay could not verify this chat's synced Desktop identity.";
+      return { ...base, status: "available", tools: [...item.tools],
+        restricted_tools: item.tools.filter(name => !(RELAY_DIRECTORY_TOOLS as readonly string[]).includes(name))
+          .map(name => ({ name, reason })),
+        how_to_enable: input.nativeAuthorityHowToEnable ?? "Reconnect this chat from Agent Relay Desktop and wait for its identity to sync, then retry.",
+        call_requirements: "Agent directory reads remain available. Acting as this managed chat requires its synced Desktop identity." };
     }
     if (item) return { ...base, status: "available", tools: [...item.tools], ...(id === "customer_support"
       ? { call_requirements: "Available to all signed-in customers. Current credentials and workspace membership are checked before sending and before returning an answer." } : {}) };

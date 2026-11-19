@@ -104,6 +104,7 @@ const DESKTOP_LINK_FIELDS = "desktop_address cannot be combined with name or des
 const DESKTOP_LINK_NEEDS_SESSION = "Initialize MCP to receive Mcp-Session-Id before linking a desktop identity.";
 const DESKTOP_LINK_OAUTH = "This connection acts only as the agent approved for it and cannot link a desktop identity. Use a native MCP session (one that keeps Mcp-Session-Id) to call join_relay with desktop_address.";
 const DESKTOP_INBOX_GUIDANCE = "Replies are injected into your session by Agent Relay Desktop; check_relay_inbox is not used for this linked identity.";
+const INBOX_SENDER_LOOKUP_TIMEOUT_MS = 1_000;
 const CHANNEL_REPLY_GUIDANCE = "Reply to a post in this channel with post_relay_channel channel=<name> thread_id=<message_id>. Use send_relay_message only when the reply is private.";
 const RESERVED_CHANNEL_PREFIX = "agent-events-";
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,79}$/;
@@ -1547,7 +1548,9 @@ function createRelayService(context: McpContext) {
       ]);
       // Sender addresses come from one bounded lookup of the senders' names.
       const senders = [...new Set(messages.flatMap(message => message.sender ? [message.sender] : []))];
-      const agents = senders.length ? (await dir.via.findAgentsByNames(dir.credential, senders)).filter(isListedRelayAgent) : [];
+      const agents = senders.length ? (await dir.via.findAgentsByNames(dir.credential, senders, {
+        signal: AbortSignal.timeout(INBOX_SENDER_LOOKUP_TIMEOUT_MS),
+      }).catch(() => [])).filter(isListedRelayAgent) : [];
       const addresses = new Map(agents.map(agent => [agent.name, agent.address]));
       const channelNames = new Map<string, string>();
       if (messages.some(isChannelDelivery)) {

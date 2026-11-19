@@ -531,8 +531,11 @@ test("describe_capabilities does not advertise managed relay tools without a syn
     workspaceId: "workspace", role: "owner", providers: [], nativeAuthorityAvailable: false,
     nativeAuthorityReason: "This chat has no synced Desktop identity." });
   const messaging = report.groups.find(group => group.id === "relay_messaging");
-  assert.equal(messaging?.status, "restricted");
-  assert.equal(messaging?.reason, "This chat has no synced Desktop identity.");
+  assert.equal(messaging?.status, "available");
+  assert.deepEqual(messaging?.restricted_tools?.map(tool => tool.name).slice(0, 3),
+    ["set_relay_agent_card", "send_relay_message", "get_relay_message_status"]);
+  assert.equal(messaging?.restricted_tools?.every(tool => tool.reason === "This chat has no synced Desktop identity."), true);
+  assert.equal(messaging?.restricted_tools?.some(tool => tool.name === "list_relay_agents" || tool.name === "get_relay_agent_card"), false);
 });
 
 test("the capability handler preserves safe refusals, distinguishes outages, and skips unavailable or unmanaged relay messaging", async (t) => {
@@ -545,23 +548,25 @@ test("the capability handler preserves safe refusals, distinguishes outages, and
     registerCapabilityDiscovery({ registerTool: (_name: string, _definition: unknown, run: typeof handler) => { handler = run; } } as never,
       { ...baseContext, authMode, desktopCall: { required, nativeSession: required ? { kind: "codex", id: "native" } : undefined } } as unknown as McpContext,
       { nativeStatus });
-    return (await handler!()).structuredContent as { groups: Array<{ id: string; status: string; reason?: string; how_to_enable?: string }> };
+    return (await handler!()).structuredContent as { groups: Array<{ id: string; status: string; reason?: string; how_to_enable?: string;
+      restricted_tools?: Array<{ name: string; reason: string }> }> };
   }
   let checks = 0;
   const refusal = "This chat is synced to two Desktop identities. Remove the duplicate identity, then retry.";
   const refused = await call(true, async () => { checks += 1; throw new RelayToolError(refusal); });
   assert.equal(checks, 1);
   const refusedMessaging = refused.groups.find(group => group.id === "relay_messaging");
-  assert.equal(refusedMessaging?.status, "restricted");
-  assert.equal(refusedMessaging?.reason, refusal);
+  assert.equal(refusedMessaging?.status, "available");
+  assert.equal(refusedMessaging?.restricted_tools?.find(tool => tool.name === "send_relay_message")?.reason, refusal);
   assert.doesNotMatch(refusedMessaging?.how_to_enable ?? "", /reconnect/i);
 
   const warnings: unknown[][] = [];
   t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
   const unavailable = await call(true, async () => { checks += 1; throw new Error("private outage details"); });
   const unavailableMessaging = unavailable.groups.find(group => group.id === "relay_messaging");
-  assert.match(unavailableMessaging?.reason ?? "", /could not check.*right now/i);
-  assert.doesNotMatch(unavailableMessaging?.reason ?? "", /private outage details|reconnect/i);
+  const unavailableReason = unavailableMessaging?.restricted_tools?.find(tool => tool.name === "send_relay_message")?.reason ?? "";
+  assert.match(unavailableReason, /could not check.*right now/i);
+  assert.doesNotMatch(unavailableReason, /private outage details|reconnect/i);
   assert.deepEqual(warnings, [["[selfhost-mcp] native identity capability check failed", { error: "Error" }]]);
 
   const available = await call(true, async () => { checks += 1; });
@@ -1615,6 +1620,18 @@ test("check_relay_inbox resolves sender addresses with one bounded lookup", asyn
   assert.deepEqual(lookups.listings, []);
   assert.equal(lookups.names.length, 1);
   assert.deepEqual([...lookups.names[0]!].sort(), ["peer-a", "peer-b"]);
+});
+
+test("check_relay_inbox delivers messages with null sender addresses when bounded enrichment fails", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-a");
+  const client = await relayClient(t, env);
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-inbox" } }));
+  env.relay.world.sendAs("peer-a", "owner-inbox", "from a");
+  env.relay.namesLookup = "fail";
+  const inbox = structured(await client.callTool({ name: "check_relay_inbox", arguments: {} }));
+  assert.deepEqual(inbox.messages.map((message: any) => ({ sender: message.sender, sender_address: message.sender_address })),
+    [{ sender: "peer-a", sender_address: null }]);
 });
 
 type AuditRow = Record<string, any>;
