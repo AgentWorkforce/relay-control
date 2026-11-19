@@ -7,7 +7,7 @@ import type { PresenceRow, RosterAgent } from "../src/messaging/relaycast.js";
 const INPUT: TeamActivityInput = { status: "all", stale_after_seconds: 300, max_agents: 100, max_agents_with_activity: 50, max_content: 600 };
 // One shared timestamp keeps the roster order (ranking ties are stable).
 const SEEN = new Date().toISOString();
-const LIMITS = { rosterTimeoutMs: 30, activityDeadlineMs: 50 };
+const LIMITS = { rosterTimeoutMs: 30, presenceTimeoutMs: 30, activityDeadlineMs: 50 };
 
 /** An agent declaring session `sess-<name>` (no session_kind: History is read by bare session ID). */
 const agent = (name: string): RosterAgent => ({
@@ -57,10 +57,15 @@ test("a roster read that never settles fails with the roster-unavailable error a
 test("a presence read that never settles reports presence unavailable and still lists agents", async (t) => {
   const presence = hung<PresenceRow[]>();
   t.after(() => presence.release([]));
+  let seen: AbortSignal | undefined;
+  const started = Date.now();
+  // Presence has its own, shorter bound: the roster bound here is far away.
   const data = await readTeamActivity(context({
     listAgents: async () => [{ ...agent("a"), metadata: {} }],
-    listPresence: () => presence.promise,
-  }), INPUT, LIMITS);
+    listPresence: (options) => { seen = options?.signal; return presence.promise; },
+  }), INPUT, { ...LIMITS, rosterTimeoutMs: 5_000, presenceTimeoutMs: 20 });
+  assert.ok(Date.now() - started < 1_000);
+  assert.equal(seen?.aborted, true);
   assert.equal(data.presence_source, "unavailable");
   assert.deepEqual(data.agents.map(row => row.name), ["a"]);
   assert.equal(data.agents[0]!.presence.liveness, "unknown");
