@@ -900,16 +900,19 @@ test("list_relay_agents links synced Desktop sessions and keeps validated declar
   const client = await relayClient(t, env);
   const agents = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } })).agents;
   const syncedRow = agents.find((agent: any) => agent.name === synced.name);
-  assert.deepEqual([syncedRow.session_id, syncedRow.session_kind, syncedRow.session_attribution],
-    ["ses_ABCD1234", "opencode", "synced"]);
+  assert.deepEqual([syncedRow.session_id, syncedRow.session_kind, syncedRow.session_attribution,
+    syncedRow.session_unavailable_reason], ["ses_ABCD1234", "opencode", "synced", null]);
   const declaredRow = agents.find((agent: any) => agent.name === declared.name);
-  assert.deepEqual([declaredRow.session_id, declaredRow.session_kind, declaredRow.session_attribution],
-    ["declared-session-id", "claude", "declared"]);
+  assert.deepEqual([declaredRow.session_id, declaredRow.session_kind, declaredRow.session_attribution,
+    declaredRow.session_unavailable_reason], ["declared-session-id", "claude", "declared", null]);
 });
 
 test("list_relay_agents session enrichment fails open and refuses ambiguous Desktop rows", async (t) => {
   const env = await setup(t);
-  const peer = env.relay.world.addAgent("session-fallback", { source: "relay-desktop" });
+  const peer = env.relay.world.addAgent("session-fallback", { source: "relay-desktop", session_kind: "claude" });
+  const declared = env.relay.world.addAgent("session-declared-fallback", {
+    source: "relay-desktop", session_id: "declared-session-id", session_kind: "claude", injectable: "true",
+  });
   const client = await relayClient(t, env);
   const originalQuery = env.database.query.bind(env.database);
   let mode: "reject" | "duplicate" = "reject";
@@ -929,7 +932,11 @@ test("list_relay_agents session enrichment fails open and refuses ambiguous Desk
 
   const unavailable = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
   const unavailableRow = unavailable.agents.find((agent: any) => agent.name === peer.name);
-  assert.deepEqual([unavailableRow.session_id, unavailableRow.session_attribution], [null, null]);
+  assert.deepEqual([unavailableRow.session_id, unavailableRow.session_kind, unavailableRow.session_attribution,
+    unavailableRow.session_unavailable_reason], [null, "claude", null, "enrichment_failed"]);
+  const declaredRow = unavailable.agents.find((agent: any) => agent.name === declared.name);
+  assert.deepEqual([declaredRow.session_id, declaredRow.session_kind, declaredRow.session_attribution,
+    declaredRow.session_unavailable_reason], ["declared-session-id", "claude", "declared", null]);
   assert.deepEqual(warnings, [["[selfhost-mcp] session enrichment failed",
     { operation: "list_relay_agents", error: "TypeError" }]]);
   assert.doesNotMatch(JSON.stringify(warnings), /private session query detail/);
@@ -937,7 +944,8 @@ test("list_relay_agents session enrichment fails open and refuses ambiguous Desk
   mode = "duplicate";
   const ambiguous = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
   const ambiguousRow = ambiguous.agents.find((agent: any) => agent.name === peer.name);
-  assert.deepEqual([ambiguousRow.session_id, ambiguousRow.session_attribution], [null, null]);
+  assert.deepEqual([ambiguousRow.session_id, ambiguousRow.session_kind, ambiguousRow.session_attribution,
+    ambiguousRow.session_unavailable_reason], [null, "claude", null, "ambiguous_sync"]);
 });
 
 test("agent card owner enrichment fails open when its journal or membership read fails", async (t) => {
