@@ -13,13 +13,19 @@ reads one `GET /v1/sessions?includeShortSummary=recorded` page. `limit`
 defaults to 20 and cannot exceed 50.
 `since` is an ISO timestamp mapped to `lastTsAfter`; `project` maps to the
 directory's `projectContains` substring filter. A repo-only filter also uses
-`projectContains`, whose directory semantics include the recorded repository,
-so matching happens before pagination; the returned rows are still checked
-against the repository URL to exclude project-id or catalog-key matches. `person` resolves an exact
+the first 200 characters as `projectContains`, whose directory semantics are a
+case-insensitive literal substring of the project ID, catalog project key or
+recorded repository URL, so matching happens before pagination; the returned
+rows are still checked against the full repository URL to exclude project-id
+or catalog-key matches. This requires the sessions read API P3b directory-list
+version (`feat(read-api): serve the session list and activity from the Supabase
+directory`, commit `92b907e3`, migration `20261105034000`) or later. `person` resolves an exact
 workspace member ID, email or unambiguous name and sends that recorded user
 ID as `user`. Unknown and ambiguous members are refused rather than
-broadening the request. `repo` matches the recorded repository URL
-case-insensitively. Keep filters unchanged when following `next_cursor`.
+broadening the request. `repo` accepts up to 512 characters and matches the
+recorded repository URL case-insensitively. Exact URL verification can make a
+page short or empty while it still has `next_cursor`; keep paging with the same
+filters.
 
 Each result has `session_id`, `source`, `owner` (an array, since sessions may
 have several recorded owners), `project`, `repo`, `branch`, `last_active`,

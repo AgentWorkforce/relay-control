@@ -6,7 +6,7 @@ import { RelaycastCallError, type RosterAgent } from "../messaging/relaycast.js"
 import {
   bindDesktopSession, DesktopIdentityUnavailable, DESKTOP_IDENTITY_MESSAGES, findDesktopIdentityByAddress,
   findDesktopIdentityByName, findDesktopIdentityBySession, linkedDesktopIdentity, unbindDesktopSession, verifyDesktopIdentity,
-  type DesktopIdentityRow, type LinkedDesktopIdentity,
+  relaygateAgentId, type DesktopIdentityRow, type LinkedDesktopIdentity,
 } from "../messaging/desktop-identities.js";
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
@@ -674,10 +674,8 @@ function createRelayService(context: McpContext) {
   const syncedSessionId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
   const syncedIdentityId = (agent: RosterAgent) => {
     if (!gate) return agent.id;
-    const metadata = agent.metadata.relaygate;
-    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return agent.id;
-    const id = (metadata as Record<string, unknown>).agent_id;
-    return typeof id === "string" && syncedSessionId.test(id) ? id : agent.id;
+    const id = relaygateAgentId(agent.metadata);
+    return id && syncedSessionId.test(id) ? id : agent.id;
   };
   async function syncedDesktopSessions(agents: readonly RosterAgent[]) {
     const candidates = new Map(agents.map(agent => [`${syncedIdentityId(agent)}\0${agent.name}`, agent]));

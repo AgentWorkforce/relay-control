@@ -44,7 +44,7 @@ export function registerSessionSummaries(server: McpServer, context: McpContext)
     inputSchema: {
       since: timestamp.optional().describe("Select sessions last active after this ISO timestamp."),
       project: z.string().trim().min(1).max(200).optional().describe("Project substring filter applied by the session directory."),
-      repo: z.string().trim().min(1).max(200).optional().describe("Case-insensitive substring of the recorded repository URL. The session directory applies the filter before pagination."),
+      repo: z.string().trim().min(1).max(512).optional().describe("Case-insensitive substring of the recorded repository URL. A repo-only prefix is applied before pagination, then the exact URL is checked. A page can be short or empty and still have next_cursor; keep paging with the same filters."),
       person: id.optional().describe("Exact workspace member ID, name or email; ambiguous names are refused."),
       limit: z.number().int().min(1).max(50).default(20),
       cursor: cursor.optional().describe("Opaque next_cursor from the preceding call; keep the same filters."),
@@ -66,7 +66,7 @@ export function registerSessionSummaries(server: McpServer, context: McpContext)
       // filter also searches project ids and catalog keys. If both filters are
       // present, preserve the existing directory-level project constraint.
       if (input.project) params.set("projectContains", input.project);
-      else if (input.repo) params.set("projectContains", input.repo);
+      else if (input.repo) params.set("projectContains", input.repo.slice(0, 200));
       if (input.cursor) params.set("cursor", input.cursor);
       if (input.person) {
         const value = input.person.toLowerCase();

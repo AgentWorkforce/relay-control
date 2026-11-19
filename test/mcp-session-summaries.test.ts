@@ -18,7 +18,15 @@ async function fixture(t: TestContext, options: Setup = {}) {
   const paths: string[] = [];
   const context = { workspace: { id: "ws-a", organizationId: "org-a" }, origin: "https://relay.example.test",
     members: options.members ?? (async () => [{ userId: "user-a", name: "Example User", email: "fake@example.test" }]),
-    readHistory: async (path: string) => { paths.push(path); if (options.readError) throw options.readError; return options.body ?? page(); },
+    readHistory: async (path: string) => {
+      paths.push(path);
+      if (options.readError) throw options.readError;
+      if (options.body !== undefined) return options.body;
+      const result = page();
+      const needle = new URL(path, "https://reader.test").searchParams.get("projectContains")?.toLowerCase();
+      return needle ? { ...result, sessions: result.sessions.filter(item =>
+        [item.projectId, item.catalog?.repoUrl].some(value => value?.toLowerCase().includes(needle))) } : result;
+    },
   } as unknown as McpContext;
   const server = new McpServer({ name: "summaries-test", version: "1" });
   registerSharedSessionReads(server, context);
@@ -82,6 +90,13 @@ test("repo filtering is applied by the directory before pagination and verified 
   assert.equal(data(await call(f.client, "list_session_summaries", { repo: "ORG/REPO" })).sessions.length, 1);
 });
 
+test("repo filtering preserves the 512-character input and bounds the directory prefix to 200", async t => {
+  const f = await fixture(t);
+  const repo = "x".repeat(512);
+  assert.deepEqual(data(await call(f.client, "list_session_summaries", { repo })).sessions, []);
+  assert.equal(new URL(f.paths[0]!, "https://reader.test").searchParams.get("projectContains"), repo.slice(0, 200));
+});
+
 test("combined project and repo filters preserve the directory project constraint", async t => {
   const f = await fixture(t);
   assert.equal(data(await call(f.client, "list_session_summaries", { project: "fake", repo: "org/repo" })).sessions.length, 1);
@@ -108,7 +123,7 @@ test("ambiguous or unknown person filters refuse without broadening to all works
 
 test("schema bounds reject limit over 50 and invalid timestamps before any reader call", async t => {
   const f = await fixture(t);
-  for (const args of [{ limit: 51 }, { limit: 0 }, { since: "yesterday" }]) {
+  for (const args of [{ limit: 51 }, { limit: 0 }, { since: "yesterday" }, { repo: "x".repeat(513) }]) {
     assert.equal((await call(f.client, "list_session_summaries", args)).isError, true);
   }
   assert.deepEqual(f.paths, []);
