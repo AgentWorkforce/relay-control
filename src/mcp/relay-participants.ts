@@ -12,7 +12,7 @@ import {
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
 import { buildAgentCard, cardMetadata, cardSummary, recipientCard, type SetCardInput } from "./relay-agent-cards.js";
-import { loadRelayAgentOwners } from "./relay-agent-owners.js";
+import { loadRelayAgentOwners, relayAgentOwnerTarget } from "./relay-agent-owners.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
 import { admissionConnectorKind, connectorKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
@@ -73,6 +73,11 @@ const AS_PERSON_UNAVAILABLE =
 const ownerEnrichmentFailed = (operation: "list_relay_agents" | "get_relay_agent_card", error: unknown) => {
   console.warn("[selfhost-mcp] owner enrichment failed", {
     operation, error: error instanceof Error ? error.name : "unknown",
+  });
+};
+const sessionEnrichmentFailed = (error: unknown) => {
+  console.warn("[selfhost-mcp] session enrichment failed", {
+    operation: "list_relay_agents", error: error instanceof Error ? error.name : "unknown",
   });
 };
 
@@ -731,12 +736,57 @@ function createRelayService(context: McpContext) {
     return (await dir.via.listAgents(dir.credential, status, { includeStale })).filter(isListedRelayAgent);
   }
 
+  const syncedSessionKinds = new Set(["codex", "grok", "pi", "opencode", "claude", "copilot", "cursor"]);
+  const syncedSessionId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+  async function syncedDesktopSessions(agents: readonly RosterAgent[]) {
+    const targets = agents.map(agent => relayAgentOwnerTarget(agent, Boolean(gate)));
+    const candidates = new Map(targets.map((target, index) => [`${target.lookupId}\0${target.name}`, agents[index]!]));
+    const ids = [...new Set(targets.map(target => target.lookupId))];
+    if (!ids.length) return new Map<string, { sessionId: string; sessionKind: string }>();
+    const rows = await executor.query<{ agent_name: string; agent_remote_id: string; native_session_kind: string; native_session_id: string }>(
+      `SELECT agent_name, agent_remote_id, native_session_kind, native_session_id
+         FROM desktop_relay_identities
+        WHERE workspace_id = $1 AND agent_remote_id = ANY($2::text[])
+          AND relaycast_workspace_id = $3
+          AND native_session_kind IS NOT NULL AND native_session_id IS NOT NULL`,
+      [workspaceId, ids, relayWorkspaceId],
+    );
+    const sessions = new Map<string, { sessionId: string; sessionKind: string }>();
+    const matched = new Set<string>();
+    for (const row of rows.rows) {
+      const agent = candidates.get(`${row.agent_remote_id}\0${row.agent_name}`);
+      if (!agent) continue;
+      if (matched.has(agent.id)) {
+        sessions.delete(agent.id);
+        continue;
+      }
+      matched.add(agent.id);
+      const kind = row.native_session_kind.trim();
+      if (syncedSessionKinds.has(kind) && syncedSessionId.test(row.native_session_id)) {
+        sessions.set(agent.id, { sessionId: row.native_session_id, sessionKind: kind });
+      }
+    }
+    return sessions;
+  }
+
   async function roster(status: "live" | "all" | "offline", people: readonly McpMember[], includeStale = false, dir: Directory = directory()) {
     const listed = await listedAgents(status === "live" ? "active" : "all", includeStale, dir);
-    const owners = await loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, listed, people, Boolean(gate))
-      .catch(error => { ownerEnrichmentFailed("list_relay_agents", error); return undefined; });
+    const [owners, synced] = await Promise.all([
+      loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, listed, people, Boolean(gate))
+        .catch(error => { ownerEnrichmentFailed("list_relay_agents", error); return undefined; }),
+      syncedDesktopSessions(listed).catch(error => {
+        sessionEnrichmentFailed(error);
+        return new Map<string, { sessionId: string; sessionKind: string }>();
+      }),
+    ]);
     return listed
-      .map(agent => ({ ...rosterAgent(agent, people, userId, workspaceId, owners?.get(agent.id)), ...cardSummary(agent.metadata, agent) }))
+      .map(agent => {
+        const row = rosterAgent(agent, people, userId, workspaceId, owners?.get(agent.id));
+        const session = row.session_attribution ? null : synced.get(agent.id);
+        return { ...row,
+          ...(session ? { session_id: session.sessionId, session_kind: session.sessionKind, session_attribution: "synced" as const } : {}),
+          ...cardSummary(agent.metadata, agent) };
+      })
       .filter(agent => status === "all" || (status === "live" ? agent.online : !agent.online));
   }
 
