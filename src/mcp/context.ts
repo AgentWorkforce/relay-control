@@ -57,7 +57,7 @@ export type McpContext = {
   providers: () => Promise<ProviderStatus[]>;
   relaycast: {
     listAgents: (status: "active" | "all") => Promise<RosterAgent[]>;
-    listPresence: () => Promise<PresenceRow[]>;
+    listPresence: (signal?: AbortSignal) => Promise<PresenceRow[]>;
   };
   /** relay_messaging: the participant store, its key envelope, and the Relaycast client. */
   relay: {

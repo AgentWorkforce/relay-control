@@ -921,8 +921,8 @@ export function createRelaycastClient(input: {
     },
 
     /** Fresh presence from expiring broker keys, independent of roster status. */
-    async listPresence(workspaceKey: string): Promise<PresenceRow[]> {
-      const data = await labeled("list_presence", () => call("GET", "/v1/agents/presence", workspaceKey));
+    async listPresence(workspaceKey: string, signal?: AbortSignal): Promise<PresenceRow[]> {
+      const data = await labeled("list_presence", () => call("GET", "/v1/agents/presence", workspaceKey, undefined, undefined, false, signal));
       if (!Array.isArray(data)) throw new RelaycastCallError(200, "", true);
       return data.flatMap((item) => {
         const row = record(item);

@@ -144,7 +144,7 @@ type RelaycastCall = { path: string; authorization: string | null };
 
 /** Relaycast served through the injected messaging fetch: roster and presence, and the relay world. */
 function fakeRelaycast(state: {
-  agents: unknown[]; presence: unknown[] | "fail"; calls: RelaycastCall[]; world: RelaycastWorld;
+  agents: unknown[]; presence: unknown[] | "fail" | "hang"; presenceAborted?: boolean; calls: RelaycastCall[]; world: RelaycastWorld;
   /** The bounded `names` lookup: "fail" answers 503; "roster" plays an older engine that ignores `names`. */
   namesLookup?: "fail" | "roster";
 }): typeof fetch {
@@ -164,6 +164,12 @@ function fakeRelaycast(state: {
       return json(200, { ok: true, data: state.agents.filter(row => names.includes((row as { name?: string }).name ?? "")) });
     }
     if (url.pathname === "/v1/agents/presence") {
+      if (state.presence === "hang") return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          state.presenceAborted = true;
+          reject(init?.signal?.reason);
+        }, { once: true });
+      });
       return state.presence === "fail" ? json(503, { ok: false, error: { code: "unavailable" } }) : json(200, { ok: true, data: state.presence });
     }
     const body = typeof init?.body === "string" && init.body ? JSON.parse(init.body) as Record<string, any> : null;
@@ -180,7 +186,7 @@ async function setup(t: TestContext) {
   const historyAudience = "https://history.selfhosted.test";
   const history = await startHistory(t);
   const agents: unknown[] = [];
-  const relay = { agents, presence: [] as unknown[] | "fail", calls: [] as RelaycastCall[], world: createRelaycastWorld(agents),
+  const relay = { agents, presence: [] as unknown[] | "fail" | "hang", presenceAborted: false, calls: [] as RelaycastCall[], world: createRelaycastWorld(agents),
     namesLookup: undefined as "fail" | "roster" | undefined };
   const database = new PGliteDatabase();
   await migrate(database);
@@ -240,7 +246,7 @@ async function setup(t: TestContext) {
   };
   const accessToken = await login();
   return {
-    origin, config, database, history, relay, login,
+    origin, config, database, history, relay, login, store,
     orgId: org.body.id as string,
     workspaceId: workspace.body.id as string,
     otherWorkspaceId: other.body.id as string,
@@ -349,11 +355,47 @@ test("initialize advertises the self-host server and its tools on both paths", a
   assert.equal(echoed.headers.get("mcp-session-id"), "client-chosen_1");
 });
 
+function assertCorrelatedRpcError(response: { headers: Headers; body: any }, code: number, message: string) {
+  const id = response.headers.get("x-correlation-id");
+  assert.match(id ?? "", /^[0-9a-f-]{36}$/);
+  assert.deepEqual(response.body.error, { code, message, data: { correlation_id: id } });
+}
+
+test("MCP admission storage failures return a useful correlated error", async t => {
+  const env = await setup(t);
+  t.mock.method(env.store, "authenticateAccessToken", async () => { throw new Error("SECRET storage failure"); });
+  const response = await rpc(env.origin, MCP_PATH, { headers: { authorization: `Bearer ${env.accessToken}` } });
+  assert.equal(response.status, 500);
+  assertCorrelatedRpcError(response, -32603, "The MCP service is temporarily unavailable. Please try again.");
+  assert.equal(JSON.stringify(response.body).includes("SECRET"), false);
+});
+
+test("list_team_activity returns a usable roster when optional presence hangs", async t => {
+  const env = await setup(t);
+  env.relay.agents = [{ id: "a1", name: "builder", type: "agent", status: "active", metadata: {} }];
+  env.relay.presence = "hang";
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([client.callTool({ name: "list_team_activity", arguments: { max_agents: 1 } }),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("Optional presence blocked the roster past three seconds")), 3_000);
+      })]);
+    const data = structured(result);
+    assert.equal(data.presence_source, "unavailable");
+    assert.equal(data.agents[0].name, "builder");
+    assert.equal(data.agents[0].presence.liveness, "unknown");
+    assert.equal(env.relay.presenceAborted, true);
+  } finally { clearTimeout(timer); }
+});
+
 test("admission refuses foreign credentials, origins, methods, and oversized bodies", async (t) => {
   const env = await setup(t);
   const missing = await rpc(env.origin, MCP_PATH);
   assert.equal(missing.status, 401);
-  assert.deepEqual(missing.body, { jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+  assert.equal(missing.body.jsonrpc, "2.0");
+  assert.equal(missing.body.id, null);
+  assertCorrelatedRpcError(missing, -32001, "Unauthorized");
   assert.equal(missing.headers.get("www-authenticate"), "Bearer");
 
   const invalid = await rpc(env.origin, MCP_PATH, { headers: { authorization: "Bearer sh_at_not-a-real-token" } });
@@ -373,13 +415,13 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
   for (const token of [agentToken.accessToken, env.config.internalServiceToken!]) {
     const refused = await rpc(env.origin, MCP_PATH, { headers: { authorization: `Bearer ${token}` } });
     assert.equal(refused.status, 403);
-    assert.deepEqual(refused.body.error, { code: -32003, message: "Forbidden" });
+    assertCorrelatedRpcError(refused, -32003, "Forbidden");
   }
 
   const auth = { authorization: `Bearer ${env.accessToken}` };
   const foreign = await rpc(env.origin, MCP_PATH, { headers: { ...auth, origin: "https://evil.example" } });
   assert.equal(foreign.status, 403);
-  assert.deepEqual(foreign.body.error, { code: -32003, message: "Cross-origin MCP requests are forbidden." });
+  assertCorrelatedRpcError(foreign, -32003, "Cross-origin MCP requests are forbidden.");
   const sameOrigin = await rpc(env.origin, MCP_PATH, { headers: { ...auth, origin: PUBLIC_ORIGIN } });
   assert.equal(sameOrigin.status, 200);
 
@@ -391,7 +433,7 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
 
   const badSession = await rpc(env.origin, MCP_PATH, { headers: { ...auth, "mcp-session-id": "bad id!" } });
   assert.equal(badSession.status, 400);
-  assert.deepEqual(badSession.body.error, { code: -32600, message: "Invalid Mcp-Session-Id." });
+  assertCorrelatedRpcError(badSession, -32600, "Invalid Mcp-Session-Id.");
 
   const parse = await rpc(env.origin, MCP_PATH, { headers: auth, raw: "{not json" });
   assert.equal(parse.status, 400);
@@ -399,7 +441,7 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
 
   const tooLarge = await rpc(env.origin, MCP_PATH, { headers: auth, raw: JSON.stringify({ pad: "x".repeat(65 * 1024) }) });
   assert.equal(tooLarge.status, 413);
-  assert.deepEqual(tooLarge.body.error, { code: -32600, message: "MCP request body is too large." });
+  assertCorrelatedRpcError(tooLarge, -32600, "MCP request body is too large.");
 
   for (const method of ["GET", "DELETE"]) {
     const wrong = await rpc(env.origin, MCP_PATH, { method, headers: auth });
@@ -411,7 +453,7 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
   await env.database.query("UPDATE token_sessions SET scopes = ARRAY['rth:read']::text[]");
   const scoped = await rpc(env.origin, MCP_PATH, { headers: auth });
   assert.equal(scoped.status, 403);
-  assert.deepEqual(scoped.body.error, { code: -32003, message: "Forbidden" });
+  assertCorrelatedRpcError(scoped, -32003, "Forbidden");
 });
 
 test("the session cookie is accepted on the /cloud path only, behind the origin guard", async (t) => {
@@ -434,7 +476,9 @@ test("desktop calls validate the native chat context", async (t) => {
     body: { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "describe_capabilities", arguments: {}, _meta: { threadId: "nope" } } },
   });
   assert.equal(bad.status, 400);
-  assert.deepEqual(bad.body, { jsonrpc: "2.0", error: { code: -32602, message: "Invalid native chat context." }, id: 7 });
+  assert.equal(bad.body.jsonrpc, "2.0");
+  assert.equal(bad.body.id, 7);
+  assertCorrelatedRpcError(bad, -32602, "Invalid native chat context.");
   const good = await rpc(env.origin, MCP_PATH, {
     headers,
     body: {

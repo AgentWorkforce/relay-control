@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { correlateMcpResponse } from "./request-diagnostics.js";
 import type { GrokRoutines } from "./grok-routines.js";
 import { connectorKind } from "./oauth/connector-kind.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -49,12 +50,15 @@ type JsonRpcId = string | number | null;
 
 function rpcError(response: ServerResponse, status: number, code: number, message: string,
   id: JsonRpcId = null, headers: Record<string, string> = {}): void {
+  const correlationId = response.getHeader("x-correlation-id") as string;
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     ...headers,
   });
-  response.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id }));
+  console.error("[mcp] request failed", { endpoint: "shared-sessions", status, correlationId });
+  response.end(JSON.stringify({ jsonrpc: "2.0", error: { code,
+    message, data: { correlation_id: correlationId } }, id }));
 }
 
 /**
@@ -287,7 +291,7 @@ export function createMcpHandler(input: {
       oauth:undefined as McpOAuthConnection|undefined };
   }
 
-  return async function handle(
+  async function handleRequest(
     request: IncomingMessage,
     response: ServerResponse,
     path: string,
@@ -399,7 +403,7 @@ export function createMcpHandler(input: {
         ? { ...provider, mcpGroupsRegistered: Boolean(context.grokRoutines) } : provider),
       relaycast: {
         listAgents: (status) => relaycast.listAgents(workspace.relaycastApiKey, status),
-        listPresence: () => relaycast.listPresence(workspace.relaycastApiKey),
+        listPresence: signal => relaycast.listPresence(workspace.relaycastApiKey, signal),
       },
       relay: {
         database: store.database,
@@ -454,11 +458,11 @@ export function createMcpHandler(input: {
       });
       await server.connect(transport);
       const url = new URL(rawPath, site);
-      const webResponse = await transport.handleRequest(
+      const webResponse = await correlateMcpResponse(await transport.handleRequest(
         // The proof is gone from `body`; the transport never sees it.
         new Request(url, { method: "POST", headers, body: JSON.stringify(body) }),
         { parsedBody: body },
-      );
+      ), "shared-sessions", response.getHeader("x-correlation-id") as string);
       const out: Record<string, string> = {};
       webResponse.headers.forEach((value, name) => { out[name] = value; });
       out["cache-control"] = "no-store";
@@ -476,5 +480,19 @@ export function createMcpHandler(input: {
       await server.close().catch(() => {});
     }
     return true;
+  }
+
+  return async function handle(request: IncomingMessage, response: ServerResponse, path: string, method: string): Promise<boolean> {
+    if (path !== MCP_FACADE.path && !(oauthSessions && (path === "/mcp" || path === "/cloud/mcp"))) return false;
+    response.setHeader("x-correlation-id", randomUUID());
+    try {
+      return await handleRequest(request, response, path, method);
+    } catch {
+      // Admission, membership and server construction failures used to escape
+      // to the generic HTTP handler, losing the MCP error and its correlation.
+      if (!response.headersSent) rpcError(response, 500, -32603, "The MCP service is temporarily unavailable. Please try again.");
+      else response.end();
+      return true;
+    }
   };
 }
