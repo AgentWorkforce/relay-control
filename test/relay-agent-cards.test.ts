@@ -27,7 +27,7 @@ test("a card needs a description; documentation_url must be https", () => {
   assert.deepEqual(storedCard({ card: { description: "Does things", documentation_url: "http://insecure.test", tags: ["x"], updated_at: "2026-11-13T00:00:00.000Z" } }),
     { description: "Does things", tags: ["x"], updated_at: "2026-11-13T00:00:00.000Z", version: "1" });
   assert.deepEqual(cardSummary({ card: { description: "Does things" }, skills: Array.from({ length: 12 }, (_, index) => ({ name: `S${index}` })) }),
-    { has_card: true, skills: Array.from({ length: 10 }, (_, index) => `S${index}`) });
+    { has_card: true, skills: Array.from({ length: 10 }, (_, index) => `S${index}`), card_source: "published" });
 });
 
 test("the card fills x-agent-relay from metadata as Relaycast does", () => {
@@ -36,11 +36,17 @@ test("the card fills x-agent-relay from metadata as Relaycast does", () => {
     address: "worker@laptop", kind: "agent", persona: "Ships builds", status: "idle", lastSeen: null };
   const card = buildAgentCard(agent, options);
   assert.equal(card.url, "https://cast.example.test/a2a/rpc");
-  assert.equal(card.description, "Ships builds");
+  assert.equal(card.description, "worker is an Agent Relay agent on build-box, available for direct collaboration.");
   assert.deepEqual(card.skills, [{ id: "ship-it", name: "Ship It", description: "", tags: [] }]);
   assert.deepEqual(card["x-agent-relay"], { address: "worker@laptop", kind: "agent", owner: "Ops", where: "build-box",
-    status: "live", tags: [], hasCard: true });
+    status: "live", tags: [], hasCard: true, cardSource: "mixed" });
   const bare = buildAgentCard({ ...agent, metadata: {}, persona: null, address: null, status: "offline" }, options);
-  assert.equal(bare.description, "worker on Agent Relay");
-  assert.deepEqual(bare["x-agent-relay"], { address: "worker", kind: "agent", status: "offline", tags: [], hasCard: false });
+  assert.equal(bare.description, "worker is an Agent Relay agent, available for direct collaboration.");
+  assert.deepEqual(bare.skills, [{ id: "coordinate-work", name: "Coordinate current work",
+    description: "Send this agent a focused request related to the work it currently owns, including the expected outcome and relevant context.",
+    tags: [], examples: ["Coordinate a task or request a focused review."] }]);
+  assert.deepEqual(bare["x-agent-relay"], { address: "worker", kind: "agent", status: "offline", tags: [],
+    hasCard: true, cardSource: "inferred" });
+  assert.deepEqual(cardSummary({}, { ...agent, metadata: {}, persona: "You are a truncated spawn prompt" }),
+    { has_card: true, skills: ["Coordinate current work"], card_source: "inferred" });
 });

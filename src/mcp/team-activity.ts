@@ -174,12 +174,14 @@ export function relayAgentSessionId(metadata: Record<string, unknown>): { sessio
     ? metadata.session_kind.trim() : null };
 }
 
-export function rosterAgent(agent: RosterAgent, people: readonly McpMember[], userId: string, workspaceId: string) {
+export function rosterAgent(agent: RosterAgent, people: readonly McpMember[], userId: string, workspaceId: string,
+  trustedOwner?: McpMember) {
   const meta = agent.metadata;
   const session = relayAgentSessionId(meta);
   const cloud = text(meta.cloud_agent_id) !== null || text(meta.source)?.startsWith("cloud") === true;
   const cloudOwner = meta.cloud_workspace_id === workspaceId ? text(meta.cloud_user_id) : null;
-  const owner = people.find(person => ownerHash(person.userId) === meta.owner_hash || person.userId === cloudOwner);
+  const metadataOwner = people.find(person => ownerHash(person.userId) === meta.owner_hash || person.userId === cloudOwner);
+  const owner = trustedOwner ?? metadataOwner;
   const address = agent.address;
   const machine = address?.startsWith(`${agent.name}@`) ? address.slice(agent.name.length + 1) : null;
   const fleet = record(meta.fleet);
