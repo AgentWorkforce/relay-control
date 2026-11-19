@@ -80,10 +80,15 @@ export class GrokRoutines {
     }
   }
 
-  async status(grantId: string, owner: Owner) {
+  /**
+   * `setup`: the caller is starting a new routine (connect_grok_bot_routine), refused under required run identity.
+   * Reading the status, the setup page and disconnecting stay available, so an owner can still remove a routine
+   * saved before the setting changed.
+   */
+  async status(grantId: string, owner: Owner, options: { setup?: boolean } = {}) {
     return this.options.database.transaction(async tx => {
       const grant = await this.grant(tx, grantId, owner);
-      this.assertSetupAllowed(grant);
+      if (options.setup) this.assertSetupAllowed(grant);
       const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1", [grantId])).rows[0];
       return { agent: grant.agent_name, configured: Boolean(routine), webhook_accepted: Boolean(routine?.last_delivered_at),
         last_delivered_at: routine?.last_delivered_at ?? null, last_error: routine?.last_error ?? null,

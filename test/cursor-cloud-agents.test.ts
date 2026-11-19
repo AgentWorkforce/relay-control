@@ -394,3 +394,13 @@ for (const gate of [false, true]) test(`a run cannot be rejoined while its relea
     assert.ok(row.relaygate_agent_id);
   }
 });
+
+test("required run identity: an existing Grok routine can still be read and disconnected; saving a new one is refused", async t => {
+  const f = await fixture(t, { cursorCloud: { runIdentity: "required" } });
+  // A routine saved while run identity was optional.
+  await f.database.query(`INSERT INTO grok_bot_routines(grant_id,credentials_ciphertext,next_attempt_at,updated_at)
+    VALUES ($1,'sealed',now(),now())`, [f.owner.grantId]);
+  assert.equal(f.ok(await f.call("grok_bot_routine_status")).configured, true);
+  assert.match(f.failed(await f.call("connect_grok_bot_routine", { mode: "webhook" })), /SELFHOST_CURSOR_CLOUD_RUN_IDENTITY=optional/);
+  assert.equal(f.ok(await f.call("disconnect_grok_bot_routine")).removed, 1);
+});
