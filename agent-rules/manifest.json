@@ -1,5 +1,5 @@
 {
-  "version": "2026.11.0",
+  "version": "2026.11.1",
   "bootstrap_version": 1,
   "sources": {
     "grok-inbox": "Cloud packages/web/lib/mcp-events/grok-routine.ts grokRoutinePrompt @ 84578009505b (rendered per grant)",
@@ -58,7 +58,16 @@
       "audiences": [
         "lead"
       ]
+    },
+    {
+      "id": "stall-watch",
+      "title": "Watch in-flight work",
+      "file": "sections/stall-watch.md",
+      "audiences": [
+        "grok-bot",
+        "lead"
+      ]
     }
   ],
-  "sections_sha256": "1dd2891d795177f33da7c51b5e5d987101617441ead332a1f496f680b78db5d2"
+  "sections_sha256": "6c055e7c06e4e110a4935b81ec4a0dae3efdca700fff255e7a84a0d1a808fb38"
 }
