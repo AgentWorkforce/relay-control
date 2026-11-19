@@ -70,8 +70,15 @@ async function fixture(t: test.TestContext, options: { redirect?: string; cursor
     return { grantId, pair: await database.transaction(tx => sessions.issue(tx, { ...owner, grantId, tokenFamilyId, scopes: ["relay:mcp"] })) };
   };
   const world = createRelaycastWorld([]);
+  /** When set, upstream releases wait for it (a release in flight). */
+  let releaseGate: Promise<void> | null = null;
+  const releaseStarted: Array<() => void> = [];
   const relayFetch: typeof fetch = async (input, init) => {
     const url = new globalThis.URL(input instanceof Request ? input.url : String(input)), headers = new Headers(init?.headers);
+    if (url.pathname === "/v1/agents/release-exact" && releaseGate) {
+      releaseStarted.splice(0).forEach(started => started());
+      await releaseGate;
+    }
     if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") return Response.json({ ok: true,
       data: [...world.agents.values()].map(agent => ({ ...agent, address: `${agent.name}@cloud-${agent.id}`, last_seen: new Date().toISOString() })) });
     const result = await world.handle(init?.method ?? "GET", url.pathname, url.searchParams,
@@ -122,7 +129,14 @@ async function fixture(t: test.TestContext, options: { redirect?: string; cursor
   /** A same-origin POST from the person's signed-in browser; returns the status. */
   const post = async (pathAndQuery: string) => (await fetch(base + pathAndQuery, { method: "POST", redirect: "manual",
     headers: { cookie: `agent_relay_session=${browser.accessToken}`, origin: ORIGIN } })).status;
-  return { database, owner, world, issuer, call, ok, failed, nonce, confirm, teardown, grant, connect, post };
+  /** Holds upstream releases until resume(); started resolves once one is waiting. */
+  const pauseReleases = () => {
+    let resume!: () => void;
+    releaseGate = new Promise<void>(resolve => { resume = () => { releaseGate = null; resolve(); }; });
+    const started = new Promise<void>(resolve => releaseStarted.push(resolve));
+    return { started, resume: () => resume() };
+  };
+  return { database, owner, world, issuer, call, ok, failed, nonce, confirm, teardown, grant, connect, post, pauseReleases };
 }
 
 test("a Cursor cloud agent run links its Cursor account, joins as its own participant and messages as it", async t => {
@@ -291,4 +305,24 @@ test("required run identity: leaving a run twice is idempotent, and Grok routine
   assert.equal(f.ok(await f.call("leave_relay", { as: name })).already_left, false);
   assert.equal(f.ok(await f.call("leave_relay", { as: name })).already_left, true);
   assert.match(f.failed(await f.call("connect_grok_bot_routine", { mode: "webhook" })), /SELFHOST_CURSOR_CLOUD_RUN_IDENTITY=optional/);
+});
+
+test("a run cannot be rejoined while its release is in flight", async t => {
+  const f = await fixture(t, { cursorCloud: { trustedTeams: ["77"] } });
+  const name = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) })).name as string;
+  const second = await f.grant();
+  const call2 = await f.connect(second.pair.accessToken);
+  const nonce2 = async () => f.ok(await call2("relay_status")).cursor_identity.nonce as string;
+  await f.database.transaction(tx => revokeMcpOAuthGrantRows(tx, f.owner.grantId, "user_revoked", new Date()));
+  const paused = f.pauseReleases();
+  const draining = f.teardown.drain();
+  await paused.started;
+  // The upstream release is in flight: the run can't be re-recorded for the live connection.
+  assert.match(f.failed(await call2("join_relay", { cursor_identity_token: f.issuer.mint(await nonce2()) })), /being released/);
+  paused.resume();
+  await draining;
+  assert.equal(f.world.agents.has(name), false);
+  assert.deepEqual((await f.database.query("SELECT agent_name FROM cursor_cloud_runs")).rows, []);
+  assert.deepEqual((await f.database.query("SELECT agent_name FROM hosted_relay_participants")).rows, []);
+  assert.equal(f.ok(await call2("join_relay", { cursor_identity_token: f.issuer.mint(await nonce2()) })).name, name);
 });

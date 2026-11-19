@@ -1050,8 +1050,13 @@ function createRelayService(context: McpContext) {
       `INSERT INTO cursor_cloud_runs (grant_id, cloud_agent_id, workspace_id, user_id, agent_name)
        VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`, [grantId, identity.cloudAgentId, workspaceId, userId, name]);
     if (gate && await findParticipant(executor, workspaceId, userId, organizationId, { name })) {
-      // An earlier join of this run: renew it at relaygate before the lock, as every gated participant is.
-      await withOwnerLock(recordRun);
+      // An earlier join of this run: renew it at relaygate before the lock, as every gated participant is. The
+      // release fence is checked in the same transaction that records the run, so a run being released is never
+      // re-recorded.
+      await withOwnerLock(async (tx) => {
+        if (await cursorRunRetiring(tx, name)) throw new RelayToolError(CURSOR_RUN_RETIRING);
+        await recordRun(tx);
+      });
       await refreshGated(name);
     }
     let prepared: GateEnrolment | undefined;
