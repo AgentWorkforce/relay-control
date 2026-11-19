@@ -410,6 +410,7 @@ export function createMcpHandler(input: {
         ...(config.relaygatePublicUrl ? { relaygatePublicUrl: config.relaygatePublicUrl } : {}),
         ...(launchCheck ? { launchCheck } : {}),
         ...(gateClient ? { gateClient } : {}),
+        ...(config.spawnMemoryPolicy ? { spawnMemoryPolicy: config.spawnMemoryPolicy } : {}),
       },
       ...(!oauth && !staffGrant && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && !staffGrant && input.replicas ? { replicas: input.replicas } : {}),
