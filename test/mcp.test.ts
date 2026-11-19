@@ -761,8 +761,11 @@ test("every listed Desktop and spawned agent has an inferred card and trusted ow
   }
   assert.doesNotMatch(structured(result).description, /truncated spawn prompt/i);
   env.relay.world.addAgent("second-peer", { description: "Second" });
-  const bounded = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all", limit: 1 } }));
-  assert.equal(bounded.agents.length, 1); assert.equal(bounded.total_matching, 3); assert.equal(bounded.truncated, true);
+  const limited = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all", limit: 1 } }));
+  assert.equal(limited.agents.length, 1); assert.equal(limited.total_matching, 3); assert.equal(limited.truncated, true);
+  for (let index = 0; index < 100; index++) env.relay.world.addAgent(`peer-${index}`, { description: "Extra" });
+  const bounded = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
+  assert.equal(bounded.agents.length, 100); assert.equal(bounded.total_matching, 103); assert.equal(bounded.truncated, true);
   assert.ok(client.getInstructions()?.includes(CARD_GUIDANCE));
   const channels = structured(await client.callTool({ name: "list_relay_channels", arguments: {} }));
   assert.ok(channels.guidance.endsWith(CARD_GUIDANCE));
