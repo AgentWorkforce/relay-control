@@ -86,10 +86,12 @@ export function spawnPlacement(node: Record<string, unknown>): Placement {
     memory_available_bytes: first(resource => measure(resource?.memory_available_bytes, true)),
     memory_total_bytes: first(resource => measure(resource?.memory_total_bytes, true)),
   };
-  // Each capability carries its own live frame; judge memory on the newest stamped one.
+  // Each capability carries its own live frame; judge memory on the newest stamped one that reports memory.
   const stamped = configured
     .map(entry => ({ at: instant(entry.live?.observed_at), resources: record(entry.live?.resources) }))
-    .filter((entry): entry is { at: { text: string; ms: number }; resources: Record<string, unknown> | null } => entry.at !== null)
+    // Only frames that carry a memory figure: a newer frame without one must not hide an older one that has it.
+    .filter((entry): entry is { at: { text: string; ms: number }; resources: Record<string, unknown> | null } =>
+      entry.at !== null && measure(entry.resources?.memory_available_bytes, true) !== null)
     .sort((a, b) => b.at.ms - a.at.ms)[0];
   const memory: MemorySample | null = stamped
     ? { availableBytes: measure(stamped.resources?.memory_available_bytes, true),

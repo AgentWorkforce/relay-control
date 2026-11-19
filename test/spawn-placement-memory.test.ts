@@ -26,6 +26,14 @@ test("placement reads the newest stamped memory sample across capabilities", () 
   assert.deepEqual(placement.memory, { availableBytes: 3 * GIB, totalBytes: 16 * GIB, observedAt: at(2) });
 });
 
+test("a newer stamped frame without memory does not hide an older one that has it", () => {
+  const placement = spawnPlacement({ capabilities: [
+    capability("codex", { observed_at: at(20), resources: resources(9) }),
+    capability("claude", { observed_at: at(2), resources: { cpus: 8, load_1m: 1 } }),
+  ] });
+  assert.deepEqual(placement.memory, { availableBytes: 9 * GIB, totalBytes: 16 * GIB, observedAt: at(20) });
+});
+
 test("placement keeps an unstamped sample as unknown age, and the largest node floor", () => {
   const placement = spawnPlacement({ capabilities: [
     capability("codex", { resources: resources(9) }, { node_kind: "desktop", memory_floor_bytes: GIB }),
