@@ -678,7 +678,7 @@ function createRelayService(context: McpContext) {
 
   async function roster(status: "live" | "all" | "offline", people: readonly McpMember[], includeStale = false, dir: Directory = directory()) {
     const listed = await listedAgents(status === "live" ? "active" : "all", includeStale, dir);
-    const owners = await loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, listed.map(agent => agent.id), people)
+    const owners = await loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, listed, people, Boolean(gate))
       .catch(error => { ownerEnrichmentFailed("list_relay_agents", error); return undefined; });
     return listed
       .map(agent => ({ ...rosterAgent(agent, people, userId, workspaceId, owners?.get(agent.id)), ...cardSummary(agent.metadata, agent) }))
@@ -1255,8 +1255,8 @@ function createRelayService(context: McpContext) {
     async getCard(input: { agent: string }) {
       const agent = await explicitAgent(input.agent.trim(), await callerDirectory());
       if (!agent || agent.status === "released" || !isListedRelayAgent(agent)) throw new RelayToolError(UNKNOWN_CARD_AGENT);
-      const people = await context.members();
-      const owners = await loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, [agent.id], people)
+      const owners = await Promise.resolve().then(async () =>
+        loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, [agent], await context.members(), Boolean(gate)))
         .catch(error => { ownerEnrichmentFailed("get_relay_agent_card", error); return undefined; });
       return buildAgentCard(agent, cardOptions, owners?.get(agent.id));
     },

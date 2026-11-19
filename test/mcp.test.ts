@@ -763,6 +763,33 @@ test("every listed Desktop and spawned agent has an inferred card and trusted ow
   assert.equal(env.relay.world.bodies.some(call => call.method === "PATCH"), false);
 });
 
+test("agent card owner enrichment fails open when its journal or membership read fails", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-bot", {
+    owner_hash: sha256(env.ownerId), owner_name: "Metadata fallback",
+  });
+  const client = await relayClient(t, env);
+  const originalQuery = env.database.query.bind(env.database);
+  let failure: "owner" | "members" | null = null;
+  env.database.query = (async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+    if (failure === "owner" && sql.includes("'desktop'::text AS source")) throw new Error("owner query unavailable");
+    if (failure === "members" && sql.includes("FROM organization_memberships m")) throw new Error("members query unavailable");
+    return originalQuery<T>(sql, params);
+  }) as typeof env.database.query;
+  t.after(() => { env.database.query = originalQuery; });
+
+  failure = "owner";
+  const listed = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
+  assert.deepEqual(listed.agents.map((agent: any) => ({ name: agent.name, owner: agent.owner, has_card: agent.has_card })), [{
+    name: "peer-bot", owner: { user_id: env.ownerId, name: "Owner" }, has_card: true,
+  }]);
+
+  failure = "members";
+  const card = structured(await client.callTool({ name: "get_relay_agent_card", arguments: { agent: "peer-bot" } }));
+  assert.equal(card["x-agent-relay"].owner, "Metadata fallback");
+  assert.equal(card["x-agent-relay"].hasCard, true);
+});
+
 test("set_relay_agent_card writes only the joined participant's card and preserves its other metadata", async (t) => {
   const env = await setup(t);
   const client = await relayClient(t, env);
