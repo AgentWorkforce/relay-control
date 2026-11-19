@@ -7,8 +7,10 @@ import {
   configFingerprint,
   loadConfig,
   loadDatabaseUrl,
+  loadDefaultSharingMode,
   loadMigrationsDatabaseUrl,
   loadRuntimeDatabaseRole,
+  loadSharingModeOverrideRoles,
 } from "../src/config.js";
 
 const completeEnv = {
@@ -52,6 +54,39 @@ test("SELFHOST_RELAYGATE_PUBLIC_URL is optional and must be a public https origi
   }
 });
 
+test("SELFHOST_DEFAULT_SHARING_MODE is optional and one of all, new or selected", () => {
+  const unset = loadConfig(completeEnv);
+  assert.equal(unset.defaultSharingMode, undefined);
+  assert.equal(Object.hasOwn(unset, "defaultSharingMode"), false, "unset adds no key");
+  for (const empty of ["", "   "]) {
+    assert.equal(Object.hasOwn(loadConfig({ ...completeEnv, SELFHOST_DEFAULT_SHARING_MODE: empty }), "defaultSharingMode"), false);
+    assert.equal(loadDefaultSharingMode({ SELFHOST_DEFAULT_SHARING_MODE: empty }), undefined);
+  }
+  for (const mode of ["all", "new", "selected"] as const) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_DEFAULT_SHARING_MODE: mode }).defaultSharingMode, mode);
+    assert.equal(loadDefaultSharingMode({ SELFHOST_DEFAULT_SHARING_MODE: ` ${mode} ` }), mode);
+  }
+  for (const bad of ["ALL", "none", "selected,all", "off"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_DEFAULT_SHARING_MODE: bad }),
+      /SELFHOST_DEFAULT_SHARING_MODE must be all, new or selected/, bad);
+  }
+});
+
+test("SELFHOST_SHARING_MODE_OVERRIDE_ROLES is optional and lists only owner and admin", () => {
+  const unset = loadConfig(completeEnv);
+  assert.equal(Object.hasOwn(unset, "sharingModeOverrideRoles"), false, "unset adds no key");
+  for (const empty of ["", "  ", ",", " , "]) {
+    assert.equal(loadSharingModeOverrideRoles({ SELFHOST_SHARING_MODE_OVERRIDE_ROLES: empty }), undefined, empty);
+  }
+  assert.deepEqual(loadConfig({ ...completeEnv, SELFHOST_SHARING_MODE_OVERRIDE_ROLES: "owner" }).sharingModeOverrideRoles, ["owner"]);
+  assert.deepEqual(loadSharingModeOverrideRoles({ SELFHOST_SHARING_MODE_OVERRIDE_ROLES: " owner , admin " }), ["owner", "admin"]);
+  assert.deepEqual(loadSharingModeOverrideRoles({ SELFHOST_SHARING_MODE_OVERRIDE_ROLES: "admin,owner,admin,owner" }), ["admin", "owner"]);
+  for (const bad of ["member", "owner,member", "Owner", "owner;admin", "root"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_SHARING_MODE_OVERRIDE_ROLES: bad }),
+      /SELFHOST_SHARING_MODE_OVERRIDE_ROLES must list only owner and\/or admin/, bad);
+  }
+});
+
 test("SELFHOST_RELAY_NODE_SELF_MINT defaults on and is strictly boolean", () => {
   assert.equal(loadConfig(completeEnv).relayNodeSelfMint, true);
   for (const on of ["", "  ", "true", "1", "on", "TRUE"]) {
@@ -62,6 +97,19 @@ test("SELFHOST_RELAY_NODE_SELF_MINT defaults on and is strictly boolean", () => 
   }
   for (const bad of ["yes", "no", "disabled", "2"]) {
     assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_RELAY_NODE_SELF_MINT: bad }), /SELFHOST_RELAY_NODE_SELF_MINT/, bad);
+  }
+});
+
+test("SELFHOST_ENROLLMENT_SELF_RENEWAL defaults on and is strictly boolean", () => {
+  assert.equal(loadConfig(completeEnv).enrollmentSelfRenewal, true);
+  for (const on of ["", "  ", "true", "1", "on", "TRUE"]) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_ENROLLMENT_SELF_RENEWAL: on }).enrollmentSelfRenewal, true, on);
+  }
+  for (const off of ["false", "0", "off", " Off "]) {
+    assert.equal(loadConfig({ ...completeEnv, SELFHOST_ENROLLMENT_SELF_RENEWAL: off }).enrollmentSelfRenewal, false, off);
+  }
+  for (const bad of ["yes", "no", "disabled", "2"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_ENROLLMENT_SELF_RENEWAL: bad }), /SELFHOST_ENROLLMENT_SELF_RENEWAL/, bad);
   }
 });
 

@@ -1,6 +1,7 @@
 import type { CapyBindings } from "../capy/bindings.js";
 import type { AmpDeps } from "../amp/service.js";
 import type { ReplicasDeps } from "../replicas/service.js";
+import type { AgentLinkDeps } from "../events-shim/agent-link.js";
 import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
@@ -74,11 +75,18 @@ export type McpContext = {
     relaygatePublicUrl?: string;
     /** Gate-only installs only: relaygate's pre-spawn POST /v1/check (./relay-launch-check.ts). */
     launchCheck?: RelayLaunchCheck;
+    /**
+     * Gate-only installs: the Relaycast client bound to relaygate's origin;
+     * desktop identities hold rg_ tokens that only relaygate accepts.
+     */
+    gateClient?: RelaycastClient;
   };
   /** Amp control (SELFHOST_AMP_ENABLED); absent when the feature is off. */
   amp?: AmpDeps;
   /** Replicas agents (SELFHOST_REPLICAS_ENABLED); absent when the feature is off. */
   replicas?: ReplicasDeps;
+  /** Webhook inbox links to bound agents (events_shim feature, person connections only); absent otherwise. */
+  webhookInbox?: AgentLinkDeps;
   /** Agent launch tools (SELFHOST_FEATURES launch); false or absent when the feature is off. */
   launch?: boolean;
   /** Factory sessions (SELFHOST_FACTORY_ENABLED); absent when the feature is off. */
@@ -100,6 +108,14 @@ export class SharedSessionsToolError extends Error {
   constructor(readonly publicMessage: string) {
     super(publicMessage);
     this.name = "SharedSessionsToolError";
+  }
+}
+
+/** The read API answered 501 for this view; `reason` is its code (see unsupportedReason). */
+export class BackendUnsupportedError extends SharedSessionsToolError {
+  constructor(readonly reason: string) {
+    super("The selected backend does not support this view (unsupported_by_backend).");
+    this.name = "BackendUnsupportedError";
   }
 }
 
@@ -172,7 +188,7 @@ export function historyReader(
       const result = (staffGrant || desktopGrant || oauthGrant ? null : await readViaSessionRead(config, identity, url.pathname, url.searchParams, marker))
         ?? await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
       if (result.status === "unsupported") {
-        throw new SharedSessionsToolError("The selected backend does not support this view (unsupported_by_backend).");
+        throw new BackendUnsupportedError(result.reason);
       }
       if (result.status !== "ok") throw new SharedSessionsToolError(UNAVAILABLE_MESSAGE);
       return result.body;

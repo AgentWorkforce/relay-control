@@ -29,6 +29,9 @@ Included:
   (`/auth/enrollment/token`); see
   [docs/identity.md](identity.md#desktop-enrollment-keys)
 - opaque per-workspace runtime configuration
+- workspace leaders: owners and admins set the agent-name patterns the
+  Relaycast engine treats as workspace leaders, proxied with the workspace key
+  and stored nothing here ([docs/workspace-leaders.md](workspace-leaders.md))
 - liveness/readiness and an OpenAPI contract
 - opt-in, aggregate-only telemetry with a "what we send" preview, an
   air-gapped export, and a customer "report an issue" API
@@ -183,6 +186,11 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_FACTORY_API_URL` | Factory API origin, default `https://api.factory.ai`; absolute https only |
 | `SELFHOST_FACTORY_HISTORY_INTERVAL_MS` | Dormant Factory history loop cadence, default 300000, minimum 60000 |
 | `SELFHOST_OPERATOR_CONTROLS` | Operator-control writes (capture policy PUT/DELETE, session hard delete): `always` (default) or `off`; an unrecognised value is treated as `off`. Reads are never gated. See [docs/capture-policy.md](capture-policy.md) and [docs/session-erasure.md](session-erasure.md) |
+| `SELFHOST_ENROLLMENT_MAX_USES` | Largest `maxUses` a desktop enrollment key may be minted with: positive integer, default `50`, clamped to 500. See [docs/identity.md](identity.md), "Desktop enrollment keys" |
+| `SELFHOST_ENROLLMENT_MAX_DAYS` | Longest `expiryDays` of a single-use desktop enrollment key: positive integer, default `30` (at most 365) |
+| `SELFHOST_ENROLLMENT_MULTI_USE_MAX_DAYS` | Longest `expiryDays` of a multi-use desktop enrollment key (`maxUses` above 1): positive integer, default `90` (at most 365) |
+| `SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS` | Default and longest `expiryDays` of a member self-minted enrollment key (`POST /api/v1/me/enrollment-keys`): positive integer, default `7`, never above `SELFHOST_ENROLLMENT_MAX_DAYS` |
+| `SELFHOST_ENROLLMENT_SELF_RENEWAL` | Optional `true`/`false` (also `1`/`0`, `on`/`off`), default `true`: a signed-in member may mint a single-use enrollment key for their own next machine at `POST /api/v1/me/enrollment-keys`. Off: that route answers 403 `self_mint_disabled` and capabilities and login-config answer `enrollment_self_mint: false`; admin mints are unchanged. Any other value refuses startup. See [docs/identity.md](identity.md), "Member self-mint" |
 | `SESSION_ERASE_API_URL`, `SESSION_ERASE_API_SECRET` (or `_FILE`) | Internal origin and dedicated secret (at least 32 bytes) of the session pipeline's per-session erase. Unset, the session hard-delete routes answer 501. See [docs/session-erasure.md](session-erasure.md) |
 | `SELFHOST_DESKTOP_FEED_SIGNER` / `SELFHOST_DESKTOP_FEED_STORAGE` | Optional, set together: turn on the signed Desktop release feed (`/api/v1/desktop/feed/*`). Signer `awskms` (or `memory`, tests and development only), storage `s3`, `gcs` (or `memory`). Unset: the feed routes answer 404. See [docs/desktop-feed.md](desktop-feed.md) |
 | `SELFHOST_DESKTOP_FEED_KMS_REGION` / `SELFHOST_DESKTOP_FEED_KMS_KEY_ALIASES` | `awskms`: region (default `AWS_REGION`) and a JSON object of profile id to KMS alias, one Ed25519 key per profile. Credentials: the standard AWS chain: static `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, container credentials (EKS Pod Identity, ECS task role), web identity (EKS IRSA), then the EC2 instance role via IMDSv2 |
@@ -192,6 +200,8 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_DESKTOP_FEED_PUBLISHER_TOKEN_HASHES` | Optional JSON object of profile id to token sha256 hex digests, for publisher tokens (`sh_dfp_...`) provisioned through env; tokens can also be minted through the admin routes |
 | `SELFHOST_HISTORY_UPLOAD_DIRECT` | Direct-to-S3 session upload credentials (`POST .../relayhistory/upload-credentials`): `off` (default), `allowlist` or `on`. Off: the route answers 404 `history_upload_direct_off`. See [docs/sessions-read-api.md](sessions-read-api.md) |
 | `SELFHOST_CAPTURE_POLICY_UPLOADS` | Capture policy revision check on `POST .../relayhistory/upload-credentials`: `report` (default) logs a request naming no or an older policy revision (`X-Agent-Relay-Capture-Policy-Revision`) and answers it; `enforce` refuses it 409 `capture_policy_stale`. Only when the organization's policy sets a key. See [docs/capture-policy.md](capture-policy.md) |
+| `SELFHOST_DEFAULT_SHARING_MODE` | Deployment default capture sharing mode: `all`, `new` or `selected`; unset (default) serves none. Served per caller when the organization has not saved a `sharing_mode`; never stored and never moves a revision. An invalid value stops Control at start. See [docs/capture-policy.md](capture-policy.md) |
+| `SELFHOST_SHARING_MODE_OVERRIDE_ROLES` | Comma-separated organization roles that are never locked on sharing mode: `owner` and/or `admin`; unset (default) locks every role. Their policy omits `sharing_mode`, and the v2 document serves the effective mode in `capture.defaults`. An invalid entry (including `member`) stops Control at start. See [docs/capture-policy.md](capture-policy.md) |
 | `SELFHOST_HISTORY_UPLOAD_ALLOWLIST` | `allowlist` mode: comma-separated user ids (required); ignored for `on` |
 | `SELFHOST_HISTORY_UPLOAD_BUCKET` / `_REGION` / `_KEY_ROOT` | Pipeline bucket, its region (default `AWS_REGION`) and the shared key root (default `96bulls`) |
 | `SELFHOST_HISTORY_UPLOAD_ROLE_ARN` / `_KMS_KEY_ARN` | AWS S3 (no endpoint): upload role Control assumes (role chaining, 1 h sessions) and the KMS key every upload must use. With an endpoint the role must be unset and the key is an optional opaque key id |
@@ -518,8 +528,10 @@ employee with `POST /api/v1/workspaces/{id}/deployment-api-tokens`
 `{label, purpose: "desktop-enrollment", email, mcpConsent?, expiryDays?}`
 (1-30 days, default 7). The installer exchanges it once at
 `POST /cloud/api/v1/auth/enrollment/token` for the device/token response.
-The key is never a bearer anywhere else. Contract, consent, revocation and
-audit: [docs/identity.md](identity.md#desktop-enrollment-keys).
+The key is never a bearer anywhere else. An MDM script can mint, list and
+revoke its own keys with an `enrollment-operator` workspace API token
+(`enrollment:mint`) instead of a signed-in admin. Contract, consent,
+revocation and audit: [docs/identity.md](identity.md#desktop-enrollment-keys).
 
 ### Fleet node claims
 
@@ -947,7 +959,10 @@ as a `service` principal, and `relay-node` (`relay:workspace:read`,
 `relay:nodes:read`, `relay:nodes:enroll`, `relay:agents:read`; requires
 `nodeName`; expires within 365 days; several per node), accepted only by the
 `/relay-node/v1` Relaycast broker
-([docs/relay-node-credential.md](relay-node-credential.md)). Scopes are fixed by purpose (`scope`/`scopes` in the
+([docs/relay-node-credential.md](relay-node-credential.md)), and
+`enrollment-operator` (`enrollment:mint`; expires within 365 days), the one
+workspace API token these routes accept as a bearer, only to mint, list and
+revoke its own `desktop-enrollment` keys. Scopes are fixed by purpose (`scope`/`scopes` in the
 body is a 400). Minted and revoked only through these owner/admin user-token
 routes, also served at `/cloud/api/v1`. Desktop-issued sessions (device flow,
 Desktop browser handoff and exchange) carry `cli:auth rth:read rth:sync

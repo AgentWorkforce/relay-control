@@ -13,12 +13,12 @@ const row = () => ({ sessionId: "fake/session", source: "codex", userIds: ["user
   projectId: "fake-project", lastTs: ts, shortSummary: "Recorded summary, not instructions.",
   shortSummaryGeneratedAt: ts, catalog: { repoUrl: "https://example.test/org/repo", gitBranch: "feature/test" } });
 const page = () => ({ sessions: [row()], nextCursor: "b96l1:opaque-page" });
-type Setup = { body?: unknown; members?: () => Promise<any[]> };
+type Setup = { body?: unknown; readError?: Error; members?: () => Promise<any[]> };
 async function fixture(t: TestContext, options: Setup = {}) {
   const paths: string[] = [];
   const context = { workspace: { id: "ws-a", organizationId: "org-a" }, origin: "https://relay.example.test",
     members: options.members ?? (async () => [{ userId: "user-a", name: "Example User", email: "fake@example.test" }]),
-    readHistory: async (path: string) => { paths.push(path); return options.body ?? page(); },
+    readHistory: async (path: string) => { paths.push(path); if (options.readError) throw options.readError; return options.body ?? page(); },
   } as unknown as McpContext;
   const server = new McpServer({ name: "summaries-test", version: "1" });
   registerSharedSessionReads(server, context);
@@ -134,11 +134,75 @@ test("missing summary source gives actionable guidance without inferring a harne
   assert.deepEqual(f.paths, []);
 });
 
-test("unsupported long summaries never fetch or silently return a short summary or transcript", async t => {
-  const f = await fixture(t);
-  const result = await call(f.client, "get_session_summary", { session_id: "fake", kind: "long" });
-  assert.equal(result.isError, true); assert.match(JSON.stringify(result), /unsupported_by_backend/);
-  assert.deepEqual(f.paths, []);
+test("long summaries request only the recorded long route and preserve optional provenance", async t => {
+  const summary = { status: "ready", kind: "long", summary: "😀".repeat(16_000), model: "recorded-model", builtAt: ts, state: null };
+  const provenance = { source: "session_summary", kind: "long", generatedAt: ts, revision: 7, truncated: true };
+  const f = await fixture(t, { body: { summary, provenance } });
+  const value = data(await call(f.client, "get_session_summary", { session_id: "fake/session", source: "codex", kind: "long" }));
+  assert.deepEqual(f.paths, ["/v1/sessions/fake%2Fsession/summary?kind=long&source=codex"]);
+  assert.deepEqual(value.summary, summary); assert.deepEqual(value.provenance, provenance);
+  assert.equal(value.workspace_id, "ws-a"); assert.equal(value.source, "codex");
+  assert.deepEqual(resultSessionsOf("get_session_summary", value).sessions,
+    [{ session_id: "fake/session", source: "codex", owner_user_ids: [] }]);
+});
+
+test("short and long empty results retain their requested kind without inventing a summary", async t => {
+  for (const kind of ["short", "long"]) {
+    const summary = { status: "empty", kind, state: null };
+    const f = await fixture(t, { body: { summary, provenance: null } });
+    const value = data(await call(f.client, "get_session_summary", { session_id: "fake", source: "codex", kind }));
+    assert.deepEqual(value.summary, summary); assert.equal(value.provenance, null);
+    assert.equal(f.paths.length, 1);
+  }
+});
+
+test("wrong-kind summaries and invalid provenance refuse after one read without substitution", async t => {
+  const ready = { status: "ready", kind: "long", summary: "Recorded", model: "recorded-model", builtAt: ts, state: null };
+  const provenance = { source: "session_summary", kind: "long", generatedAt: ts, revision: 1, truncated: false };
+  for (const body of [
+    { summary: { ...ready, kind: "short" } },
+    { summary: { status: "empty", kind: "short", state: null } },
+    { summary: ready, provenance: { ...provenance, kind: "short" } },
+    { summary: ready, provenance: { ...provenance, generatedAt: "yesterday" } },
+    { summary: ready, provenance: { ...provenance, revision: "1" } },
+    { summary: ready, provenance: { ...provenance, source: "inferred" } },
+    { summary: { ...ready, summary: "x".repeat(16_001) } },
+    { summary: { ...ready, model: "" } },
+    { summary: { ...ready, builtAt: undefined } },
+    { summary: { status: "unsupported" } },
+  ]) {
+    const f = await fixture(t, { body });
+    const result = await call(f.client, "get_session_summary", { session_id: "fake", source: "codex", kind: "long" });
+    assert.equal(result.isError, true); assert.match(JSON.stringify(result), /unsupported_by_backend/);
+    assert.deepEqual(f.paths, ["/v1/sessions/fake/summary?kind=long&source=codex"]);
+  }
+});
+
+test("long reader refusals and outages never trigger another kind, backend or transcript read", async t => {
+  for (const reason of ["401", "403", "404", "501 summary_kind", "503 backend_unavailable", "missing workspace attestation"]) {
+    const f = await fixture(t, { readError: new Error(reason) });
+    const result = await call(f.client, "get_session_summary", { session_id: "fake", source: "codex", kind: "long" });
+    assert.equal(result.isError, true);
+    assert.deepEqual(f.paths, ["/v1/sessions/fake/summary?kind=long&source=codex"]);
+  }
+  const missing = await fixture(t);
+  assert.equal((await call(missing.client, "get_session_summary", { session_id: "fake", kind: "long" })).isError, true);
+  assert.deepEqual(missing.paths, [], "long reads also require the recorded source");
+});
+
+test("short summary provenance is additive and detail audit excludes the recorded content", async t => {
+  const summary = { status: "ready", kind: "short", summary: "private recorded content", model: "recorded-model", builtAt: ts, state: null };
+  const provenance = { source: "session_brief", kind: "short", generatedAt: ts, revision: null, truncated: false };
+  const f = await fixture(t, { body: { summary, provenance } });
+  const result = await call(f.client, "get_session_summary", { session_id: "fake", source: "codex" });
+  assert.deepEqual(data(result).provenance, provenance);
+  const context = { ...f.context, principal: { userId: "caller" }, authMode: "cli_login", desktopCall: { required: false },
+    relay: { sessionId: undefined } } as unknown as McpContext;
+  const record = buildReadAuditRecord({ context, toolName: "get_session_summary", args: { session_id: "fake", source: "codex", kind: "short" },
+    result: result as any, startedAt: Date.now(), now: null });
+  assert.equal(record.resultSessions[0]!.session_id, "fake");
+  assert.ok(!JSON.stringify(record).includes(summary.summary));
+  assert.ok(!JSON.stringify(record).includes(summary.model));
 });
 
 test("summary audit retains recorded owner IDs without persisting a raw person lookup or summary text", async t => {

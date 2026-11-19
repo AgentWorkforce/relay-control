@@ -13,6 +13,7 @@ import { mcpOAuthActive } from "./oauth/config.js";
 import { secureEqual } from "../crypto.js";
 import type { AmpDeps } from "../amp/service.js";
 import type { ReplicasDeps } from "../replicas/service.js";
+import type { AgentLinkDeps } from "../events-shim/agent-link.js";
 import type { FactoryMcpDeps } from "../factory/mcp-tools.js";
 import { createRelaycastClient } from "../messaging/relaycast.js";
 import { relayLaunchCheck } from "./relay-launch-check.js";
@@ -132,6 +133,8 @@ export function createMcpHandler(input: {
   amp?: AmpDeps;
   /** Replicas dependencies, only when SELFHOST_REPLICAS_ENABLED is on. */
   replicas?: ReplicasDeps;
+  /** Webhook inbox links to bound agents, only when the events_shim feature is selected. */
+  webhookInbox?: AgentLinkDeps;
   /** Factory tools and resolver hook, only when SELFHOST_FACTORY_ENABLED is on. */
   factory?: FactoryMcpDeps;
   /** Internal native send resolver, never supplied to OAuth or managed calls. */
@@ -154,6 +157,10 @@ export function createMcpHandler(input: {
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy);
   const attestations = postgresAttestationStore(store.database);
   const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.fetchImpl });
+  // Gate-only installs only: desktop identities hold rg_ tokens that only relaygate accepts.
+  const gateClient = config.relaygatePublicUrl
+    ? createRelaycastClient({ internalOrigin: config.relaygatePublicUrl, fetchImpl: input.fetchImpl })
+    : undefined;
   // Gate-only installs only: relaygate checks every agent launch before it is reserved or sent.
   const launchCheck = config.relaygatePublicUrl
     ? relayLaunchCheck({ relaygatePublicUrl: config.relaygatePublicUrl, store, database: store.database,
@@ -353,6 +360,19 @@ export function createMcpHandler(input: {
       if (!(error instanceof CopilotAttestationError) && !(error instanceof ClaudeAttestationError) &&
           !(error instanceof DesktopCallContextError)) throw error;
       const parsed = JSONRPCRequestSchema.safeParse(body);
+      // The response stays generic; the operator log names the check that
+      // failed (never the proof, the token or the arguments).
+      const call = body as { method?: unknown; params?: { name?: unknown } } | null;
+      console.warn("[selfhost-mcp] native chat context refused", {
+        check: error.name,
+        reason: error.message,
+        method: typeof call?.method === "string" ? call.method : null,
+        tool: typeof call?.params?.name === "string" ? call.params.name : null,
+        provider: provider ?? null,
+        auth_mode: authMode,
+        workspace_id: workspace.id,
+        user_id: principal.userId,
+      });
       rpcError(response, 400, -32602, "Invalid native chat context.", parsed.success ? parsed.data.id : null);
       return true;
     }
@@ -389,9 +409,11 @@ export function createMcpHandler(input: {
         relaycastPublicUrl: config.relaycastPublicUrl,
         ...(config.relaygatePublicUrl ? { relaygatePublicUrl: config.relaygatePublicUrl } : {}),
         ...(launchCheck ? { launchCheck } : {}),
+        ...(gateClient ? { gateClient } : {}),
       },
       ...(!oauth && !staffGrant && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && !staffGrant && input.replicas ? { replicas: input.replicas } : {}),
+      ...(!oauth && !staffGrant && input.webhookInbox ? { webhookInbox: input.webhookInbox } : {}),
       ...(!oauth && !staffGrant && input.factory ? { factory: input.factory } : {}),
       ...(!oauth && !staffGrant && !desktopCall.required && desktopCall.provider === undefined && input.capy ? { capy: input.capy } : {}),
       ...(oauth && input.capyPermits ? { capyPermits: input.capyPermits } : {}),

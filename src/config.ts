@@ -126,6 +126,18 @@ export type SelfhostConfig = {
    */
   capturePolicyUploads?: "report" | "enforce";
   /**
+   * SELFHOST_DEFAULT_SHARING_MODE (docs/capture-policy.md): the deployment
+   * default capture `sharing_mode`, served to an organization that has not
+   * saved one. Absent: no default (the member chooses).
+   */
+  defaultSharingMode?: "all" | "new" | "selected";
+  /**
+   * SELFHOST_SHARING_MODE_OVERRIDE_ROLES (docs/capture-policy.md): the
+   * organization roles never served a `sharing_mode` lock (the stored mode or
+   * the deployment default). Absent: no role is exempt.
+   */
+  sharingModeOverrideRoles?: readonly ("owner" | "admin")[];
+  /**
    * SELFHOST_EVENTS_SHIM_RELAY_ORIGINS (docs/events-shim.md): the Relaycast
    * origins an events-shim inbox may forward wake posts to. Null or absent:
    * the origin of relaycastPublicUrl.
@@ -150,6 +162,14 @@ export type SelfhostConfig = {
    * when relaygatePublicUrl is null: those routes are then 404.
    */
   relayNodeSelfMint?: boolean;
+  /**
+   * SELFHOST_ENROLLMENT_SELF_RENEWAL (docs/identity.md, "Member self-mint"):
+   * whether a signed-in person may mint a single-use desktop enrollment key
+   * for themselves at POST /api/v1/me/enrollment-keys. Default true; `false`,
+   * `0` or `off` turns it off (403 `self_mint_disabled`); the owner/admin
+   * mint and the list/revoke routes are unchanged either way. Absent means true.
+   */
+  enrollmentSelfRenewal?: boolean;
   /**
    * SELFHOST_IMAGE_VERSION: the image tag, set by the image (Dockerfile).
    * Null when run from source. Shown by GET /cloud/api/health and telemetry.
@@ -492,9 +512,12 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name), serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     historyUpload: loadHistoryUploadConfig(env),
     capturePolicyUploads: loadCapturePolicyUploads(env),
+    ...optionalField("defaultSharingMode", loadDefaultSharingMode(env)),
+    ...optionalField("sharingModeOverrideRoles", loadSharingModeOverrideRoles(env)),
     eventsShimRelayOrigins: loadEventsShimRelayOrigins(env),
     relaygatePublicUrl,
     relayNodeSelfMint: loadRelayNodeSelfMint(env),
+    enrollmentSelfRenewal: loadEnrollmentSelfRenewal(env),
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
     host: env.HOST?.trim() || "0.0.0.0",
@@ -1124,6 +1147,17 @@ export function loadRelayNodeSelfMint(env: Env = process.env): boolean {
   throw new Error("SELFHOST_RELAY_NODE_SELF_MINT must be true or false");
 }
 
+/**
+ * SELFHOST_ENROLLMENT_SELF_RENEWAL: unset, blank, `true`, `1` or `on`: true;
+ * `false`, `0` or `off`: false; anything else refuses startup.
+ */
+export function loadEnrollmentSelfRenewal(env: Env = process.env): boolean {
+  const value = env.SELFHOST_ENROLLMENT_SELF_RENEWAL?.trim().toLowerCase();
+  if (!value || value === "true" || value === "1" || value === "on") return true;
+  if (value === "false" || value === "0" || value === "off") return false;
+  throw new Error("SELFHOST_ENROLLMENT_SELF_RENEWAL must be true or false");
+}
+
 export function loadEventsShimRelayOrigins(env: Env = process.env): string[] | null {
   const raw = env.SELFHOST_EVENTS_SHIM_RELAY_ORIGINS?.trim();
   if (!raw) return null;
@@ -1152,6 +1186,41 @@ export function loadCapturePolicyUploads(env: Env = process.env): "report" | "en
     throw new Error("SELFHOST_CAPTURE_POLICY_UPLOADS must be report or enforce");
   }
   return mode;
+}
+
+/** Set only when the value is defined, so an unset variable adds no key to the config. */
+function optionalField<K extends string, V>(key: K, value: V | undefined): { [P in K]?: V } {
+  return (value === undefined ? {} : { [key]: value }) as { [P in K]?: V };
+}
+
+const SHARING_MODES = ["all", "new", "selected"] as const;
+const SHARING_MODE_OVERRIDE_ROLES = ["owner", "admin"] as const;
+
+/** SELFHOST_DEFAULT_SHARING_MODE: unset or empty is no deployment default. */
+export function loadDefaultSharingMode(env: Env = process.env): "all" | "new" | "selected" | undefined {
+  const mode = env.SELFHOST_DEFAULT_SHARING_MODE?.trim() ?? "";
+  if (mode === "") return undefined;
+  if (!(SHARING_MODES as readonly string[]).includes(mode)) {
+    throw new Error("SELFHOST_DEFAULT_SHARING_MODE must be all, new or selected");
+  }
+  return mode as "all" | "new" | "selected";
+}
+
+/**
+ * SELFHOST_SHARING_MODE_OVERRIDE_ROLES: comma-separated `owner` and/or
+ * `admin`, trimmed, duplicates collapsed. Unset or empty: no role is exempt.
+ */
+export function loadSharingModeOverrideRoles(env: Env = process.env): readonly ("owner" | "admin")[] | undefined {
+  const entries = (env.SELFHOST_SHARING_MODE_OVERRIDE_ROLES ?? "").split(",").map((entry) => entry.trim()).filter(Boolean);
+  if (entries.length === 0) return undefined;
+  const roles = new Set<"owner" | "admin">();
+  for (const entry of entries) {
+    if (!(SHARING_MODE_OVERRIDE_ROLES as readonly string[]).includes(entry)) {
+      throw new Error("SELFHOST_SHARING_MODE_OVERRIDE_ROLES must list only owner and/or admin");
+    }
+    roles.add(entry as "owner" | "admin");
+  }
+  return Object.freeze([...roles]);
 }
 
 export function loadHistoryUploadConfig(env: Env = process.env): HistoryUploadConfig | null {

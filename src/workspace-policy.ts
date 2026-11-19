@@ -4,7 +4,9 @@ import {
   CapturePolicyError,
   parseCaptureSettings,
   projectSettings,
+  sharingModeOverridden,
   type CaptureSettings,
+  type SharingDeployment,
 } from "./capture-policy.js";
 
 /**
@@ -12,7 +14,9 @@ import {
  * served to Agent Relay Desktop beside the capture policy. Each section has
  * two tiers: `locked` values the person cannot change, `defaults` initial
  * values the person may change. An absent key leaves the client's own
- * behaviour unchanged. Nothing is ever defaulted here.
+ * behaviour unchanged. Nothing is defaulted in storage; the one served default
+ * is the deployment sharing mode (SELFHOST_DEFAULT_SHARING_MODE), applied per
+ * caller by workspacePolicyForCaller and only when configured.
  *
  * Storage is the organization's capture_policies row (migration 0072): the
  * capture section is the existing `settings` (lock-only), the other sections
@@ -24,8 +28,15 @@ import {
 export type PolicyValue = boolean | number | string | string[];
 export type PolicyTier = Record<string, PolicyValue>;
 export type PolicySection = { locked: PolicyTier; defaults: PolicyTier };
-/** Capture keys are always locked; `defaults` is always empty. */
-export type CaptureSection = { locked: CaptureSettings; defaults: Record<string, never> };
+/**
+ * Capture keys are always locked as stored and written; `defaults` is empty
+ * except for `sharing_mode`, served (never accepted on write) to a caller in
+ * the deployment override roles (workspacePolicyForCaller).
+ */
+export type CaptureSection = {
+  locked: CaptureSettings;
+  defaults: { sharing_mode?: CaptureSettings["sharing_mode"] };
+};
 
 export type WorkspaceSections = {
   capture: CaptureSection;
@@ -299,10 +310,13 @@ function deliveryNamesInbound(sections: StoredWorkspaceSections): boolean {
  * The served document for a stored row (absent: unset). `adminSenders` is
  * given only on a workspace read (access/me); it is served in
  * `delivery.locked.admin_senders` while delivery sets `inbound_default`.
+ * `managed` is per session, never stored: true only on access/me for a
+ * session provisioned by an enrollment key with admin policy consent.
  */
 export function workspacePolicyFromRow(
   row: WorkspacePolicyRow | null | undefined,
   adminSenders?: string[],
+  managed = false,
 ): WorkspacePolicy {
   const sections = storedSections(row?.workspace_settings);
   if (adminSenders !== undefined && deliveryNamesInbound(sections)) {
@@ -313,12 +327,46 @@ export function workspacePolicyFromRow(
   return {
     version: 2,
     revision: stored === null || stored === undefined ? 1 : Number(stored),
-    // Always false until enrollment-key consent lands (the key will decide it).
-    managed: false,
+    managed,
     consent: Array.isArray(consent) ? [...consent].sort() : [],
     sections: {
       capture: { locked: projectSettings(storedCapture(row?.settings)), defaults: {} },
       ...sections,
+    },
+  };
+}
+
+/**
+ * The workspace policy as served to one caller (see capturePolicyForCaller).
+ * Effective sharing mode = the stored `capture.locked.sharing_mode`, else the
+ * deployment default. An override-role caller gets it as
+ * `capture.defaults.sharing_mode` and never in `capture.locked`; every other
+ * caller gets it in `capture.locked`. The revision never moves. Returns
+ * `policy` itself when nothing applies; never mutates it.
+ */
+export function workspacePolicyForCaller(
+  policy: WorkspacePolicy,
+  role: string | null | undefined,
+  deployment: SharingDeployment,
+): WorkspacePolicy {
+  const capture = policy.sections.capture;
+  const stored = capture.locked.sharing_mode;
+  if (sharingModeOverridden(role, deployment)) {
+    const effective = stored ?? deployment.defaultSharingMode;
+    if (effective === undefined) return policy;
+    const { sharing_mode: _mode, ...locked } = capture.locked;
+    return {
+      ...policy,
+      sections: { ...policy.sections, capture: { locked, defaults: { sharing_mode: effective } } },
+    };
+  }
+  const fallback = deployment.defaultSharingMode;
+  if (stored !== undefined || fallback === undefined) return policy;
+  return {
+    ...policy,
+    sections: {
+      ...policy.sections,
+      capture: { locked: { sharing_mode: fallback, ...capture.locked }, defaults: capture.defaults },
     },
   };
 }
@@ -342,13 +390,29 @@ async function adminSendersFor(executor: SqlExecutor, organizationId: string, wo
 }
 
 /**
+ * Whether a session provisioned by enrollment key `tokenId`
+ * (token_sessions.provisioned_by_token_id) is managed: the key carries
+ * `policy_consent = 'admin'` (migration 0074). One primary-key lookup.
+ */
+export async function sessionManagedByEnrollmentKey(executor: SqlExecutor, tokenId: string): Promise<boolean> {
+  const result = await executor.query<{ managed: boolean }>(
+    `SELECT policy_consent = 'admin' AS managed
+       FROM workspace_api_tokens
+      WHERE id = $1 AND purpose = 'desktop-enrollment'`,
+    [tokenId],
+  );
+  return result.rows[0]?.managed === true;
+}
+
+/**
  * The served workspace policy. With `workspaceId` (access/me) admin senders
  * are resolved for that workspace; the organization route omits them.
+ * `managed` (access/me only) is the presenting session's managed state.
  */
 export async function readWorkspacePolicy(
   database: Database,
   organizationId: string,
-  options: { workspaceId?: string } = {},
+  options: { workspaceId?: string; managed?: boolean } = {},
 ): Promise<WorkspacePolicy> {
   const row = (await database.query<WorkspacePolicyRow>(
     `SELECT ${ROW_COLUMNS} FROM capture_policies WHERE organization_id = $1`,
@@ -359,7 +423,7 @@ export async function readWorkspacePolicy(
   const senders = deliveryNamesInbound(stored)
     ? await adminSendersFor(database, organizationId, options.workspaceId)
     : [];
-  return workspacePolicyFromRow(row, senders);
+  return workspacePolicyFromRow(row, senders, options.managed === true);
 }
 
 /** Order-independent comparison of two capture settings objects. */

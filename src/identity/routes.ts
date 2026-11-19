@@ -190,6 +190,11 @@ export function createIdentityModule(input: {
   passwordHasher?: PasswordHasher;
   now?: () => number;
   log?: (message: string, fields?: Record<string, unknown>) => void;
+  /**
+   * SELFHOST_ENROLLMENT_SELF_RENEWAL (SelfhostConfig.enrollmentSelfRenewal):
+   * served as login-config `enrollment_self_mint`. Absent means true.
+   */
+  enrollmentSelfMint?: boolean;
 }): IdentityModule {
   const { config, identityStore: store, controlStore, keyring, mailer } = input;
   const now = () => input.now?.() ?? Date.now();
@@ -870,6 +875,9 @@ export function createIdentityModule(input: {
         // "Desktop enrollment keys"); an installer falls back to the device
         // flow when this is absent.
         enrollment_keys: true,
+        // A signed-in person may mint their own single-use key at POST
+        // /api/v1/me/enrollment-keys ("Member self-mint").
+        enrollment_self_mint: input.enrollmentSelfMint !== false,
       });
       return true;
     }

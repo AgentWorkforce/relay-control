@@ -226,6 +226,7 @@ test("covers every Relaycast credential column", () => {
       "factory_bindings.hosted_token_envelope",
       "capy_bindings.token_ciphertext",
       "events_shims.wake_secret_ciphertext",
+      "events_shim_agent_links.sender_token_ciphertext",
     ],
   );
 });

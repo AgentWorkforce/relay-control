@@ -4,7 +4,7 @@ import type { ApiTokenStore } from "../admin/api-tokens.js";
 import { STAFF_READ_GRANT_PREFIX, StaffReadGrants } from "../admin/staff-read-grants.js";
 import type { SelfhostConfig } from "../config.js";
 import { canonicalRelayhistoryOrigin } from "../relayhistory-origin.js";
-import type { CapturePolicy } from "../capture-policy.js";
+import { capturePolicyForCaller, sharingDeployment, type CapturePolicy } from "../capture-policy.js";
 import { hashSecret } from "../crypto.js";
 import { databaseErrorCause, isDatabaseUnavailable } from "../database.js";
 import type { FlowRunRelayfileCredentials } from "../flows/relayfile-credentials.js";
@@ -81,16 +81,22 @@ import type { HeldAudienceVerdict, IntrospectionHold } from "./introspection-hol
  *   reading its database. Each add-on is one more origin in
  *   SELFHOST_INTROSPECT_AUDIENCES; this service never depends on one existing.
  * - User tokens also carry `capture_policy` (v1.5), the organization's served
- *   capture policy `{version, revision, settings}` exactly as
- *   GET .../capture-policy returns it (docs/capture-policy.md), read in the
- *   same query as the token. The sessions pipeline enforces it from here
- *   (e.g. `user_retroactive_delete: false` refuses a member's own session
- *   delete) instead of keeping a copy. A held answer carries the policy as it
- *   was when the held verdict was checked. Agent and service tokens carry none.
- * - User tokens also carry `workspace_policy: {revision}` and `managed: false`
+ *   capture policy `{version, revision, settings}` as access/me serves it to
+ *   the token's user (docs/capture-policy.md): the stored policy read in the
+ *   same query as the token, projected by the member role from that query
+ *   and the deployment sharing-mode values in config. With
+ *   SELFHOST_DEFAULT_SHARING_MODE and SELFHOST_SHARING_MODE_OVERRIDE_ROLES
+ *   unset that is exactly GET .../capture-policy. The sessions pipeline
+ *   enforces it from here (e.g. `user_retroactive_delete: false` refuses a
+ *   member's own session delete) instead of keeping a copy. A held answer
+ *   carries the stored policy and role as they were when the held verdict was
+ *   checked, projected here the same way. Staff read grants are projected as
+ *   `member`. Agent and service tokens carry none.
+ * - User tokens also carry `workspace_policy: {revision}` and `managed`
  *   (docs/workspace-policy.md): the workspace policy revision read in the
  *   same query, so a client can tell its cached policy is stale without a
- *   fetch. Staff read grant answers carry neither.
+ *   fetch, and whether the session was provisioned by an enrollment key with
+ *   admin policy consent (same query). Staff read grant answers carry neither.
  * - No caching here: the token session row is the truth on every call.
  *   The one exception is the opt-in database outage hold
  *   (SELFHOST_INTROSPECT_OUTAGE_HOLD_MS, docs/identity.md): only when the
@@ -144,8 +150,11 @@ export type IntrospectionResult =
     capture_policy: CapturePolicy;
     /** The workspace policy revision (docs/workspace-policy.md); user tokens only. */
     workspace_policy?: { revision: number };
-    /** Always false on self-host; user tokens only. */
-    managed?: false;
+    /**
+     * Whether the session is managed: provisioned by a desktop-enrollment key
+     * with admin policy consent (docs/workspace-policy.md); user tokens only.
+     */
+    managed?: boolean;
     /** Present (true) only for a database-outage hold answer. */
     held?: true;
   }
@@ -467,7 +476,8 @@ async function introspectStaffReadGrant(
     iat: epochSeconds(grant.createdAt),
     exp: epochSeconds(grant.expiresAt),
     token_id: tokenIdFor(grant.tokenHash),
-    capture_policy: grant.capturePolicy,
+    // Projected with the grant's synthetic role, like any member.
+    capture_policy: capturePolicyForCaller(grant.capturePolicy, "member", sharingDeployment(config)),
   };
 }
 
@@ -642,10 +652,12 @@ export async function introspect(
     iat: epochSeconds(session.issuedAt),
     exp: epochSeconds(held ? new Date(heldAudience!.validUntil) : session.expiresAt),
     token_id: tokenId,
-    capture_policy: session.capturePolicy,
+    // Projected here, not in the store, so a held answer (which keeps the
+    // stored policy and role) is served exactly as a live one.
+    capture_policy: capturePolicyForCaller(session.capturePolicy, session.role, sharingDeployment(config)),
     workspace_policy: { revision: session.workspacePolicyRevision ?? 1 },
-    // Self-host has no managed (MDM-pushed) policy source.
-    managed: false,
+    // The only managed source on self-host: an enrollment key's admin policy consent.
+    managed: session.managed === true,
     ...(held ? { held: true as const } : {}),
   };
 }

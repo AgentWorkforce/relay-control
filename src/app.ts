@@ -30,7 +30,11 @@ import { handleFlowsBroker } from "./flows-broker.js";
 import { FlowRunRelayfileCredentials } from "./flows/relayfile-credentials.js";
 import { relayLaunchCredentials } from "./mcp/relay-launch-credentials.js";
 import { handleSessionRoutes } from "./sessions/routes.js";
-import { UsageRangeError, usageDays, usageReport } from "./usage/routes.js";
+import { parseClientTelemetry, recordClientTelemetry, recordsClientTelemetry } from "./sessions/client-telemetry.js";
+import { UsageRangeError, usageDates, usageDays, usageReport } from "./usage/routes.js";
+import {
+  decodeFleetCursor, FLEET_AUDIT_ACTION, FleetInputError, fleetView, type FleetCursor, type FleetUsageInput,
+} from "./fleet/view.js";
 import { UsageStore } from "./usage/store.js";
 import { GitHubDesktopReleases } from "./desktop-releases.js";
 import { listReadAudit, parseReadAuditQuery, readAuditCsv, ReadAuditQueryError } from "./mcp/read-audit.js";
@@ -103,6 +107,8 @@ import { abandonEnvironmentCleanup, disconnectEnvironments, setupEnvironments } 
 import { disconnectReplicas, purgeMemberReplicas, releaseMemberReplicas, ReplicasError } from "./replicas/service.js";
 import { isAmpPath } from "./amp/routes.js";
 import { createEventsShimRoutes, isEventsShimPath } from "./events-shim/routes.js";
+import type { AgentLinkDeps } from "./events-shim/agent-link.js";
+import { PostgresEventsShimStore } from "./events-shim/store.js";
 import { purgeMemberAmp, releaseMemberAmp } from "./amp/service.js";
 import {
   DESKTOP_MCP_TOKEN,
@@ -119,16 +125,26 @@ import { remoteAgentRoutes } from "./remote-agents/routes.js";
 import type { ProviderProbes } from "./providers/registry.js";
 import {
   CapturePolicyError,
+  capturePolicyForCaller,
   parseCaptureSettings,
   parseIfMatch,
   readCapturePolicy,
   CAPTURE_POLICY_REVISION_HEADER,
+  sharingDeployment,
   uploadPolicyVerdict,
   writeCapturePolicy,
 } from "./capture-policy.js";
-import { parseWorkspacePolicyInput, readWorkspacePolicy, UNSET_WORKSPACE_POLICY, writeWorkspacePolicy } from "./workspace-policy.js";
+import {
+  parseWorkspacePolicyInput,
+  readWorkspacePolicy,
+  workspacePolicyForCaller,
+  sessionManagedByEnrollmentKey,
+  UNSET_WORKSPACE_POLICY,
+  writeWorkspacePolicy,
+} from "./workspace-policy.js";
 import { operatorControlsEntitled } from "./admin/operator-controls.js";
-import { createRelaycastClient, type RosterAgent } from "./messaging/relaycast.js";
+import { createRelaycastClient, RelaycastCallError, type RosterAgent, type WorkspaceLeaders } from "./messaging/relaycast.js";
+import { LeaderPatternsError, parseLeaderPatterns } from "./workspace-leaders.js";
 import { isListedRelayAgent } from "./mcp/team-activity.js";
 import {
   erasureTarget,
@@ -489,6 +505,8 @@ export function createApp(input: {
     session_delete: Boolean(config.sessionErasureApi) && operatorControlsEntitled(),
     // Desktop enrollment keys (docs/identity.md): always served.
     enrollment_keys: true,
+    // Member self-mint at POST /api/v1/me/enrollment-keys (SELFHOST_ENROLLMENT_SELF_RENEWAL).
+    enrollment_self_mint: config.enrollmentSelfRenewal !== false,
   });
   // Usage page counters: written only while the `usage` feature is selected.
   const usage = new UsageStore(store.database, () => input.now?.() ?? new Date());
@@ -644,8 +662,17 @@ export function createApp(input: {
     },
     now:input.now,afterMutation:()=>oauthTeardown?.kick(),
   });
+  // Webhook inbox links to bound agents (docs/events-shim.md): with the events_shim feature only.
+  const agentLinks: AgentLinkDeps | null = features.events_shim ? {
+    database: store.database,
+    keyring: config.encryptionKeyring,
+    relaycast: createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch }),
+    store: new PostgresEventsShimStore(store.database, config.encryptionKeyring),
+    ...(input.now ? { now: input.now } : {}),
+  } : null;
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
+    ...(agentLinks ? { webhookInbox: agentLinks } : {}),
     ...(amp ? { amp: amp.deps } : {}),
     ...(replicas ? { replicas: replicas.deps } : {}),
     ...(factory.enabled ? { factory: factory.mcp } : {}),
@@ -668,6 +695,7 @@ export function createApp(input: {
     relaycast: { url: config.relaycastUrl, internalSecret: input.relaycastInternalSecret ?? null },
     gateOnly: Boolean(config.relaygatePublicUrl),
     fetchImpl: input.messagingFetch,
+    ...(agentLinks ? { agentLinks } : {}),
     now: input.now,
     authorizeCreate: async (request, response) => {
       const auth = await authenticate(request);
@@ -737,6 +765,9 @@ export function createApp(input: {
     }
     return principal;
   }
+
+  /** POST /api/v1/me/enrollment-keys: self-minted enrollment keys per person per hour. */
+  const ENROLLMENT_SELF_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
 
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy, () => input.now?.() ?? new Date());
   const STAFF_READ_GRANT_MINT_RATE = { limit: 10, windowMs: 3_600_000 };
@@ -1005,6 +1036,10 @@ export function createApp(input: {
     }
     return { principal: auth.principal, workspace, token: auth.token };
   }
+
+  // Deployment sharing-mode values (docs/capture-policy.md), applied per caller.
+  const sharing = sharingDeployment(config);
+  const sharingConfigured = sharing.defaultSharingMode !== undefined || sharing.overrideRoles !== undefined;
 
   // Desktop feed (docs/desktop-feed.md): off, so every route 404s, unless
   // both SELFHOST_DESKTOP_FEED_SIGNER and _STORAGE are configured.
@@ -2054,7 +2089,12 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       if (desktopHostName === null) {
         throw new HttpError(400, "invalid_request", "desktop_host_name must be 1-80 characters");
       }
-      const result = await store.exchangeEnrollmentKey({ key, clientName, desktopHostName, clientIp: ip });
+      // The Desktop's version, for the audit row only (never trusted for anything else).
+      const userAgent = request.headers["user-agent"];
+      const clientVersion = typeof userAgent === "string"
+        ? /^AgentRelayDesktop\/([0-9A-Za-z.+_-]{1,40})(?:[\s;(]|$)/.exec(userAgent)?.[1] ?? null
+        : null;
+      const result = await store.exchangeEnrollmentKey({ key, clientName, desktopHostName, clientIp: ip, clientVersion });
       // One line, key id only (never the key; null for an unknown key).
       console.info("[selfhost-api] enrollment key exchange", {
         keyId: result.keyId,
@@ -2075,6 +2115,23 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         refresh_token_expires_at: result.tokens.refreshTokenExpiresAt,
         scope: result.tokens.scopes.join(" "),
         api_url: `${siteBaseUrl(request)}/cloud`,
+        // Workspace policy (docs/workspace-policy.md): whether this session is
+        // managed (the key carries admin policy consent), the revision to
+        // compare a cached policy against, and the document itself so the
+        // first launch is right before the first access/me refresh.
+        managed: result.managed,
+        policy_revision: result.policyRevision,
+        // Served to the bound user (SELFHOST_DEFAULT_SHARING_MODE and
+        // SELFHOST_SHARING_MODE_OVERRIDE_ROLES); the role is read only when
+        // one of them is configured.
+        workspace_policy: workspacePolicyForCaller(
+          await readWorkspacePolicy(store.database, result.organizationId, {
+            workspaceId: result.workspaceId,
+            managed: result.managed,
+          }),
+          sharingConfigured ? await store.memberRole(result.organizationId, result.userId) : null,
+          sharing,
+        ),
       }, true);
       return;
     }
@@ -2143,6 +2200,41 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       json(response, 200, {
         keys: await apiTokens.listForUser({ organizationId: principal.organizationId, userId: principal.userId }),
       }, true);
+      return;
+    }
+    // Member self-mint (docs/identity.md, "Member self-mint"): a single-use
+    // key for the caller's own next machine, consent inherited from the key
+    // that provisioned this session and never raised.
+    if (path === "/api/v1/me/enrollment-keys" && method === "POST") {
+      const principal = await enrollmentKeyOwner(request);
+      if (config.enrollmentSelfRenewal === false) {
+        throw new HttpError(
+          403,
+          "self_mint_disabled",
+          "Enrollment key self-renewal is turned off on this install; ask an admin for a key",
+        );
+      }
+      const body = await requestObject(request);
+      const unknown = Object.keys(body).filter((key) => key !== "label" && key !== "expiryDays");
+      if (unknown.length > 0) {
+        throw new HttpError(
+          400,
+          "invalid_request",
+          `Only label and expiryDays are accepted; refused: ${unknown.sort().join(", ")}`,
+        );
+      }
+      rateLimit(response, `enrollment-self-mint:${principal.userId}`, ENROLLMENT_SELF_MINT_RATE, "rate_limited",
+        "Too many enrollment keys minted; try again later");
+      const key = await apiTokens.selfMint({
+        organizationId: principal.organizationId,
+        workspaceId: principal.workspaceId,
+        userId: principal.userId,
+        email: principal.email,
+        provisionedByTokenId: principal.provisionedByTokenId ?? null,
+        label: body.label,
+        expiryDays: body.expiryDays,
+      });
+      json(response, 201, key, true);
       return;
     }
     const ownEnrollmentKey = routeMatch(path, /^\/api\/v1\/me\/enrollment-keys\/([^/]+)$/);
@@ -2239,6 +2331,84 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         if (error instanceof PeopleInputError) throw new HttpError(400, "invalid_request", error.message);
         throw error;
       }
+      return;
+    }
+
+    // Fleet view (docs/fleet.md): owners and admins, members with their
+    // Desktop machines, policy state and (with usage_people) usage.
+    const fleetRoute = /^\/api\/v1\/organizations\/([^/]+)\/fleet$/.exec(path);
+    if (fleetRoute && method === "GET") {
+      let organizationId: string;
+      try {
+        organizationId = decodeURIComponent(fleetRoute[1]!);
+      } catch {
+        throw new HttpError(400, "invalid_request", "Invalid organization id");
+      }
+      const auth = await organizationAccess(request, organizationId);
+      const role = auth.kind === "user" ? await store.memberRole(organizationId, auth.principal.userId) : null;
+      if (auth.kind !== "user" || (role !== "owner" && role !== "admin")) {
+        throw new HttpError(403, "forbidden", "Organization owner or admin role required");
+      }
+      for (const name of new Set(url.searchParams.keys())) {
+        if (name !== "days" && name !== "cursor") throw new HttpError(400, "invalid_request", `Unknown parameter ${name}`);
+      }
+      if (url.searchParams.getAll("cursor").length > 1) throw new HttpError(400, "invalid_request", "cursor must be given once");
+      const rawCursor = url.searchParams.get("cursor");
+      let after: FleetCursor | null = null;
+      if (rawCursor !== null) {
+        try {
+          after = decodeFleetCursor(rawCursor);
+        } catch (error) {
+          if (error instanceof FleetInputError) throw new HttpError(400, "invalid_request", error.message);
+          throw error;
+        }
+      }
+      const query = new URL(url);
+      query.searchParams.delete("cursor");
+      let days: number;
+      try {
+        days = usageDays(query);
+      } catch (error) {
+        if (error instanceof UsageRangeError) throw new HttpError(400, "invalid_request", error.message);
+        throw error;
+      }
+      const now = input.now?.() ?? new Date();
+      const dates = usageDates(days, now);
+      let usage: FleetUsageInput = null;
+      if (features.usage_people) {
+        // peopleReport reads with the caller's own authority: it resolves the
+        // caller's membership per workspace and has no owner check of its own.
+        const report = await peopleReport({
+          config, store, people, organizationId, days, now,
+          owner: { userId: auth.principal.userId, token: auth.token, readerKind: readerKindOf(request) },
+        });
+        usage = {
+          byUser: new Map(report.members.map((member) => [member.userId, {
+            sessionsUploaded: member.sessionsUploaded,
+            lastSessionAt: member.lastSessionAt,
+            topProjects: member.topProjects,
+          }])),
+          unavailable: report.unavailable,
+          truncated: report.truncated,
+        };
+      }
+      const view = await fleetView({
+        executor: store.database,
+        organizationId,
+        policy: await readWorkspacePolicy(store.database, organizationId),
+        days,
+        range: { from: dates[0]!, to: dates[dates.length - 1]! },
+        after,
+        usage,
+        now,
+      });
+      await recordAudit(store.database, {
+        organizationId,
+        actor: { kind: "user", userId: auth.principal.userId },
+        action: FLEET_AUDIT_ACTION,
+        target: organizationId,
+      });
+      json(response, 200, view, true);
       return;
     }
 
@@ -2587,17 +2757,97 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       return;
     }
 
+    // Workspace leaders (docs/workspace-leaders.md): stored by the Relaycast
+    // engine; Control proxies with the workspace key and stores nothing.
+    // Any member reads, workspace owner/admin writes.
+    const workspaceLeaders = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/leaders$/);
+    if (workspaceLeaders && (method === "GET" || method === "PUT")) {
+      const { principal, workspace } = await workspaceAccess(request, workspaceLeaders[0]!, method === "PUT");
+      if (principal.pendingHandoff) {
+        throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      }
+      if (method === "PUT" && !bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      let patterns: string[] = [];
+      if (method === "PUT") {
+        try {
+          patterns = parseLeaderPatterns(await requestObject(request));
+        } catch (error) {
+          if (error instanceof LeaderPatternsError) throw new HttpError(error.status, error.code, error.message);
+          throw error;
+        }
+      }
+      // Each call spends the workspace's server-side Relaycast key.
+      rateLimit(response, `workspace-leaders:${principal.userId}`, AGENT_NAMES_RATE, "rate_limited", "Too many requests. Try again shortly.");
+      const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.messagingFetch });
+      let leaders: WorkspaceLeaders;
+      try {
+        leaders = method === "PUT"
+          ? await relaycast.setWorkspaceLeaders(workspace.relaycastApiKey, patterns)
+          : await relaycast.getWorkspaceLeaders(workspace.relaycastApiKey);
+      } catch (error) {
+        if (error instanceof RelaycastCallError && error.status === 400) {
+          throw new HttpError(400, "invalid_request", "The Relaycast engine refused the leader patterns");
+        }
+        throw new HttpError(502, "workspace_leaders_unavailable", "The workspace leaders setting is unavailable");
+      }
+      if (method === "PUT") {
+        // Agent-name patterns are not secret; the engine's normalised list is recorded.
+        await recordAudit(store.database, {
+          organizationId: workspace.organizationId,
+          workspaceId: workspace.id,
+          actor: { kind: "user", userId: principal.userId },
+          action: "workspace_leaders.set",
+          target: `${workspace.id} patterns=${leaders.patterns.length} ${JSON.stringify(leaders.patterns)}`,
+        });
+      }
+      json(response, 200, {
+        leaders: leaders.leaders.map((leader) => ({ name: leader.name, agent_id: leader.agentId })),
+        patterns: leaders.patterns,
+      }, true);
+      return;
+    }
+
     // Capture policy (docs/capture-policy.md) and workspace policy
     // (docs/workspace-policy.md): any member reads both through access/me;
     // organization owner/admin writes them.
     const accessMe = routeMatch(path, /^\/api\/v1\/workspaces\/([^/]+)\/access\/me$/);
     if (accessMe && method === "GET") {
-      const { workspace } = await workspaceAccess(request, accessMe[0]!);
+      const { principal, workspace } = await workspaceAccess(request, accessMe[0]!);
+      // Fleet rollout C1: a device-client session records the Desktop version,
+      // platform and applied policy revision it presents here. Never fails the read.
+      if (recordsClientTelemetry(principal)) {
+        try {
+          await recordClientTelemetry(store.database, principal.sessionId, parseClientTelemetry(request.headers));
+        } catch (error) {
+          console.warn("[selfhost-api] client telemetry write failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      // Managed: the session was provisioned by an enrollment key carrying admin policy consent.
+      const managed = principal.provisionedByTokenId
+        ? await sessionManagedByEnrollmentKey(store.database, principal.provisionedByTokenId)
+        : false;
       json(response, 200, {
         workspace: { id: workspace.id, name: workspace.name },
         role: workspace.role,
-        policy: await readCapturePolicy(store.database, workspace.organizationId),
-        workspace_policy: await readWorkspacePolicy(store.database, workspace.organizationId, { workspaceId: workspace.id }),
+        // Served per caller (docs/capture-policy.md, "Deployment default and
+        // override roles"); the organization routes below serve what is stored.
+        policy: capturePolicyForCaller(
+          await readCapturePolicy(store.database, workspace.organizationId),
+          workspace.role,
+          sharing,
+        ),
+        workspace_policy: workspacePolicyForCaller(
+          await readWorkspacePolicy(store.database, workspace.organizationId, {
+            workspaceId: workspace.id,
+            managed,
+          }),
+          workspace.role,
+          sharing,
+        ),
       }, true);
       return;
     }
@@ -2933,7 +3183,12 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // Capture policy revision (docs/capture-policy.md): Desktop names the policy it applies. Report mode logs a
       // missing or older one; enforce refuses it so Desktop reads the policy again (its POST fallback is checked
       // the same way by the sessions pipeline).
-      const capturePolicy = await readCapturePolicy(store.database, workspace.organizationId);
+      // Checked against the policy as served to this caller (its access/me).
+      const capturePolicy = capturePolicyForCaller(
+        await readCapturePolicy(store.database, workspace.organizationId),
+        workspace.role,
+        sharing,
+      );
       const verdict = uploadPolicyVerdict(capturePolicy, request.headers[CAPTURE_POLICY_REVISION_HEADER]);
       if (verdict === "missing" || verdict === "stale") {
         const mode = config.capturePolicyUploads ?? "report";
@@ -3040,6 +3295,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       keyring: config.encryptionKeyring,
       fetchImpl: input.messagingFetch,
       relaycastUrl: config.relaycastUrl,
+      relaygatePublicUrl: config.relaygatePublicUrl,
       csrfAllowed: (incoming) => Boolean(bearer(incoming)) || cookieRequestAllowed(incoming, browserOrigins),
     })) return;
 

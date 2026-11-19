@@ -259,7 +259,14 @@ type ParticipantOptions = {
   executor?: SqlExecutor;
 };
 /** The hosted participant every agent launch of one owner is sent as (src/mcp/relay-spawn.ts). */
-export type SpawnActor = { id: string; name: string; token: string; relaycastWorkspaceId: string };
+export type SpawnActor = {
+  id: string; name: string; token: string; relaycastWorkspaceId: string;
+  /**
+   * The verified desktop identity that asked for the launch; the node treats
+   * its DMs as native input. Absent for OAuth and unlinked hosted sessions.
+   */
+  requester?: { agentId: string; name: string };
+};
 /** The owner's launcher name: never derived from a display name. */
 export const launcherName = (userId: string) => `launcher-${ownerHash(userId).slice(0, 16)}`;
 const ACTIVE_LAUNCHES = "This participant still owns agent launches that have not been released. Release them with release_relay_agent first.";
@@ -282,7 +289,13 @@ const rejectedToken = (name: string) => new RelayToolError(
 type ChannelInput = { as?: string; as_person?: boolean; hosted?: boolean };
 
 function createRelayService(context: McpContext) {
-  const { database, keyring, client, sessionId } = context.relay;
+  const { database, keyring, client, sessionId, gateClient: gate } = context.relay;
+  /**
+   * The client for calls made with an identity's own token. On gate-only
+   * installs a Desktop identity holds an rg_ token only relaygate accepts,
+   * so those calls go through relaygate; hosted participants keep Relaycast.
+   */
+  const clientFor = (identity: { desktop?: boolean }) => identity.desktop && gate ? gate : client;
   const workspaceId = context.workspace.id;
   const organizationId = context.workspace.organizationId;
   const executor = database;
@@ -314,7 +327,8 @@ function createRelayService(context: McpContext) {
       }
       try {
         return { ...await linkedDesktopIdentity({
-          database, keyring, client, workspaceId, userId, relaycastWorkspaceId: relayWorkspaceId,
+          database, keyring, client, ...(gate ? { gate } : {}), relaycastApiKey: key,
+          workspaceId, userId, relaycastWorkspaceId: relayWorkspaceId,
           nativeSession: desktopCall.nativeSession, sourceId: desktopCall.nativeSourceId,
         }), desktop: true as const };
       } catch (error) {
@@ -328,7 +342,8 @@ function createRelayService(context: McpContext) {
   /** Re-checks a stored identity with Relaycast; failures become tool errors. */
   async function verifiedDesktop(row: DesktopIdentityRow): Promise<DesktopActor> {
     try {
-      return { ...await verifyDesktopIdentity({ keyring, client, userId, relaycastWorkspaceId: relayWorkspaceId, row }),
+      return { ...await verifyDesktopIdentity({ keyring, client, ...(gate ? { gate } : {}), relaycastApiKey: key,
+        userId, relaycastWorkspaceId: relayWorkspaceId, row }),
         desktop: true as const };
     } catch (error) {
       if (error instanceof DesktopIdentityUnavailable) throw new RelayToolError(error.message);
@@ -460,21 +475,21 @@ function createRelayService(context: McpContext) {
 
   async function addressFor(name: string, bestEffort = false): Promise<string | null> {
     try {
-      return (await listedAgents("all")).find(agent => agent.name === name)?.address ?? null;
+      // Bounded lookup: one name, never the whole roster.
+      const agent = await client.findAgentByName(key, name);
+      return agent && isListedRelayAgent(agent) ? agent.address : null;
     } catch (error) {
       if (bestEffort) return null;
       throw error;
     }
   }
 
+  /** A name or `name@machine` address, resolved by name without listing the roster. */
   async function explicitAgent(target: string): Promise<RosterAgent | null> {
     const separator = target.lastIndexOf("@");
-    const recent = (await client.listAgents(key, "all"))
-      .find(agent => separator < 0 ? agent.name === target : agent.address === target);
-    if (recent) return recent;
     const name = separator < 0 ? target : target.slice(0, separator);
     if (!name) return null;
-    const agent = await client.getRosterAgent(key, name);
+    const agent = await client.findAgentByName(key, name) ?? await client.getRosterAgent(key, name);
     return agent?.name === name && (separator < 0 || agent.address === target) ? agent : null;
   }
 
@@ -487,8 +502,8 @@ function createRelayService(context: McpContext) {
     return { ...rosterAgent(agent, people, userId, workspaceId), card: recipientCard(agent.metadata) };
   }
 
-  async function conversation(token: string, name: string, peer: string) {
-    return (await client.listConversations(token))
+  async function conversation(token: string, name: string, peer: string, via = client) {
+    return (await via.listConversations(token))
       .find(item => item.participants.length === 2 && item.participants.includes(name) && item.participants.includes(peer));
   }
 
@@ -757,8 +772,8 @@ function createRelayService(context: McpContext) {
     return fn(hosted);
   }
 
-  async function membership(token: string, channel: string) {
-    return (await client.authenticatedAgent(token)).channels.find(row => row.name === channel) ?? null;
+  async function membership(identity: Identity, channel: string) {
+    return (await clientFor(identity).authenticatedAgent(identity.token)).channels.find(row => row.name === channel) ?? null;
   }
 
   function notSubscribed(channel: string): never {
@@ -815,10 +830,16 @@ function createRelayService(context: McpContext) {
         return fn({ id: current.row.agentRemoteId, name: current.name, token: current.token, relaycastWorkspaceId: relayWorkspaceId });
       });
     }
-    if (managed) await desktop();
-    else if (sessionHash) {
+    let requester: SpawnActor["requester"];
+    if (managed) {
+      const desktopIdentity = await desktop();
+      requester = { agentId: desktopIdentity.agentId, name: desktopIdentity.name };
+    } else if (sessionHash) {
       const linkedRow = await findDesktopIdentityBySession(executor, workspaceId, userId, sessionHash);
-      if (linkedRow) await verifiedDesktop(linkedRow);
+      if (linkedRow) {
+        const desktopIdentity = await verifiedDesktop(linkedRow);
+        requester = { agentId: desktopIdentity.agentId, name: desktopIdentity.name };
+      }
     }
     const name = launcherName(userId);
     const actor = await withOwnerLock(async (tx) => {
@@ -829,7 +850,8 @@ function createRelayService(context: McpContext) {
         if (!hosted) throw new RelayToolError("Could not create the launcher participant. Retry.");
       }
       const token = hosted.tokenUsable ? hosted.token : await recoverToken(tx, hosted);
-      return { id: hosted.row.agentRemoteId, name: hosted.name, token, relaycastWorkspaceId: relayWorkspaceId };
+      return { id: hosted.row.agentRemoteId, name: hosted.name, token, relaycastWorkspaceId: relayWorkspaceId,
+        ...(requester ? { requester } : {}) };
     });
     return fn(actor);
   }
@@ -955,9 +977,12 @@ function createRelayService(context: McpContext) {
       await touchPresence(hosted.token);
       // Every fallible read finishes before any acknowledgement, so a failed
       // enrichment leaves the deliveries pending for a retry.
-      const [messages, agents, conversations] = await Promise.all([
-        client.readHostedInbox(hosted.token), listedAgents("all"), client.listConversations(hosted.token),
+      const [messages, conversations] = await Promise.all([
+        client.readHostedInbox(hosted.token), client.listConversations(hosted.token),
       ]);
+      // Sender addresses come from one bounded lookup of the senders' names.
+      const senders = [...new Set(messages.flatMap(message => message.sender ? [message.sender] : []))];
+      const agents = senders.length ? (await client.findAgentsByNames(key, senders)).filter(isListedRelayAgent) : [];
       const addresses = new Map(agents.map(agent => [agent.name, agent.address]));
       const channelNames = new Map<string, string>();
       if (messages.some(isChannelDelivery)) {
@@ -1008,9 +1033,9 @@ function createRelayService(context: McpContext) {
         const [fromAddress, conv] = await Promise.all([
           addressFor(identity.name),
           input.reply_to ? (async () => {
-            const found = await conversation(identity.token, identity.name, peer.name);
+            const found = await conversation(identity.token, identity.name, peer.name, clientFor(identity));
             // Look the parent up by its exclusive successor to verify old ids without paging.
-            const page = found ? await client.listMessages(identity.token, found.id,
+            const page = found ? await clientFor(identity).listMessages(identity.token, found.id,
               { limit: 1, before: String(BigInt(input.reply_to!) + 1n) }) : null;
             if (!page?.messages.some(message => message.id === input.reply_to)) {
               throw new RelayToolError("reply_to must belong to your DM conversation with this recipient.");
@@ -1026,12 +1051,12 @@ function createRelayService(context: McpContext) {
         }
         let sent;
         if (input.reply_to) {
-          sent = await client.replyToMessage({ token: identity.token, parentId: input.reply_to, text: input.text, idempotencyKey });
+          sent = await clientFor(identity).replyToMessage({ token: identity.token, parentId: input.reply_to, text: input.text, idempotencyKey });
           if (sent.conversationId !== conv!.id) {
             throw new RelayToolError("Reply outcome could not be verified. Do not retry with a new idempotency key.");
           }
         } else {
-          sent = await client.sendDirectMessage({ token: identity.token, to: peer.name,
+          sent = await clientFor(identity).sendDirectMessage({ token: identity.token, to: peer.name,
             ...(input.to === peer.address ? { address: input.to } : {}), text: input.text, idempotencyKey });
         }
         return { from: identity.name, from_address: fromAddress, to: peer.name, to_address: peer.address,
@@ -1062,7 +1087,7 @@ function createRelayService(context: McpContext) {
           ?? await participant(input.as, { allowMissing: viaCapy || viaFactory })
           ?? (viaCapy ? await capyActor(input.as!) : viaFactory ? await factoryActor(input.as!) : null));
       if (!identity) throw new RelayToolError("Call join_relay first, or select your own sending participant with as.");
-      const deliveries = await client.getMessageDeliveries(identity.token, input.message_id);
+      const deliveries = await clientFor(identity).getMessageDeliveries(identity.token, input.message_id);
       return { message_id: input.message_id, you: identity.name, confirmation: deliveries === null ? "unavailable" : "available",
         deliveries: deliveries ?? [], note: deliveries === null
           ? "Delivery is unconfirmed: this engine does not expose receipts, or this message is not visible as your own outgoing message. Do not resend solely because confirmation is unavailable."
@@ -1079,16 +1104,18 @@ function createRelayService(context: McpContext) {
           ?? await participant(input.as, { allowMissing: factoryFallback(input.as) })
           ?? (factoryFallback(input.as) ? await factoryActor(input.as) : null);
       if (!hosted) return { you: null, conversation_id: null, messages: [], earlier: null };
-      await touchPresence(hosted.token);
-      const conv = await conversation(hosted.token, hosted.name, peerName);
+      const via = clientFor(hosted);
+      // relaygate does not proxy heartbeats; Desktop keeps its own presence.
+      if (via === client) await touchPresence(hosted.token);
+      const conv = await conversation(hosted.token, hosted.name, peerName, via);
       if (!conv) return { you: hosted.name, conversation_id: null, messages: [], earlier: null };
-      const page = await client.listMessages(hosted.token, conv.id, { before: input.before, limit: input.limit });
+      const page = await via.listMessages(hosted.token, conv.id, { before: input.before, limit: input.limit });
       const messages = [];
       // The DM listing omits thread_id; enrich only authorized ids, five at a time.
       for (let index = 0; index < page.messages.length; index += 5) {
         messages.push(...await Promise.all(page.messages.slice(index, index + 5).map(async message => ({
           message_id: message.id, sender: message.sender, text: message.text, created_at: message.createdAt,
-          thread_id: await client.getMessageThreadId(hosted.token, message.id), mine: message.sender === hosted.name,
+          thread_id: await via.getMessageThreadId(hosted.token, message.id), mine: message.sender === hosted.name,
         }))));
       }
       return { you: hosted.name, conversation_id: conv.id, messages,
@@ -1100,7 +1127,7 @@ function createRelayService(context: McpContext) {
       const [channels, mine] = await Promise.all([client.listChannels(key), channelActor(input, false, async (identity) => {
         acted = true;
         return { you: identity.name, linked: linkedKind(identity),
-          ids: new Set((await client.authenticatedAgent(identity.token)).channels.map(row => row.id)) };
+          ids: new Set((await clientFor(identity).authenticatedAgent(identity.token)).channels.map(row => row.id)) };
       }, "none")]);
       const unlinked = !managed && !acted && !input.as && !input.hosted &&
         !(sessionHash && await findParticipant(executor, workspaceId, userId, organizationId, { sessionHash }));
@@ -1117,18 +1144,18 @@ function createRelayService(context: McpContext) {
         let created = false;
         let alreadySubscribed = false;
         try {
-          alreadySubscribed = (await client.joinChannel(identity.token, channel)).alreadyMember;
+          alreadySubscribed = (await clientFor(identity).joinChannel(identity.token, channel)).alreadyMember;
         } catch (error) {
           if (!(error instanceof RelaycastCallError) || error.status !== 404) throw error;
           if (!input.create) throw new RelayToolError(`No channel #${channel} exists. Use list_relay_channels, or pass create: true to start it.`);
           try {
             // The creator becomes the channel's owner, which is membership.
-            await client.createChannel(identity.token, channel);
+            await clientFor(identity).createChannel(identity.token, channel);
             created = true;
           } catch (createError) {
             // Someone created it first: join theirs.
             if (!(createError instanceof RelaycastCallError) || createError.status !== 409) throw createError;
-            alreadySubscribed = (await client.joinChannel(identity.token, channel)).alreadyMember;
+            alreadySubscribed = (await clientFor(identity).joinChannel(identity.token, channel)).alreadyMember;
           }
         }
         return { subscribed: true, channel, you: identity.name, linked: linkedKind(identity), created,
@@ -1139,8 +1166,8 @@ function createRelayService(context: McpContext) {
     async unsubscribeChannel(input: ChannelInput & { channel: string }) {
       const channel = normalizeChannelName(input.channel);
       return await channelActor(input, false, async (identity) => {
-        if (!await membership(identity.token, channel)) return { subscribed: false, channel, you: identity.name, already_unsubscribed: true };
-        await client.leaveChannel(identity.token, channel);
+        if (!await membership(identity, channel)) return { subscribed: false, channel, you: identity.name, already_unsubscribed: true };
+        await clientFor(identity).leaveChannel(identity.token, channel);
         return { subscribed: false, channel, you: identity.name, already_unsubscribed: false };
       }) ?? { subscribed: false, channel, you: null, already_unsubscribed: true };
     },
@@ -1150,21 +1177,21 @@ function createRelayService(context: McpContext) {
       const channel = normalizeChannelName(input.channel);
       // Posting requires a subscription, so no identity is created here.
       return (await channelActor(input, false, async (identity) => {
-        const member = await membership(identity.token, channel);
+        const member = await membership(identity, channel);
         if (!member) notSubscribed(channel);
         const responseIdempotencyKey = input.idempotency_key ?? serverIdempotencyKey;
         const idempotencyKey = `hosted-mcp-channel:${userId}:${identity.name}:${responseIdempotencyKey}`;
         let messageId: string;
         let threadId: string | null = null;
         if (input.thread_id) {
-          const parent = await client.getMessage(identity.token, input.thread_id);
+          const parent = await clientFor(identity).getMessage(identity.token, input.thread_id);
           if (!parent || parent.channelId !== member.id) throw new RelayToolError(`thread_id must be a message in #${channel}. Use read_relay_channel.`);
-          const reply = await client.replyInChannelThread({ token: identity.token, parentId: input.thread_id, text: input.text, idempotencyKey });
+          const reply = await clientFor(identity).replyInChannelThread({ token: identity.token, parentId: input.thread_id, text: input.text, idempotencyKey });
           if (reply.channelId !== member.id) throw new RelayToolError("Reply outcome could not be verified. Do not retry with a new idempotency key.");
           messageId = reply.id;
           threadId = reply.threadId;
         } else {
-          messageId = (await client.postChannelMessage({ token: identity.token, channel, text: input.text, idempotencyKey })).id;
+          messageId = (await clientFor(identity).postChannelMessage({ token: identity.token, channel, text: input.text, idempotencyKey })).id;
         }
         return { from: identity.name, channel, linked: linkedKind(identity), message_id: messageId, thread_id: threadId,
           idempotency_key: responseIdempotencyKey,
@@ -1177,7 +1204,7 @@ function createRelayService(context: McpContext) {
       const channel = normalizeChannelName(input.channel);
       return (await channelActor(input, false, async (identity) => {
         // History is read with the workspace key, so membership is checked here.
-        if (!await membership(identity.token, channel)) notSubscribed(channel);
+        if (!await membership(identity, channel)) notSubscribed(channel);
         const page = await client.listChannelMessages(key, channel, { before: input.before, limit: input.limit });
         return { you: identity.name, channel,
           messages: page.messages.map(message => ({ message_id: message.id, sender: message.sender, text: message.text,

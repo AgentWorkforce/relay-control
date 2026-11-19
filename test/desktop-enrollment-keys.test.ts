@@ -231,7 +231,8 @@ test("exchange: device/token shape and scopes; consent decides Desktop verificat
   assert.equal(exchanged.status, 200);
   assert.equal(exchanged.headers.get("cache-control"), "no-store");
   assert.deepEqual(Object.keys(exchanged.body).sort(), [
-    "access_token", "access_token_expires_at", "api_url", "refresh_token", "refresh_token_expires_at", "scope", "token_type",
+    "access_token", "access_token_expires_at", "api_url", "managed", "policy_revision", "refresh_token",
+    "refresh_token_expires_at", "scope", "token_type", "workspace_policy",
   ]);
   assert.equal(exchanged.body.token_type, "Bearer");
   assert.equal(exchanged.body.api_url, `${env.origin}/cloud`);
@@ -329,7 +330,7 @@ test("exchange audit: actor is the employee, target has key id, ip and host, nev
   assert.ok(exchange);
   assert.equal(exchange.actorKind, "user");
   assert.equal(exchange.actorId, memberId);
-  assert.match(exchange.target ?? "", new RegExp(`^${key.id} ip=\\S+ host=build-01$`));
+  assert.match(exchange.target ?? "", new RegExp(`^${key.id} ip=\\S+ host=build-01 use=1/1 client=unknown$`));
   assert.ok(/ip=(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)/.test(exchange.target ?? ""), "loopback client address");
   const secret = key.accessToken.slice("sh_ek_".length);
   const everything = JSON.stringify(events);
@@ -395,10 +396,14 @@ test("/api/v1/me/enrollment-keys: the employee lists and revokes only their own 
   assert.equal(listed.body.keys.length, 1);
   const summary = listed.body.keys[0];
   assert.deepEqual(Object.keys(summary).sort(), [
-    "createdAt", "exchangedAt", "exchangedHostName", "expiresAt", "id", "label", "mcpConsent", "mintedBy", "status",
+    "createdAt", "exchangedAt", "exchangedHostName", "expiresAt", "id", "label", "maxUses", "mcpConsent", "mintedBy",
+    "policyConsent", "status", "useCount",
   ]);
   assert.equal(summary.id, mine.id);
   assert.equal(summary.mcpConsent, "admin");
+  assert.equal(summary.policyConsent, null);
+  assert.equal(summary.maxUses, 1);
+  assert.equal(summary.useCount, 1);
   assert.equal(summary.exchangedHostName, "build-01");
   assert.equal(summary.status, "exchanged");
   assert.equal(summary.mintedBy.id, env.ownerId);

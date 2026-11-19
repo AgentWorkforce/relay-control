@@ -962,18 +962,42 @@ refresh keeps the session's scopes, so a session issued before `rth:acquire`
 existed gains it only at the next sign-in. Introspection returns the scopes
 verbatim.
 
+#### Desktop client telemetry
+
+On every `GET /api/v1/workspaces/{id}/access/me` (Desktop reads it at
+sign-in, on workspace refresh and every 15 minutes) Control records what a
+device-client session reports about itself on its `token_sessions` row:
+`client_version` and `client_platform` from the `User-Agent`
+`AgentRelayDesktop/<version>` or `AgentRelayDesktop/<version> (<platform>)`,
+`policy_revision_applied` from the `X-Agent-Relay-Policy-Revision` header
+(the workspace policy revision the client applied, a non-negative integer),
+and `policy_seen_at`. Only sessions from the device flow, the Desktop
+browser sign-in exchange and enrollment-key exchanges record it; browser
+account sessions, unredeemed handoffs and every other credential never do.
+Values are parsed strictly (version up to 64 characters of `[0-9A-Za-z.+-]`,
+platform up to 32 characters of `[a-z0-9_-]` after lower-casing, revision
+0 to 2147483647); anything else is ignored and the read answers as usual. A
+missing value leaves its column as it was, and the row is written only when
+a value changed or `policy_seen_at` is null or older than 10 minutes. The
+uploader's `X-Agent-Relay-Capture-Policy-Revision` header is unrelated.
+Whether the applied revision matches the current policy is computed by the
+fleet read model from these columns, not stored.
+
 #### Desktop enrollment keys
 
 An organization owner or admin can sign an employee's Desktop in without a
-browser: mint a one-time enrollment key for the employee, hand it to the
+browser: mint an enrollment key for the employee, hand it to the
 installer, and the installer exchanges it for a normal device session bound
-to that employee. The API is the only surface; there is no dashboard page.
+to that employee. A key is single-use by default; a per-person key may sign
+in several of the employee's machines (`maxUses`). The API is the only
+surface; there is no dashboard page.
 
 Mint, list and revoke use the workspace API token routes (owner or admin
 only):
 
 - `POST /api/v1/workspaces/{id}/deployment-api-tokens` with
-  `{label, purpose: "desktop-enrollment", email, mcpConsent?, expiryDays?}`.
+  `{label, purpose: "desktop-enrollment", email, mcpConsent?, policyConsent?,
+  maxUses?, expiryDays?}`.
   The answer carries the key (`sh_ek_...`) once, like every other workspace
   API token.
   - `email` names the employee. An existing member of the organization is
@@ -985,17 +1009,41 @@ only):
     invite that person instead.
   - `mcpConsent` is `"admin"` or absent. With `"admin"` the admin consents
     to Desktop MCP access on the employee's behalf (below).
-  - `expiryDays` is 1 to 30, default 7. Keys always expire;
-    `neverExpires: true` is refused with `400`.
-  - `email` and `mcpConsent` are refused with `400` for every other purpose.
+  - `policyConsent` is `"admin"` or absent. With `"admin"` the admin
+    consents to the workspace policy on the employee's behalf: every session
+    the key provisions is a managed session (below, and
+    [workspace-policy.md](workspace-policy.md)).
+  - `maxUses` is an integer from 1 to the `SELFHOST_ENROLLMENT_MAX_USES`
+    ceiling (default 50, never above 500); default 1, a single-use key. The
+    key signs in up to that many machines of the same employee; every
+    exchange signs in the member bound at mint (the installer never names
+    anyone).
+  - `expiryDays` is 1 to the ceiling, default 7 (or the ceiling, if lower).
+    The ceiling is `SELFHOST_ENROLLMENT_MAX_DAYS` (default 30) for a
+    single-use key and `SELFHOST_ENROLLMENT_MULTI_USE_MAX_DAYS` (default 90)
+    for a key with `maxUses` above 1; a longer request is refused with
+    `400 invalid_request`. Keys always expire; `neverExpires: true` is
+    refused with `400`.
+  - `email`, `mcpConsent`, `policyConsent` and `maxUses` are refused with
+    `400` for every other purpose.
+  - The ceilings are read from the environment on every mint. Each is a
+    positive integer; any other value (empty, `0`, `abc`, `5.5`) means the
+    default. Day ceilings never exceed 365. `SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS`
+    (default 7) applies to member self-minted keys only (see "Member
+    self-mint" below), never to an admin mint.
 - `GET /api/v1/workspaces/{id}/deployment-api-tokens` lists the keys with
-  `userId`, `userEmail`, `mcpConsent`, `exchangedAt` and
-  `exchangedHostName` (these are `null` on other purposes). The list is the
+  `userId`, `userEmail`, `mcpConsent`, `policyConsent`, `exchangedAt`,
+  `exchangedHostName` and `mintedByTokenId` (these are `null` on other
+  purposes; `mintedByTokenId` is also `null` on a key a person minted), and
+  `maxUses` and `useCount` (`1` and `0` on other purposes). `exchangedAt`
+  and `exchangedHostName` name the latest exchange; once the key is spent,
+  the last one. The list is the
   newest 100 tokens of the workspace; add `?purpose=desktop-enrollment` (or
   any other purpose) to list one purpose only, so many keys never hide the
   other tokens. An unknown purpose is `400 invalid_request`.
-- A key's `status` is `revoked`, else `exchanged` once it has been spent,
-  else `expired` past its expiry, else `active`.
+- A key's `status` is `revoked`, else `exchanged` once it has been spent
+  (`useCount` reached `maxUses`), else `expired` past its expiry, else
+  `active`.
 - `DELETE /api/v1/workspaces/{id}/deployment-api-tokens/{tokenId}` revokes
   the key and, if it was exchanged, every session it provisioned (including
   refreshed sessions and their MCP child sessions), with revoked reason
@@ -1003,19 +1051,64 @@ only):
   not by session, so they are not deleted; they cannot be used without a
   live session.
 
-The employee can see and revoke their own keys with a signed-in user token
-(`cli:auth` or `account` scope) in the token's organization:
+The employee can see, mint and revoke their own keys with a signed-in user
+token (`cli:auth` or `account` scope) in the token's organization:
 
 - `GET /api/v1/me/enrollment-keys` answers
-  `{keys: [{id, label, status, mcpConsent, createdAt, expiresAt, exchangedAt,
-  exchangedHostName, mintedBy}]}`, `status` as above.
+  `{keys: [{id, label, status, mcpConsent, policyConsent, maxUses, useCount,
+  createdAt, expiresAt, exchangedAt, exchangedHostName, mintedBy}]}`,
+  `status` as above.
+- `POST /api/v1/me/enrollment-keys` mints a key for the caller's next
+  machine; see "Member self-mint" below.
 - `DELETE /api/v1/me/enrollment-keys/{id}` (a bearer token, or the `/cloud`
   session cookie from a same-origin page; otherwise `403 csrf_rejected`)
   answers `204` with the same
   cascade as the admin revoke, or `404 token_not_found` for a key that is
   not theirs.
 
-The installer exchanges the key once at
+##### Member self-mint
+
+A member who is already signed in can mint a key for their own next machine,
+without an admin:
+
+```http
+POST /api/v1/me/enrollment-keys
+{ "label": "new laptop", "expiryDays": 3 }
+```
+
+- The caller is the session's user (a bearer `cli:auth` or `account` token,
+  or the `/cloud` session cookie from a same-origin page; otherwise
+  `403 csrf_rejected`). The key is minted in the session's workspace, for the
+  caller's own user and email; the body cannot name anyone else.
+- The body accepts only `label` (1-128 characters, default
+  `Desktop self-renewal`) and `expiryDays`. Any other key (`email`,
+  `maxUses`, `mcpConsent`, `policyConsent`, `purpose`, ...) is refused with
+  `400 invalid_request`.
+- `maxUses` is always 1.
+- `expiryDays` defaults to, and may not exceed,
+  `SELFHOST_ENROLLMENT_SELF_MINT_MAX_DAYS` (default 7), or
+  `SELFHOST_ENROLLMENT_MAX_DAYS` when that is lower. A longer or non-integer
+  value is `400 invalid_request`.
+- Consent is inherited, never raised: when the calling session was
+  provisioned by one of the caller's own enrollment keys, the new key copies
+  that key's `mcpConsent` and `policyConsent`. Any other session (device
+  flow, browser sign-in) mints a key with both `null`.
+- A person may hold at most 5 unexchanged keys in the organization (not
+  used, not revoked, not expired; admin-minted keys count). The sixth
+  self-mint answers `409 self_mint_limit`; exchange or revoke one first. The
+  cap does not apply to admin mints.
+- At most 10 self-mints per person per hour; then `429 rate_limited` with
+  `Retry-After`.
+- `SELFHOST_ENROLLMENT_SELF_RENEWAL=false` turns the route off with
+  `403 self_mint_disabled` (listing and revoking stay available).
+
+The answer is `201` with the same shape as the admin mint: the key record
+(`purpose: "desktop-enrollment"`, `maxUses: 1`, `useCount: 0`, the inherited
+consent) plus `accessToken`, shown once. The mint is audited
+`api_token.create` and `enrollment_key.self_mint`, both with the member as
+actor.
+
+The installer exchanges the key, once per use, at
 `POST /api/v1/auth/enrollment/token` (also under `/cloud`):
 
 ```json
@@ -1026,12 +1119,31 @@ The installer exchanges the key once at
 names refused); `desktop_host_name` is required (1 to 80 characters). The
 `200` body is the `POST /api/v1/auth/device/token` body: `access_token`,
 `refresh_token`, `token_type`, `access_token_expires_at`,
-`refresh_token_expires_at`, `scope` and `api_url`. The session carries the
-device scopes, is labelled with `client_name` and stores the host name. A
-missing, expired, revoked or already exchanged key gets one answer,
+`refresh_token_expires_at`, `scope` and `api_url`, plus `managed` (boolean:
+the key carries `policyConsent: "admin"`) and `policy_revision` (the
+organization's workspace policy revision, 1 when unset; compare it with a
+cached policy) and `workspace_policy` (the served document, as on
+`access/me`, with this session's `managed`). The session carries the
+device scopes, is labelled with `client_name` and stores the host name. Each
+exchange uses the key once, under a lock on the key row, so concurrent
+exchanges never exceed `maxUses`. A
+missing, expired, revoked or spent (every use taken) key gets one answer,
 `400 {"error": "invalid_grant", "error_description": "..."}`, whatever the
 reason. The route allows 30 exchanges per client address per 5 minutes and
 then answers `429 slow_down`.
+
+Every exchange is audited `enrollment_key.exchange` as the employee, target
+`<key id> ip=<client address> host=<desktop_host_name> use=<n>/<maxUses>
+client=<version>`, where `<version>` comes from a
+`User-Agent: AgentRelayDesktop/<version>` header (`unknown` without one).
+The key itself is never logged or audited.
+
+Managed sessions: a session provisioned by a key with
+`policyConsent: "admin"` is managed. `GET /api/v1/workspaces/{id}/access/me`
+serves its `workspace_policy` with `managed: true` (every other session:
+`false`), and introspection answers `managed: true` for its access token
+(see [workspace-policy.md](workspace-policy.md)). A refresh keeps it managed,
+like the provisioning link.
 
 Consent: a key minted with `mcpConsent: "admin"` yields a Desktop-verified
 session, exactly like a Desktop browser-consent handoff, so the Desktop can
@@ -1056,7 +1168,9 @@ those sessions; mint a new key.
 
 Discovery: `GET /api/v1/capabilities` answers `enrollment_keys: true` and
 `GET /api/v1/auth/login-config` answers `enrollment_keys: true`; an installer
-falls back to the device flow when the field is absent.
+falls back to the device flow when the field is absent. Both also answer
+`enrollment_self_mint`, `false` when `SELFHOST_ENROLLMENT_SELF_RENEWAL=false`
+turns member self-mint off, else `true`.
 
 The key is not a bearer. Every workspace API token gate, the relay node
 broker and the admin routes treat `sh_ek_` as no credential (`401`), and
@@ -1065,8 +1179,51 @@ introspection answers `wrong-kind`. Only the exchange route accepts it.
 Audit actions (all in the minting workspace's audit log, `GET /api/v1/workspaces/{id}/admin/audit`):
 - `api_token.create`: target `<keyId> (desktop-enrollment: user <userId>[ mcpConsent=admin])`
 - `membership.provision`: actor the minting admin, target `<userId> <email> role member`
+- `enrollment_key.self_mint`: actor the member, target `<keyId> (desktop-enrollment: user <userId>[ mcpConsent=admin][ policyConsent=admin][ from=<source key id>])`
 - `enrollment_key.exchange`: actor the employee, target `<keyId> ip=<client address> host=<host name>`; never the key
 - `api_token.revoke`: target `<keyId> (desktop-enrollment: user <userId>) sessions=<n>`, with ` reason=member_removed` when a membership removal revoked it
+
+An action taken with an enrollment-operator token (below) is recorded with
+actor kind `token` and the operator token's id as the actor id.
+
+##### Enrollment operator tokens
+
+A fleet rollout mints keys from an MDM script, not from a signed-in admin.
+For that an owner or admin mints one workspace API token of purpose
+`enrollment-operator` (`sh_wk_`, scope `enrollment:mint`) with the usual
+`POST /api/v1/workspaces/{id}/deployment-api-tokens` and
+`{label, purpose: "enrollment-operator", expiryDays?}`. It expires like
+other workspace API tokens (default 90 days, at most 365);
+`neverExpires: true` is refused with `400`.
+
+Keep the token in the MDM's secret store and hand it to the rollout script
+from there. Never send it over Relay, paste it into a chat or commit it to
+git: it mints sign-in keys for any address the organization may provision.
+
+The token is accepted on exactly three routes, and only for its own
+workspace:
+
+- `POST /api/v1/workspaces/{id}/deployment-api-tokens` with
+  `purpose: "desktop-enrollment"` and the same body as an admin mint.
+  Any other purpose is `403 enrollment_operator_scope`. The key records the
+  operator as `mintedByTokenId`; its `createdBy` is `null`, and so is
+  `provisioning.mintedBy` in the employee's `GET /api/v1/auth/whoami` and
+  `mintedBy` in their `GET /api/v1/me/enrollment-keys`.
+- `GET /api/v1/workspaces/{id}/deployment-api-tokens?purpose=desktop-enrollment`
+  lists only the keys this operator minted. No filter, or any other
+  purpose, is `403 enrollment_operator_scope`.
+- `DELETE /api/v1/workspaces/{id}/deployment-api-tokens/{tokenId}` revokes
+  a key this operator minted, with the same session cascade as an admin
+  revoke. Any other id (another operator's key, an admin-minted key, a
+  token of another purpose, the operator itself) is `404 token_not_found`.
+
+A revoked or expired operator token, or one of another workspace, is
+`401 unauthorized` on these routes. Every other admin and runtime route
+answers `401` for it, as for an unknown `sh_wk_` token; introspection
+answers `wrong-kind`. An
+owner or admin sees the operator's keys in the full list and can revoke
+them. Revoking the operator token stops further mints but leaves the keys
+it minted, and their sessions, alive; revoke those keys separately.
 
 #### Staff read grants
 
@@ -1302,6 +1459,32 @@ per-identity handouts stop too:
   relaygate reserves that prefix at `/v1/register`, so a desktop-enrolled name
   never collides with one. Only new registrations get it: identities that
   already exist keep their stored names and are not renamed.
+- Desktop identities
+  (`PUT /api/v1/workspaces/{id}/messaging/desktop-identities`) carry the
+  `rg_` token relaygate issued at enrolment and relaygate's own agent id as
+  `agent_id`. Relaycast does not accept that token, so Control verifies each
+  identity with relaygate instead, at sync and again on every MCP call:
+  relaygate's `GET /v1/whoami` must answer with the same `agent_id` and
+  `name` (and, once relaygate reports `user_id`, the syncing user, else the
+  identity is skipped `not_owned`). whoami is the proof. The upstream
+  Relaycast agent card of that name, read with the workspace key, is
+  advisory: relaygate stamps `metadata.relaygate.agent_id` only when it first
+  registers the upstream agent (a takeover or a metadata update can leave it
+  missing), so the field is compared only when present, and only a
+  different id there skips the identity `unverified`; a missing card or
+  field does not. `metadata.source` and `owner_hash` are not required, and
+  the address is stored as the desktop sent it. Each skipped identity logs
+  `[selfhost-api] desktop identity skipped` with `workspace_id`, `user_id`,
+  `source_id` (sync only), `agent_name`, `agent_id`, `reason`, `check` (the
+  failed check, for example `whoami_refused:401`, `whoami_agent_id`,
+  `whoami_name`, `whoami_user_id` or `card_relaygate_agent_id`) and, for a
+  refused token, the upstream HTTP `status`; never the token or the whoami
+  body. The sync response itself is unchanged (`{agent_id, reason}`). The stored
+  `agent_remote_id` is relaygate's agent id. MCP messaging as a desktop
+  identity (DMs, channels, conversation reads) goes through relaygate with
+  that token. Routes relaygate does not proxy answer an error there:
+  `get_relay_message_status` reports delivery confirmation as unavailable
+  because relaygate does not proxy `/v1/messages/{id}/deliveries`.
 
 Unset, nothing changes.
 

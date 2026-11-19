@@ -66,6 +66,9 @@ export type RosterAgent = RemoteAgent & {
   lastSeen: string | null;
 };
 
+/** The engine's workspace leaders setting: patterns plus the registered agents they match. */
+export type WorkspaceLeaders = { leaders: Array<{ name: string; agentId: string }>; patterns: string[] };
+
 export type PresenceRow = { agentId: string | null; agentName: string | null; status: string | null };
 
 export type RegisteredHuman = {
@@ -109,6 +112,9 @@ export type RelaySpawnInvocation = {
   id: string;
   status: string;
   callerId: string | null;
+  /** The verified desktop identity that asked for the launch, echoed by Relaycast beside the caller. */
+  requesterAgentId: string | null;
+  requesterName: string | null;
   nodeId: string | null;
   name: string | null;
   spawned: boolean;
@@ -126,6 +132,8 @@ export function isRelayHarnessCapability(capability: string): boolean {
   return capability.startsWith("spawn:") && RELAY_HARNESS_ID_PATTERN.test(capability.slice("spawn:".length));
 }
 
+/** Most names per bounded `GET /v1/agents?names=` call; mirrors the Relaycast engine limit. */
+const AGENT_NAME_LOOKUP_MAX = 100;
 const INVOCATION_STATUSES = new Set(["pending", "dispatched", "running", "completed", "failed"]);
 
 type FetchImpl = typeof fetch;
@@ -257,6 +265,27 @@ export function createRelaycastClient(input: {
     };
   }
 
+  /** Bounded name lookup behind findAgentsByNames and findAgentByName. */
+  async function agentsByNames(workspaceKey: string, names: string[]): Promise<RosterAgent[]> {
+    const wanted = [...new Set(names.map(name => name.trim()).filter(Boolean))];
+    const found: RosterAgent[] = [];
+    for (let start = 0; start < wanted.length; start += AGENT_NAME_LOOKUP_MAX) {
+      const chunk = wanted.slice(start, start + AGENT_NAME_LOOKUP_MAX);
+      const query = new URLSearchParams();
+      for (const name of chunk) query.append("names", name);
+      const data = await labeled("find_agents", () => call("GET", `/v1/agents?${query}`, workspaceKey));
+      if (!Array.isArray(data)) throw new RelaycastCallError(200, "", true);
+      const requested = new Set(chunk);
+      for (const item of data) {
+        const agent = rosterFrom(item);
+        // An engine without the `names` filter returns its roster; exact-name
+        // filtering keeps the result bounded and correct.
+        if (agent && requested.has(agent.name)) found.push(agent);
+      }
+    }
+    return found;
+  }
+
   function agentFrom(value: unknown): RemoteAgent {
     const data = record(value);
     const id = text(data?.id);
@@ -276,6 +305,7 @@ export function createRelaycastClient(input: {
     const warning = output?.warning;
     return {
       id, status, callerId: text(data?.caller_id),
+      requesterAgentId: text(data?.requester_agent_id), requesterName: text(data?.requester_name),
       nodeId: text(data?.dispatched_node_id) ?? text(data?.handler_node_id),
       name: text(output?.name), spawned: output?.spawned === true, ready: output?.ready === true,
       taskUnconfirmed: warning === "spawn_task_unconfirmed" || record(warning)?.code === "spawn_task_unconfirmed",
@@ -283,6 +313,24 @@ export function createRelaycastClient(input: {
       errorCode: error ? (/^([a-z_]{1,64})(?::|$)/.exec(error)?.[1] ?? "spawn_failed") : null,
       errorDetailsCode: text(details?.code),
     };
+  }
+
+  function leadersFrom(value: unknown): WorkspaceLeaders {
+    const data = record(value);
+    // Not a document at all is a broken answer; missing lists are just unset.
+    if (!data) throw new RelaycastCallError(200, "", true);
+    const rawLeaders: unknown = data.leaders;
+    const rawPatterns: unknown = data.patterns;
+    const leaders = Array.isArray(rawLeaders) ? rawLeaders.flatMap((item: unknown) => {
+      const leader = record(item);
+      const name = text(leader?.name);
+      const agentId = text(leader?.agent_id);
+      return name && agentId ? [{ name, agentId }] : [];
+    }) : [];
+    const patterns = Array.isArray(rawPatterns)
+      ? rawPatterns.filter((item: unknown): item is string => typeof item === "string" && item.length > 0)
+      : [];
+    return { leaders, patterns };
   }
 
   return {
@@ -436,6 +484,31 @@ export function createRelaycastClient(input: {
       });
     },
 
+    /**
+     * Roster rows for the given agent names only, via the engine's bounded
+     * `GET /v1/agents?names=` lookup (one repeated `names` param per name, at
+     * most AGENT_NAME_LOOKUP_MAX per call). The engine answers with matching
+     * rows whatever their status or age, excluding released agents. An engine
+     * without the `names` filter returns its roster instead; exact-name
+     * filtering keeps the result bounded and correct there too. Errors are not
+     * retried with a full-roster read.
+     */
+    async findAgentsByNames(workspaceKey: string, names: string[]): Promise<RosterAgent[]> {
+      return agentsByNames(workspaceKey, names);
+    },
+
+    /**
+     * One agent by exact name through the bounded `names` lookup, or null.
+     * Several rows with that name is a broken answer and fails closed.
+     */
+    async findAgentByName(workspaceKey: string, name: string): Promise<RosterAgent | null> {
+      const wanted = name.trim();
+      if (!wanted) return null;
+      const rows = (await agentsByNames(workspaceKey, [wanted])).filter(agent => agent.name === wanted);
+      if (rows.length > 1) throw new RelaycastCallError(502, "", true);
+      return rows[0] ?? null;
+    },
+
     /** One agent by name with roster fields (address, status), or null. */
     async getRosterAgent(workspaceKey: string, name: string): Promise<RosterAgent | null> {
       const data = await labeled("get_agent", () =>
@@ -538,6 +611,20 @@ export function createRelaycastClient(input: {
     async deleteSubscription(workspaceKey: string, id: string): Promise<void> {
       await labeled("delete_subscription", () =>
         call("DELETE", `/v1/subscriptions/${encodeURIComponent(id)}`, workspaceKey, undefined, undefined, true));
+    },
+
+    /**
+     * relaygate only (a client bound to relaygate's origin): the agent an rg_
+     * token controls, from GET /v1/whoami. The body is not wrapped in
+     * { ok, data }. userId is the Control user that enrolled the agent when
+     * relaygate reports one, otherwise null.
+     */
+    async whoami(token: string, signal?: AbortSignal): Promise<{ agentId: string; name: string; userId: string | null }> {
+      const data = record(await labeled("whoami", () => call("GET", "/v1/whoami", token, undefined, undefined, false, signal)));
+      const agentId = text(data?.agent_id);
+      const name = text(data?.name);
+      if (!agentId || !name) throw new RelaycastCallError(502, "", true);
+      return { agentId, name, userId: text(data?.user_id) };
     },
 
     /** The agent a token controls, with its channel memberships. */
@@ -739,11 +826,16 @@ export function createRelaycastClient(input: {
       });
     },
 
-    /** Sends one native spawn as the hosted actor (agent token); never retried. */
+    /**
+     * Sends one native spawn as the hosted actor (agent token); never retried. The optional
+     * requester (sent beside `input`, not inside it) is the verified desktop chat behind the
+     * launch: Relaycast echoes it next to the caller and the node treats its DMs as native input.
+     */
     async spawnRelayAgent(token: string, input: { name: string; cli: string; task: string; target_node: string; worker_cwd?: string },
-      idempotencyKey: string): Promise<RelaySpawnInvocation> {
+      idempotencyKey: string, requester?: { agentId: string; name: string }): Promise<RelaySpawnInvocation> {
       const data = await labeled("spawn_agent", () => call("POST", "/v1/actions/spawn/invoke", token,
-        { input: { ...input, verify_ready: true } }, idempotencyKey));
+        { input: { ...input, verify_ready: true },
+          ...(requester ? { requester_agent_id: requester.agentId, requester_name: requester.name } : {}) }, idempotencyKey));
       return invocationFrom(data, true);
     },
 
@@ -772,6 +864,16 @@ export function createRelaycastClient(input: {
       const agent = rosterFrom(data);
       if (!agent) throw new RelaycastCallError(502, "", true);
       return { ...agent, originNodeId: text(record(data)?.origin_node_id) };
+    },
+
+    /** The workspace leaders setting (workspace key); never 404, empty lists when unset. */
+    async getWorkspaceLeaders(workspaceKey: string): Promise<WorkspaceLeaders> {
+      return leadersFrom(await labeled("get_workspace_leaders", () => call("GET", "/v1/workspace/leaders", workspaceKey)));
+    },
+
+    /** Replaces the workspace leaders patterns (workspace key); `[]` clears. */
+    async setWorkspaceLeaders(workspaceKey: string, patterns: string[]): Promise<WorkspaceLeaders> {
+      return leadersFrom(await labeled("set_workspace_leaders", () => call("PUT", "/v1/workspace/leaders", workspaceKey, { patterns })));
     },
 
     /** Fresh presence from expiring broker keys, independent of roster status. */

@@ -99,6 +99,48 @@ test("a signed Claude call joins and sends as the verified desktop identity; the
   assert.equal(as.body.result.isError, true, "managed calls cannot choose another actor");
 });
 
+test("a sync without attestation_key keeps the registered key; null removes it; a new key replaces it", async (t) => {
+  const { env, parent, signer, sourceId, identity, call } = await claudeDesktop(t);
+  const keys = async () => (await env.database.query<{ kid: string }>("SELECT kid FROM desktop_attestation_keys")).rows;
+  const sync = (body: Record<string, unknown>) => request(env.origin, identitiesPath(env.workspaceId), {
+    method: "PUT", token: parent.accessToken, body: { source_id: sourceId, identities: [identity], ...body },
+  });
+  // The Desktop syncs its chats on launch before its key slot is loaded: the
+  // key registered earlier must survive, and signed calls keep verifying.
+  const keyless = await sync({});
+  assert.equal(keyless.status, 200, keyless.raw);
+  assert.deepEqual(await keys(), [{ kid: signer.kid }]);
+  const status = await rpc(env.origin, parent.accessToken, await call("relay_status", {}));
+  assert.equal(status.status, 200, JSON.stringify(status.body));
+  assert.notEqual(status.body.result.isError, true, JSON.stringify(status.body.result));
+  assert.equal((await sync({})).status, 200);
+  assert.deepEqual(await keys(), [{ kid: signer.kid }]);
+
+  const rotated = await claudeSigner();
+  const replaced = await sync({ attestation_key: { kid: rotated.kid, alg: "Ed25519", public_key: rotated.publicKey } });
+  assert.equal(replaced.status, 200, replaced.raw);
+  assert.deepEqual(await keys(), [{ kid: rotated.kid }]);
+  const oldKey = await rpc(env.origin, parent.accessToken, await call("relay_status", {}));
+  assert.equal(oldKey.status, 400, "the replaced key no longer verifies");
+  const newKey = await rpc(env.origin, parent.accessToken, await call("relay_status", {}, { signWith: rotated, kid: rotated.kid }));
+  assert.equal(newKey.status, 200, JSON.stringify(newKey.body));
+
+  const removed = await sync({ attestation_key: null });
+  assert.equal(removed.status, 200, removed.raw);
+  assert.deepEqual(await keys(), []);
+  const unverifiable = await rpc(env.origin, parent.accessToken, await call("relay_status", {}, { signWith: rotated, kid: rotated.kid }));
+  assert.equal(unverifiable.status, 400, "no key is registered any more");
+
+  // An empty identity list still clears the source, key included.
+  assert.equal((await sync({ attestation_key: { kid: rotated.kid, alg: "Ed25519", public_key: rotated.publicKey } })).status, 200);
+  assert.deepEqual(await keys(), [{ kid: rotated.kid }]);
+  const cleared = await request(env.origin, identitiesPath(env.workspaceId), {
+    method: "PUT", token: parent.accessToken, body: { source_id: sourceId, identities: [] },
+  });
+  assert.equal(cleared.status, 200, cleared.raw);
+  assert.deepEqual(await keys(), []);
+});
+
 test("a desktop Claude call without a proof fails closed, with no hosted fallback", async (t) => {
   const { env, parent } = await claudeDesktop(t);
   const before = env.world.bodies.length;

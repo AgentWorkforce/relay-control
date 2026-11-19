@@ -41,20 +41,30 @@ makes no per-session detail calls.
 ## Read one summary
 
 `get_session_summary { session_id, source?, kind?: "short" | "long" }`
-reads `GET /v1/sessions/:id/summary?kind=short&source=...`. Pass the source
+reads `GET /v1/sessions/:id/summary?kind=short|long&source=...` for exactly the
+requested kind (`short` by default). Pass the source
 returned by the list to disambiguate session IDs. The summary reader requires
 that source; omitted source is refused locally with guidance to pass it,
 without guessing a harness. A ready result retains its recorded
 model, build timestamp and state classification. An empty recorded result
-stays empty. Malformed or missing provenance is refused.
+stays empty and retains its requested kind. Missing or malformed recorded
+model/time metadata is refused; the consumer never invents a model or summary.
+Recorded text is bounded to 320 Unicode code points for `short` and 16000 for
+`long`. Oversized or wrong-kind responses are refused, never truncated or
+replaced by a different kind or a transcript.
 
-Only recorded short summaries are currently supported. `kind: "long"`
-returns an explicit unsupported result without fetching a short summary or
-transcript as a substitute. Use `get_shared_session` for a bounded transcript
-page until the reader provides a long-summary contract.
+Readers may add an outer `provenance` object with `source`
+(`session_brief` or `session_summary`), `kind`, `generatedAt`, nullable integer
+`revision` and boolean `truncated`. The tool validates and returns it only
+when it describes a ready summary of the same kind. Omitted or null provenance
+remains valid for older Reader envelopes; malformed provenance is refused.
+It never adds fields inside the recorded `summary` object. The separate
+dashboard HTTP summary route remains short-only.
 
-Hosted readers that have no summary dependency configured return 501; the
-consumer does not enable reader wiring or summary producers. An installed
+The selected Reader must support the requested kind. Readers without long
+support can return 501, which remains unsupported; the tool never retries as
+short or switches readers. Hosted readers that have no summary dependency
+configured return 501; the consumer does not enable reader wiring or summary producers. An installed
 reader may return `status: "empty"` when no summary has been produced. These
 are distinct from a ready recorded summary and from consumer test success.
 

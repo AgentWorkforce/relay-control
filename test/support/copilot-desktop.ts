@@ -28,7 +28,12 @@ function relaycastFetch(roster: unknown[], world: RelaycastWorld): typeof fetch 
     const json = (status: number, body: unknown) => new Response(JSON.stringify(body), {
       status, headers: { "content-type": "application/json" },
     });
-    if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") return json(200, { ok: true, data: roster });
+    if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") {
+      // The engine's bounded `names` lookup answers only the requested names.
+      const names = url.searchParams.getAll("names");
+      return json(200, { ok: true, data: names.length
+        ? roster.filter(row => names.includes((row as { name?: string }).name ?? "")) : roster });
+    }
     if (url.pathname === "/v1/agents/presence") return json(200, { ok: true, data: [] });
     const body = typeof init?.body === "string" && init.body ? JSON.parse(init.body) as Record<string, any> : null;
     const handled = await world.handle(init?.method ?? "GET", url.pathname, url.searchParams,
@@ -37,7 +42,11 @@ function relaycastFetch(roster: unknown[], world: RelaycastWorld): typeof fetch 
   }) as typeof fetch;
 }
 
-export async function copilotDesktopSetup(t: TestContext, modules: Pick<Parameters<typeof createApp>[0], "capy"> = {}) {
+/** A gate-only install: relaygate's public URL, and a fetch that serves it in front of the Relaycast world. */
+export type DesktopGate = { url: string; fetch: (relaycast: typeof fetch, world: RelaycastWorld) => typeof fetch };
+
+export async function copilotDesktopSetup(t: TestContext,
+  modules: Pick<Parameters<typeof createApp>[0], "capy" | "features"> = {}, gate?: DesktopGate) {
   const database = new PGliteDatabase();
   await migrate(database);
   const roster: unknown[] = [];
@@ -59,9 +68,11 @@ export async function copilotDesktopSetup(t: TestContext, modules: Pick<Paramete
     dashboardUrl: `${origin}/`,
     port: 0,
     host: "127.0.0.1",
+    ...(gate ? { relaygatePublicUrl: gate.url } : {}),
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
-  control.on("request", createApp({ config, store, messagingFetch: relaycastFetch(roster, world), ...modules }));
+  const messagingFetch = gate ? gate.fetch(relaycastFetch(roster, world), world) : relaycastFetch(roster, world);
+  control.on("request", createApp({ config, store, messagingFetch, ...modules }));
   t.after(async () => {
     await close(control);
     await database.close();

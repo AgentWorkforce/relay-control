@@ -20,7 +20,9 @@ export class EventsShimWakeSweeper {
     intervalMs?: number;
     /** Longest stop() waits for a running sweep. */
     stopGraceMs?: number;
-    log?: (event: { code: "events_shim_wake_sweep_failed" }) => void;
+    /** After each sweep: release the relay identities of deleted inboxes' agent links (agent-link.ts). */
+    releaseOrphans?: () => Promise<unknown>;
+    log?: (event: { code: "events_shim_wake_sweep_failed" | "events_shim_link_release_failed" }) => void;
   }) {}
 
   tick(): Promise<void> {
@@ -39,6 +41,12 @@ export class EventsShimWakeSweeper {
       });
     } catch {
       this.deps.log?.({ code: "events_shim_wake_sweep_failed" });
+    }
+    if (!this.deps.releaseOrphans) return;
+    try {
+      await this.deps.releaseOrphans();
+    } catch {
+      this.deps.log?.({ code: "events_shim_link_release_failed" });
     }
   }
 

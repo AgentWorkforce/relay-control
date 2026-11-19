@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAmpTools } from "../amp/mcp-tools.js";
 import { registerReplicasTools } from "../replicas/mcp-tools.js";
+import { registerWebhookInboxTools } from "../events-shim/agent-link-tools.js";
 import { registerFactoryTools } from "../factory/mcp-tools.js";
 import { registerCapyPermitTools } from "../capy/mcp-permits.js";
 import { SELFHOST_API_VERSION } from "../config.js";
@@ -16,6 +17,7 @@ import { registerRelaySpawnTools } from "./relay-spawn.js";
 import { DESKTOP_CHAT_RELAY_GUIDANCE, RELAY_COORDINATION_GUIDANCE } from "./relay-participants.js";
 import { registerSharedSessionReads } from "./shared-session-reads.js";
 import { registerTeamActivity } from "./team-activity.js";
+import { registerRelayfactsTools } from "./relayfacts.js";
 import { registerCustomerSupportTool } from "./customer-support.js";
 import { registerGrokRoutineTools } from "./grok-routine-tools.js";
 import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
@@ -69,12 +71,14 @@ export function buildMcpServer(context: McpContext): McpServer {
   const amp = context.amp;
   const factory = context.factory;
   const replicas = context.replicas;
+  const webhookInbox = context.webhookInbox;
   const launch = Boolean(context.launch);
   const capyPermits = Boolean(context.oauth && context.capyPermits);
-  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines),
+  registerToolPlan(planToolGroups({ amp: Boolean(amp), factory: Boolean(factory), replicas: Boolean(replicas), webhookInbox: Boolean(webhookInbox), launch,capyPermits, grokRoutines: Boolean(context.grokRoutines),
     staffReadGrant: context.authMode === "staff_read_grant" }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),
     team_activity: () => registerTeamActivity(server, context),
+    relayfacts: () => registerRelayfactsTools(server, context),
     relay_messaging: () => registerRelayMessaging(server, context),
     customer_support: () => registerCustomerSupportTool(server, context),
     capability_discovery: () => registerCapabilityDiscovery(server, context),
@@ -83,6 +87,7 @@ export function buildMcpServer(context: McpContext): McpServer {
     ...(amp ? { amp: () => registerAmpTools(server, context, amp) } : {}),
     ...(factory ? { factory: () => registerFactoryTools(server, context, factory) } : {}),
     ...(replicas ? { replicas: () => registerReplicasTools(server, context, replicas) } : {}),
+    ...(webhookInbox ? { webhook_inbox: () => registerWebhookInboxTools(server, context, webhookInbox) } : {}),
     ...(capyPermits ? { capy_binding: () => registerCapyPermitTools(server,context) } : {}),
   });
   return server;

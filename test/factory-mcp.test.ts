@@ -171,6 +171,8 @@ test("send and read accept as=<own bound factory agent>; inbox, leave and channe
   const read: string[] = [];
   const client = {
     listAgents: async () => [peer],
+    findAgentsByNames: async (_key: string, names: string[]) => [peer].filter(agent => names.includes(agent.name)),
+    findAgentByName: async (_key: string, name: string) => name === peer.name ? peer : null,
     getRosterAgent: async () => peer,
     heartbeat: async () => undefined,
     sendDirectMessage: async (input: { token: string; to: string; text: string }) => {
