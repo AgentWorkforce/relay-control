@@ -44,7 +44,64 @@ function cursorIssuer() {
   return { jwks, mint };
 }
 
-async function fixture(t: test.TestContext, options: { redirect?: string; cursorCloud?: Partial<CursorCloudConfig> } = {}) {
+const GATE = "https://gate.example.test";
+const INTROSPECT_SECRET = "cursor-gate-introspection-secret-".repeat(2);
+
+/**
+ * A fake relaygate in front of the Relaycast world (as in
+ * gate-only-hosted-participants.test.ts): POST /v1/register introspects the
+ * hosted credential with Control's real endpoint; rg_ tokens act as their
+ * upstream agent; self-administration and directory reads use the workspace
+ * key, as relaygate does.
+ */
+function fakeRelaygate(relaycast: typeof fetch, world: ReturnType<typeof createRelaycastWorld>, control: () => string) {
+  const tokens = new Map<string, string>(), agents = new Map<string, { agentId: string; userId: string }>();
+  const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  const upstream = (path: string, token: string, init: RequestInit) =>
+    relaycast(`http://example-relay.test${path}`, { ...init, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" } });
+  return (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new globalThis.URL(String(input instanceof Request ? input.url : input));
+    if (url.origin !== GATE) return relaycast(input, init);
+    const method = init?.method ?? "GET";
+    const bearer = (new Headers(init?.headers).get("authorization") ?? "").replace(/^Bearer /, "");
+    if (method === "POST" && url.pathname === "/v1/register") {
+      const answer = await (await fetch(`${control()}/internal/v1/auth/introspect`, { method: "POST",
+        headers: { authorization: `Bearer ${INTROSPECT_SECRET}`, "content-type": "application/json" },
+        body: JSON.stringify({ token: bearer, aud: "https://history.example.test" }) })).json() as Record<string, any>;
+      if (answer.active !== true || answer.principal_type !== "relay_hosted") return json(401, { error: "relaygate_unauthenticated" });
+      const { name } = JSON.parse(String(init!.body)) as { name: string };
+      let agent = agents.get(name);
+      if (agent && agent.userId !== answer.sub) return json(409, { error: "relaygate_name_taken" });
+      if (!agent) { agent = { agentId: `rga_${randomUUID()}`, userId: answer.sub }; agents.set(name, agent); }
+      const existing = world.agents.get(name);
+      if (existing) existing.metadata = { ...existing.metadata, relaygate: { agent_id: agent.agentId } };
+      else world.addAgent(name, { relaygate: { agent_id: agent.agentId } });
+      for (const [token, owner] of tokens) if (owner === name) tokens.delete(token);
+      const token = `rg_${randomUUID()}`;
+      tokens.set(token, name);
+      return json(200, { agent_id: agent.agentId, gid: 55, token, user_id: answer.sub });
+    }
+    const name = tokens.get(bearer);
+    if (!name) return json(401, { error: "relaygate_unauthenticated" });
+    if (method === "GET" && url.pathname === "/v1/whoami") return json(200, { agent_id: agents.get(name)!.agentId, name, user_id: agents.get(name)!.userId });
+    if (method === "PATCH" && url.pathname === "/v1/agent") return upstream(`/v1/agents/${encodeURIComponent(name)}`, "rk_example", { method: "PATCH", body: init!.body });
+    if (method === "DELETE" && url.pathname === "/v1/agent") {
+      const own = world.agents.get(name);
+      for (const [token, owner] of tokens) if (owner === name) tokens.delete(token);
+      if (!own) return json(404, { ok: false, error: { code: "agent_not_found" } });
+      return upstream("/v1/agents/release-exact", "rk_example", { method: "POST",
+        body: JSON.stringify({ name, expected_agent_id: own.id, delete_agent: true }) });
+    }
+    if (method === "GET" && (url.pathname.startsWith("/v1/agents") || url.pathname.startsWith("/v1/channels"))) {
+      return upstream(`${url.pathname}${url.search}`, "rk_example", { method });
+    }
+    const own = world.agents.get(name);
+    if (!own) return json(401, { error: "relaygate_unauthenticated" });
+    return upstream(`${url.pathname}${url.search}`, own.token, { method, ...(init?.body ? { body: init.body } : {}) });
+  }) as typeof fetch;
+}
+
+async function fixture(t: test.TestContext, options: { redirect?: string; cursorCloud?: Partial<CursorCloudConfig>; gate?: boolean } = {}) {
   const database = new PGliteDatabase(); t.after(() => database.close()); await migrate(database);
   const owner = { userId: randomUUID(), organizationId: randomUUID(), workspaceId: randomUUID(), grantId: randomUUID(), tokenFamilyId: randomUUID() };
   const clientId = "mcpc_" + randomUUID();
@@ -93,12 +150,17 @@ async function fixture(t: test.TestContext, options: { redirect?: string; cursor
     internalServiceToken: null, bootstrapToken: "example-bootstrap-token-at-least-thirty-two-bytes", encryptionKeyring: KEYRING,
     oauthRedirectUrl: ORIGIN + "/unused", host: "127.0.0.1", port: 3000,
     mcpOAuth: { enabled: true, unavailable: null, eventsEnabled: false, pumpEnabled: false, oidc: null },
-    cursorCloud: { ...loadCursorCloudConfig({}), ...options.cursorCloud } };
+    cursorCloud: { ...loadCursorCloudConfig({}), ...options.cursorCloud },
+    ...(options.gate ? { relaygatePublicUrl: GATE, introspectSecret: INTROSPECT_SECRET } : {}) };
   const store = new ControlPlaneStore(database, KEYRING, 0, { tenancy: "multi" });
   const browser = await database.transaction(tx => store.issueBrowserSession(tx, { ...owner, label: "cursor-test" }));
-  const teardown = new McpOAuthTeardown({ database, keyring: KEYRING, client: createRelaycastClient({ internalOrigin: "http://example-relay.test", fetchImpl: relayFetch }) });
-  const server = createServer(createApp({ config, store, messagingFetch: relayFetch, cursorJwks: issuer.jwks, mcpOAuthTeardown: teardown }));
-  const base = await listen(server); t.after(() => close(server));
+  let base = "";
+  const messagingFetch = options.gate ? fakeRelaygate(relayFetch, world, () => base) : relayFetch;
+  const teardown = new McpOAuthTeardown({ database, keyring: KEYRING,
+    client: createRelaycastClient({ internalOrigin: "http://example-relay.test", fetchImpl: relayFetch }),
+    ...(options.gate ? { gate: createRelaycastClient({ internalOrigin: GATE, fetchImpl: messagingFetch }) } : {}) });
+  const server = createServer(createApp({ config, store, messagingFetch, cursorJwks: issuer.jwks, mcpOAuthTeardown: teardown }));
+  base = await listen(server); t.after(() => close(server));
   const connect = async (accessToken: string) => {
     const client = new Client({ name: "cursor-cloud-test", version: "1" });
     await client.connect(new StreamableHTTPClientTransport(new globalThis.URL(base + "/mcp"), { requestInit: { headers: { authorization: `Bearer ${accessToken}` } } }));
@@ -307,8 +369,8 @@ test("required run identity: leaving a run twice is idempotent, and Grok routine
   assert.match(f.failed(await f.call("connect_grok_bot_routine", { mode: "webhook" })), /SELFHOST_CURSOR_CLOUD_RUN_IDENTITY=optional/);
 });
 
-test("a run cannot be rejoined while its release is in flight", async t => {
-  const f = await fixture(t, { cursorCloud: { trustedTeams: ["77"] } });
+for (const gate of [false, true]) test(`a run cannot be rejoined while its release is in flight${gate ? " (gate-only install)" : ""}`, async t => {
+  const f = await fixture(t, { cursorCloud: { trustedTeams: ["77"] }, gate });
   const name = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) })).name as string;
   const second = await f.grant();
   const call2 = await f.connect(second.pair.accessToken);
@@ -324,5 +386,11 @@ test("a run cannot be rejoined while its release is in flight", async t => {
   assert.equal(f.world.agents.has(name), false);
   assert.deepEqual((await f.database.query("SELECT agent_name FROM cursor_cloud_runs")).rows, []);
   assert.deepEqual((await f.database.query("SELECT agent_name FROM hosted_relay_participants")).rows, []);
-  assert.equal(f.ok(await call2("join_relay", { cursor_identity_token: f.issuer.mint(await nonce2()) })).name, name);
+  const rejoined = f.ok(await call2("join_relay", { cursor_identity_token: f.issuer.mint(await nonce2()) }));
+  assert.equal(rejoined.name, name);
+  if (gate) {
+    // Through relaygate: the participant holds only an rg_ token.
+    const row = (await f.database.query<{ relaygate_agent_id: string | null }>("SELECT relaygate_agent_id FROM hosted_relay_participants")).rows[0]!;
+    assert.ok(row.relaygate_agent_id);
+  }
 });
