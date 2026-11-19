@@ -82,17 +82,22 @@ own with a pit ceiling, and grant only what they need:
 "groups": [..., {"gid": 55, "name": "cursor-cloud"}],
 "controlPrincipals": [{"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["cursor-cloud"], "as": ["agent"]}, "gid": 55, "namePrefix": "cursor-cloud-"}, ...],
 "streamDefaults": [
-  {"prefix": "relaycast:inbox/cursor-cloud-", "gid": 55, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]},
   {"prefix": "relaycast:inbox/local-", "gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}, {"gid": 55, "perm": "w"}]},
   ...
+],
+"inboxDefaults": [
+  {"gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}, {"gid": 55, "perm": "w"}]},
+  {"gid": 55, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]}
 ],
 "ceilings": [..., {"gid": 55, "never": [22]}],
 "reservedNamePrefixes": ["cursor-cloud-"]
 ```
 
-`relaygate-explain` against `examples/policy.pit.json` with these entries gives:
+The `inboxDefaults` entries cover inboxes no prefix default names, such as a
+run's own inbox and local agents a desktop enrols under their own names.
+With `examples/policy.pit.json` and these entries, relaygate gives:
 
-- allowed: a run writing a local inbox, and local writing a run's inbox;
+- allowed: a run writing a local agent's inbox (desktop-enrolled or `local-…`), and local writing a run's inbox;
 - refused: a run reading a local inbox, a local channel, any pit stream or
   `slack:`.
 
