@@ -4,7 +4,9 @@ import {
   CapturePolicyError,
   parseCaptureSettings,
   projectSettings,
+  sharingModeOverridden,
   type CaptureSettings,
+  type SharingDeployment,
 } from "./capture-policy.js";
 
 /**
@@ -12,7 +14,9 @@ import {
  * served to Agent Relay Desktop beside the capture policy. Each section has
  * two tiers: `locked` values the person cannot change, `defaults` initial
  * values the person may change. An absent key leaves the client's own
- * behaviour unchanged. Nothing is ever defaulted here.
+ * behaviour unchanged. Nothing is defaulted in storage; the one served default
+ * is the deployment sharing mode (SELFHOST_DEFAULT_SHARING_MODE), applied per
+ * caller by workspacePolicyForCaller and only when configured.
  *
  * Storage is the organization's capture_policies row (migration 0072): the
  * capture section is the existing `settings` (lock-only), the other sections
@@ -24,8 +28,15 @@ import {
 export type PolicyValue = boolean | number | string | string[];
 export type PolicyTier = Record<string, PolicyValue>;
 export type PolicySection = { locked: PolicyTier; defaults: PolicyTier };
-/** Capture keys are always locked; `defaults` is always empty. */
-export type CaptureSection = { locked: CaptureSettings; defaults: Record<string, never> };
+/**
+ * Capture keys are always locked as stored and written; `defaults` is empty
+ * except for `sharing_mode`, served (never accepted on write) to a caller in
+ * the deployment override roles (workspacePolicyForCaller).
+ */
+export type CaptureSection = {
+  locked: CaptureSettings;
+  defaults: { sharing_mode?: CaptureSettings["sharing_mode"] };
+};
 
 export type WorkspaceSections = {
   capture: CaptureSection;
@@ -321,6 +332,41 @@ export function workspacePolicyFromRow(
     sections: {
       capture: { locked: projectSettings(storedCapture(row?.settings)), defaults: {} },
       ...sections,
+    },
+  };
+}
+
+/**
+ * The workspace policy as served to one caller (see capturePolicyForCaller).
+ * Effective sharing mode = the stored `capture.locked.sharing_mode`, else the
+ * deployment default. An override-role caller gets it as
+ * `capture.defaults.sharing_mode` and never in `capture.locked`; every other
+ * caller gets it in `capture.locked`. The revision never moves. Returns
+ * `policy` itself when nothing applies; never mutates it.
+ */
+export function workspacePolicyForCaller(
+  policy: WorkspacePolicy,
+  role: string | null | undefined,
+  deployment: SharingDeployment,
+): WorkspacePolicy {
+  const capture = policy.sections.capture;
+  const stored = capture.locked.sharing_mode;
+  if (sharingModeOverridden(role, deployment)) {
+    const effective = stored ?? deployment.defaultSharingMode;
+    if (effective === undefined) return policy;
+    const { sharing_mode: _mode, ...locked } = capture.locked;
+    return {
+      ...policy,
+      sections: { ...policy.sections, capture: { locked, defaults: { sharing_mode: effective } } },
+    };
+  }
+  const fallback = deployment.defaultSharingMode;
+  if (stored !== undefined || fallback === undefined) return policy;
+  return {
+    ...policy,
+    sections: {
+      ...policy.sections,
+      capture: { locked: { sharing_mode: fallback, ...capture.locked }, defaults: capture.defaults },
     },
   };
 }

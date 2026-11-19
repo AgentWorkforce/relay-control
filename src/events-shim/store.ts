@@ -41,14 +41,45 @@ type EventRow = {
   headers: Record<string, string> | string | null;
   delivery: string;
   delivered_at: Date | string | null;
+  claim_token: string | null;
   wake_error: string | null;
 };
 
 const SHIM_COLUMNS = `id, hook_token_ciphertext, secrets_ciphertext, wake_url, wake_secret_ciphertext,
   wake_linked_at, wake_broken_at, wake_broken_reason, created_at, last_used_at, agent_seen_at`;
 const EVENT_COLUMNS = `id, shim_id, seq, received_at, mode, event_type, idempotency_key, content_type,
-  body, headers, delivery, delivered_at, wake_error`;
+  body, headers, delivery, delivered_at, claim_token, wake_error`;
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Posts not yet handed over (`alias.`-qualified): `pending` or `sending` with
+ * no claim, or a claim (`delivered_at`) older than `$<staleBefore>`. A newer
+ * claim is a lease: a relay wake forward in flight (`sending`) or a
+ * `wait_for_webhook` lease (`pending`, `claim_token`). Mirrors the package's
+ * `MemoryEventsShimStore`.
+ */
+function claimable(alias: string, staleBefore: string): string {
+  return `(${alias}delivery IN ('pending', 'sending')
+    AND (${alias}delivered_at IS NULL OR ${alias}delivered_at < ${staleBefore}::timestamptz))`;
+}
+
+/** Event ids are uuids; anything else (client-supplied `ack_ids`) matches no post, as in the memory store. */
+const EVENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** `ids` that can name a post, or none when there is no token to match. */
+function leaseIds(ids: string[], claimToken: string): string[] {
+  return claimToken ? [...new Set(ids.filter((id) => EVENT_ID.test(id)))] : [];
+}
+
+/**
+ * The posts in `$2` (uuid[]) of shim `$1` still leased to `$3` by a
+ * `wait_for_webhook` claim: `pending` with a claim time, whose stored token
+ * matches (or, for a lease stored without one, whose claim time does, as its
+ * millisecond ISO string). Unclaimed posts and relay wake forwards
+ * (`sending`) never match, so confirmWake/releaseWake still settle theirs.
+ */
+const LEASED_TO = `shim_id = $1 AND id = ANY($2::uuid[]) AND delivery = 'pending' AND delivered_at IS NOT NULL
+  AND coalesce(claim_token, to_char(delivered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')) = $3`;
 
 function iso(value: Date | string): string {
   return (value instanceof Date ? value : new Date(value)).toISOString();
@@ -62,7 +93,10 @@ function isoOrUndefined(value: Date | string | null): string | undefined {
  * `EventsShimStore` on the control-plane database (migration 0047). Token
  * lookups use sha256 hashes; the hook token, signing secrets and the wake
  * bearer are kept with the encryption keyring. `creator` names the
- * signed-in person a new inbox belongs to (deleted with them).
+ * signed-in person a new inbox belongs to (deleted with them). It implements
+ * the optional `ackPending`/`releasePending`, so `wait_for_webhook` with
+ * `auto_ack: false` leases posts (`claim_token`, migration 0078) instead of
+ * marking them read.
  */
 export class PostgresEventsShimStore implements EventsShimStore {
   constructor(
@@ -320,7 +354,7 @@ export class PostgresEventsShimStore implements EventsShimStore {
           AND EXISTS (
             SELECT 1 FROM events_shim_events e
              WHERE e.shim_id = s.id
-               AND (e.delivery = 'pending' OR (e.delivery = 'sending' AND e.delivered_at < $1))
+               AND ${claimable("e.", "$1")}
                AND e.received_at < $2)
           AND (s.user_id IS NULL OR EXISTS (
             SELECT 1 FROM workspaces w
@@ -338,7 +372,7 @@ export class PostgresEventsShimStore implements EventsShimStore {
     const result = await this.database.query<{ n: number }>(
       `SELECT count(*)::int AS n FROM events_shim_events
         WHERE shim_id = $1
-          AND (delivery = 'pending' OR (delivery = 'sending' AND delivered_at < $2))`,
+          AND ${claimable("", "$2")}`,
       [shimId, staleBefore],
     );
     return result.rows[0]?.n ?? 0;
@@ -347,12 +381,15 @@ export class PostgresEventsShimStore implements EventsShimStore {
   async claimPending(
     shimId: string,
     options: { limit: number; ids?: string[]; staleBefore: string; linkedAt?: string },
-    state: "sending" | "read",
+    state: "sending" | "read" | "pending",
     at: string,
+    claimToken?: string,
   ): Promise<ShimEvent[]> {
     // One statement, the pick materialized once: rows another caller holds are
     // skipped and rows it already moved no longer match, so two callers never
-    // get the same event. Claimable: pending, or sending with an expired lease.
+    // get the same event. Claimable: pending or sending with no claim or an
+    // expired one. A 'pending' claim (wait_for_webhook, auto_ack: false) is a
+    // lease held by claimToken; any other claim clears the token.
     // With linkedAt (a wake send), nothing is claimed unless that link is still
     // current and unbroken and the creator is still in the workspace's
     // organization, checked in the same statement: a member removed after a
@@ -361,7 +398,7 @@ export class PostgresEventsShimStore implements EventsShimStore {
       `WITH picked AS MATERIALIZED (
          SELECT id FROM events_shim_events
           WHERE shim_id = $1
-            AND (delivery = 'pending' OR (delivery = 'sending' AND delivered_at < $6::timestamptz))
+            AND ${claimable("", "$6")}
             AND ($5::uuid[] IS NULL OR id = ANY($5::uuid[]))
             AND ($7::timestamptz IS NULL OR EXISTS (
               SELECT 1 FROM events_shims s
@@ -375,14 +412,45 @@ export class PostgresEventsShimStore implements EventsShimStore {
           ORDER BY seq ASC
           LIMIT $4::int
           FOR UPDATE SKIP LOCKED)
-       UPDATE events_shim_events e SET delivery = $2, delivered_at = $3, wake_error = NULL
+       UPDATE events_shim_events e SET delivery = $2, delivered_at = $3, claim_token = $8, wake_error = NULL
          FROM picked
         WHERE e.id = picked.id
-          AND (e.delivery = 'pending' OR (e.delivery = 'sending' AND e.delivered_at < $6::timestamptz))
+          AND ${claimable("e.", "$6")}
         RETURNING ${EVENT_COLUMNS.split(",").map((column) => `e.${column.trim()}`).join(", ")}`,
-      [shimId, state, at, options.limit, options.ids ?? null, options.staleBefore, options.linkedAt ?? null],
+      [
+        shimId, state, at, options.limit, options.ids ?? null, options.staleBefore, options.linkedAt ?? null,
+        claimToken || null,
+      ],
     );
     return result.rows.map(eventFrom).sort((a, b) => a.seq - b.seq);
+  }
+
+  // Optional EventsShimStore methods: with both, wait_for_webhook (auto_ack:
+  // false) leases posts instead of marking them read. Each is one statement, so
+  // a concurrent re-claim of an expired lease either commits first (new token,
+  // no match) or waits for the row lock and skips the row.
+  async ackPending(shimId: string, ids: string[], at: string, claimToken: string): Promise<string[]> {
+    const named = leaseIds(ids, claimToken);
+    if (named.length === 0) return [];
+    const result = await this.database.query<{ id: string; seq: number }>(
+      `UPDATE events_shim_events SET delivery = 'read', delivered_at = $4, claim_token = NULL
+        WHERE ${LEASED_TO}
+        RETURNING id, seq`,
+      [shimId, named, claimToken, at],
+    );
+    return result.rows.sort((a, b) => Number(a.seq) - Number(b.seq)).map((row) => row.id);
+  }
+
+  async releasePending(shimId: string, ids: string[], claimToken: string): Promise<string[]> {
+    const named = leaseIds(ids, claimToken);
+    if (named.length === 0) return [];
+    const result = await this.database.query<{ id: string; seq: number }>(
+      `UPDATE events_shim_events SET delivered_at = NULL, claim_token = NULL
+        WHERE ${LEASED_TO}
+        RETURNING id, seq`,
+      [shimId, named, claimToken],
+    );
+    return result.rows.sort((a, b) => Number(a.seq) - Number(b.seq)).map((row) => row.id);
   }
 
   // Both apply only to this sender's own claim: once its lease expires and
@@ -433,6 +501,7 @@ function eventFrom(row: EventRow): ShimEvent {
   if (row.idempotency_key) event.idempotencyKey = row.idempotency_key;
   const deliveredAt = isoOrUndefined(row.delivered_at);
   if (deliveredAt) event.deliveredAt = deliveredAt;
+  if (row.claim_token) event.claimToken = row.claim_token;
   if (row.wake_error) event.wakeError = row.wake_error;
   return event;
 }

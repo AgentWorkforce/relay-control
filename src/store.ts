@@ -193,6 +193,7 @@ export type IntrospectedToken = {
   /**
    * The organization's capture policy (docs/capture-policy.md) read in the
    * same query, so the sessions pipeline can enforce it without its own copy.
+   * Stored form: introspection projects it per caller (capturePolicyForCaller).
    */
   capturePolicy: CapturePolicy;
   /**
@@ -1881,6 +1882,8 @@ export class ControlPlaneStore {
         tokens: IssuedTokens;
         organizationId: string;
         workspaceId: string;
+        /** The key's bound user. */
+        userId: string;
         managed: boolean;
         policyRevision: number;
       }
@@ -1955,6 +1958,7 @@ export class ControlPlaneStore {
         tokens,
         organizationId: row.organization_id,
         workspaceId: row.workspace_id,
+        userId: row.user_id,
         managed: row.policy_consent === "admin",
         policyRevision,
       };

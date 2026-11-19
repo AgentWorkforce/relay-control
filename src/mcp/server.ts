@@ -17,6 +17,7 @@ import { registerRelaySpawnTools } from "./relay-spawn.js";
 import { DESKTOP_CHAT_RELAY_GUIDANCE, RELAY_COORDINATION_GUIDANCE } from "./relay-participants.js";
 import { registerSharedSessionReads } from "./shared-session-reads.js";
 import { registerTeamActivity } from "./team-activity.js";
+import { registerRelayfactsTools } from "./relayfacts.js";
 import { registerCustomerSupportTool } from "./customer-support.js";
 import { registerGrokRoutineTools } from "./grok-routine-tools.js";
 import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
@@ -77,6 +78,7 @@ export function buildMcpServer(context: McpContext): McpServer {
     staffReadGrant: context.authMode === "staff_read_grant" }), {
     shared_session_reads: () => registerSharedSessionReads(server, context),
     team_activity: () => registerTeamActivity(server, context),
+    relayfacts: () => registerRelayfactsTools(server, context),
     relay_messaging: () => registerRelayMessaging(server, context),
     customer_support: () => registerCustomerSupportTool(server, context),
     capability_discovery: () => registerCapabilityDiscovery(server, context),

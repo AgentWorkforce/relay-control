@@ -4,7 +4,9 @@ import { recordAudit, type AuditActor } from "./admin/audit.js";
 /**
  * Operator capture policy (docs/capture-policy.md). Only keys present in
  * `settings` are enforced; an absent key means the member chooses. Nothing is
- * ever defaulted here.
+ * defaulted in storage; the one served default is the deployment sharing mode
+ * (SELFHOST_DEFAULT_SHARING_MODE), applied per caller by
+ * capturePolicyForCaller and only when configured.
  */
 export type CaptureSettings = {
   sharing_mode?: "all" | "new" | "selected";
@@ -116,6 +118,56 @@ export function projectSettings(settings: CaptureSettings): CaptureSettings {
     return { ...settings, oops_window_seconds: DEFAULT_OOPS_WINDOW_SECONDS };
   }
   return settings;
+}
+
+/** An organization role as served (`owner`, `admin`, `member`). */
+type CallerRole = string | null | undefined;
+
+/**
+ * The deployment sharing-mode values (SELFHOST_DEFAULT_SHARING_MODE and
+ * SELFHOST_SHARING_MODE_OVERRIDE_ROLES). Both absent: every served policy is
+ * exactly the stored one.
+ */
+export type SharingDeployment = {
+  defaultSharingMode?: "all" | "new" | "selected";
+  overrideRoles?: readonly ("owner" | "admin")[];
+};
+
+/** The deployment values from the loaded config. */
+export function sharingDeployment(config: {
+  defaultSharingMode?: "all" | "new" | "selected";
+  sharingModeOverrideRoles?: readonly ("owner" | "admin")[];
+}): SharingDeployment {
+  return { defaultSharingMode: config.defaultSharingMode, overrideRoles: config.sharingModeOverrideRoles };
+}
+
+/** Whether `role` is exempt from a sharing-mode lock. Unknown or missing roles are not. */
+export function sharingModeOverridden(role: CallerRole, deployment: SharingDeployment): boolean {
+  return typeof role === "string" && (deployment.overrideRoles ?? []).some((entry) => entry === role);
+}
+
+/**
+ * The capture policy as served to one caller. Effective sharing mode = the
+ * stored one, else the deployment default. A caller whose role is in the
+ * override roles is served no `sharing_mode` (and no `sharing_mode_since`);
+ * every other caller is served the effective mode. A deployment default never
+ * carries `sharing_mode_since`. The revision never moves. Returns `policy`
+ * itself when nothing applies; never mutates it.
+ */
+export function capturePolicyForCaller(
+  policy: CapturePolicy,
+  role: CallerRole,
+  deployment: SharingDeployment,
+): CapturePolicy {
+  if (sharingModeOverridden(role, deployment)) {
+    if (policy.settings.sharing_mode === undefined && policy.sharing_mode_since === undefined) return policy;
+    const { sharing_mode: _mode, ...settings } = policy.settings;
+    const { sharing_mode_since: _since, ...rest } = policy;
+    return { ...rest, settings };
+  }
+  const fallback = deployment.defaultSharingMode;
+  if (policy.settings.sharing_mode !== undefined || fallback === undefined) return policy;
+  return { ...policy, settings: { sharing_mode: fallback, ...policy.settings } };
 }
 
 export async function readCapturePolicy(database: Database, organizationId: string): Promise<CapturePolicy> {
