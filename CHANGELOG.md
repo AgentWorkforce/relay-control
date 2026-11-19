@@ -5,6 +5,16 @@ assigned at release.
 
 ## Unreleased
 
+- Changed: the MCP endpoint's `[selfhost-mcp] native chat context refused` log
+  line now carries the response's correlation id (`correlation_id`, null until
+  the MCP endpoint sets one), a `stage` (`claude_attestation`,
+  `copilot_attestation` or `desktop_context`) in place of `check`, and a fixed
+  `reason` code (for example `unknown_key`, `tool_use_mismatch`, `expired`,
+  `conflicting_context`, or `unclassified` for a message without a code) in
+  place of the verifier's message. Operators who grep the old `check` or
+  `reason` values need the new ones. The response is unchanged (400, -32602
+  "Invalid native chat context.") and an attestation store failure is still a
+  server error, never a refusal.
 - Fixed: the analytics collector accepts the sessions read API route `/v1/sessions/users`. The reader has reported it since that route shipped, and the collector refused any batch that contained it. It also accepts the patterns `/v1/coordination/advisories` and `/v1/coordination/advisories/:advisoryId/ack`, so the reader can start naming them without a refused batch. No setting or migration; analytics stays off unless configured.
 - Added: `SELFHOST_DEFAULT_SHARING_MODE` (`all` | `new` | `selected`) sets a deployment sharing mode served to callers whose organization has not saved one, and `SELFHOST_SHARING_MODE_OVERRIDE_ROLES` (`owner` and/or `admin`) leaves callers with those roles unlocked: their v1 policy omits `sharing_mode` and `sharing_mode_since`, and the v2 document serves the effective mode as `sections.capture.defaults.sharing_mode`. The organization-saved mode always wins. Applied per caller on `access/me`, the enrollment key exchange, introspection `capture_policy` (staff read grants as a member) and the upload-credentials revision check. Nothing is stored, no revision moves, and the organization policy routes and fleet view still show only what is stored. Both unset (the default), every response is unchanged. See docs/capture-policy.md.
 - Added: `relayfacts_list` and `relayfacts_get` on the Agent Relay MCP. They read the sessions pipeline read API's `GET /v1/relayfacts` (topics with counts) and `GET /v1/relayfacts/{topic}` (one page of a topic as markdown, `page` passed back as its cursor) through the same reader as the shared-session tools: `workspace` is always the credential's workspace, and a response without the workspace attestation returns nothing. They store and write nothing. Until the read API serves relayfacts (`READ_API_RELAYFACTS_ENABLED` off), every 501 is a successful `status: "disabled"` result ("relayfacts disabled") with the upstream reason. OAuth connections need `relay:history`; staff read grants do not get them. The per-user session reader now passes relayfacts cursors through unchanged and reports a 501's upstream reason.
