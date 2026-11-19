@@ -15,8 +15,14 @@ assigned at release.
   `reason` values need the new ones. The response is unchanged (400, -32602
   "Invalid native chat context.") and an attestation store failure is still a
   server error, never a refusal.
+- Changed: every agent returned by MCP `list_relay_agents` now has a fetchable card. Older Desktop and launched agents without a published card get an explicitly `inferred` coordination purpose and skill; agents with published skills but no card text are `mixed`, and complete cards are `published`. `get_relay_agent_card` reports the same `cardSource`, while `owner` and `is_mine` prefer Control's verified Desktop, hosted-participant and ready-launch records over agent-written metadata. Clients that used `has_card` to distinguish published cards from no card must now read `card_source`. Truncated session titles and personas are no longer presented as published card purposes. No migration.
 - Fixed: `list_team_activity` no longer holds the request open when Relaycast or History stall. The roster read is bounded at 10 seconds, the optional presence read at 2 seconds (after which the roster is returned with `presence_source: "unavailable"`), and all activity reads at 20 seconds in total; an agent whose read did not finish in time is returned with `activity_status: "unavailable"`.
 - Fixed: `list_session_timings` now sends `user_id` to RelayHistory and, when a filtered page comes back empty, reads up to five pages before answering, so a member's sessions are no longer hidden behind an empty page with a cursor. `sessions_scanned` counts every page read.
+- Fixed: MCP `list_session_timings` now reads each selected session's timing
+  from the same per-user sessions reader as transcript search, the session
+  directory and exact-session transcript reads. A Reader-only desktop session
+  therefore no longer disappears into the legacy History path at the timing
+  step. No setting or migration.
 - Fixed: the analytics collector accepts the sessions read API route `/v1/sessions/users`. The reader has reported it since that route shipped, and the collector refused any batch that contained it. It also accepts the patterns `/v1/coordination/advisories` and `/v1/coordination/advisories/:advisoryId/ack`, so the reader can start naming them without a refused batch. No setting or migration; analytics stays off unless configured.
 - Added: `SELFHOST_DEFAULT_SHARING_MODE` (`all` | `new` | `selected`) sets a deployment sharing mode served to callers whose organization has not saved one, and `SELFHOST_SHARING_MODE_OVERRIDE_ROLES` (`owner` and/or `admin`) leaves callers with those roles unlocked: their v1 policy omits `sharing_mode` and `sharing_mode_since`, and the v2 document serves the effective mode as `sections.capture.defaults.sharing_mode`. The organization-saved mode always wins. Applied per caller on `access/me`, the enrollment key exchange, introspection `capture_policy` (staff read grants as a member) and the upload-credentials revision check. Nothing is stored, no revision moves, and the organization policy routes and fleet view still show only what is stored. Both unset (the default), every response is unchanged. See docs/capture-policy.md.
 - Added: `relayfacts_list` and `relayfacts_get` on the Agent Relay MCP. They read the sessions pipeline read API's `GET /v1/relayfacts` (topics with counts) and `GET /v1/relayfacts/{topic}` (one page of a topic as markdown, `page` passed back as its cursor) through the same reader as the shared-session tools: `workspace` is always the credential's workspace, and a response without the workspace attestation returns nothing. They store and write nothing. Until the read API serves relayfacts (`READ_API_RELAYFACTS_ENABLED` off), every 501 is a successful `status: "disabled"` result ("relayfacts disabled") with the upstream reason. OAuth connections need `relay:history`; staff read grants do not get them. The per-user session reader now passes relayfacts cursors through unchanged and reports a 501's upstream reason.
@@ -78,6 +84,12 @@ assigned at release.
   and that joining a public hosted Connect invite from Agent Relay Desktop is
   separate; it no longer files them under "not part of the self-hosted
   edition". No tools or routes change.
+- Fixed: MCP failures carry matching correlation IDs in protocol error data or
+  tool error text, response headers and operator logs. Admission and storage
+  failures return safe protocol errors. Successful transcript bodies are not
+  decoded or copied for diagnostics; existing messages and access checks stay
+  unchanged. Unexpected failures still reach configured error telemetry, and
+  their logs include only an allowlisted error class and the correlation ID.
 - Fixed: MCP relay sends, inbox polls, `relay_status` and agent card reads no
   longer list the whole Relaycast roster to resolve one agent name or address.
   They use the engine's bounded `GET /v1/agents?names=` lookup (one call per
