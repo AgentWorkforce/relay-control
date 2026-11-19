@@ -320,6 +320,7 @@ const CARD_IDENTITY_CHANGED = "Your relay identity is no longer available or cha
 const NEEDS_GATE_ENROLMENT = Symbol("needs-gate-enrolment");
 /** A Cursor cloud agent run's participant name (cursorCloudParticipantName). */
 const CURSOR_RUN_NAME = /^cursor-cloud-[0-9a-f]{10}$/;
+const CURSOR_RUN_RETIRING = "This Cursor cloud agent run's earlier connection was disconnected and its relay agent is being released. Retry join_relay in a minute.";
 const CURSOR_TOKEN_ELSEWHERE = "cursor_identity_token is only for Cursor cloud agents connected through this server's OAuth (added at cursor.com/agents).";
 const NO_PARTICIPANT_MESSAGE = "No hosted participant with that name is owned by you in this workspace.";
 const NAME_TAKEN = "That relay name is already taken. Choose another name.";
@@ -520,6 +521,18 @@ function createRelayService(context: McpContext) {
     return (await query.query(
       "SELECT 1 FROM cursor_cloud_runs WHERE grant_id = $1 AND agent_name = $2 AND user_id = $3 AND workspace_id = $4",
       [oauth.access.grantId, name, userId, workspaceId])).rows.length > 0;
+  }
+
+  /**
+   * The release fence of a Cursor cloud agent run: a run row of a revoked
+   * grant stays until the OAuth teardown worker has released the
+   * participant, so nothing may reattach it meanwhile.
+   */
+  async function cursorRunRetiring(tx: SqlExecutor, name: string): Promise<boolean> {
+    if (!CURSOR_RUN_NAME.test(name)) return false;
+    return (await tx.query(`SELECT 1 FROM cursor_cloud_runs r JOIN mcp_oauth_grants g ON g.id = r.grant_id
+      WHERE r.workspace_id = $1 AND r.user_id = $2 AND r.agent_name = $3 AND g.revoked_at IS NOT NULL LIMIT 1`,
+    [workspaceId, userId, name])).rows.length > 0;
   }
 
   /** SELFHOST_CURSOR_CLOUD_RUN_IDENTITY=required: a cursor-cloud grant acts only as a verified run. */
@@ -944,6 +957,7 @@ function createRelayService(context: McpContext) {
       }
       let existing = bound ?? await participant(requestedName, {
         allowMissing: true, allowRejected: true, executor: tx, bind: Boolean(sessionHash) });
+      if (existing && await cursorRunRetiring(tx, existing.row.agentName)) throw new RelayToolError(CURSOR_RUN_RETIRING);
       if (existing) {
         if (sessionHash && existing.row.sessionHash && existing.row.sessionHash !== sessionHash) {
           throw new RelayToolError("That participant is bound to another MCP session. Use as to act as it without changing its binding, or choose a new name.");
@@ -1044,6 +1058,7 @@ function createRelayService(context: McpContext) {
     for (;;) {
       const joined = await withOwnerLock(async (tx) => {
         if (await findParticipant(tx, workspaceId, userId, organizationId, { name })) {
+          if (await cursorRunRetiring(tx, name)) throw new RelayToolError(CURSOR_RUN_RETIRING);
           await recordRun(tx);
           let existing = (await participant(name, { executor: tx, run: true, allowRejected: !gate }))!;
           if (gate && prepared) existing = await settlePrepared(tx, existing, prepared);

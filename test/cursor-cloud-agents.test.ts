@@ -61,6 +61,14 @@ async function fixture(t: test.TestContext, options: { redirect?: string; cursor
     ["relay:mcp"], protocol.mcpResourceUrl("/mcp"), owner.tokenFamilyId]);
   const sessions = new McpOAuthSessions(database, { protocol, tenancyMode: "multi" });
   const pair = await database.transaction(tx => sessions.issue(tx, { ...owner, scopes: ["relay:mcp"] }));
+  /** Another connection of the same person and Cursor client: a new grant and its session. */
+  const grant = async () => {
+    const grantId = randomUUID(), tokenFamilyId = randomUUID();
+    await database.query(`INSERT INTO mcp_oauth_grants(id,client_id,user_id,organization_id,workspace_id,agent_name,scopes,resource,token_family_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [grantId, clientId, owner.userId, owner.organizationId, owner.workspaceId, `dev-cursor-${grantId.slice(0, 6)}`,
+      ["relay:mcp"], protocol.mcpResourceUrl("/mcp"), tokenFamilyId]);
+    return { grantId, pair: await database.transaction(tx => sessions.issue(tx, { ...owner, grantId, tokenFamilyId, scopes: ["relay:mcp"] })) };
+  };
   const world = createRelaycastWorld([]);
   const relayFetch: typeof fetch = async (input, init) => {
     const url = new globalThis.URL(input instanceof Request ? input.url : String(input)), headers = new Headers(init?.headers);
@@ -84,10 +92,13 @@ async function fixture(t: test.TestContext, options: { redirect?: string; cursor
   const teardown = new McpOAuthTeardown({ database, keyring: KEYRING, client: createRelaycastClient({ internalOrigin: "http://example-relay.test", fetchImpl: relayFetch }) });
   const server = createServer(createApp({ config, store, messagingFetch: relayFetch, cursorJwks: issuer.jwks, mcpOAuthTeardown: teardown }));
   const base = await listen(server); t.after(() => close(server));
-  const client = new Client({ name: "cursor-cloud-test", version: "1" });
-  await client.connect(new StreamableHTTPClientTransport(new globalThis.URL(base + "/mcp"), { requestInit: { headers: { authorization: `Bearer ${pair.accessToken}` } } }));
-  t.after(() => client.close());
-  const call = async (name: string, args: Record<string, unknown> = {}) => client.callTool({ name, arguments: args });
+  const connect = async (accessToken: string) => {
+    const client = new Client({ name: "cursor-cloud-test", version: "1" });
+    await client.connect(new StreamableHTTPClientTransport(new globalThis.URL(base + "/mcp"), { requestInit: { headers: { authorization: `Bearer ${accessToken}` } } }));
+    t.after(() => client.close());
+    return async (name: string, args: Record<string, unknown> = {}) => client.callTool({ name, arguments: args });
+  };
+  const call = await connect(pair.accessToken);
   const ok = (result: Awaited<ReturnType<typeof call>>) => {
     assert.notEqual(result.isError, true, JSON.stringify(result.content));
     return result.structuredContent as Record<string, any>;
@@ -108,7 +119,7 @@ async function fixture(t: test.TestContext, options: { redirect?: string; cursor
     const done = await fetch(base + path.pathname + path.search, { method: "POST", headers, redirect: "manual" });
     assert.equal(done.status, 200, await done.clone().text());
   };
-  return { database, owner, world, issuer, call, ok, failed, nonce, confirm, teardown };
+  return { database, owner, world, issuer, call, ok, failed, nonce, confirm, teardown, grant, connect };
 }
 
 test("a Cursor cloud agent run links its Cursor account, joins as its own participant and messages as it", async t => {
@@ -195,4 +206,27 @@ test("leaving releases a run, and revoking the connection releases its remaining
   assert.equal(f.world.agents.has(two), false);
   assert.deepEqual((await f.database.query("SELECT agent_name FROM cursor_cloud_runs")).rows, []);
   assert.deepEqual((await f.database.query("SELECT agent_name FROM hosted_relay_participants")).rows, []);
+});
+
+test("a revoked connection's run stays while something live still uses it, and is fenced from reattachment until released", async t => {
+  const f = await fixture(t, { cursorCloud: { trustedTeams: ["77"] } });
+  const name = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) })).name as string;
+  const second = await f.grant();
+  const call2 = await f.connect(second.pair.accessToken);
+  const nonce2 = async () => f.ok(await call2("relay_status")).cursor_identity.nonce as string;
+  await f.database.transaction(tx => revokeMcpOAuthGrantRows(tx, f.owner.grantId, "user_revoked", new Date()));
+  // Until the teardown worker has released it, no other connection may take the run over.
+  assert.match(f.failed(await call2("join_relay", { cursor_identity_token: f.issuer.mint(await nonce2()) })), /being released/);
+  await f.teardown.drain();
+  assert.equal(f.world.agents.has(name), false);
+  // After the release the run joins afresh under the new connection.
+  assert.equal(f.ok(await call2("join_relay", { cursor_identity_token: f.issuer.mint(await nonce2()) })).name, name);
+
+  // A run a native MCP session is bound to, or a live grant is pinned to, is kept; only the revoked run is forgotten.
+  await f.database.query("UPDATE hosted_relay_participants SET session_hash='bound-native-session' WHERE agent_name=$1", [name]);
+  await f.database.transaction(tx => revokeMcpOAuthGrantRows(tx, second.grantId, "user_revoked", new Date()));
+  await f.teardown.drain();
+  assert.equal(f.world.agents.has(name), true);
+  assert.deepEqual((await f.database.query("SELECT agent_name FROM hosted_relay_participants")).rows, [{ agent_name: name }]);
+  assert.deepEqual((await f.database.query("SELECT agent_name FROM cursor_cloud_runs")).rows, []);
 });

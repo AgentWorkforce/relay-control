@@ -70,15 +70,31 @@ Cursor cloud agent participants are hosted participants (see
 [identity.md](identity.md), "Hosted participants on gate-only installs"). They
 enrol at relaygate as client `cursor-cloud` and hold only rg_ tokens.
 relaygate admits them only through a rule naming the hosted kind and,
-usually, that client. With no rule, they are refused, never placed in the local
-group. Put them in the pit:
+usually, that client. With no rule, they are refused, never placed in the
+local group.
+
+They run in Cursor's cloud. Don't put them in the pit (gid 22) of relaygate's
+`examples/policy.pit.json`: that group is inside the boundary and may read
+`relaycast:channel/` and `relaycast:inbox/local-`. Give them a group of their
+own with a pit ceiling, and grant only what they need:
 
 ```json
-{"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["cursor-cloud"], "as": ["agent"]}, "gid": 22, "namePrefix": "cursor-cloud-"}
+"groups": [..., {"gid": 55, "name": "cursor-cloud"}],
+"controlPrincipals": [{"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["cursor-cloud"], "as": ["agent"]}, "gid": 55, "namePrefix": "cursor-cloud-"}, ...],
+"streamDefaults": [
+  {"prefix": "relaycast:inbox/cursor-cloud-", "gid": 55, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]},
+  {"prefix": "relaycast:inbox/local-", "gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}, {"gid": 55, "perm": "w"}]},
+  ...
+],
+"ceilings": [..., {"gid": 55, "never": [22]}],
+"reservedNamePrefixes": ["cursor-cloud-"]
 ```
 
-and reserve `"cursor-cloud-"` in `reservedNamePrefixes` so desktops and
-enrollment keys can't take those names.
+`relaygate-explain` against `examples/policy.pit.json` with these entries gives:
+
+- allowed: a run writing a local inbox, and local writing a run's inbox;
+- refused: a run reading a local inbox, a local channel, any pit stream or
+  `slack:`.
 
 A Grok Bot running as a Cursor cloud agent connects the same way and enrols as
 `cursor-cloud`. Grok Bot connections from an x.ai callback stay `grok-bot`.
