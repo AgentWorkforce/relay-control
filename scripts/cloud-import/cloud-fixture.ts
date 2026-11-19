@@ -217,7 +217,9 @@ INSERT INTO workspace_integrations (id, workspace_id, provider, name, created_by
   -- An older default for the same workspace, keyed by the app workspace UUID.
   ('${id(0x906)}', '${id(0x201)}', 'github', NULL, '${id(1)}', 'nango-6', '12345', '2025-06-01T00:00:00Z', '2026-03-01T00:00:00Z');
 INSERT INTO staff_read_grants (id, workspace_id, organization_id, staff_user_id, reason, created_at, expires_at) VALUES
-  ('${id(0xa01)}', '${id(0x201)}', '${ORG_A}', '${id(5)}', '  Investigating a support ticket  ', ${t}, '2026-09-01T00:00:00Z'),
+  -- Created the day before Europe's 2026 DST change and expiring past the
+  -- 365-day clamp, which then lands on the day of the 2027 change (DST tests).
+  ('${id(0xa01)}', '${id(0x201)}', '${ORG_A}', '${id(5)}', '  Investigating a support ticket  ', '2026-03-28T12:00:00.123456Z', '2028-01-01T00:00:00Z'),
   ('${id(0xa02)}', '${id(0x203)}', '${ORG_A}', '${id(1)}', 'Unbound workspace', ${t}, '2026-02-01T00:00:00Z');
 INSERT INTO fleet_node_owners (id, workspace_id, relay_workspace_id, node_id, user_id, source, created_at) VALUES
   ('${id(0x701)}', '${id(0x201)}', 'rw_0000a201', 'node-1', '${id(3)}', 'claim', ${t}),

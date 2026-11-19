@@ -8,7 +8,7 @@ import type { TenancyMode } from "../tenancy.js";
 import { iso, recordAudit } from "./audit.js";
 
 /**
- * Staff read grants (docs/staff-read-grants.md, migration 0061): a read-only,
+ * Staff read grants (docs/staff-read-grants.md, migrations 0061 and 0080): a read-only,
  * sessions-only credential `sh_sr_` pinned to one workspace, minted by an
  * owner of the operator organization. Honoured only by the shared-sessions
  * MCP facade and by token introspection; every other bearer gate refuses it
@@ -17,7 +17,10 @@ import { iso, recordAudit } from "./audit.js";
  */
 export const STAFF_READ_GRANT_PREFIX = "sh_sr_";
 export const STAFF_READ_GRANT_SCOPES: readonly string[] = ["rth:read"];
-export const STAFF_READ_GRANT_MAX_DAYS = 90;
+/** Hard ceiling (migration 0080), also enforced by the table. A year must be asked for explicitly. */
+export const STAFF_READ_GRANT_MAX_DAYS = 365;
+/** Lifetime when a mint omits `expires_in_days`. */
+export const STAFF_READ_GRANT_DEFAULT_DAYS = 90;
 export const STAFF_READ_GRANT_REASON_MAX = 500;
 const DAY_MS = 86_400_000;
 
@@ -137,7 +140,7 @@ export function parseMintRequest(body: Record<string, unknown>): { reason: strin
     throw new StaffReadGrantError(400, "invalid_request",
       `reason must be a non-empty string of at most ${STAFF_READ_GRANT_REASON_MAX} characters`);
   }
-  const days = body.expires_in_days ?? STAFF_READ_GRANT_MAX_DAYS;
+  const days = body.expires_in_days ?? STAFF_READ_GRANT_DEFAULT_DAYS;
   if (typeof days !== "number" || !Number.isInteger(days) || days < 1 || days > STAFF_READ_GRANT_MAX_DAYS) {
     throw new StaffReadGrantError(400, "invalid_request",
       `expires_in_days must be an integer from 1 to ${STAFF_READ_GRANT_MAX_DAYS}`);

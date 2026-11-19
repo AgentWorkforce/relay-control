@@ -251,7 +251,7 @@ operator organization remains an unresolved skip.
 
 The main synthetic fixture uses UTC sessions. A separate audit on PostgreSQL's
 Europe/Oslo session timezone found that the importer's `created_at + interval
-'90 days'` staff-grant clamp shifts one hour across DST compared with the
+'90 days'` staff-grant clamp (365 days since migration 0080) shifts one hour across DST compared with the
 verifier's UTC snapshot. The fix merged in #168 at `c13c294`: both importer source transactions use
 UTC, the default canonicalizer is Control's, and selection conflicts fail the
 copy report. The dedicated PostgreSQL regression switches the source to Oslo,
