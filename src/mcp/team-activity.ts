@@ -19,7 +19,7 @@ import { assertEventScope, boundedContent, buildDirectEventsPath, resolveWorkspa
 const MAX_CONTENT_LENGTH = 4_000;
 const ROSTER_UNAVAILABLE = "Workspace relay roster is temporarily unavailable. Please try again.";
 /** Bound on the Relaycast roster read; without the roster the tool fails. */
-const ROSTER_TIMEOUT_MS = 10_000;
+export const ROSTER_TIMEOUT_MS = 10_000;
 /**
  * Bound on the Relaycast presence read. Presence is optional, so a stalled
  * presence service gives way early and the roster is returned without it.
@@ -35,7 +35,7 @@ export type TeamActivityLimits = { rosterTimeoutMs?: number; presenceTimeoutMs?:
  * Run `read` with a signal aborted after `ms`, and stop waiting then even if
  * the read ignores the signal. A late result or rejection is dropped.
  */
-function within<T>(read: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+export function withinRelayRead<T>(read: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
@@ -205,9 +205,9 @@ async function readTeam(
   context: McpContext, status: "live" | "all", rosterTimeoutMs: number, presenceTimeoutMs: number,
 ): Promise<{ agents: TeamAgent[]; presenceAvailable: boolean }> {
   const [rosterResult, presenceResult, people] = await Promise.all([
-    Promise.allSettled([within(signal => context.relaycast.listAgents(status === "live" ? "active" : "all", { signal }), rosterTimeoutMs)])
+    Promise.allSettled([withinRelayRead(signal => context.relaycast.listAgents(status === "live" ? "active" : "all", { signal }), rosterTimeoutMs)])
       .then(([result]) => result!),
-    Promise.allSettled([within(signal => context.relaycast.listPresence({ signal }), presenceTimeoutMs)]).then(([result]) => result!),
+    Promise.allSettled([withinRelayRead(signal => context.relaycast.listPresence({ signal }), presenceTimeoutMs)]).then(([result]) => result!),
     context.members(),
   ]);
   if (rosterResult.status === "rejected") {
@@ -335,7 +335,7 @@ export async function readTeamActivity(
     await Promise.all(candidates.slice(i, i + 5).map(async ({ key, sessionId, source }) => {
       try {
         // A read still pending at the deadline is unavailable; its late answer is dropped.
-        const parsed = SessionEventsPageSchema.safeParse(await within(() => context.readHistory(
+        const parsed = SessionEventsPageSchema.safeParse(await withinRelayRead(() => context.readHistory(
           buildDirectEventsPath(sessionId, { source, limit: 1, order: "desc", maxContent: input.max_content })), remaining));
         if (!parsed.success || parsed.data.sessionId !== sessionId) {
           throw new SharedSessionsToolError("Unsupported session response.");
