@@ -1383,14 +1383,17 @@ function createRelayService(context: McpContext) {
   return {
     withSpawnActor,
 
-    async list(input: { status: "live" | "all" | "offline"; person?: string; query?: string; include_stale?: boolean; as?: string }) {
+    async list(input: { status: "live" | "all" | "offline"; person?: string; query?: string; include_stale?: boolean; limit?: number; as?: string }) {
       const query = input.query?.toLowerCase();
       const person = input.person?.toLowerCase();
       const agents = await roster(input.status, await context.members(), input.include_stale, await callerDirectory(input.as));
-      return { workspace_id: workspaceId, agents: agents.filter(agent =>
+      const matching = agents.filter(agent =>
         (!person || (person === "me" ? agent.is_mine
           : agent.owner?.user_id.toLowerCase() === person || agent.owner?.name.toLowerCase().includes(person))) &&
-        (!query || [agent.name, agent.address, agent.description, agent.where].some(value => value?.toLowerCase().includes(query)))) };
+        (!query || [agent.name, agent.address, agent.description, agent.where].some(value => value?.toLowerCase().includes(query))));
+      const listed = matching.slice(0, input.limit ?? 100);
+      return { workspace_id: workspaceId, agents: listed, total_matching: matching.length,
+        truncated: matching.length > listed.length };
     },
 
     join,
