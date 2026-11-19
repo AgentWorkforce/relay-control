@@ -776,6 +776,8 @@ test("join_relay by name registers a hosted participant with Cloud's metadata", 
 
   const status = structured(await client.callTool({ name: "relay_status", arguments: {} }));
   assert.deepEqual({ joined: status.joined, name: status.name, unread: status.unread_count }, { joined: true, name: "owner-helper", unread: 0 });
+  (remote.metadata as Record<string, unknown>).renamed_to = "owner-successor";
+  assert.equal(structured(await client.callTool({ name: "relay_status", arguments: {} })).address, null);
 });
 
 test("relay_status returns with a null address when its bounded exact-name lookup stalls", async (t) => {

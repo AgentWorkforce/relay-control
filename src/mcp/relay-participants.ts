@@ -1601,7 +1601,7 @@ function createRelayService(context: McpContext) {
         ).catch(error => { relayStatusAddressEnrichmentFailed(error); return []; }),
         clientFor(hosted).readHostedInbox(hosted.token),
       ]);
-      const address = agents.find(agent => agent.name === hosted.name)?.address ?? null;
+      const address = agents.find(agent => agent.name === hosted.name && isListedRelayAgent(agent))?.address ?? null;
       return { joined: true, linked: "hosted" as const, name: hosted.name, address,
         unread_count: inbox.length, unread_count_is_lower_bound: inbox.length === 100,
         ...(cursor && !await ownRun(as) ? { cursor_identity: cursor } : {}) };
