@@ -5,7 +5,7 @@ import { page } from "../identity/pages.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import { isBindingOwnedIdentity } from "../messaging/binding-identities.js";
 import { lockOrganization, lockUser, type TenancyMode } from "../tenancy.js";
-import { admissionConnectorKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
+import { admissionConnectorKind, isGrokRoutineKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
 import { enrolHostedAtGate, type GateEnrolment } from "./hosted-gate.js";
 import type { McpConsentPrincipal } from "./oauth/consent.js";
 import { GrokRoutineError, grokInboxPrompt, parseGrokRoutineCredentials } from "./grok-routine.js";
@@ -14,11 +14,13 @@ import { ownerHash, HOSTED_SOURCE } from "./relay-participants.js";
 // Shared dashboard ingresses route /cloud/api to Control, and /cloud to the UI.
 export const GROK_SETUP_PATH = "/cloud/api/v1/grok-bot/routine";
 type Owner = Pick<McpConsentPrincipal, "userId" | "organizationId" | "workspaceId">;
-type Grant = { id: string; agent_name: string; agent_remote_id: string | null };
+/** `kind`: the kind the grant is admitted as (grok-bot, or cursor-cloud for a Grok Bot running as a Cursor cloud agent). */
+type Grant = { id: string; agent_name: string; agent_remote_id: string | null; kind: RoutineKind };
+type RoutineKind = "grok-bot" | "cursor-cloud";
 type Routine = { credentials_ciphertext: string; notified_delivery_ids: string[]; failures: number;
   last_delivered_at: Date | string | null; last_error: string | null };
 /** A gated participant to enrol again at relaygate after the delivery transaction ends (GrokRoutines.recover). */
-type Recovery = { participantId: string; tokenCiphertext: string; relaygateAgentId: string; agentName: string; admittedClients: string[] };
+type Recovery = { participantId: string; tokenCiphertext: string; relaygateAgentId: string; agentName: string; admittedClients: string[]; kind: RoutineKind };
 
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { "cache-control": "no-store" } });
 const escape = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
@@ -34,6 +36,11 @@ export class GrokRoutines {
   constructor(readonly options: { database: Database; keyring: EncryptionKeyring; client: RelaycastClient;
     /** Gate-only installs: participants enrolled through relaygate (relaygate_agent_id set) are read through it. */
     gate?: RelaycastClient;
+    /**
+     * SELFHOST_CURSOR_CLOUD_RUN_IDENTITY=required: a cursor-cloud grant acts only as verified runs and never pins
+     * its approved agent, so it has no identity a routine could wake; its routine setup is refused.
+     */
+    cursorRunIdentityRequired?: boolean;
     publicOrigin: string; tenancyMode: TenancyMode; fetchImpl?: typeof fetch; now?: () => Date; requestTimeoutMs?: number }) {}
 
   private now() { return this.options.now?.() ?? new Date(); }
@@ -55,19 +62,33 @@ export class GrokRoutines {
       FOR UPDATE OF g`, [id, owner.userId, owner.organizationId, owner.workspaceId,
       [this.options.publicOrigin + "/mcp", this.options.publicOrigin + "/cloud/api/v1/mcp/shared-sessions"],
       this.options.tenancyMode, this.now()])).rows[0];
-    if (!row || admissionConnectorKind({ clientName: row.client_name, redirectUris: row.redirect_uris }, row.used ?? []) !== "grok-bot") {
+    const kind = row ? admissionConnectorKind({ clientName: row.client_name, redirectUris: row.redirect_uris }, row.used ?? []) : "mcp";
+    if (!row || !isGrokRoutineKind(kind)) {
       throw new GrokRoutineError("This Grok Bot connection is no longer available. Reconnect it in this workspace.");
     }
-    return row;
+    return { ...row, kind: kind as RoutineKind };
   }
 
   setupUrl(grantId: string): string {
     return `${this.options.publicOrigin}${GROK_SETUP_PATH}?${new URLSearchParams({ grant: grantId })}`;
   }
 
-  async status(grantId: string, owner: Owner) {
+  /** Routine setup for a cursor-cloud grant needs its approved agent, which required run identity never uses. */
+  private assertSetupAllowed(grant: Grant): void {
+    if (grant.kind === "cursor-cloud" && this.options.cursorRunIdentityRequired) {
+      throw new GrokRoutineError("Grok Bot routines on a Cursor connection need SELFHOST_CURSOR_CLOUD_RUN_IDENTITY=optional on this server: with required run identity the connection has no shared agent to wake.");
+    }
+  }
+
+  /**
+   * `setup`: the caller is starting a new routine (connect_grok_bot_routine), refused under required run identity.
+   * Reading the status, the setup page and disconnecting stay available, so an owner can still remove a routine
+   * saved before the setting changed.
+   */
+  async status(grantId: string, owner: Owner, options: { setup?: boolean } = {}) {
     return this.options.database.transaction(async tx => {
       const grant = await this.grant(tx, grantId, owner);
+      if (options.setup) this.assertSetupAllowed(grant);
       const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1", [grantId])).rows[0];
       return { agent: grant.agent_name, configured: Boolean(routine), webhook_accepted: Boolean(routine?.last_delivered_at),
         last_delivered_at: routine?.last_delivered_at ?? null, last_error: routine?.last_error ?? null,
@@ -97,6 +118,7 @@ export class GrokRoutines {
         const credentials = parseGrokRoutineCredentials(body.webhook_url, body.authorization);
         await this.options.database.transaction(async tx => {
           const grant = await this.grant(tx, grantId, owner);
+          this.assertSetupAllowed(grant);
           if (!grant.agent_remote_id) throw new GrokRoutineError("Call join_relay from this bot before saving its routine.");
           await tx.query(`INSERT INTO grok_bot_routines(grant_id,credentials_ciphertext,next_attempt_at,updated_at)
             VALUES ($1,$2,$3,$3) ON CONFLICT (grant_id) DO UPDATE SET credentials_ciphertext=$2,
@@ -174,9 +196,9 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
               [grant.id, new Date(this.now().getTime() + GATE_RECOVERY_LEASE_MS), this.now()]);
             return { participantId: participant.id, tokenCiphertext: participant.token_ciphertext, relaygateAgentId: participant.relaygate_agent_id!,
               agentName: participant.agent_name,
-              admittedClients: rejected ? ["grok-bot"] : [...new Set([...(participant.admitted_clients ?? []), "grok-bot"])] };
+              admittedClients: rejected ? [grant.kind] : [...new Set([...(participant.admitted_clients ?? []), grant.kind])], kind: grant.kind };
           };
-          if (gated && !(participant.admitted_clients ?? []).includes("grok-bot")) return await recover(false);
+          if (gated && !(participant.admitted_clients ?? []).includes(grant.kind)) return await recover(false);
           let remote: Awaited<ReturnType<RelaycastClient["authenticatedAgent"]>>;
           try {
             if (gated && participant.stale) {
@@ -227,7 +249,7 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
   }
 
   /**
-   * Enrols a gated participant again at relaygate as Grok Bot (the kind its
+   * Enrols a gated participant again at relaygate as its grant's kind (Grok Bot, or Cursor cloud for a Cursor-hosted Grok Bot; the kind its
    * grant is admitted as), with no transaction open: relaygate introspects
    * the hosted credential with this service. The new token is adopted, under
    * the same user, organization, grant and routine locks as a delivery, only
@@ -241,7 +263,7 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
       try {
         enrolled = await enrolHostedAtGate({ database: this.options.database, gate: this.options.gate }, {
           workspaceId: owner.workspaceId, organizationId: owner.organizationId, userId: owner.userId,
-          agentName: recovery.agentName, client: "grok-bot" });
+          agentName: recovery.agentName, client: recovery.kind });
       } catch {
         enrolled = null;
       }
