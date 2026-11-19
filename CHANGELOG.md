@@ -29,8 +29,9 @@ assigned at release.
   connection of another kind enrols it again at relaygate as that kind first,
   which re-applies that rule's groups and revokes the earlier token, and a
   refusal leaves the participant as it was. The client is the connection's
-  admission kind: a registration whose redirect URIs name two different
-  providers enrols as `mcp`. Grok Bot routines whose token relaygate rejects
+  admission kind, from the redirect URIs its authorization codes were
+  delivered to (index `mcp_oauth_codes_grant_idx`, migration 0079): a client
+  that registers a provider's callback beside its own enrols as `mcp`. Grok Bot routines whose token relaygate rejects
   enrol again as `grok-bot` and adopt the token only for the same relaygate
   and upstream agent. A stored participant is enrolled again only while its
   own upstream agent still holds the name. See docs/identity.md, "Hosted

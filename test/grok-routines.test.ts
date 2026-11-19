@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -224,6 +224,24 @@ test("browser setup refuses anonymous, bearer, cross-origin and cross-owner call
   assert.equal(report.groups.find((g: any) => g.id === "grok_routines").status, "unavailable");
   const tools = await f.tool("connect_grok_bot_routine"); assert.equal(tools.isError, true);
   assert.equal((await f.save()).status, 400);
+});
+
+test("a connection is Grok Bot's only when its authorization codes were delivered to the Grok callback", async (t) => {
+  const f = await fixture(t);
+  const grok = "https://www.cursor.com/agents/fake/callback", own = "http://localhost:8787/callback";
+  await f.database.query("UPDATE mcp_oauth_clients SET redirect_uris=$2 WHERE client_id=$1", [f.clientId, [grok, own]]);
+  const code = (redirectUri: string, consumed: boolean) => f.database.query(`INSERT INTO mcp_oauth_authorization_codes
+    (code_hash,client_id,user_id,organization_id,workspace_id,agent_name,redirect_uri,code_challenge,scopes,resource,grant_id,expires_at,consumed_at)
+    SELECT $1,g.client_id,g.user_id,g.organization_id,g.workspace_id,g.agent_name,$2,'fake-challenge',g.scopes,g.resource,g.id,now(),$3
+      FROM mcp_oauth_grants g WHERE g.id=$4`, [randomBytes(32).toString("hex"), redirectUri, consumed ? new Date() : null, f.owner.grantId]);
+  // No recorded delivery: a registration with the client's own callback beside Grok's is not Grok Bot.
+  await assert.rejects(f.routines.status(f.owner.grantId, f.owner));
+  // A code that was never redeemed says nothing; one delivered to the Grok callback makes the connection Grok Bot's.
+  await code(own, false); await code(grok, true);
+  assert.equal((await f.routines.status(f.owner.grantId, f.owner)).configured, false);
+  // A code delivered to the client's own callback: not Grok Bot, whatever else it registered.
+  await code(own, true);
+  await assert.rejects(f.routines.status(f.owner.grantId, f.owner));
 });
 
 test("revocation deletes the encrypted routine atomically; expired sessions stop the worker", async t => {

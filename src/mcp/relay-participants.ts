@@ -12,7 +12,7 @@ import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
 import { buildAgentCard, cardMetadata, cardSummary, recipientCard, type SetCardInput } from "./relay-agent-cards.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
-import { admissionConnectorKind, connectorKind } from "./oauth/connector-kind.js";
+import { admissionConnectorKind, connectorKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
 import { RECEIPT_GUIDANCE } from "../messaging/delivery-status.js";
 import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } from "./oauth/retirement.js";
@@ -456,16 +456,19 @@ function createRelayService(context: McpContext) {
 
   /**
    * The hosted MCP client relaygate's policy matches this caller's
-   * participants on: the grant's admission kind, so a registration naming two
-   * providers enrols as neither ("mcp"). Callers inside a transaction pass it.
+   * participants on: the grant's admission kind, from the redirect URIs its
+   * authorization codes were delivered to, so a client that only registers a
+   * provider's callback beside its own enrols as "mcp". Callers inside a
+   * transaction pass it.
    */
   let clientKind: Promise<RelayHostedClient> | undefined;
   function hostedClient(query: SqlExecutor = executor): Promise<RelayHostedClient> {
     clientKind ??= (async () => {
       if (!oauth) return "mcp" as const;
-      const row = (await query.query<{ client_name: string | null; redirect_uris: string[] }>(
-        "SELECT client_name, redirect_uris FROM mcp_oauth_clients WHERE client_id = $1", [oauth.access.clientId])).rows[0];
-      return row ? admissionConnectorKind({ clientName: row.client_name, redirectUris: row.redirect_uris ?? [] }) : "mcp" as const;
+      const row = (await query.query<{ client_name: string | null; redirect_uris: string[]; used: string[] }>(
+        `SELECT c.client_name, c.redirect_uris, ${usedRedirectUrisSql("$2::uuid", "c.client_id")} AS used
+           FROM mcp_oauth_clients c WHERE c.client_id = $1`, [oauth.access.clientId, oauth.access.grantId])).rows[0];
+      return row ? admissionConnectorKind({ clientName: row.client_name, redirectUris: row.redirect_uris ?? [] }, row.used ?? []) : "mcp" as const;
     })();
     return clientKind;
   }

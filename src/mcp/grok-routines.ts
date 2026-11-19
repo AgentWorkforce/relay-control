@@ -5,7 +5,7 @@ import { page } from "../identity/pages.js";
 import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import { isBindingOwnedIdentity } from "../messaging/binding-identities.js";
 import { lockOrganization, lockUser, type TenancyMode } from "../tenancy.js";
-import { admissionConnectorKind } from "./oauth/connector-kind.js";
+import { admissionConnectorKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
 import { enrolHostedAtGate, type GateEnrolment } from "./hosted-gate.js";
 import type { McpConsentPrincipal } from "./oauth/consent.js";
 import { GrokRoutineError, grokInboxPrompt, parseGrokRoutineCredentials } from "./grok-routine.js";
@@ -41,7 +41,8 @@ export class GrokRoutines {
   async grant(tx: SqlExecutor, id: string, owner: Owner): Promise<Grant> {
     await lockUser(tx, owner.userId);
     await lockOrganization(tx, owner.organizationId);
-    const row = (await tx.query<Grant & { client_name: string | null; redirect_uris: string[] }>(`SELECT g.id,g.agent_name,g.agent_remote_id,c.client_name,c.redirect_uris
+    const row = (await tx.query<Grant & { client_name: string | null; redirect_uris: string[]; used: string[] }>(`SELECT g.id,g.agent_name,g.agent_remote_id,c.client_name,c.redirect_uris,
+        ${usedRedirectUrisSql("g.id", "g.client_id")} AS used
       FROM mcp_oauth_grants g JOIN mcp_oauth_clients c ON c.client_id=g.client_id
       JOIN workspaces w ON w.id=g.workspace_id AND w.organization_id=g.organization_id
       JOIN organization_memberships m ON m.organization_id=g.organization_id AND m.user_id=g.user_id
@@ -54,7 +55,7 @@ export class GrokRoutines {
       FOR UPDATE OF g`, [id, owner.userId, owner.organizationId, owner.workspaceId,
       [this.options.publicOrigin + "/mcp", this.options.publicOrigin + "/cloud/api/v1/mcp/shared-sessions"],
       this.options.tenancyMode, this.now()])).rows[0];
-    if (!row || admissionConnectorKind({ clientName: row.client_name, redirectUris: row.redirect_uris }) !== "grok-bot") {
+    if (!row || admissionConnectorKind({ clientName: row.client_name, redirectUris: row.redirect_uris }, row.used ?? []) !== "grok-bot") {
       throw new GrokRoutineError("This Grok Bot connection is no longer available. Reconnect it in this workspace.");
     }
     return row;

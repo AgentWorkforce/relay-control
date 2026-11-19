@@ -1568,12 +1568,17 @@ Relaycast agent token for its traffic:
   the hosted client (table `relay_hosted_credentials`, migration 0079; only
   the hash is stored). Control presents it to relaygate's `POST /v1/register`
   itself, with no database transaction open, because relaygate introspects it
-  here. The client is the connection's admission kind, from its registered
-  OAuth redirect URIs: `chatgpt`, `grok-bot`, `muse` or `cursor-cloud` when
-  every URI that names a provider names the same one, else `mcp`. A
-  registration whose redirect URIs name two different providers enrols as
-  `mcp`, so it never matches a rule written for either provider. Native MCP
-  sessions enrol as `mcp`.
+  here. The client is the connection's admission kind: `chatgpt`, `grok-bot`
+  or `muse` when every redirect URI its authorization codes were delivered
+  to is that provider's callback, else `mcp`. A client that registers a
+  provider's callback beside its own receives its codes at its own callback,
+  so it enrols as `mcp` and never matches a rule written for a provider. (A
+  connection with no recorded delivery is a provider's only when every
+  registered redirect URI is.) The kind says where the codes went, not which
+  software redeemed them: OAuth clients here are public and self-registered,
+  and the consenting user can read a code out of their own browser. It keeps
+  another application from passing as a provider; it does not restrain the
+  user who consents. Native MCP sessions enrol as `mcp`.
 - **Name ownership.** relaygate reserves a name for its first enroller and
   takes over an upstream agent of that name it did not register. So before
   minting a credential Control checks the name with the workspace roster (a

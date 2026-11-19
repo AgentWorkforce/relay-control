@@ -52,13 +52,34 @@ test("admission kind refuses registrations that name two different providers", (
   assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [] }), "mcp");
 });
 
-test("admission kind keeps one provider beside neutral cursor and localhost callbacks", () => {
-  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [
-    "https://www.cursor.com/agents/fake/callback", "cursor://agents/fake/callback", "http://localhost:8787/callback",
-  ] }), "grok-bot");
+test("admission kind from the registration needs every redirect URI to name the same provider", () => {
   assert.equal(admissionConnectorKind({ clientName: null, redirectUris: ["https://chatgpt.com/a", "https://api.openai.com/b"] }), "chatgpt");
   assert.equal(admissionConnectorKind({ clientName: null, redirectUris: ["https://muse.ai/callback"] }), "muse");
-  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: ["cursor://agents/fake/callback"] }), "mcp");
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: ["https://www.cursor.com/agents/fake/callback"] }), "grok-bot");
+  // A callback of its own beside a provider's is where such a client would receive its codes.
+  for (const provider of ["https://chatgpt.com/callback", "https://muse.ai/callback", "https://www.cursor.com/agents/fake/callback"]) {
+    for (const own of ["https://attacker.example.test/callback", "http://localhost:8787/callback", "http://127.0.0.1:8787/callback"]) {
+      assert.equal(admissionConnectorKind({ clientName: "ChatGPT", redirectUris: [provider, own] }), "mcp");
+      assert.equal(admissionConnectorKind({ clientName: "ChatGPT", redirectUris: [own, provider] }), "mcp");
+    }
+  }
+});
+
+test("admission kind follows the redirect URIs the grant's codes were delivered to", () => {
+  const grok = "https://www.cursor.com/agents/fake/callback";
+  const chatgpt = "https://chatgpt.com/callback";
+  const own = "https://attacker.example.test/callback";
+  const local = "http://localhost:8787/callback";
+  // A provider that also registers a loopback callback is still that provider when its codes went to its own callback.
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [grok, local] }, [grok]), "grok-bot");
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [chatgpt, own] }, [chatgpt]), "chatgpt");
+  // The same registrations are no provider when a code went anywhere else.
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [grok, local] }, [local]), "mcp");
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [chatgpt, own] }, [own]), "mcp");
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [chatgpt, own] }, [chatgpt, own]), "mcp");
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [grok, chatgpt] }, [grok, chatgpt]), "mcp");
+  // The delivery decides even when the registration alone names one provider.
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [chatgpt] }, [own]), "mcp");
 });
 
 test("host parsing normalizes hostname and keeps display port/path; malformed URI stays null", () => {

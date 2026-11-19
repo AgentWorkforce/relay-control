@@ -37,3 +37,7 @@ ALTER TABLE hosted_relay_participants ADD COLUMN IF NOT EXISTS relaygate_agent_i
 -- every client that acts as it. Empty: none yet (a row that is not gated, or
 -- one written before this column; it enrols on its next use).
 ALTER TABLE hosted_relay_participants ADD COLUMN IF NOT EXISTS admitted_clients text[] NOT NULL DEFAULT '{}';
+
+-- A grant's admission kind is read from the redirect URIs its consumed
+-- authorization codes were delivered to.
+CREATE INDEX IF NOT EXISTS mcp_oauth_codes_grant_idx ON mcp_oauth_authorization_codes (grant_id) WHERE grant_id IS NOT NULL;

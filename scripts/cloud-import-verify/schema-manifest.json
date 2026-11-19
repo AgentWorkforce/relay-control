@@ -81,7 +81,7 @@
     {"name":"0076_events_shim_agent_links.sql","sha256":"3f1441ca8cd33613c585c4c725de0a8e88df457e070ec6fb1756214aa7c3e821"},
     {"name":"0077_events_shim_sender_release_attempts.sql","sha256":"f586a6324c3af8d81e00cae9fea161772673a0d7ea55c865dfb00bafa3d901cd"},
     {"name":"0078_events_shim_claim_leases.sql","sha256":"1729204ca96b4196d16369b039b72c70b43ae6036c955d06e89f2f168d6d4b7a"},
-    {"name":"0079_hosted_relay_gate.sql","sha256":"dcba28091f8a00963cc52463f3f7165cd6f41ef08b03f47d0a5a1ff355a4144c"}
+    {"name":"0079_hosted_relay_gate.sql","sha256":"c9b201ff87a00dc9bf06cb304e46673556e47153343a68edf8d557029b988af1"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -1880,6 +1880,7 @@
     {"kind":"index","name":"public.mcp_attestation_tool_uses.mcp_attestation_tool_uses_pkey","definition":{"definition":"CREATE UNIQUE INDEX mcp_attestation_tool_uses_pkey ON public.mcp_attestation_tool_uses USING btree (workspace_id, user_id, tool_use_id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.mcp_oauth_authorization_codes.mcp_oauth_authorization_codes_pkey","definition":{"definition":"CREATE UNIQUE INDEX mcp_oauth_authorization_codes_pkey ON public.mcp_oauth_authorization_codes USING btree (code_hash)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.mcp_oauth_authorization_codes.mcp_oauth_codes_expiry_idx","definition":{"definition":"CREATE INDEX mcp_oauth_codes_expiry_idx ON public.mcp_oauth_authorization_codes USING btree (expires_at)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
+    {"kind":"index","name":"public.mcp_oauth_authorization_codes.mcp_oauth_codes_grant_idx","definition":{"definition":"CREATE INDEX mcp_oauth_codes_grant_idx ON public.mcp_oauth_authorization_codes USING btree (grant_id) WHERE (grant_id IS NOT NULL)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.mcp_oauth_clients.mcp_oauth_clients_pkey","definition":{"definition":"CREATE UNIQUE INDEX mcp_oauth_clients_pkey ON public.mcp_oauth_clients USING btree (client_id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.mcp_oauth_grants.mcp_oauth_grant_family_pair","definition":{"definition":"CREATE UNIQUE INDEX mcp_oauth_grant_family_pair ON public.mcp_oauth_grants USING btree (id, token_family_id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.mcp_oauth_grants.mcp_oauth_grants_id_organization_id_workspace_id_u_key","definition":{"definition":"CREATE UNIQUE INDEX mcp_oauth_grants_id_organization_id_workspace_id_u_key ON public.mcp_oauth_grants USING btree (id, organization_id, workspace_id, user_id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":true,"valid":true}},
@@ -2132,5 +2133,5 @@
   "optional":{
 
   },
-  "sha256":"f462e4c9a77b83b5eed8a420c6209270833589dc2ccaaffc0865326001eed50a"
+  "sha256":"33cc721c5bde60d7b06dde343d9f6027dcf8c784ca2212d615bedd16eb5cd863"
 }
