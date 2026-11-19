@@ -5,6 +5,17 @@ assigned at release.
 
 ## Unreleased
 
+- Changed: the MCP endpoint's `[selfhost-mcp] native chat context refused` log
+  line now carries the response's correlation id (`correlation_id`, the same
+  value as the `x-correlation-id` header and the error's
+  `data.correlation_id`), a `stage` (`claude_attestation`,
+  `copilot_attestation` or `desktop_context`) in place of `check`, and a fixed
+  `reason` code (for example `unknown_key`, `tool_use_mismatch`, `expired`,
+  `conflicting_context`, or `unclassified` for a message without a code) in
+  place of the verifier's message. Operators who grep the old `check` or
+  `reason` values need the new ones. The response is unchanged (400, -32602
+  "Invalid native chat context.") and an attestation store failure is still a
+  server error, never a refusal.
 - Changed: every agent returned by MCP `list_relay_agents` now has a fetchable card. Older Desktop and launched agents without a published card get an explicitly `inferred` coordination purpose and skill; agents with published skills but no card text are `mixed`, and complete cards are `published`. `get_relay_agent_card` reports the same `cardSource`, while `owner` and `is_mine` prefer Control's verified Desktop, hosted-participant and ready-launch records over agent-written metadata. Clients that used `has_card` to distinguish published cards from no card must now read `card_source`. Truncated session titles and personas are no longer presented as published card purposes. No migration.
 - Fixed: `list_team_activity` no longer holds the request open when Relaycast or History stall. The roster read is bounded at 10 seconds, the optional presence read at 2 seconds (after which the roster is returned with `presence_source: "unavailable"`), and all activity reads at 20 seconds in total; an agent whose read did not finish in time is returned with `activity_status: "unavailable"`.
 - Fixed: `list_session_timings` now sends `user_id` to RelayHistory and, when a filtered page comes back empty, reads up to five pages before answering, so a member's sessions are no longer hidden behind an empty page with a cursor. `sessions_scanned` counts every page read.
