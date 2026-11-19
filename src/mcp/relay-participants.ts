@@ -10,7 +10,7 @@ import {
   type DesktopIdentityRow, type LinkedDesktopIdentity,
 } from "../messaging/desktop-identities.js";
 import type { McpContext, McpMember } from "./context.js";
-import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
+import { isListedRelayAgent, rosterAgent, ROSTER_TIMEOUT_MS, withinRelayRead } from "./team-activity.js";
 import { buildAgentCard, cardMetadata, cardSummary, recipientCard, type SetCardInput } from "./relay-agent-cards.js";
 import { loadRelayAgentOwners, relayAgentOwnerTarget } from "./relay-agent-owners.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
@@ -80,6 +80,11 @@ const inboxSenderEnrichmentFailed = (error: unknown) => {
     operation: "check_relay_inbox", error: error instanceof Error ? error.name : "unknown",
   });
 };
+const relayStatusAddressEnrichmentFailed = (error: unknown) => {
+  console.warn("[selfhost-mcp] relay status address enrichment failed", {
+    operation: "relay_status", error: error instanceof Error ? error.name : "unknown",
+  });
+};
 const sessionEnrichmentFailed = (error: unknown) => {
   console.warn("[selfhost-mcp] session enrichment failed", {
     operation: "list_relay_agents", error: error instanceof Error ? error.name : "unknown",
@@ -115,6 +120,7 @@ const DESKTOP_LINK_NEEDS_SESSION = "Initialize MCP to receive Mcp-Session-Id bef
 const DESKTOP_LINK_OAUTH = "This connection acts only as the agent approved for it and cannot link a desktop identity. Use a native MCP session (one that keeps Mcp-Session-Id) to call join_relay with desktop_address.";
 const DESKTOP_INBOX_GUIDANCE = "Replies are injected into your session by Agent Relay Desktop; check_relay_inbox is not used for this linked identity.";
 const INBOX_SENDER_LOOKUP_TIMEOUT_MS = 1_000;
+const RELAY_STATUS_LOOKUP_TIMEOUT_MS = 1_000;
 const CHANNEL_REPLY_GUIDANCE = "Reply to a post in this channel with post_relay_channel channel=<name> thread_id=<message_id>. Use send_relay_message only when the reply is private.";
 const RESERVED_CHANNEL_PREFIX = "agent-events-";
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,79}$/;
@@ -739,7 +745,10 @@ function createRelayService(context: McpContext) {
   }
 
   async function listedAgents(status: "active" | "all", includeStale = false, dir: Directory = directory()) {
-    return (await dir.via.listAgents(dir.credential, status, { includeStale })).filter(isListedRelayAgent);
+    return (await withinRelayRead(
+      signal => dir.via.listAgents(dir.credential, status, { includeStale, signal }),
+      ROSTER_TIMEOUT_MS,
+    )).filter(isListedRelayAgent);
   }
 
   const syncedSessionKinds = new Set(["codex", "grok", "pi", "opencode", "claude", "copilot", "cursor"]);
@@ -1584,7 +1593,15 @@ function createRelayService(context: McpContext) {
         ...(cursor ? { cursor_identity: cursor } : {}),
         guidance: "Send a message with send_relay_message to auto-join this MCP session, or call join_relay first." };
       await touchPresence(hosted);
-      const [address, inbox] = await Promise.all([addressFor(hosted.name, false, directory(hosted)), clientFor(hosted).readHostedInbox(hosted.token)]);
+      const dir = directory(hosted);
+      const [agents, inbox] = await Promise.all([
+        withinRelayRead(
+          signal => dir.via.findAgentsByNames(dir.credential, [hosted.name], { signal }),
+          RELAY_STATUS_LOOKUP_TIMEOUT_MS,
+        ).catch(error => { relayStatusAddressEnrichmentFailed(error); return []; }),
+        clientFor(hosted).readHostedInbox(hosted.token),
+      ]);
+      const address = agents.find(agent => agent.name === hosted.name)?.address ?? null;
       return { joined: true, linked: "hosted" as const, name: hosted.name, address,
         unread_count: inbox.length, unread_count_is_lower_bound: inbox.length === 100,
         ...(cursor && !await ownRun(as) ? { cursor_identity: cursor } : {}) };

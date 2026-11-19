@@ -152,6 +152,9 @@ function fakeRelaycast(state: {
   agents: unknown[]; presence: unknown[] | "fail"; calls: RelaycastCall[]; world: RelaycastWorld;
   /** The bounded `names` lookup: "fail" answers 503; "hang" waits for abort; "roster" ignores `names`. */
   namesLookup?: "fail" | "hang" | "roster";
+  /** A deliberately non-cooperative full-roster read, used to prove the outer MCP deadline. */
+  rosterLookup?: "hang";
+  rosterSignal?: AbortSignal;
 }): typeof fetch {
   return (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input instanceof Request ? input.url : input));
@@ -163,6 +166,10 @@ function fakeRelaycast(state: {
     });
     if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") {
       const names = url.searchParams.getAll("names");
+      if (state.rosterLookup === "hang" && names.length === 0) {
+        state.rosterSignal = init?.signal ?? undefined;
+        return await new Promise<Response>(() => {});
+      }
       if (state.namesLookup === "fail" && names.length) return json(503, { ok: false, error: { code: "unavailable" } });
       if (state.namesLookup === "hang" && names.length) {
         return await new Promise<Response>((_resolve, reject) => {
@@ -193,7 +200,8 @@ async function setup(t: TestContext, telemetry?: TelemetryModule) {
   const history = await startHistory(t);
   const agents: unknown[] = [];
   const relay = { agents, presence: [] as unknown[] | "fail", calls: [] as RelaycastCall[], world: createRelaycastWorld(agents),
-    namesLookup: undefined as "fail" | "hang" | "roster" | undefined };
+    namesLookup: undefined as "fail" | "hang" | "roster" | undefined,
+    rosterLookup: undefined as "hang" | undefined, rosterSignal: undefined as AbortSignal | undefined };
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -552,11 +560,11 @@ test("the capability handler preserves safe refusals, distinguishes outages, and
     endpointUrl: "https://relay.example.test/mcp", authMode: "cli_login", role: "owner",
     principal: { scopes: ["cli:auth"] }, workspace: { id: "workspace" }, providers: async () => [],
   };
-  async function call(required: boolean, nativeStatus: () => Promise<unknown>, authMode = "cli_login") {
+  async function call(required: boolean, nativeStatus: () => Promise<unknown>, authMode = "cli_login", nativeTimeoutMs?: number) {
     let handler: (() => Promise<{ structuredContent: Record<string, unknown> }>) | undefined;
     registerCapabilityDiscovery({ registerTool: (_name: string, _definition: unknown, run: typeof handler) => { handler = run; } } as never,
       { ...baseContext, authMode, desktopCall: { required, nativeSession: required ? { kind: "codex", id: "native" } : undefined } } as unknown as McpContext,
-      { nativeStatus });
+      { nativeStatus, nativeTimeoutMs });
     return (await handler!()).structuredContent as { groups: Array<{ id: string; status: string; reason?: string; how_to_enable?: string;
       restricted_tools?: Array<{ name: string; reason: string }> }> };
   }
@@ -577,6 +585,12 @@ test("the capability handler preserves safe refusals, distinguishes outages, and
   assert.match(unavailableReason, /could not check.*right now/i);
   assert.doesNotMatch(unavailableReason, /private outage details|reconnect/i);
   assert.deepEqual(warnings, [["[selfhost-mcp] native identity capability check failed", { error: "Error" }]]);
+
+  const timedOut = await call(true, () => new Promise(() => {}), "cli_login", 5);
+  const timeoutReason = timedOut.groups.find(group => group.id === "relay_messaging")?.restricted_tools
+    ?.find(tool => tool.name === "send_relay_message")?.reason ?? "";
+  assert.match(timeoutReason, /could not check.*right now/i);
+  assert.deepEqual(warnings.at(-1), ["[selfhost-mcp] native identity capability check failed", { error: "Error" }]);
 
   const available = await call(true, async () => { checks += 1; });
   assert.equal(checks, 3);
@@ -764,6 +778,23 @@ test("join_relay by name registers a hosted participant with Cloud's metadata", 
   assert.deepEqual({ joined: status.joined, name: status.name, unread: status.unread_count }, { joined: true, name: "owner-helper", unread: 0 });
 });
 
+test("relay_status returns with a null address when its bounded exact-name lookup stalls", async (t) => {
+  const env = await setup(t);
+  const client = await relayClient(t, env);
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-status" } }));
+  env.relay.namesLookup = "hang";
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+  const started = Date.now();
+  const status = structured(await client.callTool({ name: "relay_status", arguments: {} }));
+  assert(Date.now() - started < 2_500, "status address enrichment stays within its one-second budget");
+  assert.equal(status.joined, true);
+  assert.equal(status.name, "owner-status");
+  assert.equal(status.address, null);
+  assert.deepEqual(warnings, [["[selfhost-mcp] relay status address enrichment failed",
+    { operation: "relay_status", error: "Error" }]]);
+});
+
 test("join_relay is idempotent, defaults its name, and refuses a foreign owner's agent", async (t) => {
   const env = await setup(t);
   const client = await relayClient(t, env);
@@ -884,6 +915,17 @@ test("every listed Desktop and spawned agent has an inferred card and trusted ow
   // Read-only: nothing joined and nothing written.
   assert.equal((await env.database.query("SELECT 1 FROM hosted_relay_participants")).rows.length, 0);
   assert.equal(env.relay.world.bodies.some(call => call.method === "PATCH"), false);
+});
+
+test("list_relay_agents stops waiting after ten seconds when the roster ignores cancellation", async (t) => {
+  const env = await setup(t);
+  const client = await relayClient(t, env);
+  env.relay.rosterLookup = "hang";
+  const started = Date.now();
+  assert.match(toolError(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } })),
+    /relay operation failed/i);
+  assert(Date.now() - started < 12_500, "the MCP roster read stays within its ten-second budget");
+  assert.equal(env.relay.rosterSignal?.aborted, true);
 });
 
 test("list_relay_agents links synced Desktop sessions and keeps validated declarations authoritative", async (t) => {
