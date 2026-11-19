@@ -687,6 +687,7 @@ export function createApp(input: {
   } : null;
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
+    onError: (error, context) => telemetry?.observeError(error, context),
     ...(agentLinks ? { webhookInbox: agentLinks } : {}),
     ...(amp ? { amp: amp.deps } : {}),
     ...(replicas ? { replicas: replicas.deps } : {}),
