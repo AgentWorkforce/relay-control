@@ -82,7 +82,7 @@
     {"name":"0077_events_shim_sender_release_attempts.sql","sha256":"f586a6324c3af8d81e00cae9fea161772673a0d7ea55c865dfb00bafa3d901cd"},
     {"name":"0078_events_shim_claim_leases.sql","sha256":"1729204ca96b4196d16369b039b72c70b43ae6036c955d06e89f2f168d6d4b7a"},
     {"name":"0079_hosted_relay_gate.sql","sha256":"c9b201ff87a00dc9bf06cb304e46673556e47153343a68edf8d557029b988af1"},
-    {"name":"0080_person_device_credentials.sql","sha256":"e1dfd45b9ec6f157fcddabb4a51b81d04ab3af8e7539f6f31cd8dc8b2dcb271d"}
+    {"name":"0081_person_device_credentials.sql","sha256":"e1dfd45b9ec6f157fcddabb4a51b81d04ab3af8e7539f6f31cd8dc8b2dcb271d"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -2162,5 +2162,5 @@
   "optional":{
 
   },
-  "sha256":"ea4d0fb5fcda74cb8a6ad0e8b206142bc40d30a16a7e2e1c81c725e6c63de96c"
+  "sha256":"de9a87abaf8cb4de5c94819e50b8699a2d06370b83661e89b26ada65601549c9"
 }

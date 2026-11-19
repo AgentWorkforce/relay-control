@@ -1486,7 +1486,7 @@ leaves Control while Relaycast serves device tokens.
   other refusal, including `400` and `409 not_a_person_agent`, answers
   `502 upstream_unavailable`.
 - Tokens are stored encrypted in `person_device_credentials` (migration
-  0080), one row per workspace, person and device. A device row is deleted
+  0081), one row per workspace, person and device. A device row is deleted
   with its sign-in row. Ending a sign-in (sign-out, workspace switch,
   revoke-all, API token or Desktop credential revocation) revokes its rows in
   the same transaction; revoke-all also revokes the web row. Relaycast is told
