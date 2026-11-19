@@ -43,8 +43,17 @@ import {
  * workspace's explicit VM principal (a current member chosen by an admin,
  * never derived from an email or the owner); the first admitted call enrols
  * a Relay identity for that Replicas workspace. No
- * helper, credentials file or exec is written into the replica, and nothing
- * is pushed into its chats: it reads its inbox through the MCP tools.
+ * helper, credentials file or exec is written into the replica.
+ *
+ * Delivery is not pull-only: once enrolled, Relay messages for the binding
+ * are pushed into one chat of the replica (./inbound.ts). A replica with a
+ * single chat has it selected automatically; with several, the workspace
+ * owner/admin who is the binding's person selects one through bind_replica,
+ * and the selection cannot be changed afterwards. A push is sent only while
+ * the replica is awake: sleeping compute is never woken, and the message
+ * waits for a later retry or for check_relay_inbox. A pushed message stays
+ * readable through check_relay_inbox until it is acknowledged there, so a
+ * replica that also polls may see it twice.
  *
  * Connecting Replicas (an owner/admin action) discovers every environment of
  * the connected organization, enables it and registers the MCP entry; ones
@@ -268,6 +277,41 @@ async function liveBinding(tx: SqlExecutor, claims: ReplicaIdentityClaims, admis
     throw new IdentityRefusal("replica_creator_not_allowed", 403, scopeOf(admission));
   }
   return row;
+}
+
+/**
+ * Re-runs the admission checks for a persisted environment-identity binding,
+ * from its saved pins rather than a presented token: used before pushing a
+ * Relay message into the replica or selecting its chat. The binding must
+ * still be this replica's first live binding, admitted through an enabled
+ * policy of its own workspace, with an acting creator or principal that is
+ * still its person. A tombstone answers replica_released. Writes nothing:
+ * no stamp, no audit and no pending creator request (there is no token).
+ */
+export async function assertEnvironmentRowAccessInTx(tx: SqlExecutor, row: SpawnRow): Promise<void> {
+  if (row.source !== ENVIRONMENT_IDENTITY || !row.issuer || !row.provider_organization_id || !row.environment_id || !row.replica_id) {
+    throw new IdentityRefusal("replica_identity_invalid", 403);
+  }
+  const claims: ReplicaIdentityClaims = {
+    issuer: row.issuer,
+    organizationId: row.provider_organization_id.toLowerCase(),
+    environmentId: row.environment_id.toLowerCase(),
+    workspaceId: row.replica_id.toLowerCase(),
+    creatorId: row.input.creator_id ?? null,
+    creatorEmail: null,
+    jti: "persisted-binding",
+  };
+  const admission = await admissionChecks(tx, claims);
+  if (admission.policy.workspace_id !== row.workspace_id) throw new IdentityRefusal("replica_environment_not_enabled", 403);
+  const live = await tx.query<{ id: string }>(
+    "SELECT id FROM replica_spawns WHERE lower(replica_id) = $1 AND state <> 'gone' ORDER BY created_at, id FOR UPDATE",
+    [claims.workspaceId],
+  );
+  if (live.rows[0]?.id !== row.id) throw new IdentityRefusal("replica_already_bound", 409, scopeOf(admission));
+  // The same person rule as liveBinding: a changed mapping or principal never moves the binding.
+  if (!acting(admission) || row.user_id !== admission.userId) {
+    throw new IdentityRefusal("replica_creator_not_allowed", 403, scopeOf(admission));
+  }
 }
 
 /** This replica's own released environment-identity binding in the admitted workspace, locked. */

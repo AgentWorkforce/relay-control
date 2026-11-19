@@ -546,19 +546,29 @@ test("relaycast: the collector enforces native workspace and installation scopes
   assert.deepEqual((await readSegments(ctx.dataDir)).map((segment) => segment.events), [[dm, exception, rating]]);
 });
 
-test("session-read-api: the coordination overlaps route is accepted", async (t) => {
+test("session-read-api: the user aggregate and coordination routes are accepted, a concrete path is not", async (t) => {
   const ctx = await setup(t, {
     registries: COLLECTOR_REGISTRIES,
     producers: createProducerRegistry([{ name: "read-a", component: "session-read-api", deploymentId: DEPLOYMENT_A, token: TOKEN_A }]),
   });
-  const event = installEvent({
+  const read = (route: string) => installEvent({
     component: "session-read-api",
     event: "session_read.request_completed",
     tenant_id: "org_synthetic",
     workspace_id: "ws_synthetic",
-    properties: { route: "/v1/coordination/overlaps", outcome: "served", status_class: "2xx", latency_bucket: "lt_250ms" },
+    properties: { route, outcome: "served", status_class: "2xx", latency_bucket: "lt_250ms" },
   });
-  assert.equal((await post(ctx.origin, batch([event]), { token: TOKEN_A })).status, 204);
+  for (const route of [
+    "/v1/sessions/users",
+    "/v1/coordination/overlaps",
+    "/v1/coordination/advisories",
+    "/v1/coordination/advisories/:advisoryId/ack",
+  ]) {
+    assert.equal((await post(ctx.origin, batch([read(route)]), { token: TOKEN_A })).status, 204, route);
+  }
+  // The pattern is accepted, never a path that carries an advisory ID.
+  const concrete = await post(ctx.origin, batch([read("/v1/coordination/advisories/adv_synthetic/ack")]), { token: TOKEN_A });
+  assert.equal(concrete.status, 400);
 });
 
 test("busy gate: beyond MAX_IN_FLIGHT is 429 busy with Retry-After", async (t) => {

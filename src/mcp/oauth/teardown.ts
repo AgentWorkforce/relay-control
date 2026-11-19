@@ -11,6 +11,8 @@ type Intent = {
 type Participant = {
   id:string; agent_name:string; agent_remote_id:string; relaycast_workspace_id:string;
   session_hash:string|null; token_ciphertext:string;
+  /** Set when the participant enrolled through relaygate: token_ciphertext then seals an rg_ token. */
+  relaygate_agent_id:string|null;
 };
 type Workspace = {relaycast_workspace_id:string|null;relaycast_api_key_ciphertext:string|null};
 type Grant = {id:string;agent_remote_id:string|null;agent_name:string;created_at:Date|string};
@@ -91,6 +93,8 @@ export class McpOAuthTeardown {
   private migrationWarned=false;
   constructor(readonly deps:{
     database:Database; keyring:EncryptionKeyring; client:RelaycastClient; now?:()=>Date;
+    /** Gate-only installs: participants enrolled through relaygate are looked up and released through it. */
+    gate?:RelaycastClient;
     /** Wall-clock budget of one pass; the remainder follows in an immediate rerun. */
     passBudgetMs?:number;
   }) {}
@@ -228,7 +232,8 @@ export class McpOAuthTeardown {
   private async snapshot(tx:SqlExecutor,intent:Claim["intent"]):Promise<Snapshot> {
     const workspace=(await tx.query<Workspace>(`SELECT relaycast_workspace_id,relaycast_api_key_ciphertext
       FROM workspaces WHERE id=$1 AND organization_id=$2`,[intent.workspace_id,intent.organization_id])).rows[0]??null;
-    const row=(await tx.query<Participant>(`SELECT p.id,p.agent_name,p.agent_remote_id,p.relaycast_workspace_id,p.session_hash,p.token_ciphertext
+    const row=(await tx.query<Participant>(`SELECT p.id,p.agent_name,p.agent_remote_id,p.relaycast_workspace_id,p.session_hash,p.token_ciphertext,
+        p.relaygate_agent_id
       FROM hosted_relay_participants p
       WHERE p.workspace_id=$1 AND p.user_id=$2 AND p.agent_remote_id=$3`,
     [intent.workspace_id,intent.user_id,intent.agent_remote_id])).rows[0]??null;
@@ -273,6 +278,9 @@ export class McpOAuthTeardown {
     const byId=async()=>(await this.deps.client.listAgents(key,"all",{includeStale:true}))
       .find(agent=>agent.id===intent.agent_remote_id && agent.status!=="released")??null;
     let remote:RosterAgent|null;
+    // A participant enrolled through relaygate holds an rg_ token only relaygate accepts.
+    const via=row?.relaygate_agent_id && this.deps.gate ? this.deps.gate : this.deps.client;
+    let gateToken:string|null=null;
     if(row) {
       let token:string|null=null;
       // A token sealed under a retired key: the workspace-key roster still
@@ -281,7 +289,8 @@ export class McpOAuthTeardown {
       try {
         if(token===null) remote=await byId();
         else {
-          remote=await this.deps.client.authenticatedAgent(token);
+          remote=await via.authenticatedAgent(token);
+          if(via!==this.deps.client) gateToken=token;
           if(remote.status==="released") remote=null;
         }
       } catch(error) {
@@ -316,6 +325,16 @@ export class McpOAuthTeardown {
     // a binding committed before the revocation row existed; the commit
     // re-read below is the last belt, and keeps the row pending if one appears.
     if(!await this.unchanged(claim)) return "pending";
+    // Through relaygate when it still accepts the participant's token: that also revokes its relaygate tokens.
+    // A rejected (expired) rg_ token is held by no one, so the workspace-key release below is enough.
+    if(gateToken) {
+      try {
+        await this.deps.gate!.releaseOwnAgent(gateToken);
+        return {outcome:"released",deleteRow:true};
+      } catch(error) {
+        if(!(error instanceof RelaycastCallError) || error.status!==401) throw error;
+      }
+    }
     try {
       await this.deps.client.releaseHosted(key,remote.name,remote.id);
     } catch(error) {

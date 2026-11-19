@@ -398,8 +398,8 @@ export function createMcpHandler(input: {
       providers: async () => (await providerStatuses(input.providerProbes)).map(provider => provider.id === "grok-bot"
         ? { ...provider, mcpGroupsRegistered: Boolean(context.grokRoutines) } : provider),
       relaycast: {
-        listAgents: (status) => relaycast.listAgents(workspace.relaycastApiKey, status),
-        listPresence: () => relaycast.listPresence(workspace.relaycastApiKey),
+        listAgents: (status, options) => relaycast.listAgents(workspace.relaycastApiKey, status, { signal: options?.signal }),
+        listPresence: (options) => relaycast.listPresence(workspace.relaycastApiKey, { signal: options?.signal }),
       },
       relay: {
         database: store.database,

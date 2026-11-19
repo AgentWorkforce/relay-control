@@ -43,6 +43,7 @@ async function startHistory(t: TestContext) {
   const events: HistoryEvent[] = [];
   let mints = 0;
   let origin = "";
+  let eventsFailure: { status: number; body: unknown } | null = null;
   const server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -94,6 +95,10 @@ async function startHistory(t: TestContext) {
     const visible = events.filter((event) => event.workspaceId === tokenWorkspace);
     const wire = ({ workspaceId: _workspace, ...event }: HistoryEvent) => event;
     if (url.pathname === "/v1/events") {
+      if (eventsFailure) {
+        send(eventsFailure.status, eventsFailure.body);
+        return;
+      }
       const q = (url.searchParams.get("q") ?? "").toLowerCase();
       send(200, {
         events: visible.filter((event) => event.content.toLowerCase().includes(q)).map(wire),
@@ -129,7 +134,10 @@ async function startHistory(t: TestContext) {
   });
   origin = await listen(server);
   t.after(() => close(server));
-  return { origin, paths, events, handoffs };
+  return {
+    origin, paths, events, handoffs,
+    failEvents(status: number, body: unknown) { eventsFailure = { status, body }; },
+  };
 }
 
 type RelaycastCall = { path: string; authorization: string | null };
@@ -488,6 +496,21 @@ test("session reads go to RelayHistory for the bound workspace only", async (t) 
   assert(!env.history.paths.some((path) => path.includes(env.otherWorkspaceId)));
 });
 
+test("a failed transcript search is text, so clients do not check it against the success schema", async (t) => {
+  const env = await setup(t);
+  env.history.failEvents(500, { error: { code: "internal_error", message: "SECRET upstream failure" } });
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  await client.listTools();
+  const result = await client.callTool({ name: "search_shared_sessions", arguments: { query: "deploy" } });
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent, undefined);
+  const text = (result.content as Array<{ text?: string }>).map((part) => part.text ?? "").join("\n");
+  assert.match(text, /Shared session history is temporarily unavailable/);
+  assert.match(text, /correlation_id: [0-9a-f-]{36}/);
+  assert.equal(text.includes("SECRET"), false);
+  assert.equal(text.includes("internal_error"), false);
+});
+
 test("History reads for bearer and cookie callers go through the read API handoff, never with the caller token", async (t) => {
   const env = await setup(t);
   env.history.events.push(
@@ -671,9 +694,30 @@ const CARD_INPUT = {
   documentation_url: "https://docs.example.test/reviewer",
 };
 
-test("get_relay_agent_card returns a minimal card for an agent without one, and refuses unknown agents", async (t) => {
+test("every listed Desktop and spawned agent has an inferred card and trusted owner", async (t) => {
   const env = await setup(t);
-  const peer = env.relay.world.addAgent("peer-bot", { description: "Answers questions", kind: "grok-bot", owner_name: "Teammate" });
+  const peer = env.relay.world.addAgent("peer-bot", {
+    session_title: "You are peer-bot. This truncated spawn prompt is not its published purpose.",
+    kind: "grok-bot", owner_name: "Untrusted label",
+  });
+  const spawned = env.relay.world.addAgent("spawned-bot", { session_title: "You are spawned-bot. Also truncated." });
+  await env.database.query(
+    `INSERT INTO desktop_relay_identities
+       (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id, agent_name,
+        agent_remote_id, address, token_ciphertext)
+     VALUES ($1, $2, $3, $4, 'rc-first', $5, $6, $7, $8, 'encrypted-test-token')`,
+    ["00000000-0000-4000-8000-000000000091", env.workspaceId, env.orgId, env.ownerId,
+      "00000000-0000-4000-8000-000000000092", peer.name, peer.id, `peer-bot@cloud-${peer.id}`],
+  );
+  await env.database.query(
+    `INSERT INTO relay_spawns
+       (id, workspace_id, user_id, authority_hash, relaycast_workspace_id, actor_id, idempotency_hash,
+        request_hash, agent_name, cli, node_id, state, worker_id, worker_address, audit)
+     VALUES ($1, $2, $3, 'authority', 'rc-first', 'actor', 'spawn-owner-card-idem', 'request',
+       $4, 'codex', 'node-1', 'ready', $5, $6, '[]'::jsonb)`,
+    ["00000000-0000-4000-8000-000000000093", env.workspaceId, env.ownerId,
+      spawned.name, spawned.id, `spawned-bot@cloud-${spawned.id}`],
+  );
   const client = await relayClient(t, env);
   const result = await client.callTool({ name: "get_relay_agent_card", arguments: { agent: `peer-bot@cloud-${peer.id}` } });
   assert.match((result.content as Array<{ text: string }>)[0]!.text,
@@ -681,7 +725,7 @@ test("get_relay_agent_card returns a minimal card for an agent without one, and 
   assert.deepEqual(structured(result), {
     protocolVersion: "0.3.0",
     name: "peer-bot",
-    description: "Answers questions",
+    description: `peer-bot is an Agent Relay agent on cloud-${peer.id}, available for direct collaboration.`,
     url: "https://cast.selfhosted.example/a2a/rpc",
     preferredTransport: "JSONRPC",
     version: "1",
@@ -689,14 +733,24 @@ test("get_relay_agent_card returns a minimal card for an agent without one, and 
     capabilities: { streaming: false, pushNotifications: false },
     defaultInputModes: ["text/plain"],
     defaultOutputModes: ["text/plain"],
-    skills: [],
+    skills: [{ id: "coordinate-work", name: "Coordinate current work",
+      description: "Send this agent a focused request related to the work it currently owns, including the expected outcome and relevant context.",
+      tags: [], examples: ["Coordinate a task or request a focused review."] }],
     "x-agent-relay": {
-      address: `peer-bot@cloud-${peer.id}`, kind: "grok-bot", owner: "Teammate", where: `cloud-${peer.id}`, status: "live",
-      tags: [], hasCard: false,
+      address: `peer-bot@cloud-${peer.id}`, kind: "grok-bot", owner: "Owner", where: `cloud-${peer.id}`, status: "live",
+      tags: [], hasCard: true, cardSource: "inferred",
     },
   });
   const listed = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
-  assert.deepEqual(listed.agents.map((agent: any) => [agent.name, agent.skills, agent.has_card]), [["peer-bot", [], false]]);
+  assert.deepEqual(listed.agents.map((agent: any) => [agent.name, agent.skills, agent.has_card, agent.card_source]), [
+    ["peer-bot", ["Coordinate current work"], true, "inferred"],
+    ["spawned-bot", ["Coordinate current work"], true, "inferred"],
+  ]);
+  for (const agent of listed.agents) {
+    assert.deepEqual(agent.owner, { user_id: env.ownerId, name: "Owner" });
+    assert.equal(agent.is_mine, true);
+  }
+  assert.doesNotMatch(structured(result).description, /truncated spawn prompt/i);
   assert.ok(client.getInstructions()?.includes(CARD_GUIDANCE));
   const channels = structured(await client.callTool({ name: "list_relay_channels", arguments: {} }));
   assert.ok(channels.guidance.endsWith(CARD_GUIDANCE));
@@ -707,6 +761,33 @@ test("get_relay_agent_card returns a minimal card for an agent without one, and 
   // Read-only: nothing joined and nothing written.
   assert.equal((await env.database.query("SELECT 1 FROM hosted_relay_participants")).rows.length, 0);
   assert.equal(env.relay.world.bodies.some(call => call.method === "PATCH"), false);
+});
+
+test("agent card owner enrichment fails open when its journal or membership read fails", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-bot", {
+    owner_hash: sha256(env.ownerId), owner_name: "Metadata fallback",
+  });
+  const client = await relayClient(t, env);
+  const originalQuery = env.database.query.bind(env.database);
+  let failure: "owner" | "members" | null = null;
+  env.database.query = (async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+    if (failure === "owner" && sql.includes("'desktop'::text AS source")) throw new Error("owner query unavailable");
+    if (failure === "members" && sql.includes("FROM organization_memberships m")) throw new Error("members query unavailable");
+    return originalQuery<T>(sql, params);
+  }) as typeof env.database.query;
+  t.after(() => { env.database.query = originalQuery; });
+
+  failure = "owner";
+  const listed = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
+  assert.deepEqual(listed.agents.map((agent: any) => ({ name: agent.name, owner: agent.owner, has_card: agent.has_card })), [{
+    name: "peer-bot", owner: { user_id: env.ownerId, name: "Owner" }, has_card: true,
+  }]);
+
+  failure = "members";
+  const card = structured(await client.callTool({ name: "get_relay_agent_card", arguments: { agent: "peer-bot" } }));
+  assert.equal(card["x-agent-relay"].owner, "Metadata fallback");
+  assert.equal(card["x-agent-relay"].hasCard, true);
 });
 
 test("set_relay_agent_card writes only the joined participant's card and preserves its other metadata", async (t) => {

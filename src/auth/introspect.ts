@@ -13,6 +13,9 @@ import {
 } from "../mcp/relay-launch-credentials.js";
 import { NODE_ID_PATTERN, type ControlPlaneStore, type IntrospectedToken, type Principal } from "../store.js";
 import type { HeldAudienceVerdict, IntrospectionHold } from "./introspection-hold.js";
+import {
+  RELAY_HOSTED_CREDENTIAL_PREFIX, RELAY_HOSTED_SCOPE, type RelayHostedClient, type RelayHostedCredentials,
+} from "../mcp/relay-hosted-credentials.js";
 
 /**
  * POST /internal/v1/auth/introspect: the sessions pipeline (and relayfile)
@@ -76,6 +79,14 @@ import type { HeldAudienceVerdict, IntrospectionHold } from "./introspection-hol
  *   node_name of the launch, scopes `["relay:agent:enrol"]`, token_id = the
  *   credential id, iat = minted and exp = the credential's expiry. Unset gate
  *   URL: every `sh_lt_` is `unknown`.
+ * - Hosted participant credentials (gate-only installs; docs/identity.md,
+ *   "Hosted participants on gate-only installs"): an `sh_ht_` token
+ *   relay-control mints for one hosted MCP participant and presents to
+ *   relaygate's POST /v1/register itself. Checked and burned like a launch
+ *   credential. Active answers have principal_type `relay_hosted`, sub = the
+ *   participant's owner, agent_name, client (the hosted MCP client), scopes
+ *   `["relay:hosted:enrol"]`, token_id = the credential id. Unset gate URL:
+ *   every `sh_ht_` is `unknown`.
  * - User tokens also carry `role`, the live organization role, so optional
  *   add-on services can make the same admin decisions as this service without
  *   reading its database. Each add-on is one more origin in
@@ -207,12 +218,36 @@ export type IntrospectionResult =
     iat: number;
     exp: number;
     token_id: string;
+  }
+  | {
+    active: true;
+    /** The participant's owner. */
+    sub: string;
+    email: null;
+    principal_type: "relay_hosted";
+    agent_name: string;
+    /** The hosted MCP client relaygate's controlPrincipals match on (`match.clients`). */
+    client: RelayHostedClient;
+    machine_id: null;
+    org: string;
+    workspace: string;
+    /** Always `["relay:hosted:enrol"]` (RELAY_HOSTED_SCOPE). */
+    scopes: string[];
+    aud: string;
+    iat: number;
+    exp: number;
+    token_id: string;
   };
 
 export type IntrospectionLog = (message: string, fields: Record<string, unknown>) => void;
 
 /** Only the HTTP route passes a hold; every in-process caller stays strict. */
-export type IntrospectionOptions = { hold?: IntrospectionHold; log?: IntrospectionLog };
+export type IntrospectionOptions = {
+  hold?: IntrospectionHold;
+  log?: IntrospectionLog;
+  /** Gate-only installs: one-time hosted participant credentials (`sh_ht_`). */
+  hostedCredentials?: RelayHostedCredentials;
+};
 
 export type IntrospectionOutcome =
   | { status: 200; body: IntrospectionResult }
@@ -521,6 +556,45 @@ async function introspectRelayLaunchCredential(
   };
 }
 
+/** One-time hosted participant credentials (`sh_ht_`, principal `relay_hosted`); burned on the active answer. */
+async function introspectRelayHostedCredential(
+  config: SelfhostConfig,
+  credentials: RelayHostedCredentials | undefined,
+  request: IntrospectionRequest,
+): Promise<IntrospectionResult> {
+  const found = credentials ? await credentials.peek(request.token) : { state: "unknown" as const };
+  if (found.state === "unknown") return { active: false, reason: "unknown" };
+  if (found.state === "redeemed") return { active: false, reason: "revoked" };
+  if (found.state === "expired") return { active: false, reason: "expired" };
+  const aud = normalizedOrigin(request.aud);
+  if (aud === null || !acceptedAudiences(config).includes(aud)) return { active: false, reason: "audience" };
+  if (request.workspace !== undefined && found.credential.workspaceId !== request.workspace) {
+    return { active: false, reason: "workspace" };
+  }
+  if (request.machine !== undefined) return { active: false, reason: "machine_not_owned" };
+  const redeemed = await credentials!.redeem(request.token);
+  if (redeemed.state !== "active") {
+    return { active: false, reason: redeemed.state === "expired" ? "expired" : redeemed.state === "unknown" ? "unknown" : "revoked" };
+  }
+  const credential = redeemed.credential;
+  return {
+    active: true,
+    sub: credential.userId,
+    email: null,
+    principal_type: "relay_hosted",
+    agent_name: credential.agentName,
+    client: credential.client,
+    machine_id: null,
+    org: credential.organizationId,
+    workspace: credential.workspaceId,
+    scopes: [RELAY_HOSTED_SCOPE],
+    aud,
+    iat: epochSeconds(credential.createdAt),
+    exp: epochSeconds(credential.expiresAt),
+    token_id: credential.id,
+  };
+}
+
 export async function introspect(
   config: SelfhostConfig,
   store: ControlPlaneStore,
@@ -541,6 +615,9 @@ export async function introspect(
   }
   if (request.token.startsWith(RELAY_LAUNCH_CREDENTIAL_PREFIX)) {
     return introspectRelayLaunchCredential(config, launchCredentials, request);
+  }
+  if (request.token.startsWith(RELAY_HOSTED_CREDENTIAL_PREFIX)) {
+    return introspectRelayHostedCredential(config, options?.hostedCredentials, request);
   }
   // Refresh, internal, bootstrap, worker, run and enrollment tokens are
   // never looked up as user tokens. That includes sh_ek_ desktop enrollment
@@ -672,6 +749,7 @@ export async function handleIntrospection(
   flowRunCredentials?: FlowRunRelayfileCredentials,
   launchCredentials?: RelayLaunchCredentials,
   hold?: IntrospectionHold,
+  hostedCredentials?: RelayHostedCredentials,
 ): Promise<IntrospectionOutcome> {
   const secret = config.introspectSecret;
   if (!secret) {
@@ -695,5 +773,5 @@ export async function handleIntrospection(
       message: "Body must be a JSON object with string token and aud, optionally a non-empty string (or null) workspace, and optionally a node-id string machine (at most 16 KiB)",
     };
   }
-  return { status: 200, body: await introspect(config, store, body, apiTokens, flowRunCredentials, launchCredentials, { hold, log }) };
+  return { status: 200, body: await introspect(config, store, body, apiTokens, flowRunCredentials, launchCredentials, { hold, log, hostedCredentials }) };
 }

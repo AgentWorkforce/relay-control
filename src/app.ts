@@ -3,6 +3,7 @@ import { revokeOrganizationMcpOAuthGrants } from "./mcp/oauth/revocations.js";
 import { createMcpOAuthHttpModule } from "./mcp/oauth/routes.js";
 import { McpOAuthStore } from "./mcp/oauth/store.js";
 import { connectorKind } from "./mcp/oauth/connector-kind.js";
+import { relayHostedCredentials } from "./mcp/relay-hosted-credentials.js";
 import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
@@ -620,9 +621,12 @@ export function createApp(input: {
   const oauthTeardown=mcpOAuthActive(config) ? input.mcpOAuthTeardown??new McpOAuthTeardown({
     database:store.database,keyring:config.encryptionKeyring,
     client:createRelaycastClient({internalOrigin:config.relaycastUrl,fetchImpl:mcpOAuthTeardownFetch(input.messagingFetch)}),now:input.now,
+    ...(config.relaygatePublicUrl ? {gate:createRelaycastClient({internalOrigin:config.relaygatePublicUrl,
+      fetchImpl:mcpOAuthTeardownFetch(input.messagingFetch)})} : {}),
   }) : null;
   const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines({
       database:store.database,keyring:config.encryptionKeyring,client:oauthRelay,
+      ...(config.relaygatePublicUrl ? {gate:createRelaycastClient({internalOrigin:config.relaygatePublicUrl,fetchImpl:input.messagingFetch})} : {}),
       publicOrigin:new URL(config.publicBaseUrl).origin,tenancyMode:store.tenancy,now:input.now,
     }) : undefined;
   const mcpOAuth = createMcpOAuthHttpModule({
@@ -978,6 +982,8 @@ export function createApp(input: {
   // Gate-only installs only: relaygate introspects one-time `sh_lt_` launch credentials.
   const relayLaunchCredentialStore = config.relaygatePublicUrl
     ? relayLaunchCredentials(store.database, config.encryptionKeyring) : undefined;
+  // Gate-only installs only: relaygate introspects one-time `sh_ht_` hosted participant credentials.
+  const relayHostedCredentialStore = config.relaygatePublicUrl ? relayHostedCredentials(store.database) : undefined;
   // Gate-only installs only: Control holds relay nodes' Relaycast node tokens and bridges their sockets.
   const relayNodeCredentialStore = config.relaygatePublicUrl
     ? relayNodeCredentials(store.database, config.encryptionKeyring) : undefined;
@@ -1341,6 +1347,7 @@ export function createApp(input: {
     if (method === "POST" && publicPath === INTROSPECT_PATH) {
       const outcome = await handleIntrospection(
         config, store, request, undefined, admin?.apiTokens, flowRelayfileCredentials, relayLaunchCredentialStore, introspectionHold,
+        relayHostedCredentialStore,
       );
       if (outcome.status === 200) json(response, 200, outcome.body, true);
       else json(response, outcome.status, { error: outcome.error, message: outcome.message }, true);

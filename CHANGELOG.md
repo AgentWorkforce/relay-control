@@ -5,9 +5,48 @@ assigned at release.
 
 ## Unreleased
 
+- Changed: every agent returned by MCP `list_relay_agents` now has a fetchable card. Older Desktop and launched agents without a published card get an explicitly `inferred` coordination purpose and skill; agents with published skills but no card text are `mixed`, and complete cards are `published`. `get_relay_agent_card` reports the same `cardSource`, while `owner` and `is_mine` prefer Control's verified Desktop, hosted-participant and ready-launch records over agent-written metadata. Clients that used `has_card` to distinguish published cards from no card must now read `card_source`. Truncated session titles and personas are no longer presented as published card purposes. No migration.
+- Fixed: `list_team_activity` no longer holds the request open when Relaycast or History stall. The roster read is bounded at 10 seconds, the optional presence read at 2 seconds (after which the roster is returned with `presence_source: "unavailable"`), and all activity reads at 20 seconds in total; an agent whose read did not finish in time is returned with `activity_status: "unavailable"`.
+- Fixed: `list_session_timings` now sends `user_id` to RelayHistory and, when a filtered page comes back empty, reads up to five pages before answering, so a member's sessions are no longer hidden behind an empty page with a cursor. `sessions_scanned` counts every page read.
+- Fixed: MCP `list_session_timings` now reads each selected session's timing
+  from the same per-user sessions reader as transcript search, the session
+  directory and exact-session transcript reads. A Reader-only desktop session
+  therefore no longer disappears into the legacy History path at the timing
+  step. No setting or migration.
+- Fixed: the analytics collector accepts the sessions read API route `/v1/sessions/users`. The reader has reported it since that route shipped, and the collector refused any batch that contained it. It also accepts the patterns `/v1/coordination/advisories` and `/v1/coordination/advisories/:advisoryId/ack`, so the reader can start naming them without a refused batch. No setting or migration; analytics stays off unless configured.
 - Added: memory-aware agent launches (docs/specs/spawn-placement-memory.md). `list_relay_spawn_targets` takes an optional `harness` and, unless `SELFHOST_SPAWN_MEMORY_POLICY=off`, reports each target's `memory` (tier, free, floor, the harness's need, agents that fit, sample age) and `admissible`, with a memory clause in `why`; `describe_capabilities` reports `workspace.spawn_memory_policy`. The default `observe` changes no ranking or admission and logs what `enforce` would refuse. `rank` puts targets that would take the launch first and filters alternatives to them; `enforce` also refuses with retryable `spawn_memory_low`. The policy is the shared `@agent-relay/spawn-placement` package, so Cloud judges memory the same way; its golden fixtures run in this repo's tests. Placement moved from `src/mcp/relay-spawn-placement.ts` to `src/mcp/spawn-placement/`. No migration.
 - Added: `SELFHOST_DEFAULT_SHARING_MODE` (`all` | `new` | `selected`) sets a deployment sharing mode served to callers whose organization has not saved one, and `SELFHOST_SHARING_MODE_OVERRIDE_ROLES` (`owner` and/or `admin`) leaves callers with those roles unlocked: their v1 policy omits `sharing_mode` and `sharing_mode_since`, and the v2 document serves the effective mode as `sections.capture.defaults.sharing_mode`. The organization-saved mode always wins. Applied per caller on `access/me`, the enrollment key exchange, introspection `capture_policy` (staff read grants as a member) and the upload-credentials revision check. Nothing is stored, no revision moves, and the organization policy routes and fleet view still show only what is stored. Both unset (the default), every response is unchanged. See docs/capture-policy.md.
 - Added: `relayfacts_list` and `relayfacts_get` on the Agent Relay MCP. They read the sessions pipeline read API's `GET /v1/relayfacts` (topics with counts) and `GET /v1/relayfacts/{topic}` (one page of a topic as markdown, `page` passed back as its cursor) through the same reader as the shared-session tools: `workspace` is always the credential's workspace, and a response without the workspace attestation returns nothing. They store and write nothing. Until the read API serves relayfacts (`READ_API_RELAYFACTS_ENABLED` off), every 501 is a successful `status: "disabled"` result ("relayfacts disabled") with the upstream reason. OAuth connections need `relay:history`; staff read grants do not get them. The per-user session reader now passes relayfacts cursors through unchanged and reports a 501's upstream reason.
+- Security: on a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set), every
+  hosted MCP participant now enrols at relaygate and its traffic, reads
+  included, goes through relaygate. That covers native MCP sessions and OAuth
+  connectors such as ChatGPT, Grok Bot, Muse and Cursor cloud agents. Before,
+  they were registered in Relaycast with the workspace key and messaged
+  around relaygate's policy (migration 0079). Control mints a one-time `sh_ht_`
+  hosted credential that relaygate introspects as `relay_hosted` with the
+  participant's client. relaygate admits hosted participants only through
+  rules naming the hosted kind, so **operators must add a relaygate
+  `controlPrincipals` rule per allowed client** (relaygate's "Hosted
+  participants"). Without one, `join_relay` fails and names the rule. Existing
+  participants are re-enrolled through relaygate on next use and keep their
+  upstream agent, so OAuth connections keep working. OAuth connections can no
+  longer launch agents on a gate-only install. A session with no relay
+  identity must `join_relay` before listing agents or channels there. A name
+  another owner or a provider binding holds is refused before any credential
+  is minted, and relaygate's answer must be the checked agent, the owner's,
+  or one relaygate registered itself. Each participant records the hosted
+  clients relaygate admitted it for (`admitted_clients`, migration 0079); a
+  connection of another kind enrols it again at relaygate as that kind first,
+  which re-applies that rule's groups and revokes the earlier token, and a
+  refusal leaves the participant as it was. The client is the connection's
+  admission kind, from the redirect URIs its authorization codes were
+  delivered to (index `mcp_oauth_codes_grant_idx`, migration 0079): a client
+  that registers a provider's callback beside its own enrols as `mcp`. Grok Bot routines whose token relaygate rejects
+  enrol again as `grok-bot` and adopt the token only for the same relaygate
+  and upstream agent. A stored participant is enrolled again only while its
+  own upstream agent still holds the name. See docs/identity.md, "Hosted
+  participants on gate-only installs".
+- Fixed: a Replicas launch or bind that never got a Relay identity no longer sits in `preparing`/`binding` forever. After 7 days the sync sweep abandons it (`gone`, audited `replicas.spawn.abandoned`). A replica Relay launched is put to sleep first; an existing chat is left awake. A failed sleep is retried no sooner than one hour later, and not at all while the connection is latched as refused. Rows with a Relay identity and environment identities are untouched.
 - Added: MCP `get_session_summary` can read recorded short or long summaries
   of the requested kind and return validated optional provenance. It enforces
   320/16000 Unicode code-point bounds, preserves empty/unsupported responses,

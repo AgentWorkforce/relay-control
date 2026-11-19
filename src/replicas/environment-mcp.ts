@@ -5,7 +5,8 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { z } from "zod";
 import { admitIdentity, IDENTITY_SERVER_NAME, IdentityRefusal, withIdentityBinding } from "./environments.js";
 import { ReplicaIdentityError, ReplicaIdentityUnavailable, type ReplicaIdentityClaims } from "./identity.js";
-import { ReplicaProvisioningError, ReplicasError, type ReplicasDeps } from "./service.js";
+import { scheduleReplicaInbound } from "./inbound.js";
+import { ReplicaProvisioningError, ReplicasError, type ReplicasDeps, type SpawnRow } from "./service.js";
 import { checkRelayInbox, listRelayAgents, sendRelayMessage } from "./tools.js";
 
 /**
@@ -26,7 +27,14 @@ import { checkRelayInbox, listRelayAgents, sendRelayMessage } from "./tools.js";
  * applies, (5) binding lookup (a live launch or bind of the same replica in
  * this workspace is reused while its owner is a member, before a mapping or
  * principal is required) or enrolment. Every tool call repeats 2-4 under the
- * workspace lock. Pull-only: nothing is pushed into the replica's chats.
+ * workspace lock.
+ *
+ * Delivery is not pull-only. Each admitted call also starts (coalesced per
+ * replica) a check of push delivery (./inbound.ts): Relay messages are pushed
+ * into the replica's selected chat, which is its only chat or the one the
+ * binding's owner/admin chose with bind_replica (then immutable). Sleeping
+ * compute is never woken for a push. check_relay_inbox remains the polling
+ * fallback, and a pushed message stays readable there until acknowledged.
  */
 const BODY_MAX_BYTES = 256 * 1024;
 const MAX_BEARER = 8 * 1024 + 16;
@@ -157,9 +165,10 @@ export async function handleEnvironmentMcp(deps: ReplicasDeps, request: Incoming
     return rpcError(response, 400, -32700, "Parse error");
   }
   const id = requestId(body);
+  let admitted: SpawnRow;
   try {
     // Checks 2-5; enrols on the first admitted call.
-    await admitIdentity(deps, claims);
+    admitted = await admitIdentity(deps, claims);
   } catch (error) {
     if (error instanceof IdentityRefusal) return rpcError(response, error.status, error.status === 409 ? -32009 : -32003, error.code, id);
     // The workspace's Relay binding could not be provisioned: the reserved row is kept, the replica retries.
@@ -169,6 +178,8 @@ export async function handleEnvironmentMcp(deps: ReplicasDeps, request: Incoming
     if (error instanceof ReplicasError && error.status < 500) return rpcError(response, error.status, -32000, error.message, id);
     return rpcError(response, 503, -32000, "Agent Relay could not admit this replica. Retry the call.", id);
   }
+  // Fire and forget: the call is served while push delivery is checked.
+  scheduleReplicaInbound(deps, admitted);
   const server = buildServer(deps, claims);
   try {
     const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });

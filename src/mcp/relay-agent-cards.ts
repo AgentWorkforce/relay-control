@@ -143,10 +143,50 @@ export function hasCard(metadata: Record<string, unknown>): boolean {
   return storedCard(metadata) !== null || storedSkills(metadata).length > 0;
 }
 
-/** The two fields list_relay_agents adds per agent. */
-export function cardSummary(metadata: Record<string, unknown>): { skills: string[]; has_card: boolean } {
-  return { skills: storedSkills(metadata).slice(0, CARD_LIMITS.listedSkills).map(skill => skill.name),
-    has_card: hasCard(metadata) };
+export type AgentCardSource = "published" | "mixed" | "inferred";
+
+const INFERRED_SKILL: CardSkill = {
+  id: "coordinate-work",
+  name: "Coordinate current work",
+  description: "Send this agent a focused request related to the work it currently owns, including the expected outcome and relevant context.",
+  tags: [],
+  examples: ["Coordinate a task or request a focused review."],
+};
+
+/**
+ * Fleet and Desktop agents predate self-published cards. Give every roster
+ * agent a useful, explicitly inferred card without treating a truncated
+ * session title or persona as a purpose the agent published.
+ */
+function inferredCard(agent: RosterAgent) {
+  const metadata = agent.metadata;
+  const at = agent.address?.lastIndexOf("@") ?? -1;
+  const machine = at >= 0 ? agent.address!.slice(at + 1) || null : null;
+  const where = bounded(metadata.where, 200) ?? machine;
+  const suffix = where ? ` on ${where}` : "";
+  const role = agent.kind === "agent" ? "Agent Relay agent" : `Agent Relay ${agent.kind} agent`;
+  const declaredPurpose = bounded(metadata.objective, CARD_LIMITS.description)
+    ?? bounded(metadata.description, CARD_LIMITS.description);
+  return {
+    description: declaredPurpose ?? `${agent.name} is an ${role}${suffix}, available for direct collaboration.`,
+    skills: [{ ...INFERRED_SKILL, examples: [...(INFERRED_SKILL.examples ?? [])] }],
+  };
+}
+
+/** What list_relay_agents adds: effective skill names and a fetchable-card marker. */
+export function cardSummary(metadata: Record<string, unknown>, agent?: RosterAgent): {
+  skills: string[]; has_card: boolean; card_source?: AgentCardSource;
+} {
+  const card = storedCard(metadata);
+  const publishedSkills = storedSkills(metadata);
+  const published = card !== null || publishedSkills.length > 0;
+  const source: AgentCardSource = card ? "published" : publishedSkills.length ? "mixed" : "inferred";
+  const skills = source === "inferred" && agent ? inferredCard(agent).skills : publishedSkills;
+  return {
+    skills: skills.slice(0, CARD_LIMITS.listedSkills).map(skill => skill.name),
+    has_card: published || agent !== undefined,
+    ...(published || agent ? { card_source: source } : {}),
+  };
 }
 
 /**
@@ -185,25 +225,31 @@ export function cardMetadata(input: SetCardInput, existing: Record<string, unkno
 }
 
 // ---------------------------------------------------------------------------
-// The card returned to agents (contract section 2), field for field what
-// Relaycast's buildAgentCard (GET /v1/agents/:name/card) returns:
-// - description: metadata.card.description, else the persona, else
-//   metadata.description, else "<name> on Agent Relay".
+// The card returned to agents (contract section 2), compatible with
+// Relaycast's buildAgentCard (GET /v1/agents/:name/card). Older Desktop and
+// fleet identities get an explicitly inferred purpose and coordination skill;
+// a session persona/title is never presented as a purpose the agent published.
 // - x-agent-relay.kind: metadata.kind, else the Relaycast agent type.
-// - x-agent-relay.owner: metadata.owner_name, else metadata.owner; omitted when unset.
+// - x-agent-relay.owner: Control's identity journal when available, else
+//   metadata.owner_name / metadata.owner; omitted when unset.
 // - x-agent-relay.where: metadata.where, else the address's machine part; omitted when unset.
 // - x-agent-relay.status: "offline" when Relaycast reports offline, else "live".
 // - x-agent-relay.cardUpdatedAt: omitted without a card.
 
-export function buildAgentCard(agent: RosterAgent, options: { organization: string; relaycastUrl: string }) {
+export function buildAgentCard(agent: RosterAgent, options: { organization: string; relaycastUrl: string },
+  trustedOwner?: { userId: string; email: string; name: string | null }) {
   const metadata = agent.metadata;
   const card = storedCard(metadata);
-  const skills = storedSkills(metadata);
-  const description = card?.description ?? bounded(agent.persona, CARD_LIMITS.description)
-    ?? bounded(metadata.description, CARD_LIMITS.description) ?? `${agent.name} on Agent Relay`;
+  const publishedSkills = storedSkills(metadata);
+  const source: AgentCardSource = card ? "published" : publishedSkills.length ? "mixed" : "inferred";
+  const inferred = source === "published" ? null : inferredCard(agent);
+  const skills = source === "inferred" ? inferred?.skills ?? [] : publishedSkills;
+  const description = card?.description ?? inferred?.description ?? `${agent.name} on Agent Relay`;
   const at = agent.address?.indexOf("@") ?? -1;
   const machine = agent.address && at >= 0 ? agent.address.slice(at + 1) || null : null;
-  const owner = bounded(metadata.owner_name, 200) ?? bounded(metadata.owner, 200);
+  const owner = trustedOwner
+    ? bounded(trustedOwner.name, 200) ?? bounded(trustedOwner.email, 200) ?? trustedOwner.userId
+    : bounded(metadata.owner_name, 200) ?? bounded(metadata.owner, 200);
   const where = bounded(metadata.where, 200) ?? machine;
   return {
     protocolVersion: A2A_PROTOCOL_VERSION,
@@ -226,7 +272,8 @@ export function buildAgentCard(agent: RosterAgent, options: { organization: stri
       status: agent.status === "offline" ? "offline" : "live",
       tags: card?.tags ?? [],
       ...(card?.updated_at ? { cardUpdatedAt: card.updated_at } : {}),
-      hasCard: card !== null || skills.length > 0,
+      hasCard: true,
+      cardSource: source,
     },
   };
 }
