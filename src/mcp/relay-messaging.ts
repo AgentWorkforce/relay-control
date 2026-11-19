@@ -96,9 +96,10 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
   }, input => run(service => service.read(input)));
 
   server.registerTool("join_relay", {
-    description: "Link this MCP session to your local Agent Relay Desktop identity with desktop_address (the address from GET /whoami on the relay socket, or from an injected `[reply: ...]` hint); later sends, channel posts and status then act as that identity, and replies are injected into your session by Desktop. Without desktop_address, create or reuse a hosted inbox participant as the fallback, named by name or a default derived from your name (replies arrive in check_relay_inbox). Either binding belongs to this MCP session, is idempotent, and replaces the other. Joining an existing participant whose relay token Relaycast rejects recovers the token (recovered: true).",
+    description: "Link this MCP session to your local Agent Relay Desktop identity with desktop_address (the address from GET /whoami on the relay socket, or from an injected `[reply: ...]` hint); later sends, channel posts and status then act as that identity, and replies are injected into your session by Desktop. Without desktop_address, create or reuse a hosted inbox participant as the fallback, named by name or a default derived from your name (replies arrive in check_relay_inbox). Either binding belongs to this MCP session, is idempotent, and replaces the other. Joining an existing participant whose relay token Relaycast rejects recovers the token (recovered: true). A Cursor cloud agent joins as its own run with cursor_identity_token (see relay_status).",
     inputSchema: { desktop_address: z.string().trim().min(3).max(512).optional().describe("Exact synced Agent Relay Desktop identity address owned by the signed-in person: the direct name@machine address (GET /whoami on the relay socket), not an alias; cannot be combined with name or description."),
-      name: name.optional(), description: z.string().trim().max(1000).optional() },
+      name: name.optional(), description: z.string().trim().max(1000).optional(),
+      cursor_identity_token: z.string().trim().min(16).max(16384).optional().describe("Cursor cloud agents only: a Cursor OIDC token minted in this run's VM with relay_status's cursor_identity.mint_command. Joins as this run's own participant; pass its name as `as` afterwards. Cannot be combined with name or desktop_address.") },
     annotations: { ...annotations, readOnlyHint: false, idempotentHint: true },
   }, input => run(service => service.join(input), "join"));
 

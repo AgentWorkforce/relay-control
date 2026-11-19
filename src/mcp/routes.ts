@@ -1,3 +1,4 @@
+import type { CursorCloudDeps } from "./cursor-cloud.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { GrokRoutines } from "./grok-routines.js";
@@ -148,6 +149,7 @@ export function createMcpHandler(input: {
   /** Own credential resolver, used only at these MCP routes when the module is enabled. */
   oauthSessions?: McpOAuthSessions;
   grokRoutines?: GrokRoutines;
+  cursorCloud?: CursorCloudDeps;
   /** Clock for shared-session read audit records; tests inject it. */
   now?: () => Date;
 }) {
@@ -420,6 +422,7 @@ export function createMcpHandler(input: {
       ...(input.launch && !staffGrant ? { launch: true } : {}),
       readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
     };
+    if (oauth && input.cursorCloud) context.cursorCloud = input.cursorCloud;
     if (oauth && input.grokRoutines) {
       const client = (await store.database.query<{ client_name: string | null; redirect_uris: string[] }>(
         "SELECT client_name,redirect_uris FROM mcp_oauth_clients WHERE client_id=$1", [oauth.access.clientId])).rows[0];

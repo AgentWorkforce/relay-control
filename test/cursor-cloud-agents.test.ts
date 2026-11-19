@@ -1,0 +1,198 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { createServer } from "node:http";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { createApp } from "../src/app.js";
+import type { SelfhostConfig } from "../src/config.js";
+import { encryptSecret } from "../src/crypto.js";
+import { migrate } from "../src/migrations.js";
+import { ControlPlaneStore } from "../src/store.js";
+import { createRelaycastClient } from "../src/messaging/relaycast.js";
+import { cursorCloudParticipantName, cursorJwks } from "../src/mcp/cursor-oidc.js";
+import { loadCursorCloudConfig, type CursorCloudConfig } from "../src/mcp/cursor-cloud.js";
+import { createMcpOAuthProtocol } from "../src/mcp/oauth/protocol.js";
+import { McpOAuthSessions } from "../src/mcp/oauth/sessions.js";
+import { McpOAuthTeardown } from "../src/mcp/oauth/teardown.js";
+import { revokeMcpOAuthGrantRows } from "../src/mcp/oauth/revocations.js";
+import { PGliteDatabase, listen, close } from "./support/harness.js";
+import { createRelaycastWorld } from "./support/relaycast-world.js";
+
+// Cursor cloud agents (docs/cursor-cloud-agents.md): a Cursor cloud agent
+// connects with the person's OAuth grant from cursor.com/agents and joins as
+// its own run's participant with a Cursor-signed OIDC token, once the Cursor
+// account is linked to the person. A local RSA key stands in for
+// api.cursor.com's signing key.
+
+const ORIGIN = "https://relay.example.test";
+const AUDIENCE = `${ORIGIN}/mcp#cursor-cloud`;
+const KEYRING = { active: { id: "fake-key", key: Buffer.alloc(32, 7) } };
+
+function cursorIssuer() {
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const kid = "cursor-test-key";
+  const jwks = cursorJwks({ fetchImpl: (async () => Response.json({ keys: [{ ...publicKey.export({ format: "jwk" }), kid, alg: "RS256", use: "sig" }] })) as typeof fetch });
+  const mint = (nonce: string, claims: Record<string, unknown> = {}) => {
+    const now = Math.floor(Date.now() / 1000);
+    const head = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT", kid })).toString("base64url");
+    const body = Buffer.from(JSON.stringify({ iss: "https://api.cursor.com", aud: AUDIENCE, sub: "user:4242", iat: now, nbf: now - 5,
+      exp: now + 300, jti: randomUUID(), cloud_agent_id: "bc-run-1", agent_runtime: "managed", owner_user_id: "4242",
+      owner_email: "dev@example.test", team_id: "77", repo_url: "github.com/example/widgets", nonce, ...claims })).toString("base64url");
+    return `${head}.${body}.${sign("sha256", Buffer.from(`${head}.${body}`), privateKey).toString("base64url")}`;
+  };
+  return { jwks, mint };
+}
+
+async function fixture(t: test.TestContext, options: { redirect?: string; cursorCloud?: Partial<CursorCloudConfig> } = {}) {
+  const database = new PGliteDatabase(); t.after(() => database.close()); await migrate(database);
+  const owner = { userId: randomUUID(), organizationId: randomUUID(), workspaceId: randomUUID(), grantId: randomUUID(), tokenFamilyId: randomUUID() };
+  const clientId = "mcpc_" + randomUUID();
+  await database.query("INSERT INTO users(id,email,name) VALUES ($1,'dev@example.test','Dev Person')", [owner.userId]);
+  await database.query("INSERT INTO organizations(id,name) VALUES ($1,'Example Org')", [owner.organizationId]);
+  await database.query("INSERT INTO organization_memberships(organization_id,user_id,role) VALUES ($1,$2,'member')", [owner.organizationId, owner.userId]);
+  await database.query(`INSERT INTO workspaces(id,organization_id,name,relaycast_workspace_id,relaycast_api_key_ciphertext)
+    VALUES ($1,$2,'Example Workspace','example-workspace',$3)`, [owner.workspaceId, owner.organizationId, encryptSecret("rk_example", KEYRING.active)]);
+  await database.query("INSERT INTO mcp_oauth_clients(client_id,redirect_uris) VALUES ($1,$2)",
+    [clientId, [options.redirect ?? "https://www.cursor.com/agents/oauth/callback"]]);
+  const protocol = createMcpOAuthProtocol({ publicOrigin: ORIGIN, enabledResources: ["/api/v1/mcp/shared-sessions", "/mcp"] });
+  await database.query(`INSERT INTO mcp_oauth_grants(id,client_id,user_id,organization_id,workspace_id,agent_name,scopes,resource,token_family_id)
+    VALUES ($1,$2,$3,$4,$5,'dev-cursor',$6,$7,$8)`, [owner.grantId, clientId, owner.userId, owner.organizationId, owner.workspaceId,
+    ["relay:mcp"], protocol.mcpResourceUrl("/mcp"), owner.tokenFamilyId]);
+  const sessions = new McpOAuthSessions(database, { protocol, tenancyMode: "multi" });
+  const pair = await database.transaction(tx => sessions.issue(tx, { ...owner, scopes: ["relay:mcp"] }));
+  const world = createRelaycastWorld([]);
+  const relayFetch: typeof fetch = async (input, init) => {
+    const url = new globalThis.URL(input instanceof Request ? input.url : String(input)), headers = new Headers(init?.headers);
+    if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") return Response.json({ ok: true,
+      data: [...world.agents.values()].map(agent => ({ ...agent, address: `${agent.name}@cloud-${agent.id}`, last_seen: new Date().toISOString() })) });
+    const result = await world.handle(init?.method ?? "GET", url.pathname, url.searchParams,
+      (headers.get("authorization") ?? "").replace(/^Bearer /, ""), init?.body ? JSON.parse(String(init.body)) : null, headers.get("idempotency-key"));
+    return Response.json(result?.body ?? { ok: false, error: { code: "not_found" } }, { status: result?.status ?? 404 });
+  };
+  const issuer = cursorIssuer();
+  const config: SelfhostConfig = { databaseUrl: "unused", publicBaseUrl: ORIGIN, dashboardUrl: ORIGIN,
+    relaycastUrl: "http://example-relay.test", relaycastPublicUrl: "https://cast.example.test",
+    relayhistoryUrl: "http://unused-history.test", relayhistoryPublicUrl: "https://history.example.test",
+    sessionReadApi: { url: "http://unused-history.test", publicUrl: "https://history.example.test", secret: "session-read-secret-".repeat(2) },
+    internalServiceToken: null, bootstrapToken: "example-bootstrap-token-at-least-thirty-two-bytes", encryptionKeyring: KEYRING,
+    oauthRedirectUrl: ORIGIN + "/unused", host: "127.0.0.1", port: 3000,
+    mcpOAuth: { enabled: true, unavailable: null, eventsEnabled: false, pumpEnabled: false, oidc: null },
+    cursorCloud: { ...loadCursorCloudConfig({}), ...options.cursorCloud } };
+  const store = new ControlPlaneStore(database, KEYRING, 0, { tenancy: "multi" });
+  const browser = await database.transaction(tx => store.issueBrowserSession(tx, { ...owner, label: "cursor-test" }));
+  const teardown = new McpOAuthTeardown({ database, keyring: KEYRING, client: createRelaycastClient({ internalOrigin: "http://example-relay.test", fetchImpl: relayFetch }) });
+  const server = createServer(createApp({ config, store, messagingFetch: relayFetch, cursorJwks: issuer.jwks, mcpOAuthTeardown: teardown }));
+  const base = await listen(server); t.after(() => close(server));
+  const client = new Client({ name: "cursor-cloud-test", version: "1" });
+  await client.connect(new StreamableHTTPClientTransport(new globalThis.URL(base + "/mcp"), { requestInit: { headers: { authorization: `Bearer ${pair.accessToken}` } } }));
+  t.after(() => client.close());
+  const call = async (name: string, args: Record<string, unknown> = {}) => client.callTool({ name, arguments: args });
+  const ok = (result: Awaited<ReturnType<typeof call>>) => {
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    return result.structuredContent as Record<string, any>;
+  };
+  const failed = (result: Awaited<ReturnType<typeof call>>) => {
+    assert.equal(result.isError, true, JSON.stringify(result.structuredContent));
+    return (result.content as Array<{ text: string }>)[0]!.text;
+  };
+  /** The nonce relay_status hands this connection, as the agent would read it. */
+  const nonce = async () => ok(await call("relay_status")).cursor_identity.nonce as string;
+  /** Follows a confirmation URL in the person's signed-in browser. */
+  const confirm = async (url: string) => {
+    const path = new URL(url);
+    const headers = { cookie: `agent_relay_session=${browser.accessToken}`, origin: ORIGIN };
+    const page = await fetch(base + path.pathname + path.search, { headers, redirect: "manual" });
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /user:4242/);
+    const done = await fetch(base + path.pathname + path.search, { method: "POST", headers, redirect: "manual" });
+    assert.equal(done.status, 200, await done.clone().text());
+  };
+  return { database, owner, world, issuer, call, ok, failed, nonce, confirm, teardown };
+}
+
+test("a Cursor cloud agent run links its Cursor account, joins as its own participant and messages as it", async t => {
+  const f = await fixture(t);
+  f.world.addAgent("peer");
+  const status = f.ok(await f.call("relay_status"));
+  assert.equal(status.cursor_identity.audience, AUDIENCE);
+  assert.match(status.cursor_identity.mint_command, /CURSOR_AGENT_SOCKET.*\/v1\/tokens\/oidc/);
+  assert.ok(status.cursor_identity.mint_command.includes(status.cursor_identity.nonce));
+
+  // Not linked yet: a one-time confirmation link for the signed-in person.
+  const pending = f.failed(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) }));
+  const url = /(https:\/\/relay\.example\.test\/cloud\/api\/v1\/cursor-cloud\/link\?code=[A-Za-z0-9_-]+)/.exec(pending)?.[1];
+  assert.ok(url, pending);
+  // The confirmation page answers on the server under test, not the public origin.
+  await f.confirm(url!);
+
+  const joined = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) }));
+  const name = cursorCloudParticipantName("bc-run-1");
+  assert.equal(joined.name, name);
+  assert.equal(joined.cursor_cloud_run, true);
+  assert.match(joined.reply_guidance, new RegExp(`as="${name}"`));
+  // The run is its own participant: the grant's approved agent is never pinned to it.
+  const grant = (await f.database.query("SELECT agent_remote_id FROM mcp_oauth_grants WHERE id=$1", [f.owner.grantId])).rows[0]!;
+  assert.equal(grant.agent_remote_id, null);
+  assert.deepEqual((await f.database.query("SELECT agent_name FROM cursor_cloud_runs")).rows, [{ agent_name: name }]);
+  assert.equal(f.world.agents.get(name)!.metadata.created_by, "mcp-oauth");
+
+  const sent = f.ok(await f.call("send_relay_message", { to: "peer", text: "hello from a cloud run", as: name }));
+  assert.equal(sent.from, name);
+  f.world.sendAs("peer", name, "hello back");
+  const inbox = f.ok(await f.call("check_relay_inbox", { as: name }));
+  assert.deepEqual(inbox.messages.map((m: any) => m.text), ["hello back"]);
+
+  // A second run under the same connection is a different participant.
+  const second = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce(), { cloud_agent_id: "bc-run-2" }) }));
+  assert.equal(second.name, cursorCloudParticipantName("bc-run-2"));
+  assert.notEqual(second.name, name);
+});
+
+test("tokens that are replayed, for another audience or another connection, or from an unlinked account are refused", async t => {
+  const f = await fixture(t, { cursorCloud: { trustedTeams: ["77"] } });
+  const token = f.issuer.mint(await f.nonce());
+  // The operator trusts team 77 and the token's email is the person's own: linked without a click.
+  assert.equal(f.ok(await f.call("join_relay", { cursor_identity_token: token })).name, cursorCloudParticipantName("bc-run-1"));
+  assert.match(f.failed(await f.call("join_relay", { cursor_identity_token: token })), /refused \(replayed\)/);
+  assert.match(f.failed(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce(), { aud: "sts.amazonaws.com" }) })), /refused \(audience\)/);
+  assert.match(f.failed(await f.call("join_relay", { cursor_identity_token: f.issuer.mint("a-nonce-for-some-other-connection") })), /refused \(nonce\)/);
+  // A trusted team with someone else's email still needs the person to confirm.
+  const other = f.failed(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce(),
+    { sub: "user:9999", owner_email: "someone@example.test", cloud_agent_id: "bc-run-9" }) }));
+  assert.match(other, /cursor-cloud\/link\?code=/);
+  // A run name can't be chosen, and it can't be combined with name.
+  assert.match(f.failed(await f.call("join_relay", { name: "my-own-name", cursor_identity_token: f.issuer.mint(await f.nonce()) })), /cannot be combined/);
+});
+
+test("required run identity refuses the connector's shared agent and points at the mint command", async t => {
+  const f = await fixture(t, { cursorCloud: { runIdentity: "required", trustedTeams: ["77"] } });
+  f.world.addAgent("peer");
+  const status = f.ok(await f.call("relay_status"));
+  assert.equal(status.joined, false);
+  assert.match(status.guidance, /join_relay with cursor_identity_token/);
+  assert.match(f.failed(await f.call("send_relay_message", { to: "peer", text: "x" })), /acts only as a verified cloud agent run.*tokens\/oidc/s);
+  const joined = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) }));
+  assert.equal(f.ok(await f.call("send_relay_message", { to: "peer", text: "x", as: joined.name })).from, joined.name);
+});
+
+test("only Cursor cloud agent connections take identity tokens", async t => {
+  const f = await fixture(t, { redirect: "https://chatgpt.com/connector/oauth/callback" });
+  const status = f.ok(await f.call("relay_status"));
+  assert.equal(status.cursor_identity, undefined);
+  assert.match(f.failed(await f.call("join_relay", { cursor_identity_token: "x".repeat(40) })), /only for Cursor cloud agents/);
+});
+
+test("leaving releases a run, and revoking the connection releases its remaining runs", async t => {
+  const f = await fixture(t, { cursorCloud: { trustedTeams: ["77"] } });
+  const one = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) })).name as string;
+  const two = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce(), { cloud_agent_id: "bc-run-2" }) })).name as string;
+  f.ok(await f.call("leave_relay", { as: one }));
+  assert.equal(f.world.agents.has(one), false);
+  assert.deepEqual((await f.database.query("SELECT agent_name FROM cursor_cloud_runs")).rows, [{ agent_name: two }]);
+  await f.database.transaction(tx => revokeMcpOAuthGrantRows(tx, f.owner.grantId, "user_revoked", new Date()));
+  await f.teardown.drain();
+  assert.equal(f.world.agents.has(two), false);
+  assert.deepEqual((await f.database.query("SELECT agent_name FROM cursor_cloud_runs")).rows, []);
+  assert.deepEqual((await f.database.query("SELECT agent_name FROM hosted_relay_participants")).rows, []);
+});

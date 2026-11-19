@@ -1,4 +1,5 @@
 import { loadMcpOAuthConfig, type McpOAuthConfig } from "./mcp/oauth/config.js";
+import { loadCursorCloudConfig, type CursorCloudConfig } from "./mcp/cursor-cloud.js";
 import { readFileSync } from "node:fs";
 import { createHash, createPrivateKey, type KeyObject } from "node:crypto";
 import { isIP } from "node:net";
@@ -105,6 +106,8 @@ export type SelfhostConfig = {
   factory?: FactoryConfig;
   /** Hosted MCP module settings; omitted is off. Loading does not mount routes. */
   mcpOAuth?: McpOAuthConfig;
+  /** Cursor cloud agents (docs/cursor-cloud-agents.md); needs MCP OAuth. Omitted: on, run identity optional. */
+  cursorCloud?: CursorCloudConfig;
   /**
    * Desktop feed (docs/desktop-feed.md). Null or absent turns the feature off
    * and every feed route answers 404 like any unknown path.
@@ -510,6 +513,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     factory: loadFactoryConfig(env, introspection),
     mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name), serviceUrl(env, "SELFHOST_PUBLIC_URL")),
+    cursorCloud: loadCursorCloudConfig(env),
     historyUpload: loadHistoryUploadConfig(env),
     capturePolicyUploads: loadCapturePolicyUploads(env),
     ...optionalField("defaultSharingMode", loadDefaultSharingMode(env)),

@@ -1,3 +1,4 @@
+import type { CursorCloudDeps } from "./cursor-cloud.js";
 import type { CapyBindings } from "../capy/bindings.js";
 import type { AmpDeps } from "../amp/service.js";
 import type { ReplicasDeps } from "../replicas/service.js";
@@ -47,6 +48,8 @@ export type McpContext = {
   /** Present only after the MCP-only OAuth resolver admits its exact resource. */
   oauth?: McpOAuthConnection;
   grokRoutines?: GrokRoutines;
+  /** Cursor cloud agent runs (./cursor-cloud.ts); present only for OAuth contexts when the feature is on. */
+  cursorCloud?: CursorCloudDeps;
   customerSupport?: CustomerSupportConnection;
   /** GET a workspace-scoped RelayHistory path (with its query); throws SharedSessionsToolError. */
   readHistory: (path: string, options?: { timeoutMessage?: string }) => Promise<unknown>;
