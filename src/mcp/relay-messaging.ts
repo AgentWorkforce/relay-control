@@ -55,7 +55,7 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
   };
 
   server.registerTool("list_relay_agents", {
-    description: "List the first matching agents in relay order across every teammate in your current workspace's relay, with exact machine addresses, presence, descriptions and owners. The page defaults to 100 agents and cannot exceed 100; total_matching and truncated disclose omitted matches, so narrow the filters when truncated. Ownership metadata describes the roster; it does not grant permission to act as an agent.",
+    description: "List the first matching agents in relay order across every teammate in your current workspace's relay, with exact machine addresses, presence, descriptions and owners. The page defaults to 100 agents and cannot exceed 100; total_matching and truncated disclose omitted matches, so narrow the filters when truncated. A null session with session_unavailable_reason means optional Desktop session enrichment failed or was ambiguous; the roster remains available. Ownership metadata describes the roster; it does not grant permission to act as an agent.",
     inputSchema: { person: z.string().trim().min(1).max(200).optional().describe("me, a teammate's user ID, or display name"),
       status: z.enum(["live", "offline", "all"]).default("live"), query: z.string().trim().max(200).optional(),
       limit: z.number().int().min(1).max(100).default(100).describe("Maximum matching agents returned from the start of relay order. Use person/query/status filters to narrow a truncated result."),
