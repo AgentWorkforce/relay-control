@@ -82,9 +82,9 @@ export async function enrolHostedAtGate(
   } catch (error) {
     throw refusal(error, input);
   }
-  // relaygate names the Control user it enrolled the agent for; any other user is not this owner.
+  // relaygate names the Control user it enrolled the agent for; any other user is not this owner. The token is
+  // dropped and nothing is released: by relaygate's own answer the agent behind it is that other user's.
   if (enrolled.userId !== null && enrolled.userId !== input.userId) {
-    await deps.gate.releaseOwnAgent(enrolled.token).catch(() => {});
     throw new HostedGateRefused("relaygate enrolled this participant for another user. Nothing was joined.");
   }
   const upstream = await deps.gate.authenticatedAgent(enrolled.token);

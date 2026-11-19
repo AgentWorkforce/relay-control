@@ -80,7 +80,8 @@
     {"name":"0075_token_session_client_telemetry.sql","sha256":"6c9ce658602d7a5eebad9b7c13a2e2ddca6c1a22f6a3e4ee0be8b3357fafd479"},
     {"name":"0076_events_shim_agent_links.sql","sha256":"3f1441ca8cd33613c585c4c725de0a8e88df457e070ec6fb1756214aa7c3e821"},
     {"name":"0077_events_shim_sender_release_attempts.sql","sha256":"f586a6324c3af8d81e00cae9fea161772673a0d7ea55c865dfb00bafa3d901cd"},
-    {"name":"0078_events_shim_claim_leases.sql","sha256":"1729204ca96b4196d16369b039b72c70b43ae6036c955d06e89f2f168d6d4b7a"}
+    {"name":"0078_events_shim_claim_leases.sql","sha256":"1729204ca96b4196d16369b039b72c70b43ae6036c955d06e89f2f168d6d4b7a"},
+    {"name":"0079_hosted_relay_gate.sql","sha256":"dcba28091f8a00963cc52463f3f7165cd6f41ef08b03f47d0a5a1ff355a4144c"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -574,6 +575,7 @@
     {"kind":"column","name":"public.grok_bot_routines.next_attempt_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":4,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.grok_bot_routines.notified_delivery_ids","definition":{"collation":"pg_catalog.default","default":"'{}'::text[]","generated":"","identity":"","not_null":true,"position":3,"type":"text[]"}},
     {"kind":"column","name":"public.grok_bot_routines.updated_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":8,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.hosted_relay_participants.admitted_clients","definition":{"collation":"pg_catalog.default","default":"'{}'::text[]","generated":"","identity":"","not_null":true,"position":12,"type":"text[]"}},
     {"kind":"column","name":"public.hosted_relay_participants.agent_name","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
     {"kind":"column","name":"public.hosted_relay_participants.agent_remote_id","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":7,"type":"text"}},
     {"kind":"column","name":"public.hosted_relay_participants.created_at","definition":{"collation":null,"default":"now()","generated":"","identity":"","not_null":true,"position":9,"type":"timestamp with time zone"}},
@@ -2130,5 +2132,5 @@
   "optional":{
 
   },
-  "sha256":"58bf921c18df5ac451d344a78b72cb34a3a58b79bebfc058845ba1dd36fd5c6c"
+  "sha256":"f462e4c9a77b83b5eed8a420c6209270833589dc2ccaaffc0865326001eed50a"
 }

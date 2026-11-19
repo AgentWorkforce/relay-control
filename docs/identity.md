@@ -1582,7 +1582,11 @@ Relaycast agent token for its traffic:
   already taken") and relaygate never sees an enrolment. relaygate's answer
   is checked again: the agent must be the one checked, this owner's, or one
   relaygate registered itself for this enrolment. Anything else is refused
-  and never released, since releasing deletes the agent by name.
+  and never released, since releasing deletes the agent by name. A stored
+  participant is enrolled again (a lapsed token, or a new hosted client) only
+  while the roster still shows its own upstream agent under that name; a
+  replaced or renamed agent is never handed to relaygate. An answer relaygate
+  gives for another Control user is refused and nothing is released.
 - **Introspection.** Checked and burned like a launch credential. The active
   answer is `{active: true, sub: <owner user id>, email: null, principal_type:
   "relay_hosted", agent_name, client, machine_id: null, org, workspace,

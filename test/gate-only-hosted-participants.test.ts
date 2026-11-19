@@ -389,3 +389,24 @@ test("on a gate-only install a renewed participant adopts the new relaygate agen
   assert.equal(after.agent_remote_id, before.agent_remote_id, "the same upstream agent");
   assert.ok(env.world.agents.has("notes-agent"), "the upstream agent was not released");
 });
+
+test("on a gate-only install a lapsed participant whose name now belongs to another agent is not enrolled again at relaygate", async (t) => {
+  const { env, state, issue, connect, rows } = await gateHosted(t);
+  const client = await connect();
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "notes-agent" } }));
+  const before = (await rows())[0]!;
+  // The upstream agent was released outside this service and another owner registered the name; the stored token lapsed.
+  env.world.agents.delete("notes-agent");
+  const foreign = env.world.addAgent("notes-agent", {
+    source: "cloud-hosted-mcp", cloud_workspace_id: env.workspaceId, owner_hash: ownerHash("another-user"), kind: "hosted" });
+  assert.notEqual(foreign.id, before.agent_remote_id);
+  issue("notes-agent");
+  const credentials = state.credentials.length;
+  const registrations = state.seen.filter(call => call === "POST /v1/register").length;
+  await client.callTool({ name: "relay_status", arguments: {} });
+  assert.equal(state.credentials.length, credentials, "no hosted credential was minted for a name that is no longer this row's agent");
+  assert.equal(state.seen.filter(call => call === "POST /v1/register").length, registrations, "relaygate was not asked to take the name over");
+  assert.equal(env.world.agents.get("notes-agent"), foreign, "the other owner's agent is untouched");
+  const after = (await rows())[0];
+  if (after) assert.equal(after.token, before.token, "the row adopted nothing");
+});

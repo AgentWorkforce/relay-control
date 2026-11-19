@@ -537,10 +537,13 @@ function createRelayService(context: McpContext) {
       const state = (await gateState(row, decryptSecret(row.tokenCiphertext, keyring))).state;
       if (state === "changed" || (state === "ok" && row.admittedClients.includes(kind))) return;
       rejected = state === "rejected";
-    } else {
-      const upstream = await client.getRosterAgent(key, row.agentName);
-      if (!upstream || upstream.status === "released" || upstream.id !== row.agentRemoteId || !ownsRemote(upstream)) return;
     }
+    // relaygate takes an upstream agent of this name over when it enrols one it already knows. Ask only while that
+    // agent is still this row's: a replaced or renamed one is never handed to relaygate. A pre-gate row must also
+    // still be this owner's; a gated row's agent was registered by relaygate and carries no owner marker.
+    const upstream = await client.getRosterAgent(key, row.agentName);
+    if (!upstream || upstream.status === "released" || upstream.id !== row.agentRemoteId
+        || (row.relaygateAgentId === null && !ownsRemote(upstream))) return;
     const enrolled = await enrolAtGate(row.agentName);
     if (enrolled.relaycastAgentId !== row.agentRemoteId) {
       // The agent this row was is gone: never adopt another. Release only an agent relaygate registered itself for
