@@ -82,7 +82,8 @@
     {"name":"0077_events_shim_sender_release_attempts.sql","sha256":"f586a6324c3af8d81e00cae9fea161772673a0d7ea55c865dfb00bafa3d901cd"},
     {"name":"0078_events_shim_claim_leases.sql","sha256":"1729204ca96b4196d16369b039b72c70b43ae6036c955d06e89f2f168d6d4b7a"},
     {"name":"0079_hosted_relay_gate.sql","sha256":"c9b201ff87a00dc9bf06cb304e46673556e47153343a68edf8d557029b988af1"},
-    {"name":"0080_cursor_cloud_identity.sql","sha256":"4b8bd4a7e758708db798f953fe50b0f225ca1db17e841a490ce363940c4a949c"}
+    {"name":"0080_staff_read_grants_year_cap.sql","sha256":"86d678003039015d447a4d3461830082d0a3bf03a578ece20526ccf763e4f562"},
+    {"name":"0081_cursor_cloud_identity.sql","sha256":"4b8bd4a7e758708db798f953fe50b0f225ca1db17e841a490ce363940c4a949c"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -1666,7 +1667,7 @@
     {"kind":"constraint","name":"public.shared_session_read_audit.shared_session_read_audit_query_length","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((query_text IS NULL) OR (length(query_text) <= 500)))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.shared_session_read_audit.shared_session_read_audit_result_count","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((result_count >= 0))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.shared_session_read_audit.shared_session_read_audit_workspace_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.shared_session_read_audit","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.shared_session_read_audit","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_cascade_del","table":"public.workspaces","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.workspaces","type":17}],"type":"f","validated":true}},
-    {"kind":"constraint","name":"public.staff_read_grants.staff_read_grant_lifetime","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((expires_at > created_at) AND (expires_at <= (created_at + '90 days'::interval))))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
+    {"kind":"constraint","name":"public.staff_read_grants.staff_read_grant_lifetime","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((expires_at > created_at) AND (expires_at <= (created_at + '365 days'::interval))))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.staff_read_grants.staff_read_grant_reason","definition":{"deferrable":false,"deferred":false,"definition":"CHECK (((length(btrim(reason)) > 0) AND (length(reason) <= 500)))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.staff_read_grants.staff_read_grant_workspace","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (workspace_id, organization_id) REFERENCES workspaces(id, organization_id) ON DELETE CASCADE","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.staff_read_grants","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.staff_read_grants","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_cascade_del","table":"public.workspaces","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.workspaces","type":17}],"type":"f","validated":true}},
     {"kind":"constraint","name":"public.staff_read_grants.staff_read_grants_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
@@ -2167,5 +2168,5 @@
   "optional":{
 
   },
-  "sha256":"13c499b898783cea7f2f9074a7d4b932cbca2e5722e939e1feed420b8bb99127"
+  "sha256":"a84f62943bd06f7c9879f13a303ffedbc4e702f64b3a4294ac8d87eeade8bbd5"
 }

@@ -401,7 +401,7 @@ export async function runImport(deps: ImportDeps, scope: ImportScope, mode: Impo
   const prepared = {} as Record<ImportTable, PreparedRow[]>;
   await deps.source.transaction(async (tx) => {
     await tx.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
-    // Deterministic transforms: interval arithmetic (the 90-day grant clamp)
+    // Deterministic transforms: interval arithmetic (the 365-day grant clamp)
     // and rendered timestamps must not depend on the session's time zone.
     await tx.exec("SET LOCAL TIME ZONE 'UTC'");
     for (const table of SOURCE_TABLES) {
