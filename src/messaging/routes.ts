@@ -17,6 +17,14 @@ import {
   type PersonIdentity,
   type SendClaim,
 } from "./identity.js";
+import {
+  DeviceMintRateLimited,
+  ensureDeviceCredential,
+  type DeviceCredential,
+  parseCredentialRequest,
+  personDevice,
+  sweepDeviceRevocations,
+} from "./device-credentials.js";
 import { MessagingHttpError, SEND_UNCERTAIN_MESSAGE, SendAbandoned } from "./http.js";
 import { createRelaycastClient, RelaycastCallError } from "./relaycast.js";
 
@@ -260,6 +268,7 @@ export function createMessagingHandler(input: MessagingDeps & {
       throw new MessagingHttpError(403, "csrf_rejected", "Cross-origin messaging write refused");
     }
     await sweepRevocations(deps, access.workspace.organizationId);
+    await sweepDeviceRevocations(deps, access.workspace.organizationId);
     const person = accessInput(access);
 
     if (people && method === "GET") {
@@ -311,14 +320,45 @@ export function createMessagingHandler(input: MessagingDeps & {
         }, true);
         return true;
       }
+      // A Desktop browser handoff token, exchanged or not, is never a device:
+      // only the session its PKCE exchange issues may hold a messaging token.
+      if (access.principal.pendingHandoff) {
+        throw new MessagingHttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      }
+      if (access.principal.handoff) {
+        throw new MessagingHttpError(
+          403,
+          "handoff_not_capable",
+          "This sign-in handoff cannot hold a messaging credential; use the session issued by POST /api/v1/auth/desktop/session",
+        );
+      }
+      // Optional `{"refusedTokenSha256": ...}`: the client saw that token refused.
+      const { refusedTokenSha256 } = parseCredentialRequest(await requestBody(request));
+      const { device, signInId } = personDevice(access.principal, !bearerToken);
       const identity = await ensurePersonIdentity(deps, person);
+      let issued: DeviceCredential;
+      try {
+        issued = await ensureDeviceCredential(deps, person, identity, device, signInId, { refusedTokenSha256 });
+      } catch (error) {
+        if (error instanceof DeviceMintRateLimited) response.setHeader("retry-after", String(error.retryAfterSeconds));
+        throw error;
+      }
       helpers.json(response, 200, {
-        identity: {
-          name: identity.name,
-          agentId: identity.agentId,
-          token: identity.token,
-          relaycastUrl: publicOrigin,
-        },
+        identity: issued.kind === "device"
+          ? {
+            name: issued.identity.name,
+            agentId: issued.identity.agentId,
+            token: issued.token,
+            relaycastUrl: publicOrigin,
+            device: issued.device,
+            expiresAt: issued.expiresAt.toISOString(),
+          }
+          : {
+            name: issued.identity.name,
+            agentId: issued.identity.agentId,
+            token: issued.identity.token,
+            relaycastUrl: publicOrigin,
+          },
       }, true);
       return true;
     }

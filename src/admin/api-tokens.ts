@@ -3,7 +3,7 @@ import type { Database, SqlExecutor } from "../database.js";
 import { hashSecret, opaqueToken } from "../crypto.js";
 import { normalizedOrigin } from "../auth/introspect.js";
 import { normalizeEmailAddress } from "../identity/config.js";
-import { NODE_ID_PATTERN } from "../store.js";
+import { NODE_ID_PATTERN, revokeSessionDeviceCredentials } from "../store.js";
 import { lockIdentity, lockOrganization } from "../tenancy.js";
 import { iso, recordAudit, type AuditActor } from "./audit.js";
 
@@ -1155,6 +1155,7 @@ export class ApiTokenStore {
           RETURNING id`,
         [input.tokenId],
       );
+      await revokeSessionDeviceCredentials(tx, sessions.rows.map((row) => row.id));
       target = `${input.tokenId} (desktop-enrollment: user ${revoked.user_id}) sessions=${sessions.rows.length}`;
     }
     if (input.reason) target = `${target} reason=${input.reason}`;

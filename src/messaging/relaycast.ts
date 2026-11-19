@@ -22,6 +22,12 @@ export class RelaycastCallError extends Error {
 
 export type RegisteredAgent = { id: string; name: string; token: string };
 
+/** The device a person agent's device token is stamped with. */
+export type DeviceTokenDevice = { id: string; name: string; kind: "desktop" | "cli" | "web" };
+
+/** `expiresAt` is the upstream ISO expiry, or null when it reported none. */
+export type IssuedDeviceToken = { token: string; agentId: string; expiresAt: string | null };
+
 export type HostedDelivery = {
   delivery_id: string;
   message_id: string;
@@ -376,6 +382,45 @@ export function createRelaycastClient(input: {
         node_id: "selfhost-control",
       }, undefined, true);
       await call("DELETE", `/v1/agents/${encodeURIComponent(name)}`, workspaceKey, undefined, undefined, true);
+    },
+
+    /**
+     * Mints a device-scoped token for a person agent with the workspace key.
+     * The token acts as the agent, and Relaycast stamps what it sends with
+     * the device. `ttlSeconds` is always sent: an omitted TTL means a token
+     * that never expires. The answer must name the agent that was asked for.
+     */
+    async issueDeviceToken(
+      workspaceKey: string,
+      name: string,
+      input: { expectedAgentId: string; device: DeviceTokenDevice; ttlSeconds: number },
+    ): Promise<IssuedDeviceToken> {
+      const data = record(await labeled("issue_device_token", () => call(
+        "POST",
+        `/v1/agents/${encodeURIComponent(name)}/device-tokens`,
+        workspaceKey,
+        {
+          agent_id: input.expectedAgentId,
+          device: { id: input.device.id, name: input.device.name, kind: input.device.kind },
+          ttl_seconds: input.ttlSeconds,
+        },
+      )));
+      const token = text(data?.token);
+      const agentId = text(data?.agent_id);
+      if (!token || agentId !== input.expectedAgentId) throw new RelaycastCallError(502, "", false);
+      return { token, agentId, expiresAt: text(data?.expires_at) };
+    },
+
+    /** Revokes one device's token of an agent; a device with no token (404) is already done. */
+    async revokeDeviceToken(workspaceKey: string, name: string, deviceId: string): Promise<void> {
+      await labeled("revoke_device_token", () => call(
+        "DELETE",
+        `/v1/agents/${encodeURIComponent(name)}/device-tokens/${encodeURIComponent(deviceId)}`,
+        workspaceKey,
+        undefined,
+        undefined,
+        true,
+      ));
     },
 
     async sendDirectMessage(input: {

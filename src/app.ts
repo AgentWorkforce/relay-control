@@ -93,6 +93,7 @@ import {
 } from "./admin/staff-read-grants.js";
 import type { TelemetryModule } from "./telemetry/module.js";
 import { identityErrorResponse, type IdentityModule } from "./identity/routes.js";
+import { sweepDeviceRevocations } from "./messaging/device-credentials.js";
 import { revokeRemovedMember, type MessagingDeps } from "./messaging/identity.js";
 import { createMessagingHandler, MessagingHttpError } from "./messaging/routes.js";
 import { isBindingOwnedIdentity } from "./messaging/binding-identities.js";
@@ -478,7 +479,8 @@ export function createApp(input: {
   now?: () => Date;
   /** Test hooks for claim leases and crash injection. Production leaves this unset. */
   messaging?: Pick<MessagingDeps,
-    "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck">;
+    "claimLeaseMs" | "beforeDispatch" | "afterUpstream" | "afterRemoteRegister" | "afterIdentityStaged" | "beforeMembershipRecheck"
+    | "afterDeviceMint" | "warn">;
 }): AppHandler {
   const { config, store, admin, telemetry, identity } = input;
   const features = input.features ?? NO_FEATURES;
@@ -2162,6 +2164,10 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         : bearer(request);
       if (!token) throw new HttpError(400, "invalid_request", "token is required");
       if (!await store.revoke(token)) throw new HttpError(404, "token_not_found", "Token not found");
+      // Best effort: the ended sign-in's device token is revoked at Relaycast
+      // now when it can be; otherwise the messaging sweep and the token's own
+      // expiry end it.
+      await sweepDeviceRevocations(messagingDeps).catch(() => undefined);
       json(response, 200, { revoked: true }, true);
       return;
     }
