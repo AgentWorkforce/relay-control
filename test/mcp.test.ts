@@ -43,6 +43,7 @@ async function startHistory(t: TestContext) {
   const events: HistoryEvent[] = [];
   let mints = 0;
   let origin = "";
+  let eventsFailure: { status: number; body: unknown } | null = null;
   const server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -94,6 +95,10 @@ async function startHistory(t: TestContext) {
     const visible = events.filter((event) => event.workspaceId === tokenWorkspace);
     const wire = ({ workspaceId: _workspace, ...event }: HistoryEvent) => event;
     if (url.pathname === "/v1/events") {
+      if (eventsFailure) {
+        send(eventsFailure.status, eventsFailure.body);
+        return;
+      }
       const q = (url.searchParams.get("q") ?? "").toLowerCase();
       send(200, {
         events: visible.filter((event) => event.content.toLowerCase().includes(q)).map(wire),
@@ -129,7 +134,10 @@ async function startHistory(t: TestContext) {
   });
   origin = await listen(server);
   t.after(() => close(server));
-  return { origin, paths, events, handoffs };
+  return {
+    origin, paths, events, handoffs,
+    failEvents(status: number, body: unknown) { eventsFailure = { status, body }; },
+  };
 }
 
 type RelaycastCall = { path: string; authorization: string | null };
@@ -484,6 +492,21 @@ test("session reads go to RelayHistory for the bound workspace only", async (t) 
   const foreign = await client.callTool({ name: "search_shared_sessions", arguments: { query: "deploy", workspace_id: env.otherWorkspaceId } });
   assert.equal(foreign.isError, true);
   assert(!env.history.paths.some((path) => path.includes(env.otherWorkspaceId)));
+});
+
+test("a failed transcript search is text, so clients do not check it against the success schema", async (t) => {
+  const env = await setup(t);
+  env.history.failEvents(500, { error: { code: "internal_error", message: "SECRET upstream failure" } });
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  await client.listTools();
+  const result = await client.callTool({ name: "search_shared_sessions", arguments: { query: "deploy" } });
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent, undefined);
+  const text = (result.content as Array<{ text?: string }>).map((part) => part.text ?? "").join("\n");
+  assert.match(text, /Shared session history is temporarily unavailable/);
+  assert.match(text, /correlation_id: [0-9a-f-]{36}/);
+  assert.equal(text.includes("SECRET"), false);
+  assert.equal(text.includes("internal_error"), false);
 });
 
 test("History reads for bearer and cookie callers go through the read API handoff, never with the caller token", async (t) => {
