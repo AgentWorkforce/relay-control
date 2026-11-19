@@ -9,6 +9,7 @@ import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
+import type { TelemetryModule } from "../src/telemetry/module.js";
 import { createRelaycastWorld, type RelaycastWorld } from "./support/relaycast-world.js";
 import { PGliteDatabase } from "./support/harness.js";
 import { RECIPIENT_CARD_NOTE } from "../src/mcp/relay-agent-cards.js";
@@ -176,7 +177,7 @@ function fakeRelaycast(state: {
 
 const PUBLIC_ORIGIN = "https://control.internal.example";
 
-async function setup(t: TestContext) {
+async function setup(t: TestContext, telemetry?: TelemetryModule) {
   const historyAudience = "https://history.selfhosted.test";
   const history = await startHistory(t);
   const agents: unknown[] = [];
@@ -201,7 +202,7 @@ async function setup(t: TestContext) {
     host: "127.0.0.1",
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
-  const control = createServer(createApp({ config, store, messagingFetch: fakeRelaycast(relay) }));
+  const control = createServer(createApp({ config, store, messagingFetch: fakeRelaycast(relay), telemetry }));
   const origin = await listen(control);
   t.after(async () => {
     await close(control);
@@ -356,12 +357,44 @@ function assertCorrelatedRpcError(response: { headers: Headers; body: any }, cod
 }
 
 test("MCP admission storage failures return a useful correlated error", async t => {
-  const env = await setup(t);
-  t.mock.method(env.store, "authenticateAccessToken", async () => { throw new Error("SECRET storage failure"); });
+  const observed = t.mock.fn((_error: unknown, _context: { path: string; status: number }) => {});
+  const env = await setup(t, telemetryWithObserver(observed));
+  const log = t.mock.method(console, "error", () => {});
+  const error = new TypeError("SECRET storage failure");
+  t.mock.method(env.store, "authenticateAccessToken", async () => { throw error; });
   const response = await rpc(env.origin, MCP_PATH, { headers: { authorization: `Bearer ${env.accessToken}` } });
   assert.equal(response.status, 500);
   assertCorrelatedRpcError(response, -32603, "The MCP service is temporarily unavailable. Please try again.");
   assert.equal(JSON.stringify(response.body).includes("SECRET"), false);
+  assert.equal(observed.mock.calls.length, 1);
+  assert.equal(observed.mock.calls[0]?.arguments[0], error);
+  assert.deepEqual(observed.mock.calls[0]?.arguments[1], { path: MCP_PATH, status: 500 });
+  assert.deepEqual(log.mock.calls.find(call => call.arguments[0] === "[selfhost-mcp] Request failed")?.arguments[1], {
+    error: "TypeError", correlationId: response.headers.get("x-correlation-id"),
+  });
+  assert.equal(JSON.stringify(log.mock.calls).includes("SECRET"), false);
+});
+
+function telemetryWithObserver(observeError: TelemetryModule["observeError"]): TelemetryModule {
+  // The app boundary consumes these callbacks; module storage has its own suite.
+  return { observeError, observeRequest: () => {}, handle: async () => false } as unknown as TelemetryModule;
+}
+
+test("MCP telemetry failures and writable error names never leak or change the response", async t => {
+  const observed = t.mock.fn((_error: unknown, _context: { path: string; status: number }) => { throw Error("SECRET observer failure"); });
+  const env = await setup(t, telemetryWithObserver(observed));
+  const log = t.mock.method(console, "error", () => {});
+  const error = new Error("SECRET storage details");
+  error.name = "SECRET writable name";
+  t.mock.method(env.store, "authenticateAccessToken", async () => { throw error; });
+  const response = await rpc(env.origin, MCP_PATH, { headers: { authorization: `Bearer ${env.accessToken}` } });
+  assert.equal(response.status, 500);
+  assertCorrelatedRpcError(response, -32603, "The MCP service is temporarily unavailable. Please try again.");
+  assert.equal(observed.mock.calls.length, 1);
+  assert.equal(JSON.stringify([response.body, log.mock.calls]).includes("SECRET"), false);
+  assert.deepEqual(log.mock.calls.find(call => call.arguments[0] === "[selfhost-mcp] Request failed")?.arguments[1], {
+    error: "Error", correlationId: response.headers.get("x-correlation-id"),
+  });
 });
 
 test("admission refuses foreign credentials, origins, methods, and oversized bodies", async (t) => {
