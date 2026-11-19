@@ -71,6 +71,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "password_registrations",
   "password_reset_tokens",
   "password_setup_tokens",
+  "person_device_credentials",
   "person_identities",
   "person_messages",
   "person_revocations",

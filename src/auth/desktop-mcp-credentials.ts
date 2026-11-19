@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "../database.js";
 import { hashSecret, opaqueToken } from "../crypto.js";
-import type { Principal } from "../store.js";
+import { revokeSessionDeviceCredentials, type Principal } from "../store.js";
 
 /**
  * Desktop-provider MCP credentials, ported from Cloud's
@@ -301,6 +301,7 @@ export class DesktopMcpCredentials {
           WHERE id = $1 AND revoked_at IS NULL`,
         [tokenId.toLowerCase()],
       );
+      await revokeSessionDeviceCredentials(tx, [tokenId.toLowerCase()]);
     });
   }
 

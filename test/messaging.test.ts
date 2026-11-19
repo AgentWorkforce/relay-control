@@ -303,7 +303,9 @@ function createRelay(state: RelayState) {
       return;
     }
 
-    sendJson(response, 404, { error: { code: "not_found", message: "missing" } });
+    // Relaycast answers routes it does not have with this exact body; the
+    // device-token mint falls back to the shared person token only on it.
+    sendJson(response, 404, { error: { code: "not_found", message: "Route not found" } });
   });
 }
 
