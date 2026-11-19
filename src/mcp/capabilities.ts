@@ -1,6 +1,10 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CAPABILITY_DISCOVERY_TOOL, describeCapabilities } from "./catalog.js";
 import type { McpContext } from "./context.js";
+import { RelayToolError, relayService } from "./relay-participants.js";
+
+const NATIVE_CHECK_RETRY_REASON = "Agent Relay could not check this chat's synced Desktop identity right now. Retry describe_capabilities.";
+const NATIVE_CHECK_RETRY_GUIDANCE = "Retry shortly. If the check keeps failing, ask the operator to verify Relay and database health.";
 
 /**
  * describe_capabilities, ported from Cloud's
@@ -18,16 +22,27 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
   }, async () => {
     const managed = !context.oauth && (context.desktopCall.required || context.desktopCall.provider !== undefined);
     let nativeAuthorityAvailable: boolean | undefined;
-    if (managed) {
+    let nativeAuthorityReason: string | undefined;
+    let nativeAuthorityHowToEnable: string | undefined;
+    // Staff read grants do not serve relay_messaging, so probing their native
+    // identity would add a database and Relay round trip without changing the report.
+    if (managed && context.authMode !== "staff_read_grant") {
       try {
         if (options.nativeStatus) await options.nativeStatus();
-        else {
-          const { relayService } = await import("./relay-participants.js");
-          await relayService(context).status();
-        }
+        else await relayService(context).status();
         nativeAuthorityAvailable = true;
-      } catch {
+      } catch (error) {
         nativeAuthorityAvailable = false;
+        if (error instanceof RelayToolError) {
+          nativeAuthorityReason = error.message;
+          nativeAuthorityHowToEnable = "Follow the guidance in the refusal reason, then retry.";
+        } else {
+          nativeAuthorityReason = NATIVE_CHECK_RETRY_REASON;
+          nativeAuthorityHowToEnable = NATIVE_CHECK_RETRY_GUIDANCE;
+          console.warn("[selfhost-mcp] native identity capability check failed", {
+            error: error instanceof Error ? error.name : "unknown",
+          });
+        }
       }
     }
     const report = describeCapabilities({
@@ -45,6 +60,8 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       customerSupport: Boolean(context.customerSupport),
       grokRoutines: Boolean(context.grokRoutines),
       nativeAuthorityAvailable,
+      nativeAuthorityReason,
+      nativeAuthorityHowToEnable,
       providers: await context.providers(),
     });
     return {
