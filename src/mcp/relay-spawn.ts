@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import {
+  DEFAULT_MEMORY_POLICY, memoryLowMessage, memoryRefusal, type MemoryAssessment, type MemoryPolicy,
+} from "@agent-relay/spawn-placement";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { SqlExecutor } from "../database.js";
@@ -11,8 +14,8 @@ import type { RelayLaunchCheck } from "./relay-launch-check.js";
 import { relayLaunchCredentials, type RelayLaunchCredentials } from "./relay-launch-credentials.js";
 import { ownerHash, relayFailure, relayService, RelayToolError, type SpawnActor } from "./relay-participants.js";
 import {
-  alternativesFor, notAllowedMessage, rankTargets, type PlacedTarget, type SpawnNodeOwner,
-} from "./relay-spawn-placement.js";
+  alternativesFor, notAllowedMessage, rankTargets, type PlacedTarget, type PlacementRanking, type SpawnNodeOwner,
+} from "./spawn-placement/index.js";
 
 /**
  * Agent launches (SELFHOST_FEATURES launch; docs/agent-launch.md), ported
@@ -35,6 +38,11 @@ import {
  * relaygate checks the launch (./relay-launch-check.ts): a denied, classified
  * or unanswered check refuses the launch before a row is reserved.
  */
+
+export const targetsInput = z.object({
+  harness: z.string().regex(RELAY_HARNESS_ID_PATTERN).optional()
+    .describe("The harness you intend to launch (for example codex or claude), so each target's memory is judged for it."),
+}).strict();
 
 export const spawnInput = z.object({
   name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
@@ -177,6 +185,7 @@ const eligible = (target: RelaySpawnTarget) => target.name !== "self" && target.
 
 function failureMessage(code: string, node: string, harness: string, advertised?: string[]): string {
   return code === "spawn_capacity_exceeded" ? `Node "${node}" is at capacity`
+    : code === "spawn_memory_low" ? `Node "${node}" does not have the memory for another agent`
     : code === "spawn_target_offline" ? `Node "${node}" is offline`
     : code === "spawn_harness_unavailable" ? `Node "${node}" does not provide spawn:${harness}` +
       (advertised?.length ? `; it advertises ${advertised.join(", ")}` : "")
@@ -187,11 +196,12 @@ function failureMessage(code: string, node: string, harness: string, advertised?
     : `Agent launch on "${node}" failed`;
 }
 const SPAWN_CODES = new Set(["spawn_failed", "spawn_capacity_exceeded", "spawn_target_unavailable", "spawn_target_offline",
-  "spawn_harness_unavailable", "capacity_changed"]);
+  "spawn_harness_unavailable", "spawn_memory_low", "capacity_changed"]);
+const RETRYABLE_CODES = ["spawn_capacity_exceeded", "spawn_target_offline", "spawn_target_unavailable", "spawn_memory_low", "capacity_changed"];
 function failure(code: string | null, node: string, harness: string): SpawnFailure {
   const known = code && SPAWN_CODES.has(code) ? code : "spawn_failed";
   return { code: known, message: failureMessage(known, node, harness), node, harness, observed_at: new Date().toISOString(),
-    retryable: ["spawn_capacity_exceeded", "spawn_target_offline", "spawn_target_unavailable", "capacity_changed"].includes(known) };
+    retryable: RETRYABLE_CODES.includes(known) };
 }
 
 /** The upstream refusal code Relaycast attached to a rejected spawn, when it is one we know. */
@@ -236,7 +246,18 @@ export type RelaySpawnDeps = {
   launchCredentials?: RelayLaunchCredentials;
   /** Gate-only installs only: relaygate's POST /v1/check before anything is reserved or sent. */
   launchCheck?: RelayLaunchCheck;
+  /** The spawn memory policy (docs/specs/spawn-placement-memory.md); absent means the defaults in observe. */
+  memoryPolicy?: MemoryPolicy;
+  /** When this workspace's in-flight launches (reserved or accepted, last minute) were reserved, per node. */
+  pendingLaunches?(): Promise<Map<string, Date[]>>;
+  now?(): Date;
 };
+
+/** Shadow accounting for observe and rank: what enforce would have refused. Counts only, no names or ids. */
+function recordMemoryShadow(policy: MemoryPolicy, harness: string, memory: MemoryAssessment | undefined): void {
+  if (policy.mode === "off" || policy.mode === "enforce" || !memory || memory.admissible) return;
+  console.info("[selfhost-mcp] spawn_memory_policy_shadow", { mode: policy.mode, tier: memory.tier, reason: memory.reason, harness });
+}
 
 export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" | "principal" | "workspace" | "relay" | "oauth">,
   deps: RelaySpawnDeps) {
@@ -299,15 +320,30 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
       taskUnconfirmed: invocation.taskUnconfirmed });
   }
 
+  const memoryPolicy = deps.memoryPolicy ?? DEFAULT_MEMORY_POLICY;
+  /** Ranking inputs: the policy, the clock and this workspace's launches still starting. */
+  async function placementOptions(harness: string | null) {
+    const pending = memoryPolicy.mode === "off" || !deps.pendingLaunches ? new Map<string, Date[]>()
+      : await deps.pendingLaunches().catch(() => new Map<string, Date[]>());
+    return { policy: memoryPolicy, now: deps.now?.() ?? new Date(), harness, pending };
+  }
+
   return {
-    async targets() {
+    async targets(raw: unknown = {}) {
+      const parsed = targetsInput.safeParse(raw ?? {});
+      if (!parsed.success) throw new RelayToolError("Invalid input. harness is a harness id: lowercase letters, digits and hyphens, at most 32 characters.");
       if (context.oauth) await context.relay.database.transaction(tx => context.oauth!.lock(tx));
       authorize();
       const targets = (await deps.client.listSpawnTargets(deps.workspaceKey)).filter(eligible);
+      const ranking = rankTargets(targets, await deps.owners(targets.map(target => target.id)), userId,
+        await placementOptions(parsed.data.harness ?? null));
       return {
-        targets: rankTargets(targets, await deps.owners(targets.map(target => target.id)), userId),
+        targets: ranking.targets,
+        ...(ranking.policy.mode === "off" ? {} : { memory_policy: ranking.policy.mode }),
         note: "Ranked best first. Choose an allowed target, preferring an allowed desktop with the task's repository and free slots, " +
-          "and pass its target_node to spawn_relay_agent. Existing machines only; permission and capacity are rechecked at launch.",
+          "and pass its target_node to spawn_relay_agent. Existing machines only; permission and capacity are rechecked at launch." +
+          (ranking.policy.mode === "off" ? "" : " Pass the harness you intend to launch so memory is judged for it; " +
+            "a target with admissible false would refuse that launch now."),
       };
     },
 
@@ -334,31 +370,42 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
           : (await deps.client.listSpawnTargets(deps.workspaceKey, { includeOffline: true })).find(item => item.id === input.target_node);
         const owners = await deps.owners([...online.filter(eligible), ...(target ? [target] : []), ...(offline ? [offline] : [])]
           .map(item => item.id));
-        const ranked = rankTargets(online.filter(eligible), owners, userId);
-        const refuse = (code: string, refused: RelaySpawnTarget | undefined, placed?: PlacedTarget) => {
+        const options = await placementOptions(input.cli);
+        const ranking: PlacementRanking = rankTargets(online.filter(eligible), owners, userId, options);
+        const refuse = (code: string, refused: RelaySpawnTarget | undefined, placed?: PlacedTarget, memory?: MemoryAssessment) => {
           const name = refused?.name ?? input.target_node;
+          const alternatives = alternativesFor(ranking, input.cli, { id: input.target_node, repositories: placed?.repositories });
           const advertised = code === "spawn_harness_unavailable" && refused
             ? refused.capabilities.map(capability => capability.slice("spawn:".length)) : undefined;
           return new RelaySpawnAdmissionError({
-            code, message: code === "spawn_target_not_allowed" && placed ? notAllowedMessage(placed) : failureMessage(code, name, input.cli, advertised),
+            code, message: code === "spawn_target_not_allowed" && placed ? notAllowedMessage(placed)
+              : code === "spawn_memory_low" && memory ? memoryLowMessage(name, input.cli, memory) : failureMessage(code, name, input.cli, advertised),
             node: name, harness: input.cli, ...(advertised ? { advertised } : {}),
             ...(code === "spawn_target_not_allowed" ? { owner: placed?.owner ?? null } : {}),
             active: refused?.activeAgents ?? null, reserved: refused?.reservedAgents ?? null, max: refused?.maxAgents ?? null,
             observed_at: new Date().toISOString(),
             retryable: !["spawn_harness_unavailable", "spawn_target_not_allowed", "relaygate_denied", "relaygate_classified"].includes(code),
-            alternatives: alternativesFor(ranked, input.cli, { id: input.target_node,
-              repositories: placed?.repositories }),
+            ...(memory ? { memory: { reason: memory.reason, available_bytes: memory.available_bytes,
+              projected_available_bytes: memory.projected_available_bytes, total_bytes: memory.total_bytes, floor_bytes: memory.floor_bytes,
+              need_bytes: memory.need_bytes, memory_cap: memory.memory_cap, held: memory.held, sampled_at: memory.observed_at } } : {}),
+            alternatives,
+            ...(memory && alternatives.length === 0 ? { retry_after_seconds: ranking.policy.retryAfterSeconds } : {}),
           });
         };
         // Permission first, even for an offline node: a node you may not use is never retryable.
         const known = target ?? offline ?? undefined;
         if (!known) throw refuse("spawn_target_unavailable", undefined);
-        const placed = rankTargets([known], owners, userId)[0]!;
+        const placed = ranking.targets.find(item => item.target_node === known.id) ?? rankTargets([known], owners, userId, options).targets[0]!;
         if (!placed.allowed) throw refuse("spawn_target_not_allowed", known, placed);
         if (!target || !target.live) throw refuse("spawn_target_offline", known, placed);
         if (!target.handlersLive || target.stale || target.name === "self") throw refuse("spawn_target_unavailable", target, placed);
         if (!target.capabilities.includes(`spawn:${input.cli}`)) throw refuse("spawn_harness_unavailable", target, placed);
         if (!eligible(target)) throw refuse("spawn_capacity_exceeded", target, placed);
+        // Memory last: under enforce a fresh sample without room refuses (fail open when unknown); otherwise counted only.
+        const assessed = ranking.ranked.find(entry => entry.candidate.id === target!.id);
+        const short = assessed ? memoryRefusal(assessed, ranking.policy) : null;
+        if (short) throw refuse("spawn_memory_low", target, placed, short);
+        recordMemoryShadow(ranking.policy, input.cli, assessed?.memory);
         // Gate-only installs: relaygate sees the exact task first. Refused before reserve, so nothing is journaled or cached.
         if (deps.launchCheck) {
           const outcome = await deps.launchCheck.check({ userId, organizationId: context.workspace.organizationId,
@@ -399,7 +446,7 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         }
         if (row.state === "failed") await deps.launchCredentials?.discard(row.id);
         return row.state === "failed"
-          ? { ...result(row), alternatives: alternativesFor(ranked, input.cli, { id: target.id, repositories: placed.repositories }) }
+          ? { ...result(row), alternatives: alternativesFor(ranking, input.cli, { id: target.id, repositories: placed.repositories }) }
           : result(row);
       });
     },
@@ -485,6 +532,22 @@ export function relaySpawnDeps(context: McpContext): RelaySpawnDeps {
     withActor: fn => relayService(context).withSpawnActor(fn),
     ...(context.relay.relaygatePublicUrl ? { launchCredentials: relayLaunchCredentials(database, context.relay.keyring) } : {}),
     ...(context.relay.launchCheck ? { launchCheck: context.relay.launchCheck } : {}),
+    ...(context.relay.spawnMemoryPolicy ? { memoryPolicy: context.relay.spawnMemoryPolicy } : {}),
+    async pendingLaunches() {
+      // Launches still starting on each node, which a node's memory sample may not reflect yet.
+      const result = await database.query<{ node_id: string; created_at: Date | string }>(
+        `SELECT node_id, created_at FROM relay_spawns
+          WHERE workspace_id = $1 AND relaycast_workspace_id = $2 AND state IN ('reserved', 'accepted')
+            AND created_at > now() - interval '60 seconds'`,
+        [workspaceId, relaycastWorkspaceId]);
+      const pending = new Map<string, Date[]>();
+      for (const row of result.rows) {
+        const list = pending.get(String(row.node_id)) ?? [];
+        list.push(new Date(row.created_at));
+        pending.set(String(row.node_id), list);
+      }
+      return pending;
+    },
   };
 }
 
@@ -508,11 +571,11 @@ export function registerRelaySpawnTools(server: McpServer, context: McpContext, 
     }
   };
   server.registerTool("list_relay_spawn_targets", {
-    description: "List the live machines in the current workspace's fleet that can launch agents, ranked best first. Each target reports target_node, kind, machine, owner, allowed status, repositories, harnesses and versions, available slots, load and ranking reason. A target with allowed false cannot accept this connection's launch. Requires current workspace owner or admin access. Does not provision machines.",
-    inputSchema: {}, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, () => run(service => service.targets()));
+    description: "List the live machines in the current workspace's fleet that can launch agents, ranked best first. Each target reports target_node, kind, machine, owner, allowed status, repositories, harnesses and versions, available slots, load, memory and ranking reason. Pass harness (the one you intend to launch) so memory is judged for it. A target with allowed false cannot accept this connection's launch; one with admissible false would refuse that launch now. Requires current workspace owner or admin access. Does not provision machines.",
+    inputSchema: targetsInput.shape, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, input => run(service => service.targets(input)));
   server.registerTool("spawn_relay_agent", {
-    description: "Start an agent on one exact allowed target_node with a harness that target advertises. worker_cwd (strongly recommended) is the absolute working directory on that machine. Nothing is selected, queued, retried or rerouted automatically. Permission, capacity and availability are rechecked; a rejection returns a structured failure and allowed alternatives. An accepted result includes spawn_id and is not yet a readiness confirmation; poll get_relay_spawn_status.",
+    description: "Start an agent on one exact allowed target_node with a harness that target advertises. worker_cwd (strongly recommended) is the absolute working directory on that machine. Nothing is selected, queued, retried or rerouted automatically. Permission, capacity, availability and (when the memory policy enforces) free memory are rechecked; a rejection returns a structured failure and allowed alternatives that would take the launch now. spawn_memory_low is retryable. An accepted result includes spawn_id and is not yet a readiness confirmation; poll get_relay_spawn_status.",
     inputSchema: spawnInput.shape, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   }, (input, extra) => run(service => service.spawn(input, extra.requestId)));
   server.registerTool("get_relay_spawn_status", {

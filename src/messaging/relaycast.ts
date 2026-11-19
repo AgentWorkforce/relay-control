@@ -530,9 +530,14 @@ export function createRelaycastClient(input: {
     },
 
     /** Workspace roster with the default metadata (ownership and declared sessions). */
-    async listAgents(workspaceKey: string, status: "active" | "all", options: { includeStale?: boolean } = {}): Promise<RosterAgent[]> {
+    async listAgents(
+      workspaceKey: string,
+      status: "active" | "all",
+      options: { includeStale?: boolean; signal?: AbortSignal } = {},
+    ): Promise<RosterAgent[]> {
       const query = new URLSearchParams({ status, ...(options.includeStale ? { include_stale: "true" } : {}) });
-      const data = await labeled("list_agents", () => call("GET", `/v1/agents?${query}`, workspaceKey));
+      const data = await labeled("list_agents", () =>
+        call("GET", `/v1/agents?${query}`, workspaceKey, undefined, undefined, false, options.signal));
       if (!Array.isArray(data)) throw new RelaycastCallError(200, "", true);
       return data.flatMap((item) => {
         const agent = rosterFrom(item);
@@ -977,8 +982,9 @@ export function createRelaycastClient(input: {
     },
 
     /** Fresh presence from expiring broker keys, independent of roster status. */
-    async listPresence(workspaceKey: string): Promise<PresenceRow[]> {
-      const data = await labeled("list_presence", () => call("GET", "/v1/agents/presence", workspaceKey));
+    async listPresence(workspaceKey: string, options: { signal?: AbortSignal } = {}): Promise<PresenceRow[]> {
+      const data = await labeled("list_presence", () =>
+        call("GET", "/v1/agents/presence", workspaceKey, undefined, undefined, false, options.signal));
       if (!Array.isArray(data)) throw new RelaycastCallError(200, "", true);
       return data.flatMap((item) => {
         const row = record(item);

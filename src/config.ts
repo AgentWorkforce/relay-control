@@ -1,4 +1,6 @@
+import { MemoryPolicyError, parseMemoryPolicy, type MemoryPolicy } from "@agent-relay/spawn-placement";
 import { loadMcpOAuthConfig, type McpOAuthConfig } from "./mcp/oauth/config.js";
+import { loadCursorCloudConfig, type CursorCloudConfig } from "./mcp/cursor-cloud.js";
 import { readFileSync } from "node:fs";
 import { createHash, createPrivateKey, type KeyObject } from "node:crypto";
 import { isIP } from "node:net";
@@ -105,6 +107,8 @@ export type SelfhostConfig = {
   factory?: FactoryConfig;
   /** Hosted MCP module settings; omitted is off. Loading does not mount routes. */
   mcpOAuth?: McpOAuthConfig;
+  /** Cursor cloud agents (docs/cursor-cloud-agents.md); needs MCP OAuth. Omitted: on, run identity optional. */
+  cursorCloud?: CursorCloudConfig;
   /**
    * Desktop feed (docs/desktop-feed.md). Null or absent turns the feature off
    * and every feed route answers 404 like any unknown path.
@@ -162,6 +166,15 @@ export type SelfhostConfig = {
    * when relaygatePublicUrl is null: those routes are then 404.
    */
   relayNodeSelfMint?: boolean;
+  /**
+   * The spawn memory policy (docs/specs/spawn-placement-memory.md), from
+   * SELFHOST_SPAWN_MEMORY_POLICY (`off|observe|rank|enforce`, default
+   * `observe`), SELFHOST_SPAWN_MEMORY_FLOOR, SELFHOST_SPAWN_HARNESS_MEMORY,
+   * SELFHOST_SPAWN_AGENT_MEMORY, SELFHOST_SPAWN_DENSITY_CAPS_CONFIGURED and
+   * SELFHOST_SPAWN_MEMORY_FRESH_SECONDS. Absent means the package defaults
+   * in `observe`.
+   */
+  spawnMemoryPolicy?: MemoryPolicy;
   /**
    * SELFHOST_ENROLLMENT_SELF_RENEWAL (docs/identity.md, "Member self-mint"):
    * whether a signed-in person may mint a single-use desktop enrollment key
@@ -510,6 +523,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     ...loadAdminConfig(env, serviceUrl(env, "SELFHOST_PUBLIC_URL")),
     factory: loadFactoryConfig(env, introspection),
     mcpOAuth: loadMcpOAuthConfig(env, name => readSecret(env, name), serviceUrl(env, "SELFHOST_PUBLIC_URL")),
+    cursorCloud: loadCursorCloudConfig(env),
     historyUpload: loadHistoryUploadConfig(env),
     capturePolicyUploads: loadCapturePolicyUploads(env),
     ...optionalField("defaultSharingMode", loadDefaultSharingMode(env)),
@@ -517,6 +531,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     eventsShimRelayOrigins: loadEventsShimRelayOrigins(env),
     relaygatePublicUrl,
     relayNodeSelfMint: loadRelayNodeSelfMint(env),
+    spawnMemoryPolicy: loadSpawnMemoryPolicy(env),
     enrollmentSelfRenewal: loadEnrollmentSelfRenewal(env),
     imageVersion: env.SELFHOST_IMAGE_VERSION?.trim() || null,
     port: boundedPort(env.PORT),
@@ -1134,6 +1149,30 @@ function uploadEndpoint(env: Env, name: string): string | null {
 export function loadRelaygatePublicUrl(env: Env = process.env): string | null {
   if (!env.SELFHOST_RELAYGATE_PUBLIC_URL?.trim()) return null;
   return publicServiceUrl(env, "SELFHOST_RELAYGATE_PUBLIC_URL");
+}
+
+const SPAWN_MEMORY_ENV = {
+  mode: "SELFHOST_SPAWN_MEMORY_POLICY",
+  floor: "SELFHOST_SPAWN_MEMORY_FLOOR",
+  harnessMemory: "SELFHOST_SPAWN_HARNESS_MEMORY",
+  agentMemory: "SELFHOST_SPAWN_AGENT_MEMORY",
+  densityCapsConfigured: "SELFHOST_SPAWN_DENSITY_CAPS_CONFIGURED",
+  freshSeconds: "SELFHOST_SPAWN_MEMORY_FRESH_SECONDS",
+} as const;
+
+/**
+ * The spawn memory policy settings, parsed by the shared package so they mean
+ * what Cloud's do. Any invalid value refuses startup, naming the variable.
+ */
+export function loadSpawnMemoryPolicy(env: Env = process.env): MemoryPolicy {
+  const settings = Object.fromEntries(Object.entries(SPAWN_MEMORY_ENV)
+    .flatMap(([setting, name]) => env[name] === undefined ? [] : [[setting, env[name]]]));
+  try {
+    return parseMemoryPolicy(settings);
+  } catch (error) {
+    if (error instanceof MemoryPolicyError) throw new Error(`${SPAWN_MEMORY_ENV[error.setting]} is invalid: ${error.message}`);
+    throw error;
+  }
 }
 
 /**

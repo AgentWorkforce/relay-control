@@ -1,5 +1,6 @@
 import { isBindingOwnedIdentity } from "../messaging/binding-identities.js";
 import { createHash, randomUUID } from "node:crypto";
+import { recordAudit } from "../admin/audit.js";
 import { decryptSecret, encryptSecret } from "../crypto.js";
 import type { SqlExecutor } from "../database.js";
 import { RelaycastCallError, type RosterAgent } from "../messaging/relaycast.js";
@@ -11,11 +12,16 @@ import {
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
 import { buildAgentCard, cardMetadata, cardSummary, recipientCard, type SetCardInput } from "./relay-agent-cards.js";
+import { loadRelayAgentOwners } from "./relay-agent-owners.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
 import { admissionConnectorKind, connectorKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
 import { RECEIPT_GUIDANCE } from "../messaging/delivery-status.js";
 import { MCP_OAUTH_RETIRING_MESSAGE, McpOAuthAgentRetiring, retiringIdentity } from "./oauth/retirement.js";
+import {
+  CursorIdentityError, cursorCloudParticipantName, cursorIdentityNonces, cursorMintCommand, verifyCursorIdentityToken,
+} from "./cursor-oidc.js";
+import { postgresAttestationStore } from "./copilot-attestation.js";
 import { enrolHostedAtGate, freshAtGate, HostedGateRefused, type GateEnrolment } from "./hosted-gate.js";
 import type { RelayHostedClient } from "./relay-hosted-credentials.js";
 
@@ -64,6 +70,11 @@ export const HOSTED_KIND = "hosted";
 export const DESKTOP_KIND = "relay-desktop";
 const AS_PERSON_UNAVAILABLE =
   "as_person is not available on this self-hosted site. Omit it to act as this MCP session's hosted participant.";
+const ownerEnrichmentFailed = (operation: "list_relay_agents" | "get_relay_agent_card", error: unknown) => {
+  console.warn("[selfhost-mcp] owner enrichment failed", {
+    operation, error: error instanceof Error ? error.name : "unknown",
+  });
+};
 
 /** Contract section 4, verbatim (shared with Cloud's hosted MCP). */
 export const RELAY_AGENT_CARD_GUIDANCE = "Before delegating to a peer, read its card with get_relay_agent_card to see what it does and what to send it. Keep your own card current with set_relay_agent_card: a description of your purpose and one skill per kind of work you take on, with example requests.";
@@ -283,6 +294,8 @@ type ParticipantOptions = {
   executor?: SqlExecutor;
   /** The owner's launcher (withSpawnActor only): on gate-only installs it is never a messaging identity. */
   internal?: boolean;
+  /** A Cursor cloud agent run of this OAuth grant (cursor_cloud_runs): never the grant's pinned agent. */
+  run?: boolean;
 };
 /** The hosted participant every agent launch of one owner is sent as (src/mcp/relay-spawn.ts). */
 export type SpawnActor = {
@@ -311,6 +324,10 @@ const CARD_NEEDS_IDENTITY = "This MCP session has no relay identity to publish a
 const CARD_IDENTITY_CHANGED = "Your relay identity is no longer available or changed. Call relay_status, join_relay again if needed, then retry.";
 /** joinLocked found nothing to join on a gate-only install: enrol at relaygate outside the lock, then retry. */
 const NEEDS_GATE_ENROLMENT = Symbol("needs-gate-enrolment");
+/** A Cursor cloud agent run's participant name (cursorCloudParticipantName). */
+const CURSOR_RUN_NAME = /^cursor-cloud-[0-9a-f]{10}$/;
+const CURSOR_RUN_RETIRING = "This Cursor cloud agent run's earlier connection was disconnected and its relay agent is being released. Retry join_relay in a minute.";
+const CURSOR_TOKEN_ELSEWHERE = "cursor_identity_token is only for Cursor cloud agents connected through this server's OAuth (added at cursor.com/agents).";
 const NO_PARTICIPANT_MESSAGE = "No hosted participant with that name is owned by you in this workspace.";
 const NAME_TAKEN = "That relay name is already taken. Choose another name.";
 /** Gate-only installs: reads go through relaygate as the caller's own relay identity, so one is needed first. */
@@ -504,8 +521,50 @@ function createRelayService(context: McpContext) {
     return remote.id === row.agentRemoteId && remote.status !== "released" ? { state: "ok", remote } : { state: "changed" };
   }
 
+  /** Whether `name` is one of this OAuth grant's Cursor cloud agent runs (cursor_cloud_runs). */
+  async function ownRun(name: string | undefined, query: SqlExecutor = executor): Promise<boolean> {
+    if (!oauth || !context.cursorCloud || !name || !CURSOR_RUN_NAME.test(name)) return false;
+    return (await query.query(
+      "SELECT 1 FROM cursor_cloud_runs WHERE grant_id = $1 AND agent_name = $2 AND user_id = $3 AND workspace_id = $4",
+      [oauth.access.grantId, name, userId, workspaceId])).rows.length > 0;
+  }
+
+  /**
+   * The release fence of a Cursor cloud agent run: a run row of a revoked
+   * grant stays until the OAuth teardown worker has released the
+   * participant, so nothing may reattach it meanwhile.
+   */
+  async function cursorRunRetiring(tx: SqlExecutor, name: string): Promise<boolean> {
+    if (!CURSOR_RUN_NAME.test(name)) return false;
+    return (await tx.query(`SELECT 1 FROM cursor_cloud_runs r JOIN mcp_oauth_grants g ON g.id = r.grant_id
+      WHERE r.workspace_id = $1 AND r.user_id = $2 AND r.agent_name = $3 AND g.revoked_at IS NOT NULL LIMIT 1`,
+    [workspaceId, userId, name])).rows.length > 0;
+  }
+
+  /** SELFHOST_CURSOR_CLOUD_RUN_IDENTITY=required: a cursor-cloud grant acts only as a verified run. */
+  async function runRequired(query: SqlExecutor = executor): Promise<boolean> {
+    return Boolean(oauth && context.cursorCloud?.config.runIdentity === "required") && await hostedClient(query) === "cursor-cloud";
+  }
+
+  /** How a Cursor cloud agent mints the token join_relay takes; null for any other connection. */
+  async function cursorIdentityGuidance(query: SqlExecutor = executor) {
+    const cc = context.cursorCloud;
+    if (!oauth || !cc || await hostedClient(query) !== "cursor-cloud") return null;
+    const nonce = cursorIdentityNonces(cc.nonceSecret, oauth.access.grantId).current;
+    return { audience: cc.audience, nonce, mint_command: cursorMintCommand(cc.audience, nonce),
+      next_step: "Run mint_command in this cloud agent's shell, then call join_relay with cursor_identity_token set to the returned token. Use the name it returns as `as` on every relay tool call." };
+  }
+
+  async function cursorRunRequiredError(query: SqlExecutor = executor): Promise<RelayToolError> {
+    const guidance = await cursorIdentityGuidance(query);
+    return new RelayToolError(`This Cursor connection acts only as a verified cloud agent run. ${guidance
+      ? `Mint an identity token with: ${guidance.mint_command} then call join_relay with cursor_identity_token, and pass the returned name as \`as\`.`
+      : "Call join_relay with cursor_identity_token."}`);
+  }
+
   /** The row participant() would select for `as` (or this session), read without the owner lock. */
   async function selectedRow(as?: string): Promise<ParticipantRow | null> {
+    if (await ownRun(as)) return findParticipant(executor, workspaceId, userId, organizationId, { name: as! });
     const approvedId = oauth?.access.agentRemoteId;
     const name = oauth && !approvedId ? oauth.access.agentName : as;
     const selector: Selector | null = approvedId ? { agentRemoteId: approvedId }
@@ -597,7 +656,7 @@ function createRelayService(context: McpContext) {
       await updateParticipant(query, row.id, { agentName: remote.name });
       name = remote.name;
     }
-    if (oauth) {
+    if (oauth && !options.run) {
       oauth.assertActor(requested, name);
       if (usable) await oauth.pin(query, { workspaceId, userId, agentName: name, agentRemoteId: row.agentRemoteId });
     }
@@ -616,8 +675,10 @@ function createRelayService(context: McpContext) {
     if (oauth && !options.executor) return withOwnerLock(tx=>participant(as,{...options,executor:tx}));
     const { allowMissing = false, allowGone = false, allowRejected = false, executor: query = executor } = options;
     const requested = as;
-    const approvedId = oauth?.access.agentRemoteId;
-    if (oauth && !approvedId) { oauth.assertActor(as); as = oauth.access.agentName; }
+    const run = options.run || await ownRun(as, query);
+    if (oauth && !run && await runRequired(query)) throw await cursorRunRequiredError(query);
+    const approvedId = run ? undefined : oauth?.access.agentRemoteId;
+    if (oauth && !run && !approvedId) { oauth.assertActor(as); as = oauth.access.agentName; }
     const selector: Selector | null = approvedId ? { agentRemoteId: approvedId }
       : as ? { name: as } : sessionHash ? { sessionHash } : null;
     const row = selector ? await findParticipant(query, workspaceId, userId, organizationId, selector) : null;
@@ -631,14 +692,14 @@ function createRelayService(context: McpContext) {
     }
     // Retirement fence, before any Relaycast call: an unpinned OAuth grant
     // would pin this row's agent, and a native join would bind its session.
-    if (((oauth && !approvedId) || (options.bind && !row.sessionHash)) && options.executor) {
+    if (((oauth && !run && !approvedId) || (options.bind && !row.sessionHash)) && options.executor) {
       await refuseRetiring(query, row.agentRemoteId, row.agentName);
     }
     if (gate) {
       // The owner's launcher stays a Relaycast identity (relaygate does not proxy launches; each launch is
       // checked at relaygate's /v1/check instead), so it never messages on a gate-only install.
       if (row.agentName === launcherName(userId) && !options.internal) throw new RelayToolError(NO_PARTICIPANT_MESSAGE);
-      if (row.agentName !== launcherName(userId)) return gatedParticipant(row, requested, options);
+      if (row.agentName !== launcherName(userId)) return gatedParticipant(row, requested, { ...options, run });
     }
     const token = decryptSecret(row.tokenCiphertext, keyring);
     const { remote, tokenUsable } = await hostedRemote(row, token);
@@ -650,7 +711,7 @@ function createRelayService(context: McpContext) {
       await updateParticipant(query, row.id, { agentName: remote.name });
       name = remote.name;
     }
-    if (oauth) {
+    if (oauth && !run) {
       oauth.assertActor(requested, name);
       if (remote) await oauth.pin(query, { workspaceId, userId, agentName: name, agentRemoteId: row.agentRemoteId });
     }
@@ -671,8 +732,11 @@ function createRelayService(context: McpContext) {
   }
 
   async function roster(status: "live" | "all" | "offline", people: readonly McpMember[], includeStale = false, dir: Directory = directory()) {
-    return (await listedAgents(status === "live" ? "active" : "all", includeStale, dir))
-      .map(agent => ({ ...rosterAgent(agent, people, userId, workspaceId), ...cardSummary(agent.metadata) }))
+    const listed = await listedAgents(status === "live" ? "active" : "all", includeStale, dir);
+    const owners = await loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, listed, people, Boolean(gate))
+      .catch(error => { ownerEnrichmentFailed("list_relay_agents", error); return undefined; });
+    return listed
+      .map(agent => ({ ...rosterAgent(agent, people, userId, workspaceId, owners?.get(agent.id)), ...cardSummary(agent.metadata, agent) }))
       .filter(agent => status === "all" || (status === "live" ? agent.online : !agent.online));
   }
 
@@ -715,11 +779,11 @@ function createRelayService(context: McpContext) {
    * the owner's launcher (`internal`) enrols through relaygate.
    */
   async function registerParticipant(tx: SqlExecutor, name: string, boundSession: string | null, objective: string,
-    options: { internal?: boolean; enrolled?: GateEnrolment } = {}) {
+    options: { internal?: boolean; enrolled?: GateEnrolment; run?: boolean } = {}) {
     if (gate && !options.internal) {
       // Gate-only installs enrol at relaygate before the owner lock (prepareGateRegistration).
       if (!options.enrolled || options.enrolled.name !== name) throw new Error("gate registration needs a prepared enrolment");
-      return registerAtGate(tx, options.enrolled, boundSession);
+      return registerAtGate(tx, options.enrolled, boundSession, options.run);
     }
     const remote = await client.getAgent(key, name);
     if (remote && !ownsRemote(remote)) throw new RelayToolError(NAME_TAKEN);
@@ -740,7 +804,7 @@ function createRelayService(context: McpContext) {
         agentName: registered.name, agentRemoteId: registered.id,
         tokenCiphertext: encryptSecret(registered.token, keyring.active), relaygateAgentId: null, admittedClients: [],
       });
-      if (oauth) await oauth.pin(tx, { workspaceId, userId, agentName: registered.name, agentRemoteId: registered.id });
+      if (oauth && !options.run) await oauth.pin(tx, { workspaceId, userId, agentName: registered.name, agentRemoteId: registered.id });
     } catch (error) {
       if (!remote) await client.releaseHosted(key, registered.name, registered.id).catch(() => {});
       throw error;
@@ -792,7 +856,7 @@ function createRelayService(context: McpContext) {
   }
 
   /** registerParticipant on a gate-only install, under the owner lock: the row keeps relaygate's rg_ token. */
-  async function registerAtGate(tx: SqlExecutor, enrolled: GateEnrolment, boundSession: string | null) {
+  async function registerAtGate(tx: SqlExecutor, enrolled: GateEnrolment, boundSession: string | null, run = false) {
     try {
       // The same owner may get an agent back whose release is in flight.
       await refuseRetiring(tx, enrolled.relaycastAgentId, enrolled.name);
@@ -802,7 +866,7 @@ function createRelayService(context: McpContext) {
         tokenCiphertext: encryptSecret(enrolled.token, keyring.active), relaygateAgentId: enrolled.relaygateAgentId,
         admittedClients: [await hostedClient(tx)],
       });
-      if (oauth) await oauth.pin(tx, { workspaceId, userId, agentName: enrolled.name, agentRemoteId: enrolled.relaycastAgentId });
+      if (oauth && !run) await oauth.pin(tx, { workspaceId, userId, agentName: enrolled.name, agentRemoteId: enrolled.relaycastAgentId });
     } catch (error) {
       // Never leave a retiring agent's release to race a new binding: only a fresh one is released here.
       if (!(error instanceof RelayToolError && error.message === MCP_OAUTH_RETIRING_MESSAGE)) {
@@ -855,7 +919,11 @@ function createRelayService(context: McpContext) {
     return recovered.token;
   }
 
-  async function join(input: { name?: string; description?: string; desktop_address?: string }) {
+  async function join(input: { name?: string; description?: string; desktop_address?: string; cursor_identity_token?: string }) {
+    if (input.cursor_identity_token !== undefined) {
+      if (input.name || input.desktop_address) throw new RelayToolError("cursor_identity_token cannot be combined with name or desktop_address: the run's name is fixed.");
+      return joinCursorRun(input.cursor_identity_token, input.description);
+    }
     if (managed) {
       const identity = await desktop();
       if (input.name || input.description || (input.desktop_address && input.desktop_address !== identity.address)) {
@@ -898,6 +966,7 @@ function createRelayService(context: McpContext) {
       }
       let existing = bound ?? await participant(requestedName, {
         allowMissing: true, allowRejected: true, executor: tx, bind: Boolean(sessionHash) });
+      if (existing && await cursorRunRetiring(tx, existing.row.agentName)) throw new RelayToolError(CURSOR_RUN_RETIRING);
       if (existing) {
         if (sessionHash && existing.row.sessionHash && existing.row.sessionHash !== sessionHash) {
           throw new RelayToolError("That participant is bound to another MCP session. Use as to act as it without changing its binding, or choose a new name.");
@@ -945,6 +1014,87 @@ function createRelayService(context: McpContext) {
       ?? await findParticipant(tx, workspaceId, userId, organizationId, { agentRemoteId: prepared.relaycastAgentId });
     if (!held && freshAtGate(prepared)) await gate!.releaseOwnAgent(prepared.token).catch(() => {});
     return existing;
+  }
+
+  /**
+   * join_relay cursor_identity_token: a Cursor cloud agent run joins as its
+   * own participant (docs/cursor-cloud-agents.md). The token is a
+   * Cursor-signed OIDC JWT minted in the run's VM for this install's audience
+   * and this grant's nonce (./cursor-oidc.ts); the Cursor account behind it
+   * must be linked to the grant's user. The participant's name is fixed by
+   * the run, it is recorded as the grant's run (never pinned as the grant's
+   * approved agent), and later calls select it with `as`. On a gate-only
+   * install it enrols at relaygate as cursor-cloud like any hosted
+   * participant.
+   */
+  async function joinCursorRun(token: string, description?: string) {
+    const cc = context.cursorCloud;
+    if (!oauth || !cc || await hostedClient() !== "cursor-cloud") throw new RelayToolError(CURSOR_TOKEN_ELSEWHERE);
+    const grantId = oauth.access.grantId;
+    const store = postgresAttestationStore(database);
+    let identity;
+    try {
+      identity = await verifyCursorIdentityToken(token, {
+        audience: cc.audience, nonces: cursorIdentityNonces(cc.nonceSecret, grantId).accepted, jwks: cc.jwks,
+        allowSelfHosted: cc.config.allowSelfHosted,
+        // Spent ids share the attestation store; the prefix keeps them apart from desktop proofs.
+        spend: (jti, expiresAt) => store.spend({ workspaceId, userId, toolUseId: `cursor-oidc:${jti}`, expiresAt }),
+      });
+    } catch (error) {
+      if (!(error instanceof CursorIdentityError)) throw error;
+      const guidance = await cursorIdentityGuidance();
+      throw new RelayToolError(`The Cursor identity token was refused (${error.reason}). Mint a fresh one with: ${guidance!.mint_command}`);
+    }
+    const decision = await withOwnerLock(tx => cc.links.decide(tx,
+      { userId, organizationId, workspaceId, email: context.principal.email ?? null }, identity, cc.config.trustedTeams));
+    if (!decision.linked) {
+      throw new RelayToolError("conflict" in decision
+        ? "That Cursor account is linked to another person in this workspace. Connect Cursor with your own Agent Relay account."
+        : `Before this Cursor cloud agent can join as you, open ${decision.confirmUrl} signed in to Agent Relay as yourself and confirm the Cursor account (the link works once, for 15 minutes). Then mint a fresh token and call join_relay again.`);
+    }
+    const name = cursorCloudParticipantName(identity.cloudAgentId);
+    const ownerLabel = context.principal.name.trim() || context.principal.email || userId;
+    const objective = description ?? `Cursor cloud agent run acting for ${ownerLabel}${identity.repoUrl ? ` on ${identity.repoUrl}` : ""}`;
+    const recordRun = (tx: SqlExecutor) => tx.query(
+      `INSERT INTO cursor_cloud_runs (grant_id, cloud_agent_id, workspace_id, user_id, agent_name)
+       VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`, [grantId, identity.cloudAgentId, workspaceId, userId, name]);
+    if (gate && await findParticipant(executor, workspaceId, userId, organizationId, { name })) {
+      // An earlier join of this run: renew it at relaygate before the lock, as every gated participant is. The
+      // release fence is checked in the same transaction that records the run, so a run being released is never
+      // re-recorded.
+      await withOwnerLock(async (tx) => {
+        if (await cursorRunRetiring(tx, name)) throw new RelayToolError(CURSOR_RUN_RETIRING);
+        await recordRun(tx);
+      });
+      await refreshGated(name);
+    }
+    let prepared: GateEnrolment | undefined;
+    for (;;) {
+      const joined = await withOwnerLock(async (tx) => {
+        if (await findParticipant(tx, workspaceId, userId, organizationId, { name })) {
+          if (await cursorRunRetiring(tx, name)) throw new RelayToolError(CURSOR_RUN_RETIRING);
+          await recordRun(tx);
+          let existing = (await participant(name, { executor: tx, run: true, allowRejected: !gate }))!;
+          if (gate && prepared) existing = await settlePrepared(tx, existing, prepared);
+          if (gate && !existing.tokenUsable) throw new RelayToolError(GATE_RENEW_FAILED);
+          const token = existing.tokenUsable ? existing.token : await recoverToken(tx, existing);
+          return { name, token, gated: existing.gated, alreadyJoined: true };
+        }
+        if (gate && !prepared) return NEEDS_GATE_ENROLMENT;
+        const registered = await registerParticipant(tx, name, null, objective, { enrolled: prepared, run: true });
+        await recordRun(tx);
+        return { name: registered.name, token: registered.token, gated: Boolean(gate), alreadyJoined: false };
+      });
+      if (joined !== NEEDS_GATE_ENROLMENT) {
+        await touchPresence(joined);
+        await recordAudit(database, { organizationId, workspaceId, actor: { kind: "user", userId },
+          action: "cursor_cloud.run.joined", target: `${name} grant=${grantId} subject=${identity.subject}` });
+        return { joined: true, linked: "hosted" as const, name: joined.name, address: await addressFor(joined.name, true, directory(joined)),
+          already_joined: joined.alreadyJoined, cursor_cloud_run: true,
+          reply_guidance: `Pass as="${joined.name}" on every relay tool call from this cloud agent run. ${HOSTED_REPLY_GUIDANCE} with as="${joined.name}".` };
+      }
+      prepared = await prepareGateRegistration(name, objective);
+    }
   }
 
   /** Callers hold the owner lock. */
@@ -1120,14 +1270,16 @@ function createRelayService(context: McpContext) {
   type CardIdentity = { name: string; agentId: string; linked: "desktop" | "hosted"; kind: string; gated?: { token: string } };
 
   /** The identity set_relay_agent_card writes: the caller's own, chosen as relay_status reports it. */
-  async function ownCardIdentity(): Promise<CardIdentity> {
+  async function ownCardIdentity(as?: string): Promise<CardIdentity> {
     if (managed) {
+      await managedActorOnly(as);
       const identity = await desktop();
       return { name: identity.name, agentId: identity.agentId, linked: "desktop", kind: DESKTOP_KIND };
     }
-    const linkedIdentity = await linkedDesktop();
+    const linkedIdentity = as ? null : await linkedDesktop();
     if (linkedIdentity) return { name: linkedIdentity.name, agentId: linkedIdentity.agentId, linked: "desktop", kind: DESKTOP_KIND };
-    const hosted = await participant();
+    // `as` selects the caller's own participant, e.g. a Cursor cloud agent run (never someone else's).
+    const hosted = await participant(as);
     if (!hosted) throw new RelayToolError(CARD_NEEDS_IDENTITY);
     return { name: hosted.name, agentId: hosted.row.agentRemoteId, linked: "hosted", kind: await hostedKind(),
       ...(hosted.gated ? { gated: { token: hosted.token } } : {}) };
@@ -1200,9 +1352,10 @@ function createRelayService(context: McpContext) {
    * caller that is not a Desktop identity reads through relaygate as its
    * hosted participant, and must have joined first.
    */
-  async function callerDirectory(): Promise<Directory> {
-    if (!gate || managed || await linkedDesktop()) return directory();
-    const hosted = await participant();
+  async function callerDirectory(as?: string): Promise<Directory> {
+    if (managed) await managedActorOnly(as);
+    if (!gate || managed || (!as && await linkedDesktop())) return directory();
+    const hosted = await participant(as);
     if (!hosted) throw new RelayToolError(GATE_JOIN_FIRST);
     return directory(hosted);
   }
@@ -1230,10 +1383,10 @@ function createRelayService(context: McpContext) {
   return {
     withSpawnActor,
 
-    async list(input: { status: "live" | "all" | "offline"; person?: string; query?: string; include_stale?: boolean }) {
+    async list(input: { status: "live" | "all" | "offline"; person?: string; query?: string; include_stale?: boolean; as?: string }) {
       const query = input.query?.toLowerCase();
       const person = input.person?.toLowerCase();
-      const agents = await roster(input.status, await context.members(), input.include_stale, await callerDirectory());
+      const agents = await roster(input.status, await context.members(), input.include_stale, await callerDirectory(input.as));
       return { workspace_id: workspaceId, agents: agents.filter(agent =>
         (!person || (person === "me" ? agent.is_mine
           : agent.owner?.user_id.toLowerCase() === person || agent.owner?.name.toLowerCase().includes(person))) &&
@@ -1243,10 +1396,13 @@ function createRelayService(context: McpContext) {
     join,
 
     /** get_relay_agent_card: any listed agent in this workspace, by name or exact machine address. Read-only. */
-    async getCard(input: { agent: string }) {
-      const agent = await explicitAgent(input.agent.trim(), await callerDirectory());
+    async getCard(input: { agent: string; as?: string }) {
+      const agent = await explicitAgent(input.agent.trim(), await callerDirectory(input.as));
       if (!agent || agent.status === "released" || !isListedRelayAgent(agent)) throw new RelayToolError(UNKNOWN_CARD_AGENT);
-      return buildAgentCard(agent, cardOptions);
+      const owners = await Promise.resolve().then(async () =>
+        loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, [agent], await context.members(), Boolean(gate)))
+        .catch(error => { ownerEnrichmentFailed("get_relay_agent_card", error); return undefined; });
+      return buildAgentCard(agent, cardOptions, owners?.get(agent.id));
     },
 
     /**
@@ -1258,8 +1414,8 @@ function createRelayService(context: McpContext) {
      * Relaycast merges them into the stored metadata, so every other key is
      * preserved.
      */
-    async setCard(input: SetCardInput) {
-      const own = await ownCardIdentity();
+    async setCard(input: SetCardInput & { as?: string }) {
+      const own = await ownCardIdentity(input.as);
       if (own.gated) {
         // A gated participant writes its own card through relaygate (which merges it upstream).
         const current = await gate!.authenticatedAgent(own.gated.token);
@@ -1268,7 +1424,8 @@ function createRelayService(context: McpContext) {
           ...cardMetadata(input, current.metadata, new Date()), kind: own.kind, ...(ownerName ? { owner_name: ownerName } : {}) });
         const updated = await gate!.authenticatedAgent(own.gated.token);
         if (updated.id !== own.agentId) throw new RelayToolError(CARD_IDENTITY_CHANGED);
-        return { updated: true, linked: own.linked, name: updated.name, card: buildAgentCard(updated, cardOptions) };
+        return { updated: true, linked: own.linked, name: updated.name,
+          card: buildAgentCard(updated, cardOptions, context.principal) };
       }
       const current = await client.getRosterAgent(key, own.name);
       if (!current || current.id !== own.agentId || current.status === "released") throw new RelayToolError(CARD_IDENTITY_CHANGED);
@@ -1282,7 +1439,7 @@ function createRelayService(context: McpContext) {
         });
       if (updated.id !== own.agentId) throw new RelayToolError(CARD_IDENTITY_CHANGED);
       return { updated: true, linked: own.linked, name: updated.name,
-        card: buildAgentCard(updated, cardOptions) };
+        card: buildAgentCard(updated, cardOptions, context.principal) };
     },
 
     async leave(as?: string) {
@@ -1291,6 +1448,8 @@ function createRelayService(context: McpContext) {
         await desktop();
         return { joined: false, desktop_agent_unchanged: true, native_chat_identity_retained: true };
       }
+      // A run this connection already left (or never had): leaving again is a no-op, not a run-identity refusal.
+      if (oauth && as && CURSOR_RUN_NAME.test(as) && context.cursorCloud && !await ownRun(as)) return { joined: false, already_left: true };
       // Gate-only installs: renew at relaygate first so the release goes through it; a refusal still lets it leave.
       await refreshGated(as).catch(() => {});
       return withOwnerLock(async (tx) => {
@@ -1302,6 +1461,20 @@ function createRelayService(context: McpContext) {
         // Release uses the workspace key (or, gated, a token re-enrolled at relaygate), so a rejected token can still leave.
         const hosted = await participant(as, { allowGone: true, allowRejected: true, executor: tx });
         if (!hosted) return { joined: false, already_left: true };
+        // A Cursor cloud agent run may be shared: other connections' runs, or a native session bound to it. Leaving then
+        // detaches only this caller (its run record, or its session binding); the last user releases the participant.
+        if (CURSOR_RUN_NAME.test(hosted.name)) {
+          const mine = oauth ? oauth.access.grantId : null;
+          const others = await tx.query(`SELECT 1 FROM cursor_cloud_runs r JOIN mcp_oauth_grants g ON g.id = r.grant_id
+            WHERE r.workspace_id = $1 AND r.user_id = $2 AND r.agent_name = $3 AND g.revoked_at IS NULL
+              AND ($4::uuid IS NULL OR r.grant_id <> $4::uuid) LIMIT 1`, [workspaceId, userId, hosted.name, mine]);
+          const boundElsewhere = oauth !== undefined && hosted.row.sessionHash !== null;
+          if (others.rows.length || boundElsewhere) {
+            if (mine) await tx.query("DELETE FROM cursor_cloud_runs WHERE grant_id = $1 AND agent_name = $2", [mine, hosted.name]);
+            else await tx.query("UPDATE hosted_relay_participants SET session_hash = NULL, updated_at = now() WHERE id = $1", [hosted.row.id]);
+            return { joined: false, already_left: false, kept_for_other_connections: true };
+          }
+        }
         if (oauth && hosted.row.sessionHash) {
           throw new RelayToolError("A native MCP session still uses this agent. Leave from that session instead.");
         }
@@ -1311,6 +1484,10 @@ function createRelayService(context: McpContext) {
         if (await hasActiveLaunches(tx, workspaceId, hosted.row.agentRemoteId)) throw new RelayToolError(ACTIVE_LAUNCHES);
         await releaseRemote(hosted);
         await removeParticipant(tx, hosted.row.id);
+        // A Cursor cloud agent run that leaves is no longer any grant's run.
+        if (CURSOR_RUN_NAME.test(hosted.name)) {
+          await tx.query("DELETE FROM cursor_cloud_runs WHERE workspace_id = $1 AND user_id = $2 AND agent_name = $3", [workspaceId, userId, hosted.name]);
+        }
         return { joined: false, already_left: false };
       });
     },
@@ -1327,13 +1504,20 @@ function createRelayService(context: McpContext) {
         return { joined: true, linked: "desktop" as const, name: linkedIdentity.name, address: linkedIdentity.address,
           unread_count: null, guidance: DESKTOP_REPLY_GUIDANCE };
       }
+      // A Cursor cloud agent learns here how to join as its own run.
+      const cursor = await cursorIdentityGuidance();
+      if (cursor && !as && await runRequired()) {
+        return { joined: false, name: null, address: null, unread_count: 0, cursor_identity: cursor, guidance: cursor.next_step };
+      }
       const hosted = await participant(as);
       if (!hosted) return { joined: false, name: null, address: null, unread_count: 0,
+        ...(cursor ? { cursor_identity: cursor } : {}),
         guidance: "Send a message with send_relay_message to auto-join this MCP session, or call join_relay first." };
       await touchPresence(hosted);
       const [address, inbox] = await Promise.all([addressFor(hosted.name, false, directory(hosted)), clientFor(hosted).readHostedInbox(hosted.token)]);
       return { joined: true, linked: "hosted" as const, name: hosted.name, address,
-        unread_count: inbox.length, unread_count_is_lower_bound: inbox.length === 100 };
+        unread_count: inbox.length, unread_count_is_lower_bound: inbox.length === 100,
+        ...(cursor && !await ownRun(as) ? { cursor_identity: cursor } : {}) };
     },
 
     async inbox(as: string | undefined, acknowledge: string[]) {

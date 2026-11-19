@@ -1,3 +1,4 @@
+import { DEFAULT_MEMORY_POLICY } from "@agent-relay/spawn-placement";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CAPABILITY_DISCOVERY_TOOL, describeCapabilities } from "./catalog.js";
 import type { McpContext } from "./context.js";
@@ -31,6 +32,8 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       grokRoutines: Boolean(context.grokRoutines),
       providers: await context.providers(),
     });
+    // Launches on: which memory policy they run under, so clients and parity checks can see it.
+    if (context.launch) report.workspace.spawn_memory_policy = (context.relay.spawnMemoryPolicy ?? DEFAULT_MEMORY_POLICY).mode;
     return {
       structuredContent: report as unknown as Record<string, unknown>,
       content: [{ type: "text" as const, text: JSON.stringify(report) }],

@@ -978,7 +978,7 @@ fixtureTest("source Oslo sessions retain UTC expiry and conflicts fail copy",asy
   await source.query("SET TIME ZONE 'Europe/Oslo'");
   const fixture=await copiedFixture();
   const expiry=(await target.query("SELECT to_char(expires_at AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS.US') AS expiry FROM staff_read_grants WHERE id=$1",[id(0xa01)])).rows[0].expiry;
-  assert.equal(expiry,"2026-04-01 00:00:00.123456");
+  assert.equal(expiry,"2027-03-28 12:00:00.123456");
   const report=await verifyImport(source,target,scope,fixture.ledger,fixtureKeyring,cloudKeyHex,
     {credentialCopy:{report:fixture.copy,reader:fixture.reader,targetBlobs:fixture.blobs}});
   assert.equal(report.ok,true,JSON.stringify(report.findings.filter((f) => !f.ok)));

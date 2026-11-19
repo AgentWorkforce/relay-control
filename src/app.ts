@@ -2,7 +2,9 @@ import { page } from "./identity/pages.js";
 import { revokeOrganizationMcpOAuthGrants } from "./mcp/oauth/revocations.js";
 import { createMcpOAuthHttpModule } from "./mcp/oauth/routes.js";
 import { McpOAuthStore } from "./mcp/oauth/store.js";
-import { connectorKind } from "./mcp/oauth/connector-kind.js";
+import { connectorKind, isGrokRoutineKind } from "./mcp/oauth/connector-kind.js";
+import { createCursorCloud } from "./mcp/cursor-cloud.js";
+import type { CursorJwks } from "./mcp/cursor-oidc.js";
 import { relayHostedCredentials } from "./mcp/relay-hosted-credentials.js";
 import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
@@ -433,6 +435,8 @@ export function createApp(input: {
   /** Server-owned worker; absent tests use the same on-demand cleanup without a timer. */
   mcpOAuthTeardown?: McpOAuthTeardown;
   grokRoutines?: GrokRoutines;
+  /** Cursor's OIDC signing keys (tests inject a local issuer); default api.cursor.com's JWKS. */
+  cursorJwks?: CursorJwks;
   /**
    * Runtime probes for the provider modules this build contains. Unset (the
    * default) means no provider module: each reports implemented, configured
@@ -628,19 +632,26 @@ export function createApp(input: {
   }) : null;
   const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines({
       database:store.database,keyring:config.encryptionKeyring,client:oauthRelay,
+      cursorRunIdentityRequired:config.cursorCloud?.enabled!==false && config.cursorCloud?.runIdentity==="required",
       ...(config.relaygatePublicUrl ? {gate:createRelaycastClient({internalOrigin:config.relaygatePublicUrl,fetchImpl:input.messagingFetch})} : {}),
       publicOrigin:new URL(config.publicBaseUrl).origin,tenancyMode:store.tenancy,now:input.now,
     }) : undefined;
+  // Cursor cloud agents: per-run identity on cursor-cloud OAuth grants (docs/cursor-cloud-agents.md).
+  const cursorCloud = mcpOAuthActive(config) && config.cursorCloud ? createCursorCloud({
+    config:config.cursorCloud,publicOrigin:config.publicBaseUrl,keyring:config.encryptionKeyring,database:store.database,
+    ...(input.cursorJwks ? {jwks:input.cursorJwks} : {}),
+  }) : undefined;
   const mcpOAuth = createMcpOAuthHttpModule({
     grokRoutines,
+    ...(cursorCloud ? {cursorCloudLinks:cursorCloud.links} : {}),
     config,mountedResources:["/mcp","/api/v1/mcp/shared-sessions"],
     clientAddress:request=>limiterKey(clientIp(request)),
     createStore:({protocol,issuer})=>new McpOAuthStore(store.database,{
       protocol,tenancyMode:store.tenancy,now:input.now,issueIdToken:issuer?.issueMcpOidcIdToken,
       isGrokRoutine:(request,client)=>request.resourcePath==="/api/v1/mcp/relay-events" &&
-        request.scopes.includes("relay:events") && connectorKind({
+        request.scopes.includes("relay:events") && isGrokRoutineKind(connectorKind({
           clientName:client.clientName,redirectUris:[request.redirectUri],
-        })==="grok-bot",
+        })),
     }),
     resolveSession:async request=>{
       if(request.headers.has("authorization")) return null;
@@ -678,6 +689,7 @@ export function createApp(input: {
   } : null;
   const mcp = createMcpHandler({
     config, store, browserOrigins, siteBaseUrl, fetchImpl: input.messagingFetch, providerProbes,
+    onError: (error, context) => telemetry?.observeError(error, context),
     ...(agentLinks ? { webhookInbox: agentLinks } : {}),
     ...(amp ? { amp: amp.deps } : {}),
     ...(replicas ? { replicas: replicas.deps } : {}),
@@ -686,6 +698,7 @@ export function createApp(input: {
     ...(features.launch ? { launch: true } : {}),
     ...(mcpOAuth.store ? {oauthSessions:mcpOAuth.store.sessions} : {}),
     grokRoutines,
+    ...(cursorCloud ? { cursorCloud } : {}),
     ...(input.now ? { now: input.now } : {}),
   });
   const desktopMcpCredentials = new DesktopMcpCredentials(store.database);

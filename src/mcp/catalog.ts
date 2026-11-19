@@ -168,7 +168,11 @@ export type CapabilityGroup = {
 export type CapabilityReport = {
   endpoint: { facade: typeof MCP_FACADE.facade; name: string; url: string };
   connection: { auth_mode: McpAuthMode; description: string; scopes: string[] };
-  workspace: { workspace_id: string; role: Exclude<WorkspaceRole, null> | "unknown"; can_launch: boolean | null };
+  workspace: {
+    workspace_id: string; role: Exclude<WorkspaceRole, null> | "unknown"; can_launch: boolean | null;
+    /** With launches on: the spawn memory policy mode (docs/specs/spawn-placement-memory.md). */
+    spawn_memory_policy?: "off" | "observe" | "rank" | "enforce";
+  };
   groups: CapabilityGroup[];
   /** The provider catalog with this build's runtime state (src/providers/registry.ts). */
   providers: ProviderStatus[];

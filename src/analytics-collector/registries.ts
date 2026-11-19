@@ -5,8 +5,11 @@ import { RELAYCAST_COLLECTOR_REGISTRY } from "./relaycast-registry.js";
 import type { CollectorRegistries } from "./validate.js";
 
 // Sessions producer contract: relayhistory-pipeline src/shared/analytics.ts at
-// 0acd0e747390a04d40265c417a16731c6c189dd9. A vocabulary change needs review
+// 8f8ceaebc98214f870450b5d7f4a9e06dd245545. A vocabulary change needs review
 // in both repositories; request paths and session content are never properties.
+// The read routes are a superset of the producer's list: the two coordination
+// advisory patterns are accepted before the producer names them, because an
+// unknown route refuses the whole batch.
 const LATENCY: PropertySpec = {
   type: "enum",
   values: ["lt_100ms", "lt_250ms", "lt_500ms", "lt_1s", "lt_2500ms", "lt_5s", "lt_30s", "ge_30s"],
@@ -38,9 +41,11 @@ export const COLLECTOR_REGISTRIES: CollectorRegistries = {
           type: "enum",
           values: [
             "/v1/events", "/v1/sessions", "/v1/sessions/activity", "/v1/sessions/output", "/v1/sessions/titles",
+            "/v1/sessions/users",
             "/v1/sessions/:sessionId/events", "/v1/sessions/:sessionId/timing", "/v1/sessions/:sessionId/turns",
             "/v1/sessions/:sessionId/metadata", "/v1/sessions/:sessionId/summary", "/v1/sessions/:sessionId/catalog",
-            "/v1/digest/daily", "/v1/coordination/overlaps", "/v1/delivery/records", "other",
+            "/v1/digest/daily", "/v1/coordination/overlaps", "/v1/coordination/advisories",
+            "/v1/coordination/advisories/:advisoryId/ack", "/v1/delivery/records", "other",
           ],
         },
         outcome: {
