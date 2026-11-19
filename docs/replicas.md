@@ -127,7 +127,8 @@ workspace in that environment then reaches
 the provider mints for the entry's audience. Control installs nothing inside
 the replica: no helper, credentials file or exec call.
 
-The endpoint is stateless streamable HTTP and pull-only. It answers 404 before
+The endpoint is stateless streamable HTTP (Relay messages are also pushed
+into the replica's chat, see [Push delivery](#push-delivery)). It answers 404 before
 authentication while `SELFHOST_REPLICAS_ENABLED` is off, is not an OAuth
 resource, and accepts only a Bearer `workspace_identity` token. Person
 credentials and capabilities are refused. It is rate limited twice: a coarse
@@ -224,10 +225,71 @@ Each call is admitted in this order:
    Releasing that binding tombstones the replica as any per-launch release.
 
 The server offers the same three tools as the per-launch server:
-`list_relay_agents`, `check_relay_inbox` and `send_relay_message`. Messages are
-pulled with `check_relay_inbox`; nothing is pushed into the replica's chat.
-Future wake-up delivery will need a chat selection and will answer 409
-`replica_chat_selection_required` when none is set.
+`list_relay_agents`, `check_relay_inbox` and `send_relay_message`. Their list
+and inbox results carry `inbound_delivery` (below).
+
+### Push delivery
+
+Delivery is not pull-only. Once a replica is enrolled, Relay direct
+messages, thread replies and channel mentions for its agent are pushed into
+one chat of the replica through the binding's Relay webhook, the same
+claim-then-inject path as per-launch bindings. `check_relay_inbox` stays the
+polling fallback.
+
+- **Chat selection.** A replica that lists exactly one chat has it selected
+  automatically. With several chats, a push answers 409
+  `replica_chat_selection_required` until a chat is selected with
+  `bind_replica` (`replica_id`, `chat_id`). Only a current workspace owner or
+  admin who is also the binding's person (its mapped creator or the VM
+  principal) can select, the same rules as any bind; there is no admin
+  override. The selection is immutable: a later `bind_replica` with another
+  chat answers 409, and a selected chat the replica no longer lists answers
+  `replica_chat_not_found`.
+- **Sleeping compute is never woken.** A push is sent only while the provider
+  reports the replica `active`. Otherwise the claim is left `retrying`
+  (`replica_chat_inactive`) and Relay retries the webhook later; the message
+  also stays in the inbox.
+- **Checks before every push.** The binding must still pass its enrolment
+  checks from its saved pins (no release tombstone, the environment still
+  enabled for this workspace, the connection not refused by the provider,
+  its creator mapping or principal still the binding's person), and the
+  workspace must keep its Relay binding. A failed check sends nothing and
+  answers 503 so Relay retries; nothing falls back to another person or chat.
+- **Double visibility.** A pushed message stays readable through
+  `check_relay_inbox` until it is acknowledged there, so a replica that also
+  polls may see it twice. The pushed prompt carries a stable request id for
+  the reply.
+- **Status.** `inbound_delivery` is `configured` once a chat is selected and
+  both subscriptions exist, `unavailable` with a safe `error` code after a
+  failed check (`replica_chat_selection_required`, `replica_chat_inactive`,
+  `replica_chat_not_found`, an enrolment refusal code,
+  `replica_provider_access_revoked` or `replica_inbound_unavailable`), and
+  `pending` otherwise. It appears in spawn status, the dashboard summary and
+  the replica's list and inbox tool results.
+- **When it is checked.** Each admitted environment MCP call starts a check
+  in the background (chat proof, Relay webhook subscriptions), at most once
+  per replica every 30 seconds per Control process. Each pod keeps its own
+  coalescing map; the workspace lock serializes them, so extra pods only add
+  provider reads. Messages that arrived while no push was possible are not
+  replayed by Control yet; they stay in the inbox for `check_relay_inbox`.
+- **Duplicates.** A repeated webhook for an already claimed message is not
+  injected again; it answers with the earlier outcome (`prior`: `confirmed`,
+  `outcome_unknown` or `rejected`). A provider timeout stays
+  `outcome_unknown` and is never replayed.
+
+Releasing the binding deletes both webhook subscriptions, as for any binding.
+
+Live-proof checklist for a deployment:
+
+1. Send a DM to an enrolled replica that is not polling; it appears in the
+   replica's chat once, with no terminal helper line in the prompt.
+2. Let the replica sleep and send a DM; nothing wakes it, the webhook is
+   retried, and the message is in `check_relay_inbox` after it reconnects.
+3. On a replica with two chats, a DM is refused with
+   `replica_chat_selection_required`; `bind_replica` by the binding's
+   owner/admin selects one, and a second selection is refused.
+4. A provider timeout during a push leaves the delivery uncertain
+   (`outcome_unknown`) and a redelivery does not send it again.
 
 Audit actions: `replicas.identity.enrolled` and `replicas.identity.refused`
 (reason code only, no token, claim or email; written only when the refusal
@@ -576,3 +638,5 @@ shows each enabled environment as `access_revoked`, distinct from
 
 - Background history through the push-only producer/consumer contract.
 - Webapp journeys and acceptance on an owned test instance.
+- Inbox catch-up and a periodic sweep for environment-identity push delivery:
+  messages that arrived while no push was possible are left to `check_relay_inbox`.
