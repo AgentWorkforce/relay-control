@@ -909,7 +909,7 @@ test("list_relay_agents links synced Desktop sessions and keeps validated declar
 
 test("list_relay_agents session enrichment fails open and refuses ambiguous Desktop rows", async (t) => {
   const env = await setup(t);
-  const peer = env.relay.world.addAgent("session-fallback", { source: "relay-desktop" });
+  const peer = env.relay.world.addAgent("session-fallback", { source: "relay-desktop", session_kind: "claude" });
   const client = await relayClient(t, env);
   const originalQuery = env.database.query.bind(env.database);
   let mode: "reject" | "duplicate" = "reject";
@@ -929,8 +929,8 @@ test("list_relay_agents session enrichment fails open and refuses ambiguous Desk
 
   const unavailable = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
   const unavailableRow = unavailable.agents.find((agent: any) => agent.name === peer.name);
-  assert.deepEqual([unavailableRow.session_id, unavailableRow.session_attribution,
-    unavailableRow.session_unavailable_reason], [null, null, "enrichment_failed"]);
+  assert.deepEqual([unavailableRow.session_id, unavailableRow.session_kind, unavailableRow.session_attribution,
+    unavailableRow.session_unavailable_reason], [null, null, null, "enrichment_failed"]);
   assert.deepEqual(warnings, [["[selfhost-mcp] session enrichment failed",
     { operation: "list_relay_agents", error: "TypeError" }]]);
   assert.doesNotMatch(JSON.stringify(warnings), /private session query detail/);
@@ -938,8 +938,8 @@ test("list_relay_agents session enrichment fails open and refuses ambiguous Desk
   mode = "duplicate";
   const ambiguous = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
   const ambiguousRow = ambiguous.agents.find((agent: any) => agent.name === peer.name);
-  assert.deepEqual([ambiguousRow.session_id, ambiguousRow.session_attribution,
-    ambiguousRow.session_unavailable_reason], [null, null, "ambiguous_sync"]);
+  assert.deepEqual([ambiguousRow.session_id, ambiguousRow.session_kind, ambiguousRow.session_attribution,
+    ambiguousRow.session_unavailable_reason], [null, null, null, "ambiguous_sync"]);
 });
 
 test("agent card owner enrichment fails open when its journal or membership read fails", async (t) => {

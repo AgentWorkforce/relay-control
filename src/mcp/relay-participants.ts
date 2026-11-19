@@ -790,11 +790,13 @@ function createRelayService(context: McpContext) {
       .map(agent => {
         const row = rosterAgent(agent, people, userId, workspaceId, owners?.get(agent.id));
         const session = row.session_attribution ? null : synced.sessions.get(agent.id);
+        const unavailableReason = row.session_attribution || session ? null
+          : synced.failed ? "enrichment_failed" as const
+            : synced.ambiguous.has(agent.id) ? "ambiguous_sync" as const : null;
         return { ...row,
           ...(session ? { session_id: session.sessionId, session_kind: session.sessionKind, session_attribution: "synced" as const } : {}),
-          session_unavailable_reason: row.session_attribution || session ? null
-            : synced.failed ? "enrichment_failed" as const
-              : synced.ambiguous.has(agent.id) ? "ambiguous_sync" as const : null,
+          ...(unavailableReason ? { session_id: null, session_kind: null, session_attribution: null } : {}),
+          session_unavailable_reason: unavailableReason,
           ...cardSummary(agent.metadata, agent) };
       })
       .filter(agent => status === "all" || (status === "live" ? agent.online : !agent.online));
