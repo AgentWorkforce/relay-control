@@ -672,11 +672,19 @@ function createRelayService(context: McpContext) {
 
   const syncedSessionKinds = new Set(["codex", "grok", "pi", "opencode", "claude", "copilot", "cursor"]);
   const syncedSessionId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+  const syncedIdentityId = (agent: RosterAgent) => {
+    if (!gate) return agent.id;
+    const metadata = agent.metadata.relaygate;
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return agent.id;
+    const id = (metadata as Record<string, unknown>).agent_id;
+    return typeof id === "string" && syncedSessionId.test(id) ? id : agent.id;
+  };
   async function syncedDesktopSessions(agents: readonly RosterAgent[]) {
-    const ids = [...new Set(agents.map(agent => agent.id))];
+    const candidates = new Map(agents.map(agent => [`${syncedIdentityId(agent)}\0${agent.name}`, agent]));
+    const ids = [...new Set(agents.map(syncedIdentityId))];
     if (!ids.length) return new Map<string, { sessionId: string; sessionKind: string }>();
-    const rows = await executor.query<{ agent_remote_id: string; native_session_kind: string; native_session_id: string }>(
-      `SELECT agent_remote_id, native_session_kind, native_session_id
+    const rows = await executor.query<{ agent_name: string; agent_remote_id: string; native_session_kind: string; native_session_id: string }>(
+      `SELECT agent_name, agent_remote_id, native_session_kind, native_session_id
          FROM desktop_relay_identities
         WHERE workspace_id = $1 AND agent_remote_id = ANY($2::text[])
           AND native_session_kind IS NOT NULL AND native_session_id IS NOT NULL`,
@@ -684,9 +692,10 @@ function createRelayService(context: McpContext) {
     );
     const sessions = new Map<string, { sessionId: string; sessionKind: string }>();
     for (const row of rows.rows) {
+      const agent = candidates.get(`${row.agent_remote_id}\0${row.agent_name}`);
       const kind = row.native_session_kind.trim();
-      if (syncedSessionKinds.has(kind) && syncedSessionId.test(row.native_session_id)) {
-        sessions.set(row.agent_remote_id, { sessionId: row.native_session_id, sessionKind: kind });
+      if (agent && syncedSessionKinds.has(kind) && syncedSessionId.test(row.native_session_id)) {
+        sessions.set(agent.id, { sessionId: row.native_session_id, sessionKind: kind });
       }
     }
     return sessions;

@@ -187,6 +187,14 @@ test("a signed Cursor call on a gate-only install sends, reads and reports statu
       tuid: randomUUID(), kind: "cursor", extra: { args } }) } },
   });
 
+  assert.notEqual(env.world.agents.get(chat.name)?.id, chat.agent_id, "the two agent-id namespaces differ");
+  const listed = await rpc(env.origin, secret, await call("list_relay_agents", { status: "all" }));
+  assert.equal(listed.status, 200, JSON.stringify(listed.body));
+  assert.notEqual(listed.body.result.isError, true, JSON.stringify(listed.body.result));
+  const listedChat = listed.body.result.structuredContent.agents.find((agent: any) => agent.name === chat.name);
+  assert.deepEqual([listedChat.session_id, listedChat.session_kind, listedChat.session_attribution],
+    [chat.native_session.id, chat.native_session.kind, "synced"]);
+
   const sent = await rpc(env.origin, secret, await call("send_relay_message", { to: "peer", text: "hello through the gate" }));
   assert.equal(sent.status, 200, JSON.stringify(sent.body));
   assert.notEqual(sent.body.result.isError, true, JSON.stringify(sent.body.result));
