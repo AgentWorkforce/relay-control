@@ -23,6 +23,9 @@ type Claim = {intent:Intent&{agent_remote_id:string;created_at:Date|string;attem
 export type McpOAuthTeardownOutcome = "released"|"no_remote"|"kept"|"workspace_mismatch"|"decrypt_failed"
   |"metadata_mismatch"|"operator_abandoned";
 type Decision = {outcome:McpOAuthTeardownOutcome;transfer?:RosterAgent;deleteRow?:boolean}|"pending";
+/** A revoked grant's Cursor cloud agent run awaiting release. */
+type CursorRun = {grant_id:string;cloud_agent_id:string;workspace_id:string;user_id:string;organization_id:string;agent_name:string;
+  created_at:Date|string};
 type Counted = "completed"|"kept"|"pending"|"skipped";
 export type McpOAuthTeardownResult = {completed:number;kept:number;pending:number};
 
@@ -91,6 +94,8 @@ export class McpOAuthTeardown {
   /** Timer passes pause until then after a schema error; see deferred(). */
   private pausedUntil=0;
   private migrationWarned=false;
+  /** Rotation through revoked Cursor runs (releaseCursorRuns). */
+  private runCursor:{createdAt:Date|string;grantId:string;cloudAgentId:string}|null=null;
   constructor(readonly deps:{
     database:Database; keyring:EncryptionKeyring; client:RelaycastClient; now?:()=>Date;
     /** Gate-only installs: participants enrolled through relaygate are looked up and released through it. */
@@ -193,69 +198,84 @@ export class McpOAuthTeardown {
    * the run for the next pass.
    */
   private async releaseCursorRuns():Promise<void> {
-    const runs=(await this.deps.database.query<{grant_id:string;cloud_agent_id:string;workspace_id:string;user_id:string;
-      organization_id:string;agent_name:string}>(`SELECT r.grant_id,r.cloud_agent_id,r.workspace_id,r.user_id,g.organization_id,r.agent_name
+    const page=()=>this.deps.database.query<CursorRun>(`SELECT r.grant_id,r.cloud_agent_id,r.workspace_id,r.user_id,g.organization_id,
+        r.agent_name,r.created_at
       FROM cursor_cloud_runs r JOIN mcp_oauth_grants g ON g.id=r.grant_id
-      WHERE g.revoked_at IS NOT NULL ORDER BY r.created_at LIMIT ${PAGE}`)).rows;
-    type Row={id:string;agent_remote_id:string;token_ciphertext:string;relaygate_agent_id:string|null;session_hash:string|null};
+      WHERE g.revoked_at IS NOT NULL
+        ${this.runCursor?"AND (r.created_at,r.grant_id,r.cloud_agent_id)>($1::timestamptz,$2::uuid,$3::text)":""}
+      ORDER BY r.created_at,r.grant_id,r.cloud_agent_id LIMIT ${PAGE}`,
+    this.runCursor?[this.runCursor.createdAt,this.runCursor.grantId,this.runCursor.cloudAgentId]:[]);
+    let runs=(await page()).rows;
+    if(!runs.length && this.runCursor) {this.runCursor=null;runs=(await page()).rows;}
     for(const run of runs) {
-      const intent={id:"",grant_id:run.grant_id,organization_id:run.organization_id,workspace_id:run.workspace_id,
-        user_id:run.user_id,agent_name:run.agent_name,agent_remote_id:null};
-      /** The participant row, and whether something live still uses it. */
-      const inspect=async(tx:SqlExecutor)=>{
-        const row=(await tx.query<Row>(`SELECT id,agent_remote_id,token_ciphertext,relaygate_agent_id,session_hash
-          FROM hosted_relay_participants WHERE workspace_id=$1 AND user_id=$2 AND agent_name=$3`,
-        [run.workspace_id,run.user_id,run.agent_name])).rows[0]??null;
-        if(!row) return {row,inUse:false};
-        const live=await tx.query(`SELECT 1 FROM cursor_cloud_runs r JOIN mcp_oauth_grants g ON g.id=r.grant_id
-            WHERE r.workspace_id=$1 AND r.user_id=$2 AND r.agent_name=$3 AND g.revoked_at IS NULL
-          UNION ALL
-          SELECT 1 FROM mcp_oauth_grants WHERE workspace_id=$1 AND user_id=$2 AND agent_remote_id=$4 AND revoked_at IS NULL
-          LIMIT 1`,[run.workspace_id,run.user_id,run.agent_name,row.agent_remote_id]);
-        return {row,inUse:live.rows.length>0 || row.session_hash!==null};
-      };
-      const forgetRevoked=(tx:SqlExecutor)=>tx.query(`DELETE FROM cursor_cloud_runs r USING mcp_oauth_grants g
-        WHERE g.id=r.grant_id AND g.revoked_at IS NOT NULL AND r.workspace_id=$1 AND r.user_id=$2 AND r.agent_name=$3`,
-      [run.workspace_id,run.user_id,run.agent_name]);
-      const target=await this.locked(intent,async tx=>{
-        const {row,inUse}=await inspect(tx);
-        if(!row || inUse) {await forgetRevoked(tx);return null;}
-        const workspace=(await tx.query<Workspace>(`SELECT relaycast_workspace_id,relaycast_api_key_ciphertext FROM workspaces
-          WHERE id=$1 AND organization_id=$2`,[run.workspace_id,run.organization_id])).rows[0];
-        return {row,workspace};
-      });
-      if(!target) continue;
-      const {row,workspace}=target;
-      let released=false;
-      if(row.relaygate_agent_id && this.deps.gate) {
-        try {
-          await this.deps.gate.releaseOwnAgent(decryptSecret(row.token_ciphertext,this.deps.keyring));
-          released=true;
-        } catch(error) {
-          if(!(error instanceof RelaycastCallError) || error.status!==401) throw error;
-        }
+      // Each pass continues after the last run it looked at, so runs that keep failing never hold up the rest.
+      this.runCursor={createdAt:run.created_at,grantId:run.grant_id,cloudAgentId:run.cloud_agent_id};
+      try {
+        await this.releaseCursorRun(run);
+      } catch(error) {
+        console.error("[mcp-oauth] cursor run teardown deferred",{error:error instanceof Error?error.name:"unknown"});
       }
-      if(!released) {
-        // No usable relaygate token: no one can use the agent, so the workspace key releases it upstream.
-        if(!workspace?.relaycast_api_key_ciphertext) continue;
-        const key=decryptSecret(workspace.relaycast_api_key_ciphertext,this.deps.keyring);
-        try {
-          await this.deps.client.releaseHosted(key,run.agent_name,row.agent_remote_id);
-        } catch(error) {
-          if(!(error instanceof RelaycastCallError) || error.status!==404) throw error;
-        }
-      }
-      await this.locked(intent,async tx=>{
-        const {row:current,inUse}=await inspect(tx);
-        // The fence keeps joins away; anything that still appeared keeps its row (its agent was released).
-        if(current && current.id===row.id && current.agent_remote_id===row.agent_remote_id && !inUse) {
-          await tx.query("DELETE FROM hosted_relay_participants WHERE id=$1",[row.id]);
-        } else if(current) {
-          console.error("[mcp-oauth] cursor run kept after release",{reason:"in_use"});
-        }
-        await forgetRevoked(tx);
-      });
     }
+  }
+
+  private async releaseCursorRun(run:CursorRun):Promise<void> {
+    type Row={id:string;agent_remote_id:string;token_ciphertext:string;relaygate_agent_id:string|null;session_hash:string|null};
+    const intent={id:"",grant_id:run.grant_id,organization_id:run.organization_id,workspace_id:run.workspace_id,
+      user_id:run.user_id,agent_name:run.agent_name,agent_remote_id:null};
+    /** The participant row, and whether something live still uses it. */
+    const inspect=async(tx:SqlExecutor)=>{
+      const row=(await tx.query<Row>(`SELECT id,agent_remote_id,token_ciphertext,relaygate_agent_id,session_hash
+        FROM hosted_relay_participants WHERE workspace_id=$1 AND user_id=$2 AND agent_name=$3`,
+      [run.workspace_id,run.user_id,run.agent_name])).rows[0]??null;
+      if(!row) return {row,inUse:false};
+      const live=await tx.query(`SELECT 1 FROM cursor_cloud_runs r JOIN mcp_oauth_grants g ON g.id=r.grant_id
+          WHERE r.workspace_id=$1 AND r.user_id=$2 AND r.agent_name=$3 AND g.revoked_at IS NULL
+        UNION ALL
+        SELECT 1 FROM mcp_oauth_grants WHERE workspace_id=$1 AND user_id=$2 AND agent_remote_id=$4 AND revoked_at IS NULL
+        LIMIT 1`,[run.workspace_id,run.user_id,run.agent_name,row.agent_remote_id]);
+      return {row,inUse:live.rows.length>0 || row.session_hash!==null};
+    };
+    const forgetRevoked=(tx:SqlExecutor)=>tx.query(`DELETE FROM cursor_cloud_runs r USING mcp_oauth_grants g
+      WHERE g.id=r.grant_id AND g.revoked_at IS NOT NULL AND r.workspace_id=$1 AND r.user_id=$2 AND r.agent_name=$3`,
+    [run.workspace_id,run.user_id,run.agent_name]);
+    const target=await this.locked(intent,async tx=>{
+      const {row,inUse}=await inspect(tx);
+      if(!row || inUse) {await forgetRevoked(tx);return null;}
+      const workspace=(await tx.query<Workspace>(`SELECT relaycast_workspace_id,relaycast_api_key_ciphertext FROM workspaces
+        WHERE id=$1 AND organization_id=$2`,[run.workspace_id,run.organization_id])).rows[0];
+      return {row,workspace};
+    });
+    if(!target) return;
+    const {row,workspace}=target;
+    let released=false;
+    if(row.relaygate_agent_id && this.deps.gate) {
+      try {
+        await this.deps.gate.releaseOwnAgent(decryptSecret(row.token_ciphertext,this.deps.keyring));
+        released=true;
+      } catch(error) {
+        if(!(error instanceof RelaycastCallError) || error.status!==401) throw error;
+      }
+    }
+    if(!released) {
+      // No usable relaygate token: no one can use the agent, so the workspace key releases it upstream.
+      if(!workspace?.relaycast_api_key_ciphertext) return;
+      const key=decryptSecret(workspace.relaycast_api_key_ciphertext,this.deps.keyring);
+      try {
+        await this.deps.client.releaseHosted(key,run.agent_name,row.agent_remote_id);
+      } catch(error) {
+        if(!(error instanceof RelaycastCallError) || error.status!==404) throw error;
+      }
+    }
+    await this.locked(intent,async tx=>{
+      const {row:current,inUse}=await inspect(tx);
+      // The fence keeps joins away; anything that still appeared keeps its row (its agent was released).
+      if(current && current.id===row.id && current.agent_remote_id===row.agent_remote_id && !inUse) {
+        await tx.query("DELETE FROM hosted_relay_participants WHERE id=$1",[row.id]);
+      } else if(current) {
+        console.error("[mcp-oauth] cursor run kept after release",{reason:"in_use"});
+      }
+      await forgetRevoked(tx);
+    });
   }
 
   /** Anonymous registration must not grow the client table without bound. */

@@ -1256,14 +1256,16 @@ function createRelayService(context: McpContext) {
   type CardIdentity = { name: string; agentId: string; linked: "desktop" | "hosted"; kind: string; gated?: { token: string } };
 
   /** The identity set_relay_agent_card writes: the caller's own, chosen as relay_status reports it. */
-  async function ownCardIdentity(): Promise<CardIdentity> {
+  async function ownCardIdentity(as?: string): Promise<CardIdentity> {
     if (managed) {
+      await managedActorOnly(as);
       const identity = await desktop();
       return { name: identity.name, agentId: identity.agentId, linked: "desktop", kind: DESKTOP_KIND };
     }
-    const linkedIdentity = await linkedDesktop();
+    const linkedIdentity = as ? null : await linkedDesktop();
     if (linkedIdentity) return { name: linkedIdentity.name, agentId: linkedIdentity.agentId, linked: "desktop", kind: DESKTOP_KIND };
-    const hosted = await participant();
+    // `as` selects the caller's own participant, e.g. a Cursor cloud agent run (never someone else's).
+    const hosted = await participant(as);
     if (!hosted) throw new RelayToolError(CARD_NEEDS_IDENTITY);
     return { name: hosted.name, agentId: hosted.row.agentRemoteId, linked: "hosted", kind: await hostedKind(),
       ...(hosted.gated ? { gated: { token: hosted.token } } : {}) };
@@ -1336,9 +1338,10 @@ function createRelayService(context: McpContext) {
    * caller that is not a Desktop identity reads through relaygate as its
    * hosted participant, and must have joined first.
    */
-  async function callerDirectory(): Promise<Directory> {
-    if (!gate || managed || await linkedDesktop()) return directory();
-    const hosted = await participant();
+  async function callerDirectory(as?: string): Promise<Directory> {
+    if (managed) await managedActorOnly(as);
+    if (!gate || managed || (!as && await linkedDesktop())) return directory();
+    const hosted = await participant(as);
     if (!hosted) throw new RelayToolError(GATE_JOIN_FIRST);
     return directory(hosted);
   }
@@ -1366,10 +1369,10 @@ function createRelayService(context: McpContext) {
   return {
     withSpawnActor,
 
-    async list(input: { status: "live" | "all" | "offline"; person?: string; query?: string; include_stale?: boolean }) {
+    async list(input: { status: "live" | "all" | "offline"; person?: string; query?: string; include_stale?: boolean; as?: string }) {
       const query = input.query?.toLowerCase();
       const person = input.person?.toLowerCase();
-      const agents = await roster(input.status, await context.members(), input.include_stale, await callerDirectory());
+      const agents = await roster(input.status, await context.members(), input.include_stale, await callerDirectory(input.as));
       return { workspace_id: workspaceId, agents: agents.filter(agent =>
         (!person || (person === "me" ? agent.is_mine
           : agent.owner?.user_id.toLowerCase() === person || agent.owner?.name.toLowerCase().includes(person))) &&
@@ -1379,8 +1382,8 @@ function createRelayService(context: McpContext) {
     join,
 
     /** get_relay_agent_card: any listed agent in this workspace, by name or exact machine address. Read-only. */
-    async getCard(input: { agent: string }) {
-      const agent = await explicitAgent(input.agent.trim(), await callerDirectory());
+    async getCard(input: { agent: string; as?: string }) {
+      const agent = await explicitAgent(input.agent.trim(), await callerDirectory(input.as));
       if (!agent || agent.status === "released" || !isListedRelayAgent(agent)) throw new RelayToolError(UNKNOWN_CARD_AGENT);
       return buildAgentCard(agent, cardOptions);
     },
@@ -1394,8 +1397,8 @@ function createRelayService(context: McpContext) {
      * Relaycast merges them into the stored metadata, so every other key is
      * preserved.
      */
-    async setCard(input: SetCardInput) {
-      const own = await ownCardIdentity();
+    async setCard(input: SetCardInput & { as?: string }) {
+      const own = await ownCardIdentity(input.as);
       if (own.gated) {
         // A gated participant writes its own card through relaygate (which merges it upstream).
         const current = await gate!.authenticatedAgent(own.gated.token);
@@ -1438,6 +1441,20 @@ function createRelayService(context: McpContext) {
         // Release uses the workspace key (or, gated, a token re-enrolled at relaygate), so a rejected token can still leave.
         const hosted = await participant(as, { allowGone: true, allowRejected: true, executor: tx });
         if (!hosted) return { joined: false, already_left: true };
+        // A Cursor cloud agent run may be shared: other connections' runs, or a native session bound to it. Leaving then
+        // detaches only this caller (its run record, or its session binding); the last user releases the participant.
+        if (CURSOR_RUN_NAME.test(hosted.name)) {
+          const mine = oauth ? oauth.access.grantId : null;
+          const others = await tx.query(`SELECT 1 FROM cursor_cloud_runs r JOIN mcp_oauth_grants g ON g.id = r.grant_id
+            WHERE r.workspace_id = $1 AND r.user_id = $2 AND r.agent_name = $3 AND g.revoked_at IS NULL
+              AND ($4::uuid IS NULL OR r.grant_id <> $4::uuid) LIMIT 1`, [workspaceId, userId, hosted.name, mine]);
+          const boundElsewhere = oauth !== undefined && hosted.row.sessionHash !== null;
+          if (others.rows.length || boundElsewhere) {
+            if (mine) await tx.query("DELETE FROM cursor_cloud_runs WHERE grant_id = $1 AND agent_name = $2", [mine, hosted.name]);
+            else await tx.query("UPDATE hosted_relay_participants SET session_hash = NULL, updated_at = now() WHERE id = $1", [hosted.row.id]);
+            return { joined: false, already_left: false, kept_for_other_connections: true };
+          }
+        }
         if (oauth && hosted.row.sessionHash) {
           throw new RelayToolError("A native MCP session still uses this agent. Leave from that session instead.");
         }

@@ -230,3 +230,45 @@ test("a revoked connection's run stays while something live still uses it, and i
   assert.deepEqual((await f.database.query("SELECT agent_name FROM hosted_relay_participants")).rows, [{ agent_name: name }]);
   assert.deepEqual((await f.database.query("SELECT agent_name FROM cursor_cloud_runs")).rows, []);
 });
+
+test("a run shared by two connections survives one leaving; the last one releases it", async t => {
+  const f = await fixture(t, { cursorCloud: { trustedTeams: ["77"] } });
+  f.world.addAgent("peer");
+  const name = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) })).name as string;
+  const second = await f.grant();
+  const call2 = await f.connect(second.pair.accessToken);
+  const nonce2 = async () => f.ok(await call2("relay_status")).cursor_identity.nonce as string;
+  assert.equal(f.ok(await call2("join_relay", { cursor_identity_token: f.issuer.mint(await nonce2()) })).name, name);
+  assert.equal(f.ok(await f.call("leave_relay", { as: name })).kept_for_other_connections, true);
+  assert.equal(f.world.agents.has(name), true);
+  assert.equal(f.ok(await call2("send_relay_message", { to: "peer", text: "still here", as: name })).from, name);
+  assert.match(f.failed(await f.call("send_relay_message", { to: "peer", text: "x", as: name })), /./);
+  f.ok(await call2("leave_relay", { as: name }));
+  assert.equal(f.world.agents.has(name), false);
+});
+
+test("required run identity: cards and directory reads take the run's name", async t => {
+  const f = await fixture(t, { cursorCloud: { runIdentity: "required", trustedTeams: ["77"] } });
+  f.world.addAgent("peer");
+  const name = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) })).name as string;
+  const card = f.ok(await f.call("set_relay_agent_card", { description: "Builds widgets in the cloud", skills: [], as: name }));
+  assert.equal(card.name, name);
+  assert.equal(card.card.description, "Builds widgets in the cloud");
+  assert.match(JSON.stringify(f.world.agents.get(name)!.metadata), /Builds widgets in the cloud/);
+  assert.ok(f.ok(await f.call("list_relay_agents", { status: "all", as: name })).agents.some((agent: any) => agent.name === "peer"));
+  assert.equal(f.ok(await f.call("get_relay_agent_card", { agent: name, as: name })).description, "Builds widgets in the cloud");
+});
+
+test("a run whose release keeps failing does not hold up other runs' cleanup", async t => {
+  const f = await fixture(t, { cursorCloud: { trustedTeams: ["77"] } });
+  const one = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) })).name as string;
+  const two = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce(), { cloud_agent_id: "bc-run-2" }) })).name as string;
+  await f.database.transaction(tx => revokeMcpOAuthGrantRows(tx, f.owner.grantId, "user_revoked", new Date()));
+  // The first run's release fails; the second is still released in the same pass.
+  f.world.failNext("POST", "/v1/agents/release-exact", 503);
+  await f.teardown.drain();
+  assert.deepEqual([f.world.agents.has(one), f.world.agents.has(two)], [true, false]);
+  await f.teardown.drain();
+  assert.equal(f.world.agents.has(one), false);
+  assert.deepEqual((await f.database.query("SELECT agent_name FROM cursor_cloud_runs")).rows, []);
+});
