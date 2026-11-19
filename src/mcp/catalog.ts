@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ProviderStatus } from "../providers/registry.js";
-import { GROK_ROUTINE_TOOLS } from "./grok-routine.js";
+import { GROK_EVENT_TOOLS, GROK_ROUTINE_TOOLS } from "./grok-routine.js";
 import { MCP_HISTORY_SCOPE } from "./oauth/protocol.js";
 
 /**
@@ -68,7 +68,7 @@ export const CAPABILITY_DISCOVERY_TOOL = "describe_capabilities";
 
 export type ToolGroupId =
   | "shared_session_reads" | "team_activity" | "relayfacts" | "relay_messaging" | "hosted_launch" | "replicas" | "amp" | "factory" | "webhook_inbox" | "capy_binding"
-  | "customer_support" | "capy_launch" | "connect" | "events" | "grok_routines" | "relay_inbox_app" | "screens" | "events_settings" | "capability_discovery";
+  | "customer_support" | "capy_launch" | "connect" | "events" | "grok_routines" | "grok_events" | "relay_inbox_app" | "screens" | "events_settings" | "capability_discovery";
 
 type GroupDefinition = {
   title: string;
@@ -94,6 +94,8 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
   connect: { title: "Relay Connect rooms", tools: CONNECT_TOOLS },
   events: { title: "Agent Relay events", tools: EVENT_TOOLS, relayEventsOnly: true },
   grok_routines: { title: "Self-hosted Grok Bot webhook wake-ups", tools: GROK_ROUTINE_TOOLS },
+  // SELFHOST_GROK_ROUTINES_CLOUD_COPY: the event reads Cloud's copied routine prompt calls.
+  grok_events: { title: "Grok Bot routine events (Cloud copy)", tools: GROK_EVENT_TOOLS },
   relay_inbox_app: { title: "Relay inbox app", tools: INBOX_APP_TOOLS, relayEventsOnly: true },
   screens: { title: "Live screens (show_ui)", tools: SCREEN_TOOLS },
   events_settings: { title: "Event handling settings", tools: EVENTS_SETTINGS_TOOLS, relayEventsOnly: true },
@@ -103,7 +105,7 @@ export const TOOL_GROUPS: Readonly<Record<ToolGroupId, GroupDefinition>> = {
 export type ToolPlanEntry = { group: ToolGroupId; tools: readonly string[] };
 
 /** The self-host shared-sessions plan, in registration order. */
-export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; staffReadGrant?: boolean } = {}): ToolPlanEntry[] {
+export function planToolGroups(options: { amp?: boolean; factory?: boolean; replicas?: boolean; webhookInbox?: boolean; launch?: boolean; capyPermits?: boolean; grokRoutines?: boolean; grokEvents?: boolean; staffReadGrant?: boolean } = {}): ToolPlanEntry[] {
   // A staff read grant (docs/staff-read-grants.md) reaches the shared-session
   // reads and capability discovery only, whatever else the server enables.
   if (options.staffReadGrant) {
@@ -123,6 +125,7 @@ export function planToolGroups(options: { amp?: boolean; factory?: boolean; repl
   if (options.webhookInbox) groups.push("webhook_inbox");
   if (options.capyPermits) groups.push("capy_binding");
   if (options.grokRoutines) groups.push("grok_routines");
+  if (options.grokRoutines && options.grokEvents) groups.push("grok_events");
   groups.push("capability_discovery");
   return groups.map(group => ({ group, tools: TOOL_GROUPS[group].tools }));
 }
@@ -196,12 +199,13 @@ export function describeCapabilities(input: {
   capyPermits?: boolean;
   customerSupport?: boolean;
   grokRoutines?: boolean;
+  grokEvents?: boolean;
   providers: ProviderStatus[];
 }): CapabilityReport {
   const launchRole = input.role === "owner" || input.role === "admin";
   const canLaunch = Boolean(input.launch) && launchRole;
   const planned = new Map(planToolGroups({ amp: input.amp, factory: input.factory, replicas: input.replicas, webhookInbox: input.webhookInbox, launch: input.launch,
-    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines,
+    capyPermits: input.capyPermits && input.authMode === "oauth", grokRoutines: input.grokRoutines, grokEvents: input.grokEvents,
     staffReadGrant: input.authMode === "staff_read_grant" })
     .map(item => [item.group, item]));
   const groups = (Object.keys(TOOL_GROUPS) as ToolGroupId[]).map((id): CapabilityGroup => {

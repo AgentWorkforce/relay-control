@@ -29,6 +29,7 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       capyPermits: Boolean(context.oauth && context.capyPermits),
       customerSupport: Boolean(context.customerSupport),
       grokRoutines: Boolean(context.grokRoutines),
+      grokEvents: Boolean(context.grokRoutines?.cloudCopy),
       providers: await context.providers(),
     });
     return {

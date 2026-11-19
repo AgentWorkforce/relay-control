@@ -47,6 +47,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "flow_run_relayfile_credentials",
   "flows_workspace_deletions",
   "hosted_relay_participants",
+  "grok_bot_events",
   "grok_bot_routines",
   "github_app_installations",
   "installation_bootstrap",
@@ -115,6 +116,7 @@ export const CONTROL_TABLES: readonly string[] = [
 export const CONTROL_SEQUENCES: readonly string[] = [
   "desktop_feed_publish_seq",
   "desktop_feed_publisher_tokens_seq_seq",
+  "grok_bot_events_seq_seq",
 ];
 
 // Tables a migration creates that the runtime role must NOT be granted:

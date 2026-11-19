@@ -548,6 +548,7 @@ paths:
   /cloud/api/v1/grok-bot/routine:
     parameters:
       - {name: grant, in: query, required: true, schema: {type: string, format: uuid}}
+      - {name: from, in: query, required: false, schema: {type: string, maxLength: 512}, description: "Cloud copy only: sender filter carried from connect_grok_bot_routine"}
     get:
       operationId: grokRoutineSetup
       tags: [MCP OAuth]
@@ -574,13 +575,16 @@ paths:
           application/json:
             schema:
               type: object
-              required: [webhook_url, authorization]
+              description: webhook_url and authorization are required unless SELFHOST_GROK_ROUTINES_CLOUD_COPY is on and routine_details is given.
               properties:
                 webhook_url: {type: string, maxLength: 512, writeOnly: true}
                 authorization: {type: string, writeOnly: true, description: The routine crsr_ key or Authorization Bearer header}
+                routine_details: {type: string, maxLength: 4096, writeOnly: true, description: "Cloud copy only: one paste containing exactly one routine URL and one crsr_ key"}
+                reply_mode: {type: string, enum: [notes-only, acknowledge, answer], description: "Cloud copy only; default notes-only. acknowledge and answer reply automatically only to agents the person owns"}
+                from: {type: string, maxLength: 512, description: "Cloud copy only: wake only for messages from this agent (defaults to the page's from query parameter)"}
       responses:
         "200": {description: Configuration saved without echoing secrets}
-        "400": {description: Invalid credentials or unavailable/unowned/unpinned Grok grant}
+        "400": {description: Invalid credentials or reply mode, a routine already saved under another connection, or an unavailable/unowned/unpinned Grok grant}
         "401": {description: Browser sign-in required; MCP bearers are refused}
         "403": {description: Invalid Origin or browser account capability}
         "404": {description: Module disabled, invalid grant ID or workspace inaccessible}

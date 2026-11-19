@@ -624,6 +624,7 @@ export function createApp(input: {
   const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines({
       database:store.database,keyring:config.encryptionKeyring,client:oauthRelay,
       publicOrigin:new URL(config.publicBaseUrl).origin,tenancyMode:store.tenancy,now:input.now,
+      cloudCopy:config.mcpOAuth?.grokCloudCopy===true,
     }) : undefined;
   const mcpOAuth = createMcpOAuthHttpModule({
     grokRoutines,

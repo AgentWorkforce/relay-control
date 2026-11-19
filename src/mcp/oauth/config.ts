@@ -10,6 +10,12 @@ export type McpOAuthConfig = {
   unavailable: null | {reason: McpOAuthUnavailableReason; detail: string};
   eventsEnabled: boolean;
   pumpEnabled: boolean;
+  /**
+   * SELFHOST_GROK_ROUTINES_CLOUD_COPY (default off): Grok Bot routines use
+   * Cloud's copied prompt, polling mode, event log and per-message wakes
+   * (docs/specs/grok-bot-dynamic-prompt.md, Phase 1). Off keeps docs/grok-bot.md.
+   */
+  grokCloudCopy?: boolean;
   /** Null means OAuth without OpenID Connect; callers derive OIDC availability from this one value. */
   oidc: McpOidcConfiguration | null;
 };
@@ -40,6 +46,7 @@ export function loadMcpOAuthConfig(env: Env, readSecret: (name:string)=>string|u
   const eventsEnabled=flag(env,"SELFHOST_MCP_EVENTS",false);
   const pumpEnabled=flag(env,"SELFHOST_MCP_EVENTS_PUMP",false);
   if(pumpEnabled && !eventsEnabled) throw new Error("SELFHOST_MCP_EVENTS_PUMP requires SELFHOST_MCP_EVENTS=on");
+  const grokCloudCopy=flag(env,"SELFHOST_GROK_ROUTINES_CLOUD_COPY",false);
   let oidc:McpOidcConfiguration|null=null;
   let reason:McpOAuthUnavailableReason|null=null,detail="";
   try { oidc=loadOidc(env,readSecret); } catch(error) {
@@ -47,7 +54,7 @@ export function loadMcpOAuthConfig(env: Env, readSecret: (name:string)=>string|u
     reason="oidc_signing_key";detail=error.message;
   }
   if(publicBaseUrl!==undefined && !mcpOAuthPublicOriginAllowed(publicBaseUrl)) reason="public_url",detail="SELFHOST_PUBLIC_URL must be an HTTPS origin (or loopback HTTP) to serve OAuth";
-  return {enabled,unavailable:enabled && reason?{reason,detail}:null,eventsEnabled,pumpEnabled,oidc:reason?null:oidc};
+  return {enabled,unavailable:enabled && reason?{reason,detail}:null,eventsEnabled,pumpEnabled,grokCloudCopy,oidc:reason?null:oidc};
 }
 
 function loadOidc(env: Env, readSecret: (name:string)=>string|undefined): McpOidcConfiguration|null {
