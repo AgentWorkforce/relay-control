@@ -109,6 +109,8 @@ async function setup(t: TestContext, options: {
   omitCredentialsHook?: boolean;
   /** SELFHOST_CAPTURE_POLICY_UPLOADS; absent is report. */
   capturePolicyUploads?: "report" | "enforce";
+  /** SELFHOST_DEFAULT_SHARING_MODE and SELFHOST_SHARING_MODE_OVERRIDE_ROLES; absent is unset. */
+  sharing?: Pick<SelfhostConfig, "defaultSharingMode" | "sharingModeOverrideRoles">;
 } = {}) {
   const aws = await fakeAws(t);
   const database = new PGliteDatabase();
@@ -133,6 +135,7 @@ async function setup(t: TestContext, options: {
     host: "127.0.0.1",
     historyUpload: upload,
     ...(options.capturePolicyUploads ? { capturePolicyUploads: options.capturePolicyUploads } : {}),
+    ...options.sharing,
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
   const server = createServer(createApp({
@@ -615,6 +618,29 @@ test("route: the capture policy revision is reported by default and enforced wit
     assert.equal(warned.length, 0);
     t.mock.restoreAll();
   }
+});
+
+test("route: the upload check uses the capture policy as served to the caller under a deployment default", async (t) => {
+  const HEADER = "X-Agent-Relay-Capture-Policy-Revision";
+  // Locked: the deployment default is a served setting, so a revision is needed.
+  const locked = await setup(t, { capturePolicyUploads: "enforce", sharing: { defaultSharingMode: "selected" } });
+  const lockedAsk = (revision?: string) => request(locked.origin, locked.path, {
+    method: "POST", token: locked.token, body: stsBody, ...(revision !== undefined ? { headers: { [HEADER]: revision } } : {}),
+  });
+  const missing = await lockedAsk();
+  assert.equal(missing.status, 409);
+  assert.equal(missing.body.error, "capture_policy_stale");
+  assert.equal((await lockedAsk("0")).status, 409);
+  assert.equal((await lockedAsk("1")).status, 200);
+
+  // The owner is an override role: nothing is served to it, so no revision is needed.
+  const overridden = await setup(t, {
+    capturePolicyUploads: "enforce",
+    sharing: { defaultSharingMode: "selected", sharingModeOverrideRoles: ["owner"] },
+  });
+  assert.equal((await request(overridden.origin, overridden.path, {
+    method: "POST", token: overridden.token, body: stsBody,
+  })).status, 200);
 });
 
 test("route: a browser cookie session under /cloud gets 403 forbidden", async (t) => {
