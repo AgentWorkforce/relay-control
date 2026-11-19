@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { correlateMcpResponse, instrumentMcpTransport, withMcpDiagnosticContext } from "./request-diagnostics.js";
 import type { GrokRoutines } from "./grok-routines.js";
 import { connectorKind } from "./oauth/connector-kind.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -44,17 +45,24 @@ const MAX_BODY_BYTES = 64 * 1024;
 /** Copilot calls carry a signed proof of the exact arguments, so their cap is larger (Cloud's limit). */
 const COPILOT_MAX_BODY_BYTES = 128 * 1024;
 const MCP_SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const SAFE_ERROR_NAMES = new Set([
+  "Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError", "EvalError", "AggregateError",
+  "AbortError", "TimeoutError", "DatabaseError", "PostgresError", "McpError", "UpstreamError", "SessionReadError",
+]);
 
 type JsonRpcId = string | number | null;
 
 function rpcError(response: ServerResponse, status: number, code: number, message: string,
   id: JsonRpcId = null, headers: Record<string, string> = {}): void {
+  const correlationId = response.getHeader("x-correlation-id") as string;
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     ...headers,
   });
-  response.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id }));
+  console.error("[mcp] request failed", { endpoint: "shared-sessions", status, correlationId });
+  response.end(JSON.stringify({ jsonrpc: "2.0", error: { code,
+    message, data: { correlation_id: correlationId } }, id }));
 }
 
 /**
@@ -150,6 +158,8 @@ export function createMcpHandler(input: {
   grokRoutines?: GrokRoutines;
   /** Clock for shared-session read audit records; tests inject it. */
   now?: () => Date;
+  /** Observe handled unexpected failures without changing their MCP response. */
+  onError?: (error: unknown, context: { path: string; status: number }) => void;
 }) {
   const { config, store } = input;
   const apiTokens = new ApiTokenStore(store.database);
@@ -157,6 +167,14 @@ export function createMcpHandler(input: {
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy);
   const attestations = postgresAttestationStore(store.database);
   const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.fetchImpl });
+  function reportUnexpected(error: unknown, request: IncomingMessage, response: ServerResponse, path: string): void {
+    let errorPath = path;
+    try { errorPath = new URL(request.url ?? path, config.publicBaseUrl).pathname; } catch { /* Use the matched route. */ }
+    try { input.onError?.(error, { path: errorPath, status: 500 }); } catch { /* Telemetry cannot change the response. */ }
+    // Error.name is writable too. Keep only fixed class names, never a message.
+    const name = error instanceof Error && SAFE_ERROR_NAMES.has(error.name) ? error.name : error instanceof Error ? "Error" : "unknown";
+    console.error("[selfhost-mcp] Request failed", { error: name, correlationId: response.getHeader("x-correlation-id") });
+  }
   // Gate-only installs only: desktop identities hold rg_ tokens that only relaygate accepts.
   const gateClient = config.relaygatePublicUrl
     ? createRelaycastClient({ internalOrigin: config.relaygatePublicUrl, fetchImpl: input.fetchImpl })
@@ -287,7 +305,7 @@ export function createMcpHandler(input: {
       oauth:undefined as McpOAuthConnection|undefined };
   }
 
-  return async function handle(
+  async function handleRequest(
     request: IncomingMessage,
     response: ServerResponse,
     path: string,
@@ -452,13 +470,14 @@ export function createMcpHandler(input: {
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
       });
+      instrumentMcpTransport(transport, "shared-sessions");
       await server.connect(transport);
       const url = new URL(rawPath, site);
-      const webResponse = await transport.handleRequest(
+      const webResponse = await correlateMcpResponse(await transport.handleRequest(
         // The proof is gone from `body`; the transport never sees it.
         new Request(url, { method: "POST", headers, body: JSON.stringify(body) }),
         { parsedBody: body },
-      );
+      ), "shared-sessions");
       const out: Record<string, string> = {};
       webResponse.headers.forEach((value, name) => { out[name] = value; });
       out["cache-control"] = "no-store";
@@ -469,12 +488,28 @@ export function createMcpHandler(input: {
       response.writeHead(webResponse.status, out);
       response.end(payload);
     } catch (error) {
-      console.error("[selfhost-mcp] Request failed", { error: error instanceof Error ? error.name : "unknown" });
+      reportUnexpected(error, request, response, path);
       if (!response.headersSent) rpcError(response, 500, -32603, "Internal server error");
       else response.end();
     } finally {
       await server.close().catch(() => {});
     }
     return true;
+  }
+
+  return async function handle(request: IncomingMessage, response: ServerResponse, path: string, method: string): Promise<boolean> {
+    if (path !== MCP_FACADE.path && !(oauthSessions && (path === "/mcp" || path === "/cloud/mcp"))) return false;
+    response.setHeader("x-correlation-id", randomUUID());
+    try {
+      return await withMcpDiagnosticContext(response.getHeader("x-correlation-id") as string,
+        () => handleRequest(request, response, path, method));
+    } catch (error) {
+      // Admission, membership and server construction failures used to escape
+      // to the generic HTTP handler, losing the MCP error and its correlation.
+      reportUnexpected(error, request, response, path);
+      if (!response.headersSent) rpcError(response, 500, -32603, "The MCP service is temporarily unavailable. Please try again.");
+      else response.end();
+      return true;
+    }
   };
 }
