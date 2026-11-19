@@ -738,11 +738,15 @@ function createRelayService(context: McpContext) {
 
   const syncedSessionKinds = new Set(["codex", "grok", "pi", "opencode", "claude", "copilot", "cursor"]);
   const syncedSessionId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+  type SyncedDesktopSessions = {
+    sessions: Map<string, { sessionId: string; sessionKind: string }>;
+    ambiguous: Set<string>;
+  };
   async function syncedDesktopSessions(agents: readonly RosterAgent[]) {
     const targets = agents.map(agent => relayAgentOwnerTarget(agent, Boolean(gate)));
     const candidates = new Map(targets.map((target, index) => [`${target.lookupId}\0${target.name}`, agents[index]!]));
     const ids = [...new Set(targets.map(target => target.lookupId))];
-    if (!ids.length) return new Map<string, { sessionId: string; sessionKind: string }>();
+    if (!ids.length) return { sessions: new Map(), ambiguous: new Set() } satisfies SyncedDesktopSessions;
     const rows = await executor.query<{ agent_name: string; agent_remote_id: string; native_session_kind: string; native_session_id: string }>(
       `SELECT agent_name, agent_remote_id, native_session_kind, native_session_id
          FROM desktop_relay_identities
@@ -753,11 +757,13 @@ function createRelayService(context: McpContext) {
     );
     const sessions = new Map<string, { sessionId: string; sessionKind: string }>();
     const matched = new Set<string>();
+    const ambiguous = new Set<string>();
     for (const row of rows.rows) {
       const agent = candidates.get(`${row.agent_remote_id}\0${row.agent_name}`);
       if (!agent) continue;
       if (matched.has(agent.id)) {
         sessions.delete(agent.id);
+        ambiguous.add(agent.id);
         continue;
       }
       matched.add(agent.id);
@@ -766,7 +772,7 @@ function createRelayService(context: McpContext) {
         sessions.set(agent.id, { sessionId: row.native_session_id, sessionKind: kind });
       }
     }
-    return sessions;
+    return { sessions, ambiguous };
   }
 
   async function roster(status: "live" | "all" | "offline", people: readonly McpMember[], includeStale = false, dir: Directory = directory()) {
@@ -774,17 +780,21 @@ function createRelayService(context: McpContext) {
     const [owners, synced] = await Promise.all([
       loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, listed, people, Boolean(gate))
         .catch(error => { ownerEnrichmentFailed("list_relay_agents", error); return undefined; }),
-      syncedDesktopSessions(listed).catch(error => {
+      syncedDesktopSessions(listed).then(result => ({ ...result, failed: false as const })).catch(error => {
         sessionEnrichmentFailed(error);
-        return new Map<string, { sessionId: string; sessionKind: string }>();
+        return { sessions: new Map<string, { sessionId: string; sessionKind: string }>(),
+          ambiguous: new Set<string>(), failed: true as const };
       }),
     ]);
     return listed
       .map(agent => {
         const row = rosterAgent(agent, people, userId, workspaceId, owners?.get(agent.id));
-        const session = row.session_attribution ? null : synced.get(agent.id);
+        const session = row.session_attribution ? null : synced.sessions.get(agent.id);
         return { ...row,
           ...(session ? { session_id: session.sessionId, session_kind: session.sessionKind, session_attribution: "synced" as const } : {}),
+          session_unavailable_reason: row.session_attribution || session ? null
+            : synced.failed ? "enrichment_failed" as const
+              : synced.ambiguous.has(agent.id) ? "ambiguous_sync" as const : null,
           ...cardSummary(agent.metadata, agent) };
       })
       .filter(agent => status === "all" || (status === "live" ? agent.online : !agent.online));
