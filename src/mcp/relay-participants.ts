@@ -670,9 +670,39 @@ function createRelayService(context: McpContext) {
     return (await dir.via.listAgents(dir.credential, status, { includeStale })).filter(isListedRelayAgent);
   }
 
+  const syncedSessionKinds = new Set(["codex", "grok", "pi", "opencode", "claude", "copilot", "cursor"]);
+  const syncedSessionId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+  async function syncedDesktopSessions(agents: readonly RosterAgent[]) {
+    const ids = [...new Set(agents.map(agent => agent.id))];
+    if (!ids.length) return new Map<string, { sessionId: string; sessionKind: string }>();
+    const rows = await executor.query<{ agent_remote_id: string; native_session_kind: string; native_session_id: string }>(
+      `SELECT agent_remote_id, native_session_kind, native_session_id
+         FROM desktop_relay_identities
+        WHERE workspace_id = $1 AND agent_remote_id = ANY($2::text[])
+          AND native_session_kind IS NOT NULL AND native_session_id IS NOT NULL`,
+      [workspaceId, ids],
+    );
+    const sessions = new Map<string, { sessionId: string; sessionKind: string }>();
+    for (const row of rows.rows) {
+      const kind = row.native_session_kind.trim();
+      if (syncedSessionKinds.has(kind) && syncedSessionId.test(row.native_session_id)) {
+        sessions.set(row.agent_remote_id, { sessionId: row.native_session_id, sessionKind: kind });
+      }
+    }
+    return sessions;
+  }
+
   async function roster(status: "live" | "all" | "offline", people: readonly McpMember[], includeStale = false, dir: Directory = directory()) {
-    return (await listedAgents(status === "live" ? "active" : "all", includeStale, dir))
-      .map(agent => ({ ...rosterAgent(agent, people, userId, workspaceId), ...cardSummary(agent.metadata) }))
+    const agents = await listedAgents(status === "live" ? "active" : "all", includeStale, dir);
+    const synced = await syncedDesktopSessions(agents);
+    return agents
+      .map(agent => {
+        const listed = rosterAgent(agent, people, userId, workspaceId);
+        const session = listed.session_attribution ? null : synced.get(agent.id);
+        return { ...listed,
+          ...(session ? { session_id: session.sessionId, session_kind: session.sessionKind, session_attribution: "synced" as const } : {}),
+          ...cardSummary(agent.metadata) };
+      })
       .filter(agent => status === "all" || (status === "live" ? agent.online : !agent.online));
   }
 

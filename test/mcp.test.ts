@@ -732,6 +732,37 @@ test("get_relay_agent_card returns a minimal card for an agent without one, and 
   assert.equal(env.relay.world.bodies.some(call => call.method === "PATCH"), false);
 });
 
+test("list_relay_agents links synced Desktop sessions and keeps validated declarations authoritative", async (t) => {
+  const env = await setup(t);
+  const synced = env.relay.world.addAgent("synced-session", { source: "relay-desktop", owner_hash: sha256(env.ownerId) });
+  const declared = env.relay.world.addAgent("declared-session", {
+    source: "relay-desktop", owner_hash: sha256(env.ownerId), injectable: "true",
+    session_id: "declared-session-id", session_kind: "claude",
+  });
+  const insert = (values: { id: string; sourceId: string; agentName: string; agentRemoteId: string; sessionKind: string; sessionId: string }) =>
+    env.database.query(
+      `INSERT INTO desktop_relay_identities
+         (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id,
+          agent_name, agent_remote_id, address, token_ciphertext, native_session_kind, native_session_id)
+       VALUES ($1, $2, $3, $4, 'rc-first', $5, $6, $7, $6 || '@fixture', 'encrypted', $8, $9)`,
+      [values.id, env.workspaceId, env.orgId, env.ownerId, values.sourceId, values.agentName,
+        values.agentRemoteId, values.sessionKind, values.sessionId],
+    );
+  await insert({ id: "00000000-0000-4000-8000-000000000101", sourceId: "00000000-0000-4000-8000-000000000102",
+    agentName: synced.name, agentRemoteId: synced.id, sessionKind: "opencode", sessionId: "ses_ABCD1234" });
+  await insert({ id: "00000000-0000-4000-8000-000000000103", sourceId: "00000000-0000-4000-8000-000000000104",
+    agentName: declared.name, agentRemoteId: declared.id, sessionKind: "codex", sessionId: "00000000-0000-4000-8000-000000000105" });
+
+  const client = await relayClient(t, env);
+  const agents = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } })).agents;
+  const syncedRow = agents.find((agent: any) => agent.name === synced.name);
+  assert.deepEqual([syncedRow.session_id, syncedRow.session_kind, syncedRow.session_attribution],
+    ["ses_ABCD1234", "opencode", "synced"]);
+  const declaredRow = agents.find((agent: any) => agent.name === declared.name);
+  assert.deepEqual([declaredRow.session_id, declaredRow.session_kind, declaredRow.session_attribution],
+    ["declared-session-id", "claude", "declared"]);
+});
+
 test("set_relay_agent_card writes only the joined participant's card and preserves its other metadata", async (t) => {
   const env = await setup(t);
   const client = await relayClient(t, env);

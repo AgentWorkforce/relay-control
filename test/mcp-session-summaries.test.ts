@@ -74,11 +74,18 @@ test("list never substitutes a task title for an absent recorded summary", async
   assert.equal(legacy.paths.length, 1, "missing summary fields never trigger a fallback or detail scan");
 });
 
-test("repo filtering preserves pagination, including an empty filtered page", async t => {
+test("repo filtering is applied by the directory before pagination and verified against the URL", async t => {
   const f = await fixture(t);
   const value = data(await call(f.client, "list_session_summaries", { repo: "unmatched" }));
   assert.deepEqual(value.sessions, []); assert.equal(value.next_cursor, "b96l1:opaque-page"); assert.equal(f.paths.length, 1);
+  assert.equal(new URL(f.paths[0]!, "https://reader.test").searchParams.get("projectContains"), "unmatched");
   assert.equal(data(await call(f.client, "list_session_summaries", { repo: "ORG/REPO" })).sessions.length, 1);
+});
+
+test("combined project and repo filters preserve the directory project constraint", async t => {
+  const f = await fixture(t);
+  assert.equal(data(await call(f.client, "list_session_summaries", { project: "fake", repo: "org/repo" })).sessions.length, 1);
+  assert.equal(new URL(f.paths[0]!, "https://reader.test").searchParams.get("projectContains"), "fake");
 });
 
 test("recorded list summaries use the reader bound of 1000 Unicode code points", async t => {
