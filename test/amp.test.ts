@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { registerAmpTools } from "../src/amp/mcp-tools.js";
 import { claimNext, RELAY_EVENT_MAX_BYTES } from "../src/amp/delivery.js";
-import { decrypt } from "../src/amp/service.js";
+import { decrypt, ownedThreadPage } from "../src/amp/service.js";
 import { startAmpWorker } from "../src/amp/worker.js";
 import { planToolGroups } from "../src/mcp/catalog.js";
 import type { McpContext } from "../src/mcp/context.js";
@@ -430,9 +430,17 @@ test("amp MCP tools exist only when enabled and authorize the connection's perso
   assert.equal(refused.content[0].text, "Only current owners and admins using a person connection can manage Amp.");
   const listed = await toolsFor(h.ownerId).get("list_amp_threads")!.handler({});
   assert.equal(listed.isError, undefined);
-  assert.deepEqual(JSON.parse(listed.content[0].text), [{ id: THREAD, title: `Thread ${THREAD}` }]);
+  assert.deepEqual(JSON.parse(listed.content[0].text), { threads: [{ id: THREAD, title: `Thread ${THREAD}` }], truncated: false });
   const adminBind = await toolsFor(h.adminId).get("bind_amp_thread")!.handler({ thread_id: THREAD });
   assert.equal(adminBind.isError, true, "an admin who did not connect the key cannot bind with it");
+});
+
+test("amp thread pages disclose a provider tail instead of silently truncating it", () => {
+  const page = ownedThreadPage(Array.from({ length: 101 }, (_, index) => ({
+    id: `T-${index.toString(16).padStart(16, "0")}`, title: `Thread ${index}`,
+  })));
+  assert.equal(page.threads.length, 100);
+  assert.equal(page.truncated, true);
 });
 
 test("amp never returns stored secrets in summaries or errors (req 9)", async (t) => {

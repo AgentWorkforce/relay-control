@@ -196,10 +196,15 @@ export async function requireBoundAgent(deps: AmpDeps, relay: WorkspaceRelay, ro
 }
 
 export function ownedThreads(data: unknown): Array<{ id: string; title: string }> {
+  return ownedThreadPage(data).threads;
+}
+
+/** The MCP directory is intentionally bounded; disclose the provider tail. */
+export function ownedThreadPage(data: unknown): { threads: Array<{ id: string; title: string }>; truncated: boolean } {
   const rows = Array.isArray(data) ? data : (data as { threads?: unknown[] } | null)?.threads;
   const unsupported = () => new AmpError(502, "amp_unsupported_response", "Amp returned an unsupported thread list.");
   if (!Array.isArray(rows)) throw unsupported();
-  return rows.slice(0, 100).map((value: unknown) => {
+  const threads = rows.slice(0, 100).map((value: unknown) => {
     if (!value || typeof value !== "object") throw unsupported();
     const row = value as { id?: unknown; title?: unknown };
     let id: string;
@@ -210,6 +215,7 @@ export function ownedThreads(data: unknown): Array<{ id: string; title: string }
     }
     return { id, title: typeof row.title === "string" ? row.title.slice(0, 200) : id };
   });
+  return { threads, truncated: rows.length > threads.length };
 }
 
 /** Proves the key reads this thread, through the RelayHistory-owned parser only. */
@@ -345,10 +351,14 @@ async function ownerKey(deps: AmpDeps, actor: AmpActor, message: string) {
 }
 
 export async function discover(deps: AmpDeps, actor: AmpActor) {
+  return (await discoverPage(deps, actor)).threads;
+}
+
+export async function discoverPage(deps: AmpDeps, actor: AmpActor) {
   // Use the same row whose ownership was authorized; a replacement committed
   // since then must never supply another person's key.
   const { key } = await ownerKey(deps, actor, "Only the person who connected Amp can browse its threads.");
-  return ownedThreads(await runAmp(deps, key, { kind: "discover" }));
+  return ownedThreadPage(await runAmp(deps, key, { kind: "discover" }));
 }
 
 async function saveParticipant(deps: AmpDeps, tx: SqlExecutor, row: BindingRow, tokenCiphertext: string) {
