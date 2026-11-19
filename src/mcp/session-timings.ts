@@ -57,6 +57,7 @@ type SessionsPage = z.infer<typeof sessionsResponse>;
  * filters each page and skips ahead so an empty page never hides later matches.
  */
 const MAX_USER_FILTER_PAGES = 5;
+const timingUnavailableReason = z.enum(["read_failed", "invalid_response", "identity_mismatch"]);
 
 type Member = { userId: string; name: string | null };
 type Context = {
@@ -82,6 +83,7 @@ export function registerSessionTimings(
       attribution: z.enum(["single_member", "shared", "unattributed"]),
       members: z.array(z.object({ user_id: z.string(), name: z.string().nullable() })),
       timing_status: z.enum(["ok", "unavailable"]),
+      timing_unavailable_reason: timingUnavailableReason.nullable(),
       timing: timingOutput.nullable(),
       recorded_span_ms: z.number().nonnegative().nullable(),
       citation_url: z.string().url(),
@@ -134,11 +136,14 @@ export function registerSessionTimings(
         rows.push(...await Promise.all(selected.slice(i, i + 5).map(async session => {
           const ids = [...new Set(session.userIds ?? [])];
           let timing: z.infer<typeof sessionTimingResponse> | null = null;
+          let unavailableReason: z.infer<typeof timingUnavailableReason> | null = null;
           try {
-            const parsed = sessionTimingResponse.parse(await ctx.read(`/v1/sessions/${encodeURIComponent(session.sessionId)}/timing?${new URLSearchParams({ source: session.source })}`));
-            if (parsed.sessionId !== session.sessionId || parsed.source !== session.source) throw new Error("Timing identity mismatch");
-            timing = parsed;
-          } catch { /* Preserve the session and explicitly report missing timing. */ }
+            const parsed = sessionTimingResponse.safeParse(await ctx.read(`/v1/sessions/${encodeURIComponent(session.sessionId)}/timing?${new URLSearchParams({ source: session.source })}`));
+            if (!parsed.success) unavailableReason = "invalid_response";
+            else if (parsed.data.sessionId !== session.sessionId || parsed.data.source !== session.source) {
+              unavailableReason = "identity_mismatch";
+            } else timing = parsed.data;
+          } catch { unavailableReason = "read_failed"; }
           const span = timing?.startedAt && timing.lastActionAt
             ? Date.parse(timing.lastActionAt) - Date.parse(timing.startedAt) : null;
           const { correlationId: _correlationId, ...timingData } = timing ?? { correlationId: "" };
@@ -148,6 +153,7 @@ export function registerSessionTimings(
             attribution: ids.length === 1 ? "single_member" as const : ids.length > 1 ? "shared" as const : "unattributed" as const,
             members: ids.map(id => ({ user_id: id, name: names.get(id) ?? null })),
             timing_status: timing ? "ok" as const : "unavailable" as const,
+            timing_unavailable_reason: unavailableReason,
             timing: timing ? timingOutput.parse(timingData) : null,
             recorded_span_ms: span !== null && span >= 0 ? span : null,
             citation_url: ctx.citation(session.sessionId, session.source),

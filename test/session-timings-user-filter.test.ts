@@ -108,3 +108,28 @@ test("reads one page and sends no user filter when no member is given", async ()
     assert.equal(h.calls.filter(isList).length, 1);
   } finally { await h.close(); }
 });
+
+test("keeps a safe cause when a session timing is unavailable", async () => {
+  const cases = [
+    { reason: "read_failed", response: () => { throw new Error("private upstream detail"); } },
+    { reason: "invalid_response", response: () => ({}) },
+    { reason: "identity_mismatch", response: () => timing("other") },
+  ];
+  for (const item of cases) {
+    const h = await harness((path) => isList(path) ? page([session("s1", ["u1"])], null) : item.response());
+    try {
+      const r = await h.call({ since });
+      const data = r.structuredContent as { sessions: Array<{
+        timing_status: string; timing_unavailable_reason: string | null; timing: unknown;
+      }> };
+      assert.deepEqual(data.sessions[0], {
+        session_id: "s1", source: "claude", task_title: null, project_id: null,
+        attribution: "single_member", members: [{ user_id: "u1", name: "One" }],
+        timing_status: "unavailable", timing_unavailable_reason: item.reason,
+        timing: null, recorded_span_ms: null,
+        citation_url: "https://control.example.com/s/claude/s1",
+      });
+      assert.ok(!JSON.stringify(data).includes("private upstream detail"));
+    } finally { await h.close(); }
+  }
+});
