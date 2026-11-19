@@ -1,3 +1,4 @@
+import { CURSOR_LINK_PATH, type CursorCloudLinks } from "../cursor-cloud.js";
 import { page as renderPage } from "../../identity/pages.js";
 import { randomBytes } from "node:crypto";
 import { GROK_SETUP_PATH, type GrokRoutines } from "../grok-routines.js";
@@ -78,6 +79,7 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
   now?:()=>Date;
   afterMutation?():void;
   grokRoutines?: GrokRoutines;
+  cursorCloudLinks?: CursorCloudLinks;
 }) {
   const settings=deps.config.mcpOAuth;
   const enabled=settings?.enabled===true;
@@ -117,6 +119,7 @@ export function createMcpOAuthHttpModule<Store extends OAuthHttpStore>(deps:{
   function recognizes(path:string):boolean {
     return enabled && (discovery.has(path)||metadata.has(path)||path===AUTHORIZE||path===`${API}/authorize`||
       (Boolean(deps.grokRoutines) && path===GROK_SETUP_PATH)||
+      (Boolean(deps.cursorCloudLinks) && path===CURSOR_LINK_PATH)||
       path===`${API}/authorize/agent-name`||path===GRANTS||path.startsWith(GRANTS+"/")||
       [`${API}/register`,`${API}/token`,`${API}/revoke`,jwks].includes(path));
   }
@@ -200,6 +203,16 @@ form.addEventListener('submit',event=>{event.preventDefault();decide('approve');
         }
         if (!await deps.workspaceAccess(principal)) return json({error:"not_found"},404);
         return await deps.grokRoutines.handle(request.method==='POST'?await bounded(request):request,principal);
+      }
+      if (path===CURSOR_LINK_PATH && deps.cursorCloudLinks) {
+        const principal=await resolveMcpConsentAccount(request,deps.resolveSession);
+        if (principal instanceof Response) {
+          if (request.method==='GET' && principal.status===401) return new Response(null,{status:302,headers:{
+            location:`/login?${new URLSearchParams({next:url.pathname+url.search})}`,"cache-control":"no-store"}});
+          return principal;
+        }
+        if (!await deps.workspaceAccess(principal)) return json({error:"not_found"},404);
+        return await deps.cursorCloudLinks.handle(request,principal);
       }
       if(path===GRANTS || path.startsWith(GRANTS+"/")) {
         const principal=await resolveMcpConsentAccount(request,deps.resolveSession);

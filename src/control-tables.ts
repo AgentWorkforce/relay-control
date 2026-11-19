@@ -15,6 +15,8 @@ export const CONTROL_TABLES: readonly string[] = [
   "coding_agent_credential_blobs",
   "coding_agent_credentials",
   "coding_agent_device_sessions",
+  "cursor_cloud_links",
+  "cursor_cloud_runs",
   "desktop_attestation_keys",
   "desktop_consent_tokens",
   "desktop_feed_assets",

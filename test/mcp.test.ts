@@ -937,7 +937,7 @@ test("set_relay_agent_card writes only the joined participant's card and preserv
   assert.equal(remote.metadata.owner_hash, sha256(env.ownerId));
 });
 
-test("set_relay_agent_card validates the card limits and has no target parameter", async (t) => {
+test("set_relay_agent_card validates the card limits and has no target parameter (as selects only your own participant)", async (t) => {
   const env = await setup(t);
   const peer = env.relay.world.addAgent("peer-bot", { objective: "Answers questions" });
   const client = await relayClient(t, env);
@@ -960,14 +960,18 @@ test("set_relay_agent_card validates the card limits and has no target parameter
     const result = await client.callTool({ name: "set_relay_agent_card", arguments: args });
     assert.equal(result.isError, true, JSON.stringify(args).slice(0, 120));
   }
-  // An unknown `agent` or `as` argument is ignored: the write still targets the caller only.
-  structured(await client.callTool({ name: "set_relay_agent_card", arguments: { ...CARD_INPUT, agent: "peer-bot", as: "peer-bot" } }));
+  // `as` selects only the caller's own participant: naming someone else's agent is refused and writes nothing.
+  const foreign = await client.callTool({ name: "set_relay_agent_card", arguments: { ...CARD_INPUT, as: "peer-bot" } });
+  assert.equal(foreign.isError, true);
+  // An unknown `agent` argument is ignored: the write still targets the caller only.
+  structured(await client.callTool({ name: "set_relay_agent_card", arguments: { ...CARD_INPUT, agent: "peer-bot" } }));
   assert.equal(peer.metadata.card, undefined);
   assert.equal(env.relay.world.agents.get("owner-carded")!.metadata.card !== undefined, true);
   assert.deepEqual(env.relay.world.bodies.filter(call => call.method === "PATCH").map(call => call.path), ["/v1/agents/owner-carded"]);
   const { tools } = await client.listTools();
   const schema = tools.find(tool => tool.name === "set_relay_agent_card")!.inputSchema as { properties: Record<string, unknown>; required?: string[] };
-  assert.deepEqual(Object.keys(schema.properties).sort(), ["description", "documentation_url", "skills", "tags", "version"]);
+  // No target: `as` is the own-participant selector every relay tool has (a Cursor cloud agent run's name).
+  assert.deepEqual(Object.keys(schema.properties).sort(), ["as", "description", "documentation_url", "skills", "tags", "version"]);
   assert.deepEqual([...schema.required ?? []].sort(), ["description", "skills"]);
 });
 
