@@ -36,6 +36,11 @@ export class GrokRoutines {
   constructor(readonly options: { database: Database; keyring: EncryptionKeyring; client: RelaycastClient;
     /** Gate-only installs: participants enrolled through relaygate (relaygate_agent_id set) are read through it. */
     gate?: RelaycastClient;
+    /**
+     * SELFHOST_CURSOR_CLOUD_RUN_IDENTITY=required: a cursor-cloud grant acts only as verified runs and never pins
+     * its approved agent, so it has no identity a routine could wake; its routine setup is refused.
+     */
+    cursorRunIdentityRequired?: boolean;
     publicOrigin: string; tenancyMode: TenancyMode; fetchImpl?: typeof fetch; now?: () => Date; requestTimeoutMs?: number }) {}
 
   private now() { return this.options.now?.() ?? new Date(); }
@@ -68,9 +73,17 @@ export class GrokRoutines {
     return `${this.options.publicOrigin}${GROK_SETUP_PATH}?${new URLSearchParams({ grant: grantId })}`;
   }
 
+  /** Routine setup for a cursor-cloud grant needs its approved agent, which required run identity never uses. */
+  private assertSetupAllowed(grant: Grant): void {
+    if (grant.kind === "cursor-cloud" && this.options.cursorRunIdentityRequired) {
+      throw new GrokRoutineError("Grok Bot routines on a Cursor connection need SELFHOST_CURSOR_CLOUD_RUN_IDENTITY=optional on this server: with required run identity the connection has no shared agent to wake.");
+    }
+  }
+
   async status(grantId: string, owner: Owner) {
     return this.options.database.transaction(async tx => {
       const grant = await this.grant(tx, grantId, owner);
+      this.assertSetupAllowed(grant);
       const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1", [grantId])).rows[0];
       return { agent: grant.agent_name, configured: Boolean(routine), webhook_accepted: Boolean(routine?.last_delivered_at),
         last_delivered_at: routine?.last_delivered_at ?? null, last_error: routine?.last_error ?? null,
@@ -100,6 +113,7 @@ export class GrokRoutines {
         const credentials = parseGrokRoutineCredentials(body.webhook_url, body.authorization);
         await this.options.database.transaction(async tx => {
           const grant = await this.grant(tx, grantId, owner);
+          this.assertSetupAllowed(grant);
           if (!grant.agent_remote_id) throw new GrokRoutineError("Call join_relay from this bot before saving its routine.");
           await tx.query(`INSERT INTO grok_bot_routines(grant_id,credentials_ciphertext,next_attempt_at,updated_at)
             VALUES ($1,$2,$3,$3) ON CONFLICT (grant_id) DO UPDATE SET credentials_ciphertext=$2,

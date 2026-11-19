@@ -134,8 +134,12 @@ export class CursorCloudLinks {
         const taken = await tx.query("SELECT 1 FROM cursor_cloud_links WHERE workspace_id = $1 AND cursor_subject = $2 AND confirmed_at IS NOT NULL",
           [owner.workspaceId, row.cursor_subject]);
         if (taken.rows.length) return "conflict" as const;
-        await tx.query(`UPDATE cursor_cloud_links SET confirmed_at = now(), code_hash = NULL, code_expires_at = NULL
-          WHERE workspace_id = $1 AND user_id = $2 AND cursor_subject = $3`, [owner.workspaceId, owner.userId, row.cursor_subject]);
+        // Redeemed atomically: only one of two concurrent confirmations matches the code.
+        const redeemed = await tx.query(`UPDATE cursor_cloud_links SET confirmed_at = now(), code_hash = NULL, code_expires_at = NULL
+          WHERE workspace_id = $1 AND user_id = $2 AND cursor_subject = $3
+            AND code_hash = $4 AND code_expires_at > now() AND confirmed_at IS NULL
+          RETURNING cursor_subject`, [owner.workspaceId, owner.userId, row.cursor_subject, hashSecret(code)]);
+        if (redeemed.rows.length !== 1) return null;
         await recordAudit(tx, { organizationId: owner.organizationId, workspaceId: owner.workspaceId,
           actor: { kind: "user", userId: owner.userId }, action: "cursor_cloud.link.confirmed", target: row.cursor_subject });
         return row.cursor_subject;

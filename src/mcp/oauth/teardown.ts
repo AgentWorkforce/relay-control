@@ -249,11 +249,16 @@ export class McpOAuthTeardown {
     const {row,workspace}=target;
     let released=false;
     if(row.relaygate_agent_id && this.deps.gate) {
-      try {
-        await this.deps.gate.releaseOwnAgent(decryptSecret(row.token_ciphertext,this.deps.keyring));
-        released=true;
-      } catch(error) {
-        if(!(error instanceof RelaycastCallError) || error.status!==401) throw error;
+      let token:string|null=null;
+      // A token sealed under a retired key is as unusable as one relaygate rejects: fall back to the workspace key.
+      try {token=decryptSecret(row.token_ciphertext,this.deps.keyring);} catch {token=null;}
+      if(token!==null) {
+        try {
+          await this.deps.gate.releaseOwnAgent(token);
+          released=true;
+        } catch(error) {
+          if(!(error instanceof RelaycastCallError) || error.status!==401) throw error;
+        }
       }
     }
     if(!released) {

@@ -1430,6 +1430,8 @@ function createRelayService(context: McpContext) {
         await desktop();
         return { joined: false, desktop_agent_unchanged: true, native_chat_identity_retained: true };
       }
+      // A run this connection already left (or never had): leaving again is a no-op, not a run-identity refusal.
+      if (oauth && as && CURSOR_RUN_NAME.test(as) && context.cursorCloud && !await ownRun(as)) return { joined: false, already_left: true };
       // Gate-only installs: renew at relaygate first so the release goes through it; a refusal still lets it leave.
       await refreshGated(as).catch(() => {});
       return withOwnerLock(async (tx) => {

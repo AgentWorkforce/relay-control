@@ -68,7 +68,11 @@ export function admissionConnectorKind(
 ): ConnectorKind {
   const uris = used.length > 0 ? used : client.redirectUris;
   const kinds = new Set(uris.map((uri) => connectorKind({ clientName: client.clientName, redirectUris: [uri] })));
-  return kinds.size === 1 ? [...kinds][0]! : "mcp";
+  if (kinds.size === 1) return [...kinds][0]!;
+  // A Grok Bot that received codes at both its x.ai and its Cursor cloud agent callback is still Grok Bot: it keeps
+  // its routine (it was grok-bot before Cursor callbacks became cursor-cloud). Any other mix is no provider.
+  if (kinds.size === 2 && kinds.has("grok-bot") && kinds.has("cursor-cloud")) return "grok-bot";
+  return "mcp";
 }
 
 /**

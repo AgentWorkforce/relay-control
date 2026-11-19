@@ -119,7 +119,10 @@ async function fixture(t: test.TestContext, options: { redirect?: string; cursor
     const done = await fetch(base + path.pathname + path.search, { method: "POST", headers, redirect: "manual" });
     assert.equal(done.status, 200, await done.clone().text());
   };
-  return { database, owner, world, issuer, call, ok, failed, nonce, confirm, teardown, grant, connect };
+  /** A same-origin POST from the person's signed-in browser; returns the status. */
+  const post = async (pathAndQuery: string) => (await fetch(base + pathAndQuery, { method: "POST", redirect: "manual",
+    headers: { cookie: `agent_relay_session=${browser.accessToken}`, origin: ORIGIN } })).status;
+  return { database, owner, world, issuer, call, ok, failed, nonce, confirm, teardown, grant, connect, post };
 }
 
 test("a Cursor cloud agent run links its Cursor account, joins as its own participant and messages as it", async t => {
@@ -271,4 +274,21 @@ test("a run whose release keeps failing does not hold up other runs' cleanup", a
   await f.teardown.drain();
   assert.equal(f.world.agents.has(one), false);
   assert.deepEqual((await f.database.query("SELECT agent_name FROM cursor_cloud_runs")).rows, []);
+});
+
+test("a confirmation link redeems once even when confirmed twice at the same time", async t => {
+  const f = await fixture(t);
+  const pending = f.failed(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) }));
+  const url = new URL(/(https:\/\/\S+cursor-cloud\/link\?code=[A-Za-z0-9_-]+)/.exec(pending)![1]!);
+  const statuses = await Promise.all([1, 2].map(() => f.post(url.pathname + url.search)));
+  assert.deepEqual(statuses.sort(), [200, 404]);
+  assert.equal((await f.database.query("SELECT count(*)::int AS n FROM admin_audit_events WHERE action='cursor_cloud.link.confirmed'")).rows[0]!.n, 1);
+});
+
+test("required run identity: leaving a run twice is idempotent, and Grok routines are refused with the setting to change", async t => {
+  const f = await fixture(t, { cursorCloud: { runIdentity: "required", trustedTeams: ["77"] } });
+  const name = f.ok(await f.call("join_relay", { cursor_identity_token: f.issuer.mint(await f.nonce()) })).name as string;
+  assert.equal(f.ok(await f.call("leave_relay", { as: name })).already_left, false);
+  assert.equal(f.ok(await f.call("leave_relay", { as: name })).already_left, true);
+  assert.match(f.failed(await f.call("connect_grok_bot_routine", { mode: "webhook" })), /SELFHOST_CURSOR_CLOUD_RUN_IDENTITY=optional/);
 });

@@ -630,6 +630,7 @@ export function createApp(input: {
   }) : null;
   const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines({
       database:store.database,keyring:config.encryptionKeyring,client:oauthRelay,
+      cursorRunIdentityRequired:config.cursorCloud?.enabled!==false && config.cursorCloud?.runIdentity==="required",
       ...(config.relaygatePublicUrl ? {gate:createRelaycastClient({internalOrigin:config.relaygatePublicUrl,fetchImpl:input.messagingFetch})} : {}),
       publicOrigin:new URL(config.publicBaseUrl).origin,tenancyMode:store.tenancy,now:input.now,
     }) : undefined;

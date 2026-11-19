@@ -98,3 +98,9 @@ test("Grok Bot routines stay available to Cursor cloud agents, the way a Cursor-
   assert.equal(isGrokRoutineKind("cursor-cloud"), true);
   for (const kind of ["chatgpt", "muse", "mcp"] as const) assert.equal(isGrokRoutineKind(kind), false);
 });
+
+test("a Grok Bot that received codes at both its x.ai and its Cursor callback stays Grok Bot (and keeps its routine)", () => {
+  const xai = "https://x.ai/callback", cursor = "https://www.cursor.com/agents/fake/callback";
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [xai, cursor] }, [xai, cursor]), "grok-bot");
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [cursor, "https://chatgpt.com/callback"] }, [cursor, "https://chatgpt.com/callback"]), "mcp");
+});
