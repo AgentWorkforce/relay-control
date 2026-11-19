@@ -46,8 +46,8 @@ and a staff read grant itself are all refused.
   `expired`), created, expiry, revocation and last use. Never token material.
 - `POST /api/v1/workspaces/{workspaceId}/staff-read-grants` with
   `{ "reason": "...", "expires_in_days": 7 }`. `reason` is trimmed and must be
-  1 to 500 characters. `expires_in_days` is an integer from 1 to 90 (default
-  90). Answers `201 { grant, token: { accessToken, workspaceId, expiresAt } }`.
+  1 to 500 characters. `expires_in_days` is an integer from 1 to 365 (default
+  90, so a longer grant must be asked for). Answers `201 { grant, token: { accessToken, workspaceId, expiresAt } }`.
   The token is shown once; only its SHA-256 is stored. At most 10 mints per
   staff person per hour (`429 rate_limited`).
 - `DELETE /api/v1/workspaces/{workspaceId}/staff-read-grants/{grantId}`
@@ -114,7 +114,8 @@ does not count as a use.
 
 ## Lifetime
 
-At most 90 days, enforced by the table as well as the route. Revocation,
+At most 365 days (90 before migration 0080), enforced by the table as well
+as the route. A mint without `expires_in_days` lasts 90 days. Revocation,
 expiry or losing the staff rule fails the next request. Deleting the staff
 person, the operator organization or the workspace deletes the grant.
 

@@ -227,7 +227,7 @@ test("cloud import: current target (every checked-in migration) keeps rw_, slugs
   assert.equal(grant.reason, "Investigating a support ticket");
   assert.match(grant.token_hash, /^[0-9a-f]{64}$/);
   assert.ok(grant.revoked_at);
-  assert.equal(grant.lifetime, "90 days");
+  assert.equal(grant.lifetime, "365 days");
   const audits = async () => (await target.query<{ n: number }>(
     "SELECT count(*)::int AS n FROM admin_audit_events WHERE action = 'staff_read_grant.imported' AND target = $1",
     [`${id(0xa01)} workspace ${id(0x201)}`])).rows[0]!.n;
@@ -687,14 +687,15 @@ test("cloud import: ledger guards: no ledger table refuses; a Control-native org
   assert.equal((await target.query("SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2", [ORG_B, id(0xeee)])).rows.length, 1);
 });
 
-test("cloud import: transforms are time-zone independent (90-day clamp across DST)", async (t) => {
+test("cloud import: transforms are time-zone independent (365-day clamp across DST)", async (t) => {
   const source = await cloudSource();
   const target = await controlTarget("current");
   t.after(async () => {
     await source.close();
     await target.close();
   });
-  // A session zone with a DST change inside the 90-day window (late March).
+  // A session zone whose DST state differs at the two ends of the 365-day
+  // window: created 2026-03-28 (CET), clamped to 2027-03-28 12:00 UTC (CEST).
   await source.exec("SET TIME ZONE 'Europe/Oslo'");
   const OPS = id(0xc0ffee);
   await target.query("INSERT INTO organizations (id, name) VALUES ($1, 'Operator')", [OPS]);
@@ -703,5 +704,5 @@ test("cloud import: transforms are time-zone independent (90-day clamp across DS
   assert.equal(report.ok, true, JSON.stringify(report.orgs));
   const grant = (await target.query<{ expires_at: string }>(
     "SELECT to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') AS expires_at FROM staff_read_grants WHERE id = $1", [id(0xa01)])).rows[0]!;
-  assert.equal(grant.expires_at, "2026-04-01T00:00:00.123456", "created_at + 90 days in UTC, not in the session zone");
+  assert.equal(grant.expires_at, "2027-03-28T12:00:00.123456", "created_at + 365 days in UTC, not in the session zone");
 });
