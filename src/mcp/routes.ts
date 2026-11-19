@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { correlateMcpResponse } from "./request-diagnostics.js";
+import { correlateMcpResponse, instrumentMcpTransport, withMcpDiagnosticContext } from "./request-diagnostics.js";
 import type { GrokRoutines } from "./grok-routines.js";
 import { connectorKind } from "./oauth/connector-kind.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -456,13 +456,14 @@ export function createMcpHandler(input: {
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
       });
+      instrumentMcpTransport(transport, "shared-sessions");
       await server.connect(transport);
       const url = new URL(rawPath, site);
       const webResponse = await correlateMcpResponse(await transport.handleRequest(
         // The proof is gone from `body`; the transport never sees it.
         new Request(url, { method: "POST", headers, body: JSON.stringify(body) }),
         { parsedBody: body },
-      ), "shared-sessions", response.getHeader("x-correlation-id") as string);
+      ), "shared-sessions");
       const out: Record<string, string> = {};
       webResponse.headers.forEach((value, name) => { out[name] = value; });
       out["cache-control"] = "no-store";
@@ -486,7 +487,8 @@ export function createMcpHandler(input: {
     if (path !== MCP_FACADE.path && !(oauthSessions && (path === "/mcp" || path === "/cloud/mcp"))) return false;
     response.setHeader("x-correlation-id", randomUUID());
     try {
-      return await handleRequest(request, response, path, method);
+      return await withMcpDiagnosticContext(response.getHeader("x-correlation-id") as string,
+        () => handleRequest(request, response, path, method));
     } catch {
       // Admission, membership and server construction failures used to escape
       // to the generic HTTP handler, losing the MCP error and its correlation.
