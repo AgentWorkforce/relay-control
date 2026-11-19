@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { SelfhostConfig } from "../config.js";
 import { ReadCursorExpiredError, UpstreamError } from "../relayhistory.js";
 import { MCP_READER_HEADER } from "../session-read.js";
-import { isRecord, WORKSPACE_ATTESTATION_HEADER, UNSUPPORTED_BY_BACKEND, type HistoryIdentity, type HistoryRead } from "../sessions/history.js";
+import { isRecord, unsupportedReason, WORKSPACE_ATTESTATION_HEADER, type HistoryIdentity, type HistoryRead } from "../sessions/history.js";
 
 /**
  * Client configuration deliberately excludes the issuer URL and internal secret.
@@ -17,8 +17,10 @@ type ReaderConfig = Pick<SelfhostConfig,"publicBaseUrl"|"sessionReadMcpReads"> &
 };
 
 /** Per-user reader client. Only Control sees the reader's internal issuer secret. */
-const READ_ROUTES = /^\/v1\/(?:events|sessions(?:\/activity|\/[^/]+\/(?:turns|metadata|events|summary))?)$/;
+const READ_ROUTES = /^\/v1\/(?:events|sessions(?:\/activity|\/[^/]+\/(?:turns|metadata|events|summary))?|relayfacts(?:\/[^/]+)?)$/;
 const READ_API_CURSOR = /^b96[a-z][0-9]+:/;
+/** relayfacts topic pages issue their own opaque cursors (md1: today), never session cursors. */
+const RELAYFACTS_ROUTE = /^\/v1\/relayfacts(?:\/|$)/;
 const EXPIRY_MARGIN_MS = 30_000;
 const CACHE_LIMIT = 1_000;
 const HANDOFF_MAX_BYTES = 16_384;
@@ -122,7 +124,7 @@ export async function readViaSessionRead(config:ReaderConfig,identity:HistoryIde
   // Every History reader is the read API, so its cursors stay valid either way.
   if(!selected) return null;
   // A foreign/legacy cursor cannot silently switch the selected backend.
-  if(cursor && !READ_API_CURSOR.test(cursor)) throw new ReadCursorExpiredError();
+  if(cursor && !RELAYFACTS_ROUTE.test(path) && !READ_API_CURSOR.test(cursor)) throw new ReadCursorExpiredError();
   const query=new URLSearchParams(params);query.delete("workspace");query.set("workspace",identity.workspaceId);
   let rejectedAccess:string|undefined;
   for(let attempt=0;attempt<2;attempt++) {
@@ -140,11 +142,9 @@ export async function readViaSessionRead(config:ReaderConfig,identity:HistoryIde
       continue;
     }
     // Selection is final: every 501 stays unsupported on this backend,
-    // regardless of the response's reason or whether this is the first page.
-    if(response.status===501) {
-      await response.body?.cancel().catch(()=>{});
-      return {status:"unsupported",reason:UNSUPPORTED_BY_BACKEND};
-    }
+    // whatever its reason or whether this is the first page. The reason is
+    // reported (relayfacts tells a disabled flag from other refusals).
+    if(response.status===501) return {status:"unsupported",reason:await unsupportedReason(response)};
     if(!response.ok) {
       await response.body?.cancel().catch(()=>{});
       if(response.status===410 && cursor) throw new ReadCursorExpiredError();

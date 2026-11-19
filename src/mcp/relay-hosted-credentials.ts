@@ -6,7 +6,7 @@ import type { Database } from "../database.js";
 /**
  * One-time hosted participant credentials for gate-only installs
  * (SELFHOST_RELAYGATE_PUBLIC_URL set; docs/identity.md, "Hosted participants
- * on gate-only installs"). Migration 0078.
+ * on gate-only installs"). Migration 0079.
  *
  * Every hosted MCP participant (an MCP connector's agent: ChatGPT, Grok Bot,
  * Muse, Cursor cloud agents, any MCP client) enrols at relaygate, so the

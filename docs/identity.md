@@ -1565,7 +1565,7 @@ Relaycast agent token for its traffic:
 - **Enrolment.** For each participant Control mints an opaque `sh_ht_`
   hosted credential, valid for 2 minutes and redeemable once. It is bound to
   the workspace, the organization, the owning user, the exact agent name and
-  the hosted client (table `relay_hosted_credentials`, migration 0078; only
+  the hosted client (table `relay_hosted_credentials`, migration 0079; only
   the hash is stored). Control presents it to relaygate's `POST /v1/register`
   itself, with no database transaction open, because relaygate introspects it
   here. The client is the connection's connector kind (`chatgpt`, `grok-bot`,

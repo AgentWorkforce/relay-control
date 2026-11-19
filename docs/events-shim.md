@@ -58,7 +58,19 @@ All under `/api/v1/events-shim` (also `/cloud/api/v1/events-shim`).
 The three tokens are shown once; an unknown or expired token answers 404.
 
 MCP tools: `watch_webhooks` (start here), `link_relay_wake`,
-`unlink_relay_wake`, `get_webhook_events`, `wait_for_webhook`.
+`unlink_relay_wake`, `get_webhook_events`, `wait_for_webhook`,
+`ack_webhook_events`, `release_webhook_events`.
+
+`wait_for_webhook` with `auto_ack: false` leases the posts it returns instead
+of marking them read (the store implements the package's optional
+`ackPending`/`releasePending`): they stay `pending` with `delivered_at` set to
+the claim time and `claim_token` (migration 0078) to the token the result
+carries, and no other wait takes them for 2 minutes. `ack_webhook_events`
+(or the next wait's `ack_ids` with `ack_claim_token`) marks them read, and
+`release_webhook_events` makes them claimable at once; posts neither
+acknowledged nor released are offered again once the lease ends. Both act
+only on posts still `pending` under that token, never on a `sending` wake
+forward. While a relay wake link works, `wait_for_webhook` claims nothing.
 
 ## Waking the agent
 

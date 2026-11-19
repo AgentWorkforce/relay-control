@@ -251,6 +251,56 @@ test("without a link the agent long-polls wait_for_webhook", async (t) => {
   assert.equal(result.structuredContent!.events[0].delivery, "read");
 });
 
+test("wait_for_webhook (auto_ack: false) leases posts until acknowledged or released; none while a wake link works", async (t) => {
+  const p = await plane(t);
+  const shim = await p.create(await p.signIn());
+  const call = await p.connect(shim.mcp_url);
+  const posted = await p.post(shim.webhook_url, { n: 1 });
+  assert.equal(posted.status, 202, posted.raw);
+  const id = posted.body.event_id as string;
+
+  const leased = await call("wait_for_webhook", { timeout_seconds: 2, auto_ack: false });
+  assert.notEqual(leased.isError, true, JSON.stringify(leased.content));
+  assert.deepEqual(leased.structuredContent!.events.map((event: { id: string; delivery: string }) => [event.id, event.delivery]), [[id, "pending"]]);
+  const token = leased.structuredContent!.claim_token as string;
+  assert.match(token, /^clm_/);
+  const row = async () => (await p.database.query<{ delivery: string; claim_token: string | null }>(
+    "SELECT delivery, claim_token FROM events_shim_events WHERE id = $1", [id])).rows[0];
+  assert.deepEqual(await row(), { delivery: "pending", claim_token: token });
+  // Leased: another wait takes nothing.
+  const other = await call("wait_for_webhook", { timeout_seconds: 1, auto_ack: false });
+  assert.deepEqual(other.structuredContent!.events, []);
+
+  // A wrong token settles nothing; release gives the post back at once.
+  assert.equal((await call("release_webhook_events", { ids: [id], claim_token: "clm_wrong" })).isError, true);
+  const released = await call("release_webhook_events", { ids: [id], claim_token: token });
+  assert.notEqual(released.isError, true, JSON.stringify(released.content));
+  assert.deepEqual(released.structuredContent!.released, [id]);
+  const again = await call("wait_for_webhook", { timeout_seconds: 2, auto_ack: false });
+  assert.deepEqual(again.structuredContent!.events.map((event: { id: string }) => event.id), [id]);
+  const second = again.structuredContent!.claim_token as string;
+  assert.notEqual(second, token);
+  const acked = await call("ack_webhook_events", { ids: [id], claim_token: second });
+  assert.notEqual(acked.isError, true, JSON.stringify(acked.content));
+  assert.deepEqual(acked.structuredContent!.acked, [id]);
+  assert.deepEqual(await row(), { delivery: "read", claim_token: null });
+
+  // While a relay wake link works, a leased wait takes nothing: the link delivers the post.
+  const linked = await call("link_relay_wake", { url: RELAY_HOOK, secret: RELAY_SECRET });
+  assert.equal(linked.structuredContent!.wake, "linked");
+  const next = await p.post(shim.webhook_url, { n: 2 });
+  const waited = await call("wait_for_webhook", { timeout_seconds: 1, auto_ack: false });
+  assert.deepEqual(waited.structuredContent!.events, []);
+  assert.equal(waited.structuredContent!.claim_token, undefined);
+  let forwarded: { delivery: string; claim_token: string | null } | undefined;
+  for (let i = 0; i < 100 && forwarded?.delivery !== "woken"; i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+    forwarded = (await p.database.query<{ delivery: string; claim_token: string | null }>(
+      "SELECT delivery, claim_token FROM events_shim_events WHERE id = $1", [next.body.event_id])).rows[0];
+  }
+  assert.deepEqual(forwarded, { delivery: "woken", claim_token: null });
+});
+
 test("creating needs a signed-in person; manage, webhook and MCP routes need their capability", async (t) => {
   const p = await plane(t);
   const anonymous = await request(p.origin, `${SHIM}/shims`, { method: "POST" });
@@ -518,6 +568,137 @@ test("a claim for a stale or broken wake link claims nothing", async (t) => {
   await s.store.setWakeTarget(s.shim.id, { url: RELAY_HOOK, secret: RELAY_SECRET, linkedAt: newLink });
   const claimed = await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: NOT_STALE, linkedAt: newLink }, "sending", s.now);
   assert.deepEqual(claimed.map((event) => event.id), [a.id]);
+});
+
+// wait_for_webhook leases (auto_ack: false): the optional ackPending/releasePending, as the package's memory store.
+const T = (minutes: number) => new Date(Date.parse("2026-01-01T00:00:00.000Z") + minutes * 60_000).toISOString();
+
+test("a lease holds a claim for its token: pending, neither claimable nor counted until it expires", async (t) => {
+  const s = await bareStore(t);
+  const a = await s.fresh(1);
+  const leased = await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: NOT_STALE }, "pending", T(10), "clm_first");
+  assert.deepEqual(leased.map((event) => [event.id, event.delivery, event.deliveredAt, event.claimToken]), [[a.id, "pending", T(10), "clm_first"]]);
+  // Lease live (claimed at 10, stale cut-off at 5): no other wait takes it.
+  assert.equal(await s.store.countPending(s.shim.id, T(5)), 0);
+  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: T(5) }, "pending", T(11), "clm_other"), []);
+  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: T(5) }, "read", T(11)), []);
+  // The listener died: once the lease is older than staleBefore the post is offered again.
+  assert.equal(await s.store.countPending(s.shim.id, T(15)), 1);
+  const again = await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: T(15) }, "pending", T(16), "clm_second");
+  assert.deepEqual(again.map((event) => [event.id, event.deliveredAt, event.claimToken]), [[a.id, T(16), "clm_second"]]);
+  // The first listener's token no longer settles anything; the new one does.
+  assert.deepEqual(await s.store.ackPending(s.shim.id, [a.id], T(17), "clm_first"), []);
+  assert.deepEqual(await s.store.releasePending(s.shim.id, [a.id], "clm_first"), []);
+  assert.deepEqual(await s.store.ackPending(s.shim.id, [a.id], T(18), "clm_second"), [a.id]);
+  const read = await s.state(a.id);
+  assert.equal(read.delivery, "read");
+  assert.equal(read.deliveredAt, T(18));
+  assert.equal(read.claimToken, undefined);
+});
+
+test("ackPending acknowledges only with the claim's token, once, and only the named posts", async (t) => {
+  const s = await bareStore(t);
+  const [a, b] = [await s.fresh(1), await s.fresh(2)];
+  await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: NOT_STALE }, "pending", T(10), "clm_mine");
+  assert.deepEqual(await s.store.ackPending(s.shim.id, [a.id, b.id], T(11), "clm_wrong"), []);
+  assert.deepEqual(await s.store.ackPending(s.shim.id, [a.id, b.id], T(11), ""), []);
+  // A malformed id matches nothing and fails nothing.
+  assert.deepEqual(await s.store.ackPending(s.shim.id, ["not-a-uuid", b.id], T(12), "clm_mine"), [b.id]);
+  assert.deepEqual(await s.store.ackPending(s.shim.id, [b.id], T(13), "clm_mine"), []);
+  const held = await s.state(a.id);
+  assert.deepEqual([held.delivery, held.deliveredAt, held.claimToken], ["pending", T(10), "clm_mine"]);
+  const done = await s.state(b.id);
+  assert.deepEqual([done.delivery, done.deliveredAt], ["read", T(12)]);
+  // Another inbox cannot reach these posts, even with the token.
+  assert.deepEqual(await s.store.ackPending(crypto.randomUUID(), [a.id], T(14), "clm_mine"), []);
+  // A lease that expired but was not claimed again can still be acknowledged.
+  assert.equal(await s.store.countPending(s.shim.id, T(30)), 1);
+  assert.deepEqual(await s.store.ackPending(s.shim.id, [a.id], T(31), "clm_mine"), [a.id]);
+  assert.equal(await s.store.countPending(s.shim.id, T(30)), 0);
+});
+
+test("releasePending ends a lease at once: the post is claimable before the lease would end", async (t) => {
+  const s = await bareStore(t);
+  const a = await s.fresh(1);
+  await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: NOT_STALE }, "pending", T(10), "clm_mine");
+  assert.deepEqual(await s.store.releasePending(s.shim.id, [a.id], "clm_wrong"), []);
+  assert.deepEqual(await s.store.releasePending(s.shim.id, [a.id], ""), []);
+  assert.equal(await s.store.countPending(s.shim.id, T(5)), 0);
+  assert.deepEqual(await s.store.releasePending(s.shim.id, [a.id], "clm_mine"), [a.id]);
+  const released = await s.state(a.id);
+  assert.deepEqual([released.delivery, released.deliveredAt, released.claimToken], ["pending", undefined, undefined]);
+  // The old token is spent, and the next wait takes the post at once.
+  assert.deepEqual(await s.store.ackPending(s.shim.id, [a.id], T(11), "clm_mine"), []);
+  assert.equal(await s.store.countPending(s.shim.id, T(5)), 1);
+  const next = await s.store.claimPending(s.shim.id, { limit: 10, staleBefore: T(5) }, "read", T(12));
+  assert.deepEqual(next.map((event) => [event.id, event.delivery, event.claimToken]), [[a.id, "read", undefined]]);
+});
+
+test("ackPending and releasePending never settle unclaimed posts or relay wake forwards in flight", async (t) => {
+  const s = await bareStore(t);
+  const [unclaimed, forwarding] = [await s.fresh(1), await s.fresh(2)];
+  const [sending] = await s.store.claimPending(s.shim.id, { limit: 1, ids: [forwarding.id], staleBefore: NOT_STALE }, "sending", T(10));
+  assert.equal(sending!.claimToken, undefined);
+  // Not even with the forward's claim time, which a token-less lease would match.
+  for (const token of [T(10), "clm_any"]) {
+    assert.deepEqual(await s.store.ackPending(s.shim.id, [unclaimed.id, forwarding.id], T(11), token), []);
+    assert.deepEqual(await s.store.releasePending(s.shim.id, [unclaimed.id, forwarding.id], token), []);
+  }
+  const untouched = await s.state(unclaimed.id);
+  assert.deepEqual([untouched.delivery, untouched.deliveredAt], ["pending", undefined]);
+  const inFlight = await s.state(forwarding.id);
+  assert.deepEqual([inFlight.delivery, inFlight.deliveredAt], ["sending", T(10)]);
+  // The forward still settles as before.
+  await s.store.confirmWake(s.shim.id, forwarding.id, T(10), T(12));
+  const woken = await s.state(forwarding.id);
+  assert.deepEqual([woken.delivery, woken.deliveredAt], ["woken", T(12)]);
+});
+
+test("a lease stored without a token is matched by its claim time", async (t) => {
+  const s = await bareStore(t);
+  const a = await s.fresh(1);
+  const [leased] = await s.store.claimPending(s.shim.id, { limit: 1, staleBefore: NOT_STALE }, "pending", T(10));
+  assert.deepEqual([leased!.delivery, leased!.deliveredAt, leased!.claimToken], ["pending", T(10), undefined]);
+  assert.deepEqual(await s.store.ackPending(s.shim.id, [a.id], T(11), T(9)), []);
+  assert.deepEqual(await s.store.ackPending(s.shim.id, [a.id], T(11), T(10)), [a.id]);
+});
+
+test("concurrent leased waits never share a post, and each lease answers only to its own token", async (t) => {
+  const s = await bareStore(t);
+  for (let n = 0; n < 20; n += 1) await s.fresh(n);
+  const tokenOf = (i: number) => (i % 3 ? `clm_${i}` : undefined);
+  const claims = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+    s.store.claimPending(s.shim.id, { limit: 5, staleBefore: NOT_STALE }, i % 3 ? "pending" : "read", T(30), tokenOf(i))));
+  const ids = claims.flat().map((event) => event.id);
+  assert.equal(ids.length, 20, "every event claimed");
+  assert.equal(new Set(ids).size, 20, "no event claimed twice");
+  // Every lease is live at a cut-off before its claim: nothing left to take.
+  assert.equal(await s.store.countPending(s.shim.id, T(25)), 0);
+  assert.deepEqual(await s.store.claimPending(s.shim.id, { limit: 50, staleBefore: T(25) }, "pending", T(31), "clm_late"), []);
+  for (const [i, batch] of claims.entries()) {
+    if (!tokenOf(i)) continue;
+    const named = batch.map((event) => event.id);
+    const other = claims.findIndex((_, j) => j !== i && tokenOf(j));
+    assert.deepEqual(await s.store.ackPending(s.shim.id, named, T(32), tokenOf(other)!), []);
+    assert.deepEqual(await s.store.ackPending(s.shim.id, named, T(32), tokenOf(i)!), named);
+  }
+});
+
+test("the claim token is stored only while the post is leased", async (t) => {
+  const s = await bareStore(t);
+  const a = await s.fresh(1);
+  const token = async () => (await s.database.query<{ claim_token: string | null }>(
+    "SELECT claim_token FROM events_shim_events WHERE id = $1", [a.id])).rows[0]!.claim_token;
+  await s.store.claimPending(s.shim.id, { limit: 1, staleBefore: NOT_STALE }, "pending", T(10), "clm_stored");
+  assert.equal(await token(), "clm_stored");
+  // The lease expired and a relay wake forward took the post: the old token is gone.
+  await s.store.claimPending(s.shim.id, { limit: 1, staleBefore: T(15) }, "sending", T(16));
+  assert.equal(await token(), null);
+  assert.deepEqual(await s.store.ackPending(s.shim.id, [a.id], T(17), "clm_stored"), []);
+  await s.store.releaseWake(s.shim.id, a.id, T(16), "relay down");
+  await s.store.claimPending(s.shim.id, { limit: 1, staleBefore: NOT_STALE }, "pending", T(20), "clm_next");
+  assert.deepEqual(await s.store.releasePending(s.shim.id, [a.id], "clm_next"), [a.id]);
+  assert.equal(await token(), null);
 });
 
 test("listStalledWakes finds linked inboxes with an old enough stalled post; the sweeper delivers it", async (t) => {

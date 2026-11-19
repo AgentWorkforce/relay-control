@@ -80,7 +80,7 @@
     {"name":"0075_token_session_client_telemetry.sql","sha256":"6c9ce658602d7a5eebad9b7c13a2e2ddca6c1a22f6a3e4ee0be8b3357fafd479"},
     {"name":"0076_events_shim_agent_links.sql","sha256":"3f1441ca8cd33613c585c4c725de0a8e88df457e070ec6fb1756214aa7c3e821"},
     {"name":"0077_events_shim_sender_release_attempts.sql","sha256":"f586a6324c3af8d81e00cae9fea161772673a0d7ea55c865dfb00bafa3d901cd"},
-    {"name":"0078_hosted_relay_gate.sql","sha256":"e4e6e37fed462f13df43bcd521436120064f1e89e4048168bb055200eb1db9ed"}
+    {"name":"0078_events_shim_claim_leases.sql","sha256":"1729204ca96b4196d16369b039b72c70b43ae6036c955d06e89f2f168d6d4b7a"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -406,6 +406,7 @@
     {"kind":"column","name":"public.events_shim_agent_links.user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"uuid"}},
     {"kind":"column","name":"public.events_shim_agent_links.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"uuid"}},
     {"kind":"column","name":"public.events_shim_events.body","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":9,"type":"text"}},
+    {"kind":"column","name":"public.events_shim_events.claim_token","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":14,"type":"text"}},
     {"kind":"column","name":"public.events_shim_events.content_type","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":8,"type":"text"}},
     {"kind":"column","name":"public.events_shim_events.delivered_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":12,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.events_shim_events.delivery","definition":{"collation":"pg_catalog.default","default":"'pending'::text","generated":"","identity":"","not_null":true,"position":11,"type":"text"}},
@@ -2129,5 +2130,5 @@
   "optional":{
 
   },
-  "sha256":"916331cb32a94e8abe384be468915a614fab34231d8faeefcb3e1d3081dc85bf"
+  "sha256":"58bf921c18df5ac451d344a78b72cb34a3a58b79bebfc058845ba1dd36fd5c6c"
 }

@@ -111,6 +111,14 @@ export class SharedSessionsToolError extends Error {
   }
 }
 
+/** The read API answered 501 for this view; `reason` is its code (see unsupportedReason). */
+export class BackendUnsupportedError extends SharedSessionsToolError {
+  constructor(readonly reason: string) {
+    super("The selected backend does not support this view (unsupported_by_backend).");
+    this.name = "BackendUnsupportedError";
+  }
+}
+
 export const UNAVAILABLE_MESSAGE = "Shared session history is temporarily unavailable. Please try again.";
 const ATTESTATION_MESSAGE =
   "Workspace-scoped shared session history is not available yet. Please try again later.";
@@ -180,7 +188,7 @@ export function historyReader(
       const result = (staffGrant || desktopGrant || oauthGrant ? null : await readViaSessionRead(config, identity, url.pathname, url.searchParams, marker))
         ?? await readWorkspaceHistory(config, identity, url.pathname, url.searchParams);
       if (result.status === "unsupported") {
-        throw new SharedSessionsToolError("The selected backend does not support this view (unsupported_by_backend).");
+        throw new BackendUnsupportedError(result.reason);
       }
       if (result.status !== "ok") throw new SharedSessionsToolError(UNAVAILABLE_MESSAGE);
       return result.body;

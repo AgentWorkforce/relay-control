@@ -5,12 +5,14 @@ assigned at release.
 
 ## Unreleased
 
+- Added: `SELFHOST_DEFAULT_SHARING_MODE` (`all` | `new` | `selected`) sets a deployment sharing mode served to callers whose organization has not saved one, and `SELFHOST_SHARING_MODE_OVERRIDE_ROLES` (`owner` and/or `admin`) leaves callers with those roles unlocked: their v1 policy omits `sharing_mode` and `sharing_mode_since`, and the v2 document serves the effective mode as `sections.capture.defaults.sharing_mode`. The organization-saved mode always wins. Applied per caller on `access/me`, the enrollment key exchange, introspection `capture_policy` (staff read grants as a member) and the upload-credentials revision check. Nothing is stored, no revision moves, and the organization policy routes and fleet view still show only what is stored. Both unset (the default), every response is unchanged. See docs/capture-policy.md.
+- Added: `relayfacts_list` and `relayfacts_get` on the Agent Relay MCP. They read the sessions pipeline read API's `GET /v1/relayfacts` (topics with counts) and `GET /v1/relayfacts/{topic}` (one page of a topic as markdown, `page` passed back as its cursor) through the same reader as the shared-session tools: `workspace` is always the credential's workspace, and a response without the workspace attestation returns nothing. They store and write nothing. Until the read API serves relayfacts (`READ_API_RELAYFACTS_ENABLED` off), every 501 is a successful `status: "disabled"` result ("relayfacts disabled") with the upstream reason. OAuth connections need `relay:history`; staff read grants do not get them. The per-user session reader now passes relayfacts cursors through unchanged and reports a 501's upstream reason.
 - Security: on a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set), every
   hosted MCP participant now enrols at relaygate and its traffic, reads
   included, goes through relaygate. That covers native MCP sessions and OAuth
   connectors such as ChatGPT, Grok Bot, Muse and Cursor cloud agents. Before,
   they were registered in Relaycast with the workspace key and messaged
-  around relaygate's policy (migration 0078). Control mints a one-time `sh_ht_`
+  around relaygate's policy (migration 0079). Control mints a one-time `sh_ht_`
   hosted credential that relaygate introspects as `relay_hosted` with the
   participant's client. relaygate admits hosted participants only through
   rules naming the hosted kind, so **operators must add a relaygate
@@ -34,6 +36,7 @@ assigned at release.
   caller, so the node treats that chat's DMs to the worker as native input.
   OAuth and unlinked hosted sessions omit both. The requester is not stored
   and does not change the launch's idempotency.
+- Fixed: a webhook inbox no longer loses a post when the `wait_for_webhook` listener dies between claiming it and handing it over (migration 0078, `@agent-relay/events-shim` leases). With `auto_ack: false` the posts stay unread under a 2-minute lease and a `claim_token`; `ack_webhook_events` (or the next wait's `ack_ids`) marks them read, `release_webhook_events` gives them back at once, and posts neither acknowledged nor released are offered again when the lease ends. Only the claim's token settles a lease, and relay wake forwards in flight are never touched. While a relay wake link works, no wait takes posts.
 - Fixed: a webhook inbox's relay identity is no longer lost when releasing it fails or the server stops mid-release (migration 0077). Unlinking, relinking or the sweep now queues the identity in the same transaction that removes or replaces its link, and it leaves the queue only once released. The sweep retries the least recently attempted releases first, so one failing Relaycast workspace cannot hold up the others.
 - Added: a webhook inbox can wake a bound cloud agent (migration 0076). With `events_shim` selected, the Agent Relay MCP's `link_webhook_inbox` lets a current owner or admin link an inbox they created to their own bound Amp thread, Replica or Capy binding. Each post then reaches that agent as a relay DM from the inbox's own relay identity, framed as untrusted webhook data with `@mentions` neutralised. `unlink_webhook_inbox` undoes it. Every forward re-checks the inbox, the binding row and generation, the relay agent id, the name's current holder and the Relaycast workspace, and marks the link broken if any changed. The minute sweep releases a deleted inbox's identity on the Relaycast workspace it was registered on. Capy links wake the thread once native Capy delivery is mounted. See docs/events-shim.md.
 - Fixed: Desktop identity sync no longer drops the installation's attestation
