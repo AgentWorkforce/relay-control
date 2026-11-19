@@ -3,166 +3,124 @@
 Status: **proposal, not implemented.** Requested by Khaliq Gant. This document
 changes no code, migration or deployment.
 
-It covers three connected changes, all landing in relay-control:
+There are three phases, all in relay-control:
 
-1. Move hosted Grok Bot routine handling from Cloud (`AgentWorkforce/cloud`)
-   into relay-control, replacing Cloud piece by piece (strangler style).
-2. Replace the hardcoded routine prompt and the static plugin skill with a
-   versioned rules source that relay-control serves. Bots fetch it on every
-   wake, so changing it needs no plugin reinstall and no new setup. The
-   layered lead prompts use the same text.
-3. Add two operating rules to that source: orchestration-only, and stall
-   watching.
-
-The three are ordered on purpose. Every existing bot has to be set up once more
-when it moves off Cloud (see §1.4). That one setup also installs the dynamic
-bootstrap prompt, so it is the last setup any bot ever needs.
+1. **Copy** Cloud's Grok Bot webhook handling into relay-control as it is:
+   `grokRoutinePrompt`, `connect_grok_bot_routine` and what they directly need.
+   **This is a copy, not a migration.** Cloud (`AgentWorkforce/cloud`) is not
+   changed and keeps serving every bot connected to it. There is no cutover, no
+   move of existing routines and no Cloud rollback plan.
+2. Make the Grok Bot initial prompt **dynamic**: a versioned rules source in
+   relay-control that bots fetch on every wake. Changing it needs no plugin
+   reinstall and no new setup. The layered lead prompts share the same text.
+3. Add two rules to that source: **orchestration-only** and **stall watching**.
 
 ---
 
 ## 0. Current state
 
-### 0.1 Cloud (hosted, `agentrelay.com`)
+### 0.1 Cloud (source of the copy; read only)
 
 | Piece | Location in `cloud` | What it does |
 |---|---|---|
 | Routine contract | `packages/web/lib/mcp-events/grok-routine.ts` | `parseGrokRoutineUrl`, `parseGrokRoutineKey`, `parseGrokRoutineDetails` (one-paste), `parseGrokRoutineAgentName`, `perBotConnectionRequired`, `grokRoutineHeaders` (Bearer `crsr_` key + `X-MCP-Subscription-Id` + `webhook-id`), `SHOW_UI_GUIDANCE`, and **`grokRoutinePrompt()`**: a hardcoded template for webhook or polling mode, with or without reply rights |
-| Sender-check strings | `lib/mcp-events/sender-check.ts` | `SENDER_CHECK` / `REPLY_SETTING` labels, quoted by both the prompt and `get_event`'s app block so the two cannot drift apart |
-| MCP tools | `lib/mcp-events/server.ts` (~390–475) | `connect_grok_bot_routine` (webhook or polling; returns `routine_prompt`, `inbox_address`, `setup_url`, `next_steps`), `disconnect_grok_bot_routine`, plus `get_event` / `get_recent_events` / `relay_events_status` / `answer_reply_question`, which the prompt depends on |
-| Delivery | `lib/mcp-events/service.ts` (`post` / `postRoutine`, ~513–529) | Events pump; POSTs a thin `relay.message` / `relay.channel_message` event body to the routine. Row in `mcp_event_subscriptions` with `delivery_mode='routine'` (`secrets[0]` is the `crsr_` key) or `'polling'` (ingest only) |
-| Setup context | `lib/mcp-events/grok-setup-context.ts`, `grok-setup.ts` | Query keys for the setup page; `hasGrokRoutine(principal)` |
-| UI | `app/connect/grok/*` (name prefill and `webhook/` setup flow with verification screen), `app/dashboard/relay/grok-routine-*` (dashboard setup and actions), `app/oauth/connect/grok/*` and `app/oauth/_components/grok-*` (Grok consent screen), `lib/auth/grok-name-handoff.ts` | Browser flows |
-| Plugin | `integrations/grok-bot/` (v0.1.4): `mcp.json` → `https://agentrelay.com/cloud/api/v1/mcp/relay-events`; `skills/agent-relay-grok-bot/SKILL.md` | Static skill: connect flow, wake-up setup, **wake handling, delegation policy**, `show_ui` usage. Public copy in `AgentWorkforce/skills` `plugins/grok-bot` |
-| Scenarios | `.composal/scenarios/grok-webhook/*` | Setup UX scenarios |
+| Sender-check strings | `lib/mcp-events/sender-check.ts` | `SENDER_CHECK` / `REPLY_SETTING` labels, quoted by both the prompt and `get_event`'s app block |
+| MCP tools | `lib/mcp-events/server.ts` (~390–475) | `connect_grok_bot_routine` (webhook or polling; returns `routine_prompt`, `inbox_address`, `setup_url` or `suggested_interval_minutes`, `next_steps`), `disconnect_grok_bot_routine`; the prompt depends on `get_event` / `get_recent_events` |
+| Delivery | `lib/mcp-events/service.ts` (`post` / `postRoutine`, ~513–529) | Events pump; POSTs a thin `relay.message` / `relay.channel_message` event to the routine URL. Row in `mcp_event_subscriptions`, `delivery_mode='routine'` (`secrets[0]` is the `crsr_` key) or `'polling'` |
+| Setup context | `lib/mcp-events/grok-setup-context.ts`, `grok-setup.ts` | Setup-page query keys; `hasGrokRoutine(principal)` |
+| UI | `app/connect/grok/*`, `app/dashboard/relay/grok-routine-*`, `app/oauth/connect/grok/*` | Next.js browser flows |
+| Plugin | `integrations/grok-bot/` (v0.1.4): `mcp.json` → `https://agentrelay.com/cloud/api/v1/mcp/relay-events`; `skills/agent-relay-grok-bot/SKILL.md` | Static skill: connect, wake-up setup, wake handling, delegation, `show_ui` |
 
-### 0.2 relay-control today (merged in #136, self-hosted only)
+### 0.2 relay-control today (self-hosted port, merged in #136)
 
-- `src/mcp/grok-routine.ts`: `parseGrokRoutineCredentials`, `grokInboxPrompt()`
-  (a second hardcoded template, inbox-based).
-- `src/mcp/grok-routines.ts`: `GrokRoutines`, a grant-fenced, encrypted
-  routine per `mcp_oauth_grants` row (migration `0051_grok_bot_routines.sql`).
-  It runs a scan-and-wake worker that sends `{eventId, name:"relay.inbox",
-  agent, pending_count}` and serves a server-rendered setup page at
-  `/cloud/api/v1/grok-bot/routine`.
-- `src/mcp/grok-routine-tools.ts`: `connect_grok_bot_routine`
-  (`mode:"webhook"` only), `disconnect_grok_bot_routine`,
-  `grok_bot_routine_status`.
-- `docs/grok-bot.md`: the self-hosted contract.
+`src/mcp/grok-routine.ts` provides `parseGrokRoutineCredentials` and its own
+hardcoded `grokInboxPrompt()`. `src/mcp/grok-routines.ts` keeps one encrypted
+routine per `mcp_oauth_grants` row (migration `0051`), runs an inbox-scan
+worker that sends `{name:"relay.inbox", pending_count}`, and serves a
+server-rendered setup page at `/cloud/api/v1/grok-bot/routine`.
+`src/mcp/grok-routine-tools.ts` registers `connect_grok_bot_routine`
+(`mode:"webhook"` only), `disconnect_grok_bot_routine` and
+`grok_bot_routine_status`. The contract is documented in `docs/grok-bot.md`.
 
-Gaps relative to Cloud: no polling mode; no sender check or reply mode (every
-reply needs the person's approval); no `get_event` / `get_recent_events`; no
-one-paste parser; no dashboard UI or name-prefill page; plugin points at
-Cloud.
-
-### 0.3 Key constraint
-
-`scripts/cloud-import/README.md` lists **MCP OAuth grants as not imported
-("Connectors re-authorize")**. Cloud-issued Grok OAuth tokens are not valid at
-relay-control, and Cloud routine rows are keyed to Cloud grants
-(`principal = oauth:<cloudGrantId>`). Flipping the ingress route for
-`/cloud/api/v1/mcp/relay-events` to relay-control would break every connected
-bot at once. The migration below avoids that.
+The two differ. Cloud's prompt tells the bot to call `get_event(eventId)`, read
+a sender check, and follow a reply mode. relay-control's prompt drains
+`check_relay_inbox` and always asks before replying.
 
 ---
 
-## 1. Migrating Grok Bot handling into relay-control
+## 1. Phase 1: copy Cloud's Grok webhook handling as is
 
-### 1.1 What moves, what stays, what is dropped
+### 1.1 Goal and non-goals
 
-| Cloud piece | Decision | Lands as |
+Goal: a Grok Bot connected to relay-control gets the **same routine prompt and
+setup behaviour** it would get from Cloud, so the copied `grokRoutinePrompt`
+works unchanged. Non-goals: changing Cloud, moving Cloud's bots or routine rows,
+syncing state between the two systems, or porting Cloud's Next.js dashboard.
+
+The two systems run independently. A bot connected to Cloud keeps using Cloud.
+A bot connected to relay-control uses the copy. The only shared rule is
+guidance for the person: register one Grok routine URL in **one** system, or it
+is woken twice. The relay-control setup page says so. relay-control also refuses
+a routine id that is already saved under another grant in its own table.
+
+### 1.2 What is copied
+
+Copied verbatim except for imports and error types. Each copied file starts
+with a header comment naming the Cloud source path and commit.
+
+| Cloud source | relay-control destination | Notes |
 |---|---|---|
-| `parseGrokRoutineUrl` / `parseGrokRoutineKey` | **Already moved** (`parseGrokRoutineCredentials`). Keep one implementation | `src/mcp/grok-routine.ts` |
-| `parseGrokRoutineDetails` (one-paste) | **Move** | same file; setup page gets a single paste box as well as the two fields |
-| `parseGrokRoutineAgentName`, `perBotConnectionRequired` | **Move** (relay-control has `assertActor`, but not the explanatory message) | `src/mcp/grok-routine.ts` |
-| `grokRoutineHeaders` | **Move.** relay-control sends `webhook-id` today; add `X-MCP-Subscription-Id` = grant id so routine runs can correlate | `src/mcp/grok-routines.ts` |
-| `post()` / `postRoutine()` | **Do not port the MCP Events pump.** relay-control's inbox-scan worker already delivers; port only the header contract and the private-address revalidation behaviour (the exact host already rules out SSRF, so this is a no-op check) | `GrokRoutines` worker |
-| `grokRoutinePrompt()` | **Replace, do not port.** It becomes a short bootstrap prompt (§2.3); its procedural content moves into the rules source | `agent-rules/` + `grokBootstrapPrompt()` |
-| `grokInboxPrompt()` (relay-control) | **Replace** with the same bootstrap | — |
-| `sender-check.ts` + `get_event` app block | **Decision D1.** Recommended: port the sender check *as data* (`trusted_sender`, `reply_mode` fields on `check_relay_inbox` items for Grok connections) rather than as quoted text, and state the reply policy in the rules source. The string labels exist only because the old prompt was frozen at paste time; a dynamic prompt removes that need | `src/mcp/relay-messaging.ts` |
-| Polling mode | **Move** as `mode:"polling"`: no credential; the bootstrap says to call `check_relay_inbox` on a schedule. No ingest-only subscription table is needed, because the Relaycast inbox is the durable log | `grok-routine-tools.ts` |
-| `get_event` / `get_recent_events` | **Compat aliases only, Grok connections only, time-boxed** (§1.3) | `grok-routine-tools.ts` |
-| `grok-setup-context.ts`, `grok-setup.ts` | **Drop.** relay-control keys setup by grant id behind the browser session; workspace and name come from the grant | — |
-| `app/dashboard/relay/grok-routine-*` | **Move to relay-web** (dashboard UI), calling relay-control's `/cloud/api/v1/grok-bot/routine` JSON API. relay-control keeps its server-rendered page for self-hosters without relay-web | relay-web |
-| `app/connect/grok/*` (name prefill, webhook flow, verification screen) | **Move to relay-web**; prefill backed by a relay-control endpoint (decision D5) | relay-web + relay-control |
-| `app/oauth/connect/grok/*` consent screen | **Stays with whoever serves OAuth consent**: relay-control `src/mcp/oauth/consent.ts` already handles Grok redirect classification; port the Grok-specific copy or art only if Khaliq wants parity | relay-control |
-| `integrations/grok-bot/` plugin | **Move canonical copy to `AgentWorkforce/skills` `plugins/grok-bot`** (already the public copy). Cloud's copy is frozen. New version 0.2.0 points at relay-control (§1.4) and is slimmed (§2.6) | skills repo |
-| `.composal/scenarios/grok-webhook/*` | Port the scenarios that still apply (masking, reject-invalid, name handoff) to relay-web | relay-web |
+| `grok-routine.ts`: `grokRoutinePrompt`, `SHOW_UI_GUIDANCE`, `grokRoutineHeaders`, `parseGrokRoutineDetails`, `parseGrokRoutineAgentName`, `perBotConnectionRequired` | `src/mcp/grok-routine.ts` (merged into the existing file) | Keep the existing `parseGrokRoutineCredentials`; it implements the same rules as `parseGrokRoutineUrl` / `Key`. Tests copied from `grok-routine.test.ts` |
+| `sender-check.ts` | `src/mcp/sender-check.ts` | Two constants; needed by the prompt text |
+| `connect_grok_bot_routine` handler (webhook **and** polling, `name` / `from` / `mode`, `next_steps` strings) | `src/mcp/grok-routine-tools.ts` | Replaces the current webhook-only handler for Grok connections (decision D1). Still returns `setup_url` on relay-control's own page |
+| `disconnect_grok_bot_routine` (`mode` / `webhook_url`) | same | — |
+| `postRoutine` / `post` header and body contract | `GrokRoutines` worker in `src/mcp/grok-routines.ts` | The worker sends one Cloud-shaped event per message (`{eventId, name:"relay.message" \| "relay.channel_message", timestamp, cursor, data:{messageId, from, summary, agent, conversationId, threadId, …}}`) instead of the `relay.inbox` batch, using `grokRoutineHeaders`. The existing grant fence, encryption, backoff and redirect refusal stay |
 
-### 1.2 New relay-control surface (summary)
+**What the copied prompt directly needs.** The copy only works if these tools
+and data exist in relay-control:
 
-- `connect_grok_bot_routine({mode: "webhook" | "polling", name?})` returns
-  `{mode, inbox_address, routine_prompt (bootstrap), rules_version, setup_url?,
-  next_steps}`.
-- `disconnect_grok_bot_routine({mode?})`, `grok_bot_routine_status()`
-  (unchanged, plus `rules_version_last_fetched`).
-- `get_agent_rules` (§2.4), registered for every OAuth connection.
-- `get_event` / `get_recent_events` compat aliases (§1.3), Grok connections only.
-- Setup JSON API (existing `POST`/`DELETE` `/cloud/api/v1/grok-bot/routine`)
-  gains `routine_details` (one-paste).
+| Needed by the copied prompt | relay-control work |
+|---|---|
+| `get_event(eventId)` returning the full message plus an Agent Relay app block with `Sender check: trustedSender …` and `Reply setting: replyMode …` | New tool on Grok connections, backed by the Relaycast inbox (`eventId` = delivery id). The trusted-sender check uses the person's own agents and workspace members, as in Cloud's `trustedAgentNames` |
+| `get_recent_events(agent, since, scheduled, limit)` with `cursor`, `polling_active` and `delivery_paused` (polling mode) | New tool on Grok connections; the cursor is the Relaycast inbox position |
+| A reply mode setting (`notes-only` / `acknowledge` / `answer`) and reply consent | A small per-grant settings row (new migration `grok_bot_routines` columns: `delivery_mode`, `reply_mode`, `from_filter`, `polling_since`). Set on the setup page; defaults to `notes-only`, which keeps relay-control's current "ask first" behaviour unless the person opts in |
+| Polling mode with no credential | `delivery_mode='polling'` row with no ciphertext; the worker skips it |
+| `send_relay_message` / `post_relay_channel` with `reply_to` / `thread_id` | Already present |
 
-### 1.3 Keeping existing routines working
+**Not copied:** Cloud's MCP Events pump and `mcp_event_subscriptions`. The
+existing worker delivers instead. Also not copied:
+`grok-setup-context.ts` / `grok-setup.ts`, because relay-control keys setup by
+grant id behind the browser session. Cloud's Next.js `app/connect/grok/*` and
+`app/dashboard/relay/grok-routine-*` are not copied either; relay-control's
+server-rendered setup page gains the same fields (one-paste box, reply mode,
+sender filter). Porting the dashboard UI to relay-web is separate (D3).
 
-An existing hosted bot depends on three Cloud things at once: its Cloud OAuth
-grant, its `mcp_event_subscriptions` row holding the `crsr_` key, and the
-**pasted** prompt, which names `get_event` / `get_recent_events` and expects a
-`relay.message` body. None of these can be repointed silently. So:
+### 1.3 Tests for Phase 1
 
-1. **Cloud keeps serving every existing routine, unchanged, until that bot is
-   reconnected.** Nothing in Cloud is modified by this work (Cloud code is in
-   feature freeze for Grok; bug fixes only).
-2. **One deliverer per routine at any time.** A routine URL must never be
-   saved in both systems, or the bot wakes twice. Before saving, relay-control
-   checks its own table for the same routine id (the URL path) across grants
-   and refuses duplicates. Cross-system duplicates are prevented by the
-   reconnect flow (step 3) and by a read-only check, described below.
-3. **Per-bot reconnect** (the one remaining setup): the bot adds the relay-control MCP
-   server (new account label), approves consent, calls
-   `connect_grok_bot_routine`, and **reuses its existing Grok routine** by
-   replacing its prompt with the new bootstrap. The person pastes the same
-   routine URL and header into the relay-control page. Then the bot calls
-   Cloud's `disconnect_grok_bot_routine` on its old account, which deletes the
-   Cloud row and key.
-   - The ordering is "relay-control saved, then Cloud disconnected". Between
-     those two steps both systems could wake the routine. The bootstrap tells
-     the bot to deduplicate by `delivery_id` / `eventId`, and the window is one
-     chat turn.
-4. **Compat aliases** catch a bot whose prompt was not updated: on a Grok
-   connection, `get_event(eventId)` and `get_recent_events(...)` return the
-   pending inbox in the old shape and include `next_steps` saying: "This
-   routine's instructions are out of date: call `get_agent_rules` and update
-   the routine prompt to `routine_prompt`." Aliases are removed when the
-   telemetry counter of alias calls is zero for 14 days.
-5. **Optional bulk path (decision D2):** extend `scripts/cloud-import` to import
-   Cloud Grok OAuth grants and `delivery_mode IN ('routine','polling')` rows,
-   with the `crsr_` key re-encrypted under the Control keyring. This would avoid
-   re-consent, but it still needs the prompt update and an ingress flip of
-   `/cloud/api/v1/mcp/relay-events`, so it does not remove the per-bot step. It
-   also widens the import's credential surface. **Recommendation: skip it unless
-   the hosted Grok fleet is larger than the handful of AgentWorkforce bots.**
+- Copied unit tests: URL/key/one-paste parsing, header shape, and prompt
+  snapshots for webhook/polling × `canReply`. These match Cloud byte for byte,
+  so drift shows in a diff.
+- New: `get_event` app block for trusted and untrusted senders; reply-mode
+  text; `get_recent_events` cursor paging; polling-mode connect; duplicate
+  routine id refused.
+- End to end, self-hosted staging: create a Grok webhook routine with the
+  copied prompt, send a Relay message, and see it handled in the bot's chat.
+  Cloud is not involved.
 
-### 1.4 Phases, cutover and rollback
+### 1.4 Rollout
 
-| Phase | Change | Exit gate | Rollback |
-|---|---|---|---|
-| P0 | This spec approved; Cloud Grok code frozen | Khaliq's OK | — |
-| P1 | relay-control: rules source + `get_agent_rules` (§2), bootstrap prompt, polling mode, one-paste, sender-check fields, compat aliases. All behind `SELFHOST_GROK_ROUTINES_V2` (default off) | Tests (§5); self-hosted bot end-to-end in staging | Flag off; the existing #136 path is unchanged |
-| P2 | Hosted relay-control: enable for one internal bot (e.g. `iosgrok`) on a relay-control MCP URL (decision D3: `/mcp` or a dedicated `/cloud/api/v1/mcp/grok` alias). Reconnect it via §1.3 | 7 days of real wakes; every run fetched rules; no duplicate or missed wake against the Relaycast inbox | Re-save the routine in Cloud through the old dashboard, then disconnect it in relay-control. Cloud code is untouched, so this always works |
-| P3 | Remaining AgentWorkforce bots reconnect one at a time; relay-web dashboard and connect UI ship; plugin 0.2.0 published in `skills`, pointing new installs at relay-control | Count of Cloud `delivery_mode IN ('routine','polling')` rows = 0, via a read-only Cloud query run by its owner | Per bot, as in P2 |
-| P4 | Cloud's Grok `connect_grok_bot_routine` returns "moved: reconnect to Agent Relay" for new setups (a Cloud change, owned by the Cloud lead, separate PR) | 30 days with no Cloud Grok traffic | Revert that Cloud PR |
-| P5 | Remove compat aliases; Cloud Grok code deleted by Cloud owner as part of Cloud retirement | Alias counter at zero for 14 days | Re-add aliases (pure functions) |
-
-Cutover is per bot, not a global switch, so no point in the plan breaks all
-bots at once. Production enablement in P2 and P3 still requires Khaliq's
-explicit OK at each gate (AGENTS.md production gates).
+Behind `SELFHOST_GROK_ROUTINES_CLOUD_COPY` (default off). With the flag off,
+the #136 behaviour stays exactly as it is. Enabling it on a hosted or production
+deployment is a separate gate that needs Khaliq's OK.
 
 ---
 
-## 2. A dynamic rules source
+## 2. Phase 2: a dynamic rules source
 
 ### 2.1 Problem
 
-The routine prompt is fixed at paste time (`grokRoutinePrompt` in Cloud,
-`grokInboxPrompt` in relay-control), and `SKILL.md` is fixed at plugin
+After Phase 1, the routine prompt is still fixed at paste time (the copied
+`grokRoutinePrompt`), and `SKILL.md` is fixed at plugin
 install. Changing bot behaviour today means a new plugin version, a reinstall,
 and re-running `connect_grok_bot_routine` on every bot. Layered leads have a
 third copy of similar policy in `layered-agents/kit/{delegation,orchestration}.md`,
@@ -179,6 +137,16 @@ call `get_agent_rules` on every wake and follow it. Layered leads fetch the
 same bundle (`audience=lead`) when they start, and fall back to a pinned
 snapshot. To change behaviour you merge a PR to relay-control and deploy;
 nothing is reinstalled.
+
+**Continuity with Phase 1:** rules version 1's `grok-inbox` section is the copied
+`grokRoutinePrompt` text, rendered for the connection's mode and reply rights.
+The server fills in the agent name, mode, `since` and `from` per grant when it
+answers `get_agent_rules`. Behaviour on day one of Phase 2 therefore matches
+Phase 1; only where the text lives changes. Bots set up during Phase 1 keep
+their pasted prompt and still work, because the tools it calls stay. To move
+such a bot onto the dynamic source, replace its routine prompt with the
+bootstrap once. `connect_grok_bot_routine` returns the bootstrap from Phase 2
+on.
 
 ### 2.3 Bootstrap prompt (the only text pasted into Grok)
 
@@ -299,7 +267,7 @@ cannot write them.
 
 **Telemetry:** count fetches by `(connector kind, audience, version)` and record
 `rules_version_last_fetched` on the routine row. That shows which bots are on
-which rules and lets compat-alias removal be scheduled.
+which rules, and which Phase 1 bots still run a pasted prompt.
 
 ### 2.6 What happens to SKILL.md
 
@@ -342,7 +310,7 @@ never implement.
 
 ---
 
-## 3. Rules to include (draft text)
+## 3. Phase 3: rules to include (draft text)
 
 `sections/orchestration-only.md` (audience `grok-bot`):
 
@@ -395,7 +363,7 @@ covers the case where nothing arrives. See D6.
 - The bootstrap's fallback is fail-closed: no replies, spawns or actions without
   rules.
 - No change to grant fencing, revocation or encryption in `GrokRoutines`.
-- Compat aliases are read-only and appear only on `grok-bot` connector kinds.
+- `get_event` / `get_recent_events` (Phase 1) are read-only and registered only for `grok-bot` connector kinds.
 
 ## 5. Test plan
 
@@ -406,30 +374,31 @@ covers the case where nothing arrives. See D6.
   `tenancyMode=multi` and single.
 - HTTP: ETag/304, 401, org isolation.
 - Grok routine: the bootstrap is returned by `connect_grok_bot_routine` and
-  shown on the setup page; polling mode; compat aliases return `next_steps`;
-  duplicate routine id refused.
-- End to end (staging, P1/P2): a real Grok routine wakes, fetches rules
+  shown on the setup page; v1 `grok-inbox` output matches the Phase 1
+  `grokRoutinePrompt` snapshot for each mode.
+- End to end (self-hosted staging): a real Grok routine wakes, fetches rules
   (version visible in the chat note), drains the inbox, and follows up on a
   deliberately silent spawned agent.
 
 ## 6. Open questions and decisions for Khaliq
 
-- **D1 Sender check:** should hosted Grok bots keep auto-replying to trusted
-  senders (`trusted_sender` + `reply_mode` as data on inbox items), or adopt
-  relay-control's current "always ask before replying"? The orchestration rule
-  suggests auto-relaying results to the person is fine, but replying to other
-  agents unattended is a policy choice.
-- **D2 Grant import:** reconnect each hosted bot once (recommended), or build
-  a Cloud OAuth grant and routine import? How many hosted Grok routines exist
-  outside AgentWorkforce?
-- **D3 Endpoint:** which URL new Grok installs use on hosted relay-control:
-  `/mcp`, `/cloud/api/v1/mcp/shared-sessions`, or a new
-  `/cloud/api/v1/mcp/grok` alias? And is hosted relay-control already behind
-  `agentrelay.com` ingress for these paths?
+- **D1 Copy replaces or sits beside #136:** for Grok connections, should the
+  copied Cloud handler replace relay-control's current webhook-only
+  `connect_grok_bot_routine` and `grokInboxPrompt` (recommended: one behaviour,
+  behind the flag), or should both exist (for example `mode:"inbox"`
+  for the #136 prompt)?
+- **D2 Reply mode default:** the copied prompt allows unattended replies to
+  trusted senders when reply mode is `acknowledge` or `answer`. Default
+  `notes-only` (recommended, matching relay-control's current "ask first"), or
+  Cloud's default?
+- **D3 UI:** is the extended server-rendered setup page in relay-control enough
+  for Phase 1, with a relay-web dashboard port later, or should Phase 1 include
+  the relay-web UI?
 - **D4 Overlay storage:** DB overlay table with an admin API (recommended), or
   repo-file overlays for v1?
-- **D5 UI home:** confirm the dashboard and connect pages go to relay-web, with
-  relay-control's server-rendered page kept for self-hosters.
+- **D5 Plugin:** publish a Grok plugin variant pointing at relay-control's MCP
+  URL (in `AgentWorkforce/skills`, slimmed per §2.6), and which URL: `/mcp` or
+  `/cloud/api/v1/mcp/shared-sessions`? Cloud's plugin is untouched.
 - **D6 Stall watching without messages:** webhook routines only wake when
   messages arrive. Should every bot also get a scheduled heartbeat routine
   (for example every 30 minutes) so stalls are caught when nothing comes in?
@@ -444,5 +413,6 @@ covers the case where nothing arrives. See D6.
 
 ## 7. Out of scope
 
-Implementation; any Cloud code change (P4 and P5 are separate Cloud PRs by
-the Cloud owner); the MCP Events protocol for ChatGPT; Muse polling; deploys.
+Implementation; any change to Cloud (it stays untouched and keeps working);
+moving, importing or syncing Cloud's connected bots or routine rows; Cloud
+cutover or rollback; the MCP Events protocol for ChatGPT; Muse polling; deploys.
