@@ -75,6 +75,11 @@ const ownerEnrichmentFailed = (operation: "list_relay_agents" | "get_relay_agent
     operation, error: error instanceof Error ? error.name : "unknown",
   });
 };
+const inboxSenderEnrichmentFailed = (error: unknown) => {
+  console.warn("[selfhost-mcp] inbox sender enrichment failed", {
+    operation: "check_relay_inbox", error: error instanceof Error ? error.name : "unknown",
+  });
+};
 const sessionEnrichmentFailed = (error: unknown) => {
   console.warn("[selfhost-mcp] session enrichment failed", {
     operation: "list_relay_agents", error: error instanceof Error ? error.name : "unknown",
@@ -109,6 +114,7 @@ const DESKTOP_LINK_FIELDS = "desktop_address cannot be combined with name or des
 const DESKTOP_LINK_NEEDS_SESSION = "Initialize MCP to receive Mcp-Session-Id before linking a desktop identity.";
 const DESKTOP_LINK_OAUTH = "This connection acts only as the agent approved for it and cannot link a desktop identity. Use a native MCP session (one that keeps Mcp-Session-Id) to call join_relay with desktop_address.";
 const DESKTOP_INBOX_GUIDANCE = "Replies are injected into your session by Agent Relay Desktop; check_relay_inbox is not used for this linked identity.";
+const INBOX_SENDER_LOOKUP_TIMEOUT_MS = 1_000;
 const CHANNEL_REPLY_GUIDANCE = "Reply to a post in this channel with post_relay_channel channel=<name> thread_id=<message_id>. Use send_relay_message only when the reply is private.";
 const RESERVED_CHANNEL_PREFIX = "agent-events-";
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,79}$/;
@@ -1599,8 +1605,9 @@ function createRelayService(context: McpContext) {
       const hosted = await participant(as);
       if (!hosted) throw new RelayToolError("No hosted participant is bound to this MCP session. Send a message with send_relay_message to auto-join, or call join_relay first.");
       await touchPresence(hosted);
-      // Every fallible read finishes before any acknowledgement, so a failed
-      // enrichment leaves the deliveries pending for a retry.
+      // Required inbox and conversation reads finish before acknowledgement.
+      // Sender-address enrichment is optional and bounded: failure is logged
+      // and returned as a null address without failing the delivery read.
       const via = clientFor(hosted);
       const dir = directory(hosted);
       const [messages, conversations] = await Promise.all([
@@ -1608,7 +1615,9 @@ function createRelayService(context: McpContext) {
       ]);
       // Sender addresses come from one bounded lookup of the senders' names.
       const senders = [...new Set(messages.flatMap(message => message.sender ? [message.sender] : []))];
-      const agents = senders.length ? (await dir.via.findAgentsByNames(dir.credential, senders)).filter(isListedRelayAgent) : [];
+      const agents = senders.length ? (await dir.via.findAgentsByNames(dir.credential, senders, {
+        signal: AbortSignal.timeout(INBOX_SENDER_LOOKUP_TIMEOUT_MS),
+      }).catch(error => { inboxSenderEnrichmentFailed(error); return []; })).filter(isListedRelayAgent) : [];
       const addresses = new Map(agents.map(agent => [agent.name, agent.address]));
       const channelNames = new Map<string, string>();
       if (messages.some(isChannelDelivery)) {

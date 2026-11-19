@@ -266,14 +266,14 @@ export function createRelaycastClient(input: {
   }
 
   /** Bounded name lookup behind findAgentsByNames and findAgentByName. */
-  async function agentsByNames(workspaceKey: string, names: string[]): Promise<RosterAgent[]> {
+  async function agentsByNames(workspaceKey: string, names: string[], options: { signal?: AbortSignal } = {}): Promise<RosterAgent[]> {
     const wanted = [...new Set(names.map(name => name.trim()).filter(Boolean))];
     const found: RosterAgent[] = [];
     for (let start = 0; start < wanted.length; start += AGENT_NAME_LOOKUP_MAX) {
       const chunk = wanted.slice(start, start + AGENT_NAME_LOOKUP_MAX);
       const query = new URLSearchParams();
       for (const name of chunk) query.append("names", name);
-      const data = await labeled("find_agents", () => call("GET", `/v1/agents?${query}`, workspaceKey));
+      const data = await labeled("find_agents", () => call("GET", `/v1/agents?${query}`, workspaceKey, undefined, undefined, false, options.signal));
       if (!Array.isArray(data)) throw new RelaycastCallError(200, "", true);
       const requested = new Set(chunk);
       for (const item of data) {
@@ -498,8 +498,8 @@ export function createRelaycastClient(input: {
      * filtering keeps the result bounded and correct there too. Errors are not
      * retried with a full-roster read.
      */
-    async findAgentsByNames(workspaceKey: string, names: string[]): Promise<RosterAgent[]> {
-      return agentsByNames(workspaceKey, names);
+    async findAgentsByNames(workspaceKey: string, names: string[], options: { signal?: AbortSignal } = {}): Promise<RosterAgent[]> {
+      return agentsByNames(workspaceKey, names, options);
     },
 
     /**
