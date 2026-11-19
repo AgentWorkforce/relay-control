@@ -17,9 +17,10 @@ the first 200 characters as `projectContains`, whose directory semantics are a
 case-insensitive literal substring of the project ID, catalog project key or
 recorded repository URL, so matching happens before pagination; the returned
 rows are still checked against the full repository URL to exclude project-id
-or catalog-key matches. This requires the sessions read API P3b directory-list
-version (`feat(read-api): serve the session list and activity from the Supabase
-directory`, commit `92b907e3`, migration `20261105034000`) or later. `person` resolves an exact
+or catalog-key matches. This requires a sessions read API whose session directory
+list applies `projectContains` as a case-insensitive substring of project ID,
+catalog project key or recorded repository URL (directory migration
+`20261105034000` or later). `person` resolves an exact
 workspace member ID, email or unambiguous name and sends that recorded user
 ID as `user`. Unknown and ambiguous members are refused rather than
 broadening the request. `repo` accepts up to 512 characters and matches the

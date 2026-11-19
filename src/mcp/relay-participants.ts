@@ -75,6 +75,11 @@ const ownerEnrichmentFailed = (operation: "list_relay_agents" | "get_relay_agent
     operation, error: error instanceof Error ? error.name : "unknown",
   });
 };
+const sessionEnrichmentFailed = (error: unknown) => {
+  console.warn("[selfhost-mcp] session enrichment failed", {
+    operation: "list_relay_agents", error: error instanceof Error ? error.name : "unknown",
+  });
+};
 
 /** Contract section 4, verbatim (shared with Cloud's hosted MCP). */
 export const RELAY_AGENT_CARD_GUIDANCE = "Before delegating to a peer, read its card with get_relay_agent_card to see what it does and what to send it. Keep your own card current with set_relay_agent_card: a description of your purpose and one skill per kind of work you take on, with example requests.";
@@ -742,14 +747,22 @@ function createRelayService(context: McpContext) {
       `SELECT agent_name, agent_remote_id, native_session_kind, native_session_id
          FROM desktop_relay_identities
         WHERE workspace_id = $1 AND agent_remote_id = ANY($2::text[])
+          AND relaycast_workspace_id = $3
           AND native_session_kind IS NOT NULL AND native_session_id IS NOT NULL`,
-      [workspaceId, ids],
+      [workspaceId, ids, relayWorkspaceId],
     );
     const sessions = new Map<string, { sessionId: string; sessionKind: string }>();
+    const matched = new Set<string>();
     for (const row of rows.rows) {
       const agent = candidates.get(`${row.agent_remote_id}\0${row.agent_name}`);
+      if (!agent) continue;
+      if (matched.has(agent.id)) {
+        sessions.delete(agent.id);
+        continue;
+      }
+      matched.add(agent.id);
       const kind = row.native_session_kind.trim();
-      if (agent && syncedSessionKinds.has(kind) && syncedSessionId.test(row.native_session_id)) {
+      if (syncedSessionKinds.has(kind) && syncedSessionId.test(row.native_session_id)) {
         sessions.set(agent.id, { sessionId: row.native_session_id, sessionKind: kind });
       }
     }
@@ -761,7 +774,10 @@ function createRelayService(context: McpContext) {
     const [owners, synced] = await Promise.all([
       loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, listed, people, Boolean(gate))
         .catch(error => { ownerEnrichmentFailed("list_relay_agents", error); return undefined; }),
-      syncedDesktopSessions(listed),
+      syncedDesktopSessions(listed).catch(error => {
+        sessionEnrichmentFailed(error);
+        return new Map<string, { sessionId: string; sessionKind: string }>();
+      }),
     ]);
     return listed
       .map(agent => {

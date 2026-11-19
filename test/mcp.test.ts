@@ -879,15 +879,19 @@ test("list_relay_agents links synced Desktop sessions and keeps validated declar
     source: "relay-desktop", owner_hash: sha256(env.ownerId), injectable: "true",
     session_id: "declared-session-id", session_kind: "claude",
   });
-  const insert = (values: { id: string; sourceId: string; agentName: string; agentRemoteId: string; sessionKind: string; sessionId: string }) =>
+  const insert = (values: { id: string; sourceId: string; agentName: string; agentRemoteId: string; sessionKind: string; sessionId: string;
+    relaycastWorkspaceId?: string }) =>
     env.database.query(
       `INSERT INTO desktop_relay_identities
          (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id,
           agent_name, agent_remote_id, address, token_ciphertext, native_session_kind, native_session_id)
-       VALUES ($1, $2, $3, $4, 'rc-first', $5, $6, $7, $6 || '@fixture', 'encrypted', $8, $9)`,
-      [values.id, env.workspaceId, env.orgId, env.ownerId, values.sourceId, values.agentName,
-        values.agentRemoteId, values.sessionKind, values.sessionId],
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $7 || '@fixture', 'encrypted', $9, $10)`,
+      [values.id, env.workspaceId, env.orgId, env.ownerId, values.relaycastWorkspaceId ?? "rc-first", values.sourceId,
+        values.agentName, values.agentRemoteId, values.sessionKind, values.sessionId],
     );
+  await insert({ id: "00000000-0000-4000-8000-000000000106", sourceId: "00000000-0000-4000-8000-000000000107",
+    agentName: synced.name, agentRemoteId: synced.id, sessionKind: "claude", sessionId: "foreign-session-id",
+    relaycastWorkspaceId: "rc-other" });
   await insert({ id: "00000000-0000-4000-8000-000000000101", sourceId: "00000000-0000-4000-8000-000000000102",
     agentName: synced.name, agentRemoteId: synced.id, sessionKind: "opencode", sessionId: "ses_ABCD1234" });
   await insert({ id: "00000000-0000-4000-8000-000000000103", sourceId: "00000000-0000-4000-8000-000000000104",
@@ -901,6 +905,39 @@ test("list_relay_agents links synced Desktop sessions and keeps validated declar
   const declaredRow = agents.find((agent: any) => agent.name === declared.name);
   assert.deepEqual([declaredRow.session_id, declaredRow.session_kind, declaredRow.session_attribution],
     ["declared-session-id", "claude", "declared"]);
+});
+
+test("list_relay_agents session enrichment fails open and refuses ambiguous Desktop rows", async (t) => {
+  const env = await setup(t);
+  const peer = env.relay.world.addAgent("session-fallback", { source: "relay-desktop" });
+  const client = await relayClient(t, env);
+  const originalQuery = env.database.query.bind(env.database);
+  let mode: "reject" | "duplicate" = "reject";
+  env.database.query = (async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+    if (sql.includes("FROM desktop_relay_identities") && sql.includes("native_session_kind IS NOT NULL")) {
+      if (mode === "reject") throw new TypeError("private session query detail");
+      return { rows: [
+        { agent_name: peer.name, agent_remote_id: peer.id, native_session_kind: "codex", native_session_id: "session-one" },
+        { agent_name: peer.name, agent_remote_id: peer.id, native_session_kind: "claude", native_session_id: "session-two" },
+      ] as unknown as T[] };
+    }
+    return originalQuery<T>(sql, params);
+  }) as typeof env.database.query;
+  t.after(() => { env.database.query = originalQuery; });
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+
+  const unavailable = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
+  const unavailableRow = unavailable.agents.find((agent: any) => agent.name === peer.name);
+  assert.deepEqual([unavailableRow.session_id, unavailableRow.session_attribution], [null, null]);
+  assert.deepEqual(warnings, [["[selfhost-mcp] session enrichment failed",
+    { operation: "list_relay_agents", error: "TypeError" }]]);
+  assert.doesNotMatch(JSON.stringify(warnings), /private session query detail/);
+
+  mode = "duplicate";
+  const ambiguous = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
+  const ambiguousRow = ambiguous.agents.find((agent: any) => agent.name === peer.name);
+  assert.deepEqual([ambiguousRow.session_id, ambiguousRow.session_attribution], [null, null]);
 });
 
 test("agent card owner enrichment fails open when its journal or membership read fails", async (t) => {
