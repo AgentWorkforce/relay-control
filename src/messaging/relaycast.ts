@@ -639,9 +639,10 @@ export function createRelaycastClient(input: {
     /**
      * relaygate only: renews an unexpired rg_ token of a launched or hosted
      * agent (POST /v1/token/refresh); the presented token is revoked.
+     * `signal` aborts the request (a caller's deadline or shutdown).
      */
-    async refreshGateToken(token: string): Promise<string> {
-      const data = record(await labeled("gate_refresh", () => call("POST", "/v1/token/refresh", token, {})));
+    async refreshGateToken(token: string, signal?: AbortSignal): Promise<string> {
+      const data = record(await labeled("gate_refresh", () => call("POST", "/v1/token/refresh", token, {}, undefined, false, signal)));
       const renewed = text(data?.token);
       if (!renewed?.startsWith("rg_")) throw new RelaycastCallError(502, "", true);
       return renewed;

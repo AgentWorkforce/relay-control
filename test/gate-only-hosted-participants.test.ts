@@ -110,10 +110,9 @@ function relaygate(control: { origin: () => string }) {
           agent = { agentId: `rga_${randomUUID()}`, userId: answer.sub };
           state.agents.set(name, agent);
         }
-        // relaygate registers the agent upstream with its own workspace key, or takes the name over.
-        const existing = world.agents.get(name);
-        if (existing) existing.metadata = { ...existing.metadata, relaygate: { agent_id: agent.agentId } };
-        else world.addAgent(name, { relaygate: { agent_id: agent.agentId } });
+        // relaygate registers the agent upstream with its own workspace key, stamped with its agent id, or takes an
+        // existing upstream agent of that name over, leaving its metadata as it was.
+        if (!world.agents.has(name)) world.addAgent(name, { relaygate: { agent_id: agent.agentId } });
         return json(200, { agent_id: agent.agentId, gid: 22, token: issue(name), expires_at: new Date(Date.now() + 86_400_000).toISOString(), user_id: answer.sub });
       }
       const name = state.tokens.get(bearer);
@@ -158,8 +157,9 @@ async function gateHosted(t: TestContext) {
     t.after(() => client.close());
     return client;
   };
-  const rows = async () => (await env.database.query<{ agent_name: string; agent_remote_id: string; token_ciphertext: string; relaygate_agent_id: string | null }>(
-    "SELECT agent_name, agent_remote_id, token_ciphertext, relaygate_agent_id FROM hosted_relay_participants ORDER BY agent_name")).rows
+  const rows = async () => (await env.database.query<{ agent_name: string; agent_remote_id: string; token_ciphertext: string; relaygate_agent_id: string | null;
+    admitted_clients: string[] }>(
+    "SELECT agent_name, agent_remote_id, token_ciphertext, relaygate_agent_id, admitted_clients FROM hosted_relay_participants ORDER BY agent_name")).rows
     .map(row => ({ ...row, token: decryptSecret(row.token_ciphertext, KEYRING) }));
   /** Direct Relaycast calls made since `mark`. */
   const directSince = (mark: number) => state.direct.slice(mark);
@@ -214,8 +214,10 @@ test("on a gate-only install a hosted participant enrols at relaygate and every 
   structured(await client.callTool({ name: "relay_status", arguments: {} }));
   structured(await client.callTool({ name: "set_relay_agent_card", arguments: { description: "Takes notes", skills: [] } }));
 
-  // Nothing above reached Relaycast without relaygate: no participant token, no workspace key.
-  assert.deepEqual(directSince(mark), []);
+  assert.deepEqual((await rows())[0]!.admitted_clients, ["mcp"]);
+  // Nothing above reached Relaycast without relaygate: no participant token, and the workspace key only for the
+  // one control-plane check that the name is free before enrolling.
+  assert.deepEqual(directSince(mark), ["GET /v1/agents/notes-agent workspace-key"]);
   for (const expected of ["POST /v1/register", "GET /v1/whoami", "POST /v1/dm", "GET /v1/deliveries", "GET /v1/agents", "POST /v1/channels",
     "GET /v1/channels", "PATCH /v1/agent"]) {
     assert.ok(state.seen.includes(expected), `${expected} went through relaygate: ${JSON.stringify(state.seen)}`);
@@ -235,7 +237,9 @@ test("on a gate-only install relaygate fails closed: without a hosted rule nothi
   // Sending auto-joins, and is refused the same way; no agent was registered in Relaycast directly.
   assert.match(toolError(await client.callTool({ name: "send_relay_message", arguments: { to: "peer", text: "x" } })), /does not allow hosted mcp/);
   assert.equal(env.world.agents.has("notes-agent"), false);
-  assert.deepEqual(directSince(mark), []);
+  // Only the control-plane name checks used the workspace key; no agent was registered with it.
+  assert.ok(directSince(mark).length > 0);
+  for (const call of directSince(mark)) assert.match(call, /^GET \/v1\/agents\/[^/]+ workspace-key$/);
 });
 
 test("on a gate-only install a hosted participant can no longer reach Relaycast directly, and a pre-gate participant is re-enrolled through relaygate", async (t) => {
@@ -299,4 +303,89 @@ test("on a gate-only install directory reads need a relay identity first, and th
   assert.match(toolError(await client.callTool({ name: "list_relay_channels", arguments: {} })), /Call join_relay first/);
   assert.match(toolError(await client.callTool({ name: "join_relay", arguments: { name: launcherName(env.ownerId) } })), /reserved/);
   assert.deepEqual(await rows(), []);
+});
+
+test("on a gate-only install a name another owner holds is refused before any hosted credential is minted", async (t) => {
+  const { env, state, connect, rows } = await gateHosted(t);
+  const foreign = env.world.addAgent("notes-agent", {
+    source: "cloud-hosted-mcp", cloud_workspace_id: env.workspaceId, owner_hash: ownerHash("another-user"), kind: "hosted" });
+  const client = await connect();
+  assert.match(toolError(await client.callTool({ name: "join_relay", arguments: { name: "notes-agent" } })), /already taken/);
+  assert.equal(state.credentials.length, 0, "relaygate never saw an enrolment, so it never took the name over");
+  assert.deepEqual(await rows(), []);
+  assert.equal(env.world.agents.get("notes-agent"), foreign, "the other owner's agent is untouched");
+});
+
+test("on a gate-only install a binding-owned agent's name is refused before any hosted credential is minted", async (t) => {
+  const { env, state, connect, rows } = await gateHosted(t);
+  env.world.addAgent("notes-agent", { capy_binding_id: "binding-1" });
+  const client = await connect();
+  assert.match(toolError(await client.callTool({ name: "join_relay", arguments: { name: "notes-agent" } })), /already taken/);
+  assert.equal(state.credentials.length, 0);
+  assert.deepEqual(await rows(), []);
+  assert.ok(env.world.agents.has("notes-agent"));
+});
+
+test("on a gate-only install an interrupted join of the owner's own agent enrols that same agent through relaygate", async (t) => {
+  const { env, state, connect, rows } = await gateHosted(t);
+  const own = env.world.addAgent("notes-agent", {
+    source: "cloud-hosted-mcp", cloud_workspace_id: env.workspaceId, owner_hash: ownerHash(env.ownerId), kind: "hosted" });
+  const client = await connect();
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "notes-agent" } }));
+  const [row] = await rows();
+  assert.equal(row!.agent_remote_id, own.id);
+  assert.equal(row!.relaygate_agent_id, state.agents.get("notes-agent")!.agentId);
+  assert.match(row!.token, /^rg_/);
+});
+
+test("on a gate-only install a participant relaygate admitted for another hosted client is refused when the policy has no rule for this one", async (t) => {
+  const { env, state, connect, rows } = await gateHosted(t);
+  const client = await connect();
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "notes-agent" } }));
+  // Enrolled as another hosted client; this install's policy now allows only that one.
+  await env.database.query("UPDATE hosted_relay_participants SET admitted_clients = '{chatgpt}'");
+  state.allowed = new Set(["chatgpt"]);
+  const before = (await rows())[0]!;
+  const credentials = state.credentials.length;
+  assert.match(toolError(await client.callTool({ name: "relay_status", arguments: {} })), /does not allow hosted mcp participants/);
+  assert.equal(state.credentials.length, credentials + 1, "relaygate's policy decided, with a fresh enrolment");
+  const after = (await rows())[0]!;
+  assert.equal(after.token, before.token, "a refusal leaves the row and its token as they were");
+  assert.deepEqual(after.admitted_clients, ["chatgpt"]);
+  assert.equal(state.tokens.get(after.token), "notes-agent", "the stored token still works for the client it was admitted for");
+});
+
+test("on a gate-only install a second hosted client enrols once at relaygate and is then admitted beside the first", async (t) => {
+  const { env, state, connect, rows } = await gateHosted(t);
+  const client = await connect();
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "notes-agent" } }));
+  await env.database.query("UPDATE hosted_relay_participants SET admitted_clients = '{chatgpt}'");
+  state.allowed = new Set(["mcp", "chatgpt"]);
+  const before = (await rows())[0]!;
+  const credentials = state.credentials.length;
+  structured(await client.callTool({ name: "relay_status", arguments: {} }));
+  assert.equal(state.credentials.length, credentials + 1);
+  const after = (await rows())[0]!;
+  assert.deepEqual([...after.admitted_clients].sort(), ["chatgpt", "mcp"]);
+  assert.notEqual(after.token, before.token, "relaygate revoked the earlier token and issued one for the current rule");
+  assert.equal(after.relaygate_agent_id, before.relaygate_agent_id);
+  structured(await client.callTool({ name: "relay_status", arguments: {} }));
+  assert.equal(state.credentials.length, credentials + 1, "an admitted client does not enrol again");
+});
+
+test("on a gate-only install a renewed participant adopts the new relaygate agent relaygate answers for the same upstream agent", async (t) => {
+  const { env, state, issue, connect, rows } = await gateHosted(t);
+  const client = await connect();
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "notes-agent" } }));
+  const before = (await rows())[0]!;
+  // relaygate re-created its record for the name (a new relaygate agent id), and the stored token stopped working.
+  state.agents.set("notes-agent", { agentId: `rga_${randomUUID()}`, userId: env.ownerId });
+  issue("notes-agent");
+  const status = structured(await client.callTool({ name: "relay_status", arguments: {} }));
+  assert.equal(status.name, "notes-agent");
+  const after = (await rows())[0]!;
+  assert.equal(after.relaygate_agent_id, state.agents.get("notes-agent")!.agentId);
+  assert.notEqual(after.relaygate_agent_id, before.relaygate_agent_id);
+  assert.equal(after.agent_remote_id, before.agent_remote_id, "the same upstream agent");
+  assert.ok(env.world.agents.has("notes-agent"), "the upstream agent was not released");
 });

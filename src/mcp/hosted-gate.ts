@@ -51,7 +51,20 @@ export type GateEnrolment = {
   name: string;
   /** An rg_ token; only relaygate accepts it. */
   token: string;
+  /**
+   * The upstream agent's metadata as relaygate left it. relaygate stamps a
+   * name it registers itself with `relaygate.agent_id`; a name it took over
+   * keeps the metadata it had.
+   */
+  metadata: Record<string, unknown>;
 };
+
+/** Whether relaygate registered the upstream agent itself for this enrolment, so it carries no other owner's metadata. */
+export function freshAtGate(enrolled: Pick<GateEnrolment, "relaygateAgentId" | "metadata">): boolean {
+  const stamp = enrolled.metadata.relaygate;
+  return enrolled.metadata.source === undefined && typeof stamp === "object" && stamp !== null
+    && (stamp as Record<string, unknown>).agent_id === enrolled.relaygateAgentId;
+}
 
 /**
  * Enrols (or, for the same owner and name, recovers) one hosted participant
@@ -76,5 +89,6 @@ export async function enrolHostedAtGate(
   }
   const upstream = await deps.gate.authenticatedAgent(enrolled.token);
   if (upstream.name !== input.agentName) throw new HostedGateRefused("relaygate enrolled a different agent name. Nothing was joined.");
-  return { relaygateAgentId: enrolled.agentId, relaycastAgentId: upstream.id, name: upstream.name, token: enrolled.token };
+  return { relaygateAgentId: enrolled.agentId, relaycastAgentId: upstream.id, name: upstream.name, token: enrolled.token,
+    metadata: upstream.metadata };
 }

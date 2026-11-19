@@ -1568,8 +1568,21 @@ Relaycast agent token for its traffic:
   the hosted client (table `relay_hosted_credentials`, migration 0079; only
   the hash is stored). Control presents it to relaygate's `POST /v1/register`
   itself, with no database transaction open, because relaygate introspects it
-  here. The client is the connection's connector kind (`chatgpt`, `grok-bot`,
-  `muse`, `cursor-cloud`) from its registered OAuth redirect URIs, else `mcp`.
+  here. The client is the connection's admission kind, from its registered
+  OAuth redirect URIs: `chatgpt`, `grok-bot`, `muse` or `cursor-cloud` when
+  every URI that names a provider names the same one, else `mcp`. A
+  registration whose redirect URIs name two different providers enrols as
+  `mcp`, so it never matches a rule written for either provider. Native MCP
+  sessions enrol as `mcp`.
+- **Name ownership.** relaygate reserves a name for its first enroller and
+  takes over an upstream agent of that name it did not register. So before
+  minting a credential Control checks the name with the workspace roster (a
+  control-plane read with the workspace key, as on other installs): an agent
+  another owner, or a provider binding, holds is refused ("That relay name is
+  already taken") and relaygate never sees an enrolment. relaygate's answer
+  is checked again: the agent must be the one checked, this owner's, or one
+  relaygate registered itself for this enrolment. Anything else is refused
+  and never released, since releasing deletes the agent by name.
 - **Introspection.** Checked and burned like a launch credential. The active
   answer is `{active: true, sub: <owner user id>, email: null, principal_type:
   "relay_hosted", agent_name, client, machine_id: null, org, workspace,
@@ -1590,6 +1603,17 @@ Relaycast agent token for its traffic:
   `kind`, `hosted_client`) is merged onto the agent card through relaygate's
   `PATCH /v1/agent`. Ownership is decided by relaygate's `GET /v1/whoami` (the
   agent id and the owner), never by that metadata.
+  `hosted_relay_participants.admitted_clients` (migration 0079) lists the
+  hosted clients relaygate enrolled the participant for. A participant is
+  used only by a connection whose admission kind is in that list.
+- **A second hosted client.** When a connection of another kind (for example
+  Grok Bot for a participant enrolled from ChatGPT) uses the participant,
+  Control enrols it again at relaygate as that kind first, so relaygate's
+  policy decides that client too. relaygate then applies the current rule's
+  groups to the agent and revokes its earlier tokens; the row keeps the new
+  token and adds the kind. If relaygate refuses (no rule for that client),
+  the call fails, naming the rule to add, and the row and its token stay as
+  they were, still usable by the clients already admitted.
 - **Traffic.** Sends, replies, inbox, conversations, channels and cards go to
   relaygate with the rg_ token. So do directory reads (the roster, names,
   channel lists and history), which relaygate filters by its policy. On a
@@ -1597,9 +1621,19 @@ Relaycast agent token for its traffic:
   before it can list agents or channels.
 - **Renewal.** relaygate tokens last 24 hours. When relaygate rejects the
   stored one, Control enrols the participant again before taking the owner
-  lock: the same owner gets the same relaygate agent back. Grok Bot routines
-  renew a participant's token with relaygate's `POST /v1/token/refresh` once
-  it is 12 hours old.
+  lock: the same owner gets the same upstream agent back. If relaygate
+  answers with a new relaygate agent id for that same upstream agent, the row
+  adopts it; an enrolment answered with a different upstream agent is never
+  adopted. Enrolling again after a rejected token resets `admitted_clients`
+  to the current client, since relaygate revoked the tokens of the others.
+  Grok Bot routines renew a participant's token with relaygate's
+  `POST /v1/token/refresh` once it is 12 hours old. When relaygate rejects a
+  routine's token (it lapsed while the routine was idle), or the participant
+  was not admitted as `grok-bot`, the routine enrols it again as `grok-bot`
+  after its delivery transaction ends. It adopts the new token only if
+  relaygate answered with the stored relaygate agent and the grant's
+  upstream agent and the row is unchanged; otherwise it records a delivery
+  failure and releases nothing.
 - **Release.** `leave_relay`, linking a desktop identity and OAuth teardown
   release a gated participant through relaygate's `DELETE /v1/agent`, which
   also revokes its relaygate tokens. If relaygate no longer accepts the token,

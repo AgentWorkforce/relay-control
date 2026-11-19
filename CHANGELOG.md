@@ -21,8 +21,19 @@ assigned at release.
   participants are re-enrolled through relaygate on next use and keep their
   upstream agent, so OAuth connections keep working. OAuth connections can no
   longer launch agents on a gate-only install. A session with no relay
-  identity must `join_relay` before listing agents or channels there. See
-  docs/identity.md, "Hosted participants on gate-only installs".
+  identity must `join_relay` before listing agents or channels there. A name
+  another owner or a provider binding holds is refused before any credential
+  is minted, and relaygate's answer must be the checked agent, the owner's,
+  or one relaygate registered itself. Each participant records the hosted
+  clients relaygate admitted it for (`admitted_clients`, migration 0079); a
+  connection of another kind enrols it again at relaygate as that kind first,
+  which re-applies that rule's groups and revokes the earlier token, and a
+  refusal leaves the participant as it was. The client is the connection's
+  admission kind: a registration whose redirect URIs name two different
+  providers enrols as `mcp`. Grok Bot routines whose token relaygate rejects
+  enrol again as `grok-bot` and adopt the token only for the same relaygate
+  and upstream agent. See docs/identity.md, "Hosted participants on gate-only
+  installs".
 - Added: MCP `get_session_summary` can read recorded short or long summaries
   of the requested kind and return validated optional provenance. It enforces
   320/16000 Unicode code-point bounds, preserves empty/unsupported responses,

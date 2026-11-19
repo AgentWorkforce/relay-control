@@ -30,3 +30,10 @@ CREATE INDEX IF NOT EXISTS relay_hosted_credentials_workspace ON relay_hosted_cr
 -- gate, or created before this install enforced the gate for hosted
 -- participants; such a row is re-enrolled through relaygate on its next use).
 ALTER TABLE hosted_relay_participants ADD COLUMN IF NOT EXISTS relaygate_agent_id text;
+
+-- The hosted clients (connector kinds: chatgpt, grok-bot, muse, cursor-cloud,
+-- mcp) relaygate enrolled a gated participant for. Another kind enrols at
+-- relaygate before it may use the participant, so relaygate's policy decides
+-- every client that acts as it. Empty: none yet (a row that is not gated, or
+-- one written before this column; it enrols on its next use).
+ALTER TABLE hosted_relay_participants ADD COLUMN IF NOT EXISTS admitted_clients text[] NOT NULL DEFAULT '{}';

@@ -39,3 +39,18 @@ export function connectorKind(client: { clientName: string | null; redirectUris:
   if (hosts.some(({ scheme, host }) => scheme === "https" && (under(host, "muse.ai") || under(host, "agent.meta.ai")))) return "muse";
   return "mcp";
 }
+
+/**
+ * The kind an OAuth grant is admitted as: relaygate enrolment of its hosted
+ * participant and Grok routines. Unlike connectorKind's display precedence, a
+ * registration naming two different providers is no provider at all ("mcp"),
+ * so a client cannot claim one provider's admission by adding its callback
+ * beside another's. Callbacks that classify as no provider (cursor://,
+ * localhost) are neutral: Grok Bot registers them beside its cursor.com
+ * callback.
+ */
+export function admissionConnectorKind(client: { clientName: string | null; redirectUris: string[] }): ConnectorKind {
+  const kinds = new Set(client.redirectUris.map((uri) => connectorKind({ clientName: client.clientName, redirectUris: [uri] })));
+  kinds.delete("mcp");
+  return kinds.size === 1 ? [...kinds][0]! : "mcp";
+}
