@@ -360,6 +360,22 @@ Each attempt is counted on the row (`cleanup_attempts`,
 one minute doubling per attempt up to one hour. A failing row is logged
 (`replicas_cleanup_failed` with the launch id) and the sweep goes on.
 
+The same tick abandons launches and binds stuck in `preparing` or `binding`
+for 7 days that never got a relay identity (no relay workspace, agent name or
+subscriptions). Nothing advances one in the background, since that could
+wake paid compute; only the person's status read retries it. An abandoned row
+becomes `gone` with an error asking to spawn or bind again, and is audited as
+`replicas.spawn.abandoned`. A replica Relay launched is put to sleep first, as
+release does; an existing chat the person bound is left awake. A failed sleep
+keeps the row, stamped (`abandon_attempted_at`, its age is not reset): it is
+tried again no sooner than one hour later, behind rows not yet tried. A
+401/403 latches the connection as refused, like every provider refusal, and
+while the latch is set no sleep is attempted: rows that need one wait without
+a provider call (existing-chat binds are still abandoned). A row whose
+abandon fails outright is logged (`replicas_abandon_failed` with the launch
+id) and the sweep goes on. Rows that got a relay identity are left for
+`release_replica`, and environment identities are never touched.
+
 Discovery fencing: a complete discovery listing (every page read) that no
 longer shows an enabled environment records `discovery_missing_since` on its
 policy (the first time only). The environment stays enabled and keeps its

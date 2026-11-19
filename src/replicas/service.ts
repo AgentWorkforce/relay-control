@@ -120,6 +120,8 @@ export type SpawnInput = {
   creator_id?: string | null;
   /** API launches and binds: set once by the first verified environment admission that reused the row (tenant pin). */
   identity_admitted?: { issuer: string; organization_id: string; at: string };
+  /** Stale-binding cleanup: when its last failed sleep was (ISO); the row waits STALE_BINDING_RETRY_MS, then rotates behind the rest. */
+  abandon_attempted_at?: string;
   /** Inbound delivery bookkeeping (./inbound.ts): when the last check ran (ISO). */
   relay_inbound_checked_at?: string;
   /** Inbound delivery bookkeeping: the safe code of the last failed check, null once it passes. */
@@ -474,11 +476,11 @@ export async function spawnReplica(deps: ReplicasDeps, actor: ReplicasActor, raw
     );
     const existing = found.rows[0];
     if (existing) {
-      // Cleanup, release, revive, tenant-pin and inbound delivery bookkeeping is not part of the caller's
-      // immutable launch options.
+      // Cleanup, release, revive, tenant-pin, stale-binding and inbound delivery bookkeeping is not part of the
+      // caller's immutable launch options.
       const { cleanup_complete: _cleanup, relay_mcp_version: _mcp, released: _released, revived_at: _revived,
-        identity_admitted: _admitted, relay_inbound_checked_at: _checked, relay_inbound_error: _inboundError,
-        relay_inbound_cursor: _cursor, ...original } = existing.input;
+        identity_admitted: _admitted, abandon_attempted_at: _abandon, relay_inbound_checked_at: _checked,
+        relay_inbound_error: _inboundError, relay_inbound_cursor: _cursor, ...original } = existing.input;
       const same = Object.keys(input).every((k) => original[k as keyof typeof original] === input[k as keyof typeof input])
         && Object.keys(original).length === Object.keys(input).length;
       if (!same) throw new ReplicasError("This request id already belongs to different launch options.", 409);
@@ -1082,6 +1084,84 @@ export const CLEANUP_BACKOFF_BASE_MS = 60_000;
 export const CLEANUP_BACKOFF_MAX_MS = 3_600_000;
 export const cleanupBackoffMs = (attempts: number) =>
   Math.min(CLEANUP_BACKOFF_MAX_MS, CLEANUP_BACKOFF_BASE_MS * 2 ** Math.max(0, Math.min(attempts, 20) - 1));
+
+/** How long a launch or bind may sit unfinished before the sync sweep abandons it. */
+export const STALE_BINDING_MS = 7 * 24 * 60 * 60 * 1000;
+export const STALE_BINDING_ERROR = "Binding did not finish within 7 days and was abandoned. Spawn or bind the replica again.";
+/** How long a stale row whose sleep failed waits before the sweep tries it again. */
+export const STALE_BINDING_RETRY_MS = 60 * 60 * 1000;
+
+/**
+ * Abandons this workspace's launches and binds stuck in `preparing` or
+ * `binding` for STALE_BINDING_MS that never got a relay identity (no relay
+ * workspace, agent name or subscriptions), so they stop counting as live work.
+ * No Relay cleanup is needed for them. A replica Relay launched (not an
+ * existing chat the person bound) is put to sleep first, as release does, so an
+ * abandoned launch stops costing compute; if that fails the row is stamped and
+ * stays, and a later sweep tries it again once STALE_BINDING_RETRY_MS has
+ * passed. While the workspace's connection is latched as refused, rows that
+ * need a sleep are left alone without a provider call. Nothing is ever woken.
+ * Rows that got a relay identity are left for release_replica; environment
+ * identities are never touched. Not advanced automatically: advancing a stuck
+ * row may wake paid compute, so only the person's status read
+ * (get_replica_spawn) retries one. A row whose transaction fails is reported
+ * through `onError` and never blocks the rest.
+ *
+ * @returns How many rows were abandoned.
+ */
+export async function abandonStaleBindings(deps: ReplicasDeps, actor: ReplicasActor, now: () => number = Date.now, limit = 25,
+  onError: (spawnId: string) => void = () => undefined): Promise<number> {
+  const before = new Date(now() - STALE_BINDING_MS);
+  const retryBefore = new Date(now() - STALE_BINDING_RETRY_MS);
+  // Rows that need a sleep (a replica Relay launched): the same test as the sleep below.
+  const needsSleep = `replica_id IS NOT NULL AND COALESCE(input->>'origin', '') <> 'existing' AND COALESCE(source, '') <> 'bind'`;
+  const where = `state IN ('preparing', 'binding') AND updated_at < $2 AND relay_workspace_id IS NULL AND agent_name IS NULL
+    AND subscription_id IS NULL AND mention_subscription_id IS NULL AND COALESCE(source, '') <> '${ENVIRONMENT_IDENTITY}'
+    AND (input->>'abandon_attempted_at' IS NULL OR (input->>'abandon_attempted_at')::timestamptz < $4)
+    AND NOT (${needsSleep} AND EXISTS (SELECT 1 FROM remote_agent_connections c
+      WHERE c.workspace_id = replica_spawns.workspace_id AND c.provider = 'replicas' AND c.access_revoked_at IS NOT NULL))`;
+  const rows = await deps.database.query<{ id: string }>(
+    // Never-attempted rows first, then the least recently attempted, so rows whose sleep keeps
+    // failing rotate behind the rest (existing-chat binds need no provider call at all).
+    `SELECT id FROM replica_spawns WHERE workspace_id = $1 AND ${where}
+      ORDER BY input->>'abandon_attempted_at' ASC NULLS FIRST, updated_at, id LIMIT $3`,
+    [actor.workspaceId, before, limit, retryBefore],
+  );
+  let abandoned = 0;
+  for (const { id } of rows.rows) {
+    abandoned += await withReplicasLock(deps, actor, async (tx) => {
+      // Re-read under the workspace lock: a status read may have advanced it, or a refusal latched, meanwhile.
+      const row = (await tx.query<SpawnRow>(`SELECT ${COLUMNS} FROM replica_spawns WHERE id = $1 AND workspace_id = $3 AND ${where} FOR UPDATE`,
+        [id, before, actor.workspaceId, retryBefore])).rows[0];
+      if (!row) return 0;
+      if (row.replica_id && row.input.origin !== "existing" && row.source !== "bind") {
+        try {
+          const { key, ciphertext } = await connectionKey(deps, tx, row.workspace_id);
+          await underKey(ciphertext, () => deps.replicas.sleep(key, row.replica_id!));
+        } catch (error) {
+          if (!(error instanceof ReplicasRuntimeError) || ![404, 410].includes(error.status)) {
+            // A refused key is latched like every other provider refusal (this transaction commits),
+            // so admission stops trusting it.
+            const refused = refusedKey(error);
+            if (refused) await recordProviderAccess(tx, row.workspace_id, error, refused);
+            // Stamp the attempt without touching updated_at (that would reset its age).
+            await tx.query("UPDATE replica_spawns SET input = input || jsonb_build_object('abandon_attempted_at', $2::text) WHERE id = $1",
+              [row.id, new Date(now()).toISOString()]);
+            return 0;
+          }
+        }
+      }
+      const gone = await patch(tx, row.id, { state: "gone", helper_hash: null, helper_ciphertext: null, hook_ciphertext: null,
+        token_ciphertext: null, last_error: STALE_BINDING_ERROR, input: { ...row.input, cleanup_complete: true } });
+      await audit(tx, gone, null, "replicas.spawn.abandoned");
+      return 1;
+    }).catch(() => {
+      onError(id);
+      return 0;
+    });
+  }
+  return abandoned;
+}
 
 /**
  * Sweep retry of remote cleanup left incomplete (for example a Relay release

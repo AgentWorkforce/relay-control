@@ -32,8 +32,10 @@ assigned at release.
   admission kind: a registration whose redirect URIs name two different
   providers enrols as `mcp`. Grok Bot routines whose token relaygate rejects
   enrol again as `grok-bot` and adopt the token only for the same relaygate
-  and upstream agent. See docs/identity.md, "Hosted participants on gate-only
-  installs".
+  and upstream agent. A stored participant is enrolled again only while its
+  own upstream agent still holds the name. See docs/identity.md, "Hosted
+  participants on gate-only installs".
+- Fixed: a Replicas launch or bind that never got a Relay identity no longer sits in `preparing`/`binding` forever. After 7 days the sync sweep abandons it (`gone`, audited `replicas.spawn.abandoned`). A replica Relay launched is put to sleep first; an existing chat is left awake. A failed sleep is retried no sooner than one hour later, and not at all while the connection is latched as refused. Rows with a Relay identity and environment identities are untouched.
 - Added: MCP `get_session_summary` can read recorded short or long summaries
   of the requested kind and return validated optional provenance. It enforces
   320/16000 Unicode code-point bounds, preserves empty/unsupported responses,
