@@ -30,6 +30,7 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
       customerSupport: Boolean(context.customerSupport),
       grokRoutines: Boolean(context.grokRoutines),
       grokEvents: Boolean(context.grokRoutines?.cloudCopy),
+      agentRules: Boolean(context.agentRules),
       providers: await context.providers(),
     });
     return {

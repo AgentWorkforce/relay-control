@@ -9,6 +9,7 @@ import { connectorKind } from "./oauth/connector-kind.js";
 import type { McpConsentPrincipal } from "./oauth/consent.js";
 import { GrokRoutineError, grokInboxPrompt, grokRoutineHeaders, grokRoutinePrompt, parseGrokRoutineCredentials, parseGrokRoutineDetails, parseGrokRoutineUrl } from "./grok-routine.js";
 import { REPLY_MODES, type ReplyMode } from "./grok-events-policy.js";
+import { grokBootstrapPrompt } from "../agent-rules/service.js";
 import {
   GROK_EVENT_RETENTION_MS, eventFromDelivery, getEvent, insertEvent, pendingWakes, recentEvents, senderTrust, wakeBody,
 } from "./grok-events.js";
@@ -33,7 +34,12 @@ export class GrokRoutines {
   constructor(readonly options: { database: Database; keyring: EncryptionKeyring; client: RelaycastClient;
     publicOrigin: string; tenancyMode: TenancyMode; fetchImpl?: typeof fetch; now?: () => Date; requestTimeoutMs?: number;
     /** SELFHOST_GROK_ROUTINES_CLOUD_COPY: Cloud's copied prompt, polling, event log and wakes (spec Phase 1). Default off. */
-    cloudCopy?: boolean }) {}
+    cloudCopy?: boolean;
+    /**
+     * SELFHOST_GROK_DYNAMIC_PROMPT (requires the Cloud copy): the pasted routine
+     * prompt is the bootstrap that calls get_agent_rules on every run (spec Phase 2).
+     */
+    dynamicPrompt?: { bootstrapVersion: number } }) {}
 
   get cloudCopy(): boolean { return this.options.cloudCopy === true; }
 
@@ -65,7 +71,25 @@ export class GrokRoutines {
     return `${this.options.publicOrigin}${GROK_SETUP_PATH}?${new URLSearchParams({ grant: grantId, ...(from ? { from } : {}) })}`;
   }
 
-  /** The non-secret routine prompt for this grant: Cloud's copy when enabled, else the #136 inbox prompt. */
+  /** What the person pastes into Grok: the bootstrap with dynamic rules, else the full procedure. */
+  pastePrompt(agent: string, routine?: Pick<Routine, "delivery_mode" | "polling_since" | "from_filter">): string {
+    return this.cloudCopy && this.options.dynamicPrompt
+      ? grokBootstrapPrompt(agent, this.options.dynamicPrompt.bootstrapVersion) : this.prompt(agent, routine);
+  }
+
+  /** The grant's message-handling procedure for get_agent_rules' grok-inbox section; records which rules it read. */
+  async procedure(grantId: string, owner: Owner, rulesVersion: string | null): Promise<string> {
+    return this.options.database.transaction(async tx => {
+      const grant = await this.grant(tx, grantId, owner);
+      const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1", [grantId])).rows[0];
+      if (routine && rulesVersion) {
+        await tx.query("UPDATE grok_bot_routines SET rules_version_last_fetched=$2 WHERE grant_id=$1", [grantId, rulesVersion]);
+      }
+      return this.prompt(grant.agent_name, routine);
+    });
+  }
+
+  /** The non-secret routine procedure for this grant: Cloud's copy when enabled, else the #136 inbox prompt. */
   prompt(agent: string, routine?: Pick<Routine, "delivery_mode" | "polling_since" | "from_filter">): string {
     if (!this.cloudCopy) return grokInboxPrompt(agent);
     // Every self-hosted Grok grant holds relay:mcp, so send_relay_message is available.
@@ -82,9 +106,10 @@ export class GrokRoutines {
       const base = { agent: grant.agent_name, configured: Boolean(routine && (routine.credentials_ciphertext || routine.delivery_mode === "polling")),
         webhook_accepted: Boolean(routine?.last_delivered_at),
         last_delivered_at: routine?.last_delivered_at ?? null, last_error: routine?.last_error ?? null,
-        setup_url: this.setupUrl(grantId), routine_prompt: this.prompt(grant.agent_name, routine) };
+        setup_url: this.setupUrl(grantId), routine_prompt: this.pastePrompt(grant.agent_name, routine) };
       return this.cloudCopy ? { ...base, mode: routine?.delivery_mode ?? null, reply_mode: routine?.reply_mode ?? "notes-only",
-        from: routine?.from_filter ?? null } : base;
+        from: routine?.from_filter ?? null,
+        ...(this.options.dynamicPrompt ? { rules_version_last_fetched: (routine as { rules_version_last_fetched?: string | null } | undefined)?.rules_version_last_fetched ?? null } : {}) } : base;
     });
   }
 
@@ -111,7 +136,7 @@ export class GrokRoutines {
         delivery_mode='polling',from_filter=$2,polling_since=$3,next_attempt_at=$3,updated_at=$3,failures=0,last_error=NULL,last_delivered_at=NULL,
         notified_delivery_ids='{}'`, [grantId, from ?? null, now]);
       return { agent: grant.agent_name, since: now.toISOString(),
-        routine_prompt: this.prompt(grant.agent_name, { delivery_mode: "polling", polling_since: now, from_filter: from ?? null }) };
+        routine_prompt: this.pastePrompt(grant.agent_name, { delivery_mode: "polling", polling_since: now, from_filter: from ?? null }) };
     });
   }
 

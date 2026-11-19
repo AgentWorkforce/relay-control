@@ -130,3 +130,7 @@ from `AgentWorkforce/cloud` (`packages/web/lib/mcp-events/grok-routine.ts`,
 - The setup page also accepts one paste of the routine's URL and header. A
   routine URL can be saved under only one connection on this server. Do not
   also register it in Agent Relay Cloud or another deployment, or it wakes twice.
+
+With `SELFHOST_GROK_DYNAMIC_PROMPT` also on, the routine prompt is a short
+bootstrap that fetches the rules, including this procedure, from
+`get_agent_rules` on every run; see [agent-rules.md](agent-rules.md).

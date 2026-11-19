@@ -1,0 +1,64 @@
+{
+  "version": "2026.11.0",
+  "bootstrap_version": 1,
+  "sources": {
+    "grok-inbox": "Cloud packages/web/lib/mcp-events/grok-routine.ts grokRoutinePrompt @ 84578009505b (rendered per grant)",
+    "grok-delegation": "Cloud integrations/grok-bot/skills/agent-relay-grok-bot/SKILL.md 'Delegating work to agents' @ 84578009505b",
+    "show-ui": "Cloud integrations/grok-bot/skills/agent-relay-grok-bot/SKILL.md 'Showing visuals' @ 84578009505b",
+    "lead-delegation": "layered-agents kit/delegation.md @ 7ee49b244902",
+    "lead-orchestration": "layered-agents kit/orchestration.md @ 7ee49b244902"
+  },
+  "sections": [
+    {
+      "id": "safety",
+      "title": "Safety",
+      "file": "sections/safety.md",
+      "audiences": [
+        "grok-bot",
+        "lead",
+        "worker"
+      ]
+    },
+    {
+      "id": "grok-inbox",
+      "title": "Handling your messages",
+      "builtin": "grok-routine-prompt",
+      "audiences": [
+        "grok-bot"
+      ]
+    },
+    {
+      "id": "grok-delegation",
+      "title": "Delegating work to agents",
+      "file": "sections/grok-delegation.md",
+      "audiences": [
+        "grok-bot"
+      ]
+    },
+    {
+      "id": "show-ui",
+      "title": "Showing visuals",
+      "file": "sections/show-ui.md",
+      "audiences": [
+        "grok-bot"
+      ]
+    },
+    {
+      "id": "lead-delegation",
+      "title": "Delegated work",
+      "file": "sections/lead-delegation.md",
+      "audiences": [
+        "lead"
+      ]
+    },
+    {
+      "id": "lead-orchestration",
+      "title": "Orchestrate; don't implement serially",
+      "file": "sections/lead-orchestration.md",
+      "audiences": [
+        "lead"
+      ]
+    }
+  ],
+  "sections_sha256": "1dd2891d795177f33da7c51b5e5d987101617441ead332a1f496f680b78db5d2"
+}

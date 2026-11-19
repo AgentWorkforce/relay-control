@@ -20,6 +20,7 @@ import type { DesktopCallContext } from "./desktop-call.js";
 import type { McpOAuthConnection } from "./oauth/admission.js";
 import type { CustomerSupportConnection } from "./customer-support.js";
 import type { GrokRoutines } from "./grok-routines.js";
+import type { AgentRules } from "../agent-rules/service.js";
 import type { RelayLaunchCheck } from "./relay-launch-check.js";
 
 export type McpWorkspace = {
@@ -47,6 +48,8 @@ export type McpContext = {
   /** Present only after the MCP-only OAuth resolver admits its exact resource. */
   oauth?: McpOAuthConnection;
   grokRoutines?: GrokRoutines;
+  /** The rules source for get_agent_rules (docs/agent-rules.md); absent for staff read grants. */
+  agentRules?: AgentRules;
   customerSupport?: CustomerSupportConnection;
   /** GET a workspace-scoped RelayHistory path (with its query); throws SharedSessionsToolError. */
   readHistory: (path: string, options?: { timeoutMessage?: string }) => Promise<unknown>;
