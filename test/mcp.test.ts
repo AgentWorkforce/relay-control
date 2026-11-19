@@ -13,6 +13,10 @@ import type { TelemetryModule } from "../src/telemetry/module.js";
 import { createRelaycastWorld, type RelaycastWorld } from "./support/relaycast-world.js";
 import { PGliteDatabase } from "./support/harness.js";
 import { RECIPIENT_CARD_NOTE } from "../src/mcp/relay-agent-cards.js";
+import { describeCapabilities } from "../src/mcp/catalog.js";
+import { registerCapabilityDiscovery } from "../src/mcp/capabilities.js";
+import type { McpContext } from "../src/mcp/context.js";
+import { RelayToolError } from "../src/mcp/relay-participants.js";
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -522,6 +526,53 @@ test("describe_capabilities reports the served groups and the bound workspace", 
   assert(!connectRooms.reason.includes("edition"));
 });
 
+test("describe_capabilities does not advertise managed relay tools without a synced native identity", () => {
+  const report = describeCapabilities({ endpointUrl: "https://relay.example.test/mcp", authMode: "cli_login", scopes: ["cli:auth"],
+    workspaceId: "workspace", role: "owner", providers: [], nativeAuthorityAvailable: false,
+    nativeAuthorityReason: "This chat has no synced Desktop identity." });
+  const messaging = report.groups.find(group => group.id === "relay_messaging");
+  assert.equal(messaging?.status, "restricted");
+  assert.equal(messaging?.reason, "This chat has no synced Desktop identity.");
+});
+
+test("the capability handler preserves safe refusals, distinguishes outages, and skips unavailable or unmanaged relay messaging", async (t) => {
+  const baseContext = {
+    endpointUrl: "https://relay.example.test/mcp", authMode: "cli_login", role: "owner",
+    principal: { scopes: ["cli:auth"] }, workspace: { id: "workspace" }, providers: async () => [],
+  };
+  async function call(required: boolean, nativeStatus: () => Promise<unknown>, authMode = "cli_login") {
+    let handler: (() => Promise<{ structuredContent: Record<string, unknown> }>) | undefined;
+    registerCapabilityDiscovery({ registerTool: (_name: string, _definition: unknown, run: typeof handler) => { handler = run; } } as never,
+      { ...baseContext, authMode, desktopCall: { required, nativeSession: required ? { kind: "codex", id: "native" } : undefined } } as unknown as McpContext,
+      { nativeStatus });
+    return (await handler!()).structuredContent as { groups: Array<{ id: string; status: string; reason?: string; how_to_enable?: string }> };
+  }
+  let checks = 0;
+  const refusal = "This chat is synced to two Desktop identities. Remove the duplicate identity, then retry.";
+  const refused = await call(true, async () => { checks += 1; throw new RelayToolError(refusal); });
+  assert.equal(checks, 1);
+  const refusedMessaging = refused.groups.find(group => group.id === "relay_messaging");
+  assert.equal(refusedMessaging?.status, "restricted");
+  assert.equal(refusedMessaging?.reason, refusal);
+  assert.doesNotMatch(refusedMessaging?.how_to_enable ?? "", /reconnect/i);
+
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+  const unavailable = await call(true, async () => { checks += 1; throw new Error("private outage details"); });
+  const unavailableMessaging = unavailable.groups.find(group => group.id === "relay_messaging");
+  assert.match(unavailableMessaging?.reason ?? "", /could not check.*right now/i);
+  assert.doesNotMatch(unavailableMessaging?.reason ?? "", /private outage details|reconnect/i);
+  assert.deepEqual(warnings, [["[selfhost-mcp] native identity capability check failed", { error: "Error" }]]);
+
+  const available = await call(true, async () => { checks += 1; });
+  assert.equal(checks, 3);
+  assert.equal(available.groups.find(group => group.id === "relay_messaging")?.status, "available");
+  await call(false, async () => { checks += 1; });
+  assert.equal(checks, 3, "unmanaged capability discovery does not probe native identity");
+  await call(true, async () => { checks += 1; }, "staff_read_grant");
+  assert.equal(checks, 3, "a connection without relay_messaging does not probe native identity");
+});
+
 test("session reads go to RelayHistory for the bound workspace only", async (t) => {
   const env = await setup(t);
   env.history.events.push(
@@ -803,6 +854,12 @@ test("every listed Desktop and spawned agent has an inferred card and trusted ow
     assert.equal(agent.is_mine, true);
   }
   assert.doesNotMatch(structured(result).description, /truncated spawn prompt/i);
+  env.relay.world.addAgent("second-peer", { description: "Second" });
+  const limited = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all", limit: 1 } }));
+  assert.equal(limited.agents.length, 1); assert.equal(limited.total_matching, 3); assert.equal(limited.truncated, true);
+  for (let index = 0; index < 100; index++) env.relay.world.addAgent(`peer-${index}`, { description: "Extra" });
+  const bounded = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
+  assert.equal(bounded.agents.length, 100); assert.equal(bounded.total_matching, 103); assert.equal(bounded.truncated, true);
   assert.ok(client.getInstructions()?.includes(CARD_GUIDANCE));
   const channels = structured(await client.callTool({ name: "list_relay_channels", arguments: {} }));
   assert.ok(channels.guidance.endsWith(CARD_GUIDANCE));

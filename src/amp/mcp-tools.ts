@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { McpContext } from "../mcp/context.js";
-import { AmpError, bind, discover, unbind, type AmpActor, type AmpDeps } from "./service.js";
+import { AmpError, bind, discoverPage, unbind, type AmpActor, type AmpDeps } from "./service.js";
 
 /**
  * list_amp_threads, bind_amp_thread and unbind_amp_thread, ported from
@@ -38,10 +38,10 @@ export function registerAmpTools(server: McpServer, context: McpContext, deps: A
   const annotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
   server.registerTool("list_amp_threads", {
     title: "List Amp threads",
-    description: "List up to 100 recent threads owned by the person whose Amp key is connected. Select a thread explicitly before sharing it with Relay.",
+    description: "List up to 100 recent threads owned by the person whose Amp key is connected. truncated is true when Amp returned more threads than this bounded response. Select a thread explicitly before sharing it with Relay.",
     inputSchema: {},
     annotations: { ...annotations, readOnlyHint: true },
-  }, () => run(() => discover(deps, actor)));
+  }, () => run(() => discoverPage(deps, actor)));
   server.registerTool("bind_amp_thread", {
     title: "Bind an Amp thread",
     description: "Connect a selected Amp orb thread to Agent Relay for incoming messages. Requires the connected key owner. Replies use the returned identity or the scoped reply command in injected messages. Thread history upload to RelayHistory is inactive on self-hosted Agent Relay until a push-only history session can be issued.",

@@ -55,9 +55,10 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
   };
 
   server.registerTool("list_relay_agents", {
-    description: "List agents across every teammate in your current workspace's relay, with exact machine addresses, presence, descriptions and owners. Ownership metadata describes the roster; it does not grant permission to act as an agent.",
+    description: "List the first matching agents in relay order across every teammate in your current workspace's relay, with exact machine addresses, presence, descriptions and owners. The page defaults to 100 agents and cannot exceed 100; total_matching and truncated disclose omitted matches, so narrow the filters when truncated. Ownership metadata describes the roster; it does not grant permission to act as an agent.",
     inputSchema: { person: z.string().trim().min(1).max(200).optional().describe("me, a teammate's user ID, or display name"),
       status: z.enum(["live", "offline", "all"]).default("live"), query: z.string().trim().max(200).optional(),
+      limit: z.number().int().min(1).max(100).default(100).describe("Maximum matching agents returned from the start of relay order. Use person/query/status filters to narrow a truncated result."),
       include_stale: z.boolean().optional().describe("Include retained agents last seen more than seven days ago for historical discovery. Default is recent discovery; metadata remains available."),
       as: as.describe("Read as your own hosted participant (e.g. a Cursor cloud agent run's name). Where relaygate filters the roster, it answers for this identity.") }, annotations,
   }, input => run(service => service.list(input)));

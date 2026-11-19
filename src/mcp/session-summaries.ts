@@ -28,6 +28,7 @@ const session = z.object({
   project: z.string().nullable(), repo: z.string().nullable(), branch: z.string().nullable(),
   last_active: timestamp, short_summary: z.string().nullable(),
   short_summary_status: z.enum(["available", "empty", "unsupported"]),
+  transcript_status: z.literal("not_verified"),
   short_summary_generated_at: timestamp.nullable(), citation_url: z.string().url(),
 });
 
@@ -40,7 +41,7 @@ function success(value: Record<string, unknown>) {
 export function registerSessionSummaries(server: McpServer, context: McpContext): void {
   server.registerTool("list_session_summaries", {
     title: "List recent session summaries",
-    description: "Start here to discover recent shared workspace sessions and their recorded short summaries. Open a relevant session with get_session_summary or get_shared_session. A null summary is unknown, not an inferred task title. Historical activity does not prove an agent is online.",
+    description: "Start here to discover recent shared workspace sessions and their recorded short summaries. Directory publication can precede transcript indexing, so every row reports transcript_status not_verified until a transcript read succeeds. Open a relevant session with get_session_summary or get_shared_session. A null summary is unknown, not an inferred task title. Historical activity does not prove an agent is online.",
     inputSchema: {
       since: timestamp.optional().describe("Select sessions last active after this ISO timestamp."),
       project: z.string().trim().min(1).max(200).optional().describe("Project substring filter applied by the session directory."),
@@ -87,6 +88,7 @@ export function registerSessionSummaries(server: McpServer, context: McpContext)
         last_active: row.lastTs, short_summary: row.shortSummary ?? null,
         short_summary_status: row.shortSummary === undefined || row.shortSummaryGeneratedAt === undefined ? "unsupported"
           : row.shortSummary === null ? "empty" : "available",
+        transcript_status: "not_verified" as const,
         short_summary_generated_at: row.shortSummaryGeneratedAt ?? null,
         citation_url: sessionCitation(context.origin, row.sessionId, row.source),
       })), next_cursor: page.nextCursor });
@@ -108,7 +110,7 @@ export function registerSessionSummaries(server: McpServer, context: McpContext)
       const params = new URLSearchParams({ kind: input.kind, source: input.source });
       const body = await context.readHistory(`/v1/sessions/${encodeURIComponent(input.session_id)}/summary?${params}`);
       const recorded = recordedSummaryResponse(body, input.kind);
-      if (!recorded || recorded.summary.status === "unsupported") {
+      if (!recorded) {
         throw new SharedSessionsToolError(unsupported);
       }
       return success({ workspace_id: context.workspace.id, session_id: input.session_id, source: input.source ?? null,
