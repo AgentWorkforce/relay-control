@@ -120,6 +120,12 @@ export type SpawnInput = {
   creator_id?: string | null;
   /** API launches and binds: set once by the first verified environment admission that reused the row (tenant pin). */
   identity_admitted?: { issuer: string; organization_id: string; at: string };
+  /** Inbound delivery bookkeeping (./inbound.ts): when the last check ran (ISO). */
+  relay_inbound_checked_at?: string;
+  /** Inbound delivery bookkeeping: the safe code of the last failed check, null once it passes. */
+  relay_inbound_error?: string | null;
+  /** Inbound delivery bookkeeping: reserved for the inbox catch-up cursor. */
+  relay_inbound_cursor?: number;
 };
 export type SpawnRow = {
   id: string;
@@ -219,6 +225,14 @@ export async function underKey<T>(ciphertext: string, run: () => Promise<T>): Pr
 }
 const refusedKey = (error: unknown): string | undefined => accessRevoked(error)
   ? (error as ReplicasRuntimeError & { [REFUSED_KEY]?: string })[REFUSED_KEY] : undefined;
+/**
+ * Latches a provider 401/403 raised under `underKey` from a site that catches
+ * it and commits (so withReplicasLock never sees it). Unmarked errors are skipped.
+ */
+export async function recordRefusedKey(executor: SqlExecutor, workspaceId: string, error: unknown): Promise<void> {
+  const ciphertext = refusedKey(error);
+  if (ciphertext) await recordProviderAccess(executor, workspaceId, error, ciphertext);
+}
 
 /** Stored and returned failure text: only Control-authored messages, never a provider or Relay body. */
 const safeFailure = (error: unknown) => error instanceof ReplicasError ? error.message
@@ -398,11 +412,27 @@ export function bindingStatus(state: SpawnRow["state"], mcpVersion: number | und
   return state === "bound" && mcpVersion !== 1 ? "binding" : state;
 }
 
+export type InboundDeliveryView = { status: "configured" | "pending" | "unavailable"; error?: string };
+
+/**
+ * Whether Relay messages are pushed into the binding's chat: "configured"
+ * once a chat is selected and both subscriptions exist, "unavailable" with
+ * the safe code of the last failed check, else "pending" (not checked yet,
+ * or waiting on a chat). check_relay_inbox works in every state.
+ */
+export function inboundDelivery(row: SpawnRow): InboundDeliveryView {
+  if (row.state === "gone" || row.state === "rejected") return { status: "unavailable" };
+  if (row.input.relay_inbound_error) return { status: "unavailable", error: row.input.relay_inbound_error };
+  return row.state === "bound" && row.chat_id && row.hook_ciphertext && row.subscription_id && row.mention_subscription_id
+    ? { status: "configured" } : { status: "pending" };
+}
+
 export function spawnView(row: SpawnRow) {
   const status = bindingStatus(row.state, row.input.relay_mcp_version);
   return {
     spawn_id: row.id, replica_id: row.replica_id, chat_id: row.chat_id, status,
     binding: status === "bound" ? { state: "bound", agent: row.agent_name } : { state: "pending" },
+    inbound_delivery: inboundDelivery(row),
     ...(row.last_error ? { error: row.last_error } : {}),
     ...(row.last_error === REPLICA_MCP_FAILURE ? { provisioning_error: {
       code: "relay_mcp_provisioning_failed", stage: "relay_mcp", retryable: true,
@@ -444,9 +474,11 @@ export async function spawnReplica(deps: ReplicasDeps, actor: ReplicasActor, raw
     );
     const existing = found.rows[0];
     if (existing) {
-      // Cleanup, release, revive and tenant-pin bookkeeping is not part of the caller's immutable launch options.
+      // Cleanup, release, revive, tenant-pin and inbound delivery bookkeeping is not part of the caller's
+      // immutable launch options.
       const { cleanup_complete: _cleanup, relay_mcp_version: _mcp, released: _released, revived_at: _revived,
-        identity_admitted: _admitted, ...original } = existing.input;
+        identity_admitted: _admitted, relay_inbound_checked_at: _checked, relay_inbound_error: _inboundError,
+        relay_inbound_cursor: _cursor, ...original } = existing.input;
       const same = Object.keys(input).every((k) => original[k as keyof typeof original] === input[k as keyof typeof input])
         && Object.keys(original).length === Object.keys(input).length;
       if (!same) throw new ReplicasError("This request id already belongs to different launch options.", 409);
@@ -637,17 +669,7 @@ async function advanceStep(deps: ReplicasDeps, tx: SqlExecutor, id: string, acto
       await audit(tx, row, actor, "replicas.mcp.failed");
       throw new ReplicasError(REPLICA_MCP_FAILURE, 502);
     }
-    const hookSecret = decrypt(deps, row.hook_ciphertext!);
-    if (!row.subscription_id) {
-      const subscriptionId = await deps.relaycast.createSubscription(relay.key,
-        { events: ["dm.received", "thread.reply"], url: relayEventsUrl(deps, row.id), secret: hookSecret });
-      row = await patch(tx, row.id, { subscription_id: subscriptionId });
-    }
-    if (!row.mention_subscription_id) {
-      const mentionSubscriptionId = await deps.relaycast.createSubscription(relay.key, { events: ["message.created"],
-        url: relayEventsUrl(deps, row.id), secret: hookSecret, filter: { mentions: row.agent_name! } });
-      row = await patch(tx, row.id, { mention_subscription_id: mentionSubscriptionId });
-    }
+    row = await ensureRelaySubscriptions(deps, tx, row, relay);
     if (row.input.origin === "existing" || row.task_message_id) {
       const wasBound = row.state === "bound";
       row = await patch(tx, row.id, { state: "bound", last_error: null });
@@ -662,6 +684,42 @@ async function advanceStep(deps: ReplicasDeps, tx: SqlExecutor, id: string, acto
     row = await patch(tx, row.id, { last_error: safeFailure(error) });
     return { row, next: "done" };
   }
+}
+
+/**
+ * The binding's webhook secret and its two Relay subscriptions (direct
+ * messages and thread replies to the agent; channel messages that mention
+ * it), each created only while missing. A subscription whose id cannot be
+ * saved is deleted again, best effort, so a failed save leaves no orphan.
+ * Retirement (retireRemote) deletes both and clears the secret for every
+ * kind of binding.
+ */
+export async function ensureRelaySubscriptions(deps: ReplicasDeps, tx: SqlExecutor, start: SpawnRow,
+  relay: WorkspaceRelay): Promise<SpawnRow> {
+  let row = start;
+  if (!row.agent_name) throw new ReplicasError("The replica's relay identity is not registered yet.", 409);
+  const agentName = row.agent_name;
+  if (!row.hook_ciphertext) row = await patch(tx, row.id, { hook_ciphertext: encrypt(deps, `whsec_${randomBytes(32).toString("base64")}`) });
+  const hookSecret = decrypt(deps, row.hook_ciphertext!);
+  const saved = async (subscriptionId: string, values: Partial<SpawnRow>): Promise<SpawnRow> => {
+    try {
+      return await patch(tx, row.id, values);
+    } catch (error) {
+      await deps.relaycast.deleteSubscription(relay.key, subscriptionId).catch(() => undefined);
+      throw error;
+    }
+  };
+  if (!row.subscription_id) {
+    const subscriptionId = await deps.relaycast.createSubscription(relay.key,
+      { events: ["dm.received", "thread.reply"], url: relayEventsUrl(deps, row.id), secret: hookSecret });
+    row = await saved(subscriptionId, { subscription_id: subscriptionId });
+  }
+  if (!row.mention_subscription_id) {
+    const mentionSubscriptionId = await deps.relaycast.createSubscription(relay.key, { events: ["message.created"],
+      url: relayEventsUrl(deps, row.id), secret: hookSecret, filter: { mentions: agentName } });
+    row = await saved(mentionSubscriptionId, { mention_subscription_id: mentionSubscriptionId });
+  }
+  return row;
 }
 
 /** Sends the original task once, right after this call committed `dispatching`. */
@@ -1128,30 +1186,57 @@ async function reviveIdentity(deps: ReplicasDeps, actor: ReplicasActor, id: stri
   });
 }
 
-/** Connects an existing chat without creating a replica or running a repository task. */
+/**
+ * Connects an existing chat without creating a replica or running a
+ * repository task. For a replica enrolled through its environment identity
+ * whose chat is not chosen yet, it selects the chat that Relay messages are
+ * pushed into instead: the same owner/admin and same-person rules apply, and
+ * the selection cannot be changed afterwards.
+ */
 export async function bindReplica(deps: ReplicasDeps, actor: ReplicasActor, raw: unknown) {
   const input = z.object({ replica_id: z.string().uuid(), chat_id: z.string().uuid() }).safeParse(raw);
   if (!input.success) throw new ReplicasError("Use the existing replica and chat UUIDs.");
-  const row = await withReplicasLock(deps, actor, async (tx) => {
+  const outcome = await withReplicasLock(deps, actor, async (tx): Promise<{ row: SpawnRow; selected: boolean }> => {
     await requireAdmin(tx, actor);
     const { key, ciphertext } = await connectionKey(deps, tx, actor.workspaceId);
     const { replica } = await underKey(ciphertext, () => deps.replicas.get(key, input.data.replica_id));
-    const chat = replica.chats?.find((item) => item.id === input.data.chat_id);
+    const chat = replica.chats?.find((item) => item.id.toLowerCase() === input.data.chat_id.toLowerCase());
     if (!chat) throw new ReplicasError("The key cannot see that chat in that replica.", 404);
-    // The API's provider values are canonical. Refuse unsupported harnesses
-    // before saving a binding or registering an identity; never guess aliases.
-    const codingAgent = z.enum(["claude", "codex"]).safeParse(chat.provider);
-    if (!codingAgent.success) throw new ReplicasError("Native Relay MCP binding currently supports only Claude Code and Codex chats.", 422);
-    const older = await tx.query<SpawnRow>(`SELECT ${COLUMNS} FROM replica_spawns WHERE replica_id = $1 FOR UPDATE`, [replica.id]);
+    const older = await tx.query<SpawnRow>(`SELECT ${COLUMNS} FROM replica_spawns WHERE lower(replica_id) = lower($1) FOR UPDATE`, [replica.id]);
     if (older.rows.some((row) => row.state === "gone" && !row.input.cleanup_complete)) {
       throw new ReplicasError("Finish the previous binding cleanup before reconnecting this replica.", 409);
     }
     const prior = older.rows.find((row) => row.state !== "gone");
+    if (prior?.source === ENVIRONMENT_IDENTITY) {
+      if (prior.workspace_id !== actor.workspaceId || prior.user_id !== actor.userId) {
+        throw new ReplicasError("This replica already has another relay binding.", 409);
+      }
+      if (prior.chat_id !== null && prior.chat_id.toLowerCase() !== chat.id.toLowerCase()) {
+        throw new ReplicasError("This replica's Relay chat is already selected and cannot be changed.", 409);
+      }
+      // The binding must still pass its persisted enrolment checks before a
+      // person can point pushed messages at one of its chats.
+      const { assertEnvironmentRowAccessInTx } = await import("./environments.js");
+      await assertEnvironmentRowAccessInTx(tx, prior);
+      let row = prior;
+      const selecting = row.chat_id === null;
+      if (selecting) row = await patch(tx, row.id, { chat_id: chat.id, input: { ...row.input, relay_inbound_error: null } });
+      if (row.state === "bound" && row.token_ciphertext && row.agent_name) {
+        const relay = await relayFor(deps, tx, { workspaceId: row.workspace_id, userId: row.user_id }, row.relay_workspace_id);
+        row = await ensureRelaySubscriptions(deps, tx, row, relay);
+      }
+      if (selecting) await audit(tx, row, actor, "replicas.chat.selected");
+      return { row, selected: true };
+    }
+    // The API's provider values are canonical. Refuse unsupported harnesses
+    // before saving a binding or registering an identity; never guess aliases.
+    const codingAgent = z.enum(["claude", "codex"]).safeParse(chat.provider);
+    if (!codingAgent.success) throw new ReplicasError("Native Relay MCP binding currently supports only Claude Code and Codex chats.", 422);
     if (prior) {
       if (prior.workspace_id !== actor.workspaceId || prior.user_id !== actor.userId || prior.chat_id !== chat.id) {
         throw new ReplicasError("This replica already has another relay binding.", 409);
       }
-      return prior;
+      return { row: prior, selected: false };
     }
     const inserted = (await tx.query<SpawnRow>(
       `INSERT INTO replica_spawns (id, workspace_id, organization_id, user_id, client_request_id, source, input, replica_id, chat_id, state)
@@ -1163,9 +1248,11 @@ export async function bindReplica(deps: ReplicasDeps, actor: ReplicasActor, raw:
         replica.id, chat.id],
     )).rows[0]!;
     await audit(tx, inserted, actor, "replicas.spawn.created");
-    return inserted;
+    return { row: inserted, selected: false };
   });
-  return spawnView(await advance(deps, row, actor));
+  // An environment binding is already enrolled: there is nothing to prepare.
+  if (outcome.selected) return spawnView(outcome.row);
+  return spawnView(await advance(deps, outcome.row, actor));
 }
 
 /** Dashboard summary: the connection (never its key) and every live binding with its delivery warnings. */
@@ -1199,6 +1286,7 @@ export async function workspaceReplicas(deps: ReplicasDeps, actor: ReplicasActor
         return {
           id: row.id, agent: row.agent_name, replicaId: row.replica_id, status: bindingStatus(row.state, row.input.relay_mcp_version), error: row.last_error,
           ...(view.provisioning_error ? { provisioning_error: view.provisioning_error } : {}),
+          inbound_delivery: view.inbound_delivery,
           uncertainMessages: count?.uncertain ?? 0, rejectedMessages: count?.rejected ?? 0, retryingMessages: count?.retrying ?? 0,
         };
       }),
@@ -1240,6 +1328,131 @@ export async function withCapability<T>(
 }
 
 type RelayEventResult = { status: number; body: Record<string, unknown> };
+
+/** What an earlier claim of the same message reached: sent, possibly sent, or refused. */
+export type DeliveryPrior = "confirmed" | "outcome_unknown" | "rejected";
+export type DeliveryClaim = { kind: "gone" } | { kind: "claimed" } | { kind: "duplicate"; prior: DeliveryPrior };
+
+/**
+ * Claims one Relay message for a binding. The caller commits the claim
+ * before any injection, so a crash during injection leaves an uncertain
+ * claim, never a second injection. A `retrying` claim is taken again; any
+ * other existing claim is a duplicate that reports what it reached.
+ */
+export async function claimDeliveryInTx(tx: SqlExecutor, spawnId: string, messageId: string): Promise<DeliveryClaim> {
+  // Recheck under the revocation lock; the signature alone does not keep a released binding alive.
+  const current = await byId(tx, spawnId, true);
+  if (!current || !["bound", "dispatching"].includes(current.state)) return { kind: "gone" };
+  const inserted = await tx.query(
+    `INSERT INTO replica_deliveries (spawn_id, message_id, state) VALUES ($1, $2, 'sending')
+     ON CONFLICT (spawn_id, message_id) DO NOTHING RETURNING message_id`,
+    [spawnId, messageId],
+  );
+  if (inserted.rows.length) return { kind: "claimed" };
+  const retried = await tx.query(
+    `UPDATE replica_deliveries SET state = 'sending', updated_at = now()
+      WHERE spawn_id = $1 AND message_id = $2 AND state = 'retrying' RETURNING message_id`,
+    [spawnId, messageId],
+  );
+  if (retried.rows.length) return { kind: "claimed" };
+  const existing = (await tx.query<{ state: string }>(
+    "SELECT state FROM replica_deliveries WHERE spawn_id = $1 AND message_id = $2",
+    [spawnId, messageId],
+  )).rows[0];
+  const prior: DeliveryPrior = existing?.state === "sent" ? "confirmed" : existing?.state === "rejected" ? "rejected" : "outcome_unknown";
+  return { kind: "duplicate", prior };
+}
+
+export type RelayDelivery = { messageId: string; sender: string; type: string; text: string; threadId: string | null };
+/**
+ * How one injection settled: `sent` (the provider accepted it), `rejected`
+ * (refused for good), `retrying` (nothing was sent; a later delivery of the
+ * same message may try again), `unknown` (possibly sent; never replayed) or
+ * `gone` (the binding was released after the claim).
+ */
+export type DeliveryOutcome = {
+  state: "sent" | "rejected" | "retrying" | "unknown" | "gone";
+  /** The provider answered with a refusal status. */
+  providerRefused?: boolean;
+  /** Safe code when an environment binding failed its checks. */
+  code?: string;
+};
+
+/**
+ * Injects one claimed Relay message into the binding's chat and settles the
+ * claim. Runs under the workspace lock, in a transaction after the one that
+ * committed the claim. An environment-identity binding must first pass its
+ * persisted enrolment checks, still list an awake selected (or sole) chat,
+ * and keep a live workspace Relay binding; otherwise nothing is sent and the
+ * claim waits in `retrying`. Sleeping compute is never woken here.
+ */
+export async function injectDeliveryInTx(deps: ReplicasDeps, tx: SqlExecutor, spawnId: string,
+  delivery: RelayDelivery): Promise<DeliveryOutcome> {
+  const { messageId, sender, type, text } = delivery;
+  const settle = (state: string, error: string | null, providerMessageId: string | null = null) => tx.query(
+    `UPDATE replica_deliveries SET state = $3, last_error = $4, provider_message_id = $5, updated_at = now()
+      WHERE spawn_id = $1 AND message_id = $2`,
+    [spawnId, messageId, state, error, providerMessageId],
+  );
+  let current = await byId(tx, spawnId, true);
+  if (!current || !["bound", "dispatching"].includes(current.state)) {
+    // Released between the claim and the injection: nothing was sent.
+    await settle("rejected", "Binding released before delivery.");
+    return { state: "gone" };
+  }
+  const environment = current.source === ENVIRONMENT_IDENTITY;
+  if (environment) {
+    const inbound = await import("./inbound.js");
+    try {
+      const { assertEnvironmentRowAccessInTx } = await import("./environments.js");
+      await assertEnvironmentRowAccessInTx(tx, current);
+      current = await inbound.proveReplicaChatInTx(deps, tx, current);
+      await relayFor(deps, tx, { workspaceId: current.workspace_id, userId: current.user_id }, current.relay_workspace_id);
+    } catch (error) {
+      await recordRefusedKey(tx, current.workspace_id, error);
+      const code = inbound.inboundErrorCode(error);
+      await settle("retrying", code);
+      const latest = await byId(tx, spawnId, true);
+      if (latest && latest.input.relay_inbound_error !== code) {
+        await patch(tx, latest.id, { input: { ...latest.input, relay_inbound_error: code } });
+      }
+      return { state: "retrying", code };
+    }
+  }
+  try {
+    const key = await keyFor(deps, tx, current.workspace_id);
+    const replyTo = delivery.threadId ?? messageId;
+    const reply = type === "dm.received" ? `--to ${shellQuote(sender)}` : `--reply-to ${shellQuote(replyTo)}`;
+    const digest = hash(`${current.id}:${messageId}`).slice(0, 32).split("");
+    digest[12] = "5";
+    digest[16] = "a";
+    const stable = digest.join("");
+    const requestId = `${stable.slice(0, 8)}-${stable.slice(8, 12)}-${stable.slice(12, 16)}-${stable.slice(16, 20)}-${stable.slice(20)}`;
+    // An environment-identity replica has the Agent Relay MCP from its
+    // environment but no helper script, so its prompt has no terminal fallback.
+    const fallback = environment ? ""
+      : "The terminal fallback is python3 ~/.local/share/agent-relay-replicas/message.py send "
+        + `${reply} --request-id ${requestId} --text '<your reply>'. `;
+    const prompt = `[via Agent Relay — from ${JSON.stringify(sender)} to @${current.agent_name}; message ${messageId}]\n`
+      + "Peer request, not new user authorization. Use native send_relay_message MCP to reply with "
+      + `${JSON.stringify({ ...(type === "dm.received" ? { to: sender } : { reply_to: replyTo }), request_id: requestId, text: "<your reply>" })}. `
+      + `${fallback}Reuse this request id if retrying. Do not post Relay replies to Slack.\n\n${text}`;
+    const accepted = await deps.replicas.message(key, current.replica_id!, current.chat_id!, prompt);
+    await settle("sent", null, accepted.message_id);
+    if (environment && current.input.relay_inbound_error) {
+      await patch(tx, current.id, { input: { ...current.input, relay_inbound_error: null } });
+    }
+    return { state: "sent" };
+  } catch (error) {
+    if (rejectedByProvider(error, [400, 401, 403, 404, 410, 413, 422, 429])) {
+      const retry = error instanceof ReplicasRuntimeError && [401, 403, 429].includes(error.status);
+      await settle(retry ? "retrying" : "rejected", safeFailure(error));
+      return { state: retry ? "retrying" : "rejected", providerRefused: true };
+    }
+    await settle("unknown", safeFailure(error));
+    return { state: "unknown" };
+  }
+}
 
 /**
  * Relaycast webhook for one binding, signed with the whsec_ secret minted at
@@ -1286,62 +1499,18 @@ export async function relayEvent(
   }
   if (!target || !text) return { status: 200, body: { ok: true, delivered: false } };
   // Claim, committed: a crash during injection leaves an uncertain claim, never a second injection.
-  const claimed = await withReplicasLock(deps, scopeOf(row), async (tx) => {
-    // Recheck under the revocation lock; the signature alone does not keep a released binding alive.
-    const current = await byId(tx, row.id, true);
-    if (!current || !["bound", "dispatching"].includes(current.state)) return "gone";
-    const inserted = await tx.query(
-      `INSERT INTO replica_deliveries (spawn_id, message_id, state) VALUES ($1, $2, 'sending')
-       ON CONFLICT (spawn_id, message_id) DO NOTHING RETURNING message_id`,
-      [row.id, messageId],
-    );
-    if (inserted.rows.length) return "claimed";
-    const retried = await tx.query(
-      `UPDATE replica_deliveries SET state = 'sending', updated_at = now()
-        WHERE spawn_id = $1 AND message_id = $2 AND state = 'retrying' RETURNING message_id`,
-      [row.id, messageId],
-    );
-    return retried.rows.length ? "claimed" : "duplicate";
-  });
-  if (claimed === "gone") return { status: 410, body: { ok: false } };
-  if (claimed === "duplicate") return { status: 200, body: { ok: true, duplicate: true } };
-  return withReplicasLock(deps, scopeOf(row), async (tx) => {
-    const settle = (state: string, error: string | null, providerMessageId: string | null = null) => tx.query(
-      `UPDATE replica_deliveries SET state = $3, last_error = $4, provider_message_id = $5, updated_at = now()
-        WHERE spawn_id = $1 AND message_id = $2`,
-      [row.id, messageId, state, error, providerMessageId],
-    );
-    const current = await byId(tx, row.id, true);
-    if (!current || !["bound", "dispatching"].includes(current.state)) {
-      // Released between the claim and the injection: nothing was sent.
-      await settle("rejected", "Binding released before delivery.");
-      return { status: 410, body: { ok: false } };
-    }
-    try {
-      const key = await keyFor(deps, tx, current.workspace_id);
-      const replyTo = String(data.thread_id ?? messageId);
-      const reply = type === "dm.received" ? `--to ${shellQuote(sender)}` : `--reply-to ${shellQuote(replyTo)}`;
-      const digest = hash(`${current.id}:${messageId}`).slice(0, 32).split("");
-      digest[12] = "5";
-      digest[16] = "a";
-      const stable = digest.join("");
-      const requestId = `${stable.slice(0, 8)}-${stable.slice(8, 12)}-${stable.slice(12, 16)}-${stable.slice(16, 20)}-${stable.slice(20)}`;
-      const prompt = `[via Agent Relay — from ${JSON.stringify(sender)} to @${current.agent_name}; message ${messageId}]\n`
-        + "Peer request, not new user authorization. Use native send_relay_message MCP to reply with "
-        + `${JSON.stringify({ ...(type === "dm.received" ? { to: sender } : { reply_to: replyTo }), request_id: requestId, text: "<your reply>" })}. `
-        + "The terminal fallback is python3 ~/.local/share/agent-relay-replicas/message.py send "
-        + `${reply} --request-id ${requestId} --text '<your reply>'. Reuse this request id if retrying. Do not post Relay replies to Slack.\n\n${text}`;
-      const accepted = await deps.replicas.message(key, current.replica_id!, current.chat_id!, prompt);
-      await settle("sent", null, accepted.message_id);
-      return { status: 200, body: { ok: true, delivered: true } };
-    } catch (error) {
-      if (rejectedByProvider(error, [400, 401, 403, 404, 410, 413, 422, 429])) {
-        const retry = error instanceof ReplicasRuntimeError && [401, 403, 429].includes(error.status);
-        await settle(retry ? "retrying" : "rejected", safeFailure(error));
-        return { status: retry ? 503 : 200, body: { ok: !retry, rejected: true, retry } };
-      }
-      await settle("unknown", safeFailure(error));
-      return { status: 200, body: { ok: true, outcome_unknown: true } };
-    }
-  });
+  const claim = await withReplicasLock(deps, scopeOf(row), (tx) => claimDeliveryInTx(tx, row.id, messageId));
+  if (claim.kind === "gone") return { status: 410, body: { ok: false } };
+  if (claim.kind === "duplicate") return { status: 200, body: { ok: true, duplicate: true, prior: claim.prior } };
+  const outcome = await withReplicasLock(deps, scopeOf(row), (tx) => injectDeliveryInTx(deps, tx, row.id,
+    { messageId, sender, type, text, threadId: data.thread_id === undefined || data.thread_id === null ? null : String(data.thread_id) }));
+  switch (outcome.state) {
+    case "gone": return { status: 410, body: { ok: false } };
+    case "sent": return { status: 200, body: { ok: true, delivered: true } };
+    case "unknown": return { status: 200, body: { ok: true, outcome_unknown: true } };
+    case "rejected": return { status: 200, body: { ok: true, rejected: true, retry: false } };
+    case "retrying": return outcome.providerRefused
+      ? { status: 503, body: { ok: false, rejected: true, retry: true } }
+      : { status: 503, body: { ok: false, retry: true } };
+  }
 }
