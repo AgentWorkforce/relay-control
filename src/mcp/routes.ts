@@ -370,7 +370,7 @@ export function createMcpHandler(input: {
       console.warn("[selfhost-mcp] native chat context refused", {
         correlation_id: responseCorrelationId(response),
         stage,
-        reason: nativeContextRefusalReason(error),
+        reason: nativeContextRefusalReason(stage, error),
         method: typeof call?.method === "string" ? call.method : null,
         tool: typeof call?.params?.name === "string" ? call.params.name : null,
         provider: provider ?? null,

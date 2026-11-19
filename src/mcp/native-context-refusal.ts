@@ -9,42 +9,43 @@
 export type NativeContextStage = "claude_attestation" | "copilot_attestation" | "desktop_context";
 
 // Every fixed message of claude-attestation.ts, copilot-attestation.ts and
-// desktop-call.ts (a test keeps this in step with those files).
-const REASONS = new Map<string, string>([
-  // Claude Code / Cursor proofs.
+// desktop-call.ts (a test keeps this in step with those files). The codes are
+// the same in both editions; several messages share one code on purpose.
+const PROOF_REASONS = new Map<string, string>([
+  ["proof is not a compact JWS", "malformed_proof"],
+  ["invalid proof", "malformed_proof"],
   ["malformed segment", "malformed_segment"],
-  ["proof is not a compact JWS", "proof_not_compact_jws"],
   ["unexpected header", "unexpected_header"],
   ["unexpected payload", "unexpected_payload"],
   ["provider mismatch", "provider_mismatch"],
   ["tool use mismatch", "tool_use_mismatch"],
   ["tool mismatch", "tool_mismatch"],
   ["arguments mismatch", "arguments_mismatch"],
-  ["lifetime out of range", "lifetime_out_of_range"],
-  ["expired", "expired"],
-  ["issued in the future", "issued_in_the_future"],
-  ["malformed signature", "malformed_signature"],
-  ["unknown key", "unknown_key"],
-  ["bad signature", "bad_signature"],
-  ["replayed tool use", "replayed_tool_use"],
-  ["batched proof", "batched_proof"],
-  // Copilot proofs (shared messages above).
-  ["invalid proof", "invalid_proof"],
   ["owner mismatch", "owner_mismatch"],
   ["call mismatch", "call_mismatch"],
+  ["lifetime out of range", "invalid_lifetime"],
   ["invalid lifetime", "invalid_lifetime"],
-  ["invalid signature", "invalid_signature"],
+  ["expired", "expired"],
+  ["issued in the future", "issued_in_future"],
+  ["malformed signature", "malformed_signature"],
+  ["invalid signature", "malformed_signature"],
+  ["unknown key", "unknown_key"],
+  ["bad signature", "bad_signature"],
+  ["replayed tool use", "replayed_proof"],
   ["replayed proof", "replayed_proof"],
-  // Desktop call context.
-  ["Unsupported desktop identity headers.", "unsupported_identity_headers"],
+  ["batched proof", "batched_proof"],
+]);
+const CONTEXT_REASONS = new Map<string, string>([
+  ["Unsupported desktop identity headers.", "obsolete_identity_headers"],
   ["Unsupported native chat context.", "unsupported_context"],
   ["Conflicting native chat context.", "conflicting_context"],
   ["Invalid native chat context.", "invalid_context"],
 ]);
 
-/** The fixed code for a refusal; never the raw message. */
-export function nativeContextRefusalReason(error: unknown): string {
-  return error instanceof Error ? REASONS.get(error.message) ?? "unclassified" : "unclassified";
+/** The fixed code for a refusal at this stage; never the raw message. */
+export function nativeContextRefusalReason(stage: NativeContextStage, error: unknown): string {
+  const reasons = stage === "desktop_context" ? CONTEXT_REASONS : PROOF_REASONS;
+  return error instanceof Error ? reasons.get(error.message) ?? "unclassified" : "unclassified";
 }
 
 /** The response's `x-correlation-id`, when one was set; null otherwise. */

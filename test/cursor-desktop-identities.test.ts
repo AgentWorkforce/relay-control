@@ -160,7 +160,7 @@ test("bad Cursor proofs are refused: replay, wrong key, changed or unsigned args
   // carries the proof, the credential or the arguments.
   assert.equal(warn.mock.callCount(), 1);
   const fields = lastRefusal(warn);
-  assert.deepEqual(fields, { correlation_id: replayed.correlationId, stage: "claude_attestation", reason: "replayed_tool_use",
+  assert.deepEqual(fields, { correlation_id: replayed.correlationId, stage: "claude_attestation", reason: "replayed_proof",
     method: "tools/call", tool: "relay_status", provider: "cursor", auth_mode: "cli_login", workspace_id: env.workspaceId,
     user_id: fields.user_id });
   assert.equal(typeof fields.user_id, "string");
