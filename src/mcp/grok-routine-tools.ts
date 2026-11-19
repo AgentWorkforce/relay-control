@@ -28,7 +28,7 @@ export function registerGrokRoutineTools(server: McpServer, context: McpContext)
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, input => run(async () => {
     oauth.assertActor(input.name);
-    await routines.status(oauth.access.grantId, owner);
+    await routines.status(oauth.access.grantId, owner, { setup: true });
     const joined = await relayService(context).join({ name: oauth.access.agentName });
     return { ...await routines.status(oauth.access.grantId, owner), inbox_address: joined.address, mode: "webhook" };
   }));

@@ -293,7 +293,7 @@ test("gate-only: a routine reads a gated participant through relaygate and renew
   // The participant as a gate-only install stores it: relaygate's agent id and an rg_ token, written 13 hours ago.
   const tokens = new Map<string, string>([["rg_old", agent.token]]);
   const refreshed: string[] = [];
-  await f.database.query(`UPDATE hosted_relay_participants SET relaygate_agent_id='rga_fake', token_ciphertext=$1, admitted_clients='{grok-bot}',
+  await f.database.query(`UPDATE hosted_relay_participants SET relaygate_agent_id='rga_fake', token_ciphertext=$1, admitted_clients='{cursor-cloud}',
     updated_at=now() - interval '13 hours' WHERE agent_remote_id=$2`, [encryptSecret("rg_old", KEYRING.active), agent.id]);
   const gate = createRelaycastClient({ internalOrigin: "https://gate.example.test", fetchImpl: async (input, init) => {
     const url = new globalThis.URL(input instanceof Request ? input.url : String(input));
@@ -343,7 +343,7 @@ async function lapsedGatedParticipant(t: test.TestContext, answer: { agentId: st
   const f = await fixture(t, "/mcp");
   await f.tool("connect_grok_bot_routine"); await f.save();
   const agent = f.world.agents.get("fake-grok")!;
-  await f.database.query(`UPDATE hosted_relay_participants SET relaygate_agent_id='rga_fake', token_ciphertext=$1, admitted_clients='{grok-bot}'
+  await f.database.query(`UPDATE hosted_relay_participants SET relaygate_agent_id='rga_fake', token_ciphertext=$1, admitted_clients='{cursor-cloud}'
     WHERE agent_remote_id=$2`, [encryptSecret("rg_lapsed", KEYRING.active), agent.id]);
   const tokens = new Map<string, string>();
   const enrolments: Array<{ agentName: string; client: string }> = [];
@@ -372,15 +372,15 @@ async function lapsedGatedParticipant(t: test.TestContext, answer: { agentId: st
   return { f, routines, enrolments, stored, routine };
 }
 
-test("gate-only: a routine whose rg_ token relaygate rejects enrols again as Grok Bot and wakes on the next scan", async t => {
+test("gate-only: a routine whose rg_ token relaygate rejects enrols again as its grant's kind (a Cursor-hosted Grok Bot: cursor-cloud) and wakes on the next scan", async t => {
   const { f, routines, enrolments, stored, routine } = await lapsedGatedParticipant(t, { agentId: "rga_fake" });
   await f.message();
   await routines.tick();
-  assert.deepEqual(enrolments, [{ agentName: "fake-grok", client: "grok-bot" }]);
+  assert.deepEqual(enrolments, [{ agentName: "fake-grok", client: "cursor-cloud" }]);
   const row = await stored();
   assert.equal(row.token, "rg_renewed");
   assert.equal(row.relaygate_agent_id, "rga_fake");
-  assert.deepEqual(row.admitted_clients, ["grok-bot"]);
+  assert.deepEqual(row.admitted_clients, ["cursor-cloud"]);
   assert.equal(f.calls.length, 0, "the scan that recovered the token woke nothing");
   assert.equal((await routine()).failures, 0);
   await routines.tick();
@@ -395,7 +395,7 @@ test("gate-only: a routine re-enrolment answered with another relaygate agent is
   const row = await stored();
   assert.equal(row.token, "rg_lapsed", "the stored token is kept");
   assert.equal(row.relaygate_agent_id, "rga_fake");
-  assert.deepEqual(row.admitted_clients, ["grok-bot"]);
+  assert.deepEqual(row.admitted_clients, ["cursor-cloud"]);
   const state = await routine();
   assert.equal(state.failures, 1); assert.equal(state.last_error, "delivery_unavailable");
   f.advance(); await routines.tick();

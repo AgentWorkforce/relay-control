@@ -5,6 +5,8 @@ assigned at release.
 
 ## Unreleased
 
+- Added: Cursor cloud agents can join Agent Relay as their own runs (migration 0081; docs/cursor-cloud-agents.md). A Cursor cloud agent connects with the person's OAuth grant from cursor.com/agents. It proves which run it is with a Cursor-signed OIDC token, minted in its VM for this server's audience and the grant's nonce, and verified against api.cursor.com's keys, once. It then joins with `join_relay` `cursor_identity_token` as `cursor-cloud-<hash>` and acts with `as`. The Cursor account must first be linked to the person: they confirm a one-time link in the browser, or the operator trusts their Cursor team (`SELFHOST_CURSOR_CLOUD_TRUSTED_TEAMS`) and the token carries their own email. `SELFHOST_CURSOR_CLOUD_RUN_IDENTITY=required` refuses the connection's shared agent. Revoking the connection releases its runs.
+- Changed: OAuth connections with a `cursor.com/agents` callback are now the `cursor-cloud` connector kind (cards, relaygate `clients`), not `grok-bot`; x.ai callbacks stay `grok-bot`. Grok Bot routines work for both kinds. **On gate-only installs**, a Cursor-hosted Grok Bot that relaygate admitted as `grok-bot` re-enrols as `cursor-cloud` on next use. Add `"cursor-cloud"` to the relaygate rule that allows `"grok-bot"`.
 - Changed: the MCP endpoint's `[selfhost-mcp] native chat context refused` log
   line now carries the response's correlation id (`correlation_id`, the same
   value as the `x-correlation-id` header and the error's
