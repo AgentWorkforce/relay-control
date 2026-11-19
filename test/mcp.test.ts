@@ -694,9 +694,30 @@ const CARD_INPUT = {
   documentation_url: "https://docs.example.test/reviewer",
 };
 
-test("get_relay_agent_card returns a minimal card for an agent without one, and refuses unknown agents", async (t) => {
+test("every listed Desktop and spawned agent has an inferred card and trusted owner", async (t) => {
   const env = await setup(t);
-  const peer = env.relay.world.addAgent("peer-bot", { description: "Answers questions", kind: "grok-bot", owner_name: "Teammate" });
+  const peer = env.relay.world.addAgent("peer-bot", {
+    session_title: "You are peer-bot. This truncated spawn prompt is not its published purpose.",
+    kind: "grok-bot", owner_name: "Untrusted label",
+  });
+  const spawned = env.relay.world.addAgent("spawned-bot", { session_title: "You are spawned-bot. Also truncated." });
+  await env.database.query(
+    `INSERT INTO desktop_relay_identities
+       (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id, agent_name,
+        agent_remote_id, address, token_ciphertext)
+     VALUES ($1, $2, $3, $4, 'rc-first', $5, $6, $7, $8, 'encrypted-test-token')`,
+    ["00000000-0000-4000-8000-000000000091", env.workspaceId, env.orgId, env.ownerId,
+      "00000000-0000-4000-8000-000000000092", peer.name, peer.id, `peer-bot@cloud-${peer.id}`],
+  );
+  await env.database.query(
+    `INSERT INTO relay_spawns
+       (id, workspace_id, user_id, authority_hash, relaycast_workspace_id, actor_id, idempotency_hash,
+        request_hash, agent_name, cli, node_id, state, worker_id, worker_address, audit)
+     VALUES ($1, $2, $3, 'authority', 'rc-first', 'actor', 'spawn-owner-card-idem', 'request',
+       $4, 'codex', 'node-1', 'ready', $5, $6, '[]'::jsonb)`,
+    ["00000000-0000-4000-8000-000000000093", env.workspaceId, env.ownerId,
+      spawned.name, spawned.id, `spawned-bot@cloud-${spawned.id}`],
+  );
   const client = await relayClient(t, env);
   const result = await client.callTool({ name: "get_relay_agent_card", arguments: { agent: `peer-bot@cloud-${peer.id}` } });
   assert.match((result.content as Array<{ text: string }>)[0]!.text,
@@ -704,7 +725,7 @@ test("get_relay_agent_card returns a minimal card for an agent without one, and 
   assert.deepEqual(structured(result), {
     protocolVersion: "0.3.0",
     name: "peer-bot",
-    description: "Answers questions",
+    description: `peer-bot is an Agent Relay agent on cloud-${peer.id}, available for direct collaboration.`,
     url: "https://cast.selfhosted.example/a2a/rpc",
     preferredTransport: "JSONRPC",
     version: "1",
@@ -712,14 +733,24 @@ test("get_relay_agent_card returns a minimal card for an agent without one, and 
     capabilities: { streaming: false, pushNotifications: false },
     defaultInputModes: ["text/plain"],
     defaultOutputModes: ["text/plain"],
-    skills: [],
+    skills: [{ id: "coordinate-work", name: "Coordinate current work",
+      description: "Send this agent a focused request related to the work it currently owns, including the expected outcome and relevant context.",
+      tags: [], examples: ["Coordinate a task or request a focused review."] }],
     "x-agent-relay": {
-      address: `peer-bot@cloud-${peer.id}`, kind: "grok-bot", owner: "Teammate", where: `cloud-${peer.id}`, status: "live",
-      tags: [], hasCard: false,
+      address: `peer-bot@cloud-${peer.id}`, kind: "grok-bot", owner: "Owner", where: `cloud-${peer.id}`, status: "live",
+      tags: [], hasCard: true, cardSource: "inferred",
     },
   });
   const listed = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
-  assert.deepEqual(listed.agents.map((agent: any) => [agent.name, agent.skills, agent.has_card]), [["peer-bot", [], false]]);
+  assert.deepEqual(listed.agents.map((agent: any) => [agent.name, agent.skills, agent.has_card, agent.card_source]), [
+    ["peer-bot", ["Coordinate current work"], true, "inferred"],
+    ["spawned-bot", ["Coordinate current work"], true, "inferred"],
+  ]);
+  for (const agent of listed.agents) {
+    assert.deepEqual(agent.owner, { user_id: env.ownerId, name: "Owner" });
+    assert.equal(agent.is_mine, true);
+  }
+  assert.doesNotMatch(structured(result).description, /truncated spawn prompt/i);
   assert.ok(client.getInstructions()?.includes(CARD_GUIDANCE));
   const channels = structured(await client.callTool({ name: "list_relay_channels", arguments: {} }));
   assert.ok(channels.guidance.endsWith(CARD_GUIDANCE));

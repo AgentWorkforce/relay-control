@@ -11,6 +11,7 @@ import {
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
 import { buildAgentCard, cardMetadata, cardSummary, recipientCard, type SetCardInput } from "./relay-agent-cards.js";
+import { loadRelayAgentOwners } from "./relay-agent-owners.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
 import { admissionConnectorKind, connectorKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
@@ -64,6 +65,11 @@ export const HOSTED_KIND = "hosted";
 export const DESKTOP_KIND = "relay-desktop";
 const AS_PERSON_UNAVAILABLE =
   "as_person is not available on this self-hosted site. Omit it to act as this MCP session's hosted participant.";
+const ownerEnrichmentFailed = (operation: "list_relay_agents" | "get_relay_agent_card", error: unknown) => {
+  console.warn("[selfhost-mcp] owner enrichment failed", {
+    operation, error: error instanceof Error ? error.name : "unknown",
+  });
+};
 
 /** Contract section 4, verbatim (shared with Cloud's hosted MCP). */
 export const RELAY_AGENT_CARD_GUIDANCE = "Before delegating to a peer, read its card with get_relay_agent_card to see what it does and what to send it. Keep your own card current with set_relay_agent_card: a description of your purpose and one skill per kind of work you take on, with example requests.";
@@ -671,8 +677,11 @@ function createRelayService(context: McpContext) {
   }
 
   async function roster(status: "live" | "all" | "offline", people: readonly McpMember[], includeStale = false, dir: Directory = directory()) {
-    return (await listedAgents(status === "live" ? "active" : "all", includeStale, dir))
-      .map(agent => ({ ...rosterAgent(agent, people, userId, workspaceId), ...cardSummary(agent.metadata) }))
+    const listed = await listedAgents(status === "live" ? "active" : "all", includeStale, dir);
+    const owners = await loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, listed.map(agent => agent.id), people)
+      .catch(error => { ownerEnrichmentFailed("list_relay_agents", error); return undefined; });
+    return listed
+      .map(agent => ({ ...rosterAgent(agent, people, userId, workspaceId, owners?.get(agent.id)), ...cardSummary(agent.metadata, agent) }))
       .filter(agent => status === "all" || (status === "live" ? agent.online : !agent.online));
   }
 
@@ -1246,7 +1255,10 @@ function createRelayService(context: McpContext) {
     async getCard(input: { agent: string }) {
       const agent = await explicitAgent(input.agent.trim(), await callerDirectory());
       if (!agent || agent.status === "released" || !isListedRelayAgent(agent)) throw new RelayToolError(UNKNOWN_CARD_AGENT);
-      return buildAgentCard(agent, cardOptions);
+      const people = await context.members();
+      const owners = await loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, [agent.id], people)
+        .catch(error => { ownerEnrichmentFailed("get_relay_agent_card", error); return undefined; });
+      return buildAgentCard(agent, cardOptions, owners?.get(agent.id));
     },
 
     /**
@@ -1268,7 +1280,8 @@ function createRelayService(context: McpContext) {
           ...cardMetadata(input, current.metadata, new Date()), kind: own.kind, ...(ownerName ? { owner_name: ownerName } : {}) });
         const updated = await gate!.authenticatedAgent(own.gated.token);
         if (updated.id !== own.agentId) throw new RelayToolError(CARD_IDENTITY_CHANGED);
-        return { updated: true, linked: own.linked, name: updated.name, card: buildAgentCard(updated, cardOptions) };
+        return { updated: true, linked: own.linked, name: updated.name,
+          card: buildAgentCard(updated, cardOptions, context.principal) };
       }
       const current = await client.getRosterAgent(key, own.name);
       if (!current || current.id !== own.agentId || current.status === "released") throw new RelayToolError(CARD_IDENTITY_CHANGED);
@@ -1282,7 +1295,7 @@ function createRelayService(context: McpContext) {
         });
       if (updated.id !== own.agentId) throw new RelayToolError(CARD_IDENTITY_CHANGED);
       return { updated: true, linked: own.linked, name: updated.name,
-        card: buildAgentCard(updated, cardOptions) };
+        card: buildAgentCard(updated, cardOptions, context.principal) };
     },
 
     async leave(as?: string) {
