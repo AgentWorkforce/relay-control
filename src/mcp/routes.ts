@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { GrokRoutines } from "./grok-routines.js";
-import { connectorKind } from "./oauth/connector-kind.js";
+import { connectorKind, isGrokRoutineKind } from "./oauth/connector-kind.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { ApiTokenStore } from "../admin/api-tokens.js";
@@ -423,7 +423,7 @@ export function createMcpHandler(input: {
     if (oauth && input.grokRoutines) {
       const client = (await store.database.query<{ client_name: string | null; redirect_uris: string[] }>(
         "SELECT client_name,redirect_uris FROM mcp_oauth_clients WHERE client_id=$1", [oauth.access.clientId])).rows[0];
-      if (client && connectorKind({ clientName: client.client_name, redirectUris: client.redirect_uris }) === "grok-bot") {
+      if (client && isGrokRoutineKind(connectorKind({ clientName: client.client_name, redirectUris: client.redirect_uris }))) {
         context.grokRoutines = input.grokRoutines;
       }
     }

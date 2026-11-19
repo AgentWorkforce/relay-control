@@ -2,7 +2,16 @@
 // URIs. A leaf (no imports) so the request-auth path can classify a grant
 // without loading the connectors dashboard module.
 
-export type ConnectorKind = "chatgpt" | "grok-bot" | "muse" | "mcp";
+export type ConnectorKind = "chatgpt" | "grok-bot" | "cursor-cloud" | "muse" | "mcp";
+
+/**
+ * Kinds that may use Grok Bot routines (relay-events wake-ups). Grok Bot runs
+ * as a Cursor cloud agent (a Cursor automation), and from this server a
+ * Cursor-hosted Grok Bot cannot be told apart from any other Cursor cloud
+ * agent, so both kinds keep the routine features.
+ */
+export const GROK_ROUTINE_KINDS: ReadonlySet<ConnectorKind> = new Set(["grok-bot", "cursor-cloud"]);
+export const isGrokRoutineKind = (kind: ConnectorKind) => GROK_ROUTINE_KINDS.has(kind);
 
 export function hostOf(uri: string): { scheme: string; host: string; displayHost: string; path: string } | null {
   try {
@@ -21,20 +30,22 @@ export function hostOf(uri: string): { scheme: string; host: string; displayHost
 const under = (host: string, domain: string) => host === domain || host.endsWith(`.${domain}`);
 
 /**
- * Which client a grant belongs to, from what it registered. Grok Bot runs on
- * Cursor's cloud-agent backend and registers its
- * https://www.cursor.com/agents/... callback (plus cursor:// and localhost);
- * the Cursor IDE registers cursor:// too, so cursor:// alone is not Grok Bot.
+ * Which client a grant belongs to, from what it registered. A Cursor cloud
+ * agent (Cursor's cloud-agent backend, including a Grok Bot running there)
+ * registers its https://www.cursor.com/agents/... callback (plus cursor://
+ * and localhost); the Cursor IDE registers cursor:// too, so cursor:// alone
+ * is not a cloud agent. x.ai callbacks are Grok Bot.
  * ChatGPT registers chatgpt.com / openai.com callbacks. The client name is
  * self-reported, so it never decides the kind; a grant with a routine is Grok
  * Bot unless its registered callback identifies Muse, whose polling uses
  * the same ingest infrastructure.
  */
 export function connectorKind(client: { clientName: string | null; redirectUris: string[] }): ConnectorKind {
-  // Mixed registrations retain the established Grok, then ChatGPT, then Muse
+  // Mixed registrations retain the established Cursor, Grok, then ChatGPT, then Muse
   // precedence. This is provider presentation, never additional OAuth authority.
   const hosts = client.redirectUris.map(hostOf).filter((value) => value !== null);
-  if (hosts.some(({ host, path }) => (under(host, "cursor.com") && path.startsWith("/agents/")) || under(host, "x.ai"))) return "grok-bot";
+  if (hosts.some(({ host, path }) => under(host, "cursor.com") && path.startsWith("/agents/"))) return "cursor-cloud";
+  if (hosts.some(({ host }) => under(host, "x.ai"))) return "grok-bot";
   if (hosts.some(({ host }) => under(host, "chatgpt.com") || under(host, "openai.com"))) return "chatgpt";
   if (hosts.some(({ scheme, host }) => scheme === "https" && (under(host, "muse.ai") || under(host, "agent.meta.ai")))) return "muse";
   return "mcp";

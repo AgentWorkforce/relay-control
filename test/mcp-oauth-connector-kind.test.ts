@@ -3,8 +3,9 @@ import { test } from "node:test";
 import { admissionConnectorKind, connectorKind, hostOf, type ConnectorKind } from "../src/mcp/oauth/connector-kind.js";
 
 const classifications: ReadonlyArray<readonly [string, ConnectorKind]> = [
-  ["https://cursor.com/agents/fake/callback", "grok-bot"],
-  ["https://www.cursor.com/agents/fake/callback", "grok-bot"],
+  // Cursor cloud agents, including a Grok Bot running as one.
+  ["https://cursor.com/agents/fake/callback", "cursor-cloud"],
+  ["https://www.cursor.com/agents/fake/callback", "cursor-cloud"],
   ["https://cursor.com/agents", "mcp"],
   ["https://cursor.com/other/fake/callback", "mcp"],
   ["cursor://agents/fake/callback", "mcp"],
@@ -28,13 +29,14 @@ for (const [uri, expected] of classifications) {
   });
 }
 
-test("mixed registrations retain Grok then ChatGPT then Muse precedence in either URI order", () => {
+test("mixed registrations retain Cursor, Grok, then ChatGPT then Muse precedence in either URI order", () => {
   const grok = "https://www.cursor.com/agents/fake/callback";
   const chatgpt = "https://chatgpt.com/callback";
   const muse = "https://muse.ai/callback";
   for (const uris of [[grok, chatgpt, muse], [muse, chatgpt, grok]]) {
-    assert.equal(connectorKind({ clientName: "fake-muse", redirectUris: uris }), "grok-bot");
+    assert.equal(connectorKind({ clientName: "fake-muse", redirectUris: uris }), "cursor-cloud");
   }
+  assert.equal(connectorKind({ clientName: null, redirectUris: ["https://x.ai/callback", "https://chatgpt.com/callback"] }), "grok-bot");
   for (const uris of [[chatgpt, muse], [muse, chatgpt]]) {
     assert.equal(connectorKind({ clientName: "fake-grok", redirectUris: uris }), "chatgpt");
   }
@@ -55,7 +57,8 @@ test("admission kind refuses registrations that name two different providers", (
 test("admission kind from the registration needs every redirect URI to name the same provider", () => {
   assert.equal(admissionConnectorKind({ clientName: null, redirectUris: ["https://chatgpt.com/a", "https://api.openai.com/b"] }), "chatgpt");
   assert.equal(admissionConnectorKind({ clientName: null, redirectUris: ["https://muse.ai/callback"] }), "muse");
-  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: ["https://www.cursor.com/agents/fake/callback"] }), "grok-bot");
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: ["https://www.cursor.com/agents/fake/callback"] }), "cursor-cloud");
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: ["https://x.ai/callback"] }), "grok-bot");
   // A callback of its own beside a provider's is where such a client would receive its codes.
   for (const provider of ["https://chatgpt.com/callback", "https://muse.ai/callback", "https://www.cursor.com/agents/fake/callback"]) {
     for (const own of ["https://attacker.example.test/callback", "http://localhost:8787/callback", "http://127.0.0.1:8787/callback"]) {
@@ -71,7 +74,7 @@ test("admission kind follows the redirect URIs the grant's codes were delivered 
   const own = "https://attacker.example.test/callback";
   const local = "http://localhost:8787/callback";
   // A provider that also registers a loopback callback is still that provider when its codes went to its own callback.
-  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [grok, local] }, [grok]), "grok-bot");
+  assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [grok, local] }, [grok]), "cursor-cloud");
   assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [chatgpt, own] }, [chatgpt]), "chatgpt");
   // The same registrations are no provider when a code went anywhere else.
   assert.equal(admissionConnectorKind({ clientName: null, redirectUris: [grok, local] }, [local]), "mcp");
@@ -87,4 +90,11 @@ test("host parsing normalizes hostname and keeps display port/path; malformed UR
     scheme: "https", host: "www.x.ai", displayHost: "www.x.ai:8443", path: "/fake/callback",
   });
   assert.equal(hostOf("https://[bad"), null);
+});
+
+test("Grok Bot routines stay available to Cursor cloud agents, the way a Cursor-hosted Grok Bot connects", async () => {
+  const { isGrokRoutineKind } = await import("../src/mcp/oauth/connector-kind.js");
+  assert.equal(isGrokRoutineKind("grok-bot"), true);
+  assert.equal(isGrokRoutineKind("cursor-cloud"), true);
+  for (const kind of ["chatgpt", "muse", "mcp"] as const) assert.equal(isGrokRoutineKind(kind), false);
 });

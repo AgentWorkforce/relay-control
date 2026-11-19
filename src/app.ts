@@ -2,7 +2,7 @@ import { page } from "./identity/pages.js";
 import { revokeOrganizationMcpOAuthGrants } from "./mcp/oauth/revocations.js";
 import { createMcpOAuthHttpModule } from "./mcp/oauth/routes.js";
 import { McpOAuthStore } from "./mcp/oauth/store.js";
-import { connectorKind } from "./mcp/oauth/connector-kind.js";
+import { connectorKind, isGrokRoutineKind } from "./mcp/oauth/connector-kind.js";
 import { relayHostedCredentials } from "./mcp/relay-hosted-credentials.js";
 import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
@@ -636,9 +636,9 @@ export function createApp(input: {
     createStore:({protocol,issuer})=>new McpOAuthStore(store.database,{
       protocol,tenancyMode:store.tenancy,now:input.now,issueIdToken:issuer?.issueMcpOidcIdToken,
       isGrokRoutine:(request,client)=>request.resourcePath==="/api/v1/mcp/relay-events" &&
-        request.scopes.includes("relay:events") && connectorKind({
+        request.scopes.includes("relay:events") && isGrokRoutineKind(connectorKind({
           clientName:client.clientName,redirectUris:[request.redirectUri],
-        })==="grok-bot",
+        })),
     }),
     resolveSession:async request=>{
       if(request.headers.has("authorization")) return null;
