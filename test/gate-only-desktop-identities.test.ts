@@ -188,12 +188,20 @@ test("a signed Cursor call on a gate-only install sends, reads and reports statu
   });
 
   assert.notEqual(env.world.agents.get(chat.name)?.id, chat.agent_id, "the two agent-id namespaces differ");
-  const listed = await rpc(env.origin, secret, await call("list_relay_agents", { status: "all" }));
-  assert.equal(listed.status, 200, JSON.stringify(listed.body));
-  assert.notEqual(listed.body.result.isError, true, JSON.stringify(listed.body.result));
-  const listedChat = listed.body.result.structuredContent.agents.find((agent: any) => agent.name === chat.name);
-  assert.deepEqual([listedChat.session_id, listedChat.session_kind, listedChat.session_attribution],
+  const roster = await rpc(env.origin, secret, await call("list_relay_agents", { status: "all" }));
+  assert.equal(roster.status, 200, JSON.stringify(roster.body));
+  assert.notEqual(roster.body.result.isError, true, JSON.stringify(roster.body.result));
+  const listed = roster.body.result.structuredContent.agents.find((agent: any) => agent.name === chat.name);
+  assert.deepEqual([listed.session_id, listed.session_kind, listed.session_attribution],
     [chat.native_session.id, chat.native_session.kind, "synced"]);
+  assert.deepEqual({ owner: listed?.owner, is_mine: listed?.is_mine, has_card: listed?.has_card, card_source: listed?.card_source }, {
+    owner: { user_id: env.ownerId, name: "Owner" }, is_mine: true, has_card: true, card_source: "inferred",
+  });
+  const card = await rpc(env.origin, secret, await call("get_relay_agent_card", { agent: chat.name }));
+  assert.equal(card.status, 200, JSON.stringify(card.body));
+  assert.notEqual(card.body.result.isError, true, JSON.stringify(card.body.result));
+  assert.equal(card.body.result.structuredContent["x-agent-relay"].owner, "Owner");
+  assert.equal(card.body.result.structuredContent["x-agent-relay"].hasCard, true);
 
   const sent = await rpc(env.origin, secret, await call("send_relay_message", { to: "peer", text: "hello through the gate" }));
   assert.equal(sent.status, 200, JSON.stringify(sent.body));

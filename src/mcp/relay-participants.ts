@@ -6,11 +6,12 @@ import { RelaycastCallError, type RosterAgent } from "../messaging/relaycast.js"
 import {
   bindDesktopSession, DesktopIdentityUnavailable, DESKTOP_IDENTITY_MESSAGES, findDesktopIdentityByAddress,
   findDesktopIdentityByName, findDesktopIdentityBySession, linkedDesktopIdentity, unbindDesktopSession, verifyDesktopIdentity,
-  relaygateAgentId, type DesktopIdentityRow, type LinkedDesktopIdentity,
+  type DesktopIdentityRow, type LinkedDesktopIdentity,
 } from "../messaging/desktop-identities.js";
 import type { McpContext, McpMember } from "./context.js";
 import { isListedRelayAgent, rosterAgent } from "./team-activity.js";
 import { buildAgentCard, cardMetadata, cardSummary, recipientCard, type SetCardInput } from "./relay-agent-cards.js";
+import { loadRelayAgentOwners, relayAgentOwnerTarget } from "./relay-agent-owners.js";
 import { McpOAuthAccessRefused, McpOAuthActorRefused } from "./oauth/admission.js";
 import { admissionConnectorKind, connectorKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
 import { LAUNCH_ROLE_REFUSAL } from "./catalog.js";
@@ -64,6 +65,11 @@ export const HOSTED_KIND = "hosted";
 export const DESKTOP_KIND = "relay-desktop";
 const AS_PERSON_UNAVAILABLE =
   "as_person is not available on this self-hosted site. Omit it to act as this MCP session's hosted participant.";
+const ownerEnrichmentFailed = (operation: "list_relay_agents" | "get_relay_agent_card", error: unknown) => {
+  console.warn("[selfhost-mcp] owner enrichment failed", {
+    operation, error: error instanceof Error ? error.name : "unknown",
+  });
+};
 
 /** Contract section 4, verbatim (shared with Cloud's hosted MCP). */
 export const RELAY_AGENT_CARD_GUIDANCE = "Before delegating to a peer, read its card with get_relay_agent_card to see what it does and what to send it. Keep your own card current with set_relay_agent_card: a description of your purpose and one skill per kind of work you take on, with example requests.";
@@ -672,14 +678,10 @@ function createRelayService(context: McpContext) {
 
   const syncedSessionKinds = new Set(["codex", "grok", "pi", "opencode", "claude", "copilot", "cursor"]);
   const syncedSessionId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
-  const syncedIdentityId = (agent: RosterAgent) => {
-    if (!gate) return agent.id;
-    const id = relaygateAgentId(agent.metadata);
-    return id && syncedSessionId.test(id) ? id : agent.id;
-  };
   async function syncedDesktopSessions(agents: readonly RosterAgent[]) {
-    const candidates = new Map(agents.map(agent => [`${syncedIdentityId(agent)}\0${agent.name}`, agent]));
-    const ids = [...new Set(agents.map(syncedIdentityId))];
+    const targets = agents.map(agent => relayAgentOwnerTarget(agent, Boolean(gate)));
+    const candidates = new Map(targets.map((target, index) => [`${target.lookupId}\0${target.name}`, agents[index]!]));
+    const ids = [...new Set(targets.map(target => target.lookupId))];
     if (!ids.length) return new Map<string, { sessionId: string; sessionKind: string }>();
     const rows = await executor.query<{ agent_name: string; agent_remote_id: string; native_session_kind: string; native_session_id: string }>(
       `SELECT agent_name, agent_remote_id, native_session_kind, native_session_id
@@ -700,15 +702,19 @@ function createRelayService(context: McpContext) {
   }
 
   async function roster(status: "live" | "all" | "offline", people: readonly McpMember[], includeStale = false, dir: Directory = directory()) {
-    const agents = await listedAgents(status === "live" ? "active" : "all", includeStale, dir);
-    const synced = await syncedDesktopSessions(agents);
-    return agents
+    const listed = await listedAgents(status === "live" ? "active" : "all", includeStale, dir);
+    const [owners, synced] = await Promise.all([
+      loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, listed, people, Boolean(gate))
+        .catch(error => { ownerEnrichmentFailed("list_relay_agents", error); return undefined; }),
+      syncedDesktopSessions(listed),
+    ]);
+    return listed
       .map(agent => {
-        const listed = rosterAgent(agent, people, userId, workspaceId);
-        const session = listed.session_attribution ? null : synced.get(agent.id);
-        return { ...listed,
+        const row = rosterAgent(agent, people, userId, workspaceId, owners?.get(agent.id));
+        const session = row.session_attribution ? null : synced.get(agent.id);
+        return { ...row,
           ...(session ? { session_id: session.sessionId, session_kind: session.sessionKind, session_attribution: "synced" as const } : {}),
-          ...cardSummary(agent.metadata) };
+          ...cardSummary(agent.metadata, agent) };
       })
       .filter(agent => status === "all" || (status === "live" ? agent.online : !agent.online));
   }
@@ -1283,7 +1289,10 @@ function createRelayService(context: McpContext) {
     async getCard(input: { agent: string }) {
       const agent = await explicitAgent(input.agent.trim(), await callerDirectory());
       if (!agent || agent.status === "released" || !isListedRelayAgent(agent)) throw new RelayToolError(UNKNOWN_CARD_AGENT);
-      return buildAgentCard(agent, cardOptions);
+      const owners = await Promise.resolve().then(async () =>
+        loadRelayAgentOwners(database, workspaceId, relayWorkspaceId, [agent], await context.members(), Boolean(gate)))
+        .catch(error => { ownerEnrichmentFailed("get_relay_agent_card", error); return undefined; });
+      return buildAgentCard(agent, cardOptions, owners?.get(agent.id));
     },
 
     /**
@@ -1305,7 +1314,8 @@ function createRelayService(context: McpContext) {
           ...cardMetadata(input, current.metadata, new Date()), kind: own.kind, ...(ownerName ? { owner_name: ownerName } : {}) });
         const updated = await gate!.authenticatedAgent(own.gated.token);
         if (updated.id !== own.agentId) throw new RelayToolError(CARD_IDENTITY_CHANGED);
-        return { updated: true, linked: own.linked, name: updated.name, card: buildAgentCard(updated, cardOptions) };
+        return { updated: true, linked: own.linked, name: updated.name,
+          card: buildAgentCard(updated, cardOptions, context.principal) };
       }
       const current = await client.getRosterAgent(key, own.name);
       if (!current || current.id !== own.agentId || current.status === "released") throw new RelayToolError(CARD_IDENTITY_CHANGED);
@@ -1319,7 +1329,7 @@ function createRelayService(context: McpContext) {
         });
       if (updated.id !== own.agentId) throw new RelayToolError(CARD_IDENTITY_CHANGED);
       return { updated: true, linked: own.linked, name: updated.name,
-        card: buildAgentCard(updated, cardOptions) };
+        card: buildAgentCard(updated, cardOptions, context.principal) };
     },
 
     async leave(as?: string) {

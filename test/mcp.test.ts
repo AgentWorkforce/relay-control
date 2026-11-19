@@ -9,6 +9,7 @@ import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
+import type { TelemetryModule } from "../src/telemetry/module.js";
 import { createRelaycastWorld, type RelaycastWorld } from "./support/relaycast-world.js";
 import { PGliteDatabase } from "./support/harness.js";
 import { RECIPIENT_CARD_NOTE } from "../src/mcp/relay-agent-cards.js";
@@ -176,7 +177,7 @@ function fakeRelaycast(state: {
 
 const PUBLIC_ORIGIN = "https://control.internal.example";
 
-async function setup(t: TestContext) {
+async function setup(t: TestContext, telemetry?: TelemetryModule) {
   const historyAudience = "https://history.selfhosted.test";
   const history = await startHistory(t);
   const agents: unknown[] = [];
@@ -201,7 +202,7 @@ async function setup(t: TestContext) {
     host: "127.0.0.1",
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
-  const control = createServer(createApp({ config, store, messagingFetch: fakeRelaycast(relay) }));
+  const control = createServer(createApp({ config, store, messagingFetch: fakeRelaycast(relay), telemetry }));
   const origin = await listen(control);
   t.after(async () => {
     await close(control);
@@ -240,7 +241,7 @@ async function setup(t: TestContext) {
   };
   const accessToken = await login();
   return {
-    origin, config, database, history, relay, login,
+    origin, config, database, history, relay, login, store,
     orgId: org.body.id as string,
     workspaceId: workspace.body.id as string,
     otherWorkspaceId: other.body.id as string,
@@ -349,11 +350,60 @@ test("initialize advertises the self-host server and its tools on both paths", a
   assert.equal(echoed.headers.get("mcp-session-id"), "client-chosen_1");
 });
 
+function assertCorrelatedRpcError(response: { headers: Headers; body: any }, code: number, message: string) {
+  const id = response.headers.get("x-correlation-id");
+  assert.match(id ?? "", /^[0-9a-f-]{36}$/);
+  assert.deepEqual(response.body.error, { code, message, data: { correlation_id: id } });
+}
+
+test("MCP admission storage failures return a useful correlated error", async t => {
+  const observed = t.mock.fn((_error: unknown, _context: { path: string; status: number }) => {});
+  const env = await setup(t, telemetryWithObserver(observed));
+  const log = t.mock.method(console, "error", () => {});
+  const error = new TypeError("SECRET storage failure");
+  t.mock.method(env.store, "authenticateAccessToken", async () => { throw error; });
+  const response = await rpc(env.origin, MCP_PATH, { headers: { authorization: `Bearer ${env.accessToken}` } });
+  assert.equal(response.status, 500);
+  assertCorrelatedRpcError(response, -32603, "The MCP service is temporarily unavailable. Please try again.");
+  assert.equal(JSON.stringify(response.body).includes("SECRET"), false);
+  assert.equal(observed.mock.calls.length, 1);
+  assert.equal(observed.mock.calls[0]?.arguments[0], error);
+  assert.deepEqual(observed.mock.calls[0]?.arguments[1], { path: MCP_PATH, status: 500 });
+  assert.deepEqual(log.mock.calls.find(call => call.arguments[0] === "[selfhost-mcp] Request failed")?.arguments[1], {
+    error: "TypeError", correlationId: response.headers.get("x-correlation-id"),
+  });
+  assert.equal(JSON.stringify(log.mock.calls).includes("SECRET"), false);
+});
+
+function telemetryWithObserver(observeError: TelemetryModule["observeError"]): TelemetryModule {
+  // The app boundary consumes these callbacks; module storage has its own suite.
+  return { observeError, observeRequest: () => {}, handle: async () => false } as unknown as TelemetryModule;
+}
+
+test("MCP telemetry failures and writable error names never leak or change the response", async t => {
+  const observed = t.mock.fn((_error: unknown, _context: { path: string; status: number }) => { throw Error("SECRET observer failure"); });
+  const env = await setup(t, telemetryWithObserver(observed));
+  const log = t.mock.method(console, "error", () => {});
+  const error = new Error("SECRET storage details");
+  error.name = "SECRET writable name";
+  t.mock.method(env.store, "authenticateAccessToken", async () => { throw error; });
+  const response = await rpc(env.origin, MCP_PATH, { headers: { authorization: `Bearer ${env.accessToken}` } });
+  assert.equal(response.status, 500);
+  assertCorrelatedRpcError(response, -32603, "The MCP service is temporarily unavailable. Please try again.");
+  assert.equal(observed.mock.calls.length, 1);
+  assert.equal(JSON.stringify([response.body, log.mock.calls]).includes("SECRET"), false);
+  assert.deepEqual(log.mock.calls.find(call => call.arguments[0] === "[selfhost-mcp] Request failed")?.arguments[1], {
+    error: "Error", correlationId: response.headers.get("x-correlation-id"),
+  });
+});
+
 test("admission refuses foreign credentials, origins, methods, and oversized bodies", async (t) => {
   const env = await setup(t);
   const missing = await rpc(env.origin, MCP_PATH);
   assert.equal(missing.status, 401);
-  assert.deepEqual(missing.body, { jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+  assert.equal(missing.body.jsonrpc, "2.0");
+  assert.equal(missing.body.id, null);
+  assertCorrelatedRpcError(missing, -32001, "Unauthorized");
   assert.equal(missing.headers.get("www-authenticate"), "Bearer");
 
   const invalid = await rpc(env.origin, MCP_PATH, { headers: { authorization: "Bearer sh_at_not-a-real-token" } });
@@ -373,13 +423,13 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
   for (const token of [agentToken.accessToken, env.config.internalServiceToken!]) {
     const refused = await rpc(env.origin, MCP_PATH, { headers: { authorization: `Bearer ${token}` } });
     assert.equal(refused.status, 403);
-    assert.deepEqual(refused.body.error, { code: -32003, message: "Forbidden" });
+    assertCorrelatedRpcError(refused, -32003, "Forbidden");
   }
 
   const auth = { authorization: `Bearer ${env.accessToken}` };
   const foreign = await rpc(env.origin, MCP_PATH, { headers: { ...auth, origin: "https://evil.example" } });
   assert.equal(foreign.status, 403);
-  assert.deepEqual(foreign.body.error, { code: -32003, message: "Cross-origin MCP requests are forbidden." });
+  assertCorrelatedRpcError(foreign, -32003, "Cross-origin MCP requests are forbidden.");
   const sameOrigin = await rpc(env.origin, MCP_PATH, { headers: { ...auth, origin: PUBLIC_ORIGIN } });
   assert.equal(sameOrigin.status, 200);
 
@@ -391,7 +441,7 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
 
   const badSession = await rpc(env.origin, MCP_PATH, { headers: { ...auth, "mcp-session-id": "bad id!" } });
   assert.equal(badSession.status, 400);
-  assert.deepEqual(badSession.body.error, { code: -32600, message: "Invalid Mcp-Session-Id." });
+  assertCorrelatedRpcError(badSession, -32600, "Invalid Mcp-Session-Id.");
 
   const parse = await rpc(env.origin, MCP_PATH, { headers: auth, raw: "{not json" });
   assert.equal(parse.status, 400);
@@ -399,7 +449,7 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
 
   const tooLarge = await rpc(env.origin, MCP_PATH, { headers: auth, raw: JSON.stringify({ pad: "x".repeat(65 * 1024) }) });
   assert.equal(tooLarge.status, 413);
-  assert.deepEqual(tooLarge.body.error, { code: -32600, message: "MCP request body is too large." });
+  assertCorrelatedRpcError(tooLarge, -32600, "MCP request body is too large.");
 
   for (const method of ["GET", "DELETE"]) {
     const wrong = await rpc(env.origin, MCP_PATH, { method, headers: auth });
@@ -411,7 +461,7 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
   await env.database.query("UPDATE token_sessions SET scopes = ARRAY['rth:read']::text[]");
   const scoped = await rpc(env.origin, MCP_PATH, { headers: auth });
   assert.equal(scoped.status, 403);
-  assert.deepEqual(scoped.body.error, { code: -32003, message: "Forbidden" });
+  assertCorrelatedRpcError(scoped, -32003, "Forbidden");
 });
 
 test("the session cookie is accepted on the /cloud path only, behind the origin guard", async (t) => {
@@ -434,7 +484,9 @@ test("desktop calls validate the native chat context", async (t) => {
     body: { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "describe_capabilities", arguments: {}, _meta: { threadId: "nope" } } },
   });
   assert.equal(bad.status, 400);
-  assert.deepEqual(bad.body, { jsonrpc: "2.0", error: { code: -32602, message: "Invalid native chat context." }, id: 7 });
+  assert.equal(bad.body.jsonrpc, "2.0");
+  assert.equal(bad.body.id, 7);
+  assertCorrelatedRpcError(bad, -32602, "Invalid native chat context.");
   const good = await rpc(env.origin, MCP_PATH, {
     headers,
     body: {
@@ -694,9 +746,30 @@ const CARD_INPUT = {
   documentation_url: "https://docs.example.test/reviewer",
 };
 
-test("get_relay_agent_card returns a minimal card for an agent without one, and refuses unknown agents", async (t) => {
+test("every listed Desktop and spawned agent has an inferred card and trusted owner", async (t) => {
   const env = await setup(t);
-  const peer = env.relay.world.addAgent("peer-bot", { description: "Answers questions", kind: "grok-bot", owner_name: "Teammate" });
+  const peer = env.relay.world.addAgent("peer-bot", {
+    session_title: "You are peer-bot. This truncated spawn prompt is not its published purpose.",
+    kind: "grok-bot", owner_name: "Untrusted label",
+  });
+  const spawned = env.relay.world.addAgent("spawned-bot", { session_title: "You are spawned-bot. Also truncated." });
+  await env.database.query(
+    `INSERT INTO desktop_relay_identities
+       (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id, agent_name,
+        agent_remote_id, address, token_ciphertext)
+     VALUES ($1, $2, $3, $4, 'rc-first', $5, $6, $7, $8, 'encrypted-test-token')`,
+    ["00000000-0000-4000-8000-000000000091", env.workspaceId, env.orgId, env.ownerId,
+      "00000000-0000-4000-8000-000000000092", peer.name, peer.id, `peer-bot@cloud-${peer.id}`],
+  );
+  await env.database.query(
+    `INSERT INTO relay_spawns
+       (id, workspace_id, user_id, authority_hash, relaycast_workspace_id, actor_id, idempotency_hash,
+        request_hash, agent_name, cli, node_id, state, worker_id, worker_address, audit)
+     VALUES ($1, $2, $3, 'authority', 'rc-first', 'actor', 'spawn-owner-card-idem', 'request',
+       $4, 'codex', 'node-1', 'ready', $5, $6, '[]'::jsonb)`,
+    ["00000000-0000-4000-8000-000000000093", env.workspaceId, env.ownerId,
+      spawned.name, spawned.id, `spawned-bot@cloud-${spawned.id}`],
+  );
   const client = await relayClient(t, env);
   const result = await client.callTool({ name: "get_relay_agent_card", arguments: { agent: `peer-bot@cloud-${peer.id}` } });
   assert.match((result.content as Array<{ text: string }>)[0]!.text,
@@ -704,7 +777,7 @@ test("get_relay_agent_card returns a minimal card for an agent without one, and 
   assert.deepEqual(structured(result), {
     protocolVersion: "0.3.0",
     name: "peer-bot",
-    description: "Answers questions",
+    description: `peer-bot is an Agent Relay agent on cloud-${peer.id}, available for direct collaboration.`,
     url: "https://cast.selfhosted.example/a2a/rpc",
     preferredTransport: "JSONRPC",
     version: "1",
@@ -712,14 +785,24 @@ test("get_relay_agent_card returns a minimal card for an agent without one, and 
     capabilities: { streaming: false, pushNotifications: false },
     defaultInputModes: ["text/plain"],
     defaultOutputModes: ["text/plain"],
-    skills: [],
+    skills: [{ id: "coordinate-work", name: "Coordinate current work",
+      description: "Send this agent a focused request related to the work it currently owns, including the expected outcome and relevant context.",
+      tags: [], examples: ["Coordinate a task or request a focused review."] }],
     "x-agent-relay": {
-      address: `peer-bot@cloud-${peer.id}`, kind: "grok-bot", owner: "Teammate", where: `cloud-${peer.id}`, status: "live",
-      tags: [], hasCard: false,
+      address: `peer-bot@cloud-${peer.id}`, kind: "grok-bot", owner: "Owner", where: `cloud-${peer.id}`, status: "live",
+      tags: [], hasCard: true, cardSource: "inferred",
     },
   });
   const listed = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
-  assert.deepEqual(listed.agents.map((agent: any) => [agent.name, agent.skills, agent.has_card]), [["peer-bot", [], false]]);
+  assert.deepEqual(listed.agents.map((agent: any) => [agent.name, agent.skills, agent.has_card, agent.card_source]), [
+    ["peer-bot", ["Coordinate current work"], true, "inferred"],
+    ["spawned-bot", ["Coordinate current work"], true, "inferred"],
+  ]);
+  for (const agent of listed.agents) {
+    assert.deepEqual(agent.owner, { user_id: env.ownerId, name: "Owner" });
+    assert.equal(agent.is_mine, true);
+  }
+  assert.doesNotMatch(structured(result).description, /truncated spawn prompt/i);
   assert.ok(client.getInstructions()?.includes(CARD_GUIDANCE));
   const channels = structured(await client.callTool({ name: "list_relay_channels", arguments: {} }));
   assert.ok(channels.guidance.endsWith(CARD_GUIDANCE));
@@ -761,6 +844,33 @@ test("list_relay_agents links synced Desktop sessions and keeps validated declar
   const declaredRow = agents.find((agent: any) => agent.name === declared.name);
   assert.deepEqual([declaredRow.session_id, declaredRow.session_kind, declaredRow.session_attribution],
     ["declared-session-id", "claude", "declared"]);
+});
+
+test("agent card owner enrichment fails open when its journal or membership read fails", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-bot", {
+    owner_hash: sha256(env.ownerId), owner_name: "Metadata fallback",
+  });
+  const client = await relayClient(t, env);
+  const originalQuery = env.database.query.bind(env.database);
+  let failure: "owner" | "members" | null = null;
+  env.database.query = (async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+    if (failure === "owner" && sql.includes("'desktop'::text AS source")) throw new Error("owner query unavailable");
+    if (failure === "members" && sql.includes("FROM organization_memberships m")) throw new Error("members query unavailable");
+    return originalQuery<T>(sql, params);
+  }) as typeof env.database.query;
+  t.after(() => { env.database.query = originalQuery; });
+
+  failure = "owner";
+  const listed = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
+  assert.deepEqual(listed.agents.map((agent: any) => ({ name: agent.name, owner: agent.owner, has_card: agent.has_card })), [{
+    name: "peer-bot", owner: { user_id: env.ownerId, name: "Owner" }, has_card: true,
+  }]);
+
+  failure = "members";
+  const card = structured(await client.callTool({ name: "get_relay_agent_card", arguments: { agent: "peer-bot" } }));
+  assert.equal(card["x-agent-relay"].owner, "Metadata fallback");
+  assert.equal(card["x-agent-relay"].hasCard, true);
 });
 
 test("set_relay_agent_card writes only the joined participant's card and preserves its other metadata", async (t) => {
