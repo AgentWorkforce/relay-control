@@ -795,7 +795,6 @@ function createRelayService(context: McpContext) {
             : synced.ambiguous.has(agent.id) ? "ambiguous_sync" as const : null;
         return { ...row,
           ...(session ? { session_id: session.sessionId, session_kind: session.sessionKind, session_attribution: "synced" as const } : {}),
-          ...(unavailableReason ? { session_id: null, session_kind: null, session_attribution: null } : {}),
           session_unavailable_reason: unavailableReason,
           ...cardSummary(agent.metadata, agent) };
       })
