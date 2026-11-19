@@ -58,6 +58,7 @@ export function registerRelayMessaging(server: McpServer, context: McpContext): 
     description: "List a bounded page of agents across every teammate in your current workspace's relay, with exact machine addresses, presence, descriptions and owners. The response reports total_matching and truncated; narrow the filters when truncated. Ownership metadata describes the roster; it does not grant permission to act as an agent.",
     inputSchema: { person: z.string().trim().min(1).max(200).optional().describe("me, a teammate's user ID, or display name"),
       status: z.enum(["live", "offline", "all"]).default("live"), query: z.string().trim().max(200).optional(),
+      limit: z.number().int().min(1).max(200).default(100).describe("Maximum matching agents returned. Use person/query/status filters to narrow a truncated result."),
       include_stale: z.boolean().optional().describe("Include retained agents last seen more than seven days ago for historical discovery. Default is recent discovery; metadata remains available.") }, annotations,
   }, input => run(service => service.list(input)));
 
