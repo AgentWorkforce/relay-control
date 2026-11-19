@@ -18,6 +18,34 @@ import { assertEventScope, boundedContent, buildDirectEventsPath, resolveWorkspa
 
 const MAX_CONTENT_LENGTH = 4_000;
 const ROSTER_UNAVAILABLE = "Workspace relay roster is temporarily unavailable. Please try again.";
+/** Bound on the Relaycast roster read; without the roster the tool fails. */
+const ROSTER_TIMEOUT_MS = 10_000;
+/**
+ * Bound on the Relaycast presence read. Presence is optional, so a stalled
+ * presence service gives way early and the roster is returned without it.
+ */
+const PRESENCE_TIMEOUT_MS = 2_000;
+/** Total time for the History activity reads; later rows are marked unavailable. */
+const ACTIVITY_DEADLINE_MS = 20_000;
+
+/** Overrides for the read bounds (tests); the registered tool uses the defaults. */
+export type TeamActivityLimits = { rosterTimeoutMs?: number; presenceTimeoutMs?: number; activityDeadlineMs?: number };
+
+/**
+ * Run `read` with a signal aborted after `ms`, and stop waiting then even if
+ * the read ignores the signal. A late result or rejection is dropped.
+ */
+function within<T>(read: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("The read timed out."));
+    }, Math.max(0, ms));
+  });
+  return Promise.race([Promise.resolve().then(() => read(controller.signal)), timeout]).finally(() => clearTimeout(timer));
+}
 
 const TeamActivityOutputSchema = z.object({
   workspace_id: z.string(),
@@ -173,10 +201,13 @@ export function rosterAgent(agent: RosterAgent, people: readonly McpMember[], us
 export type TeamAgent = ReturnType<typeof rosterAgent> & { liveness: AgentLiveness; livenessSource: AgentLivenessSource };
 
 /** The workspace roster merged with presence; throws when the roster cannot be read. */
-async function readTeam(context: McpContext, status: "live" | "all"): Promise<{ agents: TeamAgent[]; presenceAvailable: boolean }> {
+async function readTeam(
+  context: McpContext, status: "live" | "all", rosterTimeoutMs: number, presenceTimeoutMs: number,
+): Promise<{ agents: TeamAgent[]; presenceAvailable: boolean }> {
   const [rosterResult, presenceResult, people] = await Promise.all([
-    Promise.allSettled([context.relaycast.listAgents(status === "live" ? "active" : "all")]).then(([result]) => result!),
-    Promise.allSettled([context.relaycast.listPresence()]).then(([result]) => result!),
+    Promise.allSettled([within(signal => context.relaycast.listAgents(status === "live" ? "active" : "all", { signal }), rosterTimeoutMs)])
+      .then(([result]) => result!),
+    Promise.allSettled([within(signal => context.relaycast.listPresence({ signal }), presenceTimeoutMs)]).then(([result]) => result!),
     context.members(),
   ]);
   if (rosterResult.status === "rejected") {
@@ -280,10 +311,14 @@ export type TeamActivityInput = {
 };
 
 /** Workspace agents with presence and latest recorded activity. */
-export async function readTeamActivity(context: McpContext, input: TeamActivityInput): Promise<TeamActivity> {
+export async function readTeamActivity(
+  context: McpContext, input: TeamActivityInput, limits: TeamActivityLimits = {},
+): Promise<TeamActivity> {
   const workspaceId = resolveWorkspace(undefined, context);
-  const team = await readTeam(context, input.status);
+  const team = await readTeam(context, input.status,
+    limits.rosterTimeoutMs ?? ROSTER_TIMEOUT_MS, limits.presenceTimeoutMs ?? PRESENCE_TIMEOUT_MS);
   const now = Date.now();
+  const deadline = now + (limits.activityDeadlineMs ?? ACTIVITY_DEADLINE_MS);
   // Rank before capping, so the freshest agents are never the ones cut;
   // the rows that survive keep the roster's order.
   const kept = new Set(rankTeamAgents(team.agents).slice(0, input.max_agents));
@@ -291,10 +326,17 @@ export async function readTeamActivity(context: McpContext, input: TeamActivityI
   const candidates = selectActivityCandidates(agents, input.max_agents_with_activity);
   const reads = new Map<string, ActivityRead>();
   for (let i = 0; i < candidates.length; i += 5) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      // Out of time: the rest are unavailable and no further reads start.
+      for (const { key } of candidates.slice(i)) reads.set(key, { status: "unavailable", activity: null });
+      break;
+    }
     await Promise.all(candidates.slice(i, i + 5).map(async ({ key, sessionId, source }) => {
       try {
-        const parsed = SessionEventsPageSchema.safeParse(await context.readHistory(
-          buildDirectEventsPath(sessionId, { source, limit: 1, order: "desc", maxContent: input.max_content })));
+        // A read still pending at the deadline is unavailable; its late answer is dropped.
+        const parsed = SessionEventsPageSchema.safeParse(await within(() => context.readHistory(
+          buildDirectEventsPath(sessionId, { source, limit: 1, order: "desc", maxContent: input.max_content })), remaining));
         if (!parsed.success || parsed.data.sessionId !== sessionId) {
           throw new SharedSessionsToolError("Unsupported session response.");
         }
