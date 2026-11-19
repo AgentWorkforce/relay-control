@@ -26,6 +26,7 @@ import { historyReader, type McpContext, type McpMember } from "./context.js";
 import { ClaudeAttestationError, claudeAttestationFor, type ClaudeAttestation } from "./claude-attestation.js";
 import { CopilotAttestationError, copilotAttestationFor, postgresAttestationStore, type CopilotAttestation } from "./copilot-attestation.js";
 import { desktopCallContext, DesktopCallContextError } from "./desktop-call.js";
+import { nativeContextRefusalReason, responseCorrelationId, type NativeContextStage } from "./native-context-refusal.js";
 import { auditUnhandledReadCalls } from "./read-audit.js";
 import { buildMcpServer } from "./server.js";
 import { admitMcpOAuthBearer, type McpOAuthConnection } from "./oauth/admission.js";
@@ -362,6 +363,7 @@ export function createMcpHandler(input: {
     }
     const headers = webHeaders(request);
     let desktopCall;
+    let stage: NativeContextStage = provider === "copilot" ? "copilot_attestation" : "claude_attestation";
     try {
       // Always strips `_agent_relay_attestation` from the arguments; a proof
       // that does not verify refuses the call (no unattested fallback).
@@ -374,18 +376,21 @@ export function createMcpHandler(input: {
       const attested: CopilotAttestation | ClaudeAttestation | undefined = provider === "copilot"
         ? await copilotAttestationFor(body, auth, attestations)
         : await claudeAttestationFor(body, callHeaders, auth, attestations);
+      stage = "desktop_context";
       desktopCall = desktopCallContext(body, callHeaders, provider, attested);
     } catch (error) {
       // Store failures are server errors, not a refused proof.
       if (!(error instanceof CopilotAttestationError) && !(error instanceof ClaudeAttestationError) &&
           !(error instanceof DesktopCallContextError)) throw error;
       const parsed = JSONRPCRequestSchema.safeParse(body);
-      // The response stays generic; the operator log names the check that
-      // failed (never the proof, the token or the arguments).
+      // The response stays generic; the operator log joins it by correlation
+      // id and names the stage and a fixed reason code (never the verifier's
+      // message, the proof, the token or the arguments).
       const call = body as { method?: unknown; params?: { name?: unknown } } | null;
       console.warn("[selfhost-mcp] native chat context refused", {
-        check: error.name,
-        reason: error.message,
+        correlation_id: responseCorrelationId(response),
+        stage,
+        reason: nativeContextRefusalReason(stage, error),
         method: typeof call?.method === "string" ? call.method : null,
         tool: typeof call?.params?.name === "string" ? call.params.name : null,
         provider: provider ?? null,
@@ -430,6 +435,7 @@ export function createMcpHandler(input: {
         ...(config.relaygatePublicUrl ? { relaygatePublicUrl: config.relaygatePublicUrl } : {}),
         ...(launchCheck ? { launchCheck } : {}),
         ...(gateClient ? { gateClient } : {}),
+        ...(config.spawnMemoryPolicy ? { spawnMemoryPolicy: config.spawnMemoryPolicy } : {}),
       },
       ...(!oauth && !staffGrant && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && !staffGrant && input.replicas ? { replicas: input.replicas } : {}),

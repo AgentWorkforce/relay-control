@@ -1,4 +1,5 @@
 import type { CursorCloudDeps } from "./cursor-cloud.js";
+import type { MemoryPolicy } from "@agent-relay/spawn-placement";
 import type { CapyBindings } from "../capy/bindings.js";
 import type { AmpDeps } from "../amp/service.js";
 import type { ReplicasDeps } from "../replicas/service.js";
@@ -79,6 +80,8 @@ export type McpContext = {
     relaygatePublicUrl?: string;
     /** Gate-only installs only: relaygate's pre-spawn POST /v1/check (./relay-launch-check.ts). */
     launchCheck?: RelayLaunchCheck;
+    /** The spawn memory policy (docs/specs/spawn-placement-memory.md); absent means the defaults in observe. */
+    spawnMemoryPolicy?: MemoryPolicy;
     /**
      * Gate-only installs: the Relaycast client bound to relaygate's origin;
      * desktop identities hold rg_ tokens that only relaygate accepts.
