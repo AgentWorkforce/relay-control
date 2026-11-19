@@ -75,6 +75,11 @@ const ownerEnrichmentFailed = (operation: "list_relay_agents" | "get_relay_agent
     operation, error: error instanceof Error ? error.name : "unknown",
   });
 };
+const inboxSenderEnrichmentFailed = (error: unknown) => {
+  console.warn("[selfhost-mcp] inbox sender enrichment failed", {
+    operation: "check_relay_inbox", error: error instanceof Error ? error.name : "unknown",
+  });
+};
 
 /** Contract section 4, verbatim (shared with Cloud's hosted MCP). */
 export const RELAY_AGENT_CARD_GUIDANCE = "Before delegating to a peer, read its card with get_relay_agent_card to see what it does and what to send it. Keep your own card current with set_relay_agent_card: a description of your purpose and one skill per kind of work you take on, with example requests.";
@@ -1539,8 +1544,9 @@ function createRelayService(context: McpContext) {
       const hosted = await participant(as);
       if (!hosted) throw new RelayToolError("No hosted participant is bound to this MCP session. Send a message with send_relay_message to auto-join, or call join_relay first.");
       await touchPresence(hosted);
-      // Every fallible read finishes before any acknowledgement, so a failed
-      // enrichment leaves the deliveries pending for a retry.
+      // Required inbox and conversation reads finish before acknowledgement.
+      // Sender-address enrichment is optional and bounded: failure is logged
+      // and returned as a null address without failing the delivery read.
       const via = clientFor(hosted);
       const dir = directory(hosted);
       const [messages, conversations] = await Promise.all([
@@ -1550,7 +1556,7 @@ function createRelayService(context: McpContext) {
       const senders = [...new Set(messages.flatMap(message => message.sender ? [message.sender] : []))];
       const agents = senders.length ? (await dir.via.findAgentsByNames(dir.credential, senders, {
         signal: AbortSignal.timeout(INBOX_SENDER_LOOKUP_TIMEOUT_MS),
-      }).catch(() => [])).filter(isListedRelayAgent) : [];
+      }).catch(error => { inboxSenderEnrichmentFailed(error); return []; })).filter(isListedRelayAgent) : [];
       const addresses = new Map(agents.map(agent => [agent.name, agent.address]));
       const channelNames = new Map<string, string>();
       if (messages.some(isChannelDelivery)) {

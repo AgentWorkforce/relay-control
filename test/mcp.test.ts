@@ -150,8 +150,8 @@ type RelaycastCall = { path: string; authorization: string | null };
 /** Relaycast served through the injected messaging fetch: roster and presence, and the relay world. */
 function fakeRelaycast(state: {
   agents: unknown[]; presence: unknown[] | "fail"; calls: RelaycastCall[]; world: RelaycastWorld;
-  /** The bounded `names` lookup: "fail" answers 503; "roster" plays an older engine that ignores `names`. */
-  namesLookup?: "fail" | "roster";
+  /** The bounded `names` lookup: "fail" answers 503; "hang" waits for abort; "roster" ignores `names`. */
+  namesLookup?: "fail" | "hang" | "roster";
 }): typeof fetch {
   return (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input instanceof Request ? input.url : input));
@@ -164,6 +164,13 @@ function fakeRelaycast(state: {
     if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") {
       const names = url.searchParams.getAll("names");
       if (state.namesLookup === "fail" && names.length) return json(503, { ok: false, error: { code: "unavailable" } });
+      if (state.namesLookup === "hang" && names.length) {
+        return await new Promise<Response>((_resolve, reject) => {
+          const aborted = () => reject(init?.signal?.reason ?? new DOMException("Aborted", "AbortError"));
+          if (init?.signal?.aborted) aborted();
+          else init?.signal?.addEventListener("abort", aborted, { once: true });
+        });
+      }
       if (names.length === 0 || state.namesLookup === "roster") return json(200, { ok: true, data: state.agents });
       // The engine's bounded lookup: only the requested names.
       return json(200, { ok: true, data: state.agents.filter(row => names.includes((row as { name?: string }).name ?? "")) });
@@ -186,7 +193,7 @@ async function setup(t: TestContext, telemetry?: TelemetryModule) {
   const history = await startHistory(t);
   const agents: unknown[] = [];
   const relay = { agents, presence: [] as unknown[] | "fail", calls: [] as RelaycastCall[], world: createRelaycastWorld(agents),
-    namesLookup: undefined as "fail" | "roster" | undefined };
+    namesLookup: undefined as "fail" | "hang" | "roster" | undefined };
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -341,6 +348,8 @@ test("initialize advertises the self-host server and its tools on both paths", a
       "subscribe_relay_channel",
       "unsubscribe_relay_channel",
     ]);
+    assert.match(tools.find(tool => tool.name === "describe_capabilities")?.description ?? "",
+      /restricted_tools as \{ name, reason \}/);
     for (const tool of tools) {
       assert.equal(typeof tool.title, "string", tool.name);
       assert.equal(tool._meta, undefined, tool.name);
@@ -1629,9 +1638,38 @@ test("check_relay_inbox delivers messages with null sender addresses when bounde
   structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-inbox" } }));
   env.relay.world.sendAs("peer-a", "owner-inbox", "from a");
   env.relay.namesLookup = "fail";
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
   const inbox = structured(await client.callTool({ name: "check_relay_inbox", arguments: {} }));
   assert.deepEqual(inbox.messages.map((message: any) => ({ sender: message.sender, sender_address: message.sender_address })),
     [{ sender: "peer-a", sender_address: null }]);
+  assert.deepEqual(warnings, [["[selfhost-mcp] inbox sender enrichment failed",
+    { operation: "check_relay_inbox", error: "RelaycastCallError" }]]);
+});
+
+test("check_relay_inbox times out sender enrichment and acknowledges the delivery once on the following call", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-a");
+  const client = await relayClient(t, env);
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-inbox" } }));
+  env.relay.world.sendAs("peer-a", "owner-inbox", "from a");
+  env.relay.namesLookup = "hang";
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+  const started = Date.now();
+  const inbox = structured(await client.callTool({ name: "check_relay_inbox", arguments: {} }));
+  assert(Date.now() - started < 2_500, "sender enrichment stays within its one-second budget");
+  assert.equal(inbox.messages[0].sender_address, null);
+  const deliveryId = inbox.messages[0].delivery_id as string;
+  assert.deepEqual(env.relay.world.pending("owner-inbox").map(row => row.id), [deliveryId]);
+  assert.equal(warnings[0]?.[0], "[selfhost-mcp] inbox sender enrichment failed");
+  assert.equal((warnings[0]?.[1] as Record<string, unknown>)?.operation, "check_relay_inbox");
+
+  env.relay.namesLookup = undefined;
+  const acknowledged = structured(await client.callTool({ name: "check_relay_inbox", arguments: { acknowledge: [deliveryId] } }));
+  assert.deepEqual(acknowledged.acknowledged, [deliveryId]);
+  assert.deepEqual(env.relay.world.pending("owner-inbox"), []);
+  assert.equal(env.relay.world.bodies.filter(call => call.path === `/v1/deliveries/${deliveryId}/ack`).length, 1);
 });
 
 type AuditRow = Record<string, any>;

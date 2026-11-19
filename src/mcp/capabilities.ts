@@ -17,7 +17,7 @@ export function registerCapabilityDiscovery(server: McpServer, context: McpConte
   options: { nativeStatus?: () => Promise<unknown> } = {}): void {
   server.registerTool(CAPABILITY_DISCOVERY_TOOL, {
     title: "Describe this connection's capabilities",
-    description: "Use when an expected Agent Relay capability is missing or an operation is refused. Returns this MCP connection's endpoint, authentication mode, granted scopes, current workspace role and tool groups; unavailable or restricted groups include the exact reason and enablement requirements. Read-only.",
+    description: "Use when an expected Agent Relay capability is missing or an operation is refused. Returns this MCP connection's endpoint, authentication mode, granted scopes, current workspace role and tool groups. A group can remain available for directory reads while actor-dependent calls appear in restricted_tools as { name, reason }; unavailable or fully restricted groups include the exact reason and enablement requirements. Read-only.",
     inputSchema: {},
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async () => {
