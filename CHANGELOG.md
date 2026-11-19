@@ -8,6 +8,35 @@ assigned at release.
 - Added: per-device person messaging credentials. `POST /api/v1/workspaces/{id}/messaging/identity/credential` now mints each signed-in device its own 12 hour Relaycast device token for the person's agent (`POST /v1/agents/{name}/device-tokens`, workspace key) instead of handing out the agent's shared token, and answers with `device` (`{id, name, kind}`, derived from the server-side session only) and `expiresAt`. Tokens are stored encrypted in `person_device_credentials` (migration 0080), probed on every serve, re-minted inside one hour of expiry or when refused, and revoked at Relaycast when their sign-in ends (immediately on sign-out, else by a sweep on messaging requests; the expiry is the backstop). An optional body `{"refusedTokenSha256": "<64 lowercase hex>"}` forces a re-mint when it matches the stored token, at most once per device per 30 seconds (`429 rate_limited` with `Retry-After` inside the window); any other body is `400 invalid_request`. A device revoked while its sign-in still authenticates answers `403 device_revoked`. Mints take the same per-person lock as identity registration, recovery and member revocation, and re-check the sign-in and membership after the token is saved. A relay node token minted with a device token ends with that device token, so clients mint it again after a renewal. Desktop handoff tokens get `403 handoff_not_exchanged` / `403 handoff_not_capable`. Against a Relaycast without the device-token route (its exact `404 not_found` "Route not found" answer, agent confirmed) the shared token is served in the old shape and the fallback is logged. See docs/identity.md, "Person messaging credential".
 - Added: `SELFHOST_DEFAULT_SHARING_MODE` (`all` | `new` | `selected`) sets a deployment sharing mode served to callers whose organization has not saved one, and `SELFHOST_SHARING_MODE_OVERRIDE_ROLES` (`owner` and/or `admin`) leaves callers with those roles unlocked: their v1 policy omits `sharing_mode` and `sharing_mode_since`, and the v2 document serves the effective mode as `sections.capture.defaults.sharing_mode`. The organization-saved mode always wins. Applied per caller on `access/me`, the enrollment key exchange, introspection `capture_policy` (staff read grants as a member) and the upload-credentials revision check. Nothing is stored, no revision moves, and the organization policy routes and fleet view still show only what is stored. Both unset (the default), every response is unchanged. See docs/capture-policy.md.
 - Added: `relayfacts_list` and `relayfacts_get` on the Agent Relay MCP. They read the sessions pipeline read API's `GET /v1/relayfacts` (topics with counts) and `GET /v1/relayfacts/{topic}` (one page of a topic as markdown, `page` passed back as its cursor) through the same reader as the shared-session tools: `workspace` is always the credential's workspace, and a response without the workspace attestation returns nothing. They store and write nothing. Until the read API serves relayfacts (`READ_API_RELAYFACTS_ENABLED` off), every 501 is a successful `status: "disabled"` result ("relayfacts disabled") with the upstream reason. OAuth connections need `relay:history`; staff read grants do not get them. The per-user session reader now passes relayfacts cursors through unchanged and reports a 501's upstream reason.
+- Security: on a gate-only install (`SELFHOST_RELAYGATE_PUBLIC_URL` set), every
+  hosted MCP participant now enrols at relaygate and its traffic, reads
+  included, goes through relaygate. That covers native MCP sessions and OAuth
+  connectors such as ChatGPT, Grok Bot, Muse and Cursor cloud agents. Before,
+  they were registered in Relaycast with the workspace key and messaged
+  around relaygate's policy (migration 0079). Control mints a one-time `sh_ht_`
+  hosted credential that relaygate introspects as `relay_hosted` with the
+  participant's client. relaygate admits hosted participants only through
+  rules naming the hosted kind, so **operators must add a relaygate
+  `controlPrincipals` rule per allowed client** (relaygate's "Hosted
+  participants"). Without one, `join_relay` fails and names the rule. Existing
+  participants are re-enrolled through relaygate on next use and keep their
+  upstream agent, so OAuth connections keep working. OAuth connections can no
+  longer launch agents on a gate-only install. A session with no relay
+  identity must `join_relay` before listing agents or channels there. A name
+  another owner or a provider binding holds is refused before any credential
+  is minted, and relaygate's answer must be the checked agent, the owner's,
+  or one relaygate registered itself. Each participant records the hosted
+  clients relaygate admitted it for (`admitted_clients`, migration 0079); a
+  connection of another kind enrols it again at relaygate as that kind first,
+  which re-applies that rule's groups and revokes the earlier token, and a
+  refusal leaves the participant as it was. The client is the connection's
+  admission kind, from the redirect URIs its authorization codes were
+  delivered to (index `mcp_oauth_codes_grant_idx`, migration 0079): a client
+  that registers a provider's callback beside its own enrols as `mcp`. Grok Bot routines whose token relaygate rejects
+  enrol again as `grok-bot` and adopt the token only for the same relaygate
+  and upstream agent. A stored participant is enrolled again only while its
+  own upstream agent still holds the name. See docs/identity.md, "Hosted
+  participants on gate-only installs".
 - Fixed: a Replicas launch or bind that never got a Relay identity no longer sits in `preparing`/`binding` forever. After 7 days the sync sweep abandons it (`gone`, audited `replicas.spawn.abandoned`). A replica Relay launched is put to sleep first; an existing chat is left awake. A failed sleep is retried no sooner than one hour later, and not at all while the connection is latched as refused. Rows with a Relay identity and environment identities are untouched.
 - Added: MCP `get_session_summary` can read recorded short or long summaries
   of the requested kind and return validated optional provenance. It enforces

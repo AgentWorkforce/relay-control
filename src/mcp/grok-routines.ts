@@ -2,10 +2,11 @@ import { randomBytes } from "node:crypto";
 import { decryptSecret, encryptSecret, hashSecret, type EncryptionKeyring } from "../crypto.js";
 import type { Database, SqlExecutor } from "../database.js";
 import { page } from "../identity/pages.js";
-import type { RelaycastClient } from "../messaging/relaycast.js";
+import { RelaycastCallError, type RelaycastClient } from "../messaging/relaycast.js";
 import { isBindingOwnedIdentity } from "../messaging/binding-identities.js";
 import { lockOrganization, lockUser, type TenancyMode } from "../tenancy.js";
-import { connectorKind } from "./oauth/connector-kind.js";
+import { admissionConnectorKind, usedRedirectUrisSql } from "./oauth/connector-kind.js";
+import { enrolHostedAtGate, type GateEnrolment } from "./hosted-gate.js";
 import type { McpConsentPrincipal } from "./oauth/consent.js";
 import { GrokRoutineError, grokInboxPrompt, parseGrokRoutineCredentials } from "./grok-routine.js";
 import { ownerHash, HOSTED_SOURCE } from "./relay-participants.js";
@@ -16,14 +17,23 @@ type Owner = Pick<McpConsentPrincipal, "userId" | "organizationId" | "workspaceI
 type Grant = { id: string; agent_name: string; agent_remote_id: string | null };
 type Routine = { credentials_ciphertext: string; notified_delivery_ids: string[]; failures: number;
   last_delivered_at: Date | string | null; last_error: string | null };
+/** A gated participant to enrol again at relaygate after the delivery transaction ends (GrokRoutines.recover). */
+type Recovery = { participantId: string; tokenCiphertext: string; relaygateAgentId: string; agentName: string; admittedClients: string[] };
 
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { "cache-control": "no-store" } });
 const escape = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
   .replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 
 /** One encrypted routine per grant. User -> organization -> grant locks fence every delivery against revocation. */
+/** A gated participant's rg_ token (24 h at relaygate) is renewed once it is this old. */
+const GATE_TOKEN_REFRESH_AFTER_MS = 12 * 3_600_000;
+/** How long one scan holds a routine while its participant enrols again at relaygate, so another scan does not race it. */
+const GATE_RECOVERY_LEASE_MS = 60_000;
+
 export class GrokRoutines {
   constructor(readonly options: { database: Database; keyring: EncryptionKeyring; client: RelaycastClient;
+    /** Gate-only installs: participants enrolled through relaygate (relaygate_agent_id set) are read through it. */
+    gate?: RelaycastClient;
     publicOrigin: string; tenancyMode: TenancyMode; fetchImpl?: typeof fetch; now?: () => Date; requestTimeoutMs?: number }) {}
 
   private now() { return this.options.now?.() ?? new Date(); }
@@ -31,7 +41,8 @@ export class GrokRoutines {
   async grant(tx: SqlExecutor, id: string, owner: Owner): Promise<Grant> {
     await lockUser(tx, owner.userId);
     await lockOrganization(tx, owner.organizationId);
-    const row = (await tx.query<Grant & { client_name: string | null; redirect_uris: string[] }>(`SELECT g.id,g.agent_name,g.agent_remote_id,c.client_name,c.redirect_uris
+    const row = (await tx.query<Grant & { client_name: string | null; redirect_uris: string[]; used: string[] }>(`SELECT g.id,g.agent_name,g.agent_remote_id,c.client_name,c.redirect_uris,
+        ${usedRedirectUrisSql("g.id", "g.client_id")} AS used
       FROM mcp_oauth_grants g JOIN mcp_oauth_clients c ON c.client_id=g.client_id
       JOIN workspaces w ON w.id=g.workspace_id AND w.organization_id=g.organization_id
       JOIN organization_memberships m ON m.organization_id=g.organization_id AND m.user_id=g.user_id
@@ -44,7 +55,7 @@ export class GrokRoutines {
       FOR UPDATE OF g`, [id, owner.userId, owner.organizationId, owner.workspaceId,
       [this.options.publicOrigin + "/mcp", this.options.publicOrigin + "/cloud/api/v1/mcp/shared-sessions"],
       this.options.tenancyMode, this.now()])).rows[0];
-    if (!row || connectorKind({ clientName: row.client_name, redirectUris: row.redirect_uris }) !== "grok-bot") {
+    if (!row || admissionConnectorKind({ clientName: row.client_name, redirectUris: row.redirect_uris }, row.used ?? []) !== "grok-bot") {
       throw new GrokRoutineError("This Grok Bot connection is no longer available. Reconnect it in this workspace.");
     }
     return row;
@@ -125,36 +136,65 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
        JOIN mcp_oauth_grants g ON g.id=r.grant_id WHERE r.next_attempt_at<=$1 ORDER BY r.next_attempt_at LIMIT 20`, [this.now()]);
     for (const candidate of candidates.rows) {
       if (signal?.aborted) break;
-      await this.options.database.transaction(async tx => {
+      const owner: Owner = { userId: candidate.user_id, organizationId: candidate.organization_id, workspaceId: candidate.workspace_id };
+      const recovery = await this.options.database.transaction(async (tx): Promise<Recovery | null> => {
         let grant: Grant;
-        try { grant = await this.grant(tx, candidate.grant_id, {
-          userId: candidate.user_id, organizationId: candidate.organization_id, workspaceId: candidate.workspace_id,
-        }); } catch (error) {
+        try { grant = await this.grant(tx, candidate.grant_id, owner); } catch (error) {
           if (!(error instanceof GrokRoutineError)) throw error;
           await tx.query("DELETE FROM grok_bot_routines WHERE grant_id=$1", [candidate.grant_id]);
-          return;
+          return null;
         }
         const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1 AND next_attempt_at<=$2 FOR UPDATE",
           [grant.id, this.now()])).rows[0];
-        if (!routine) return;
+        if (!routine) return null;
         try {
           // One budget bounds all remote reads, response bodies and the wake
           // while the revocation fence is held. stop() aborts the same requests.
           const deadline = AbortSignal.timeout(this.options.requestTimeoutMs ?? 5_000);
           const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
-          const participant = (await tx.query<{ token_ciphertext: string; relaycast_workspace_id: string }>(`SELECT p.token_ciphertext,p.relaycast_workspace_id
+          const participant = (await tx.query<{ id: string; token_ciphertext: string; relaycast_workspace_id: string;
+            relaygate_agent_id: string | null; agent_name: string; admitted_clients: string[]; stale: boolean }>(
+            `SELECT p.id,p.token_ciphertext,p.relaycast_workspace_id,p.relaygate_agent_id,p.agent_name,p.admitted_clients,
+              p.updated_at < $5 AS stale
             FROM hosted_relay_participants p JOIN workspaces w ON w.id=p.workspace_id AND w.organization_id=$4
             WHERE p.workspace_id=$1 AND p.user_id=$2 AND p.agent_remote_id=$3
               AND p.relaycast_workspace_id=w.relaycast_workspace_id`,
-          [candidate.workspace_id, candidate.user_id, grant.agent_remote_id, candidate.organization_id])).rows[0];
+          [candidate.workspace_id, candidate.user_id, grant.agent_remote_id, candidate.organization_id,
+            new Date(this.now().getTime() - GATE_TOKEN_REFRESH_AFTER_MS)])).rows[0];
           if (!participant) throw new Error("identity_unavailable");
-          const token = decryptSecret(participant.token_ciphertext, this.options.keyring);
-          const remote = await this.options.client.authenticatedAgent(token, requestSignal);
+          // A participant enrolled through relaygate holds an rg_ token: it reads through relaygate only.
+          const gated = participant.relaygate_agent_id !== null;
+          if (gated && !this.options.gate) throw new Error("identity_unavailable");
+          const via = gated ? this.options.gate! : this.options.client;
+          let token = decryptSecret(participant.token_ciphertext, this.options.keyring);
+          // relaygate enrolled this participant for other hosted clients only, or rejects its token (it lapsed
+          // while the routine was idle): enrol it again as Grok Bot once this transaction ends (recover).
+          const recover = async (rejected: boolean): Promise<Recovery> => {
+            await tx.query("UPDATE grok_bot_routines SET next_attempt_at=$2,updated_at=$3 WHERE grant_id=$1",
+              [grant.id, new Date(this.now().getTime() + GATE_RECOVERY_LEASE_MS), this.now()]);
+            return { participantId: participant.id, tokenCiphertext: participant.token_ciphertext, relaygateAgentId: participant.relaygate_agent_id!,
+              agentName: participant.agent_name,
+              admittedClients: rejected ? ["grok-bot"] : [...new Set([...(participant.admitted_clients ?? []), "grok-bot"])] };
+          };
+          if (gated && !(participant.admitted_clients ?? []).includes("grok-bot")) return await recover(false);
+          let remote: Awaited<ReturnType<RelaycastClient["authenticatedAgent"]>>;
+          try {
+            if (gated && participant.stale) {
+              // rg_ tokens last 24 hours; a routine may poll an idle participant for longer, so renew it at half-life.
+              token = await via.refreshGateToken(token, requestSignal);
+              await tx.query("UPDATE hosted_relay_participants SET token_ciphertext=$2, updated_at=now() WHERE id=$1",
+                [participant.id, encryptSecret(token, this.options.keyring.active)]);
+            }
+            remote = await via.authenticatedAgent(token, requestSignal);
+          } catch (error) {
+            if (gated && error instanceof RelaycastCallError && error.status === 401) return await recover(true);
+            throw error;
+          }
           if (remote.id !== grant.agent_remote_id || remote.workspaceId !== participant.relaycast_workspace_id || remote.status === "released" ||
               isBindingOwnedIdentity(remote.metadata) ||
               remote.metadata.source !== HOSTED_SOURCE || remote.metadata.owner_hash !== ownerHash(candidate.user_id) ||
               remote.metadata.cloud_workspace_id !== candidate.workspace_id) throw new Error("identity_unavailable");
-          const inbox = (await this.options.client.readHostedInbox(token, requestSignal)).slice(0, 100).filter(message => message.sender_id !== remote.id);
+          const inbox = (await via.readHostedInbox(token, requestSignal)).slice(0, 100).filter(message => message.sender_id !== remote.id);
           const ids = inbox.map(message => message.delivery_id).sort();
           const fresh = ids.filter(id => !routine.notified_delivery_ids.includes(id));
           if (fresh.length) {
@@ -172,12 +212,61 @@ form.addEventListener('submit',e=>{e.preventDefault();change('POST');});document
             next_attempt_at=$3,updated_at=$4,last_delivered_at=CASE WHEN $5 THEN $4 ELSE last_delivered_at END WHERE grant_id=$1`,
           [grant.id, ids, new Date(this.now().getTime() + 5_000), this.now(), fresh.length > 0]);
         } catch {
-          // Neither provider error bodies nor URLs/keys are ever stored or logged.
-          await tx.query(`UPDATE grok_bot_routines SET failures=failures+1,last_error='delivery_unavailable',next_attempt_at=$2,updated_at=$3
-            WHERE grant_id=$1`, [grant.id, new Date(this.now().getTime() + Math.min(300_000, 5_000 * 2 ** Math.min(routine.failures + 1, 6))), this.now()]);
+          await this.failed(tx, grant.id, routine.failures);
         }
+        return null;
       });
+      if (recovery) await this.recover(owner, candidate.grant_id, recovery);
     }
+  }
+
+  /** Neither provider error bodies nor URLs/keys are ever stored or logged. */
+  private async failed(tx: SqlExecutor, grantId: string, failures: number): Promise<void> {
+    await tx.query(`UPDATE grok_bot_routines SET failures=failures+1,last_error='delivery_unavailable',next_attempt_at=$2,updated_at=$3
+      WHERE grant_id=$1`, [grantId, new Date(this.now().getTime() + Math.min(300_000, 5_000 * 2 ** Math.min(failures + 1, 6))), this.now()]);
+  }
+
+  /**
+   * Enrols a gated participant again at relaygate as Grok Bot (the kind its
+   * grant is admitted as), with no transaction open: relaygate introspects
+   * the hosted credential with this service. The new token is adopted, under
+   * the same user, organization, grant and routine locks as a delivery, only
+   * if relaygate answered with the stored relaygate agent and the grant's
+   * Relaycast agent and the row is unchanged. Anything else, including a
+   * relaygate refusal, records a delivery failure; nothing is released.
+   */
+  private async recover(owner: Owner, grantId: string, recovery: Recovery): Promise<void> {
+    let enrolled: GateEnrolment | null = null;
+    if (this.options.gate) {
+      try {
+        enrolled = await enrolHostedAtGate({ database: this.options.database, gate: this.options.gate }, {
+          workspaceId: owner.workspaceId, organizationId: owner.organizationId, userId: owner.userId,
+          agentName: recovery.agentName, client: "grok-bot" });
+      } catch {
+        enrolled = null;
+      }
+    }
+    await this.options.database.transaction(async tx => {
+      let grant: Grant;
+      try { grant = await this.grant(tx, grantId, owner); } catch (error) {
+        if (error instanceof GrokRoutineError) return;
+        throw error;
+      }
+      const routine = (await tx.query<Routine>("SELECT * FROM grok_bot_routines WHERE grant_id=$1 FOR UPDATE", [grant.id])).rows[0];
+      if (!routine) return;
+      const current = (await tx.query<{ token_ciphertext: string; relaygate_agent_id: string | null; agent_remote_id: string }>(
+        `SELECT token_ciphertext,relaygate_agent_id,agent_remote_id FROM hosted_relay_participants
+          WHERE id=$1 AND workspace_id=$2 AND user_id=$3 FOR UPDATE`, [recovery.participantId, owner.workspaceId, owner.userId])).rows[0];
+      if (enrolled && current && current.token_ciphertext === recovery.tokenCiphertext
+          && current.relaygate_agent_id === recovery.relaygateAgentId && enrolled.relaygateAgentId === recovery.relaygateAgentId
+          && current.agent_remote_id === grant.agent_remote_id && enrolled.relaycastAgentId === current.agent_remote_id) {
+        await tx.query("UPDATE hosted_relay_participants SET token_ciphertext=$2,admitted_clients=$3::text[],updated_at=now() WHERE id=$1",
+          [recovery.participantId, encryptSecret(enrolled.token, this.options.keyring.active), recovery.admittedClients]);
+        await tx.query("UPDATE grok_bot_routines SET next_attempt_at=$2,updated_at=$2 WHERE grant_id=$1", [grant.id, this.now()]);
+        return;
+      }
+      await this.failed(tx, grant.id, routine.failures);
+    });
   }
 
   private timer?: ReturnType<typeof setTimeout>;

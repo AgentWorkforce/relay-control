@@ -1642,6 +1642,116 @@ task to the target node:
 Unset `SELFHOST_RELAYGATE_PUBLIC_URL`: no check is made, no credential is minted and every
 `sh_lt_` introspects as `unknown`.
 
+#### Hosted participants on gate-only installs
+
+A hosted participant is the relay agent a hosted MCP connection acts as: a
+native MCP session's participant, an OAuth connector's approved agent
+(ChatGPT, Grok Bot, Muse, Cursor cloud agents, any MCP client), as opposed to
+an Agent Relay Desktop identity. On a gate-only install every hosted
+participant enrols at relaygate and holds only an rg_ token, so relaygate's
+policy decides what it may do. Control uses neither the workspace key nor a
+Relaycast agent token for its traffic:
+
+- **Enrolment.** For each participant Control mints an opaque `sh_ht_`
+  hosted credential, valid for 2 minutes and redeemable once. It is bound to
+  the workspace, the organization, the owning user, the exact agent name and
+  the hosted client (table `relay_hosted_credentials`, migration 0079; only
+  the hash is stored). Control presents it to relaygate's `POST /v1/register`
+  itself, with no database transaction open, because relaygate introspects it
+  here. The client is the connection's admission kind: `chatgpt`, `grok-bot`
+  or `muse` when every redirect URI its authorization codes were delivered
+  to is that provider's callback, else `mcp`. A client that registers a
+  provider's callback beside its own receives its codes at its own callback,
+  so it enrols as `mcp` and never matches a rule written for a provider. (A
+  connection with no recorded delivery is a provider's only when every
+  registered redirect URI is.) The kind says where the codes went, not which
+  software redeemed them: OAuth clients here are public and self-registered,
+  and the consenting user can read a code out of their own browser. It keeps
+  another application from passing as a provider; it does not restrain the
+  user who consents. Native MCP sessions enrol as `mcp`.
+- **Name ownership.** relaygate reserves a name for its first enroller and
+  takes over an upstream agent of that name it did not register. So before
+  minting a credential Control checks the name with the workspace roster (a
+  control-plane read with the workspace key, as on other installs): an agent
+  another owner, or a provider binding, holds is refused ("That relay name is
+  already taken") and relaygate never sees an enrolment. relaygate's answer
+  is checked again: the agent must be the one checked, this owner's, or one
+  relaygate registered itself for this enrolment. Anything else is refused
+  and never released, since releasing deletes the agent by name. A stored
+  participant is enrolled again (a lapsed token, or a new hosted client) only
+  while the roster still shows its own upstream agent under that name; a
+  replaced or renamed agent is never handed to relaygate. An answer relaygate
+  gives for another Control user is refused and nothing is released.
+- **Introspection.** Checked and burned like a launch credential. The active
+  answer is `{active: true, sub: <owner user id>, email: null, principal_type:
+  "relay_hosted", agent_name, client, machine_id: null, org, workspace,
+  scopes: ["relay:hosted:enrol"], aud, iat, exp, token_id: <credential id>}`.
+  Audit events: `relay_hosted.credential.issued` and
+  `relay_hosted.credential.redeemed`. Unset `SELFHOST_RELAYGATE_PUBLIC_URL`:
+  every `sh_ht_` is `unknown`.
+- **relaygate fails closed.** A hosted credential matches only relaygate
+  `controlPrincipals` rules whose `kinds` lists `"hosted"`, never a catch-all.
+  Without one, `join_relay` (and any tool that would auto-join) fails with a
+  message naming the rule to add, e.g.
+  `{"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["mcp"], "as": ["agent"]}, "gid": 22}`.
+  See "Hosted participants" in relaygate's `docs/contract.md`.
+- **The row.** `hosted_relay_participants.relaygate_agent_id` holds relaygate's
+  agent id, and `token_ciphertext` seals the rg_ token. `agent_remote_id`
+  stays the upstream Relaycast agent id, which pins, retirement and teardown
+  key on. Owner metadata (`source`, `owner_hash`, `cloud_workspace_id`,
+  `kind`, `hosted_client`) is merged onto the agent card through relaygate's
+  `PATCH /v1/agent`. Ownership is decided by relaygate's `GET /v1/whoami` (the
+  agent id and the owner), never by that metadata.
+  `hosted_relay_participants.admitted_clients` (migration 0079) lists the
+  hosted clients relaygate enrolled the participant for. A participant is
+  used only by a connection whose admission kind is in that list.
+- **A second hosted client.** When a connection of another kind (for example
+  Grok Bot for a participant enrolled from ChatGPT) uses the participant,
+  Control enrols it again at relaygate as that kind first, so relaygate's
+  policy decides that client too. relaygate then applies the current rule's
+  groups to the agent and revokes its earlier tokens; the row keeps the new
+  token and adds the kind. If relaygate refuses (no rule for that client),
+  the call fails, naming the rule to add, and the row and its token stay as
+  they were, still usable by the clients already admitted.
+- **Traffic.** Sends, replies, inbox, conversations, channels and cards go to
+  relaygate with the rg_ token. So do directory reads (the roster, names,
+  channel lists and history), which relaygate filters by its policy. On a
+  gate-only install a session with no relay identity is asked to `join_relay`
+  before it can list agents or channels.
+- **Renewal.** relaygate tokens last 24 hours. When relaygate rejects the
+  stored one, Control enrols the participant again before taking the owner
+  lock: the same owner gets the same upstream agent back. If relaygate
+  answers with a new relaygate agent id for that same upstream agent, the row
+  adopts it; an enrolment answered with a different upstream agent is never
+  adopted. Enrolling again after a rejected token resets `admitted_clients`
+  to the current client, since relaygate revoked the tokens of the others.
+  Grok Bot routines renew a participant's token with relaygate's
+  `POST /v1/token/refresh` once it is 12 hours old. When relaygate rejects a
+  routine's token (it lapsed while the routine was idle), or the participant
+  was not admitted as `grok-bot`, the routine enrols it again as `grok-bot`
+  after its delivery transaction ends. It adopts the new token only if
+  relaygate answered with the stored relaygate agent and the grant's
+  upstream agent and the row is unchanged; otherwise it records a delivery
+  failure and releases nothing.
+- **Release.** `leave_relay`, linking a desktop identity and OAuth teardown
+  release a gated participant through relaygate's `DELETE /v1/agent`, which
+  also revokes its relaygate tokens. If relaygate no longer accepts the token,
+  Control releases the upstream agent with the workspace key. That is cleanup
+  of an agent no one can use.
+- **Migration.** A participant registered in Relaycast directly before the
+  install set `SELFHOST_RELAYGATE_PUBLIC_URL` (or before this change) is
+  enrolled through relaygate on its next use. First, a one-time workspace-key
+  roster check confirms that its upstream agent is still the owner's. It keeps
+  its name and upstream agent id, so OAuth connections keep working without
+  reconnecting. If relaygate refuses it (no hosted rule), it can't send or
+  read until the operator adds a rule, but `leave_relay` still removes it.
+- **Not hosted participants.** The owner's launcher (`launcher-<hash>`) stays a
+  Relaycast identity: relaygate does not proxy launches, which are checked at
+  relaygate's `/v1/check` instead (above). The launcher name can't be joined
+  as a messaging participant. OAuth connections cannot launch agents on a
+  gate-only install. Provider bindings (Amp, Factory, Capy, Replicas) are
+  unchanged.
+
 ### Scope mint matrix
 
 Scopes are fixed when a credential is issued and stored on its session row.
