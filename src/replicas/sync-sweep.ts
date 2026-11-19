@@ -4,7 +4,8 @@ import { abandonStaleBindings, retirePendingCleanup, type ReplicasActor, type Re
 export const REPLICAS_SYNC_SERVICE = "replicas-sync";
 
 export type ReplicasSyncLog = (event: {
-  code: "replicas_sync_failed" | "replicas_sync_scan_failed" | "replicas_cleanup_failed" | "replicas_cleanup_scan_failed";
+  code: "replicas_sync_failed" | "replicas_sync_scan_failed" | "replicas_cleanup_failed" | "replicas_cleanup_scan_failed"
+    | "replicas_abandon_failed";
   workspaceId?: string;
   spawnId?: string;
 }) => void;
@@ -65,7 +66,8 @@ export class ReplicasSyncSweep {
         await retirePendingCleanup(this.deps.replicas, this.actor(target),
           (spawnId) => this.deps.log?.({ code: "replicas_cleanup_failed", workspaceId: target.workspace_id, spawnId }));
         // Launches and binds that never got a relay identity: abandoned after 7 days.
-        await abandonStaleBindings(this.deps.replicas, this.actor(target));
+        await abandonStaleBindings(this.deps.replicas, this.actor(target), undefined, undefined,
+          (spawnId) => this.deps.log?.({ code: "replicas_abandon_failed", workspaceId: target.workspace_id, spawnId }));
       } catch {
         this.deps.log?.({ code: "replicas_cleanup_scan_failed", workspaceId: target.workspace_id });
       }
