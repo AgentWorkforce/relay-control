@@ -12,7 +12,7 @@
 // The rules here are reviewed configuration. Bump MAPPING_REVISION whenever a
 // rule, a projection or a target column changes.
 
-export const MAPPING_REVISION = "cloud-identity-2026-11-16.30";
+export const MAPPING_REVISION = "cloud-identity-2026-11-16.31";
 
 /** Lowest Control migration the import is written against. */
 export const REQUIRED_MIGRATION = "0051_grok_bot_routines.sql";
@@ -460,13 +460,13 @@ SELECT id, workspace_id, 'github'::text AS provider, 'github_app'::text AS auth_
   FROM github_rows`,
     // Hosted staff read grants (Cloud drizzle 0419) arrive as revoked history
     // (relay-control 0061, docs/staff-read-grants.md): fresh random token
-    // hash, revoked at import time, lifetime clamped to Control's 90 days.
+    // hash, revoked at import time, lifetime clamped to Control's 365 days (0080).
     // staff_organization_id (the operator org) is set by the importer from
     // the target's installation_bootstrap.
     staff_read_grants: `
 SELECT g.id, g.workspace_id, iw.organization_id, iu.id AS staff_user_id,
        left(btrim(g.reason), 500) AS reason, g.created_at,
-       LEAST(g.expires_at, g.created_at + interval '90 days') AS expires_at,
+       LEAST(g.expires_at, g.created_at + interval '365 days') AS expires_at,
        now() AS revoked_at, NULL::uuid AS revoked_by, NULL::timestamptz AS last_used_at,
        CASE
          WHEN iw.id IS NULL THEN 'workspace_not_imported'
