@@ -52,6 +52,12 @@ type RelayState = {
   probeDown: boolean;
   /** Answers for the next GET /v1/agent calls, used before the normal behaviour. */
   probeAnswers: Answer[];
+  /** Relaycast issues device tokens in two shapes; Control must not depend on either. */
+  deviceTokenPrefix: "at_live_dv_" | "ar_ad_";
+  /** Every device token issued, in order. */
+  issuedTokens: string[];
+  /** Device-token DELETEs are accepted and never answered. */
+  deleteHangs: boolean;
 };
 
 function relayState(): RelayState {
@@ -69,7 +75,21 @@ function relayState(): RelayState {
     deleteFailures: 0,
     probeDown: false,
     probeAnswers: [],
+    deviceTokenPrefix: "at_live_dv_",
+    issuedTokens: [],
+    deleteHangs: false,
   };
+}
+
+/** Whether `value` carries any device token the relay issued. */
+function mentionsIssuedToken(state: RelayState, value: unknown): boolean {
+  const serialized = typeof value === "string" ? value : JSON.stringify(value);
+  return state.issuedTokens.some((token) => serialized.includes(token));
+}
+
+/** Relaycast's device name cleaning: control characters to spaces, whitespace collapsed, trimmed, at most 80. */
+function relayCleanName(name: unknown): string {
+  return String(name).replace(/\p{Cc}/gu, " ").replace(/\s+/g, " ").trim().slice(0, 80);
 }
 
 async function readBody(request: IncomingMessage): Promise<string> {
@@ -161,15 +181,17 @@ function createRelay(state: RelayState) {
         sendJson(response, 409, { error: { code: "agent_identity_conflict", message: "Agent id does not match" } });
         return;
       }
-      const device = parsed.device as Record<string, unknown>;
-      if (device.id === "direct" || device.id === "unknown") {
+      const asked = parsed.device as Record<string, unknown>;
+      if (asked.id === "direct" || asked.id === "unknown") {
         sendJson(response, 400, { error: { code: "invalid_request", message: "Reserved device id" } });
         return;
       }
+      const device = { id: asked.id, name: relayCleanName(asked.name), kind: asked.kind };
       const key = `${agent.name}\n${String(device.id)}`;
       const previous = state.deviceTokens.get(key);
       if (previous) state.tokenOwner.delete(previous.token);
-      const issued = `dt_${state.mints.length}`;
+      const issued = `${state.deviceTokenPrefix}${state.mints.length}`;
+      state.issuedTokens.push(issued);
       state.deviceTokens.set(key, { token: issued, device });
       state.tokenOwner.set(issued, agent.name);
       const expiresAt = state.mintExpiresAt === undefined
@@ -182,6 +204,8 @@ function createRelay(state: RelayState) {
     if (request.method === "DELETE" && revoke) {
       const deviceIdValue = decodeURIComponent(revoke[2]!);
       state.deviceDeletes.push(deviceIdValue);
+      // Left open; the harness closes every connection at the end of the test.
+      if (state.deleteHangs) return;
       if (state.deleteFailures > 0) {
         state.deleteFailures -= 1;
         sendJson(response, 500, { error: { code: "unavailable", message: "try later" } });
@@ -254,7 +278,9 @@ async function jsonRequest(
   if (options.cookie) headers.cookie = options.cookie;
   if (options.cookie && method !== "GET") headers.origin = "https://control.internal.example";
   const payload = options.rawBody ?? (options.body !== undefined ? JSON.stringify(options.body) : undefined);
-  if (payload !== undefined) headers["content-type"] = "application/json";
+  // Cookie writes must declare JSON (the CSRF guard), with or without a body.
+  const cookieWrite = Boolean(options.cookie) && method !== "GET";
+  if (payload !== undefined || cookieWrite) headers["content-type"] = "application/json";
   const response = await fetch(`${baseUrl}${path}`, {
     method,
     headers,
@@ -264,12 +290,15 @@ async function jsonRequest(
   return { status: response.status, body: text ? JSON.parse(text) as Record<string, any> : {}, headers: response.headers };
 }
 
-type Hooks = { afterDeviceMint?: (tx: SqlExecutor) => Promise<void> | void };
+type Hooks = {
+  beforeDeviceSave?: (tx: SqlExecutor) => Promise<void> | void;
+  afterDeviceMint?: (tx: SqlExecutor) => Promise<void> | void;
+};
 type SignIn = { accessToken: string; refreshToken: string; sessionId: string };
 
 async function harness(
   t: { after: (fn: () => Promise<void>) => void },
-  options?: { config?: Partial<SelfhostConfig> },
+  options?: { config?: Partial<SelfhostConfig>; signOutRevokeTimeoutMs?: number },
 ) {
   const state = relayState();
   const hooks: Hooks = {};
@@ -306,7 +335,9 @@ async function harness(
     config,
     store,
     messaging: {
+      beforeDeviceSave: (tx) => hooks.beforeDeviceSave?.(tx),
       afterDeviceMint: (tx) => hooks.afterDeviceMint?.(tx),
+      ...(options?.signOutRevokeTimeoutMs !== undefined ? { signOutRevokeTimeoutMs: options.signOutRevokeTimeoutMs } : {}),
       warn: (message, fields) => { warnings.push({ message, fields }); },
     },
   }));
@@ -445,7 +476,7 @@ test("a browser session gets the web device and each bearer sign-in its own devi
   const rows = await fx.deviceRows();
   assert.equal(rows.length, 3);
   assert.deepEqual(rows.map((row) => row.session_id), [null, first.sessionId, second.sessionId]);
-  for (const row of rows) assert.equal(row.token_ciphertext.startsWith("dt_"), false);
+  for (const row of rows) assert.equal(mentionsIssuedToken(fx.state, row.token_ciphertext), false);
 });
 
 test("a stored device token is reused until the renew margin, and a refresh keeps the device", async (t) => {
@@ -483,28 +514,30 @@ test("a stored device token is reused until the renew margin, and a refresh keep
   assert.equal((await fx.deviceRows()).length, 1);
 });
 
-test("the device name comes from the session row and a client-sent device is refused", async (t) => {
+test("the device comes from the session row, a client-sent device is ignored, and the name Relaycast returns is served", async (t) => {
   const fx = await harness(t);
   const signIn = await fx.signIn();
-  await fx.database.query("UPDATE token_sessions SET desktop_host_name = $2 WHERE id = $1", [signIn.sessionId, "Ada's MacBook Pro"]);
-  const named = await fx.credential({ token: signIn.accessToken }, {
+  // Relaycast collapses the runs of spaces that Control's own cleaning keeps.
+  const hostName = "Ada's   MacBook  Pro";
+  await fx.database.query("UPDATE token_sessions SET desktop_host_name = $2 WHERE id = $1", [signIn.sessionId, hostName]);
+  const answer = await fx.credential({ token: signIn.accessToken }, {
     json: { device: { id: "unknown", name: "Evil", kind: "web" }, name: "Evil", deviceId: "direct" },
   });
-  assert.equal(named.status, 400);
-  assert.equal(named.body.error, "invalid_request");
-  assert.equal(fx.state.mints.length, 0);
-  const answer = await fx.credential({ token: signIn.accessToken });
   assert.equal(answer.status, 200);
-  assert.deepEqual(answer.body.identity.device, {
-    id: deviceId("Ada's MacBook Pro", "desktop", signIn.sessionId),
-    name: "Ada's MacBook Pro",
-    kind: "desktop",
-  });
+  const expected = { id: deviceId(hostName, "desktop", signIn.sessionId), name: "Ada's MacBook Pro", kind: "desktop" };
+  assert.deepEqual(answer.body.identity.device, expected);
   assert.match(answer.body.identity.device.id as string, /^ada-s-macbook-pro-[0-9a-f]{8}$/);
-  assert.deepEqual(fx.state.mints[0]!.device, answer.body.identity.device);
+  // The mint asked for the session's device, not the body's.
+  assert.equal(fx.state.mints.length, 1);
+  assert.deepEqual(fx.state.mints[0]!.device, { ...expected, name: hostName });
   const [row] = await fx.deviceRows();
   assert.equal(row!.device_name, "Ada's MacBook Pro");
   assert.equal(row!.device_kind, "desktop");
+  // A stored token is served with the stored, returned name.
+  const again = await fx.credential({ token: signIn.accessToken });
+  assert.equal(again.status, 200);
+  assert.equal(fx.state.mints.length, 1);
+  assert.deepEqual(again.body.identity.device, expected);
 });
 
 test("device names are cut on a grapheme boundary and stripped of control and bidi characters", () => {
@@ -591,9 +624,12 @@ function sha256Hex(value: string): string {
 
 test("a reported refused token that matches the stored one is re-minted without a probe", async (t) => {
   const fx = await harness(t);
+  // The other upstream token shape; nothing in Control reads the prefix.
+  fx.state.deviceTokenPrefix = "ar_ad_";
   const signIn = await fx.signIn();
   const minted = await fx.credential({ token: signIn.accessToken });
   assert.equal(minted.status, 200);
+  assert.match(minted.body.identity.token as string, /^ar_ad_/);
   // Outside the 30 second window of the first mint.
   await fx.database.query("UPDATE person_device_credentials SET minted_at = now() - interval '1 minute'");
   const probes = fx.state.probeCalls;
@@ -624,7 +660,7 @@ test("a second reported refusal of a device token within 30 seconds of its mint 
   assert.equal(limited.body.error, "rate_limited");
   const retryAfter = Number(limited.headers.get("retry-after"));
   assert.equal(Number.isInteger(retryAfter) && retryAfter >= 1 && retryAfter <= 30, true, String(retryAfter));
-  assert.equal(JSON.stringify(limited.body).includes("dt_"), false);
+  assert.equal(mentionsIssuedToken(fx.state, limited.body), false);
   assert.equal(fx.state.mints.length, 1);
 
   // Once the window has passed the report re-mints; reporting the new token at once is limited again.
@@ -654,7 +690,7 @@ test("a reported refused token that does not match the stored one takes the norm
   assert.equal(minted.status, 200);
   const probes = fx.state.probeCalls;
 
-  const served = await fx.credential({ token: signIn.accessToken }, { json: { refusedTokenSha256: sha256Hex("dt_stale") } });
+  const served = await fx.credential({ token: signIn.accessToken }, { json: { refusedTokenSha256: sha256Hex("at_live_dv_stale") } });
   assert.equal(served.status, 200);
   assert.equal(served.body.identity.token, minted.body.identity.token);
   assert.equal(fx.state.mints.length, 1);
@@ -662,7 +698,7 @@ test("a reported refused token that does not match the stored one takes the norm
 
   // A stored token Relaycast refuses is still dropped by the probe, without the 30 second limit.
   fx.state.tokenOwner.delete(minted.body.identity.token as string);
-  const reminted = await fx.credential({ token: signIn.accessToken }, { json: { refusedTokenSha256: sha256Hex("dt_stale") } });
+  const reminted = await fx.credential({ token: signIn.accessToken }, { json: { refusedTokenSha256: sha256Hex("at_live_dv_stale") } });
   assert.equal(reminted.status, 200);
   assert.equal(fx.state.mints.length, 2);
   assert.notEqual(reminted.body.identity.token, minted.body.identity.token);
@@ -671,7 +707,7 @@ test("a reported refused token that does not match the stored one takes the norm
 test("a malformed credential request body is refused with 400 before anything is registered or minted", async (t) => {
   const fx = await harness(t);
   const signIn = await fx.signIn();
-  const hash = sha256Hex("dt_1");
+  const hash = sha256Hex("at_live_dv_1");
   for (const raw of [
     "not json",
     "[]",
@@ -681,9 +717,9 @@ test("a malformed credential request body is refused with 400 before anything is
     JSON.stringify({ refusedTokenSha256: hash.toUpperCase() }),
     JSON.stringify({ refusedTokenSha256: hash.slice(1) }),
     JSON.stringify({ refusedTokenSha256: `${hash}0` }),
-    JSON.stringify({ refusedTokenSha256: null }),
-    JSON.stringify({ refusedTokenSha256: hash, extra: true }),
-    JSON.stringify({ refused: true }),
+    JSON.stringify({ refusedTokenSha256: "" }),
+    JSON.stringify({ refusedTokenSha256: 42 }),
+    JSON.stringify({ refusedTokenSha256: [hash] }),
   ]) {
     const refused = await fx.credential({ token: signIn.accessToken }, { raw });
     assert.equal(refused.status, 400, raw);
@@ -694,18 +730,25 @@ test("a malformed credential request body is refused with 400 before anything is
   assert.equal((await fx.deviceRows()).length, 0);
 });
 
-test("no body, an empty body or an empty object leaves the credential request unchanged", async (t) => {
+test("no body, an empty object, a null report or unknown keys leave the credential request unchanged", async (t) => {
   const fx = await harness(t);
   const signIn = await fx.signIn();
   const minted = await fx.credential({ token: signIn.accessToken });
   assert.equal(minted.status, 200);
-  for (const body of [{ raw: "" }, { raw: "  \n" }, { json: {} }] as const) {
+  const bodies = [
+    { raw: "" },
+    { raw: "  \n" },
+    { json: {} },
+    { json: { refusedTokenSha256: null } },
+    { json: { refused: true, client: "test" } },
+  ];
+  for (const body of bodies) {
     const served = await fx.credential({ token: signIn.accessToken }, body);
     assert.equal(served.status, 200, JSON.stringify(body));
     assert.equal(served.body.identity.token, minted.body.identity.token);
   }
   assert.equal(fx.state.mints.length, 1);
-  assert.equal(fx.state.probeCalls, 3);
+  assert.equal(fx.state.probeCalls, bodies.length);
 });
 
 test("a device revoked while its sign-in still authenticates answers 403 device_revoked", async (t) => {
@@ -723,7 +766,7 @@ test("a device revoked while its sign-in still authenticates answers 403 device_
   });
   assert.equal(reported.status, 403);
   assert.equal(reported.body.error, "device_revoked");
-  assert.equal(JSON.stringify([revoked.body, reported.body]).includes("dt_"), false);
+  assert.equal(mentionsIssuedToken(fx.state, [revoked.body, reported.body]), false);
   assert.equal(fx.state.mints.length, 1);
 
   // The web device is bound to no sign-in: a revoked web row is minted again for the browser session.
@@ -849,12 +892,29 @@ test("a mint answer naming another agent is refused", async (t) => {
   const signIn = await fx.signIn();
   fx.state.mintAnswers.push({
     status: 201,
-    body: { data: { agent_id: "ag_other", device: {}, token: "dt_foreign", expires_at: null } },
+    body: { data: { agent_id: "ag_other", device: {}, token: "at_live_dv_foreign", expires_at: null } },
   });
   const refused = await fx.credential({ token: signIn.accessToken });
   assert.equal(refused.status, 502);
   assert.equal(refused.body.error, "upstream_unavailable");
-  assert.equal(JSON.stringify(refused.body).includes("dt_foreign"), false);
+  assert.equal(JSON.stringify(refused.body).includes("at_live_dv_foreign"), false);
+  assert.equal((await fx.deviceRows()).length, 0);
+});
+
+test("a mint answer naming another device id or kind is refused", async (t) => {
+  const fx = await harness(t);
+  const signIn = await fx.signIn();
+  const asked = { id: deviceId("cli", "cli", signIn.sessionId), name: "cli", kind: "cli" };
+  for (const device of [{ ...asked, id: "other-device" }, { ...asked, kind: "desktop" }, { name: "cli" }]) {
+    fx.state.mintAnswers.push({
+      status: 201,
+      body: { data: { agent_id: "ag_1", device, token: "ar_ad_foreign", expires_at: null } },
+    });
+    const refused = await fx.credential({ token: signIn.accessToken });
+    assert.equal(refused.status, 502, JSON.stringify(device));
+    assert.equal(refused.body.error, "upstream_unavailable");
+    assert.equal(JSON.stringify(refused.body).includes("ar_ad_foreign"), false);
+  }
   assert.equal((await fx.deviceRows()).length, 0);
 });
 
@@ -940,34 +1000,101 @@ test("a sign-in that ends while its device token is minted gets 401 and the toke
   const refused = await fx.credential({ token: signIn.accessToken });
   assert.equal(refused.status, 401);
   assert.equal(refused.body.error, "unauthorized");
-  assert.equal(JSON.stringify(refused.body).includes("dt_"), false);
+  assert.equal(mentionsIssuedToken(fx.state, refused.body), false);
   assert.equal(fx.state.mints.length, 1);
   assert.equal(fx.state.deviceDeletes.length, 1);
-  assert.equal(await relayAccepts(fx.config.relaycastUrl, "dt_1"), false);
+  assert.equal(await relayAccepts(fx.config.relaycastUrl, fx.state.issuedTokens[0]!), false);
   const [row] = await fx.deviceRows();
   assert.equal(row!.revoked, true);
   assert.equal(row!.upstream_revoked, true);
 });
 
-test("a membership that ends while a device token is minted gets 403 and the token is revoked upstream", async (t) => {
+test("a sign-in row deleted while its device token is minted gets 401 and the token is recorded revoked and revoked upstream", async (t) => {
+  const fx = await harness(t);
+  const signIn = await fx.signIn();
+  // PGlite runs a transaction on its only connection, so the delete that
+  // would come from another connection runs on the mint's transaction,
+  // after the mint and before the session row is locked.
+  fx.hooks.beforeDeviceSave = async (tx) => {
+    fx.hooks.beforeDeviceSave = undefined;
+    await tx.query("DELETE FROM token_sessions WHERE id = $1", [signIn.sessionId]);
+  };
+  const refused = await fx.credential({ token: signIn.accessToken });
+  assert.equal(refused.status, 401);
+  assert.equal(refused.body.error, "unauthorized");
+  assert.equal(mentionsIssuedToken(fx.state, refused.body), false);
+  assert.equal(fx.state.mints.length, 1);
+  assert.equal(fx.state.deviceDeletes.length, 1);
+  assert.equal(await relayAccepts(fx.config.relaycastUrl, fx.state.issuedTokens[0]!), false);
+  const rows = await fx.deviceRows();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.session_id, null);
+  assert.equal(rows[0]!.revoked, true);
+  assert.equal(rows[0]!.upstream_revoked, true);
+});
+
+test("a membership that ends while a bearer device token is minted gets 401, since its sign-in goes with it, and the token is revoked upstream", async (t) => {
   const fx = await harness(t);
   const signIn = await fx.signIn();
   fx.hooks.afterDeviceMint = async (tx) => {
     fx.hooks.afterDeviceMint = undefined;
-    // The token is saved before membership is checked.
+    // The token is saved before the session and membership are checked.
     const saved = await tx.query("SELECT 1 FROM person_device_credentials WHERE session_id = $1 AND revoked_at IS NULL", [signIn.sessionId]);
     assert.equal(saved.rows.length, 1);
+    // Removing the membership deletes the person's sign-ins and, with them, the saved row.
     await tx.query("DELETE FROM organization_memberships WHERE user_id = $1", [fx.userId]);
   };
   const refused = await fx.credential({ token: signIn.accessToken });
+  assert.equal(refused.status, 401);
+  assert.equal(refused.body.error, "unauthorized");
+  assert.equal(mentionsIssuedToken(fx.state, refused.body), false);
+  assert.equal(fx.state.deviceDeletes.length, 1);
+  assert.equal(await relayAccepts(fx.config.relaycastUrl, fx.state.issuedTokens[0]!), false);
+  const rows = await fx.deviceRows();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.session_id, null);
+  assert.equal(rows[0]!.revoked, true);
+  assert.equal(rows[0]!.upstream_revoked, true);
+});
+
+test("a membership that ends while the web device token is minted gets 403 and the token is revoked upstream", async (t) => {
+  const fx = await harness(t);
+  const signIn = await fx.signIn();
+  fx.hooks.afterDeviceMint = async (tx) => {
+    fx.hooks.afterDeviceMint = undefined;
+    // The web row is bound to no sign-in, so the membership re-check is its only guard.
+    const saved = await tx.query("SELECT 1 FROM person_device_credentials WHERE device_id = 'web' AND revoked_at IS NULL");
+    assert.equal(saved.rows.length, 1);
+    await tx.query("DELETE FROM organization_memberships WHERE user_id = $1", [fx.userId]);
+  };
+  const refused = await fx.credential({ cookie: `agent_relay_session=${signIn.accessToken}` });
   assert.equal(refused.status, 403);
   assert.equal(refused.body.error, "forbidden");
-  assert.equal(JSON.stringify(refused.body).includes("dt_"), false);
-  assert.equal(fx.state.deviceDeletes.length, 1);
-  assert.equal(await relayAccepts(fx.config.relaycastUrl, "dt_1"), false);
+  assert.equal(mentionsIssuedToken(fx.state, refused.body), false);
+  assert.deepEqual(fx.state.deviceDeletes, ["web"]);
+  assert.equal(await relayAccepts(fx.config.relaycastUrl, fx.state.issuedTokens[0]!), false);
   const [row] = await fx.deviceRows();
   assert.equal(row!.revoked, true);
   assert.equal(row!.upstream_revoked, true);
+});
+
+test("sign-out answers 200 when Relaycast never answers the device-token revoke", async (t) => {
+  const fx = await harness(t, { signOutRevokeTimeoutMs: 50 });
+  const signIn = await fx.signIn();
+  const minted = await fx.credential({ token: signIn.accessToken });
+  assert.equal(minted.status, 200);
+
+  fx.state.deleteHangs = true;
+  const signOut = await jsonRequest(fx.origin, "/api/v1/auth/token/revoke", {
+    method: "POST",
+    body: { token: signIn.accessToken },
+  });
+  assert.equal(signOut.status, 200);
+  assert.deepEqual(fx.state.deviceDeletes, [minted.body.identity.device.id]);
+  // The aborted revoke leaves the row pending for the sweep.
+  const [row] = await fx.deviceRows();
+  assert.equal(row!.revoked, true);
+  assert.equal(row!.upstream_revoked, false);
 });
 
 test("a gate-only install mints no device token", async (t) => {

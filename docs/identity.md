@@ -1421,7 +1421,7 @@ that one agent, minted with the workspace key
 leaves Control while Relaycast serves device tokens.
 
 - The device comes from the server-side session only; the client cannot name
-  it (a body with device fields is `400`). The browser session (the `/cloud`
+  it (device fields in the body are ignored). The browser session (the `/cloud`
   cookie) is the device `{id: "web", name: "web", kind: "web"}`, bound to no
   sign-in. A bearer is its
   own sign-in's device: kind `desktop` when the session carries a Desktop host
@@ -1433,8 +1433,11 @@ leaves Control while Relaycast serves device tokens.
   Relaycast's reserved `unknown` or `direct`. The session id survives a token
   refresh, so a refreshed sign-in keeps its device and token.
 - Every mint asks for a 12 hour TTL (`ttl_seconds: 43200`) and sends the
-  expected `agent_id`; an answer naming another agent is refused. The stored
-  expiry is the earlier of Relaycast's `expires_at` and now + 12 hours.
+  expected `agent_id`; an answer naming another agent, or another device id
+  or kind, is refused. Relaycast cleans the device name it records (control
+  characters to spaces, whitespace collapsed, trimmed, at most 80
+  characters), so the name stored and served is the one in its answer. The
+  stored expiry is the earlier of Relaycast's `expires_at` and now + 12 hours.
 - The answer is
   `{identity: {name, agentId, token, relaycastUrl, device: {id, name, kind}, expiresAt}}`.
   A stored token is served again while it is more than one hour from expiry
@@ -1442,28 +1445,34 @@ leaves Control while Relaycast serves device tokens.
   request, never cached). A refused token is re-minted. While Relaycast is
   unreachable the stored token is served as long as it is unexpired. A probe
   answered `403 device_token_forbidden` is a `502`, never a re-mint.
-- The request body is optional. No body, an empty body or `{}` changes
-  nothing. A client that saw its token refused may send
+- The request body is optional and read the same way as on the hosted
+  service, so one client works against both. No body, a JSON object without
+  `refusedTokenSha256`, or `"refusedTokenSha256": null` changes nothing;
+  other keys are ignored. A client that saw its token refused may send
   `{"refusedTokenSha256": "<64 lowercase hex>"}`, the SHA-256 of that token.
   When it matches the stored token (compared in constant time; neither the
   hash nor the token is logged) the stored token is dropped without a probe
   and a new one minted, at most once per device every 30 seconds, measured
   from the stored token's `minted_at` by the database clock so every replica
-  agrees. Inside that window the answer is `429 rate_limited` with
-  `Retry-After` (seconds). A hash that does not match takes the normal path
-  (probe, no forced mint). Any other body (not JSON, not an object, another
-  key, a value that is not 64 lowercase hex) is `400 invalid_request`. The
-  shared-token fallback below ignores the field.
-- A device row revoked while its sign-in still authenticates (for example a
-  member removed and added back on the same sign-in) answers
-  `403 device_revoked`; sign in again for a new device. The web device is
-  bound to no sign-in, so a new browser request mints it again.
+  agrees. Inside that window the answer is `429 rate_limited`. Control also
+  sends `Retry-After` (seconds), but clients must not depend on it: the
+  hosted route sends none. A hash that does not match takes the normal path
+  (probe, no forced mint). A body that is not JSON or not an object, or a
+  `refusedTokenSha256` that is not 64 lowercase hex (uppercase included), is
+  `400 invalid_request`. The shared-token fallback below ignores the field.
+- A device row revoked while its sign-in still authenticates answers
+  `403 device_revoked`; sign in again for a new device. No Control route
+  leaves a row in that state today; the answer exists so clients handle the
+  same code as on the hosted service. The web device is bound to no sign-in,
+  so a new browser request mints it again.
 - Mints, sweeps of revoked device tokens, the person agent's registration,
   takeover and recovery, and member revocation take the same per-person
   advisory lock, so a mint never interleaves with a recovery or a removal.
   After a minted token is saved, the mint re-checks in the same transaction
   that the sign-in is live and the person is still a member; if not, the row
-  is revoked and the token revoked upstream (or left to the sweep).
+  is revoked and the token revoked upstream (or left to the sweep). A sign-in
+  row deleted while the mint was in flight leaves the token recorded with no
+  sign-in, already revoked, for the same upstream revoke.
 - A device token is never presented to Relaycast's token rotation, recovery
   or upgrade routes; recovery uses the workspace key and the shared token.
   Relaycast refuses device tokens there with `403 device_token_forbidden`,
@@ -1477,15 +1486,22 @@ leaves Control while Relaycast serves device tokens.
   other refusal, including `400` and `409 not_a_person_agent`, answers
   `502 upstream_unavailable`.
 - Tokens are stored encrypted in `person_device_credentials` (migration
-  0080), one row per workspace, person and device. Ending a sign-in (sign-out,
-  workspace switch, revoke-all, API token or Desktop credential revocation)
-  revokes its rows in the same transaction; revoke-all also revokes the web
-  row. Relaycast is told with `DELETE /v1/agents/{name}/device-tokens/{device}`
-  (a `404` means already gone) right after sign-out and by a bounded sweep on
-  every messaging request until it confirms. A token Relaycast never hears
-  about still ends at its 12 hour expiry. A sign-in or membership that ends
-  while a token is being minted answers `401` or `403`, and that token is
-  revoked upstream at once.
+  0080), one row per workspace, person and device. A device row is deleted
+  with its sign-in row. Ending a sign-in (sign-out, workspace switch,
+  revoke-all, API token or Desktop credential revocation) revokes its rows in
+  the same transaction; revoke-all also revokes the web row. Relaycast is told
+  with `DELETE /v1/agents/{name}/device-tokens/{device}` (a `404` means
+  already gone) right after sign-out, which waits at most 5 seconds for it,
+  and by a bounded sweep on every messaging request until it confirms. A
+  token Relaycast never hears about still ends at its 12 hour expiry.
+- Removing a membership deletes the person's sign-in rows, and with them
+  their device rows. Their device tokens end because member revocation
+  deletes the person agent at Relaycast, not by per-device revokes.
+- A bearer sign-in that ends while its token is being minted answers `401`,
+  including when the membership is removed (the sign-in goes with it). The
+  web device is bound to no sign-in, so for it a membership removed during
+  the mint answers `403`. Either way the minted token is revoked upstream at
+  once, or by the sweep if that fails.
 - A Desktop browser handoff token never holds a messaging credential: before
   its PKCE exchange it answers `403 handoff_not_exchanged`, after it
   `403 handoff_not_capable`. The session the exchange issues is the device.

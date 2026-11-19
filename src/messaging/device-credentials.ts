@@ -41,6 +41,7 @@ export type DeviceCredential =
 
 type DeviceRow = {
   id: string;
+  device_name: string;
   session_id: string | null;
   relaycast_workspace_id: string;
   agent_name: string;
@@ -52,7 +53,11 @@ type DeviceRow = {
   forced_mint_wait: number;
 };
 
-type StoredToken = { token: string; expiresAt: Date };
+/** A device token with the device as Relaycast recorded it (its cleaned name). */
+type StoredToken = { token: string; expiresAt: Date; device: DeviceTokenDevice };
+
+/** Bound on the upstream device-token revokes a sign-out waits for. */
+export const SIGN_OUT_REVOKE_TIMEOUT_MS = 5_000;
 
 const REFUSED_TOKEN_SHA256 = /^[0-9a-f]{64}$/;
 
@@ -69,9 +74,12 @@ function deviceRevoked(): MessagingHttpError {
 }
 
 /**
- * The optional credential request body: nothing, an empty body or `{}`, or
- * exactly `{"refusedTokenSha256": "<64 lowercase hex>"}`, the SHA-256 of the
- * token the client saw refused. Anything else is 400 invalid_request.
+ * The optional credential request body, read the same way as the hosted
+ * route so one client works against both: no body, or a JSON object whose
+ * optional `refusedTokenSha256` is the 64 lowercase hex SHA-256 of the token
+ * the client saw refused (absent or null: no report). Other keys are ignored;
+ * the device never comes from the body. Invalid JSON, a non-object body or a
+ * malformed hash is 400 invalid_request.
  */
 export function parseCredentialRequest(raw: string): { refusedTokenSha256: string | null } {
   if (!raw.trim()) return { refusedTokenSha256: null };
@@ -84,14 +92,13 @@ export function parseCredentialRequest(raw: string): { refusedTokenSha256: strin
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new MessagingHttpError(400, "invalid_request", "Body must be a JSON object");
   }
-  const keys = Object.keys(parsed);
-  if (keys.length === 0) return { refusedTokenSha256: null };
   const value = (parsed as Record<string, unknown>).refusedTokenSha256;
-  if (keys.length !== 1 || keys[0] !== "refusedTokenSha256" || typeof value !== "string" || !REFUSED_TOKEN_SHA256.test(value)) {
+  if (value === undefined || value === null) return { refusedTokenSha256: null };
+  if (typeof value !== "string" || !REFUSED_TOKEN_SHA256.test(value)) {
     throw new MessagingHttpError(
       400,
       "invalid_request",
-      "The only accepted field is refusedTokenSha256, the 64 lowercase hex SHA-256 of the refused token",
+      "refusedTokenSha256 must be the 64 lowercase hex SHA-256 of the refused token",
     );
   }
   return { refusedTokenSha256: value };
@@ -211,7 +218,7 @@ function nowOf(deps: MessagingDeps): Date {
 
 async function readDeviceRow(executor: SqlExecutor, access: PersonAccess, deviceIdValue: string): Promise<DeviceRow | null> {
   const result = await executor.query<DeviceRow>(
-    `SELECT id, session_id, relaycast_workspace_id, agent_name, agent_remote_id, token_ciphertext, expires_at, revoked_at,
+    `SELECT id, device_name, session_id, relaycast_workspace_id, agent_name, agent_remote_id, token_ciphertext, expires_at, revoked_at,
             CEIL(EXTRACT(EPOCH FROM minted_at + interval '${FORCED_MINT_INTERVAL_SECONDS} seconds' - now()))::int
               AS forced_mint_wait
        FROM person_device_credentials
@@ -224,6 +231,7 @@ async function readDeviceRow(executor: SqlExecutor, access: PersonAccess, device
 function usableRow(
   row: DeviceRow | null,
   identity: PersonIdentity,
+  device: DeviceTokenDevice,
   signInId: string | null,
   now: Date,
   deps: MessagingDeps,
@@ -234,7 +242,11 @@ function usableRow(
   if (row.session_id !== signInId) return null;
   const expiresAt = new Date(row.expires_at);
   if (expiresAt.getTime() - now.getTime() <= DEVICE_TOKEN_RENEW_MARGIN_MS) return null;
-  return { token: decryptSecret(row.token_ciphertext, deps.keyring), expiresAt };
+  return {
+    token: decryptSecret(row.token_ciphertext, deps.keyring),
+    expiresAt,
+    device: { ...device, name: row.device_name },
+  };
 }
 
 /**
@@ -262,10 +274,13 @@ async function probeServes(deps: MessagingDeps, token: string, identity: PersonI
  * Locks the sign-in's session row FOR SHARE before the device row is written,
  * the order a sign-out takes them in (session row, then its device rows). A
  * concurrent sign-out then waits for this transaction and its device-row
- * revoke sees the row stored here.
+ * revoke sees the row stored here. False when the session row is gone:
+ * removing a membership deletes the person's session rows, and that can
+ * commit while the Relaycast mint is in flight.
  */
-async function lockSession(tx: SqlExecutor, signInId: string): Promise<void> {
-  await tx.query("SELECT 1 FROM token_sessions WHERE id = $1 FOR SHARE", [signInId]);
+async function lockSession(tx: SqlExecutor, signInId: string): Promise<boolean> {
+  const result = await tx.query("SELECT 1 FROM token_sessions WHERE id = $1 FOR SHARE", [signInId]);
+  return result.rows.length === 1;
 }
 
 async function sessionLive(tx: SqlExecutor, signInId: string): Promise<boolean> {
@@ -288,13 +303,15 @@ async function storeRow(
     signInId: string | null;
     token: string;
     expiresAt: Date;
+    /** Saves the row already revoked, pending the upstream revoke. */
+    revoked: boolean;
   },
 ): Promise<string> {
   const stored = await tx.query<{ id: string }>(
     `INSERT INTO person_device_credentials
        (id, workspace_id, user_id, device_id, device_name, device_kind, session_id, relaycast_workspace_id,
         agent_name, agent_remote_id, token_ciphertext, expires_at, minted_at, revoked_at, upstream_revoked_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), NULL, NULL)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), CASE WHEN $13::boolean THEN now() END, NULL)
      ON CONFLICT (workspace_id, user_id, device_id) DO UPDATE
        SET device_name = EXCLUDED.device_name,
            device_kind = EXCLUDED.device_kind,
@@ -305,7 +322,7 @@ async function storeRow(
            token_ciphertext = EXCLUDED.token_ciphertext,
            expires_at = EXCLUDED.expires_at,
            minted_at = now(),
-           revoked_at = NULL,
+           revoked_at = EXCLUDED.revoked_at,
            upstream_revoked_at = NULL,
            updated_at = now()
      RETURNING id`,
@@ -322,6 +339,7 @@ async function storeRow(
       input.identity.agentId,
       encryptSecret(input.token, deps.keyring.active),
       input.expiresAt,
+      input.revoked,
     ],
   );
   return stored.rows[0]!.id;
@@ -367,7 +385,7 @@ async function mintUnderLock(
       const row = await readDeviceRow(tx, access, device.id);
       if (revokedForSignIn(row, signInId)) return { kind: "device_revoked" };
       // Another request may have minted while this one waited for the lock.
-      const again = usableRow(row, identity, signInId, nowOf(deps), deps);
+      const again = usableRow(row, identity, device, signInId, nowOf(deps), deps);
       if (again && again.token !== droppedToken) return { kind: "served", stored: again };
       if (forced && again && row && row.forced_mint_wait > 0) {
         return { kind: "rate_limited", retryAfterSeconds: row.forced_mint_wait };
@@ -377,24 +395,33 @@ async function mintUnderLock(
         device,
         ttlSeconds: DEVICE_TOKEN_TTL_SECONDS,
       });
-      const stored = { token: issued.token, expiresAt: deviceTokenExpiry(issued.expiresAt, nowOf(deps)) };
-      if (signInId) await lockSession(tx, signInId);
-      const rowId = await storeRow(tx, deps, { access, identity, device, signInId, ...stored });
+      const stored: StoredToken = {
+        token: issued.token,
+        expiresAt: deviceTokenExpiry(issued.expiresAt, nowOf(deps)),
+        device: issued.device,
+      };
+      if (deps.beforeDeviceSave) await deps.beforeDeviceSave(tx);
+      // A refused token stays recorded, revoked and with no session, so the
+      // sweep retries the upstream revoke if the immediate one fails.
+      const recordRevoked = () => storeRow(tx, deps, { access, identity, signInId: null, revoked: true, ...stored });
+      if (signInId && !(await lockSession(tx, signInId))) {
+        return { kind: "refused", status: 401, rowId: await recordRevoked() };
+      }
+      const rowId = await storeRow(tx, deps, { access, identity, signInId, revoked: false, ...stored });
       if (deps.afterDeviceMint) await deps.afterDeviceMint(tx);
       // Checked after the save: a sign-out or member removal that commits
       // before this point is seen here, one that comes later waits for this
-      // transaction and revokes the saved row.
+      // transaction and revokes or deletes the saved row.
       const refusal = signInId && !(await sessionLive(tx, signInId))
         ? 401 as const
         : !(await isMember(tx, access.organizationId, access.user.userId)) ? 403 as const : null;
       if (refusal === null) return { kind: "served", stored };
-      // The refused token stays recorded, revoked, so the sweep retries the
-      // upstream revoke if the immediate one below fails.
-      await tx.query(
-        "UPDATE person_device_credentials SET revoked_at = now(), updated_at = now() WHERE id = $1",
+      const revoked = await tx.query<{ id: string }>(
+        "UPDATE person_device_credentials SET revoked_at = now(), updated_at = now() WHERE id = $1 RETURNING id",
         [rowId],
       );
-      return { kind: "refused", status: refusal, rowId };
+      // A deleted session row takes its device rows with it.
+      return { kind: "refused", status: refusal, rowId: revoked.rows[0]?.id ?? await recordRevoked() };
     },
   );
   if (outcome.kind === "served") return outcome.stored;
@@ -443,11 +470,11 @@ export async function ensureDeviceCredential(
   let forced = false;
   const row = await readDeviceRow(deps.database, access, device.id);
   if (revokedForSignIn(row, signInId)) throw deviceRevoked();
-  const stored = usableRow(row, current, signInId, nowOf(deps), deps);
+  const stored = usableRow(row, current, device, signInId, nowOf(deps), deps);
   if (stored) {
     forced = options.refusedTokenSha256 ? tokenHashMatches(stored.token, options.refusedTokenSha256) : false;
     if (!forced && await probeServes(deps, stored.token, current)) {
-      return { kind: "device", identity: current, device, token: stored.token, expiresAt: stored.expiresAt };
+      return { kind: "device", identity: current, ...stored };
     }
     droppedToken = stored.token;
   }
@@ -455,7 +482,7 @@ export async function ensureDeviceCredential(
   for (;;) {
     try {
       const minted = await mintUnderLock(deps, access, current, device, signInId, droppedToken, forced);
-      return { kind: "device", identity: current, device, token: minted.token, expiresAt: minted.expiresAt };
+      return { kind: "device", identity: current, ...minted };
     } catch (error) {
       if (!(error instanceof RelaycastCallError)) throw error;
       if (!recovered && isIdentityRefusal(error)) {
@@ -495,9 +522,15 @@ function defaultWarn(message: string, fields: Record<string, string>): void {
 /**
  * Sends the upstream revoke for device rows revoked locally (ended sign-ins,
  * refused mints) that Relaycast has not confirmed yet. Bounded per call; a
- * failed row is retried on a later call after the others.
+ * failed row is retried on a later call after the others. `options.signal`
+ * bounds the upstream calls; an aborted call leaves its row pending like any
+ * other failure.
  */
-export async function sweepDeviceRevocations(deps: MessagingDeps, organizationId?: string): Promise<void> {
+export async function sweepDeviceRevocations(
+  deps: MessagingDeps,
+  organizationId?: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<void> {
   const rows = await deps.database.query<{
     id: string;
     workspace_id: string;
@@ -523,6 +556,7 @@ export async function sweepDeviceRevocations(deps: MessagingDeps, organizationId
   if (rows.rows.length === 0) return;
   const relaycast = client(deps);
   for (const row of rows.rows) {
+    if (options.signal?.aborted) return;
     try {
       await withLock(deps.database, personLockKey(row.workspace_id, row.user_id), async (tx) => {
         // A mint may have replaced the row with a live token since it was read.
@@ -539,6 +573,7 @@ export async function sweepDeviceRevocations(deps: MessagingDeps, organizationId
             decryptSecret(row.relaycast_api_key_ciphertext, deps.keyring),
             row.agent_name,
             row.device_id,
+            options.signal,
           );
         }
         await tx.query(

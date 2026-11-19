@@ -59,9 +59,16 @@ export type MessagingDeps = {
   afterUpstream?: () => Promise<void> | void;
   /**
    * Runs inside the device-credential lock after Relaycast minted a device
-   * token and before the session and membership re-check that guards storing it.
+   * token and before the session row is locked and the token row saved.
+   */
+  beforeDeviceSave?: (tx: SqlExecutor) => Promise<void> | void;
+  /**
+   * Runs inside the device-credential lock after the minted token row is
+   * saved and before the session and membership re-check.
    */
   afterDeviceMint?: (tx: SqlExecutor) => Promise<void> | void;
+  /** Tests shorten the bound on the upstream revokes a sign-out waits for. */
+  signOutRevokeTimeoutMs?: number;
   /** Server-side warning sink; defaults to console.warn. Never given a token or a device name. */
   warn?: (message: string, fields: Record<string, string>) => void;
 };
