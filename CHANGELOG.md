@@ -6,8 +6,9 @@ assigned at release.
 ## Unreleased
 
 - Changed: the MCP endpoint's `[selfhost-mcp] native chat context refused` log
-  line now carries the response's correlation id (`correlation_id`, null until
-  the MCP endpoint sets one), a `stage` (`claude_attestation`,
+  line now carries the response's correlation id (`correlation_id`, the same
+  value as the `x-correlation-id` header and the error's
+  `data.correlation_id`), a `stage` (`claude_attestation`,
   `copilot_attestation` or `desktop_context`) in place of `check`, and a fixed
   `reason` code (for example `unknown_key`, `tool_use_mismatch`, `expired`,
   `conflicting_context`, or `unclassified` for a message without a code) in

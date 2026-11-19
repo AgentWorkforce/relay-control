@@ -164,6 +164,11 @@ test("bad Cursor proofs are refused: replay, wrong key, changed or unsigned args
     method: "tools/call", tool: "relay_status", provider: "cursor", auth_mode: "cli_login", workspace_id: env.workspaceId,
     user_id: fields.user_id });
   assert.equal(typeof fields.user_id, "string");
+  // One id joins all three: the response header, the JSON-RPC error data the
+  // client sees, and the operator log line.
+  assert.match(replayed.correlationId ?? "", /^[0-9a-f]{8}-[0-9a-f-]{27}$/);
+  assert.equal(replayed.body.error.data.correlation_id, replayed.correlationId);
+  assert.equal(fields.correlation_id, replayed.correlationId);
 
   // Each refusal logs the first check of the verifier that fails.
   const refused = async (body: unknown, label: string, reason: string) => {
@@ -208,6 +213,8 @@ test("a verified Cursor proof with a native session header too is refused at the
   assert.deepEqual(fields, { correlation_id: conflicting.correlationId, stage: "desktop_context", reason: "conflicting_context",
     method: "tools/call", tool: "send_relay_message", provider: "cursor", auth_mode: "cli_login", workspace_id: env.workspaceId,
     user_id: fields.user_id });
+  assert.match(conflicting.correlationId ?? "", /^[0-9a-f]{8}-[0-9a-f-]{27}$/);
+  assert.equal(conflicting.body.error.data.correlation_id, conflicting.correlationId);
   assert.equal(env.world.bodies.slice(before).some((row) => row.method === "POST"), false, "nothing was sent");
 });
 
