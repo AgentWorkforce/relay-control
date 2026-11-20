@@ -16,7 +16,7 @@ two layers:
    Grok Bot connection it is that grant's own routine procedure (Cloud's copied
    `grokRoutinePrompt` for its webhook or polling mode; see
    [grok-bot.md](grok-bot.md#cloud-copy-mode-selfhost_grok_routines_cloud_copy)).
-2. **An organization overlay** (`agent_rules_overlays`, migration `0080`),
+2. **An organization overlay** (`agent_rules_overlays`, migration `0083`),
    appended as "Organization rules". This is where tenant-specific policy
    goes, for example who to escalate to. An overlay can add rules but cannot
    remove a base section.
@@ -75,10 +75,10 @@ bootstrap once.
 
 ## Layered leads
 
-The `lead` audience carries layered-agents `kit/delegation.md` and
-`kit/orchestration.md`, copied as is. Having `kit/lead-run.sh` fetch it
-(`GET /api/v1/agent-rules/lead`, falling back to a pinned snapshot) is a
-change for the layered-agents owner; this repository only serves it.
+The `lead` audience carries the layered lead kit's delegation and
+orchestration guidance, copied as is. Having the layered lead start-up script
+fetch it (`GET /api/v1/agent-rules/lead`, falling back to a pinned snapshot)
+is a change for the layered-agents owner; this repository only serves it.
 
 ## Orchestration and stall-watching rules
 

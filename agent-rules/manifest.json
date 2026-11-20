@@ -2,11 +2,11 @@
   "version": "2026.11.1",
   "bootstrap_version": 1,
   "sources": {
-    "grok-inbox": "Cloud packages/web/lib/mcp-events/grok-routine.ts grokRoutinePrompt @ 84578009505b (rendered per grant)",
-    "grok-delegation": "Cloud integrations/grok-bot/skills/agent-relay-grok-bot/SKILL.md 'Delegating work to agents' @ 84578009505b",
-    "show-ui": "Cloud integrations/grok-bot/skills/agent-relay-grok-bot/SKILL.md 'Showing visuals' @ 84578009505b",
-    "lead-delegation": "layered-agents kit/delegation.md @ 7ee49b244902",
-    "lead-orchestration": "layered-agents kit/orchestration.md @ 7ee49b244902"
+    "grok-inbox": "Agent Relay Cloud's Grok routine prompt, copied in Phase 1 (rendered per grant)",
+    "grok-delegation": "The public Grok Bot plugin skill (AgentWorkforce/skills, plugins/grok-bot): 'Delegating work to agents'",
+    "show-ui": "The public Grok Bot plugin skill (AgentWorkforce/skills, plugins/grok-bot): 'Showing visuals'",
+    "lead-delegation": "The layered lead kit's delegation guidance",
+    "lead-orchestration": "The layered lead kit's orchestration guidance"
   },
   "sections": [
     {

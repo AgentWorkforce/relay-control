@@ -17,17 +17,19 @@ const PROOF = "_agent_relay_attestation";
 // Cursor's per-call tool_use_id (a UUID in Cursor 3.30).
 const ticket = () => randomUUID();
 
-async function rpc(origin: string, token: string, body: unknown, options: { desktop?: boolean; path?: string } = {}) {
+async function rpc(origin: string, token: string, body: unknown,
+  options: { desktop?: boolean; path?: string; headers?: Record<string, string> } = {}) {
   const response = await fetch(`${origin}${options.path ?? MCP_PATH}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${token}`, accept: "application/json, text/event-stream", "content-type": "application/json",
-      ...(options.desktop ? { "x-agent-relay-desktop": "1" } : {}),
+      ...(options.desktop ? { "x-agent-relay-desktop": "1" } : {}), ...options.headers,
     },
     body: JSON.stringify(body),
   });
   const text = await response.text();
-  return { status: response.status, body: text ? JSON.parse(text) as Record<string, any> : {} };
+  return { status: response.status, body: text ? JSON.parse(text) as Record<string, any> : {},
+    correlationId: response.headers.get("x-correlation-id") };
 }
 
 /** A verified Desktop with one synced Cursor chat, its signing key and a cursor-bound provider credential. */
@@ -73,6 +75,14 @@ const invalid = (response: { status: number; body: Record<string, any> }, label:
   assert.equal(response.status, 400, `${label}: ${JSON.stringify(response.body)}`);
   assert.equal(response.body.error.code, -32602, label);
   assert.equal(response.body.error.message, "Invalid native chat context.", label);
+};
+
+type WarnMock = { mock: { calls: readonly { arguments: readonly unknown[] }[] } };
+/** The latest refusal log line's fields. */
+const lastRefusal = (warn: WarnMock) => {
+  const [message, fields] = warn.mock.calls.at(-1)!.arguments as [string, Record<string, unknown>];
+  assert.equal(message, "[selfhost-mcp] native chat context refused");
+  return fields;
 };
 
 test("identity sync advertises cursor_session_attestation, stores kind cursor, and MCP initialize advertises it", async (t) => {
@@ -143,32 +153,80 @@ test("bad Cursor proofs are refused: replay, wrong key, changed or unsigned args
   const once = await call("relay_status", {});
   assert.equal((await rpc(env.origin, secret, once)).status, 200);
   assert.equal(warn.mock.callCount(), 0, "an accepted proof logs nothing");
-  invalid(await rpc(env.origin, secret, once), "replayed ticket");
-  // The operator log names the failed check; the response never does and
-  // the log never carries the proof or the arguments.
+  const replayed = await rpc(env.origin, secret, once);
+  invalid(replayed, "replayed ticket");
+  // The operator log joins the response by its correlation id and names the
+  // stage and a fixed reason code; the response never does and the log never
+  // carries the proof, the credential or the arguments.
   assert.equal(warn.mock.callCount(), 1);
-  const [message, fields] = warn.mock.calls[0]!.arguments as [string, Record<string, unknown>];
-  assert.equal(message, "[selfhost-mcp] native chat context refused");
-  assert.deepEqual(fields, { check: "ClaudeAttestationError", reason: "replayed tool use", method: "tools/call",
-    tool: "relay_status", provider: "cursor", auth_mode: "cli_login", workspace_id: env.workspaceId,
+  const fields = lastRefusal(warn);
+  assert.deepEqual(fields, { correlation_id: replayed.correlationId, stage: "claude_attestation", reason: "replayed_proof",
+    method: "tools/call", tool: "relay_status", provider: "cursor", auth_mode: "cli_login", workspace_id: env.workspaceId,
     user_id: fields.user_id });
   assert.equal(typeof fields.user_id, "string");
-  assert.doesNotMatch(JSON.stringify(fields), /eyJ|_agent_relay_attestation/, "no proof in the log");
+  // One id joins all three: the response header, the JSON-RPC error data the
+  // client sees, and the operator log line.
+  assert.match(replayed.correlationId ?? "", /^[0-9a-f]{8}-[0-9a-f-]{27}$/);
+  assert.equal(replayed.body.error.data.correlation_id, replayed.correlationId);
+  assert.equal(fields.correlation_id, replayed.correlationId);
 
-  invalid(await rpc(env.origin, secret, await call("relay_status", {}, { signWith: await claudeSigner() })), "other installation key");
-  invalid(await rpc(env.origin, secret, await call("relay_status", {}, { signWith: await claudeSigner(), kid: signer.kid })), "forged kid");
-  invalid(await rpc(env.origin, secret, await call("send_relay_message", { to: "peer", text: "changed" },
-    { signedArgs: { to: "peer", text: "approved" } })), "arguments mismatch");
+  // Each refusal logs the first check of the verifier that fails.
+  const refused = async (body: unknown, label: string, reason: string) => {
+    const before = warn.mock.callCount();
+    invalid(await rpc(env.origin, secret, body), label);
+    assert.equal(warn.mock.callCount(), before + 1, label);
+    const logged = lastRefusal(warn);
+    assert.equal(logged.stage, "claude_attestation", label);
+    assert.equal(logged.reason, reason, label);
+  };
+  await refused(await call("relay_status", {}, { signWith: await claudeSigner() }), "other installation key", "unknown_key");
+  await refused(await call("relay_status", {}, { signWith: await claudeSigner(), kid: signer.kid }), "forged kid", "bad_signature");
+  await refused(await call("send_relay_message", { to: "peer", text: "changed" },
+    { signedArgs: { to: "peer", text: "approved" } }), "arguments mismatch", "arguments_mismatch");
   const renamed = await call("relay_status", {});
   renamed.params.name = "send_relay_message";
-  invalid(await rpc(env.origin, secret, renamed), "other tool");
+  await refused(renamed, "other tool", "tool_mismatch");
   const now = Math.floor(Date.now() / 1000);
-  invalid(await rpc(env.origin, secret, await call("relay_status", {}, { iat: now - 120, exp: now - 60 })), "expired");
-  invalid(await rpc(env.origin, secret, await call("relay_status", {}, { src: "another-source" })), "other source");
-  invalid(await rpc(env.origin, secret, await call("relay_status", {}, { kind: "claude", signedArgs: null })), "claude proof on cursor credential");
-  invalid(await rpc(env.origin, secret, await call("relay_status", {}, { tuid: "has space" })), "malformed ticket");
-  invalid(await rpc(env.origin, secret, await call("relay_status", {}, { signedArgs: null })), "no signed arguments");
+  await refused(await call("relay_status", {}, { iat: now - 120, exp: now - 60 }), "expired", "expired");
+  await refused(await call("relay_status", {}, { src: "another-source" }), "other source", "unknown_key");
+  await refused(await call("relay_status", {}, { kind: "claude", signedArgs: null }), "claude proof on cursor credential",
+    "provider_mismatch");
+  await refused(await call("relay_status", {}, { tuid: "has space" }), "malformed ticket", "unexpected_payload");
+  await refused(await call("relay_status", {}, { signedArgs: null }), "no signed arguments", "unexpected_payload");
   assert.equal(env.world.bodies.some((row) => row.method === "POST" && row.path === "/v1/dm"), false);
+  for (const entry of warn.mock.calls) {
+    const logged = JSON.stringify(entry.arguments);
+    assert.doesNotMatch(logged, /eyJ|_agent_relay_attestation/, "no proof in the log");
+    for (const value of [secret, "changed", "approved"]) assert.equal(logged.includes(value), false, `${value} in the log`);
+  }
+});
+
+test("a verified Cursor proof with a native session header too is refused at the desktop context and sends nothing", async (t) => {
+  const { env, secret, call } = await cursorDesktop(t);
+  const warn = t.mock.method(console, "warn", () => {});
+  const before = env.world.bodies.length;
+  const conflicting = await rpc(env.origin, secret, await call("send_relay_message", { to: "peer", text: "conflict" }),
+    { headers: { "x-agent-relay-native-session-id": randomUUID() } });
+  invalid(conflicting, "proof plus native session header");
+  assert.equal(warn.mock.callCount(), 1);
+  const fields = lastRefusal(warn);
+  assert.deepEqual(fields, { correlation_id: conflicting.correlationId, stage: "desktop_context", reason: "conflicting_context",
+    method: "tools/call", tool: "send_relay_message", provider: "cursor", auth_mode: "cli_login", workspace_id: env.workspaceId,
+    user_id: fields.user_id });
+  assert.match(conflicting.correlationId ?? "", /^[0-9a-f]{8}-[0-9a-f-]{27}$/);
+  assert.equal(conflicting.body.error.data.correlation_id, conflicting.correlationId);
+  assert.equal(env.world.bodies.slice(before).some((row) => row.method === "POST"), false, "nothing was sent");
+});
+
+test("an attestation store failure is a server error, not a refused proof", async (t) => {
+  const { env, secret, call } = await cursorDesktop(t);
+  const warn = t.mock.method(console, "warn", () => {});
+  t.mock.method(console, "error", () => {});
+  // The proof verifies; spending its ticket then fails in the store.
+  await env.database.query("ALTER TABLE mcp_attestation_tool_uses RENAME TO mcp_attestation_tool_uses_unavailable");
+  const failed = await rpc(env.origin, secret, await call("relay_status", {}));
+  assert.equal(failed.status, 500, JSON.stringify(failed.body));
+  assert.equal(warn.mock.calls.some((entry) => entry.arguments[0] === "[selfhost-mcp] native chat context refused"), false);
 });
 
 test("a Cursor proof acts only as a synced cursor chat of the same person", async (t) => {

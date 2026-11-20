@@ -1,3 +1,5 @@
+import type { CursorCloudDeps } from "./cursor-cloud.js";
+import type { MemoryPolicy } from "@agent-relay/spawn-placement";
 import type { CapyBindings } from "../capy/bindings.js";
 import type { AmpDeps } from "../amp/service.js";
 import type { ReplicasDeps } from "../replicas/service.js";
@@ -50,6 +52,8 @@ export type McpContext = {
   grokRoutines?: GrokRoutines;
   /** The rules source for get_agent_rules (docs/agent-rules.md); absent for staff read grants. */
   agentRules?: AgentRules;
+  /** Cursor cloud agent runs (./cursor-cloud.ts); present only for OAuth contexts when the feature is on. */
+  cursorCloud?: CursorCloudDeps;
   customerSupport?: CustomerSupportConnection;
   /** GET a workspace-scoped RelayHistory path (with its query); throws SharedSessionsToolError. */
   readHistory: (path: string, options?: { timeoutMessage?: string }) => Promise<unknown>;
@@ -59,8 +63,9 @@ export type McpContext = {
   /** The provider catalog with this build's runtime state, for describe_capabilities. */
   providers: () => Promise<ProviderStatus[]>;
   relaycast: {
-    listAgents: (status: "active" | "all") => Promise<RosterAgent[]>;
-    listPresence: () => Promise<PresenceRow[]>;
+    /** `signal`, when given, aborts the read (list_team_activity bounds it). */
+    listAgents: (status: "active" | "all", options?: { signal?: AbortSignal }) => Promise<RosterAgent[]>;
+    listPresence: (options?: { signal?: AbortSignal }) => Promise<PresenceRow[]>;
   };
   /** relay_messaging: the participant store, its key envelope, and the Relaycast client. */
   relay: {
@@ -78,6 +83,8 @@ export type McpContext = {
     relaygatePublicUrl?: string;
     /** Gate-only installs only: relaygate's pre-spawn POST /v1/check (./relay-launch-check.ts). */
     launchCheck?: RelayLaunchCheck;
+    /** The spawn memory policy (docs/specs/spawn-placement-memory.md); absent means the defaults in observe. */
+    spawnMemoryPolicy?: MemoryPolicy;
     /**
      * Gate-only installs: the Relaycast client bound to relaygate's origin;
      * desktop identities hold rg_ tokens that only relaygate accepts.

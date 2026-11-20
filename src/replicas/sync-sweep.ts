@@ -1,10 +1,11 @@
 import { syncEnvironments } from "./environments.js";
-import { retirePendingCleanup, type ReplicasActor, type ReplicasDeps } from "./service.js";
+import { abandonStaleBindings, retirePendingCleanup, type ReplicasActor, type ReplicasDeps } from "./service.js";
 
 export const REPLICAS_SYNC_SERVICE = "replicas-sync";
 
 export type ReplicasSyncLog = (event: {
-  code: "replicas_sync_failed" | "replicas_sync_scan_failed" | "replicas_cleanup_failed" | "replicas_cleanup_scan_failed";
+  code: "replicas_sync_failed" | "replicas_sync_scan_failed" | "replicas_cleanup_failed" | "replicas_cleanup_scan_failed"
+    | "replicas_abandon_failed";
   workspaceId?: string;
   spawnId?: string;
 }) => void;
@@ -18,7 +19,8 @@ export type ReplicasSyncLog = (event: {
  * a person, and never sets or infers the VM principal. Like every sync, it
  * never re-sends a create whose earlier outcome is unconfirmed. After the
  * sync it retries incomplete remote cleanup of gone bindings for every
- * Replicas connection (whatever its default), with per-row backoff.
+ * Replicas connection (whatever its default), with per-row backoff, and
+ * abandons launches and binds stuck for 7 days without a relay identity.
  */
 export class ReplicasSyncSweep {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -63,6 +65,9 @@ export class ReplicasSyncSweep {
       try {
         await retirePendingCleanup(this.deps.replicas, this.actor(target),
           (spawnId) => this.deps.log?.({ code: "replicas_cleanup_failed", workspaceId: target.workspace_id, spawnId }));
+        // Launches and binds that never got a relay identity: abandoned after 7 days.
+        await abandonStaleBindings(this.deps.replicas, this.actor(target), undefined, undefined,
+          (spawnId) => this.deps.log?.({ code: "replicas_abandon_failed", workspaceId: target.workspace_id, spawnId }));
       } catch {
         this.deps.log?.({ code: "replicas_cleanup_scan_failed", workspaceId: target.workspace_id });
       }

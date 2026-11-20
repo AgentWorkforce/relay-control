@@ -45,6 +45,8 @@ export function ensureToolTitles(server: McpServer): void {
 export const RELAY_TOOLS = ["list_relay_agents", "get_relay_agent_card", "set_relay_agent_card", "send_relay_message", "get_relay_message_status", "read_relay_conversation", "join_relay", "leave_relay",
   "relay_status", "check_relay_inbox", "list_relay_channels", "subscribe_relay_channel", "unsubscribe_relay_channel",
   "post_relay_channel", "read_relay_channel"] as const;
+/** Directory reads do not act as the managed chat, so they survive a missing synced Desktop identity. */
+const RELAY_DIRECTORY_TOOLS = ["list_relay_agents", "get_relay_agent_card"] as const;
 const RELAY_SPAWN_TOOLS = ["list_relay_spawn_targets", "spawn_relay_agent", "get_relay_spawn_status", "release_relay_agent"] as const;
 const AMP_TOOLS = ["list_amp_threads", "bind_amp_thread", "unbind_amp_thread"] as const;
 const WEBHOOK_INBOX_TOOLS = ["link_webhook_inbox", "unlink_webhook_inbox"] as const;
@@ -166,6 +168,8 @@ export type CapabilityGroup = {
   title: string;
   status: "available" | "restricted" | "unavailable";
   tools: string[];
+  /** Listed tools whose calls are refused while the rest of the group remains usable. */
+  restricted_tools?: Array<{ name: string; reason: string }>;
   reason?: string;
   how_to_enable?: string;
   call_requirements?: string;
@@ -174,7 +178,11 @@ export type CapabilityGroup = {
 export type CapabilityReport = {
   endpoint: { facade: typeof MCP_FACADE.facade; name: string; url: string };
   connection: { auth_mode: McpAuthMode; description: string; scopes: string[] };
-  workspace: { workspace_id: string; role: Exclude<WorkspaceRole, null> | "unknown"; can_launch: boolean | null };
+  workspace: {
+    workspace_id: string; role: Exclude<WorkspaceRole, null> | "unknown"; can_launch: boolean | null;
+    /** With launches on: the spawn memory policy mode (docs/specs/spawn-placement-memory.md). */
+    spawn_memory_policy?: "off" | "observe" | "rank" | "enforce";
+  };
   groups: CapabilityGroup[];
   /** The provider catalog with this build's runtime state (src/providers/registry.ts). */
   providers: ProviderStatus[];
@@ -204,6 +212,11 @@ export function describeCapabilities(input: {
   grokRoutines?: boolean;
   grokEvents?: boolean;
   agentRules?: boolean;
+  /** Whether a managed native call resolves to its synced Desktop identity. */
+  nativeAuthorityAvailable?: boolean;
+  /** Safe reason and remedy when the managed native identity cannot be used. */
+  nativeAuthorityReason?: string;
+  nativeAuthorityHowToEnable?: string;
   providers: ProviderStatus[];
 }): CapabilityReport {
   const launchRole = input.role === "owner" || input.role === "admin";
@@ -254,8 +267,19 @@ export function describeCapabilities(input: {
       how_to_enable: input.authMode === "oauth"
         ? "Use your own Agent Relay sign-in (a person connection) for these tools."
         : "An operator adds events_shim to SELFHOST_FEATURES (chart selectedFeatures)." };
+    if (item && id === "relay_messaging" && input.nativeAuthorityAvailable === false) {
+      const reason = input.nativeAuthorityReason ?? "Agent Relay could not verify this chat's synced Desktop identity.";
+      return { ...base, status: "available", tools: [...item.tools],
+        restricted_tools: item.tools.filter(name => !(RELAY_DIRECTORY_TOOLS as readonly string[]).includes(name))
+          .map(name => ({ name, reason })),
+        how_to_enable: input.nativeAuthorityHowToEnable ?? "Reconnect this chat from Agent Relay Desktop and wait for its identity to sync, then retry.",
+        call_requirements: "Agent directory reads remain available. Acting as this managed chat requires its synced Desktop identity." };
+    }
     if (item) return { ...base, status: "available", tools: [...item.tools], ...(id === "customer_support"
       ? { call_requirements: "Available to all signed-in customers. Current credentials and workspace membership are checked before sending and before returning an answer." } : {}) };
+    if (id === "grok_events" && !item) return { ...base, status: "unavailable", tools: [...definition.tools],
+      reason: "Grok Bot routine events serve Grok Bot connections only, on a server with SELFHOST_GROK_ROUTINES_CLOUD_COPY on.",
+      how_to_enable: "Ask your operator to set SELFHOST_GROK_ROUTINES_CLOUD_COPY=on, then connect from Grok Bot." };
     if (id === "grok_routines") return { ...base, status: "unavailable", tools: [...definition.tools],
       reason: "Webhook wake-ups require a Grok Bot OAuth connection on this self-hosted server.",
       how_to_enable: "Connect Grok Bot to this server's /cloud/api/v1/mcp/shared-sessions endpoint, then call connect_grok_bot_routine." };

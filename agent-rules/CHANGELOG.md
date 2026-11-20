@@ -22,5 +22,5 @@ Each version is immutable. Bump `version` in `manifest.json` (CalVer
 - `grok-inbox` is Cloud's `grokRoutinePrompt`, copied in Phase 1 and rendered
   for each grant's mode, so behaviour is unchanged on day one.
 - `grok-delegation` and `show-ui` are copied from the Grok Bot plugin skill.
-- `lead-delegation` and `lead-orchestration` are copied from layered-agents
-  `kit/delegation.md` and `kit/orchestration.md`.
+- `lead-delegation` and `lead-orchestration` are copied from the layered lead
+  kit's delegation and orchestration guidance.

@@ -1,7 +1,6 @@
-// Reply policy for Grok Bot get_event, copied as is from AgentWorkforce/cloud
-// @ 84578009505b: repliesAutomatically, VERIFIED_AS, CHANNEL_ASK_TO_REPLY and
-// eventSteps from packages/web/lib/mcp-events/settings.ts, replyCall from
-// service.ts, and the trust types from trusted-senders.ts. Only the settings
+// Reply policy for Grok Bot get_event, copied as is from Agent Relay Cloud's
+// MCP Events module: repliesAutomatically, VERIFIED_AS, CHANNEL_ASK_TO_REPLY,
+// eventSteps, replyCall and the sender-trust types. Only the settings
 // type is narrowed to the fields relay-control stores per grant
 // (docs/specs/grok-bot-dynamic-prompt.md, Phase 1). Keep the strings identical.
 
@@ -81,7 +80,7 @@ export function eventSteps(settings: Pick<EventsSettings, "noteEveryMessage" | "
   const reply = options.channel
     ? "post_relay_channel (channel = data.channel, thread_id = data.replyThreadId"
     : "send_relay_message (to = data.from, as = data.agent, reply_to = data.messageId";
-  // Prod 2026-10-11: a woken chat read events and the conversation before
+  // A woken chat read events and the conversation before
   // replying (~6s plus model turns); get_event carries what it needs.
   const direct = options.channel
     ? "This is a post in a relay channel: reply in the channel, never by DM. Reply from this post and earlierMessages (earlier posts of this thread that reached you): do not call get_recent_events or relay_events_status first; call read_relay_channel only if the post refers to something neither has."
@@ -89,11 +88,11 @@ export function eventSteps(settings: Pick<EventsSettings, "noteEveryMessage" | "
   // A first reply to a new sender waits for the person's approval: a declined
   // send ends the wait, and the note still says so.
   // A reply goes to whoever wrote, so it is never confirmed first, however new
-  // the sender (a woken dot asked "Want me to send it back?", 2026-10-11).
+  // the sender (a woken chat asked "Want me to send it back?").
   // The saved setting is the person's consent; a fresh chat with no history of
   // it otherwise asks before an irreversible send.
   // A chat sends on its own only once the person agreed in a chat; until they
-  // have been asked, it asks first (seen live 2026-10-11).
+  // have been asked, it asks first.
   // Under the trusted scope a yes covers only senders Agent Relay verified
   // (get_event's trustedSender); anyone else is asked about, one message at a time.
   const automatic = repliesAutomatically(settings, options.trust);
@@ -135,7 +134,7 @@ export function eventSteps(settings: Pick<EventsSettings, "noteEveryMessage" | "
 /**
  * The reply as a ready call, filled in but for the text, so a replying chat
  * acts on the person's saved setting instead of asking them (a fresh chat
- * asked "Want me to send it back?", 2026-10-11). notes-only offers none.
+ * asked "Want me to send it back?"). notes-only offers none.
  */
 export function replyCall(event: { name: string; data: Record<string, unknown> }, settings: EventsSettings, trust: SenderTrust) {
   const { from, agent, messageId, channel, replyThreadId } = event.data;

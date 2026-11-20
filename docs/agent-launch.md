@@ -50,7 +50,9 @@ name, see
 | An unclaimed broker (`node_kind: "broker"`) | yes |
 
 `list_relay_spawn_targets` ranks allowed first, then yours, then desktop
-before broker, then free capacity and measured load.
+before broker, then free capacity and measured load. With the memory policy
+at `rank` or `enforce`, a target that would take the launch now (free slots
+and memory) ranks above everything but permission; see [Free memory](#free-memory).
 
 ## Using the tools
 
@@ -61,7 +63,8 @@ before broker, then free capacity and measured load.
    stable `idempotency_key`. `accepted` means dispatch receipt, not readiness.
    Refusals (`spawn_target_not_allowed`, `spawn_target_offline`,
    `spawn_target_unavailable`, `spawn_harness_unavailable`,
-   `spawn_capacity_exceeded`, and on gate-only installs `relaygate_denied`,
+   `spawn_capacity_exceeded`, `spawn_memory_low` (retryable; under the
+   `enforce` memory policy only), and on gate-only installs `relaygate_denied`,
    `relaygate_classified` and `relaygate_unavailable`) carry up to three
    allowed `alternatives`. Only `relaygate_unavailable` of the relaygate
    codes is retryable; see [identity.md](identity.md), "Launch check".
@@ -82,6 +85,30 @@ cleanup retains the launcher credentials while its journal has active or
 unconfirmed launches. An operator must drain those workers and reconcile their
 journal rows before the deferred cleanup can finish; it never marks a live
 worker released merely because the grant was revoked.
+
+## Free memory
+
+Each relay node reports its free and total memory with every heartbeat.
+`SELFHOST_SPAWN_MEMORY_POLICY` decides what that does (spec:
+[specs/spawn-placement-memory.md](specs/spawn-placement-memory.md); the policy
+is the shared `@agent-relay/spawn-placement` package, so Cloud judges memory
+the same way):
+
+| Mode | Effect |
+|---|---|
+| `off` | Today's behavior; targets carry no memory fields |
+| `observe` (default) | Each target carries `memory` (tier, free, floor, need, agents that fit) and `admissible`; launches that `enforce` would refuse are logged as `spawn_memory_policy_shadow` (counts, no names) |
+| `rank` | Also: a target that would take the launch ranks first, then by memory tier; alternatives only offer such targets |
+| `enforce` | Also: a launch to a node without the memory is refused with `spawn_memory_low`, a memory snapshot and up to three alternatives (`retry_after_seconds` when there are none) |
+
+A launch fits when the node's free memory, less launches still starting,
+covers the harness's budget (claude and opencode 1.5 GiB, codex and grok
+1 GiB, others 1.5 GiB) on top of a floor it keeps free (desktops: the larger
+of 2 GiB and 10% of total; brokers: 1 GiB or 5%). A node with no agent limit
+(`max_agents` 0) is full at `(total − floor) / 1 GiB` agents. A sample older
+than 45 s, or none, never refuses a launch. Pass `harness` to
+`list_relay_spawn_targets` to have memory judged for the harness you will
+launch. A node itself enforcing memory at launch is a relay-node follow-up.
 
 ## Journal and failure handling
 
