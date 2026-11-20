@@ -1453,6 +1453,68 @@ paths:
           description: Session revoked
         "404":
           description: Token not found
+  /api/v1/auth/cloud-bridge/start:
+    get:
+      security: []
+      operationId: cloudBridgeStart
+      description: >-
+        Session bridge for organizations moved from Agent Relay Cloud
+        (docs/identity.md). 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED. Sets the
+        encrypted attempt cookie agent_relay_cloud_bridge (SameSite=None,
+        Path /cloud/api/v1/auth/cloud-bridge/consume, 5 minutes) and redirects
+        to SELFHOST_CLOUD_BRIDGE_HANDOFF_URL with only a nonce. Public form
+        /cloud/api/v1/auth/cloud-bridge/start.
+      parameters:
+        - name: next
+          in: query
+          required: false
+          schema: { type: string }
+          description: Same-site path to land on after sign-in; anything else becomes /.
+      responses:
+        "302":
+          description: Redirect to the Cloud handoff page
+        "404":
+          description: The bridge is off
+        "429":
+          description: Too many attempts from this address
+  /api/v1/auth/cloud-bridge/consume:
+    post:
+      security: []
+      operationId: cloudBridgeConsume
+      description: >-
+        Cloud's handoff page posts the signed assertion here (public form
+        /cloud/api/v1/auth/cloud-bridge/consume). Origin must equal the
+        handoff URL's origin. On success sets the session cookie and answers
+        303 to the start's next. Refusals are HTML pages; the x-error-code
+        header carries cloud_bridge_invalid or an account-level
+        cloud_bridge_* code. 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [assertion]
+              properties:
+                assertion:
+                  type: string
+                  description: Compact EdDSA JWS, typ cloud-bridge+jwt
+      responses:
+        "303":
+          description: Signed in; redirect to next
+        "400":
+          description: cloud_bridge_invalid
+        "403":
+          description: >-
+            cloud_bridge_user_unknown, cloud_bridge_org_not_moved,
+            cloud_bridge_not_member, cloud_bridge_auth_too_old or
+            cloud_bridge_signed_out
+        "404":
+          description: The bridge is off
+        "429":
+          description: Too many attempts
+        "503":
+          description: not_ready (no organization or workspace yet)
   /api/v1/cli/login:
     get:
       security: [{ cookieAuth: [] }]
@@ -1698,6 +1760,86 @@ paths:
           description: Invalid body
         "403":
           description: Bootstrap bearer required
+  /api/v1/installation/cloud-bridge/organizations:
+    get:
+      security: [{ bearerAuth: [] }]
+      operationId: listCloudBridgeOrganizations
+      description: >-
+        Bootstrap bearer only; 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED.
+        Organizations listed for the session bridge from Agent Relay Cloud,
+        open or not.
+      responses:
+        "200":
+          description: Bridge windows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  organizations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CloudBridgeOrganization"
+        "403":
+          description: Bootstrap bearer required
+        "404":
+          description: The bridge is off
+  /api/v1/installation/cloud-bridge/organizations/{organizationId}:
+    parameters:
+      - name: organizationId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      security: [{ bearerAuth: [] }]
+      operationId: setCloudBridgeOrganization
+      description: >-
+        Bootstrap bearer only; 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED. Opens
+        or changes the organization's bridge window. List an organization
+        only after its import has been applied and verified. closesAt must be
+        in the future and at most 90 days after opensAt (default now).
+        Audited as installation.cloud_bridge.organization_set.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [closesAt, setBy]
+              properties:
+                closesAt: { type: string, format: date-time }
+                opensAt: { type: string, format: date-time }
+                setBy: { type: string, minLength: 1, maxLength: 120 }
+      responses:
+        "200":
+          description: The stored window
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CloudBridgeOrganization"
+        "400":
+          description: Invalid body or window
+        "403":
+          description: Bootstrap bearer required
+        "404":
+          description: Organization not found, or the bridge is off
+        "409":
+          description: organization_empty (the organization has no members)
+    delete:
+      security: [{ bearerAuth: [] }]
+      operationId: removeCloudBridgeOrganization
+      description: >-
+        Bootstrap bearer only; 404 unless SELFHOST_CLOUD_BRIDGE_ENABLED.
+        Removes the window. Audited as
+        installation.cloud_bridge.organization_removed.
+      responses:
+        "204":
+          description: Removed
+        "403":
+          description: Bootstrap bearer required
+        "404":
+          description: No window for this organization, or the bridge is off
   /api/v1/auth/whoami:
     get:
       operationId: whoami
@@ -9890,6 +10032,15 @@ components:
           type: string
           format: uri
           description: "`<site>/cloud` (the dashboard or public origin the request arrived on, or SELFHOST_ROUTED_SITE_URL through its edge router)"
+    CloudBridgeOrganization:
+      type: object
+      required: [organizationId, opensAt, closesAt, setBy, updatedAt]
+      properties:
+        organizationId: { type: string, format: uuid }
+        opensAt: { type: string, format: date-time }
+        closesAt: { type: string, format: date-time }
+        setBy: { type: string }
+        updatedAt: { type: string, format: date-time }
     Whoami:
       type: object
       required:

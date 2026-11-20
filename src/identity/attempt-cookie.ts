@@ -14,12 +14,19 @@ export const ATTEMPT_MAX_CHUNKS = 5;
 
 const MANIFEST_PREFIX = "chunked.";
 
-function setCookie(name: string, value: string, path: string, maxAge: number): string {
-  return `${name}=${encodeURIComponent(value)}; Path=${path}; Max-Age=${maxAge}; Secure; HttpOnly; SameSite=Lax`;
+/**
+ * Lax for the provider attempts, whose callback is a top-level GET. None for
+ * an attempt read by a cross-site form POST (the Cloud session bridge), which
+ * a Lax cookie would not accompany.
+ */
+export type AttemptSameSite = "Lax" | "None";
+
+function setCookie(name: string, value: string, path: string, maxAge: number, sameSite: AttemptSameSite = "Lax"): string {
+  return `${name}=${encodeURIComponent(value)}; Path=${path}; Max-Age=${maxAge}; Secure; HttpOnly; SameSite=${sameSite}`;
 }
 
-function clearCookie(name: string, path: string): string {
-  return `${name}=; Path=${path}; Max-Age=0; Secure; HttpOnly; SameSite=Lax`;
+function clearCookie(name: string, path: string, sameSite: AttemptSameSite = "Lax"): string {
+  return `${name}=; Path=${path}; Max-Age=0; Secure; HttpOnly; SameSite=${sameSite}`;
 }
 
 function digest(blob: string): string {
@@ -31,26 +38,26 @@ function chunkName(name: string, index: number): string {
 }
 
 /** Set-Cookie strings for the attempt blob, or null when it needs more than ATTEMPT_MAX_CHUNKS chunks. */
-export function attemptSetCookies(blob: string, name: string, path: string, maxAge: number): string[] | null {
+export function attemptSetCookies(blob: string, name: string, path: string, maxAge: number, sameSite: AttemptSameSite = "Lax"): string[] | null {
   if (blob.length <= ATTEMPT_CHUNK_SIZE) {
-    const cookies = [setCookie(name, blob, path, maxAge)];
-    for (let index = 0; index < ATTEMPT_MAX_CHUNKS; index += 1) cookies.push(clearCookie(chunkName(name, index), path));
+    const cookies = [setCookie(name, blob, path, maxAge, sameSite)];
+    for (let index = 0; index < ATTEMPT_MAX_CHUNKS; index += 1) cookies.push(clearCookie(chunkName(name, index), path, sameSite));
     return cookies;
   }
   const count = Math.ceil(blob.length / ATTEMPT_CHUNK_SIZE);
   if (count > ATTEMPT_MAX_CHUNKS) return null;
-  const cookies = [setCookie(name, `${MANIFEST_PREFIX}${count}.${digest(blob)}`, path, maxAge)];
+  const cookies = [setCookie(name, `${MANIFEST_PREFIX}${count}.${digest(blob)}`, path, maxAge, sameSite)];
   for (let index = 0; index < count; index += 1) {
-    cookies.push(setCookie(chunkName(name, index), blob.slice(index * ATTEMPT_CHUNK_SIZE, (index + 1) * ATTEMPT_CHUNK_SIZE), path, maxAge));
+    cookies.push(setCookie(chunkName(name, index), blob.slice(index * ATTEMPT_CHUNK_SIZE, (index + 1) * ATTEMPT_CHUNK_SIZE), path, maxAge, sameSite));
   }
-  for (let index = count; index < ATTEMPT_MAX_CHUNKS; index += 1) cookies.push(clearCookie(chunkName(name, index), path));
+  for (let index = count; index < ATTEMPT_MAX_CHUNKS; index += 1) cookies.push(clearCookie(chunkName(name, index), path, sameSite));
   return cookies;
 }
 
 /** Clear strings for the base cookie and every chunk slot. */
-export function attemptClearCookies(name: string, path: string): string[] {
-  const cookies = [clearCookie(name, path)];
-  for (let index = 0; index < ATTEMPT_MAX_CHUNKS; index += 1) cookies.push(clearCookie(chunkName(name, index), path));
+export function attemptClearCookies(name: string, path: string, sameSite: AttemptSameSite = "Lax"): string[] {
+  const cookies = [clearCookie(name, path, sameSite)];
+  for (let index = 0; index < ATTEMPT_MAX_CHUNKS; index += 1) cookies.push(clearCookie(chunkName(name, index), path, sameSite));
   return cookies;
 }
 

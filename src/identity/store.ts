@@ -102,6 +102,45 @@ export type SignInResult = {
 
 export type SignInMethod = "oidc" | "microsoft" | "email" | "password";
 
+/** A bridge window as the operator routes return it. */
+export type CloudBridgeOrganization = {
+  organizationId: string;
+  opensAt: string;
+  closesAt: string;
+  setBy: string;
+  updatedAt: string;
+};
+
+type CloudBridgeRow = {
+  organization_id: string;
+  opens_at: Date | string;
+  closes_at: Date | string;
+  set_by: string;
+  updated_at: Date | string;
+};
+
+function cloudBridgeOrganization(row: CloudBridgeRow): CloudBridgeOrganization {
+  return {
+    organizationId: row.organization_id,
+    opensAt: new Date(row.opens_at).toISOString(),
+    closesAt: new Date(row.closes_at).toISOString(),
+    setBy: row.set_by,
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Longest bridge window: the bridge is for a migration, not a standing trust. */
+const CLOUD_BRIDGE_MAX_WINDOW_MS = 90 * 24 * 60 * 60 * 1_000;
+const CLOUD_BRIDGE_ACTOR = { kind: "service", subject: "cloud-bridge" } as const;
+
+export type CloudBridgeAccountReason = "user_unknown" | "org_not_moved" | "not_member" | "auth_too_old" | "signed_out";
+
+/** The account-level bridge refusals; the route maps cloud_bridge_<reason> back to the reason. */
+function bridgeRefusal(reason: CloudBridgeAccountReason): IdentityError {
+  return new IdentityError(403, `cloud_bridge_${reason}`, `Cloud session bridge refused: ${reason}.`);
+}
+
 type SignInInput = {
   /**
    * Where this account is being created (users.signup_source, 0068), when the
@@ -1310,6 +1349,241 @@ export class IdentityStore {
       [hashSecret(token), new Date(this.now())],
     );
     return result.rows[0]?.email ?? null;
+  }
+
+  // ---- session bridge for organizations moved from Cloud ----------------------
+
+  /**
+   * Spends a bridge assertion id (docs/identity.md, "Session bridge for
+   * organizations moved from Agent Relay Cloud"). It runs as its own
+   * statement before the sign-in transaction, so the assertion stays spent
+   * even when that sign-in is refused or fails: a replay is never a second
+   * try. False when the id was already spent. Ids that expired more than an
+   * hour ago are swept in the same call, which keeps the table to about an
+   * hour of sign-ins without a background job.
+   */
+  async burnCloudBridgeAssertion(jti: string, expiresAt: Date): Promise<boolean> {
+    await this.database.query("DELETE FROM cloud_bridge_assertions WHERE expires_at < $1", [new Date(this.now() - 60 * 60 * 1_000)]);
+    const result = await this.database.query<{ jti: string }>(
+      "INSERT INTO cloud_bridge_assertions (jti, expires_at) VALUES ($1, $2) ON CONFLICT (jti) DO NOTHING RETURNING jti",
+      [jti, expiresAt],
+    );
+    return result.rows.length === 1;
+  }
+
+  /**
+   * Signs in the Control user a verified Cloud assertion names, without ever
+   * creating anything: the user (by id, never by email), the organization's
+   * open bridge window and the membership must all exist already, and no
+   * invite, auto-join domain or admin-email rule is consulted. Refusals throw
+   * an IdentityError whose code is the bridge reason (cloud_bridge_*).
+   *
+   * Lock order: lockUser, then lockOrganization (no identity lock: the email
+   * is not an input here, and no later step takes one).
+   */
+  async bridgeSignIn(input: {
+    userId: string;
+    organizationId: string;
+    workspaceId: string | null;
+    /** Epoch seconds of the Cloud sign-in. */
+    authTime: number;
+    authMethod: string | null;
+    jti: string;
+    maxAuthAgeSeconds: number;
+    skewSeconds: number;
+  }): Promise<SignInResult> {
+    // A malformed id cannot name a row; checking first keeps it a refusal
+    // instead of a uuid cast error.
+    if (!UUID.test(input.userId)) throw bridgeRefusal("user_unknown");
+    if (!UUID.test(input.organizationId)) throw bridgeRefusal("org_not_moved");
+    const claimedWorkspaceId = input.workspaceId !== null && UUID.test(input.workspaceId) ? input.workspaceId : null;
+    return this.database.transaction(async (tx) => {
+      if (this.tenancy.mode === "single") {
+        // The same readiness rule password, OIDC and email sign-in apply.
+        const org = await tx.query<{ id: string }>("SELECT id FROM organizations ORDER BY created_at LIMIT 2");
+        if (org.rows.length !== 1) {
+          throw new IdentityError(503, "not_ready", "This Agent Relay installation is not set up yet. Ask your administrator to configure its organization.");
+        }
+      }
+      await lockUser(tx, input.userId);
+      const user = await tx.query<{ email: string }>("SELECT email FROM users WHERE id = $1", [input.userId]);
+      if (!user.rows[0]) throw bridgeRefusal("user_unknown");
+      await lockOrganization(tx, input.organizationId);
+      const now = new Date(this.now());
+      const window = await tx.query<{ organization_id: string }>(
+        `SELECT organization_id FROM cloud_bridge_organizations
+          WHERE organization_id = $1 AND opens_at <= $2 AND closes_at > $2`,
+        [input.organizationId, now],
+      );
+      if (!window.rows[0]) throw bridgeRefusal("org_not_moved");
+      const membership = await tx.query<{ role: Role }>(
+        "SELECT role FROM organization_memberships WHERE organization_id = $1 AND user_id = $2",
+        [input.organizationId, input.userId],
+      );
+      if (!membership.rows[0]) throw bridgeRefusal("not_member");
+      const nowSeconds = now.getTime() / 1_000;
+      if (nowSeconds - input.authTime > input.maxAuthAgeSeconds || input.authTime > nowSeconds + input.skewSeconds) {
+        throw bridgeRefusal("auth_too_old");
+      }
+      // Signed out since: Cloud's session is a stateless cookie it cannot end
+      // server-side, so a kept copy could bridge again after the person signs
+      // out here. Any session ended after the Cloud sign-in fences it; a
+      // workspace switch ends the old session row without the person signing
+      // out, and removing one Desktop MCP provider ends only that child
+      // credential, so neither counts.
+      const signedOut = await tx.query<{ fenced: boolean }>(
+        `SELECT true AS fenced FROM token_sessions
+          WHERE user_id = $1 AND revoked_at IS NOT NULL
+            AND revoked_reason IS DISTINCT FROM 'workspace_switch'
+            AND revoked_reason IS DISTINCT FROM 'desktop_provider_removed'
+            AND revoked_at >= to_timestamp($2::double precision)
+          LIMIT 1`,
+        [input.userId, input.authTime],
+      );
+      if (signedOut.rows[0]) throw bridgeRefusal("signed_out");
+      // The claimed workspace when it is this organization's (membership of
+      // the organization is what makes a workspace usable), else the same
+      // choice as every other sign-in: last used, then oldest.
+      const workspace = await tx.query<{ id: string }>(
+        `SELECT w.id FROM workspaces w
+           LEFT JOIN users u ON u.id = $2 AND u.last_workspace_id = w.id
+          WHERE w.organization_id = $1
+          ORDER BY (w.id = $3::uuid) IS TRUE DESC, (u.id IS NOT NULL) DESC, w.created_at, w.id LIMIT 1`,
+        [input.organizationId, input.userId, claimedWorkspaceId],
+      );
+      if (!workspace.rows[0]) {
+        throw new IdentityError(503, "not_ready", "Agent Relay is still creating this organization's workspace. Try again in a minute.");
+      }
+      const workspaceId = workspace.rows[0].id;
+      await tx.query(
+        "UPDATE users SET last_organization_id = $2, last_workspace_id = $3 WHERE id = $1",
+        [input.userId, input.organizationId, workspaceId],
+      );
+      const tokens = await this.options.issueSession(tx, {
+        userId: input.userId,
+        organizationId: input.organizationId,
+        workspaceId,
+        label: "Browser sign-in (moved from Cloud)",
+      });
+      await recordAudit(tx, {
+        organizationId: input.organizationId,
+        workspaceId,
+        actor: { kind: "user", userId: input.userId },
+        action: "auth.cloud_bridge.accepted",
+        target: JSON.stringify({ jti: input.jti, authMethod: input.authMethod }),
+      });
+      return { userId: input.userId, email: user.rows[0].email, organizationId: input.organizationId, workspaceId, joined: null, tokens };
+    });
+  }
+
+  /**
+   * Audits a refused bridge assertion whose signature verified, in the
+   * organization it named. False when that organization is not in Control
+   * (an audit row needs one); the caller's log line is then the only record.
+   */
+  async recordCloudBridgeRefusal(input: {
+    organizationId: string;
+    reason: string;
+    sub: string | null;
+    jti: string | null;
+    kid: string | null;
+  }): Promise<boolean> {
+    if (!UUID.test(input.organizationId)) return false;
+    // One statement, so a missing organization is simply no row (the
+    // shared recordAudit would need a separate existence check first).
+    const result = await this.database.query<{ id: string }>(
+      `INSERT INTO admin_audit_events (id, organization_id, actor_kind, actor_id, action, target)
+       SELECT $1, o.id, 'service', $4, 'auth.cloud_bridge.refused', $3
+         FROM organizations o WHERE o.id = $2
+       RETURNING id`,
+      [
+        randomUUID(),
+        input.organizationId,
+        JSON.stringify({ reason: input.reason, sub: input.sub, jti: input.jti, kid: input.kid }),
+        CLOUD_BRIDGE_ACTOR.subject,
+      ],
+    );
+    return result.rows.length === 1;
+  }
+
+  /** The organizations listed for the bridge, open or not. */
+  async listCloudBridgeOrganizations(): Promise<CloudBridgeOrganization[]> {
+    const result = await this.database.query<CloudBridgeRow>(
+      `SELECT organization_id, opens_at, closes_at, set_by, updated_at
+         FROM cloud_bridge_organizations ORDER BY opens_at, organization_id`,
+    );
+    return result.rows.map(cloudBridgeOrganization);
+  }
+
+  /**
+   * Opens or changes an organization's bridge window (bootstrap only). The
+   * organization must exist and have members: a mistyped or not yet imported
+   * id fails here, at the operator step, before any person meets it.
+   */
+  async setCloudBridgeOrganization(input: {
+    organizationId: string;
+    opensAt: Date | null;
+    closesAt: Date;
+    setBy: string;
+  }): Promise<CloudBridgeOrganization> {
+    const now = this.now();
+    const opensAt = input.opensAt ?? new Date(now);
+    if (input.closesAt.getTime() <= now) throw new IdentityError(400, "invalid_request", "closesAt must be in the future.");
+    if (input.closesAt.getTime() <= opensAt.getTime()) throw new IdentityError(400, "invalid_request", "closesAt must be after opensAt.");
+    if (input.closesAt.getTime() - opensAt.getTime() > CLOUD_BRIDGE_MAX_WINDOW_MS) {
+      throw new IdentityError(400, "invalid_request", "closesAt must be at most 90 days after opensAt.");
+    }
+    if (!UUID.test(input.organizationId)) throw new IdentityError(404, "not_found", "Organization not found");
+    return this.database.transaction(async (tx) => {
+      await lockOrganization(tx, input.organizationId);
+      const org = await tx.query<{ members: number }>(
+        `SELECT (SELECT count(*)::int FROM organization_memberships m WHERE m.organization_id = o.id) AS members
+           FROM organizations o WHERE o.id = $1`,
+        [input.organizationId],
+      );
+      if (!org.rows[0]) throw new IdentityError(404, "not_found", "Organization not found");
+      if (org.rows[0].members === 0) {
+        throw new IdentityError(409, "organization_empty", "That organization has no members yet. List it only after its import has been applied and verified.");
+      }
+      const result = await tx.query<CloudBridgeRow>(
+        `INSERT INTO cloud_bridge_organizations (organization_id, opens_at, closes_at, set_by)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (organization_id) DO UPDATE
+           SET opens_at = EXCLUDED.opens_at, closes_at = EXCLUDED.closes_at,
+               set_by = EXCLUDED.set_by, updated_at = now()
+         RETURNING organization_id, opens_at, closes_at, set_by, updated_at`,
+        [input.organizationId, opensAt, input.closesAt, input.setBy],
+      );
+      const row = cloudBridgeOrganization(result.rows[0]!);
+      await recordAudit(tx, {
+        organizationId: input.organizationId,
+        actor: { kind: "bootstrap" },
+        action: "installation.cloud_bridge.organization_set",
+        target: JSON.stringify({ opensAt: row.opensAt, closesAt: row.closesAt, setBy: row.setBy }),
+      });
+      return row;
+    });
+  }
+
+  /** Closes an organization's bridge window by removing it; false when none was listed. */
+  async removeCloudBridgeOrganization(organizationId: string): Promise<boolean> {
+    if (!UUID.test(organizationId)) return false;
+    return this.database.transaction(async (tx) => {
+      const removed = await tx.query<CloudBridgeRow>(
+        `DELETE FROM cloud_bridge_organizations WHERE organization_id = $1
+         RETURNING organization_id, opens_at, closes_at, set_by, updated_at`,
+        [organizationId],
+      );
+      const row = removed.rows[0];
+      if (!row) return false;
+      await recordAudit(tx, {
+        organizationId,
+        actor: { kind: "bootstrap" },
+        action: "installation.cloud_bridge.organization_removed",
+        target: JSON.stringify({ setBy: row.set_by }),
+      });
+      return true;
+    });
   }
 
   // ---- membership management ---------------------------------------------------
