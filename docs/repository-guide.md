@@ -157,6 +157,7 @@ is explicit. History is served only by the sessions pipeline: see
 | `SELFHOST_FLOWS_RUNTIME_ENV_URL` | Origin serving that internal route, default `http://127.0.0.1:$PORT` (this process) |
 | `SELFHOST_OAUTH_REDIRECT_URL` | Optional. OAuth redirect URI registered in each provider OAuth app. Default `$SELFHOST_PUBLIC_URL/api/v1/integrations/oauth/callback` |
 | `SELFHOST_DASHBOARD_URL` | Optional dashboard origin. Link shown on the OAuth result page (default `$SELFHOST_PUBLIC_URL/`) and, when https, `runUrl` on mirrored flow runs |
+| `SELFHOST_ROUTED_SITE_URL` | Optional https origin of a third site whose edge router forwards `<site>/cloud/...` here and overwrites `x-original-host` with that site's host. When one such header names this origin's host, the Desktop/CLI sign-in answers (`api_url`, `apiUrl`, `verification_uri`) name it instead of the Host-selected origin. Unset: unchanged. See [Desktop sign-in through an edge router](#desktop-sign-in-through-an-edge-router) |
 | `SELFHOST_BOOTSTRAP_ORG_NAME` / `SELFHOST_BOOTSTRAP_ADMIN_EMAIL` | Optional, set together (or the org name with `SELFHOST_ADMIN_EMAILS`). First-boot bootstrap: creates the organization with this admin as owner and a default workspace bound to a new Relaycast workspace. Idempotent. See [docs/identity.md](identity.md) |
 | `SELFHOST_BOOTSTRAP_ADMIN_NAME` / `SELFHOST_BOOTSTRAP_WORKSPACE_NAME` | Optional display name for the admin (default: the email's local part) and the workspace name (default `Default`) |
 | `RELAYCAST_INTERNAL_SECRET` | Optional (`_FILE` supported), at least 32 bytes, equal to Relaycast's own internal secret. Lets the bootstrap create the default workspace through Relaycast's `POST /internal/workspaces` |
@@ -526,6 +527,48 @@ hosted: 30 per minute per client address on both routes.
 Self-host has no Desktop-authority grant: approving a named host records
 nothing beyond the session itself. A session is bound to one workspace, so a
 `workspace` parameter naming another is refused (403).
+
+### Desktop sign-in through an edge router
+
+Some deployments are reached through an edge router on a third site origin
+that forwards `<site>/cloud/...` here. Those requests arrive with this
+service's own Host, so the rule above would name the API or dashboard origin,
+and a Desktop that signed in through `<site>` would refuse the answer. Set
+`SELFHOST_ROUTED_SITE_URL` to that site's https origin (no path, query,
+fragment or credentials).
+
+The rule: when the request carries exactly one `x-original-host` header whose
+value, trimmed and lower-cased, equals the host of `SELFHOST_ROUTED_SITE_URL`,
+these answers name `SELFHOST_ROUTED_SITE_URL` instead of the Host-selected
+origin:
+
+- the browser handoff's loopback redirect `api_url` (`GET`/`POST /cloud/api/v1/cli/login`;
+  the redirect target itself is still the loopback `redirect_uri`)
+- `apiUrl` from `POST /cloud/api/v1/auth/desktop/session`
+- `apiUrl` from `POST /cloud/api/v1/auth/desktop/workspaces`
+- `verification_uri` and `verification_uri_complete` from `POST /cloud/api/v1/auth/device/start`
+- `api_url` from `POST /cloud/api/v1/auth/device/token`
+- `api_url` from `POST /cloud/api/v1/auth/enrollment/token`
+- `apiUrl` from `POST /cloud/api/v1/auth/token/refresh`
+
+A repeated header or one naming any other host falls back to the
+Host-selected origin. Nothing else uses the setting: emailed sign-in and
+password links carry one-time tokens and keep the Host-selected origin, OIDC
+redirect URIs are registered per origin, the MCP endpoint URL is unchanged,
+and browser origin checks and cookies are unchanged. A browser sign-in page
+reached through that router is therefore not covered by this setting: the
+Desktop consent form, like every cookie-authenticated write, still admits
+only the API and dashboard origins, so a consent posted from the routed site
+is refused. The device and enrollment-key sign-ins and every session-bearer
+call are covered.
+
+The header only selects a configured value and is never echoed. A caller that
+reaches the service directly and sends the header itself only receives the
+operator-configured public origin in its own response; that origin scopes no
+cookie, is never the target of a redirect this service sends and is not
+stored. The router must
+overwrite `x-original-host` with its own site's host rather than pass a
+client's copy through.
 
 ### Desktop enrollment keys (no browser)
 

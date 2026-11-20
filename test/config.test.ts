@@ -54,6 +54,20 @@ test("SELFHOST_RELAYGATE_PUBLIC_URL is optional and must be a public https origi
   }
 });
 
+test("SELFHOST_ROUTED_SITE_URL is optional and must be an https origin", () => {
+  assert.equal(loadConfig(completeEnv).routedSiteOrigin, null);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_ROUTED_SITE_URL: "  " }).routedSiteOrigin, null);
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_ROUTED_SITE_URL: "https://site.example.test" }).routedSiteOrigin,
+    "https://site.example.test");
+  assert.equal(loadConfig({ ...completeEnv, SELFHOST_ROUTED_SITE_URL: " https://Site.Example.Test/ " }).routedSiteOrigin,
+    "https://site.example.test");
+  for (const bad of ["http://site.example.test", "https://site.example.test/cloud", "https://site.example.test/?a=1",
+    "https://site.example.test/#top", "https://u:p@site.example.test", "not a url"]) {
+    assert.throws(() => loadConfig({ ...completeEnv, SELFHOST_ROUTED_SITE_URL: bad }),
+      /SELFHOST_ROUTED_SITE_URL must be an https origin without credentials, path, query, or fragment/, bad);
+  }
+});
+
 test("SELFHOST_DEFAULT_SHARING_MODE is optional and one of all, new or selected", () => {
   const unset = loadConfig(completeEnv);
   assert.equal(unset.defaultSharingMode, undefined);

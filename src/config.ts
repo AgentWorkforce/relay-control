@@ -20,6 +20,13 @@ export type SelfhostConfig = {
   githubApp?: GithubAppConfig | null;
   databaseUrl: string;
   publicBaseUrl: string;
+  /**
+   * SELFHOST_ROUTED_SITE_URL: a third site origin whose edge router forwards
+   * <site>/cloud/... here and sets x-original-host. Desktop/CLI sign-in
+   * answers name it when that header matches; null (unset) keeps the
+   * Host-selected origin everywhere.
+   */
+  routedSiteOrigin?: string | null;
   relaycastUrl: string;
   relaycastPublicUrl: string;
   /**
@@ -357,6 +364,31 @@ export function serviceUrl(env: Env, name: string): string {
   return value.replace(/\/+$/, "");
 }
 
+// Optional third site origin (an edge router's site that forwards /cloud
+// here). https only: Desktop is told to call it as its API base.
+function loadRoutedSiteOrigin(env: Env): string | null {
+  const name = "SELFHOST_ROUTED_SITE_URL";
+  const value = env[name]?.trim();
+  if (!value) return null;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${name} must be an https origin without credentials, path, query, or fragment`);
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    (url.pathname !== "" && url.pathname !== "/")
+  ) {
+    throw new Error(`${name} must be an https origin without credentials, path, query, or fragment`);
+  }
+  return url.origin;
+}
+
 function publicServiceUrl(env: Env, name: string): string {
   const value = required(env, name);
   const maxOriginLength = 253 + "https://".length + ":65535".length;
@@ -502,6 +534,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
   return {
     databaseUrl: loadDatabaseUrl(env),
     publicBaseUrl: serviceUrl(env, "SELFHOST_PUBLIC_URL"),
+    routedSiteOrigin: loadRoutedSiteOrigin(env),
     relaycastUrl: serviceUrl(env, "RELAYCAST_URL"),
     relaycastPublicUrl: publicServiceUrl(env, "RELAYCAST_PUBLIC_URL"),
     relayhistoryUrl: sessionReadApi.url,

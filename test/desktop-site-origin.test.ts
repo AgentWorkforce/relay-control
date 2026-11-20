@@ -26,7 +26,14 @@ type Raw = { status: number; headers: Record<string, string | string[] | undefin
 function raw(
   origin: string,
   path: string,
-  options: { host: string; method?: string; token?: string; cookie?: string; body?: unknown },
+  options: {
+    host: string;
+    method?: string;
+    token?: string;
+    cookie?: string;
+    body?: unknown;
+    headers?: Record<string, string | string[]>;
+  },
 ): Promise<Raw> {
   const target = new URL(origin);
   const payload = options.body === undefined ? undefined : JSON.stringify(options.body);
@@ -37,6 +44,7 @@ function raw(
       path,
       method: options.method ?? "GET",
       headers: {
+        ...options.headers,
         host: options.host,
         ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
         ...(options.cookie ? { cookie: options.cookie } : {}),
@@ -62,7 +70,7 @@ function raw(
   });
 }
 
-async function setup(t: test.TestContext) {
+async function setup(t: test.TestContext, overrides: Partial<SelfhostConfig> = {}) {
   const database = new PGliteDatabase();
   await migrate(database);
   const control = createServer();
@@ -82,6 +90,7 @@ async function setup(t: test.TestContext) {
     dashboardUrl: `${DASHBOARD_SITE}/`,
     port: 0,
     host: "127.0.0.1",
+    ...overrides,
   };
   const store = new ControlPlaneStore(database, KEYRING, 0);
   control.on("request", createApp({ config, store }));
@@ -216,4 +225,190 @@ test("an unconfigured Host header falls back to SELFHOST_PUBLIC_URL, never the H
   assert.equal(tokens.status, 200);
   assert.equal(tokens.body.api_url, `${API_SITE}/cloud`);
   assert(!tokens.text.includes("evil.example"));
+});
+
+// SELFHOST_ROUTED_SITE_URL: an edge router on a third site origin forwards
+// <site>/cloud/... here, so the request carries this service's own Host and
+// the router's x-original-host. Only the Desktop/CLI API answers follow it,
+// and only for one header value equal to the configured origin's host.
+const ROUTED_SITE = "https://site.proof.test";
+const ROUTED = { routedSiteOrigin: ROUTED_SITE };
+const ROUTER = { "x-original-host": new URL(ROUTED_SITE).host };
+
+type SignIn = {
+  callbackApiUrl: string | null;
+  exchangeApiUrl: unknown;
+  refreshApiUrl: unknown;
+  verificationUri: unknown;
+  verificationUriComplete: unknown;
+  deviceApiUrl: unknown;
+  /** The device flow's session (cli:auth). */
+  accessToken: string;
+  /** The browser flow's exchanged Desktop session (desktop:workspaces). */
+  desktopAccessToken: string;
+  /** Every answer's headers and body, for "never echoed" checks. */
+  seen: string;
+};
+
+/** Both Desktop sign-in flows and a refresh on `host`, each answer request carrying `headers`. */
+async function signIn(
+  origin: string,
+  ownerId: string,
+  workspaceId: string,
+  host: string,
+  headers: Record<string, string | string[]> = {},
+): Promise<SignIn> {
+  const session = await browserSession(origin, host, ownerId, workspaceId);
+  const handoff = await raw(origin, loginPath(), { host, cookie: session, headers });
+  assert.equal(handoff.status, 307);
+  const callback = new URL(String(handoff.headers.location));
+  // The redirect target is the stored loopback URI whatever the header says.
+  assert.equal(`${callback.origin}${callback.pathname}`, "http://127.0.0.1:5123/callback/STATE1");
+  const exchanged = await raw(origin, "/cloud/api/v1/auth/desktop/session", {
+    host,
+    method: "POST",
+    token: callback.searchParams.get("access_token")!,
+    body: { codeVerifier: VERIFIER },
+    headers,
+  });
+  assert.equal(exchanged.status, 200);
+  const refreshed = await raw(origin, "/cloud/api/v1/auth/token/refresh", {
+    host,
+    method: "POST",
+    body: { refreshToken: exchanged.body.refreshToken },
+    headers,
+  });
+  assert.equal(refreshed.status, 200);
+  const started = await raw(origin, "/cloud/api/v1/auth/device/start", {
+    host,
+    method: "POST",
+    body: { client_name: "Agent Relay Desktop" },
+    headers,
+  });
+  assert.equal(started.status, 201);
+  await approve(origin, started.body.user_code, ownerId, workspaceId);
+  const tokens = await raw(origin, "/cloud/api/v1/auth/device/token", {
+    host,
+    method: "POST",
+    body: { device_code: started.body.device_code },
+    headers,
+  });
+  assert.equal(tokens.status, 200);
+  return {
+    callbackApiUrl: callback.searchParams.get("api_url"),
+    exchangeApiUrl: exchanged.body.apiUrl,
+    refreshApiUrl: refreshed.body.apiUrl,
+    verificationUri: started.body.verification_uri,
+    verificationUriComplete: started.body.verification_uri_complete,
+    deviceApiUrl: tokens.body.api_url,
+    accessToken: tokens.body.access_token,
+    // The refresh above rotated the exchanged pair; this is the live one.
+    desktopAccessToken: refreshed.body.accessToken,
+    seen: [handoff, exchanged, refreshed, started, tokens]
+      .map((answer) => `${JSON.stringify(answer.headers)}\n${answer.text}`)
+      .join("\n"),
+  };
+}
+
+function assertAnswersName(answers: SignIn, site: string, label: string) {
+  assert.equal(answers.callbackApiUrl, `${site}/cloud`, label);
+  assert.equal(answers.exchangeApiUrl, `${site}/cloud`, label);
+  assert.equal(answers.refreshApiUrl, `${site}/cloud`, label);
+  assert.equal(answers.verificationUri, `${site}/cloud/api/v1/auth/device/approve`, label);
+  assert(String(answers.verificationUriComplete).startsWith(`${site}/cloud/api/v1/auth/device/approve?user_code=`), label);
+  assert.equal(answers.deviceApiUrl, `${site}/cloud`, label);
+}
+
+test("a Desktop signing in through the edge router gets the routed site in every sign-in answer", async (t) => {
+  const { origin, ownerId, workspaceId } = await setup(t, ROUTED);
+  const answers = await signIn(origin, ownerId, workspaceId, new URL(API_SITE).host, ROUTER);
+  assertAnswersName(answers, ROUTED_SITE, "through the router");
+});
+
+for (const site of [DASHBOARD_SITE, API_SITE]) {
+  test(`with a routed site configured, a Desktop signing in directly through ${site} still gets ${site}`, async (t) => {
+    const { origin, ownerId, workspaceId } = await setup(t, ROUTED);
+    const answers = await signIn(origin, ownerId, workspaceId, new URL(site).host);
+    assertAnswersName(answers, site, "no header");
+    assert(!answers.seen.includes("site.proof.test"));
+  });
+}
+
+test("only one x-original-host value equal to the routed host selects it, and the header is never echoed", async (t) => {
+  const { origin, ownerId, workspaceId } = await setup(t, ROUTED);
+  const host = new URL(API_SITE).host;
+  const matching = await signIn(origin, ownerId, workspaceId, host, { "x-original-host": "  SITE.Proof.TEST  " });
+  assertAnswersName(matching, ROUTED_SITE, "case variant with spaces");
+  for (const value of [
+    "evil.example",
+    "site.proof.test, evil.example",
+    ["site.proof.test", "evil.example"],
+    ["site.proof.test", "site.proof.test"],
+  ]) {
+    const label = JSON.stringify(value);
+    const answers = await signIn(origin, ownerId, workspaceId, host, { "x-original-host": value });
+    assertAnswersName(answers, API_SITE, label);
+    assert(!answers.seen.includes("evil.example"), label);
+  }
+});
+
+test("without a routed site configured, x-original-host changes nothing", async (t) => {
+  const { origin, ownerId, workspaceId } = await setup(t);
+  const answers = await signIn(origin, ownerId, workspaceId, new URL(API_SITE).host, ROUTER);
+  assertAnswersName(answers, API_SITE, "routed site unset");
+  assert(!answers.seen.includes("site.proof.test"));
+});
+
+test("the MCP endpoint URL keeps the Host-selected origin through the edge router", async (t) => {
+  const { origin, ownerId, workspaceId } = await setup(t, ROUTED);
+  const host = new URL(API_SITE).host;
+  const { accessToken } = await signIn(origin, ownerId, workspaceId, host, ROUTER);
+  const described = await raw(origin, "/api/v1/mcp/shared-sessions", {
+    host,
+    method: "POST",
+    token: accessToken,
+    headers: { ...ROUTER, accept: "application/json, text/event-stream" },
+    body: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "describe_capabilities", arguments: {} } },
+  });
+  assert.equal(described.status, 200);
+  assert.equal(described.body.result.structuredContent.endpoint.url, `${API_SITE}/api/v1/mcp/shared-sessions`);
+  assert(!described.text.includes("site.proof.test"));
+});
+
+test("a Desktop workspace switch through the edge router gets the routed site, and the Host-selected site without the header", async (t) => {
+  const { origin, ownerId, workspaceId } = await setup(t, ROUTED);
+  const host = new URL(API_SITE).host;
+  // Each switch answers with a fresh pair and retires the one that asked.
+  let { desktopAccessToken: token } = await signIn(origin, ownerId, workspaceId, host);
+  for (const [headers, site] of [[ROUTER, ROUTED_SITE], [{}, API_SITE]] as const) {
+    const switched = await raw(origin, "/cloud/api/v1/auth/desktop/workspaces", {
+      host,
+      method: "POST",
+      token,
+      body: { workspaceId },
+      headers,
+    });
+    assert.equal(switched.status, 200, switched.text);
+    assert.equal(switched.body.apiUrl, `${site}/cloud`);
+    token = switched.body.accessToken;
+  }
+});
+
+test("an enrollment key exchange through the edge router gets the routed site, and the Host-selected site without the header", async (t) => {
+  const { origin, ownerId, workspaceId } = await setup(t, ROUTED);
+  const host = new URL(API_SITE).host;
+  // Member self-mint from the owner's device session: a single-use sh_ek_ key per exchange.
+  const { accessToken } = await signIn(origin, ownerId, workspaceId, host);
+  for (const [headers, site] of [[ROUTER, ROUTED_SITE], [{}, API_SITE]] as const) {
+    const minted = await raw(origin, "/api/v1/me/enrollment-keys", { host, method: "POST", token: accessToken, body: {} });
+    assert.equal(minted.status, 201, minted.text);
+    const exchanged = await raw(origin, "/api/v1/auth/enrollment/token", {
+      host,
+      method: "POST",
+      body: { enrollment_key: minted.body.accessToken, client_name: "Agent Relay Desktop", desktop_host_name: "build-01" },
+      headers,
+    });
+    assert.equal(exchanged.status, 200, exchanged.text);
+    assert.equal(exchanged.body.api_url, `${site}/cloud`);
+  }
 });
