@@ -10,6 +10,8 @@ import { ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
 import { GrokRoutines } from "./mcp/grok-routines.js";
+import { AgentRules, isAgentRulesAudience } from "./agent-rules/service.js";
+import { AgentRulesInputError } from "./agent-rules/overlays.js";
 import { retiringIdentity } from "./mcp/oauth/retirement.js";
 import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -434,6 +436,8 @@ export function createApp(input: {
   /** Server-owned worker; absent tests use the same on-demand cleanup without a timer. */
   mcpOAuthTeardown?: McpOAuthTeardown;
   grokRoutines?: GrokRoutines;
+  /** The rules source (docs/agent-rules.md); tests may inject one with a fixture bundle. */
+  agentRules?: AgentRules;
   /** Cursor's OIDC signing keys (tests inject a local issuer); default api.cursor.com's JWKS. */
   cursorJwks?: CursorJwks;
   /**
@@ -628,12 +632,15 @@ export function createApp(input: {
     ...(config.relaygatePublicUrl ? {gate:createRelaycastClient({internalOrigin:config.relaygatePublicUrl,
       fetchImpl:mcpOAuthTeardownFetch(input.messagingFetch)})} : {}),
   }) : null;
+  // Loaded once: a malformed or unpinned bundle fails start-up.
+  const agentRules = input.agentRules ?? new AgentRules({ database: store.database, now: input.now });
   const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines({
       database:store.database,keyring:config.encryptionKeyring,client:oauthRelay,
       cursorRunIdentityRequired:config.cursorCloud?.enabled!==false && config.cursorCloud?.runIdentity==="required",
       ...(config.relaygatePublicUrl ? {gate:createRelaycastClient({internalOrigin:config.relaygatePublicUrl,fetchImpl:input.messagingFetch})} : {}),
       publicOrigin:new URL(config.publicBaseUrl).origin,tenancyMode:store.tenancy,now:input.now,
       cloudCopy:config.mcpOAuth?.grokCloudCopy===true,
+      ...(config.mcpOAuth?.grokDynamicPrompt ? { dynamicPrompt:{ bootstrapVersion:agentRules.bundle.bootstrapVersion } } : {}),
     }) : undefined;
   // Cursor cloud agents: per-run identity on cursor-cloud OAuth grants (docs/cursor-cloud-agents.md).
   const cursorCloud = mcpOAuthActive(config) && config.cursorCloud ? createCursorCloud({
@@ -697,6 +704,7 @@ export function createApp(input: {
     ...(features.launch ? { launch: true } : {}),
     ...(mcpOAuth.store ? {oauthSessions:mcpOAuth.store.sessions} : {}),
     grokRoutines,
+    agentRules,
     ...(cursorCloud ? { cursorCloud } : {}),
     ...(input.now ? { now: input.now } : {}),
   });
@@ -2910,6 +2918,64 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         action: method === "PUT" ? "capture_policy.set" : "capture_policy.cleared",
       });
       json(response, 200, policy, true);
+      return;
+    }
+
+    // Agent rules (docs/agent-rules.md). Any signed-in member reads the
+    // composed rules for their organization; owners and admins write overlays.
+    const rulesRead = routeMatch(path, /^\/api\/v1\/agent-rules\/([^/]+)$/);
+    if (rulesRead && method === "GET") {
+      const audience = rulesRead[0]!;
+      if (!isAgentRulesAudience(audience)) throw new HttpError(404, "not_found", "Unknown audience");
+      const auth = await authenticate(request);
+      if (auth.kind !== "user") throw new HttpError(401, "unauthorized", "User token required");
+      const { principal } = auth;
+      if (principal.pendingHandoff) throw new HttpError(403, "handoff_not_exchanged", "Exchange the sign-in handoff first");
+      if (!principal.scopes.includes("cli:auth") && !principal.scopes.includes(ACCOUNT_SCOPE)) {
+        throw new HttpError(403, "insufficient_scope", "Requires a cli:auth or account session");
+      }
+      if (!await store.memberRole(principal.organizationId, principal.userId)) throw new HttpError(404, "not_found", "Organization not found");
+      const composed = await agentRules.compose(principal.organizationId, audience);
+      const etag = `"${composed.sha256}"`;
+      response.setHeader("etag", etag);
+      response.setHeader("cache-control", "private, no-cache");
+      if (request.headers["if-none-match"] === etag) {
+        response.statusCode = 304;
+        response.end();
+        return;
+      }
+      if (/\btext\/markdown\b/.test(String(request.headers.accept ?? ""))) {
+        response.setHeader("content-type", "text/markdown; charset=utf-8");
+        response.end(composed.text);
+        return;
+      }
+      json(response, 200, { audience: composed.audience, version: composed.version, sha256: composed.sha256,
+        bootstrap_version_current: composed.bootstrapVersion, sections: composed.sections, text: composed.text }, true);
+      return;
+    }
+    const rulesOverlay = routeMatch(path, /^\/api\/v1\/organizations\/([^/]+)\/agent-rules\/([^/]+)$/);
+    if (rulesOverlay && (method === "GET" || method === "PUT")) {
+      const [organizationId, audience] = rulesOverlay as [string, string];
+      if (!isAgentRulesAudience(audience)) throw new HttpError(404, "not_found", "Unknown audience");
+      const auth = await organizationAccess(request, organizationId, true);
+      if (method === "GET") {
+        const overlay = await agentRules.overlays.read(organizationId, audience);
+        json(response, 200, { audience, overlay, base_version: agentRules.bundle.version }, true);
+        return;
+      }
+      if (!bearer(request) && !cookieRequestAllowed(request, browserOrigins)) {
+        throw new HttpError(403, "csrf_rejected", "Cross-origin request refused");
+      }
+      const body = await requestObject(request);
+      if (typeof body.text !== "string") throw new HttpError(400, "invalid_request", "text must be a string; an empty string clears the overlay");
+      try {
+        const written = await agentRules.overlays.write({ organizationId, audience, text: body.text,
+          actor: auth.kind === "user" ? { kind: "user", userId: auth.principal.userId } : { kind: "bootstrap" } });
+        json(response, 200, { audience, ...written, version_string: written.cleared ? agentRules.bundle.version : `${agentRules.bundle.version}+org.${written.version}` }, true);
+      } catch (error) {
+        if (error instanceof AgentRulesInputError) throw new HttpError(400, "invalid_request", error.message);
+        throw error;
+      }
       return;
     }
 

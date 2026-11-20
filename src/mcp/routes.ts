@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { correlateMcpResponse, instrumentMcpTransport, withMcpDiagnosticContext } from "./request-diagnostics.js";
 import type { GrokRoutines } from "./grok-routines.js";
+import type { AgentRules } from "../agent-rules/service.js";
 import { connectorKind, isGrokRoutineKind } from "./oauth/connector-kind.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -159,6 +160,8 @@ export function createMcpHandler(input: {
   oauthSessions?: McpOAuthSessions;
   grokRoutines?: GrokRoutines;
   cursorCloud?: CursorCloudDeps;
+  /** get_agent_rules source; every context but a staff read grant gets it. */
+  agentRules?: AgentRules;
   /** Clock for shared-session read audit records; tests inject it. */
   now?: () => Date;
   /** Observe handled unexpected failures without changing their MCP response. */
@@ -447,6 +450,7 @@ export function createMcpHandler(input: {
       readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
     };
     if (oauth && input.cursorCloud) context.cursorCloud = input.cursorCloud;
+    if (input.agentRules && !staffGrant) context.agentRules = input.agentRules;
     if (oauth && input.grokRoutines) {
       const client = (await store.database.query<{ client_name: string | null; redirect_uris: string[] }>(
         "SELECT client_name,redirect_uris FROM mcp_oauth_clients WHERE client_id=$1", [oauth.access.clientId])).rows[0];

@@ -152,3 +152,7 @@ migration `0082_grok_routines_cloud_copy.sql` first.
   routine URL can be saved under only one connection on this server; a
   concurrent second save gets the same refusal. Do not also register it in
   Agent Relay Cloud or another deployment, or it wakes twice.
+
+With `SELFHOST_GROK_DYNAMIC_PROMPT` also on, the routine prompt is a short
+bootstrap that fetches the rules, including this procedure, from
+`get_agent_rules` on every run; see [agent-rules.md](agent-rules.md).
