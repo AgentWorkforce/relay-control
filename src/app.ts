@@ -633,6 +633,7 @@ export function createApp(input: {
       cursorRunIdentityRequired:config.cursorCloud?.enabled!==false && config.cursorCloud?.runIdentity==="required",
       ...(config.relaygatePublicUrl ? {gate:createRelaycastClient({internalOrigin:config.relaygatePublicUrl,fetchImpl:input.messagingFetch})} : {}),
       publicOrigin:new URL(config.publicBaseUrl).origin,tenancyMode:store.tenancy,now:input.now,
+      cloudCopy:config.mcpOAuth?.grokCloudCopy===true,
     }) : undefined;
   // Cursor cloud agents: per-run identity on cursor-cloud OAuth grants (docs/cursor-cloud-agents.md).
   const cursorCloud = mcpOAuthActive(config) && config.cursorCloud ? createCursorCloud({

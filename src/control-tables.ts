@@ -49,6 +49,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "flow_run_relayfile_credentials",
   "flows_workspace_deletions",
   "hosted_relay_participants",
+  "grok_bot_events",
   "grok_bot_routines",
   "github_app_installations",
   "installation_bootstrap",
