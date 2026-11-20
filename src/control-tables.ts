@@ -12,6 +12,8 @@ export const CONTROL_TABLES: readonly string[] = [
   "capy_bindings",
   "capy_grant_permits",
   "cli_credential_refs",
+  "cloud_bridge_assertions",
+  "cloud_bridge_organizations",
   "coding_agent_credential_blobs",
   "coding_agent_credentials",
   "coding_agent_device_sessions",

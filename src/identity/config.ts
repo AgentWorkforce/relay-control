@@ -2,6 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { domainToASCII } from "node:url";
 import { loadTenancyConfig, type TenancyConfig } from "../tenancy.js";
 import { trustedProxyHops } from "../auth/device-approval.js";
+import { parseCloudBridgeConfig, type CloudBridgeConfig } from "./cloud-bridge.js";
 
 /**
  * bootstrap-signup lane: first-boot bootstrap, sign-in methods and invites,
@@ -111,6 +112,23 @@ export type IdentityConfig = {
    * 32 bytes, random per install), or null. Only its SHA-256 hash is stored.
    */
   setupKey: string | null;
+  /**
+   * Session bridge for organizations moved from Agent Relay Cloud
+   * (docs/identity.md), or null when SELFHOST_CLOUD_BRIDGE_ENABLED is not
+   * true. When off, the other SELFHOST_CLOUD_BRIDGE_* variables are ignored
+   * and the bridge routes answer 404.
+   *  - SELFHOST_CLOUD_BRIDGE_ENABLED: exactly true or false (default false).
+   *  - SELFHOST_CLOUD_BRIDGE_ISSUER: the `iss` Cloud signs.
+   *  - SELFHOST_CLOUD_BRIDGE_AUDIENCE: the `aud` Cloud signs for this
+   *    deployment, e.g. its public base URL https://control.example.com/cloud.
+   *  - SELFHOST_CLOUD_BRIDGE_HANDOFF_URL: Cloud's signing page; absolute
+   *    HTTPS (HTTP only on loopback), no query or fragment.
+   *  - SELFHOST_CLOUD_BRIDGE_PUBLIC_KEYS[_FILE]: JWKS with 1-4 public
+   *    OKP/Ed25519 keys, unique kids.
+   *  - SELFHOST_CLOUD_BRIDGE_MAX_AUTH_AGE_SECONDS: oldest Cloud sign-in
+   *    accepted, default 2592000 (30 days), at most 7776000 (90 days).
+   */
+  cloudBridge: CloudBridgeConfig | null;
 };
 
 type Env = Record<string, string | undefined>;
@@ -438,6 +456,21 @@ function loadSmtp(env: Env): SmtpConfig | null {
   return { host, port, security, username, password, from };
 }
 
+function loadCloudBridge(env: Env): CloudBridgeConfig | null {
+  // Strict on purpose: a typo must not leave an operator believing the
+  // bridge is off (or on) when it is the other way round.
+  const enabled = env.SELFHOST_CLOUD_BRIDGE_ENABLED?.trim();
+  if (!enabled || enabled === "false") return null;
+  if (enabled !== "true") throw new Error("SELFHOST_CLOUD_BRIDGE_ENABLED must be true or false");
+  return parseCloudBridgeConfig({
+    issuer: env.SELFHOST_CLOUD_BRIDGE_ISSUER,
+    audience: env.SELFHOST_CLOUD_BRIDGE_AUDIENCE,
+    handoffUrl: env.SELFHOST_CLOUD_BRIDGE_HANDOFF_URL,
+    publicKeys: readSecret(env, "SELFHOST_CLOUD_BRIDGE_PUBLIC_KEYS"),
+    maxAuthAgeSeconds: env.SELFHOST_CLOUD_BRIDGE_MAX_AUTH_AGE_SECONDS,
+  });
+}
+
 export function loadIdentityConfig(env: Env = process.env): IdentityConfig {
   const smtp = loadSmtp(env);
   const emailLoginFlag = flag(env, "SELFHOST_EMAIL_LOGIN");
@@ -512,5 +545,6 @@ export function loadIdentityConfig(env: Env = process.env): IdentityConfig {
     loginOrgName: cleanLabel(env.SELFHOST_LOGIN_ORG_NAME ?? "") || bootstrap?.organizationName || null,
     password: signinMethods.includes("password") ? loadPassword(env) : null,
     setupKey,
+    cloudBridge: loadCloudBridge(env),
   };
 }
