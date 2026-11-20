@@ -9,9 +9,14 @@ import { createApp } from "../src/app.js";
 import type { SelfhostConfig } from "../src/config.js";
 import { migrate } from "../src/migrations.js";
 import { ControlPlaneStore } from "../src/store.js";
+import type { TelemetryModule } from "../src/telemetry/module.js";
 import { createRelaycastWorld, type RelaycastWorld } from "./support/relaycast-world.js";
 import { PGliteDatabase } from "./support/harness.js";
 import { RECIPIENT_CARD_NOTE } from "../src/mcp/relay-agent-cards.js";
+import { describeCapabilities } from "../src/mcp/catalog.js";
+import { registerCapabilityDiscovery } from "../src/mcp/capabilities.js";
+import type { McpContext } from "../src/mcp/context.js";
+import { RelayToolError } from "../src/mcp/relay-participants.js";
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -43,6 +48,7 @@ async function startHistory(t: TestContext) {
   const events: HistoryEvent[] = [];
   let mints = 0;
   let origin = "";
+  let eventsFailure: { status: number; body: unknown } | null = null;
   const server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -94,6 +100,10 @@ async function startHistory(t: TestContext) {
     const visible = events.filter((event) => event.workspaceId === tokenWorkspace);
     const wire = ({ workspaceId: _workspace, ...event }: HistoryEvent) => event;
     if (url.pathname === "/v1/events") {
+      if (eventsFailure) {
+        send(eventsFailure.status, eventsFailure.body);
+        return;
+      }
       const q = (url.searchParams.get("q") ?? "").toLowerCase();
       send(200, {
         events: visible.filter((event) => event.content.toLowerCase().includes(q)).map(wire),
@@ -129,7 +139,10 @@ async function startHistory(t: TestContext) {
   });
   origin = await listen(server);
   t.after(() => close(server));
-  return { origin, paths, events, handoffs };
+  return {
+    origin, paths, events, handoffs,
+    failEvents(status: number, body: unknown) { eventsFailure = { status, body }; },
+  };
 }
 
 type RelaycastCall = { path: string; authorization: string | null };
@@ -137,8 +150,11 @@ type RelaycastCall = { path: string; authorization: string | null };
 /** Relaycast served through the injected messaging fetch: roster and presence, and the relay world. */
 function fakeRelaycast(state: {
   agents: unknown[]; presence: unknown[] | "fail"; calls: RelaycastCall[]; world: RelaycastWorld;
-  /** The bounded `names` lookup: "fail" answers 503; "roster" plays an older engine that ignores `names`. */
-  namesLookup?: "fail" | "roster";
+  /** The bounded `names` lookup: "fail" answers 503; "hang" waits for abort; "roster" ignores `names`. */
+  namesLookup?: "fail" | "hang" | "roster";
+  /** A deliberately non-cooperative full-roster read, used to prove the outer MCP deadline. */
+  rosterLookup?: "hang";
+  rosterSignal?: AbortSignal;
 }): typeof fetch {
   return (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input instanceof Request ? input.url : input));
@@ -150,7 +166,18 @@ function fakeRelaycast(state: {
     });
     if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") {
       const names = url.searchParams.getAll("names");
+      if (state.rosterLookup === "hang" && names.length === 0) {
+        state.rosterSignal = init?.signal ?? undefined;
+        return await new Promise<Response>(() => {});
+      }
       if (state.namesLookup === "fail" && names.length) return json(503, { ok: false, error: { code: "unavailable" } });
+      if (state.namesLookup === "hang" && names.length) {
+        return await new Promise<Response>((_resolve, reject) => {
+          const aborted = () => reject(init?.signal?.reason ?? new DOMException("Aborted", "AbortError"));
+          if (init?.signal?.aborted) aborted();
+          else init?.signal?.addEventListener("abort", aborted, { once: true });
+        });
+      }
       if (names.length === 0 || state.namesLookup === "roster") return json(200, { ok: true, data: state.agents });
       // The engine's bounded lookup: only the requested names.
       return json(200, { ok: true, data: state.agents.filter(row => names.includes((row as { name?: string }).name ?? "")) });
@@ -168,12 +195,13 @@ function fakeRelaycast(state: {
 
 const PUBLIC_ORIGIN = "https://control.internal.example";
 
-async function setup(t: TestContext) {
+async function setup(t: TestContext, telemetry?: TelemetryModule) {
   const historyAudience = "https://history.selfhosted.test";
   const history = await startHistory(t);
   const agents: unknown[] = [];
   const relay = { agents, presence: [] as unknown[] | "fail", calls: [] as RelaycastCall[], world: createRelaycastWorld(agents),
-    namesLookup: undefined as "fail" | "roster" | undefined };
+    namesLookup: undefined as "fail" | "hang" | "roster" | undefined,
+    rosterLookup: undefined as "hang" | undefined, rosterSignal: undefined as AbortSignal | undefined };
   const database = new PGliteDatabase();
   await migrate(database);
   const config: SelfhostConfig = {
@@ -193,7 +221,7 @@ async function setup(t: TestContext) {
     host: "127.0.0.1",
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
-  const control = createServer(createApp({ config, store, messagingFetch: fakeRelaycast(relay) }));
+  const control = createServer(createApp({ config, store, messagingFetch: fakeRelaycast(relay), telemetry }));
   const origin = await listen(control);
   t.after(async () => {
     await close(control);
@@ -232,7 +260,7 @@ async function setup(t: TestContext) {
   };
   const accessToken = await login();
   return {
-    origin, config, database, history, relay, login,
+    origin, config, database, history, relay, login, store,
     orgId: org.body.id as string,
     workspaceId: workspace.body.id as string,
     otherWorkspaceId: other.body.id as string,
@@ -328,6 +356,8 @@ test("initialize advertises the self-host server and its tools on both paths", a
       "subscribe_relay_channel",
       "unsubscribe_relay_channel",
     ]);
+    assert.match(tools.find(tool => tool.name === "describe_capabilities")?.description ?? "",
+      /restricted_tools as \{ name, reason \}/);
     for (const tool of tools) {
       assert.equal(typeof tool.title, "string", tool.name);
       assert.equal(tool._meta, undefined, tool.name);
@@ -341,11 +371,60 @@ test("initialize advertises the self-host server and its tools on both paths", a
   assert.equal(echoed.headers.get("mcp-session-id"), "client-chosen_1");
 });
 
+function assertCorrelatedRpcError(response: { headers: Headers; body: any }, code: number, message: string) {
+  const id = response.headers.get("x-correlation-id");
+  assert.match(id ?? "", /^[0-9a-f-]{36}$/);
+  assert.deepEqual(response.body.error, { code, message, data: { correlation_id: id } });
+}
+
+test("MCP admission storage failures return a useful correlated error", async t => {
+  const observed = t.mock.fn((_error: unknown, _context: { path: string; status: number }) => {});
+  const env = await setup(t, telemetryWithObserver(observed));
+  const log = t.mock.method(console, "error", () => {});
+  const error = new TypeError("SECRET storage failure");
+  t.mock.method(env.store, "authenticateAccessToken", async () => { throw error; });
+  const response = await rpc(env.origin, MCP_PATH, { headers: { authorization: `Bearer ${env.accessToken}` } });
+  assert.equal(response.status, 500);
+  assertCorrelatedRpcError(response, -32603, "The MCP service is temporarily unavailable. Please try again.");
+  assert.equal(JSON.stringify(response.body).includes("SECRET"), false);
+  assert.equal(observed.mock.calls.length, 1);
+  assert.equal(observed.mock.calls[0]?.arguments[0], error);
+  assert.deepEqual(observed.mock.calls[0]?.arguments[1], { path: MCP_PATH, status: 500 });
+  assert.deepEqual(log.mock.calls.find(call => call.arguments[0] === "[selfhost-mcp] Request failed")?.arguments[1], {
+    error: "TypeError", correlationId: response.headers.get("x-correlation-id"),
+  });
+  assert.equal(JSON.stringify(log.mock.calls).includes("SECRET"), false);
+});
+
+function telemetryWithObserver(observeError: TelemetryModule["observeError"]): TelemetryModule {
+  // The app boundary consumes these callbacks; module storage has its own suite.
+  return { observeError, observeRequest: () => {}, handle: async () => false } as unknown as TelemetryModule;
+}
+
+test("MCP telemetry failures and writable error names never leak or change the response", async t => {
+  const observed = t.mock.fn((_error: unknown, _context: { path: string; status: number }) => { throw Error("SECRET observer failure"); });
+  const env = await setup(t, telemetryWithObserver(observed));
+  const log = t.mock.method(console, "error", () => {});
+  const error = new Error("SECRET storage details");
+  error.name = "SECRET writable name";
+  t.mock.method(env.store, "authenticateAccessToken", async () => { throw error; });
+  const response = await rpc(env.origin, MCP_PATH, { headers: { authorization: `Bearer ${env.accessToken}` } });
+  assert.equal(response.status, 500);
+  assertCorrelatedRpcError(response, -32603, "The MCP service is temporarily unavailable. Please try again.");
+  assert.equal(observed.mock.calls.length, 1);
+  assert.equal(JSON.stringify([response.body, log.mock.calls]).includes("SECRET"), false);
+  assert.deepEqual(log.mock.calls.find(call => call.arguments[0] === "[selfhost-mcp] Request failed")?.arguments[1], {
+    error: "Error", correlationId: response.headers.get("x-correlation-id"),
+  });
+});
+
 test("admission refuses foreign credentials, origins, methods, and oversized bodies", async (t) => {
   const env = await setup(t);
   const missing = await rpc(env.origin, MCP_PATH);
   assert.equal(missing.status, 401);
-  assert.deepEqual(missing.body, { jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+  assert.equal(missing.body.jsonrpc, "2.0");
+  assert.equal(missing.body.id, null);
+  assertCorrelatedRpcError(missing, -32001, "Unauthorized");
   assert.equal(missing.headers.get("www-authenticate"), "Bearer");
 
   const invalid = await rpc(env.origin, MCP_PATH, { headers: { authorization: "Bearer sh_at_not-a-real-token" } });
@@ -365,13 +444,13 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
   for (const token of [agentToken.accessToken, env.config.internalServiceToken!]) {
     const refused = await rpc(env.origin, MCP_PATH, { headers: { authorization: `Bearer ${token}` } });
     assert.equal(refused.status, 403);
-    assert.deepEqual(refused.body.error, { code: -32003, message: "Forbidden" });
+    assertCorrelatedRpcError(refused, -32003, "Forbidden");
   }
 
   const auth = { authorization: `Bearer ${env.accessToken}` };
   const foreign = await rpc(env.origin, MCP_PATH, { headers: { ...auth, origin: "https://evil.example" } });
   assert.equal(foreign.status, 403);
-  assert.deepEqual(foreign.body.error, { code: -32003, message: "Cross-origin MCP requests are forbidden." });
+  assertCorrelatedRpcError(foreign, -32003, "Cross-origin MCP requests are forbidden.");
   const sameOrigin = await rpc(env.origin, MCP_PATH, { headers: { ...auth, origin: PUBLIC_ORIGIN } });
   assert.equal(sameOrigin.status, 200);
 
@@ -383,7 +462,7 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
 
   const badSession = await rpc(env.origin, MCP_PATH, { headers: { ...auth, "mcp-session-id": "bad id!" } });
   assert.equal(badSession.status, 400);
-  assert.deepEqual(badSession.body.error, { code: -32600, message: "Invalid Mcp-Session-Id." });
+  assertCorrelatedRpcError(badSession, -32600, "Invalid Mcp-Session-Id.");
 
   const parse = await rpc(env.origin, MCP_PATH, { headers: auth, raw: "{not json" });
   assert.equal(parse.status, 400);
@@ -391,7 +470,7 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
 
   const tooLarge = await rpc(env.origin, MCP_PATH, { headers: auth, raw: JSON.stringify({ pad: "x".repeat(65 * 1024) }) });
   assert.equal(tooLarge.status, 413);
-  assert.deepEqual(tooLarge.body.error, { code: -32600, message: "MCP request body is too large." });
+  assertCorrelatedRpcError(tooLarge, -32600, "MCP request body is too large.");
 
   for (const method of ["GET", "DELETE"]) {
     const wrong = await rpc(env.origin, MCP_PATH, { method, headers: auth });
@@ -403,7 +482,7 @@ test("admission refuses foreign credentials, origins, methods, and oversized bod
   await env.database.query("UPDATE token_sessions SET scopes = ARRAY['rth:read']::text[]");
   const scoped = await rpc(env.origin, MCP_PATH, { headers: auth });
   assert.equal(scoped.status, 403);
-  assert.deepEqual(scoped.body.error, { code: -32003, message: "Forbidden" });
+  assertCorrelatedRpcError(scoped, -32003, "Forbidden");
 });
 
 test("the session cookie is accepted on the /cloud path only, behind the origin guard", async (t) => {
@@ -426,7 +505,9 @@ test("desktop calls validate the native chat context", async (t) => {
     body: { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "describe_capabilities", arguments: {}, _meta: { threadId: "nope" } } },
   });
   assert.equal(bad.status, 400);
-  assert.deepEqual(bad.body, { jsonrpc: "2.0", error: { code: -32602, message: "Invalid native chat context." }, id: 7 });
+  assert.equal(bad.body.jsonrpc, "2.0");
+  assert.equal(bad.body.id, 7);
+  assertCorrelatedRpcError(bad, -32602, "Invalid native chat context.");
   const good = await rpc(env.origin, MCP_PATH, {
     headers,
     body: {
@@ -462,6 +543,64 @@ test("describe_capabilities reports the served groups and the bound workspace", 
   assert(!connectRooms.reason.includes("edition"));
 });
 
+test("describe_capabilities does not advertise managed relay tools without a synced native identity", () => {
+  const report = describeCapabilities({ endpointUrl: "https://relay.example.test/mcp", authMode: "cli_login", scopes: ["cli:auth"],
+    workspaceId: "workspace", role: "owner", providers: [], nativeAuthorityAvailable: false,
+    nativeAuthorityReason: "This chat has no synced Desktop identity." });
+  const messaging = report.groups.find(group => group.id === "relay_messaging");
+  assert.equal(messaging?.status, "available");
+  assert.deepEqual(messaging?.restricted_tools?.map(tool => tool.name).slice(0, 3),
+    ["set_relay_agent_card", "send_relay_message", "get_relay_message_status"]);
+  assert.equal(messaging?.restricted_tools?.every(tool => tool.reason === "This chat has no synced Desktop identity."), true);
+  assert.equal(messaging?.restricted_tools?.some(tool => tool.name === "list_relay_agents" || tool.name === "get_relay_agent_card"), false);
+});
+
+test("the capability handler preserves safe refusals, distinguishes outages, and skips unavailable or unmanaged relay messaging", async (t) => {
+  const baseContext = {
+    endpointUrl: "https://relay.example.test/mcp", authMode: "cli_login", role: "owner",
+    principal: { scopes: ["cli:auth"] }, workspace: { id: "workspace" }, providers: async () => [],
+  };
+  async function call(required: boolean, nativeStatus: () => Promise<unknown>, authMode = "cli_login", nativeTimeoutMs?: number) {
+    let handler: (() => Promise<{ structuredContent: Record<string, unknown> }>) | undefined;
+    registerCapabilityDiscovery({ registerTool: (_name: string, _definition: unknown, run: typeof handler) => { handler = run; } } as never,
+      { ...baseContext, authMode, desktopCall: { required, nativeSession: required ? { kind: "codex", id: "native" } : undefined } } as unknown as McpContext,
+      { nativeStatus, nativeTimeoutMs });
+    return (await handler!()).structuredContent as { groups: Array<{ id: string; status: string; reason?: string; how_to_enable?: string;
+      restricted_tools?: Array<{ name: string; reason: string }> }> };
+  }
+  let checks = 0;
+  const refusal = "This chat is synced to two Desktop identities. Remove the duplicate identity, then retry.";
+  const refused = await call(true, async () => { checks += 1; throw new RelayToolError(refusal); });
+  assert.equal(checks, 1);
+  const refusedMessaging = refused.groups.find(group => group.id === "relay_messaging");
+  assert.equal(refusedMessaging?.status, "available");
+  assert.equal(refusedMessaging?.restricted_tools?.find(tool => tool.name === "send_relay_message")?.reason, refusal);
+  assert.doesNotMatch(refusedMessaging?.how_to_enable ?? "", /reconnect/i);
+
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+  const unavailable = await call(true, async () => { checks += 1; throw new Error("private outage details"); });
+  const unavailableMessaging = unavailable.groups.find(group => group.id === "relay_messaging");
+  const unavailableReason = unavailableMessaging?.restricted_tools?.find(tool => tool.name === "send_relay_message")?.reason ?? "";
+  assert.match(unavailableReason, /could not check.*right now/i);
+  assert.doesNotMatch(unavailableReason, /private outage details|reconnect/i);
+  assert.deepEqual(warnings, [["[selfhost-mcp] native identity capability check failed", { error: "Error" }]]);
+
+  const timedOut = await call(true, () => new Promise(() => {}), "cli_login", 5);
+  const timeoutReason = timedOut.groups.find(group => group.id === "relay_messaging")?.restricted_tools
+    ?.find(tool => tool.name === "send_relay_message")?.reason ?? "";
+  assert.match(timeoutReason, /could not check.*right now/i);
+  assert.deepEqual(warnings.at(-1), ["[selfhost-mcp] native identity capability check failed", { error: "Error" }]);
+
+  const available = await call(true, async () => { checks += 1; });
+  assert.equal(checks, 3);
+  assert.equal(available.groups.find(group => group.id === "relay_messaging")?.status, "available");
+  await call(false, async () => { checks += 1; });
+  assert.equal(checks, 3, "unmanaged capability discovery does not probe native identity");
+  await call(true, async () => { checks += 1; }, "staff_read_grant");
+  assert.equal(checks, 3, "a connection without relay_messaging does not probe native identity");
+});
+
 test("session reads go to RelayHistory for the bound workspace only", async (t) => {
   const env = await setup(t);
   env.history.events.push(
@@ -486,6 +625,21 @@ test("session reads go to RelayHistory for the bound workspace only", async (t) 
   const foreign = await client.callTool({ name: "search_shared_sessions", arguments: { query: "deploy", workspace_id: env.otherWorkspaceId } });
   assert.equal(foreign.isError, true);
   assert(!env.history.paths.some((path) => path.includes(env.otherWorkspaceId)));
+});
+
+test("a failed transcript search is text, so clients do not check it against the success schema", async (t) => {
+  const env = await setup(t);
+  env.history.failEvents(500, { error: { code: "internal_error", message: "SECRET upstream failure" } });
+  const client = await connect(t, `${env.origin}${MCP_PATH}`, { authorization: `Bearer ${env.accessToken}` });
+  await client.listTools();
+  const result = await client.callTool({ name: "search_shared_sessions", arguments: { query: "deploy" } });
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent, undefined);
+  const text = (result.content as Array<{ text?: string }>).map((part) => part.text ?? "").join("\n");
+  assert.match(text, /Shared session history is temporarily unavailable/);
+  assert.match(text, /correlation_id: [0-9a-f-]{36}/);
+  assert.equal(text.includes("SECRET"), false);
+  assert.equal(text.includes("internal_error"), false);
 });
 
 test("History reads for bearer and cookie callers go through the read API handoff, never with the caller token", async (t) => {
@@ -622,6 +776,25 @@ test("join_relay by name registers a hosted participant with Cloud's metadata", 
 
   const status = structured(await client.callTool({ name: "relay_status", arguments: {} }));
   assert.deepEqual({ joined: status.joined, name: status.name, unread: status.unread_count }, { joined: true, name: "owner-helper", unread: 0 });
+  (remote.metadata as Record<string, unknown>).renamed_to = "owner-successor";
+  assert.equal(structured(await client.callTool({ name: "relay_status", arguments: {} })).address, null);
+});
+
+test("relay_status returns with a null address when its bounded exact-name lookup stalls", async (t) => {
+  const env = await setup(t);
+  const client = await relayClient(t, env);
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-status" } }));
+  env.relay.namesLookup = "hang";
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+  const started = Date.now();
+  const status = structured(await client.callTool({ name: "relay_status", arguments: {} }));
+  assert(Date.now() - started < 2_500, "status address enrichment stays within its one-second budget");
+  assert.equal(status.joined, true);
+  assert.equal(status.name, "owner-status");
+  assert.equal(status.address, null);
+  assert.deepEqual(warnings, [["[selfhost-mcp] relay status address enrichment failed",
+    { operation: "relay_status", error: "Error" }]]);
 });
 
 test("join_relay is idempotent, defaults its name, and refuses a foreign owner's agent", async (t) => {
@@ -671,9 +844,30 @@ const CARD_INPUT = {
   documentation_url: "https://docs.example.test/reviewer",
 };
 
-test("get_relay_agent_card returns a minimal card for an agent without one, and refuses unknown agents", async (t) => {
+test("every listed Desktop and spawned agent has an inferred card and trusted owner", async (t) => {
   const env = await setup(t);
-  const peer = env.relay.world.addAgent("peer-bot", { description: "Answers questions", kind: "grok-bot", owner_name: "Teammate" });
+  const peer = env.relay.world.addAgent("peer-bot", {
+    session_title: "You are peer-bot. This truncated spawn prompt is not its published purpose.",
+    kind: "grok-bot", owner_name: "Untrusted label",
+  });
+  const spawned = env.relay.world.addAgent("spawned-bot", { session_title: "You are spawned-bot. Also truncated." });
+  await env.database.query(
+    `INSERT INTO desktop_relay_identities
+       (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id, agent_name,
+        agent_remote_id, address, token_ciphertext)
+     VALUES ($1, $2, $3, $4, 'rc-first', $5, $6, $7, $8, 'encrypted-test-token')`,
+    ["00000000-0000-4000-8000-000000000091", env.workspaceId, env.orgId, env.ownerId,
+      "00000000-0000-4000-8000-000000000092", peer.name, peer.id, `peer-bot@cloud-${peer.id}`],
+  );
+  await env.database.query(
+    `INSERT INTO relay_spawns
+       (id, workspace_id, user_id, authority_hash, relaycast_workspace_id, actor_id, idempotency_hash,
+        request_hash, agent_name, cli, node_id, state, worker_id, worker_address, audit)
+     VALUES ($1, $2, $3, 'authority', 'rc-first', 'actor', 'spawn-owner-card-idem', 'request',
+       $4, 'codex', 'node-1', 'ready', $5, $6, '[]'::jsonb)`,
+    ["00000000-0000-4000-8000-000000000093", env.workspaceId, env.ownerId,
+      spawned.name, spawned.id, `spawned-bot@cloud-${spawned.id}`],
+  );
   const client = await relayClient(t, env);
   const result = await client.callTool({ name: "get_relay_agent_card", arguments: { agent: `peer-bot@cloud-${peer.id}` } });
   assert.match((result.content as Array<{ text: string }>)[0]!.text,
@@ -681,7 +875,7 @@ test("get_relay_agent_card returns a minimal card for an agent without one, and 
   assert.deepEqual(structured(result), {
     protocolVersion: "0.3.0",
     name: "peer-bot",
-    description: "Answers questions",
+    description: `peer-bot is an Agent Relay agent on cloud-${peer.id}, available for direct collaboration.`,
     url: "https://cast.selfhosted.example/a2a/rpc",
     preferredTransport: "JSONRPC",
     version: "1",
@@ -689,14 +883,30 @@ test("get_relay_agent_card returns a minimal card for an agent without one, and 
     capabilities: { streaming: false, pushNotifications: false },
     defaultInputModes: ["text/plain"],
     defaultOutputModes: ["text/plain"],
-    skills: [],
+    skills: [{ id: "coordinate-work", name: "Coordinate current work",
+      description: "Send this agent a focused request related to the work it currently owns, including the expected outcome and relevant context.",
+      tags: [], examples: ["Coordinate a task or request a focused review."] }],
     "x-agent-relay": {
-      address: `peer-bot@cloud-${peer.id}`, kind: "grok-bot", owner: "Teammate", where: `cloud-${peer.id}`, status: "live",
-      tags: [], hasCard: false,
+      address: `peer-bot@cloud-${peer.id}`, kind: "grok-bot", owner: "Owner", where: `cloud-${peer.id}`, status: "live",
+      tags: [], hasCard: true, cardSource: "inferred",
     },
   });
   const listed = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
-  assert.deepEqual(listed.agents.map((agent: any) => [agent.name, agent.skills, agent.has_card]), [["peer-bot", [], false]]);
+  assert.deepEqual(listed.agents.map((agent: any) => [agent.name, agent.skills, agent.has_card, agent.card_source]), [
+    ["peer-bot", ["Coordinate current work"], true, "inferred"],
+    ["spawned-bot", ["Coordinate current work"], true, "inferred"],
+  ]);
+  for (const agent of listed.agents) {
+    assert.deepEqual(agent.owner, { user_id: env.ownerId, name: "Owner" });
+    assert.equal(agent.is_mine, true);
+  }
+  assert.doesNotMatch(structured(result).description, /truncated spawn prompt/i);
+  env.relay.world.addAgent("second-peer", { description: "Second" });
+  const limited = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all", limit: 1 } }));
+  assert.equal(limited.agents.length, 1); assert.equal(limited.total_matching, 3); assert.equal(limited.truncated, true);
+  for (let index = 0; index < 100; index++) env.relay.world.addAgent(`peer-${index}`, { description: "Extra" });
+  const bounded = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
+  assert.equal(bounded.agents.length, 100); assert.equal(bounded.total_matching, 103); assert.equal(bounded.truncated, true);
   assert.ok(client.getInstructions()?.includes(CARD_GUIDANCE));
   const channels = structured(await client.callTool({ name: "list_relay_channels", arguments: {} }));
   assert.ok(channels.guidance.endsWith(CARD_GUIDANCE));
@@ -707,6 +917,120 @@ test("get_relay_agent_card returns a minimal card for an agent without one, and 
   // Read-only: nothing joined and nothing written.
   assert.equal((await env.database.query("SELECT 1 FROM hosted_relay_participants")).rows.length, 0);
   assert.equal(env.relay.world.bodies.some(call => call.method === "PATCH"), false);
+});
+
+test("list_relay_agents stops waiting after ten seconds when the roster ignores cancellation", async (t) => {
+  const env = await setup(t);
+  const client = await relayClient(t, env);
+  env.relay.rosterLookup = "hang";
+  const started = Date.now();
+  assert.match(toolError(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } })),
+    /relay operation failed/i);
+  assert(Date.now() - started < 12_500, "the MCP roster read stays within its ten-second budget");
+  assert.equal(env.relay.rosterSignal?.aborted, true);
+});
+
+test("list_relay_agents links synced Desktop sessions and keeps validated declarations authoritative", async (t) => {
+  const env = await setup(t);
+  const synced = env.relay.world.addAgent("synced-session", { source: "relay-desktop", owner_hash: sha256(env.ownerId) });
+  const declared = env.relay.world.addAgent("declared-session", {
+    source: "relay-desktop", owner_hash: sha256(env.ownerId), injectable: "true",
+    session_id: "declared-session-id", session_kind: "claude",
+  });
+  const insert = (values: { id: string; sourceId: string; agentName: string; agentRemoteId: string; sessionKind: string; sessionId: string;
+    relaycastWorkspaceId?: string }) =>
+    env.database.query(
+      `INSERT INTO desktop_relay_identities
+         (id, workspace_id, organization_id, user_id, relaycast_workspace_id, source_id,
+          agent_name, agent_remote_id, address, token_ciphertext, native_session_kind, native_session_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $7 || '@fixture', 'encrypted', $9, $10)`,
+      [values.id, env.workspaceId, env.orgId, env.ownerId, values.relaycastWorkspaceId ?? "rc-first", values.sourceId,
+        values.agentName, values.agentRemoteId, values.sessionKind, values.sessionId],
+    );
+  await insert({ id: "00000000-0000-4000-8000-000000000106", sourceId: "00000000-0000-4000-8000-000000000107",
+    agentName: synced.name, agentRemoteId: synced.id, sessionKind: "claude", sessionId: "foreign-session-id",
+    relaycastWorkspaceId: "rc-other" });
+  await insert({ id: "00000000-0000-4000-8000-000000000101", sourceId: "00000000-0000-4000-8000-000000000102",
+    agentName: synced.name, agentRemoteId: synced.id, sessionKind: "opencode", sessionId: "ses_ABCD1234" });
+  await insert({ id: "00000000-0000-4000-8000-000000000103", sourceId: "00000000-0000-4000-8000-000000000104",
+    agentName: declared.name, agentRemoteId: declared.id, sessionKind: "codex", sessionId: "00000000-0000-4000-8000-000000000105" });
+
+  const client = await relayClient(t, env);
+  const agents = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } })).agents;
+  const syncedRow = agents.find((agent: any) => agent.name === synced.name);
+  assert.deepEqual([syncedRow.session_id, syncedRow.session_kind, syncedRow.session_attribution,
+    syncedRow.session_unavailable_reason], ["ses_ABCD1234", "opencode", "synced", null]);
+  const declaredRow = agents.find((agent: any) => agent.name === declared.name);
+  assert.deepEqual([declaredRow.session_id, declaredRow.session_kind, declaredRow.session_attribution,
+    declaredRow.session_unavailable_reason], ["declared-session-id", "claude", "declared", null]);
+});
+
+test("list_relay_agents session enrichment fails open and refuses ambiguous Desktop rows", async (t) => {
+  const env = await setup(t);
+  const peer = env.relay.world.addAgent("session-fallback", { source: "relay-desktop", session_kind: "claude" });
+  const declared = env.relay.world.addAgent("session-declared-fallback", {
+    source: "relay-desktop", session_id: "declared-session-id", session_kind: "claude", injectable: "true",
+  });
+  const client = await relayClient(t, env);
+  const originalQuery = env.database.query.bind(env.database);
+  let mode: "reject" | "duplicate" = "reject";
+  env.database.query = (async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+    if (sql.includes("FROM desktop_relay_identities") && sql.includes("native_session_kind IS NOT NULL")) {
+      if (mode === "reject") throw new TypeError("private session query detail");
+      return { rows: [
+        { agent_name: peer.name, agent_remote_id: peer.id, native_session_kind: "codex", native_session_id: "session-one" },
+        { agent_name: peer.name, agent_remote_id: peer.id, native_session_kind: "claude", native_session_id: "session-two" },
+      ] as unknown as T[] };
+    }
+    return originalQuery<T>(sql, params);
+  }) as typeof env.database.query;
+  t.after(() => { env.database.query = originalQuery; });
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+
+  const unavailable = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
+  const unavailableRow = unavailable.agents.find((agent: any) => agent.name === peer.name);
+  assert.deepEqual([unavailableRow.session_id, unavailableRow.session_kind, unavailableRow.session_attribution,
+    unavailableRow.session_unavailable_reason], [null, "claude", null, "enrichment_failed"]);
+  const declaredRow = unavailable.agents.find((agent: any) => agent.name === declared.name);
+  assert.deepEqual([declaredRow.session_id, declaredRow.session_kind, declaredRow.session_attribution,
+    declaredRow.session_unavailable_reason], ["declared-session-id", "claude", "declared", null]);
+  assert.deepEqual(warnings, [["[selfhost-mcp] session enrichment failed",
+    { operation: "list_relay_agents", error: "TypeError" }]]);
+  assert.doesNotMatch(JSON.stringify(warnings), /private session query detail/);
+
+  mode = "duplicate";
+  const ambiguous = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
+  const ambiguousRow = ambiguous.agents.find((agent: any) => agent.name === peer.name);
+  assert.deepEqual([ambiguousRow.session_id, ambiguousRow.session_kind, ambiguousRow.session_attribution,
+    ambiguousRow.session_unavailable_reason], [null, "claude", null, "ambiguous_sync"]);
+});
+
+test("agent card owner enrichment fails open when its journal or membership read fails", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-bot", {
+    owner_hash: sha256(env.ownerId), owner_name: "Metadata fallback",
+  });
+  const client = await relayClient(t, env);
+  const originalQuery = env.database.query.bind(env.database);
+  let failure: "owner" | "members" | null = null;
+  env.database.query = (async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+    if (failure === "owner" && sql.includes("'desktop'::text AS source")) throw new Error("owner query unavailable");
+    if (failure === "members" && sql.includes("FROM organization_memberships m")) throw new Error("members query unavailable");
+    return originalQuery<T>(sql, params);
+  }) as typeof env.database.query;
+  t.after(() => { env.database.query = originalQuery; });
+
+  failure = "owner";
+  const listed = structured(await client.callTool({ name: "list_relay_agents", arguments: { status: "all" } }));
+  assert.deepEqual(listed.agents.map((agent: any) => ({ name: agent.name, owner: agent.owner, has_card: agent.has_card })), [{
+    name: "peer-bot", owner: { user_id: env.ownerId, name: "Owner" }, has_card: true,
+  }]);
+
+  failure = "members";
+  const card = structured(await client.callTool({ name: "get_relay_agent_card", arguments: { agent: "peer-bot" } }));
+  assert.equal(card["x-agent-relay"].owner, "Metadata fallback");
+  assert.equal(card["x-agent-relay"].hasCard, true);
 });
 
 test("set_relay_agent_card writes only the joined participant's card and preserves its other metadata", async (t) => {
@@ -773,7 +1097,7 @@ test("set_relay_agent_card writes only the joined participant's card and preserv
   assert.equal(remote.metadata.owner_hash, sha256(env.ownerId));
 });
 
-test("set_relay_agent_card validates the card limits and has no target parameter", async (t) => {
+test("set_relay_agent_card validates the card limits and has no target parameter (as selects only your own participant)", async (t) => {
   const env = await setup(t);
   const peer = env.relay.world.addAgent("peer-bot", { objective: "Answers questions" });
   const client = await relayClient(t, env);
@@ -796,14 +1120,18 @@ test("set_relay_agent_card validates the card limits and has no target parameter
     const result = await client.callTool({ name: "set_relay_agent_card", arguments: args });
     assert.equal(result.isError, true, JSON.stringify(args).slice(0, 120));
   }
-  // An unknown `agent` or `as` argument is ignored: the write still targets the caller only.
-  structured(await client.callTool({ name: "set_relay_agent_card", arguments: { ...CARD_INPUT, agent: "peer-bot", as: "peer-bot" } }));
+  // `as` selects only the caller's own participant: naming someone else's agent is refused and writes nothing.
+  const foreign = await client.callTool({ name: "set_relay_agent_card", arguments: { ...CARD_INPUT, as: "peer-bot" } });
+  assert.equal(foreign.isError, true);
+  // An unknown `agent` argument is ignored: the write still targets the caller only.
+  structured(await client.callTool({ name: "set_relay_agent_card", arguments: { ...CARD_INPUT, agent: "peer-bot" } }));
   assert.equal(peer.metadata.card, undefined);
   assert.equal(env.relay.world.agents.get("owner-carded")!.metadata.card !== undefined, true);
   assert.deepEqual(env.relay.world.bodies.filter(call => call.method === "PATCH").map(call => call.path), ["/v1/agents/owner-carded"]);
   const { tools } = await client.listTools();
   const schema = tools.find(tool => tool.name === "set_relay_agent_card")!.inputSchema as { properties: Record<string, unknown>; required?: string[] };
-  assert.deepEqual(Object.keys(schema.properties).sort(), ["description", "documentation_url", "skills", "tags", "version"]);
+  // No target: `as` is the own-participant selector every relay tool has (a Cursor cloud agent run's name).
+  assert.deepEqual(Object.keys(schema.properties).sort(), ["as", "description", "documentation_url", "skills", "tags", "version"]);
   assert.deepEqual([...schema.required ?? []].sort(), ["description", "skills"]);
 });
 
@@ -1421,6 +1749,47 @@ test("check_relay_inbox resolves sender addresses with one bounded lookup", asyn
   assert.deepEqual(lookups.listings, []);
   assert.equal(lookups.names.length, 1);
   assert.deepEqual([...lookups.names[0]!].sort(), ["peer-a", "peer-b"]);
+});
+
+test("check_relay_inbox delivers messages with null sender addresses when bounded enrichment fails", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-a");
+  const client = await relayClient(t, env);
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-inbox" } }));
+  env.relay.world.sendAs("peer-a", "owner-inbox", "from a");
+  env.relay.namesLookup = "fail";
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+  const inbox = structured(await client.callTool({ name: "check_relay_inbox", arguments: {} }));
+  assert.deepEqual(inbox.messages.map((message: any) => ({ sender: message.sender, sender_address: message.sender_address })),
+    [{ sender: "peer-a", sender_address: null }]);
+  assert.deepEqual(warnings, [["[selfhost-mcp] inbox sender enrichment failed",
+    { operation: "check_relay_inbox", error: "RelaycastCallError" }]]);
+});
+
+test("check_relay_inbox times out sender enrichment and acknowledges the delivery once on the following call", async (t) => {
+  const env = await setup(t);
+  env.relay.world.addAgent("peer-a");
+  const client = await relayClient(t, env);
+  structured(await client.callTool({ name: "join_relay", arguments: { name: "owner-inbox" } }));
+  env.relay.world.sendAs("peer-a", "owner-inbox", "from a");
+  env.relay.namesLookup = "hang";
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+  const started = Date.now();
+  const inbox = structured(await client.callTool({ name: "check_relay_inbox", arguments: {} }));
+  assert(Date.now() - started < 2_500, "sender enrichment stays within its one-second budget");
+  assert.equal(inbox.messages[0].sender_address, null);
+  const deliveryId = inbox.messages[0].delivery_id as string;
+  assert.deepEqual(env.relay.world.pending("owner-inbox").map(row => row.id), [deliveryId]);
+  assert.equal(warnings[0]?.[0], "[selfhost-mcp] inbox sender enrichment failed");
+  assert.equal((warnings[0]?.[1] as Record<string, unknown>)?.operation, "check_relay_inbox");
+
+  env.relay.namesLookup = undefined;
+  const acknowledged = structured(await client.callTool({ name: "check_relay_inbox", arguments: { acknowledge: [deliveryId] } }));
+  assert.deepEqual(acknowledged.acknowledged, [deliveryId]);
+  assert.deepEqual(env.relay.world.pending("owner-inbox"), []);
+  assert.equal(env.relay.world.bodies.filter(call => call.path === `/v1/deliveries/${deliveryId}/ack`).length, 1);
 });
 
 type AuditRow = Record<string, any>;

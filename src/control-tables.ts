@@ -15,6 +15,8 @@ export const CONTROL_TABLES: readonly string[] = [
   "coding_agent_credential_blobs",
   "coding_agent_credentials",
   "coding_agent_device_sessions",
+  "cursor_cloud_links",
+  "cursor_cloud_runs",
   "desktop_attestation_keys",
   "desktop_consent_tokens",
   "desktop_feed_assets",
@@ -73,6 +75,7 @@ export const CONTROL_TABLES: readonly string[] = [
   "person_identities",
   "person_messages",
   "person_revocations",
+  "relay_hosted_credentials",
   "relay_launch_credentials",
   "relay_node_credentials",
   "relay_spawns",
@@ -116,7 +119,6 @@ export const CONTROL_TABLES: readonly string[] = [
 export const CONTROL_SEQUENCES: readonly string[] = [
   "desktop_feed_publish_seq",
   "desktop_feed_publisher_tokens_seq_seq",
-  "grok_bot_events_seq_seq",
 ];
 
 // Tables a migration creates that the runtime role must NOT be granted:

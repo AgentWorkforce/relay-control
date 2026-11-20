@@ -12,12 +12,21 @@ that an agent is currently running; use the existing presence tools for that.
 reads one `GET /v1/sessions?includeShortSummary=recorded` page. `limit`
 defaults to 20 and cannot exceed 50.
 `since` is an ISO timestamp mapped to `lastTsAfter`; `project` maps to the
-directory's `projectContains` substring filter. `person` resolves an exact
+directory's `projectContains` substring filter. A repo-only filter also uses
+the first 200 characters as `projectContains`, whose directory semantics are a
+case-insensitive literal substring of the project ID, catalog project key or
+recorded repository URL, so matching happens before pagination; the returned
+rows are still checked against the full repository URL to exclude project-id
+or catalog-key matches. This requires a sessions read API whose session directory
+list applies `projectContains` as a case-insensitive substring of project ID,
+catalog project key or recorded repository URL (directory migration
+`20261105034000` or later). `person` resolves an exact
 workspace member ID, email or unambiguous name and sends that recorded user
 ID as `user`. Unknown and ambiguous members are refused rather than
-broadening the request. `repo` filters the recorded repository URL within
-the page, case-insensitively; an empty filtered page may have `next_cursor`.
-Keep filters unchanged when following that cursor.
+broadening the request. `repo` accepts up to 512 characters and matches the
+recorded repository URL case-insensitively. Exact URL verification can make a
+page short or empty while it still has `next_cursor`; keep paging with the same
+filters.
 
 Each result has `session_id`, `source`, `owner` (an array, since sessions may
 have several recorded owners), `project`, `repo`, `branch`, `last_active`,

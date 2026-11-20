@@ -98,35 +98,57 @@ customer-facing setup; the hosted plugin's configured MCP URL points to Cloud.
 ## Cloud copy mode (`SELFHOST_GROK_ROUTINES_CLOUD_COPY`)
 
 Off by default. With it off, everything above applies unchanged. With it on,
-Grok Bot connections get Agent Relay Cloud's routine behaviour, copied as is
-from `AgentWorkforce/cloud` (`packages/web/lib/mcp-events/grok-routine.ts`,
-`sender-check.ts` and the reply policy). Cloud itself is not changed. See
-[the spec](specs/grok-bot-dynamic-prompt.md), Phase 1. Apply migration
-`0079_grok_routines_cloud_copy.sql` first.
+new Grok Bot routines get Agent Relay Cloud's routine behaviour: Cloud's
+routine prompt, sender check and reply policy, copied as is. Cloud itself is
+not changed. See [the spec](specs/grok-bot-dynamic-prompt.md), Phase 1. Apply
+migration `0082_grok_routines_cloud_copy.sql` first.
 
+- **Per routine, not per server.** A routine uses the copy only if it was
+  saved on the setup page, or connected for polling, while the flag was on
+  (`cloud_copy`). Routines saved before keep the inbox-batch behaviour above,
+  whatever the flag says now, because their pasted prompt reads
+  `check_relay_inbox`. The setup page marks such a routine. Replacing its
+  instructions in Grok and saving it again moves it to the copy. With the flag
+  off, copy routines are not scanned: they neither wake nor delay other
+  routines.
 - `connect_grok_bot_routine` takes Cloud's `{name, from, mode}` and returns
-  Cloud's `routine_prompt` and `next_steps`. `mode:"webhook"` returns `setup_url`
-  (this server's page). `mode:"polling"` stores no credential and returns
-  `suggested_interval_minutes: 15`. Choosing a mode replaces the other for this
-  connection. `disconnect_grok_bot_routine` takes `mode` or `webhook_url`;
-  passing neither stops both.
-- The routine prompt calls `get_event` and `get_recent_events`, which are
-  registered for Grok connections only in this mode (tool group `grok_events`).
-  The worker ingests each inbox delivery into `grok_bot_events`, with message
-  text encrypted under the Control keyring and kept seven days. It
-  acknowledges a delivery only after its event has committed, so
-  `check_relay_inbox` is empty for this bot in this mode. A webhook routine gets
-  one wake per message, with Cloud's body
-  (`{eventId, name:"relay.message"|"relay.channel_message", timestamp, cursor, data}`;
-  `data.summary` is the first 200 characters) and headers (`Authorization`,
-  `webhook-id` = `eventId`, `X-MCP-Subscription-Id` = grant id). A retry keeps
-  the same `eventId`. A `from` filter limits which messages wake the routine.
+  Cloud's `routine_prompt` and `next_steps`. `mode:"webhook"` returns
+  `setup_url` (this server's page). `mode:"polling"` stores no credential and
+  returns `suggested_interval_minutes: 15`. Choosing a mode replaces the
+  other for this connection. The grant is checked before anything is joined.
+  `disconnect_grok_bot_routine` takes `mode` or `webhook_url`; passing neither
+  stops both.
+- The copied prompt calls `get_event` and `get_recent_events`. These are
+  registered for Grok connections only, in tool group `grok_events`, which is
+  listed only while the flag is on. The worker ingests each inbox delivery into
+  `grok_bot_events`, with message text encrypted under the Control keyring,
+  and acknowledges the page only after the events have committed. That
+  includes the bot's own sends, so they cannot fill the 100-item page.
+  `check_relay_inbox` is therefore empty for a copy routine.
+- Reads and acknowledgements use the same client as the rest of the scan.
+  On a gate-only install a gated participant reads and acknowledges through
+  relaygate with its own (renewed) token and never talks to Relaycast
+  directly.
+- Events are kept for seven days, then deleted on the next scan whatever
+  the flag says. They are also deleted with their routine: on disconnect, on
+  revocation, or when the grant is no longer valid. Reads never return older
+  events. `cursor` is the grant's own sequence.
+- A webhook routine gets one wake per message, with Cloud's body
+  (`{eventId, name:"relay.message"|"relay.channel_message", timestamp, cursor, data}`).
+  `data.summary` is the first 200 characters of the message. The headers are
+  `Authorization`, `webhook-id` = `eventId` and `X-MCP-Subscription-Id` =
+  grant id. A retry keeps the same `eventId`. An event whose payload can no
+  longer be decrypted is skipped rather than blocking later wakes. A `from`
+  filter limits which messages wake the routine.
 - `get_event` returns Cloud's app block: `Sender check: trustedSender …` and
   `Reply setting: replyMode …`, followed by the steps. A sender is trusted only
-  when it is a roster agent the person owns (same immutable agent ID and
-  `owner_hash`). The setup page's **How to reply** sets the reply mode:
-  `notes-only` (the default) never replies; `acknowledge` and `answer` reply
-  automatically only to trusted senders and ask the person about anyone else.
+  when its agent ID belongs to one of this person's own rows in this
+  workspace: a hosted participant, a Desktop identity, or a bound Amp or Capy
+  binding. Agent metadata is never used for trust. The setup page's **How to
+  reply** sets the reply mode. `notes-only` (the default) never replies.
+  `acknowledge` and `answer` reply automatically only to trusted senders and
+  ask the person about anyone else.
 - The setup page also accepts one paste of the routine's URL and header. A
-  routine URL can be saved under only one connection on this server. Do not
-  also register it in Agent Relay Cloud or another deployment, or it wakes twice.
+  routine URL can be saved under only one connection on this server; a
+  concurrent second save gets the same refusal. Do not also register it in
+  Agent Relay Cloud or another deployment, or it wakes twice.

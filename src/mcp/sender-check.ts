@@ -1,4 +1,4 @@
-// Copied verbatim from AgentWorkforce/cloud packages/web/lib/mcp-events/sender-check.ts @ 84578009505b.
+// Copied verbatim from Agent Relay Cloud's MCP Events module.
 /**
  * How get_event's app block states Agent Relay's sender check ("Sender check:
  * trustedSender true (your agent)."). Prompts that gate replies on it quote

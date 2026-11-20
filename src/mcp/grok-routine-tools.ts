@@ -35,7 +35,7 @@ export function registerGrokRoutineTools(server: McpServer, context: McpContext)
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, input => run(async () => {
     oauth.assertActor(input.name);
-    await routines.status(oauth.access.grantId, owner);
+    await routines.status(oauth.access.grantId, owner, { setup: true });
     const joined = await relayService(context).join({ name: oauth.access.agentName });
     return { ...await routines.status(oauth.access.grantId, owner), inbox_address: joined.address, mode: "webhook" };
   }));
@@ -57,7 +57,7 @@ type Run = (fn: () => Promise<unknown>) => Promise<{ structuredContent?: Record<
  * Phase 1): Cloud's connect_grok_bot_routine / disconnect_grok_bot_routine and
  * the get_event / get_recent_events tools its copied routine prompt calls.
  * Descriptions and next_steps are copied as is from Cloud
- * packages/web/lib/mcp-events/server.ts; setup_url is this server's page.
+ * Agent Relay Cloud's MCP Events server; setup_url is this server's page.
  */
 function registerCloudCopyTools(server: McpServer, context: McpContext, run: Run): void {
   const oauth = context.oauth!;
@@ -74,7 +74,7 @@ function registerCloudCopyTools(server: McpServer, context: McpContext, run: Run
   const annotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 
   server.registerTool("connect_grok_bot_routine", {
-    description: "Grok Bot only. Returns this bot's non-secret routine_prompt and inbox_address. Webhook mode also returns a secure Agent Relay dashboard link with separate Webhook URL and Authorization header fields; polling mode creates no webhook credential and checks on a schedule with interval latency and routine usage. Each Grok Bot needs its own Agent Relay connection, approved with its own agent name (for example devopsgrok-khaliq); a name other than this connection's is refused. Use only after the person explicitly chooses a wake-up mode.",
+    description: "Grok Bot only. Returns this bot's non-secret routine_prompt and inbox_address. Webhook mode also returns a secure Agent Relay dashboard link with separate Webhook URL and Authorization header fields; polling mode creates no webhook credential and checks on a schedule with interval latency and routine usage. Each Grok Bot needs its own Agent Relay connection, approved with its own agent name (for example ops-bot); a name other than this connection's is refused. Use only after the person explicitly chooses a wake-up mode.",
     inputSchema: {
       name: z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/).optional().describe("This bot's Relay agent identity: the agent name approved when this connection was made. Omit it to use that name."),
       from: z.string().trim().min(1).max(512).optional().describe("Only wake the routine for messages from this agent name."),
@@ -89,6 +89,8 @@ function registerCloudCopyTools(server: McpServer, context: McpContext, run: Run
     const selectedMode = mode ?? "webhook";
     const result = await run(async () => {
       oauth.assertActor(name);
+      // The grant is checked (a live Grok Bot grant, setup allowed) before anything is joined or enrolled.
+      await routines.status(grantId, owner, { setup: true });
       const joined = await relayService(context).join({ name: oauth.access.agentName });
       if (selectedMode === "polling") {
         const connected = await routines.connectPolling(grantId, owner, from);
@@ -155,7 +157,7 @@ export function registerGrokEventTools(server: McpServer, context: McpContext): 
     const event = (found.structuredContent as { event: Awaited<ReturnType<typeof routines.event>> }).event;
     if (!event) return { isError: true, content: [{ type: "text" as const, text: "No event with that id belongs to you." }] };
     // The app's steps and the sender's message go in separate blocks: steps
-    // inside the block marked untrusted were read as an injection (Cloud, 2026-10-11).
+    // inside the block marked untrusted were read as an injection.
     const { nextSteps, reply, detail, earlierMessages, trustedSender, trustedSenderReason, ...view } = event as typeof event & {
       reply?: { tool: string; instruction: string } };
     // Agent Relay's own check, from the sender's agent id: it goes in the

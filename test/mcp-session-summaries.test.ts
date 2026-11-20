@@ -18,7 +18,15 @@ async function fixture(t: TestContext, options: Setup = {}) {
   const paths: string[] = [];
   const context = { workspace: { id: "ws-a", organizationId: "org-a" }, origin: "https://relay.example.test",
     members: options.members ?? (async () => [{ userId: "user-a", name: "Example User", email: "fake@example.test" }]),
-    readHistory: async (path: string) => { paths.push(path); if (options.readError) throw options.readError; return options.body ?? page(); },
+    readHistory: async (path: string) => {
+      paths.push(path);
+      if (options.readError) throw options.readError;
+      if (options.body !== undefined) return options.body;
+      const result = page();
+      const needle = new URL(path, "https://reader.test").searchParams.get("projectContains")?.toLowerCase();
+      return needle ? { ...result, sessions: result.sessions.filter(item =>
+        [item.projectId, item.catalog?.repoUrl].some(value => value?.toLowerCase().includes(needle))) } : result;
+    },
   } as unknown as McpContext;
   const server = new McpServer({ name: "summaries-test", version: "1" });
   registerSharedSessionReads(server, context);
@@ -53,7 +61,7 @@ test("list reads one bounded directory page and preserves recorded provenance, o
   assert.equal(f.paths.length, 1, "no per-session reads or transcript scan");
   assert.deepEqual(value.sessions[0], { session_id: "fake/session", source: "codex", owner: [{ user_id: "user-a", name: "Example User" }, { user_id: "former-user", name: null }],
     project: "fake-project", repo: "https://example.test/org/repo", branch: "feature/test", last_active: ts,
-    short_summary: row().shortSummary, short_summary_status: "available", short_summary_generated_at: ts,
+    short_summary: row().shortSummary, short_summary_status: "available", transcript_status: "not_verified", short_summary_generated_at: ts,
     citation_url: "https://relay.example.test/dashboard/sessions/fake%2Fsession?source=codex" });
   assert.equal(value.next_cursor, "b96l1:opaque-page");
   assert.deepEqual(resultSessionsOf("list_session_summaries", value), { count: 1, truncated: false,
@@ -74,11 +82,25 @@ test("list never substitutes a task title for an absent recorded summary", async
   assert.equal(legacy.paths.length, 1, "missing summary fields never trigger a fallback or detail scan");
 });
 
-test("repo filtering preserves pagination, including an empty filtered page", async t => {
+test("repo filtering is applied by the directory before pagination and verified against the URL", async t => {
   const f = await fixture(t);
   const value = data(await call(f.client, "list_session_summaries", { repo: "unmatched" }));
   assert.deepEqual(value.sessions, []); assert.equal(value.next_cursor, "b96l1:opaque-page"); assert.equal(f.paths.length, 1);
+  assert.equal(new URL(f.paths[0]!, "https://reader.test").searchParams.get("projectContains"), "unmatched");
   assert.equal(data(await call(f.client, "list_session_summaries", { repo: "ORG/REPO" })).sessions.length, 1);
+});
+
+test("repo filtering preserves the 512-character input and bounds the directory prefix to 200", async t => {
+  const f = await fixture(t);
+  const repo = "x".repeat(512);
+  assert.deepEqual(data(await call(f.client, "list_session_summaries", { repo })).sessions, []);
+  assert.equal(new URL(f.paths[0]!, "https://reader.test").searchParams.get("projectContains"), repo.slice(0, 200));
+});
+
+test("combined project and repo filters preserve the directory project constraint", async t => {
+  const f = await fixture(t);
+  assert.equal(data(await call(f.client, "list_session_summaries", { project: "fake", repo: "org/repo" })).sessions.length, 1);
+  assert.equal(new URL(f.paths[0]!, "https://reader.test").searchParams.get("projectContains"), "fake");
 });
 
 test("recorded list summaries use the reader bound of 1000 Unicode code points", async t => {
@@ -101,7 +123,7 @@ test("ambiguous or unknown person filters refuse without broadening to all works
 
 test("schema bounds reject limit over 50 and invalid timestamps before any reader call", async t => {
   const f = await fixture(t);
-  for (const args of [{ limit: 51 }, { limit: 0 }, { since: "yesterday" }]) {
+  for (const args of [{ limit: 51 }, { limit: 0 }, { since: "yesterday" }, { repo: "x".repeat(513) }]) {
     assert.equal((await call(f.client, "list_session_summaries", args)).isError, true);
   }
   assert.deepEqual(f.paths, []);
@@ -117,14 +139,17 @@ test("short summary uses the exact session route and retains recorded model/time
   assert.equal(resultSessionsOf("get_session_summary", value).sessions[0]!.session_id, "fake/session");
 });
 
-test("empty summaries stay empty; malformed provenance and unsupported responses are refused", async t => {
-  for (const summary of [{ status: "ready", kind: "short", summary: "Recorded", builtAt: ts, state: null }, { status: "unsupported" }]) {
+test("empty summaries stay empty; malformed provenance is refused and unsupported is data", async t => {
+  for (const summary of [{ status: "ready", kind: "short", summary: "Recorded", builtAt: ts, state: null }]) {
     const f = await fixture(t, { body: { summary } });
     assert.equal((await call(f.client, "get_session_summary", { session_id: "fake", source: "codex" })).isError, true);
   }
   const summary = { status: "empty", kind: "short", state: null };
   const f = await fixture(t, { body: { summary } });
   assert.deepEqual(data(await call(f.client, "get_session_summary", { session_id: "fake", source: "codex" })).summary, summary);
+  const unavailable = await fixture(t, { body: { summary: { status: "unsupported" } } });
+  assert.deepEqual(data(await call(unavailable.client, "get_session_summary", { session_id: "fake", source: "codex" })).summary,
+    { status: "unsupported" });
 });
 
 test("missing summary source gives actionable guidance without inferring a harness or calling the reader", async t => {
@@ -169,13 +194,15 @@ test("wrong-kind summaries and invalid provenance refuse after one read without 
     { summary: { ...ready, summary: "x".repeat(16_001) } },
     { summary: { ...ready, model: "" } },
     { summary: { ...ready, builtAt: undefined } },
-    { summary: { status: "unsupported" } },
   ]) {
     const f = await fixture(t, { body });
     const result = await call(f.client, "get_session_summary", { session_id: "fake", source: "codex", kind: "long" });
     assert.equal(result.isError, true); assert.match(JSON.stringify(result), /unsupported_by_backend/);
     assert.deepEqual(f.paths, ["/v1/sessions/fake/summary?kind=long&source=codex"]);
   }
+  const unsupportedResult = data(await call((await fixture(t, { body: { summary: { status: "unsupported" } } })).client,
+    "get_session_summary", { session_id: "fake", source: "codex", kind: "long" }));
+  assert.deepEqual(unsupportedResult.summary, { status: "unsupported" });
 });
 
 test("long reader refusals and outages never trigger another kind, backend or transcript read", async t => {

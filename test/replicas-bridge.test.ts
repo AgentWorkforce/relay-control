@@ -319,7 +319,7 @@ test("Replicas bridge: spawn, MCP provisioning retry, capability, relay events, 
     assert.match(prompt, /send_relay_message/);
     assert.match(prompt, /status\?$/);
     const duplicate = await api(path, { method: "POST", raw: event, headers: signed(event) });
-    assert.deepEqual(duplicate.body, { ok: true, duplicate: true });
+    assert.deepEqual(duplicate.body, { ok: true, duplicate: true, prior: "confirmed" });
     assert.equal(provider.messages.length, before + 1);
     const other = JSON.stringify({ type: "dm.received", data: { to: "someone-else", message: { id: "9002", agent_name: "peer", text: "hi" } } });
     assert.deepEqual((await api(path, { method: "POST", raw: other, headers: signed(other) })).body, { ok: true, delivered: false });

@@ -17,7 +17,7 @@ type ReaderConfig = Pick<SelfhostConfig,"publicBaseUrl"|"sessionReadMcpReads"> &
 };
 
 /** Per-user reader client. Only Control sees the reader's internal issuer secret. */
-const READ_ROUTES = /^\/v1\/(?:events|sessions(?:\/activity|\/[^/]+\/(?:turns|metadata|events|summary))?|relayfacts(?:\/[^/]+)?)$/;
+const READ_ROUTES = /^\/v1\/(?:events|sessions(?:\/activity|\/[^/]+\/(?:turns|metadata|events|summary|timing))?|relayfacts(?:\/[^/]+)?)$/;
 const READ_API_CURSOR = /^b96[a-z][0-9]+:/;
 /** relayfacts topic pages issue their own opaque cursors (md1: today), never session cursors. */
 const RELAYFACTS_ROUTE = /^\/v1\/relayfacts(?:\/|$)/;
