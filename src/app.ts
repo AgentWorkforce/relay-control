@@ -588,6 +588,17 @@ export function createApp(input: {
   // api_url == <its site>/cloud, so sign-in answers name the origin the
   // request arrived on. Only these configured origins are ever echoed, so a
   // forged Host header cannot point a client elsewhere.
+  //
+  // A third origin (SELFHOST_ROUTED_SITE_URL, docs/repository-guide.md): an edge
+  // router on another site origin forwards <site>/cloud/... here, so those
+  // requests arrive with this service's own Host, and the router sets
+  // x-original-host to its site's host. That header only selects among
+  // configured values; nothing from it is echoed. It is honoured without proof
+  // from the router because the origin goes back only to the caller that sent
+  // the header, is an operator-configured public value, scopes no cookie, is
+  // never the target of a redirect sent here and is not stored. That is also
+  // why only the Desktop/CLI API answers use apiSiteBaseUrl: emailed links,
+  // OIDC redirect URIs and the MCP endpoint URL keep the Host-selected origin.
   const siteBases = new Map<string, string>([
     [new URL(config.dashboardUrl).host.toLowerCase(), new URL(config.dashboardUrl).origin],
     [new URL(config.publicBaseUrl).host.toLowerCase(), config.publicBaseUrl.replace(/\/+$/, "")],
@@ -595,6 +606,16 @@ export function createApp(input: {
   function siteBaseUrl(request: IncomingMessage): string {
     const host = typeof request.headers.host === "string" ? request.headers.host.trim().toLowerCase() : "";
     return siteBases.get(host) ?? config.publicBaseUrl.replace(/\/+$/, "");
+  }
+  const routedSiteOrigin = config.routedSiteOrigin ?? null;
+  const routedSiteHost = routedSiteOrigin ? new URL(routedSiteOrigin).host.toLowerCase() : null;
+  function apiSiteBaseUrl(request: IncomingMessage): string {
+    if (routedSiteOrigin && routedSiteHost) {
+      // One header, one value: Node joins repeats with ", ", which never matches.
+      const forwarded = request.headers["x-original-host"];
+      if (typeof forwarded === "string" && forwarded.trim().toLowerCase() === routedSiteHost) return routedSiteOrigin;
+    }
+    return siteBaseUrl(request);
   }
   // Hosted MCP (shared-sessions facade): reads, team activity, capabilities.
   const amp = input.amp?.config.enabled ? input.amp : null;
@@ -1651,7 +1672,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
           ...(consentedHostName ? { consentedHostName } : {}),
         });
         response.writeHead(status, {
-          location: handoffCallbackUrl(login, issued, `${siteBaseUrl(request)}/cloud`),
+          location: handoffCallbackUrl(login, issued, `${apiSiteBaseUrl(request)}/cloud`),
           "cache-control": "no-store",
           "referrer-policy": "no-referrer",
         });
@@ -1746,7 +1767,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         accessTokenExpiresAt: issued.accessTokenExpiresAt,
         refreshToken: issued.refreshToken,
         refreshTokenExpiresAt: issued.refreshTokenExpiresAt,
-        apiUrl: `${siteBaseUrl(request)}/cloud`,
+        apiUrl: `${apiSiteBaseUrl(request)}/cloud`,
         tokenType: "Bearer",
       }, true);
       return;
@@ -1901,7 +1922,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         accessTokenExpiresAt: issued.accessTokenExpiresAt,
         refreshToken: issued.refreshToken,
         refreshTokenExpiresAt: issued.refreshTokenExpiresAt,
-        apiUrl: `${siteBaseUrl(request)}/cloud`,
+        apiUrl: `${apiSiteBaseUrl(request)}/cloud`,
         tokenType: "Bearer",
         workspace: {
           id: target.id,
@@ -1933,7 +1954,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // Under /cloud/api so it reaches this service on a shared dashboard
       // origin too (the ingress sends only /cloud/api and /login here). A GET
       // redirects to the dashboard's approval page.
-      const verification = `${siteBaseUrl(request)}/cloud/api/v1/auth/device/approve`;
+      const verification = `${apiSiteBaseUrl(request)}/cloud/api/v1/auth/device/approve`;
       json(response, 201, {
         device_code: started.deviceCode,
         user_code: started.userCode,
@@ -2074,7 +2095,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         scope: result.tokens.scopes.join(" "),
         // Hosted Cloud's shape: the API base is the site's /cloud mount, and
         // Desktop refuses a sign-in whose api_url is anything else.
-        api_url: `${siteBaseUrl(request)}/cloud`,
+        api_url: `${apiSiteBaseUrl(request)}/cloud`,
       }, true);
       return;
     }
@@ -2134,7 +2155,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         access_token_expires_at: result.tokens.accessTokenExpiresAt,
         refresh_token_expires_at: result.tokens.refreshTokenExpiresAt,
         scope: result.tokens.scopes.join(" "),
-        api_url: `${siteBaseUrl(request)}/cloud`,
+        api_url: `${apiSiteBaseUrl(request)}/cloud`,
         // Workspace policy (docs/workspace-policy.md): whether this session is
         // managed (the key carries admin policy consent), the revision to
         // compare a cached policy against, and the document itself so the
@@ -2170,7 +2191,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
         refreshToken: issued.refreshToken,
         refreshTokenExpiresAt: issued.refreshTokenExpiresAt,
         tokenType: "Bearer",
-        apiUrl: `${siteBaseUrl(request)}/cloud`,
+        apiUrl: `${apiSiteBaseUrl(request)}/cloud`,
       }, true);
       return;
     }

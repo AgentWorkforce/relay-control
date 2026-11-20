@@ -1471,7 +1471,8 @@ paths:
         handoff access token bound to the challenge and redirects (307) to the
         loopback redirect_uri with state, access_token,
         access_token_expires_at and api_url (<site>/cloud: the dashboard or
-        public origin the request arrived on). No
+        public origin the request arrived on, or SELFHOST_ROUTED_SITE_URL
+        through its edge router). No
         refresh token is placed in the URL. With desktop_host_name, a consent
         page asks the person to approve "Agent Relay Desktop on <host>" first;
         its Approve posts the same parameters back (303 on approval).
@@ -1561,7 +1562,7 @@ paths:
                   accessTokenExpiresAt: { type: string, format: date-time }
                   refreshToken: { type: string }
                   refreshTokenExpiresAt: { type: string, format: date-time }
-                  apiUrl: { type: string, description: "<site>/cloud (the dashboard or public origin the request arrived on)" }
+                  apiUrl: { type: string, description: "<site>/cloud (the dashboard or public origin the request arrived on, or SELFHOST_ROUTED_SITE_URL through its edge router)" }
                   tokenType: { type: string, enum: [Bearer] }
         "400":
           description: Missing codeVerifier
@@ -9833,7 +9834,7 @@ components:
         api_url:
           type: string
           format: uri
-          description: "`<site>/cloud`, as hosted Cloud returns; Desktop requires it. <site> is SELFHOST_DASHBOARD_URL's origin when the request arrived on the dashboard host, otherwise SELFHOST_PUBLIC_URL."
+          description: "`<site>/cloud`, as hosted Cloud returns; Desktop requires it. <site> is SELFHOST_ROUTED_SITE_URL when set and the request carries one x-original-host header naming its host, else SELFHOST_DASHBOARD_URL's origin when the request arrived on the dashboard host, otherwise SELFHOST_PUBLIC_URL."
     DeviceLookup:
       type: object
       required: [user_code, client_name, desktop_host_name, status, expires_at, current_workspace_id, workspaces]
@@ -9888,7 +9889,7 @@ components:
         apiUrl:
           type: string
           format: uri
-          description: "`<site>/cloud` (the dashboard or public origin the request arrived on)"
+          description: "`<site>/cloud` (the dashboard or public origin the request arrived on, or SELFHOST_ROUTED_SITE_URL through its edge router)"
     Whoami:
       type: object
       required:
