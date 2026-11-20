@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { hash, ReplicasError, type ReplicasDeps, type ResolvedBinding } from "./service.js";
+import { hash, inboundDelivery, ReplicasError, type ReplicasDeps, type ResolvedBinding } from "./service.js";
 
 /**
  * The replica-side Agent Relay tools (list_relay_agents, check_relay_inbox,
@@ -8,6 +8,9 @@ import { hash, ReplicasError, type ReplicasDeps, type ResolvedBinding } from "./
  * (service.withCapability) and returns a plain result. The capability RPC
  * route is one caller; any later replica transport calls the same handlers.
  * None of them grants session, admin, spawn or channel-management scope.
+ * The list and inbox results carry `inbound_delivery`: whether Relay
+ * messages are also pushed into the replica's chat. check_relay_inbox works
+ * either way, and shows a pushed message until it is acknowledged.
  */
 export const outgoingInput = z.object({
   to: z.string().min(1).max(256).nullable().optional(),
@@ -28,6 +31,7 @@ export async function listRelayAgents(deps: ReplicasDeps, binding: ResolvedBindi
   return {
     agent: binding.row.agent_name,
     agents: agents.map((agent) => ({ name: agent.name, address: agent.address, kind: agent.kind, status: agent.status })),
+    inbound_delivery: inboundDelivery(binding.row),
   };
 }
 
@@ -35,7 +39,8 @@ export async function checkRelayInbox(deps: ReplicasDeps, binding: ResolvedBindi
   const parsed = inboxInput.safeParse(raw ?? {});
   if (!parsed.success) throw new ReplicasError("Unsupported binding action or arguments.");
   for (const deliveryId of parsed.data.acknowledge) await deps.relaycast.acknowledgeDelivery(binding.token, deliveryId);
-  return { agent: binding.row.agent_name, messages: await deps.relaycast.readHostedInbox(binding.token) };
+  return { agent: binding.row.agent_name, messages: await deps.relaycast.readHostedInbox(binding.token),
+    inbound_delivery: inboundDelivery(binding.row) };
 }
 
 export async function sendRelayMessage(deps: ReplicasDeps, binding: ResolvedBinding, raw: unknown) {

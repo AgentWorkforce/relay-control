@@ -198,7 +198,8 @@ test("staff mints over a CLI login, lists without token material, revokes idempo
   assert.ok(Math.abs(days - 7) < 0.01, `expires after ${days} days`);
   const defaulted = await env.mintGrant();
   const defaultDays = (Date.parse(defaulted.grant.expires_at) - Date.parse(defaulted.grant.created_at)) / 86_400_000;
-  assert.ok(Math.abs(defaultDays - 90) < 0.01);
+  // No expires_in_days: the default stays 90 days although the cap is 365.
+  assert.ok(Math.abs(defaultDays - 90) < 0.01, `default expires after ${defaultDays} days`);
 
   // Stored only as a hash; never in a list or an audit row.
   const row = (await env.database.query<{ token_hash: string }>(
@@ -324,7 +325,7 @@ test("mint input is validated, the lifetime CHECK holds, and minting is rate lim
   const env = await setup(t);
   const bad: Array<Record<string, unknown>> = [
     {}, { reason: "" }, { reason: "   " }, { reason: "x".repeat(501) }, { reason: 7 },
-    { reason: "ok", expires_in_days: 0 }, { reason: "ok", expires_in_days: 91 }, { reason: "ok", expires_in_days: 1.5 },
+    { reason: "ok", expires_in_days: 0 }, { reason: "ok", expires_in_days: 366 }, { reason: "ok", expires_in_days: 1.5 },
     { reason: "ok", expires_in_days: "7" }, { reason: "ok", expires_in_days: -1 },
   ];
   for (const body of bad) {
@@ -332,11 +333,22 @@ test("mint input is validated, the lifetime CHECK holds, and minting is rate lim
     assert.equal(answer.status, 400, JSON.stringify(body));
     assert.equal(answer.body.error, "invalid_request");
   }
-  assert.equal((await env.mintGrant({ reason: "x".repeat(500), expires_in_days: 90 })).grant.reason.length, 500);
+  // The cap is 365 days (0080): a year may be asked for explicitly.
+  const year = (await env.mintGrant({ reason: "x".repeat(500), expires_in_days: 365 })).grant;
+  assert.equal(year.reason.length, 500);
+  const yearDays = (Date.parse(year.expires_at) - Date.parse(year.created_at)) / 86_400_000;
+  assert.ok(Math.abs(yearDays - 365) < 0.01, `expires after ${yearDays} days`);
+
+  // The table enforces the same ceiling: 365 days fits, 366 does not.
+  await env.database.query(
+    `INSERT INTO staff_read_grants (id, workspace_id, organization_id, staff_user_id, staff_organization_id, reason, token_hash, expires_at)
+     VALUES ($1, $2, $3, $4, $5, 'a year', $6, now() + interval '365 days')`,
+    [randomUUID(), env.customerWorkspace, env.customer.id, env.operator.ownerId, env.operator.id, sha256("year")],
+  );
 
   await assert.rejects(env.database.query(
     `INSERT INTO staff_read_grants (id, workspace_id, organization_id, staff_user_id, staff_organization_id, reason, token_hash, expires_at)
-     VALUES ($1, $2, $3, $4, $5, 'too long', $6, now() + interval '91 days')`,
+     VALUES ($1, $2, $3, $4, $5, 'too long', $6, now() + interval '366 days')`,
     [randomUUID(), env.customerWorkspace, env.customer.id, env.operator.ownerId, env.operator.id, sha256("x")],
   ), /staff_read_grant_lifetime/);
   // A grant cannot name a workspace under the wrong organization.
@@ -350,7 +362,8 @@ test("mint input is validated, the lifetime CHECK holds, and minting is rate lim
   const limited = await env.mint(env.staffToken);
   assert.equal(limited.status, 429);
   assert.equal(limited.body.error, "rate_limited");
-  assert.equal((await env.database.query("SELECT 1 FROM staff_read_grants")).rows.length, 10);
+  // Ten minted grants plus the 365-day row inserted directly above.
+  assert.equal((await env.database.query("SELECT 1 FROM staff_read_grants")).rows.length, 11);
 });
 
 test("the credential reaches only the shared-session read tools of its workspace", async (t) => {

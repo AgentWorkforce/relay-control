@@ -24,8 +24,6 @@ export const KEYRING = { active: { id: "fake-key", key: Buffer.alloc(32, 7) } };
 export const URL = "https://api2.cursor.sh/automations/webhook/rt_fake";
 export const KEY = "crsr_" + "fake_routine_key_".repeat(3);
 
-export const ORIGIN_FOR_TESTS = "https://relay.example.test";
-
 /** A Grok Bot OAuth connection on a self-hosted app, with the Cloud copy on unless cloudCopy is false. */
 export async function grokFixture(t: test.TestContext, cloudCopy = true, extra: { dynamicPrompt?: { bootstrapVersion: number }; agentRules?: AgentRules } = {}) {
   const database = new PGliteDatabase(); t.after(() => database.close()); await migrate(database);
@@ -46,8 +44,10 @@ export async function grokFixture(t: test.TestContext, cloudCopy = true, extra: 
   const sessions = new McpOAuthSessions(database, { protocol, tenancyMode: "multi", now: () => now });
   const pair = await database.transaction(tx => sessions.issue(tx, { ...owner, scopes: ["relay:mcp"] }));
   const world = createRelaycastWorld([]);
+  const relayPaths: string[] = [];
   const relayFetch: typeof fetch = async (input, init) => {
     const url = new globalThis.URL(input instanceof Request ? input.url : String(input)), headers = new Headers(init?.headers);
+    relayPaths.push(`${init?.method ?? "GET"} ${url.pathname}`);
     if (url.pathname === "/v1/agents" && (init?.method ?? "GET") === "GET") return Response.json({ ok: true,
       data: [...world.agents.values()].map(agent => ({ ...agent, address: `${agent.name}@cloud-${agent.id}`, last_seen: new Date().toISOString() })) });
     const result = await world.handle(init?.method ?? "GET", url.pathname, url.searchParams,
@@ -83,11 +83,20 @@ export async function grokFixture(t: test.TestContext, cloudCopy = true, extra: 
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const sender = (name = "sender", metadata: Record<string, unknown> = {}) => world.agents.get(name) ?? world.addAgent(name, metadata);
+  /** An agent this person owns as this service records it: a Desktop identity row (never agent metadata). */
+  const ownAgent = async (name: string) => {
+    const agent = sender(name);
+    await database.query(`INSERT INTO desktop_relay_identities(id,workspace_id,organization_id,user_id,relaycast_workspace_id,source_id,agent_name,
+      agent_remote_id,address,token_ciphertext) VALUES ($1,$2,$3,$4,'fake-workspace',$5,$6,$7,$8,$9)`,
+    [randomUUID(), owner.workspaceId, owner.organizationId, owner.userId, randomUUID(), name, agent.id, `${name}@laptop`,
+      encryptSecret(agent.token, KEYRING.active)]);
+    return agent;
+  };
   const message = async (from = "sender", text = "PRIVATE_MESSAGE_BODY") =>
     cast.sendDirectMessage({ token: sender(from).token, to: "fake-grok", text, idempotencyKey: randomUUID() });
   const issue = (grantId: string, tokenFamilyId: string) =>
     database.transaction(tx => sessions.issue(tx, { ...owner, grantId, tokenFamilyId, scopes: ["relay:mcp"] }));
-  return { database, owner, addGrant, issue, pair, store, base, browser, routines, world, calls, tool, setup, message, sender,
-    advance: () => { now = new Date(now.getTime() + 301_000); }, fail: (status: number) => { webhookStatus = status; } };
+  return { database, owner, addGrant, issue, pair, store, base, browser, routines, world, calls, tool, setup, message, sender, ownAgent, relayPaths, cast,
+    advance: (ms = 301_000) => { now = new Date(now.getTime() + ms); }, fail: (status: number) => { webhookStatus = status; } };
 }
 

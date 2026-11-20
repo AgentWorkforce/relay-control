@@ -1,8 +1,10 @@
+import type { CursorCloudDeps } from "./cursor-cloud.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { correlateMcpResponse, instrumentMcpTransport, withMcpDiagnosticContext } from "./request-diagnostics.js";
 import type { GrokRoutines } from "./grok-routines.js";
 import type { AgentRules } from "../agent-rules/service.js";
-import { connectorKind } from "./oauth/connector-kind.js";
+import { connectorKind, isGrokRoutineKind } from "./oauth/connector-kind.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { ApiTokenStore } from "../admin/api-tokens.js";
@@ -25,6 +27,7 @@ import { historyReader, type McpContext, type McpMember } from "./context.js";
 import { ClaudeAttestationError, claudeAttestationFor, type ClaudeAttestation } from "./claude-attestation.js";
 import { CopilotAttestationError, copilotAttestationFor, postgresAttestationStore, type CopilotAttestation } from "./copilot-attestation.js";
 import { desktopCallContext, DesktopCallContextError } from "./desktop-call.js";
+import { nativeContextRefusalReason, responseCorrelationId, type NativeContextStage } from "./native-context-refusal.js";
 import { auditUnhandledReadCalls } from "./read-audit.js";
 import { buildMcpServer } from "./server.js";
 import { admitMcpOAuthBearer, type McpOAuthConnection } from "./oauth/admission.js";
@@ -45,17 +48,24 @@ const MAX_BODY_BYTES = 64 * 1024;
 /** Copilot calls carry a signed proof of the exact arguments, so their cap is larger (Cloud's limit). */
 const COPILOT_MAX_BODY_BYTES = 128 * 1024;
 const MCP_SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const SAFE_ERROR_NAMES = new Set([
+  "Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError", "EvalError", "AggregateError",
+  "AbortError", "TimeoutError", "DatabaseError", "PostgresError", "McpError", "UpstreamError", "SessionReadError",
+]);
 
 type JsonRpcId = string | number | null;
 
 function rpcError(response: ServerResponse, status: number, code: number, message: string,
   id: JsonRpcId = null, headers: Record<string, string> = {}): void {
+  const correlationId = response.getHeader("x-correlation-id") as string;
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     ...headers,
   });
-  response.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id }));
+  console.error("[mcp] request failed", { endpoint: "shared-sessions", status, correlationId });
+  response.end(JSON.stringify({ jsonrpc: "2.0", error: { code,
+    message, data: { correlation_id: correlationId } }, id }));
 }
 
 /**
@@ -149,10 +159,13 @@ export function createMcpHandler(input: {
   /** Own credential resolver, used only at these MCP routes when the module is enabled. */
   oauthSessions?: McpOAuthSessions;
   grokRoutines?: GrokRoutines;
+  cursorCloud?: CursorCloudDeps;
   /** get_agent_rules source; every context but a staff read grant gets it. */
   agentRules?: AgentRules;
   /** Clock for shared-session read audit records; tests inject it. */
   now?: () => Date;
+  /** Observe handled unexpected failures without changing their MCP response. */
+  onError?: (error: unknown, context: { path: string; status: number }) => void;
 }) {
   const { config, store } = input;
   const apiTokens = new ApiTokenStore(store.database);
@@ -160,6 +173,14 @@ export function createMcpHandler(input: {
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy);
   const attestations = postgresAttestationStore(store.database);
   const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.fetchImpl });
+  function reportUnexpected(error: unknown, request: IncomingMessage, response: ServerResponse, path: string): void {
+    let errorPath = path;
+    try { errorPath = new URL(request.url ?? path, config.publicBaseUrl).pathname; } catch { /* Use the matched route. */ }
+    try { input.onError?.(error, { path: errorPath, status: 500 }); } catch { /* Telemetry cannot change the response. */ }
+    // Error.name is writable too. Keep only fixed class names, never a message.
+    const name = error instanceof Error && SAFE_ERROR_NAMES.has(error.name) ? error.name : error instanceof Error ? "Error" : "unknown";
+    console.error("[selfhost-mcp] Request failed", { error: name, correlationId: response.getHeader("x-correlation-id") });
+  }
   // Gate-only installs only: desktop identities hold rg_ tokens that only relaygate accepts.
   const gateClient = config.relaygatePublicUrl
     ? createRelaycastClient({ internalOrigin: config.relaygatePublicUrl, fetchImpl: input.fetchImpl })
@@ -290,7 +311,7 @@ export function createMcpHandler(input: {
       oauth:undefined as McpOAuthConnection|undefined };
   }
 
-  return async function handle(
+  async function handleRequest(
     request: IncomingMessage,
     response: ServerResponse,
     path: string,
@@ -345,6 +366,7 @@ export function createMcpHandler(input: {
     }
     const headers = webHeaders(request);
     let desktopCall;
+    let stage: NativeContextStage = provider === "copilot" ? "copilot_attestation" : "claude_attestation";
     try {
       // Always strips `_agent_relay_attestation` from the arguments; a proof
       // that does not verify refuses the call (no unattested fallback).
@@ -357,18 +379,21 @@ export function createMcpHandler(input: {
       const attested: CopilotAttestation | ClaudeAttestation | undefined = provider === "copilot"
         ? await copilotAttestationFor(body, auth, attestations)
         : await claudeAttestationFor(body, callHeaders, auth, attestations);
+      stage = "desktop_context";
       desktopCall = desktopCallContext(body, callHeaders, provider, attested);
     } catch (error) {
       // Store failures are server errors, not a refused proof.
       if (!(error instanceof CopilotAttestationError) && !(error instanceof ClaudeAttestationError) &&
           !(error instanceof DesktopCallContextError)) throw error;
       const parsed = JSONRPCRequestSchema.safeParse(body);
-      // The response stays generic; the operator log names the check that
-      // failed (never the proof, the token or the arguments).
+      // The response stays generic; the operator log joins it by correlation
+      // id and names the stage and a fixed reason code (never the verifier's
+      // message, the proof, the token or the arguments).
       const call = body as { method?: unknown; params?: { name?: unknown } } | null;
       console.warn("[selfhost-mcp] native chat context refused", {
-        check: error.name,
-        reason: error.message,
+        correlation_id: responseCorrelationId(response),
+        stage,
+        reason: nativeContextRefusalReason(stage, error),
         method: typeof call?.method === "string" ? call.method : null,
         tool: typeof call?.params?.name === "string" ? call.params.name : null,
         provider: provider ?? null,
@@ -401,8 +426,8 @@ export function createMcpHandler(input: {
       providers: async () => (await providerStatuses(input.providerProbes)).map(provider => provider.id === "grok-bot"
         ? { ...provider, mcpGroupsRegistered: Boolean(context.grokRoutines) } : provider),
       relaycast: {
-        listAgents: (status) => relaycast.listAgents(workspace.relaycastApiKey, status),
-        listPresence: () => relaycast.listPresence(workspace.relaycastApiKey),
+        listAgents: (status, options) => relaycast.listAgents(workspace.relaycastApiKey, status, { signal: options?.signal }),
+        listPresence: (options) => relaycast.listPresence(workspace.relaycastApiKey, { signal: options?.signal }),
       },
       relay: {
         database: store.database,
@@ -413,6 +438,7 @@ export function createMcpHandler(input: {
         ...(config.relaygatePublicUrl ? { relaygatePublicUrl: config.relaygatePublicUrl } : {}),
         ...(launchCheck ? { launchCheck } : {}),
         ...(gateClient ? { gateClient } : {}),
+        ...(config.spawnMemoryPolicy ? { spawnMemoryPolicy: config.spawnMemoryPolicy } : {}),
       },
       ...(!oauth && !staffGrant && input.amp ? { amp: input.amp } : {}),
       ...(!oauth && !staffGrant && input.replicas ? { replicas: input.replicas } : {}),
@@ -423,11 +449,12 @@ export function createMcpHandler(input: {
       ...(input.launch && !staffGrant ? { launch: true } : {}),
       readAudit: { database: store.database, handled: new Set<string>(), ...(input.now ? { now: input.now } : {}) },
     };
+    if (oauth && input.cursorCloud) context.cursorCloud = input.cursorCloud;
     if (input.agentRules && !staffGrant) context.agentRules = input.agentRules;
     if (oauth && input.grokRoutines) {
       const client = (await store.database.query<{ client_name: string | null; redirect_uris: string[] }>(
         "SELECT client_name,redirect_uris FROM mcp_oauth_clients WHERE client_id=$1", [oauth.access.clientId])).rows[0];
-      if (client && connectorKind({ clientName: client.client_name, redirectUris: client.redirect_uris }) === "grok-bot") {
+      if (client && isGrokRoutineKind(connectorKind({ clientName: client.client_name, redirectUris: client.redirect_uris }))) {
         context.grokRoutines = input.grokRoutines;
       }
     }
@@ -456,13 +483,14 @@ export function createMcpHandler(input: {
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
       });
+      instrumentMcpTransport(transport, "shared-sessions");
       await server.connect(transport);
       const url = new URL(rawPath, site);
-      const webResponse = await transport.handleRequest(
+      const webResponse = await correlateMcpResponse(await transport.handleRequest(
         // The proof is gone from `body`; the transport never sees it.
         new Request(url, { method: "POST", headers, body: JSON.stringify(body) }),
         { parsedBody: body },
-      );
+      ), "shared-sessions");
       const out: Record<string, string> = {};
       webResponse.headers.forEach((value, name) => { out[name] = value; });
       out["cache-control"] = "no-store";
@@ -473,12 +501,28 @@ export function createMcpHandler(input: {
       response.writeHead(webResponse.status, out);
       response.end(payload);
     } catch (error) {
-      console.error("[selfhost-mcp] Request failed", { error: error instanceof Error ? error.name : "unknown" });
+      reportUnexpected(error, request, response, path);
       if (!response.headersSent) rpcError(response, 500, -32603, "Internal server error");
       else response.end();
     } finally {
       await server.close().catch(() => {});
     }
     return true;
+  }
+
+  return async function handle(request: IncomingMessage, response: ServerResponse, path: string, method: string): Promise<boolean> {
+    if (path !== MCP_FACADE.path && !(oauthSessions && (path === "/mcp" || path === "/cloud/mcp"))) return false;
+    response.setHeader("x-correlation-id", randomUUID());
+    try {
+      return await withMcpDiagnosticContext(response.getHeader("x-correlation-id") as string,
+        () => handleRequest(request, response, path, method));
+    } catch (error) {
+      // Admission, membership and server construction failures used to escape
+      // to the generic HTTP handler, losing the MCP error and its correlation.
+      reportUnexpected(error, request, response, path);
+      if (!response.headersSent) rpcError(response, 500, -32603, "The MCP service is temporarily unavailable. Please try again.");
+      else response.end();
+      return true;
+    }
   };
 }

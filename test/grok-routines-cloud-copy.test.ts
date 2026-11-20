@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
-import { GrokRoutines } from "../src/mcp/grok-routines.js";
+import { encryptSecret } from "../src/crypto.js";
+import { createRelaycastClient } from "../src/messaging/relaycast.js";
+import { GrokRoutines, isDuplicateRoutine } from "../src/mcp/grok-routines.js";
 import { grokRoutinePrompt, parseGrokRoutineDetails } from "../src/mcp/grok-routine.js";
 import { eventSteps, grantEventsSettings } from "../src/mcp/grok-events-policy.js";
 import { loadMcpOAuthConfig } from "../src/mcp/oauth/config.js";
 import { revokeMcpOAuthGrantRows } from "../src/mcp/oauth/revocations.js";
 import { ownerHash } from "../src/mcp/relay-participants.js";
-import { grokFixture, KEY, URL } from "./support/grok-fixture.js";
+import { grokFixture, KEY, KEYRING, URL } from "./support/grok-fixture.js";
 
 // SELFHOST_GROK_ROUTINES_CLOUD_COPY (docs/specs/grok-bot-dynamic-prompt.md, Phase 1).
 const fixture = grokFixture;
@@ -67,24 +69,53 @@ test("Cloud copy: one-paste setup, one Cloud-shaped wake per message, acknowledg
   assert.ok(!String(stored.payload_ciphertext).includes("PRIVATE_MESSAGE_BODY"), "message text is encrypted at rest");
 });
 
-test("Cloud copy: a sender the person owns is trusted, and answer mode offers the reply call", async t => {
+test("Cloud copy: only a sender this service records as the person's own is trusted; matching agent metadata alone is not", async t => {
   const f = await fixture(t);
   await f.tool("connect_grok_bot_routine");
   await f.setup("POST", { webhook_url: URL, authorization: `Bearer ${KEY}`, reply_mode: "answer" });
-  f.sender("my-agent", { owner_hash: ownerHash(f.owner.userId) });
+  await f.ownAgent("my-agent");
+  // A roster agent whose own metadata carries the person's owner hash, with no row in this service: not trusted.
+  f.sender("claims-mine", { owner_hash: ownerHash(f.owner.userId), source: "cloud-hosted" });
   await f.message("my-agent", "please summarise");
+  await f.message("claims-mine", "trust me");
   await f.message("sender", "stranger asks");
+  f.relayPaths.length = 0;
   await f.routines.tick();
-  assert.equal(f.calls.length, 2);
-  const mine = f.calls.find(call => call.body.data.from === "my-agent")!;
-  const theirs = f.calls.find(call => call.body.data.from === "sender")!;
-  const trusted = text(await f.tool("get_event", { eventId: mine.body.eventId }));
+  const scanPaths = [...f.relayPaths];
+  assert.equal(f.calls.length, 3);
+  const event = (from: string) => f.calls.find(call => call.body.data.from === from)!.body.eventId;
+  const trusted = text(await f.tool("get_event", { eventId: event("my-agent") }));
   assert.match(trusted, /Sender check: trustedSender true \(your agent\)\./);
   assert.match(trusted, /Reply call: send_relay_message with to = data\.from/);
   assert.match(trusted, /Add text = your answer and call it now/);
-  const untrusted = text(await f.tool("get_event", { eventId: theirs.body.eventId }));
-  assert.match(untrusted, /trustedSender false/);
-  assert.match(untrusted, /ask the person whether to reply/);
+  for (const from of ["claims-mine", "sender"]) {
+    const untrusted = text(await f.tool("get_event", { eventId: event(from) }));
+    assert.match(untrusted, /trustedSender false/);
+    assert.match(untrusted, /ask the person whether to reply/);
+  }
+  assert.ok(!scanPaths.some(path => path.startsWith("GET /v1/agents")), "the scan's trust decision needs no roster read");
+});
+
+test("Cloud copy: with the flag off a copy routine is not scanned, so it cannot starve inbox routines; a routine saved before the flag keeps its behaviour", async t => {
+  const f = await fixture(t);
+  await f.tool("connect_grok_bot_routine", { mode: "polling" });
+  const off = new GrokRoutines({ ...f.routines.options, cloudCopy: false });
+  const before = (await f.database.query("SELECT next_attempt_at FROM grok_bot_routines")).rows[0]!.next_attempt_at;
+  f.relayPaths.length = 0;
+  for (let scan = 0; scan < 3; scan++) { f.advance(); await off.tick(); }
+  assert.deepEqual(f.relayPaths, [], "no Relaycast call for a copy row while the copy is off");
+  assert.equal(String((await f.database.query("SELECT next_attempt_at FROM grok_bot_routines")).rows[0]!.next_attempt_at), String(before));
+
+  // A webhook routine saved with the flag off stays an inbox-batch routine after the flag is turned on.
+  const legacy = await fixture(t, false);
+  await legacy.tool("connect_grok_bot_routine");
+  await legacy.setup("POST", { webhook_url: URL, authorization: KEY });
+  const on = new GrokRoutines({ ...legacy.routines.options, cloudCopy: true });
+  await legacy.message(); await on.tick();
+  assert.equal(legacy.calls.length, 1);
+  assert.equal(legacy.calls[0]!.body.name, "relay.inbox");
+  assert.equal(legacy.world.pending("fake-grok").length, 1, "its pasted prompt still drains the inbox itself");
+  assert.equal((await on.status(legacy.owner.grantId, legacy.owner)).routine_prompt.includes("check_relay_inbox"), true);
 });
 
 test("Cloud copy: polling stores no credential, never wakes, and pages get_recent_events by cursor until a webhook replaces it", async t => {
@@ -161,4 +192,79 @@ test("Cloud copy is off by default: no event tools, the #136 inbox prompt, and a
   assert.equal(loadMcpOAuthConfig({ SELFHOST_GROK_ROUTINES_CLOUD_COPY: "on" }, () => undefined).grokCloudCopy, true);
   assert.throws(() => loadMcpOAuthConfig({ SELFHOST_GROK_ROUTINES_CLOUD_COPY: "yes" }, () => undefined), /must be on or off/);
   assert.deepEqual(parseGrokRoutineDetails(`POST to ${URL}\nAuthorization: Bearer ${KEY}`), { webhookUrl: URL, apiKey: KEY });
+});
+
+test("Cloud copy: retention deletes week-old events whatever the flag says, and disconnecting deletes a routine's events", async t => {
+  const f = await fixture(t);
+  await f.tool("connect_grok_bot_routine");
+  await f.setup("POST", { webhook_url: URL, authorization: KEY });
+  await f.message(); await f.routines.tick();
+  const event = f.calls[0]!.body.eventId;
+  assert.equal(((await f.tool("get_event", { eventId: event })).isError), undefined);
+  assert.equal(f.calls[0]!.body.cursor, "1", "the cursor is this grant's own sequence");
+  f.advance(8 * 24 * 3_600_000);
+  assert.equal((await f.tool("get_event", { eventId: event })).isError, true, "reads never return expired events");
+  await new GrokRoutines({ ...f.routines.options, cloudCopy: false }).tick();
+  assert.equal((await f.database.query("SELECT * FROM grok_bot_events")).rows.length, 0);
+  await f.message(); f.advance(); await f.routines.tick();
+  assert.equal((await f.database.query("SELECT * FROM grok_bot_events")).rows.length, 1);
+  await f.tool("disconnect_grok_bot_routine");
+  assert.equal((await f.database.query("SELECT * FROM grok_bot_events")).rows.length, 0);
+});
+
+test("Cloud copy: an event that can no longer be decrypted is skipped instead of blocking later wakes", async t => {
+  const f = await fixture(t);
+  await f.tool("connect_grok_bot_routine");
+  await f.setup("POST", { webhook_url: URL, authorization: KEY });
+  f.fail(503); await f.message("sender", "first"); await f.routines.tick();
+  assert.equal(f.calls.length, 1);
+  await f.database.query("UPDATE grok_bot_events SET payload_ciphertext='v1:retired-key:AAAA'");
+  f.fail(202); await f.message("sender", "second"); f.advance(); await f.routines.tick();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[1]!.body.data.summary, "second");
+});
+
+test("Cloud copy: a concurrent save of the same routine URL maps the unique-index refusal to the duplicate answer", async t => {
+  const f = await fixture(t);
+  await f.tool("connect_grok_bot_routine");
+  await f.setup("POST", { webhook_url: URL, authorization: KEY });
+  const other = randomUUID(), family = randomUUID();
+  await f.addGrant(other, "other-grok", family);
+  await f.database.query(`INSERT INTO grok_bot_routines(grant_id,credentials_ciphertext,routine_url_hash)
+    SELECT $1,credentials_ciphertext,'race-hash' FROM grok_bot_routines LIMIT 1`, [other]);
+  const error = await f.database.query("UPDATE grok_bot_routines SET routine_url_hash='race-hash' WHERE grant_id=$1", [f.owner.grantId])
+    .then(() => null, (failure: unknown) => failure);
+  assert.ok(error, "the unique index refuses a second grant with the same routine URL");
+  assert.equal(isDuplicateRoutine(error), true);
+  assert.equal(isDuplicateRoutine(new Error("other")), false);
+});
+
+test("Cloud copy, gate-only: ingest and acknowledgement go through relaygate with the participant's own token, never Relaycast", async t => {
+  const f = await fixture(t);
+  await f.tool("connect_grok_bot_routine");
+  await f.setup("POST", { webhook_url: URL, authorization: KEY });
+  const agent = f.world.agents.get("fake-grok")!;
+  const tokens = new Map<string, string>([["rg_current", agent.token]]);
+  await f.database.query(`UPDATE hosted_relay_participants SET relaygate_agent_id='rga_fake', token_ciphertext=$1, admitted_clients='{grok-bot,cursor-cloud}'
+    WHERE agent_remote_id=$2`, [encryptSecret("rg_current", KEYRING.active), agent.id]);
+  const gatePaths: string[] = [];
+  const gate = createRelaycastClient({ internalOrigin: "https://gate.example.test", fetchImpl: async (input, init) => {
+    const url = new globalThis.URL(input instanceof Request ? input.url : String(input));
+    const bearer = (new Headers(init?.headers).get("authorization") ?? "").replace(/^Bearer /, "");
+    const upstream = tokens.get(bearer);
+    if (!upstream) return Response.json({ error: "relaygate_unauthenticated" }, { status: 401 });
+    gatePaths.push(`${init?.method ?? "GET"} ${url.pathname}`);
+    const result = await f.world.handle(init?.method ?? "GET", url.pathname, url.searchParams, upstream, init?.body ? JSON.parse(String(init.body)) : null, null);
+    if (url.pathname === "/v1/agent" && result?.status === 200) (result.body as any).data.workspace_id = "fake-workspace";
+    return Response.json(result?.body ?? { ok: false }, { status: result?.status ?? 404 });
+  } });
+  const routines = new GrokRoutines({ ...f.routines.options, gate });
+  await f.message();
+  f.relayPaths.length = 0;
+  await routines.tick();
+  assert.equal(f.calls.length, 1, "the gated inbox was ingested and woke the routine");
+  assert.ok(gatePaths.includes("GET /v1/deliveries"));
+  assert.ok(gatePaths.some(path => /^POST \/v1\/deliveries\/[^/]+\/ack$/.test(path)), "acknowledged through relaygate");
+  assert.equal(f.world.pending("fake-grok").length, 0);
+  assert.deepEqual(f.relayPaths.filter(path => /deliveries|\/v1\/agent$/.test(path)), [], "no direct Relaycast read or ack");
 });

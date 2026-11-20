@@ -295,9 +295,30 @@ test("routes outside the read contract stay on History", async (t) => {
   const cfg = config();
   t.after(() => forgetSessionReadTokens(cfg));
 
-  const body = await historyReader(cfg, principal("user-a"), workspace("ws-a", "org-a"), "sh_at_user_a")("/v1/sessions/s-1/timing");
+  const body = await historyReader(cfg, principal("user-a"), workspace("ws-a", "org-a"), "sh_at_user_a")("/v1/sessions/s-1/catalog");
   assert.deepEqual(body, { from: "history" });
   assert.equal(seen.issues.length, 0);
+});
+
+test("searchable MCP sessions use one reader for directory, exact-session and timing reads", async t => {
+  const seen = fake(t), cfg = config();
+  t.after(() => forgetSessionReadTokens(cfg));
+  const read = historyReader(cfg, principal("user-a"), workspace("ws-a", "org-a"), "sh_at_user_a");
+
+  for (const path of [
+    "/v1/events?q=searchable",
+    "/v1/sessions?includeShortSummary=recorded",
+    "/v1/sessions/s-1/events?source=codex",
+    "/v1/sessions/s-1/timing?source=codex",
+  ]) await read(path);
+
+  assert.deepEqual(seen.reads.map(row => row.url.pathname), [
+    "/v1/events",
+    "/v1/sessions",
+    "/v1/sessions/s-1/events",
+    "/v1/sessions/s-1/timing",
+  ]);
+  assert.equal(seen.history.length, 0);
 });
 
 
@@ -343,7 +364,7 @@ test("reader cursors retain their exact bytes and never switch to History",async
   await assert.rejects(historyReader(config(),principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")("/v1/sessions?cursor=legacy-cursor"),/cursor has expired/);
   assert.equal(seen.issues.length,before);assert.equal(seen.history.length,0);
   // History is the read API too, so its cursors stay valid when a read is not selected.
-  for(const [other,path] of [[config(false),"/v1/sessions?cursor=b96l1:old"],[config(),"/v1/sessions/s-1/timing?cursor=b96l1:old"]] as const) {
+  for(const [other,path] of [[config(false),"/v1/sessions?cursor=b96l1:old"],[config(),"/v1/sessions/s-1/catalog?cursor=b96l1:old"]] as const) {
     assert.deepEqual(await historyReader(other,principal("user-a"),workspace("ws-a","org-a"),"sh_at_user_a")(path),{from:"history"});
   }
   assert.deepEqual(seen.history.map(row=>row.url.searchParams.get("cursor")),["b96l1:old","b96l1:old"]);

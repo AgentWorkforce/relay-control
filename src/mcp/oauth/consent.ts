@@ -5,7 +5,7 @@
  */
 import { createHash } from "node:crypto";
 import { agentNameError } from "./agent-name.js";
-import { connectorKind } from "./connector-kind.js";
+import { connectorKind, isGrokRoutineKind } from "./connector-kind.js";
 import { APP_BASE_PATH, MCP_EVENTS_SCOPE, type AuthorizationRequest, type createMcpOAuthProtocol } from "./protocol.js";
 
 export type McpConsentPrincipal = {
@@ -105,7 +105,7 @@ export function createMcpOAuthConsentHandlers(deps: {
       { ...validated.error, state: validated.state }) });
     const authorization = validated.value;
     const grok = authorization.resourcePath === "/api/v1/mcp/relay-events" && authorization.scopes.includes(MCP_EVENTS_SCOPE) &&
-      connectorKind({ clientName: client!.clientName, redirectUris: [authorization.redirectUri] }) === "grok-bot";
+      isGrokRoutineKind(connectorKind({ clientName: client!.clientName, redirectUris: [authorization.redirectUri] }));
     function finish(payload: unknown): Response {
       const response = oauthJson(payload);
       const hint = readNameHint(request, now());

@@ -5,7 +5,7 @@ import test, { type TestContext } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createApp } from "../src/app.js";
-import type { SelfhostConfig } from "../src/config.js";
+import { loadSpawnMemoryPolicy, type SelfhostConfig } from "../src/config.js";
 import { NO_FEATURES } from "../src/features.js";
 import { migrate } from "../src/migrations.js";
 import { launcherName } from "../src/mcp/relay-participants.js";
@@ -29,19 +29,22 @@ const FIRST_KEY = "rk_live_first";
 const OTHER_KEY = "rk_live_other";
 
 function node(id: string, name: string, options: { kind?: "desktop" | "broker" | null; teammates?: boolean; live?: boolean;
-  harnesses?: string[]; max?: number; active?: number } = {}) {
+  harnesses?: string[]; max?: number; active?: number; memory?: { availableGiB: number; totalGiB: number } } = {}) {
   const configured: Record<string, unknown> = {};
+  // A fresh relay-node sample (metadata.live) when the test gives one.
+  const live = options.memory ? { live: { observed_at: new Date().toISOString(), resources: { cpus: 8, load_1m: 1,
+    memory_available_bytes: options.memory.availableGiB * 1024 ** 3, memory_total_bytes: options.memory.totalGiB * 1024 ** 3 } } } : {};
   if (options.kind !== null) configured.node_kind = options.kind ?? "desktop";
   if (options.teammates !== undefined) configured.teammates = options.teammates;
   return {
     id, name, live: options.live ?? true, handlers_live: options.live ?? true,
     active_agents: options.active ?? 0, max_agents: options.max ?? 0, reserved_agents: 0,
-    capabilities: (options.harnesses ?? ["codex", "claude"]).map(harness => ({ name: `spawn:${harness}`, metadata: { configured } })),
+    capabilities: (options.harnesses ?? ["codex", "claude"]).map(harness => ({ name: `spawn:${harness}`, metadata: { configured, ...live } })),
     tags: ["repo:acme/app"],
   };
 }
 
-async function setup(t: TestContext, options: { launch?: boolean } = {}) {
+async function setup(t: TestContext, options: { launch?: boolean; env?: Record<string, string> } = {}) {
   const agents: unknown[] = [];
   const world = createRelaycastWorld(agents);
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -72,6 +75,7 @@ async function setup(t: TestContext, options: { launch?: boolean } = {}) {
     dashboardUrl: `${PUBLIC_ORIGIN}/`,
     port: 3000,
     host: "127.0.0.1",
+    ...(options.env ? { spawnMemoryPolicy: loadSpawnMemoryPolicy(options.env) } : {}),
   };
   const store = new ControlPlaneStore(database, config.encryptionKeyring, 0);
   const features = { ...NO_FEATURES, launch: options.launch ?? true };
@@ -423,4 +427,82 @@ test("a failed exact release can be retried with a new attempt; the worker bindi
   const released = data(await client.callTool({ name: "release_relay_agent", arguments: { spawn_id: receipt.spawn_id } }));
   assert.equal(released.status, "released");
   assert.equal(env.world.agents.has("reviewer-1"), false);
+});
+
+test("memory enforce: a desktop without the memory is refused with spawn_memory_low and the one that fits as the alternative", async (t) => {
+  const env = await setup(t, { env: { SELFHOST_SPAWN_MEMORY_POLICY: "enforce" } });
+  env.world.nodes.set(FIRST_KEY, [
+    node("small", "small-desktop", { memory: { availableGiB: 2.5, totalGiB: 16 } }),
+    node("large", "large-desktop", { memory: { availableGiB: 30, totalGiB: 64 } }),
+  ]);
+  await env.claim("small");
+  await env.claim("large");
+  const client = await env.connect();
+  const report = data(await client.callTool({ name: "describe_capabilities", arguments: {} }));
+  assert.equal(report.workspace.spawn_memory_policy, "enforce");
+
+  const listed = data(await client.callTool({ name: "list_relay_spawn_targets", arguments: { harness: "claude" } }));
+  assert.equal(listed.memory_policy, "enforce");
+  assert.deepEqual(listed.targets.map((item: { target_node: string }) => item.target_node), ["large", "small"]);
+  const small = listed.targets[1];
+  assert.equal(small.admissible, false);
+  assert.equal(small.memory.tier, "low");
+  assert.match(small.why, /Not enough memory: 2\.5 GB free of 16 GB; it keeps 2 GB free and claude needs 1\.5 GB\./);
+  assert.match(errorText(await client.callTool({ name: "list_relay_spawn_targets", arguments: { harness: "Not A Harness" } })),
+    /harness|Invalid/);
+
+  const refused = await client.callTool({ name: "spawn_relay_agent", arguments: launch("small", { cli: "claude" }) });
+  assert.equal(refused.isError, true);
+  const error = (refused.structuredContent as { error: Record<string, any> }).error;
+  assert.equal(error.code, "spawn_memory_low");
+  assert.equal(error.retryable, true);
+  assert.equal(error.message, 'Node "small-desktop" has 2.5 GB free; launching claude needs 1.5 GB on top of the 2 GB it keeps free.');
+  assert.equal(error.memory.reason, "available");
+  assert.equal(error.memory.floor_bytes, 2 * 1024 ** 3);
+  assert.deepEqual(error.alternatives.map((item: { target_node: string }) => item.target_node), ["large"]);
+  assert.equal("retry_after_seconds" in error, false);
+  // Refused before anything is journaled or sent.
+  assert.equal(env.world.bodies.some(body => body.path === "/v1/actions/spawn/invoke"), false);
+  assert.equal((await env.database.query("SELECT 1 FROM relay_spawns")).rows.length, 0);
+
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("large", { cli: "claude" }) })).status, "accepted");
+});
+
+test("memory enforce: with no alternative the refusal suggests when to retry", async (t) => {
+  const env = await setup(t, { env: { SELFHOST_SPAWN_MEMORY_POLICY: "enforce" } });
+  env.world.nodes.set(FIRST_KEY, [node("small", "small-desktop", { memory: { availableGiB: 2.5, totalGiB: 16 } })]);
+  await env.claim("small");
+  const client = await env.connect();
+  const error = (await client.callTool({ name: "spawn_relay_agent", arguments: launch("small", { cli: "claude" }) }))
+    .structuredContent as { error: Record<string, any> };
+  assert.equal(error.error.code, "spawn_memory_low");
+  assert.deepEqual(error.error.alternatives, []);
+  assert.equal(error.error.retry_after_seconds, 30);
+});
+
+test("memory observe (default): memory is reported but the same launch is accepted", async (t) => {
+  const env = await setup(t);
+  env.world.nodes.set(FIRST_KEY, [node("small", "small-desktop", { memory: { availableGiB: 2.5, totalGiB: 16 } })]);
+  await env.claim("small");
+  const client = await env.connect();
+  assert.equal(data(await client.callTool({ name: "describe_capabilities", arguments: {} })).workspace.spawn_memory_policy, "observe");
+  const listed = data(await client.callTool({ name: "list_relay_spawn_targets", arguments: {} }));
+  assert.equal(listed.memory_policy, "observe");
+  // Observe refuses nothing, so the target is admissible; memory says what enforce would do.
+  assert.equal(listed.targets[0].admissible, true);
+  assert.equal(listed.targets[0].memory.admissible, false);
+  assert.equal(listed.targets[0].memory.need_bytes, 1.5 * 1024 ** 3);
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("small", { cli: "claude" }) })).status, "accepted");
+});
+
+test("memory off: no memory fields, today's output", async (t) => {
+  const env = await setup(t, { env: { SELFHOST_SPAWN_MEMORY_POLICY: "off" } });
+  env.world.nodes.set(FIRST_KEY, [node("small", "small-desktop", { memory: { availableGiB: 2.5, totalGiB: 16 } })]);
+  await env.claim("small");
+  const client = await env.connect();
+  const listed = data(await client.callTool({ name: "list_relay_spawn_targets", arguments: {} }));
+  assert.equal("memory_policy" in listed, false);
+  assert.equal("memory" in listed.targets[0], false);
+  assert.equal(listed.targets[0].why, "Your computer.");
+  assert.equal(data(await client.callTool({ name: "spawn_relay_agent", arguments: launch("small", { cli: "claude" }) })).status, "accepted");
 });
