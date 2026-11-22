@@ -10,7 +10,8 @@ import { encryptSecret } from "../src/crypto.js";
 import { createRelaycastClient } from "../src/messaging/relaycast.js";
 import { historyReader, type McpContext } from "../src/mcp/context.js";
 import { desktopCallContext } from "../src/mcp/desktop-call.js";
-import { HOSTED_SOURCE, ownerHash, relayService } from "../src/mcp/relay-participants.js";
+import { HOSTED_SOURCE, ownerHash, relayFailure, relayService } from "../src/mcp/relay-participants.js";
+import { ownerLockFetch } from "../src/mcp/owner-lock-deadline.js";
 import { createRelaycastWorld } from "./support/relaycast-world.js";
 import { createServer } from "node:http";
 import { createApp } from "../src/app.js";
@@ -23,7 +24,7 @@ import { pkceS256 } from "../src/mcp/oauth/protocol.js";
 import { McpOAuthStore } from "../src/mcp/oauth/store.js";
 import { MCP_OAUTH_TEARDOWN_DECRYPT_MAX_ATTEMPTS,McpOAuthTeardown,mcpOAuthTeardownBackoffMs,mcpOAuthTeardownFetch } from "../src/mcp/oauth/teardown.js";
 import { lockOrganization,lockUser } from "../src/tenancy.js";
-import type { RelaycastClient } from "../src/messaging/relaycast.js";
+import { RelaycastCallError, type RelaycastClient } from "../src/messaging/relaycast.js";
 import { relaySpawnService, relaySpawnDeps, spawnStore, type SpawnOwner } from "../src/mcp/relay-spawn.js";
 import { NO_FEATURES } from "../src/features.js";
 
@@ -650,6 +651,129 @@ test("teardown commits its claim and holds no lifecycle lock while Relaycast ans
   assert.deepEqual(await running,{completed:1,kept:0,pending:0});
   assert.equal((await revocation(f)).outcome,"released");
   assert.equal(f.world.agents.has("approved-agent"),false);
+});
+
+/**
+ * Records each Relaycast call; a matching call answers only when its signal aborts.
+ * With `applied`, the stalled request takes effect upstream first and only its answer is lost.
+ */
+function stalling(f:Awaited<ReturnType<typeof relayFixture>>,stalls:(method:string,path:string)=>boolean=()=>false,applied=false) {
+  const seen:{method:string;path:string;signal:boolean}[]=[];
+  let entered!:()=>void;
+  const reached=new Promise<void>(resolve=>{entered=resolve;});
+  const fetchImpl:typeof fetch=async(input,init)=>{
+    const method=init?.method??"GET",path=new URL(String(input)).pathname;
+    seen.push({method,path,signal:Boolean(init?.signal)});
+    if(!stalls(method,path)) return f.fetchImpl(input,init);
+    if(applied) await f.fetchImpl(input,init);
+    entered();
+    return new Promise<Response>((_resolve,reject)=>{
+      // Later than within(): an unbounded call fails the test instead of answering.
+      const network=setTimeout(()=>reject(new Error("missing abort")),5000);
+      const signal=init?.signal;
+      const aborted=()=>{clearTimeout(network);reject(signal!.reason);};
+      if(signal?.aborted)aborted();
+      else signal?.addEventListener("abort",aborted,{once:true});
+    });
+  };
+  return {fetchImpl,seen,reached};
+}
+const ownerLockBounded=(f:Awaited<ReturnType<typeof relayFixture>>,fetchImpl:typeof fetch,timeoutMs:number)=>relayService({...f.context,
+  relay:{...f.context.relay,client:createRelaycastClient({internalOrigin:"http://fake-relay.test",fetchImpl:ownerLockFetch(fetchImpl,timeoutMs)})}});
+
+test("a stalled Relaycast write under the OAuth owner lock ends at the deadline as an unknown outcome and frees the lock",async t=>{
+  const f=await relayFixture(t);f.world.addAgent("peer");
+  const {fetchImpl,seen,reached}=stalling(f,(method,path)=>method==="POST" && path==="/v1/agents");
+  const service=ownerLockBounded(f,fetchImpl,200);
+  // First use registers the approved agent under the owner lock.
+  const sending=service.send({to:"peer",text:"never registered",idempotency_key:"fake-deadline-send"}).then(()=>null,(error:unknown)=>error);
+  await within(reached);
+  // The same user's refresh needs the user and organization locks the stalled transaction holds.
+  const refresh=f.oauth.refreshMcpOAuthToken({refreshToken:f.pair.refreshToken,clientId:f.clientId,resource:undefined});
+  const error=await within(sending);
+  assert.ok(error instanceof RelaycastCallError);
+  assert.equal(error.outcomeUnknown,true);
+  assert.equal(error.operation,"register_hosted");
+  const text=relayFailure(error,"send").content[0]!.text;
+  assert.match(text,/If a send was attempted, its outcome may be unknown/);
+  assert.match(text,/operation=register_hosted status=none/);
+  assert.equal((await within(refresh)).ok,true);
+  assert.equal(seen.find(call=>call.method==="POST" && call.path==="/v1/agents")?.signal,true);
+  assert.equal(f.world.messages.size,0);
+  assert.equal((await f.database.query("SELECT id FROM hosted_relay_participants")).rows.length,0);
+});
+
+test("owner-lock calls that answer in time are unaffected; sends carry no deadline",async t=>{
+  const f=await relayFixture(t);f.world.addAgent("peer");
+  const {fetchImpl,seen}=stalling(f);
+  const service=ownerLockBounded(f,fetchImpl,1000);
+  await service.send({to:"peer",text:"answered in time",idempotency_key:"fake-in-time"});
+  assert.equal(f.world.messages.size,1);
+  assert.equal(f.connection.access.agentRemoteId,f.world.agents.get("approved-agent")!.id);
+  assert.equal(seen.find(call=>call.method==="POST" && call.path==="/v1/agents")?.signal,true);
+  // The send itself runs after the lock is released.
+  assert.equal(seen.find(call=>call.method==="POST" && call.path==="/v1/dm")?.signal,false);
+  assert.deepEqual(await service.leave(),{joined:false,already_left:false});
+  // leave releases under the owner lock, so the release is bounded too.
+  assert.equal(seen.find(call=>call.path==="/v1/agents/release-exact")?.signal,true);
+  assert.equal(f.world.agents.has("approved-agent"),false);
+});
+
+test("a call made after the owner lock's budget is spent is refused without being sent",async t=>{
+  const f=await relayFixture(t);f.world.addAgent("peer");
+  const {fetchImpl,seen}=stalling(f);
+  const service=ownerLockBounded(f,fetchImpl,0);
+  const error=await within(service.send({to:"peer",text:"never sent",idempotency_key:"fake-spent"}).then(()=>null,(caught:unknown)=>caught));
+  assert.ok(error instanceof RelaycastCallError);
+  assert.equal(error.outcomeUnknown,true);
+  // The registration under the lock never reached the upstream.
+  assert.equal(seen.some(call=>call.method==="POST" && call.path==="/v1/agents"),false);
+  assert.equal(f.world.agents.has("approved-agent"),false);
+  assert.equal(f.world.messages.size,0);
+  assert.equal((await f.database.query("SELECT id FROM hosted_relay_participants")).rows.length,0);
+});
+
+for (const applied of [false,true]) {
+  test(`a stalled leave release ${applied?"that took effect upstream ":""}fails at the deadline with the leave wording and a retry leaves`,async t=>{
+    const f=await relayFixture(t);f.world.addAgent("peer");
+    let stall=false;
+    const {fetchImpl,seen}=stalling(f,(_method,path)=>stall && path==="/v1/agents/release-exact",applied);
+    const service=ownerLockBounded(f,fetchImpl,200);
+    await service.send({to:"peer",text:"joined",idempotency_key:"fake-leave-stall"});
+    stall=true;
+    const error=await within(service.leave().then(()=>null,(caught:unknown)=>caught));
+    assert.ok(error instanceof RelaycastCallError);
+    assert.equal(error.outcomeUnknown,true);
+    assert.match(relayFailure(error,"leave").content[0]!.text,/^Leaving the hosted relay participant failed\. It is safe to retry leave_relay\./);
+    assert.equal(seen.find(call=>call.path==="/v1/agents/release-exact")?.signal,true);
+    // The transaction rolled back: the participant row is kept for the retry.
+    assert.equal((await f.database.query("SELECT id FROM hosted_relay_participants")).rows.length,1);
+    assert.equal(f.world.agents.has("approved-agent"),!applied);
+    stall=false;
+    assert.deepEqual(await within(service.leave()),{joined:false,already_left:false});
+    assert.equal(f.world.agents.has("approved-agent"),false);
+    assert.equal((await f.database.query("SELECT id FROM hosted_relay_participants")).rows.length,0);
+  });
+}
+
+test("a Relaycast answer whose body is lost mid-read is an unknown outcome",async()=>{
+  const fetchImpl:typeof fetch=async(_input,init)=>{
+    const signal=init!.signal!;
+    // Headers arrive; the body stream errors only when the caller's signal aborts.
+    const body=new ReadableStream<Uint8Array>({start(controller){
+      signal.addEventListener("abort",()=>controller.error(signal.reason),{once:true});
+    }});
+    return new Response(body,{status:200,headers:{"content-type":"application/json"}});
+  };
+  const client=createRelaycastClient({internalOrigin:"http://fake-relay.test",fetchImpl});
+  const controller=new AbortController();
+  const reading=client.authenticatedAgent("at_fake",controller.signal).then(()=>null,(caught:unknown)=>caught);
+  setTimeout(()=>controller.abort(),10);
+  const error=await within(reading);
+  assert.ok(error instanceof RelaycastCallError);
+  assert.equal(error.status,200);
+  assert.equal(error.outcomeUnknown,true);
+  assert.equal(error.operation,"authenticated_agent");
 });
 
 test("a retryable failure backs off exponentially and retries only once due",async t=>{

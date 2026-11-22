@@ -34,6 +34,7 @@ import type { McpOAuthSessions } from "./oauth/sessions.js";
 import { MCP_RELAY_SCOPE, type McpOAuthResourcePath } from "./oauth/protocol.js";
 import { sendCustomerSupport } from "./customer-support.js";
 import { customerSupportDesktop } from "./customer-support-notice.js";
+import { ownerLockFetch } from "./owner-lock-deadline.js";
 import { controlSessionToken } from "../auth/session-cookie.js";
 
 /**
@@ -169,7 +170,9 @@ export function createMcpHandler(input: {
   const desktopCredentials = new DesktopMcpCredentials(store.database);
   const staffReadGrants = new StaffReadGrants(store.database, store.tenancy);
   const attestations = postgresAttestationStore(store.database);
-  const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: input.fetchImpl });
+  // Calls made under the hosted-MCP owner lock share one time budget; all others are unchanged.
+  const relayFetch = ownerLockFetch(input.fetchImpl);
+  const relaycast = createRelaycastClient({ internalOrigin: config.relaycastUrl, fetchImpl: relayFetch });
   function reportUnexpected(error: unknown, request: IncomingMessage, response: ServerResponse, path: string): void {
     let errorPath = path;
     try { errorPath = new URL(request.url ?? path, config.publicBaseUrl).pathname; } catch { /* Use the matched route. */ }
@@ -180,7 +183,7 @@ export function createMcpHandler(input: {
   }
   // Gate-only installs only: desktop identities hold rg_ tokens that only relaygate accepts.
   const gateClient = config.relaygatePublicUrl
-    ? createRelaycastClient({ internalOrigin: config.relaygatePublicUrl, fetchImpl: input.fetchImpl })
+    ? createRelaycastClient({ internalOrigin: config.relaygatePublicUrl, fetchImpl: relayFetch })
     : undefined;
   // Gate-only installs only: relaygate checks every agent launch before it is reserved or sent.
   const launchCheck = config.relaygatePublicUrl
