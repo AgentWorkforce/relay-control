@@ -84,7 +84,8 @@
     {"name":"0079_hosted_relay_gate.sql","sha256":"c9b201ff87a00dc9bf06cb304e46673556e47153343a68edf8d557029b988af1"},
     {"name":"0080_staff_read_grants_year_cap.sql","sha256":"86d678003039015d447a4d3461830082d0a3bf03a578ece20526ccf763e4f562"},
     {"name":"0081_cursor_cloud_identity.sql","sha256":"4b8bd4a7e758708db798f953fe50b0f225ca1db17e841a490ce363940c4a949c"},
-    {"name":"0083_cloud_bridge.sql","sha256":"5209e515add2701035cee73757ddadc18fe337b47ab443aad82555d5e52de210"}
+    {"name":"0083_cloud_bridge.sql","sha256":"5209e515add2701035cee73757ddadc18fe337b47ab443aad82555d5e52de210"},
+    {"name":"0084_mcp_oauth_undelivered_refresh.sql","sha256":"858162f963c0b29539c6ef7c3a4a3a7f3e365b8bcedbb48e40e241f8f434fcd4"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -714,7 +715,10 @@
     {"kind":"column","name":"public.mcp_oauth_grants.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"uuid"}},
     {"kind":"column","name":"public.mcp_oauth_retired_refresh_tokens.grant_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
     {"kind":"column","name":"public.mcp_oauth_retired_refresh_tokens.organization_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":4,"type":"uuid"}},
+    {"kind":"column","name":"public.mcp_oauth_retired_refresh_tokens.refresh_token_expires_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":8,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.mcp_oauth_retired_refresh_tokens.reissued_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":9,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.mcp_oauth_retired_refresh_tokens.retired_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.mcp_oauth_retired_refresh_tokens.successor_token_hash","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":7,"type":"text"}},
     {"kind":"column","name":"public.mcp_oauth_retired_refresh_tokens.token_hash","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"text"}},
     {"kind":"column","name":"public.mcp_oauth_retired_refresh_tokens.user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":3,"type":"uuid"}},
     {"kind":"column","name":"public.mcp_oauth_retired_refresh_tokens.workspace_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":5,"type":"uuid"}},
@@ -737,6 +741,7 @@
     {"kind":"column","name":"public.mcp_oauth_sessions.access_token_expires_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":10,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.mcp_oauth_sessions.access_token_hash","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":8,"type":"text"}},
     {"kind":"column","name":"public.mcp_oauth_sessions.created_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":14,"type":"timestamp with time zone"}},
+    {"kind":"column","name":"public.mcp_oauth_sessions.current_pair_used_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":17,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.mcp_oauth_sessions.grant_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":2,"type":"uuid"}},
     {"kind":"column","name":"public.mcp_oauth_sessions.id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":true,"position":1,"type":"uuid"}},
     {"kind":"column","name":"public.mcp_oauth_sessions.last_refreshed_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":16,"type":"timestamp with time zone"}},
@@ -2186,5 +2191,5 @@
   "optional":{
 
   },
-  "sha256":"9b8321468fdfb58e2a2b3d3ff820596072eea521a7b4bb43396cbb51ed5772a3"
+  "sha256":"4909c8c82aa36e0bc46f1fa88db802d0219ee2d1f6ea91b0e3768774ddd79d91"
 }
