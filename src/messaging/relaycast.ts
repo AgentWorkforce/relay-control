@@ -224,7 +224,13 @@ export function createRelaycastClient(input: {
     } catch {
       throw new RelaycastCallError(0, "", true);
     }
-    const raw = await response.text();
+    let raw: string;
+    try {
+      raw = await response.text();
+    } catch {
+      // A body lost after the status (an abort mid-read) leaves the outcome unknown under the same rule as below.
+      throw new RelaycastCallError(response.status, "", response.ok || response.status >= 500);
+    }
     if (allowNotFound && response.status === 404) return null;
     if (!response.ok) {
       const unknown = response.status === 0 || response.status >= 500;
