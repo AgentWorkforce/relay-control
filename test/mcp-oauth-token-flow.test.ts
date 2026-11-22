@@ -19,7 +19,7 @@ function issued(result:McpOAuthTokenResult) {
   return result.body;
 }
 
-async function fixture(t:test.TestContext) {
+async function fixture(t:test.TestContext,redirectUris=["https://x.ai/callback"]) {
   const database=new PGliteDatabase(); t.after(()=>database.close()); await migrate(database);
   const owner={ userId:randomUUID(),organizationId:randomUUID(),workspaceId:randomUUID(),agentName:"fake-agent" };
   await database.query("INSERT INTO users(id,email,name) VALUES ($1,'fake@example.test','Fake User')",[owner.userId]);
@@ -36,7 +36,7 @@ async function fixture(t:test.TestContext) {
     issueIdToken:input=>{ if(signerFails) throw new Error("fake signer failure"); signed.push(input); return "fake-id-token"; },
     logRefresh:entry=>{ refreshLogs.push(entry); },
   });
-  const client=await store.registerMcpOAuthClient({ clientName:"fake-client",redirectUris:["https://x.ai/callback"] });
+  const client=await store.registerMcpOAuthClient({ clientName:"fake-client",redirectUris });
   function authorization(overrides:Record<string,string>={}) {
     const result=protocol.validateAuthorizationRequest({ client_id:client.clientId,redirect_uri:client.redirectUris[0]!,
       response_type:"code",code_challenge:pkceS256(VERIFIER),code_challenge_method:"S256",resource:`${ORIGIN}/cloud${SHARED}`,...overrides },client);
@@ -549,4 +549,175 @@ test("organization departure revokes every workspace while preserving session re
   assert.ok(await f.store.sessions.resolveAccessToken(other.access_token,`${ORIGIN}/cloud${SHARED}`));
   assert.equal(await f.count("sessions"),3); assert.equal(await f.count("revocations"),2);
   assert.equal((await f.store.refreshMcpOAuthToken({ refreshToken:first.refresh_token,clientId:f.client.clientId,resource:undefined })).ok,false);
+});
+
+const GOOGLE_CALLBACK="https://oauth-redirect.googleusercontent.com/r/fake-project";
+const MINUTE=60*1000,DAY=24*60*MINUTE;
+
+/** A delivered pair for a client whose only callback is a Google Connected Apps callback. */
+async function stableRefresh(t:test.TestContext,request:Record<string,string>={},redirectUris=[GOOGLE_CALLBACK]) {
+  const f=await fixture(t,redirectUris),code=await f.create(request),first=issued(await f.exchange(code)),id=await f.grantId(code);
+  const resource=request.resource??`${ORIGIN}/cloud${SHARED}`;
+  const refresh=(token=first.refresh_token,clientId=f.client.clientId,resourceParam:string|undefined=undefined)=>
+    f.store.refreshMcpOAuthToken({ refreshToken:token,clientId,resource:resourceParam });
+  const resolve=(token:string)=>f.store.sessions.resolveAccessToken(token,resource);
+  const anchor=async()=>(await f.database.query<{ id:string; access_token_hash:string; refresh_token_hash:string; refresh_token_expires_at:Date }>(
+    "SELECT id,access_token_hash,refresh_token_hash,refresh_token_expires_at FROM mcp_oauth_sessions WHERE refresh_token_hash=$1",
+    [hashSecret(first.refresh_token)])).rows[0]!;
+  const children=async(parent:string)=>(await f.database.query<{ id:string; access_token_hash:string }>(
+    "SELECT id,access_token_hash FROM mcp_oauth_sessions WHERE parent_session_id=$1 ORDER BY created_at",[parent])).rows;
+  const retired=async()=>(await f.database.query<{ n:number }>("SELECT count(*)::int AS n FROM mcp_oauth_retired_refresh_tokens")).rows[0]!.n;
+  return { ...f,code,first,id,resource,refresh,resolve,anchor,children,retired };
+}
+
+test("a Google Connected Apps client keeps its refresh token, extends its expiry and gets an access sibling per refresh",async t=>{
+  const f=await stableRefresh(t),root=await f.anchor(),initialExpiry=root.refresh_token_expires_at.getTime();
+  f.advance(10*MINUTE);
+  const second=issued(await f.refresh());
+  assert.equal(second.refresh_token,f.first.refresh_token); assert.notEqual(second.access_token,f.first.access_token);
+  assert.equal(second.expires_in,3600); assert.equal(second.scope,"relay:mcp");
+  const extended=await f.anchor();
+  assert.equal(extended.id,root.id); assert.equal(extended.refresh_token_expires_at.getTime(),initialExpiry+10*MINUTE);
+  assert.equal(extended.access_token_hash,hashSecret(f.first.access_token));
+  assert.deepEqual((await f.children(root.id)).map(row=>row.access_token_hash),[hashSecret(second.access_token)]);
+  const firstAccess=await f.resolve(f.first.access_token),secondAccess=await f.resolve(second.access_token);
+  assert.equal(firstAccess!.principal.sessionId,root.id); assert.notEqual(secondAccess!.principal.sessionId,root.id);
+  assert.equal(secondAccess!.grantId,f.id); assert.equal(secondAccess!.principal.tokenFamilyId,firstAccess!.principal.tokenFamilyId);
+  assert.deepEqual(secondAccess!.principal.scopes,["relay:mcp"]);
+  // Each access token lives to its own expiry; a later refresh does not end an earlier one.
+  f.advance(51*MINUTE);
+  assert.equal(await f.resolve(f.first.access_token),null);
+  assert.ok(await f.resolve(second.access_token));
+  const third=issued(await f.refresh());
+  assert.equal(third.refresh_token,f.first.refresh_token);
+  assert.ok(await f.resolve(second.access_token)); assert.ok(await f.resolve(third.access_token));
+  f.advance(10*MINUTE);
+  assert.equal(await f.resolve(second.access_token),null); assert.ok(await f.resolve(third.access_token));
+  // Past the first refresh expiry, still inside 30 days of the last refresh.
+  f.advance(29*DAY);
+  assert.ok(await f.resolve(issued(await f.refresh()).access_token));
+  f.advance(2*DAY);
+  assert.ok(initialExpiry<f.store.options.now!().getTime());
+  const late=issued(await f.refresh());
+  assert.equal(late.refresh_token,f.first.refresh_token); assert.ok(await f.resolve(late.access_token));
+  assert.equal(await f.retired(),0); assert.equal(await f.count("revocations"),0); assert.equal(await f.count("grants"),1);
+  assert.equal(await f.store.isOAuthGrantActive(f.id,f.owner),true);
+  assert.deepEqual(f.refreshLogs,Array.from({ length:4 },()=>({ outcome:"extended",grantId:f.id })));
+});
+
+test("stable refresh prunes its expired access siblings and keeps live ones",async t=>{
+  const f=await stableRefresh(t),root=(await f.anchor()).id;
+  f.advance(MINUTE); const first=issued(await f.refresh());
+  f.advance(30*MINUTE); const second=issued(await f.refresh());
+  assert.equal((await f.children(root)).length,2);
+  f.advance(45*MINUTE); const third=issued(await f.refresh());
+  assert.deepEqual((await f.children(root)).map(row=>row.access_token_hash),[hashSecret(second.access_token),hashSecret(third.access_token)]);
+  assert.equal(await f.resolve(first.access_token),null);
+  f.advance(2*60*MINUTE); issued(await f.refresh());
+  assert.equal((await f.children(root)).length,1); assert.equal(await f.count("sessions"),2);
+  assert.ok(await f.anchor());
+});
+
+test("a stable refresh token expires 30 days after its last refresh",async t=>{
+  const f=await stableRefresh(t);
+  f.advance(DAY); issued(await f.refresh());
+  f.advance(30*DAY+1_000);
+  const expired=await f.refresh();
+  assert.ok(!expired.ok); assert.equal(expired.error.error,"invalid_grant");
+  assert.equal(await f.count("revocations"),0);
+});
+
+test("a stable refresh child's refresh token is refused without extending anything",async t=>{
+  const f=await stableRefresh(t),root=await f.anchor();
+  f.advance(MINUTE); const second=issued(await f.refresh());
+  const childToken=`mcp_rt_${"c".repeat(43)}`,child=(await f.children(root.id))[0]!;
+  await f.database.query("UPDATE mcp_oauth_sessions SET refresh_token_hash=$2 WHERE id=$1",[child.id,hashSecret(childToken)]);
+  const before=(await f.anchor()).refresh_token_expires_at.getTime();
+  f.advance(MINUTE);
+  const refused=await f.refresh(childToken);
+  assert.ok(!refused.ok); assert.equal(refused.error.error,"invalid_grant");
+  assert.deepEqual(f.refreshLogs.at(-1),{ outcome:"refused",grantId:f.id,reason:"child_session" });
+  assert.equal((await f.anchor()).refresh_token_expires_at.getTime(),before);
+  assert.equal(await f.count("sessions"),2); assert.equal(await f.count("revocations"),0);
+  assert.ok(await f.resolve(second.access_token));
+});
+
+test("a client with any non-Google callback keeps rotation",async t=>{
+  const f=await stableRefresh(t,{},[GOOGLE_CALLBACK,"https://x.ai/callback"]);
+  const next=issued(await f.refresh());
+  assert.notEqual(next.refresh_token,f.first.refresh_token);
+  assert.equal(await f.retired(),1); assert.equal(await f.count("sessions"),1);
+  assert.deepEqual(f.refreshLogs.at(-1),{ outcome:"rotated",grantId:f.id });
+  assert.equal((await f.refresh()).ok,false);
+});
+
+test("stable refresh checks client and resource before extending anything",async t=>{
+  const f=await stableRefresh(t),before=(await f.anchor()).refresh_token_expires_at.getTime();
+  f.advance(MINUTE);
+  const other=await f.refresh(f.first.refresh_token,"mcpc_fake_other");
+  assert.ok(!other.ok); assert.equal(other.error.error,"invalid_grant");
+  assert.deepEqual(f.refreshLogs.at(-1),{ outcome:"refused",grantId:f.id,reason:"client_mismatch" });
+  const wrongResource=await f.refresh(f.first.refresh_token,f.client.clientId,`${ORIGIN}/mcp`);
+  assert.ok(!wrongResource.ok); assert.equal(wrongResource.error.error,"invalid_target");
+  assert.deepEqual(f.refreshLogs.at(-1),{ outcome:"refused",grantId:f.id,reason:"resource_mismatch" });
+  assert.equal((await f.anchor()).refresh_token_expires_at.getTime(),before);
+  assert.equal(await f.count("sessions"),1); assert.equal(await f.count("revocations"),0);
+  assert.equal(issued(await f.refresh()).refresh_token,f.first.refresh_token);
+});
+
+test("revoking a stable refresh token ends the root session and every sibling",async t=>{
+  const f=await stableRefresh(t);
+  f.advance(MINUTE); const second=issued(await f.refresh());
+  f.advance(MINUTE); const third=issued(await f.refresh());
+  await f.store.revokeMcpOAuthToken({ token:f.first.refresh_token,clientId:f.client.clientId });
+  for(const token of [f.first.access_token,second.access_token,third.access_token]) assert.equal(await f.resolve(token),null);
+  assert.equal((await f.refresh()).ok,false);
+  assert.equal(await f.store.isOAuthGrantActive(f.id,f.owner),false);
+  assert.equal((await f.database.query("SELECT reason FROM mcp_oauth_revocations")).rows[0]!.reason,"client_revoked");
+});
+
+test("revoking a stable-refresh grant ends its sibling access tokens",async t=>{
+  const f=await stableRefresh(t);
+  f.advance(MINUTE); const second=issued(await f.refresh());
+  await f.store.revokeMcpOAuthGrant(f.id,"fake-management-revoke");
+  assert.equal(await f.resolve(f.first.access_token),null); assert.equal(await f.resolve(second.access_token),null);
+  assert.equal(await f.store.hasMcpOAuthGrantForWorkspace(f.owner,f.resource),false);
+  assert.equal((await f.refresh()).ok,false);
+});
+
+test("an initial code replay after two stable refreshes revokes the grant; siblings do not count as a continuation",async t=>{
+  const requests:Record<string,string>[]=[{},{ resource:`${ORIGIN}/cloud${EVENTS}`,scope:"relay:events" }];
+  for(const request of requests) {
+    const f=await stableRefresh(t,request);
+    // Stay inside the 120 s code lifetime: an expired code is refused before the replay action.
+    f.advance(10_000); const second=issued(await f.refresh());
+    f.advance(10_000); const third=issued(await f.refresh());
+    assert.equal((await f.exchange(f.code)).ok,false);
+    for(const token of [f.first.access_token,second.access_token,third.access_token]) assert.equal(await f.resolve(token),null);
+    assert.equal(await f.store.isOAuthGrantActive(f.id,f.owner),false);
+    assert.equal((await f.database.query("SELECT continued_at FROM mcp_oauth_grants WHERE id=$1",[f.id])).rows[0]!.continued_at,null);
+    assert.deepEqual((await f.database.query<{ reason:string }>("SELECT reason FROM mcp_oauth_revocations")).rows.map(row=>row.reason),
+      ["authorization_code_replayed"]);
+    assert.equal((await f.refresh()).ok,false);
+  }
+});
+
+test("a continuation code replay revokes only the continuation session and its siblings",async t=>{
+  const request={ resource:`${ORIGIN}/cloud${EVENTS}`,scope:"relay:events" };
+  const f=await stableRefresh(t,request);
+  f.advance(MINUTE); const initialChild=issued(await f.refresh());
+  const nextCode=await f.create({ ...request,scope:"relay:events relay:mcp relay:agents" },f.id),next=issued(await f.exchange(nextCode));
+  f.advance(10_000); const nextChild=issued(await f.refresh(next.refresh_token));
+  f.advance(10_000); const nextChild2=issued(await f.refresh(next.refresh_token));
+  assert.equal(nextChild.refresh_token,next.refresh_token);
+  assert.deepEqual((await f.resolve(nextChild.access_token))!.principal.scopes,(await f.resolve(next.access_token))!.principal.scopes);
+  assert.deepEqual((await f.resolve(initialChild.access_token))!.principal.scopes,["relay:events"]);
+  assert.equal((await f.exchange(nextCode)).ok,false);
+  for(const token of [next.access_token,nextChild.access_token,nextChild2.access_token]) assert.equal(await f.resolve(token),null);
+  assert.equal((await f.refresh(next.refresh_token)).ok,false);
+  assert.ok(await f.resolve(f.first.access_token)); assert.ok(await f.resolve(initialChild.access_token));
+  const again=issued(await f.refresh());
+  assert.equal(again.refresh_token,f.first.refresh_token); assert.ok(await f.resolve(again.access_token));
+  assert.equal(await f.store.isOAuthGrantActive(f.id,f.owner),true);
+  assert.equal(await f.count("revocations"),0);
 });
