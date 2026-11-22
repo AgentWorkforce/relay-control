@@ -8,7 +8,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "../../database.js";
 import { hashSecret } from "../../crypto.js";
 import { lockOrganization, lockUser, type TenancyMode } from "../../tenancy.js";
-import { isValidCodeVerifier, pkceS256, oidcSectorIdentifierForRedirectUri,
+import { isValidCodeVerifier, pkceS256, oidcSectorIdentifierForRedirectUri, usesGoogleConnectedAppsPersistentRefresh,
   type AuthorizationRequest, type ClientRegistrationInput, type McpAuthorizationScope,
   type OAuthErrorBody, type createMcpOAuthProtocol } from "./protocol.js";
 import { McpOAuthSessions, MCP_OAUTH_REFRESH_PREFIX, type McpOAuthIssuedPair, type McpOAuthSessionOwner } from "./sessions.js";
@@ -45,7 +45,7 @@ export type McpOAuthTokenResponse = { access_token: string; token_type: "Bearer"
 export type McpOAuthTokenResult = { ok: true; body: McpOAuthTokenResponse }
   | { ok: false; status: number; error: OAuthErrorBody };
 /** One `mcp_oauth_refresh` line per refresh outcome; never a token, hash, user or agent name. */
-export type McpOAuthRefreshLog = { outcome: "rotated" | "reissued_undelivered" | "refused" | "revoked";
+export type McpOAuthRefreshLog = { outcome: "rotated" | "extended" | "reissued_undelivered" | "refused" | "revoked";
   grantId?: string; reason?: string; retiredForSeconds?: number };
 type RefreshOutcome = [McpOAuthTokenResult, McpOAuthRefreshLog];
 type RetiredRow = { grant_id: string; retired_at: Date | string; successor_token_hash: string | null;
@@ -68,7 +68,7 @@ function refused(reason: string, grantId?: string, retiredForSeconds?: number): 
   return [reason==="resource_mismatch"?invalidTarget():invalidGrant(),refreshLog("refused",grantId,reason,retiredForSeconds)];
 }
 function logRefresh(entry: McpOAuthRefreshLog): void {
-  (entry.outcome==="rotated"?console.info:console.warn)("[mcp-oauth] refresh",{ event:"mcp_oauth_refresh",...entry });
+  (entry.outcome==="rotated" || entry.outcome==="extended"?console.info:console.warn)("[mcp-oauth] refresh",{ event:"mcp_oauth_refresh",...entry });
 }
 function ownerOf(row: GrantRow): McpOAuthSessionOwner {
   return { grantId:row.id,tokenFamilyId:row.token_family_id,userId:row.user_id,organizationId:row.organization_id,workspaceId:row.workspace_id };
@@ -233,10 +233,11 @@ export class McpOAuthStore {
           grant.client_id!==row.client_id || grant.resource!==row.resource)) return invalidGrant();
         const previousSessions=grant && !grant.continued_at && resourcePath==="/api/v1/mcp/relay-events"
           ? (await tx.query(`SELECT id FROM mcp_oauth_sessions WHERE grant_id=$1 AND token_family_id=$2
-              AND user_id=$3 AND organization_id=$4 AND workspace_id=$5 LIMIT 2`,
+              AND user_id=$3 AND organization_id=$4 AND workspace_id=$5 AND parent_session_id IS NULL LIMIT 2`,
             [grant.id,grant.token_family_id,grant.user_id,grant.organization_id,grant.workspace_id])).rows:[];
         if(grant && (grant.continued_at || previousSessions.length===2)) {
           if(!grant.continued_at) await tx.query("UPDATE mcp_oauth_grants SET continued_at=$2 WHERE id=$1",[grant.id,now]);
+          // Revokes the continuation's session and its stable-refresh children; the rest of the grant stays live.
           if(row.issued_session_id) await this.sessions.revokeSession(tx,row.issued_session_id,ownerOf(grant),"authorization_code_replayed");
         } else if(grant) await this.revokeRows(tx,grant.id,"authorization_code_replayed");
         return invalidGrant("The authorization code was already used.");
@@ -341,6 +342,16 @@ export class McpOAuthStore {
     if(session.revokedAt) return refused("session_revoked",grant.id);
     if(grant.client_id!==input.clientId) return refused("client_mismatch",grant.id);
     if(input.resource!==undefined && this.options.protocol.canonicalMcpResourceParam(input.resource)!==grant.resource) return refused("resource_mismatch",grant.id);
+    // A stable-refresh child's refresh token is never returned to the client; it extends and rotates nothing.
+    if(session.parentSessionId!==null) return refused("child_session",grant.id);
+    // Google Connected Apps requires the refresh response to return the presented refresh token with an extended
+    // expiry. Only clients whose every registered callback is on Google's callback hosts get that weaker lifecycle;
+    // every other client keeps rotation, reuse detection and undelivered-response recovery.
+    const client=(await tx.query<ClientRow>("SELECT * FROM mcp_oauth_clients WHERE client_id=$1",[grant.client_id])).rows[0];
+    if(client && usesGoogleConnectedAppsPersistentRefresh(client.redirect_uris)) {
+      const extended=await this.sessions.refreshStable(tx,input.refreshToken,session);
+      return extended?[this.tokenResult(extended),refreshLog("extended",grant.id)]:refused("rotation_lost_race",grant.id);
+    }
     const tokens=await this.sessions.rotate(tx,input.refreshToken,session);
     return tokens?[this.tokenResult(tokens),refreshLog("rotated",grant.id)]:refused("rotation_lost_race",grant.id);
   }
