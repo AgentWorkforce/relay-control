@@ -44,12 +44,31 @@ export type McpOAuthTokenResponse = { access_token: string; token_type: "Bearer"
   refresh_token: string; scope: string; id_token?: string };
 export type McpOAuthTokenResult = { ok: true; body: McpOAuthTokenResponse }
   | { ok: false; status: number; error: OAuthErrorBody };
+/** One `mcp_oauth_refresh` line per refresh outcome; never a token, hash, user or agent name. */
+export type McpOAuthRefreshLog = { outcome: "rotated" | "reissued_undelivered" | "refused" | "revoked";
+  grantId?: string; reason?: string; retiredForSeconds?: number };
+type RefreshOutcome = [McpOAuthTokenResult, McpOAuthRefreshLog];
+type RetiredRow = { grant_id: string; retired_at: Date | string; successor_token_hash: string | null;
+  refresh_token_expires_at: Date | string | null; reissued_at: Date | string | null };
+/** A retired refresh token can recover an undelivered pair for this long after its first retirement. */
+export const MCP_OAUTH_UNDELIVERED_REFRESH_RECOVERY_SECONDS = 60*60*36;
+/** A retired token presented this soon after its rotation or its last re-issue is refused without revoking. */
+export const MCP_OAUTH_REFRESH_RACE_MS = 30_000;
 
 function invalidGrant(description = "The token or authorization code is invalid, expired, or revoked."): McpOAuthTokenResult {
   return { ok:false,status:400,error:{ error:"invalid_grant",error_description:description } };
 }
 function invalidTarget(): McpOAuthTokenResult {
   return { ok:false,status:400,error:{ error:"invalid_target",error_description:"resource does not match the grant or authorization request." } };
+}
+function refreshLog(outcome: McpOAuthRefreshLog["outcome"], grantId?: string, reason?: string, retiredForSeconds?: number): McpOAuthRefreshLog {
+  return { outcome,...(grantId?{ grantId }:{}),...(reason?{ reason }:{}),...(retiredForSeconds===undefined?{}:{ retiredForSeconds }) };
+}
+function refused(reason: string, grantId?: string, retiredForSeconds?: number): RefreshOutcome {
+  return [reason==="resource_mismatch"?invalidTarget():invalidGrant(),refreshLog("refused",grantId,reason,retiredForSeconds)];
+}
+function logRefresh(entry: McpOAuthRefreshLog): void {
+  (entry.outcome==="rotated"?console.info:console.warn)("[mcp-oauth] refresh",{ event:"mcp_oauth_refresh",...entry });
 }
 function ownerOf(row: GrantRow): McpOAuthSessionOwner {
   return { grantId:row.id,tokenFamilyId:row.token_family_id,userId:row.user_id,organizationId:row.organization_id,workspaceId:row.workspace_id };
@@ -77,6 +96,8 @@ export class McpOAuthStore {
     issueIdToken?(input: { issuer:string; clientId:string; sectorIdentifier:string; userId:string;
       accessToken:string; nonce:string|null; now:Date }): string;
     now?: () => Date;
+    /** Refresh outcome sink; defaults to console info/warn. */
+    logRefresh?(entry: McpOAuthRefreshLog): void;
   }) { this.sessions=new McpOAuthSessions(database,options); }
 
   async registerMcpOAuthClient(input: ClientRegistrationInput): Promise<McpOAuthClient> {
@@ -259,30 +280,69 @@ export class McpOAuthStore {
     });
   }
 
-  /** Cloud refresh bindings, rotation and 30-second lost-race/reuse grace. */
+  /**
+   * Cloud refresh bindings, rotation and 30-second lost-race/reuse grace. After the window a retired
+   * token whose successor pair was never used is a lost response: re-issue on the same grant, not reuse.
+   */
   async refreshMcpOAuthToken(input:{ refreshToken:string; clientId:string; resource:string|undefined }):Promise<McpOAuthTokenResult> {
     if(!input.refreshToken.startsWith(MCP_OAUTH_REFRESH_PREFIX) || input.refreshToken.length>128) return invalidGrant();
-    return this.database.transaction(async tx=>{
-      const session=await this.sessions.find(tx,"refresh",input.refreshToken);
-      if(!session) {
-        const retired=(await tx.query<{ grant_id:string; retired_at:Date|string }>(
-          "SELECT grant_id,retired_at FROM mcp_oauth_retired_refresh_tokens WHERE token_hash=$1",[hashSecret(input.refreshToken)])).rows[0];
-        if(!retired) return invalidGrant();
-        const candidate=(await tx.query<GrantRow>("SELECT * FROM mcp_oauth_grants WHERE id=$1",[retired.grant_id])).rows[0];
-        if(!candidate || !await this.lockWorkspaceAccess(tx,{ userId:candidate.user_id,organizationId:candidate.organization_id,workspaceId:candidate.workspace_id })) return invalidGrant();
-        const grant=await this.grant(tx,candidate.id);
-        if(!grant || grant.revoked_at || grant.client_id!==input.clientId) return invalidGrant();
-        if(input.resource!==undefined && this.options.protocol.canonicalMcpResourceParam(input.resource)!==grant.resource) return invalidTarget();
-        if(this.now().getTime()-new Date(retired.retired_at).getTime()>=30_000) await this.revokeRows(tx,grant.id,"refresh_token_reused");
-        return invalidGrant();
+    const [result,entry]=await this.database.transaction(tx=>this.refreshInTransaction(tx,input));
+    (this.options.logRefresh??logRefresh)(entry);
+    return result;
+  }
+
+  private async refreshInTransaction(tx:SqlExecutor,input:{ refreshToken:string; clientId:string; resource:string|undefined }):Promise<RefreshOutcome> {
+    const session=await this.sessions.find(tx,"refresh",input.refreshToken);
+    if(!session) {
+      const tokenHash=hashSecret(input.refreshToken);
+      const retired=(await tx.query<RetiredRow>(`SELECT grant_id,retired_at,successor_token_hash,refresh_token_expires_at,reissued_at
+        FROM mcp_oauth_retired_refresh_tokens WHERE token_hash=$1`,[tokenHash])).rows[0];
+      if(!retired) return refused("unknown_token");
+      const candidate=(await tx.query<GrantRow>("SELECT * FROM mcp_oauth_grants WHERE id=$1",[retired.grant_id])).rows[0];
+      if(!candidate || !await this.lockWorkspaceAccess(tx,{ userId:candidate.user_id,organizationId:candidate.organization_id,workspaceId:candidate.workspace_id })) return refused("access_lost",retired.grant_id);
+      const grant=await this.grant(tx,candidate.id);
+      if(!grant || grant.revoked_at) return refused("grant_revoked",retired.grant_id);
+      if(grant.client_id!==input.clientId) return refused("client_mismatch",grant.id);
+      if(input.resource!==undefined && this.options.protocol.canonicalMcpResourceParam(input.resource)!==grant.resource) return refused("resource_mismatch",grant.id);
+      const now=this.now(),retiredForMs=now.getTime()-new Date(retired.retired_at).getTime();
+      const retiredFor=Math.max(0,Math.floor(retiredForMs/1000));
+      // The race window restarts at the last re-issue; the recovery window and retiredFor do not.
+      const graceFrom=Math.max(new Date(retired.retired_at).getTime(),retired.reissued_at===null?0:new Date(retired.reissued_at).getTime());
+      if(now.getTime()-graceFrom<MCP_OAUTH_REFRESH_RACE_MS) return refused("refresh_race",grant.id,retiredFor);
+      // Undelivered response: re-issue the exact successor while it is unused, inside the token's own expiry and the
+      // window from its first retirement. The locked re-read catches a concurrent retry that moved the successor.
+      const recoverable=retired.successor_token_hash!==null && retired.refresh_token_expires_at!==null
+        && new Date(retired.refresh_token_expires_at).getTime()>now.getTime()
+        && retiredForMs<=MCP_OAUTH_UNDELIVERED_REFRESH_RECOVERY_SECONDS*1000;
+      if(recoverable) {
+        const locked=(await tx.query<{ successor_token_hash:string|null; reissued_at:Date|string|null }>(`SELECT successor_token_hash,reissued_at
+          FROM mcp_oauth_retired_refresh_tokens WHERE token_hash=$1 FOR UPDATE`,[tokenHash])).rows[0];
+        const successor=locked?.successor_token_hash??null;
+        if(successor!==null && successor!==retired.successor_token_hash) return refused("reissue_lost_race",grant.id,retiredFor);
+        if(successor!==null && locked?.reissued_at!=null
+          && now.getTime()-new Date(locked.reissued_at).getTime()<MCP_OAUTH_REFRESH_RACE_MS) return refused("reissue_lost_race",grant.id,retiredFor);
+        const tokens=successor===null?null:await this.sessions.reissueUndelivered(tx,successor,ownerOf(grant),now);
+        if(tokens) {
+          const next=hashSecret(tokens.refreshToken);
+          await tx.query("UPDATE mcp_oauth_retired_refresh_tokens SET successor_token_hash=$2,reissued_at=$3 WHERE token_hash=$1",[tokenHash,next,now]);
+          await tx.query(`INSERT INTO mcp_oauth_retired_refresh_tokens
+            (token_hash,grant_id,user_id,organization_id,workspace_id,retired_at,successor_token_hash,refresh_token_expires_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (token_hash) DO UPDATE SET successor_token_hash=EXCLUDED.successor_token_hash`,
+          [successor,grant.id,grant.user_id,grant.organization_id,grant.workspace_id,now,next,new Date(tokens.refreshTokenExpiresAt)]);
+          return [this.tokenResult(tokens),refreshLog("reissued_undelivered",grant.id,undefined,retiredFor)];
+        }
       }
-      if(!await this.lockWorkspaceAccess(tx,session)) return invalidGrant();
-      const grant=await this.grant(tx,session.grantId);
-      if(!grant || grant.revoked_at || session.revokedAt || grant.client_id!==input.clientId) return invalidGrant();
-      if(input.resource!==undefined && this.options.protocol.canonicalMcpResourceParam(input.resource)!==grant.resource) return invalidTarget();
-      const tokens=await this.sessions.rotate(tx,input.refreshToken,session);
-      return tokens?this.tokenResult(tokens):invalidGrant();
-    });
+      await this.revokeRows(tx,grant.id,"refresh_token_reused");
+      return [invalidGrant(),refreshLog("revoked",grant.id,"refresh_token_reused",retiredFor)];
+    }
+    if(!await this.lockWorkspaceAccess(tx,session)) return refused("access_lost",session.grantId);
+    const grant=await this.grant(tx,session.grantId);
+    if(!grant || grant.revoked_at) return refused("grant_revoked",session.grantId);
+    if(session.revokedAt) return refused("session_revoked",grant.id);
+    if(grant.client_id!==input.clientId) return refused("client_mismatch",grant.id);
+    if(input.resource!==undefined && this.options.protocol.canonicalMcpResourceParam(input.resource)!==grant.resource) return refused("resource_mismatch",grant.id);
+    const tokens=await this.sessions.rotate(tx,input.refreshToken,session);
+    return tokens?[this.tokenResult(tokens),refreshLog("rotated",grant.id)]:refused("rotation_lost_race",grant.id);
   }
 
   /** Internal cleanup entry; user-facing callers must authorize the grant owner. */
@@ -299,9 +359,19 @@ export class McpOAuthStore {
   async revokeMcpOAuthToken(input:{ token:string; clientId:string|undefined }):Promise<void> {
     await this.database.transaction(async tx=>{
       const session=await this.sessions.find(tx,"access",input.token)??await this.sessions.find(tx,"refresh",input.token);
-      if(!session || (input.clientId!==undefined && input.clientId!==session.clientId)) return;
-      await lockUser(tx,session.userId); await lockOrganization(tx,session.organizationId);
-      await this.revokeRows(tx,session.grantId,"client_revoked");
+      if(session) {
+        if(input.clientId!==undefined && input.clientId!==session.clientId) return;
+        await lockUser(tx,session.userId); await lockOrganization(tx,session.organizationId);
+        await this.revokeRows(tx,session.grantId,"client_revoked");
+        return;
+      }
+      // A retired refresh token can still recover an undelivered pair, so revoking it ends its grant.
+      if(!input.token.startsWith(MCP_OAUTH_REFRESH_PREFIX) || input.token.length>128) return;
+      const grant=(await tx.query<GrantRow>(`SELECT g.* FROM mcp_oauth_retired_refresh_tokens r JOIN mcp_oauth_grants g ON g.id=r.grant_id
+        WHERE r.token_hash=$1`,[hashSecret(input.token)])).rows[0];
+      if(!grant || (input.clientId!==undefined && input.clientId!==grant.client_id)) return;
+      await lockUser(tx,grant.user_id); await lockOrganization(tx,grant.organization_id);
+      await this.revokeRows(tx,grant.id,"client_revoked");
     });
   }
 
