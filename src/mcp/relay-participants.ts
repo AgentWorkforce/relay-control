@@ -23,6 +23,7 @@ import {
 } from "./cursor-oidc.js";
 import { postgresAttestationStore } from "./copilot-attestation.js";
 import { enrolHostedAtGate, freshAtGate, HostedGateRefused, type GateEnrolment } from "./hosted-gate.js";
+import { underOwnerLock } from "./owner-lock-deadline.js";
 import type { RelayHostedClient } from "./relay-hosted-credentials.js";
 
 /**
@@ -448,13 +449,17 @@ function createRelayService(context: McpContext) {
     }
   }
 
-  /** Serializes join and leave for this owner in Postgres; every store access inside uses `tx`. */
+  /**
+   * Serializes join and leave for this owner in Postgres; every store access inside uses `tx`.
+   * Once the locks are held, Relaycast and relaygate calls inside share ownerLockFetch's budget,
+   * so a stalled upstream cannot hold the locks; waiting for the locks does not count.
+   */
   function withOwnerLock<T>(run: (tx: SqlExecutor) => Promise<T>): Promise<T> {
     return database.transaction(async (tx) => {
       if (oauth) await oauth.lock(tx);
       await tx.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
         ["selfhost-hosted-mcp", `${workspaceId}:${userId}`]);
-      return run(tx);
+      return underOwnerLock(() => run(tx));
     });
   }
 
