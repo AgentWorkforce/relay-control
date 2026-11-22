@@ -132,9 +132,27 @@ and is refused with `invalid_scope` unless `relay:mcp` is requested with it
 (see Session reads).
 
 Access tokens last one hour; refresh tokens last 30 days. Refresh rotates the
-pair and preserves its issued scope limit. Retired refresh tokens are always
-refused. Verified reuse within 30 seconds leaves the family live to tolerate
-racing refresh requests; verified reuse after that window revokes the grant.
+pair and preserves its issued scope limit. A retired refresh token presented
+within 30 seconds of its rotation is refused and the connection stays live, to
+tolerate racing refresh requests. After that window, if the exact pair it was
+rotated into has never been used as a bearer token, the client is assumed to
+have lost the refresh response: the server rotates that unused pair again and
+returns the new pair on the same connection and approved agent. Recovery is
+available for 36 hours after the token's first rotation and never past the
+retired token's own expiry. A re-issued pair keeps the refresh expiry it had;
+its access expiry never passes it. A retry within 30 seconds of a recovery is
+refused without revoking, like a retry within 30 seconds of the rotation.
+Otherwise the retired token counts as reuse
+and revokes the grant. Revoking a retired refresh token at the revocation
+endpoint ends the grant. Each refresh logs one `mcp_oauth_refresh` line with
+`outcome` (`rotated`, `reissued_undelivered`, `refused` or `revoked`), the
+grant ID, a reason and the seconds since retirement; it never logs tokens,
+hashes, user IDs or agent names.
+
+Upgrading to migration 0084: rotations made before the upgrade are not
+recoverable, so their reuse revokes the grant as before. During a rolling
+upgrade a server still on the previous version neither records first use nor
+writes the successor link.
 
 Each connection acts only as its approved relay agent. First use pins the
 agent's immutable ID. A rename follows that same ID; a replacement holding
