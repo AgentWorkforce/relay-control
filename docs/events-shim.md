@@ -62,6 +62,14 @@ deduplicated by `webhook-id`, verification challenges are echoed, and
 `gap`/`terminated` envelopes wake the agent like posts.
 
 `POST /shims` answers `{shim_id, mcp_url, webhook_url, webhook_urls, manage_token, limits}`.
+
+The linked agent's name: `link_relay_wake` takes an optional `agent` and
+answers `linked_agent` (and `replaced_agent` when it replaces another link);
+`watch_webhooks` and `GET /shims/current` (`agent.wake_agent`) report it for a
+linked inbox. Control does not store the name yet, so it is only in the
+linking call's own answer; afterwards those fields are null and the agent is
+told to assume the link belongs to another session unless it linked in this
+conversation.
 The three tokens are shown once; an unknown or expired token answers 404.
 
 MCP tools: `watch_webhooks` (start here), `link_relay_wake`,

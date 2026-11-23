@@ -868,19 +868,23 @@ test("events/stream frames reach the client while the stream is open", async (t)
   const reader = stream.body!.getReader();
   const decoder = new TextDecoder();
   let text = "";
+  // A stalled read never returns, so the deadline aborts the request instead of being checked between reads.
+  const deadline = setTimeout(() => controller.abort(), 10_000);
+  t.after(() => clearTimeout(deadline));
   const until = async (needle: string) => {
-    const deadline = Date.now() + 10_000;
     while (!text.includes(needle)) {
-      assert.ok(Date.now() < deadline, `no ${needle} frame before the deadline: ${text}`);
-      const { done, value } = await reader.read();
-      assert.equal(done, false, "the stream closed early");
+      const { done, value } = await reader.read().catch((error: unknown) => {
+        throw new Error(`no ${needle} before the deadline: ${text}`, { cause: error });
+      });
+      assert.equal(done, false, `the stream closed before ${needle}: ${text}`);
       text += decoder.decode(value, { stream: true });
     }
   };
   await until("notifications/events/active");
   assert.equal((await p.post(shim.webhook_url, { streamed: true })).status, 202);
   await until("notifications/events/event");
-  assert.match(text, /streamed/);
+  // The event's payload can arrive in a later chunk than its method name.
+  await until("streamed");
   controller.abort();
 });
 
