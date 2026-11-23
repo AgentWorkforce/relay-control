@@ -17,8 +17,27 @@ export const EVENTS_SHIM_PREFIX = "/api/v1/events-shim";
 /** Largest request body read: the package's webhook and MCP limit. */
 const MAX_BODY_BYTES = EVENTS_SHIM_LIMITS.maxBodyBytes;
 
+/**
+ * MCP Events (SEP-3415) receiver document, served at the origin root while the
+ * feature is on: it lists the path prefix of this install's `/h/<token>/mcp`
+ * webhook URLs so an MCP Events server can deliver without a challenge round trip.
+ */
+export const MCP_WEBHOOK_RECEIVER_DOCUMENT = "/.well-known/mcp-webhook-receiver.json";
+/**
+ * How often an open `events/stream` re-reads Postgres. The package default is
+ * 1s; 2s halves the reads per open stream and matches hosted Cloud.
+ */
+export const EVENTS_SHIM_STREAM_POLL_MS = 2_000;
+
 export function isEventsShimPath(path: string): boolean {
-  return path === EVENTS_SHIM_PREFIX || path.startsWith(`${EVENTS_SHIM_PREFIX}/`);
+  return path === EVENTS_SHIM_PREFIX || path.startsWith(`${EVENTS_SHIM_PREFIX}/`)
+    || path === MCP_WEBHOOK_RECEIVER_DOCUMENT;
+}
+
+/** Origin-relative prefixes of the webhook URLs, for `mcpWebhookReceivers`. */
+export function eventsShimMcpWebhookReceivers(publicBaseUrl: string): string[] {
+  const basePath = new URL(publicBaseUrl).pathname.replace(/\/+$/, "");
+  return [`${basePath}${EVENTS_SHIM_PREFIX}/h/`];
 }
 
 export type EventsShimRoutesInput = {
@@ -72,7 +91,9 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
     method: string,
   ): Promise<boolean> {
     if (!isEventsShimPath(path)) return false;
-    const relative = path.slice(EVENTS_SHIM_PREFIX.length) || "/";
+    const relative = path === MCP_WEBHOOK_RECEIVER_DOCUMENT
+      ? path
+      : path.slice(EVENTS_SHIM_PREFIX.length) || "/";
     const temp: TempWorkspaceDeps | null = input.relaycast && !input.gateOnly
       ? {
         database: input.database,
@@ -138,6 +159,8 @@ export function createEventsShimRoutes(input: EventsShimRoutesInput) {
       },
       urls,
       relayOrigins: input.relayOrigins,
+      mcpWebhookReceivers: eventsShimMcpWebhookReceivers(input.publicBaseUrl),
+      eventsStream: { pollMs: EVENTS_SHIM_STREAM_POLL_MS },
       ...(input.pollIntervalMs ? { pollIntervalMs: input.pollIntervalMs } : {}),
       beforeCreate: async () => {
         creator = await input.authorizeCreate(request, response);
@@ -220,6 +243,28 @@ async function send(response: ServerResponse, answer: Response): Promise<void> {
   answer.headers.forEach((value, name) => {
     headers[name] = value;
   });
+  // `events/stream` answers Server-Sent Events: write each chunk as it comes,
+  // or the client sees nothing until the stream closes minutes later.
+  if (answer.body && (headers["content-type"] ?? "").startsWith("text/event-stream")) {
+    if (response.writableEnded || response.destroyed) {
+      await answer.body.cancel().catch(() => undefined);
+      return;
+    }
+    response.writeHead(answer.status, headers);
+    response.flushHeaders();
+    const reader = answer.body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || response.destroyed) break;
+        response.write(value);
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      if (!response.writableEnded) response.end();
+    }
+    return;
+  }
   const body = Buffer.from(await answer.arrayBuffer());
   if (response.writableEnded || response.destroyed) return;
   response.writeHead(answer.status, headers);

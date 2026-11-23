@@ -90,7 +90,9 @@
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
     {"name":"0087_relay_channel_creations.sql","sha256":"ff28fbb66c7ad41ebd44d6a1e886c05a3d06217884e686eb5cdd380ed31e5677"},
     {"name":"0088_owner_delegates.sql","sha256":"6a76a09cb3a6dc0fabb5bca8d778e95e3ccd71b20f8926e20576ee6305e93de4"},
-    {"name":"0089_delegation_release_gates.sql","sha256":"ec63416bf7df133120573e601016060e4c7fe2777b5bc4eb56db317676362a4e"}
+    {"name":"0089_delegation_release_gates.sql","sha256":"ec63416bf7df133120573e601016060e4c7fe2777b5bc4eb56db317676362a4e"},
+    {"name":"0092_events_shim_mcp_mode.sql","sha256":"de55a67510f635bd2cecea5e5d0209876a4f7246799e4549be10f1c3288fea8c"},
+    {"name":"0095_events_shim_wake_agent.sql","sha256":"7db9de27af2caa8bed6a8b1ad6322fdb717240202c547973ced72357cc9a5d50"}
   ],
   "required":[
     {"kind":"column","name":"public.admin_audit_events.action","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":true,"position":6,"type":"text"}},
@@ -618,6 +620,7 @@
     {"kind":"column","name":"public.events_shims.relay_workspace_key_ciphertext","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":19,"type":"text"}},
     {"kind":"column","name":"public.events_shims.secrets_ciphertext","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":6,"type":"text"}},
     {"kind":"column","name":"public.events_shims.user_id","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":17,"type":"uuid"}},
+    {"kind":"column","name":"public.events_shims.wake_agent","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":21,"type":"text"}},
     {"kind":"column","name":"public.events_shims.wake_broken_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":10,"type":"timestamp with time zone"}},
     {"kind":"column","name":"public.events_shims.wake_broken_reason","definition":{"collation":"pg_catalog.default","default":null,"generated":"","identity":"","not_null":false,"position":11,"type":"text"}},
     {"kind":"column","name":"public.events_shims.wake_linked_at","definition":{"collation":null,"default":null,"generated":"","identity":"","not_null":false,"position":9,"type":"timestamp with time zone"}},
@@ -1645,7 +1648,7 @@
     {"kind":"constraint","name":"public.events_shim_agent_links.events_shim_agent_links_id_key","definition":{"deferrable":false,"deferred":false,"definition":"UNIQUE (id)","no_inherit":true,"triggers":[],"type":"u","validated":true}},
     {"kind":"constraint","name":"public.events_shim_agent_links.events_shim_agent_links_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (shim_id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.events_shim_events.events_shim_events_delivery_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((delivery = ANY (ARRAY['pending'::text, 'sending'::text, 'woken'::text, 'read'::text])))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
-    {"kind":"constraint","name":"public.events_shim_events.events_shim_events_mode_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((mode = ANY (ARRAY['open'::text, 'github'::text, 'stripe'::text, 'linear'::text, 'bearer'::text])))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
+    {"kind":"constraint","name":"public.events_shim_events.events_shim_events_mode_check","definition":{"deferrable":false,"deferred":false,"definition":"CHECK ((mode = ANY (ARRAY['open'::text, 'github'::text, 'stripe'::text, 'linear'::text, 'bearer'::text, 'mcp'::text])))","no_inherit":false,"triggers":[],"type":"c","validated":true}},
     {"kind":"constraint","name":"public.events_shim_events.events_shim_events_pkey","definition":{"deferrable":false,"deferred":false,"definition":"PRIMARY KEY (id)","no_inherit":true,"triggers":[],"type":"p","validated":true}},
     {"kind":"constraint","name":"public.events_shim_events.events_shim_events_shim_id_fkey","definition":{"deferrable":false,"deferred":false,"definition":"FOREIGN KEY (shim_id) REFERENCES events_shims(id) ON DELETE CASCADE","no_inherit":true,"triggers":[{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_ins","table":"public.events_shim_events","type":5},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_check_upd","table":"public.events_shim_events","type":17},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_cascade_del","table":"public.events_shims","type":9},{"deferrable":false,"deferred":false,"enabled":"O","function":"pg_catalog.RI_FKey_noaction_upd","table":"public.events_shims","type":17}],"type":"f","validated":true}},
     {"kind":"constraint","name":"public.events_shim_events.events_shim_events_shim_id_seq_key","definition":{"deferrable":false,"deferred":false,"definition":"UNIQUE (shim_id, seq)","no_inherit":true,"triggers":[],"type":"u","validated":true}},
@@ -2453,5 +2456,5 @@
   "optional":{
 
   },
-  "sha256":"5b3f2964ca062d41b01b1ad75dcac435d458615853a0fdbf4e97b508ba3a5c32"
+  "sha256":"cebeb1c07e1b8bd2ec5007550824c5273e9d6d9a1dc0a24e7b745dd10b8f7fb7"
 }

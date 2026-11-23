@@ -119,7 +119,7 @@ async function fixture(t: TestContext) {
   const delivery = async (shimId: string) =>
     (await database.query<{ seq: number; delivery: string }>("SELECT seq, delivery FROM events_shim_events WHERE shim_id = $1 ORDER BY seq", [shimId])).rows;
   const wake = async (shimId: string) =>
-    (await database.query<{ wake_url: string | null; wake_broken_reason: string | null }>("SELECT wake_url, wake_broken_reason FROM events_shims WHERE id = $1", [shimId])).rows[0]!;
+    (await database.query<{ wake_url: string | null; wake_broken_reason: string | null; wake_agent: string | null }>("SELECT wake_url, wake_broken_reason, wake_agent FROM events_shims WHERE id = $1", [shimId])).rows[0]!;
 
   /** A bound agent of `who`: its binding row with the relay agent id it was bound as, now holding the name. */
   async function bind(kind: "capy" | "replica" | "amp", name: string, who: AgentLinkActor = owner, options: { state?: string; generation?: number } = {}) {
@@ -185,6 +185,8 @@ test("delivers each post, and the backlog, to the agent as a DM from the inbox's
   await f.settle();
   assert.equal(linked.inbox_id, shim.shim_id);
   assert.equal(linked.kind, "capy");
+  // The bound agent's name (without the @) is the link's wake agent, so watch_webhooks can name it.
+  assert.equal((await f.wake(shim.shim_id)).wake_agent, "capy-a");
   assert.deepEqual(f.state.registered, [linked.sender]);
   assert.match(linked.sender, /^webhooks-/u);
 
@@ -277,6 +279,7 @@ test("unlinking clears the wake link and releases the inbox's identity", async (
   assert.deepEqual(await unlinkInboxFromAgent(f.deps, f.owner, { inbox: shim.mcp_url }), { inbox_id: shim.shim_id, unlinked: true });
   assert.deepEqual(f.state.released, [`rk_${RELAY}:${linked.sender}`]);
   assert.equal((await f.wake(shim.shim_id)).wake_url, null);
+  assert.equal((await f.wake(shim.shim_id)).wake_agent, null);
   await f.post(shim.webhook_url, { n: 1 });
   await f.settle();
   assert.deepEqual(f.state.sent, []);
