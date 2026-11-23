@@ -143,8 +143,10 @@ Control then:
    reports one, otherwise now. The expiry is the approval's `expires_at`
    (default base + 1 hour), capped at base + 24 hours and at the grant's
    expiry. Later attestations keep the stored value;
-8. re-checks the caller's membership, signs, records the `jti`, and writes
-   `approval.attested` with the quote and its SHA-256. The route then
+8. at the commit point, in one transaction after every Relaycast lookup,
+   re-reads what steps 4 to 6 used instead of trusting the earlier copies
+   (see "Commit-point checks"), then signs, records the `jti`, and writes
+   `approval.attested` with the quote and its keyed digest. The route then
    re-checks the bearer.
 
 Once the request is authenticated and well formed, every failure, including
@@ -246,12 +248,36 @@ on every redeem and never consumed. Control:
   - An unmet condition answers `condition_unmet` with `unmet` and does not
     consume the approval.
 
-The grant is re-checked under its row lock, and a single-use action is
-consumed by one atomic insert in the same transaction, so a replay or a race
-with a revocation or a narrowing is refused. The answer is
+The commit-point checks below run again before consuming, and a single-use
+action is consumed by one atomic insert in the same transaction, so a replay
+or a race with a revocation, a narrowing or a policy change is refused. The answer is
 `{ok:true, consumed}` or `{ok:false, reason, unmet?}`. Cloud also returns
 `checked.head_sha` for PR targets; relay-control never does, because it does
 not read GitHub (PR conditions are `condition_unavailable`).
+
+### Commit-point checks
+
+Attestation (before signing) and redeem (before consuming) end in one
+transaction that re-reads, from committed state, everything the earlier
+checks read before the slow Relaycast lookups:
+
+1. the workspace policy, share-locked (a policy `PUT` locks it for update):
+   delegation off is `not_enabled`;
+2. the grant, locked for update (revocation and `PATCH` take the same lock):
+   `revoked` or `expired`;
+3. every action against the current grant and policy (allowed classes, the
+   grant's fit, scope coverage, the recipient's own target): `out_of_scope`;
+4. for tier D, the current policy's and grant's `require_tier_o`:
+   `tier_o_required`;
+5. the caller's membership and bearer, share-locked: `not_pending`;
+6. the approval row, locked: revoked, withdrawn or invalidated is `revoked`;
+7. standing against the target owners as committed now: `recipient_policy`.
+
+The reason codes are the same as the early checks'. Locks are taken policy,
+then grant, then membership, session and approval; a policy `PUT` (policy,
+then grants, then approvals) and revocation (grants, then approvals) take
+them in the same order. Attestation signs last, inside the transaction, so a
+refusal at the commit point signs nothing.
 
 ### Revoking or withdrawing one approval
 
@@ -294,7 +320,16 @@ Turning `delegation_enabled` off makes every attestation and redeem
 - `policy.updated`, `target_owners.updated`
 
 `GET /delegates/audit?since=&grant_id=&format=jsonl&limit=&after_id=` shows a member
-their own events and an admin all of them. Each event is `id, event,
+their own events and an admin all of them. Events come in id order; resume
+with `after_id=<last id>`. Ids come from a sequence at insert, but a row only
+becomes visible when its transaction commits, so a later id can be visible
+before an earlier one. A page therefore stops before the first event (of any
+viewer or filter) that could still be committing: one inserted at or after
+the start of a transaction still in flight on the database (read from
+`pg_stat_activity` before the page's snapshot; a five-minute lag if activity
+tracking is off). A page can be short or empty while writes are in flight;
+the next read with the same `after_id` returns the rest, and nothing is ever
+skipped. Each event is `id, event,
 created_at, actor_user_id, actor_agent_id, auth_method, owner_id, grant_id,
 approval_id, message_id, recipient_agent_id, reason, data, quote, quote_hash,
 quote_redacted_at`, as in Cloud. The attestation's `jti` and `kid` are in
@@ -321,6 +356,12 @@ quote text past its window.
   one restores nothing.
 - The redaction runs hourly from the server, and also on every attestation
   and every audit read. The hash and the event itself are kept.
+- Redaction is per message. Once any event's quote for a message is
+  redacted, attesting that message again signs `quote: null` and stores only
+  the digest (with `quote_redacted_at` set), and the next sweep or audit read
+  redacts any other event still quoting it (one written concurrently with the
+  redaction). relay-control calls no Relaycast redaction (Cloud's is a
+  Cloud-only internal route), so there is no redaction queue.
 
 ## Migration
 

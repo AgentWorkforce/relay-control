@@ -3435,7 +3435,7 @@ paths:
         - name: after_id
           in: query
           required: false
-          description: Resume after this event `id` (as Cloud). Ids increase strictly, while timestamps can repeat within one transaction, so paging never skips events.
+          description: Resume after this event `id` (as Cloud). Events come in id order, and a page stops before the first event that could still be committing, so resuming after the last id never skips an event committed out of id order. A page can be short or empty while writes are in flight.
           schema: { type: string, pattern: "^(0|[1-9][0-9]{0,15})$" }
       responses:
         "200":

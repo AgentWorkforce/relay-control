@@ -36,6 +36,7 @@ import {
   CLAIM_TTL_MS,
   expireLapsed,
   grantView,
+  listAuditPage,
   loadOrgPolicy,
   loadPolicy,
   loadTargetOwners,
@@ -728,9 +729,11 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (since && !Number.isFinite(Date.parse(since))) fail("invalid_request", "since must be a timestamp", 400);
       const grantId = params.get("grant_id");
       if (grantId && !GRANT_ID.test(grantId)) fail("invalid_request", "Invalid grant_id", 400);
-      // Resume after an event id: events are returned in id order, so this
-      // never skips events that share a timestamp.
-      // As Cloud: `?after_id=<last event id>`; ids increase strictly, timestamps can repeat.
+      // Resume after an event id, as Cloud: `?after_id=<last event id>`.
+      // Events are returned in id order and a page never runs past an event
+      // that could still be committing (listAuditPage's watermark), so
+      // resuming after the last id never skips an event committed out of
+      // id order.
       const after = params.get("after_id");
       if (after !== null && !/^(0|[1-9][0-9]{0,15})$/.test(after)) fail("invalid_request", "after_id must be an event id", 400);
       const format = params.get("format") ?? "json";
@@ -738,16 +741,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const limit = Math.min(MAX_AUDIT_EVENTS,
         Math.max(1, Number.parseInt(params.get("limit") ?? `${MAX_AUDIT_EVENTS}`, 10) || MAX_AUDIT_EVENTS));
       await redactExpiredQuotes(input.database);
-      const events = (await input.database.query<Record<string, unknown>>(
-        `SELECT * FROM delegation_audit_events
-          WHERE workspace_id = $1
-            AND ($2::boolean OR owner_user_id = $3 OR actor_user_id = $3)
-            AND ($4::timestamptz IS NULL OR created_at > $4::timestamptz)
-            AND ($5::text IS NULL OR grant_id = $5)
-            AND ($7::bigint IS NULL OR id > $7::bigint)
-          ORDER BY id LIMIT $6`,
-        [workspace.id, caller.admin, principal.userId, since || null, grantId || null, limit, after || null],
-      )).rows.map(auditView);
+      const events = (await listAuditPage(input.database, {
+        workspaceId: workspace.id, all: caller.admin, viewerUserId: principal.userId, since: since || null,
+        grantId: grantId || null, limit, afterId: after,
+      })).map(auditView);
       if (format === "jsonl") {
         response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" });
         response.end(events.map(event => JSON.stringify(event)).join("\n") + (events.length ? "\n" : ""));

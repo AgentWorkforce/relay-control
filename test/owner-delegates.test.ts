@@ -1343,3 +1343,187 @@ test("a bearer revoked while redeem or attestation waits is refused and nothing 
   assert.equal((await env.database.query("SELECT 1 FROM delegation_attestations")).rows.length, before);
   env.world.handle = handle;
 });
+
+/** Runs `run` once, the next time the delegate's roster lookup (a slow Relaycast read) is made. */
+function duringRosterLookup(env: Env, t: TestContext) {
+  const handle = env.world.handle;
+  let during: (() => Promise<void>) | null = null;
+  env.world.handle = (async (...args: Parameters<typeof handle>) => {
+    if (during && args[0] === "GET" && args[1] === "/v1/agents/assistant") {
+      const run = during;
+      during = null;
+      await run();
+    }
+    return handle(...args);
+  }) as typeof handle;
+  t.after(() => { env.world.handle = handle; });
+  return (run: () => Promise<void>) => { during = run; };
+}
+
+test("review: the policy, Tier O classes and approval are rechecked at the commit point, not from before the lookups", async (t) => {
+  const { env, recipient, bot, grantId } = await ready(t);
+  const during = duringRosterLookup(env, t);
+  const attestations = async () => (await env.database.query("SELECT 1 FROM delegation_attestations")).rows.length;
+  const put = async (body: Record<string, unknown>) => {
+    const response = await env.browser("/delegates/policy", "PUT", { delegation_enabled: true, ...body });
+    assert.equal(response.status, 200, response.raw);
+  };
+
+  // Attest: delegation turned off while the lookups run is not_enabled; nothing is recorded.
+  during(() => put({ delegation_enabled: false }));
+  const off = await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#201" }])));
+  assert.deepEqual(off.body, { verdict: "none", reason: "not_enabled" });
+  assert.equal(await attestations(), 0);
+  await put({});
+
+  // Attest: the policy starts requiring Tier O for merge (no grant is revoked by that) mid-flight.
+  during(() => put({ require_tier_o: ["merge"] }));
+  const tierO = await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#202" }])));
+  assert.deepEqual(tierO.body, { verdict: "none", reason: "tier_o_required" });
+  assert.equal(await attestations(), 0);
+  await put({});
+
+  // Attest: the grant itself starts requiring Tier O for merge mid-flight.
+  during(async () => {
+    const patched = await env.browser(`/delegates/${grantId}`, "PATCH", { require_tier_o: ["merge"] });
+    assert.equal(patched.status, 200, patched.raw);
+  });
+  const grantTierO = await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#203" }])));
+  assert.deepEqual(grantTierO.body, { verdict: "none", reason: "tier_o_required" });
+  assert.equal(await attestations(), 0);
+
+  // Redeem: a fresh grant and an attested multi-use deploy approval.
+  await env.bearer("/delegates/revoke-all", "POST", {});
+  await env.grant(bot.id, [{ class: "deploy", targets: ["*:staging"] }]);
+  const staging = { class: "deploy", target: "web:staging" };
+  const attested = await env.attest(recipient, send(env, bot, recipient, env.approval([staging])));
+  assert.equal(attested.body.verdict, "delegate", attested.raw);
+  const approvalId = attested.body.claims.approval_id as string;
+  const consumed = async () => (await env.database.query(
+    "SELECT 1 FROM delegation_action_consumptions WHERE approval_id = $1", [approvalId])).rows.length;
+  // Delegation turned off mid-redeem.
+  during(() => put({ delegation_enabled: false }));
+  assert.deepEqual((await env.redeem(recipient, approvalId, staging)).body, { ok: false, reason: "not_enabled" });
+  await put({});
+  // Tier O required for deploy mid-redeem.
+  during(() => put({ require_tier_o: ["deploy"] }));
+  assert.deepEqual((await env.redeem(recipient, approvalId, staging)).body, { ok: false, reason: "tier_o_required" });
+  await put({});
+  // An allowed-classes change: the PUT revokes the grant itself.
+  during(() => put({ allowed_classes: ["merge"] }));
+  assert.deepEqual((await env.redeem(recipient, approvalId, staging)).body, { ok: false, reason: "revoked" });
+  assert.equal(await consumed(), 0);
+
+  // Attest a Tier O approval the owner revokes while the lookups run: revoked, nothing recorded.
+  await put({});
+  await env.grant(bot.id, [{ class: "deploy", targets: ["*:staging"] }]);
+  const minted = await env.browser("/delegates/approvals", "POST", { actions: [staging] });
+  assert.equal(minted.status, 201, minted.raw);
+  const before = await attestations();
+  during(async () => {
+    assert.equal((await env.bearer(`/delegates/approvals/${minted.body.approval_id}`, "DELETE")).status, 200);
+  });
+  const withdrawn = await env.attest(recipient, send(env, bot, recipient,
+    env.approval([staging], { approval_ref: minted.body.approval_id })));
+  assert.deepEqual(withdrawn.body, { verdict: "none", reason: "revoked" });
+  assert.equal(await attestations(), before);
+
+  // Standing: a target-owners entry removed mid-flight refuses another person's approval.
+  const otherId = await env.addMember("target-owner@acme.test");
+  const other = await env.desktopSignIn({ hostName: "other-box", userId: otherId });
+  const otherBot = env.world.addAgent("other-bot");
+  await env.database.query(
+    `INSERT INTO delegation_agent_bindings (workspace_id, relaycast_workspace_id, agent_id, agent_name, user_id, claim_id)
+     VALUES ($1, 'rw_primary', $2, 'other-bot', $3,
+       (SELECT id FROM delegation_claims LIMIT 1))`, [env.workspaceId, otherBot.id, otherId]);
+  const otherGrant = await env.browser("/delegates", "POST",
+    { delegate_agent_id: otherBot.id, scopes: [{ class: "deploy", targets: ["web:*"] }] }, other.session);
+  assert.equal(otherGrant.status, 201, otherGrant.raw);
+  const owners = await env.browser("/delegates/target-owners", "PUT", [{ pattern: "web:*", owner_ids: [otherId] }]);
+  assert.equal(owners.status, 200, owners.raw);
+  const otherDuring = env.world.handle;
+  let clear: (() => Promise<void>) | null = async () => {
+    assert.equal((await env.browser("/delegates/target-owners", "PUT", [])).status, 200);
+  };
+  env.world.handle = (async (...args: Parameters<typeof otherDuring>) => {
+    if (clear && args[0] === "GET" && args[1] === "/v1/agents/other-bot") {
+      const run = clear;
+      clear = null;
+      await run();
+    }
+    return otherDuring(...args);
+  }) as typeof otherDuring;
+  const standing = await env.attest(recipient, env.world.sendApprovalAs("other-bot", recipient.name, "ok",
+    { v: 1, owner_id: otherId, actions: [{ class: "deploy", target: "web:staging" }] }).message.id);
+  assert.deepEqual(standing.body, { verdict: "none", reason: "recipient_policy" });
+});
+
+test("review: a message whose quote was redacted is never stored or signed again", async (t) => {
+  const { env, recipient, bot } = await ready(t);
+  const merge = { class: "merge", target: "AgentWorkforce/relay#210" };
+  const messageId = send(env, bot, recipient, env.approval([merge]));
+  const first = await env.attest(recipient, messageId);
+  assert.equal(first.body.claims.quote, "yes merge 2250 when green");
+  // The first record passes the retention window and the sweep redacts it.
+  await env.database.query("UPDATE delegation_audit_events SET created_at = now() - interval '91 days' WHERE event = 'approval.attested'");
+  const { createDelegationRetention } = await import("../src/delegation/retention.js");
+  await createDelegationRetention({ database: env.database }).sweep();
+  // Attesting the same message again: no quote is signed or stored, the digest is kept.
+  const again = await env.attest(recipient, messageId);
+  assert.equal(again.body.verdict, "delegate", again.raw);
+  assert.equal(again.body.claims.quote, null);
+  const rows = (await env.database.query<{ quote: string | null; quote_hash: string | null; quote_redacted_at: Date | null }>(
+    "SELECT quote, quote_hash, quote_redacted_at FROM delegation_audit_events WHERE event = 'approval.attested' ORDER BY id")).rows;
+  assert.equal(rows.length, 2);
+  for (const row of rows) {
+    assert.equal(row.quote, null);
+    assert.match(row.quote_hash!, /^[0-9a-f]{64}$/);
+    assert.ok(row.quote_redacted_at);
+  }
+  assert.equal(rows[1]!.quote_hash, rows[0]!.quote_hash);
+  // A quote row for that message committed concurrently with the redaction
+  // (simulated) is redacted by the next sweep or audit read.
+  await env.database.query(
+    `INSERT INTO delegation_audit_events (workspace_id, event, message_id, quote, quote_hash)
+     VALUES ($1, 'approval.attested', $2, 'yes merge 2250 when green', 'h')`, [env.workspaceId, messageId]);
+  const audit = await env.bearer("/delegates/audit");
+  assert.equal(audit.status, 200, audit.raw);
+  assert.ok(audit.body.events.every((event: { quote: string | null }) => event.quote === null));
+  // Another message keeps its quote.
+  const other = await env.attest(recipient, send(env, bot, recipient, env.approval([{ ...merge, target: "AgentWorkforce/relay#211" }])));
+  assert.equal(other.body.claims.quote, "yes merge 2250 when green");
+});
+
+test("review: audit pages never run past an event that may still be committing", async (t) => {
+  const { env, recipient, bot, grantId } = await ready(t);
+  await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#220" }])));
+  const settled = (await env.bearer("/delegates/audit")).body.events as Array<{ id: string }>;
+  assert.ok(settled.length > 0);
+  // An event whose insert time is past the watermark stands for a transaction
+  // still in flight: it and every later id are held back, even though a later
+  // event has committed.
+  const inFlight = (await env.database.query<{ id: string }>(
+    `INSERT INTO delegation_audit_events (workspace_id, event, owner_user_id, created_at)
+     VALUES ($1, 'grant.updated', $2, clock_timestamp() + interval '1 hour') RETURNING id::text`,
+    [env.workspaceId, env.ownerId])).rows[0]!.id;
+  await env.attest(recipient, send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#221" }])));
+  const held = (await env.bearer("/delegates/audit")).body.events as Array<{ id: string }>;
+  assert.deepEqual(held.map(event => event.id), settled.map(event => event.id));
+  const resumed = (await env.bearer(`/delegates/audit?after_id=${settled.at(-1)!.id}&format=jsonl`));
+  assert.equal(resumed.status, 200, resumed.raw);
+  assert.equal(resumed.raw, "");
+  // Once it settles, resuming from the last id returns it and the later event, in id order.
+  await env.database.query("UPDATE delegation_audit_events SET created_at = clock_timestamp() - interval '1 second' WHERE id = $1",
+    [inFlight]);
+  const rest = (await env.bearer(`/delegates/audit?after_id=${settled.at(-1)!.id}`)).body.events as Array<{ id: string; event: string }>;
+  assert.equal(rest[0]!.id, inFlight);
+  assert.ok(rest.length >= 2);
+  assert.deepEqual(rest.map(event => BigInt(event.id)), rest.map(event => BigInt(event.id)).sort((a, b) => (a < b ? -1 : 1)));
+  // A filter that hides the in-flight event still stops before it.
+  await env.database.query("UPDATE delegation_audit_events SET created_at = clock_timestamp() + interval '1 hour' WHERE id = $1",
+    [inFlight]);
+  const filtered = await env.bearer(`/delegates/audit?after_id=${settled.at(-1)!.id}&grant_id=${grantId}`);
+  assert.equal(filtered.status, 200, filtered.raw);
+  assert.deepEqual(filtered.body.events, []);
+  assert.deepEqual((await env.bearer(`/delegates/audit?after_id=${settled.at(-1)!.id}`)).body.events, []);
+});

@@ -167,13 +167,18 @@ export function newClaimCode(): string {
   return `dlg_${randomBytes(24).toString("base64url")}`;
 }
 
-export async function loadPolicy(executor: SqlExecutor, workspaceId: string): Promise<DelegationPolicy> {
+/**
+ * The workspace policy. `lock` (inside a transaction) share-locks the policy
+ * row, so a policy PUT (which locks it FOR UPDATE) serializes with whatever
+ * the transaction commits. A missing row is the default, disabled policy.
+ */
+export async function loadPolicy(executor: SqlExecutor, workspaceId: string, lock = false): Promise<DelegationPolicy> {
   const row = (await executor.query<{
     delegation_enabled: boolean; max_expiry_days: number; allowed_classes: ActionClass[] | null;
     require_tier_o: ActionClass[]; code_owner_match: "any_path" | "all_paths";
   }>(
     `SELECT delegation_enabled, max_expiry_days, allowed_classes, require_tier_o, code_owner_match
-       FROM delegation_policies WHERE workspace_id = $1`,
+       FROM delegation_policies WHERE workspace_id = $1${lock ? " FOR SHARE" : ""}`,
     [workspaceId],
   )).rows[0];
   if (!row) return { ...DEFAULT_POLICY };
@@ -277,6 +282,11 @@ export type AuditInput = {
   quote?: string | null;
   /** The quote's keyed digest (quoteDigest); required with a quote. */
   quoteHash?: string | null;
+  /**
+   * The message's quote was already redacted (§15.9): the row keeps the
+   * digest, stores no quote text and is marked redacted from the start.
+   */
+  quoteRedacted?: boolean;
 };
 
 /**
@@ -293,8 +303,9 @@ export async function recordDelegationAudit(executor: SqlExecutor, input: AuditI
   await executor.query(
     `INSERT INTO delegation_audit_events
        (workspace_id, event, actor_user_id, actor_agent_id, auth_method, owner_user_id, grant_id,
-        approval_id, message_id, recipient_agent_id, reason, data, quote, quote_hash)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14)`,
+        approval_id, message_id, recipient_agent_id, reason, data, quote, quote_hash, quote_redacted_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14,
+             CASE WHEN $15::boolean THEN now() END)`,
     [
       input.workspaceId, input.event,
       input.actorUserId && UUID.test(input.actorUserId) ? input.actorUserId : null,
@@ -302,7 +313,8 @@ export async function recordDelegationAudit(executor: SqlExecutor, input: AuditI
       input.ownerUserId && UUID.test(input.ownerUserId) ? input.ownerUserId : null,
       input.grantId ?? null, input.approvalId ?? null, input.messageId ?? null, input.recipientAgentId ?? null,
       input.reason ?? null, JSON.stringify(input.data ?? {}),
-      input.quote ?? null, input.quote ? input.quoteHash ?? null : null,
+      input.quoteRedacted ? null : input.quote ?? null, input.quote ? input.quoteHash ?? null : null,
+      Boolean(input.quote && input.quoteRedacted),
     ],
   );
 }
@@ -323,19 +335,101 @@ export function auditView(row: Record<string, unknown>) {
  * §15.9 retention, as Cloud's sweep: each quote older than its org's
  * `quote_retention_days` (90 without an org policy row) is redacted to its hash.
  * A shorter window applies to existing quotes at the next sweep; a longer one
- * cannot restore a quote already redacted. Runs on every attestation and
- * every audit read (relay-control has no cron).
+ * cannot restore a quote already redacted.
+ *
+ * Redaction is per message: once any row's quote for a message is redacted,
+ * every other row quoting that message is redacted too. Attestation already
+ * refuses to store a redacted message's quote; this second rule catches an
+ * attestation that committed concurrently with the redaction. Runs in the
+ * hourly sweep, on every attestation and on every audit read, as one
+ * statement, so a crash cannot leave half of it applied.
  */
 export async function redactExpiredQuotes(executor: SqlExecutor): Promise<void> {
   await executor.query(
     `UPDATE delegation_audit_events AS e SET quote = NULL, quote_redacted_at = now()
       WHERE e.quote IS NOT NULL
-        AND e.created_at <= now() - make_interval(days => COALESCE(
-          (SELECT p.quote_retention_days FROM delegation_org_policies p
-             JOIN workspaces w ON w.organization_id = p.organization_id
-            WHERE w.id = e.workspace_id), $1))`,
+        AND (e.created_at <= now() - make_interval(days => COALESCE(
+              (SELECT p.quote_retention_days FROM delegation_org_policies p
+                 JOIN workspaces w ON w.organization_id = p.organization_id
+                WHERE w.id = e.workspace_id), $1))
+          OR (e.message_id IS NOT NULL AND EXISTS (
+              SELECT 1 FROM delegation_audit_events r
+               WHERE r.workspace_id = e.workspace_id AND r.message_id = e.message_id
+                 AND r.quote_redacted_at IS NOT NULL)))`,
     [QUOTE_RETENTION_DAYS],
   );
+}
+
+/** Whether any audit row's quote for this message has been redacted (§15.9). */
+export async function messageQuoteRedacted(executor: SqlExecutor, workspaceId: string, messageId: string): Promise<boolean> {
+  return (await executor.query(
+    `SELECT 1 FROM delegation_audit_events
+      WHERE workspace_id = $1 AND message_id = $2 AND quote_redacted_at IS NOT NULL LIMIT 1`,
+    [workspaceId, messageId],
+  )).rows.length > 0;
+}
+
+/**
+ * The audit log's commit-safe watermark. Event ids come from a sequence when
+ * a row is inserted, but rows become visible when their transaction commits,
+ * so a reader can see id N+1 before id N. Every row a transaction still in
+ * flight has written, or is writing, has `created_at` (clock_timestamp() at
+ * insert) at or after that transaction's start, or (before it has a
+ * transaction id) its current statement's start. The watermark is the
+ * earliest of those across the database's other backends, capped at now: no
+ * row with `created_at` before it can still appear.
+ *
+ * It is read in its own statement, before the page's snapshot, so a
+ * transaction that commits between the two is visible to the page. Only
+ * Control's own database role writes this log, and pg_stat_activity shows a
+ * role's own sessions. With activity tracking off it falls back to a
+ * five-minute lag.
+ */
+export async function auditWatermark(executor: SqlExecutor): Promise<string> {
+  return (await executor.query<{ watermark: string }>(
+    `SELECT (CASE WHEN current_setting('track_activities') = 'on' THEN LEAST(clock_timestamp(), (
+               SELECT min(CASE WHEN backend_xid IS NOT NULL THEN xact_start
+                               WHEN state = 'active' THEN query_start END)
+                 FROM pg_stat_activity
+                WHERE datname = current_database() AND pid <> pg_backend_pid()))
+             ELSE clock_timestamp() - interval '5 minutes' END)::text AS watermark`,
+  )).rows[0]!.watermark;
+}
+
+/**
+ * One page of a workspace's audit log in id order, after `afterId`, that
+ * never skips an event: it stops before the first event (of any viewer or
+ * filter) at or after the commit-safe watermark, so an event committed after
+ * this read can only ever have an id above the page's last. A page can be
+ * short, or empty, while writes are in flight; the next read with the same
+ * `after_id` returns the rest.
+ */
+export async function listAuditPage(executor: SqlExecutor, input: {
+  workspaceId: string; all: boolean; viewerUserId: string; since: string | null; grantId: string | null;
+  limit: number; afterId: string | null;
+}): Promise<Record<string, unknown>[]> {
+  const watermark = await auditWatermark(executor);
+  const rows = (await executor.query<Record<string, unknown>>(
+    `SELECT * FROM delegation_audit_events
+      WHERE workspace_id = $1
+        AND ($2::boolean OR owner_user_id = $3 OR actor_user_id = $3)
+        AND ($4::timestamptz IS NULL OR created_at > $4::timestamptz)
+        AND ($5::text IS NULL OR grant_id = $5)
+        AND ($7::bigint IS NULL OR id > $7::bigint)
+        AND created_at < $8::timestamptz
+      ORDER BY id LIMIT $6`,
+    [input.workspaceId, input.all, input.viewerUserId, input.since, input.grantId, input.limit, input.afterId, watermark],
+  )).rows;
+  if (!rows.length) return rows;
+  // An event at or after the watermark below the page's last id (sequence
+  // order and clock order can differ by a few microseconds between
+  // concurrent inserts) ends the page before it.
+  const cut = (await executor.query<{ id: string | null }>(
+    `SELECT min(id)::text AS id FROM delegation_audit_events
+      WHERE workspace_id = $1 AND id > COALESCE($2::bigint, 0) AND id <= $3::bigint AND created_at >= $4::timestamptz`,
+    [input.workspaceId, input.afterId, String(rows.at(-1)!.id), watermark],
+  )).rows[0]?.id;
+  return cut ? rows.filter(row => BigInt(String(row.id)) < BigInt(cut)) : rows;
 }
 
 /**
@@ -519,10 +613,10 @@ export function resolveStanding(input: { approvalOwnerId: string; recipientOwner
   return "code_owner";
 }
 
-async function standingFor(deps: DelegationDeps, workspaceId: string, input: Omit<Parameters<typeof resolveStanding>[0],
+async function standingFor(executor: SqlExecutor, workspaceId: string, input: Omit<Parameters<typeof resolveStanding>[0],
   "targetOwners">): Promise<Standing | null> {
   const needsTable = input.approvalOwnerId !== input.recipientOwnerId && input.accept === "code_owners";
-  return resolveStanding({ ...input, targetOwners: needsTable ? await loadTargetOwners(deps.database, workspaceId) : [] });
+  return resolveStanding({ ...input, targetOwners: needsTable ? await loadTargetOwners(executor, workspaceId) : [] });
 }
 
 export type DelegationVerdict =
@@ -637,18 +731,57 @@ function scopeRefusal(actions: readonly Action[], grant: GrantRow, policy: Deleg
 }
 
 /**
- * Rechecks a grant under a row lock at a commit boundary: still active,
- * unexpired, within policy and covering every action. Grant revocation and
- * narrowing lock the same row, so they serialize with this check.
+ * The commit-point check, run inside the transaction that signs an
+ * attestation or consumes an action, after every slow lookup. Everything is
+ * read again from committed state under locks, never from the policy or grant
+ * read before the lookups:
+ *
+ * - the workspace policy, share-locked (a policy PUT locks it FOR UPDATE):
+ *   delegation off is `not_enabled`;
+ * - the grant, locked FOR UPDATE (revocation and narrowing lock it too):
+ *   `revoked` or `expired`;
+ * - the actions against the current grant and policy (allowed classes, the
+ *   grant's fit, scope coverage, the recipient's own target): `out_of_scope`;
+ * - for tier D, the current policy's and grant's tier O classes:
+ *   `tier_o_required`.
+ *
+ * Lock order is policy row, then grant row, then (in the callers) the
+ * membership, session and approval rows. A policy PUT takes the policy row,
+ * then grants, then approvals; revocation takes grants, then approvals. So
+ * none of them can deadlock with this.
  */
-async function recheckGrant(tx: SqlExecutor, workspaceId: string, grantId: string, actions: readonly Action[],
-  policy: DelegationPolicy, nowMs: number): Promise<void> {
-  const current = (await tx.query<GrantRow>(
-    "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2 FOR UPDATE", [grantId, workspaceId],
+export async function recheckAtCommit(tx: SqlExecutor, input: {
+  workspaceId: string; grantId: string; tier: "D" | "O"; actions: readonly Action[]; recipientAgentId: string;
+  nowMs: number;
+}): Promise<{ grant: GrantRow; policy: DelegationPolicy }> {
+  const policy = await loadPolicy(tx, input.workspaceId, true);
+  if (!policy.delegation_enabled) refuse("not_enabled");
+  const grant = (await tx.query<GrantRow>(
+    "SELECT * FROM delegation_grants WHERE id = $1 AND workspace_id = $2 FOR UPDATE", [input.grantId, input.workspaceId],
   )).rows[0];
-  if (!current || current.status === "revoked") refuse("revoked");
-  if (current!.status === "expired" || time(current!.expires_at) <= nowMs) refuse("expired");
-  if (!grantFitsPolicy(current!, policy) || !actionsCovered(current!.scopes, actions)) refuse("out_of_scope");
+  if (!grant || grant.status === "revoked") refuse("revoked");
+  if (grant!.status === "expired" || time(grant!.expires_at) <= input.nowMs) refuse("expired");
+  const outOfScope = scopeRefusal(input.actions, grant!, policy, input.recipientAgentId);
+  if (outOfScope) refuse(outOfScope);
+  if (input.tier === "D") {
+    const required = tierOClasses(policy, grant!);
+    if (input.actions.some(action => required.has(action.class))) refuse("tier_o_required");
+  }
+  return { grant: grant!, policy };
+}
+
+/**
+ * The approval row at the commit point, locked (after the grant): an approval
+ * revoked by its owner or an admin, withdrawn by its delegate, or invalidated
+ * with its grant while the caller waited is `revoked`.
+ */
+export async function approvalStillLive(tx: SqlExecutor, workspaceId: string, approvalId: string,
+  lock: "FOR SHARE" | "FOR UPDATE"): Promise<void> {
+  const live = (await tx.query(
+    `SELECT 1 FROM delegation_approvals WHERE id = $1 AND workspace_id = $2 AND invalidated_at IS NULL ${lock}`,
+    [approvalId, workspaceId],
+  )).rows.length > 0;
+  if (!live) refuse("revoked");
 }
 
 /**
@@ -743,7 +876,7 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
       if (actions.some(action => required.has(action.class))) refuse("tier_o_required");
     }
     // §5.4: the owner needs standing over every action's target.
-    const standing = await standingFor(deps, workspace.id, {
+    const standing = await standingFor(deps.database, workspace.id, {
       approvalOwnerId: approval.owner_id, recipientOwnerId: input.callerUserId, accept: input.accept, actions,
     });
     if (!standing) return refuse("recipient_policy");
@@ -774,41 +907,48 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
     const owner = (await deps.database.query<{ name: string | null }>(
       "SELECT name FROM users WHERE id = $1", [approval.owner_id],
     )).rows[0];
-    // Time the claims at signing, after every wait above: an attestation is
-    // never signed already expired.
-    const signedAt = deps.now().getTime();
-    if (expiresAt <= signedAt) refuse("expired");
-    const iat = Math.floor(signedAt / 1000);
-    const claims: AttestationClaims = {
-      v: 1,
-      ws: workspace.id,
-      owner_id: approval.owner_id,
-      owner_display: ownerDisplay(owner?.name),
-      delegate_agent_id: senderId!,
-      grant_id: grant.id,
-      message_id: input.messageId,
-      recipient_agent_id: input.recipientAgentId,
-      approval_id: context.approvalId!,
-      tier,
-      actions: actions.map(canonicalAction),
-      standing,
-      single_use: singleUse,
-      quote: approval.quote ?? null,
-      iat,
-      exp: Math.min(iat + ATTESTATION_TTL_SECONDS, Math.floor(expiresAt / 1000)),
-      jti: randomUUID(),
-    };
-    if (claims.exp <= iat) refuse("expired");
-    const attestation = deps.signer!.sign(claims);
-    await deps.database.transaction(async (tx) => {
-      // The grant may have changed during the Relaycast lookups: recheck it
-      // under a row lock (revocation and narrowing take the same lock) before
-      // recording anything a redeem could rely on.
-      await recheckGrant(tx, workspace.id, grant.id, actions, policy, now.getTime());
+    const { attestation, claims } = await deps.database.transaction(async (tx) => {
+      // The policy, grant and approval may have changed during the Relaycast
+      // lookups: recheck all of them from committed state, under locks, before
+      // signing or recording anything a redeem could rely on.
+      await recheckAtCommit(tx, { workspaceId: workspace.id, grantId: grant.id, tier, actions,
+        recipientAgentId: recipient.agentId, nowMs: deps.now().getTime() });
       // The caller's membership and bearer, under share locks, so a revocation
       // between the earlier check and this commit cannot be missed.
       if (!await memberRole(tx, workspace.id, input.callerUserId, true) ||
           (input.stillAuthorized && !await input.stillAuthorized(tx))) refuse("not_pending");
+      await approvalStillLive(tx, workspace.id, context.approvalId!, "FOR SHARE");
+      // Standing against the target owners as committed now.
+      if (await standingFor(tx, workspace.id, { approvalOwnerId: approval.owner_id, recipientOwnerId: input.callerUserId,
+        accept: input.accept, actions }) !== standing) refuse("recipient_policy");
+      // §15.9: a message whose quote has been redacted is never stored or
+      // signed again; the row keeps only the digest.
+      const quoteRedacted = Boolean(approval.quote) && await messageQuoteRedacted(tx, workspace.id, input.messageId);
+      // Time the claims at signing, after every wait above: an attestation is
+      // never signed already expired.
+      const signedAt = deps.now().getTime();
+      if (expiresAt <= signedAt) refuse("expired");
+      const iat = Math.floor(signedAt / 1000);
+      const claims: AttestationClaims = {
+        v: 1,
+        ws: workspace.id,
+        owner_id: approval.owner_id,
+        owner_display: ownerDisplay(owner?.name),
+        delegate_agent_id: senderId!,
+        grant_id: grant.id,
+        message_id: input.messageId,
+        recipient_agent_id: input.recipientAgentId,
+        approval_id: context.approvalId!,
+        tier,
+        actions: actions.map(canonicalAction),
+        standing,
+        single_use: singleUse,
+        quote: quoteRedacted ? null : approval.quote ?? null,
+        iat,
+        exp: Math.min(iat + ATTESTATION_TTL_SECONDS, Math.floor(expiresAt / 1000)),
+        jti: randomUUID(),
+      };
+      if (claims.exp <= iat) refuse("expired");
       await tx.query(
         `INSERT INTO delegation_attestations
            (jti, workspace_id, approval_id, grant_id, message_id, recipient_agent_id, delegate_agent_id, kid, accept,
@@ -825,8 +965,11 @@ export async function attestDelegation(deps: DelegationDeps, input: RecipientInp
           quote_source: approval.quote_source ?? null, quoted_at: approval.quoted_at ?? null },
         quote: approval.quote ?? null,
         quoteHash: approval.quote ? quoteDigest(deps.quoteKey, workspace.id, approval.quote) : null,
+        quoteRedacted,
       });
       await redactExpiredQuotes(tx);
+      // Signed last, inside the transaction: a refusal above signs nothing.
+      return { attestation: deps.signer!.sign(claims), claims };
     });
     return { verdict: "delegate", attestation, claims };
   } catch (error) {
@@ -911,11 +1054,11 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     const outOfScope = scopeRefusal([action!], grant!, policy, input.recipientAgentId);
     if (outOfScope) refuse(outOfScope);
     if (approval!.tier === "D" && tierOClasses(policy, grant!).has(action!.class)) refuse("tier_o_required");
-    const standing = await standingFor(deps, workspace.id, {
+    const standingInput = {
       approvalOwnerId: approval!.owner_user_id, recipientOwnerId: input.callerUserId,
-      accept: attested!.accept === "own_owner" ? "own_owner" : "code_owners", actions: [action!],
-    });
-    if (!standing) refuse("recipient_policy");
+      accept: attested!.accept === "own_owner" ? "own_owner" as const : "code_owners" as const, actions: [action!],
+    };
+    if (!await standingFor(deps.database, workspace.id, standingInput)) refuse("recipient_policy");
     const singleUse = approval!.single_use || highRisk(action!);
     if (singleUse && await actionConsumed(deps.database, approval!.id, action!)) refuse("consumed");
     const conditions = evaluateConditions(action!.conditions ?? [], now);
@@ -924,18 +1067,18 @@ export async function redeemApproval(deps: DelegationDeps, input: RecipientInput
     if (!await memberRole(deps.database, workspace.id, input.callerUserId) ||
         (input.stillAuthorized && !await input.stillAuthorized())) refuse("not_pending");
     await deps.database.transaction(async (tx) => {
-      // The grant may have been narrowed or revoked during the Relaycast
-      // lookups: recheck it under its row lock in both paths, then consume a
-      // single-use approval in the same transaction.
-      await recheckGrant(tx, workspace.id, grant!.id, [action!], policy, deps.now().getTime());
+      // The policy, grant and approval may have changed during the Relaycast
+      // lookups: recheck all of them from committed state, under locks, in
+      // both paths, then consume a single-use action in the same transaction.
+      await recheckAtCommit(tx, { workspaceId: workspace.id, grantId: grant!.id, tier: approval!.tier, actions: [action!],
+        recipientAgentId: input.recipientAgentId, nowMs: deps.now().getTime() });
       // The caller's membership and bearer, under share locks: a revocation
       // while this waited on the grant lock is never missed before consuming.
       if (!await memberRole(tx, workspace.id, input.callerUserId, true) ||
           (input.stillAuthorized && !await input.stillAuthorized(tx))) refuse("not_pending");
       // The approval may have been revoked or withdrawn meanwhile.
-      const live = (await tx.query("SELECT 1 FROM delegation_approvals WHERE id = $1 AND invalidated_at IS NULL FOR UPDATE",
-        [input.approvalId])).rows.length > 0;
-      if (!live) refuse("revoked");
+      await approvalStillLive(tx, workspace.id, input.approvalId, "FOR UPDATE");
+      if (!await standingFor(tx, workspace.id, standingInput)) refuse("recipient_policy");
       if (!singleUse) return;
       // Single use is per action (§5.1): one atomic insert per action.
       if (!await consumeAction(tx, { approvalId: input.approvalId, workspaceId: workspace.id, action: action!,
