@@ -21,6 +21,7 @@ type ShimRow = {
   wake_url: string | null;
   wake_secret_ciphertext: string | null;
   wake_linked_at: Date | string | null;
+  wake_agent: string | null;
   wake_broken_at: Date | string | null;
   wake_broken_reason: string | null;
   created_at: Date | string;
@@ -46,7 +47,7 @@ type EventRow = {
 };
 
 const SHIM_COLUMNS = `id, hook_token_ciphertext, secrets_ciphertext, wake_url, wake_secret_ciphertext,
-  wake_linked_at, wake_broken_at, wake_broken_reason, created_at, last_used_at, agent_seen_at`;
+  wake_linked_at, wake_agent, wake_broken_at, wake_broken_reason, created_at, last_used_at, agent_seen_at`;
 const EVENT_COLUMNS = `id, shim_id, seq, received_at, mode, event_type, idempotency_key, content_type,
   body, headers, delivery, delivered_at, claim_token, wake_error`;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -130,6 +131,7 @@ export class PostgresEventsShimStore implements EventsShimStore {
         secret: this.decrypt(row.wake_secret_ciphertext),
         linkedAt: iso(row.wake_linked_at ?? row.created_at),
       };
+      if (row.wake_agent) wake.agent = row.wake_agent;
       if (row.wake_broken_at) wake.brokenAt = iso(row.wake_broken_at);
       if (row.wake_broken_reason) wake.brokenReason = row.wake_broken_reason;
       shim.wake = wake;
@@ -222,11 +224,12 @@ export class PostgresEventsShimStore implements EventsShimStore {
     await this.database.query(
       `UPDATE events_shims
           SET wake_url = $2, wake_secret_ciphertext = $3, wake_linked_at = $4,
-              wake_broken_at = $5, wake_broken_reason = $6
+              wake_broken_at = $5, wake_broken_reason = $6, wake_agent = $7
         WHERE id = $1`,
       target
-        ? [shimId, target.url, this.encrypt(target.secret), target.linkedAt, target.brokenAt ?? null, target.brokenReason ?? null]
-        : [shimId, null, null, null, null, null],
+        ? [shimId, target.url, this.encrypt(target.secret), target.linkedAt, target.brokenAt ?? null, target.brokenReason ?? null,
+          target.agent ?? null]
+        : [shimId, null, null, null, null, null, null],
     );
   }
 

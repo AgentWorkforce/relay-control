@@ -66,8 +66,9 @@ deduplicated by `webhook-id`, verification challenges are echoed, and
 The linked agent's name: `link_relay_wake` takes an optional `agent` and
 answers `linked_agent` (and `replaced_agent` when it replaces another link);
 `watch_webhooks` and `GET /shims/current` (`agent.wake_agent`) report it for a
-linked inbox. Control does not store the name yet, so it is only in the
-linking call's own answer; afterwards those fields are null and the agent is
+linked inbox. Control keeps it in `events_shims.wake_agent` (migration 0095):
+the name `link_relay_wake` was given, or the bound agent's name for an agent
+link. A link made without a name, or before 0095, has none, and the agent is
 told to assume the link belongs to another session unless it linked in this
 conversation.
 The three tokens are shown once; an unknown or expired token answers 404.
@@ -216,7 +217,7 @@ Stripe event id) are stored once and still count toward the limits.
 
 Migration 0047 adds `events_shims`, `events_shim_posts` and
 `events_shim_events`; 0076 adds `events_shim_agent_links` (see "Linking an
-inbox to a bound agent"); 0092 lets `events_shim_events.mode` be `mcp`.
+inbox to a bound agent"); 0092 lets `events_shim_events.mode` be `mcp`; 0095 adds `events_shims.wake_agent`.
 
 - MCP, webhook and manage tokens are stored as SHA-256 hashes. The webhook
   token is also stored encrypted with `SELFHOST_ENCRYPTION_KEY` so the MCP

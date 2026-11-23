@@ -888,6 +888,35 @@ test("events/stream frames reach the client while the stream is open", async (t)
   controller.abort();
 });
 
+test("the wake link keeps the agent name it was linked with: linked_agent, replaced_agent and wake_agent", async (t) => {
+  const p = await plane(t);
+  const shim = await p.create(await p.signIn());
+  const call = await p.connect(shim.mcp_url);
+  const first = await call("link_relay_wake", { url: RELAY_HOOK, secret: RELAY_SECRET, agent: "claude-one" });
+  assert.notEqual(first.isError, true, JSON.stringify(first.content));
+  assert.equal(first.structuredContent!.linked_agent, "claude-one");
+  const stored = (await p.database.query<{ wake_agent: string | null }>("SELECT wake_agent FROM events_shims")).rows[0]!;
+  assert.equal(stored.wake_agent, "claude-one");
+
+  // A later call, in another conversation, reads the name back from the store.
+  const watched = await call("watch_webhooks");
+  assert.equal(watched.structuredContent!.linked_agent, "claude-one");
+  const feed = await request(p.origin, `${SHIM}/shims/current`, { token: shim.manage_token });
+  assert.equal(feed.body.agent.wake_agent, "claude-one");
+
+  const other = "https://cast.agentrelay.com/v1/hooks/hook_9876543210";
+  const second = await call("link_relay_wake", { url: other, secret: RELAY_SECRET, agent: "codex-two" });
+  assert.equal(second.structuredContent!.linked_agent, "codex-two");
+  assert.equal(second.structuredContent!.replaced_agent, "claude-one");
+
+  // Linked without a name: none is kept from the link it replaced.
+  await call("link_relay_wake", { url: RELAY_HOOK, secret: RELAY_SECRET });
+  assert.equal((await p.database.query<{ wake_agent: string | null }>("SELECT wake_agent FROM events_shims")).rows[0]!.wake_agent, null);
+
+  await call("unlink_relay_wake");
+  assert.equal((await p.database.query<{ wake_agent: string | null }>("SELECT wake_agent FROM events_shims")).rows[0]!.wake_agent, null);
+});
+
 test("feature off: every events-shim path answers 404 before authentication", async (t) => {
   const p = await plane(t, NO_FEATURES);
   const token = await p.signIn();
