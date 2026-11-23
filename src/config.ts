@@ -15,6 +15,7 @@ import {
 import { loadDesktopReleasesRepo } from "./desktop-releases.js";
 import type { GithubAppConfig } from "./admin/github-app.js";
 import { canonicalRelayhistoryOrigin } from "./relayhistory-origin.js";
+import { privateKeyFromSeed, type DelegationSigningConfig } from "./delegation/jws.js";
 
 /** One extra site: a dashboard origin and an API origin (may be equal). */
 export type ExtraSite = { dashboardOrigin: string; apiOrigin: string };
@@ -49,6 +50,14 @@ export type SelfhostConfig = {
   relayfileControlBrokerSecret?: string | null;
   /** RELAYCHIEF_CONTROL_RELAY_SECRET: chief agent registration route. Unset: it 404s. */
   chiefRelaySecret?: string | null;
+  /**
+   * SELFHOST_DELEGATION_SIGNING_KEY (or _FILE, a base64url 32-byte Ed25519
+   * seed) + SELFHOST_DELEGATION_SIGNING_KID: the owner-delegate attestation
+   * key (docs/owner-delegates.md). SELFHOST_DELEGATION_PREVIOUS_KEYS, a JSON
+   * array of {kid, x}, keeps retired public keys in the JWKS. Unset:
+   * attestation answers `unavailable` and the JWKS is empty.
+   */
+  delegationSigning?: DelegationSigningConfig | null;
   /**
    * RELAYFILE_CONTROL_URL + RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: deleting
    * a workspace queues the same delete for relayfile-control's Flows data.
@@ -598,6 +607,7 @@ export function loadConfig(env: Env = process.env): SelfhostConfig {
     sessionReadApi,
     relayfileControlBrokerSecret: loadBrokerSecret(env),
     chiefRelaySecret: loadChiefRelaySecret(env),
+    delegationSigning: loadDelegationSigning(env),
     flowsWorkspaceDelete: loadFlowsWorkspaceDelete(env),
     customerSupport: loadCustomerSupportConfig(env),
     sessionErasureApi: loadSessionErasureApiConfig(env),
@@ -689,6 +699,44 @@ function loadSessionErasureApiConfig(env: Env): SelfhostConfig["sessionErasureAp
     throw new Error("SESSION_ERASE_API_SECRET (or _FILE) must be at least 32 bytes");
   }
   return { url: serviceUrl(env, "SESSION_ERASE_API_URL"), secret };
+}
+
+const DELEGATION_KID = /^[A-Za-z0-9._-]{1,64}$/;
+
+export function loadDelegationSigning(env: Env): DelegationSigningConfig | null {
+  const seedValue = readSecret(env, "SELFHOST_DELEGATION_SIGNING_KEY");
+  const kid = env.SELFHOST_DELEGATION_SIGNING_KID?.trim();
+  const previousValue = env.SELFHOST_DELEGATION_PREVIOUS_KEYS?.trim();
+  if (!seedValue && !kid && !previousValue) return null;
+  if (!seedValue || !kid) {
+    throw new Error("SELFHOST_DELEGATION_SIGNING_KEY (or _FILE) and SELFHOST_DELEGATION_SIGNING_KID are required together");
+  }
+  if (!DELEGATION_KID.test(kid)) throw new Error("SELFHOST_DELEGATION_SIGNING_KID must be 1-64 of A-Z a-z 0-9 . _ -");
+  if (!/^[A-Za-z0-9_-]{43}$/.test(seedValue)) {
+    throw new Error("SELFHOST_DELEGATION_SIGNING_KEY must be a base64url 32-byte Ed25519 seed");
+  }
+  const seed = Buffer.from(seedValue, "base64url");
+  if (seed.byteLength !== 32) throw new Error("SELFHOST_DELEGATION_SIGNING_KEY must be a base64url 32-byte Ed25519 seed");
+  privateKeyFromSeed(seed);
+  let previous: DelegationSigningConfig["previous"] = [];
+  if (previousValue) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(previousValue);
+    } catch {
+      throw new Error("SELFHOST_DELEGATION_PREVIOUS_KEYS must be a JSON array of {kid, x}");
+    }
+    if (!Array.isArray(parsed) || parsed.length > 8 || !parsed.every((item: unknown) => {
+      const key = item as Record<string, unknown> | null;
+      return Boolean(key) && typeof key === "object" && Object.keys(key!).sort().join(",") === "kid,x"
+        && typeof key!.kid === "string" && DELEGATION_KID.test(key!.kid) && key!.kid !== kid
+        && typeof key!.x === "string" && /^[A-Za-z0-9_-]{43}$/.test(key!.x);
+    })) {
+      throw new Error("SELFHOST_DELEGATION_PREVIOUS_KEYS must be a JSON array of at most 8 {kid, x} with distinct kids");
+    }
+    previous = (parsed as Array<{ kid: string; x: string }>).map(key => ({ kid: key.kid, x: key.x }));
+  }
+  return { kid, seed, previous };
 }
 
 function loadChiefRelaySecret(env: Env): string | null {

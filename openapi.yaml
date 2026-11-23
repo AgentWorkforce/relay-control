@@ -78,6 +78,12 @@ tags:
     description: |
       In-cluster service routes under /internal/v1. Never served through the
       /cloud alias; each operation names the service credential it accepts.
+  - name: Owner delegates
+    description: |
+      Owner-named trusted delegates (relay docs/design/owner-trusted-delegates.md
+      §16): grants, claims, tier O approvals, attestation (EdDSA JWS), redeem
+      and audit. Off per workspace until an admin sets delegation_enabled.
+      See docs/owner-delegates.md.
   - name: Desktop feed
     description: |
       Private, workspace-authenticated release feed for enterprise Desktop
@@ -3122,6 +3128,561 @@ paths:
         "404": { description: Workspace not found or not the token's workspace }
         "429": { description: "`rate_limited`" }
         "502": { description: "`workspace_leaders_unavailable`: the Relaycast engine is unreachable or failed" }
+  /.well-known/relay-delegation-keys.json:
+    get:
+      operationId: getDelegationKeys
+      tags: [Owner delegates]
+      description: |
+        JWKS of the OKP Ed25519 keys that sign delegation attestations
+        (`kid` per key; the active key from SELFHOST_DELEGATION_SIGNING_KEY /
+        _KID plus retired keys from SELFHOST_DELEGATION_PREVIOUS_KEYS). Empty
+        `keys` when no signing key is configured. Public, cacheable for 300
+        seconds; also served at `/cloud/.well-known/relay-delegation-keys.json`.
+        See docs/owner-delegates.md.
+      security: []
+      responses:
+        "200":
+          description: JWKS
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationJwks" }
+  /api/v1/workspaces/{workspaceId}/delegates:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listDelegateGrants
+      tags: [Owner delegates]
+      description: |
+        Human-only (browser account session on `/cloud`, or a verified Agent
+        Relay Desktop bearer; never a device-flow CLI token, enrollment-key
+        session, workspace API token or agent token). The caller's grants;
+        workspace owner/admin may pass `all=1` for every grant. Includes the
+        workspace delegation policy. Allowed while delegation is off.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - { name: all, in: query, required: false, schema: { type: string, enum: ["1"] } }
+      responses:
+        "200":
+          description: Grants and policy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grants, policy]
+                properties:
+                  grants: { type: array, items: { $ref: "#/components/schemas/DelegateGrant" } }
+                  policy: { $ref: "#/components/schemas/DelegationPolicy" }
+        "401": { description: Missing or invalid credential }
+        "403": { description: "`human_session_required`, or `forbidden` for `all=1` without admin role" }
+        "404": { description: "`workspace_not_found`" }
+    post:
+      operationId: createDelegateGrant
+      tags: [Owner delegates]
+      description: |
+        Human-only; refused with `not_enabled` while delegation is off. A
+        browser session must have signed in within the last 15 minutes
+        (`reauthentication_required`). The delegate must be bound to the
+        caller by exactly one Control binding (Desktop identity, hosted
+        participant, ready spawn, person identity or completed claim).
+        Expiry defaults to 30 days, at most min(90, policy max_expiry_days).
+        `prompt_approval` targets are `*` or `<agent id>:*`. Audited
+        `grant.created`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DelegateGrantInput" }
+      responses:
+        "201":
+          description: Created grant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegateGrant" }
+        "400": { description: "`invalid_request`: unknown field, unknown class, invalid target pattern, duplicate class, or expiry out of range" }
+        "401": { description: Missing or invalid credential }
+        "403": { description: "`human_session_required`, `not_enabled`, `class_not_allowed`, `reauthentication_required` or `csrf_rejected`" }
+        "404": { description: "`workspace_not_found`" }
+        "409": { description: "`delegate_not_bound`" }
+  /api/v1/workspaces/{workspaceId}/delegates/{grantId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: grantId, in: path, required: true, schema: { type: string, pattern: "^grt_[A-Za-z0-9]{8,64}$" } }
+    get:
+      operationId: getDelegateGrant
+      tags: [Owner delegates]
+      description: Human-only. The grant's owner, or a workspace owner/admin.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Grant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegateGrant" }
+        "404": { description: "`grant_not_found`" }
+    patch:
+      operationId: narrowDelegateGrant
+      tags: [Owner delegates]
+      description: |
+        Human-only, the grant's owner, delegation on, recent browser sign-in.
+        Narrowing only: every new target must be covered by an existing
+        pattern of its class, expiry may only move earlier and
+        `require_tier_o` may only grow; anything wider is `widening_refused`
+        (create a new grant). Audited `grant.updated` with the scope diff.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DelegateGrantPatch" }
+      responses:
+        "200":
+          description: Updated grant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegateGrant" }
+        "400": { description: "`invalid_request` or `widening_refused`" }
+        "403": { description: "`human_session_required`, `not_enabled`, `reauthentication_required` or `csrf_rejected`" }
+        "404": { description: "`grant_not_found`" }
+        "409": { description: "`grant_not_active`" }
+    delete:
+      operationId: revokeDelegateGrant
+      tags: [Owner delegates]
+      description: |
+        Human-only revocation by the grant's owner or a workspace owner/admin.
+        Allowed while delegation is off and without a recent sign-in.
+        Invalidates every unredeemed approval under the grant. Idempotent.
+        Audited `grant.revoked`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The revoked grant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegateGrant" }
+        "404": { description: "`grant_not_found`" }
+  /api/v1/workspaces/{workspaceId}/delegates/revoke-all:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: revokeAllDelegateGrants
+      tags: [Owner delegates]
+      description: |
+        Human-only panic button: revokes every live grant of the caller, or
+        with `{"all": true}` (workspace owner/admin) every live grant in the
+        workspace. Allowed while delegation is off and without a recent
+        sign-in.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                all: { type: boolean }
+      responses:
+        "200":
+          description: Revoked grants
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked, grant_ids]
+                properties:
+                  revoked: { type: integer }
+                  grant_ids: { type: array, items: { type: string } }
+        "403": { description: "`human_session_required`, `forbidden` (all without admin) or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/claims:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: startDelegateClaim
+      tags: [Owner delegates]
+      description: |
+        Human-only, delegation on, recent browser sign-in. Starts a claim:
+        a one-time code (80 bits, shown once, stored as SHA-256) valid for
+        10 minutes, that an agent with no other Control binding presents with
+        its own Relaycast token to bind its immutable agent id to the caller.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "201":
+          description: Claim started
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [claim_id, code, expires_at]
+                properties:
+                  claim_id: { type: string }
+                  code: { type: string, example: "7K2M-9QXR-4HNP-B3TW" }
+                  expires_at: { type: string, format: date-time }
+        "403": { description: "`human_session_required`, `not_enabled`, `reauthentication_required` or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/claims/complete:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: completeDelegateClaim
+      tags: [Owner delegates]
+      description: |
+        Agent route. No Control credential: the proof is the one-time code
+        plus the agent's own Relaycast token, which must authenticate as
+        exactly `agent_id` (in this workspace's Relaycast workspace). The code
+        is consumed atomically. Refused when the agent already has any
+        Control binding. Rate limited per client address. Audited
+        `delegate.claimed`. Unavailable on gate-only installs.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code, agent_id, agent_token]
+              properties:
+                code: { type: string, minLength: 8, maxLength: 64 }
+                agent_id: { type: string, minLength: 1, maxLength: 200 }
+                agent_token: { type: string, minLength: 12, maxLength: 512 }
+      responses:
+        "200":
+          description: Bound
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [claim_id, owner_id, agent_id, agent_name]
+                properties:
+                  claim_id: { type: string }
+                  owner_id: { type: string }
+                  agent_id: { type: string }
+                  agent_name: { type: string }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`agent_not_proven` or `not_enabled`" }
+        "404": { description: "`claim_not_found`: unknown, expired or used code" }
+        "409": { description: "`already_bound`" }
+        "429": { description: "`rate_limited`" }
+        "502": { description: "`unavailable`: Relaycast unreachable" }
+        "503": { description: "`unavailable`: gate-only install" }
+  /api/v1/workspaces/{workspaceId}/delegates/approvals:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: mintOwnerApproval
+      tags: [Owner delegates]
+      description: |
+        Human-only tier O: the owner approves exact actions directly. Expiry
+        defaults to 1 hour, at most 24 hours. `single_use` is forced on for
+        high-risk actions. A delegate's message then names it in
+        `owner_approval.approval_ref`, with identical actions. Audited
+        `approval.minted`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [actions]
+              properties:
+                actions: { type: array, minItems: 1, maxItems: 20, items: { $ref: "#/components/schemas/DelegationAction" } }
+                expires_at: { type: string, format: date-time }
+                single_use: { type: boolean }
+      responses:
+        "201":
+          description: Minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [approval_id, actions, single_use, expires_at]
+                properties:
+                  approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
+                  actions: { type: array, items: { $ref: "#/components/schemas/DelegationAction" } }
+                  single_use: { type: boolean }
+                  expires_at: { type: string, format: date-time }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`human_session_required`, `not_enabled`, `class_not_allowed`, `reauthentication_required` or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/audit:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listDelegationAudit
+      tags: [Owner delegates]
+      description: |
+        Human-only. The append-only delegation log: members see events where
+        they are the owner or actor, workspace owner/admin see all. Up to 1000
+        events after `since`, oldest first. `format=jsonl` answers
+        `application/x-ndjson`. Quote text older than 90 days is redacted to
+        `quote_sha256`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - { name: since, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: grant_id, in: query, required: false, schema: { type: string } }
+        - { name: format, in: query, required: false, schema: { type: string, enum: [json, jsonl] } }
+      responses:
+        "200":
+          description: Events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events: { type: array, items: { $ref: "#/components/schemas/DelegationAuditEvent" } }
+            application/x-ndjson:
+              schema: { type: string }
+        "400": { description: "`invalid_request`" }
+  /api/v1/workspaces/{workspaceId}/delegates/policy:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    put:
+      operationId: putDelegationPolicy
+      tags: [Owner delegates]
+      description: |
+        Human-only, workspace owner/admin, recent browser sign-in. The
+        workspace switch (`delegation_enabled`, off by default) and limits.
+        Omitted optional fields keep their current values. Live grants that no
+        longer fit (a class no longer allowed, or a lifetime above the new
+        maximum) are revoked with reason `policy_changed`. Audited
+        `policy.updated`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DelegationPolicyInput" }
+      responses:
+        "200":
+          description: Stored policy and grants it revoked
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/DelegationPolicy"
+                  - type: object
+                    required: [revoked_grant_ids]
+                    properties:
+                      revoked_grant_ids: { type: array, items: { type: string } }
+        "400": { description: "`invalid_request`" }
+        "403": { description: "`human_session_required`, `forbidden`, `reauthentication_required` or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/delegates/target-owners:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getDelegationTargetOwners
+      tags: [Owner delegates]
+      description: Human-only, workspace owner/admin. Owners of targets that are not repos (§5.4).
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Entries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [target_owners]
+                properties:
+                  target_owners: { type: array, items: { $ref: "#/components/schemas/DelegationTargetOwner" } }
+        "403": { description: "`human_session_required` or `forbidden`" }
+    put:
+      operationId: putDelegationTargetOwners
+      tags: [Owner delegates]
+      description: |
+        Human-only, workspace owner/admin, delegation on, recent browser
+        sign-in. Full replace. The body is the bare list (a
+        `{"target_owners": [...]}` wrapper is also accepted). Each entry maps
+        a target pattern to a repo (whose CODEOWNERS applies; relay-control
+        cannot resolve CODEOWNERS, so such entries confer no standing) or to
+        member ids. Audited `target_owners.updated`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: array, maxItems: 200, items: { $ref: "#/components/schemas/DelegationTargetOwner" } }
+      responses:
+        "200":
+          description: Stored entries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [target_owners]
+                properties:
+                  target_owners: { type: array, items: { $ref: "#/components/schemas/DelegationTargetOwner" } }
+        "400": { description: "`invalid_request`: invalid pattern, both or neither of repo/owner_ids, or an owner id that is not a member" }
+        "403": { description: "`human_session_required`, `forbidden`, `not_enabled`, `reauthentication_required` or `csrf_rejected`" }
+  /api/v1/workspaces/{workspaceId}/messaging/delegation:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: attestDelegation
+      tags: [Owner delegates]
+      description: |
+        Agent route, called by the recipient's relay-node with its owner's
+        verified Agent Relay Desktop bearer (a current member of this
+        workspace's organization). The recipient must be bound to that person
+        and proven by `recipient_token`. Control reads the sender id and the
+        immutable `owner_approval` from Relaycast's
+        `GET /v1/deliveries/by-message/:id` for that token, checks the live
+        grant, delegate binding, policy, scope, tier, standing (`accept`) and
+        expiry, then signs a 300-second EdDSA JWS. Every failure, including an
+        outage, is `{"verdict": "none", "reason": ...}` with HTTP 200 and an
+        `approval.refused` audit event. Never cached.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [recipient_agent_id, recipient_token, message_id, accept]
+              properties:
+                recipient_agent_id: { type: string, minLength: 1, maxLength: 200 }
+                recipient_token: { type: string, minLength: 12, maxLength: 512 }
+                message_id: { type: string, minLength: 1, maxLength: 200 }
+                accept: { type: string, enum: [code_owners, own_owner] }
+      responses:
+        "200":
+          description: Verdict
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationVerdict" }
+        "400": { description: "`invalid_request`" }
+        "401": { description: Missing or invalid credential }
+        "403": { description: "`forbidden`: not a verified Desktop bearer, or not a member" }
+        "429": { description: "`rate_limited`" }
+  /api/v1/workspaces/{workspaceId}/messaging/delegation/redeem:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: redeemDelegatedApproval
+      tags: [Owner delegates]
+      description: |
+        Agent route, same credentials as attestation. Required right before
+        acting when the approval is single-use or the action has conditions.
+        Requires an earlier attestation of this approval to this recipient.
+        Re-checks revocation, binding, scope and expiry, then evaluates the
+        action's conditions: `not_before` here; GitHub conditions (`ci_green`,
+        `head_sha`, `reviews_approved`, `mergeable`) are
+        `condition_unavailable` on relay-control. An unmet condition answers
+        `condition_unmet` with `unmet` and does not consume. A single-use
+        approval is consumed atomically; a second redeem is `consumed`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [recipient_agent_id, recipient_token, approval_id, action]
+              properties:
+                recipient_agent_id: { type: string, minLength: 1, maxLength: 200 }
+                recipient_token: { type: string, minLength: 12, maxLength: 512 }
+                approval_id: { type: string, pattern: "^apv_[A-Za-z0-9]{8,64}$" }
+                action:
+                  type: object
+                  additionalProperties: false
+                  required: [class, target]
+                  properties:
+                    class: { $ref: "#/components/schemas/DelegationActionClass" }
+                    target: { type: string, maxLength: 256 }
+      responses:
+        "200":
+          description: Result
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, consumed]
+                    properties:
+                      ok: { const: true }
+                      consumed: { type: boolean }
+                  - type: object
+                    required: [ok, reason]
+                    properties:
+                      ok: { const: false }
+                      reason: { $ref: "#/components/schemas/DelegationReason" }
+                      unmet: { type: array, items: { $ref: "#/components/schemas/DelegationCondition" } }
+        "400": { description: "`invalid_request`" }
+        "401": { description: Missing or invalid credential }
+        "403": { description: "`forbidden`" }
+  /api/v1/workspaces/{workspaceId}/messaging/delegation/prompt-delegates:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: listPromptDelegates
+      tags: [Owner delegates]
+      description: |
+        Agent route, same credentials as attestation. The session must be the
+        caller's own agent, proven by `session_token`. Lists the machine
+        owner's delegates (still bound, live grant) whose `prompt_approval`
+        targets cover the session, excluding the session itself. Delegation
+        off, a failed proof, or a gate-only install is an empty list.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_agent_id, session_token]
+              properties:
+                session_agent_id: { type: string, minLength: 1, maxLength: 200 }
+                session_token: { type: string, minLength: 12, maxLength: 512 }
+      responses:
+        "200":
+          description: Delegates
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [delegates]
+                properties:
+                  delegates:
+                    type: array
+                    items:
+                      type: object
+                      required: [agent_id, grant_id]
+                      properties:
+                        agent_id: { type: string }
+                        grant_id: { type: string }
+        "401": { description: Missing or invalid credential }
+        "403": { description: "`forbidden`" }
   /api/v1/organizations/{organizationId}/capture-policy:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -9321,6 +9882,176 @@ components:
       description: A declared `expected_assets[].name`; one path segment.
       schema: { type: string, maxLength: 255, pattern: "^[A-Za-z0-9][A-Za-z0-9_+-]*(?:\\.[A-Za-z0-9_+-]+)*$" }
   schemas:
+    DelegationActionClass:
+      type: string
+      enum: [merge, pr_ops, deploy, release, secret_change, destructive, spend, external_comms, prompt_approval]
+    DelegationReason:
+      type: string
+      enum: [not_enabled, not_delegate, no_approval, out_of_scope, expired, revoked, recipient_policy, tier_o_required,
+        consumed, not_pending, unavailable, condition_unmet, condition_unavailable]
+    DelegationCondition:
+      oneOf:
+        - { type: object, additionalProperties: false, required: [type], properties: { type: { const: ci_green } } }
+        - type: object
+          additionalProperties: false
+          required: [type, sha]
+          properties: { type: { const: head_sha }, sha: { type: string, pattern: "^[0-9a-f]{40}$" } }
+        - type: object
+          additionalProperties: false
+          required: [type, min]
+          properties: { type: { const: reviews_approved }, min: { type: integer, minimum: 1, maximum: 10 } }
+        - { type: object, additionalProperties: false, required: [type], properties: { type: { const: mergeable } } }
+        - type: object
+          additionalProperties: false
+          required: [type, at]
+          properties: { type: { const: not_before }, at: { type: string, format: date-time } }
+    DelegationAction:
+      type: object
+      additionalProperties: false
+      required: [class, target]
+      properties:
+        class: { $ref: "#/components/schemas/DelegationActionClass" }
+        target: { type: string, minLength: 1, maxLength: 256 }
+        conditions: { type: array, maxItems: 5, items: { $ref: "#/components/schemas/DelegationCondition" } }
+        note: { type: string, maxLength: 280 }
+    DelegationScope:
+      type: object
+      additionalProperties: false
+      required: [class, targets]
+      properties:
+        class: { $ref: "#/components/schemas/DelegationActionClass" }
+        targets: { type: array, minItems: 1, maxItems: 32, items: { type: string, maxLength: 256 } }
+    DelegateGrantInput:
+      type: object
+      additionalProperties: false
+      required: [delegate_agent_id, scopes]
+      properties:
+        delegate_agent_id: { type: string, minLength: 1, maxLength: 200 }
+        scopes: { type: array, minItems: 1, items: { $ref: "#/components/schemas/DelegationScope" } }
+        expires_at: { type: string, format: date-time }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+    DelegateGrantPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        scopes: { type: array, minItems: 1, items: { $ref: "#/components/schemas/DelegationScope" } }
+        expires_at: { type: string, format: date-time }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+    DelegateGrant:
+      type: object
+      required: [grant_id, owner_id, delegate_agent_id, delegate_agent_name, scopes, require_tier_o, expires_at, created_at,
+        updated_at, revoked_at, revoked_reason, status]
+      properties:
+        grant_id: { type: string }
+        owner_id: { type: string }
+        delegate_agent_id: { type: string }
+        delegate_agent_name: { type: string }
+        scopes: { type: array, items: { $ref: "#/components/schemas/DelegationScope" } }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        revoked_at: { type: [string, "null"], format: date-time }
+        revoked_reason: { type: [string, "null"] }
+        status: { type: string, enum: [active, revoked, expired] }
+    DelegationPolicy:
+      type: object
+      required: [delegation_enabled, max_expiry_days, allowed_classes, require_tier_o, code_owner_match, updated_at]
+      properties:
+        delegation_enabled: { type: boolean }
+        max_expiry_days: { type: integer, minimum: 1, maximum: 90 }
+        allowed_classes: { type: [array, "null"], items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        code_owner_match: { type: string, enum: [any_path, all_paths] }
+        updated_at: { type: [string, "null"], format: date-time }
+    DelegationPolicyInput:
+      type: object
+      additionalProperties: false
+      required: [delegation_enabled]
+      properties:
+        delegation_enabled: { type: boolean }
+        max_expiry_days: { type: integer, minimum: 1, maximum: 90 }
+        allowed_classes: { type: [array, "null"], items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        require_tier_o: { type: array, items: { $ref: "#/components/schemas/DelegationActionClass" } }
+        code_owner_match: { type: string, enum: [any_path, all_paths] }
+    DelegationTargetOwner:
+      type: object
+      additionalProperties: false
+      required: [pattern]
+      properties:
+        pattern: { type: string, maxLength: 256 }
+        repo: { type: string }
+        owner_ids: { type: array, minItems: 1, maxItems: 50, items: { type: string, format: uuid } }
+    DelegationAttestationClaims:
+      type: object
+      required: [v, ws, owner_id, owner_display, delegate_agent_id, grant_id, message_id, recipient_agent_id, approval_id,
+        tier, actions, standing, single_use, iat, exp, jti]
+      properties:
+        v: { const: 1 }
+        ws: { type: string }
+        owner_id: { type: string }
+        owner_display: { type: string, maxLength: 80 }
+        delegate_agent_id: { type: string }
+        grant_id: { type: string }
+        message_id: { type: string }
+        recipient_agent_id: { type: string }
+        approval_id: { type: string }
+        tier: { type: string, enum: [D, O] }
+        actions: { type: array, items: { $ref: "#/components/schemas/DelegationAction" } }
+        standing: { type: string, enum: [own_owner, code_owner] }
+        single_use: { type: boolean }
+        iat: { type: integer }
+        exp: { type: integer }
+        jti: { type: string }
+    DelegationVerdict:
+      oneOf:
+        - type: object
+          required: [verdict, attestation, claims]
+          properties:
+            verdict: { const: delegate }
+            attestation: { type: string, description: "Compact JWS, header {alg: EdDSA, typ: relay-delegation+jws, kid}" }
+            claims: { $ref: "#/components/schemas/DelegationAttestationClaims" }
+        - type: object
+          required: [verdict, reason]
+          properties:
+            verdict: { const: none }
+            reason: { $ref: "#/components/schemas/DelegationReason" }
+    DelegationAuditEvent:
+      type: object
+      properties:
+        id: { type: string }
+        occurred_at: { type: string, format: date-time }
+        event: { type: string }
+        actor_user_id: { type: [string, "null"] }
+        actor_agent_id: { type: [string, "null"] }
+        auth_method: { type: [string, "null"] }
+        owner_user_id: { type: [string, "null"] }
+        grant_id: { type: [string, "null"] }
+        approval_id: { type: [string, "null"] }
+        message_id: { type: [string, "null"] }
+        recipient_agent_id: { type: [string, "null"] }
+        reason: { type: [string, "null"] }
+        jti: { type: [string, "null"] }
+        details: { type: object }
+        quote: { type: [string, "null"] }
+        quote_sha256: { type: [string, "null"] }
+    DelegationJwks:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            required: [kty, crv, x, kid, alg, use]
+            properties:
+              kty: { const: OKP }
+              crv: { const: Ed25519 }
+              x: { type: string }
+              kid: { type: string }
+              alg: { const: EdDSA }
+              use: { const: sig }
     FleetView:
       type: object
       required: [policy_revision, range, totals, members, usage_unavailable, truncated, next_cursor]
