@@ -93,6 +93,16 @@ credentials, generates summaries, changes privacy settings or selects a
 different backend after a reader refusal. `401`, `403`, `404`, `501`, transient
 errors and missing attestation preserve existing fail-closed behavior.
 
+The list and the point summary share one reader selection. A native user
+session reads both through the per-user session-read route when
+`SESSION_READ_API_MCP_READS=true` and through the workspace-scoped History
+reader otherwise; staff, Desktop and OAuth grants always read both through the
+workspace-scoped reader. Either way the reader replaces any caller `workspace`
+parameter with the admitted workspace and refuses a response that attests
+another one. Self-host has no per-workspace or per-route selector: that one
+install-wide setting decides for every workspace, and a failed read is never
+retried on the other reader.
+
 Calls are recorded in `shared_session_read_audit`, including filters and
 returned session/owner IDs, never summary text or the raw person name/email
 lookup. No migration or new feature

@@ -27,6 +27,8 @@ type Options = {
   errorReason?: string;
   issueStatus?: (path:string) => number;
   reply?: (pair:Record<string,unknown>,path:string)=>Record<string,unknown>;
+  /** Status the workspace (History) reader answers; 200 when absent. */
+  historyStatus?: (url: URL) => number;
 };
 
 function config(on = true) {
@@ -92,6 +94,8 @@ function fake(t: TestContext, options: Options = {}) {
     }
     if (url.origin === HISTORY) {
       history.push({ url, bearer });
+      const status = options.historyStatus?.(url) ?? 200;
+      if (status !== 200) return Response.json({error:{code:"unsupported_by_backend",reason:options.errorReason??"unavailable"}},{status});
       return Response.json({ from: "history" }, { headers: { [WORKSPACE_HEADER]: url.searchParams.get("workspace") ?? "" } });
     }
     reads.push({ url, bearer });
@@ -534,4 +538,70 @@ test("an unavailable selected read retries on the same backend and cursor withou
   assert.equal(seen.issues.length,1);assert.equal(seen.reads.length,2);
   assert.equal(seen.reads[0]!.url.toString(),seen.reads[1]!.url.toString());
   assert.equal(seen.reads[0]!.bearer,seen.reads[1]!.bearer);assert.equal(seen.history.length,0);
+});
+
+// The paths list_session_summaries and get_session_summary build, each with a
+// caller workspace param the reader must replace.
+const RECORDED_LIST = "/v1/sessions?limit=20&includeShortSummary=recorded&workspace=ws-other";
+const POINT_SUMMARY = "/v1/sessions/s-1/summary?kind=short&source=codex&workspace=ws-other";
+
+test("recorded list and point summary share one reader per workspace, with the setting on and off", async t => {
+  for (const on of [true, false]) {
+    const seen = fake(t), cfg = config(on);
+    t.after(() => forgetSessionReadTokens(cfg));
+    for (const [user, ws, org] of [["user-a", "ws-a", "org-a"], ["user-b", "ws-b", "org-b"]] as const) {
+      const read = historyReader(cfg, principal(user), workspace(ws, org), `sh_at_${user.replace("-", "_")}`);
+      const expected = on ? { from: "read-api" } : { from: "history" };
+      assert.deepEqual(await read(RECORDED_LIST), expected);
+      assert.deepEqual(await read(POINT_SUMMARY), expected);
+    }
+    // On selects the per-user read API for both tools; off sends both to History.
+    const used = on ? seen.reads : seen.history;
+    assert.equal((on ? seen.history : seen.reads).length, 0, `setting ${on}`);
+    assert.deepEqual(used.map(({ url }) => [url.pathname, url.searchParams.getAll("workspace")]), [
+      ["/v1/sessions", ["ws-a"]], ["/v1/sessions/s-1/summary", ["ws-a"]],
+      ["/v1/sessions", ["ws-b"]], ["/v1/sessions/s-1/summary", ["ws-b"]],
+    ]);
+    // List and point for one person carry the same minted token.
+    assert.equal(used[0]!.bearer, used[1]!.bearer);
+    assert.equal(used[2]!.bearer, used[3]!.bearer);
+    assert.notEqual(used[0]!.bearer, used[2]!.bearer);
+    const minted = on ? seen.issues.map(({ path }) => path.split("/")[4]) : seen.handoffs.map(({ body }) => body.workspaceId);
+    assert.deepEqual(minted, ["ws-a", "ws-b"]);
+    assert.equal((on ? seen.handoffs : seen.issues).length, 0);
+  }
+});
+
+test("with the setting off, a terminal point-summary status keeps its outcome and tries no other backend", async t => {
+  for (const [status, outcome] of [[403, /temporarily unavailable/], [404, /temporarily unavailable/],
+    [501, /unsupported_by_backend/], [503, /temporarily unavailable/]] as const) {
+    const seen = fake(t, { historyStatus: () => status }), cfg = config(false);
+    await assert.rejects(historyReader(cfg, principal("user-a"), workspace("ws-a", "org-a"), "sh_at_user_a")(POINT_SUMMARY), outcome);
+    assert.equal(seen.history.length, 1, `status ${status}`);
+    assert.equal(seen.history[0]!.url.pathname, "/v1/sessions/s-1/summary");
+    assert.deepEqual(seen.history[0]!.url.searchParams.getAll("workspace"), ["ws-a"]);
+    assert.equal(seen.reads.length + seen.issues.length, 0, "never the read API hop");
+    assert.equal(seen.handoffs.length, 1);
+  }
+});
+
+test("staff, Desktop and OAuth grants read list and point summary through the same workspace reader", async t => {
+  const grants: Array<[string, Principal, string]> = [
+    ["staff", principal("user-a"), `sh_sr_${"S".repeat(43)}`],
+    ["desktop", { ...principal("user-a"), scopes: ["rth:read", "mcp:desktop"] } as Principal, `cld_at_${"G".repeat(43)}`],
+    ["oauth", oauth(["relay:mcp", "relay:history"]), OAUTH_TOKEN],
+  ];
+  for (const on of [true, false]) for (const [name, who, token] of grants) {
+    const seen = fake(t), cfg = config(on);
+    const read = historyReader(cfg, who, workspace("ws-a", "org-a"), token);
+    assert.deepEqual(await read(RECORDED_LIST), { from: "history" });
+    assert.deepEqual(await read(POINT_SUMMARY), { from: "history" });
+    assert.deepEqual(seen.history.map(({ url }) => [url.pathname, url.searchParams.getAll("workspace")]),
+      [["/v1/sessions", ["ws-a"]], ["/v1/sessions/s-1/summary", ["ws-a"]]], `${name} setting ${on}`);
+    assert.equal(seen.history[0]!.bearer, seen.history[1]!.bearer);
+    assert.equal(seen.reads.length + seen.issues.length, 0, `${name} never takes the per-user hop`);
+    assert.equal(seen.handoffs.length, 1);
+    assert.equal(seen.handoffs[0]!.body.workspaceId, "ws-a");
+    assert.equal(JSON.stringify([seen.handoffs, seen.history]).includes(token), false);
+  }
 });
