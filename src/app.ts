@@ -19,6 +19,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { SELFHOST_API_VERSION, type SelfhostConfig } from "./config.js";
+import { browserOriginsFor } from "./site-origins.js";
 import { secureEqual } from "./crypto.js";
 import type { SqlExecutor } from "./database.js";
 import { adminErrorResponse, type AdminModule } from "./admin/routes.js";
@@ -385,13 +386,8 @@ function routeMatch(pathname: string, pattern: RegExp): string[] | null {
   return match ? match.slice(1).map(decodeURIComponent) : null;
 }
 
-/** Origins allowed to send cookie-authenticated writes. */
-export function browserOriginsFor(config: SelfhostConfig): string[] {
-  return [...new Set([
-    new URL(config.publicBaseUrl).origin,
-    new URL(config.dashboardUrl).origin,
-  ])];
-}
+// Re-exported: src/server.ts and tests import it from here.
+export { browserOriginsFor };
 
 /** A bodiless cookie DELETE needs an allowed Origin, or same-origin fetch metadata. */
 function cookieDeleteAllowed(request: IncomingMessage, browserOrigins: string[]): boolean {
@@ -599,13 +595,36 @@ export function createApp(input: {
   // never the target of a redirect sent here and is not stored. That is also
   // why only the Desktop/CLI API answers use apiSiteBaseUrl: emailed links,
   // OIDC redirect URIs and the MCP endpoint URL keep the Host-selected origin.
+  //
+  // Extra sites (SELFHOST_EXTRA_SITES) are more host sets in front of this same
+  // deployment: each of their hosts maps to its own configured origin here, so
+  // a request arriving on one is answered with that origin. Config validation
+  // keeps every host in one site only.
   const siteBases = new Map<string, string>([
     [new URL(config.dashboardUrl).host.toLowerCase(), new URL(config.dashboardUrl).origin],
     [new URL(config.publicBaseUrl).host.toLowerCase(), config.publicBaseUrl.replace(/\/+$/, "")],
+    ...(config.extraSites ?? []).flatMap((site): [string, string][] => [
+      [new URL(site.dashboardOrigin).host.toLowerCase(), site.dashboardOrigin],
+      [new URL(site.apiOrigin).host.toLowerCase(), site.apiOrigin],
+    ]),
   ]);
+  // Either host of an extra site -> that site's dashboard origin.
+  const extraDashboards = new Map<string, string>((config.extraSites ?? []).flatMap((site): [string, string][] => [
+    [new URL(site.dashboardOrigin).host.toLowerCase(), site.dashboardOrigin],
+    [new URL(site.apiOrigin).host.toLowerCase(), site.dashboardOrigin],
+  ]));
+  function requestHost(request: IncomingMessage): string {
+    return typeof request.headers.host === "string" ? request.headers.host.trim().toLowerCase() : "";
+  }
   function siteBaseUrl(request: IncomingMessage): string {
-    const host = typeof request.headers.host === "string" ? request.headers.host.trim().toLowerCase() : "";
-    return siteBases.get(host) ?? config.publicBaseUrl.replace(/\/+$/, "");
+    return siteBases.get(requestHost(request)) ?? config.publicBaseUrl.replace(/\/+$/, "");
+  }
+  /** The dashboard URL for the site the request arrived on: an extra site's origin with the configured path, else dashboardUrl. */
+  function dashboardUrlFor(request: IncomingMessage): string {
+    const origin = extraDashboards.get(requestHost(request));
+    if (!origin) return config.dashboardUrl;
+    const primary = new URL(config.dashboardUrl);
+    return new URL(`${primary.pathname}${primary.search}`, origin).toString();
   }
   const routedSiteOrigin = config.routedSiteOrigin ?? null;
   const routedSiteHost = routedSiteOrigin ? new URL(routedSiteOrigin).host.toLowerCase() : null;
@@ -1357,7 +1376,8 @@ export function createApp(input: {
     // Agent Relay Desktop's Cloud-shaped browser links on a separate dashboard host.
     const dashboardLink = dashboardLinkRedirect({
       method, target: request.url ?? "/", host: request.headers.host,
-      publicBaseUrl: config.publicBaseUrl, dashboardUrl: config.dashboardUrl,
+      // An extra site's links open that site's dashboard, not the primary one.
+      publicBaseUrl: config.publicBaseUrl, dashboardUrl: dashboardUrlFor(request),
     });
     if (dashboardLink) {
       response.writeHead(302, { location: dashboardLink, "cache-control": "no-store", "referrer-policy": "no-referrer" });
@@ -1985,7 +2005,7 @@ setTimeout(poll,${Math.max(1, started.intervalSeconds) * 1_000});
       // verification_uri(_complete): a person opened it; send them to the
       // dashboard's approval page, which signs them in first if needed.
       response.writeHead(303, {
-        location: deviceApprovalPageUrl(config.dashboardUrl, url.searchParams.get("user_code")),
+        location: deviceApprovalPageUrl(dashboardUrlFor(request), url.searchParams.get("user_code")),
         "cache-control": "no-store",
         "referrer-policy": "no-referrer",
       });

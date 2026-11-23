@@ -188,12 +188,20 @@ export function createAdminModule(input: {
     config.githubApp ?? null,
   );
 
-  /** A same-origin dashboard URL to return to after the provider callback, or null. */
+  // The primary dashboard and every extra site's (SELFHOST_EXTRA_SITES).
+  const dashboardOrigins = new Set([
+    new URL(config.dashboardUrl).origin,
+    ...(config.extraSites ?? []).map((site) => site.dashboardOrigin),
+  ]);
+  /**
+   * A configured dashboard URL to return to after the provider callback, or
+   * null. Relative values resolve against the primary dashboard.
+   */
   function safeReturnTo(value: unknown): string | null {
     if (typeof value !== "string" || !value || value.length > 2_048) return null;
     try {
       const target = new URL(value, config.dashboardUrl);
-      return target.origin === new URL(config.dashboardUrl).origin ? target.toString() : null;
+      return dashboardOrigins.has(target.origin) ? target.toString() : null;
     } catch {
       return null;
     }
