@@ -49,7 +49,9 @@ chmod 600 delegation-signing.pem
 SELFHOST_DELEGATION_SIGNING_KEY_FILE=/path/to/delegation-signing.pem
 ```
 
-Its kid is shown in `GET /.well-known/relay-delegation-keys.json`.
+Its kid is shown in `GET /.well-known/relay-delegation-keys.json`, which is
+cached for 5 minutes (`public, max-age=300`) when it holds keys and `no-store`
+when it is empty, so verifiers pick up a first key at once.
 
 Rotate (quarterly, or at once if the key leaked) with Cloud's keyring JSON,
 which keeps up to 3 retired public keys in the JWKS so that attestations they
@@ -137,7 +139,7 @@ There is one active grant per (owner, delegate), as in Cloud. A second grant
 answers `409 grant_exists`. A grant that has lapsed is marked `expired`
 (audited `grant.expired`) when the pair gets a new grant.
 
-`PATCH` only narrows. Anything wider is `400 widening_not_allowed`: revoke
+`PATCH` only narrows, and works while delegation is off (as Cloud). Anything wider is `400 widening_not_allowed`: revoke
 the grant and create a new one.
 
 Grant JSON is `grant_id, owner_id, delegate_agent_id, scopes, require_tier_o,
@@ -173,7 +175,7 @@ Control then:
    milliseconds since 2025-01-01T00:00:00Z; at most 5 minutes in the future).
    An unknown send time is `unavailable`. A message sent before the grant was
    created (before a revoke and re-grant, or before any grant) was never
-   authorized by it: `revoked`. Then it fixes the approval's expiry at its
+   authorized by it: `predates_grant` (2 seconds of clock skew allowed). Then it fixes the approval's expiry at its
    first attestation, as Cloud's `approvalExpiry` does. The base time is the
    send time. The expiry is the approval's `expires_at`
    (default base + 1 hour), capped at base + 24 hours and at the grant's
@@ -347,9 +349,12 @@ write the event, commit. Attestation and gate dry runs keep `FOR SHARE`.
   withdraws it, for example when the owner later says no. The proof is the
   delegate's own Relaycast token: it must name an agent in this workspace's
   relay, and the approval must be one this delegate sent (minted under its
-  grant, or attested from it). With delegation off it answers 404. No person's
-  credential is needed, because withdrawing only narrows. An unknown approval
-  is 404 before any Relaycast call. It is audited as `approval.withdrawn`.
+  grant, or attested from it). It works while delegation is off, like every
+  other revocation. No person's credential is needed, because withdrawing only
+  narrows. An unknown approval is 404 before any Relaycast call, and a token
+  that does not prove the agent (or an agent not in this relay, or an
+  approval it did not send) is the same 404. It is audited as
+  `approval.withdrawn`.
 
 After either, the next attest or redeem of that approval is `revoked`.
 
@@ -381,8 +386,14 @@ Turning `delegation_enabled` off makes every attestation and redeem
 - `policy.updated`, `target_owners.updated`
 - `approval.revoked`, `approval.withdrawn`, `quote.redacted`
 
-`GET /delegates/audit?since=&grant_id=&format=jsonl&limit=&after_id=` shows a member
-their own events and an admin all of them. The answer is `{events,
+`GET /delegates/audit?since=&grant_id=&format=jsonl&limit=&after_id=` shows an
+admin every event. A member sees, as Cloud, the events filed under them as
+owner (their grants and approvals) and the events they caused that are filed
+under no owner (a policy change, a refusal before any grant from the claimed
+owner exists); on those ownerless rows `quote` and `quote_hash` are null. As a
+recipient's owner they do not see another owner's attestations, refusals or
+redeems. A refusal that names an owner with no grant to that sender is filed
+under no owner, with `data.claimed_owner_id`. The answer is `{events,
 next_after_id, complete}` (JSONL: the `X-Audit-Next-After-Id` and
 `X-Audit-Complete` headers). Paging is commit-safe, as Cloud: each event
 records the id of the transaction that wrote it (`xact_id`, never returned),
@@ -407,7 +418,7 @@ quote redaction, and deletes outside a workspace deletion). Each event is `id, e
 created_at, actor_user_id, actor_agent_id, auth_method, owner_id, grant_id,
 approval_id, message_id, recipient_agent_id, reason, data, quote, quote_hash,
 quote_redacted_at`, as in Cloud. The attestation's `jti` and `kid` are in
-`data`. `quote_hash` is a keyed digest (§8), `hmac-sha256:<hex>`: an
+`data`. `quote_hash` is a keyed digest (§8), `hmac-sha256:v1:<64 hex>` (the version names the key derivation): an
 HMAC-SHA256 under a per-workspace key (HKDF-SHA256, salt
 `relay-delegation-quote-digest-v1`, info `workspace:<id>`, as Cloud) derived
 from a server-held secret, so a reader of the log

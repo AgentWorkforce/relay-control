@@ -44,7 +44,7 @@ export const CLAIM_TTL_MS = 10 * 60 * 1000;
 export const REASON_CODES = [
   "not_enabled", "not_delegate", "no_approval", "out_of_scope", "expired", "revoked",
   "recipient_policy", "tier_o_required", "consumed", "not_pending", "unavailable",
-  "condition_unmet", "condition_unavailable",
+  "condition_unmet", "condition_unavailable", "predates_grant",
 ] as const;
 export type ReasonCode = typeof REASON_CODES[number];
 

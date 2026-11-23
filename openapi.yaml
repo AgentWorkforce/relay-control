@@ -10084,7 +10084,7 @@ components:
     DelegationReason:
       type: string
       enum: [not_enabled, not_delegate, no_approval, out_of_scope, expired, revoked, recipient_policy, tier_o_required,
-        consumed, not_pending, unavailable, condition_unmet, condition_unavailable]
+        consumed, not_pending, unavailable, condition_unmet, condition_unavailable, predates_grant]
     DelegationCondition:
       oneOf:
         - { type: object, additionalProperties: false, required: [type], properties: { type: { const: ci_green } } }

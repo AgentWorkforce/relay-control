@@ -37,6 +37,7 @@ import {
   auditView,
   CLAIM_TTL_MS,
   expireLapsed,
+  grantFitsPolicy,
   grantView,
   listAuditPage,
   loadOrgPolicy,
@@ -405,8 +406,12 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
     method: string): Promise<boolean> {
     if (path === DELEGATION_JWKS_PATH || path === `/cloud${DELEGATION_JWKS_PATH}`) {
       if (method !== "GET") fail("method_not_allowed", "Method not allowed", 405);
-      response.setHeader("cache-control", "public, max-age=300");
-      input.json(response, 200, input.signer ? input.signer.jwks() : { keys: [] });
+      // As Cloud: a non-empty key set is cached for 5 minutes; an empty one (no
+      // key configured yet) is not, so verifiers pick up a new key at once.
+      // The keys come from memory, so there is no read failure to answer 503 for.
+      const jwks = input.signer ? input.signer.jwks() : { keys: [] };
+      response.setHeader("cache-control", jwks.keys.length ? "public, max-age=300" : "no-store");
+      input.json(response, 200, jwks);
       return true;
     }
     const orgMatch = ORG_POLICY_PATH.exec(path);
@@ -609,8 +614,10 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
           const current = await loadPolicy(tx, workspace.id);
           if (!locked || !current.delegation_enabled) NOT_ENABLED();
           policyRefusal(scopes.map(scope => scope.class), current);
-          if (expiresAt.getTime() > now().getTime() + Math.min(GRANT_MAX_DAYS, current.max_expiry_days) * 86_400_000) {
-            fail("invalid_expiry", `expires_at may be at most ${Math.min(GRANT_MAX_DAYS, current.max_expiry_days)} days away`, 400);
+          // As Cloud: the grant must fit the policy as it stands inside the
+          // creating transaction (403 out_of_scope otherwise).
+          if (!grantFitsPolicy({ scopes, expires_at: expiresAt, created_at: now() }, current)) {
+            fail("out_of_scope", "The grant does not fit the workspace policy", 403);
           }
           await expireLapsed(tx, workspace.id, principal.userId, binding!.agentId);
           const existing = await tx.query(
@@ -879,7 +886,8 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       const body = patchGrantBody.safeParse(await readJson(request));
       if (!body.success || !GRANT_ID.test(sub)) fail("invalid_request", "Invalid grant change", 400);
       const patch = body.data!;
-      await requireEnabled(workspace.id);
+      // Allowed while delegation is off, as Cloud: narrowing only removes
+      // authority, so nothing comes back when delegation is turned on again.
       const row = await input.database.transaction(async (tx) => {
         // Lock and reread the grant, so concurrent changes apply to the
         // current row and can never restore a narrowed scope or expiry.
@@ -937,8 +945,9 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       "SELECT id FROM workspaces WHERE id::text = $1", [workspaceId],
     )).rows[0];
     if (!workspace) return fail("not_found", "Approval not found", 404);
-    // As Cloud: with delegation off there is nothing to withdraw.
-    if (!(await loadPolicy(input.database, workspace.id)).delegation_enabled) return fail("not_found", "Approval not found", 404);
+    // Allowed while delegation is off, as every other revocation is (as
+    // Cloud): withdrawing only narrows, so an approval cannot come back when
+    // delegation is turned on again.
     // As Cloud: the approval must exist before anything is asked of Relaycast,
     // so an unauthenticated body cannot drive Relaycast calls for made-up ids.
     const exists = (await input.database.query(
@@ -954,9 +963,11 @@ export function createDelegationHandler(input: DelegationRoutesInput) {
       if (!(error instanceof RelaycastCallError) || ![401, 403, 404].includes(error.status)) return UNAVAILABLE();
       agent = null;
     }
-    if (!agent || agent.id !== delegateAgentId) return fail("invalid_agent", "The agent token does not prove this agent id", 403);
+    // A token that proves nothing answers the same 404 as an unknown approval,
+    // so the route never tells an unauthenticated caller an approval exists (as Cloud).
+    if (!agent || agent.id !== delegateAgentId) return fail("not_found", "Approval not found", 404);
     const local = await input.relaycast.getRosterAgent(binding.relaycastApiKey, agent.name).catch(() => null);
-    if (!local || local.id !== agent.id) return fail("invalid_agent", "The agent is not part of this workspace's relay", 403);
+    if (!local || local.id !== agent.id) return fail("not_found", "Approval not found", 404);
     // Only an approval this delegate sent, as Cloud's approvalSentBy: one minted
     // under its grant (tier D), or one attested from it.
     const sent = (await input.database.query<{ owner_user_id: string }>(

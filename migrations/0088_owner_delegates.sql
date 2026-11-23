@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS delegation_claims (
 
 CREATE INDEX IF NOT EXISTS delegation_claims_workspace_idx
   ON delegation_claims (workspace_id, user_id, created_at);
+-- A person's claims, for deleting a user (as Cloud's claims owner index).
+CREATE INDEX IF NOT EXISTS delegation_claims_user_idx ON delegation_claims (user_id);
 
 -- Agent ids bound to a person by a completed claim. The immutable Relaycast
 -- agent id is the key; the name is the one Relaycast reported at claim time
@@ -113,6 +115,10 @@ CREATE TABLE IF NOT EXISTS delegation_grants (
   CONSTRAINT delegation_grants_auth_method CHECK (created_auth_method IN ('session', 'desktop_bearer')),
   CONSTRAINT delegation_grants_status CHECK (status IN ('active', 'revoked', 'expired'))
 );
+
+-- Lapsed active grants, for the sweep.
+CREATE INDEX IF NOT EXISTS delegation_grants_active_expiry_idx
+  ON delegation_grants (expires_at) WHERE status = 'active';
 
 -- One active grant per (owner, delegate); widening is a new grant after revoking.
 CREATE UNIQUE INDEX IF NOT EXISTS delegation_grants_active_pair
@@ -178,6 +184,7 @@ CREATE TABLE IF NOT EXISTS delegation_attestations (
 
 CREATE INDEX IF NOT EXISTS delegation_attestations_approval_idx
   ON delegation_attestations (approval_id, recipient_agent_id);
+CREATE INDEX IF NOT EXISTS delegation_attestations_grant_idx ON delegation_attestations (grant_id);
 
 -- Append-only per-workspace delegation log (§8). Quote text is kept for the
 -- org's quote_retention_days (default 90) and then redacted to its keyed digest
@@ -210,6 +217,8 @@ CREATE INDEX IF NOT EXISTS delegation_audit_events_workspace_idx
   ON delegation_audit_events (workspace_id, id);
 CREATE INDEX IF NOT EXISTS delegation_audit_events_owner_idx
   ON delegation_audit_events (workspace_id, owner_user_id, id);
+CREATE INDEX IF NOT EXISTS delegation_audit_events_actor_idx
+  ON delegation_audit_events (workspace_id, actor_user_id, id);
 -- Retention reads due quotes as one (workspace_id, created_at) range per
 -- workspace; quote writes and redactions find a message's rows by message id.
 CREATE INDEX IF NOT EXISTS delegation_audit_events_quote_idx

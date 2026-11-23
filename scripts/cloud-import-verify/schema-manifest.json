@@ -89,7 +89,7 @@
     {"name":"0085_mcp_oauth_session_parent.sql","sha256":"a2f709681bb844df11f81fe2ca3c6b8e1a7ac7d6bf53892663efcb4014cf29a3"},
     {"name":"0086_agent_identities.sql","sha256":"6213dc65aae27a9c601858e40ddf55d310255961e2198bf3310598819a621a5f"},
     {"name":"0087_relay_channel_creations.sql","sha256":"ff28fbb66c7ad41ebd44d6a1e886c05a3d06217884e686eb5cdd380ed31e5677"},
-    {"name":"0088_owner_delegates.sql","sha256":"41621d8c1ade5a2869ee2803543aa6e57fa471646c1252953b801f838af2b195"},
+    {"name":"0088_owner_delegates.sql","sha256":"5e882f3949a5a8348b5c018b145569a8b05839374bc67474bc661175938230df"},
     {"name":"0092_events_shim_mcp_mode.sql","sha256":"de55a67510f635bd2cecea5e5d0209876a4f7246799e4549be10f1c3288fea8c"},
     {"name":"0095_events_shim_wake_agent.sql","sha256":"7db9de27af2caa8bed6a8b1ad6322fdb717240202c547973ced72357cc9a5d50"}
   ],
@@ -2024,7 +2024,9 @@
     {"kind":"index","name":"public.delegation_approvals.delegation_approvals_grant_idx","definition":{"definition":"CREATE INDEX delegation_approvals_grant_idx ON public.delegation_approvals USING btree (grant_id) WHERE (grant_id IS NOT NULL)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.delegation_approvals.delegation_approvals_pkey","definition":{"definition":"CREATE UNIQUE INDEX delegation_approvals_pkey ON public.delegation_approvals USING btree (id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.delegation_attestations.delegation_attestations_approval_idx","definition":{"definition":"CREATE INDEX delegation_attestations_approval_idx ON public.delegation_attestations USING btree (approval_id, recipient_agent_id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
+    {"kind":"index","name":"public.delegation_attestations.delegation_attestations_grant_idx","definition":{"definition":"CREATE INDEX delegation_attestations_grant_idx ON public.delegation_attestations USING btree (grant_id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.delegation_attestations.delegation_attestations_pkey","definition":{"definition":"CREATE UNIQUE INDEX delegation_attestations_pkey ON public.delegation_attestations USING btree (jti)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
+    {"kind":"index","name":"public.delegation_audit_events.delegation_audit_events_actor_idx","definition":{"definition":"CREATE INDEX delegation_audit_events_actor_idx ON public.delegation_audit_events USING btree (workspace_id, actor_user_id, id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.delegation_audit_events.delegation_audit_events_commit_order_idx","definition":{"definition":"CREATE INDEX delegation_audit_events_commit_order_idx ON public.delegation_audit_events USING btree (workspace_id, xact_id, id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.delegation_audit_events.delegation_audit_events_message_idx","definition":{"definition":"CREATE INDEX delegation_audit_events_message_idx ON public.delegation_audit_events USING btree (workspace_id, message_id) WHERE (message_id IS NOT NULL)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.delegation_audit_events.delegation_audit_events_owner_idx","definition":{"definition":"CREATE INDEX delegation_audit_events_owner_idx ON public.delegation_audit_events USING btree (workspace_id, owner_user_id, id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
@@ -2033,7 +2035,9 @@
     {"kind":"index","name":"public.delegation_audit_events.delegation_audit_events_workspace_idx","definition":{"definition":"CREATE INDEX delegation_audit_events_workspace_idx ON public.delegation_audit_events USING btree (workspace_id, id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.delegation_claims.delegation_claims_code_hash_key","definition":{"definition":"CREATE UNIQUE INDEX delegation_claims_code_hash_key ON public.delegation_claims USING btree (code_hash)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.delegation_claims.delegation_claims_pkey","definition":{"definition":"CREATE UNIQUE INDEX delegation_claims_pkey ON public.delegation_claims USING btree (id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
+    {"kind":"index","name":"public.delegation_claims.delegation_claims_user_idx","definition":{"definition":"CREATE INDEX delegation_claims_user_idx ON public.delegation_claims USING btree (user_id)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.delegation_claims.delegation_claims_workspace_idx","definition":{"definition":"CREATE INDEX delegation_claims_workspace_idx ON public.delegation_claims USING btree (workspace_id, user_id, created_at)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
+    {"kind":"index","name":"public.delegation_grants.delegation_grants_active_expiry_idx","definition":{"definition":"CREATE INDEX delegation_grants_active_expiry_idx ON public.delegation_grants USING btree (expires_at) WHERE (status = 'active'::text)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":false,"valid":true}},
     {"kind":"index","name":"public.delegation_grants.delegation_grants_active_pair","definition":{"definition":"CREATE UNIQUE INDEX delegation_grants_active_pair ON public.delegation_grants USING btree (workspace_id, owner_user_id, delegate_agent_id) WHERE (status = 'active'::text)","live":true,"nulls_not_distinct":false,"primary":false,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.delegation_grants.delegation_grants_pkey","definition":{"definition":"CREATE UNIQUE INDEX delegation_grants_pkey ON public.delegation_grants USING btree (id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
     {"kind":"index","name":"public.delegation_org_policies.delegation_org_policies_pkey","definition":{"definition":"CREATE UNIQUE INDEX delegation_org_policies_pkey ON public.delegation_org_policies USING btree (organization_id)","live":true,"nulls_not_distinct":false,"primary":true,"ready":true,"unique":true,"valid":true}},
@@ -2414,5 +2418,5 @@
   "optional":{
 
   },
-  "sha256":"d868ab1d8b683f780759b7da649356f5fad1b3a4b91307b6dd23b3c02ac79def"
+  "sha256":"a968d2639e6640166fe73c308b89fb00c9abdaf022fbb6f08348591f05716059"
 }

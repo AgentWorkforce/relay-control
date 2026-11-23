@@ -536,7 +536,7 @@ test("attestation: a live delegate's in-scope approval is signed and verifies ag
   assert.equal(event!.jti, claims.jti);
   assert.equal(event!.quote, "yes merge 2250 when green");
   // §8: a keyed digest (HMAC under a server key), never the plain SHA-256 of the quote.
-  assert.match(event!.quote_hash!, /^hmac-sha256:[0-9a-f]{64}$/);
+  assert.match(event!.quote_hash!, /^hmac-sha256:v1:[0-9a-f]{64}$/);
   assert.notEqual(event!.quote_hash, createHash("sha256").update("yes merge 2250 when green").digest("hex"));
   // §16.4: the quote is in the signed claims.
   assert.equal(claims.quote, "yes merge 2250 when green");
@@ -803,7 +803,7 @@ test("quote text is redacted to its hash after 90 days", async (t) => {
   const audit = await env.bearer("/delegates/audit");
   const attested = audit.body.events.find((event: { event: string }) => event.event === "approval.attested");
   assert.equal(attested.quote, null);
-  assert.match(attested.quote_hash, /^hmac-sha256:[0-9a-f]{64}$/);
+  assert.match(attested.quote_hash, /^hmac-sha256:v1:[0-9a-f]{64}$/);
   assert.ok(attested.quote_redacted_at);
   assert.deepEqual(Object.keys(attested).sort(), ["actor_agent_id", "actor_user_id", "approval_id", "auth_method", "created_at",
     "data", "event", "grant_id", "id", "message_id", "owner_id", "quote", "quote_hash", "quote_redacted_at", "reason",
@@ -1048,7 +1048,7 @@ test("quote_retention_days is an org setting (1–3650, default 90) that every w
   let events = await audit();
   assert.equal(byJti(events, old).quote, null);
   assert.ok(byJti(events, old).quote_redacted_at);
-  assert.match(byJti(events, old).quote_hash!, /^hmac-sha256:[0-9a-f]{64}$/);
+  assert.match(byJti(events, old).quote_hash!, /^hmac-sha256:v1:[0-9a-f]{64}$/);
   assert.equal(byJti(events, recent).quote, "yes merge 2250 when green");
   assert.equal(byJti(events, recent).quote_redacted_at, null);
 
@@ -1344,7 +1344,8 @@ test("the owner revokes one approval; the delegate that sent one withdraws it", 
   // Not the sender: another agent, or a token that is not the delegate's.
   const other = env.world.addAgent("someone-else");
   assert.equal((await withdraw({ delegate_agent_id: other.id, delegate_token: other.token, approval_id: secondId })).status, 404);
-  assert.equal((await withdraw({ delegate_agent_id: bot.id, delegate_token: other.token, approval_id: secondId })).status, 403);
+  // A token that does not prove the agent is the same 404 as an unknown approval.
+  assert.equal((await withdraw({ delegate_agent_id: bot.id, delegate_token: other.token, approval_id: secondId })).status, 404);
   const done = await withdraw({ delegate_agent_id: bot.id, delegate_token: bot.token, approval_id: secondId });
   assert.equal(done.status, 200, done.raw);
   assert.deepEqual(done.body, { ok: true });
@@ -1353,12 +1354,12 @@ test("the owner revokes one approval; the delegate that sent one withdraws it", 
   const events = (await env.database.query<{ event: string; reason: string | null }>(
     "SELECT event, reason FROM delegation_audit_events WHERE event IN ('approval.revoked', 'approval.withdrawn') ORDER BY id")).rows;
   assert.deepEqual(events, [{ event: "approval.revoked", reason: "owner_revoked" }, { event: "approval.withdrawn", reason: "delegate_withdrew" }]);
-  // With delegation off there is nothing to withdraw: the same 404 as an unknown approval.
+  // Withdrawing works while delegation is off, like every other revocation (as Cloud).
   const third = await env.attest(recipient, send(env, bot, recipient, env.approval([{ ...merge, target: "AgentWorkforce/relay#103" }])));
   await env.enable({ delegation_enabled: false });
   const off = await withdraw({ delegate_agent_id: bot.id, delegate_token: bot.token, approval_id: third.body.claims.approval_id });
-  assert.equal(off.status, 404, off.raw);
-  assert.equal(off.body.code, "not_found");
+  assert.equal(off.status, 200, off.raw);
+  assert.deepEqual(off.body, { ok: true });
 });
 
 test("the owner redacts one message's quote; Relaycast is asked, and a failure stays queued", async (t) => {
@@ -1381,7 +1382,7 @@ test("the owner redacts one message's quote; Relaycast is asked, and a failure s
     "SELECT event, quote, quote_hash, quote_redacted_at FROM delegation_audit_events WHERE message_id = $1 ORDER BY id", [messageId])).rows;
   const attested = rows.find(row => row.event === "approval.attested")!;
   assert.equal(attested.quote, null);
-  assert.match(attested.quote_hash!, /^hmac-sha256:[0-9a-f]{64}$/);
+  assert.match(attested.quote_hash!, /^hmac-sha256:v1:[0-9a-f]{64}$/);
   assert.ok(attested.quote_redacted_at);
   assert.ok(rows.some(row => row.event === "quote.redacted"));
   // Nothing left to redact for that message.
@@ -1629,7 +1630,7 @@ test("review: a message whose quote was redacted is never stored or signed again
   assert.equal(rows.length, 2);
   for (const row of rows) {
     assert.equal(row.quote, null);
-    assert.match(row.quote_hash!, /^hmac-sha256:[0-9a-f]{64}$/);
+    assert.match(row.quote_hash!, /^hmac-sha256:v1:[0-9a-f]{64}$/);
     assert.ok(row.quote_redacted_at);
   }
   assert.equal(rows[1]!.quote_hash, rows[0]!.quote_hash);
@@ -1828,11 +1829,17 @@ test("review: tier D never attests a message sent before its grant; an unknown s
   const { env, recipient, bot } = await ready(t);
   const merge = (n: number) => [{ class: "merge", target: `AgentWorkforce/relay#${n}` }];
   // A message sent, the grant revoked and re-granted, then the old message attested: revoked.
-  const old = send(env, bot, recipient, env.approval(merge(260)));
+  // A message sent, the grant revoked and re-granted, then the old message attested: predates_grant.
+  // (More than the 2 s send-time skew before the new grant.)
+  const old = env.world.sendApprovalAs(bot.name, recipient.name, "ok", env.approval(merge(260)),
+    { createdAt: new Date(Date.now() - 5_000).toISOString() }).message.id;
   await env.bearer("/delegates/revoke-all", "POST", {});
-  await new Promise(resolve => setTimeout(resolve, 20));
   await env.grant(bot.id, [{ class: "merge", targets: ["AgentWorkforce/*"] }]);
-  assert.deepEqual((await env.attest(recipient, old)).body, { verdict: "none", reason: "revoked" });
+  assert.deepEqual((await env.attest(recipient, old)).body, { verdict: "none", reason: "predates_grant" });
+  // Within the skew, a message is not refused for it.
+  const skewed = env.world.sendApprovalAs(bot.name, recipient.name, "ok", env.approval(merge(265)),
+    { createdAt: new Date(Date.now() - 1_000).toISOString() }).message.id;
+  assert.equal((await env.attest(recipient, skewed)).body.verdict, "delegate");
   // A message sent after the new grant attests.
   assert.equal((await env.attest(recipient, send(env, bot, recipient, env.approval(merge(261))))).body.verdict, "delegate");
   // No created_at and an id that is not a snowflake: unavailable.
@@ -1848,7 +1855,7 @@ test("review: tier D never attests a message sent before its grant; an unknown s
   const stale = String(BigInt(Date.now() - 3_600_000 - Date.UTC(2025, 0, 1)) << 22n);
   const before = env.world.sendApprovalAs(bot.name, recipient.name, "ok", env.approval(merge(264)),
     { createdAt: null, id: stale }).message.id;
-  assert.deepEqual((await env.attest(recipient, before)).body, { verdict: "none", reason: "revoked" });
+  assert.deepEqual((await env.attest(recipient, before)).body, { verdict: "none", reason: "predates_grant" });
 });
 
 test("review: identical refusals are audited once per 10 minutes; an audit cursor must be visible to the viewer", async (t) => {
@@ -1868,4 +1875,50 @@ test("review: identical refusals are audited once per 10 minutes; an audit curso
   const hidden = await env.bearer(`/delegates/audit?after_id=${adminEvent}`, "GET", undefined, member.accessToken);
   assert.equal(hidden.status, 400, hidden.raw);
   assert.equal(hidden.body.code, "invalid_request");
+});
+
+test("review: a non-admin sees own-owner rows and their own ownerless rows (quote hidden); JWKS caching; narrowing while off", async (t) => {
+  const { env, recipient, bot, grantId } = await ready(t);
+  // A refusal that names another person who has no grant to this sender is filed under no owner.
+  const strangerId = await env.addMember("stranger@acme.test");
+  const forged = send(env, bot, recipient, env.approval([{ class: "merge", target: "AgentWorkforce/relay#270" }], { owner_id: strangerId }));
+  assert.deepEqual((await env.attest(recipient, forged)).body, { verdict: "none", reason: "not_delegate" });
+  const row = (await env.database.query<{ owner_user_id: string | null; data: Record<string, unknown> }>(
+    "SELECT owner_user_id, data FROM delegation_audit_events WHERE event = 'approval.refused' AND message_id = $1", [forged])).rows[0]!;
+  assert.equal(row.owner_user_id, null);
+  assert.equal(row.data.claimed_owner_id, strangerId);
+  // The named person does not see it.
+  const stranger = await env.desktopSignIn({ hostName: "stranger-box", userId: strangerId });
+  const theirs = (await env.bearer("/delegates/audit", "GET", undefined, stranger.accessToken)).body.events as Array<{ message_id: string }>;
+  assert.ok(!theirs.some(event => event.message_id === forged));
+  // An ownerless row the viewer caused is listed with quote and digest hidden.
+  await env.database.query(
+    `INSERT INTO delegation_audit_events (workspace_id, event, actor_user_id, message_id, quote, quote_hash)
+     VALUES ($1, 'approval.refused', $2, 'm-ownerless', 'secret words', 'hmac-sha256:v1:x')`, [env.workspaceId, env.ownerId]);
+  // The workspace owner is an admin and sees everything: check a plain member's view of their own ownerless row.
+  const plainId = await env.addMember("plain@acme.test");
+  const plain = await env.desktopSignIn({ hostName: "plain-box", userId: plainId });
+  await env.database.query(
+    `INSERT INTO delegation_audit_events (workspace_id, event, actor_user_id, message_id, quote, quote_hash)
+     VALUES ($1, 'approval.refused', $2, 'm-plain', 'their words', 'hmac-sha256:v1:y')`, [env.workspaceId, plainId]);
+  const plainEvents = (await env.bearer("/delegates/audit", "GET", undefined, plain.accessToken)).body.events as
+    Array<{ message_id: string; quote: string | null; quote_hash: string | null }>;
+  const own = plainEvents.find(event => event.message_id === "m-plain")!;
+  assert.equal(own.quote, null);
+  assert.equal(own.quote_hash, null);
+  assert.ok(!plainEvents.some(event => event.message_id === "m-ownerless"));
+  // JWKS: a configured key set is cached for 5 minutes.
+  const keys = await request(env.origin, "/.well-known/relay-delegation-keys.json");
+  assert.equal(keys.headers.get("cache-control"), "public, max-age=300");
+  // A grant can be narrowed while delegation is off.
+  await env.enable({ delegation_enabled: false });
+  const narrowed = await env.browser(`/delegates/${grantId}`, "PATCH", { scopes: [{ class: "merge", targets: ["AgentWorkforce/relay"] }] });
+  assert.equal(narrowed.status, 200, narrowed.raw);
+});
+
+test("review: without a signing key the empty JWKS is not cached", async (t) => {
+  const env = await setup(t, { signing: false });
+  const keys = await request(env.origin, "/.well-known/relay-delegation-keys.json");
+  assert.deepEqual(keys.body, { keys: [] });
+  assert.equal(keys.headers.get("cache-control"), "no-store");
 });
