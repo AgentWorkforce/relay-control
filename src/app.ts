@@ -9,7 +9,7 @@ import { relayHostedCredentials } from "./mcp/relay-hosted-credentials.js";
 import { agentIdentityHoldsName, ownerHash, HOSTED_SOURCE } from "./mcp/relay-participants.js";
 import { McpOAuthTeardown,mcpOAuthTeardownFetch } from "./mcp/oauth/teardown.js";
 import { mcpOAuthActive } from "./mcp/oauth/config.js";
-import { GrokRoutines } from "./mcp/grok-routines.js";
+import { GrokRoutines, grokRoutinesOptions } from "./mcp/grok-routines.js";
 import { retiringIdentity } from "./mcp/oauth/retirement.js";
 import { isDeviceReservedClientName } from "./reserved-client-names.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -681,12 +681,9 @@ export function createApp(input: {
     ...(config.relaygatePublicUrl ? {gate:createRelaycastClient({internalOrigin:config.relaygatePublicUrl,
       fetchImpl:mcpOAuthTeardownFetch(input.messagingFetch)})} : {}),
   }) : null;
-  const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines({
-      database:store.database,keyring:config.encryptionKeyring,client:oauthRelay,
-      cursorRunIdentityRequired:config.cursorCloud?.enabled!==false && config.cursorCloud?.runIdentity==="required",
-      ...(config.relaygatePublicUrl ? {gate:createRelaycastClient({internalOrigin:config.relaygatePublicUrl,fetchImpl:input.messagingFetch})} : {}),
-      publicOrigin:new URL(config.publicBaseUrl).origin,tenancyMode:store.tenancy,now:input.now,
-    }) : undefined;
+  const grokRoutines = mcpOAuthActive(config) ? input.grokRoutines ?? new GrokRoutines(grokRoutinesOptions(config,{
+      database:store.database,tenancyMode:store.tenancy,client:oauthRelay,fetchImpl:input.messagingFetch,now:input.now,
+    })) : undefined;
   // Cursor cloud agents: per-run identity on cursor-cloud OAuth grants (docs/cursor-cloud-agents.md).
   const cursorCloud = mcpOAuthActive(config) && config.cursorCloud ? createCursorCloud({
     config:config.cursorCloud,publicOrigin:config.publicBaseUrl,keyring:config.encryptionKeyring,database:store.database,
