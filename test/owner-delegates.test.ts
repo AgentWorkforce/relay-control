@@ -181,15 +181,15 @@ test("high-risk classes and approval ids follow §16.1 and §16.4", () => {
   assert.equal(ownerDisplay("k@example.com"), "the owner");
   assert.equal(ownerDisplay(""), "the owner");
   assert.equal([...ownerDisplay("x".repeat(200))].length, 80);
-  // Cut at 80 UTF-16 units on a character boundary: an emoji (a surrogate
-  // pair) straddling the boundary is dropped whole, never split.
-  const straddling = ownerDisplay(`${"a".repeat(79)}\u{1F600}tail`);
-  assert.equal(straddling, "a".repeat(79));
-  assert.equal(straddling.length, 79);
-  const fits = ownerDisplay(`${"a".repeat(78)}\u{1F600}tail`);
-  assert.equal(fits, `${"a".repeat(78)}\u{1F600}`);
-  assert.equal(fits.length, 80);
-  assert.ok(!/[\uD800-\uDBFF]$/.test(ownerDisplay(`${"b".repeat(79)}\u{1F680}\u{1F680}`)));
+  // Cut at 80 characters on a code point boundary, as Cloud: an emoji (a
+  // surrogate pair) at the boundary is kept whole or dropped whole, never split.
+  const atBoundary = ownerDisplay(`${"a".repeat(79)}\u{1F600}tail`);
+  assert.equal(atBoundary, `${"a".repeat(79)}\u{1F600}`);
+  assert.equal(Array.from(atBoundary).length, 80);
+  const emoji = ownerDisplay(`a${"\u{1F600}".repeat(100)}`);
+  assert.equal(Array.from(emoji).length, 80);
+  assert.ok(emoji.endsWith("\u{1F600}"));
+  assert.equal(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u.test(emoji), false);
 });
 
 test("signing key config: seed and kid together, previous keys validated", () => {

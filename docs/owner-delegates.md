@@ -152,7 +152,7 @@ Control workspace id. A tier D `approval_id` is `apv_` followed by base62 (alpha
 `0-9A-Za-z`, big-endian, no padding) of `SHA-256(ws|message_id)[0..16]`.
 `owner_display` is the person's name on one line, at most 80 characters, or
 "the owner" when it is empty or looks like an email address. Brackets are
-stripped. The cut is at 80 UTF-16 units on a character boundary, so an emoji is never split. The result is trimmed after the cut, as in Cloud.
+stripped. The cut is at 80 characters on a code point boundary, so an emoji is never split. The result is trimmed after the cut, as in Cloud.
 
 ### Standing (§5.4)
 

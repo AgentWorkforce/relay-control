@@ -279,15 +279,13 @@ export function sameActions(left: readonly Action[], right: readonly Action[]): 
 
 /** §15.2: the owner's display name on one line, at most 80 characters, or "the owner". */
 export function ownerDisplay(name: string | null | undefined): string {
-  // As Cloud's ownerDisplay: brackets stripped (they delimit the delegate
-  // line), at most 80 UTF-16 units cut on a character boundary (never between
-  // the halves of a surrogate pair), trailing space trimmed.
+  // Byte-for-byte Cloud's ownerDisplay: brackets stripped (they delimit the
+  // delegate line), at most 80 characters cut on a code point boundary (never
+  // inside a surrogate pair), trailing space trimmed.
   const flat = (name ?? "").replace(/[\u0000-\u001f\u007f\u2028\u2029[\]]+/gu, " ").replace(/\s+/gu, " ").trim();
   if (!flat || flat.includes("@")) return "the owner";
-  if (flat.length <= 80) return flat;
-  const high = flat.charCodeAt(79);
-  const cut = high >= 0xd800 && high <= 0xdbff ? 79 : 80;
-  return flat.slice(0, cut).trimEnd();
+  const chars = Array.from(flat);
+  return chars.length > 80 ? chars.slice(0, 80).join("").trimEnd() : flat;
 }
 
 export function sha256Hex(value: string): string {
