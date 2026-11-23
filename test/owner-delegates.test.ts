@@ -630,12 +630,14 @@ test("attestation refusal reasons", async (t) => {
   await env.database.query("UPDATE delegation_grants SET expires_at = now() - interval '1 second' WHERE id = $1", [fresh.grant_id]);
   assert.equal(await reason(send(env, bot, recipient, env.approval(deploy))), "expired");
 
-  // Every refusal is audited with its reason.
+  // Every refusal once the recipient is proven is audited with its reason. A
+  // refusal before that (here, delegation off) is logged, not audited, as Cloud.
   const refused = new Set((await env.events("approval.refused")).map(row => row.reason));
   for (const code of ["no_approval", "not_delegate", "out_of_scope", "expired", "not_pending", "tier_o_required",
-    "recipient_policy", "revoked", "not_enabled"]) {
+    "recipient_policy", "revoked"]) {
     assert.ok(refused.has(code), `${code} audited`);
   }
+  assert.ok(!refused.has("not_enabled"), "an unproven refusal is not audited");
 });
 
 test("attestation: expired grant, relay outage, wrong credentials and a released delegate fail closed", async (t) => {
@@ -1441,9 +1443,17 @@ test("routes that run before any caller is proven never provision a Relaycast bi
   // Unbind the primary workspace, as an imported workspace starts out.
   await env.database.query(
     "UPDATE workspaces SET relaycast_workspace_id = NULL, relaycast_api_key_ciphertext = NULL WHERE id = $1", [env.workspaceId]);
-  const withdraw = await request(env.origin, `${env.base}/messaging/delegation/withdraw`, { method: "POST",
-    body: { delegate_agent_id: "ag_x", delegate_token: "at_not_a_real_token", approval_id: "apv_abcdefgh1234" } });
-  assert.equal(withdraw.status, 503, withdraw.raw);
+  // An unknown approval is 404 before anything else; a known one reaches the binding lookup (503 here).
+  const withdraw = (approvalId: string) => request(env.origin, `${env.base}/messaging/delegation/withdraw`, { method: "POST",
+    body: { delegate_agent_id: "ag_x", delegate_token: "at_not_a_real_token", approval_id: approvalId } });
+  const bodies = env.world.bodies.length;
+  assert.equal((await withdraw("apv_abcdefgh1234")).status, 404);
+  assert.equal(env.world.bodies.length, bodies, "no Relaycast call for an unknown approval");
+  await env.database.query(
+    `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at)
+     VALUES ('apv_knownapproval1', $1, $2, 'O', '[]'::jsonb, false, now() + interval '1 hour')`, [env.workspaceId, env.ownerId]);
+  const known = await withdraw("apv_knownapproval1");
+  assert.equal(known.status, 503, known.raw);
   const row = await env.database.query<{ relaycast_workspace_id: string | null; relaycast_binding_claim_id: string | null }>(
     "SELECT relaycast_workspace_id, relaycast_binding_claim_id FROM workspaces WHERE id = $1", [env.workspaceId]);
   assert.deepEqual(row.rows[0], { relaycast_workspace_id: null, relaycast_binding_claim_id: null });
@@ -1655,6 +1665,16 @@ test("review: audit pages follow commit order (xact_id, id); after_id resolves t
   assert.equal(rest.status, 200, rest.raw);
   const restIds = rest.raw.trim().split("\n").map(line => (JSON.parse(line) as { id: string }).id);
   assert.deepEqual([...first.map(event => event.id), ...restIds], all.map(event => event.id));
+  // The JSON page carries the safe cursor and whether it is complete; JSONL carries them as headers.
+  const whole = await env.bearer("/delegates/audit");
+  assert.equal(whole.body.complete, true);
+  assert.equal(whole.body.next_after_id, all.at(-1)!.id);
+  const short = await env.bearer("/delegates/audit?limit=2");
+  assert.equal(short.body.complete, false);
+  assert.equal(short.body.next_after_id, first.at(-1)!.id);
+  const lines = await env.bearer(`/delegates/audit?format=jsonl&after_id=${first.at(-1)!.id}`);
+  assert.equal(lines.headers.get("x-audit-complete"), "true");
+  assert.equal(lines.headers.get("x-audit-next-after-id"), all.at(-1)!.id);
   // An id that names no event of this workspace is invalid_request.
   const unknown = await env.bearer("/delegates/audit?after_id=999999999");
   assert.equal(unknown.status, 400, unknown.raw);

@@ -310,7 +310,10 @@ The attestation (or, for redeem, the consumption and the `approval.redeemed`
 event) is written in the same transaction, and the attestation is signed
 last, so a refusal signs nothing. If the `approval.redeemed` write fails, the
 consumption rolls back and the answer is `unavailable`: no use goes
-unrecorded. Refusal events stay best-effort; a failed write is logged
+unrecorded. Refusal events (`approval.refused`, `redeem.refused`) are
+written only once the recipient is proven; a refusal before that (delegation
+off, no key, a bad token) is logged as `delegation.refused`, never audited.
+They stay best-effort; a failed write is logged
 (`delegation.audit_write_failed`), as is every `unavailable` caused by an
 exception (`delegation.unavailable`). See
 `docs/delegation-quote-redaction-runbook.md` for the log lines.
@@ -321,7 +324,10 @@ is no longer unredeemed: grant revocation and `revoke-all` leave it alone. Its `
 least of 300 seconds after issue, the approval window found earlier, and the
 grant's and approval's expiry as read under the locks. Policy `PUT` (policy,
 then grants, then approvals) and revocation (grants, then approvals) take
-these rows in the same order.
+these rows in the same order. A consuming call (redeem, gate redeem) locks the
+approval `FOR NO KEY UPDATE` instead of `FOR SHARE`, so consumers of one
+approval run one at a time: insert the consumption, stamp `consumed_at`,
+write the event, commit. Attestation and gate dry runs keep `FOR SHARE`.
 
 ### Revoking or withdrawing one approval
 
@@ -335,8 +341,8 @@ these rows in the same order.
   delegate's own Relaycast token: it must name an agent in this workspace's
   relay, and the approval must be one this delegate sent (minted under its
   grant, or attested from it). With delegation off it answers 404. No person's
-  credential is needed, because withdrawing only narrows. It is audited as
-  `approval.withdrawn`.
+  credential is needed, because withdrawing only narrows. An unknown approval
+  is 404 before any Relaycast call. It is audited as `approval.withdrawn`.
 
 After either, the next attest or redeem of that approval is `revoked`.
 
@@ -369,15 +375,26 @@ Turning `delegation_enabled` off makes every attestation and redeem
 - `approval.revoked`, `approval.withdrawn`, `quote.redacted`
 
 `GET /delegates/audit?since=&grant_id=&format=jsonl&limit=&after_id=` shows a member
-their own events and an admin all of them. Paging is commit-safe, as Cloud:
-each event records the id of the transaction that wrote it (`xact_id`,
-never returned), events come in `(xact_id, id)` order, and only events of
-transactions older than the oldest one still in flight are returned. That set
-is final, so resuming with `after_id=<last id>` never skips an event committed
-out of id order; a just-committed event appears once every older transaction
-has ended. `after_id` resolves to its event's `(xact_id, id)`; `0` starts from
-the beginning, and an id that names no event of this workspace is 400
-`invalid_request`. The log is append-only (a trigger refuses every change but a
+their own events and an admin all of them. The answer is `{events,
+next_after_id, complete}` (JSONL: the `X-Audit-Next-After-Id` and
+`X-Audit-Complete` headers). Paging is commit-safe, as Cloud: each event
+records the id of the transaction that wrote it (`xact_id`, never returned),
+and events come in `(xact_id, id)` order. The fence is the statement's
+snapshot xmin, read with the rows: events of transactions below it are final.
+
+- The first page (no `after_id`, or `0`) lists every committed event.
+  `next_after_id` is the last listed event below the fence.
+- To page, pass `after_id=<next_after_id>`, not the last event's id. A cursor
+  page lists only events after that event's `(xact_id, id)` and below the
+  fence, so it never skips an event whose transaction committed late. Events
+  held back are counted (logged as `delegation.audit_fenced`) and make
+  `complete` false; `next_after_id` is the last listed event, or the cursor
+  itself when none is.
+- `complete` is true when the page is not full and nothing was held back.
+  Events after the cursor may repeat; none is ever skipped.
+- An id that names no event of this workspace is 400 `invalid_request`.
+
+The log is append-only (a trigger refuses every change but a
 quote redaction, and deletes outside a workspace deletion). Each event is `id, event,
 created_at, actor_user_id, actor_agent_id, auth_method, owner_id, grant_id,
 approval_id, message_id, recipient_agent_id, reason, data, quote, quote_hash,

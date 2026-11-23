@@ -1,18 +1,18 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import pg from "pg";
 import { PostgresDatabase } from "../src/database.js";
-import { listAuditPage, recordDelegationAudit } from "../src/delegation/service.js";
+import { consumeAction, decideUnderLocks, listAuditPage, recordDelegationAudit } from "../src/delegation/service.js";
 import { migrate } from "../src/migrations.js";
 import { isolatedPostgresPool } from "./support/postgres.js";
 
 const postgresUrl = process.env.TEST_DATABASE_URL;
-const options = { skip: postgresUrl ? false : "TEST_DATABASE_URL is not set (audit paging multi-connection proof)", timeout: 60_000 };
+const options = { skip: postgresUrl ? false : "TEST_DATABASE_URL is not set (delegation multi-connection proofs)", timeout: 60_000 };
 
-test("audit pages never skip an event committed out of id order", options, async (t) => {
+async function fixture(t: TestContext) {
   const admin = new pg.Pool({ connectionString: postgresUrl, max: 1 });
-  const schema = `delegation_audit_${randomUUID().replaceAll("-", "")}`;
+  const schema = `delegation_pg_${randomUUID().replaceAll("-", "")}`;
   await admin.query(`CREATE SCHEMA "${schema}"`);
   let database: PostgresDatabase | null = null;
   t.after(async () => {
@@ -20,76 +20,153 @@ test("audit pages never skip an event committed out of id order", options, async
       try { await admin.query(`DROP SCHEMA "${schema}" CASCADE`); } finally { await admin.end(); }
     }
   });
-  const pool = await isolatedPostgresPool(postgresUrl!, schema, 3);
+  const pool = await isolatedPostgresPool(postgresUrl!, schema, 4);
   database = new PostgresDatabase(pool);
   await migrate(database);
   const organizationId = randomUUID();
   const workspaceId = randomUUID();
+  const ownerId = randomUUID();
+  await database.query("INSERT INTO users (id, email, name) VALUES ($1, $2, 'Owner')", [ownerId, `owner-${ownerId}@example.test`]);
   await database.query("INSERT INTO organizations (id, name) VALUES ($1, 'Org')", [organizationId]);
   await database.query(`INSERT INTO workspaces (id, organization_id, name, relaycast_workspace_id, relaycast_api_key_ciphertext)
     VALUES ($1, $2, 'Workspace', $3, 'envelope')`, [workspaceId, organizationId, `rw-${workspaceId}`]);
-  const viewer = randomUUID();
-  const page = (afterId: string | null) => listAuditPage(database!, {
-    workspaceId, all: true, viewerUserId: viewer, since: null, grantId: null, limit: 100, afterId,
+  return { pool, database, workspaceId, ownerId };
+}
+
+test("audit pages: the first page lists every committed event; cursor pages never skip one committed out of id order", options,
+  async (t) => {
+    const { pool, database, workspaceId } = await fixture(t);
+    const viewer = randomUUID();
+    const page = (afterId: string | null) => listAuditPage(database, {
+      workspaceId, all: true, viewerUserId: viewer, since: null, grantId: null, limit: 100, afterId,
+    });
+    const ids = (rows: Record<string, unknown>[]) => rows.map(row => String(row.id));
+
+    await recordDelegationAudit(database, { workspaceId, event: "first" });
+    const start = await page(null);
+    assert.equal(start.events.length, 1);
+    assert.equal(start.complete, true);
+    const first = start.nextAfterId!;
+    assert.equal(first, ids(start.events)[0]);
+
+    // A transaction takes the next id and stays open; a later one commits a higher id.
+    const slow = await pool.connect();
+    try {
+      await slow.query("BEGIN");
+      const pending = (await slow.query<{ id: string }>(
+        "INSERT INTO delegation_audit_events (workspace_id, event) VALUES ($1, 'slow') RETURNING id::text", [workspaceId],
+      )).rows[0]!.id;
+      await recordDelegationAudit(database, { workspaceId, event: "fast" });
+      const fast = (await database.query<{ id: string }>(
+        "SELECT id::text FROM delegation_audit_events WHERE event = 'fast'")).rows[0]!.id;
+      assert.ok(BigInt(fast) > BigInt(pending));
+      // The first page is not fenced: it lists the committed higher id, but its
+      // safe cursor stays before it, and it is not complete.
+      const unfenced = await page(null);
+      assert.deepEqual(ids(unfenced.events), [first, fast]);
+      assert.equal(unfenced.nextAfterId, first);
+      assert.equal(unfenced.complete, false);
+      // A cursor page holds the committed higher id back while the lower one is in flight.
+      const held = await page(first);
+      assert.deepEqual(ids(held.events), []);
+      assert.equal(held.heldBack, 1);
+      assert.equal(held.nextAfterId, first);
+      assert.equal(held.complete, false);
+      await slow.query("COMMIT");
+      // Resuming from the cursor returns both, in commit-safe order: nothing was skipped.
+      const resumed = await page(first);
+      assert.deepEqual(ids(resumed.events), [pending, fast]);
+      assert.equal(resumed.nextAfterId, fast);
+      assert.equal(resumed.complete, true);
+    } finally {
+      slow.release();
+    }
+
+    // A transaction that took its id early but writes its event late is ordered
+    // by its transaction, ahead of an event a younger transaction committed first.
+    const before = (await page(null)).nextAfterId!;
+    const early = await pool.connect();
+    let late: string;
+    try {
+      await early.query("BEGIN");
+      await early.query("SELECT pg_current_xact_id()");
+      await recordDelegationAudit(database, { workspaceId, event: "younger" });
+      assert.deepEqual(ids((await page(before)).events), []);
+      late = (await early.query<{ id: string }>(
+        "INSERT INTO delegation_audit_events (workspace_id, event) VALUES ($1, 'older') RETURNING id::text", [workspaceId],
+      )).rows[0]!.id;
+      await early.query("COMMIT");
+    } finally {
+      early.release();
+    }
+    const resumed = (await page(before)).events;
+    assert.deepEqual(resumed.map(row => row.event), ["older", "younger"]);
+    assert.ok(BigInt(String(resumed[0]!.id)) > BigInt(String(resumed[1]!.id)));
+    assert.equal(String(resumed[0]!.id), late);
+
+    // A rolled-back transaction leaves a gap that does not hold the log back.
+    const aborted = await pool.connect();
+    try {
+      await aborted.query("BEGIN");
+      await aborted.query("INSERT INTO delegation_audit_events (workspace_id, event) VALUES ($1, 'aborted')", [workspaceId]);
+      await aborted.query("ROLLBACK");
+    } finally {
+      aborted.release();
+    }
+    await recordDelegationAudit(database, { workspaceId, event: "after-gap" });
+    const all = await page(null);
+    assert.deepEqual(all.events.map(row => row.event), ["first", "slow", "fast", "older", "younger", "after-gap"]);
+    assert.equal(all.complete, true);
   });
-  const ids = (rows: Record<string, unknown>[]) => rows.map(row => String(row.id));
 
-  await recordDelegationAudit(database, { workspaceId, event: "first" });
-  const settled = ids(await page(null));
-  assert.equal(settled.length, 1);
+test("consuming redeems of one approval serialize (FOR NO KEY UPDATE); share locks deadlock", options, async (t) => {
+  const { database, workspaceId, ownerId } = await fixture(t);
+  await database.query("INSERT INTO delegation_policies (workspace_id, delegation_enabled) VALUES ($1, true)", [workspaceId]);
+  const action = { class: "deploy" as const, target: "web:prod" };
+  const mint = async () => {
+    const id = `apv_${randomUUID().replaceAll("-", "")}`;
+    await database.query(
+      `INSERT INTO delegation_approvals (id, workspace_id, owner_user_id, tier, actions, single_use, expires_at)
+       VALUES ($1, $2, $3, 'O', $4::jsonb, true, now() + interval '1 hour')`,
+      [id, workspaceId, ownerId, JSON.stringify([action])],
+    );
+    return id;
+  };
+  const consumer = (approvalId: string, consuming: boolean, afterLock: () => Promise<void>) =>
+    decideUnderLocks(database, { workspaceId, memberUserIds: [], grantId: null, approvalId, consuming }, async (_state, tx) => {
+      await afterLock();
+      return consumeAction(tx, { approvalId, workspaceId, action, consumedBy: "recipient" });
+    });
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-  // A transaction takes the next id and stays open; a later one commits a higher id.
-  const slow = await pool.connect();
-  try {
-    await slow.query("BEGIN");
-    const pending = (await slow.query<{ id: string }>(
-      "INSERT INTO delegation_audit_events (workspace_id, event) VALUES ($1, 'slow') RETURNING id::text", [workspaceId],
-    )).rows[0]!.id;
-    await recordDelegationAudit(database, { workspaceId, event: "fast" });
-    const fast = (await database.query<{ id: string }>(
-      "SELECT id::text FROM delegation_audit_events WHERE event = 'fast'")).rows[0]!.id;
-    assert.ok(BigInt(fast) > BigInt(pending));
-    // The committed higher id is held back while the lower one is in flight.
-    assert.deepEqual(ids(await page(settled.at(-1)!)), []);
-    assert.deepEqual(ids(await page(null)), settled);
-    await slow.query("COMMIT");
-    // Resuming from the last id returns both, in id order: nothing was skipped.
-    assert.deepEqual(ids(await page(settled.at(-1)!)), [pending, fast]);
-  } finally {
-    slow.release();
-  }
+  // Share locks: both hold the approval, A's consumed_at stamp waits on B's
+  // share lock while B's insert of the same action waits on A: a deadlock.
+  const shared = await mint();
+  let locked = 0;
+  const bothLocked = async () => {
+    locked += 1;
+    while (locked < 2) await sleep(10);
+  };
+  const results = await Promise.allSettled([
+    consumer(shared, false, bothLocked),
+    consumer(shared, false, async () => { await bothLocked(); await sleep(200); }),
+  ]);
+  const rejected = results.filter(result => result.status === "rejected") as PromiseRejectedResult[];
+  assert.equal(rejected.length, 1, JSON.stringify(results));
+  assert.equal((rejected[0]!.reason as { code?: string }).code, "40P01");
 
-  // A transaction that took its id early but writes its event late is ordered
-  // by its transaction, ahead of an event a younger transaction committed first.
-  const early = await pool.connect();
-  let late: string;
-  const before = ids(await page(null)).at(-1)!;
-  try {
-    await early.query("BEGIN");
-    await early.query("SELECT pg_current_xact_id()");
-    await recordDelegationAudit(database, { workspaceId, event: "younger" });
-    assert.deepEqual(ids(await page(before)), []);
-    late = (await early.query<{ id: string }>(
-      "INSERT INTO delegation_audit_events (workspace_id, event) VALUES ($1, 'older') RETURNING id::text", [workspaceId],
-    )).rows[0]!.id;
-    await early.query("COMMIT");
-  } finally {
-    early.release();
-  }
-  const resumed = await page(before);
-  assert.deepEqual(resumed.map(row => row.event), ["older", "younger"]);
-  assert.ok(BigInt(String(resumed[0]!.id)) > BigInt(String(resumed[1]!.id)));
-  assert.equal(String(resumed[0]!.id), late);
-
-  // A rolled-back transaction leaves a gap that does not hold the log back.
-  const aborted = await pool.connect();
-  try {
-    await aborted.query("BEGIN");
-    await aborted.query("INSERT INTO delegation_audit_events (workspace_id, event) VALUES ($1, 'aborted')", [workspaceId]);
-    await aborted.query("ROLLBACK");
-  } finally {
-    aborted.release();
-  }
-  await recordDelegationAudit(database, { workspaceId, event: "after-gap" });
-  assert.deepEqual((await page(null)).map(row => row.event), ["first", "slow", "fast", "older", "younger", "after-gap"]);
+  // FOR NO KEY UPDATE: the second consumer waits for the first to commit, then
+  // sees its consumption; the approval is stamped consumed_at.
+  const serialized = await mint();
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const firstRun = consumer(serialized, true, () => held);
+  await sleep(100);
+  const secondRun = consumer(serialized, true, async () => undefined);
+  await sleep(200);
+  release();
+  assert.deepEqual(await Promise.all([firstRun, secondRun]), [true, false]);
+  const row = (await database.query<{ consumed_at: Date | null }>(
+    "SELECT consumed_at FROM delegation_approvals WHERE id = $1", [serialized])).rows[0]!;
+  assert.ok(row.consumed_at);
 });
