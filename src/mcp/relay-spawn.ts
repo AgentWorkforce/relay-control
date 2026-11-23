@@ -384,7 +384,8 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
       const ranking = rankTargets(targets, await deps.owners(targets.map(target => target.id)), userId,
         await placementOptions(parsed.data.harness ?? null));
       return {
-        targets: ranking.targets,
+        // Roster- and profile-controlled text is escaped, as in refusals.
+        targets: ranking.targets.map(displayPlaced),
         ...(ranking.policy.mode === "off" ? {} : { memory_policy: ranking.policy.mode }),
         note: "Ranked best first. Choose an allowed target, preferring an allowed desktop with the task's repository and free slots, " +
           "and pass its target_node to spawn_relay_agent. Existing machines only; permission and capacity are rechecked at launch." +
@@ -421,14 +422,21 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
           return null;
         });
         const offlineUnread = !byId && everyState === null;
-        const offline = everyState?.find(item => item.id === input.target_node);
-        // Names: live nodes only, and only a single match on the normalized key is used. An id held by a node in any
-        // state seen is never reread as a name. Without the every-state read that cannot be ruled out, so a single
+        const idHolder = everyState?.find(item => item.id === input.target_node);
+        // Names, on an id miss only: an id held by a node in any state seen is never reread as a name. Relaycast's
+        // selector matches stored names of every state, so names are compared over every state: the value resolves
+        // only when exactly one node of any state carries its normalized key and that node is live. A lone offline
+        // match keeps its offline refusal and several matches are ambiguous, so an offline node's own name never
+        // launches on a live look-alike. Without the every-state read neither can be ruled out, so a single live
         // name match is held back and refused as retryable instead.
         const nameKey = nodeNameKey(input.target_node);
-        const named = byId || offline ? [] : listable(online).filter(item => nodeNameKey(item.name) === nameKey);
+        const roster = everyState ? [...online, ...everyState.filter(node => !online.some(live => live.id === node.id))] : listable(online);
+        const named = byId || idHolder ? [] : roster.filter(item => item.name !== "self" && nodeNameKey(item.name) === nameKey);
         const unconfirmed = offlineUnread && named.length === 1;
-        const target = byId ?? (named.length === 1 && !unconfirmed ? named[0] : undefined);
+        const lone = named.length === 1 ? named[0] : undefined;
+        const liveLone = lone ? online.find(item => item.id === lone.id && item.live) : undefined;
+        const target = byId ?? liveLone;
+        const offline = idHolder ?? (lone && !liveLone ? lone : undefined);
         const owners = await deps.owners([...online.filter(eligible), ...(target ? [target] : []), ...(offline ? [offline] : [])]
           .map(item => item.id));
         const options = await placementOptions(input.cli);
@@ -463,10 +471,10 @@ export function relaySpawnService(context: Pick<McpContext, "authMode" | "role" 
         };
         const requested = displayName(input.target_node);
         if (named.length > 1) {
-          // Several live nodes share the normalized key (for example case variants). Relaycast keeps stored names
+          // Several nodes share the normalized key (for example case variants), live or offline. Relaycast keeps stored names
           // unique and selects by the exact trimmed name, so each of their ids reaches exactly one machine.
           throw refuse("spawn_target_unavailable", undefined, undefined, undefined, { retryable: false, valid_targets: validTargets(online),
-            message: `target_node "${requested}" matches no node id and the names of ${named.length} live nodes; ` +
+            message: `target_node "${requested}" matches no node id and the names of ${named.length} nodes; ` +
               `pass one of their ids as target_node: ${listTargets(named)}` });
         }
         if (unconfirmed) {

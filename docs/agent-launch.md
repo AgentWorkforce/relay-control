@@ -98,16 +98,21 @@ node it resolved, so each node id reaches exactly one machine.
   name match is then refused as retryable, since it might be an offline node's
   id, and a value matching nothing is refused as retryable, still listing the
   live ids and names.
-- **Name fallback.** Otherwise the value is compared with live node names
-  after trimming, NFC normalization, curly apostrophes (U+2018, U+2019, U+02BC)
-  as a straight `'`, and lowercasing. Exactly one match selects that node.
-  Admission (permission, harness, capacity, memory) then runs on that node as
-  it would for its id, and the receipt and journal record its id.
-- **Ambiguous names.** Several live nodes on that key (for example `Studio`
-  and `studio`) are refused with `spawn_target_unavailable`, `retryable:
-  false`, listing their `id (name)` pairs; pass one of those ids. Case or
-  apostrophe variants are distinct machines to Relaycast, so a launch by
-  either id is fine and both remain alternatives.
+- **Name fallback.** Otherwise the value is compared with node names of every
+  state (Relaycast's selector matches stored names of every state) after
+  trimming, NFC normalization, curly apostrophes (U+2018, U+2019, U+02BC) as a
+  straight `'`, and lowercasing. It resolves only when exactly one node carries
+  that key and the node is live. Admission (permission, harness, capacity,
+  memory) then runs on that node as it would for its id, and the receipt and
+  journal record its id. A lone offline match keeps its offline (or
+  not-allowed) refusal, so an offline node's own name never launches on a live
+  look-alike.
+- **Ambiguous names.** Several nodes of any state on that key (for example a
+  live `Studio` and an offline `studio`) are refused with
+  `spawn_target_unavailable`, `retryable: false`, listing their `id (name)`
+  pairs; pass one of those ids. Case or apostrophe variants are distinct
+  machines to Relaycast, so a launch by either id is fine and live ones remain
+  alternatives.
 - **Padded names.** A node whose stored name has surrounding whitespace
   (`" lab "`) can never be reached by its own name, because the selector trims
   it. It is refused by id or by name, `retryable: false`, asking the owner to
@@ -117,7 +122,8 @@ node it resolved, so each node id reaches exactly one machine.
   20, with an "(and N more; call list_relay_spawn_targets)" suffix; ambiguous
   matches are capped the same way).
 - **Echoed text.** Node, machine and owner names and the ranking reason in
-  refusal messages, `node`, `owner`, `alternatives` and `valid_targets` come
+  refusal messages, `node`, `owner`, `alternatives`, `valid_targets` and
+  `list_relay_spawn_targets` results come
   from the roster or user profiles, so control, format and separator
   characters in them are shown as `\u{...}` escapes. `node` is for display
   only: pass ids back as `target_node`.
