@@ -1292,3 +1292,17 @@ test("the owner revokes one approval; the delegate that sent one withdraws it", 
     "SELECT event, reason FROM delegation_audit_events WHERE event IN ('approval.revoked', 'approval.withdrawn') ORDER BY id")).rows;
   assert.deepEqual(events, [{ event: "approval.revoked", reason: "owner_revoked" }, { event: "approval.withdrawn", reason: "delegate_withdrew" }]);
 });
+
+test("routes that run before any caller is proven never provision a Relaycast binding", async (t) => {
+  const env = await setup(t);
+  await env.enable();
+  // Unbind the primary workspace, as an imported workspace starts out.
+  await env.database.query(
+    "UPDATE workspaces SET relaycast_workspace_id = NULL, relaycast_api_key_ciphertext = NULL WHERE id = $1", [env.workspaceId]);
+  const withdraw = await request(env.origin, `${env.base}/messaging/delegation/withdraw`, { method: "POST",
+    body: { delegate_agent_id: "ag_x", delegate_token: "at_not_a_real_token", approval_id: "apv_abcdefgh1234" } });
+  assert.equal(withdraw.status, 503, withdraw.raw);
+  const row = await env.database.query<{ relaycast_workspace_id: string | null; relaycast_binding_claim_id: string | null }>(
+    "SELECT relaycast_workspace_id, relaycast_binding_claim_id FROM workspaces WHERE id = $1", [env.workspaceId]);
+  assert.deepEqual(row.rows[0], { relaycast_workspace_id: null, relaycast_binding_claim_id: null });
+});

@@ -586,7 +586,8 @@ export function createApp(input: {
     authenticateAccessToken: (token) => store.authenticateAccessToken(token),
     workspaceForUser: (workspaceId, userId) => store.workspaceForUser(workspaceId, userId),
     json,
-    relaycastBinding: (workspaceId) => store.relaycastBinding(workspaceId),
+    // Never provisions: these lookups can run before any caller is proven.
+    relaycastBinding: (workspaceId) => store.existingRelaycastBinding(workspaceId),
     rateLimit: (res, key, rule) => rateLimit(res, key, rule, "rate_limited", "Too many delegation requests; retry later"),
     clientKey: (request) => limiterKey(clientIp(request)),
     now: input.now,
