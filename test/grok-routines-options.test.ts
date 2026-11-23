@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import type { SelfhostConfig } from "../src/config.js";
 import type { Database } from "../src/database.js";
@@ -46,4 +47,13 @@ test("options carry the keyring, public origin, tenancy mode, client and clock",
   assert.equal(options.client, client);
   assert.equal(options.database, database);
   assert.equal(options.now, now);
+});
+
+// The defect this guards: one of the two construction sites built its own options object and drifted from the other.
+test("the server and createApp build GrokRoutines only through grokRoutinesOptions", async () => {
+  for (const file of ["../src/server.ts", "../src/app.ts"]) {
+    const source = await readFile(new URL(file, import.meta.url), "utf8");
+    assert.equal((source.match(/new GrokRoutines\(/g) ?? []).length, 1, file);
+    assert.match(source, /new GrokRoutines\(grokRoutinesOptions\(config,/, file);
+  }
 });
